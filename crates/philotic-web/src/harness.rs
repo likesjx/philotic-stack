@@ -2458,13 +2458,22 @@ fn render_harness_config(
     }
 }
 
+/// Node ids (`harness:codex-local`) and short ids (`codex-local`) are both
+/// accepted by every CLI entry point, but projection paths must be derived
+/// from the short form only — otherwise `verify harness:x` and `verify x`
+/// silently address two different files (observed live: duplicate
+/// `~/.gemini/.../harness:gemini-*` projection dirs).
+fn short_harness_id(harness_id: &str) -> &str {
+    harness_id.strip_prefix("harness:").unwrap_or(harness_id)
+}
+
 fn codex_target_path(harness_id: &str) -> Result<PathBuf> {
     let home = dirs::home_dir().context("failed to locate home directory")?;
     Ok(home
         .join(".codex")
         .join("philotic")
         .join("harnesses")
-        .join(harness_id)
+        .join(short_harness_id(harness_id))
         .join("AGENTS.md"))
 }
 
@@ -2474,7 +2483,7 @@ fn claude_code_target_path(harness_id: &str) -> Result<PathBuf> {
         .join(".claude")
         .join("philotic")
         .join("harnesses")
-        .join(harness_id)
+        .join(short_harness_id(harness_id))
         .join("CLAUDE.md"))
 }
 
@@ -2485,7 +2494,7 @@ fn antigravity_target_path(harness_id: &str) -> Result<PathBuf> {
         .join("antigravity")
         .join("philotic")
         .join("harnesses")
-        .join(harness_id)
+        .join(short_harness_id(harness_id))
         .join("GEMINI_HARNESS.md"))
 }
 
@@ -2494,7 +2503,7 @@ fn windsurf_target_path(harness_id: &str) -> Result<PathBuf> {
     Ok(root
         .join(".windsurf")
         .join("rules")
-        .join(format!("philotic-{}.md", harness_id)))
+        .join(format!("philotic-{}.md", short_harness_id(harness_id))))
 }
 
 fn default_skills_for_profile(profile: &str) -> Vec<String> {
@@ -2510,6 +2519,7 @@ fn default_skills_for_profile(profile: &str) -> Vec<String> {
 }
 
 fn render_codex_markdown(harness_id: &str, profile: &str, skills: &[String]) -> String {
+    let harness_id = short_harness_id(harness_id);
     let skills_lines = if skills.is_empty() {
         "- none".to_string()
     } else {
@@ -2551,6 +2561,7 @@ fn merge_managed_block(existing: &str, begin: &str, end: &str, block: &str) -> S
 }
 
 fn codex_managed_block_markers(harness_id: &str) -> (String, String) {
+    let harness_id = short_harness_id(harness_id);
     (
         format!("<!-- BEGIN PHILOTIC HARNESS {harness_id} (managed by `phil graph harness apply`; do not edit) -->"),
         format!("<!-- END PHILOTIC HARNESS {harness_id} -->"),
@@ -2564,6 +2575,7 @@ fn write_codex_workspace_files(
     harness_id: &str,
     projection_path: &PathBuf,
 ) -> Result<Vec<AuxCheck>> {
+    let harness_id = short_harness_id(harness_id);
     let home = dirs::home_dir().context("failed to locate home directory")?;
     let agents_md = home.join(".codex").join("AGENTS.md");
     let (begin, end) = codex_managed_block_markers(harness_id);
@@ -2597,6 +2609,7 @@ fn write_codex_workspace_files(
 }
 
 fn render_claude_code_markdown(harness_id: &str, profile: &str, skills: &[String]) -> String {
+    let harness_id = short_harness_id(harness_id);
     let skills_lines = if skills.is_empty() {
         "- none".to_string()
     } else {
@@ -2612,6 +2625,7 @@ fn render_claude_code_markdown(harness_id: &str, profile: &str, skills: &[String
 }
 
 fn render_antigravity_markdown(harness_id: &str, profile: &str, skills: &[String]) -> String {
+    let harness_id = short_harness_id(harness_id);
     let skills_lines = if skills.is_empty() {
         "- none".to_string()
     } else {
@@ -2627,6 +2641,7 @@ fn render_antigravity_markdown(harness_id: &str, profile: &str, skills: &[String
 }
 
 fn render_windsurf_rule_markdown(harness_id: &str, profile: &str, skills: &[String]) -> String {
+    let harness_id = short_harness_id(harness_id);
     let skills_lines = if skills.is_empty() {
         "- none".to_string()
     } else {
@@ -2697,6 +2712,7 @@ fn write_claude_code_workspace_files(
     harness_id: &str,
     projection_path: &PathBuf,
 ) -> Result<Vec<AuxCheck>> {
+    let harness_id = short_harness_id(harness_id);
     let root = std::env::current_dir().context("failed to locate current workspace")?;
     let dot_claude = root.join(".claude");
 
@@ -2785,6 +2801,7 @@ fn write_antigravity_workspace_files(
     harness_id: &str,
     projection_path: &PathBuf,
 ) -> Result<Vec<AuxCheck>> {
+    let harness_id = short_harness_id(harness_id);
     let root = std::env::current_dir().context("failed to locate current workspace")?;
     let agents_dir = root.join(".agents").join("workflows");
 
@@ -3302,6 +3319,41 @@ mod tests {
         assert!(!trial_close_has_verified("completed", Some("")));
         assert!(trial_close_has_verified("completed", Some("test-green")));
         assert!(trial_close_has_verified("blocked", None));
+    }
+
+    #[test]
+    fn prefixed_and_short_harness_ids_resolve_identical_projection_paths() {
+        for (a, b) in [
+            (
+                codex_target_path("harness:codex-local").unwrap(),
+                codex_target_path("codex-local").unwrap(),
+            ),
+            (
+                claude_code_target_path("harness:claude-local").unwrap(),
+                claude_code_target_path("claude-local").unwrap(),
+            ),
+            (
+                antigravity_target_path("harness:gemini-architect").unwrap(),
+                antigravity_target_path("gemini-architect").unwrap(),
+            ),
+            (
+                windsurf_target_path("harness:windsurf-native").unwrap(),
+                windsurf_target_path("windsurf-native").unwrap(),
+            ),
+        ] {
+            assert_eq!(a, b);
+            assert!(!a.to_string_lossy().contains("harness:"));
+        }
+        // Rendered content and markers must also be id-form independent,
+        // or verify-by-node-id reports drift against apply-by-short-id.
+        assert_eq!(
+            render_codex_markdown("harness:codex-local", "implementer", &[]),
+            render_codex_markdown("codex-local", "implementer", &[])
+        );
+        assert_eq!(
+            codex_managed_block_markers("harness:codex-local"),
+            codex_managed_block_markers("codex-local")
+        );
     }
 
     #[test]
