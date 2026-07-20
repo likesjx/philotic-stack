@@ -4223,6 +4223,11 @@ fn seed_abstract_skill_catalog(graph: &GraphDomain) -> anyhow::Result<()> {
                           new capability (\"I need X\", \"build me Y\", \"idea: Z\"), capture it \
                           with life.observe as a GrowthHypothesis node — id `idea:<slug>`, \
                           claim_summary in one or two sentences preserving the operator's words. \
+                          This applies EVEN IF the idea arrives as a fleshed-out design or \
+                          project (2026-07-20: the Lyra design was captured only as a Project \
+                          node and the triage sweep missed it) — a Project/Decision node may \
+                          complement the capture but never replaces it; ONLY `idea:<slug>` \
+                          GrowthHypothesis nodes enter the idea triage pipeline. \
                           Do NOT set lifecycle properties — the triage pipeline stamps \
                           idea_status/graph_ref later; a node without idea_status counts as \
                           captured. Batch with life.observe.batch when several ideas arrive at \
