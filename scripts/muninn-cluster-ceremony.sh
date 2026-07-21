@@ -13,9 +13,10 @@
 #   design (registry written on first engram). Skip empties; nothing lost.
 # - Exports require admin auth: -u root -p'<password>' (mesh-config
 #   context_graph.muninn creds work on the Air and mbp-jane).
-# - vps admin password is CUSTOM: recover via `ansible-vault view
-#   ansible/vault/jane-vps.yml` in the MAIN checkout, or rotate by
-#   restarting the vps daemon with MUNINN_ADMIN_PASSWORD=<new>.
+# - vps admin password is `vault_muninn_admin_password`: recover via
+#   `ansible-vault view ansible/vault/jane-vps.yml`. Rotate by changing it
+#   there and running `ansible-playbook deploy_muninn.yml --limit jane-vps`
+#   (renders ~/.muninn/muninn.env; bootstrap re-hashes on daemon start).
 # - `muninn cluster enable` CLI ALWAYS 401s (sends no session cookie).
 #   Use REST: login -> POST /api/admin/cluster/enable with cookie.
 # - Consider upgrading all three daemons to v0.8.0 BEFORE clustering.

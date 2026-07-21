@@ -26,3 +26,8 @@
 
   roles:
     - role: philotic_hotel
+    # Hotel deploys also re-enforce the MuninnDB hardened baseline so a full
+    # rebuild can never regress muninn to open/default-password state
+    # (proposal:muninn-vps-reharden). Restarts muninn only on config change.
+    - role: muninn
+      tags: [muninn]
