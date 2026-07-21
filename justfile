@@ -425,6 +425,29 @@ smoke-agent-graph:
 smoke-desktop-membrane:
     bash scripts/smoke-desktop-membrane.sh
 
+# Run the `phil config get/set` IPC roundtrip smoke (ephemeral throwaway hotel)
+smoke-config:
+    bash scripts/smoke-config-roundtrip.sh
+
+# Substrate Hardening S4: run ONE bounded chaos-smoke scenario against a
+# designated hotel (guest-kill / config-corrupt / mesh-peer-drop, or omit to
+# round-robin the two real scenarios). Pass --dry-run to print the plan only.
+# See scripts/chaos-smoke.sh's header for the full env-var contract —
+# PHILOTIC_CHAOS_HOTEL / PHILOTIC_CHAOS_PROFILE / PHILOTIC_CHAOS_GUEST_ID in
+# particular must be set to match the real target hotel before a live run.
+chaos-smoke *args:
+    bash scripts/chaos-smoke.sh {{args}}
+
+# Install the OPT-IN weekly launchd schedule for chaos-smoke (macOS; never
+# auto-installed — see scripts/install-chaos-smoke-schedule.sh).
+chaos-smoke-schedule:
+    ./scripts/install-chaos-smoke-schedule.sh
+
+# Unit-test chaos-smoke.sh's assertion/parsing logic (denylists, JSON field
+# extraction, heal-queue counting) against fixture data — no real hotel touched.
+chaos-smoke-unit-test:
+    bash scripts/tests/chaos-smoke-unit-test.sh
+
 # Run the model-controller roundtrip smoke (requires mesh-config.json with model credentials)
 smoke-model-controller:
     bash scripts/smoke-model-controller-roundtrip.sh
