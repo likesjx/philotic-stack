@@ -1819,6 +1819,24 @@ impl GraphDomain {
         Ok(out)
     }
 
+    /// List every audit record across **all** lanes, oldest first. Unlike
+    /// [`Self::list_autonomy_audits_by_lane`], which scopes to one lane, this
+    /// crosses lanes — used by the A9 timeout-to-Neutral sweep
+    /// (`aiua::autonomy_sweep`, which must consider every lane's `Pending`
+    /// backlog in one pass) and by the `phil autonomy pending` operator
+    /// surface (`GetConfig("__autonomy_pending__")`).
+    pub fn list_all_autonomy_audits(&self) -> Result<Vec<AutonomyAuditRecord>> {
+        let mut out = Vec::new();
+        for node in self.adapter.list_nodes_by_kind(NODE_KIND_AUTONOMY_AUDIT)? {
+            let record: AutonomyAuditRecord = serde_json::from_value(node.data).context(
+                "GraphDomain::list_all_autonomy_audits: deserialize AutonomyAuditRecord",
+            )?;
+            out.push(record);
+        }
+        out.sort_by_key(|r| r.created_at);
+        Ok(out)
+    }
+
     /// Update the review outcome on an existing audit record. Returns `false`
     /// when the record does not exist.
     pub fn set_autonomy_audit_outcome(
@@ -2082,6 +2100,41 @@ mod tests {
         assert!(!domain
             .set_autonomy_audit_outcome("missing", AuditOutcome::Reversed, 3_001)
             .expect("set missing"));
+    }
+
+    #[test]
+    fn list_all_autonomy_audits_crosses_lanes_oldest_first() {
+        let domain = make_domain();
+        let lane_a = crate::autonomy::LANE_STEWARD_ACTIVE_CHECKINS;
+        let lane_b = crate::autonomy::LANE_WORK_EXECUTE_SLICES;
+
+        let a = AutonomyAuditRecord::new(
+            "audit-a",
+            AutonomyLane::new(lane_a),
+            "did a thing",
+            "evidence",
+            "revert",
+            crate::autonomy::AutonomyPosture::ConfirmFirst,
+            2_000,
+        );
+        let b = AutonomyAuditRecord::new(
+            "audit-b",
+            AutonomyLane::new(lane_b),
+            "did another thing",
+            "evidence",
+            "revert",
+            crate::autonomy::AutonomyPosture::ProposalOnly,
+            1_000,
+        );
+        domain.record_autonomy_audit(&a).expect("record a");
+        domain.record_autonomy_audit(&b).expect("record b");
+
+        let all = domain.list_all_autonomy_audits().expect("list all");
+        assert_eq!(all.len(), 2);
+        // Oldest first, across lanes — unlike list_autonomy_audits_by_lane,
+        // no lane filter is applied.
+        assert_eq!(all[0].audit_id, "audit-b");
+        assert_eq!(all[1].audit_id, "audit-a");
     }
 
     #[test]

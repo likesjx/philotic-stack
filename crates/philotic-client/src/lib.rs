@@ -2081,10 +2081,11 @@ pub enum IpcRequest {
     /// `recorded=false, reason="already_recorded"` so one confirmation can
     /// never double-count toward promotion.
     ///
-    /// TODO(A9): a configurable timeout-to-`"neutral"` for audits left
-    /// `Pending` past some age is not wired up — `"neutral"` is only
-    /// reachable through an explicit report today. See
-    /// `ansible_mesh_core::autonomy::AuditOutcome::Neutral`.
+    /// A configurable timeout-to-`"neutral"` sweep for audits left `Pending`
+    /// past some age is wired up in `aiua::autonomy_sweep` (A9
+    /// outcome-stamping follow-up slice) — see
+    /// `ansible_mesh_core::autonomy::AuditOutcome::Neutral`. `"neutral"` is
+    /// also reachable at any time through an explicit report on this path.
     ///
     /// Responds with [`IpcResponse::Standard`] — `data` carries
     /// `{recorded, lane?, transition?, posture?, reason?}`.
