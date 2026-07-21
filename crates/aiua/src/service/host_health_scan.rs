@@ -180,27 +180,39 @@ pub fn parse_meminfo_used_pct(content: &str) -> Option<f32> {
 /// filed `host_mem_pressure critical` on every scan cycle of every Mac
 /// (155 false rows on mbp-jane by 2026-07-20), burying real heal signals.
 pub fn parse_vm_stat_used_pct(stdout: &str) -> Option<f32> {
-    let mut free_pages: u64 = 0;
+    // ONLY page-STATE lines participate. vm_stat also prints cumulative
+    // event counters (Pageins, Compressions, Decompressions, Swapouts, …)
+    // that grow without bound — the old parser summed every numeric line
+    // into `total`, so on any uptime the counters dwarfed the states and
+    // used% pinned at 100 regardless of real pressure (mbp-jane 2026-07-20:
+    // parser said 100%, true usage 68.8%). Used = active + wired +
+    // compressor-occupied; total = those + free + inactive + speculative.
+    const USED_STATES: [&str; 3] = [
+        "Pages active",
+        "Pages wired down",
+        "Pages occupied by compressor",
+    ];
+    const RECLAIMABLE_STATES: [&str; 3] = ["Pages free", "Pages inactive", "Pages speculative"];
+    let mut used_pages: u64 = 0;
     let mut total_pages: u64 = 0;
     for line in stdout.lines() {
         let parts: Vec<&str> = line.splitn(2, ':').collect();
         if parts.len() != 2 {
             continue;
         }
+        let key = parts[0].trim();
         let val: u64 = parts[1].trim().trim_end_matches('.').parse().unwrap_or(0);
-        total_pages += val;
-        if parts[0].contains("Pages free")
-            || parts[0].contains("Pages speculative")
-            || parts[0].contains("Pages inactive")
-            || parts[0].contains("Pages purgeable")
-        {
-            free_pages += val;
+        if USED_STATES.iter().any(|s| key == *s) {
+            used_pages += val;
+            total_pages += val;
+        } else if RECLAIMABLE_STATES.iter().any(|s| key == *s) {
+            total_pages += val;
         }
     }
     if total_pages == 0 {
         return None;
     }
-    Some((total_pages - free_pages.min(total_pages)) as f32 / total_pages as f32 * 100.0)
+    Some(used_pages as f32 / total_pages as f32 * 100.0)
 }
 
 /// Aggregate CPU jiffies from the first line of `/proc/stat`. `idle` includes
@@ -649,20 +661,30 @@ mod tests {
     }
 
     #[test]
-    fn vm_stat_counts_reclaimable_pages_as_free() {
-        // macOS keeps RAM full of reclaimable cache: inactive + purgeable
-        // pages must count as free or a healthy Mac reads ~100% used and
-        // files `host_mem_pressure critical` on every scan cycle.
+    fn vm_stat_counts_reclaimable_pages_as_free_and_ignores_event_counters() {
+        // Two false-100% bugs live here: (1) inactive/speculative pages are
+        // reclaimable and must not count as used; (2) vm_stat's cumulative
+        // EVENT counters (Pageins, Compressions, …) grow unboundedly with
+        // uptime and must not enter the total — summing them pinned used%
+        // at 100 on any host with real uptime (mbp-jane read 100% while
+        // truly at 68.8%, filing host_mem_pressure critical every 5 min).
         let stdout = "Mach Virtual Memory Statistics: (page size of 16384 bytes)\n\
                       Pages free:                   10000.\n\
                       Pages active:                 40000.\n\
                       Pages inactive:               30000.\n\
                       Pages speculative:             5000.\n\
                       Pages wired down:             10000.\n\
-                      Pages purgeable:               5000.\n";
+                      Pages purgeable:               5000.\n\
+                      \"Translation faults\":     999999999.\n\
+                      Pages copy-on-write:      123456789.\n\
+                      Pageins:                  987654321.\n\
+                      Compressions:             555555555.\n\
+                      Swapouts:                  44444444.\n";
         let pct = parse_vm_stat_used_pct(stdout).unwrap();
-        // free = 10000 + 5000 + 30000 + 5000 = 50000 of 100000 → 50% used.
-        assert!((pct - 50.0).abs() < 0.5, "{pct}");
+        // used = active 40000 + wired 10000 = 50000
+        // total = used + free 10000 + inactive 30000 + speculative 5000 = 95000
+        // → 52.6% — counters and purgeable (a subset of other states) ignored.
+        assert!((pct - 52.6).abs() < 0.5, "{pct}");
     }
 
     #[test]
