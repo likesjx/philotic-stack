@@ -12521,6 +12521,34 @@ mod tests {
             assert_eq!(fwd["task"]["concept"], "test concept");
         }
 
+        // A session-principal fallback (user id == session id, e.g. a cron
+        // session) must route shared writes to the fleet `default` vault,
+        // not mint a junk per-session user_* vault on the primary.
+        let routed_fallback = runtime
+            .forward_shared_memory_write(
+                &memory_core::MemoryScope::SharedUser,
+                "sess-memroute-fallback",
+                "fallback concept",
+                "fallback content",
+                &[],
+                &serde_json::Value::Null,
+                "sess-memroute-fallback",
+            )
+            .await;
+        assert!(routed_fallback.is_some());
+        {
+            let emitted = emitted.lock().unwrap();
+            let fwd = emitted
+                .iter()
+                .filter(|e| e["target_role"] == philotic_client::MEMORY_WRITE_FORWARD_ROLE)
+                .last()
+                .expect("fallback forward present");
+            assert_eq!(
+                fwd["task"]["vault"], "default",
+                "session-fallback shared writes must target the default vault"
+            );
+        }
+
         // Self-scope writes stay local even with a route configured — agent
         // vaults are per-host by design (the vault registry never replicates).
         let not_routed = runtime

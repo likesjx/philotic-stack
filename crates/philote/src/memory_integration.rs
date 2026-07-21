@@ -2097,6 +2097,17 @@ impl AgentRuntime {
             user_id: memory_user_id.to_string(),
         }
         .resolve_primary(scope);
+        // Sessions with no human principal (cron fires, synthetic sessions)
+        // fall back to `memory_user_id == session_id` (see
+        // `turn_memory_user_id`), which would mint a junk per-session
+        // `user_*` vault on the primary. A shared-scope write from such a
+        // session means "fleet-visible": route it to the shared `default`
+        // vault, which exists everywhere and replicates.
+        let vault = if matches!(scope, MemoryScope::SharedUser) && memory_user_id == session_id {
+            "default".to_string()
+        } else {
+            vault
+        };
         if !memory_core::is_fleet_shared_vault(&vault) {
             return None;
         }
