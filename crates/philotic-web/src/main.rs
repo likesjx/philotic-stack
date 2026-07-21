@@ -4,6 +4,7 @@ use std::path::PathBuf;
 
 mod autonomy;
 mod component;
+mod config;
 mod doctor;
 mod explain;
 mod flush;
@@ -225,6 +226,12 @@ enum Command {
     Heal {
         #[command(subcommand)]
         action: heal::HealAction,
+    },
+
+    /// Read/write a `node_config` key/value (operator/management-only IPC)
+    Config {
+        #[command(subcommand)]
+        action: config::ConfigAction,
     },
 
     /// Autonomy trust ledger — per-lane posture, budget, and promotion
@@ -578,6 +585,7 @@ async fn main() -> Result<()> {
         Command::Mcp { action } => mcp::run(action).await,
         Command::Keys { action } => keys::run(action).await,
         Command::Heal { action } => heal::run(action).await,
+        Command::Config { action } => config::run(action).await,
         Command::Autonomy { action } => autonomy::run(action).await,
         Command::Memory { action } => memory_explain::run(action).await,
         Command::Graph { action } => {
