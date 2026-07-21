@@ -3,7 +3,7 @@ title: MCP Client Fabric — Philote-Governed Consumption of External MCP Server
 doc_type: proposal
 domain: membrane-transport
 status: in-progress
-disposition: phase-2-implemented
+disposition: phase-3-implemented
 last_updated: 2026-07-18
 tags:
   - mcp
@@ -83,8 +83,33 @@ source_of_truth_targets:
 >   server** — Muninn MCP `:8750` (auth-required) returned live vault status
 >   through the credential path. Driver supports `MCP_SMOKE_CREDENTIAL`,
 >   `MCP_SMOKE_REFRESH_SECS`, `MCP_SMOKE_MODE=inspect`.
-> Remaining for Phase 3: stdio transport under a command allowlist; also
-> outstanding — philote approval-UX live drill on a deployed hotel.
+> **Phase 3 implemented + SMOKE-GREEN ×4 (2026-07-21).**
+> - **Stdio transport**: `membrane-mcp-client` spawns the allowlisted command
+>   as a child, speaks newline-framed JSON-RPC over its stdin/stdout, respawns
+>   on failure, and `kill_on_drop`s it on revoke. The child is launched with a
+>   **scrubbed environment** (`env_clear` + only HOME/PATH/LANG/… and an
+>   optional `MCP_STDIO_ENV_PASSTHROUGH` allowlist) so projected tools can't
+>   read the guest's ambient secrets.
+> - **Fail-closed command allowlist**: `McpStdioAllowlist` under the
+>   operator-managed `mcp_stdio_allowlist` node — empty default rejects all
+>   stdio; each entry is an exact `command` + required `args_prefix` (pins an
+>   interpreter to one script, no PATH/basename matching). `RegisterMcpUpstream`
+>   enforces it (`STDIO_NOT_ALLOWED`).
+> - **Operator ceremony CLI**: `phil mcp upstreams | show-policy | allow-host |
+>   allow-command --args-prefix …` (widening egress/stdio policy is operator-only,
+>   never a philote tool).
+> - Live proofs (scratch hotel): (1) stdio **rejected** fail-closed with no
+>   allowlist; (2) `phil mcp allow-command python3 --args-prefix
+>   scripts/mcp_stdio_stub.py` → connect + call green; (3) **env-scrub
+>   observable** — guest started with `MCP_STDIO_SECRET_PROBE=leaked-secret`,
+>   child's tool result reported `probe=<absent>`; (4) **real `muninn mcp`
+>   stdio proxy** (allowed via `--args-prefix mcp`) returned live vault status
+>   through the fabric. Fixture: `scripts/mcp_stdio_stub.py`; driver adds
+>   `MCP_SMOKE_STDIO_CMD` / `MCP_SMOKE_STDIO_ARGS`.
+>
+> The fabric is now feature-complete across all three phases. Still outstanding:
+> the philote approval-UX drill through a real cognitive turn, and a fleet
+> deploy (no production hotel runs the fabric binaries yet).
 
 ## Problem
 

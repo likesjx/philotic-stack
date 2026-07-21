@@ -3,11 +3,12 @@
 //! Hand-rolled on reqwest, mirroring the wire shapes `membrane-mcp` serves:
 //! `initialize` → `tools/list` → `tools/call` over `POST <url>` JSON-RPC 2.0.
 
+use crate::stdio::StdioTransport;
 use ansible_mesh_core::mcp_upstream::{
     McpProjectedTool, McpUpstreamConfig, McpUpstreamState, McpUpstreamToolGrant,
-    DEFAULT_UPSTREAM_CALL_TIMEOUT_SECS, DEFAULT_UPSTREAM_MAX_RESPONSE_BYTES,
+    McpUpstreamTransport, DEFAULT_UPSTREAM_CALL_TIMEOUT_SECS, DEFAULT_UPSTREAM_MAX_RESPONSE_BYTES,
 };
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
 use std::time::Duration;
 use tracing::{info, warn};
@@ -15,11 +16,25 @@ use tracing::{info, warn};
 /// The MCP protocol revision we request; matches what `membrane-mcp` serves.
 const MCP_PROTOCOL_VERSION: &str = "2024-11-05";
 
+/// Transport backend for one upstream: HTTP JSON-RPC or a spawned stdio child.
+enum Backend {
+    Http {
+        http: reqwest::Client,
+        url: String,
+        /// Raw bearer credential resolved from the vault, if any.
+        bearer: Option<String>,
+    },
+    Stdio {
+        /// Lazily spawned on first use / respawned after exit.
+        transport: Option<StdioTransport>,
+        command: String,
+        args: Vec<String>,
+    },
+}
+
 pub struct UpstreamClient {
     pub config: McpUpstreamConfig,
-    http: reqwest::Client,
-    /// Raw bearer credential resolved from the vault, if any.
-    bearer: Option<String>,
+    backend: Backend,
     next_id: u64,
     /// Approved baseline per remote tool: `(description, input_schema)` as
     /// captured at the last config update (`mcp.connect` re-run / replay).
@@ -89,61 +104,115 @@ pub fn filter_listing(
 
 impl UpstreamClient {
     pub fn new(config: McpUpstreamConfig, bearer: Option<String>) -> Result<Self> {
-        let http = reqwest::Client::builder()
-            .timeout(Duration::from_secs(DEFAULT_UPSTREAM_CALL_TIMEOUT_SECS))
-            .build()
-            .context("building http client")?;
+        let backend = match &config.transport {
+            McpUpstreamTransport::Http { url } => {
+                let http = reqwest::Client::builder()
+                    .timeout(Duration::from_secs(DEFAULT_UPSTREAM_CALL_TIMEOUT_SECS))
+                    .build()
+                    .context("building http client")?;
+                Backend::Http {
+                    http,
+                    url: url.clone(),
+                    bearer,
+                }
+            }
+            McpUpstreamTransport::Stdio { command, args } => Backend::Stdio {
+                transport: None,
+                command: command.clone(),
+                args: args.clone(),
+            },
+        };
         Ok(Self {
             config,
-            http,
-            bearer,
+            backend,
             next_id: 1,
             baseline: std::collections::HashMap::new(),
         })
     }
 
-    fn url(&self) -> Result<&str> {
-        self.config
-            .transport
-            .http_url()
-            .ok_or_else(|| anyhow!("upstream {} has no http url", self.config.upstream_id))
-    }
-
     async fn rpc(&mut self, method: &str, params: Value) -> Result<Value> {
         let id = self.next_id;
         self.next_id += 1;
-        let body = json!({
-            "jsonrpc": "2.0",
-            "id": id,
-            "method": method,
-            "params": params,
-        });
-        let mut req = self.http.post(self.url()?).json(&body);
-        if let Some(token) = &self.bearer {
-            req = req.bearer_auth(token);
+        match &mut self.backend {
+            Backend::Http { http, url, bearer } => {
+                let body = json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "method": method,
+                    "params": params,
+                });
+                let mut req = http.post(url.as_str()).json(&body);
+                if let Some(token) = bearer {
+                    req = req.bearer_auth(token);
+                }
+                let resp = req.send().await.context("upstream request failed")?;
+                let status = resp.status();
+                let bytes = resp.bytes().await.context("reading upstream response")?;
+                if bytes.len() as u64 > DEFAULT_UPSTREAM_MAX_RESPONSE_BYTES * 4 {
+                    bail!(
+                        "upstream response too large ({} bytes) for method {method}",
+                        bytes.len()
+                    );
+                }
+                if !status.is_success() {
+                    bail!(
+                        "upstream returned HTTP {status} for {method}: {}",
+                        String::from_utf8_lossy(&bytes[..bytes.len().min(512)])
+                    );
+                }
+                let envelope: Value =
+                    serde_json::from_slice(&bytes).context("upstream response is not JSON")?;
+                if let Some(err) = envelope.get("error") {
+                    bail!("upstream JSON-RPC error for {method}: {err}");
+                }
+                Ok(envelope.get("result").cloned().unwrap_or(Value::Null))
+            }
+            Backend::Stdio {
+                transport,
+                command,
+                args,
+            } => {
+                if transport.is_none() {
+                    *transport = Some(StdioTransport::spawn(
+                        command,
+                        args,
+                        Duration::from_secs(DEFAULT_UPSTREAM_CALL_TIMEOUT_SECS),
+                    )?);
+                }
+                let t = transport.as_mut().expect("spawned above");
+                match t.rpc(id, method, params).await {
+                    Ok(v) => Ok(v),
+                    Err(e) => {
+                        // Drop the child so the next attempt respawns.
+                        *transport = None;
+                        Err(e)
+                    }
+                }
+            }
         }
-        let resp = req.send().await.context("upstream request failed")?;
-        let status = resp.status();
-        let bytes = resp.bytes().await.context("reading upstream response")?;
-        if bytes.len() as u64 > DEFAULT_UPSTREAM_MAX_RESPONSE_BYTES * 4 {
-            // Hard transport-level backstop; per-tool caps applied by callers.
-            bail!(
-                "upstream response too large ({} bytes) for method {method}",
-                bytes.len()
-            );
+    }
+
+    async fn send_initialized_notification(&mut self) {
+        let res = match &mut self.backend {
+            Backend::Http { http, url, bearer } => {
+                let notify = json!({
+                    "jsonrpc": "2.0",
+                    "method": "notifications/initialized",
+                });
+                let mut req = http.post(url.as_str()).json(&notify);
+                if let Some(token) = bearer {
+                    req = req.bearer_auth(token);
+                }
+                req.send().await.map(|_| ()).map_err(anyhow::Error::from)
+            }
+            Backend::Stdio { transport, .. } => match transport.as_mut() {
+                Some(t) => t.notify("notifications/initialized").await,
+                None => Ok(()),
+            },
+        };
+        if let Err(e) = res {
+            warn!(upstream = self.config.upstream_id, err = %e, "initialized notification failed (ignored)");
         }
-        if !status.is_success() {
-            bail!(
-                "upstream returned HTTP {status} for {method}: {}",
-                String::from_utf8_lossy(&bytes[..bytes.len().min(512)])
-            );
-        }
-        let envelope: Value =
-            serde_json::from_slice(&bytes).context("upstream response is not JSON")?;
-        if let Some(err) = envelope.get("error") {
-            bail!("upstream JSON-RPC error for {method}: {err}");
-        }
-        Ok(envelope.get("result").cloned().unwrap_or(Value::Null))
     }
 
     /// `initialize` + `notifications/initialized` handshake.
@@ -169,18 +238,7 @@ impl UpstreamClient {
             upstream = self.config.upstream_id,
             server_version, "upstream initialized"
         );
-        // Best-effort initialized notification (id-less; many servers 202 it).
-        let notify = json!({
-            "jsonrpc": "2.0",
-            "method": "notifications/initialized",
-        });
-        let mut req = self.http.post(self.url()?).json(&notify);
-        if let Some(token) = &self.bearer {
-            req = req.bearer_auth(token);
-        }
-        if let Err(e) = req.send().await {
-            warn!(upstream = self.config.upstream_id, err = %e, "initialized notification failed (ignored)");
-        }
+        self.send_initialized_notification().await;
         Ok(())
     }
 
