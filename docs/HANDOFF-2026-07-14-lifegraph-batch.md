@@ -75,7 +75,10 @@ Root cause (`crates/philote/src/memory_integration.rs` `inbound_primary_user_id`
 2. **Verify transcribe** — operator sends a long voice memo (see above).
 3. **Revoke throwaway key** — a full-access diagnostic key minted during the muninn incident: `ssh -t deploy@jane-vps 'muninn api-key revoke 3jaGmoCs5ek --vault user_likesjx -p'` (needs muninn root pw). Also 2 orphan `muninn_vault_token` secrets prunable (`b8c6147`, `66665303`).
 4. **PR the orphaned vps `membrane-telegram` hotfix** if wanted (see gotchas).
-5. **Muninn on vps-jane** was re-provisioned this session (key store had been wiped); config block added to `/opt/philotic/etc/mesh-config.json` with `context_graph.muninn` admin creds. Working.
+5. **Muninn token durability (2026-07-21 incident)** — Beacon's memory 401'd again because the Jul-20 cluster rebuild **wiped Muninn's key store**, invalidating the hotel's stored tokens (the token↔key binding spans two independent stores; the hotel DB was fine, Muninn forgot its half). Fixed with a **DB-centric resync** (mint fresh Muninn keys → re-encrypt with the hotel master key → update the `graph_nodes` secret records in place → restart; verified `WRITE 201`, 0 401s). Two follow-up proposals FILED to the intel-graph:
+   - **`proposal:memory-token-self-heal`** — on a token-401 (distinct from unreachable), auto re-mint + re-store from the durable hotel-DB truth, so the system self-heals across the two-store gap (the operator's "DBs are truth" philosophy, made resilient). The 2026-07-21 manual resync is the reference implementation.
+   - **`proposal:muninn-vps-reharden`** — the rebuilt vps Muninn is **open (no admin auth)**; restore admin + token auth WITHOUT rotating `auth_secret` (would re-break the resynced tokens), and put the hardened baseline + config block in the deploy source so rebuilds restore it. Couples with the self-heal (which needs an admin credential source to mint).
+   - Recurrence root: **rebuilds keep dropping Muninn's auth + keys.** The durable answer is the pair above (hardened baseline that rebuilds restore + hotel auto-recovery regardless).
 6. Optional immediate mitigation if the batch keeps wedging Beacon before it's root-caused: **disable `life.observe.batch`** from the `life.steward` skill `implied_tools` (live DB patch) so Beacon falls back to single observe.
 
 ---
