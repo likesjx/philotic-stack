@@ -39,3 +39,17 @@ phil graph harness list 2>/dev/null | awk 'NR>2 {print $1}' | sed 's/^harness://
 done
 
 phil graph harness drift || true
+
+# Keep the skill catalog in lockstep with the on-disk corpus.
+phil graph harness skills sync 2>/dev/null | tail -2 || true
+
+# Expire stale agent sessions so the dashboard reflects reality.
+if curl -s -m 3 -o /dev/null "$GRAPH_URL/api/status"; then
+    curl -s -m 30 -X POST "$GRAPH_URL/api/session/cleanup" \
+        ${PHILOTIC_GRAPH_TOKEN:+-H "Authorization: Bearer $PHILOTIC_GRAPH_TOKEN"} \
+        -H "Content-Type: application/json" -d '{}' >/dev/null 2>&1 \
+        && echo "sessions: stale cleanup ran"
+fi
+
+# Surface trial-ledger adoption (read side of the telemetry flywheel).
+phil graph harness trials list --limit 5 2>/dev/null | head -8 || true

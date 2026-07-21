@@ -325,6 +325,11 @@ enum GraphAction {
 
     /// Manage local external harnesses and record desired/rendered/observed state in intel-graph
     Harness {
+        /// Graph DB to operate on (default: live DB; env: PHILOTIC_GRAPH_DB).
+        /// Use a scratch path when testing so dev iterations never pollute
+        /// the live registry.
+        #[arg(long, global = true)]
+        db: Option<String>,
         #[command(subcommand)]
         action: harness::HarnessAction,
     },
@@ -784,7 +789,7 @@ async fn main() -> Result<()> {
                     }
                     Ok(())
                 }
-                GraphAction::Harness { action } => harness::run(action),
+                GraphAction::Harness { db, action } => harness::run(action, db),
             }
         }
         Command::Role { action } => {
