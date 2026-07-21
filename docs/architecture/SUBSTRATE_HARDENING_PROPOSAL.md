@@ -79,7 +79,17 @@ S1 is the single highest-leverage item and should be the first slice claimed.
 
 ### Slice status
 
-- **S1** `supervision-invariant` — not started.
+- **S1** `supervision-invariant` — completed via live ops 2026-07-11/12 (no code
+  slice): mbp-jane confirmed under launchd with KeepAlive (the "nohup,
+  unsupervised" reading was stale — and the ssh `launchctl list` gui-domain
+  visibility gotcha caused a later false "no job loaded" too, see DEF-046);
+  `com.philotic.logrotate` copytruncate agent installed on mbp-jane
+  (`~/.philotic/bin/rotate-hotel-logs.sh`, first run rotated a 90MB stranded
+  log — watched-live); vps-jane systemd `Restart=on-failure/10s` verified;
+  router-listener startup crash not reproducible (graceful no-config
+  fallback observed live). The doctor-flags-unsupervised check shipped with
+  S2. Verified: watched-live (unattended launchd auto-restore observed on
+  mbp-jane 2026-07-12T01:20Z).
 - **S2** `heal-the-healer` — landed 2026-07-11 (`codex/substrate-s2-heal-the-healer`):
   `GuestManager::check_heal_dispatcher_heartbeat` watchdog closes the loop
   doctor's `heal.dispatcher-staleness` check only displayed (stale heartbeat
