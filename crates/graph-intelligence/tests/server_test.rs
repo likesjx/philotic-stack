@@ -52,6 +52,7 @@ fn test_state() -> Arc<AppState> {
         },
         repo_root: root.to_string_lossy().to_string(),
         change_tx,
+        server_info: serde_json::json!({"version": "test"}),
     })
 }
 

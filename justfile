@@ -65,6 +65,10 @@ harness-skills-sync:
 intel-graph-freshness-schedule:
     ./scripts/install-intel-graph-freshness-schedule.sh
 
+# Install the launchd service that SUPERVISES the graph server (KeepAlive, RunAtLoad).
+intel-graph-service:
+    ./scripts/install-intel-graph-service.sh
+
 # Re-apply the canonical profile to a harness (default: claude-local with philotic-operator).
 harness-apply harness="claude-local" profile="philotic-operator":
     phil graph harness apply {{harness}} --profile {{profile}}
@@ -293,6 +297,7 @@ worktree-create slug base="main":
 # Bootstrap an implementation workstream with a dedicated sibling worktree and checklist.
 workstream-start slug base="develop":
     ./scripts/codex-workstream.sh start {{slug}} {{base}}
+    @echo "Tip: record slice telemetry — just harness-trial-start <seam-id> (close at slice end with harness-trial-close)"
 
 # Alias for the multi-role workstream workflow.
 start-workstream slug base="develop":

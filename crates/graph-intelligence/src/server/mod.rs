@@ -127,6 +127,27 @@ pub struct AppState {
     pub scan_config: ScanConfig,
     pub repo_root: String,
     pub change_tx: broadcast::Sender<ws::ChangeEvent>,
+    /// Identity of the running server: version, start time, binary path+hash.
+    /// Surfaced in /api/status so stale-binary drift is observable (the server
+    /// once ran 12 days from a deleted binary with no way to tell).
+    pub server_info: serde_json::Value,
+}
+
+fn server_identity() -> serde_json::Value {
+    let exe = std::env::current_exe().ok();
+    let binary_sha256 = exe.as_ref().and_then(|p| {
+        std::fs::read(p).ok().map(|bytes| {
+            use sha2::{Digest, Sha256};
+            format!("{:x}", Sha256::digest(&bytes))
+        })
+    });
+    serde_json::json!({
+        "version": env!("CARGO_PKG_VERSION"),
+        "started_at": chrono::Utc::now().to_rfc3339(),
+        "binary_path": exe.as_ref().map(|p| p.display().to_string()),
+        "binary_sha256": binary_sha256,
+        "pid": std::process::id(),
+    })
 }
 
 /// Start both the HTTP/WS server and the MCP server.
@@ -162,6 +183,7 @@ pub async fn serve(config: ServerConfig) -> Result<()> {
         scan_config: config.scan_config,
         repo_root: config.repo_root,
         change_tx,
+        server_info: server_identity(),
     });
 
     // Build the HTTP + WebSocket router

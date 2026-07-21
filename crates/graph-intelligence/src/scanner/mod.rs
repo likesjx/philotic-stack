@@ -37,6 +37,10 @@ pub struct ScanResult {
 pub fn full_scan(root: &Path, config: &ScanConfig, engine: &mut GraphEngine) -> Result<ScanResult> {
     let start = Instant::now();
 
+    // Scans are destructive (delete + reinsert); hold embeddings aside so
+    // semantic-search state survives nodes being recreated (DEF-066).
+    let embedding_snapshot = engine.snapshot_embeddings().unwrap_or_default();
+
     // Clear existing data for this worktree before re-scanning
     engine.clear_worktree(&config.worktree)?;
 
@@ -167,6 +171,11 @@ pub fn full_scan(root: &Path, config: &ScanConfig, engine: &mut GraphEngine) -> 
         branches,
         duration_ms: duration.as_millis() as u64,
     };
+
+    let restored = engine.restore_embeddings(&embedding_snapshot).unwrap_or(0);
+    if restored > 0 {
+        eprintln!("[scan] restored {} embeddings across rescan", restored);
+    }
 
     // Record scan completion so freshness is observable (surfaced as last_scan in /api/status)
     let _ = engine.record_mutation(&crate::schema::Mutation {
