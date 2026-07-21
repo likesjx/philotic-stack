@@ -6,7 +6,7 @@ domain: memory-context
 status: proposed
 disposition: proposed
 last_updated: 2026-07-21
-verification_level: none
+verification_level: test-green
 tags:
 - muninn
 - memory
@@ -113,7 +113,7 @@ throttled operator escalation instead of a mint.
 |---|---|---|---|
 | S1 `auth-error-as-signal` | memory-core: introduce a typed error (`MemoryError::TokenRejected { vault }`) raised wherever a muninn response is `401 UNAUTHORIZED` — both the `discover_vault` loop and single-vault ops (check status before `error_for_status`). Philote callers in `memory_integration.rs` log it distinctly from unreachable; the hotel gains a `muninn_authorized` signal alongside `muninn_available` so doctor/status can say "reachable but rejecting tokens". No behavior change beyond classification. | S | test-green (unit: 401 → `TokenRejected`; 5xx/conn-refused unchanged) |
 | S2 `hotel-remint-on-401` | New IPC op `HealMemoryToken { vault }` in aiua: guardrails (vault must already be in `vault_registry`; per-vault mint budget, e.g. 1 mint / 10 min with backoff; heal-queue event + graph mutation on every attempt), then admin login → `POST /api/admin/keys` → `rotate_secret` on the registry `secret_ref` → return fresh config. Admin credential resolved from the graph (`muninn_admin_credential`, from `muninn-vps-reharden`); absent credential → throttled operator escalation, no mint. Also fix the provisioning skip: `provision_muninn_vaults` validates the stored token with a cheap authenticated probe instead of the registry-presence `continue` at `muninn_provision.rs:152-156`, so `--load-config` after a key wipe re-mints instead of skipping. | M | smoke-green (test muninn: wipe keys → next write 401s → auto re-mint → retried write 201; budget exhaustion escalates, no mint storm) |
-| S3 `config-propagation-without-restart` | Close the cached-config gap: philote reacts to `TokenRejected` (or a successful heal response) by re-fetching memory config (`FetchMemoryConfig`) and dropping the cached `muninn_config` before the single retry; `RefreshMemoryConfig` (`ipc.rs:3022`) additionally re-runs `load_muninn_config` so its broadcast carries refreshed tokens, not just a reachability bool. Removes the "restart the hotel" step from the runbook entirely. | S–M | smoke-green (manual `rotate_secret` → next memory op picks up the new token with no restart) |
+| S3 `config-propagation-without-restart` | Close the cached-config gap: `FetchMemoryConfig` serves the config LIVE from the Context Graph (`load_muninn_config`) instead of the boot snapshot — DBs are truth — so any post-boot rotation reaches re-fetching guests; the `HealMemoryToken` response itself carries the refreshed config, and the philote replaces its cached `muninn_config` from it before the single retry. (Tokens are never pushed over the hotel-wide broadcast — `RefreshMemoryConfig` stays a reachability bool.) Removes the "restart the hotel" step from the runbook entirely. | S–M | smoke-green (manual `rotate_secret` → next `FetchMemoryConfig`/heal picks up the new token with no restart) |
 | S4 `key-wipe-drill` | Fold the two-store drift into the substrate chaos smokes (SUBSTRATE_HARDENING_PROPOSAL S4): a scheduled drill on a designated hotel wipes/rotates a test vault's muninn key and asserts the full circuit — `TokenRejected` classified, heal-queue entry filed, re-mint within budget, retried op succeeds, audit mutation recorded — with zero manual steps. This is the regression gate for the 2026-07-20/21 recurrence class. | S | watched-live (first drill cycle reviewed; a deliberately-missing admin credential produces escalation, not silence) |
 
 ## Guardrails
@@ -146,9 +146,27 @@ started.
 
 ### Slice status
 
-- S1 `auth-error-as-signal` — not started
-- S2 `hotel-remint-on-401` — not started (blocked on an admin credential
-  source for vps; mbp-jane/mac-jane can land first where admin auth exists)
-- S3 `config-propagation-without-restart` — not started
-- S4 `key-wipe-drill` — not started (depends on S1–S3; slots into substrate
-  chaos smokes)
+- S1 `auth-error-as-signal` — implemented (this PR): typed
+  `memory_core::TokenRejected` + `token_rejected_vault` helper, raised at
+  every authed REST site including the cross-scope activate fan-out and the
+  vault-discovery loop; unit-tested against canned 401/500 servers.
+- S2 `hotel-remint-on-401` — implemented (this PR): `HealMemoryToken` IPC
+  (`handle_heal_memory_token` in `ipc.rs`) with 10-min per-vault mint budget,
+  registered-vaults-only refusal, and heal-queue escalation when no admin
+  credential resolves; `remint_vault_token` + `resolve_admin_credential`
+  (secret record preferred, `--load-config` `muninn` object fallback) in
+  `muninn_provision.rs`; provisioning now probes stored-token validity
+  (`probe_token_validity`, cookie-free client) and re-mints on 401 instead of
+  the registry-presence skip. Budget semantics (adversarial-review-driven):
+  inside the window the hotel does NOT mint again but DOES serve the live
+  config — after the first guest's heal rotated the secret, every other
+  guest of a shared vault heals off the same rotation instead of being
+  stranded with a bare `HEAL_BUDGET_EXHAUSTED` for the rest of the window.
+  On vps the mint path still needs the `muninn-vps-reharden` admin
+  credential; until then it escalates loudly.
+- S3 `config-propagation-without-restart` — implemented (this PR):
+  `FetchMemoryConfig` loads live from the Context Graph; heal response
+  carries refreshed config; philote replaces cached `muninn_config` and
+  retries once at auto-recall, `memory.recall`, and `memory.remember`.
+- S4 `key-wipe-drill` — not started (depends on a deployed S1–S3; slots into
+  substrate chaos smokes)

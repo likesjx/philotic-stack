@@ -1429,6 +1429,17 @@ pub enum IpcRequest {
     /// Force the hotel to re-probe MuninnDB reachability immediately and broadcast the result.
     /// Responds with [`IpcResponse::MuninnStatus`].
     RefreshMemoryConfig,
+    /// MuninnDB rejected the stored bearer token for `vault` (HTTP 401 while
+    /// reachable): ask the hotel to re-mint the token from the durable
+    /// Context-Graph truth — admin mint via the MuninnDB admin API, then
+    /// `rotate_secret` on the registry `secret_ref` in place. Budgeted
+    /// per-vault on the hotel side; escalates instead of minting when no
+    /// admin credential is available. Responds with
+    /// [`IpcResponse::MemoryConfig`] carrying the refreshed config on
+    /// success, or [`IpcResponse::error`] on refusal/failure.
+    HealMemoryToken {
+        vault: String,
+    },
     /// Register a graph instance with the hotel's ODS so it can route graph_id → instance_id.
     /// Historically sent by the retired graph-runner guest on startup (for all existing
     /// graphs) and after each graph.create; the hotel-side registry handler remains live.
