@@ -11,6 +11,7 @@
 //! ride the standard `datasource_response` shape so the philote turn resumes
 //! through the existing re-entry path with no new routing code.
 
+mod stdio;
 mod upstream;
 
 use ansible_mesh_core::mcp_upstream::{

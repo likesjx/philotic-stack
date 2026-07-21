@@ -222,6 +222,49 @@ impl McpEgressPolicy {
     }
 }
 
+// ── Stdio command allowlist ───────────────────────────────────────────────────
+
+/// One permitted stdio upstream command. Stored (as part of
+/// [`McpStdioAllowlist`]) under the operator-managed `mcp_stdio_allowlist`
+/// config node. Widening the list is an operator ceremony
+/// (`phil mcp allow-command`), never a philote tool.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct McpStdioAllowEntry {
+    /// Exact command string the transport must use (e.g. `"muninn"`,
+    /// `"/usr/bin/python3"`). Compared verbatim — no PATH resolution, no
+    /// basename matching.
+    pub command: String,
+    /// Required prefix of the args vector. The transport's args must start
+    /// with exactly these elements. Empty = any args. This is what makes
+    /// interpreter entries safe: allow `python3` ONLY with
+    /// `args_prefix: ["scripts/muninn_mcp.py"]`, not python3-with-anything.
+    #[serde(default)]
+    pub args_prefix: Vec<String>,
+}
+
+/// Operator-managed allowlist for stdio upstream transports. Absent/empty =
+/// stdio registration is rejected (fail closed).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct McpStdioAllowlist {
+    #[serde(default)]
+    pub entries: Vec<McpStdioAllowEntry>,
+}
+
+impl McpStdioAllowlist {
+    /// Whether `command` + `args` match an allowlist entry.
+    pub fn command_allowed(&self, command: &str, args: &[String]) -> bool {
+        self.entries.iter().any(|entry| {
+            entry.command == command
+                && args.len() >= entry.args_prefix.len()
+                && entry
+                    .args_prefix
+                    .iter()
+                    .zip(args.iter())
+                    .all(|(want, got)| want == got)
+        })
+    }
+}
+
 /// Extract the host portion from an `http://` / `https://` URL without a URL
 /// crate: strips the scheme, any userinfo, the port, and IPv6 brackets.
 /// Returns `None` for non-HTTP schemes or empty hosts.
@@ -321,6 +364,38 @@ mod tests {
             parse_projected_tool_name("mcp:up.tool.with.dots"),
             Some(("up", "tool.with.dots"))
         );
+    }
+
+    #[test]
+    fn stdio_allowlist_fail_closed_and_prefix() {
+        let empty = McpStdioAllowlist::default();
+        assert!(!empty.command_allowed("muninn", &["mcp".into()]));
+
+        let list = McpStdioAllowlist {
+            entries: vec![
+                McpStdioAllowEntry {
+                    command: "muninn".into(),
+                    args_prefix: vec!["mcp".into()],
+                },
+                McpStdioAllowEntry {
+                    command: "/usr/bin/python3".into(),
+                    args_prefix: vec!["scripts/muninn_mcp.py".into()],
+                },
+            ],
+        };
+        assert!(list.command_allowed("muninn", &["mcp".into()]));
+        assert!(list.command_allowed("muninn", &["mcp".into(), "--verbose".into()]));
+        // Args prefix must match from the start.
+        assert!(!list.command_allowed("muninn", &["serve".into()]));
+        assert!(!list.command_allowed("muninn", &[]));
+        // Interpreter confined to the declared script.
+        assert!(list.command_allowed(
+            "/usr/bin/python3",
+            &["scripts/muninn_mcp.py".into(), "--vault".into()]
+        ));
+        assert!(!list.command_allowed("/usr/bin/python3", &["evil.py".into()]));
+        // No basename matching.
+        assert!(!list.command_allowed("python3", &["scripts/muninn_mcp.py".into()]));
     }
 
     #[test]

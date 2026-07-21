@@ -23,7 +23,8 @@
 //! MCP_SMOKE_REFRESH_SECS (periodic re-list interval),
 //! MCP_SMOKE_MODE=inspect (only print the stored catalog incl. stale grants,
 //! no register/call — for stale-grant drills where re-registering would reset
-//! the approval baseline).
+//! the approval baseline), MCP_SMOKE_STDIO_CMD + MCP_SMOKE_STDIO_ARGS (register
+//! a stdio transport instead of HTTP — space-separated args; Phase-3 proof).
 
 use anyhow::{Context, Result, bail};
 use philotic_client::{GuestIdentity, IpcRequest, IpcResponse, PhiloticClient};
@@ -53,6 +54,11 @@ async fn main() -> Result<()> {
         .ok()
         .and_then(|s| s.parse::<u64>().ok());
     let inspect_only = std::env::var("MCP_SMOKE_MODE").as_deref() == Ok("inspect");
+    let stdio_cmd = std::env::var("MCP_SMOKE_STDIO_CMD").ok().filter(|s| !s.is_empty());
+    let stdio_args: Vec<String> = std::env::var("MCP_SMOKE_STDIO_ARGS")
+        .ok()
+        .map(|s| s.split_whitespace().map(str::to_string).collect())
+        .unwrap_or_default();
 
     let identity = GuestIdentity {
         guest_id: OWNER.into(),
@@ -102,7 +108,15 @@ async fn main() -> Result<()> {
     let config = ansible_mesh_core::mcp_upstream::McpUpstreamConfig {
         upstream_id: UPSTREAM_ID.into(),
         owner_agent_id: OWNER.into(),
-        transport: ansible_mesh_core::mcp_upstream::McpUpstreamTransport::Http { url: url.clone() },
+        transport: match &stdio_cmd {
+            Some(cmd) => ansible_mesh_core::mcp_upstream::McpUpstreamTransport::Stdio {
+                command: cmd.clone(),
+                args: stdio_args.clone(),
+            },
+            None => ansible_mesh_core::mcp_upstream::McpUpstreamTransport::Http {
+                url: url.clone(),
+            },
+        },
         credential_ref: None,
         tool_allowlist: vec![ansible_mesh_core::mcp_upstream::McpUpstreamToolGrant {
             remote_name: tool.clone(),

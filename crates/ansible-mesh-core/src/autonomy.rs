@@ -408,12 +408,14 @@ pub fn bound_evidence(evidence: &str) -> String {
 /// demote transition). `Neutral` is a review with no promotion/demotion
 /// effect — a wash, not a signal either way — and never mutates the grant.
 ///
-/// TODO(A9): a configurable timeout-to-`Neutral` (an audit left `Pending`
-/// past some age auto-resolves to `Neutral` so it stops silently occupying
-/// "awaiting review" state forever) is not wired up. Today `Neutral` is only
-/// reachable through an explicit stamp; the timeout sweep needs a cron-like
-/// caller and is deferred to whichever slice adds scheduled hotel-side
-/// sweeps generally, rather than inventing a one-off timer for this.
+/// The configurable timeout-to-`Neutral` sweep (an audit left `Pending` past
+/// some age auto-resolves to `Neutral` so it stops silently occupying
+/// "awaiting review" state forever) is wired up in `aiua::autonomy_sweep`
+/// (A9 outcome-stamping follow-up slice) — see [`is_due_for_neutral`] /
+/// [`select_due_for_neutral`] for the pure selection logic and
+/// `crate::domain::GraphDomain::list_all_autonomy_audits` for the cross-lane
+/// read the sweep scans. `Neutral` is also reachable at any time through an
+/// explicit operator stamp (`phil autonomy stamp <id> neutral`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AuditOutcome {
@@ -498,6 +500,59 @@ impl AutonomyAuditRecord {
         self.provenance = Some(provenance);
         self
     }
+}
+
+// ── Timeout-to-Neutral sweep (A9 outcome-stamping follow-up) ────────────────
+
+/// Env var overriding how many days a `Pending` audit record may sit
+/// unreviewed before `aiua::autonomy_sweep`'s daily sweep stamps it
+/// `Neutral`. Consulted by [`neutral_after_days_from_env`].
+pub const ENV_NEUTRAL_AFTER_DAYS: &str = "PHILOTIC_AUTONOMY_NEUTRAL_AFTER_DAYS";
+/// Default timeout window, in days.
+pub const DEFAULT_NEUTRAL_AFTER_DAYS: u64 = 7;
+
+/// Resolve the timeout-to-Neutral window (in days) from `env`, falling back
+/// to [`DEFAULT_NEUTRAL_AFTER_DAYS`] when unset, unparsable, or `0`.
+pub fn neutral_after_days_from_env(env: impl Fn(&str) -> Option<String>) -> u64 {
+    env(ENV_NEUTRAL_AFTER_DAYS)
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(DEFAULT_NEUTRAL_AFTER_DAYS)
+}
+
+/// True when `record` is still `Pending` and has been for at least
+/// `window_secs` as of `now`. Pure — no clock reads, easy to test against
+/// fixture records.
+pub fn is_due_for_neutral(record: &AutonomyAuditRecord, now: u64, window_secs: u64) -> bool {
+    record.outcome == AuditOutcome::Pending && now.saturating_sub(record.created_at) >= window_secs
+}
+
+/// Filter `records` down to those [`is_due_for_neutral`] would stamp,
+/// preserving input order. The caller (`aiua::autonomy_sweep::run_sweep`)
+/// owns the actual stamping — this is pure selection logic so the "which
+/// records are due" question is unit-testable without a `GraphDomain`.
+pub fn select_due_for_neutral(
+    records: &[AutonomyAuditRecord],
+    now: u64,
+    window_secs: u64,
+) -> Vec<&AutonomyAuditRecord> {
+    records
+        .iter()
+        .filter(|r| is_due_for_neutral(r, now, window_secs))
+        .collect()
+}
+
+/// Human-readable pending-outcome notice for the self-heal queue channel
+/// (Piece 3 of the A9 outcome-stamping follow-up slice — an unresolved,
+/// throttled breadcrumb pointing at a fresh `Pending` audit awaiting
+/// operator review). Pure formatting — the caller decides whether/where to
+/// push it via `HealQueueStorage::push_classified` and under what
+/// pattern_tag/severity (`aiua` uses `"autonomy_outcome_pending"` / `"info"`).
+pub fn pending_outcome_notice(audit_id: &str, lane: &str, action_summary: &str) -> String {
+    format!(
+        "autonomy outcome pending review: lane={lane} audit_id={audit_id} — {action_summary}. \
+         Stamp it: `phil autonomy stamp {audit_id} confirmed_good|reversed|neutral`"
+    )
 }
 
 // ── Trust-ledger status report ──────────────────────────────────────────────
@@ -1003,5 +1058,99 @@ mod tests {
         assert_eq!(report.actions_today, 0);
         // The stored grant is untouched — this is a read, not a mutation.
         assert_eq!(g.actions_today, 9);
+    }
+
+    // ── timeout-to-Neutral sweep (A9 outcome-stamping follow-up) ────────────
+
+    fn audit_at(outcome: AuditOutcome, created_at: u64) -> AutonomyAuditRecord {
+        let mut record = AutonomyAuditRecord::new(
+            format!("audit:{created_at}"),
+            AutonomyLane::new(LANE_GRAPH_BRIDGE_EDGES),
+            "did a thing",
+            "evidence",
+            "revert the thing",
+            AutonomyPosture::ConfirmFirst,
+            created_at,
+        );
+        record.outcome = outcome;
+        record
+    }
+
+    const SEVEN_DAYS_SECS: u64 = 7 * 86_400;
+
+    #[test]
+    fn neutral_after_days_from_env_falls_back_on_unset_zero_or_garbage() {
+        assert_eq!(
+            neutral_after_days_from_env(|_| None),
+            DEFAULT_NEUTRAL_AFTER_DAYS
+        );
+        assert_eq!(
+            neutral_after_days_from_env(|k| (k == ENV_NEUTRAL_AFTER_DAYS).then(|| "0".to_string())),
+            DEFAULT_NEUTRAL_AFTER_DAYS
+        );
+        assert_eq!(
+            neutral_after_days_from_env(
+                |k| (k == ENV_NEUTRAL_AFTER_DAYS).then(|| "not-a-number".to_string())
+            ),
+            DEFAULT_NEUTRAL_AFTER_DAYS
+        );
+        assert_eq!(
+            neutral_after_days_from_env(|k| (k == ENV_NEUTRAL_AFTER_DAYS).then(|| "14".to_string())),
+            14
+        );
+    }
+
+    #[test]
+    fn is_due_for_neutral_only_flags_old_unstamped_records() {
+        // Old + Pending: due.
+        let old_pending = audit_at(AuditOutcome::Pending, T0);
+        assert!(is_due_for_neutral(
+            &old_pending,
+            T0 + SEVEN_DAYS_SECS,
+            SEVEN_DAYS_SECS
+        ));
+
+        // Recent + Pending: not due yet.
+        let recent_pending = audit_at(AuditOutcome::Pending, T0);
+        assert!(!is_due_for_neutral(
+            &recent_pending,
+            T0 + SEVEN_DAYS_SECS - 1,
+            SEVEN_DAYS_SECS
+        ));
+
+        // Old but already stamped: never due, regardless of age.
+        for outcome in [
+            AuditOutcome::ConfirmedGood,
+            AuditOutcome::Reversed,
+            AuditOutcome::Neutral,
+        ] {
+            let stamped = audit_at(outcome, T0);
+            assert!(!is_due_for_neutral(
+                &stamped,
+                T0 + SEVEN_DAYS_SECS * 10,
+                SEVEN_DAYS_SECS
+            ));
+        }
+    }
+
+    #[test]
+    fn select_due_for_neutral_filters_a_mixed_batch() {
+        let due = audit_at(AuditOutcome::Pending, T0);
+        let not_due_yet = audit_at(AuditOutcome::Pending, T0 + SEVEN_DAYS_SECS - 1);
+        let already_stamped = audit_at(AuditOutcome::ConfirmedGood, T0);
+        let records = vec![due.clone(), not_due_yet.clone(), already_stamped.clone()];
+
+        let now = T0 + SEVEN_DAYS_SECS;
+        let selected = select_due_for_neutral(&records, now, SEVEN_DAYS_SECS);
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].audit_id, due.audit_id);
+    }
+
+    #[test]
+    fn pending_outcome_notice_carries_the_stamp_command() {
+        let notice = pending_outcome_notice("audit-123", LANE_GRAPH_BRIDGE_EDGES, "bridged edge");
+        assert!(notice.contains("audit-123"));
+        assert!(notice.contains(LANE_GRAPH_BRIDGE_EDGES));
+        assert!(notice.contains("phil autonomy stamp audit-123 confirmed_good|reversed|neutral"));
     }
 }

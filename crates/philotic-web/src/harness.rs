@@ -178,6 +178,16 @@ pub enum CanonicalWorkflowAction {
 
 #[derive(clap::Subcommand, Debug)]
 pub enum HarnessTrialAction {
+    /// List recorded harness trials with their telemetry totals.
+    List {
+        /// Only show trials with this status (active, completed, blocked, ...)
+        #[arg(long)]
+        status: Option<String>,
+        /// Max rows (default 20, newest first)
+        #[arg(long, default_value = "20")]
+        limit: usize,
+    },
+
     /// Start a measured harness trial and optionally apply a canonical profile first.
     Start {
         harness_id: String,
@@ -471,9 +481,10 @@ impl HarnessAdapter for WindsurfAdapter {
     }
 }
 
-pub fn run(action: HarnessAction) -> Result<()> {
+pub fn run(action: HarnessAction, db_override: Option<String>) -> Result<()> {
     let config = PhiloticGraphConfig::default();
-    let engine = GraphEngine::open(&config.db_path)?;
+    let db_path = db_override.unwrap_or(config.db_path);
+    let engine = GraphEngine::open(&db_path)?;
     match action {
         HarnessAction::List => list_harnesses(&engine),
         HarnessAction::Bootstrap => bootstrap_canonical_model(&engine),
@@ -600,6 +611,9 @@ fn run_workflow_action(engine: &GraphEngine, action: CanonicalWorkflowAction) ->
 
 fn run_trial_action(engine: &GraphEngine, action: HarnessTrialAction) -> Result<()> {
     match action {
+        HarnessTrialAction::List { status, limit } => {
+            list_harness_trials(engine, status.as_deref(), limit)
+        }
         HarnessTrialAction::Start {
             harness_id,
             seam_id,
@@ -1910,6 +1924,85 @@ fn report_drift(engine: &GraphEngine, harness_id: Option<&str>) -> Result<()> {
         let drift = prop_str(&harness, &["observed_summary", "drift_status"]).unwrap_or("unknown");
         let checked = prop_str(&harness, &["observed_summary", "last_checked_at"]).unwrap_or("-");
         println!("{:<24} {:<14} {}", harness.id, drift, checked);
+    }
+    Ok(())
+}
+
+/// Read side of the trial ledger: without this, telemetry went in and nothing
+/// ever came back out (zero trials were recorded in the first three months).
+fn list_harness_trials(
+    engine: &GraphEngine,
+    status_filter: Option<&str>,
+    limit: usize,
+) -> Result<()> {
+    let sessions = engine.query_nodes(Some(NodeKind::Session), None)?;
+    let mut trials: Vec<&Node> = sessions
+        .iter()
+        .filter(|node| {
+            node.properties.get("trial_kind").and_then(|v| v.as_str()) == Some("harness")
+                && status_filter
+                    .map(|s| node.properties.get("status").and_then(|v| v.as_str()) == Some(s))
+                    .unwrap_or(true)
+        })
+        .collect();
+    trials.sort_by(|a, b| {
+        let key = |n: &Node| {
+            n.properties
+                .get("start_time")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string()
+        };
+        key(b).cmp(&key(a))
+    });
+
+    if trials.is_empty() {
+        println!(
+            "No harness trials recorded{}.",
+            match status_filter {
+                Some(s) => format!(" with status '{s}'"),
+                None => String::new(),
+            }
+        );
+        println!("Start one with: just harness-trial-start <seam-id>");
+        return Ok(());
+    }
+
+    println!(
+        "{:<44} {:<18} {:<24} {:<10} {:>8} {:>9} {}",
+        "SESSION", "HARNESS", "SEAM", "STATUS", "TOKENS", "ELAPSED", "VERIFIED"
+    );
+    println!("{}", "─".repeat(130));
+    for node in trials.iter().take(limit) {
+        let p = |keys: &[&str]| prop_str(node, keys).unwrap_or("-").to_string();
+        let tokens = node
+            .properties
+            .get("tokens_total")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0);
+        let elapsed_ms = node
+            .properties
+            .get("elapsed_ms")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0);
+        let elapsed = if elapsed_ms >= 60_000 {
+            format!("{}m{}s", elapsed_ms / 60_000, (elapsed_ms % 60_000) / 1000)
+        } else {
+            format!("{}s", elapsed_ms / 1000)
+        };
+        println!(
+            "{:<44} {:<18} {:<24} {:<10} {:>8} {:>9} {}",
+            node.id.chars().take(44).collect::<String>(),
+            p(&["harness_id"]).trim_start_matches("harness:"),
+            p(&["seam_id"]).trim_start_matches("seam:"),
+            p(&["status"]),
+            tokens,
+            elapsed,
+            p(&["verified"]),
+        );
+    }
+    if trials.len() > limit {
+        println!("... {} more (use --limit)", trials.len() - limit);
     }
     Ok(())
 }

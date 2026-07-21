@@ -4192,6 +4192,19 @@ impl IpcServer {
                         .unwrap_or(0);
                     return Self::handle_query_autonomy_status(graph, Some(lane), now);
                 }
+                // Read-only operator surface for the A9 outcome-stamping
+                // follow-up slice (`phil autonomy pending`): every audit
+                // record across all lanes still awaiting an operator
+                // outcome. Companion to `__autonomy_status__` — status
+                // reports the trust-ledger counters, this reports the raw
+                // review backlog those counters are waiting on.
+                if key == "__autonomy_pending__" {
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs())
+                        .unwrap_or(0);
+                    return Self::handle_query_autonomy_pending(graph, now);
+                }
                 // Read-only operator/steward surface for the Memory
                 // Transparency Slice M3 delta digest (`memory.delta_digest`
                 // philote tool). `__memory_delta_digest__` uses the default
@@ -9010,46 +9023,64 @@ impl IpcServer {
                     );
                 }
 
-                // Phase 1: HTTP transport only. Stdio needs the command
-                // allowlist + sandbox review (client-fabric Phase 3).
-                let url = match &config.transport {
-                    McpUpstreamTransport::Http { url } => url.clone(),
-                    McpUpstreamTransport::Stdio { .. } => {
-                        return IpcResponse::error(
-                            "mcp_upstream",
-                            "TRANSPORT_NOT_IMPLEMENTED",
-                            "stdio upstream transport is not available yet; use an HTTP url",
-                        );
+                // Transport fence, by kind:
+                // - HTTP: egress policy on the target host (loopback + tailnet
+                //   by default; operator widens via `mcp_egress_policy`).
+                // - Stdio: fail-closed command allowlist (operator widens via
+                //   `mcp_stdio_allowlist` / `phil mcp allow-command`). The
+                //   guest additionally spawns the child with a scrubbed env.
+                match &config.transport {
+                    McpUpstreamTransport::Stdio { command, args } => {
+                        use ansible_mesh_core::mcp_upstream::McpStdioAllowlist;
+                        let allowlist: McpStdioAllowlist = graph
+                            .get_config_value("mcp_stdio_allowlist")
+                            .ok()
+                            .flatten()
+                            .and_then(|j| serde_json::from_str(&j).ok())
+                            .unwrap_or_default();
+                        if !allowlist.command_allowed(command, args) {
+                            return IpcResponse::error(
+                                "mcp_upstream",
+                                "STDIO_NOT_ALLOWED",
+                                format!(
+                                    "stdio command '{command}' (args {args:?}) is not on the \
+                                     operator allowlist; an operator must add it via \
+                                     `phil mcp allow-command` (config node mcp_stdio_allowlist)"
+                                ),
+                            );
+                        }
                     }
-                };
-
-                // Egress fence: the target host must be loopback, tailnet, or
-                // explicitly allowlisted in the operator-managed policy node.
-                let policy: McpEgressPolicy = graph
-                    .get_config_value("mcp_egress_policy")
-                    .ok()
-                    .flatten()
-                    .and_then(|j| serde_json::from_str(&j).ok())
-                    .unwrap_or_default();
-                match host_from_http_url(&url) {
-                    Some(host) if policy.host_allowed(&host) => {}
-                    Some(host) => {
-                        return IpcResponse::error(
-                            "mcp_upstream",
-                            "EGRESS_DENIED",
-                            format!(
-                                "host '{host}' is outside the egress policy (loopback + tailnet \
-                                 by default); an operator must add it to the mcp_egress_policy \
-                                 config node"
-                            ),
-                        );
-                    }
-                    None => {
-                        return IpcResponse::error(
-                            "mcp_upstream",
-                            "INVALID_URL",
-                            format!("'{url}' is not a valid http(s) URL"),
-                        );
+                    McpUpstreamTransport::Http { url } => {
+                        let url = url.clone();
+                        // Egress fence: the target host must be loopback,
+                        // tailnet, or explicitly allowlisted.
+                        let policy: McpEgressPolicy = graph
+                            .get_config_value("mcp_egress_policy")
+                            .ok()
+                            .flatten()
+                            .and_then(|j| serde_json::from_str(&j).ok())
+                            .unwrap_or_default();
+                        match host_from_http_url(&url) {
+                            Some(host) if policy.host_allowed(&host) => {}
+                            Some(host) => {
+                                return IpcResponse::error(
+                                    "mcp_upstream",
+                                    "EGRESS_DENIED",
+                                    format!(
+                                        "host '{host}' is outside the egress policy (loopback + \
+                                         tailnet by default); an operator must add it to the \
+                                         mcp_egress_policy config node"
+                                    ),
+                                );
+                            }
+                            None => {
+                                return IpcResponse::error(
+                                    "mcp_upstream",
+                                    "INVALID_URL",
+                                    format!("'{url}' is not a valid http(s) URL"),
+                                );
+                            }
+                        }
                     }
                 }
 
@@ -10214,6 +10245,35 @@ impl IpcServer {
                 }
                 Err(e) => warn!("heal work item info entry push failed: {e:#}"),
             }
+
+            // 6. A9 Piece 3: an UNRESOLVED, throttled pending-outcome
+            // notice — deliberately distinct from the `work_item_filed`
+            // entry above, which is immediately `.resolve()`d and would
+            // make a poor "still awaiting review" breadcrumb. Best-effort;
+            // the audit record above is the durable one. Throttled per
+            // (lane, pattern_tag) by `push_classified`'s own flood window.
+            let notice = ansible_mesh_core::autonomy::pending_outcome_notice(
+                &audit_id,
+                LANE_FLEET_HEAL_SLICES,
+                &audit.action_summary,
+            );
+            match hq.push_classified(
+                LANE_FLEET_HEAL_SLICES,
+                &notice,
+                "info",
+                "autonomy_outcome_pending",
+            ) {
+                Ok(Some(id)) => info!(
+                    id,
+                    audit_id = %audit_id,
+                    "heal work item filing: pending-outcome notice pushed to heal queue"
+                ),
+                Ok(None) => debug!(
+                    audit_id = %audit_id,
+                    "heal work item filing: pending-outcome notice collapsed (flood window)"
+                ),
+                Err(e) => warn!("heal work item filing: pending-outcome notice push failed: {e:#}"),
+            }
         }
 
         info!(
@@ -10564,6 +10624,41 @@ impl IpcServer {
             }
         };
         IpcResponse::ConfigData { key, value_json }
+    }
+
+    /// Handle `GetConfig("__autonomy_pending__")` — the A9 outcome-stamping
+    /// follow-up slice's `phil autonomy pending` surface: every
+    /// `autonomy_audit` record across all lanes still `Pending` an operator
+    /// outcome, oldest first. Read-only, computed straight from
+    /// [`ansible_mesh_core::domain::GraphDomain::list_all_autonomy_audits`] —
+    /// no new state, and no autonomy grant is consulted (a read, not an
+    /// action). Each entry carries `audit_id`, `lane`, `action_summary`,
+    /// `created_at`, and `age_secs` (as of `now`) so an operator can eyeball
+    /// how stale the backlog is before the timeout-to-Neutral sweep
+    /// (`crate::autonomy_sweep`) catches up to it.
+    pub(crate) fn handle_query_autonomy_pending(graph: &GraphDomain, now: u64) -> IpcResponse {
+        use ansible_mesh_core::autonomy::AuditOutcome;
+
+        const KEY: &str = "__autonomy_pending__";
+        let records = graph.list_all_autonomy_audits().unwrap_or_default();
+        let pending: Vec<_> = records
+            .into_iter()
+            .filter(|r| r.outcome == AuditOutcome::Pending)
+            .map(|r| {
+                serde_json::json!({
+                    "audit_id": r.audit_id,
+                    "lane": r.lane.as_str(),
+                    "action_summary": r.action_summary,
+                    "created_at": r.created_at,
+                    "age_secs": now.saturating_sub(r.created_at),
+                })
+            })
+            .collect();
+        let value_json = serde_json::to_string(&pending).ok();
+        IpcResponse::ConfigData {
+            key: KEY.to_string(),
+            value_json,
+        }
     }
 
     /// Handle `GetConfig("__memory_delta_digest__")` /
@@ -14523,9 +14618,20 @@ pub(crate) mod tests {
                 .expect("grant")
                 .expect("grant exists");
             assert_eq!(grant.actions_today, 1);
-            // The info entry is triaged+resolved — never left pending, so the
-            // dispatcher will not re-classify it.
-            assert!(hq.pending_errors(10).expect("pending").is_empty());
+            // The work_item_filed info entry is triaged+resolved — never left
+            // pending, so the dispatcher will not re-classify it. But A9
+            // Piece 3's pending-outcome notice IS left unresolved (it is
+            // awaiting an operator `phil autonomy stamp`, not a heal action) —
+            // exactly one such entry, distinguishable by its pattern_tag.
+            let pending = hq.pending_errors(10).expect("pending");
+            assert_eq!(pending.len(), 1);
+            assert_eq!(
+                pending[0].pattern_tag.as_deref(),
+                Some("autonomy_outcome_pending")
+            );
+            assert_eq!(pending[0].guest_id, LANE_FLEET_HEAL_SLICES);
+            assert!(pending[0].raw_text.contains(&audit_id));
+            assert!(pending[0].raw_text.contains("phil autonomy stamp"));
 
             // Second breach while open: bump, no second item, no budget spend.
             let data = call(&graph, Some(&hq), T0 + 60, NO_ENV);
@@ -15038,6 +15144,43 @@ pub(crate) mod tests {
                 serde_json::from_str(&value_json.expect("some json")).expect("parse");
             assert_eq!(reports.len(), 1);
             assert_eq!(reports[0]["lane"], LANE_GRAPH_BRIDGE_EDGES);
+        }
+
+        #[test]
+        fn pending_surface_lists_only_unstamped_records_with_age() {
+            let graph = graph();
+            set_posture(&graph, AutonomyPosture::AutoWithAudit, T0);
+
+            // One consult at AutoWithAudit writes a Pending audit record.
+            let data = consult(&graph, T0, NO_ENV);
+            assert_eq!(data["allowed"], true);
+            let audit_id = data["audit_id"].as_str().expect("audit id").to_string();
+
+            // Fixed clock (mirrors handle_query_autonomy_status's own test
+            // pattern) — never mutate process env for this.
+            let now = T0 + 3_600;
+            let resp = IpcServer::handle_query_autonomy_pending(&graph, now);
+            let IpcResponse::ConfigData { key, value_json } = resp else {
+                panic!("expected ConfigData");
+            };
+            assert_eq!(key, "__autonomy_pending__");
+            let pending: Vec<serde_json::Value> =
+                serde_json::from_str(&value_json.expect("some json")).expect("parse");
+            assert_eq!(pending.len(), 1);
+            assert_eq!(pending[0]["audit_id"], audit_id);
+            assert_eq!(pending[0]["lane"], LANE_GRAPH_BRIDGE_EDGES);
+            assert_eq!(pending[0]["created_at"], T0);
+            assert_eq!(pending[0]["age_secs"], 3_600);
+
+            // Stamping the only pending record empties the surface.
+            record(&graph, &audit_id, "confirmed_good", now);
+            let resp = IpcServer::handle_query_autonomy_pending(&graph, now);
+            let IpcResponse::ConfigData { value_json, .. } = resp else {
+                panic!("expected ConfigData");
+            };
+            let pending: Vec<serde_json::Value> =
+                serde_json::from_str(&value_json.expect("some json")).expect("parse");
+            assert!(pending.is_empty());
         }
     }
 

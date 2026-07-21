@@ -10,7 +10,7 @@
 //! lane [`ansible_mesh_core::autonomy::LANE_MEMORY_HYGIENE`] —
 //! annotation/flagging only, never forget or consolidate-merge.
 //!
-//! # Vault discovery (DEF-066)
+//! # Vault discovery (DEF-067)
 //!
 //! Discovery used to derive vault names from materialized guest configs
 //! (`dream::collect_agent_vault_names`, keyed on a guest config's top-level
@@ -909,11 +909,20 @@ pub async fn push_intel_graph_record(
 /// Run one scheduled sweep for `hotel_name`. No-op (logged) when Muninn is
 /// not configured on this hotel. Never panics or propagates — cron fires are
 /// fire-and-forget from the ticker's perspective.
+///
+/// `heal_queue` is optional and wired for Piece 3 of the A9 outcome-stamping
+/// follow-up slice: when a fresh filing happens, an unresolved, throttled
+/// pending-outcome notice is pushed alongside the `autonomy_audit` record so
+/// the finding surfaces via the existing heal-queue channel (not just
+/// `phil autonomy pending`) — the same breadcrumb the A3 heal-filing site
+/// pushes, but deliberately left unresolved instead of immediately
+/// `.resolve()`d, since this one is *awaiting* an operator stamp.
 pub async fn run_scheduled_sweep(
     graph: &GraphDomain,
     muninn_config: Option<&MuninnConfig>,
     hotel_name: &str,
     intel_graph_url: Option<&str>,
+    heal_queue: Option<&dyn ansible_mesh_core::heal_queue::HealQueueStorage>,
     now_secs: u64,
 ) {
     let Some(config) = muninn_config else {
@@ -951,6 +960,32 @@ pub async fn run_scheduled_sweep(
     if let Some(audit_id) = &audit_id {
         if let Some(url) = intel_graph_url {
             push_intel_graph_record(&client, url, &report, audit_id).await;
+        }
+        // A9 Piece 3: push the pending-outcome breadcrumb for this fresh
+        // filing. Best-effort and non-blocking — the `autonomy_audit` record
+        // above is the durable one; this is visibility only.
+        if let Some(hq) = heal_queue {
+            let notice = ansible_mesh_core::autonomy::pending_outcome_notice(
+                audit_id,
+                LANE_MEMORY_HYGIENE,
+                &report.action_summary(),
+            );
+            match hq.push_classified(
+                LANE_MEMORY_HYGIENE,
+                &notice,
+                "info",
+                "autonomy_outcome_pending",
+            ) {
+                Ok(Some(id)) => info!(
+                    id,
+                    audit_id, "memory.hygiene: pending-outcome notice pushed to heal queue"
+                ),
+                Ok(None) => debug!(
+                    audit_id,
+                    "memory.hygiene: pending-outcome notice collapsed (flood window)"
+                ),
+                Err(e) => warn!("memory.hygiene: pending-outcome notice push failed: {e:#}"),
+            }
         }
     }
 

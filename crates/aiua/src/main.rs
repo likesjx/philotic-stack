@@ -34,7 +34,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::sync::{Mutex, RwLock, broadcast, mpsc};
 use tracing::{debug, error, info, warn};
 
+mod architect_charter;
 mod auth;
+mod autonomy_sweep;
 mod dream;
 mod graph;
 mod memory;
@@ -4741,6 +4743,11 @@ fn seed_toolset_profiles(graph: &GraphDomain) -> anyhow::Result<()> {
                 "bash.exec".into(),
                 "memory.recall".into(),
                 "memory.remember".into(),
+                // Autopoiesis Slice A4 (`aria-architect-charter`): the
+                // architect-charter steward reuses this profile and its
+                // daily brief must call memory.delta_digest (Memory
+                // Transparency Slice M3) before composing the brief.
+                "memory.delta_digest".into(),
                 "agent.graph.read".into(),
                 "graph.query".into(),
                 "graph.create".into(),
@@ -7669,6 +7676,21 @@ async fn main() -> Result<()> {
         warn!(error = %e, "memory.hygiene: failed to ensure nightly sweep cron job");
     }
 
+    // Autopoiesis Slice A4 (`aria-architect-charter`): idempotent, operator
+    // opt-in registration of the daily architect-charter steward role + cron
+    // job. No-op unless PHILOTIC_ARCHITECT_CHARTER_ENABLED and
+    // PHILOTIC_ARCHITECT_CHARTER_AGENT are set for this hotel process; never
+    // overwrites an operator-edited role manifest or cron schedule. See
+    // `architect_charter.rs` module docs.
+    if let Err(e) = architect_charter::ensure_scheduled(
+        &graph_domain_arc,
+        &hotel_name,
+        service::cron_ticker::now_ms(),
+        |k| std::env::var(k).ok(),
+    ) {
+        warn!(error = %e, "architect-charter: failed to ensure daily dev-brief cron job");
+    }
+
     // Nightly dream sweep (consolidation): the shutdown-drain sweep alone
     // never runs on a long-lived hotel, so near-duplicate engrams accumulate
     // for days. Same opt-in/idempotency contract as memory.hygiene, gated on
@@ -7680,6 +7702,19 @@ async fn main() -> Result<()> {
         |k| std::env::var(k).ok(),
     ) {
         warn!(error = %e, "dream-sweep: failed to ensure nightly consolidation cron job");
+    }
+
+    // Autopoiesis Slice A9 outcome-stamping follow-up: idempotent, always-on
+    // registration of the daily timeout-to-Neutral sweep. Unlike
+    // memory.hygiene/dream-sweep there is no operator opt-in env var — the
+    // trust ledger's promotion arithmetic needs this running on every hotel,
+    // not just ones an operator remembered to flip on.
+    if let Err(e) = autonomy_sweep::ensure_scheduled(
+        &graph_domain_arc,
+        &hotel_name,
+        service::cron_ticker::now_ms(),
+    ) {
+        warn!(error = %e, "autonomy_sweep: failed to ensure daily timeout-to-neutral sweep cron job");
     }
 
     if smoke_mode {
@@ -8088,7 +8123,10 @@ async fn main() -> Result<()> {
     .with_egress(egress_gw.clone())
     .with_resource_registry(resource_registry_arc.clone())
     .with_hotel_state_dirty_tx(ipc_dirty_tx);
-    let ipc_server = if let Some(hq) = heal_queue_arc {
+    // Cloned (not moved): the CronTicker wiring below also needs the heal
+    // queue, to push the A9 Piece 3 pending-outcome notice from the
+    // in-process memory.hygiene sweep.
+    let ipc_server = if let Some(hq) = heal_queue_arc.clone() {
         ipc_server.with_heal_queue(hq)
     } else {
         ipc_server
@@ -8169,11 +8207,29 @@ async fn main() -> Result<()> {
             // registration): CronJobSync replicates the job definition to
             // every mesh peer regardless of that peer's own opt-in.
             memory_hygiene::sweep_enabled(|k| std::env::var(k).ok()),
+            // A9 Piece 3: lets a fresh hygiene filing push an unresolved
+            // pending-outcome breadcrumb into the same heal queue A3 already
+            // uses for operator visibility.
+            heal_queue_arc.clone(),
         )
         .with_dream_sweep(
             muninn_config_arc.clone(),
             hotel_name.clone(),
             dream::sweep_enabled(|k| std::env::var(k).ok()),
+        )
+        // Autopoiesis Slice A9 outcome-stamping follow-up: always-on (no
+        // opt-in flag — see `autonomy_sweep` module docs on why the
+        // mesh-trap gate is a job-id match, not a local-enabled re-check).
+        .with_autonomy_sweep(hotel_name.clone())
+        .with_architect_charter(
+            hotel_name.clone(),
+            // Local-hotel opt-in, re-checked at fire time by job id (not
+            // just target_role, unlike memory.hygiene — see
+            // `architect_charter.rs`'s "Fire-time re-check" module docs):
+            // CronJobSync replicates a hotel's charter job definition to
+            // every mesh peer regardless of that peer's own opt-in.
+            architect_charter::charter_enabled(&|k| std::env::var(k).ok())
+                && architect_charter::charter_agent_id(&|k| std::env::var(k).ok()).is_some(),
         );
         tokio::spawn(async move {
             cron_ticker.run().await;
