@@ -79,6 +79,14 @@ pub struct CronTicker {
     /// job somehow targets [`crate::autonomy_sweep::CRON_TARGET_ROLE`]
     /// without it.
     autonomy_sweep: Option<AutonomySweepCronContext>,
+    /// Autopoiesis Slice A4 (`aria-architect-charter`) fire-time gate.
+    /// `None` when `with_architect_charter` was never called. Unlike
+    /// `memory_hygiene`/`dream_sweep`, this does NOT intercept delivery —
+    /// the charter's daily fire goes through the normal role-delivery path
+    /// below (PR #80 heritage). It only gates *whether* that normal path
+    /// runs at all for a `architect-charter:*` job id — see the "Fire-time
+    /// re-check" docs on `crate::architect_charter`.
+    architect_charter: Option<ArchitectCharterCronContext>,
 }
 
 /// Wiring the in-process nightly dream sweep needs at fire time. Mirrors
@@ -130,6 +138,25 @@ struct AutonomySweepCronContext {
     hotel_name: String,
 }
 
+/// Wiring the Autopoiesis A4 architect-charter fire-time gate needs. Unlike
+/// [`MemoryHygieneCronContext`]/[`DreamSweepCronContext`] (whose action is
+/// symmetric — any hotel firing acts on itself), the charter delivers to a
+/// specific `role:{agent_id}:{role_name}` that may only exist/mean something
+/// on the hotel that registered it, so gating is job-id-scoped, not just
+/// target-role-scoped. See `crate::architect_charter` module docs
+/// ("Fire-time re-check") for the full reasoning.
+struct ArchitectCharterCronContext {
+    /// This hotel's own deterministic job id
+    /// (`crate::architect_charter::cron_job_id(hotel_name)`). A fired job
+    /// whose id does not match this exactly is a mesh-replicated peer's
+    /// charter job and is never acted on locally, regardless of
+    /// `enabled_locally`.
+    expected_job_id: String,
+    /// This hotel's own `PHILOTIC_ARCHITECT_CHARTER_ENABLED` (+ agent)
+    /// opt-in, captured at boot.
+    enabled_locally: bool,
+}
+
 impl CronTicker {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -154,6 +181,7 @@ impl CronTicker {
             memory_hygiene: None,
             dream_sweep: None,
             autonomy_sweep: None,
+            architect_charter: None,
         }
     }
 
@@ -211,6 +239,27 @@ impl CronTicker {
         self.dream_sweep = Some(DreamSweepCronContext {
             muninn_config,
             hotel_name: hotel_name.into(),
+            enabled_locally,
+        });
+        self
+    }
+
+    /// Wire the Autopoiesis A4 architect-charter fire-time gate.
+    /// `enabled_locally` is this hotel's own `PHILOTIC_ARCHITECT_CHARTER_ENABLED`
+    /// **and** `PHILOTIC_ARCHITECT_CHARTER_AGENT` opt-in (both required —
+    /// see `crate::architect_charter::ensure_scheduled`, which registers
+    /// nothing without an explicit agent). `fire()` computes this hotel's own
+    /// expected job id from `hotel_name` and only ever runs the normal
+    /// role-delivery path for a `architect-charter:*` job whose id matches it
+    /// exactly.
+    pub fn with_architect_charter(
+        mut self,
+        hotel_name: impl Into<String>,
+        enabled_locally: bool,
+    ) -> Self {
+        let hotel_name = hotel_name.into();
+        self.architect_charter = Some(ArchitectCharterCronContext {
+            expected_job_id: crate::architect_charter::cron_job_id(&hotel_name),
             enabled_locally,
         });
         self
@@ -379,6 +428,36 @@ impl CronTicker {
                 );
             }
             return;
+        }
+
+        // Autopoiesis Slice A4 (`aria-architect-charter`): unlike the
+        // in-process sentinels above, a charter job DOES go through the
+        // normal role-delivery path below — but only for THIS hotel's own
+        // registration. `CronJobSync` replicates job definitions mesh-wide
+        // unconditionally, so a peer hotel's `architect-charter:<peer>` job
+        // can become locally due here too; without this re-check this hotel
+        // would attempt to deliver to a `role:{agent}:{role}` that may not
+        // exist (or may mean something different) on this hotel. See
+        // `crate::architect_charter` module docs ("Fire-time re-check").
+        if job.id.starts_with(crate::architect_charter::JOB_ID_PREFIX) {
+            let allowed = self
+                .architect_charter
+                .as_ref()
+                .is_some_and(|ctx| ctx.enabled_locally && job.id == ctx.expected_job_id);
+            if !allowed {
+                debug!(
+                    job_id = %job.id,
+                    "CronTicker: architect-charter job not enabled locally for this hotel/job id \
+                     — skipping fire (likely a mesh-replicated peer registration)"
+                );
+                if let Err(e) = self.advance_schedule(job, fire_epoch) {
+                    error!(
+                        "CronTicker: architect-charter advance failed for job {}: {e}",
+                        job.id
+                    );
+                }
+                return;
+            }
         }
 
         // Guaranteed dedup: if last_fired_epoch already covers this epoch,
@@ -1510,6 +1589,180 @@ mod tests {
                 .strip_prefix("role:")
                 .is_none(),
             "the sentinel must never be mistaken for a role incarnation routing key"
+        );
+    }
+
+    // ── Autopoiesis Slice A4 (`aria-architect-charter`) ─────────────────────
+
+    fn architect_charter_job(hotel_name: &str, target_role: &str, next_fire_at: u64) -> CronJob {
+        CronJob {
+            id: crate::architect_charter::cron_job_id(hotel_name),
+            schedule: crate::architect_charter::DEFAULT_SCHEDULE.to_string(),
+            target_role: target_role.to_string(),
+            target_node_id: None,
+            payload: r#"{"message":"Run your daily architect-charter sweep now."}"#.into(),
+            guaranteed: false,
+            enabled: true,
+            last_fired_epoch: None,
+            next_fire_at,
+            created_at: 0,
+            created_by: CronJobSource::Operator,
+            silent_ok: false,
+            session_target: ansible_mesh_core::cron::CronSessionTarget::Isolated,
+        }
+    }
+
+    /// Same mesh-replication-leak concern as `memory_hygiene`, but gated by
+    /// job id rather than target_role (see `architect_charter`'s "Fire-time
+    /// re-check" module docs): a peer hotel that never opted in must not
+    /// deliver to a role that only exists there because a job definition
+    /// replicated in.
+    #[tokio::test]
+    async fn architect_charter_fire_skips_when_not_locally_enabled() {
+        use ansible_mesh_core::sqlite_storage::SqliteGraphStorage;
+        use std::collections::HashMap;
+        use tokio::sync::Mutex;
+
+        let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
+        let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
+        let (dispatcher_tx, mut dispatcher_rx) = crate::service::ipc::test_dispatcher_channel();
+        let parked_inbound: crate::service::ipc::ParkedInboundRegistry =
+            Arc::new(Mutex::new(HashMap::new()));
+        let inboxes: InboxRegistry = Arc::new(Mutex::new(HashMap::new()));
+        let ticker = CronTicker::new(
+            graph.clone(),
+            dispatcher_tx,
+            inboxes,
+            "local-aiua-01",
+            0,
+            parked_inbound.clone(),
+            None,
+            crate::service::ipc::new_delivery_claim_registry(),
+        )
+        .with_architect_charter("local-hotel", false);
+
+        let job = architect_charter_job("local-hotel", "role:agent-test:architect", 1_000);
+        graph.upsert_cron_job(&job).expect("seed job");
+
+        tokio::time::timeout(Duration::from_secs(2), ticker.fire(&job, 1_000))
+            .await
+            .expect("fire() must not hang when the charter is skipped");
+
+        let after = graph
+            .get_cron_job(&job.id)
+            .expect("lookup")
+            .expect("job still present");
+        assert!(
+            after.next_fire_at > 1_000,
+            "schedule must advance even when the charter is locally disabled"
+        );
+        assert!(parked_inbound.lock().await.is_empty());
+        assert!(dispatcher_rx.try_recv().is_err());
+    }
+
+    /// This hotel opted in for its OWN job id, but the fired job belongs to a
+    /// different hotel (a mesh-replicated peer registration) — must still be
+    /// skipped, unlike `memory.hygiene`'s target-role-only gate, because
+    /// delivering here could target a role that means something different
+    /// (or nothing) on this hotel.
+    #[tokio::test]
+    async fn architect_charter_fire_skips_replicated_peer_job_even_when_enabled_locally() {
+        use ansible_mesh_core::sqlite_storage::SqliteGraphStorage;
+        use std::collections::HashMap;
+        use tokio::sync::Mutex;
+
+        let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
+        let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
+        let (dispatcher_tx, mut dispatcher_rx) = crate::service::ipc::test_dispatcher_channel();
+        let parked_inbound: crate::service::ipc::ParkedInboundRegistry =
+            Arc::new(Mutex::new(HashMap::new()));
+        let inboxes: InboxRegistry = Arc::new(Mutex::new(HashMap::new()));
+        let ticker = CronTicker::new(
+            graph.clone(),
+            dispatcher_tx,
+            inboxes,
+            "local-aiua-01",
+            0,
+            parked_inbound.clone(),
+            None,
+            crate::service::ipc::new_delivery_claim_registry(),
+        )
+        // Enabled locally — but for "local-hotel", not "peer-hotel".
+        .with_architect_charter("local-hotel", true);
+
+        let job = architect_charter_job("peer-hotel", "role:agent-test:architect", 1_000);
+        graph.upsert_cron_job(&job).expect("seed replicated job");
+
+        tokio::time::timeout(Duration::from_secs(2), ticker.fire(&job, 1_000))
+            .await
+            .expect("fire() must not hang");
+
+        assert!(parked_inbound.lock().await.is_empty());
+        assert!(dispatcher_rx.try_recv().is_err());
+    }
+
+    /// The positive path: this hotel's own job, locally enabled — `fire()`
+    /// falls through to the normal role-delivery path (PR #80 heritage,
+    /// unmodified) exactly like any other role-targeted cron job.
+    #[tokio::test]
+    async fn architect_charter_fire_delivers_normally_when_enabled_and_matching_id() {
+        use ansible_mesh_core::graph::{RoleReadinessState, TurnLoopConfig};
+        use ansible_mesh_core::sqlite_storage::SqliteGraphStorage;
+        use std::collections::HashMap;
+        use tokio::sync::Mutex;
+
+        let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
+        let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
+        graph
+            .upsert_role_incarnation(&RoleIncarnationRecord {
+                agent_id: "agent-test".into(),
+                role_name: "architect".into(),
+                guest_id: "agent-test:architect".into(),
+                toolset_profile: "architect".into(),
+                readiness_state: RoleReadinessState::Configured,
+                turn_loop_config: TurnLoopConfig::default(),
+                ..Default::default()
+            })
+            .expect("seed role incarnation");
+
+        let (dispatcher_tx, mut dispatcher_rx) = crate::service::ipc::test_dispatcher_channel();
+        let parked_inbound: crate::service::ipc::ParkedInboundRegistry =
+            Arc::new(Mutex::new(HashMap::new()));
+        let inboxes: InboxRegistry = Arc::new(Mutex::new(HashMap::new()));
+        let ticker = CronTicker::new(
+            graph.clone(),
+            dispatcher_tx,
+            inboxes,
+            "local-aiua-01",
+            0,
+            parked_inbound.clone(),
+            None,
+            crate::service::ipc::new_delivery_claim_registry(),
+        )
+        .with_architect_charter("local-hotel", true);
+
+        let job = architect_charter_job("local-hotel", "role:agent-test:architect", 1_000);
+        graph.upsert_cron_job(&job).expect("seed job");
+
+        tokio::time::timeout(Duration::from_secs(2), ticker.fire(&job, 1_000))
+            .await
+            .expect("fire() must not hang");
+
+        // No live subscriber and no materialization_requester wired in this
+        // fixture, so the task is parked rather than delivered directly —
+        // proof the normal role-delivery path was actually entered (unlike
+        // the skip tests above, which never append/park anything).
+        let appended = tokio::time::timeout(Duration::from_secs(2), dispatcher_rx.recv())
+            .await
+            .expect("dispatcher channel should yield the appended command")
+            .expect("dispatcher channel should stay open");
+        let crate::LedgerCommand::AppendLocal(envelope) = appended else {
+            panic!("fire() should append the TaskInvoke via AppendLocal");
+        };
+        assert!(matches!(envelope.kind, EventKind::TaskInvoke));
+        assert_eq!(
+            envelope.target_agent_id.as_deref(),
+            Some("role:agent-test:architect")
         );
     }
 

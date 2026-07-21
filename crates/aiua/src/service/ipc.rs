@@ -9023,46 +9023,64 @@ impl IpcServer {
                     );
                 }
 
-                // Phase 1: HTTP transport only. Stdio needs the command
-                // allowlist + sandbox review (client-fabric Phase 3).
-                let url = match &config.transport {
-                    McpUpstreamTransport::Http { url } => url.clone(),
-                    McpUpstreamTransport::Stdio { .. } => {
-                        return IpcResponse::error(
-                            "mcp_upstream",
-                            "TRANSPORT_NOT_IMPLEMENTED",
-                            "stdio upstream transport is not available yet; use an HTTP url",
-                        );
+                // Transport fence, by kind:
+                // - HTTP: egress policy on the target host (loopback + tailnet
+                //   by default; operator widens via `mcp_egress_policy`).
+                // - Stdio: fail-closed command allowlist (operator widens via
+                //   `mcp_stdio_allowlist` / `phil mcp allow-command`). The
+                //   guest additionally spawns the child with a scrubbed env.
+                match &config.transport {
+                    McpUpstreamTransport::Stdio { command, args } => {
+                        use ansible_mesh_core::mcp_upstream::McpStdioAllowlist;
+                        let allowlist: McpStdioAllowlist = graph
+                            .get_config_value("mcp_stdio_allowlist")
+                            .ok()
+                            .flatten()
+                            .and_then(|j| serde_json::from_str(&j).ok())
+                            .unwrap_or_default();
+                        if !allowlist.command_allowed(command, args) {
+                            return IpcResponse::error(
+                                "mcp_upstream",
+                                "STDIO_NOT_ALLOWED",
+                                format!(
+                                    "stdio command '{command}' (args {args:?}) is not on the \
+                                     operator allowlist; an operator must add it via \
+                                     `phil mcp allow-command` (config node mcp_stdio_allowlist)"
+                                ),
+                            );
+                        }
                     }
-                };
-
-                // Egress fence: the target host must be loopback, tailnet, or
-                // explicitly allowlisted in the operator-managed policy node.
-                let policy: McpEgressPolicy = graph
-                    .get_config_value("mcp_egress_policy")
-                    .ok()
-                    .flatten()
-                    .and_then(|j| serde_json::from_str(&j).ok())
-                    .unwrap_or_default();
-                match host_from_http_url(&url) {
-                    Some(host) if policy.host_allowed(&host) => {}
-                    Some(host) => {
-                        return IpcResponse::error(
-                            "mcp_upstream",
-                            "EGRESS_DENIED",
-                            format!(
-                                "host '{host}' is outside the egress policy (loopback + tailnet \
-                                 by default); an operator must add it to the mcp_egress_policy \
-                                 config node"
-                            ),
-                        );
-                    }
-                    None => {
-                        return IpcResponse::error(
-                            "mcp_upstream",
-                            "INVALID_URL",
-                            format!("'{url}' is not a valid http(s) URL"),
-                        );
+                    McpUpstreamTransport::Http { url } => {
+                        let url = url.clone();
+                        // Egress fence: the target host must be loopback,
+                        // tailnet, or explicitly allowlisted.
+                        let policy: McpEgressPolicy = graph
+                            .get_config_value("mcp_egress_policy")
+                            .ok()
+                            .flatten()
+                            .and_then(|j| serde_json::from_str(&j).ok())
+                            .unwrap_or_default();
+                        match host_from_http_url(&url) {
+                            Some(host) if policy.host_allowed(&host) => {}
+                            Some(host) => {
+                                return IpcResponse::error(
+                                    "mcp_upstream",
+                                    "EGRESS_DENIED",
+                                    format!(
+                                        "host '{host}' is outside the egress policy (loopback + \
+                                         tailnet by default); an operator must add it to the \
+                                         mcp_egress_policy config node"
+                                    ),
+                                );
+                            }
+                            None => {
+                                return IpcResponse::error(
+                                    "mcp_upstream",
+                                    "INVALID_URL",
+                                    format!("'{url}' is not a valid http(s) URL"),
+                                );
+                            }
+                        }
                     }
                 }
 

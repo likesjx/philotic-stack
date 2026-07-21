@@ -156,6 +156,7 @@ struct StatusResponse {
     edge_count: usize,
     snippet_count: usize,
     last_scan: Option<String>,
+    server: serde_json::Value,
 }
 
 #[derive(Serialize)]
@@ -413,6 +414,7 @@ async fn get_status(
         edge_count,
         snippet_count,
         last_scan,
+        server: state.server_info.clone(),
     }))
 }
 

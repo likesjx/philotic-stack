@@ -65,6 +65,7 @@ just intel-graph-health        # health check both services
 just intel-graph-ui            # open the web UI (http://127.0.0.1:8900)
 just intel-graph-agent 60      # start with auto-shutdown after N minutes
 just intel-graph-freshness-schedule  # launchd: scan + harness verify every 6h
+just intel-graph-service       # launchd: supervise the graph server (KeepAlive)
 
 # Harnesses (graph-managed agent charters for Claude Code, Codex, Windsurf, Antigravity)
 just harness-drift             # drift report for all managed harnesses
