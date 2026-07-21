@@ -203,6 +203,29 @@ pub fn parse_vm_stat_used_pct(stdout: &str) -> Option<f32> {
     Some((total_pages - free_pages.min(total_pages)) as f32 / total_pages as f32 * 100.0)
 }
 
+/// Used % from macOS `memory_pressure -Q`, the kernel's pressure-aware view
+/// ("System-wide memory free percentage: NN%"). Unlike any page-count
+/// accounting, this already discounts everything the kernel will reclaim
+/// under pressure, so it tracks the signal Activity Monitor calls "memory
+/// pressure" — the number worth alerting on.
+pub fn parse_memory_pressure_used_pct(stdout: &str) -> Option<f32> {
+    let line = stdout
+        .lines()
+        .find(|l| l.contains("memory free percentage"))?;
+    let free: f32 = line
+        .split(':')
+        .nth(1)?
+        .trim()
+        .trim_end_matches('%')
+        .trim()
+        .parse()
+        .ok()?;
+    if !(0.0..=100.0).contains(&free) {
+        return None;
+    }
+    Some(100.0 - free)
+}
+
 /// Aggregate CPU jiffies from the first line of `/proc/stat`. `idle` includes
 /// iowait (a waiting CPU is not busy).
 #[cfg_attr(target_os = "macos", allow(dead_code))]
@@ -348,6 +371,22 @@ fn sample_vitals(data_dir: &Path, prev_cpu: &mut Option<CpuTotals>) -> HostVital
     let mem_used_pct = (|| -> Option<f32> {
         #[cfg(target_os = "macos")]
         {
+            // `vm_stat` used% counts the page cache, which macOS keeps near
+            // 100% on any healthy host — alerting on it cried wolf hourly on
+            // both Mac hotels (2026-07-21). `memory_pressure -Q` reports the
+            // kernel's pressure-aware free percentage instead; fall back to
+            // vm_stat only when the tool is missing.
+            let pressure = std::process::Command::new("memory_pressure")
+                .arg("-Q")
+                .output()
+                .ok()
+                .filter(|out| out.status.success())
+                .and_then(|out| {
+                    parse_memory_pressure_used_pct(&String::from_utf8_lossy(&out.stdout))
+                });
+            if pressure.is_some() {
+                return pressure;
+            }
             let out = std::process::Command::new("vm_stat").output().ok()?;
             parse_vm_stat_used_pct(&String::from_utf8_lossy(&out.stdout))
         }
@@ -550,6 +589,19 @@ mod tests {
         assert!((avail_gb - 174.3).abs() < 1.0, "{avail_gb}");
 
         assert!(parse_df_disk("garbage").is_none());
+    }
+
+    #[test]
+    fn memory_pressure_used_pct_parses_quick_output() {
+        let stdout = "The system has 34359738368 (2097152 pages with a page size of 16384).\n\
+                      System-wide memory free percentage: 35%\n";
+        let pct = parse_memory_pressure_used_pct(stdout).unwrap();
+        assert!((pct - 65.0).abs() < 0.1, "{pct}");
+
+        assert!(parse_memory_pressure_used_pct("no such line").is_none());
+        assert!(
+            parse_memory_pressure_used_pct("System-wide memory free percentage: 250%").is_none()
+        );
     }
 
     #[test]
