@@ -704,10 +704,41 @@ async fn handle_agent_reply(
     let content = task["content"].as_str().unwrap_or("");
     let chat_id = task["chat_id"].as_str().unwrap_or("");
 
-    let reply_channel = active_turns
+    let mut reply_channel = active_turns
         .get(session_id)
         .map(|t| t.reply_channel_id.clone())
         .unwrap_or_else(|| chat_id.to_string());
+
+    // Text replies with no Discord origin — e.g. self-heal escalations the
+    // hotel delivers to this seat — have no channel, and POSTing to
+    // `/channels//messages` earns a Discord 405 on every attempt (live
+    // 2026-07-20: recurring `discord_reply_405` heal item). Route them to the
+    // operator channel when one is configured; otherwise skip cleanly — an
+    // undeliverable reply is not an API error. Voice replies are unaffected
+    // (they route via the UDP bridge keyed off session_id).
+    if reply_channel.is_empty() && matches!(action, "partial_reply" | "send_reply") {
+        match std::env::var("PHILOTIC_DISCORD_OPERATOR_CHANNEL_ID")
+            .ok()
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+        {
+            Some(operator_channel) => {
+                info!(
+                    session_id,
+                    "agent reply has no Discord channel; routing to operator channel"
+                );
+                reply_channel = operator_channel;
+            }
+            None => {
+                info!(
+                    session_id,
+                    action,
+                    "skipping agent reply with no Discord channel (set PHILOTIC_DISCORD_OPERATOR_CHANNEL_ID to receive these)"
+                );
+                return Ok(());
+            }
+        }
+    }
 
     let trigger_msg_id = active_turns
         .get(session_id)
