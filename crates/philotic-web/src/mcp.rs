@@ -1,10 +1,39 @@
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
+use ansible_mesh_core::mcp_upstream::{McpEgressPolicy, McpStdioAllowEntry, McpStdioAllowlist};
 use clap::Subcommand;
+use philotic_client::{GuestIdentity, IpcRequest, IpcResponse, PhiloticClient};
 use std::path::{Path, PathBuf};
 use tokio::process::Command;
 
+use crate::start::socket_path;
+
 #[derive(Subcommand, Debug)]
 pub enum McpAction {
+    /// List registered upstream MCP servers (client fabric) and their state.
+    Upstreams,
+
+    /// Show the current egress policy and stdio command allowlist.
+    ShowPolicy,
+
+    /// Allow an outbound HTTP host (exact or `*.suffix`) beyond the
+    /// loopback + tailnet default. Operator ceremony.
+    AllowHost {
+        /// Hostname or `*.suffix` pattern (e.g. `api.example.com`, `*.corp.net`).
+        host: String,
+    },
+
+    /// Allow a stdio upstream command. Fail-closed by default: nothing runs
+    /// until an operator adds it here. Operator ceremony.
+    AllowCommand {
+        /// Exact command string the transport must use (e.g. `muninn`,
+        /// `/usr/bin/python3`). Compared verbatim — no PATH/basename matching.
+        command: String,
+        /// Required args prefix. For an interpreter, pin the script:
+        /// `--args-prefix scripts/muninn_mcp.py`. Space-separated.
+        #[arg(long, num_args = 0.., value_delimiter = ' ')]
+        args_prefix: Vec<String>,
+    },
+
     /// Run MCP client UAT through scripts/mcp-client-uat.sh.
     ///
     /// Defaults to strict live mode, which requires Perplexity and LifeGraph
@@ -42,6 +71,13 @@ pub enum McpAction {
 
 pub async fn run(action: McpAction) -> Result<()> {
     match action {
+        McpAction::Upstreams => return upstreams().await,
+        McpAction::ShowPolicy => return show_policy().await,
+        McpAction::AllowHost { host } => return allow_host(host).await,
+        McpAction::AllowCommand {
+            command,
+            args_prefix,
+        } => return allow_command(command, args_prefix).await,
         McpAction::Uat {
             mode,
             perplexity_token_file,
@@ -139,5 +175,157 @@ fn ensure_readable(path: &Path) -> Result<()> {
         anyhow::bail!("{} is not a file", path.display());
     }
     std::fs::File::open(path).with_context(|| format!("open {}", path.display()))?;
+    Ok(())
+}
+
+// ── Client-fabric operator ceremony (upstreams + egress/stdio policy) ──────────
+
+async fn ipc_client() -> Result<PhiloticClient> {
+    let socket = socket_path("aiua");
+    let identity = GuestIdentity {
+        guest_id: "phil-mcp".into(),
+        role: "management".into(),
+        supported_tools: vec![],
+    };
+    PhiloticClient::connect_at(&socket, identity)
+        .await
+        .with_context(|| format!("connect to aiua at {socket}"))
+}
+
+async fn get_config<T: serde::de::DeserializeOwned + Default>(
+    client: &mut PhiloticClient,
+    key: &str,
+) -> Result<T> {
+    match client
+        .send_request(IpcRequest::GetConfig { key: key.into() })
+        .await?
+    {
+        IpcResponse::ConfigData { value_json, .. } => Ok(value_json
+            .and_then(|j| serde_json::from_str(&j).ok())
+            .unwrap_or_default()),
+        IpcResponse::Error(message) => Err(anyhow!(message)),
+        other => Err(anyhow!("unexpected GetConfig response: {other:?}")),
+    }
+}
+
+async fn set_config(
+    client: &mut PhiloticClient,
+    key: &str,
+    value: &impl serde::Serialize,
+) -> Result<()> {
+    let value_json = serde_json::to_string(value)?;
+    match client
+        .send_request(IpcRequest::SetConfig {
+            key: key.into(),
+            value_json,
+        })
+        .await?
+    {
+        IpcResponse::Standard { ok: true, .. } => Ok(()),
+        IpcResponse::Standard { message, .. } => Err(anyhow!(message)),
+        IpcResponse::Error(message) => Err(anyhow!(message)),
+        other => Err(anyhow!("unexpected SetConfig response: {other:?}")),
+    }
+}
+
+async fn upstreams() -> Result<()> {
+    use ansible_mesh_core::mcp_upstream::McpUpstreamTransport;
+    let mut client = ipc_client().await?;
+    match client.send_request(IpcRequest::GetMcpUpstreams {}).await? {
+        IpcResponse::McpUpstreamsState { mcp_upstreams } => {
+            if mcp_upstreams.is_empty() {
+                println!("no upstream MCP servers registered");
+                return Ok(());
+            }
+            for entry in &mcp_upstreams {
+                let cfg = &entry.config;
+                let transport = match &cfg.transport {
+                    McpUpstreamTransport::Http { url } => url.clone(),
+                    McpUpstreamTransport::Stdio { command, args } => {
+                        format!("stdio: {command} {}", args.join(" "))
+                    }
+                };
+                let (state, projected, stale) = entry
+                    .catalog
+                    .as_ref()
+                    .map(|c| (format!("{:?}", c.state), c.tools.len(), c.stale_grants.len()))
+                    .unwrap_or_else(|| ("Pending".into(), 0, 0));
+                println!(
+                    "{}  owner={}  [{}]  projected={} stale={}\n    {}",
+                    cfg.upstream_id, cfg.owner_agent_id, state, projected, stale, transport
+                );
+            }
+            Ok(())
+        }
+        IpcResponse::Error(message) => Err(anyhow!(message)),
+        other => Err(anyhow!("unexpected upstreams response: {other:?}")),
+    }
+}
+
+async fn show_policy() -> Result<()> {
+    let mut client = ipc_client().await?;
+    let egress: McpEgressPolicy = get_config(&mut client, "mcp_egress_policy").await?;
+    let stdio: McpStdioAllowlist = get_config(&mut client, "mcp_stdio_allowlist").await?;
+
+    println!("egress policy (HTTP hosts): loopback + tailnet always allowed");
+    if egress.allowed_hosts.is_empty() {
+        println!("  (no additional hosts allowed)");
+    } else {
+        for h in &egress.allowed_hosts {
+            println!("  + {h}");
+        }
+    }
+    println!("stdio command allowlist (fail-closed):");
+    if stdio.entries.is_empty() {
+        println!("  (empty — no stdio upstreams may run)");
+    } else {
+        for e in &stdio.entries {
+            println!("  + {} {}", e.command, e.args_prefix.join(" "));
+        }
+    }
+    Ok(())
+}
+
+async fn allow_host(host: String) -> Result<()> {
+    let host = host.trim().to_string();
+    if host.is_empty() {
+        anyhow::bail!("host cannot be empty");
+    }
+    let mut client = ipc_client().await?;
+    let mut policy: McpEgressPolicy = get_config(&mut client, "mcp_egress_policy").await?;
+    if policy.allowed_hosts.iter().any(|h| h == &host) {
+        println!("host '{host}' already allowed");
+        return Ok(());
+    }
+    policy.allowed_hosts.push(host.clone());
+    set_config(&mut client, "mcp_egress_policy", &policy).await?;
+    println!("allowed HTTP egress host '{host}'");
+    Ok(())
+}
+
+async fn allow_command(command: String, args_prefix: Vec<String>) -> Result<()> {
+    let command = command.trim().to_string();
+    if command.is_empty() {
+        anyhow::bail!("command cannot be empty");
+    }
+    let mut client = ipc_client().await?;
+    let mut allowlist: McpStdioAllowlist = get_config(&mut client, "mcp_stdio_allowlist").await?;
+    if allowlist
+        .entries
+        .iter()
+        .any(|e| e.command == command && e.args_prefix == args_prefix)
+    {
+        println!(
+            "stdio command already allowed: {command} {}",
+            args_prefix.join(" ")
+        );
+        return Ok(());
+    }
+    allowlist.entries.push(McpStdioAllowEntry {
+        command: command.clone(),
+        args_prefix: args_prefix.clone(),
+    });
+    set_config(&mut client, "mcp_stdio_allowlist", &allowlist).await?;
+    println!("allowed stdio command: {command} {}", args_prefix.join(" "));
     Ok(())
 }
