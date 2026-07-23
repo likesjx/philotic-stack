@@ -449,6 +449,15 @@ Embedding space: `skill_tool_semantic`
 | `SUGGESTS_PATCH` | `DriftFinding`, `GrowthExperiment` | `*Patch` | Leads to a patch proposal |
 | `APPLIES_TO_ROLE` | `Preference`, `Value`, `Concern`, `*Patch` | `Role` | Scoped to a specific role |
 
+**Write-enabled on `life.observe`** (LIFE_GRAPH_ACTIVE proposal, S2): the living-cycle six
+(`OWNS`, `SHAPES`, `SETS`, `SPAWNS`, `RELATES_TO`, plus server-injected `SCOPED_TO`) and the
+agenda six (`ADVANCES`, `BLOCKED_BY`, `NEEDS_FOLLOWUP`, `PROMISED_TO`, `CONTAINS`,
+`SUPPORTS`). Agenda edges are endpoint-validated against this table — wrong source label is
+rejected at compile time; a wrong-label target matches nothing and reports `target_missing`
+(see `cypher::AGENDA_EDGE_RULES`). The remaining rows (`RECURS`, `SUPERSEDES`,
+`CONTRADICTS`, `EVIDENCED_BY`, `REDUCES_FRICTION_FOR`, `SUGGESTS_PATCH`, `APPLIES_TO_ROLE`)
+are not yet writable via `life.observe`.
+
 Edge provenance: the full provenance envelope applies to agent-inferred edges. Operator-asserted edges may carry only `source_membrane` and `observed_at`.
 
 ---

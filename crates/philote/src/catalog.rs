@@ -3345,6 +3345,40 @@ fn build_catalog() -> HashMap<String, ToolDefinition> {
                         "type": "array",
                         "items": {"type": "object"},
                         "default": []
+                    },
+                    "edges": {
+                        "type": "array",
+                        "default": [],
+                        "description": "Typed edges from this node to existing nodes. Living-cycle: \
+                            OWNS, SHAPES, SETS, SPAWNS, RELATES_TO. Agenda (endpoint-validated): \
+                            ADVANCES (NextAction/Habit/Project→Goal), \
+                            BLOCKED_BY (Goal/NextAction/Project→Concern/OpenLoop/Commitment), \
+                            NEEDS_FOLLOWUP (Event/Commitment/OpenLoop→NextAction/Commitment), \
+                            PROMISED_TO (Commitment→Person), \
+                            CONTAINS (Project/System/Routine→NextAction/Habit/OpenLoop), \
+                            SUPPORTS (System/Habit/Routine→Goal/Habit). \
+                            ALWAYS wire new Goals, NextActions, Commitments and OpenLoops into the \
+                            agenda: a NextAction should ADVANCES its Goal; a Commitment should be \
+                            PROMISED_TO its Person. A target_id that matches no node (or the wrong \
+                            node type) writes nothing and is reported as target_missing.",
+                        "items": {
+                            "type": "object",
+                            "required": ["rel_type", "target_id"],
+                            "properties": {
+                                "rel_type": {
+                                    "type": "string",
+                                    "enum": [
+                                        "OWNS", "SHAPES", "SETS", "SPAWNS", "RELATES_TO",
+                                        "ADVANCES", "BLOCKED_BY", "NEEDS_FOLLOWUP",
+                                        "PROMISED_TO", "CONTAINS", "SUPPORTS"
+                                    ]
+                                },
+                                "target_id": {
+                                    "type": "string",
+                                    "description": "Existing Life Graph node ID the edge points to."
+                                }
+                            }
+                        }
                     }
                 }
             }),

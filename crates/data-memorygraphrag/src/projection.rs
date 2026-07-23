@@ -235,16 +235,19 @@ pub fn parse_vector_search_rows(result: &Value) -> Vec<VectorHit> {
 pub const EXPANSION_SCORE_DECAY: f32 = 0.6;
 
 /// Effective relationship types for read-side expansion: the intersection of
-/// the caller's `ExpansionPolicy.allowed_edge_types` with the living-cycle
-/// vocabulary. An empty allowlist means all living-cycle types. Unknown
-/// caller-supplied types are ignored (never interpolated into Cypher).
+/// the caller's `ExpansionPolicy.allowed_edge_types` with the writable
+/// vocabulary (living-cycle + agenda relations). An empty allowlist means
+/// all writable types. Unknown caller-supplied types are ignored (never
+/// interpolated into Cypher).
 pub fn expansion_rel_types(allowed_edge_types: &[String]) -> Vec<&'static str> {
-    if allowed_edge_types.is_empty() {
-        return crate::cypher::LIVING_CYCLE_REL_TYPES.to_vec();
-    }
-    crate::cypher::LIVING_CYCLE_REL_TYPES
+    let writable = crate::cypher::LIVING_CYCLE_REL_TYPES
         .iter()
         .copied()
+        .chain(crate::cypher::AGENDA_EDGE_RULES.iter().map(|r| r.rel_type));
+    if allowed_edge_types.is_empty() {
+        return writable.collect();
+    }
+    writable
         .filter(|rel| allowed_edge_types.iter().any(|allowed| allowed == rel))
         .collect()
 }
@@ -1197,12 +1200,13 @@ mod tests {
         let rel_types = expansion_rel_types(&[]);
         let cypher = expansion_cypher(&["l:ol:a", "l:ol:b'quote"], &rel_types, 32);
 
-        // Empty allowlist -> full living-cycle vocabulary, which now includes
-        // SCOPED_TO (LifeGraph auto-anchor Slice 1) so recall expansion
-        // traverses the server-injected node->Role anchor edges too.
-        assert!(
-            cypher.contains("MATCH (n)-[r:OWNS|SHAPES|SETS|SPAWNS|RELATES_TO|SCOPED_TO]-(related)")
-        );
+        // Empty allowlist -> full writable vocabulary: living-cycle (incl.
+        // SCOPED_TO, the server-injected node->Role anchor) plus the agenda
+        // relations (LIFE_GRAPH_ACTIVE S2) so recall expansion traverses
+        // goal/commitment topology too.
+        assert!(cypher.contains(
+            "MATCH (n)-[r:OWNS|SHAPES|SETS|SPAWNS|RELATES_TO|SCOPED_TO|ADVANCES|BLOCKED_BY|NEEDS_FOLLOWUP|PROMISED_TO|CONTAINS|SUPPORTS]-(related)"
+        ));
         assert!(cypher.contains("n.id IN ['l:ol:a', 'l:ol:b\\'quote']"));
         assert!(cypher.contains("coalesce(related.validation_state, 'inferred') <> 'retired'"));
         assert!(cypher.contains("RETURN n.id AS origin_id, type(r) AS rel_type, related AS node"));
@@ -1210,7 +1214,7 @@ mod tests {
     }
 
     #[test]
-    fn expansion_rel_types_intersects_allowlist_with_living_cycle_vocabulary() {
+    fn expansion_rel_types_intersects_allowlist_with_writable_vocabulary() {
         assert_eq!(
             expansion_rel_types(&[]),
             vec![
@@ -1219,12 +1223,22 @@ mod tests {
                 "SETS",
                 "SPAWNS",
                 "RELATES_TO",
-                "SCOPED_TO"
+                "SCOPED_TO",
+                "ADVANCES",
+                "BLOCKED_BY",
+                "NEEDS_FOLLOWUP",
+                "PROMISED_TO",
+                "CONTAINS",
+                "SUPPORTS"
             ]
         );
         assert_eq!(
             expansion_rel_types(&["OWNS".into(), "BOGUS_TYPE".into()]),
             vec!["OWNS"]
+        );
+        assert_eq!(
+            expansion_rel_types(&["ADVANCES".into(), "BOGUS_TYPE".into()]),
+            vec!["ADVANCES"]
         );
         // A fully-unknown allowlist yields no rel types (expansion disabled),
         // never an injection vector.
