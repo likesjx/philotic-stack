@@ -1561,6 +1561,53 @@ pub struct SessionBindings {
     /// `GetMcpUpstreams`; descriptions/schemas are third-party content.
     #[serde(default)]
     pub mcp_upstream_tools: Vec<McpUpstreamToolBinding>,
+    /// Per-skill implied tools resolved hotel-side from the tool grant registry
+    /// (`proposal:data-driven-tool-grants-skilldag`). A skill present here
+    /// overrides philote's compiled-in `skill_implied_tools` table, which is what
+    /// lets an operator change a grant at runtime without a deploy. A skill
+    /// absent here falls back to the compiled-in table.
+    #[serde(default)]
+    pub resolved_skill_grants: std::collections::HashMap<String, Vec<String>>,
+    /// Per-class tools resolved hotel-side from the same registry. Same
+    /// override-else-fallback rule as `resolved_skill_grants`.
+    #[serde(default)]
+    pub resolved_class_grants: std::collections::HashMap<String, Vec<String>>,
+    /// Tools disabled hotel-wide. A policy layer (AGENTS.md §5.3.2), not a grant:
+    /// applied after every grant source, including philote's own compiled-in
+    /// tables, so a tool cannot be re-added by a source that has not caught up.
+    #[serde(default)]
+    pub disabled_tools: Vec<String>,
+}
+
+impl SessionBindings {
+    /// Tools implied by `skill`, preferring the hotel-resolved registry grant and
+    /// falling back to the compiled-in catalog table.
+    pub fn skill_implied_tools(&self, skill: &str) -> Vec<String> {
+        match self.resolved_skill_grants.get(skill) {
+            Some(tools) => tools.clone(),
+            None => crate::catalog::skill_implied_tools(skill)
+                .iter()
+                .map(|tool| (*tool).to_string())
+                .collect(),
+        }
+    }
+
+    /// Tools granted by `class`, preferring the hotel-resolved registry grant and
+    /// falling back to the shared compiled-in class map.
+    pub fn class_granted_tools(&self, class: &str) -> Vec<String> {
+        match self.resolved_class_grants.get(class) {
+            Some(tools) => tools.clone(),
+            None => ansible_mesh_core::graph::tools_for_tool_class(class)
+                .iter()
+                .map(|tool| (*tool).to_string())
+                .collect(),
+        }
+    }
+
+    /// Returns `true` when `tool_name` is disabled hotel-wide for this session.
+    pub fn is_tool_disabled(&self, tool_name: &str) -> bool {
+        self.disabled_tools.iter().any(|name| name == tool_name)
+    }
 }
 
 /// One projected upstream MCP tool bound into a session (see

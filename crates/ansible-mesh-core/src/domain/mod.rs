@@ -22,7 +22,7 @@ use crate::graph::{
     AbstractModelRecord, AbstractRightRecord, AbstractSkillRecord, AbstractToolRecord, GraphNode,
     MembraneTransportHomeRecord, ModelProfileRecord, RoleIncarnationRecord, RoleReadinessState,
     RoutingPolicyEvaluationRecord, RoutingPolicyRecord, RuleRecord, SkillRegistrationAuditRecord,
-    ToolsetProfileRecord, WorkflowSkillRecord,
+    ToolGrantRegistryRecord, ToolsetProfileRecord, WorkflowSkillRecord,
 };
 use crate::heal_queue::{
     HealWorkItemRecord, HEAL_WORK_ITEM_STATUS_CLOSED, HEAL_WORK_ITEM_STATUS_OPEN,
@@ -1031,6 +1031,37 @@ impl GraphDomain {
             }
         }
         Ok(skills)
+    }
+
+    // ── Tool grant registry methods ───────────────────────────────────────────
+
+    /// Node key for the per-hotel tool grant registry singleton.
+    pub const TOOL_GRANT_REGISTRY_KEY: &'static str = "tool_grant_registry:default";
+
+    pub fn upsert_tool_grant_registry(&self, registry: &ToolGrantRegistryRecord) -> Result<()> {
+        let data = serde_json::to_value(registry).context(
+            "GraphDomain::upsert_tool_grant_registry: serialize ToolGrantRegistryRecord",
+        )?;
+        self.adapter.upsert_node(&GraphNode {
+            node_key: Self::TOOL_GRANT_REGISTRY_KEY.to_string(),
+            kind: NODE_KIND_TOOL_GRANT_REGISTRY.to_string(),
+            label: Some("default".to_string()),
+            data,
+        })
+    }
+
+    /// Loads the tool grant registry, or `None` when it has never been seeded.
+    ///
+    /// A malformed record is a hard error rather than a silent `None`: treating
+    /// an unreadable registry as "no registry" would fall back to the built-in
+    /// grants and silently re-enable every tool an operator had disabled.
+    pub fn get_tool_grant_registry(&self) -> Result<Option<ToolGrantRegistryRecord>> {
+        match self.adapter.get_node(Self::TOOL_GRANT_REGISTRY_KEY)? {
+            None => Ok(None),
+            Some(node) => Ok(Some(serde_json::from_value(node.data).context(
+                "GraphDomain::get_tool_grant_registry: deserialize ToolGrantRegistryRecord",
+            )?)),
+        }
     }
 
     // ── Skill registration audit methods ──────────────────────────────────────

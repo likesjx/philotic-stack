@@ -2016,7 +2016,22 @@ impl SessionState {
         format!("Context envelope breakdown:\n{}", lines.join("\n"))
     }
 
+    /// Projects the tools this turn's model call may see.
+    ///
+    /// Wraps the projection so the hotel-wide disabled-tool policy is applied at
+    /// the single choke point where tools reach the model. The inner projection
+    /// has many early returns and several ad-hoc `add_tool` paths; enforcing the
+    /// policy here means a new branch cannot accidentally reintroduce a tool an
+    /// operator disabled (AGENTS.md §5.3.2 — projection is policy).
     pub fn project_tools_for_turn(&self, user_content: &str) -> Vec<ToolDefinition> {
+        let mut projected = self.project_granted_tools_for_turn(user_content);
+        if !self.bindings.disabled_tools.is_empty() {
+            projected.retain(|tool| !self.bindings.is_tool_disabled(&tool.tool_name));
+        }
+        projected
+    }
+
+    fn project_granted_tools_for_turn(&self, user_content: &str) -> Vec<ToolDefinition> {
         let mut all_tools = self.tool_assembly.tools_for_model.clone();
 
         // Paracrine context: auto-inject delegate.merge so the specialist can explicitly
@@ -2105,8 +2120,8 @@ impl SessionState {
                 .chain(self.bindings.on_demand_skills.iter())
             {
                 if self.skill_relevant_for_turn_with_session_signal(skill, &normalized) {
-                    for &tool_name in crate::catalog::skill_implied_tools(skill) {
-                        add_tool(tool_name);
+                    for tool_name in self.bindings.skill_implied_tools(skill) {
+                        add_tool(&tool_name);
                     }
                     for &tool_name in crate::catalog::tools_for_skill(skill) {
                         add_tool(tool_name);
@@ -2767,11 +2782,12 @@ impl SessionState {
                     return self.skill_relevant_for_turn_with_session_signal(skill, &normalized);
                 }
 
-                let implied_tools = crate::catalog::skill_implied_tools(skill);
+                let implied_tools = self.bindings.skill_implied_tools(skill);
                 let owned_tools = crate::catalog::tools_for_skill(skill);
                 implied_tools
                     .iter()
-                    .chain(owned_tools.iter())
+                    .map(String::as_str)
+                    .chain(owned_tools.iter().copied())
                     .any(|tool| projected_tool_names.contains(tool))
             })
             .cloned()
@@ -2781,11 +2797,12 @@ impl SessionState {
             if !self.skill_relevant_for_turn_with_session_signal(skill, &normalized) {
                 continue;
             }
-            let implied_tools = crate::catalog::skill_implied_tools(skill);
+            let implied_tools = self.bindings.skill_implied_tools(skill);
             let owned_tools = crate::catalog::tools_for_skill(skill);
             if implied_tools
                 .iter()
-                .chain(owned_tools.iter())
+                .map(String::as_str)
+                .chain(owned_tools.iter().copied())
                 .any(|tool| projected_tool_names.contains(tool))
             {
                 projected_skills.insert(skill.clone());
@@ -4758,10 +4775,11 @@ fn default_visible_toolset(bindings: &SessionBindings) -> Vec<String> {
         bindings.effective_toolset.clone()
     };
 
-    // Expand skill grants: merge implied tools from each active skill.
+    // Expand skill grants: merge implied tools from each active skill. Resolved
+    // grants from the hotel win over the compiled-in table so a runtime edit
+    // reaches the model without a deploy.
     for skill in &bindings.effective_skillset {
-        for &implied in crate::catalog::skill_implied_tools(skill) {
-            let implied = implied.to_string();
+        for implied in bindings.skill_implied_tools(skill) {
             if !toolset.contains(&implied) {
                 toolset.push(implied);
             }
@@ -4769,9 +4787,18 @@ fn default_visible_toolset(bindings: &SessionBindings) -> Vec<String> {
     }
 
     // Expand class grants: include every catalog tool whose class is listed.
+    //
+    // The catalog's own class tags are a third grant source, independent of the
+    // registry. When the hotel resolved a class explicitly, that resolution is
+    // authoritative for it and the tag expansion is skipped — otherwise emptying
+    // a class in the registry would revoke nothing, because every catalog tool
+    // carrying that tag would immediately re-add itself.
     if !bindings.allowed_classes.is_empty() {
         for (tool_name, def) in crate::catalog::tool_catalog() {
             if let Some(class) = &def.class {
+                if bindings.resolved_class_grants.contains_key(class) {
+                    continue;
+                }
                 if bindings.allowed_classes.contains(class) && !toolset.contains(tool_name) {
                     toolset.push(tool_name.clone());
                 }
@@ -4783,9 +4810,9 @@ fn default_visible_toolset(bindings: &SessionBindings) -> Vec<String> {
         // ToolsetProfileRecord expanded to nothing here ("dead classes") and
         // the hotel and philote disagreed about what a class grants.
         for class in &bindings.allowed_classes {
-            for &tool in ansible_mesh_core::graph::tools_for_tool_class(class) {
-                if !toolset.iter().any(|existing| existing == tool) {
-                    toolset.push(tool.to_string());
+            for tool in bindings.class_granted_tools(class) {
+                if !toolset.iter().any(|existing| existing == &tool) {
+                    toolset.push(tool);
                 }
             }
         }
@@ -4804,6 +4831,11 @@ fn default_visible_toolset(bindings: &SessionBindings) -> Vec<String> {
             toolset.push(always);
         }
     }
+
+    // Policy strip, applied last so it wins over every grant source above —
+    // including the always-on list, which is a convenience default and not an
+    // exemption from operator policy.
+    toolset.retain(|tool_name| !bindings.is_tool_disabled(tool_name));
 
     toolset
 }
@@ -5480,7 +5512,7 @@ mod tests {
         SessionBindings, SessionState, TaskRunnerBaseConfig, ToolRunnerIncarnationBinding,
         TransportReplyTargetBinding, TtsMode, TurnRecord, VoiceDeliveryMode, VoiceResponsePolicy,
         WorkingTurn, apply_life_recall_char_budget, default_tool_assembly_for_bindings,
-        merge_session_index, session_checkpoint_memory_type,
+        default_visible_toolset, merge_session_index, session_checkpoint_memory_type,
     };
     use crate::r#loop::{ApprovalRequest, ToolCall, ToolResult, TurnPhase};
     use crate::reflex::ReflexEvent;
@@ -6285,6 +6317,7 @@ mod tests {
                 allowed_classes: Vec::new(),
                 mcp_upstream_tools: Vec::new(),
                 on_demand_skills: Vec::new(),
+                ..Default::default()
             }
         );
         // The dropped "waiting_model" active turn (not resumable across restart) is
@@ -6906,6 +6939,7 @@ mod tests {
             allowed_classes: Vec::new(),
             mcp_upstream_tools: Vec::new(),
             on_demand_skills: Vec::new(),
+            ..Default::default()
         };
 
         let prompt = state.build_prompt("status");
@@ -8350,6 +8384,105 @@ mod tests {
         assert!(projected_names.contains(&"echo"));
         assert!(projected_names.contains(&"workspace.read"));
         assert!(!projected_names.contains(&"bash.exec"));
+    }
+
+    /// The slice-1 acceptance behavior, philote-side: a tool the operator
+    /// disabled must not reach the model even when it is explicitly bound and
+    /// the turn is squarely about it.
+    ///
+    /// This is the case that could not be fixed without a deploy before, because
+    /// philote re-added the tool from its compiled-in tables during projection
+    /// regardless of what the hotel sent.
+    #[test]
+    fn disabled_tool_never_reaches_the_model() {
+        let mut state =
+            SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
+        state.clear_tool_bindings();
+        state.add_tool_binding("life.observe");
+        state.add_tool_binding("life.observe.batch");
+        state.bindings.effective_skillset = vec!["life.steward".into()];
+        state.bindings.disabled_tools = vec!["life.observe.batch".into()];
+
+        let projected = state.project_tools_for_turn("record this in my lifegraph please");
+        let projected_names = projected
+            .iter()
+            .map(|tool| tool.tool_name.as_str())
+            .collect::<Vec<_>>();
+
+        assert!(
+            !projected_names.contains(&"life.observe.batch"),
+            "a disabled tool must be stripped from projection, got {projected_names:?}"
+        );
+        assert!(
+            projected_names.contains(&"life.observe"),
+            "disabling one tool must not disturb its siblings, got {projected_names:?}"
+        );
+    }
+
+    /// A grant resolved by the hotel wins over philote's compiled-in table, which
+    /// is what makes a runtime grant edit reach the model without a deploy.
+    #[test]
+    fn resolved_skill_grant_overrides_the_builtin_table() {
+        let mut bindings = SessionBindings {
+            effective_skillset: vec!["life.steward".into()],
+            ..Default::default()
+        };
+
+        // Fallback: no resolved grant, so the compiled-in table applies.
+        assert!(
+            default_visible_toolset(&bindings).contains(&"life.observe.batch".to_string()),
+            "built-in table should still apply when the hotel resolved nothing"
+        );
+
+        // Hotel resolved a narrower grant — it must win.
+        bindings.resolved_skill_grants = std::collections::HashMap::from([(
+            "life.steward".to_string(),
+            vec!["life.recall".to_string()],
+        )]);
+        let toolset = default_visible_toolset(&bindings);
+        assert!(toolset.contains(&"life.recall".to_string()));
+        assert!(
+            !toolset.contains(&"life.observe.batch".to_string()),
+            "a resolved skill grant must replace the compiled-in list, got {toolset:?}"
+        );
+    }
+
+    /// Same inversion for class grants, including the emptied-class case that
+    /// must not fall back to the built-in table.
+    #[test]
+    fn resolved_class_grant_overrides_the_builtin_table() {
+        let mut bindings = SessionBindings {
+            allowed_classes: vec!["life_graph".into()],
+            ..Default::default()
+        };
+        assert!(
+            default_visible_toolset(&bindings).contains(&"life.observe.batch".to_string()),
+            "built-in class map should apply when the hotel resolved nothing"
+        );
+
+        bindings.resolved_class_grants =
+            std::collections::HashMap::from([("life_graph".to_string(), Vec::<String>::new())]);
+        let toolset = default_visible_toolset(&bindings);
+        assert!(
+            !toolset.contains(&"life.observe.batch".to_string()),
+            "an emptied class must grant nothing, got {toolset:?}"
+        );
+    }
+
+    /// The always-on convenience tools are a default, not an exemption from
+    /// operator policy.
+    #[test]
+    fn disabled_tool_is_stripped_even_from_the_always_on_list() {
+        let bindings = SessionBindings {
+            disabled_tools: vec!["hotel.logs".into()],
+            ..Default::default()
+        };
+        let toolset = default_visible_toolset(&bindings);
+        assert!(
+            !toolset.contains(&"hotel.logs".to_string()),
+            "policy must override the always-on defaults, got {toolset:?}"
+        );
+        assert!(toolset.contains(&"session.status".to_string()));
     }
 
     #[test]
