@@ -1,0 +1,122 @@
+# MuninnDB hardened baseline (proposal:muninn-vps-reharden).
+#
+# Invariants this role enforces WITHOUT touching the data directory:
+#   1. Admin password is the vaulted secret, never the shipped default.
+#   2. Secrets live in an EnvironmentFile (0600), never inline in the unit.
+#   3. The MCP port (8750) requires a bearer token.
+#   4. The `default` vault is locked (Public=false) — all data-plane access
+#      requires an mk_ API key.
+#   5. Automated daily backups (include auth_secret + Pebble key store).
+#
+# It deliberately never writes under {{ muninn_data_dir }} — engrams, API
+# keys, vault configs, and auth_secret live there and must survive redeploys.
+
+- name: Assert vaulted muninn admin password is set and non-default
+  assert:
+    that:
+      - vault_muninn_admin_password is defined
+      - vault_muninn_admin_password | length >= 16
+      - vault_muninn_admin_password != "password"
+    fail_msg: >-
+      vault_muninn_admin_password must be defined in vault/{{ inventory_hostname }}.yml
+      (>=16 chars, not the shipped default).
+  no_log: true
+
+- name: Ensure muninn home and backup directories exist
+  file:
+    path: "{{ item }}"
+    state: directory
+    owner: "{{ muninn_user }}"
+    group: "{{ muninn_group }}"
+    mode: "0700"
+  loop:
+    - "{{ muninn_home }}"
+    - "{{ muninn_backup_dir }}"
+
+- name: Deploy muninn.env (secrets from vault — never in source control)
+  template:
+    src: muninn.env.j2
+    dest: "{{ muninn_home }}/muninn.env"
+    owner: "{{ muninn_user }}"
+    group: "{{ muninn_group }}"
+    mode: "0600"
+  no_log: true
+  notify: Restart muninn
+
+- name: Install muninn systemd unit
+  template:
+    src: muninn.service.j2
+    dest: /etc/systemd/system/muninn.service
+    owner: root
+    group: root
+    mode: "0644"
+  notify: Restart muninn
+
+- name: Enable and start muninn
+  systemd:
+    name: muninn
+    enabled: yes
+    state: started
+    daemon_reload: yes
+
+# Apply any pending restart now so the auth checks below see the new config.
+- name: Flush handlers (restart muninn if config changed)
+  meta: flush_handlers
+
+# Post-deploy enforcement + verification. Skipped in --check runs: the new
+# env/unit haven't actually been applied there, so live auth still reflects
+# the old state.
+- name: Enforce and verify auth baseline
+  when: not ansible_check_mode
+  block:
+    - name: Wait for muninn admin UI
+      wait_for:
+        host: 127.0.0.1
+        port: "{{ muninn_ui_port }}"
+        timeout: 60
+
+    - name: Admin login with vaulted password
+      uri:
+        url: "http://127.0.0.1:{{ muninn_ui_port }}/api/auth/login"
+        method: POST
+        body_format: json
+        body:
+          username: root
+          password: "{{ vault_muninn_admin_password }}"
+        status_code: 200
+      register: muninn_login
+      retries: 5
+      delay: 3
+      until: muninn_login.status == 200
+      no_log: true
+
+    - name: Assert shipped default admin password is rejected
+      uri:
+        url: "http://127.0.0.1:{{ muninn_ui_port }}/api/auth/login"
+        method: POST
+        body_format: json
+        body:
+          username: root
+          password: "password"
+        status_code: 401
+      changed_when: false
+
+    - name: Lock the default vault (data plane requires API keys)
+      uri:
+        url: "http://127.0.0.1:{{ muninn_rest_port }}/api/admin/vaults/config"
+        method: PUT
+        body_format: json
+        body:
+          name: default
+          public: false
+        headers:
+          Cookie: "{{ muninn_login.cookies_string }}"
+        status_code: 200
+      no_log: true
+
+    - name: Verify unauthenticated data-plane access is rejected
+      uri:
+        url: "http://127.0.0.1:{{ muninn_rest_port }}/api/engrams?vault=default&limit=1"
+        method: GET
+        status_code: 401
+      changed_when: false
