@@ -3,9 +3,9 @@ title: Memory Token Self-Heal — Auto Re-Mint Across the Two-Store Token Bindin
 doc_type: proposal
 proposal_id: memory-token-self-heal
 domain: memory-context
-status: proposed
-disposition: proposed
-last_updated: 2026-07-21
+status: accepted-current-slice
+disposition: accepted for current slice
+last_updated: 2026-07-24
 verification_level: test-green
 tags:
 - muninn
@@ -16,6 +16,7 @@ tags:
 - substrate
 related_docs:
 - SUBSTRATE_HARDENING_PROPOSAL.md
+- MUNINN_VPS_REHARDEN_PROPOSAL.md
 - MUNINN_V07_CAPABILITY_ADOPTION_PROPOSAL.md
 - ../reference/MCP_CREDENTIAL_LIFECYCLE.md
 - ../HANDOFF-2026-07-14-lifegraph-batch.md
@@ -95,17 +96,24 @@ hotel owns all three and already contains the complete mint+store flow in
 4. The philote rebuilds its engine from the fresh config and retries the
    failed op **once**.
 
-The mint path requires an admin credential. On vps that credential does not
-currently exist — the rebuilt MuninnDB is open (no admin auth). That is the
-companion proposal **`muninn-vps-reharden`** (spec-stage, not yet authored as a
-doc): restore admin + token auth *without* rotating `auth_secret` (which would
-re-break resynced tokens), and bake the hardened baseline into the deploy
-source so rebuilds restore it. The interface this proposal needs from it is
-narrow: an admin credential resolvable from the Context Graph as a
-`SecretRecord` (proposed `secret_kind: "muninn_admin_credential"`), decrypted
-via the same `resolve_secret` path as vault tokens. Slice S2 lands behind
-that credential's presence: no credential → heal degrades to a loud,
-throttled operator escalation instead of a mint.
+The mint path requires an admin credential. When this proposal was filed that
+credential did not exist on vps — the rebuilt MuninnDB was open (no admin
+auth). The companion proposal
+[**`muninn-vps-reharden`**](MUNINN_VPS_REHARDEN_PROPOSAL.md) has since
+**shipped** (PR #346, 2026-07-21, applied live on jane-vps): admin + token auth
+restored *without* rotating `auth_secret`, and `mesh-config.json.j2` now renders
+`context_graph.muninn` from the same vaulted `vault_muninn_admin_password`, so
+hotel provisioning and muninn admin creds cannot drift. That closes this
+proposal's only external dependency — the `--load-config` `muninn` object
+fallback in `resolve_admin_credential` now resolves fleet-wide, not just on
+mbp/mac.
+
+The interface remains narrow, and the degraded path is retained deliberately:
+an admin credential resolvable from the Context Graph as a `SecretRecord`
+(`secret_kind: "muninn_admin_credential"`), decrypted via the same
+`resolve_secret` path as vault tokens, preferred over the config fallback.
+Absent either source, heal degrades to a loud, throttled operator escalation
+instead of a mint — a hotel with no way to mint must escalate, never spin.
 
 ## Slices
 
@@ -140,9 +148,16 @@ throttled operator escalation instead of a mint.
 Filed to the intel-graph 2026-07-21 as `proposal:memory-token-self-heal`
 after the second manual resync in two days (see
 [HANDOFF-2026-07-14-lifegraph-batch.md](../HANDOFF-2026-07-14-lifegraph-batch.md),
-"Muninn token durability"). Coupled with `proposal:muninn-vps-reharden`
-(admin credential source; not yet authored as a doc). Spec-stage; no slice
-started.
+"Muninn token durability"). Coupled with
+[`proposal:muninn-vps-reharden`](MUNINN_VPS_REHARDEN_PROPOSAL.md), the admin
+credential source — **implemented and applied live 2026-07-21** (PR #346).
+
+**Accepted for the current slice**: S1–S3 implemented (S4 tracked below).
+This doc is the single
+home for the spec; the short spec-stage stub that briefly lived at
+`docs/specifications/MEMORY_TOKEN_SELF_HEAL_PROPOSAL.md` (added by
+`af5fe885` for scanner visibility while this branch was open) was folded in
+here to keep one canonical proposal per `proposal_id`.
 
 ### Slice status
 
