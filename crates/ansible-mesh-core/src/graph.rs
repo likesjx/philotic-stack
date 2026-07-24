@@ -129,6 +129,86 @@ impl Default for SkillValidationState {
     }
 }
 
+/// Who owns a tool grant's current value: the compiled-in seed, or a runtime edit.
+///
+/// The boot seeders in `aiua` write built-in grants with [`GrantSource::Seed`] and
+/// may refresh those entries on every start, so new built-in tools reach existing
+/// installs on upgrade. Any runtime mutation (`skill.register`, `phil tools`)
+/// stamps [`GrantSource::Runtime`], which makes the value sticky — the seeder
+/// preserves it instead of overwriting.
+///
+/// This is the mechanism that turns the compiled-in tables into a *first-boot seed
+/// plus fallback* rather than a store that silently resets on restart. Without it,
+/// disabling a tool in the DB works live and is undone by the next hotel restart.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum GrantSource {
+    /// Written by the compiled-in boot seed; the seeder may refresh it.
+    #[default]
+    Seed,
+    /// Edited at runtime by an operator or agent; the seeder must not overwrite it.
+    Runtime,
+}
+
+/// Tools granted by one tool class, held as data in the local hotel context graph.
+///
+/// Replaces the compiled-in `tools_for_allowed_class` table as the authority. A
+/// class present here with an empty `tools` list means "operator emptied this
+/// class" and grants nothing — it does NOT fall back to the built-in table. Only
+/// a class absent from the registry falls back.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct ToolClassGrant {
+    pub class_name: String,
+    #[serde(default)]
+    pub tools: Vec<String>,
+    #[serde(default)]
+    pub grant_source: GrantSource,
+}
+
+/// Per-hotel registry of tool grants and tool policy.
+///
+/// Node kind: `tool_grant_registry`. Node key: `tool_grant_registry:default`.
+///
+/// Deliberately lives in the LOCAL hotel context graph, not the remote LifeGraph:
+/// tool resolution is on the hot path of every turn, so a remote dependency would
+/// brick every agent whenever the remote graph is down. The LifeGraph stays an
+/// optional reasoning layer whose proposals compile down into this record.
+///
+/// Two distinct layers share this record and must not be conflated:
+/// - `class_grants` is a **grant** layer — what a class is allowed to project.
+/// - `disabled_tools` is a **policy** layer (AGENTS.md §5.3.2) applied last,
+///   after every grant source has had its say. It is never seeded from code.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct ToolGrantRegistryRecord {
+    #[serde(default)]
+    pub class_grants: Vec<ToolClassGrant>,
+    /// Tools suppressed hotel-wide regardless of which source granted them.
+    #[serde(default)]
+    pub disabled_tools: Vec<String>,
+    #[serde(default)]
+    pub updated_at: u64,
+    #[serde(default)]
+    pub updated_by: String,
+}
+
+impl ToolGrantRegistryRecord {
+    /// Returns the tools granted by `class_name`, or `None` when the class is
+    /// absent entirely (the caller should fall back to the built-in table).
+    ///
+    /// An operator-emptied class returns `Some(&[])`, which is a real answer.
+    pub fn class_tools(&self, class_name: &str) -> Option<&[String]> {
+        self.class_grants
+            .iter()
+            .find(|grant| grant.class_name == class_name)
+            .map(|grant| grant.tools.as_slice())
+    }
+
+    /// Returns `true` when `tool_name` is disabled hotel-wide.
+    pub fn is_disabled(&self, tool_name: &str) -> bool {
+        self.disabled_tools.iter().any(|name| name == tool_name)
+    }
+}
+
 /// Provenance snapshot describing where and when a skill was registered.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct SkillSourceSnapshot {
@@ -157,6 +237,11 @@ pub struct AbstractSkillRecord {
     pub source_snapshot: Option<SkillSourceSnapshot>,
     #[serde(default)]
     pub field_sources: serde_json::Value,
+    /// Who owns `implied_tools`/`skill_markers` right now. Defaults to
+    /// [`GrantSource::Seed`], so records written before this field existed stay
+    /// refreshable by the boot seeder.
+    #[serde(default)]
+    pub grant_source: GrantSource,
 }
 
 /// Append-only audit entry recorded on every accepted `skill.register`.
@@ -399,6 +484,34 @@ pub fn tools_for_tool_class(class: &str) -> &'static [&'static str] {
         ],
         "asr" => &["asr.setup", "asr.status"],
         _ => &[],
+    }
+}
+
+/// Every class name [`tools_for_tool_class`] answers for.
+///
+/// A `match` arm list is not enumerable, but the boot seeder needs to walk the
+/// built-in classes to copy them into [`ToolGrantRegistryRecord::class_grants`].
+/// Keep this in sync with the match above — `builtin_tool_classes_are_complete`
+/// fails the build if an arm is added here without a grant, and the reverse
+/// direction is covered by the per-class assertions in the same test module.
+pub const BUILTIN_TOOL_CLASSES: &[&str] = &["life_graph", "agent_graph", "mcp", "training", "asr"];
+
+/// Resolves a tool class against the runtime registry, falling back to the
+/// compiled-in table only when the class is absent from the registry entirely.
+///
+/// The distinction matters: a class present in the registry with an empty tool
+/// list is an operator decision and must grant nothing. Falling back in that case
+/// would re-grant every tool the operator had just removed.
+pub fn resolve_tool_class_grants(
+    registry: Option<&ToolGrantRegistryRecord>,
+    class: &str,
+) -> Vec<String> {
+    match registry.and_then(|reg| reg.class_tools(class)) {
+        Some(tools) => tools.to_vec(),
+        None => tools_for_tool_class(class)
+            .iter()
+            .map(|tool| (*tool).to_string())
+            .collect(),
     }
 }
 
@@ -1097,5 +1210,71 @@ mod content_policy_tests {
         assert!(tools_for_tool_class("training").contains(&"training.export"));
         assert!(tools_for_tool_class("asr").contains(&"asr.setup"));
         assert!(tools_for_tool_class("nonexistent").is_empty());
+    }
+
+    /// `BUILTIN_TOOL_CLASSES` drives the registry seeder, so a class listed there
+    /// with no grants would seed an empty class and silently revoke it.
+    #[test]
+    fn builtin_tool_classes_are_complete() {
+        for class in BUILTIN_TOOL_CLASSES {
+            assert!(
+                !tools_for_tool_class(class).is_empty(),
+                "BUILTIN_TOOL_CLASSES lists {class} but tools_for_tool_class grants nothing for it"
+            );
+        }
+    }
+
+    /// The registry is the authority; the compiled-in table is only a fallback
+    /// for classes the registry has never heard of.
+    #[test]
+    fn registry_class_grants_override_the_builtin_table() {
+        let registry = ToolGrantRegistryRecord {
+            class_grants: vec![ToolClassGrant {
+                class_name: "life_graph".into(),
+                tools: vec!["life.recall".into()],
+                grant_source: GrantSource::Runtime,
+            }],
+            ..Default::default()
+        };
+        assert_eq!(
+            resolve_tool_class_grants(Some(&registry), "life_graph"),
+            vec!["life.recall".to_string()],
+            "a runtime class grant must win over the compiled-in table"
+        );
+        // A class the registry does not mention still falls back.
+        assert!(
+            resolve_tool_class_grants(Some(&registry), "asr").contains(&"asr.setup".to_string())
+        );
+        // No registry at all (pre-seed boot) falls back wholesale.
+        assert!(resolve_tool_class_grants(None, "life_graph")
+            .contains(&"life.observe.batch".to_string()));
+    }
+
+    /// An operator-emptied class must grant nothing rather than falling through
+    /// to the built-in table, which would re-grant everything just removed.
+    #[test]
+    fn emptied_class_grants_nothing_instead_of_falling_back() {
+        let registry = ToolGrantRegistryRecord {
+            class_grants: vec![ToolClassGrant {
+                class_name: "life_graph".into(),
+                tools: Vec::new(),
+                grant_source: GrantSource::Runtime,
+            }],
+            ..Default::default()
+        };
+        assert!(
+            resolve_tool_class_grants(Some(&registry), "life_graph").is_empty(),
+            "an emptied class must not fall back to the built-in grants"
+        );
+    }
+
+    #[test]
+    fn disabled_tools_are_reported_by_the_registry() {
+        let registry = ToolGrantRegistryRecord {
+            disabled_tools: vec!["life.observe.batch".into()],
+            ..Default::default()
+        };
+        assert!(registry.is_disabled("life.observe.batch"));
+        assert!(!registry.is_disabled("life.observe"));
     }
 }

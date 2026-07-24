@@ -1203,10 +1203,11 @@ fn project_effective_rights(bindings: &serde_json::Value) -> Vec<String> {
         .get("allowed_classes")
         .and_then(serde_json::Value::as_array)
     {
+        let class_grants = bindings.get("resolved_class_grants");
         for class in classes {
             if let Some(class_str) = class.as_str() {
-                for tool_name in tools_for_allowed_class(class_str) {
-                    rights.push(tool_right(tool_name));
+                for tool_name in resolved_class_tools(class_grants, class_str) {
+                    rights.push(tool_right(&tool_name));
                 }
             }
         }
@@ -12525,6 +12526,112 @@ impl IpcServer {
             }
         }
 
+        // Resolve tool grants from the registry and carry them on the bindings
+        // (proposal:data-driven-tool-grants-skilldag, slice 1).
+        //
+        // Grants resolve hotel-side, once per snapshot, against the LOCAL context
+        // graph — never the remote LifeGraph, which would put every turn's tool
+        // resolution behind a network dependency whose outage bricks every agent.
+        //
+        // philote receives the resolved map and demotes its compiled-in
+        // `skill_implied_tools` table to a fallback for skills the hotel did not
+        // resolve, which is what makes a runtime grant edit reach the model
+        // without a deploy.
+        {
+            let registry = match graph.get_tool_grant_registry() {
+                Ok(registry) => registry,
+                Err(e) => {
+                    // Fail loud but do not fail closed: an unreadable registry
+                    // must not silently strip every agent's tools. Falling back
+                    // to the compiled-in seed keeps the hotel usable, and the
+                    // warning is the operator's signal that runtime grants are
+                    // not being honored right now.
+                    warn!("tool grant registry unreadable, falling back to built-in grants: {e}");
+                    None
+                }
+            };
+
+            let mut class_grants = serde_json::Map::new();
+            let mut class_names: Vec<String> = ansible_mesh_core::graph::BUILTIN_TOOL_CLASSES
+                .iter()
+                .map(|class| (*class).to_string())
+                .collect();
+            if let Some(reg) = registry.as_ref() {
+                for grant in &reg.class_grants {
+                    if !class_names.contains(&grant.class_name) {
+                        class_names.push(grant.class_name.clone());
+                    }
+                }
+            }
+            for class_name in &class_names {
+                class_grants.insert(
+                    class_name.clone(),
+                    serde_json::json!(ansible_mesh_core::graph::resolve_tool_class_grants(
+                        registry.as_ref(),
+                        class_name
+                    )),
+                );
+            }
+
+            // Per-skill implied tools as resolved from the graph, for the skills
+            // this session can actually activate. Skills with no record are
+            // omitted so philote falls back to its built-in table rather than
+            // treating "unknown to the hotel" as "grants nothing".
+            let mut skill_grants = serde_json::Map::new();
+            let activatable_skills: Vec<String> = ["effective_skillset", "on_demand_skills"]
+                .iter()
+                .filter_map(|key| bindings.get(*key))
+                .filter_map(serde_json::Value::as_array)
+                .flatten()
+                .filter_map(serde_json::Value::as_str)
+                .map(str::to_string)
+                .collect();
+            for skill_name in &activatable_skills {
+                if skill_grants.contains_key(skill_name) {
+                    continue;
+                }
+                if let Ok(Some(record)) = graph.get_abstract_skill(skill_name) {
+                    skill_grants
+                        .insert(skill_name.clone(), serde_json::json!(record.implied_tools));
+                }
+            }
+
+            let disabled_tools = registry
+                .as_ref()
+                .map(|reg| reg.disabled_tools.clone())
+                .unwrap_or_default();
+
+            // Policy strip, applied last so it overrides every grant source that
+            // ran above — explicit toolset, class expansion, and skill expansion.
+            if !disabled_tools.is_empty() {
+                if let Some(toolset) = bindings
+                    .get_mut("effective_toolset")
+                    .and_then(serde_json::Value::as_array_mut)
+                {
+                    toolset.retain(|tool| {
+                        tool.as_str()
+                            .map(|name| !disabled_tools.iter().any(|denied| denied == name))
+                            .unwrap_or(true)
+                    });
+                }
+            }
+
+            if let Some(obj) = bindings.as_object_mut() {
+                obj.insert(
+                    "resolved_class_grants".to_string(),
+                    serde_json::Value::Object(class_grants),
+                );
+                obj.insert(
+                    "resolved_skill_grants".to_string(),
+                    serde_json::Value::Object(skill_grants),
+                );
+                obj.insert(
+                    "disabled_tools".to_string(),
+                    serde_json::json!(disabled_tools),
+                );
+            }
+        }
+
         {
             let effective_rights = project_effective_rights(&bindings);
             if let Some(obj) = bindings.as_object_mut() {
@@ -13961,13 +14068,24 @@ fn default_visible_toolset(bindings: &serde_json::Value) -> Vec<String> {
         .get("allowed_classes")
         .and_then(serde_json::Value::as_array)
     {
+        // Class grants resolved hotel-side and carried on the bindings by
+        // `compose_session_bindings`, so this stays a pure function of the
+        // bindings and the class expansion cannot drift between the two.
+        let class_grants = bindings.get("resolved_class_grants");
         for class in classes.iter().filter_map(serde_json::Value::as_str) {
-            for tool in tools_for_allowed_class(class) {
-                if !toolset.iter().any(|existing| existing == tool) {
-                    toolset.push(tool.to_string());
+            for tool in resolved_class_tools(class_grants, class) {
+                if !toolset.iter().any(|existing| existing == &tool) {
+                    toolset.push(tool);
                 }
             }
         }
+    }
+    // Policy layer, applied after every grant source has had its say
+    // (AGENTS.md §5.3.2). A disabled tool is not merely ungranted — it is
+    // removed no matter which class, skill, or explicit grant produced it.
+    let disabled = disabled_tools_from_bindings(bindings);
+    if !disabled.is_empty() {
+        toolset.retain(|tool_name| !disabled.iter().any(|denied| denied == tool_name));
     }
     let rights = bindings
         .get("effective_rights")
@@ -13990,11 +14108,43 @@ fn default_visible_toolset(bindings: &serde_json::Value) -> Vec<String> {
         .collect()
 }
 
-fn tools_for_allowed_class(class: &str) -> &'static [&'static str] {
-    // Shared with philote's session assembly so a class granted in a
-    // ToolsetProfileRecord expands identically on both sides of the IPC
-    // boundary. See ansible_mesh_core::graph::tools_for_tool_class.
-    ansible_mesh_core::graph::tools_for_tool_class(class)
+/// Expands one tool class using the grants resolved from the tool grant registry
+/// and carried on the bindings, falling back to the compiled-in table when the
+/// class is missing from that map.
+///
+/// A class present in the map with an empty list grants nothing — see
+/// [`ansible_mesh_core::graph::resolve_tool_class_grants`] for why that must not
+/// fall through to the built-in table.
+fn resolved_class_tools(class_grants: Option<&serde_json::Value>, class: &str) -> Vec<String> {
+    match class_grants
+        .and_then(|grants| grants.get(class))
+        .and_then(serde_json::Value::as_array)
+    {
+        Some(tools) => tools
+            .iter()
+            .filter_map(serde_json::Value::as_str)
+            .map(str::to_string)
+            .collect(),
+        None => ansible_mesh_core::graph::tools_for_tool_class(class)
+            .iter()
+            .map(|tool| (*tool).to_string())
+            .collect(),
+    }
+}
+
+/// Reads the hotel-wide disabled-tool policy carried on a session's bindings.
+fn disabled_tools_from_bindings(bindings: &serde_json::Value) -> Vec<String> {
+    bindings
+        .get("disabled_tools")
+        .and_then(serde_json::Value::as_array)
+        .map(|entries| {
+            entries
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default()
 }
 
 fn shared_tool_receptor_record<'a>(
@@ -14332,6 +14482,15 @@ fn compose_tool_assembly_from_incarnations(
                 .collect::<Vec<_>>()
         }
     };
+    // The runner branch above builds the toolset straight from each
+    // incarnation's `supported_tools`, bypassing `default_visible_toolset` and
+    // therefore its policy strip. Re-apply the policy here so a disabled tool
+    // cannot re-enter through a remote runner grant — this also drops the tool's
+    // execution route below, so it is unreachable rather than merely unlisted.
+    let disabled = disabled_tools_from_bindings(bindings);
+    if !disabled.is_empty() {
+        toolset.retain(|tool_name| !disabled.iter().any(|denied| denied == tool_name));
+    }
     if !rights.is_empty() {
         toolset.retain(|tool_name| has_right(&rights, &tool_right(tool_name)));
     }
@@ -14576,6 +14735,10 @@ pub(super) fn handle_register_skill(
         skill_name: skill_name.clone(),
         description,
         implied_tools: allowed_tools,
+        // A registration is a runtime grant edit. Stamping it here is what stops
+        // the boot seeder from reverting these tools on the next hotel restart
+        // when the skill name collides with a built-in seed entry.
+        grant_source: ansible_mesh_core::graph::GrantSource::Runtime,
         ..Default::default()
     };
     apply_validation_to_record(&mut record, validation_result);

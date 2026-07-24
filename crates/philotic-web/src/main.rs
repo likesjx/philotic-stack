@@ -26,6 +26,7 @@ mod service;
 mod start;
 mod status;
 mod stop;
+mod tools;
 
 /// philotic-web — operator CLI for the Philotic Web
 ///
@@ -239,6 +240,14 @@ enum Command {
     Autonomy {
         #[command(subcommand)]
         action: autonomy::AutonomyAction,
+    },
+
+    /// Tool grant registry — view and edit tool grants and tool policy at
+    /// runtime, without a rebuild or deploy
+    /// (proposal:data-driven-tool-grants-skilldag)
+    Tools {
+        #[command(subcommand)]
+        action: tools::ToolsAction,
     },
 
     /// Memory Transparency — merged provenance query across Muninn, the intel
@@ -587,6 +596,7 @@ async fn main() -> Result<()> {
         Command::Heal { action } => heal::run(action).await,
         Command::Config { action } => config::run(action).await,
         Command::Autonomy { action } => autonomy::run(action).await,
+        Command::Tools { action } => tools::run(action),
         Command::Memory { action } => memory_explain::run(action).await,
         Command::Graph { action } => {
             use graph_intelligence::{scanner, GraphEngine};

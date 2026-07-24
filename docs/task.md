@@ -12,6 +12,22 @@
 - [x] Review code for communication and split points.
 - [x] Create an implementation plan for the new services architecture.
 
+## New Project: Data-Driven Tool Grants (SkillDAG)
+
+Proposal: [DATA_DRIVEN_TOOL_GRANTS_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/DATA_DRIVEN_TOOL_GRANTS_PROPOSAL.md) · graph node `proposal:data-driven-tool-grants-skilldag` · PR #354 (`codex/data-driven-tool-grants`)
+
+Operator principle: **"we should not have any tool hard coded."** Grants were the union of five compiled-in sources, so removing a tool from one list did nothing.
+
+- [x] Slice 1 — grant registry in the local hotel context graph (`ToolGrantRegistryRecord`) plus a `disabled_tools` policy layer applied after every grant source.
+- [x] Fix the blocking prerequisite: the skill seeder blind-overwrote runtime grant edits on every boot, so DB edits reverted on restart (`GrantSource` provenance + reconciling seeders).
+- [x] Resolve grants hotel-side onto the bindings; philote demotes its compiled-in tables to fallback.
+- [x] Enforce the policy at projection *and* at dispatch — a disabled tool must be unexecutable, not merely unlisted.
+- [x] `phil tools show|disable|enable|set-class|set-skill` operator surface.
+- [ ] Watched live run: disable `life.observe.batch` on a running hotel with no deploy (slice-1 criterion; `test-green` only until then).
+- [ ] Slice 2 — runner routing as data (runner `supported_tools` is still compiled in).
+- [ ] Slice 3 — governance/audit; owns the agent-facing grant surface, deliberately deferred.
+- [ ] Retire the remaining transitional grant sources: philote `tools_for_skill`, `tool_catalog()` class tags.
+
 ## New Project: Primitives Crate Split
 
 **CLOSED 2026-07-06** — the split was folded back. `philotic-primitives-mesh` (consumed by `ansible-mesh-core`) is the only primitives crate; the five empty stub crates were deleted (codex/crate-cleanup). See ARCHITECTURE_STATUS.md.

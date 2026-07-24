@@ -1,4 +1,6 @@
-use ansible_mesh_core::graph::{AbstractSkillRecord, AbstractToolRecord, ToolsetProfileRecord};
+use ansible_mesh_core::graph::{
+    AbstractSkillRecord, AbstractToolRecord, GrantSource, ToolClassGrant, ToolsetProfileRecord,
+};
 use ansible_mesh_core::membership::{
     MeshMembershipAcceptPayload, derive_transport_session_key, fingerprint_from_base64url,
     now_epoch_secs, verify_join_request,
@@ -4419,8 +4421,79 @@ fn seed_abstract_skill_catalog(graph: &GraphDomain) -> anyhow::Result<()> {
     ];
 
     for skill in &catalog {
-        graph.upsert_abstract_skill(skill)?;
+        reconcile_seeded_skill(graph, skill)?;
     }
+    Ok(())
+}
+
+/// Seeds one built-in skill without clobbering a runtime edit to its grants.
+///
+/// This function is the reason runtime tool grants survive a restart at all.
+/// `upsert_abstract_skill` is a blind whole-record overwrite and this seeder runs
+/// on every boot from two call sites, so before this existed, editing a built-in
+/// skill's `implied_tools` in the DB worked live and was silently reverted by the
+/// next hotel restart — the grant looked data-driven and was not.
+///
+/// Reconciliation rule:
+/// - no existing record → write the built-in seed verbatim
+/// - existing record marked [`GrantSource::Runtime`] → keep its `implied_tools`
+///   and `skill_markers`, refresh only the code-owned prompt-facing fields
+/// - otherwise → refresh from code, so new built-in tools reach existing installs
+///
+/// Transitional (AGENTS.md §2.3): once a skill's grants are runtime-owned, newly
+/// shipped built-in tools for that skill no longer reach it automatically. That
+/// is the deliberate price of runtime authority; surfacing the seed-vs-runtime
+/// drift to operators belongs to the governance slice, not this one.
+fn reconcile_seeded_skill(graph: &GraphDomain, seed: &AbstractSkillRecord) -> anyhow::Result<()> {
+    let existing = graph.get_abstract_skill(&seed.skill_name)?;
+    let record = match existing {
+        Some(current) if current.grant_source == GrantSource::Runtime => AbstractSkillRecord {
+            implied_tools: current.implied_tools,
+            skill_markers: current.skill_markers,
+            grant_source: GrantSource::Runtime,
+            ..seed.clone()
+        },
+        _ => seed.clone(),
+    };
+    graph.upsert_abstract_skill(&record)
+}
+
+/// Seeds the per-hotel tool grant registry, preserving every runtime edit.
+///
+/// Seeds a class only when it is absent from the registry. A class present with
+/// an empty tool list is an operator decision ("this class grants nothing") and
+/// is left alone — re-seeding it would undo the disable on every restart, which
+/// is the exact failure this proposal exists to remove. `disabled_tools` is
+/// policy, never seeded from code, and is never touched here.
+fn seed_tool_grant_registry(graph: &GraphDomain) -> anyhow::Result<()> {
+    let mut registry = graph.get_tool_grant_registry()?.unwrap_or_default();
+    let mut changed = false;
+
+    for class_name in ansible_mesh_core::graph::BUILTIN_TOOL_CLASSES {
+        if registry.class_tools(class_name).is_some() {
+            continue;
+        }
+        registry.class_grants.push(ToolClassGrant {
+            class_name: (*class_name).to_string(),
+            tools: ansible_mesh_core::graph::tools_for_tool_class(class_name)
+                .iter()
+                .map(|tool| (*tool).to_string())
+                .collect(),
+            grant_source: GrantSource::Seed,
+        });
+        changed = true;
+    }
+
+    if !changed {
+        return Ok(());
+    }
+    registry.updated_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    registry.updated_by = "boot-seed".to_string();
+    graph.upsert_tool_grant_registry(&registry)?;
+    info!("seeded built-in tool class grants into the tool grant registry");
     Ok(())
 }
 
@@ -4962,8 +5035,9 @@ fn seed_skill_crafting(graph: &GraphDomain) -> anyhow::Result<()> {
         validation_state: SkillValidationState::Validated,
         source_snapshot: None,
         field_sources: serde_json::json!({}),
+        grant_source: GrantSource::Seed,
     };
-    graph.upsert_abstract_skill(&skill)?;
+    reconcile_seeded_skill(graph, &skill)?;
     Ok(())
 }
 
@@ -7322,6 +7396,7 @@ async fn run_load_command(file: &str, hotel_name: &str) -> Result<()> {
     seed_orchestrator_roles(&graph_domain, &all_profiles)?;
     seed_abstract_tool_catalog(&graph_domain)?;
     seed_abstract_skill_catalog(&graph_domain)?;
+    seed_tool_grant_registry(&graph_domain)?;
     seed_toolset_profiles(&graph_domain)?;
     seed_skill_crafting(&graph_domain)?;
 
@@ -7536,6 +7611,7 @@ async fn main() -> Result<()> {
 
     seed_abstract_tool_catalog(&graph_domain_arc)?;
     seed_abstract_skill_catalog(&graph_domain_arc)?;
+    seed_tool_grant_registry(&graph_domain_arc)?;
     seed_toolset_profiles(&graph_domain_arc)?;
     seed_skill_crafting(&graph_domain_arc)?;
 
@@ -8527,6 +8603,7 @@ async fn main() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use super::GrantSource;
     use super::resolve_retention_days;
     use super::{
         AgentProfile, BASE64_STANDARD, SecretAccess, StartupTest, agent_graph_guest_record,
@@ -8540,12 +8617,194 @@ mod tests {
         migrate_plaintext_provider_api_keys, nearest_available_base_port, read_string_config,
         reconcile_peer_execution_reachability, resolve_runtime_ports, resolve_secret,
         seed_abstract_skill_catalog, seed_orchestrator_roles, seed_skill_crafting,
-        seed_toolset_profiles, startup_test_gemini_base_url,
+        seed_tool_grant_registry, seed_toolset_profiles, startup_test_gemini_base_url,
     };
 
     #[test]
     fn retention_days_defaults_to_14_when_unset() {
         assert_eq!(resolve_retention_days(None), 14);
+    }
+
+    /// The whole point of the slice: a runtime grant edit must survive the next
+    /// hotel restart.
+    ///
+    /// Before the reconciling seeder existed, `seed_abstract_skill_catalog` blind
+    /// -overwrote every built-in skill on each boot, so removing a tool from a
+    /// skill's `implied_tools` in the DB worked live and was silently reverted on
+    /// restart. This test re-runs the seeder to stand in for that restart.
+    #[test]
+    fn runtime_skill_grant_survives_reseed() {
+        let storage = SqliteGraphStorage::open(":memory:").expect("open sqlite");
+        let graph = GraphDomain::new(Arc::new(storage.adapter()));
+        seed_abstract_skill_catalog(&graph).expect("initial seed");
+
+        let seeded = graph
+            .get_abstract_skill("life.steward")
+            .expect("read skill")
+            .expect("life.steward seeded");
+        assert!(
+            seeded
+                .implied_tools
+                .iter()
+                .any(|t| t == "life.observe.batch"),
+            "built-in seed should grant life.observe.batch"
+        );
+
+        // Operator disables one tool by editing the grant at runtime.
+        let mut edited = seeded.clone();
+        edited.implied_tools.retain(|t| t != "life.observe.batch");
+        edited.grant_source = GrantSource::Runtime;
+        graph.upsert_abstract_skill(&edited).expect("runtime edit");
+
+        // Hotel restarts — the seeder runs again.
+        seed_abstract_skill_catalog(&graph).expect("reseed");
+
+        let after = graph
+            .get_abstract_skill("life.steward")
+            .expect("read skill")
+            .expect("life.steward present");
+        assert!(
+            !after
+                .implied_tools
+                .iter()
+                .any(|t| t == "life.observe.batch"),
+            "runtime grant edit must survive the boot seeder, got {:?}",
+            after.implied_tools
+        );
+        assert_eq!(after.grant_source, GrantSource::Runtime);
+        // Code-owned prompt-facing fields still track the release.
+        assert_eq!(after.description, seeded.description);
+    }
+
+    /// Untouched built-in skills must still track the compiled-in catalog, so a
+    /// newly shipped tool reaches existing installs on upgrade.
+    #[test]
+    fn seeded_skill_grants_refresh_when_not_runtime_owned() {
+        let storage = SqliteGraphStorage::open(":memory:").expect("open sqlite");
+        let graph = GraphDomain::new(Arc::new(storage.adapter()));
+        seed_abstract_skill_catalog(&graph).expect("initial seed");
+
+        let mut stale = graph
+            .get_abstract_skill("life.steward")
+            .expect("read skill")
+            .expect("life.steward seeded");
+        let expected = stale.implied_tools.clone();
+        // Simulate an older install whose record predates a released tool.
+        stale.implied_tools.clear();
+        assert_eq!(stale.grant_source, GrantSource::Seed);
+        graph.upsert_abstract_skill(&stale).expect("write stale");
+
+        seed_abstract_skill_catalog(&graph).expect("reseed");
+
+        let after = graph
+            .get_abstract_skill("life.steward")
+            .expect("read skill")
+            .expect("life.steward present");
+        assert_eq!(
+            after.implied_tools, expected,
+            "seed-owned grants should refresh from the compiled-in catalog"
+        );
+    }
+
+    /// A class the operator emptied must stay empty across restarts. Re-seeding
+    /// it would undo the disable on every boot — the exact failure this proposal
+    /// exists to remove.
+    #[test]
+    fn emptied_class_grant_is_not_reseeded() {
+        let storage = SqliteGraphStorage::open(":memory:").expect("open sqlite");
+        let graph = GraphDomain::new(Arc::new(storage.adapter()));
+        seed_tool_grant_registry(&graph).expect("initial seed");
+
+        let registry = graph
+            .get_tool_grant_registry()
+            .expect("read registry")
+            .expect("registry seeded");
+        assert!(
+            registry
+                .class_tools("life_graph")
+                .expect("life_graph seeded")
+                .contains(&"life.observe.batch".to_string()),
+            "built-in seed should grant the life_graph class"
+        );
+
+        let mut edited = registry.clone();
+        for grant in &mut edited.class_grants {
+            if grant.class_name == "life_graph" {
+                grant.tools.clear();
+                grant.grant_source = GrantSource::Runtime;
+            }
+        }
+        graph
+            .upsert_tool_grant_registry(&edited)
+            .expect("runtime edit");
+
+        seed_tool_grant_registry(&graph).expect("reseed");
+
+        let after = graph
+            .get_tool_grant_registry()
+            .expect("read registry")
+            .expect("registry present");
+        assert_eq!(
+            after.class_tools("life_graph"),
+            Some(&[][..]),
+            "an emptied class must stay empty across restarts"
+        );
+    }
+
+    /// The slice-1 acceptance criterion end to end: disable a tool at runtime,
+    /// restart the hotel, and it stays disabled.
+    #[test]
+    fn disabled_tool_survives_hotel_restart() {
+        let storage = SqliteGraphStorage::open(":memory:").expect("open sqlite");
+        let graph = GraphDomain::new(Arc::new(storage.adapter()));
+        seed_tool_grant_registry(&graph).expect("boot seed");
+
+        // Operator runs `phil tools disable life.observe.batch`.
+        let mut registry = graph
+            .get_tool_grant_registry()
+            .expect("read registry")
+            .expect("registry seeded");
+        registry.disabled_tools.push("life.observe.batch".into());
+        graph
+            .upsert_tool_grant_registry(&registry)
+            .expect("write disable");
+
+        // Hotel restarts: both grant seeders run again.
+        seed_tool_grant_registry(&graph).expect("reseed registry");
+        seed_abstract_skill_catalog(&graph).expect("reseed skills");
+
+        let after = graph
+            .get_tool_grant_registry()
+            .expect("read registry")
+            .expect("registry present");
+        assert!(
+            after.is_disabled("life.observe.batch"),
+            "a runtime disable must survive a restart, got {:?}",
+            after.disabled_tools
+        );
+    }
+
+    /// The registry seeds every built-in class, and never invents a disable.
+    #[test]
+    fn registry_seeds_builtin_classes_with_no_disabled_tools() {
+        let storage = SqliteGraphStorage::open(":memory:").expect("open sqlite");
+        let graph = GraphDomain::new(Arc::new(storage.adapter()));
+        seed_tool_grant_registry(&graph).expect("seed");
+
+        let registry = graph
+            .get_tool_grant_registry()
+            .expect("read registry")
+            .expect("registry seeded");
+        for class in ansible_mesh_core::graph::BUILTIN_TOOL_CLASSES {
+            assert!(
+                registry.class_tools(class).is_some(),
+                "built-in class {class} should be seeded into the registry"
+            );
+        }
+        assert!(
+            registry.disabled_tools.is_empty(),
+            "disabled_tools is policy and must never be seeded from code"
+        );
     }
 
     #[test]
