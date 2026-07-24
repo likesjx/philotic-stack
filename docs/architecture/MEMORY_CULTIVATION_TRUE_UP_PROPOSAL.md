@@ -3,7 +3,8 @@ title: Memory Cultivation and True-Up Proposal
 doc_type: proposal
 domain: memory-context
 status: implemented
-last_updated: 2026-05-20
+disposition: accepted-current-slice
+last_updated: 2026-07-06
 tags:
 - muninn
 - memory
@@ -81,6 +82,9 @@ Implemented in the first source slice:
   frame
 - shaped `memory.remember` writes now attach spacetime frame, graph anchors, and
   graph-derived Muninn entities/relationships
+- Philote response contracts now include a `memory_candidate_policy`, and
+  model-router projects it into the provider prompt so models omit routine
+  chatter and emit only atomic durable memory candidates
 - `memory.cultivate` reports closeout/staleness candidates without mutating
   memory
 - `memory.true_up` classifies memory-vs-observed/graph mismatches

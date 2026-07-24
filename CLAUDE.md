@@ -7,7 +7,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 Every session MUST begin with these steps in order:
 1.  **Read [AGENTS.md](file:///Users/jaredlikes/code/philotic-stack/AGENTS.md)**: Adopt the standing protocol.
 2.  **Query the Project Graph**: If the graph server is running (`just intel-graph-ensure`), use MCP tools (`graph_status`, `graph_digest`) for a complete picture of what's in flight. The graph is faster and more complete than reading raw files but is NOT required — agents can work effectively without it. See `$graph-intelligence` skill.
-3.  **Orient and Recall**: Run `just session-start` to bootstrap Muninn. Use `$muninn-memory-habit` for cognitive context and the Muninn triad: self, user, topic. The graph gives you structural facts; Muninn gives you learned context.
+3.  **Orient and Recall**: Run `just session-start` to bootstrap Muninn (it also runs the LifeGraph idea sweep — triage any pending operator ideas per `$graph-intelligence` § Idea Sweep). Use `$muninn-memory-habit` for cognitive context and the Muninn triad: self, user, topic. The graph gives you structural facts; Muninn gives you learned context.
+    - Trusted local Claude clients may use Muninn's native stdio proxy (`muninn mcp`) against the loopback listener; do not expose native Muninn MCP publicly.
 4.  **Verify Green Status**: Run `just check` and `just test` (or the relevant smoke) to confirm the baseline is stable before editing.
 5.  **Record Decisions**: After completing work, use `graph_decide` (MCP) or `phil graph decide` to record what you did and why. Use `muninn_decide` / `muninn_remember` for the durable memory delta: decisions, reality gaps, validation outcomes, next seams, and operator preferences.
 
@@ -37,7 +38,7 @@ cargo test -p <crate>       # test a single crate
 
 # Run (requires mesh-config.json)
 just start-aiua             # build + start hotel daemon
-just start-gateway          # cargo run -p membrane
+just start-gateway          # cargo run -p membrane-telegram
 just start-agent            # cargo run -p philote
 just start-model            # cargo run -p model-router (Gemini/ElevenLabs)
 
@@ -52,6 +53,7 @@ phil graph serve               # start graph server (REST :8900, MCP :8901)
 phil graph status              # orientation — counts and proposal pipeline
 phil graph proposals           # all proposals with current status
 phil graph seams               # all registered seams
+phil graph green               # what is green right now — active proposals + latest recorded test run
 phil graph skeleton <crate>    # PlantUML diagram for a crate
 phil graph search "<text>"     # full-text search across code and docs
 
@@ -62,6 +64,18 @@ just intel-graph-status        # check if running
 just intel-graph-health        # health check both services
 just intel-graph-ui            # open the web UI (http://127.0.0.1:8900)
 just intel-graph-agent 60      # start with auto-shutdown after N minutes
+just intel-graph-freshness-schedule  # launchd: scan + harness verify every 6h
+just intel-graph-service       # launchd: supervise the graph server (KeepAlive)
+
+# Harnesses (graph-managed agent charters for Claude Code, Codex, Windsurf, Antigravity)
+just harness-drift             # drift report for all managed harnesses
+just harness-verify-all        # verify every harness projection, then report drift
+just harness-skills-sync       # sync graph skill catalog from skills/*/SKILL.md
+just harness-apply <id> <profile>  # re-apply canonical profile + verify
+
+# The server binds loopback by default. For tailnet exposure set
+# PHILOTIC_GRAPH_BIND=<tailscale-ip> and PHILOTIC_GRAPH_TOKEN=<secret>
+# (bearer auth on writes/MCP). See crates/graph-intelligence/README.md.
 ```
 
 The hotel daemon requires `mesh-config.json` in root — copy from `mesh-config.example.json`.
@@ -93,7 +107,7 @@ Before opening a PR from a worktree:
 just workstream-overlap <slug>
 ```
 
-Hot files include `crates/aiua/src/main.rs`, `crates/aiua/src/service/ipc.rs`, `crates/philote/src/runtime.rs`, `crates/membrane/src/main.rs`, `crates/model-router/*`, `crates/philotic-client/src/lib.rs`, `crates/aiua/README.md`, `docs/task.md`.
+Hot files include `crates/aiua/src/main.rs`, `crates/aiua/src/service/ipc.rs`, `crates/philote/src/runtime.rs`, `crates/membrane-telegram/src/main.rs`, `crates/model-router/*`, `crates/philotic-client/src/lib.rs`, `crates/aiua/README.md`, `docs/task.md`.
 
 ## Architecture
 
@@ -108,6 +122,8 @@ The Philotic Stack is a distributed AI agent OS (Rust). Metaphor: **Hotel** (nod
 - `philote`: Persona/agent cognitive loop guest.
 - `model-router`: Model provider routing guest (Gemini/ElevenLabs).
 - `tool-runner`: Seeded/inactive tool execution guest.
+- `membrane-mcp`: MCP gateway guest (serves tools to external MCP clients).
+- `membrane-mcp-client`: MCP client guest (consumes upstream MCP servers; `mcp:<upstream>.<tool>` projection).
 
 ### Communication
 
@@ -139,3 +155,4 @@ All consumers hold `Arc<dyn XxxStorage>`:
 - `AGENTS.md` — standing protocol for coding agents
 - `skills/graph-intelligence/SKILL.md` — full MCP tool reference and agent workflow
 - `docs/process/WORKFLOW.md` — SVE operating loop
+- `docs/reference/MUNINN_DIRECT_CLIENT_ACCESS.md` — private native Muninn MCP access for trusted clients

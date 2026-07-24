@@ -3,6 +3,7 @@ title: Router-Native Observability Proposal
 doc_type: proposal
 domain: operator-control-plane
 status: proposed
+disposition: obsolete
 last_updated: 2026-03-31
 tags:
 - observability

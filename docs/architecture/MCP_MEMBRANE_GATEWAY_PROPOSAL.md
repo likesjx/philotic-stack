@@ -3,6 +3,7 @@ title: MCP Membrane Gateway — Philote-Configured, Transform-Driven
 doc_type: proposal
 domain: membrane-transport
 status: proposed
+disposition: implemented
 last_updated: 2026-06-22
 tags:
   - mcp
@@ -27,11 +28,25 @@ related_docs:
   - PORT_BLUEPRINT.md
   - LIFE_GRAPH_OS_PROPOSAL.md
   - MUNINN_MEMORY_PROTOCOL_PROPOSAL.md
+  - MCP_MEMBRANE_HARDENING_PROPOSAL.md
+  - MCP_CLIENT_FABRIC_PROPOSAL.md
 source_of_truth_targets:
   - docs/architecture/MCP_MEMBRANE_GATEWAY_PROPOSAL.md
 ---
 
 # MCP Membrane Gateway — Philote-Configured, Transform-Driven
+
+> **Errata (2026-07-15 audit).** Phases 1–3 and `mcp.revoke` are implemented
+> as designed, but two claims below no longer match reality: (1) the
+> `UpdateMcpRoutes` path is declared deprecated here yet remains the live
+> startup auto-publication path (`philote/src/runtime.rs:1884`), publishing
+> the full `default_toolset` with `auth: None`; (2) the security model
+> (exposure tiers, vault-backed auth) is only partially enforced — the
+> listener binds `0.0.0.0` at every tier and philote-provisioned endpoints
+> cannot carry auth. The closure plan for both, plus the full audit gap
+> inventory, is `MCP_MEMBRANE_HARDENING_PROPOSAL.md`
+> (proposal_id `mcp-membrane-hardening`). The missing consumer direction is
+> `MCP_CLIENT_FABRIC_PROPOSAL.md` (proposal_id `mcp-client-fabric`).
 
 ## Problem
 

@@ -12,12 +12,13 @@ mod voice_udp;
 
 use anyhow::{Result, anyhow, bail};
 use clap::Parser;
+use membrane::LeaseEvent;
 use philotic_client::{GuestIdentity, IpcRequest, IpcResponse, PhiloticClient};
 use serde_json::{Value, json};
 use session::{ActiveTurn, ActiveTurns, GuildCache};
 use std::collections::HashMap;
 use tokio::sync::mpsc;
-use tokio::time::{Duration, interval};
+use tokio::time::Duration;
 use tracing::{debug, error, info, warn};
 use voice_bridge::{VoiceBridge, VoiceUtteranceEvent};
 
@@ -154,10 +155,6 @@ async fn run_once(args: Args) -> Result<()> {
     let mut active_bridges: HashMap<String, VoiceBridge> = HashMap::new();
 
     let http = reqwest::Client::new();
-    let mut lease_renew_tick = interval(Duration::from_secs(
-        lease::DiscordGatewayLease::renew_interval_secs(),
-    ));
-    lease_renew_tick.tick().await; // consume immediate tick
 
     // Ctrl-C shutdown
     let ctrl_c = tokio::signal::ctrl_c();
@@ -170,10 +167,31 @@ async fn run_once(args: Args) -> Result<()> {
 
     loop {
         tokio::select! {
-            // Periodic lease renewal
-            _ = lease_renew_tick.tick() => {
-                if let Err(e) = gateway_lease.renew(&mut ipc).await {
-                    return Err(anyhow!("Discord gateway lease lost: {}", e));
+            // Lease lifecycle — the shared LeaseDriver schedules renewals,
+            // re-acquires in place after lapses/errors, and backs off on IPC
+            // failures. Only losing the lease to ANOTHER holder ends the seat;
+            // everything else is survivable and already scheduled for retry.
+            _ = lease_deadline(&gateway_lease) => {
+                match gateway_lease.tick(&mut ipc).await {
+                    LeaseEvent::Lost { owner } => {
+                        return Err(anyhow!(
+                            "Discord gateway lease lost to [{}] — yielding seat",
+                            owner.as_deref().unwrap_or("unknown")
+                        ));
+                    }
+                    LeaseEvent::Reacquired { epoch } => {
+                        info!("Discord gateway lease re-acquired in place — epoch {}", epoch);
+                    }
+                    LeaseEvent::BackingOff { retry_in, error } => {
+                        warn!(
+                            "Discord gateway lease attempt failed ({}); retrying in {:?}",
+                            error, retry_in
+                        );
+                    }
+                    LeaseEvent::Renewed { epoch } => {
+                        debug!("Discord gateway lease renewed — epoch {}", epoch);
+                    }
+                    _ => {}
                 }
             }
 
@@ -544,6 +562,16 @@ async fn run_once(args: Args) -> Result<()> {
     Ok(())
 }
 
+/// Sleep until the lease driver's next scheduled attempt. Pends forever once
+/// the driver reaches a terminal state (lost/released) — the Lost event has
+/// already been surfaced by the tick that entered that state.
+async fn lease_deadline(gateway_lease: &lease::DiscordGatewayLease) {
+    match gateway_lease.next_deadline() {
+        Some(deadline) => tokio::time::sleep_until(deadline).await,
+        None => std::future::pending().await,
+    }
+}
+
 async fn run_with_backoff(args: Args) -> Result<()> {
     let mut backoff_secs = MEMBRANE_ERROR_BACKOFF_INITIAL_SECS;
 
@@ -676,10 +704,41 @@ async fn handle_agent_reply(
     let content = task["content"].as_str().unwrap_or("");
     let chat_id = task["chat_id"].as_str().unwrap_or("");
 
-    let reply_channel = active_turns
+    let mut reply_channel = active_turns
         .get(session_id)
         .map(|t| t.reply_channel_id.clone())
         .unwrap_or_else(|| chat_id.to_string());
+
+    // Text replies with no Discord origin — e.g. self-heal escalations the
+    // hotel delivers to this seat — have no channel, and POSTing to
+    // `/channels//messages` earns a Discord 405 on every attempt (live
+    // 2026-07-20: recurring `discord_reply_405` heal item). Route them to the
+    // operator channel when one is configured; otherwise skip cleanly — an
+    // undeliverable reply is not an API error. Voice replies are unaffected
+    // (they route via the UDP bridge keyed off session_id).
+    if reply_channel.is_empty() && matches!(action, "partial_reply" | "send_reply") {
+        match std::env::var("PHILOTIC_DISCORD_OPERATOR_CHANNEL_ID")
+            .ok()
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+        {
+            Some(operator_channel) => {
+                info!(
+                    session_id,
+                    "agent reply has no Discord channel; routing to operator channel"
+                );
+                reply_channel = operator_channel;
+            }
+            None => {
+                info!(
+                    session_id,
+                    action,
+                    "skipping agent reply with no Discord channel (set PHILOTIC_DISCORD_OPERATOR_CHANNEL_ID to receive these)"
+                );
+                return Ok(());
+            }
+        }
+    }
 
     let trigger_msg_id = active_turns
         .get(session_id)
@@ -771,8 +830,22 @@ async fn handle_agent_reply(
         }
 
         "turn_event" => {
-            // Events like waiting_tool, waiting_model — show typing to keep Discord engaged
-            egress::send_typing(http, bot_token, &reply_channel).await;
+            let event = task["event"].as_str().unwrap_or("");
+            if event == "model_fallback" || event == "model_fallback_cleared" {
+                // Model-tier fallback/recovery notice (Slice 3 of Model
+                // Failover Layers): a one-time plain operational message, not
+                // an assistant reply — sent directly, no typing indicator, no
+                // draft tracking, no TTS. `TurnEventPayload` carries the
+                // formatted text in `partial_content` (not `content`).
+                let message = task["partial_content"].as_str().unwrap_or("");
+                if !message.is_empty() {
+                    let _ = egress::send_text_reply(http, bot_token, &reply_channel, message, None)
+                        .await;
+                }
+            } else {
+                // Events like waiting_tool, waiting_model — show typing to keep Discord engaged
+                egress::send_typing(http, bot_token, &reply_channel).await;
+            }
         }
 
         _ => {

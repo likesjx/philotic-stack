@@ -10,9 +10,10 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::io::ErrorKind;
+use std::time::Duration;
 use tokio::io::AsyncWriteExt;
 use tokio::net::UnixStream;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 /// Represents the identity of a Guest materializing in the Hotel.
@@ -303,6 +304,12 @@ pub type DesktopMembraneTargetAgentInventoryView = OperatorTargetAgentInventoryV
 pub type DesktopMembraneTargetComponentInventoryView = OperatorTargetComponentInventoryView;
 
 pub const OPERATOR_SURFACE_QUERY_ROLE: &str = "management.operator_surface_query";
+/// Mesh role for muninn-cluster single-writer routing: shared-vault memory
+/// writes from lobe hotels are forwarded as TaskInvoke envelopes with this
+/// target role to the Cortex hotel, whose aiua applies them to the cluster
+/// PRIMARY in-process (`deliver_event_envelope_or_park` interception — same
+/// pattern as `OPERATOR_SURFACE_QUERY_ROLE`). Never subscribed by any guest.
+pub const MEMORY_WRITE_FORWARD_ROLE: &str = "hotel.memory_write_forward";
 pub const OPERATOR_SURFACE_QUERY_REPLY_ROLE: &str = "management.operator_surface_query.reply";
 pub const OPERATOR_SURFACE_QUERY_HANDOFF_KIND: &str = "operator_surface_query";
 pub const OPERATOR_REMOTE_CONFIG_KEYS: &[&str] =
@@ -385,9 +392,24 @@ pub struct TaskErrorPayload {
     pub retryable: Option<bool>,
     /// Narrow error subtype for precise routing decisions.
     /// Values: "network_error", "streaming_timeout", "rate_limit",
-    /// "provider_error", "content_error", "empty_response".
+    /// "provider_error", "content_error", "empty_response",
+    /// "invalid_request", "provider_auth".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sub_kind: Option<String>,
+    /// HTTP status code from the provider, when one could be determined
+    /// (e.g. 400, 429, 503). Additive — absent from older controllers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<u16>,
+    /// Machine-readable escalation class so consumers don't string-parse
+    /// `message`. Values: "retry_same_provider" (transient — the same
+    /// provider may succeed on retry), "switch_provider" (the request will
+    /// fail identically on the same provider — 4xx contract errors,
+    /// refusals, rate limits), "fatal" (auth/key misconfiguration — retrying
+    /// anywhere is pointless until an operator intervenes). Additive —
+    /// absent from older controllers; consumers must keep a sub_kind/string
+    /// fallback.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_class: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -487,6 +509,8 @@ impl TaskErrorPayload {
             capability: capability.map(str::to_string),
             retryable: None,
             sub_kind: None,
+            status: None,
+            error_class: None,
         }
     }
 
@@ -506,6 +530,8 @@ impl TaskErrorPayload {
             provider: None,
             retryable: Some(false),
             sub_kind: None,
+            status: None,
+            error_class: None,
         }
     }
 
@@ -524,6 +550,8 @@ impl TaskErrorPayload {
             capability: None,
             retryable: Some(true),
             sub_kind: None,
+            status: None,
+            error_class: None,
         }
     }
 
@@ -538,6 +566,8 @@ impl TaskErrorPayload {
             capability: None,
             retryable: Some(true),
             sub_kind: None,
+            status: None,
+            error_class: None,
         }
     }
 
@@ -557,6 +587,12 @@ impl TaskErrorPayload {
         }
         if let Some(retryable) = self.retryable {
             parts.push(format!("retryable={retryable}"));
+        }
+        if let Some(status) = self.status {
+            parts.push(format!("status={status}"));
+        }
+        if let Some(error_class) = self.error_class.as_deref() {
+            parts.push(format!("error_class={error_class}"));
         }
         parts.join(" | ")
     }
@@ -858,6 +894,24 @@ fn default_true() -> bool {
     true
 }
 
+/// Who requested a [`IpcRequest::RestartComponent`], which decides whether the
+/// hotel applies flap protection.
+///
+/// Operator-initiated restarts (desktop UI / CLI) are deliberate and MUST NOT be
+/// budget-limited. Heal-dispatcher-initiated restarts are automatic remediation
+/// and MUST go through the shared respawn budget so a crash-looping guest that
+/// keeps emitting a matching stderr line cannot be restarted every dispatch
+/// cycle forever.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RestartReason {
+    /// Deliberate operator/CLI restart — never budget-limited.
+    #[default]
+    Operator,
+    /// Automatic heal-dispatcher remediation — subject to the respawn budget.
+    Heal,
+}
+
 /// Represents the types of operations a Guest can perform locally over IPC to the Ansible Hotel.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "operation", content = "payload")]
@@ -898,7 +952,18 @@ pub enum IpcRequest {
         task_id: Uuid,
         error_code: String,
         reason: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        turn_id: Option<String>,
     },
+    RepairStaleSessionTurns {
+        min_age_secs: u64,
+    },
+    /// Self-heal detector for the role-handoff ping-pong loop: finds any agent
+    /// with more than one incarnation at `ActiveInSession`, demotes them, and
+    /// clears any session pin pointing at a demoted incarnation.
+    HealRoleHandoffLoops {},
     SubscribeInbox {
         role: String,
     },
@@ -1013,6 +1078,33 @@ pub enum IpcRequest {
         conversation_id: Option<String>,
         content: String,
     },
+    /// List conversation sessions recorded in this hotel's context graph
+    /// (operator session history), most recent activity first.
+    /// Responds with [`IpcResponse::OperatorSessionList`].
+    ListOperatorSessions {
+        /// When set, only sessions whose primary agent matches are returned.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        target_agent_id: Option<String>,
+        /// Maximum number of sessions to return (default 50, capped at 500).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        limit: Option<u32>,
+    },
+    /// List the turns of one session as operator/agent messages, oldest first.
+    /// Responds with [`IpcResponse::SessionTurnList`].
+    ListSessionTurns {
+        session_id: String,
+        /// Maximum number of underlying turn records to expand (default 50, capped at 500).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        limit: Option<u32>,
+        /// Pagination cursor: only turns strictly older than this turn_id are
+        /// returned. An unknown cursor yields an empty page (end of history).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        before_turn_id: Option<String>,
+    },
+    /// Read-only roster of the local node plus every fresh mesh peer known to
+    /// the node registry, including reachable listener endpoints and exposure
+    /// profile where advertised. Responds with [`IpcResponse::MeshRosterView`].
+    GetMeshRoster,
     ListDesktopMembraneGuests,
     ListDesktopMembraneTargetGuests {
         target_node_id: String,
@@ -1267,6 +1359,31 @@ pub enum IpcRequest {
         model_profile: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         context_window_policy: Option<String>,
+        /// Ordered model-role fallback ladder for this role incarnation.
+        /// `None` (the default when omitted) PRESERVES whatever ladder is
+        /// already on the record — every existing IPC caller that predates
+        /// this field keeps its DB-edited ladder intact instead of it being
+        /// silently wiped to empty on every reconfigure. `Some(tiers)` sets
+        /// the ladder explicitly (each tier must be a non-empty string). A
+        /// brand-new role with `None` gets `DEFAULT_FALLBACK_TIERS`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        fallback_tiers: Option<Vec<String>>,
+        /// Per-agent model NAME binding (Layer 1), keyed by provider role
+        /// (a `fallback_tiers` entry, e.g. `"model.openrouter"`) mapping to
+        /// the model id to request from that provider. `None` (the default
+        /// when omitted) PRESERVES whatever bindings are already on the
+        /// record — same preserve-on-None contract as `fallback_tiers`
+        /// above. `Some(map)` sets them explicitly.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        model_bindings: Option<std::collections::BTreeMap<String, String>>,
+        /// Content-filtering posture for this role: `"unrestricted"` | `"standard"`
+        /// | `"strict"`. `None` (the default when omitted) PRESERVES whatever
+        /// policy is already on the record — same preserve-on-None contract as
+        /// `fallback_tiers` above, so an unrelated reconfigure never silently
+        /// resets an operator-set `"unrestricted"` policy back to `"standard"`.
+        /// A brand-new role with `None` gets `"standard"` (current behavior).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        content_policy: Option<String>,
     },
     /// Execute a governed workflow through the hotel's workflow plane.
     ExecuteWorkflow {
@@ -1313,7 +1430,8 @@ pub enum IpcRequest {
     /// Responds with [`IpcResponse::MuninnStatus`].
     RefreshMemoryConfig,
     /// Register a graph instance with the hotel's ODS so it can route graph_id → instance_id.
-    /// Sent by the graph-runner on startup (for all existing graphs) and after each graph.create.
+    /// Historically sent by the retired graph-runner guest on startup (for all existing
+    /// graphs) and after each graph.create; the hotel-side registry handler remains live.
     RegisterGraphInstance {
         graph_id: String,
         instance_id: String,
@@ -1454,9 +1572,17 @@ pub enum IpcRequest {
     /// Restart a registered component: terminate the running process (if any) then
     /// immediately re-spawn it (requires `is_active=true` in the context graph).
     ///
+    /// `reason` decides whether flap protection applies: [`RestartReason::Heal`]
+    /// (automatic remediation) is routed through the shared respawn budget, while
+    /// [`RestartReason::Operator`] (the default) is never budget-limited. The field
+    /// defaults on the wire so an older heal-dispatcher talking to a newer hotel is
+    /// treated as an operator restart (fails open — no accidental budget denial).
+    ///
     /// Responds with [`IpcResponse::Standard`].
     RestartComponent {
         guest_id: String,
+        #[serde(default)]
+        reason: RestartReason,
     },
     /// Remove a registered component entirely.
     ///
@@ -1569,6 +1695,89 @@ pub enum IpcRequest {
     /// hotel's current perimeter ceiling. Responds with [`IpcResponse::Standard`].
     GetMcpEndpointStatus {
         endpoint_id: String,
+    },
+    /// Mint (or rotate) a bearer-token grant for an MCP endpoint.
+    ///
+    /// The hotel generates the token, stores `BLAKE3(token)` in the vault under
+    /// an `mcp_endpoint_token` secret readable by the `mcp-membrane` role,
+    /// attaches the grant to the named tool's auth (or the endpoint's
+    /// `default_auth` when `tool_name` is absent), and fans the updated config
+    /// out to the membrane guest. Responds with [`IpcResponse::Standard`]; the
+    /// raw token appears ONCE in `data.raw_token` and is never stored.
+    ///
+    /// Only the endpoint's `owner_agent_id` may call this; the hotel verifies
+    /// the claim against the registered guest identity on the connection.
+    ProvisionMcpTokenGrant {
+        endpoint_id: String,
+        owner_agent_id: String,
+        /// Stable opaque label for this credential (e.g. `"claude-desktop"`).
+        token_id: String,
+        /// Attach to this tool's auth; absent = endpoint `default_auth`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tool_name: Option<String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        scopes: Vec<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expires_at: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        allotment: Option<ansible_mesh_core::mcp_route::McpCallAllotment>,
+        /// Rotate an existing grant in place (same `token_id`, same vault ref,
+        /// new credential) instead of creating a new grant.
+        #[serde(default)]
+        rotate: bool,
+    },
+    /// Remove a bearer-token grant from an MCP endpoint by `token_id`.
+    ///
+    /// Removes the grant from every tool auth and the endpoint `default_auth`.
+    /// An emptied `BearerToken` grant list stays `BearerToken` (nobody can
+    /// call) rather than degrading to `None` (loopback-open).
+    /// Responds with [`IpcResponse::Standard`].
+    RevokeMcpTokenGrant {
+        endpoint_id: String,
+        owner_agent_id: String,
+        token_id: String,
+    },
+    // ── MCP upstream (client fabric) IPC ─────────────────────────────────────
+    /// Register or update an upstream MCP server this hotel consumes.
+    ///
+    /// The hotel checks the egress policy, persists the config under the
+    /// `__mcp_upstreams__` registry, fans out an `update_mcp_upstream` push to
+    /// the `mcp-client` guest, and materializes that guest if needed.
+    /// Responds with [`IpcResponse::McpUpstreamRegistered`].
+    RegisterMcpUpstream {
+        config: ansible_mesh_core::mcp_upstream::McpUpstreamConfig,
+    },
+    /// Remove an upstream MCP server registration.
+    ///
+    /// Only the `owner_agent_id` that registered the upstream may revoke it.
+    /// The hotel clears stored state and fans out a `revoke_mcp_upstream` push.
+    /// Responds with [`IpcResponse::McpUpstreamRegistered`].
+    RevokeMcpUpstream {
+        upstream_id: String,
+        owner_agent_id: String,
+    },
+    /// Return all registered upstreams with their last reported catalogs.
+    /// Responds with [`IpcResponse::McpUpstreamsState`].
+    GetMcpUpstreams {},
+    /// Guest → hotel: report an upstream's connection state and projected
+    /// tool catalog after connect/refresh. Responds with [`IpcResponse::Standard`].
+    ReportMcpUpstreamCatalog {
+        catalog: ansible_mesh_core::mcp_upstream::McpUpstreamCatalog,
+    },
+    /// Store (or rotate) the outbound credential for an upstream MCP server.
+    ///
+    /// The plaintext credential passes through to the hotel vault under
+    /// secret-kind `mcp_upstream_credential` (readable by the
+    /// `mcp-client-runner` role only) and is never persisted in the graph or
+    /// echoed back. The upstream's `credential_ref` is set and the updated
+    /// config fans out so the guest reconnects authenticated. Only the
+    /// upstream's `owner_agent_id` may call this; the claim is verified
+    /// against the registered guest identity. Responds with
+    /// [`IpcResponse::Standard`].
+    ProvisionMcpUpstreamCredential {
+        upstream_id: String,
+        owner_agent_id: String,
+        credential: String,
     },
     // ── Training data admin IPC ───────────────────────────────────────────────
     /// List voice training samples. Responds with [`IpcResponse::Standard`] (data.samples).
@@ -1801,6 +2010,156 @@ pub enum IpcRequest {
     ApplyAgentBundle {
         bundle_json: String,
     },
+    /// Heal-dispatcher → hotel: a recurring `(pattern_tag, guest_id)` failure
+    /// pattern breached the filing threshold; file (or bump) a
+    /// `heal_work_item` node through the `fleet.heal_slices` autonomy lane
+    /// (Autopoiesis Slice A3 — ProposalOnly posture: filing IS the action).
+    ///
+    /// The hotel consults the lane kill switch, grant freeze state, and daily
+    /// action budget before filing, writes an `autonomy_audit` record plus the
+    /// work-item node, and pushes a resolved `work_item_filed` heal-queue info
+    /// entry for operator visibility. Dedup: one OPEN work item per
+    /// `(pattern_tag, guest_id)` — a re-breach while open bumps count/last_seen.
+    ///
+    /// `evidence_lines` are capped hotel-side to
+    /// [`ansible_mesh_core::heal_queue::MAX_HEAL_EVIDENCE_LINES`] lines /
+    /// [`ansible_mesh_core::heal_queue::MAX_HEAL_EVIDENCE_BYTES`] bytes total.
+    ///
+    /// Responds with [`IpcResponse::Standard`] — `data` carries
+    /// `{filed, deduped, reason?, work_item_id?, audit_id?}`. No new
+    /// `IpcResponse` variant is introduced, so the untagged-ordering invariant
+    /// (all-optional variants like `MemoryConfig` stay last) is untouched.
+    ///
+    /// NOTE: new `IpcRequest` variants are appended at the END of this enum.
+    FileHealWorkItem {
+        pattern_tag: String,
+        guest_id: String,
+        occurrence_count: u32,
+        window_secs: u64,
+        #[serde(default)]
+        evidence_lines: Vec<String>,
+    },
+    /// Guest → hotel: ask permission to take one autonomous action on an
+    /// autonomy lane (Autopoiesis Slice A2; A1 grant machinery, lane
+    /// `graph.bridge_edges` first).
+    ///
+    /// The hotel consults the lane kill switch, the per-lane `AutonomyGrant`
+    /// posture, freeze state, and daily action budget — exactly the A3
+    /// shape — and, for ConfirmFirst/AutoWithAudit postures, writes a
+    /// Pending `autonomy_audit` record from `action_summary` / `evidence` /
+    /// `reversal_hint` before answering.
+    ///
+    /// Responds with [`IpcResponse::Standard`] — `data` carries
+    /// `{allowed, posture, audit_id?, reason?}`:
+    /// - `allowed=true, posture="auto_with_audit", audit_id` → act now.
+    /// - `allowed=false, posture="confirm_first", audit_id` → file the
+    ///   ready-to-apply spec as `awaiting_confirmation`; the operator's
+    ///   confirmation applies it and reports the outcome.
+    /// - `allowed=false` with no `audit_id` (posture `proposal_only`, lane
+    ///   disabled/frozen, or budget exhausted — see `reason`) → prose-only.
+    ///
+    /// No new `IpcResponse` variant — the untagged-ordering invariant
+    /// (all-optional variants like `MemoryConfig` stay last) is untouched.
+    ConsumeAutonomyAction {
+        lane: String,
+        action_summary: String,
+        evidence: String,
+        reversal_hint: String,
+    },
+    /// Operator/steward → hotel: report the reviewed outcome of an audited
+    /// autonomous action so the lane earns (or loses) trust (Autopoiesis
+    /// Slice A2; feeds A1's `record_autonomy_outcome`; the `outcome` vocabulary
+    /// itself — including `"neutral"` — is Slice A9's `trust-ledger`).
+    ///
+    /// `outcome` is `"confirmed_good"` (feeds the earn counter), `"reversed"`
+    /// (demotes one posture level), or `"neutral"` (stamps the audit record
+    /// only — no effect on the grant's earn/demote counters; a wash, not a
+    /// signal). The hotel stamps the `autonomy_audit` record and, for
+    /// `confirmed_good`/`reversed`, applies the grant transition (promotion /
+    /// demotion / failure-streak bookkeeping). Recording is idempotent: a
+    /// second report against an already-reviewed audit id is refused with
+    /// `recorded=false, reason="already_recorded"` so one confirmation can
+    /// never double-count toward promotion.
+    ///
+    /// A configurable timeout-to-`"neutral"` sweep for audits left `Pending`
+    /// past some age is wired up in `aiua::autonomy_sweep` (A9
+    /// outcome-stamping follow-up slice) — see
+    /// `ansible_mesh_core::autonomy::AuditOutcome::Neutral`. `"neutral"` is
+    /// also reachable at any time through an explicit report on this path.
+    ///
+    /// Responds with [`IpcResponse::Standard`] — `data` carries
+    /// `{recorded, lane?, transition?, posture?, reason?}`.
+    RecordAutonomyOutcome {
+        audit_id: String,
+        outcome: String,
+    },
+    /// Agent → hotel: ask the routing oracle for the best live model
+    /// controllers for a task, ranked. Consulted by philote when a turn's
+    /// configured `fallback_tiers` ladder is empty or exhausted — the oracle
+    /// is the dynamic safety net *beneath* operator-configured ladders,
+    /// never a replacement for them.
+    ///
+    /// `exclude_providers` names providers that already failed this turn so
+    /// the reply never routes straight back into the failure. All other
+    /// fields describe what the task needs (see core `RouteNeed`).
+    ///
+    /// Responds with [`IpcResponse::Standard`] — `data` carries
+    /// `{ranked: [{role, provider, model_ref, score}], disabled: bool}`.
+    /// Ranked entries are limited to controller roles with a live guest on
+    /// the local hotel. MUST remain the last variant-shape concern for
+    /// back-compat: new variants append after this one.
+    QueryModelRoute {
+        request_class: String,
+        needs_tools: bool,
+        needs_structured: bool,
+        approx_context_tokens: u32,
+        /// "interactive" | "background"
+        latency_class: String,
+        /// "local_trusted" | "local_experimental" | "remote_cloud"
+        trust_ceiling: String,
+        #[serde(default)]
+        exclude_providers: Vec<String>,
+    },
+    /// Guest → hotel: push a pre-classified turn-level failure event into the
+    /// self-heal queue (turn-failure heal intake). Used by philote for
+    /// failures only the agent loop can see: watchdog evictions
+    /// (`stuck_turn_evicted:{phase}`), fallback-ladder exhaustion
+    /// (`fallback_exhausted:{last_provider}`), and paracrine budget breaches
+    /// (`paracrine_budget_exhausted`).
+    ///
+    /// The hotel stores the entry pre-triaged (severity + pattern_tag set at
+    /// insert) so the heal-dispatcher's A3 recurrence counter aggregates it
+    /// without re-classification, and applies flood control: the same
+    /// `(guest_id, pattern_tag)` within the flood window collapses.
+    ///
+    /// Responds with [`IpcResponse::Standard`] — `data` carries
+    /// `{collapsed, id?}`. No new `IpcResponse` variant, so the
+    /// untagged-ordering invariant (all-optional variants like `MemoryConfig`
+    /// stay last) is untouched. New `IpcRequest` variants append after this
+    /// one.
+    PushHealEvent {
+        guest_id: String,
+        severity: String,
+        pattern_tag: String,
+        detail: String,
+    },
+    /// Close a heal work item (Autopoiesis Slice A3 closure path, finding F8).
+    ///
+    /// The hotel filed a `heal_work_item` node when a pattern recurred past the
+    /// window threshold; once the underlying fault is repaired the autonomy-lane
+    /// loop (or an operator via `phil heal close`) closes it so it stops showing
+    /// as open work. Wired straight to
+    /// [`ansible_mesh_core::domain::GraphDomain::close_heal_work_item`].
+    ///
+    /// Responds with [`IpcResponse::Standard`] — `data` carries
+    /// `{closed, work_item_id}`: `closed=true` when the item existed (open OR
+    /// already-closed → idempotent), `false` when no such id. No new
+    /// `IpcResponse` variant, so the untagged-ordering invariant (all-optional
+    /// variants like `MemoryConfig` stay last) is untouched. New `IpcRequest`
+    /// variants append after this one.
+    CloseHealWorkItem {
+        work_item_id: String,
+    },
 }
 
 fn default_heal_queue_limit() -> usize {
@@ -1895,6 +2254,80 @@ pub struct UserProfileDataPayload {
 #[serde(deny_unknown_fields)]
 pub struct MemoryConfigPayload {
     pub config_json: Option<String>,
+}
+
+/// One session summary returned by [`IpcResponse::OperatorSessionList`].
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct OperatorSessionView {
+    pub session_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_id: Option<String>,
+    /// Channel/transport the session arrived on (e.g. "operator_chat", "telegram").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transport: Option<String>,
+    /// Session status as stored ("active", "paused", ...).
+    pub status: String,
+    /// Unix epoch seconds of the last recorded activity on the session.
+    pub last_activity_at: u64,
+    /// Channel session key (e.g. chat id) when one is recorded — a cheap title.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    /// Short excerpt of the most recent turn content, when derivable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preview: Option<String>,
+}
+
+/// One operator/agent message expanded from a session turn record, returned by
+/// [`IpcResponse::SessionTurnList`]. A single stored turn record can expand to
+/// two items sharing the same `turn_id`: the operator message and the agent reply.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SessionTurnView {
+    pub turn_id: String,
+    /// "operator" for the inbound user message, "agent" for the reply.
+    pub role: String,
+    pub content: String,
+    /// Unix epoch seconds; started_at for operator items, completed_at for agent items.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_at: Option<u64>,
+    /// Turn processing status ("queued", "running", "completed", "failed").
+    pub status: String,
+}
+
+/// One reachable endpoint advertised by a mesh node, returned inside
+/// [`MeshRosterEntryView`].
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct MeshEndpointView {
+    /// Logical purpose: "gateway", "beacon", "execution", "blob", "membrane-mcp", "ipc".
+    pub purpose: String,
+    pub host: String,
+    pub port: u16,
+    /// Exposure tier of the listener ("local", "lan", "mesh", "internet"), when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tier: Option<String>,
+    /// Wire protocol for execution reachability entries (e.g. "tcp").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub protocol: Option<String>,
+}
+
+/// One node (self or peer) returned by [`IpcResponse::MeshRosterView`].
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct MeshRosterEntryView {
+    pub node_id: String,
+    pub is_self: bool,
+    /// Hotel name for the node when known (from the local graph for self,
+    /// from HotelStateSync for peers).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+    /// Mesh roles advertised in the node's capabilities manifest.
+    #[serde(default)]
+    pub roles: Vec<String>,
+    /// The node's effective exposure ceiling ("local", "lan", "mesh", "internet"),
+    /// when a perimeter snapshot has been advertised.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exposure_ceiling: Option<String>,
+    /// Reachable listener endpoints (perimeter listeners + execution reachability).
+    #[serde(default)]
+    pub endpoints: Vec<MeshEndpointView>,
 }
 
 /// Represents the canonical response from the local Ansible back to the Guest via IPC.
@@ -2168,6 +2601,18 @@ pub enum IpcResponse {
         /// existing guest's config was updated in place.
         materialized: bool,
     },
+    /// Response to [`IpcRequest::RegisterMcpUpstream`] /
+    /// [`IpcRequest::RevokeMcpUpstream`].
+    McpUpstreamRegistered {
+        mcp_upstream_id: String,
+        /// `true` if a new mcp-client guest was spawned; `false` if an
+        /// existing guest received the config update in place.
+        mcp_upstream_materialized: bool,
+    },
+    /// Response to [`IpcRequest::GetMcpUpstreams`].
+    McpUpstreamsState {
+        mcp_upstreams: Vec<McpUpstreamEntry>,
+    },
     DiscordGatewayLease {
         granted: bool,
         lease: Option<LeaseEnvelope>,
@@ -2275,6 +2720,33 @@ pub enum IpcResponse {
         /// Unix epoch seconds of the query.
         generated_at: u64,
     },
+    /// Response to [`IpcRequest::ListOperatorSessions`].
+    ///
+    /// Untagged-serde safety: the required, uniquely-named `operator_sessions`
+    /// field keeps this variant from swallowing `Standard` acks or being
+    /// swallowed by earlier variants.
+    OperatorSessionList {
+        operator_sessions: Vec<OperatorSessionView>,
+    },
+    /// Response to [`IpcRequest::ListSessionTurns`].
+    ///
+    /// Untagged-serde safety: both fields are required; `turns_session_id` is
+    /// deliberately not named `session_id` so no earlier variant shape matches.
+    SessionTurnList {
+        turns_session_id: String,
+        session_turns: Vec<SessionTurnView>,
+    },
+    /// Response to [`IpcRequest::GetMeshRoster`].
+    ///
+    /// Untagged-serde safety: the required, uniquely-named `mesh_roster` field
+    /// makes this variant structurally unambiguous.
+    MeshRosterView {
+        mesh_roster: Vec<MeshRosterEntryView>,
+    },
+    // CRITICAL: `MemoryConfig` (all-optional payload) must remain the LAST
+    // variant of this untagged enum — see `project_cron_scheduler.md` /
+    // `bug_ipcresponse_untagged_ordering.md`. Add new variants ABOVE this line
+    // and give them at least one required, uniquely-named field.
     MemoryConfig(MemoryConfigPayload),
 }
 
@@ -2286,6 +2758,16 @@ pub struct PersistedMcpRouteEntry {
     /// Vault ref for the bearer token, if one was supplied at provisioning time.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vault_ref: Option<String>,
+}
+
+/// One registered upstream MCP server plus its last reported catalog, as
+/// returned by [`IpcResponse::McpUpstreamsState`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct McpUpstreamEntry {
+    pub config: ansible_mesh_core::mcp_upstream::McpUpstreamConfig,
+    /// Last catalog report from the mcp-client guest, if any yet.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub catalog: Option<ansible_mesh_core::mcp_upstream::McpUpstreamCatalog>,
 }
 
 impl IpcResponse {
@@ -2328,6 +2810,16 @@ pub struct PhiloticClient {
     _identity: GuestIdentity,
     pending_push: VecDeque<IpcResponse>,
     read_buf: Vec<u8>,
+    /// DEF-045: number of responses still owed to requests whose caller gave up
+    /// on them (via [`Self::send_request_with_timeout`] elapsing) before the
+    /// hotel's reply arrived. The IPC stream is a single in-order pipe with no
+    /// per-message correlation ID, so a dropped future does not un-send the
+    /// request — the hotel still processes it and writes exactly one reply
+    /// frame back, later, in its turn. Every non-push frame read while this is
+    /// > 0 is *that* stale reply (FIFO ordering guarantees it precedes the
+    /// reply to any request written after the timeout), so it is discarded
+    /// before normal response matching resumes. Pushes are never discarded.
+    pending_stale_responses: u32,
 }
 
 pub fn is_ipc_disconnect(err: &anyhow::Error) -> bool {
@@ -2350,6 +2842,19 @@ pub fn is_ipc_disconnect(err: &anyhow::Error) -> bool {
 
 pub fn is_graceful_shutdown(resp: &IpcResponse) -> bool {
     matches!(resp, IpcResponse::GracefulShutdown { .. })
+}
+
+/// True if `err` (or something in its anyhow chain) is a
+/// [`Self::send_request_with_timeout`] elapse rather than a genuine transport/
+/// protocol failure. Lets callers that previously distinguished an outer
+/// `tokio::time::timeout` elapse from an inner `send_request` error keep doing
+/// so after migrating to `send_request_with_timeout`'s single `Result`.
+pub fn is_ipc_timeout(err: &anyhow::Error) -> bool {
+    err.chain().any(|cause| {
+        cause
+            .downcast_ref::<tokio::time::error::Elapsed>()
+            .is_some()
+    })
 }
 
 impl PhiloticClient {
@@ -2427,6 +2932,7 @@ impl PhiloticClient {
             _identity: identity.clone(),
             pending_push: VecDeque::new(),
             read_buf: Vec::new(),
+            pending_stale_responses: 0,
         };
 
         info!("Registering as Materialized Guest: {:?}", identity);
@@ -2452,19 +2958,99 @@ impl PhiloticClient {
         Self::connect_at(Self::socket_path(), identity).await
     }
 
-    /// Send an IPC request to the local Ansible
+    /// Send an IPC request to the local Ansible and wait indefinitely for its reply.
     pub async fn send_request(&mut self, req: IpcRequest) -> Result<IpcResponse> {
         let payload = serde_json::to_vec(&req).context("Failed to serialize IpcRequest")?;
         self.write_frame(&payload).await?;
+        self.read_matching_response(&req).await
+    }
 
+    /// Same contract as [`Self::send_request`], but bounds the wait for a reply to
+    /// `timeout`. This exists because callers historically wrapped `send_request`
+    /// in an external `tokio::time::timeout` — but dropping that future when the
+    /// timeout elapsed did NOT stop the hotel from eventually writing a reply
+    /// frame back. Since this IPC stream carries no per-message correlation ID,
+    /// that orphaned reply would sit at the front of the stream and get handed
+    /// out as the response to the *next* `send_request` call, permanently
+    /// desyncing the connection one frame (DEF-045).
+    ///
+    /// This method owns the timeout internally so it can record that a reply is
+    /// still owed (see [`Self::pending_stale_responses`]) and transparently
+    /// discard it — instead of misdelivering it — the next time any response is
+    /// read on this connection.
+    ///
+    /// On elapse, returns an `Err` describing the timeout (mirrors the shape
+    /// callers get from `tokio::time::timeout(..).await?` today).
+    pub async fn send_request_with_timeout(
+        &mut self,
+        req: IpcRequest,
+        timeout: Duration,
+    ) -> Result<IpcResponse> {
+        let payload = serde_json::to_vec(&req).context("Failed to serialize IpcRequest")?;
+        self.write_frame(&payload).await?;
+
+        match tokio::time::timeout(timeout, self.read_matching_response(&req)).await {
+            Ok(result) => result,
+            Err(elapsed) => {
+                self.pending_stale_responses = self.pending_stale_responses.saturating_add(1);
+                warn!(
+                    "IPC request timed out after {:?} waiting for a reply; the hotel's eventual \
+                     reply will be discarded when it arrives to keep the connection framed: {:?}",
+                    timeout, req
+                );
+                // Wrap (not discard) the tokio::time::error::Elapsed so callers that need to
+                // tell "timed out" apart from "the hotel replied with an actual error" can
+                // `err.downcast_ref::<tokio::time::error::Elapsed>()` — see is_ipc_timeout.
+                Err(anyhow::Error::new(elapsed).context(format!(
+                    "IPC request timed out after {:?}: {:?}",
+                    timeout, req
+                )))
+            }
+        }
+    }
+
+    /// Read frames from the stream until one matches `req`, buffering any push
+    /// messages encountered along the way and discarding stale replies owed to
+    /// earlier timed-out requests (see [`Self::pending_stale_responses`]).
+    async fn read_matching_response(&mut self, req: &IpcRequest) -> Result<IpcResponse> {
         loop {
             let resp = self.read_response().await?;
-            if Self::is_expected_response(&req, &resp) {
-                return Ok(resp);
-            }
+
+            // Pushes are never stale-request fallout and must never be lost —
+            // classify and buffer them before any stale-discard logic runs.
             if Self::is_push_message(&resp) {
                 self.pending_push.push_back(resp);
                 continue;
+            }
+
+            // A non-push frame arriving while a reply is still owed to an earlier
+            // timed-out request MUST be that reply: this stream is FIFO and that
+            // request's write strictly preceded `req`'s write, so its response
+            // (if not yet consumed) strictly precedes `req`'s response too.
+            //
+            // BUT: hotel-wide OOB broadcasts (`is_ignorable_push` — lease status
+            // pings, MuninnStatus, NetworkState, etc.) are not pushes but also are
+            // not owed replies to anything; they can land on this connection at
+            // any time regardless of pending_stale_responses. They must be
+            // skipped WITHOUT decrementing the counter here, or a broadcast
+            // arriving before the real stale reply burns the "owed" credit and
+            // the real reply then falls through to be misdelivered as the
+            // response to the current request — reintroducing the exact desync
+            // this counter exists to prevent.
+            if self.pending_stale_responses > 0 {
+                if Self::is_ignorable_push(&resp) {
+                    continue;
+                }
+                self.pending_stale_responses -= 1;
+                warn!(
+                    "Discarding stale IPC response left over from a prior timed-out request: {:?}",
+                    resp
+                );
+                continue;
+            }
+
+            if Self::is_expected_response(req, &resp) {
+                return Ok(resp);
             }
             // Ignorable hotel-wide broadcasts (MuninnStatus, NetworkState, lease events) can
             // arrive on any connection at any time, including between a request write and its
@@ -2489,16 +3075,36 @@ impl PhiloticClient {
             (req, response),
             (
                 IpcRequest::AcquireTelegramPollLease { .. }
-                    | IpcRequest::GetTelegramPollLeaseOwner { .. },
+                    | IpcRequest::RenewTelegramPollLease { .. },
+                IpcResponse::TelegramPollLease { .. }
+            ) | (
+                IpcRequest::GetTelegramPollLeaseOwner { .. },
                 IpcResponse::TelegramPollLeaseStatus { .. }
             ) | (
+                // Acquire/Renew reply with the lease envelope itself, not the
+                // owner-status view. Matching the actual reply variant here is
+                // load-bearing: `DesktopMembraneLease` is also in
+                // `is_ignorable_push`, so without this arm the real reply is
+                // swallowed as an OOB broadcast and send_request hangs forever
+                // (DEF-005).
                 IpcRequest::AcquireDesktopMembraneLease { .. }
-                    | IpcRequest::GetDesktopMembraneLeaseOwner { .. },
+                    | IpcRequest::RenewDesktopMembraneLease { .. },
+                IpcResponse::DesktopMembraneLease { .. }
+            ) | (
+                IpcRequest::GetDesktopMembraneLeaseOwner { .. },
                 IpcResponse::DesktopMembraneLeaseStatus { .. }
             ) | (
+                // `IpcResponse` is untagged, and `DiscordGatewayLease { granted, lease }`
+                // has the same shape as `TelegramPollLease` (which is declared first),
+                // so discord lease replies deserialize as `TelegramPollLease` on the
+                // wire. Accept both variants for discord requests.
                 IpcRequest::AcquireDiscordGatewayLease { .. }
-                    | IpcRequest::GetDiscordGatewayLeaseOwner { .. },
+                    | IpcRequest::RenewDiscordGatewayLease { .. },
+                IpcResponse::DiscordGatewayLease { .. } | IpcResponse::TelegramPollLease { .. }
+            ) | (
+                IpcRequest::GetDiscordGatewayLeaseOwner { .. },
                 IpcResponse::DiscordGatewayLeaseStatus { .. }
+                    | IpcResponse::TelegramPollLeaseStatus { .. }
             ) | (
                 IpcRequest::AcquireMcpMembraneLease { .. }
                     | IpcRequest::RenewMcpMembraneLease { .. },
@@ -2550,6 +3156,27 @@ impl PhiloticClient {
             let resp = self.read_response().await?;
             if Self::is_push_message(&resp) {
                 return Ok(resp);
+            }
+            // DEF-045: a reply still owed to an earlier timed-out send_request_with_timeout
+            // call can surface here too (recv_task and send_request share one stream).
+            // Discard it silently rather than bailing — it is expected fallout, not a
+            // protocol violation.
+            //
+            // As in `read_matching_response`: OOB broadcasts (`is_ignorable_push`) are not
+            // owed replies and must be skipped WITHOUT decrementing the counter, or a
+            // broadcast landing before the real stale reply burns the credit and the real
+            // reply then falls through unrecognized below.
+            if self.pending_stale_responses > 0 {
+                if Self::is_ignorable_push(&resp) {
+                    continue;
+                }
+                self.pending_stale_responses -= 1;
+                warn!(
+                    "Discarding stale IPC response left over from a prior timed-out request \
+                     (observed in recv_task): {:?}",
+                    resp
+                );
+                continue;
             }
             // Some live EmitTask paths can leave a successful ACK on the stream before
             // the routed push arrives. While explicitly waiting for a pushed task, this
@@ -2616,6 +3243,63 @@ mod tests {
     }
 
     #[test]
+    fn configure_role_deserializes_old_payload_without_fallback_tiers() {
+        // Wire-compat: a pre-existing caller (or a recorded fixture) that never
+        // knew about `fallback_tiers` must still deserialize cleanly, with the
+        // field defaulting to `None` (preserve semantics), not an empty Vec.
+        let old_payload = serde_json::json!({
+            "operation": "configure_role",
+            "payload": {
+                "agent_id": "agent-jane-01",
+                "role_name": "developer",
+                "guest_id": "agent-jane-01:developer",
+                "calling_role": "orchestrator",
+                "toolset_profile": "developer",
+            }
+        });
+        let req: IpcRequest = serde_json::from_value(old_payload).expect("decode legacy payload");
+        match req {
+            IpcRequest::ConfigureRole { fallback_tiers, .. } => {
+                assert_eq!(fallback_tiers, None);
+            }
+            other => panic!("expected ConfigureRole, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn configure_role_round_trips_fallback_tiers() {
+        let req = IpcRequest::ConfigureRole {
+            agent_id: "agent-jane-01".into(),
+            role_name: "orchestrator".into(),
+            guest_id: "agent-jane-01:orchestrator".into(),
+            calling_role: "orchestrator".into(),
+            toolset_profile: "orchestrator".into(),
+            role_identity_addendum: None,
+            role_manifest: None,
+            is_admin: false,
+            inactive_ttl_seconds: None,
+            iteration_cap: None,
+            approval_policy: None,
+            model_profile: None,
+            context_window_policy: None,
+            fallback_tiers: Some(vec!["model".into(), "model.openrouter".into()]),
+            model_bindings: None,
+            content_policy: None,
+        };
+        let json = serde_json::to_value(&req).expect("serialize");
+        let decoded: IpcRequest = serde_json::from_value(json).expect("deserialize");
+        match decoded {
+            IpcRequest::ConfigureRole { fallback_tiers, .. } => {
+                assert_eq!(
+                    fallback_tiers,
+                    Some(vec!["model".to_string(), "model.openrouter".to_string()])
+                );
+            }
+            other => panic!("expected ConfigureRole, got {:?}", other),
+        }
+    }
+
+    #[test]
     fn task_error_payload_formats_for_logs_and_fallbacks() {
         let payload = TaskErrorPayload {
             kind: "provider_failure".into(),
@@ -2626,6 +3310,8 @@ mod tests {
             capability: Some("voice.synthesize".into()),
             retryable: Some(false),
             sub_kind: None,
+            status: None,
+            error_class: None,
         };
 
         let rendered = payload.display_message();
@@ -2677,6 +3363,154 @@ mod tests {
     }
 
     #[test]
+    fn session_history_responses_roundtrip_to_their_own_variants() {
+        // OperatorSessionList round-trip (including the empty-list edge).
+        for sessions in [
+            vec![OperatorSessionView {
+                session_id: "operator-chat:sess-1:agent-jane-01".into(),
+                agent_id: Some("agent-jane-01".into()),
+                transport: Some("operator_chat".into()),
+                status: "active".into(),
+                last_activity_at: 1_750_000_000,
+                title: Some("chat-1".into()),
+                preview: Some("hello there".into()),
+            }],
+            Vec::new(),
+        ] {
+            let bytes = serde_json::to_vec(&IpcResponse::OperatorSessionList {
+                operator_sessions: sessions.clone(),
+            })
+            .expect("serialize operator session list");
+            match serde_json::from_slice::<IpcResponse>(&bytes)
+                .expect("deserialize operator session list")
+            {
+                IpcResponse::OperatorSessionList { operator_sessions } => {
+                    assert_eq!(operator_sessions, sessions);
+                }
+                other => panic!("operator session list decoded as wrong variant: {other:?}"),
+            }
+        }
+
+        // SessionTurnList round-trip.
+        let turns = vec![
+            SessionTurnView {
+                turn_id: "turn-1".into(),
+                role: "operator".into(),
+                content: "ping".into(),
+                created_at: Some(1),
+                status: "completed".into(),
+            },
+            SessionTurnView {
+                turn_id: "turn-1".into(),
+                role: "agent".into(),
+                content: "pong".into(),
+                created_at: Some(2),
+                status: "completed".into(),
+            },
+        ];
+        let bytes = serde_json::to_vec(&IpcResponse::SessionTurnList {
+            turns_session_id: "operator-chat:sess-1:agent-jane-01".into(),
+            session_turns: turns.clone(),
+        })
+        .expect("serialize session turn list");
+        match serde_json::from_slice::<IpcResponse>(&bytes).expect("deserialize session turn list")
+        {
+            IpcResponse::SessionTurnList {
+                turns_session_id,
+                session_turns,
+            } => {
+                assert_eq!(turns_session_id, "operator-chat:sess-1:agent-jane-01");
+                assert_eq!(session_turns, turns);
+            }
+            other => panic!("session turn list decoded as wrong variant: {other:?}"),
+        }
+
+        // MeshRosterView round-trip.
+        let roster = vec![MeshRosterEntryView {
+            node_id: "local-aiua-01".into(),
+            is_self: true,
+            display_name: Some("mac-jane".into()),
+            roles: vec!["ansible-node".into()],
+            exposure_ceiling: Some("mesh".into()),
+            endpoints: vec![MeshEndpointView {
+                purpose: "execution".into(),
+                host: "100.64.1.2".into(),
+                port: 16371,
+                tier: None,
+                protocol: Some("tcp".into()),
+            }],
+        }];
+        let bytes = serde_json::to_vec(&IpcResponse::MeshRosterView {
+            mesh_roster: roster.clone(),
+        })
+        .expect("serialize mesh roster");
+        match serde_json::from_slice::<IpcResponse>(&bytes).expect("deserialize mesh roster") {
+            IpcResponse::MeshRosterView { mesh_roster } => assert_eq!(mesh_roster, roster),
+            other => panic!("mesh roster decoded as wrong variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn existing_responses_still_decode_to_their_variants_after_session_history_variants() {
+        // Regression guard for the untagged-enum ordering hazard: adding the
+        // session-history/mesh-roster variants must not change how any existing
+        // response shape deserializes.
+
+        // Standard ack.
+        let bytes =
+            serde_json::to_vec(&IpcResponse::success("corr-1", None)).expect("serialize standard");
+        match serde_json::from_slice::<IpcResponse>(&bytes).expect("deserialize standard") {
+            IpcResponse::Standard { ok: true, code, .. } => assert_eq!(code, "OK"),
+            other => panic!("standard ack decoded as wrong variant: {other:?}"),
+        }
+
+        // Ack.
+        let bytes = serde_json::to_vec(&IpcResponse::Ack {
+            req_id: "req-1".into(),
+        })
+        .expect("serialize ack");
+        match serde_json::from_slice::<IpcResponse>(&bytes).expect("deserialize ack") {
+            IpcResponse::Ack { req_id } => assert_eq!(req_id, "req-1"),
+            other => panic!("ack decoded as wrong variant: {other:?}"),
+        }
+
+        // Error.
+        let bytes = serde_json::to_vec(&IpcResponse::Error("boom".into())).expect("serialize err");
+        match serde_json::from_slice::<IpcResponse>(&bytes).expect("deserialize err") {
+            IpcResponse::Error(msg) => assert_eq!(msg, "boom"),
+            other => panic!("error decoded as wrong variant: {other:?}"),
+        }
+
+        // MemoryConfig (the all-optional payload that must stay last).
+        let bytes = serde_json::to_vec(&IpcResponse::MemoryConfig(MemoryConfigPayload {
+            config_json: None,
+        }))
+        .expect("serialize memory config");
+        match serde_json::from_slice::<IpcResponse>(&bytes).expect("deserialize memory config") {
+            IpcResponse::MemoryConfig(_) => {}
+            other => panic!("memory config decoded as wrong variant: {other:?}"),
+        }
+
+        // UserProfileData (deny_unknown_fields payload).
+        let bytes = serde_json::to_vec(&IpcResponse::UserProfileData(UserProfileDataPayload {
+            timezone: Some("America/New_York".into()),
+            display_name: None,
+            principal_id: None,
+            preferred_name: None,
+            primary_email: None,
+            home_hotel: None,
+            linked_providers: vec![],
+        }))
+        .expect("serialize user profile");
+        match serde_json::from_slice::<IpcResponse>(&bytes).expect("deserialize user profile") {
+            IpcResponse::UserProfileData(p) => {
+                assert_eq!(p.timezone.as_deref(), Some("America/New_York"));
+            }
+            other => panic!("user profile decoded as wrong variant: {other:?}"),
+        }
+    }
+
+    #[test]
     fn standard_response_does_not_decode_as_memory_config() {
         let bytes = serde_json::to_vec(&IpcResponse::success("reg", None))
             .expect("serialize standard response");
@@ -2723,10 +3557,33 @@ mod tests {
                 lease: None,
             }
         ));
+        // Acquire/Renew reply with the lease envelope itself (`DesktopMembraneLease`),
+        // NOT the owner-status view — see the AcquireDesktopMembraneLease handler in
+        // crates/aiua/src/service/ipc.rs. Matching the actual reply variant is what
+        // keeps it from being swallowed by is_ignorable_push (DEF-005).
         assert!(PhiloticClient::is_expected_response(
             &IpcRequest::AcquireDesktopMembraneLease {
                 lease_key: "desktop:local".into(),
                 port: 49152,
+            },
+            &IpcResponse::DesktopMembraneLease {
+                desktop_granted: true,
+                desktop_lease: None,
+            }
+        ));
+        assert!(PhiloticClient::is_expected_response(
+            &IpcRequest::RenewDesktopMembraneLease {
+                lease_key: "desktop:local".into(),
+                lease_epoch: 1,
+            },
+            &IpcResponse::DesktopMembraneLease {
+                desktop_granted: true,
+                desktop_lease: None,
+            }
+        ));
+        assert!(PhiloticClient::is_expected_response(
+            &IpcRequest::GetDesktopMembraneLeaseOwner {
+                lease_key: "desktop:local".into(),
             },
             &IpcResponse::DesktopMembraneLeaseStatus {
                 desktop_active: true,
@@ -2739,6 +3596,19 @@ mod tests {
             },
             &IpcResponse::DiscordGatewayLeaseStatus {
                 active: true,
+                lease: None,
+            }
+        ));
+        // IpcResponse is untagged and DiscordGatewayLease has the same field shape
+        // as TelegramPollLease (declared first), so discord lease replies arrive
+        // deserialized as TelegramPollLease. Both variants must be accepted.
+        assert!(PhiloticClient::is_expected_response(
+            &IpcRequest::AcquireDiscordGatewayLease {
+                lease_key: "discord:bot".into(),
+                agent_id: "agent-test".into(),
+            },
+            &IpcResponse::TelegramPollLease {
+                granted: true,
                 lease: None,
             }
         ));
@@ -3122,10 +3992,521 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn send_request_with_timeout_discards_stale_response_before_next_reply() {
+        // DEF-045 regression: request A times out client-side before the hotel's
+        // reply arrives; request B is issued right after. The hotel's late reply
+        // to A must be discarded, not misdelivered as B's response.
+        let _env_guard = ipc_env_guard();
+        let socket_path = test_socket_path();
+        let listener = UnixListener::bind(&socket_path).expect("bind test socket");
+
+        let server = tokio::spawn({
+            let socket_path = socket_path.clone();
+            async move {
+                let (mut stream, _) = listener.accept().await.expect("accept client");
+                let buf = read_frame(&mut stream).await;
+                let _req: IpcRequest = serde_json::from_slice(&buf).expect("decode register");
+                write_frame(
+                    &mut stream,
+                    &serde_json::to_vec(&IpcResponse::success("reg", None)).unwrap(),
+                )
+                .await;
+
+                // Request A: the client will give up on this before we reply.
+                let buf = read_frame(&mut stream).await;
+                match serde_json::from_slice::<IpcRequest>(&buf).expect("decode request A") {
+                    IpcRequest::GetConfig { key } => assert_eq!(key, "stale-a"),
+                    other => panic!("unexpected request A: {other:?}"),
+                }
+
+                // Delay well past the client's timeout, then send the late reply.
+                tokio::time::sleep(Duration::from_millis(150)).await;
+                write_frame(
+                    &mut stream,
+                    &serde_json::to_vec(&IpcResponse::ConfigData {
+                        key: "stale-a".into(),
+                        value_json: Some("\"A\"".into()),
+                    })
+                    .unwrap(),
+                )
+                .await;
+
+                // Request B was written by the client right after its timeout fired.
+                let buf = read_frame(&mut stream).await;
+                match serde_json::from_slice::<IpcRequest>(&buf).expect("decode request B") {
+                    IpcRequest::GetConfig { key } => assert_eq!(key, "fresh-b"),
+                    other => panic!("unexpected request B: {other:?}"),
+                }
+                write_frame(
+                    &mut stream,
+                    &serde_json::to_vec(&IpcResponse::ConfigData {
+                        key: "fresh-b".into(),
+                        value_json: Some("\"B\"".into()),
+                    })
+                    .unwrap(),
+                )
+                .await;
+
+                let _ = std::fs::remove_file(&socket_path);
+            }
+        });
+
+        unsafe {
+            std::env::set_var("PHILOTIC_HOTEL_SOCKET", &socket_path);
+        }
+
+        let identity = GuestIdentity {
+            guest_id: "guest-test-stale".into(),
+            role: "test".into(),
+            supported_tools: Vec::new(),
+        };
+        let mut client = PhiloticClient::connect(identity)
+            .await
+            .expect("connect client");
+
+        let timed_out = client
+            .send_request_with_timeout(
+                IpcRequest::GetConfig {
+                    key: "stale-a".into(),
+                },
+                Duration::from_millis(30),
+            )
+            .await;
+        assert!(
+            timed_out.is_err(),
+            "expected request A to time out client-side, got {timed_out:?}"
+        );
+        assert_eq!(client.pending_stale_responses, 1);
+
+        let response_b = client
+            .send_request(IpcRequest::GetConfig {
+                key: "fresh-b".into(),
+            })
+            .await
+            .expect("send request B");
+
+        match response_b {
+            IpcResponse::ConfigData { key, value_json } => {
+                assert_eq!(key, "fresh-b");
+                assert_eq!(value_json.as_deref(), Some("\"B\""));
+            }
+            other => panic!("expected fresh-b response (stale-a must be discarded), got {other:?}"),
+        }
+        assert_eq!(
+            client.pending_stale_responses, 0,
+            "stale counter must be drained once the late reply is discarded"
+        );
+
+        server.await.expect("join server");
+        unsafe {
+            std::env::remove_var("PHILOTIC_HOTEL_SOCKET");
+        }
+        if Path::new(&socket_path).exists() {
+            let _ = std::fs::remove_file(&socket_path);
+        }
+    }
+
+    #[tokio::test]
+    async fn stale_response_discard_does_not_lose_interleaved_push() {
+        // DEF-045 regression: a push arriving between the discarded stale reply
+        // and the real reply must still surface via recv_task, not be dropped.
+        let _env_guard = ipc_env_guard();
+        let socket_path = test_socket_path();
+        let listener = UnixListener::bind(&socket_path).expect("bind test socket");
+
+        let server = tokio::spawn({
+            let socket_path = socket_path.clone();
+            async move {
+                let (mut stream, _) = listener.accept().await.expect("accept client");
+                let buf = read_frame(&mut stream).await;
+                let _req: IpcRequest = serde_json::from_slice(&buf).expect("decode register");
+                write_frame(
+                    &mut stream,
+                    &serde_json::to_vec(&IpcResponse::success("reg", None)).unwrap(),
+                )
+                .await;
+
+                let buf = read_frame(&mut stream).await;
+                match serde_json::from_slice::<IpcRequest>(&buf).expect("decode request A") {
+                    IpcRequest::GetConfig { key } => assert_eq!(key, "stale-a"),
+                    other => panic!("unexpected request A: {other:?}"),
+                }
+
+                tokio::time::sleep(Duration::from_millis(150)).await;
+
+                // Stale reply to A, then a push, then (once it arrives) the real
+                // reply to B — push sits between the stale frame and the real one.
+                write_frame(
+                    &mut stream,
+                    &serde_json::to_vec(&IpcResponse::ConfigData {
+                        key: "stale-a".into(),
+                        value_json: Some("\"A\"".into()),
+                    })
+                    .unwrap(),
+                )
+                .await;
+                write_frame(
+                    &mut stream,
+                    &serde_json::to_vec(&IpcResponse::InboundTask {
+                        source_node: "local-aiua-01".into(),
+                        task_id: Uuid::nil(),
+                        task_json: serde_json::json!({
+                            "action": "send_reply",
+                            "content": "push between stale and real"
+                        })
+                        .to_string(),
+                    })
+                    .unwrap(),
+                )
+                .await;
+
+                let buf = read_frame(&mut stream).await;
+                match serde_json::from_slice::<IpcRequest>(&buf).expect("decode request B") {
+                    IpcRequest::GetConfig { key } => assert_eq!(key, "fresh-b"),
+                    other => panic!("unexpected request B: {other:?}"),
+                }
+                write_frame(
+                    &mut stream,
+                    &serde_json::to_vec(&IpcResponse::ConfigData {
+                        key: "fresh-b".into(),
+                        value_json: Some("\"B\"".into()),
+                    })
+                    .unwrap(),
+                )
+                .await;
+
+                let _ = std::fs::remove_file(&socket_path);
+            }
+        });
+
+        unsafe {
+            std::env::set_var("PHILOTIC_HOTEL_SOCKET", &socket_path);
+        }
+
+        let identity = GuestIdentity {
+            guest_id: "guest-test-stale-push".into(),
+            role: "test".into(),
+            supported_tools: Vec::new(),
+        };
+        let mut client = PhiloticClient::connect(identity)
+            .await
+            .expect("connect client");
+
+        let timed_out = client
+            .send_request_with_timeout(
+                IpcRequest::GetConfig {
+                    key: "stale-a".into(),
+                },
+                Duration::from_millis(30),
+            )
+            .await;
+        assert!(timed_out.is_err(), "expected request A to time out");
+
+        let response_b = client
+            .send_request(IpcRequest::GetConfig {
+                key: "fresh-b".into(),
+            })
+            .await
+            .expect("send request B");
+        match response_b {
+            IpcResponse::ConfigData { key, .. } => assert_eq!(key, "fresh-b"),
+            other => panic!("expected fresh-b response, got {other:?}"),
+        }
+
+        let pushed = client
+            .recv_task()
+            .await
+            .expect("interleaved push must not be lost");
+        match pushed {
+            IpcResponse::InboundTask { task_json, .. } => {
+                let payload: serde_json::Value =
+                    serde_json::from_str(&task_json).expect("decode pushed task");
+                assert_eq!(payload["content"], "push between stale and real");
+            }
+            other => panic!("unexpected pushed response: {other:?}"),
+        }
+
+        server.await.expect("join server");
+        unsafe {
+            std::env::remove_var("PHILOTIC_HOTEL_SOCKET");
+        }
+        if Path::new(&socket_path).exists() {
+            let _ = std::fs::remove_file(&socket_path);
+        }
+    }
+
+    #[tokio::test]
+    async fn ignorable_oob_broadcast_during_stale_window_is_not_mistaken_for_the_owed_reply() {
+        // DEF-045 regression: an OOB broadcast (lease status ping, MuninnStatus,
+        // NetworkState, ...) is NOT a push and NOT the owed stale reply, but it can
+        // land on this connection at any time — including while a stale reply is
+        // still outstanding. If it were allowed to burn the pending_stale_responses
+        // credit, the *real* stale reply arriving right after it would fall through
+        // unrecognized and get misdelivered as B's response — reintroducing the
+        // exact desync this counter exists to prevent.
+        let _env_guard = ipc_env_guard();
+        let socket_path = test_socket_path();
+        let listener = UnixListener::bind(&socket_path).expect("bind test socket");
+
+        let server = tokio::spawn({
+            let socket_path = socket_path.clone();
+            async move {
+                let (mut stream, _) = listener.accept().await.expect("accept client");
+                let buf = read_frame(&mut stream).await;
+                let _req: IpcRequest = serde_json::from_slice(&buf).expect("decode register");
+                write_frame(
+                    &mut stream,
+                    &serde_json::to_vec(&IpcResponse::success("reg", None)).unwrap(),
+                )
+                .await;
+
+                let buf = read_frame(&mut stream).await;
+                match serde_json::from_slice::<IpcRequest>(&buf).expect("decode request A") {
+                    IpcRequest::GetConfig { key } => assert_eq!(key, "stale-a"),
+                    other => panic!("unexpected request A: {other:?}"),
+                }
+
+                tokio::time::sleep(Duration::from_millis(150)).await;
+
+                // OOB broadcast lands BEFORE the real stale reply.
+                write_frame(
+                    &mut stream,
+                    &serde_json::to_vec(&IpcResponse::TelegramPollLeaseStatus {
+                        active: true,
+                        lease: None,
+                    })
+                    .unwrap(),
+                )
+                .await;
+                // The real stale reply to A.
+                write_frame(
+                    &mut stream,
+                    &serde_json::to_vec(&IpcResponse::ConfigData {
+                        key: "stale-a".into(),
+                        value_json: Some("\"A\"".into()),
+                    })
+                    .unwrap(),
+                )
+                .await;
+
+                let buf = read_frame(&mut stream).await;
+                match serde_json::from_slice::<IpcRequest>(&buf).expect("decode request B") {
+                    IpcRequest::GetConfig { key } => assert_eq!(key, "fresh-b"),
+                    other => panic!("unexpected request B: {other:?}"),
+                }
+                write_frame(
+                    &mut stream,
+                    &serde_json::to_vec(&IpcResponse::ConfigData {
+                        key: "fresh-b".into(),
+                        value_json: Some("\"B\"".into()),
+                    })
+                    .unwrap(),
+                )
+                .await;
+
+                let _ = std::fs::remove_file(&socket_path);
+            }
+        });
+
+        unsafe {
+            std::env::set_var("PHILOTIC_HOTEL_SOCKET", &socket_path);
+        }
+
+        let identity = GuestIdentity {
+            guest_id: "guest-test-stale-oob".into(),
+            role: "test".into(),
+            supported_tools: Vec::new(),
+        };
+        let mut client = PhiloticClient::connect(identity)
+            .await
+            .expect("connect client");
+
+        let timed_out = client
+            .send_request_with_timeout(
+                IpcRequest::GetConfig {
+                    key: "stale-a".into(),
+                },
+                Duration::from_millis(30),
+            )
+            .await;
+        assert!(timed_out.is_err(), "expected request A to time out");
+
+        let response_b = client
+            .send_request(IpcRequest::GetConfig {
+                key: "fresh-b".into(),
+            })
+            .await
+            .expect("send request B");
+        match response_b {
+            IpcResponse::ConfigData { key, value_json } => {
+                assert_eq!(key, "fresh-b");
+                assert_eq!(value_json.as_deref(), Some("\"B\""));
+            }
+            other => panic!(
+                "expected fresh-b response (OOB broadcast must not consume the stale credit), got {other:?}"
+            ),
+        }
+        assert_eq!(
+            client.pending_stale_responses, 0,
+            "stale counter must be drained by the real stale reply, not the OOB broadcast"
+        );
+
+        server.await.expect("join server");
+        unsafe {
+            std::env::remove_var("PHILOTIC_HOTEL_SOCKET");
+        }
+        if Path::new(&socket_path).exists() {
+            let _ = std::fs::remove_file(&socket_path);
+        }
+    }
+
+    #[tokio::test]
+    async fn send_request_with_timeout_behaves_like_send_request_on_prompt_reply() {
+        // Normal (non-timeout) path: send_request_with_timeout must return the
+        // real reply and leave no stale-response bookkeeping behind, exactly
+        // like plain send_request.
+        let _env_guard = ipc_env_guard();
+        let socket_path = test_socket_path();
+        let listener = UnixListener::bind(&socket_path).expect("bind test socket");
+
+        let server = tokio::spawn({
+            let socket_path = socket_path.clone();
+            async move {
+                let (mut stream, _) = listener.accept().await.expect("accept client");
+                let buf = read_frame(&mut stream).await;
+                let _req: IpcRequest = serde_json::from_slice(&buf).expect("decode register");
+                write_frame(
+                    &mut stream,
+                    &serde_json::to_vec(&IpcResponse::success("reg", None)).unwrap(),
+                )
+                .await;
+
+                let buf = read_frame(&mut stream).await;
+                match serde_json::from_slice::<IpcRequest>(&buf).expect("decode request") {
+                    IpcRequest::GetConfig { key } => assert_eq!(key, "prompt"),
+                    other => panic!("unexpected request: {other:?}"),
+                }
+                write_frame(
+                    &mut stream,
+                    &serde_json::to_vec(&IpcResponse::ConfigData {
+                        key: "prompt".into(),
+                        value_json: Some("\"ok\"".into()),
+                    })
+                    .unwrap(),
+                )
+                .await;
+
+                let _ = std::fs::remove_file(&socket_path);
+            }
+        });
+
+        unsafe {
+            std::env::set_var("PHILOTIC_HOTEL_SOCKET", &socket_path);
+        }
+
+        let identity = GuestIdentity {
+            guest_id: "guest-test-prompt".into(),
+            role: "test".into(),
+            supported_tools: Vec::new(),
+        };
+        let mut client = PhiloticClient::connect(identity)
+            .await
+            .expect("connect client");
+
+        let response = client
+            .send_request_with_timeout(
+                IpcRequest::GetConfig {
+                    key: "prompt".into(),
+                },
+                Duration::from_secs(5),
+            )
+            .await
+            .expect("send request with ample timeout");
+
+        match response {
+            IpcResponse::ConfigData { key, value_json } => {
+                assert_eq!(key, "prompt");
+                assert_eq!(value_json.as_deref(), Some("\"ok\""));
+            }
+            other => panic!("unexpected response: {other:?}"),
+        }
+        assert_eq!(client.pending_stale_responses, 0);
+
+        server.await.expect("join server");
+        unsafe {
+            std::env::remove_var("PHILOTIC_HOTEL_SOCKET");
+        }
+        if Path::new(&socket_path).exists() {
+            let _ = std::fs::remove_file(&socket_path);
+        }
+    }
+
     #[test]
     fn disconnect_detection_matches_unexpected_eof() {
         let err = anyhow::Error::new(std::io::Error::from(ErrorKind::UnexpectedEof));
         assert!(is_ipc_disconnect(&err));
+    }
+
+    #[tokio::test]
+    async fn is_ipc_timeout_distinguishes_elapse_from_other_errors() {
+        let _env_guard = ipc_env_guard();
+        let socket_path = test_socket_path();
+        let listener = UnixListener::bind(&socket_path).expect("bind test socket");
+
+        let server = tokio::spawn({
+            let socket_path = socket_path.clone();
+            async move {
+                let (mut stream, _) = listener.accept().await.expect("accept client");
+                let buf = read_frame(&mut stream).await;
+                let _req: IpcRequest = serde_json::from_slice(&buf).expect("decode register");
+                write_frame(
+                    &mut stream,
+                    &serde_json::to_vec(&IpcResponse::success("reg", None)).unwrap(),
+                )
+                .await;
+                // Never respond to the next request — the client's timeout must elapse.
+                tokio::time::sleep(Duration::from_secs(5)).await;
+                let _ = std::fs::remove_file(&socket_path);
+            }
+        });
+
+        unsafe {
+            std::env::set_var("PHILOTIC_HOTEL_SOCKET", &socket_path);
+        }
+        let identity = GuestIdentity {
+            guest_id: "guest-test-timeout-kind".into(),
+            role: "test".into(),
+            supported_tools: Vec::new(),
+        };
+        let mut client = PhiloticClient::connect(identity)
+            .await
+            .expect("connect client");
+
+        let err = client
+            .send_request_with_timeout(
+                IpcRequest::GetConfig {
+                    key: "never".into(),
+                },
+                Duration::from_millis(20),
+            )
+            .await
+            .expect_err("expected timeout error");
+        assert!(
+            is_ipc_timeout(&err),
+            "expected an is_ipc_timeout error, got {err:?}"
+        );
+
+        let other = anyhow::anyhow!("some unrelated failure");
+        assert!(!is_ipc_timeout(&other));
+
+        server.abort();
+        unsafe {
+            std::env::remove_var("PHILOTIC_HOTEL_SOCKET");
+        }
+        if Path::new(&socket_path).exists() {
+            let _ = std::fs::remove_file(&socket_path);
+        }
     }
 
     #[test]
@@ -3174,6 +4555,29 @@ mod tests {
     }
 
     #[test]
+    fn return_route_reply_guest_id_beats_agent_id_fallback() {
+        // A role-incarnation philote (e.g. a whisper specialist running as a
+        // separate `{agent_id}:{role_name}` process) sets `reply_guest_id` to its
+        // own incarnation id. It MUST win over the bare `agent_id` fallback so the
+        // model response returns to the incarnation process — not the base agent,
+        // where it would be dropped and the specialist's turn would hang.
+        let task = serde_json::json!({
+            "reply_to": "node-1",
+            "reply_role": "agent",
+            "reply_guest_id": "agent-bjork-01:theoretician",
+            "agent_id": "agent-bjork-01"
+        });
+
+        let route = ReturnRoute::from_task(&task, "default-node", "default-role");
+        assert_eq!(route.role, "agent");
+        assert_eq!(
+            route.guest_id.as_deref(),
+            Some("agent-bjork-01:theoretician"),
+            "reply_guest_id (incarnation) must beat the agent_id base fallback"
+        );
+    }
+
+    #[test]
     fn return_route_agent_id_fallback_is_agent_role_only() {
         let task = serde_json::json!({
             "reply_to": "compat-node",
@@ -3185,5 +4589,268 @@ mod tests {
         assert_eq!(route.node, "compat-node");
         assert_eq!(route.role, "membrane");
         assert_eq!(route.guest_id, None);
+    }
+    #[test]
+    fn close_heal_work_item_request_serde_round_trip() {
+        // F8: appended at the END of IpcRequest, responds with Standard only —
+        // no new IpcResponse variant, so the untagged-ordering invariant holds.
+        let req = IpcRequest::CloseHealWorkItem {
+            work_item_id: "wi-42".into(),
+        };
+        let wire = serde_json::to_string(&req).expect("serialize");
+        assert!(wire.contains("\"close_heal_work_item\""), "wire: {wire}");
+        let back: IpcRequest = serde_json::from_str(&wire).expect("deserialize");
+        match back {
+            IpcRequest::CloseHealWorkItem { work_item_id } => {
+                assert_eq!(work_item_id, "wi-42");
+            }
+            other => panic!("expected CloseHealWorkItem, got {other:?}"),
+        }
+
+        // The close response is a plain Standard ack carrying {closed, work_item_id}.
+        let resp = serde_json::json!({
+            "ok": true,
+            "code": "OK",
+            "message": "Success",
+            "corr_id": "close_heal_work_item",
+            "data": { "closed": true, "work_item_id": "wi-42" }
+        });
+        let back: IpcResponse = serde_json::from_value(resp).expect("response");
+        match back {
+            IpcResponse::Standard { ok: true, data, .. } => {
+                let data = data.expect("data");
+                assert_eq!(data["closed"], true);
+                assert_eq!(data["work_item_id"], "wi-42");
+            }
+            other => panic!("expected Standard, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn file_heal_work_item_request_serde_round_trip() {
+        // New variant appended at the END of IpcRequest (externally-order-safe:
+        // the enum is internally tagged by "operation", so existing wire shapes
+        // are untouched; the END placement is a repo convention).
+        let req = IpcRequest::FileHealWorkItem {
+            pattern_tag: "connection_refused".into(),
+            guest_id: "membrane-telegram-01".into(),
+            occurrence_count: 5,
+            window_secs: 1800,
+            evidence_lines: vec!["connection refused".into(), "econnrefused".into()],
+        };
+        let wire = serde_json::to_string(&req).expect("serialize");
+        assert!(wire.contains("\"file_heal_work_item\""), "wire: {wire}");
+        let back: IpcRequest = serde_json::from_str(&wire).expect("deserialize");
+        match back {
+            IpcRequest::FileHealWorkItem {
+                pattern_tag,
+                guest_id,
+                occurrence_count,
+                window_secs,
+                evidence_lines,
+            } => {
+                assert_eq!(pattern_tag, "connection_refused");
+                assert_eq!(guest_id, "membrane-telegram-01");
+                assert_eq!(occurrence_count, 5);
+                assert_eq!(window_secs, 1800);
+                assert_eq!(evidence_lines.len(), 2);
+            }
+            other => panic!("expected FileHealWorkItem, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn file_heal_work_item_request_back_compat() {
+        // A sender built before evidence_lines existed (field omitted) must
+        // still deserialize — the field defaults to empty.
+        let wire = serde_json::json!({
+            "operation": "file_heal_work_item",
+            "payload": {
+                "pattern_tag": "panic",
+                "guest_id": "philote-01",
+                "occurrence_count": 7,
+                "window_secs": 900,
+            }
+        });
+        let back: IpcRequest = serde_json::from_value(wire).expect("deserialize");
+        match back {
+            IpcRequest::FileHealWorkItem { evidence_lines, .. } => {
+                assert!(evidence_lines.is_empty());
+            }
+            other => panic!("expected FileHealWorkItem, got {other:?}"),
+        }
+
+        // Pre-existing request shapes are unaffected by the appended variant.
+        let old = serde_json::json!({
+            "operation": "get_heal_queue_pending",
+            "payload": { "limit": 5 }
+        });
+        let back: IpcRequest = serde_json::from_value(old).expect("old request");
+        assert!(matches!(back, IpcRequest::GetHealQueuePending { limit: 5 }));
+
+        // The filing response is a plain Standard ack (no new IpcResponse
+        // variant), so the untagged-ordering invariant is untouched: a
+        // Standard payload with data must still parse as Standard.
+        let resp = serde_json::json!({
+            "ok": true,
+            "code": "OK",
+            "message": "Success",
+            "corr_id": "file_heal_work_item",
+            "data": { "filed": true, "deduped": false, "work_item_id": "wi-1" }
+        });
+        let back: IpcResponse = serde_json::from_value(resp).expect("response");
+        match back {
+            IpcResponse::Standard { ok: true, data, .. } => {
+                let data = data.expect("data");
+                assert_eq!(data["filed"], true);
+                assert_eq!(data["work_item_id"], "wi-1");
+            }
+            other => panic!("expected Standard, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn autonomy_action_requests_serde_round_trip() {
+        // Slice A2 variants live at the END of IpcRequest and respond with
+        // Standard only — no new IpcResponse variant, so the untagged-ordering
+        // invariant (all-optional variants like MemoryConfig stay last) holds.
+        let req = IpcRequest::ConsumeAutonomyAction {
+            lane: "graph.bridge_edges".into(),
+            action_summary: "bridge 2 RELATES_TO edge(s)".into(),
+            evidence: "feedback_id=feedback:recall:1 rating=Disconnected".into(),
+            reversal_hint: "MATCH ()-[r:RELATES_TO {feedback_signal_id: 'f1'}]-() DELETE r".into(),
+        };
+        let wire = serde_json::to_string(&req).expect("serialize");
+        assert!(wire.contains("\"consume_autonomy_action\""), "wire: {wire}");
+        let back: IpcRequest = serde_json::from_str(&wire).expect("deserialize");
+        match back {
+            IpcRequest::ConsumeAutonomyAction {
+                lane,
+                action_summary,
+                evidence,
+                reversal_hint,
+            } => {
+                assert_eq!(lane, "graph.bridge_edges");
+                assert!(action_summary.contains("RELATES_TO"));
+                assert!(evidence.contains("Disconnected"));
+                assert!(reversal_hint.contains("DELETE r"));
+            }
+            other => panic!("expected ConsumeAutonomyAction, got {other:?}"),
+        }
+
+        let req = IpcRequest::RecordAutonomyOutcome {
+            audit_id: "autonomy:graph.bridge_edges:abc".into(),
+            outcome: "confirmed_good".into(),
+        };
+        let wire = serde_json::to_string(&req).expect("serialize");
+        assert!(wire.contains("\"record_autonomy_outcome\""), "wire: {wire}");
+        let back: IpcRequest = serde_json::from_str(&wire).expect("deserialize");
+        match back {
+            IpcRequest::RecordAutonomyOutcome { audit_id, outcome } => {
+                assert_eq!(audit_id, "autonomy:graph.bridge_edges:abc");
+                assert_eq!(outcome, "confirmed_good");
+            }
+            other => panic!("expected RecordAutonomyOutcome, got {other:?}"),
+        }
+
+        // Pre-existing request shapes are unaffected by the appended variants.
+        let old = serde_json::json!({
+            "operation": "file_heal_work_item",
+            "payload": {
+                "pattern_tag": "panic",
+                "guest_id": "philote-01",
+                "occurrence_count": 1,
+                "window_secs": 900,
+            }
+        });
+        let back: IpcRequest = serde_json::from_value(old).expect("old request");
+        assert!(matches!(back, IpcRequest::FileHealWorkItem { .. }));
+
+        // The consult response is a plain Standard ack carrying the decision.
+        let resp = serde_json::json!({
+            "ok": true,
+            "code": "OK",
+            "message": "Success",
+            "corr_id": "consume_autonomy_action",
+            "data": {
+                "allowed": false,
+                "posture": "confirm_first",
+                "audit_id": "autonomy:graph.bridge_edges:abc"
+            }
+        });
+        let back: IpcResponse = serde_json::from_value(resp).expect("response");
+        match back {
+            IpcResponse::Standard { ok: true, data, .. } => {
+                let data = data.expect("data");
+                assert_eq!(data["allowed"], false);
+                assert_eq!(data["posture"], "confirm_first");
+            }
+            other => panic!("expected Standard, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn push_heal_event_request_serde_round_trip_and_back_compat() {
+        // PushHealEvent lives at the END of IpcRequest and responds with
+        // Standard only — no new IpcResponse variant, so the untagged-ordering
+        // invariant (all-optional variants like MemoryConfig stay last) holds.
+        let req = IpcRequest::PushHealEvent {
+            guest_id: "agent-jane-01".into(),
+            severity: "medium".into(),
+            pattern_tag: "stuck_turn_evicted:WaitingTool".into(),
+            detail: "Turn watchdog evicted stuck turn after 91s in WaitingTool.".into(),
+        };
+        let wire = serde_json::to_string(&req).expect("serialize");
+        assert!(wire.contains("\"push_heal_event\""), "wire: {wire}");
+        let back: IpcRequest = serde_json::from_str(&wire).expect("deserialize");
+        match back {
+            IpcRequest::PushHealEvent {
+                guest_id,
+                severity,
+                pattern_tag,
+                detail,
+            } => {
+                assert_eq!(guest_id, "agent-jane-01");
+                assert_eq!(severity, "medium");
+                assert_eq!(pattern_tag, "stuck_turn_evicted:WaitingTool");
+                assert!(detail.contains("watchdog"));
+            }
+            other => panic!("expected PushHealEvent, got {other:?}"),
+        }
+
+        // Pre-existing request shapes are unaffected by the appended variant.
+        let old = serde_json::json!({
+            "operation": "push_heal_entry",
+            "payload": { "guest_id": "g-1", "raw_text": "boom" }
+        });
+        let back: IpcRequest = serde_json::from_value(old).expect("old request");
+        assert!(matches!(back, IpcRequest::PushHealEntry { .. }));
+
+        let old = serde_json::json!({
+            "operation": "fail_task",
+            "payload": {
+                "task_id": "5f2a1a1e-0000-0000-0000-000000000001",
+                "error_code": "MODEL_EMPTY_RESPONSE",
+                "reason": "Model failed",
+            }
+        });
+        let back: IpcRequest = serde_json::from_value(old).expect("old fail_task");
+        assert!(matches!(back, IpcRequest::FailTask { .. }));
+
+        // The push response is a plain Standard ack.
+        let resp = serde_json::json!({
+            "ok": true,
+            "code": "OK",
+            "message": "Success",
+            "corr_id": "push_heal_event",
+            "data": { "collapsed": false, "id": "hq-1" }
+        });
+        let back: IpcResponse = serde_json::from_value(resp).expect("response");
+        match back {
+            IpcResponse::Standard { ok: true, data, .. } => {
+                assert_eq!(data.expect("data")["collapsed"], false);
+            }
+            other => panic!("expected Standard, got {other:?}"),
+        }
     }
 }

@@ -1,13 +1,19 @@
 use crate::controller::{
     BackoffStrategy, ControllerResponseEnvelope, ControllerTask, ModelProvider, NativeLiveProvider,
     NativeLiveRegistry, ProviderConfigs, ProviderOutput, ProviderRegistry, TaskKind,
+    refresh_gemini_credential_pool,
+};
+use crate::credential_pool::{CredentialPool, RotationTrigger};
+use crate::transcribe_stream::{
+    self, DEFAULT_IDLE_TIMEOUT_SECS, DEFAULT_MAX_SESSIONS, ElevenLabsRealtimeConnector,
+    IpcStreamReplySink, StreamFrame, StreamReplySink, SttSessionManager, parse_stream_frame,
 };
 use ansible_mesh_core::domain::GraphDomain;
 use ansible_mesh_core::router_trace::{
     RouterTraceStorage, RouterTrainingRecord, SqliteRouterTraceStorage,
 };
 use ansible_mesh_core::sqlite_storage::SqliteGraphStorage;
-use anyhow::Result;
+use anyhow::{Context, Result};
 use philotic_client::{
     GuestIdentity, IpcRequest, IpcResponse, PhiloticClient, ReturnRoute, TaskErrorPayload,
     is_ipc_disconnect,
@@ -20,6 +26,99 @@ use ulid::Ulid;
 
 fn local_node_id() -> String {
     std::env::var("PHILOTIC_NODE_ID").unwrap_or_else(|_| "local-aiua-01".to_string())
+}
+
+/// Fallback text model for the OpenRouter controller when neither
+/// `PHILOTIC_OPENROUTER_DEFAULT_MODEL` nor `config:openrouter_default_model`
+/// is set.
+///
+/// The OpenRouter controller reuses the generic OpenAI-compat provider
+/// (`OpenAIProvider`), whose own hardcoded fallback is `gpt-4.1-mini` — a bare
+/// slug that is NOT a valid OpenRouter model id. The controller must therefore
+/// supply its OWN OpenRouter-valid default rather than inheriting the OpenAI
+/// one. Keep this as the single source of truth the
+/// `model-controller-openrouter` bin references so the fallback can't silently
+/// regress back onto an OpenAI-shaped slug.
+pub const DEFAULT_OPENROUTER_MODEL: &str = "z-ai/glm-5.2";
+
+/// Default overall per-task provider-dispatch cap, in seconds.
+///
+/// Covers ANY await between receiving a task and obtaining a provider result —
+/// not just the provider's own HTTP round trip. Before this cap existed, the
+/// pre-dispatch IPC round trips in `ProviderConfigs::load` / credential-pool
+/// refresh (roughly a dozen sequential `send_request` calls with no per-call
+/// timeout) and the provider attempt+retry loop were each theoretically
+/// bounded on their own, but nothing capped the SUM — a single stuck IPC round
+/// trip before the provider was ever dispatched left the turn silent with the
+/// provider's own streaming caps (STREAMING_CONNECT/IDLE/TOTAL_SECS in
+/// gemini.rs) never engaging, riding philote's coarse 300s WaitingModel
+/// watchdog instead of failing fast onto the next fallback tier.
+/// (2026-07-09 stuck-turn forensic RC-1.)
+///
+/// Sized well under the 300s watchdog so a breach always leaves room for the
+/// FailTask → ladder-escalation round trip. Env-tunable via
+/// `PHILOTIC_MODEL_DISPATCH_TIMEOUT_SECS` for operators running against a
+/// known-slow vault/config backend without a rebuild.
+const MODEL_DISPATCH_TIMEOUT_SECS_DEFAULT: u64 = 55;
+
+fn model_dispatch_timeout() -> Duration {
+    Duration::from_secs(
+        std::env::var("PHILOTIC_MODEL_DISPATCH_TIMEOUT_SECS")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .filter(|&v| v > 0)
+            .unwrap_or(MODEL_DISPATCH_TIMEOUT_SECS_DEFAULT),
+    )
+}
+
+/// Upper bound for the scaled `voice.transcribe` dispatch budget. Kept safely
+/// under the 300s WaitingModel watchdog so a breach still leaves room for the
+/// FailTask → ladder-escalation round trip.
+const TRANSCRIBE_MAX_BUDGET_SECS: u64 = 240;
+
+/// Assumed clip length (seconds) when a voice memo carries no duration metadata,
+/// chosen so the budget defaults to the generous cap (30 + 1.5×140 = 240) rather
+/// than the short default — an unknown-length memo should get room to finish, not
+/// a guaranteed cut-off.
+const TRANSCRIBE_UNKNOWN_DURATION_SECS: u64 = 140;
+
+/// Dispatch budget for a single task. `voice.transcribe` of a long voice memo
+/// legitimately runs past the default 55s cap, so it gets a budget proportional to
+/// the clip length: `30 + 1.5 × duration_secs`, floored at the default dispatch
+/// timeout and capped at [`TRANSCRIBE_MAX_BUDGET_SECS`] (a 10s clip → floor 55s, a
+/// 60s clip → 120s, a 180s clip → the 240s cap). Duration comes from the audio
+/// attachment (e.g. Telegram `voice.duration`); when absent it falls back to
+/// [`TRANSCRIBE_UNKNOWN_DURATION_SECS`] → the cap. Every other task kind uses the
+/// default dispatch timeout unchanged.
+/// Pure budget math (seconds): `30 + 1.5 × duration`, clamped to
+/// `[default_secs, TRANSCRIBE_MAX_BUDGET_SECS]`. A `None` duration assumes a long
+/// clip ([`TRANSCRIBE_UNKNOWN_DURATION_SECS`]) so the budget lands at the cap
+/// rather than the short default.
+fn transcribe_budget_secs(default_secs: u64, duration_secs: Option<u64>) -> u64 {
+    let dur = duration_secs.unwrap_or(TRANSCRIBE_UNKNOWN_DURATION_SECS);
+    (30 + dur.saturating_mul(3) / 2).clamp(default_secs, TRANSCRIBE_MAX_BUDGET_SECS)
+}
+
+fn effective_dispatch_timeout(task: &ControllerTask) -> Duration {
+    let default = model_dispatch_timeout();
+    if task.kind != TaskKind::AudioTranscribe {
+        return default;
+    }
+    let duration_secs = task
+        .context
+        .attachments
+        .iter()
+        .filter_map(|a| a.duration_secs)
+        .max();
+    let budget = transcribe_budget_secs(default.as_secs(), duration_secs);
+    info!(
+        capability = "voice.transcribe",
+        clip_duration_secs = ?duration_secs,
+        budget_secs = budget,
+        scaled_from_duration = duration_secs.is_some(),
+        "sized transcription dispatch budget"
+    );
+    Duration::from_secs(budget)
 }
 
 type ProviderFactory =
@@ -46,6 +145,15 @@ struct ReplyRoute {
     session_id: String,
     turn_id: String,
     chat_id: String,
+    /// Persona/agent that owns this turn, threaded from philote's
+    /// `ModelRequestPayload.agent_id`. Empty string only for legacy payloads
+    /// that predate the field. Recorded verbatim into the training-tap trace.
+    agent_id: String,
+    /// Shadow-mode (`PHILOTIC_SHADOW_ORACLE`) annotations forwarded by philote:
+    /// the oracle's top pick and whether it agreed with the ladder's resolved
+    /// role. `None` when shadow mode was off. Persisted to the trace store only.
+    oracle_pick: Option<String>,
+    oracle_agreement: Option<bool>,
 }
 
 #[derive(Debug, Clone)]
@@ -122,6 +230,21 @@ pub async fn run_model_controller(config: ControllerGuestConfig) -> Result<()> {
         config.role
     );
 
+    // Credential pool state persists across tasks (cooldowns, pinned member)
+    // even though provider configs and providers are rebuilt per task.
+    // Gemini-only in slice 0 of the Model Failover Layers proposal.
+    let mut gemini_pool = CredentialPool::new("gemini");
+    let gemini_pool_enabled = matches!(config.role, "model" | "model.gemini");
+
+    // Streaming transcription sessions (voice.transcribe.stream) live at the
+    // runtime level — they are long-lived WS sessions, not one-shot provider
+    // invocations. Only the ElevenLabs controller receives these frames (role
+    // model.elevenlabs), but the manager is harmless elsewhere.
+    let mut stt_sessions = SttSessionManager::new(
+        DEFAULT_MAX_SESSIONS,
+        Duration::from_secs(DEFAULT_IDLE_TIMEOUT_SECS),
+    );
+
     loop {
         match tokio::time::timeout(Duration::from_secs(5), ipc_client.recv_task()).await {
             Ok(Ok(IpcResponse::InboundTask {
@@ -141,6 +264,20 @@ pub async fn run_model_controller(config: ControllerGuestConfig) -> Result<()> {
                         continue;
                     }
                 };
+
+                // Streaming transcription frames are session-level operations
+                // handled by the runtime's session manager — they must never
+                // reach normal one-shot provider dispatch.
+                if transcribe_stream::is_stream_task(&task_value) {
+                    handle_stream_frame(
+                        &mut ipc_client,
+                        &mut stt_sessions,
+                        &task_value,
+                        config.guest_id,
+                    )
+                    .await;
+                    continue;
+                }
 
                 let reply = ReplyRoute::from_task(&task_value);
 
@@ -167,9 +304,29 @@ pub async fn run_model_controller(config: ControllerGuestConfig) -> Result<()> {
                     }
                 };
 
-                let provider_configs = match ProviderConfigs::load(&mut ipc_client).await {
-                    Ok(configs) => configs,
-                    Err(err) => {
+                // Voice-transcription budget scaling: a long voice memo legitimately
+                // runs past the default 55s dispatch cap. `effective_dispatch` is the
+                // per-task ceiling (scaled by clip duration for `voice.transcribe`,
+                // default otherwise). For transcription the single provider attempt is
+                // allowed the whole budget — one long attempt beats a truncated retry.
+                // Pre-dispatch config loads below keep the default cap (they are quick
+                // and independent of clip length).
+                let effective_dispatch = effective_dispatch_timeout(&controller_task);
+                let is_transcribe = controller_task.kind == TaskKind::AudioTranscribe;
+
+                // Pre-dispatch config load: ~a dozen sequential IPC round trips
+                // (GetConfig / secret fetch), none individually timeout-bound.
+                // Wrap the whole load in the dispatch cap so a single stuck
+                // hotel/vault round trip can't silently burn the WaitingModel
+                // window before a provider is ever dispatched (RC-1).
+                let mut provider_configs = match tokio::time::timeout(
+                    model_dispatch_timeout(),
+                    ProviderConfigs::load(&mut ipc_client),
+                )
+                .await
+                {
+                    Ok(Ok(configs)) => configs,
+                    Ok(Err(err)) => {
                         emit_failure(
                             &mut ipc_client,
                             &reply,
@@ -184,7 +341,46 @@ pub async fn run_model_controller(config: ControllerGuestConfig) -> Result<()> {
                         .await?;
                         continue;
                     }
+                    Err(_) => {
+                        emit_failure(
+                            &mut ipc_client,
+                            &reply,
+                            Some(controller_task.kind.as_str()),
+                            None,
+                            config.guest_id,
+                            format!(
+                                "provider_timeout: config load exceeded {}s (pre-dispatch stall, no provider resolved yet)",
+                                model_dispatch_timeout().as_secs()
+                            ),
+                        )
+                        .await?;
+                        continue;
+                    }
                 };
+                if gemini_pool_enabled {
+                    match tokio::time::timeout(
+                        model_dispatch_timeout(),
+                        refresh_gemini_credential_pool(
+                            &mut ipc_client,
+                            &mut gemini_pool,
+                            &mut provider_configs,
+                        ),
+                    )
+                    .await
+                    {
+                        Ok(Ok(())) => {}
+                        Ok(Err(err)) => {
+                            warn!("gemini credential pool refresh failed: {err}");
+                        }
+                        Err(_) => {
+                            warn!(
+                                "gemini credential pool refresh exceeded {}s (pre-dispatch stall); continuing with existing pool state",
+                                model_dispatch_timeout().as_secs()
+                            );
+                        }
+                    }
+                }
+                let gemini_active_member = gemini_pool.active_member().map(|(idx, _)| idx);
                 let providers = ProviderRegistry::new((config.providers)(
                     http_client.clone(),
                     &provider_configs,
@@ -193,6 +389,36 @@ pub async fn run_model_controller(config: ControllerGuestConfig) -> Result<()> {
                     http_client.clone(),
                     &provider_configs,
                 ));
+
+                // Auxiliary-task model pinning (Model Failover Layers Slice 4).
+                // Loaded fresh per task alongside `provider_configs` above so a
+                // config change takes effect on the next dispatch without a
+                // restart. Any load failure (IPC error or timeout) degrades to
+                // `AuxModelConfig::default()` — Auto for every kind — never
+                // blocks or fails the task on account of this optional feature.
+                let aux_model_config = match tokio::time::timeout(
+                    model_dispatch_timeout(),
+                    crate::aux_model::AuxModelConfig::load(&mut ipc_client),
+                )
+                .await
+                {
+                    Ok(Ok(cfg)) => cfg,
+                    Ok(Err(err)) => {
+                        warn!(
+                            "aux_model config load failed; treating all aux tasks as Auto: {err}"
+                        );
+                        crate::aux_model::AuxModelConfig::default()
+                    }
+                    Err(_) => {
+                        warn!(
+                            "aux_model config load exceeded {}s; treating all aux tasks as Auto",
+                            model_dispatch_timeout().as_secs()
+                        );
+                        crate::aux_model::AuxModelConfig::default()
+                    }
+                };
+                let aux_pin = crate::aux_model::AuxTaskKind::from_task_kind(controller_task.kind)
+                    .and_then(|kind| aux_model_config.for_kind(kind));
 
                 let dispatch_start = Instant::now();
                 let task_kind = controller_task.kind.as_str().to_string();
@@ -306,6 +532,122 @@ pub async fn run_model_controller(config: ControllerGuestConfig) -> Result<()> {
                         }
                     }
                 } else {
+                    // Auxiliary-task model pinning (Model Failover Layers Slice 4):
+                    // if the operator configured a non-Auto `aux_model.<kind>` for
+                    // this task's aux kind, resolve the pin first, then walk
+                    // `fallback_chain` in order (one attempt each) on failure,
+                    // handling success/failure entirely in this block via
+                    // `continue`. When no pin is configured (`aux_pin` is `None`,
+                    // the default), this whole `if` is skipped and control falls
+                    // straight to the unmodified code below, so Auto behavior
+                    // stays bit-identical to today.
+                    if let Some(aux_model) = aux_pin {
+                        match crate::aux_model::dispatch_aux_chain(
+                            &controller_task,
+                            aux_model,
+                            &providers,
+                        )
+                        .await
+                        {
+                            Ok((provider_id, output)) => {
+                                let latency_ms = dispatch_start.elapsed().as_millis() as u64;
+                                let model_id = extract_output_model_gen(&output)
+                                    .or_else(|| controller_task.model.clone());
+                                record_routing_trace(
+                                    trace_store.as_deref(),
+                                    &reply,
+                                    &provider_id,
+                                    &task_kind,
+                                    "success",
+                                    None,
+                                    latency_ms,
+                                    model_id,
+                                    None,
+                                );
+                                if let Some(ref gd) = graph_domain {
+                                    if let Err(e) = gd.observe_model_outcome(
+                                        &provider_id,
+                                        &local_node_id(),
+                                        latency_ms,
+                                        true,
+                                    ) {
+                                        warn!("observe_model_outcome (success): {e}");
+                                    }
+                                }
+                                fire_transcription_capture_fanout(
+                                    &controller_task,
+                                    &output,
+                                    &reply,
+                                    config.guest_id,
+                                );
+                                match output {
+                                    ProviderOutput::ToolCall {
+                                        tool_name,
+                                        arguments,
+                                    } => {
+                                        emit_tool_call_response(
+                                            &mut ipc_client,
+                                            &reply,
+                                            tool_name,
+                                            arguments,
+                                            None,
+                                        )
+                                        .await?;
+                                    }
+                                    output => {
+                                        let response = ControllerResponseEnvelope::from_output(
+                                            &controller_task,
+                                            &provider_id,
+                                            output,
+                                        )?;
+                                        emit_text_response(&mut ipc_client, &reply, response)
+                                            .await?;
+                                    }
+                                }
+                                continue;
+                            }
+                            Err((last_provider, err)) => {
+                                if controller_task.kind == TaskKind::Embed {
+                                    // Embedding is the one aux kind that degrades to
+                                    // today's Auto path (the ONNX sidecar) on chain
+                                    // exhaustion instead of surfacing the error — an
+                                    // embedding caller (e.g. memory indexing) must
+                                    // never hard-fail just because an optional pin
+                                    // or fallback_chain was misconfigured. Falling
+                                    // through to the unmodified code below
+                                    // re-resolves via
+                                    // `providers.resolve(&controller_task)` on the
+                                    // ORIGINAL (unmodified provider/model) task —
+                                    // the exact same resolution today's Auto path
+                                    // performs.
+                                    warn!(
+                                        "aux fallback_chain exhausted for embedding task \
+                                         (last provider tried: {:?}): {}. Degrading to \
+                                         Auto (sidecar) resolution.",
+                                        last_provider, err
+                                    );
+                                } else {
+                                    error!(
+                                        "aux dispatch failed for {} task (last provider tried: {:?}): {}",
+                                        controller_task.kind.as_str(),
+                                        last_provider,
+                                        err
+                                    );
+                                    emit_failure(
+                                        &mut ipc_client,
+                                        &reply,
+                                        Some(controller_task.kind.as_str()),
+                                        last_provider.as_deref(),
+                                        config.guest_id,
+                                        format!("Provider invocation failed: {}", err),
+                                    )
+                                    .await?;
+                                    continue;
+                                }
+                            }
+                        }
+                    }
+
                     let primary_provider = match providers.resolve(&controller_task) {
                         Ok(provider) => provider,
                         Err(err) => {
@@ -337,7 +679,7 @@ pub async fn run_model_controller(config: ControllerGuestConfig) -> Result<()> {
                     // health, walk the full supporting-provider list and substitute
                     // the first healthy alternative. Only applies when there is no
                     // explicit provider_hint — hints are honoured unconditionally.
-                    let provider = if controller_task.provider_hint().is_none() {
+                    let mut provider = if controller_task.provider_hint().is_none() {
                         let primary_degraded = graph_domain
                             .as_ref()
                             .and_then(|gd| {
@@ -407,16 +749,39 @@ pub async fn run_model_controller(config: ControllerGuestConfig) -> Result<()> {
                     // outer timeout and drives the retry loop so providers don't need to
                     // implement this themselves.
                     //
-                    // Invariant: attempt_policy.total_secs × retry_policy.max_attempts < 120s
-                    // (philote WaitingModel watchdog), ensuring the controller always
-                    // resolves before the watchdog evicts the turn.
-                    let provider_result = {
+                    // Invariant: attempt_policy.total_secs × retry_policy.max_attempts < 300s
+                    // (philote WaitingModel watchdog). If the controller resolves within budget,
+                    // philote escalates via its own retry path; if the IPC connection drops
+                    // silently, the watchdog fires and escalates to the next fallback tier.
+                    //
+                    // The per-attempt `attempt_secs` timeout below bounds a single HTTP
+                    // round trip, but credential-pool key rotation (Layer 1) can chain
+                    // several attempt cycles back to back on auth/rate-limit failures.
+                    // `model_dispatch_timeout()` is an outer hard ceiling on the WHOLE
+                    // attempt+rotation sequence so a single degraded provider (even one
+                    // that keeps "making progress" by rotating keys) cannot alone consume
+                    // the full WaitingModel window before the ladder engages (RC-1).
+                    let provider_result = match tokio::time::timeout(effective_dispatch, async {
                         let retry = provider.retry_policy();
-                        let attempt_secs = provider.attempt_policy().total_secs;
+                        // Transcription gets the full task budget for its single
+                        // attempt; all other kinds keep the provider's own per-attempt
+                        // policy (leaving room for retries within the dispatch cap).
+                        let attempt_secs = if is_transcribe {
+                            effective_dispatch.as_secs()
+                        } else {
+                            provider.attempt_policy().total_secs
+                        };
                         let mut last_err = anyhow::anyhow!("dispatch: no attempts completed");
                         let mut result: Option<Result<ProviderOutput>> = None;
+                        let mut attempt: u8 = 0;
+                        // Layer 1 (credential pools): on auth/rate-limit failures the
+                        // pool rotates to a sibling key and the rotated member gets
+                        // exactly one fresh attempt. Bounded so worst-case wall clock
+                        // (attempts + rotations) stays under the philote watchdog.
+                        let mut active_pool_member = gemini_active_member;
+                        let mut rotations_left: u8 = 2;
 
-                        for attempt in 0u8..retry.max_attempts {
+                        while attempt < retry.max_attempts {
                             if attempt > 0 {
                                 warn!(
                                     "Provider [{}] retrying (attempt {}/{})",
@@ -478,19 +843,26 @@ pub async fn run_model_controller(config: ControllerGuestConfig) -> Result<()> {
                                         // 10s timeout on the ACK from aiua: if the hotel is
                                         // slow to respond, drop the connection rather than
                                         // filling the channel and stalling invoke_streaming.
-                                        let send_result = tokio::time::timeout(
-                                            Duration::from_secs(10),
-                                            stream_ipc.send_request(IpcRequest::EmitTask {
-                                                target_node: reply_clone.return_route.node.clone(),
-                                                target_role: reply_clone.return_route.role.clone(),
-                                                target_guest_id: reply_clone
-                                                    .return_route
-                                                    .guest_id
-                                                    .clone(),
-                                                task_json,
-                                            }),
-                                        )
-                                        .await;
+                                        let send_result = stream_ipc
+                                            .send_request_with_timeout(
+                                                IpcRequest::EmitTask {
+                                                    target_node: reply_clone
+                                                        .return_route
+                                                        .node
+                                                        .clone(),
+                                                    target_role: reply_clone
+                                                        .return_route
+                                                        .role
+                                                        .clone(),
+                                                    target_guest_id: reply_clone
+                                                        .return_route
+                                                        .guest_id
+                                                        .clone(),
+                                                    task_json,
+                                                },
+                                                Duration::from_secs(10),
+                                            )
+                                            .await;
                                         if send_result.is_err() {
                                             // Timeout or IPC error — stop forwarding tokens.
                                             // Dropping token_rx makes future send() calls in
@@ -529,6 +901,11 @@ pub async fn run_model_controller(config: ControllerGuestConfig) -> Result<()> {
 
                             match attempt_result {
                                 Ok(output) => {
+                                    if provider.id() == "gemini" {
+                                        if let Some(idx) = active_pool_member {
+                                            gemini_pool.note_success(idx);
+                                        }
+                                    }
                                     result = Some(Ok(output));
                                     break;
                                 }
@@ -538,6 +915,45 @@ pub async fn run_model_controller(config: ControllerGuestConfig) -> Result<()> {
                                         Some(provider.id()),
                                         &e.to_string(),
                                     );
+                                    // Layer 1: rotate to a sibling API key on auth/rate-limit
+                                    // failures before the error surfaces as tier-worthy.
+                                    let rotation = RotationTrigger::from_sub_kind(
+                                        classified.sub_kind.as_deref(),
+                                    )
+                                    .filter(|_| provider.id() == "gemini" && rotations_left > 0)
+                                    .and_then(|trigger| {
+                                        let idx = active_pool_member?;
+                                        gemini_pool
+                                            .rotate_on_failure(idx, trigger)
+                                            .map(|next| (trigger, idx, next))
+                                    });
+                                    if let Some((trigger, failed_idx, (next_idx, next_key))) =
+                                        rotation
+                                    {
+                                        provider_configs.set_provider_api_key("gemini", next_key);
+                                        let rebuilt = ProviderRegistry::new((config.providers)(
+                                            http_client.clone(),
+                                            &provider_configs,
+                                        ));
+                                        if let Some(next_provider) = rebuilt
+                                            .all_supporting(&controller_task)
+                                            .into_iter()
+                                            .find(|p| p.id() == "gemini")
+                                        {
+                                            warn!(
+                                                "Gemini credential pool: member {} failed ({:?}); rotating to member {}",
+                                                failed_idx, trigger, next_idx
+                                            );
+                                            rotations_left -= 1;
+                                            active_pool_member = Some(next_idx);
+                                            provider = next_provider;
+                                            last_err = e;
+                                            attempt = retry.max_attempts.saturating_sub(1);
+                                            continue;
+                                        }
+                                        // Rebuild lost the provider (should not happen) —
+                                        // fall through to normal failure handling.
+                                    }
                                     let retryable = classified.retryable.unwrap_or(false);
                                     let has_more = attempt + 1 < retry.max_attempts;
                                     if retryable && has_more {
@@ -554,9 +970,18 @@ pub async fn run_model_controller(config: ControllerGuestConfig) -> Result<()> {
                                     }
                                 }
                             }
+                            attempt += 1;
                         }
 
                         result.unwrap_or(Err(last_err))
+                    })
+                    .await
+                    {
+                        Ok(inner) => inner,
+                        Err(_) => Err(anyhow::anyhow!(
+                            "provider_timeout: overall dispatch exceeded {}s across attempt/rotation cycles",
+                            effective_dispatch.as_secs()
+                        )),
                     };
 
                     match provider_result {
@@ -614,63 +1039,12 @@ pub async fn run_model_controller(config: ControllerGuestConfig) -> Result<()> {
                             // ── Transcription flywheel fan-out ────────────────
                             // After a successful AudioTranscribe, fire a capture
                             // envelope to role=router-listener (if enabled).
-                            if controller_task.kind == TaskKind::AudioTranscribe {
-                                if let ProviderOutput::Text {
-                                    ref content,
-                                    ref model_gen,
-                                    ..
-                                } = output
-                                {
-                                    if std::env::var("PHILOTIC_ROUTER_CAPTURE_ENABLED").as_deref()
-                                        == Ok("true")
-                                    {
-                                        let blob_url = controller_task
-                                            .media_attachments()
-                                            .first()
-                                            .and_then(|a| a.url.clone());
-
-                                        let capture_json = serde_json::to_string(&json!({
-                                            "kind": "transcription_capture",
-                                            "session_id": reply.session_id,
-                                            "turn_id": reply.turn_id,
-                                            "agent_id": config.guest_id,
-                                            "transcript": content,
-                                            "model_gen": model_gen,
-                                            "blob_download_url": blob_url,
-                                            "timestamp": SystemTime::now()
-                                                .duration_since(UNIX_EPOCH)
-                                                .map(|d| d.as_secs())
-                                                .unwrap_or(0),
-                                        }))
-                                        .unwrap_or_default();
-
-                                        let fanout_identity = GuestIdentity {
-                                            guest_id: format!("capture-fanout-{}", Ulid::new()),
-                                            role: config.guest_id.to_string(),
-                                            supported_tools: Vec::new(),
-                                        };
-                                        tokio::spawn(async move {
-                                            let connect = tokio::time::timeout(
-                                                Duration::from_secs(5),
-                                                PhiloticClient::connect(fanout_identity),
-                                            )
-                                            .await;
-                                            if let Ok(Ok(mut fanout_ipc)) = connect {
-                                                let _ = tokio::time::timeout(
-                                                    Duration::from_secs(10),
-                                                    fanout_ipc.send_request(IpcRequest::EmitTask {
-                                                        target_node: local_node_id(),
-                                                        target_role: "router-listener".to_string(),
-                                                        target_guest_id: None,
-                                                        task_json: capture_json,
-                                                    }),
-                                                )
-                                                .await;
-                                            }
-                                        });
-                                    }
-                                }
-                            }
+                            fire_transcription_capture_fanout(
+                                &controller_task,
+                                &output,
+                                &reply,
+                                config.guest_id,
+                            );
 
                             let response = ControllerResponseEnvelope::from_output(
                                 &controller_task,
@@ -734,11 +1108,142 @@ pub async fn run_model_controller(config: ControllerGuestConfig) -> Result<()> {
                         "Hotel IPC disconnected; model controller [{}] exiting.",
                         config.guest_id
                     );
+                    // Clean shutdown: finalize and close any live streaming
+                    // transcription sessions before the process exits.
+                    stt_sessions.shutdown().await;
                     return Ok(());
                 }
                 warn!("IPC recv error: {}", err);
             }
             Err(_) => {}
+        }
+    }
+}
+
+/// Dispatch one `voice.transcribe.stream` frame (open/chunk/end) into the
+/// streaming-transcription session manager. Every OPEN failure path delivers
+/// a terminal `is_final: true` error reply so the consumer never hangs;
+/// chunk/end frames for unknown sessions carry no reply address and are
+/// logged and dropped.
+async fn handle_stream_frame(
+    ipc_client: &mut PhiloticClient,
+    sessions: &mut SttSessionManager,
+    task_value: &Value,
+    controller_guest_id: &'static str,
+) {
+    match parse_stream_frame(task_value) {
+        Ok(StreamFrame::Open(open)) => {
+            let session_id = open.stream_session_id.clone();
+            // Dedicated reply IPC connection: session replies are emitted from
+            // spawned session tasks and cannot share the controller's client.
+            let mut sink = match IpcStreamReplySink::connect(
+                controller_guest_id,
+                open.reply.clone(),
+            )
+            .await
+            {
+                Ok(sink) => sink,
+                Err(err) => {
+                    warn!(
+                        session = %session_id,
+                        "transcribe-stream open: reply IPC connect failed, dropping open: {err:#}"
+                    );
+                    return;
+                }
+            };
+
+            // Resolve the ElevenLabs API key through the same config plumbing
+            // batch STT uses, bounded by the dispatch cap (RC-1 discipline).
+            let api_key = match tokio::time::timeout(
+                model_dispatch_timeout(),
+                ProviderConfigs::load(ipc_client),
+            )
+            .await
+            {
+                Ok(Ok(configs)) => configs
+                    .elevenlabs_api_key
+                    .filter(|key| !key.trim().is_empty()),
+                Ok(Err(err)) => {
+                    let _ = sink
+                        .send(
+                            &session_id,
+                            "",
+                            true,
+                            Some(&format!("provider config load failed: {err}")),
+                        )
+                        .await;
+                    return;
+                }
+                Err(_) => {
+                    let _ = sink
+                        .send(
+                            &session_id,
+                            "",
+                            true,
+                            Some(&format!(
+                                "provider_timeout: config load exceeded {}s before stream open",
+                                model_dispatch_timeout().as_secs()
+                            )),
+                        )
+                        .await;
+                    return;
+                }
+            };
+            let Some(api_key) = api_key else {
+                let _ = sink
+                    .send(
+                        &session_id,
+                        "",
+                        true,
+                        Some("ElevenLabs API key missing from config"),
+                    )
+                    .await;
+                return;
+            };
+
+            let connector = Arc::new(ElevenLabsRealtimeConnector::new(api_key));
+            sessions.open(open, connector, Box::new(sink)).await;
+        }
+        Ok(StreamFrame::Chunk {
+            stream_session_id,
+            audio_base64,
+        }) => {
+            if !sessions.chunk(&stream_session_id, audio_base64).await {
+                warn!(
+                    session = %stream_session_id,
+                    "transcribe-stream chunk for unknown session dropped"
+                );
+            }
+        }
+        Ok(StreamFrame::End { stream_session_id }) => {
+            if !sessions.end(&stream_session_id).await {
+                warn!(
+                    session = %stream_session_id,
+                    "transcribe-stream end for unknown session ignored"
+                );
+            }
+        }
+        Err(err) => {
+            warn!("malformed transcribe-stream frame: {err:#}");
+            // Best effort: OPEN-shaped frames carry a reply address — use it
+            // to deliver a terminal error instead of leaving the consumer to
+            // hang on a session that will never open.
+            if let (Some(session_id), Some(reply)) = (
+                transcribe_stream::stream_session_id(task_value),
+                transcribe_stream::reply_address(task_value),
+            ) {
+                if let Ok(mut sink) = IpcStreamReplySink::connect(controller_guest_id, reply).await
+                {
+                    let _ = sink
+                        .send(
+                            session_id,
+                            "",
+                            true,
+                            Some(&format!("invalid stream frame: {err}")),
+                        )
+                        .await;
+                }
+            }
         }
     }
 }
@@ -920,6 +1425,77 @@ fn validate_stub_prompt(task_value: &Value, stub_value: &Value) -> Result<()> {
     Ok(())
 }
 
+/// After a successful `AudioTranscribe`, fire a capture envelope to
+/// role=router-listener (if `PHILOTIC_ROUTER_CAPTURE_ENABLED` is set). No-op
+/// for any other task kind. Shared by the default dispatch path and the aux
+/// pinned/fallback-chain dispatch path (Model Failover Layers Slice 4) so
+/// both preserve the same flywheel behavior on success.
+fn fire_transcription_capture_fanout(
+    controller_task: &ControllerTask,
+    output: &ProviderOutput,
+    reply: &ReplyRoute,
+    guest_id: &'static str,
+) {
+    if controller_task.kind != TaskKind::AudioTranscribe {
+        return;
+    }
+    let ProviderOutput::Text {
+        content, model_gen, ..
+    } = output
+    else {
+        return;
+    };
+    if std::env::var("PHILOTIC_ROUTER_CAPTURE_ENABLED").as_deref() != Ok("true") {
+        return;
+    }
+
+    let blob_url = controller_task
+        .media_attachments()
+        .first()
+        .and_then(|a| a.url.clone());
+
+    let capture_json = serde_json::to_string(&json!({
+        "kind": "transcription_capture",
+        "session_id": reply.session_id,
+        "turn_id": reply.turn_id,
+        "agent_id": guest_id,
+        "transcript": content,
+        "model_gen": model_gen,
+        "blob_download_url": blob_url,
+        "timestamp": SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0),
+    }))
+    .unwrap_or_default();
+
+    let fanout_identity = GuestIdentity {
+        guest_id: format!("capture-fanout-{}", Ulid::new()),
+        role: guest_id.to_string(),
+        supported_tools: Vec::new(),
+    };
+    tokio::spawn(async move {
+        let connect = tokio::time::timeout(
+            Duration::from_secs(5),
+            PhiloticClient::connect(fanout_identity),
+        )
+        .await;
+        if let Ok(Ok(mut fanout_ipc)) = connect {
+            let _ = fanout_ipc
+                .send_request_with_timeout(
+                    IpcRequest::EmitTask {
+                        target_node: local_node_id(),
+                        target_role: "router-listener".to_string(),
+                        target_guest_id: None,
+                        task_json: capture_json,
+                    },
+                    Duration::from_secs(10),
+                )
+                .await;
+        }
+    });
+}
+
 async fn emit_text_response(
     ipc_client: &mut PhiloticClient,
     reply: &ReplyRoute,
@@ -966,9 +1542,10 @@ async fn emit_text_response(
         .to_string(),
     };
 
-    tokio::time::timeout(Duration::from_secs(30), ipc_client.send_request(reply_req))
+    ipc_client
+        .send_request_with_timeout(reply_req, Duration::from_secs(30))
         .await
-        .map_err(|_| anyhow::anyhow!("emit_text_response: ipc ack timeout after 30s"))??;
+        .context("emit_text_response: ipc ack failed or timed out after 30s")?;
     Ok(())
 }
 
@@ -1003,9 +1580,10 @@ async fn emit_tool_call_response(
         .to_string(),
     };
 
-    tokio::time::timeout(Duration::from_secs(30), ipc_client.send_request(reply_req))
+    ipc_client
+        .send_request_with_timeout(reply_req, Duration::from_secs(30))
         .await
-        .map_err(|_| anyhow::anyhow!("emit_tool_call_response: ipc ack timeout after 30s"))??;
+        .context("emit_tool_call_response: ipc ack failed or timed out after 30s")?;
     Ok(())
 }
 
@@ -1030,6 +1608,44 @@ fn native_live_tool_call_model_result(
     }))
 }
 
+/// Isolation guarantee (Model Failover Layers Slice 4 — auxiliary-task model
+/// pinning): auxiliary (non-cognitive) task failures must never be classified
+/// in a way that engages philote's cognitive fallback ladder
+/// (`classify_provider_error` / `advance_turn_to_next_fallback_tier`) or
+/// persists a session `FallbackOverride`.
+///
+/// `classify_provider_failure` stamps `error_class` / `sub_kind` / `status`
+/// purely from the error message text, without regard to capability — that
+/// annotation must stay intact for model-router's OWN internal
+/// retry/rotation decisions (computed separately, earlier, in the attempt
+/// loop), but the WIRE payload sent to philote for the three real aux
+/// capabilities (`media.analyze`, `voice.transcribe`, `text.embed`) must
+/// present as an un-annotated, non-"text.generate" failure so philote's
+/// `classify_provider_error` falls through to its existing capability-gated
+/// default (`Unclassified` for any capability other than
+/// `text.generate`/`response.generate`) instead of matching one of the
+/// annotated escalation classes ahead of that check. This makes aux tasks
+/// resolve and degrade independently of the cognitive ladder, as required —
+/// and applies regardless of whether the failing aux task was Auto or
+/// pinned, since the guarantee must hold for aux dispatch in general.
+fn isolate_aux_failure_from_cognitive_ladder(
+    mut payload: TaskErrorPayload,
+    capability: Option<&str>,
+) -> TaskErrorPayload {
+    let is_aux_capability = matches!(
+        capability,
+        Some(k) if k == TaskKind::MediaAnalyze.as_str()
+            || k == TaskKind::AudioTranscribe.as_str()
+            || k == TaskKind::Embed.as_str()
+    );
+    if is_aux_capability {
+        payload.error_class = None;
+        payload.sub_kind = None;
+        payload.status = None;
+    }
+    payload
+}
+
 async fn emit_failure(
     ipc_client: &mut PhiloticClient,
     reply: &ReplyRoute,
@@ -1038,7 +1654,10 @@ async fn emit_failure(
     guest_id: &str,
     message: String,
 ) -> Result<()> {
-    let error_payload = classify_provider_failure(capability, provider, &message);
+    let error_payload = isolate_aux_failure_from_cognitive_ladder(
+        classify_provider_failure(capability, provider, &message),
+        capability,
+    );
     error!(
         "Emitting model failure capability={:?} provider={:?}: {}",
         capability, provider, message
@@ -1050,14 +1669,15 @@ async fn emit_failure(
         provider.unwrap_or("unknown"),
         message
     );
-    let _ = tokio::time::timeout(
-        Duration::from_secs(10),
-        ipc_client.send_request(IpcRequest::PushHealEntry {
-            guest_id: guest_id.to_string(),
-            raw_text,
-        }),
-    )
-    .await;
+    let _ = ipc_client
+        .send_request_with_timeout(
+            IpcRequest::PushHealEntry {
+                guest_id: guest_id.to_string(),
+                raw_text,
+            },
+            Duration::from_secs(10),
+        )
+        .await;
     let reply_req = IpcRequest::EmitTask {
         target_node: reply.return_route.node.clone(),
         target_role: reply.return_route.role.clone(),
@@ -1086,9 +1706,10 @@ async fn emit_failure(
         .to_string(),
     };
 
-    tokio::time::timeout(Duration::from_secs(30), ipc_client.send_request(reply_req))
+    ipc_client
+        .send_request_with_timeout(reply_req, Duration::from_secs(30))
         .await
-        .map_err(|_| anyhow::anyhow!("emit_failure: ipc ack timeout after 30s"))??;
+        .context("emit_failure: ipc ack failed or timed out after 30s")?;
     Ok(())
 }
 
@@ -1111,16 +1732,17 @@ async fn emit_falling_back(
         "chat_id": reply.chat_id,
     })
     .to_string();
-    let _ = tokio::time::timeout(
-        Duration::from_secs(10),
-        ipc_client.send_request(IpcRequest::EmitTask {
-            target_node: reply.return_route.node.clone(),
-            target_role: reply.return_route.role.clone(),
-            target_guest_id: reply.return_route.guest_id.clone(),
-            task_json,
-        }),
-    )
-    .await;
+    let _ = ipc_client
+        .send_request_with_timeout(
+            IpcRequest::EmitTask {
+                target_node: reply.return_route.node.clone(),
+                target_role: reply.return_route.role.clone(),
+                target_guest_id: reply.return_route.guest_id.clone(),
+                task_json,
+            },
+            Duration::from_secs(10),
+        )
+        .await;
 }
 
 /// Emit a dispatch status event to philote so it can surface transient state
@@ -1147,16 +1769,47 @@ async fn emit_dispatch_status(
         "chat_id": reply.chat_id,
     })
     .to_string();
-    let _ = tokio::time::timeout(
-        Duration::from_secs(10),
-        ipc_client.send_request(IpcRequest::EmitTask {
-            target_node: reply.return_route.node.clone(),
-            target_role: reply.return_route.role.clone(),
-            target_guest_id: reply.return_route.guest_id.clone(),
-            task_json,
-        }),
-    )
-    .await;
+    let _ = ipc_client
+        .send_request_with_timeout(
+            IpcRequest::EmitTask {
+                target_node: reply.return_route.node.clone(),
+                target_role: reply.return_route.role.clone(),
+                target_guest_id: reply.return_route.guest_id.clone(),
+                task_json,
+            },
+            Duration::from_secs(10),
+        )
+        .await;
+}
+
+/// Extract an HTTP status code (400..=599) from a provider error message.
+///
+/// Providers format failures as e.g. `"Gemini API error (400): ..."` or append
+/// a bracketed ` [503]` on streaming errors. Only 3-digit tokens delimited by
+/// `(`/`)`/`[`/`]`/`:`/space (or string boundaries) count, so token counts like
+/// "4096 tokens" never match.
+fn extract_http_status(message: &str) -> Option<u16> {
+    let bytes = message.as_bytes();
+    let is_delim = |c: u8| matches!(c, b'(' | b')' | b'[' | b']' | b':' | b' ' | b',' | b'.');
+    for i in 0..bytes.len().saturating_sub(2) {
+        if !bytes[i..i + 3].iter().all(u8::is_ascii_digit) {
+            continue;
+        }
+        let before_ok = i == 0 || is_delim(bytes[i - 1]);
+        let after_ok = i + 3 == bytes.len() || is_delim(bytes[i + 3]);
+        if !before_ok || !after_ok {
+            continue;
+        }
+        if let Ok(n) = std::str::from_utf8(&bytes[i..i + 3])
+            .unwrap_or("")
+            .parse::<u16>()
+        {
+            if (400..=599).contains(&n) {
+                return Some(n);
+            }
+        }
+    }
+    None
 }
 
 fn classify_provider_failure(
@@ -1170,6 +1823,28 @@ fn classify_provider_failure(
         provider,
         message.to_string(),
     );
+    payload.status = extract_http_status(message);
+
+    // Content-policy / safety block (currently Gemini-specific — see
+    // `GeminiProvider::detect_content_policy_block`). Checked before every
+    // other rule: this is a 2xx-with-empty-candidates outcome, not an HTTP
+    // failure, so it must never fall into the generic "unclassified
+    // provider_failure" bucket that philote's `classify_provider_error`
+    // defaults to `SwitchProvider` (2026-07-08 forensic) — that default exists
+    // for genuinely unrecognized failures, but a content block is recognized
+    // right here and deserves its own non-escalating outcome: switching to a
+    // different-behaving model mid-conversation is the jarring behavior this
+    // classification exists to prevent.
+    if message.contains("gemini_content_policy_block") {
+        payload.code = Some("MODEL_CONTENT_BLOCKED".into());
+        payload.sub_kind = Some("content_policy_block".into());
+        // Not retryable in the classic sense (retrying the identical prompt
+        // against the identical provider reproduces the identical block), but
+        // this is intentionally NOT `switch_provider` — see `error_class` below.
+        payload.retryable = Some(false);
+        payload.error_class = Some("content_blocked".into());
+        return payload;
+    }
 
     let malformed_tool_call = message.contains("tool_call.arguments missing from")
         || message.contains("returned invalid tool_call")
@@ -1179,6 +1854,9 @@ fn classify_provider_failure(
         payload.code = Some("MODEL_INVALID_TOOL_CALL".into());
         payload.retryable = Some(true);
         payload.sub_kind = Some("content_error".into());
+        // If the same provider mangles the repaired request too, the caller
+        // should switch providers rather than fail the turn.
+        payload.error_class = Some("switch_provider".into());
         return payload;
     }
 
@@ -1194,6 +1872,24 @@ fn classify_provider_failure(
     if is_network {
         payload.sub_kind = Some("network_error".into());
         payload.retryable = Some(true);
+        payload.error_class = Some("retry_same_provider".into());
+        return payload;
+    }
+
+    // Overall dispatch / time-to-first-token cap breached — the provider made
+    // no usable progress across the WHOLE budget (pre-dispatch config/credential
+    // IPC load, or the full attempt+retry sequence never producing output).
+    // Unlike a mid-stream `streaming_timeout` (which had already started moving
+    // bytes and gets one same-tier retry), a dispatch-cap breach means this
+    // provider tier is stuck from the start — go straight to the next fallback
+    // tier instead of burning another full attempt cycle on the same provider.
+    // (2026-07-09 stuck-turn forensic RC-1: a single slow/stuck provider must
+    // not be allowed to consume the entire philote WaitingModel window before
+    // the ladder engages.)
+    if message.contains("provider_timeout") {
+        payload.sub_kind = Some("provider_timeout".into());
+        payload.retryable = Some(true);
+        payload.error_class = Some("switch_provider".into());
         return payload;
     }
 
@@ -1201,13 +1897,16 @@ fn classify_provider_failure(
     if message.contains("streaming_timeout") {
         payload.sub_kind = Some("streaming_timeout".into());
         payload.retryable = Some(true);
+        payload.error_class = Some("retry_same_provider".into());
         return payload;
     }
 
-    // Rate limit (HTTP 429).
+    // Rate limit (HTTP 429). Immediate same-provider retry will 429 again —
+    // the next different-provider tier is the productive move.
     if message.contains("429") || message.contains("rate limit") || message.contains("quota") {
         payload.sub_kind = Some("rate_limit".into());
         payload.retryable = Some(true);
+        payload.error_class = Some("switch_provider".into());
         return payload;
     }
 
@@ -1226,10 +1925,12 @@ fn classify_provider_failure(
     {
         payload.sub_kind = Some("provider_auth".into());
         payload.retryable = Some(false);
+        payload.error_class = Some("fatal".into());
         return payload;
     }
 
-    // Generic provider-side HTTP error (5xx or non-retryable 4xx).
+    // Generic provider-side HTTP error (5xx) — transient; retrying (same
+    // provider or next tier) may succeed.
     if message.contains("500")
         || message.contains("502")
         || message.contains("503")
@@ -1237,6 +1938,22 @@ fn classify_provider_failure(
     {
         payload.sub_kind = Some("provider_error".into());
         payload.retryable = Some(true);
+        payload.error_class = Some("retry_same_provider".into());
+        return payload;
+    }
+
+    // Contract-level 4xx (400 INVALID_ARGUMENT, 404, 422, refusal…): the exact
+    // same request will fail identically on this provider — switch providers.
+    let is_contract_4xx = matches!(payload.status, Some(s) if (400..500).contains(&s))
+        || lower_message.contains("invalid_argument")
+        || lower_message.contains("invalid argument")
+        || lower_message.contains("failed_precondition")
+        || lower_message.contains("bad request");
+
+    if is_contract_4xx {
+        payload.sub_kind = Some("invalid_request".into());
+        payload.retryable = Some(false);
+        payload.error_class = Some("switch_provider".into());
         return payload;
     }
 
@@ -1278,7 +1995,7 @@ fn record_routing_trace(
     let Some(store) = store else { return };
     let record = RouterTrainingRecord {
         trace_id: Ulid::new().to_string(),
-        agent_id: String::new(),
+        agent_id: reply.agent_id.clone(),
         session_id: reply.session_id.clone(),
         turn_id: reply.turn_id.clone(),
         provider_id: provider_id.to_string(),
@@ -1288,6 +2005,8 @@ fn record_routing_trace(
         failure_code: failure_code.map(str::to_string),
         latency_ms: Some(latency_ms),
         token_count,
+        oracle_pick: reply.oracle_pick.clone(),
+        oracle_agreement: reply.oracle_agreement,
         timestamp: now_epoch_secs(),
     };
     if let Err(e) = store.record_trace(&record) {
@@ -1330,13 +2049,280 @@ impl ReplyRoute {
                 .and_then(Value::as_str)
                 .unwrap_or_default()
                 .to_string(),
+            agent_id: task
+                .get("agent_id")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            oracle_pick: task
+                .get("oracle_pick")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            oracle_agreement: task.get("oracle_agreement").and_then(Value::as_bool),
         }
     }
 }
 
 #[cfg(test)]
 mod failure_tests {
-    use super::classify_provider_failure;
+    use super::{
+        classify_provider_failure, extract_http_status, isolate_aux_failure_from_cognitive_ladder,
+        model_dispatch_timeout,
+    };
+    use crate::controller::TaskKind;
+    use std::sync::Mutex;
+    use std::time::Duration;
+
+    // ── Aux-task isolation guarantee (Slice 4) ────────────────────────────
+
+    /// The exact aux-failure shape this slice's isolation guarantee protects
+    /// against: a real, richly-annotated `classify_provider_failure` outcome
+    /// (the same shape a text.generate 429 would carry, which DOES trigger
+    /// philote's ladder) must be stripped down to an un-annotated payload for
+    /// each of the three real aux capabilities, so philote's
+    /// `classify_provider_error` falls through to its capability-gated
+    /// default (`Unclassified`) instead of matching `error_class`/`sub_kind`/
+    /// `status` ahead of that check.
+    #[test]
+    fn aux_capabilities_strip_ladder_annotations_from_rate_limited_failure() {
+        for capability in [
+            TaskKind::MediaAnalyze.as_str(),
+            TaskKind::AudioTranscribe.as_str(),
+            TaskKind::Embed.as_str(),
+        ] {
+            let annotated = classify_provider_failure(
+                Some(capability),
+                Some("gemini"),
+                "Gemini API error (429): rate limit exceeded",
+            );
+            // Sanity: classify_provider_failure itself is NOT capability-aware —
+            // it stamps the same escalation-worthy fields regardless of
+            // capability. This is the raw shape the isolation guarantee acts on.
+            assert_eq!(annotated.error_class.as_deref(), Some("switch_provider"));
+            assert_eq!(annotated.sub_kind.as_deref(), Some("rate_limit"));
+
+            let isolated = isolate_aux_failure_from_cognitive_ladder(annotated, Some(capability));
+            assert_eq!(
+                isolated.error_class, None,
+                "capability [{capability}] must not carry error_class over the wire"
+            );
+            assert_eq!(
+                isolated.sub_kind, None,
+                "capability [{capability}] must not carry sub_kind over the wire"
+            );
+            assert_eq!(
+                isolated.status, None,
+                "capability [{capability}] must not carry status over the wire"
+            );
+            // `code`/`retryable`/`message`/`provider` are informational and
+            // must NOT be stripped — only the three fields philote's
+            // classify_provider_error consults for ladder escalation.
+            assert_eq!(isolated.provider.as_deref(), Some("gemini"));
+        }
+    }
+
+    /// Cognitive capabilities (and the `None` legacy-envelope case) must be
+    /// completely unaffected — this fix is deliberately narrow-scoped to the
+    /// three real aux kinds.
+    #[test]
+    fn cognitive_capabilities_are_not_isolated() {
+        for capability in [None, Some("text.generate"), Some("response.generate")] {
+            let annotated = classify_provider_failure(
+                capability,
+                Some("gemini"),
+                "Gemini API error (429): rate limit exceeded",
+            );
+            let isolated = isolate_aux_failure_from_cognitive_ladder(annotated.clone(), capability);
+            assert_eq!(isolated.error_class, annotated.error_class);
+            assert_eq!(isolated.sub_kind, annotated.sub_kind);
+            assert_eq!(isolated.status, annotated.status);
+        }
+    }
+
+    /// Closes the Component A / shadow loop end to end on the model-router
+    /// side: a task carrying a real `agent_id` (plus optional shadow fields)
+    /// is parsed by `ReplyRoute::from_task` and then persisted by
+    /// `record_routing_trace` — so the written trace carries the real agent
+    /// (not the old `String::new()`) and the shadow annotations round-trip.
+    #[test]
+    fn from_task_threads_agent_id_and_shadow_into_recorded_trace() {
+        use super::{ReplyRoute, record_routing_trace};
+        use ansible_mesh_core::router_trace::{
+            ProviderStats, RouterTraceStorage, RouterTrainingRecord,
+        };
+
+        #[derive(Default)]
+        struct MemTrace(Mutex<Vec<RouterTrainingRecord>>);
+        impl RouterTraceStorage for MemTrace {
+            fn record_trace(&self, r: &RouterTrainingRecord) -> anyhow::Result<()> {
+                self.0.lock().unwrap().push(r.clone());
+                Ok(())
+            }
+            fn list_traces(&self, _: usize) -> anyhow::Result<Vec<RouterTrainingRecord>> {
+                unreachable!()
+            }
+            fn list_traces_by_agent(
+                &self,
+                _: &str,
+                _: usize,
+            ) -> anyhow::Result<Vec<RouterTrainingRecord>> {
+                unreachable!()
+            }
+            fn list_traces_by_provider(
+                &self,
+                _: &str,
+                _: usize,
+            ) -> anyhow::Result<Vec<RouterTrainingRecord>> {
+                unreachable!()
+            }
+            fn provider_stats(&self, _: Option<u64>) -> anyhow::Result<Vec<ProviderStats>> {
+                unreachable!()
+            }
+        }
+
+        let task = serde_json::json!({
+            "action": "generate_text",
+            "session_id": "telegram:123:agent-jane",
+            "turn_id": "turn-1",
+            "chat_id": "123",
+            "agent_id": "jane",
+            "oracle_pick": "model.openrouter:openrouter",
+            "oracle_agreement": false,
+        });
+
+        // Parse: real agent + shadow annotations land on the ReplyRoute.
+        let reply = ReplyRoute::from_task(&task);
+        assert_eq!(reply.agent_id, "jane");
+        assert_eq!(
+            reply.oracle_pick.as_deref(),
+            Some("model.openrouter:openrouter")
+        );
+        assert_eq!(reply.oracle_agreement, Some(false));
+
+        // Write: the recorded trace carries the real agent (Component A fix)
+        // and the shadow fields — never an empty agent_id.
+        let store = MemTrace::default();
+        record_routing_trace(
+            Some(&store),
+            &reply,
+            "openrouter",
+            "text.generate",
+            "success",
+            None,
+            42,
+            Some("glm-5.2".into()),
+            None,
+        );
+        let rows = store.0.lock().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].agent_id, "jane");
+        assert_eq!(
+            rows[0].oracle_pick.as_deref(),
+            Some("model.openrouter:openrouter")
+        );
+        assert_eq!(rows[0].oracle_agreement, Some(false));
+
+        // And the legacy/off path: a task with no agent_id / shadow fields
+        // records an empty agent + NULL shadow (interop with old philote).
+        let legacy = serde_json::json!({ "action": "generate_text", "turn_id": "t" });
+        let legacy_reply = ReplyRoute::from_task(&legacy);
+        assert_eq!(legacy_reply.agent_id, "");
+        assert_eq!(legacy_reply.oracle_pick, None);
+        assert_eq!(legacy_reply.oracle_agreement, None);
+    }
+
+    /// Serializes tests that mutate `PHILOTIC_MODEL_DISPATCH_TIMEOUT_SECS` —
+    /// cargo runs tests in this module on separate threads within one
+    /// process, and env vars are process-global.
+    static DISPATCH_TIMEOUT_ENV_GUARD: Mutex<()> = Mutex::new(());
+    fn dispatch_timeout_env_guard() -> std::sync::MutexGuard<'static, ()> {
+        DISPATCH_TIMEOUT_ENV_GUARD
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// RC-1 (2026-07-09 stuck-turn forensic): an overall dispatch-cap breach
+    /// (pre-dispatch config load, or the whole attempt+rotation sequence)
+    /// must classify as `switch_provider` immediately — NOT the softer
+    /// `retry_same_provider` bucket `streaming_timeout` gets, and NOT a
+    /// silent unclassified MODEL_EMPTY_RESPONSE-shaped envelope. A provider
+    /// that made zero progress across its entire budget should not get
+    /// another same-tier cycle; the ladder should engage right away.
+    #[test]
+    fn classify_provider_failure_marks_provider_timeout_switch_provider() {
+        let payload = classify_provider_failure(
+            Some("text.generate"),
+            Some("gemini"),
+            "provider_timeout: overall dispatch exceeded 55s across attempt/rotation cycles",
+        );
+
+        assert_eq!(payload.kind, "provider_failure");
+        assert_eq!(payload.sub_kind.as_deref(), Some("provider_timeout"));
+        assert_eq!(payload.retryable, Some(true));
+        assert_eq!(payload.error_class.as_deref(), Some("switch_provider"));
+        // Not the mid-stream idle bucket, and not a MODEL_EMPTY_RESPONSE-style
+        // unclassified code.
+        assert_ne!(payload.sub_kind.as_deref(), Some("streaming_timeout"));
+        assert_eq!(payload.code, None);
+    }
+
+    #[test]
+    fn classify_provider_failure_config_load_timeout_message_matches_provider_timeout() {
+        // Exact message shape emitted when ProviderConfigs::load times out —
+        // no provider has been resolved yet at that point in dispatch.
+        let payload = classify_provider_failure(
+            Some("text.generate"),
+            None,
+            "provider_timeout: config load exceeded 55s (pre-dispatch stall, no provider resolved yet)",
+        );
+
+        assert_eq!(payload.sub_kind.as_deref(), Some("provider_timeout"));
+        assert_eq!(payload.error_class.as_deref(), Some("switch_provider"));
+    }
+
+    /// A genuine mid-stream idle stall (bytes had already started moving, or
+    /// the provider's own inner SSE cap fired) keeps its existing gentler
+    /// same-tier-once-then-escalate treatment — this fix must not regress it.
+    #[test]
+    fn classify_provider_failure_streaming_timeout_still_retry_same_provider() {
+        let payload = classify_provider_failure(
+            Some("text.generate"),
+            Some("gemini"),
+            "streaming_timeout: Gemini SSE stream produced no data for 8s",
+        );
+
+        assert_eq!(payload.sub_kind.as_deref(), Some("streaming_timeout"));
+        assert_eq!(payload.error_class.as_deref(), Some("retry_same_provider"));
+    }
+
+    #[test]
+    fn model_dispatch_timeout_defaults_and_honors_env_override() {
+        let _guard = dispatch_timeout_env_guard();
+        unsafe {
+            std::env::remove_var("PHILOTIC_MODEL_DISPATCH_TIMEOUT_SECS");
+        }
+        assert_eq!(model_dispatch_timeout(), Duration::from_secs(55));
+
+        unsafe {
+            std::env::set_var("PHILOTIC_MODEL_DISPATCH_TIMEOUT_SECS", "20");
+        }
+        assert_eq!(model_dispatch_timeout(), Duration::from_secs(20));
+
+        // Invalid / zero values fall back to the default rather than
+        // producing a zero-duration timeout that would fail every dispatch.
+        unsafe {
+            std::env::set_var("PHILOTIC_MODEL_DISPATCH_TIMEOUT_SECS", "0");
+        }
+        assert_eq!(model_dispatch_timeout(), Duration::from_secs(55));
+        unsafe {
+            std::env::set_var("PHILOTIC_MODEL_DISPATCH_TIMEOUT_SECS", "not-a-number");
+        }
+        assert_eq!(model_dispatch_timeout(), Duration::from_secs(55));
+
+        unsafe {
+            std::env::remove_var("PHILOTIC_MODEL_DISPATCH_TIMEOUT_SECS");
+        }
+    }
 
     #[test]
     fn classify_provider_failure_marks_malformed_tool_calls_retryable() {
@@ -1379,6 +2365,114 @@ mod failure_tests {
         assert_eq!(payload.capability.as_deref(), Some("text.generate"));
         assert_eq!(payload.sub_kind.as_deref(), Some("provider_auth"));
         assert_eq!(payload.retryable, Some(false));
+        assert_eq!(payload.error_class.as_deref(), Some("fatal"));
+        assert_eq!(payload.status, Some(400));
+    }
+
+    /// Forensic 2026-07-08: a Gemini 400 INVALID_ARGUMENT must carry a
+    /// machine-readable switch_provider class so philote engages the fallback
+    /// ladder instead of failing the turn as MODEL_EMPTY_RESPONSE.
+    #[test]
+    fn classify_provider_failure_marks_contract_400_switch_provider() {
+        let payload = classify_provider_failure(
+            Some("text.generate"),
+            Some("gemini"),
+            "Gemini API error (400): Request contains an invalid argument. INVALID_ARGUMENT",
+        );
+
+        assert_eq!(payload.sub_kind.as_deref(), Some("invalid_request"));
+        assert_eq!(payload.retryable, Some(false));
+        assert_eq!(payload.error_class.as_deref(), Some("switch_provider"));
+        assert_eq!(payload.status, Some(400));
+    }
+
+    #[test]
+    fn classify_provider_failure_marks_5xx_retry_same_provider() {
+        let payload = classify_provider_failure(
+            Some("text.generate"),
+            Some("gemini"),
+            "Gemini API error (503): The model is overloaded. Please try again later.",
+        );
+
+        assert_eq!(payload.sub_kind.as_deref(), Some("provider_error"));
+        assert_eq!(payload.retryable, Some(true));
+        assert_eq!(payload.error_class.as_deref(), Some("retry_same_provider"));
+        assert_eq!(payload.status, Some(503));
+    }
+
+    #[test]
+    fn classify_provider_failure_marks_rate_limit_switch_provider() {
+        let payload = classify_provider_failure(
+            Some("text.generate"),
+            Some("gemini"),
+            "Gemini API error (429): Resource has been exhausted (e.g. check quota).",
+        );
+
+        assert_eq!(payload.sub_kind.as_deref(), Some("rate_limit"));
+        assert_eq!(payload.error_class.as_deref(), Some("switch_provider"));
+        assert_eq!(payload.status, Some(429));
+    }
+
+    #[test]
+    fn classify_provider_failure_marks_network_retry_same_provider() {
+        let payload = classify_provider_failure(
+            Some("text.generate"),
+            Some("ollama"),
+            "error sending request for url (http://127.0.0.1:11434/api/chat)",
+        );
+
+        assert_eq!(payload.sub_kind.as_deref(), Some("network_error"));
+        assert_eq!(payload.error_class.as_deref(), Some("retry_same_provider"));
+    }
+
+    /// The core of the second fix: a Gemini safety block (carried as the
+    /// `gemini_content_policy_block` marker bailed by
+    /// `GeminiProvider::detect_content_policy_block`) must classify as
+    /// `content_blocked`, NOT `switch_provider` — switching to a
+    /// different-behaving model mid-conversation is the jarring failover this
+    /// class exists to prevent (2026-07-09 operator report).
+    #[test]
+    fn classify_provider_failure_marks_content_policy_block_as_content_blocked_not_switch() {
+        let payload = classify_provider_failure(
+            Some("text.generate"),
+            Some("gemini"),
+            "gemini_content_policy_block: finishReason=SAFETY",
+        );
+
+        assert_eq!(payload.sub_kind.as_deref(), Some("content_policy_block"));
+        assert_eq!(payload.error_class.as_deref(), Some("content_blocked"));
+        assert_ne!(payload.error_class.as_deref(), Some("switch_provider"));
+        assert_ne!(payload.error_class.as_deref(), Some("retry_same_provider"));
+        assert_eq!(payload.code.as_deref(), Some("MODEL_CONTENT_BLOCKED"));
+    }
+
+    #[test]
+    fn classify_provider_failure_marks_prompt_feedback_block_reason_as_content_blocked() {
+        let payload = classify_provider_failure(
+            Some("text.generate"),
+            Some("gemini"),
+            "gemini_content_policy_block: promptFeedback.blockReason=SAFETY",
+        );
+
+        assert_eq!(payload.error_class.as_deref(), Some("content_blocked"));
+    }
+
+    #[test]
+    fn extract_http_status_reads_provider_error_formats() {
+        assert_eq!(
+            extract_http_status("Gemini API error (400): bad request"),
+            Some(400)
+        );
+        assert_eq!(
+            extract_http_status("Anthropic API error (529): overloaded"),
+            Some(529)
+        );
+        assert_eq!(extract_http_status("stream stalled [503]"), Some(503));
+        assert_eq!(extract_http_status("HTTP 404 model not found"), Some(404));
+        // Token counts and non-status digits never match.
+        assert_eq!(extract_http_status("prompt is 4096 tokens"), None);
+        assert_eq!(extract_http_status("id 123456 rejected"), None);
+        assert_eq!(extract_http_status("no digits at all"), None);
     }
 }
 
@@ -1487,5 +2581,41 @@ mod tests {
             model_result["native_live"]["session_marker"]["resumption_handle"],
             json!("resume-123")
         );
+    }
+
+    #[test]
+    fn transcribe_budget_scales_with_clip_duration() {
+        // Default per-task cap when no override env is set.
+        let default = super::MODEL_DISPATCH_TIMEOUT_SECS_DEFAULT; // 55
+        // 60s clip -> 30 + 90 = 120s.
+        assert_eq!(super::transcribe_budget_secs(default, Some(60)), 120);
+        // Short 10s clip -> 45s, floored up to the default 55s.
+        assert_eq!(super::transcribe_budget_secs(default, Some(10)), 55);
+        // Long 180s clip -> 300s, capped at 240s (< 300s watchdog).
+        assert_eq!(super::transcribe_budget_secs(default, Some(180)), 240);
+        // Exactly at the cap boundary: 140s -> 30 + 210 = 240.
+        assert_eq!(super::transcribe_budget_secs(default, Some(140)), 240);
+        // Unknown duration assumes a long clip -> lands at the cap, never the floor.
+        assert_eq!(
+            super::transcribe_budget_secs(default, None),
+            super::TRANSCRIBE_MAX_BUDGET_SECS
+        );
+    }
+}
+
+#[cfg(test)]
+mod openrouter_default_tests {
+    use super::DEFAULT_OPENROUTER_MODEL;
+
+    /// The OpenRouter controller must supply its own OpenRouter-valid default
+    /// model. Regression guard: it must NOT fall back to the generic
+    /// `OpenAIProvider` slug `gpt-4.1-mini` (nor its `openai/`-prefixed form),
+    /// which is what the bin used before this fix. This pins the single const
+    /// the `model-controller-openrouter` bin references.
+    #[test]
+    fn openrouter_default_model_is_glm_not_openai_slug() {
+        assert_eq!(DEFAULT_OPENROUTER_MODEL, "z-ai/glm-5.2");
+        assert_ne!(DEFAULT_OPENROUTER_MODEL, "gpt-4.1-mini");
+        assert_ne!(DEFAULT_OPENROUTER_MODEL, "openai/gpt-4.1-mini");
     }
 }

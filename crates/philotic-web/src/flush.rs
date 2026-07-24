@@ -27,8 +27,12 @@ const PHILOTIC_BINS: &[&str] = &[
     "model-controller-elevenlabs",
     "model-controller-mlx",
     "tool-runner",
+    // Retired hotel graph guest (codex/graph-runner-retire); kept so stale
+    // fleet processes are still flushed until the crate is deleted.
     "graph-runner",
+    // Legacy per-agent graph binary; kept so old processes are still flushed.
     "agent-graph-runner",
+    "agent-datasource",
     "philotic-web",
 ];
 

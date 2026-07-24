@@ -56,6 +56,10 @@ async fn main() -> anyhow::Result<()> {
             metadata: serde_json::Value::Null,
         },
         proposed_graph_refs: vec![],
+        observed_by: None,
+        observed_role: None,
+        edges: vec![],
+        provenance: None,
     };
 
     let now = chrono::Utc::now().to_rfc3339();

@@ -2,6 +2,7 @@
 members = [
     "crates/aiua",
     "crates/membrane-mcp",
+    "crates/membrane-mcp-client",
     "crates/membrane",
     "crates/membrane-discord",
     "crates/membrane-telegram",
@@ -10,10 +11,10 @@ members = [
     "crates/onnx-runner",
     "crates/tool-runner",
     "crates/philotic-client",
+    "crates/philotic-edge-protocol",
     "crates/ansible-mesh-core",
     "crates/memory-core",
     "crates/philotic-web",
-    "crates/graph-runner",
     "crates/philotic-sandbox",
     "crates/mlx-runner",
     "crates/media-prep",
@@ -29,5 +30,6 @@ members = [
     "crates/media-codec",
     "crates/perimeter-core",
     "crates/heal-dispatcher",
+    "crates/exec-guard",
 ]
 resolver = "2"

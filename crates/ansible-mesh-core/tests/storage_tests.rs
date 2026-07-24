@@ -127,11 +127,17 @@ fn sample_role_incarnation(role_name: &str) -> RoleIncarnationRecord {
             iteration_cap: Some(12),
             approval_policy: Some("default".into()),
             model_profile: Some("gemini-default".into()),
+            model_bindings: Default::default(),
             context_window_policy: Some("balanced".into()),
             loop_script: None,
             fallback_tiers: Vec::new(),
+            paracrine_hop_budget: None,
+            paracrine_chain_budget_secs: None,
+            context_window: None,
+            plan_continuation_budget: None,
         },
         home_node: None,
+        ..Default::default()
     }
 }
 
@@ -880,6 +886,7 @@ fn graph_storage_lists_role_incarnations_by_agent() {
             inactive_ttl_seconds: None,
             turn_loop_config: TurnLoopConfig::default(),
             home_node: None,
+            ..Default::default()
         })
         .unwrap();
 
@@ -922,6 +929,8 @@ fn graph_storage_toolset_profile_round_trip() {
         allowed_skills: vec!["handoff.to_role".into()],
         on_demand_skills: vec![],
         description: Some("Core orchestrator profile.".into()),
+        remote_tool_runners: vec![],
+        seed_baseline: None,
     };
 
     store.upsert_toolset_profile(&profile).unwrap();

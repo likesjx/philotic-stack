@@ -1,6 +1,5 @@
 pub mod config;
 pub mod fleet;
-pub mod muninn_bridge;
 pub mod self_model;
 pub mod sver;
 

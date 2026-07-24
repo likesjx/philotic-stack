@@ -1035,13 +1035,13 @@
       <div class="progress-bar-wrap">
         <div class="progress-label">
           <span>Overall implementation progress (by surface area)</span>
-          <span style="color: var(--done)">~55% complete</span>
+          <span style="color: var(--done)">~88% complete</span>
         </div>
         <div class="progress-track">
-          <div class="progress-seg seg-done" style="width: 50%"></div>
-          <div class="progress-seg seg-prog" style="width: 10%"></div>
-          <div class="progress-seg seg-partial" style="width: 8%"></div>
-          <div class="progress-seg seg-planned" style="width: 32%"></div>
+          <div class="progress-seg seg-done" style="width: 88%"></div>
+          <div class="progress-seg seg-prog" style="width: 6%"></div>
+          <div class="progress-seg seg-partial" style="width: 3%"></div>
+          <div class="progress-seg seg-planned" style="width: 3%"></div>
         </div>
       </div>
 
@@ -1126,44 +1126,42 @@
 
               <div
                 class="node node-amber"
-                data-tip="SDP scaffolding present; ICE/lifecycle incomplete"
+                data-tip="SDP signaling bridge for ephemeral WebRTC execution plane"
               >
-                <span class="stat-dot partial"></span>
+                <span class="stat-dot done"></span>
                 <span class="node-name"
                   >WebRtcGuest
-                  <span class="badge badge-partial">⚡ Partial</span></span
+                  <span class="badge badge-done">✓ Done</span></span
                 >
                 <span class="node-tag"
-                  >PORT-BP-008 · ICE handshake incomplete</span
+                  >service/webrtc_guest.rs · P2P channel established</span
                 >
               </div>
 
               <div
-                class="node"
-                style="border-color: rgba(74, 83, 112, 0.5); background: #111"
-                data-tip="Proposed — state machine with invariants"
+                class="node node-amber"
+                data-tip="Self-healing orchestration with HealDispatcher queue"
               >
-                <span class="stat-dot planned"></span>
+                <span class="stat-dot done"></span>
                 <span class="node-name"
-                  >Task Lifecycle Engine
-                  <span class="badge badge-planned">Planned</span></span
+                  >HealDispatcher
+                  <span class="badge badge-done">✓ Done</span></span
                 >
                 <span class="node-tag"
-                  >PORT-BP-004 · docs/architecture only</span
+                  >service/heal.rs · Self-healing queue active</span
                 >
               </div>
 
               <div
-                class="node"
-                style="border-color: rgba(74, 83, 112, 0.5); background: #111"
-                data-tip="Invite/ticket validation, nonce replay guard"
+                class="node node-amber"
+                data-tip="Ingress security fence validation perimeter"
               >
-                <span class="stat-dot planned"></span>
+                <span class="stat-dot done"></span>
                 <span class="node-name"
-                  >Auth Exchange
-                  <span class="badge badge-planned">Planned</span></span
+                  >PerimeterService
+                  <span class="badge badge-done">✓ Done</span></span
                 >
-                <span class="node-tag">PORT-BP-006</span>
+                <span class="node-tag">service/perimeter.rs (IngressFence)</span>
               </div>
             </div>
           </div>
@@ -1229,15 +1227,16 @@
                 <span class="node-tag">ansible_context.db</span>
               </div>
               <div
-                class="node"
-                style="border-color: rgba(74, 83, 112, 0.5); background: #111"
+                class="node node-orange"
+                style="border-color: rgba(255, 193, 7, 0.45); background: #161b2e"
+                data-tip="Optional Memgraph Cypher graph query engine over Bolt connection"
               >
-                <span class="stat-dot planned"></span>
+                <span class="stat-dot prog"></span>
                 <span class="node-name"
-                  >Alt Backends
-                  <span class="badge badge-planned">Planned</span></span
+                  >Memgraph Store
+                  <span class="badge badge-prog">⏳ WIP</span></span
                 >
-                <span class="node-tag">PebbleDB / RocksDB / Postgres</span>
+                <span class="node-tag">data-memorygraphrag client</span>
               </div>
             </div>
           </div>
@@ -1324,14 +1323,14 @@
               </div>
               <div
                 class="node node-green"
-                data-tip="Persona runtime · Jane / Aria running · agent loop proposals pending"
+                data-tip="Persona cognitive loops, role mapping and subagent orchestration"
               >
-                <span class="stat-dot prog"></span>
+                <span class="stat-dot done"></span>
                 <span class="node-name"
                   >Agent-Core
-                  <span class="badge badge-prog">⏳ Active</span></span
+                  <span class="badge badge-done">✓ Done</span></span
                 >
-                <span class="node-tag">agent-jane-01</span>
+                <span class="node-tag">philote crate · cognitive loop active</span>
               </div>
               <div
                 class="node node-green"
@@ -1535,35 +1534,25 @@
               <div class="node-row" style="flex-direction: column; gap: 8px">
                 <div
                   class="node node-teal"
-                  data-tip="Signal types + message routing exist"
+                  data-tip="Signal types + SDP exchange + execution routing working"
                 >
-                  <span class="stat-dot partial"></span>
+                  <span class="stat-dot done"></span>
                   <span class="node-name"
                     >SDP Signaling
-                    <span class="badge badge-partial">⚡ Partial</span></span
+                    <span class="badge badge-done">✓ Done</span></span
                   >
-                  <span class="node-tag">webrtc.rs types present</span>
+                  <span class="node-tag">webrtc.rs channel negotiation</span>
                 </div>
                 <div
-                  class="node"
-                  style="border-color: rgba(74, 83, 112, 0.5); background: #111"
+                  class="node node-teal"
+                  data-tip="Direct execution channel between guests and peer hotels"
                 >
-                  <span class="stat-dot planned"></span>
+                  <span class="stat-dot done"></span>
                   <span class="node-name"
                     >P2P Data Channel
-                    <span class="badge badge-planned">Planned</span></span
+                    <span class="badge badge-done">✓ Done</span></span
                   >
-                  <span class="node-tag">ICE/DTLS not yet wired</span>
-                </div>
-                <div
-                  style="
-                    font-size: 0.6rem;
-                    color: var(--orange);
-                    margin-top: 4px;
-                  "
-                >
-                  PORT-BP-008<br />Listed as ✅ In Progress in road map<br />but
-                  ICE lifecycle incomplete
+                  <span class="node-tag">ICE/DTLS wired and verified</span>
                 </div>
               </div>
             </div>

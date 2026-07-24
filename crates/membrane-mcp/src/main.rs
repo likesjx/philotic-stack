@@ -1,5 +1,6 @@
 mod auth;
-mod dispatch;
+#[cfg(test)]
+mod dispatch_tests;
 mod protocol;
 mod routing;
 mod server;
@@ -104,20 +105,111 @@ impl VaultResolver for IpcVaultResolver {
     }
 }
 
+// ── Listener manager — perimeter-true binding ────────────────────────────────
+
+/// Owns the HTTP listener and rebinds it when the effective audience changes.
+///
+/// The bind address derives from the endpoint's declared exposure tier and the
+/// hotel's current perimeter ceiling:
+/// - no declared endpoint config (legacy/static route mode), `Local` exposure,
+///   or a ceiling below the declared tier → `127.0.0.1` (loopback-only)
+/// - declared `Lan`/`Mesh`/`Internet` honored by the ceiling → `0.0.0.0`
+///
+/// Narrowing (ceiling drops below the declared tier) rebinds immediately;
+/// widening only happens after re-validation against the declared tier.
+struct ListenerManager {
+    port: u16,
+    state: Arc<MembraneState>,
+    current: Option<(SocketAddr, tokio::task::JoinHandle<()>)>,
+}
+
+impl ListenerManager {
+    fn new(port: u16, state: Arc<MembraneState>) -> Self {
+        Self {
+            port,
+            state,
+            current: None,
+        }
+    }
+
+    fn effective_addr(&self) -> SocketAddr {
+        let declared = *self.state.declared_exposure.read().unwrap();
+        let ceiling = *self.state.ingress_tier.read().unwrap();
+        let wide = matches!(
+            declared,
+            Some(tier) if tier > ansible_mesh_core::ExposureTier::Local && tier <= ceiling
+        );
+        if wide {
+            SocketAddr::from(([0, 0, 0, 0], self.port))
+        } else {
+            SocketAddr::from(([127, 0, 0, 1], self.port))
+        }
+    }
+
+    /// Ensure the listener is bound at the effective address, rebinding if the
+    /// declared exposure or perimeter ceiling changed it.
+    async fn reconcile(&mut self) {
+        let addr = self.effective_addr();
+        if let Some((bound, _)) = &self.current {
+            if *bound == addr {
+                return;
+            }
+        }
+        if let Some((old, handle)) = self.current.take() {
+            info!(%old, new = %addr, "rebinding MCP listener for perimeter change");
+            handle.abort();
+            let _ = handle.await;
+        }
+
+        let router = server::build_router(self.state.clone())
+            .into_make_service_with_connect_info::<SocketAddr>();
+
+        // The previous listener's fd releases on task drop; retry briefly in
+        // case the old socket has not been reaped yet.
+        let mut listener = None;
+        for attempt in 0..10 {
+            match tokio::net::TcpListener::bind(addr).await {
+                Ok(l) => {
+                    listener = Some(l);
+                    break;
+                }
+                Err(e) if attempt < 9 => {
+                    warn!(%addr, err = %e, "MCP listener bind failed — retrying");
+                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                }
+                Err(e) => error!(%addr, err = %e, "MCP listener bind failed permanently"),
+            }
+        }
+        let Some(listener) = listener else {
+            return;
+        };
+
+        info!(%addr, "MCP membrane HTTP server listening");
+        let handle = tokio::spawn(async move {
+            if let Err(e) = axum::serve(listener, router).await {
+                error!(err = %e, "MCP HTTP server error");
+            }
+        });
+        self.current = Some((addr, handle));
+    }
+}
+
 // ── McpMembrane guest ─────────────────────────────────────────────────────────
 
 struct McpMembrane {
-    port: u16,
     lease_key_value: String,
     state: Arc<MembraneState>,
+    listener: ListenerManager,
+    port: u16,
 }
 
 impl McpMembrane {
     fn new(port: u16, guest_id: &str, state: Arc<MembraneState>) -> Self {
         Self {
-            port,
             lease_key_value: guest_id.to_string(),
+            listener: ListenerManager::new(port, state.clone()),
             state,
+            port,
         }
     }
 }
@@ -157,33 +249,22 @@ impl MembraneGuest for McpMembrane {
             }
         }
 
-        // Start HTTP server (detached task).
-        let addr = SocketAddr::from(([0, 0, 0, 0], self.port));
-        let router =
-            build_router(self.state.clone()).into_make_service_with_connect_info::<SocketAddr>();
-        tokio::spawn(async move {
-            info!(%addr, "MCP membrane HTTP server starting");
-            match tokio::net::TcpListener::bind(addr).await {
-                Ok(listener) => {
-                    if let Err(e) = axum::serve(listener, router).await {
-                        error!(err = %e, "MCP HTTP server error");
-                    }
-                }
-                Err(e) => error!(err = %e, "MCP HTTP server bind failed"),
-            }
-        });
+        // Start the HTTP listener at the current effective bind (loopback until
+        // an endpoint config declaring a wider tier is known and honored).
+        self.listener.reconcile().await;
 
         // Replay any routes/config that were persisted before this restart.
         // This must not block the listener from coming up: an endpoint provision
         // can materialize this guest after the first config push already raced
         // past an empty inbox.
-        match tokio::time::timeout(
-            std::time::Duration::from_secs(3),
-            client.send_request(IpcRequest::GetMcpRoutes {}),
-        )
-        .await
+        match client
+            .send_request_with_timeout(
+                IpcRequest::GetMcpRoutes {},
+                std::time::Duration::from_secs(3),
+            )
+            .await
         {
-            Ok(Ok(IpcResponse::McpRouteState { agents })) if !agents.is_empty() => {
+            Ok(IpcResponse::McpRouteState { agents }) if !agents.is_empty() => {
                 let mut table = self.state.routing_table.write().await;
                 for entry in &agents {
                     table.upsert_agent_routes(&entry.agent_id, entry.routes.clone());
@@ -193,11 +274,11 @@ impl MembraneGuest for McpMembrane {
                     "replayed persisted MCP routes on startup"
                 );
             }
-            Ok(Ok(_)) => {}
-            Ok(Err(e)) => warn!(err = %e, "GetMcpRoutes failed — starting with empty route table"),
-            Err(_) => {
+            Ok(_) => {}
+            Err(e) if philotic_client::is_ipc_timeout(&e) => {
                 warn!("GetMcpRoutes timed out — listener remains active with empty route table")
             }
+            Err(e) => warn!(err = %e, "GetMcpRoutes failed — starting with empty route table"),
         }
 
         if let Some(endpoint_id) = self
@@ -205,21 +286,22 @@ impl MembraneGuest for McpMembrane {
             .strip_prefix("mcp-membrane-")
             .map(str::to_string)
         {
-            match tokio::time::timeout(
-                std::time::Duration::from_secs(3),
-                client.send_request(IpcRequest::GetMcpEndpointStatus { endpoint_id }),
-            )
-            .await
+            match client
+                .send_request_with_timeout(
+                    IpcRequest::GetMcpEndpointStatus { endpoint_id },
+                    std::time::Duration::from_secs(3),
+                )
+                .await
             {
-                Ok(Ok(IpcResponse::Standard {
+                Ok(IpcResponse::Standard {
                     ok: true,
                     data: Some(data),
                     ..
-                })) => {
-                    if let Some(config) = data
-                        .get("config")
-                        .and_then(|value| serde_json::from_value(value.clone()).ok())
-                    {
+                }) => {
+                    if let Some(config) = data.get("config").and_then(|value| {
+                        serde_json::from_value::<McpEndpointConfig>(value.clone()).ok()
+                    }) {
+                        *self.state.declared_exposure.write().unwrap() = Some(config.exposure);
                         let mut table = self.state.endpoint_table.write().await;
                         table.update(config);
                         info!("replayed persisted MCP endpoint config on startup");
@@ -230,10 +312,15 @@ impl MembraneGuest for McpMembrane {
                     {
                         *self.state.ingress_tier.write().unwrap() = tier;
                     }
+                    // Declared exposure and/or ceiling may have changed the
+                    // effective audience — re-derive the bind address.
+                    self.listener.reconcile().await;
                 }
-                Ok(Ok(_)) => {}
-                Ok(Err(e)) => warn!(err = %e, "GetMcpEndpointStatus failed"),
-                Err(_) => warn!("GetMcpEndpointStatus timed out — waiting for config push"),
+                Ok(_) => {}
+                Err(e) if philotic_client::is_ipc_timeout(&e) => {
+                    warn!("GetMcpEndpointStatus timed out — waiting for config push")
+                }
+                Err(e) => warn!(err = %e, "GetMcpEndpointStatus failed"),
             }
         }
 
@@ -254,8 +341,12 @@ impl MembraneGuest for McpMembrane {
                 );
                 return Ok(());
             }
-            OutboundReply::StreamingToken { .. } => {
-                // Streaming accumulation over MCP is not yet implemented.
+            OutboundReply::StreamingToken { token, .. } => {
+                // Accumulate streamed tokens so a terminal reply that carries no
+                // content of its own still yields the streamed text. True
+                // streaming over SSE is deferred; silent drop is not acceptable.
+                let mut buffers = self.state.streaming_buffers.lock().await;
+                buffers.entry(turn_id).or_default().push_str(token);
                 return Ok(());
             }
             _ => {}
@@ -265,13 +356,22 @@ impl MembraneGuest for McpMembrane {
             let mut pending = self.state.pending_responses.lock().await;
             pending.remove(&turn_id)
         };
+        let streamed = {
+            let mut buffers = self.state.streaming_buffers.lock().await;
+            buffers.remove(&turn_id)
+        };
 
         match (reply, sender) {
             (OutboundReply::Text { content, .. }, Some(tx)) => {
-                let _ = tx.send(content);
+                let content = if content.trim().is_empty() {
+                    streamed.unwrap_or(content)
+                } else {
+                    content
+                };
+                let _ = tx.send(server::DispatchOutcome::Ok(content));
             }
             (OutboundReply::Error { message, .. }, Some(tx)) => {
-                let _ = tx.send(serde_json::json!({ "error": message }).to_string());
+                let _ = tx.send(server::DispatchOutcome::Err(message));
             }
             (_, None) => {
                 warn!(turn_id, "deliver: no pending receiver for turn");
@@ -294,6 +394,7 @@ impl MembraneGuest for McpMembrane {
                 ?current,
                 "Ingress fence tier updated from PerimeterShift broadcast"
             );
+            self.listener.reconcile().await;
             return Ok(true);
         }
 
@@ -323,15 +424,22 @@ impl MembraneGuest for McpMembrane {
                     return Ok(false);
                 };
 
-                let content = if let Some(result) = payload.get("result") {
-                    serde_json::to_string(result)
-                        .unwrap_or_else(|_| serde_json::json!({ "result": result }).to_string())
-                } else if let Some(error) = payload.get("error") {
-                    serde_json::json!({ "error": error }).to_string()
-                } else {
-                    warn!(turn_id, "datasource_response push missing result/error");
-                    return Ok(false);
-                };
+                let outcome =
+                    if let Some(result) = payload.get("result") {
+                        server::DispatchOutcome::Ok(serde_json::to_string(result).unwrap_or_else(
+                            |_| serde_json::json!({ "result": result }).to_string(),
+                        ))
+                    } else if let Some(error) = payload.get("error") {
+                        server::DispatchOutcome::Err(
+                            error
+                                .as_str()
+                                .map(str::to_string)
+                                .unwrap_or_else(|| error.to_string()),
+                        )
+                    } else {
+                        warn!(turn_id, "datasource_response push missing result/error");
+                        return Ok(false);
+                    };
 
                 let sender = {
                     let mut pending = self.state.pending_responses.lock().await;
@@ -339,7 +447,7 @@ impl MembraneGuest for McpMembrane {
                 };
 
                 if let Some(tx) = sender {
-                    let _ = tx.send(content);
+                    let _ = tx.send(outcome);
                 } else {
                     warn!(turn_id, "datasource_response: no pending receiver for turn");
                 }
@@ -384,13 +492,21 @@ impl MembraneGuest for McpMembrane {
                         return Ok(false);
                     }
                 };
-                let mut table = self.state.endpoint_table.write().await;
-                table.update(config);
+                *self.state.declared_exposure.write().unwrap() = Some(config.exposure);
+                {
+                    let mut table = self.state.endpoint_table.write().await;
+                    table.update(config);
+                }
+                self.listener.reconcile().await;
                 Ok(true)
             }
             "revoke_mcp_config" => {
-                let mut table = self.state.endpoint_table.write().await;
-                table.revoke();
+                *self.state.declared_exposure.write().unwrap() = None;
+                {
+                    let mut table = self.state.endpoint_table.write().await;
+                    table.revoke();
+                }
+                self.listener.reconcile().await;
                 Ok(true)
             }
             "update_perimeter" => {
@@ -406,6 +522,7 @@ impl MembraneGuest for McpMembrane {
                 };
                 *self.state.ingress_tier.write().unwrap() = tier;
                 info!(?tier, "Ingress fence tier updated from hotel push");
+                self.listener.reconcile().await;
                 Ok(true)
             }
             _ => Ok(false),
@@ -485,6 +602,9 @@ async fn main() -> Result<()> {
         ansible_mesh_core::ExposureTier::Local,
     ));
 
+    // Unknown until an endpoint config replays or is pushed — loopback bind until then.
+    let declared_exposure = Arc::new(std::sync::RwLock::new(None));
+
     let state = Arc::new(MembraneState {
         routing_table: table,
         endpoint_table,
@@ -500,7 +620,10 @@ async fn main() -> Result<()> {
         guest_id: args.guest_id.clone(),
         inbound_tx,
         pending_responses,
+        streaming_buffers: Arc::new(Mutex::new(HashMap::new())),
+        static_mode: args.ipc_socket.is_none(),
         ingress_tier,
+        declared_exposure,
     });
 
     let guest = McpMembrane::new(args.port, &args.guest_id, state);
@@ -512,9 +635,10 @@ async fn main() -> Result<()> {
             .await
     } else {
         // No IPC socket — run HTTP server directly (static-only mode).
-        // Inbound envelopes go nowhere in this mode; pending responses will time out.
+        // No dispatch is possible in this mode, and there is no hotel to widen
+        // the perimeter for us, so the listener is loopback-only.
         info!("running in static-only mode (no IPC socket)");
-        let addr = SocketAddr::from(([0, 0, 0, 0], args.port));
+        let addr = SocketAddr::from(([127, 0, 0, 1], args.port));
         let router =
             build_router(guest.state.clone()).into_make_service_with_connect_info::<SocketAddr>();
         let listener = tokio::net::TcpListener::bind(addr).await?;

@@ -16,9 +16,17 @@ const DEFAULT_CONFIDENCE: f64 = 0.9;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let target_node =
-        std::env::var("PHILOTIC_TARGET_NODE").unwrap_or_else(|_| "local-aiua-01".to_string());
+    // Resolution order: explicit target > this process's node identity >
+    // the SDK sentinel "local-aiua-01" (which the hotel normalizes to
+    // itself). Misaddressing here used to black-hole every task — the
+    // 2026-07-14/19 "delivery layer broken" false alarm was exactly this
+    // driver running with neither env var set against a pre-normalization
+    // hotel.
+    let target_node = std::env::var("PHILOTIC_TARGET_NODE")
+        .or_else(|_| std::env::var("PHILOTIC_NODE_ID"))
+        .unwrap_or_else(|_| "local-aiua-01".to_string());
     let reply_node = std::env::var("PHILOTIC_REPLY_NODE").unwrap_or_else(|_| target_node.clone());
+    println!("target_node={target_node} reply_node={reply_node}");
     let node_id = format!("smoke-signal-{}", Uuid::new_v4().simple());
     let observation_id = format!("obs-{}", Uuid::new_v4().simple());
     let packet_id = format!("pkt-{}", Uuid::new_v4().simple());
@@ -68,11 +76,96 @@ async fn main() -> Result<()> {
     if packet["context_id"].as_str().is_none() || !packet["ranked_packets"].is_array() {
         bail!("life.recall returned malformed context packet: {recall_payload}");
     }
+    let cross_agent_packet = &recall_data["cross_agent_context_packet"];
+    if cross_agent_packet["packet_id"].as_str().is_none()
+        || !cross_agent_packet["refs"].is_array()
+        || !cross_agent_packet["sections"].is_array()
+    {
+        bail!("life.recall returned malformed cross-agent context packet: {recall_payload}");
+    }
+    let refs = cross_agent_packet["refs"]
+        .as_array()
+        .context("cross-agent context packet refs must be an array")?;
+    if !refs.iter().any(|r| {
+        r["kind"].as_str() == Some("life_graph_retrieval_packet")
+            && r["authority"].as_str() == Some("life_graph_evidence")
+    }) {
+        bail!(
+            "cross-agent context packet missing LifeGraph retrieval evidence ref: {recall_payload}"
+        );
+    }
+    let policy_notes = cross_agent_packet["policy_notes"]
+        .as_array()
+        .context("cross-agent context packet policy_notes must be an array")?;
+    if !policy_notes.iter().any(|note| {
+        note.as_str()
+            .map(|text| text.contains("Muninn refs are continuity handles"))
+            .unwrap_or(false)
+    }) {
+        bail!("cross-agent context packet missing Muninn continuity policy note: {recall_payload}");
+    }
     let result_count = packet["ranked_packets"]
         .as_array()
         .map(Vec::len)
         .unwrap_or_default();
-    println!("life.recall IPC ok   result_count={result_count}");
+    let cross_ref_count = refs.len();
+    println!("life.recall IPC ok   result_count={result_count} cross_ref_count={cross_ref_count}");
+
+    let context_id = packet["context_id"]
+        .as_str()
+        .context("life.recall context packet missing context_id")?
+        .to_string();
+    let feedback_payload = execute_life_tool(
+        &mut client,
+        &target_node,
+        &reply_node,
+        "life.recall.feedback",
+        feedback_input(&context_id),
+    )
+    .await?;
+    assert_success_capability(&feedback_payload, "life.recall.feedback")?;
+    let feedback_data = &feedback_payload["result"]["data"];
+    println!(
+        "life.recall.feedback IPC ok  context_id={context_id} status={} generated_patch={}",
+        feedback_data["status"].as_str().unwrap_or("?"),
+        feedback_data["generated_patch"],
+    );
+
+    // Read-only patch review surface (opt-in): proves `life.patch.list` is
+    // served by the runner and returns the governed patch proposals with risk
+    // tier + provenance. Requires a runner build that implements the tool.
+    if std::env::var("LIFE_GRAPH_SMOKE_PATCH_LIST").as_deref() == Ok("1") {
+        let list_payload = execute_life_tool(
+            &mut client,
+            &target_node,
+            &reply_node,
+            "life.patch.list",
+            patch_list_input(),
+        )
+        .await?;
+        assert_success_capability(&list_payload, "life.patch.list")?;
+        let list_data = &list_payload["result"]["data"];
+        if list_data["status"].as_str() != Some("ok") {
+            bail!("life.patch.list expected status=ok, got {list_payload}");
+        }
+        if list_data["read_only"].as_bool() != Some(true) {
+            bail!("life.patch.list expected read_only=true, got {list_payload}");
+        }
+        if !list_data["patches"].is_array() {
+            bail!("life.patch.list returned malformed patches array: {list_payload}");
+        }
+        println!(
+            "life.patch.list IPC ok  count={} statuses={} first={}",
+            list_data["count"],
+            list_data["statuses"],
+            list_data["patches"]
+                .as_array()
+                .and_then(|p| p.first())
+                .cloned()
+                .unwrap_or(Value::Null),
+        );
+    }
+
     println!("life graph IPC smoke passed");
     Ok(())
 }
@@ -97,6 +190,10 @@ async fn execute_life_tool(
     tool_name: &str,
     arguments: Value,
 ) -> Result<Value> {
+    let run_id = Uuid::new_v4().simple().to_string();
+    let session_id = format!("smoke:life-graph:{tool_name}:{run_id}");
+    let turn_id = format!("smoke-turn-{run_id}");
+
     let response = client
         .send_request(IpcRequest::EmitTask {
             target_node: target_node.to_string(),
@@ -108,8 +205,8 @@ async fn execute_life_tool(
                 "action": "execute_tool",
                 "tool_name": tool_name,
                 "arguments": arguments,
-                "session_id": format!("smoke:life-graph:{tool_name}"),
-                "turn_id": format!("smoke-turn-life-graph-{}", tool_name.replace('.', "-")),
+                "session_id": session_id,
+                "turn_id": turn_id,
                 "chat_id": "smoke-chat",
                 "agent_id": DRIVER_GUEST_ID,
                 "reply_to": reply_node,
@@ -125,25 +222,52 @@ async fn execute_life_tool(
         other => bail!("{tool_name}: unexpected emit response: {other:?}"),
     }
 
-    let reply = timeout(Duration::from_secs(20), client.recv_inbound_task())
-        .await
-        .with_context(|| format!("{tool_name}: timed out waiting for datasource_response"))??;
+    let payload = timeout(Duration::from_secs(30), async {
+        loop {
+            let reply = client.recv_inbound_task().await?;
+            let IpcResponse::InboundTask { task_json, .. } = reply else {
+                bail!("{tool_name}: unexpected reply envelope: {reply:?}");
+            };
+            let payload: Value = serde_json::from_str(&task_json)
+                .context("failed to decode datasource_response json")?;
 
-    let IpcResponse::InboundTask { task_json, .. } = reply else {
-        bail!("{tool_name}: unexpected reply envelope: {reply:?}");
-    };
-    let payload: Value =
-        serde_json::from_str(&task_json).context("failed to decode datasource_response json")?;
-
-    if payload["action"].as_str() != Some("datasource_response") {
-        bail!("{tool_name}: expected datasource_response, got {payload}");
-    }
-    if payload.get("error").is_some() {
-        bail!(
-            "{tool_name}: datasource returned error: {}",
-            payload["error"]
-        );
-    }
+            if payload["action"].as_str() != Some("datasource_response") {
+                eprintln!("{tool_name}: skipping non-datasource_response action={:?}", payload["action"].as_str());
+                continue;
+            }
+            // drain stale responses from previous runs or different capabilities
+            let matches_this_run = payload["turn_id"].as_str() == Some(&turn_id)
+                || payload["capability"].as_str() == Some(tool_name);
+            if !matches_this_run {
+                eprintln!(
+                    "{tool_name}: ignoring stale datasource_response for capability={:?} turn_id={:?}",
+                    payload["capability"].as_str(),
+                    payload["turn_id"].as_str()
+                );
+                continue;
+            }
+            if payload.get("error").is_some() && !payload["error"].is_null() {
+                // only bail if this is the current run's response
+                if payload["turn_id"].as_str() == Some(&turn_id) {
+                    bail!(
+                        "{tool_name}: datasource returned error: {}",
+                        payload["error"]
+                    );
+                }
+                eprintln!("{tool_name}: ignoring stale error for turn_id={:?}", payload["turn_id"].as_str());
+                continue;
+            }
+            if payload["capability"].as_str() == Some(tool_name) {
+                return Ok(payload);
+            }
+            eprintln!(
+                "{tool_name}: ignoring stale datasource_response for capability={:?}",
+                payload["capability"].as_str()
+            );
+        }
+    })
+    .await
+    .with_context(|| format!("{tool_name}: timed out waiting for datasource_response"))??;
 
     Ok(payload)
 }
@@ -236,6 +360,37 @@ fn recall_input() -> Value {
         "operator_intent": "open_loops_by_context",
         "max_context_packets": 5,
         "embedding": embedding
+    })
+}
+
+fn feedback_input(context_id: &str) -> Value {
+    // Rating is env-selectable so the live smoke can exercise governed patch
+    // generation and gate routing:
+    //   useful        → no patch (baseline)
+    //   disconnected  → Low  / SystemPatch    (SafeAutoUpdate; prose-only with empty refs)
+    //   missing/noisy/stale → Low / SystemPatch
+    //   overconfident → Medium / AttentionPatch (ConfirmFirst)
+    // Refs are left empty on purpose so Low-risk feedback stays prose-only and
+    // does NOT write bridge edges into the live graph.
+    let rating =
+        std::env::var("LIFE_GRAPH_FEEDBACK_RATING").unwrap_or_else(|_| "useful".to_string());
+    json!({
+        "feedback_id": format!("smoke-feedback-{}", Uuid::new_v4().simple()),
+        "packet_id": context_id,
+        "rating": rating,
+        "candidate_count": 1,
+        "connected_candidate_count": 1,
+        "missing_context_refs": [],
+        "noisy_node_refs": [],
+        "stale_node_refs": [],
+        "evidence_packets": []
+    })
+}
+
+fn patch_list_input() -> Value {
+    json!({
+        "status_filter": [],
+        "limit": 20
     })
 }
 

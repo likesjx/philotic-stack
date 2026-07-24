@@ -74,6 +74,12 @@ async fn main() -> Result<()> {
             if reply.is_empty() {
                 bail!("agent turn reply was empty — turn may have failed");
             }
+            if reply.contains("not enabled") || reply.contains("could not record") {
+                bail!("agent reported life.observe was unavailable: {reply}");
+            }
+            if !reply.contains("node_id") && !reply.contains("life:") {
+                bail!("agent reply did not include LifeGraph evidence id: {reply}");
+            }
             println!("agent turn smoke PASSED");
             Ok(())
         }

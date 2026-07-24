@@ -24,6 +24,10 @@ Environment="PHILOTIC_HOTEL_PORT={{ philotic_hotel_port }}"
 Environment="PHILOTIC_ENABLE_RUST_AUTH={{ philotic_enable_rust_auth }}"
 Environment="PHILOTIC_ENABLE_RUST_DISPATCHER={{ philotic_enable_rust_dispatcher }}"
 Environment="PHILOTIC_ENABLE_RUST_TASK_LIFECYCLE={{ philotic_enable_rust_task_lifecycle }}"
+# TODO(codex/graph-runner-retire, PR #120): the graph-runner guest is retired and the
+# crate is deleted, but model-router (via philotic-graph config) still reads
+# PHILOTIC_GRAPH_DB_PATH. Keep the legacy graph-runner.db filename until the graph DB
+# path is renamed/migrated on the fleet.
 Environment="PHILOTIC_GRAPH_DB_PATH={{ philotic_data_dir }}/graph-runner.db"
 Environment="PHILOTIC_GRAPH_DATABASE_DIR={{ philotic_data_dir }}/graphs"
 Environment="PHILOTIC_GRAPH_PROVIDER={{ philotic_graph_provider }}"

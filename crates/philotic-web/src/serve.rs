@@ -4,7 +4,27 @@
 //! explicit bootstrap/login ceremony before issuing a bounded same-origin
 //! operator session cookie for the embedded UI.
 //!
+//! Environment / config knobs:
+//!   PHILOTIC_WEB_BIND        (or config `web_bind`)        — bind host IP, default 127.0.0.1.
+//!                            Set to a Tailscale interface IP to expose to the tailnet.
+//!   PHILOTIC_WEB_EDGE_TOKEN  (or config `web_edge_token`)  — bearer token for device/edge
+//!                            clients (constant-time compared) accepted alongside operator
+//!                            session cookies.
+//!   PHILOTIC_WEB_EDGE_INVITE (or config `web_edge_invite`) — operator-issued invite code
+//!                            gating POST /api/edge/enroll; unset = enrollment disabled.
+//!   PHILOTIC_WEB_ROSTER      (or config `web_roster`)      — JSON mesh roster fallback for
+//!                            GET /api/mesh/roster when the aiua GetMeshRoster IPC is
+//!                            unreachable; also supplies philotic-web base URLs per node.
+//!
+//! When the bind is non-loopback, every /api route and /ws require a valid operator
+//! session (cookie or bearer session token) or the edge bearer token. GET /health stays
+//! unauthenticated on every tier (client latency probes).
+//!
 //! REST endpoints:
+//!   GET  /health   (unauthenticated — node_id + version for latency probes)
+//!   POST /api/edge/enroll   (invite-code gated — edge device enrollment)
+//!   GET  /api/edge/ws       (edge bearer token — edge-protocol WebSocket, see serve/edge.rs)
+//!   GET  /api/mesh/roster
 //!   GET  /api/auth/status
 //!   POST /api/auth/bootstrap
 //!   POST /api/auth/challenges
@@ -44,6 +64,7 @@
 //!   GET  /api/config
 //!   GET  /api/config/telegram
 //!   GET  /api/config/gemini
+//!   GET  /api/model-catalog
 //!   GET  /api/components
 //!   GET  /api/component-templates
 //!   POST /api/components
@@ -59,6 +80,11 @@
 //!   POST /api/agents/:agent_id/roles/:role_name/skills  (assign skill)
 //!   DELETE /api/agents/:agent_id/roles/:role_name/skills/:skill_name  (revoke skill)
 //!   GET  /api/sessions    (stub — returns [] until session table exists)
+//!   GET  /api/edge/sessions   (edge-bearer; hotel session history via ListOperatorSessions)
+//!   GET  /api/edge/sessions/:session_id/turns   (edge-bearer; ListSessionTurns)
+//!   GET  /api/edge/lifegraph/lens/:lens   (edge-bearer; life.recall named strategy)
+//!   GET  /api/edge/lifegraph/node/:node_id   (edge-bearer; life.view.node)
+//!   GET  /api/edge/lifegraph/neighborhood/:node_id   (edge-bearer; life.view.neighborhood)
 //!   GET  /api/apartments/:agent_id   (disabled by default for the desktop membrane)
 //!   POST /api/guests/:guest_id/restart
 //!   POST /api/guests/:guest_id/stop
@@ -66,9 +92,15 @@
 //! WebSocket:
 //!   GET  /ws  — live push of guest/session state changes
 //!              auth via same-origin cookie
+//!   GET  /api/edge/ws — edge-mesh protocol termination (philotic-edge-protocol
+//!              JSON envelopes; per-device bearer auth; see serve/edge.rs)
+
+pub(crate) mod edge;
 
 use ansible_mesh_core::domain::GraphDomain;
 use ansible_mesh_core::event::{EventEnvelope, EventKind, EventPayload};
+use ansible_mesh_core::model_manager::{project_model_catalog, ModelCatalogProjection};
+use ansible_mesh_core::provider_keys::{provider_key_spec, provider_key_specs, ProviderKeySpec};
 use ansible_mesh_core::sqlite_storage::{SqliteEventStorage, SqliteGraphStorage};
 use ansible_mesh_core::storage::{
     EventStorage, ProjectedExternalIdentityRecord, ProjectedUserIdentityRecord,
@@ -77,21 +109,24 @@ use anyhow::{anyhow, bail, Context, Result};
 use axum::{
     extract::{
         ws::{Message, WebSocket, WebSocketUpgrade},
-        Path, Query, State,
+        ConnectInfo, Path, Query, Request, State,
     },
-    http::{header, HeaderMap, HeaderName, HeaderValue, StatusCode},
+    http::{header, HeaderMap, HeaderName, HeaderValue, Method, StatusCode},
+    middleware::Next,
     response::{IntoResponse, Json, Response},
     routing::{delete, get, post, put},
     Router,
 };
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
+use perimeter_core::{classify_bind_addr, ExposureTier};
 use rand::Rng;
 use reqwest::Url;
 use rusqlite::{Connection, OptionalExtension};
 use rust_embed::RustEmbed;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::{collections::HashMap, path::PathBuf, sync::Arc, time::Duration};
 use tokio::sync::{broadcast, watch, Mutex};
 use tower_http::cors::{AllowOrigin, CorsLayer};
@@ -99,13 +134,14 @@ use tower_http::cors::{AllowOrigin, CorsLayer};
 use philotic_client::{
     ComponentInventoryEntryView, ComponentManifest, CronJob, CronJobSource,
     DesktopMembraneAgentView, DesktopMembraneGuestView, DesktopMembraneStatusView, GuestIdentity,
-    IpcRequest, IpcResponse, LeaseEnvelope, OperatorTargetAgentInventoryView,
-    OperatorTargetComponentInventoryView, OperatorTargetComponentMutationAckView,
-    OperatorTargetConfigMutationAckView, OperatorTargetConfigView,
-    OperatorTargetGuestInventoryView, OperatorTargetPlacementView, OperatorTargetRoleHomeAckView,
-    OperatorTargetSecretInventoryView, OperatorTargetSecretMutationAckView,
-    OperatorTargetStatusView, OperatorTargetView, PhiloticClient, ResponseRoutePolicyView,
-    OPERATOR_CHAT_REPLY_ROLE, OPERATOR_REMOTE_CONFIG_KEYS, OPERATOR_REMOTE_MUTABLE_CONFIG_KEYS,
+    IpcRequest, IpcResponse, LeaseEnvelope, MeshRosterEntryView, OperatorSessionView,
+    OperatorTargetAgentInventoryView, OperatorTargetComponentInventoryView,
+    OperatorTargetComponentMutationAckView, OperatorTargetConfigMutationAckView,
+    OperatorTargetConfigView, OperatorTargetGuestInventoryView, OperatorTargetPlacementView,
+    OperatorTargetRoleHomeAckView, OperatorTargetSecretInventoryView,
+    OperatorTargetSecretMutationAckView, OperatorTargetStatusView, OperatorTargetView,
+    PhiloticClient, ResponseRoutePolicyView, SessionTurnView, OPERATOR_CHAT_REPLY_ROLE,
+    OPERATOR_REMOTE_CONFIG_KEYS, OPERATOR_REMOTE_MUTABLE_CONFIG_KEYS,
 };
 
 // ── Embedded UI assets ────────────────────────────────────────────────────────
@@ -122,14 +158,22 @@ const HEADER_CORP: &str = "cross-origin-resource-policy";
 // ── State shared across request handlers ─────────────────────────────────────
 
 #[derive(Clone)]
-struct AppState {
+pub(crate) struct AppState {
     bootstrap_token: Arc<String>,
     db_path: PathBuf,
+    /// Mesh config path — consulted for `web_roster` / `web_edge_token` fallbacks
+    config_path: Arc<PathBuf>,
     hotel: Arc<String>,
     /// IPC socket path for the connected hotel
     socket: Arc<String>,
     /// Broadcast channel for WebSocket push events
     tx: broadcast::Sender<String>,
+    /// Bearer token for device/edge clients (PHILOTIC_WEB_EDGE_TOKEN / config `web_edge_token`)
+    edge_token: Option<Arc<String>>,
+    /// Exposure tier of the listener bind address (perimeter-core classification)
+    exposure_tier: ExposureTier,
+    /// Edge-tier state: enrolled-device registry + per-node outbound rings
+    edge: edge::EdgeState,
 }
 
 #[derive(Clone)]
@@ -551,7 +595,37 @@ pub async fn run(
         None => PathBuf::from("mesh-config.json"),
     });
     let hotel = read_hotel_name(&config_path);
+    let config_json = read_config_json(&config_path);
+    let bind_host = resolve_web_bind(
+        env_trimmed("PHILOTIC_WEB_BIND").as_deref(),
+        config_json
+            .as_ref()
+            .and_then(|v| v.get("web_bind"))
+            .and_then(Value::as_str),
+    )?;
+    // Conservative classification: we do not probe for a public IP here, so an
+    // unspecified bind (0.0.0.0) classifies as Lan with a logged warning.
+    let bind_classification = classify_bind_addr(bind_host, false);
+    let exposure_tier = bind_classification.tier();
+    let edge_token = resolve_edge_token(
+        env_trimmed("PHILOTIC_WEB_EDGE_TOKEN"),
+        config_json
+            .as_ref()
+            .and_then(|v| v.get("web_edge_token"))
+            .and_then(Value::as_str)
+            .map(str::to_string),
+    );
+    let edge_token_configured = edge_token.is_some();
+    let edge_invite = resolve_edge_invite(
+        env_trimmed("PHILOTIC_WEB_EDGE_INVITE"),
+        config_json
+            .as_ref()
+            .and_then(|v| v.get("web_edge_invite"))
+            .and_then(Value::as_str)
+            .map(str::to_string),
+    );
     let socket = crate::start::socket_path(&hotel);
+    let socket_for_lease_recovery = socket.clone();
     let lease_key = desktop_membrane_lease_key(&hotel);
     let lease_handle = acquire_desktop_membrane_lease(&socket, &lease_key, port).await?;
 
@@ -564,21 +638,85 @@ pub async fn run(
     // Broadcast channel for WebSocket events (capacity 256)
     let (tx, _) = broadcast::channel::<String>(256);
 
+    // Edge device registry lives next to the hotel context DB.
+    let edge_state =
+        edge::EdgeState::load(db_path.with_file_name("edge-devices.json"), edge_invite);
+    let edge_enrollment_enabled = edge_state.enrollment_enabled();
+    let edge_device_count = edge_state.device_count();
+
     let state = AppState {
         bootstrap_token: Arc::new(bootstrap_token.clone()),
         db_path,
+        config_path: Arc::new(config_path.clone()),
         hotel: Arc::new(hotel),
         socket: Arc::new(socket),
         tx,
+        edge_token: edge_token.map(Arc::new),
+        exposure_tier,
+        edge: edge_state,
     };
 
     ensure_operator_auth_tables(&state.db_path, &state.hotel)?;
+
+    // Process-wide edge retention: keeps replay rings fed for enrolled edge
+    // nodes even while they have no live WS session (see serve/edge.rs docs).
+    let _edge_retainer = edge::spawn_edge_retainer(state.edge.clone(), state.tx.clone());
+
+    // lifegraph-change-push: when an observer role is configured, subscribe
+    // it and mint retained LifeGraphChange frames for enrolled edge devices.
+    // Env-gated so hotels without an edge surface run zero extra IPC.
+    let observer_role = std::env::var(edge::LIFEGRAPH_CHANGE_OBSERVER_ENV)
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    if !observer_role.is_empty() {
+        let _lifegraph_observer = edge::spawn_lifegraph_change_observer(
+            state.edge.clone(),
+            state.socket.to_string(),
+            observer_role,
+        );
+    }
 
     // CORS — localhost only; UI is embedded and served from the same origin
     let cors = build_cors(allow_origins.as_deref());
 
     let app = Router::new()
+        // Unauthenticated lightweight probe endpoint — allowed on every tier
+        .route("/health", get(handle_health))
+        // Edge-mesh tier (see serve/edge.rs): invite-code-gated enrollment plus
+        // the bearer-authenticated edge-protocol WebSocket termination
+        .route("/api/edge/enroll", post(edge::handle_edge_enroll))
+        .route("/api/edge/agents", get(edge::handle_edge_agents))
+        .route("/api/edge/sessions", get(edge::handle_edge_sessions))
+        .route(
+            "/api/edge/sessions/:session_id/turns",
+            get(edge::handle_edge_session_turns),
+        )
+        .route(
+            "/api/edge/lifegraph/lens/:lens",
+            get(edge::handle_edge_lifegraph_lens),
+        )
+        .route(
+            "/api/edge/lifegraph/node/:node_id",
+            get(edge::handle_edge_lifegraph_node),
+        )
+        .route(
+            "/api/edge/lifegraph/neighborhood/:node_id",
+            get(edge::handle_edge_lifegraph_neighborhood),
+        )
+        .route(
+            "/api/edge/lifegraph/observe",
+            post(edge::handle_edge_lifegraph_observe)
+                .layer(axum::extract::DefaultBodyLimit::max(2 * 1024 * 1024)),
+        )
+        .route(
+            "/api/edge/blob",
+            post(edge::handle_edge_blob)
+                .layer(axum::extract::DefaultBodyLimit::max(25 * 1024 * 1024)),
+        )
+        .route("/api/edge/ws", get(edge::handle_edge_ws))
         // API routes
+        .route("/api/mesh/roster", get(handle_mesh_roster))
         .route("/api/auth/status", get(handle_auth_status))
         .route(
             "/api/auth/user",
@@ -623,6 +761,12 @@ pub async fn run(
         .route("/api/config/telegram", get(handle_config_telegram))
         .route("/api/config/gemini", get(handle_config_gemini))
         .route("/api/config/oidc", get(handle_config_oidc))
+        .route("/api/model-catalog", get(handle_model_catalog))
+        .route("/api/provider-configs", get(handle_provider_configs))
+        .route(
+            "/api/provider-configs/:provider",
+            get(handle_provider_config_get).post(handle_provider_configure),
+        )
         .route(
             "/api/components",
             get(handle_components).post(handle_component_create),
@@ -750,36 +894,70 @@ pub async fn run(
         .route("/", get(handle_index))
         .fallback(get(handle_static))
         .layer(cors)
+        // Outermost: perimeter fence for non-loopback binds (runs before CORS)
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            edge_fence_middleware,
+        ))
         .with_state(state);
 
-    let addr = format!("127.0.0.1:{port}");
-    let listener = tokio::net::TcpListener::bind(&addr).await?;
+    let addr = SocketAddr::new(bind_host, port);
+    let listener = tokio::net::TcpListener::bind(addr)
+        .await
+        .with_context(|| format!("bind philotic-web listener on {addr}"))?;
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let renew_handle = tokio::spawn(run_desktop_membrane_lease_renewal(
         lease_handle.clone(),
         shutdown_tx.clone(),
+        socket_for_lease_recovery,
+        port,
     ));
 
+    let display_host = display_host_for(bind_host);
     println!("philotic-web serve");
     println!("──────────────────────────────────────────");
-    println!("  http://127.0.0.1:{port}");
+    println!("  bind: {addr} (exposure tier: {exposure_tier:?})");
+    if let Some(warning) = bind_classification.warning() {
+        println!("  bind warning: {warning}");
+    }
+    if exposure_tier != ExposureTier::Local {
+        if edge_token_configured {
+            println!("  non-loopback bind: /api and /ws require an operator session; edge bearer tokens (PHILOTIC_WEB_EDGE_TOKEN / enrollment tokens) open /api/edge/* only");
+        } else {
+            println!("  non-loopback bind: /api and /ws require an operator session — no PHILOTIC_WEB_EDGE_TOKEN configured, only enrolled device tokens can open /api/edge/*");
+        }
+    }
+    if edge_enrollment_enabled {
+        println!(
+            "  edge enrollment: enabled (POST /api/edge/enroll, {edge_device_count} device(s) enrolled)"
+        );
+    } else {
+        println!("  edge enrollment: disabled (set PHILOTIC_WEB_EDGE_INVITE to enable)");
+    }
+    println!("  http://{display_host}:{port}");
     println!();
     println!("  Bootstrap token: {bootstrap_token}");
     println!();
     println!("  Press Ctrl-C to stop.");
 
     let open_path = normalized_open_path(open_path.as_deref());
-    let browser_url = format!("http://127.0.0.1:{port}{open_path}");
+    let browser_url = format!("http://{display_host}:{port}{open_path}");
 
-    // Auto-open the embedded desktop in the default browser
-    let _ = tokio::process::Command::new("open")
-        .arg(&browser_url)
-        .spawn();
+    // Auto-open the embedded desktop in the default browser — only when the
+    // listener is actually reachable over loopback.
+    if bind_host.is_loopback() || bind_host.is_unspecified() {
+        let _ = tokio::process::Command::new("open")
+            .arg(&browser_url)
+            .spawn();
+    }
 
     let shutdown_reason = wait_for_shutdown(shutdown_rx);
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_reason)
-        .await?;
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(shutdown_reason)
+    .await?;
 
     let _ = shutdown_tx.send(true);
     let _ = renew_handle.await;
@@ -870,6 +1048,8 @@ async fn release_desktop_membrane_lease(handle: &DesktopMembraneLeaseHandle) -> 
 async fn run_desktop_membrane_lease_renewal(
     handle: DesktopMembraneLeaseHandle,
     shutdown_tx: watch::Sender<bool>,
+    socket: String,
+    port: u16,
 ) {
     let mut shutdown_rx = shutdown_tx.subscribe();
     let mut epoch = match current_desktop_membrane_lease(&handle).await {
@@ -890,9 +1070,28 @@ async fn run_desktop_membrane_lease_renewal(
                         epoch = lease.lease_epoch;
                     }
                     Err(err) => {
-                        eprintln!("desktop membrane lease renewal lost: {err:#}");
-                        let _ = shutdown_tx.send(true);
-                        return;
+                        // A dropped renewal usually means the hotel restarted
+                        // (broken UDS pipe). Surviving that is a resilience
+                        // requirement: reconnect and re-acquire with backoff
+                        // instead of shutting the operator surface down.
+                        eprintln!(
+                            "desktop membrane lease renewal lost ({err:#}); entering re-acquire loop"
+                        );
+                        match reacquire_desktop_membrane_lease(
+                            &handle,
+                            &mut shutdown_rx,
+                            &socket,
+                            port,
+                        )
+                        .await
+                        {
+                            Some(new_epoch) => {
+                                epoch = new_epoch;
+                                interval.reset();
+                            }
+                            // Shutdown requested while re-acquiring.
+                            None => return,
+                        }
                     }
                 }
             }
@@ -903,6 +1102,83 @@ async fn run_desktop_membrane_lease_renewal(
             }
         }
     }
+}
+
+/// Reconnect to the hotel and re-acquire the desktop membrane lease, retrying
+/// every 5s until it succeeds or shutdown is requested. On success the fresh
+/// IPC client replaces the one inside `handle` (all lease calls go through
+/// that shared mutex) and the new lease epoch is returned.
+async fn reacquire_desktop_membrane_lease(
+    handle: &DesktopMembraneLeaseHandle,
+    shutdown_rx: &mut watch::Receiver<bool>,
+    socket: &str,
+    port: u16,
+) -> Option<u64> {
+    loop {
+        if *shutdown_rx.borrow() {
+            return None;
+        }
+        match try_reacquire_once(handle, socket, port).await {
+            Ok(epoch) => {
+                println!("desktop membrane lease re-acquired after hotel restart (epoch {epoch})");
+                return Some(epoch);
+            }
+            Err(err) => {
+                eprintln!("desktop membrane lease re-acquire failed ({err:#}); retrying in 5s");
+                tokio::select! {
+                    _ = tokio::time::sleep(Duration::from_secs(5)) => {}
+                    changed = shutdown_rx.changed() => {
+                        if changed.is_ok() && *shutdown_rx.borrow() {
+                            return None;
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// One re-acquire attempt: fresh IPC connection + AcquireDesktopMembraneLease,
+/// swapping the new client into the shared handle on success. Returns the new
+/// lease epoch.
+async fn try_reacquire_once(
+    handle: &DesktopMembraneLeaseHandle,
+    socket: &str,
+    port: u16,
+) -> Result<u64> {
+    let identity = GuestIdentity {
+        guest_id: format!("philotic-web-membrane-{port}"),
+        role: "management".into(),
+        supported_tools: vec![],
+    };
+    let mut client = PhiloticClient::connect_at(socket, identity)
+        .await
+        .with_context(|| format!("reconnect to hotel at {socket} for desktop membrane lease"))?;
+    let response = client
+        .send_request(IpcRequest::AcquireDesktopMembraneLease {
+            lease_key: handle.lease_key.as_str().to_string(),
+            port,
+        })
+        .await
+        .context("re-acquire desktop membrane lease")?;
+    let lease = match response {
+        IpcResponse::DesktopMembraneLease {
+            desktop_granted: true,
+            desktop_lease: Some(lease),
+        } => lease,
+        IpcResponse::DesktopMembraneLease {
+            desktop_granted: false,
+            desktop_lease: Some(lease),
+        } => bail!(
+            "desktop membrane lease [{}] is held by [{}] (epoch {})",
+            lease.lease_scope,
+            lease.owner_guest_id,
+            lease.lease_epoch
+        ),
+        other => bail!("unexpected desktop membrane lease response: {other:?}"),
+    };
+    *handle.client.lock().await = client;
+    Ok(lease.lease_epoch)
 }
 
 async fn current_desktop_membrane_lease(
@@ -1195,9 +1471,12 @@ async fn handle_setup_guide() -> Response {
 
       <article class="panel">
         <h2>2. Configure your model path</h2>
-        <p>The management UI is where model setup should become legible instead of hidden in config folklore.</p>
+        <p>The management UI and <code>phil keys</code> keep model setup legible instead of hidden in config folklore.</p>
         <ul>
+          <li>Provider keys: use <code>phil keys configure openrouter</code>, or the provider config API at <code>/api/provider-configs/openrouter</code>.</li>
+          <li>Provider status: use <code>phil keys status</code> or <code>/api/provider-configs</code>; secret values stay hidden.</li>
           <li>Remote Gemini path: confirm the configured default model and the Gemini secret/config entries.</li>
+          <li>OpenRouter path: configure <code>openrouter_api_key_ref</code>, default model, fallback models, and route through the vault/config surface.</li>
           <li>MLX path: add or edit the <code>model-controller-mlx</code> component and define its model fleet.</li>
           <li>Local controller path: use the local model controller surfaces when you want a local-first or offline-ish route.</li>
         </ul>
@@ -1805,8 +2084,160 @@ async fn handle_auth_logout(headers: HeaderMap, State(state): State<AppState>) -
     response
 }
 
+/// Operator-session gate for the admin API surface. Edge bearer tokens are
+/// deliberately NOT accepted here: an edge device holds a low-trust,
+/// chat-scoped credential (see the trust-tier notes in
+/// `philotic-edge-protocol`), so it must never unlock secrets/config/vault
+/// mutation or the operator /ws firehose. Edge bearers are honoured only on
+/// the `/api/edge/*` surface (see [`edge_fence_allows`] and
+/// `edge::handle_edge_ws`).
 fn check_auth(headers: &HeaderMap, state: &AppState) -> bool {
     current_operator_session(headers, state).is_some()
+}
+
+/// True when the request carries a valid edge bearer token: either the shared
+/// PHILOTIC_WEB_EDGE_TOKEN / config `web_edge_token`, or a per-device token
+/// issued at enrollment (POST /api/edge/enroll). Constant-time comparisons.
+/// Grants access to the `/api/edge/*` surface only — never the operator API.
+fn edge_bearer_authorized(headers: &HeaderMap, state: &AppState) -> bool {
+    edge::edge_bearer_identity(headers, state).is_some()
+}
+
+/// Constant-time byte comparison. Only the length is allowed to leak via timing.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    a.iter()
+        .zip(b.iter())
+        .fold(0u8, |acc, (x, y)| acc | (x ^ y))
+        == 0
+}
+
+// ── Perimeter fence (non-loopback binds) ──────────────────────────────────────
+
+async fn edge_fence_middleware(
+    State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    request: Request,
+    next: Next,
+) -> Response {
+    if edge_fence_allows(
+        &state,
+        request.method(),
+        request.uri().path(),
+        request.headers(),
+        peer.ip(),
+    ) {
+        next.run(request).await
+    } else {
+        unauthorized()
+    }
+}
+
+/// Gate for non-loopback binds.
+///
+/// Tier classification comes from `perimeter_core::classify_bind_addr`. The route
+/// policy is intentionally stricter than `perimeter_core::fence::check_ingress`
+/// (which is a structural pre-gate and allows Lan unauthenticated): philotic-web
+/// is an operator surface, so any non-Local bind requires a *valid* operator
+/// session (cookie or bearer session token) on every /api route and /ws. Edge
+/// bearer tokens are scoped to `/api/edge/*` only — a device credential must
+/// never open the operator admin surface. Two behaviours mirror the perimeter
+/// fence: loopback peers bypass the gate up to Mesh tier (loopback callers are
+/// local hotel tooling), and Internet tier gets no loopback bypass.
+///
+/// Non-API surfaces (static UI shell, /health latency probe, the OIDC browser
+/// callback) stay reachable; they carry no sensitive data without a session.
+fn edge_fence_allows(
+    state: &AppState,
+    method: &Method,
+    path: &str,
+    headers: &HeaderMap,
+    peer: IpAddr,
+) -> bool {
+    if state.exposure_tier == ExposureTier::Local {
+        return true;
+    }
+    if method == Method::OPTIONS {
+        // CORS preflight requests carry no credentials by design
+        return true;
+    }
+    if path == "/api/edge/enroll" {
+        // Enrollment carries its own credential: the operator-issued invite
+        // code, validated (and throttled) by the handler (serve/edge.rs).
+        // Devices enrolling for the first time cannot yet hold any session
+        // or bearer token — but a static invite is not strong enough for a
+        // public-facing bind, so Internet tier keeps it fenced.
+        return state.exposure_tier <= ExposureTier::Mesh;
+    }
+    if path.starts_with("/api/edge/") {
+        // The edge surface (currently /api/edge/ws) accepts the edge bearer
+        // or an operator session; the WS handler re-validates bearer-only.
+        return edge_bearer_authorized(headers, state) || check_auth(headers, state);
+    }
+    if !(path.starts_with("/api/") || path == "/ws") {
+        return true;
+    }
+    if peer.is_loopback() && state.exposure_tier <= ExposureTier::Mesh {
+        return true;
+    }
+    check_auth(headers, state)
+}
+
+// ── Bind resolution ───────────────────────────────────────────────────────────
+
+const DEFAULT_WEB_BIND: &str = "127.0.0.1";
+
+/// Resolve the listener bind host: PHILOTIC_WEB_BIND env wins, then the config
+/// file `web_bind` key, then loopback.
+fn resolve_web_bind(env_value: Option<&str>, config_value: Option<&str>) -> Result<IpAddr> {
+    let chosen = env_value
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .or_else(|| config_value.map(str::trim).filter(|v| !v.is_empty()))
+        .unwrap_or(DEFAULT_WEB_BIND);
+    parse_bind_host(chosen)
+}
+
+fn parse_bind_host(raw: &str) -> Result<IpAddr> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        bail!("bind host is empty");
+    }
+    if trimmed.eq_ignore_ascii_case("localhost") {
+        return Ok(IpAddr::V4(Ipv4Addr::LOCALHOST));
+    }
+    trimmed.parse::<IpAddr>().with_context(|| {
+        format!(
+            "invalid PHILOTIC_WEB_BIND host {trimmed:?} — expected an IP address \
+             such as 127.0.0.1, 0.0.0.0, or a Tailscale interface IP"
+        )
+    })
+}
+
+/// Host suitable for printed URLs: unspecified binds are reachable via loopback,
+/// IPv6 hosts need brackets.
+fn display_host_for(bind: IpAddr) -> String {
+    if bind.is_unspecified() {
+        return DEFAULT_WEB_BIND.to_string();
+    }
+    match bind {
+        IpAddr::V4(v4) => v4.to_string(),
+        IpAddr::V6(v6) => format!("[{v6}]"),
+    }
+}
+
+/// Resolve the edge bearer token: PHILOTIC_WEB_EDGE_TOKEN env wins, then the
+/// config file `web_edge_token` key.
+fn resolve_edge_token(env_value: Option<String>, config_value: Option<String>) -> Option<String> {
+    normalize_non_empty_option(env_value).or_else(|| normalize_non_empty_option(config_value))
+}
+
+/// Resolve the edge enrollment invite code: PHILOTIC_WEB_EDGE_INVITE env wins,
+/// then the config file `web_edge_invite` key. `None` disables enrollment.
+fn resolve_edge_invite(env_value: Option<String>, config_value: Option<String>) -> Option<String> {
+    normalize_non_empty_option(env_value).or_else(|| normalize_non_empty_option(config_value))
 }
 
 fn header_bearer_token(headers: &HeaderMap) -> Option<&str> {
@@ -2550,46 +2981,81 @@ async fn handle_mesh_target_agent_chat(
     let operator_session_id = body
         .operator_session_id
         .unwrap_or_else(|| "desktop-membrane".into());
+    let conversation_id = body
+        .conversation_id
+        .unwrap_or_else(|| format!("operator-chat:{operator_session_id}:{agent_id}"));
 
-    let targets = match ipc_desktop_membrane_targets(&state.socket).await {
-        Ok(targets) => targets,
-        Err(err) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": err.to_string()})),
-            )
-                .into_response()
-        }
-    };
+    match submit_operator_chat_turn(
+        &state,
+        &target_node_id,
+        &agent_id,
+        &operator_session_id,
+        conversation_id,
+        body.content,
+        None,
+        Vec::new(),
+    )
+    .await
+    {
+        Ok(accepted) => (StatusCode::ACCEPTED, Json(json!(accepted))).into_response(),
+        Err(err) => (err.status, Json(json!({"error": err.message}))).into_response(),
+    }
+}
+
+/// Error surfaced by [`submit_operator_chat_turn`] — carries the HTTP status
+/// the REST handler maps it to (the edge WS path renders it as a TurnEvent).
+struct OperatorChatSubmitError {
+    status: StatusCode,
+    message: String,
+}
+
+/// Shared submission path for operator chat turns: validates the mesh target,
+/// then spawns [`stream_operator_chat_turn`] which drives the hotel IPC leg
+/// (SubscribeInbox reply role + EmitTask to the target agent) and fans the
+/// resulting turn events out on the broadcast bus. Used by the REST chat
+/// handler and the edge WebSocket mux (serve/edge.rs).
+async fn submit_operator_chat_turn(
+    state: &AppState,
+    target_node_id: &str,
+    agent_id: &str,
+    operator_session_id: &str,
+    conversation_id: String,
+    content: String,
+    message_kind: Option<String>,
+    attachments: Vec<Value>,
+) -> Result<OperatorChatAcceptedView, OperatorChatSubmitError> {
+    let targets = ipc_desktop_membrane_targets(&state.socket)
+        .await
+        .map_err(|err| OperatorChatSubmitError {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            message: err.to_string(),
+        })?;
     let Some(target) = targets
         .iter()
         .find(|target| target.target_node_id == target_node_id)
     else {
-        return (
-            StatusCode::NOT_FOUND,
-            Json(json!({"error": format!("mesh target [{target_node_id}] is not currently active in the registry")})),
-        )
-            .into_response();
+        return Err(OperatorChatSubmitError {
+            status: StatusCode::NOT_FOUND,
+            message: format!(
+                "mesh target [{target_node_id}] is not currently active in the registry"
+            ),
+        });
     };
     let Some(local_target) = targets.iter().find(|target| target.is_local) else {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"error": "local operator target is unavailable"})),
-        )
-            .into_response();
+        return Err(OperatorChatSubmitError {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            message: "local operator target is unavailable".into(),
+        });
     };
     let local_node_id = local_target.target_node_id.clone();
 
-    let conversation_id = body
-        .conversation_id
-        .unwrap_or_else(|| format!("operator-chat:{operator_session_id}:{agent_id}"));
     let session_id = conversation_id.clone();
     let turn_id = new_operator_chat_id("operator-chat-turn");
     let accepted = OperatorChatAcceptedView {
         accepted: true,
-        target_node_id: target_node_id.clone(),
-        target_agent_id: agent_id.clone(),
-        operator_session_id: operator_session_id.clone(),
+        target_node_id: target_node_id.to_string(),
+        target_agent_id: agent_id.to_string(),
+        operator_session_id: operator_session_id.to_string(),
         conversation_id: conversation_id.clone(),
         session_id: session_id.clone(),
         turn_id: turn_id.clone(),
@@ -2603,6 +3069,9 @@ async fn handle_mesh_target_agent_chat(
     let tx = state.tx.clone();
     let socket = state.socket.as_ref().clone();
     let accepted_for_error = accepted.clone();
+    let target_node_id = target_node_id.to_string();
+    let agent_id = agent_id.to_string();
+    let operator_session_id = operator_session_id.to_string();
     tokio::spawn(async move {
         if let Err(err) = stream_operator_chat_turn(
             socket,
@@ -2614,7 +3083,9 @@ async fn handle_mesh_target_agent_chat(
             conversation_id,
             session_id,
             turn_id,
-            body.content,
+            content,
+            message_kind,
+            attachments,
         )
         .await
         {
@@ -2636,7 +3107,7 @@ async fn handle_mesh_target_agent_chat(
         }
     });
 
-    (StatusCode::ACCEPTED, Json(json!(accepted))).into_response()
+    Ok(accepted)
 }
 
 // ── GET /api/event-log ────────────────────────────────────────────────────────
@@ -2672,6 +3143,8 @@ async fn stream_operator_chat_turn(
     session_id: String,
     turn_id: String,
     content: String,
+    message_kind: Option<String>,
+    attachments: Vec<Value>,
 ) -> Result<()> {
     let reply_guest_id = new_operator_chat_id("operator-chat");
     let mut client = connect_client_with_identity(
@@ -2699,18 +3172,29 @@ async fn stream_operator_chat_turn(
             target_node: target_node_id.clone(),
             target_role: "agent".into(),
             target_guest_id: Some(agent_id.clone()),
-            task_json: json!({
-                "source": "operator_chat",
-                "transport": "operator_chat",
-                "session_id": session_id,
-                "turn_id": turn_id,
-                "chat_id": conversation_id,
-                "content": content,
-                "final_reply_to": local_node_id,
-                "final_reply_role": OPERATOR_CHAT_REPLY_ROLE,
-                "final_reply_guest_id": reply_guest_id
-            })
-            .to_string(),
+            task_json: {
+                let mut task = json!({
+                    "source": "operator_chat",
+                    "transport": "operator_chat",
+                    "session_id": session_id,
+                    "turn_id": turn_id,
+                    "chat_id": conversation_id,
+                    "content": content,
+                    "final_reply_to": local_node_id,
+                    "final_reply_role": OPERATOR_CHAT_REPLY_ROLE,
+                    "final_reply_guest_id": reply_guest_id
+                });
+                // "voice"/"audio" sets philote's had_voice_input, which lets
+                // the agent's own voice_response_policy synthesize a persona
+                // voice reply — the same marker membranes stamp on voice notes.
+                if let Some(kind) = &message_kind {
+                    task["message_kind"] = json!(kind);
+                }
+                if !attachments.is_empty() {
+                    task["attachments"] = json!(attachments);
+                }
+                task.to_string()
+            },
         })
         .await?
     {
@@ -2723,7 +3207,14 @@ async fn stream_operator_chat_turn(
             .await
             .map_err(|_| anyhow!("timed out waiting for operator chat reply"))??;
         let IpcResponse::InboundTask { task_json, .. } = inbound else {
-            bail!("unexpected operator chat reply envelope: {inbound:?}");
+            // The hotel pushes unsolicited status broadcasts (e.g. MuninnStatus)
+            // to every subscribed IPC client. They are not reply tasks — skip
+            // them instead of failing the turn (model-router's runtime does the
+            // same for its inbound leg).
+            eprintln!(
+                "philotic-web: operator chat reply leg skipping non-task IPC push: {inbound:?}"
+            );
+            continue;
         };
         let payload: Value = serde_json::from_str(&task_json)?;
         let action = payload
@@ -2765,6 +3256,26 @@ async fn stream_operator_chat_turn(
                     .to_string(),
                 );
             }
+            "voice_chunk" => {
+                let _ = tx.send(
+                    json!({
+                        "type": "operator_chat:voice_chunk",
+                        "payload": {
+                            "target_node_id": target_node_id,
+                            "target_agent_id": agent_id,
+                            "operator_session_id": operator_session_id,
+                            "conversation_id": payload.get("chat_id").and_then(Value::as_str).unwrap_or(&conversation_id),
+                            "session_id": payload.get("session_id").and_then(Value::as_str).unwrap_or(&session_id),
+                            "turn_id": payload.get("turn_id").and_then(Value::as_str).unwrap_or(&turn_id),
+                            "content": payload.get("content").and_then(Value::as_str).unwrap_or_default(),
+                            "audio_artifact": payload.get("audio_artifact").cloned().unwrap_or(Value::Null),
+                            "chunk_seq": payload.get("chunk_seq").cloned().unwrap_or(Value::Null),
+                            "is_final": payload.get("is_final").cloned().unwrap_or(Value::Null)
+                        }
+                    })
+                    .to_string(),
+                );
+            }
             "send_reply" => {
                 let _ = tx.send(
                     json!({
@@ -2777,7 +3288,12 @@ async fn stream_operator_chat_turn(
                             "session_id": payload.get("session_id").and_then(Value::as_str).unwrap_or(&session_id),
                             "turn_id": payload.get("turn_id").and_then(Value::as_str).unwrap_or(&turn_id),
                             "reply_action": action,
-                            "content": payload.get("content").and_then(Value::as_str).unwrap_or_default()
+                            "content": payload.get("content").and_then(Value::as_str).unwrap_or_default(),
+                            // Synthesized persona-voice replies ride the same
+                            // send_reply payload as an inline audio envelope;
+                            // forward it so edge/WS consumers can play it.
+                            "audio_artifact": payload.get("audio_artifact").cloned().unwrap_or(Value::Null),
+                            "send_text_caption": payload.get("send_text_caption").cloned().unwrap_or(Value::Null)
                         }
                     })
                     .to_string(),
@@ -3280,6 +3796,8 @@ struct CreateCronBody {
     guaranteed: bool,
     #[serde(default)]
     enabled: bool,
+    #[serde(default)]
+    silent_ok: bool,
 }
 
 async fn handle_cron_create(
@@ -3306,6 +3824,11 @@ async fn handle_cron_create(
         next_fire_at: now_ms,
         created_at: now_ms,
         created_by: CronJobSource::Operator,
+        silent_ok: body.silent_ok,
+        // Newly registered jobs always want isolated cron sessions; the
+        // `RegisterCronJob` IPC handler re-asserts this regardless, but
+        // setting it here too keeps the constructed value honest.
+        session_target: ansible_mesh_core::cron::CronSessionTarget::Isolated,
     };
     match ipc_register_cron_job(&state.socket, job.clone()).await {
         Ok(()) => {
@@ -3621,7 +4144,7 @@ async fn handle_graph_detail(
 // ── GET /api/secrets ──────────────────────────────────────────────────────────
 //
 // Returns a read-only inventory of known secret refs: vault registry entries
-// (vault name → secret_ref) plus known config-key secret refs (telegram, gemini).
+// (vault name → secret_ref) plus known config-key secret refs.
 // Values are never returned — only metadata about what refs are configured.
 
 async fn handle_secrets(headers: HeaderMap, State(state): State<AppState>) -> Response {
@@ -3651,7 +4174,7 @@ async fn handle_secrets(headers: HeaderMap, State(state): State<AppState>) -> Re
         .collect();
 
     // Named config-key secret refs
-    let named_refs = [
+    let mut named_refs = vec![
         ("gemini_oauth_access_token", "gemini_oauth_access_token_ref"),
         (
             "gemini_oauth_refresh_token",
@@ -3661,6 +4184,11 @@ async fn handle_secrets(headers: HeaderMap, State(state): State<AppState>) -> Re
         ("oidc_github_client_secret", "oidc_github_client_secret_ref"),
         ("telegram_bot_token", "telegram_bot_token"),
     ];
+    named_refs.extend(
+        provider_key_specs()
+            .iter()
+            .map(|spec| (spec.vault_name, spec.api_key_ref_key)),
+    );
     let mut named_entries: Vec<Value> = Vec::new();
     for (label, key) in &named_refs {
         let configured = match ipc_get_config(&state.socket, key).await {
@@ -3682,7 +4210,7 @@ async fn handle_secrets(headers: HeaderMap, State(state): State<AppState>) -> Re
 // ── PUT /api/config/:key ──────────────────────────────────────────────────────
 //
 // Allowed keys for operator mutation (prevents arbitrary config overwrites).
-const MUTABLE_CONFIG_KEYS: &[&str] = &[
+const BASE_MUTABLE_CONFIG_KEYS: &[&str] = &[
     "telegram_bot_token",
     "execution_host",
     "vault_registry",
@@ -3696,6 +4224,22 @@ const MUTABLE_CONFIG_KEYS: &[&str] = &[
 #[derive(serde::Deserialize)]
 struct SetConfigBody {
     value: Value,
+}
+
+#[derive(serde::Deserialize)]
+struct ProviderConfigureBody {
+    #[serde(default)]
+    api_key: Option<String>,
+    #[serde(default)]
+    default_model: Option<String>,
+    #[serde(default)]
+    base_url: Option<String>,
+    #[serde(default)]
+    embedding_model: Option<String>,
+    #[serde(default)]
+    fallback_models: Vec<String>,
+    #[serde(default)]
+    route: Option<String>,
 }
 
 #[derive(serde::Deserialize)]
@@ -3753,7 +4297,7 @@ async fn handle_config_put(
     if !check_auth(&headers, &state) {
         return unauthorized();
     }
-    if !MUTABLE_CONFIG_KEYS.contains(&key.as_str()) {
+    if !is_mutable_config_key(&key) {
         return (
             StatusCode::BAD_REQUEST,
             Json(json!({"error": format!("config key '{}' is not operator-mutable", key)})),
@@ -3782,6 +4326,303 @@ async fn handle_config_put(
         )
             .into_response(),
     }
+}
+
+fn is_mutable_config_key(key: &str) -> bool {
+    BASE_MUTABLE_CONFIG_KEYS.contains(&key) || provider_key_matches_mutable_config(key)
+}
+
+fn provider_key_matches_mutable_config(key: &str) -> bool {
+    provider_key_specs().iter().any(|spec| {
+        [
+            Some(spec.api_key_ref_key),
+            spec.default_model_key,
+            spec.base_url_key,
+            spec.embedding_model_key,
+            spec.fallback_models_key,
+            spec.route_key,
+        ]
+        .into_iter()
+        .flatten()
+        .any(|provider_key| provider_key == key)
+    })
+}
+
+async fn handle_provider_configs(headers: HeaderMap, State(state): State<AppState>) -> Response {
+    if !check_auth(&headers, &state) {
+        return unauthorized();
+    }
+    let mut providers = Vec::new();
+    for spec in provider_key_specs() {
+        match provider_config_view(&state, spec).await {
+            Ok(view) => providers.push(view),
+            Err(err) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({"error": err.to_string()})),
+                )
+                    .into_response()
+            }
+        }
+    }
+    Json(json!({ "providers": providers })).into_response()
+}
+
+async fn handle_model_catalog(headers: HeaderMap, State(state): State<AppState>) -> Response {
+    if !check_auth(&headers, &state) {
+        return unauthorized();
+    }
+    match model_catalog_view(&state.db_path) {
+        Ok(catalog) => Json(json!({
+            "catalog": catalog,
+            "routing_effect": "none-read-only-projection",
+        }))
+        .into_response(),
+        Err(err) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": err.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
+fn model_catalog_view(db_path: &PathBuf) -> Result<Vec<ModelCatalogProjection>> {
+    let storage = SqliteGraphStorage::open(db_path)?;
+    let graph = GraphDomain::new(Arc::new(storage.adapter()));
+    let profiles = graph.list_model_profiles()?;
+    Ok(project_model_catalog(&profiles))
+}
+
+async fn handle_provider_config_get(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Path(provider): Path<String>,
+) -> Response {
+    if !check_auth(&headers, &state) {
+        return unauthorized();
+    }
+    let Some(spec) = provider_key_spec(&provider) else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": format!("unknown provider '{provider}'")})),
+        )
+            .into_response();
+    };
+    match provider_config_view(&state, spec).await {
+        Ok(view) => Json(view).into_response(),
+        Err(err) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": err.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
+async fn handle_provider_configure(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Path(provider): Path<String>,
+    Json(body): Json<ProviderConfigureBody>,
+) -> Response {
+    if !check_auth(&headers, &state) {
+        return unauthorized();
+    }
+    let Some(spec) = provider_key_spec(&provider) else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": format!("unknown provider '{provider}'")})),
+        )
+            .into_response();
+    };
+
+    let mut changed_keys = Vec::new();
+    let mut secret_ref = match ipc_get_config(&state.socket, spec.api_key_ref_key).await {
+        Ok(Some(Value::String(value))) => Some(value),
+        _ => None,
+    };
+
+    if let Some(api_key) = body
+        .api_key
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        match ipc_add_vault_entry(
+            &state.socket,
+            spec.vault_name,
+            api_key,
+            spec.allowed_roles
+                .iter()
+                .map(|role| role.to_string())
+                .collect(),
+        )
+        .await
+        {
+            Ok(new_secret_ref) => {
+                secret_ref = Some(new_secret_ref.clone());
+                if let Err(err) = ipc_set_config(
+                    &state.socket,
+                    spec.api_key_ref_key,
+                    &serde_json::to_string(&new_secret_ref).unwrap_or_else(|_| "null".into()),
+                )
+                .await
+                {
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(json!({"error": err.to_string()})),
+                    )
+                        .into_response();
+                }
+                changed_keys.push(spec.api_key_ref_key);
+            }
+            Err(err) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({"error": err.to_string()})),
+                )
+                    .into_response()
+            }
+        }
+    }
+
+    let config_updates = [
+        (
+            spec.default_model_key,
+            body.default_model.as_deref().map(str::trim),
+        ),
+        (spec.base_url_key, body.base_url.as_deref().map(str::trim)),
+        (
+            spec.embedding_model_key,
+            body.embedding_model.as_deref().map(str::trim),
+        ),
+        (spec.route_key, body.route.as_deref().map(str::trim)),
+    ];
+    for (key, value) in config_updates {
+        let Some(key) = key else { continue };
+        let Some(value) = value.filter(|value| !value.is_empty()) else {
+            continue;
+        };
+        let value_json = match serde_json::to_string(value) {
+            Ok(value_json) => value_json,
+            Err(err) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({"error": err.to_string()})),
+                )
+                    .into_response()
+            }
+        };
+        if let Err(err) = ipc_set_config(&state.socket, key, &value_json).await {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": err.to_string()})),
+            )
+                .into_response();
+        }
+        changed_keys.push(key);
+    }
+
+    if let Some(key) = spec.fallback_models_key {
+        let fallback_models: Vec<String> = body
+            .fallback_models
+            .iter()
+            .map(|model| model.trim().to_string())
+            .filter(|model| !model.is_empty())
+            .collect();
+        if !fallback_models.is_empty() {
+            let value_json = match serde_json::to_string(&fallback_models) {
+                Ok(value_json) => value_json,
+                Err(err) => {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(json!({"error": err.to_string()})),
+                    )
+                        .into_response()
+                }
+            };
+            if let Err(err) = ipc_set_config(&state.socket, key, &value_json).await {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({"error": err.to_string()})),
+                )
+                    .into_response();
+            }
+            changed_keys.push(key);
+        }
+    }
+
+    let event = json!({
+        "type": "provider-config:updated",
+        "payload": { "provider": spec.provider, "changed_keys": changed_keys }
+    });
+    let _ = state.tx.send(event.to_string());
+    Json(json!({
+        "ok": true,
+        "provider": spec.provider,
+        "secret_configured": secret_ref.is_some(),
+        "secret_ref": secret_ref,
+        "changed_keys": changed_keys,
+    }))
+    .into_response()
+}
+
+async fn provider_config_view(state: &AppState, spec: &ProviderKeySpec) -> anyhow::Result<Value> {
+    let secret_ref = ipc_config_string(&state.socket, spec.api_key_ref_key).await?;
+    let default_model = optional_config_string(&state.socket, spec.default_model_key).await?;
+    let base_url = optional_config_string(&state.socket, spec.base_url_key).await?;
+    let embedding_model = optional_config_string(&state.socket, spec.embedding_model_key).await?;
+    let route = optional_config_string(&state.socket, spec.route_key).await?;
+    let fallback_models = if let Some(key) = spec.fallback_models_key {
+        ipc_get_config(&state.socket, key)
+            .await?
+            .and_then(|raw| {
+                raw.as_array().map(|items| {
+                    items
+                        .iter()
+                        .filter_map(|item| item.as_str().map(str::to_string))
+                        .collect::<Vec<_>>()
+                })
+            })
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+
+    Ok(json!({
+        "provider": spec.provider,
+        "display_name": spec.display_name,
+        "secret_configured": secret_ref.is_some(),
+        "secret_ref": secret_ref,
+        "api_key_ref_key": spec.api_key_ref_key,
+        "default_model": default_model,
+        "default_model_key": spec.default_model_key,
+        "base_url": base_url,
+        "base_url_key": spec.base_url_key,
+        "embedding_model": embedding_model,
+        "embedding_model_key": spec.embedding_model_key,
+        "fallback_models": fallback_models,
+        "fallback_models_key": spec.fallback_models_key,
+        "route": route,
+        "route_key": spec.route_key,
+        "defaults": {
+            "default_model": spec.default_model,
+            "base_url": spec.default_base_url,
+        },
+        "allowed_roles": spec.allowed_roles,
+    }))
+}
+
+async fn optional_config_string(socket: &str, key: Option<&str>) -> anyhow::Result<Option<String>> {
+    let Some(key) = key else {
+        return Ok(None);
+    };
+    ipc_config_string(socket, key).await
+}
+
+async fn ipc_config_string(socket: &str, key: &str) -> anyhow::Result<Option<String>> {
+    Ok(ipc_get_config(socket, key)
+        .await?
+        .and_then(|raw| raw.as_str().map(str::to_string)))
 }
 
 // ── POST /api/secrets/rotate ──────────────────────────────────────────────────
@@ -4326,6 +5167,14 @@ async fn ipc_patch_role(
                     .to_string()
             }))
             .filter(|policy| !policy.trim().is_empty()),
+            // This endpoint doesn't expose ladder editing yet; `None` now means
+            // "preserve" server-side (see ConfigureRole fix), so the patch no
+            // longer silently wipes a DB-edited fallback ladder.
+            fallback_tiers: None,
+            // Same preserve-on-None contract; this endpoint doesn't expose
+            // per-agent model-binding editing yet either.
+            model_bindings: None,
+            content_policy: None,
         })
         .await?
     {
@@ -4660,6 +5509,150 @@ async fn ipc_desktop_membrane_targets(socket: &str) -> Result<Vec<OperatorTarget
         other => Err(anyhow!(
             "unexpected desktop membrane targets response: {other:?}"
         )),
+    }
+}
+
+async fn ipc_list_operator_sessions(
+    socket: &str,
+    target_agent_id: Option<String>,
+    limit: Option<u32>,
+) -> Result<Vec<OperatorSessionView>> {
+    let mut client = connect_management_client(socket, "philotic-web-edge-sessions").await?;
+    match client
+        .send_request(IpcRequest::ListOperatorSessions {
+            target_agent_id,
+            limit,
+        })
+        .await?
+    {
+        IpcResponse::OperatorSessionList { operator_sessions } => Ok(operator_sessions),
+        IpcResponse::Standard { message, .. } => Err(anyhow!(message)),
+        other => Err(anyhow!(
+            "unexpected operator session list response: {other:?}"
+        )),
+    }
+}
+
+async fn ipc_list_session_turns(
+    socket: &str,
+    session_id: String,
+    limit: Option<u32>,
+    before_turn_id: Option<String>,
+) -> Result<Vec<SessionTurnView>> {
+    let mut client = connect_management_client(socket, "philotic-web-edge-session-turns").await?;
+    match client
+        .send_request(IpcRequest::ListSessionTurns {
+            session_id,
+            limit,
+            before_turn_id,
+        })
+        .await?
+    {
+        IpcResponse::SessionTurnList { session_turns, .. } => Ok(session_turns),
+        IpcResponse::Standard { message, .. } => Err(anyhow!(message)),
+        other => Err(anyhow!("unexpected session turn list response: {other:?}")),
+    }
+}
+
+/// Round-trip a read-only life-graph datasource tool over hotel IPC: emit an
+/// `execute_tool` task at the local `life-graph-runner` role and await its
+/// `datasource_response` push. Mirrors the request/reply discipline of
+/// `philotic-client`'s `life_graph_ipc_smoke_driver`: the `EmitTask` ack is
+/// only a routing ack — the result arrives as a separate `InboundTask`,
+/// correlated here by `turn_id`. Each call subscribes a unique reply role so
+/// concurrent edge requests can never drain each other's replies.
+async fn ipc_life_graph_datasource_call(
+    socket: &str,
+    tool_name: &str,
+    arguments: serde_json::Value,
+) -> Result<serde_json::Value> {
+    let targets = ipc_desktop_membrane_targets(socket).await?;
+    let local_node = targets
+        .iter()
+        .find(|t| t.is_local)
+        .map(|t| t.target_node_id.clone())
+        .ok_or_else(|| anyhow!("no local operator target for life-graph routing"))?;
+
+    let reply_guest_id = new_operator_chat_id("edge-lifegraph");
+    let reply_role = format!("management.life-graph.reply.{reply_guest_id}");
+    let turn_id = new_operator_chat_id("lifegraph-turn");
+
+    let mut client = connect_client_with_identity(
+        socket,
+        GuestIdentity {
+            guest_id: reply_guest_id.clone(),
+            role: reply_role.clone(),
+            supported_tools: vec![],
+        },
+    )
+    .await?;
+    match client
+        .send_request(IpcRequest::SubscribeInbox {
+            role: reply_role.clone(),
+        })
+        .await?
+    {
+        IpcResponse::Standard { ok: true, .. } => {}
+        other => bail!("life-graph reply subscription refused: {other:?}"),
+    }
+
+    let task_json = serde_json::json!({
+        "action": "execute_tool",
+        "tool_name": tool_name,
+        "arguments": arguments,
+        "session_id": format!("edge-lifegraph:{reply_guest_id}"),
+        "turn_id": turn_id,
+        "chat_id": "",
+        "agent_id": reply_guest_id,
+        "reply_to": local_node,
+        "reply_role": reply_role,
+    })
+    .to_string();
+    match client
+        .send_request(IpcRequest::EmitTask {
+            target_node: local_node.clone(),
+            target_role: "life-graph-runner".into(),
+            target_guest_id: None,
+            task_json,
+        })
+        .await?
+    {
+        IpcResponse::Standard { ok: true, .. } => {}
+        other => bail!("life-graph task emit refused: {other:?}"),
+    }
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            bail!("timed out awaiting {tool_name} datasource reply");
+        }
+        let pushed = tokio::time::timeout(remaining, client.recv_task())
+            .await
+            .map_err(|_| anyhow!("timed out awaiting {tool_name} datasource reply"))??;
+        // Skip unrelated pushes (MuninnStatus, apartment updates, stale
+        // replies) — only this call's datasource_response terminates the loop.
+        let IpcResponse::InboundTask { task_json, .. } = pushed else {
+            continue;
+        };
+        let Ok(payload) = serde_json::from_str::<serde_json::Value>(&task_json) else {
+            continue;
+        };
+        if payload.get("action").and_then(serde_json::Value::as_str) != Some("datasource_response")
+        {
+            continue;
+        }
+        if payload.get("turn_id").and_then(serde_json::Value::as_str) != Some(turn_id.as_str()) {
+            continue;
+        }
+        if let Some(error) = payload.get("error").filter(|e| !e.is_null()) {
+            bail!("life-graph {tool_name} failed: {error}");
+        }
+        return Ok(payload
+            .get("result")
+            .and_then(|r| r.get("data"))
+            .cloned()
+            .unwrap_or(serde_json::Value::Null));
     }
 }
 
@@ -5507,6 +6500,9 @@ async fn ipc_restart_component(socket: &str, guest_id: &str) -> Result<()> {
     match client
         .send_request(IpcRequest::RestartComponent {
             guest_id: guest_id.to_string(),
+            // Operator-initiated restart from the desktop/web UI — deliberate, never
+            // budget-limited.
+            reason: philotic_client::RestartReason::Operator,
         })
         .await?
     {
@@ -5735,6 +6731,53 @@ fn component_templates() -> Vec<ComponentTemplateView> {
             ],
         },
         ComponentTemplateView {
+            id: "model-controller-openrouter".into(),
+            label: "OpenRouter Model Controller".into(),
+            description: "OpenRouter-backed model controller for hosted fallback routing. API keys and model routing belong in hotel provider config, not component manifests.".into(),
+            command: "model-controller-openrouter".into(),
+            role: "model.openrouter".into(),
+            env_fields: vec![],
+            component_config_fields: vec![],
+            dependencies: vec![
+                ComponentTemplateDependencyView {
+                    key: "openrouter_api_key_ref".into(),
+                    label: "OpenRouter API Key Ref".into(),
+                    location: "hotel-config".into(),
+                    required: true,
+                    secret: true,
+                    vault_only: true,
+                    help: "Configure through phil keys configure openrouter or the desktop provider config API. The raw key is stored in the hotel vault.".into(),
+                },
+                ComponentTemplateDependencyView {
+                    key: "openrouter_default_model".into(),
+                    label: "Default Model".into(),
+                    location: "hotel-config".into(),
+                    required: false,
+                    secret: false,
+                    vault_only: false,
+                    help: "Primary OpenRouter model id used when a task does not override provider options.".into(),
+                },
+                ComponentTemplateDependencyView {
+                    key: "openrouter_fallback_models".into(),
+                    label: "Fallback Models".into(),
+                    location: "hotel-config".into(),
+                    required: false,
+                    secret: false,
+                    vault_only: false,
+                    help: "Ordered model list passed to OpenRouter as the fallback chain.".into(),
+                },
+                ComponentTemplateDependencyView {
+                    key: "openrouter_route".into(),
+                    label: "Routing Mode".into(),
+                    location: "hotel-config".into(),
+                    required: false,
+                    secret: false,
+                    vault_only: false,
+                    help: "OpenRouter route value, usually fallback when a fallback model list is configured.".into(),
+                },
+            ],
+        },
+        ComponentTemplateView {
             id: "model-controller-elevenlabs".into(),
             label: "ElevenLabs Voice Controller".into(),
             description: "ElevenLabs-backed model controller. The API key should always arrive via secret ref rather than plaintext manifest fields.".into(),
@@ -5909,9 +6952,9 @@ fn component_templates() -> Vec<ComponentTemplateView> {
         },
         ComponentTemplateView {
             id: "agent-graph-runner".into(),
-            label: "Agent Graph Runner".into(),
-            description: "Per-agent cognitive graph guest. The agent id is required; the graph DB path is optional unless you want an explicit storage location.".into(),
-            command: "agent-graph-runner".into(),
+            label: "Agent Graph (agent-datasource)".into(),
+            description: "Per-agent cognitive graph guest (agent-datasource binary). The agent id is required; the graph DB path is optional unless you want an explicit storage location.".into(),
+            command: "agent-datasource".into(),
             role: "agent-graph".into(),
             env_fields: vec![
                 ComponentTemplateFieldView {
@@ -5964,29 +7007,6 @@ fn component_templates() -> Vec<ComponentTemplateView> {
             component_config_fields: vec![],
             dependencies: vec![],
         },
-        ComponentTemplateView {
-            id: "graph-runner".into(),
-            label: "Graph Runner".into(),
-            description: "Graph query/tool guest. The hotel usually injects the graph runner id automatically; operator-authored config is minimal.".into(),
-            command: "graph-runner".into(),
-            role: "tool.graph".into(),
-            env_fields: vec![
-                ComponentTemplateFieldView {
-                    key: "PHILOTIC_GRAPH_RUNNER_ID".into(),
-                    label: "Graph Runner ID".into(),
-                    target: "env".into(),
-                    input_kind: "string".into(),
-                    required: false,
-                    secret: false,
-                    vault_only: false,
-                    placeholder: Some("local-telegram:graph-runner".into()),
-                    help: Some("Optional explicit runner id when not hotel-seeded.".into()),
-                    default_value: None,
-                },
-            ],
-            component_config_fields: vec![],
-            dependencies: vec![],
-        },
     ]
 }
 
@@ -6017,6 +7037,143 @@ async fn connect_client_with_identity(
         .map_err(Into::into)
 }
 
+// ── GET /health ───────────────────────────────────────────────────────────────
+
+/// Unauthenticated lightweight probe used by edge clients for latency racing.
+/// Returns node identity + version only — no sensitive data, allowed on any tier.
+async fn handle_health(State(state): State<AppState>) -> Response {
+    Json(json!({
+        "node_id": state.hotel.as_str(),
+        "version": env!("CARGO_PKG_VERSION"),
+    }))
+    .into_response()
+}
+
+// ── GET /api/mesh/roster ──────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+struct MeshRosterHotelView {
+    node_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    display_name: Option<String>,
+    /// philotic-web base URLs for this hotel (e.g. "http://100.79.239.64:7700"),
+    /// raced client-side for the lowest-latency reachable endpoint.
+    #[serde(default)]
+    endpoints: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+struct MeshRosterView {
+    hotels: Vec<MeshRosterHotelView>,
+    /// Full-fidelity mesh roster entries from the aiua GetMeshRoster IPC
+    /// (roles, exposure ceiling, typed listener endpoints). Present only when
+    /// `source` is "hotel-ipc".
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    nodes: Vec<MeshRosterEntryView>,
+    /// Where the roster came from: "hotel-ipc", "env", "config", or "unconfigured"
+    source: String,
+}
+
+async fn handle_mesh_roster(headers: HeaderMap, State(state): State<AppState>) -> Response {
+    if !check_auth(&headers, &state) {
+        return unauthorized();
+    }
+    Json(load_mesh_roster(&state).await).into_response()
+}
+
+/// Single seam for roster sourcing — `handle_mesh_roster` only ever calls this.
+///
+/// Primary source is the aiua `GetMeshRoster` IPC (live self + registry peers).
+/// The mesh does not yet advertise philotic-web base URLs in its perimeter
+/// listeners, so per-hotel `endpoints` (raced client-side) are still overlaid
+/// from the configured roster (PHILOTIC_WEB_ROSTER env / config `web_roster`)
+/// by node_id; the typed listener endpoints ride along in `nodes`.
+/// When the hotel IPC is unreachable the configured roster is served as-is.
+async fn load_mesh_roster(state: &AppState) -> MeshRosterView {
+    let (configured, configured_source) = configured_roster_hotels(state);
+    match fetch_mesh_roster_ipc(&state.socket).await {
+        Ok(entries) => {
+            let mut hotels: Vec<MeshRosterHotelView> = entries
+                .iter()
+                .map(|entry| MeshRosterHotelView {
+                    node_id: entry.node_id.clone(),
+                    display_name: entry.display_name.clone(),
+                    endpoints: configured
+                        .iter()
+                        .find(|hotel| hotel.node_id == entry.node_id)
+                        .map(|hotel| hotel.endpoints.clone())
+                        .unwrap_or_default(),
+                })
+                .collect();
+            // Configured hotels the live registry has not (yet) seen stay listed.
+            for hotel in &configured {
+                if !hotels.iter().any(|known| known.node_id == hotel.node_id) {
+                    hotels.push(hotel.clone());
+                }
+            }
+            MeshRosterView {
+                hotels,
+                nodes: entries,
+                source: "hotel-ipc".into(),
+            }
+        }
+        Err(err) => {
+            eprintln!(
+                "philotic-web: GetMeshRoster IPC unavailable ({err:#}); serving {configured_source} roster"
+            );
+            MeshRosterView {
+                hotels: configured,
+                nodes: vec![],
+                source: configured_source.into(),
+            }
+        }
+    }
+}
+
+/// Live roster over the hotel IPC socket (aiua `GetMeshRoster`).
+async fn fetch_mesh_roster_ipc(socket: &str) -> Result<Vec<MeshRosterEntryView>> {
+    let mut client =
+        connect_management_client(socket, &new_operator_chat_id("philotic-web-roster")).await?;
+    match client.send_request(IpcRequest::GetMeshRoster).await? {
+        IpcResponse::MeshRosterView { mesh_roster } => Ok(mesh_roster),
+        other => bail!("unexpected mesh roster response: {other:?}"),
+    }
+}
+
+/// The env/config-sourced roster chain (fallback + endpoint overlay source).
+fn configured_roster_hotels(state: &AppState) -> (Vec<MeshRosterHotelView>, &'static str) {
+    if let Some(raw) = env_trimmed("PHILOTIC_WEB_ROSTER") {
+        match parse_mesh_roster_json(&raw) {
+            Ok(hotels) => return (hotels, "env"),
+            Err(err) => eprintln!("philotic-web: ignoring invalid PHILOTIC_WEB_ROSTER: {err:#}"),
+        }
+    }
+    if let Some(value) =
+        read_config_json(&state.config_path).and_then(|v| v.get("web_roster").cloned())
+    {
+        match parse_mesh_roster_value(&value) {
+            Ok(hotels) => return (hotels, "config"),
+            Err(err) => eprintln!("philotic-web: ignoring invalid config web_roster: {err:#}"),
+        }
+    }
+    (vec![], "unconfigured")
+}
+
+fn parse_mesh_roster_json(raw: &str) -> Result<Vec<MeshRosterHotelView>> {
+    let value: Value = serde_json::from_str(raw).context("mesh roster is not valid JSON")?;
+    parse_mesh_roster_value(&value)
+}
+
+/// Accepts either a bare array of entries or an object wrapping it:
+/// `[{"node_id": "...", "endpoints": [...]}]` or `{"hotels": [...]}`.
+fn parse_mesh_roster_value(value: &Value) -> Result<Vec<MeshRosterHotelView>> {
+    let entries = value.get("hotels").unwrap_or(value);
+    serde_json::from_value(entries.clone()).context(
+        "mesh roster must be a JSON array of {node_id, display_name?, endpoints[]} entries \
+         (optionally wrapped in {\"hotels\": [...]})",
+    )
+}
+
 // ── WebSocket /ws ─────────────────────────────────────────────────────────────
 
 async fn handle_ws(
@@ -6024,7 +7181,7 @@ async fn handle_ws(
     headers: HeaderMap,
     State(state): State<AppState>,
 ) -> Response {
-    if current_operator_session(&headers, &state).is_none() {
+    if !check_auth(&headers, &state) {
         return unauthorized();
     }
 
@@ -6083,15 +7240,19 @@ fn build_cors(allow_origins: Option<&str>) -> CorsLayer {
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 fn read_hotel_name(config_path: &PathBuf) -> String {
-    std::fs::read_to_string(config_path)
-        .ok()
-        .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+    read_config_json(config_path)
         .and_then(|v| {
             v.get("hotels")
                 .and_then(|h| h.as_object())
                 .and_then(|m| m.keys().next().cloned())
         })
         .unwrap_or_else(|| "default".to_string())
+}
+
+fn read_config_json(config_path: &PathBuf) -> Option<Value> {
+    std::fs::read_to_string(config_path)
+        .ok()
+        .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
 }
 
 fn current_operator_session(
@@ -7032,8 +8193,34 @@ fn default_operator_display_name() -> String {
         .unwrap_or_else(|| "Operator".into())
 }
 
+/// Mirrors the hotel's deterministic root-key resolution order (env -> key file ->
+/// macOS Keychain) so the reported source matches what `aiua` actually uses. Keep in
+/// sync with `aiua::vault::load_or_create_root_key`.
 fn detect_root_user_key_ref(hotel: &str) -> RootUserKeyRefStatusView {
     let account = vault_root_key_account();
+
+    if let Ok(key_bytes) = load_root_key_from_env() {
+        return RootUserKeyRefStatusView {
+            user_id: default_operator_user_id(hotel),
+            key_purpose: "vault-root-key".into(),
+            vault_ref: Some(format!("env://PHILOTIC_VAULT_MASTER_KEY/{account}")),
+            public_fingerprint: Some(root_key_fingerprint(&key_bytes)),
+            rotation_state: "active".into(),
+            source_kind: "env".into(),
+        };
+    }
+
+    if let Ok(key_bytes) = load_root_key_from_file() {
+        return RootUserKeyRefStatusView {
+            user_id: default_operator_user_id(hotel),
+            key_purpose: "vault-root-key".into(),
+            vault_ref: Some(format!("file://~/.philotic/vault-master-key.env/{account}")),
+            public_fingerprint: Some(root_key_fingerprint(&key_bytes)),
+            rotation_state: "active".into(),
+            source_kind: "key-file".into(),
+        };
+    }
+
     if cfg!(target_os = "macos") {
         let keychain_ref = format!("keychain://ai.philotic.hotel-vault/{account}");
         match load_root_key_from_keychain(&account) {
@@ -7061,32 +8248,45 @@ fn detect_root_user_key_ref(hotel: &str) -> RootUserKeyRefStatusView {
         }
     }
 
-    match load_root_key_from_env() {
-        Ok(key_bytes) => RootUserKeyRefStatusView {
-            user_id: default_operator_user_id(hotel),
-            key_purpose: "vault-root-key".into(),
-            vault_ref: Some(format!(
-                "env://PHILOTIC_VAULT_MASTER_KEY/{}",
-                vault_root_key_account()
-            )),
-            public_fingerprint: Some(root_key_fingerprint(&key_bytes)),
-            rotation_state: "active".into(),
-            source_kind: "env".into(),
-        },
-        Err(_) => RootUserKeyRefStatusView {
-            user_id: default_operator_user_id(hotel),
-            key_purpose: "vault-root-key".into(),
-            vault_ref: None,
-            public_fingerprint: None,
-            rotation_state: "unavailable".into(),
-            source_kind: "missing".into(),
-        },
+    RootUserKeyRefStatusView {
+        user_id: default_operator_user_id(hotel),
+        key_purpose: "vault-root-key".into(),
+        vault_ref: None,
+        public_fingerprint: None,
+        rotation_state: "unavailable".into(),
+        source_kind: "missing".into(),
     }
 }
 
 fn load_root_key_from_env() -> Result<Vec<u8>> {
     let raw = std::env::var("PHILOTIC_VAULT_MASTER_KEY")?;
     decode_root_key(raw.trim(), "PHILOTIC_VAULT_MASTER_KEY")
+}
+
+/// Reads the operator-provisioned root key file, mirroring
+/// `aiua::vault::load_env_file_root_key`.
+fn load_root_key_from_file() -> Result<Vec<u8>> {
+    let home = std::env::var_os("HOME").ok_or_else(|| anyhow!("HOME is not set"))?;
+    let path = std::path::PathBuf::from(home)
+        .join(".philotic")
+        .join("vault-master-key.env");
+    let content = std::fs::read_to_string(&path)
+        .map_err(|err| anyhow!("failed to read {}: {err}", path.display()))?;
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        if let Some((key, value)) = trimmed.split_once('=') {
+            if key.trim() == "PHILOTIC_VAULT_MASTER_KEY" {
+                return decode_root_key(value.trim(), &path.display().to_string());
+            }
+        }
+    }
+    anyhow::bail!(
+        "{} did not contain PHILOTIC_VAULT_MASTER_KEY",
+        path.display()
+    )
 }
 
 fn load_root_key_from_keychain(account: &str) -> Result<Option<Vec<u8>>> {
@@ -7146,6 +8346,7 @@ fn root_user_key_source_kind(vault_ref: &Option<String>) -> String {
     match vault_ref.as_deref() {
         Some(value) if value.starts_with("keychain://") => "keychain".into(),
         Some(value) if value.starts_with("env://") => "env".into(),
+        Some(value) if value.starts_with("file://") => "key-file".into(),
         Some(_) => "opaque".into(),
         None => "missing".into(),
     }
@@ -7611,6 +8812,29 @@ mod tests {
         assert_eq!(
             summarize_router_event("text.generate", "gemini", "failure", Some("RATE_LIMIT")),
             "text.generate via gemini failed (RATE_LIMIT)"
+        );
+    }
+
+    #[test]
+    fn create_cron_body_reads_explicit_silent_ok_and_defaults_to_false() {
+        let with_silent: CreateCronBody = serde_json::from_value(serde_json::json!({
+            "schedule": "0 0 7 * * * *",
+            "target_role": "orchestrator",
+            "payload": "{}",
+            "silent_ok": true
+        }))
+        .expect("body with silent_ok should deserialize");
+        assert!(with_silent.silent_ok);
+
+        let without_silent: CreateCronBody = serde_json::from_value(serde_json::json!({
+            "schedule": "0 0 7 * * * *",
+            "target_role": "orchestrator",
+            "payload": "{}"
+        }))
+        .expect("body without silent_ok should deserialize");
+        assert!(
+            !without_silent.silent_ok,
+            "omitted silent_ok must default to false, preserving today's always-delivered behavior"
         );
     }
 
@@ -8238,5 +9462,459 @@ mod tests {
         assert!(resolved.is_none());
 
         let _ = fs::remove_file(&context_path);
+    }
+
+    // ── Bind resolution ─────────────────────────────────────────────────────
+
+    #[test]
+    fn resolve_web_bind_defaults_to_loopback() {
+        let addr = resolve_web_bind(None, None).unwrap();
+        assert_eq!(addr, IpAddr::V4(Ipv4Addr::LOCALHOST));
+    }
+
+    #[test]
+    fn resolve_web_bind_env_wins_over_config() {
+        let addr = resolve_web_bind(Some("100.79.239.64"), Some("192.168.1.10")).unwrap();
+        assert_eq!(addr, "100.79.239.64".parse::<IpAddr>().unwrap());
+    }
+
+    #[test]
+    fn resolve_web_bind_falls_back_to_config() {
+        let addr = resolve_web_bind(None, Some("192.168.1.10")).unwrap();
+        assert_eq!(addr, "192.168.1.10".parse::<IpAddr>().unwrap());
+    }
+
+    #[test]
+    fn resolve_web_bind_blank_env_falls_through() {
+        let addr = resolve_web_bind(Some("   "), None).unwrap();
+        assert_eq!(addr, IpAddr::V4(Ipv4Addr::LOCALHOST));
+    }
+
+    #[test]
+    fn parse_bind_host_accepts_ipv6_and_localhost_and_trims() {
+        assert_eq!(
+            parse_bind_host(" ::1 ").unwrap(),
+            "::1".parse::<IpAddr>().unwrap()
+        );
+        assert_eq!(
+            parse_bind_host("LOCALHOST").unwrap(),
+            IpAddr::V4(Ipv4Addr::LOCALHOST)
+        );
+        assert_eq!(
+            parse_bind_host("0.0.0.0").unwrap(),
+            "0.0.0.0".parse::<IpAddr>().unwrap()
+        );
+    }
+
+    #[test]
+    fn parse_bind_host_rejects_garbage() {
+        assert!(parse_bind_host("not-an-ip").is_err());
+        assert!(parse_bind_host("127.0.0.1:7700").is_err());
+        assert!(parse_bind_host("").is_err());
+    }
+
+    #[test]
+    fn display_host_for_unspecified_and_ipv6() {
+        assert_eq!(display_host_for("0.0.0.0".parse().unwrap()), "127.0.0.1");
+        assert_eq!(display_host_for("::1".parse().unwrap()), "[::1]");
+        assert_eq!(
+            display_host_for("100.79.239.64".parse().unwrap()),
+            "100.79.239.64"
+        );
+    }
+
+    // ── Edge bearer token ───────────────────────────────────────────────────
+
+    #[test]
+    fn constant_time_eq_semantics() {
+        assert!(constant_time_eq(b"abc123", b"abc123"));
+        assert!(!constant_time_eq(b"abc123", b"abc124"));
+        assert!(!constant_time_eq(b"abc123", b"abc12"));
+        assert!(constant_time_eq(b"", b""));
+    }
+
+    #[test]
+    fn resolve_edge_token_precedence() {
+        assert_eq!(
+            resolve_edge_token(Some("env-tok".into()), Some("cfg-tok".into())).as_deref(),
+            Some("env-tok")
+        );
+        assert_eq!(
+            resolve_edge_token(None, Some("cfg-tok".into())).as_deref(),
+            Some("cfg-tok")
+        );
+        assert_eq!(resolve_edge_token(Some("  ".into()), None), None);
+        assert_eq!(resolve_edge_token(None, None), None);
+    }
+
+    fn test_state(edge_token: Option<&str>, tier: ExposureTier) -> AppState {
+        let (tx, _) = broadcast::channel::<String>(4);
+        AppState {
+            bootstrap_token: Arc::new("philotic-test".into()),
+            db_path: temp_db_path("fence"),
+            config_path: Arc::new(PathBuf::from("/nonexistent/mesh-config.json")),
+            hotel: Arc::new("mac-jane".into()),
+            socket: Arc::new(format!("/tmp/philotic-test-{}.sock", uuid::Uuid::new_v4())),
+            tx,
+            edge_token: edge_token.map(|t| Arc::new(t.to_string())),
+            exposure_tier: tier,
+            edge: edge::EdgeState::load(
+                std::env::temp_dir().join(format!(
+                    "philotic-web-test-edge-devices-{}.json",
+                    uuid::Uuid::new_v4()
+                )),
+                Some("INV-TEST".into()),
+            ),
+        }
+    }
+
+    fn bearer_headers(token: &str) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "authorization",
+            HeaderValue::from_str(&format!("Bearer {token}")).unwrap(),
+        );
+        headers
+    }
+
+    #[test]
+    fn edge_bearer_authorized_matches_configured_token() {
+        let state = test_state(Some("edge-secret"), ExposureTier::Mesh);
+        assert!(edge_bearer_authorized(
+            &bearer_headers("edge-secret"),
+            &state
+        ));
+        assert!(!edge_bearer_authorized(&bearer_headers("wrong"), &state));
+        assert!(!edge_bearer_authorized(&HeaderMap::new(), &state));
+
+        let no_token = test_state(None, ExposureTier::Mesh);
+        assert!(!edge_bearer_authorized(
+            &bearer_headers("edge-secret"),
+            &no_token
+        ));
+    }
+
+    #[test]
+    fn edge_bearer_accepts_enrolled_device_tokens() {
+        let state = test_state(Some("edge-secret"), ExposureTier::Mesh);
+        let enrolled = state
+            .edge
+            .enroll(&philotic_edge_protocol::EnrollmentRequest {
+                invite_code: "INV-TEST".into(),
+                device_pubkey_b64: "cHVia2V5".into(),
+                device_name: "Jared's iPhone".into(),
+                platform: "ios".into(),
+            })
+            .unwrap();
+
+        // Device token authorizes the bearer path and resolves to its node.
+        assert!(edge_bearer_authorized(
+            &bearer_headers(&enrolled.edge_token),
+            &state
+        ));
+        assert_eq!(
+            edge::edge_bearer_identity(&bearer_headers(&enrolled.edge_token), &state),
+            Some(edge::EdgeBearerIdentity::Device(enrolled.node_id.clone()))
+        );
+        // The shared token resolves to the shared identity.
+        assert_eq!(
+            edge::edge_bearer_identity(&bearer_headers("edge-secret"), &state),
+            Some(edge::EdgeBearerIdentity::Shared)
+        );
+        // Bad tokens still fail.
+        assert_eq!(
+            edge::edge_bearer_identity(&bearer_headers("edge-tok-forged"), &state),
+            None
+        );
+    }
+
+    #[test]
+    fn fence_leaves_edge_enrollment_reachable_without_credentials() {
+        let state = test_state(None, ExposureTier::Mesh);
+        let peer: IpAddr = "100.64.1.9".parse().unwrap();
+        assert!(edge_fence_allows(
+            &state,
+            &Method::POST,
+            "/api/edge/enroll",
+            &HeaderMap::new(),
+            peer
+        ));
+        // The edge WS stays behind the fence.
+        assert!(!edge_fence_allows(
+            &state,
+            &Method::GET,
+            "/api/edge/ws",
+            &HeaderMap::new(),
+            peer
+        ));
+    }
+
+    #[test]
+    fn fence_blocks_edge_enrollment_on_internet_tier() {
+        // A static invite code is not a strong enough credential for a
+        // public-facing bind — enrollment must not be reachable there.
+        let state = test_state(None, ExposureTier::Internet);
+        let peer: IpAddr = "203.0.113.9".parse().unwrap();
+        assert!(!edge_fence_allows(
+            &state,
+            &Method::POST,
+            "/api/edge/enroll",
+            &HeaderMap::new(),
+            peer
+        ));
+    }
+
+    // ── Perimeter fence ─────────────────────────────────────────────────────
+
+    #[test]
+    fn fence_local_tier_allows_everything() {
+        let state = test_state(None, ExposureTier::Local);
+        let peer: IpAddr = "127.0.0.1".parse().unwrap();
+        assert!(edge_fence_allows(
+            &state,
+            &Method::GET,
+            "/api/status",
+            &HeaderMap::new(),
+            peer
+        ));
+    }
+
+    #[test]
+    fn fence_mesh_tier_blocks_api_without_credentials() {
+        let state = test_state(Some("edge-secret"), ExposureTier::Mesh);
+        let peer: IpAddr = "100.64.1.9".parse().unwrap();
+        assert!(!edge_fence_allows(
+            &state,
+            &Method::GET,
+            "/api/status",
+            &HeaderMap::new(),
+            peer
+        ));
+        assert!(!edge_fence_allows(
+            &state,
+            &Method::GET,
+            "/ws",
+            &HeaderMap::new(),
+            peer
+        ));
+        // wrong bearer stays blocked
+        assert!(!edge_fence_allows(
+            &state,
+            &Method::GET,
+            "/api/status",
+            &bearer_headers("wrong"),
+            peer
+        ));
+    }
+
+    #[test]
+    fn edge_bearer_is_scoped_to_the_edge_surface() {
+        let state = test_state(Some("edge-secret"), ExposureTier::Mesh);
+        let peer: IpAddr = "100.64.1.9".parse().unwrap();
+
+        // The edge bearer opens the edge WS...
+        assert!(edge_fence_allows(
+            &state,
+            &Method::GET,
+            "/api/edge/ws",
+            &bearer_headers("edge-secret"),
+            peer
+        ));
+
+        // ...but never the operator API or the operator /ws firehose: a
+        // device credential must not read secrets, mutate config, or watch
+        // every session.
+        for path in [
+            "/api/mesh/roster",
+            "/api/secrets",
+            "/api/secrets/rotate",
+            "/api/vault",
+            "/api/config/some-key",
+            "/api/event-log",
+            "/ws",
+        ] {
+            assert!(
+                !edge_fence_allows(
+                    &state,
+                    &Method::GET,
+                    path,
+                    &bearer_headers("edge-secret"),
+                    peer
+                ),
+                "edge bearer must not open {path}"
+            );
+        }
+
+        // An enrolled per-device token is equally scoped.
+        let enrolled = state
+            .edge
+            .enroll(&philotic_edge_protocol::EnrollmentRequest {
+                invite_code: "INV-TEST".into(),
+                device_pubkey_b64: "cHVia2V5LWZlbmNl".into(),
+                device_name: "Jared's iPhone".into(),
+                platform: "ios".into(),
+            })
+            .unwrap();
+        assert!(edge_fence_allows(
+            &state,
+            &Method::GET,
+            "/api/edge/ws",
+            &bearer_headers(&enrolled.edge_token),
+            peer
+        ));
+        assert!(!edge_fence_allows(
+            &state,
+            &Method::GET,
+            "/api/secrets",
+            &bearer_headers(&enrolled.edge_token),
+            peer
+        ));
+
+        // check_auth itself never honours an edge bearer.
+        assert!(!check_auth(&bearer_headers("edge-secret"), &state));
+        assert!(!check_auth(&bearer_headers(&enrolled.edge_token), &state));
+    }
+
+    #[test]
+    fn fence_leaves_non_api_surfaces_and_preflight_open() {
+        let state = test_state(None, ExposureTier::Mesh);
+        let peer: IpAddr = "100.64.1.9".parse().unwrap();
+        // /health, static UI, and OIDC callback are outside the gate
+        for path in [
+            "/health",
+            "/",
+            "/assets/app.js",
+            "/auth/oidc/github/callback",
+        ] {
+            assert!(
+                edge_fence_allows(&state, &Method::GET, path, &HeaderMap::new(), peer),
+                "expected {path} to stay reachable"
+            );
+        }
+        // CORS preflight carries no credentials
+        assert!(edge_fence_allows(
+            &state,
+            &Method::OPTIONS,
+            "/api/status",
+            &HeaderMap::new(),
+            peer
+        ));
+    }
+
+    #[test]
+    fn fence_loopback_bypass_up_to_mesh_but_not_internet() {
+        let loopback: IpAddr = "127.0.0.1".parse().unwrap();
+        let mesh_state = test_state(None, ExposureTier::Mesh);
+        assert!(edge_fence_allows(
+            &mesh_state,
+            &Method::GET,
+            "/api/status",
+            &HeaderMap::new(),
+            loopback
+        ));
+
+        let internet_state = test_state(None, ExposureTier::Internet);
+        assert!(!edge_fence_allows(
+            &internet_state,
+            &Method::GET,
+            "/api/status",
+            &HeaderMap::new(),
+            loopback
+        ));
+    }
+
+    // ── Mesh roster ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn parse_mesh_roster_accepts_bare_array_and_wrapped_object() {
+        let raw = r#"[{"node_id":"mbp-jane","endpoints":["http://100.79.239.64:7700"]}]"#;
+        let hotels = parse_mesh_roster_json(raw).unwrap();
+        assert_eq!(hotels.len(), 1);
+        assert_eq!(hotels[0].node_id, "mbp-jane");
+        assert_eq!(hotels[0].endpoints, vec!["http://100.79.239.64:7700"]);
+        assert_eq!(hotels[0].display_name, None);
+
+        let wrapped =
+            r#"{"hotels":[{"node_id":"vps-jane","display_name":"VPS Jane","endpoints":[]}]}"#;
+        let hotels = parse_mesh_roster_json(wrapped).unwrap();
+        assert_eq!(hotels.len(), 1);
+        assert_eq!(hotels[0].node_id, "vps-jane");
+        assert_eq!(hotels[0].display_name.as_deref(), Some("VPS Jane"));
+        assert!(hotels[0].endpoints.is_empty());
+    }
+
+    #[test]
+    fn parse_mesh_roster_endpoints_default_to_empty() {
+        let raw = r#"[{"node_id":"mac-jane"}]"#;
+        let hotels = parse_mesh_roster_json(raw).unwrap();
+        assert!(hotels[0].endpoints.is_empty());
+    }
+
+    #[test]
+    fn parse_mesh_roster_rejects_invalid_shapes() {
+        assert!(parse_mesh_roster_json("not json").is_err());
+        assert!(parse_mesh_roster_json(r#"{"node_id":"missing-array-wrapper"}"#).is_err());
+        assert!(
+            parse_mesh_roster_json(r#"[{"endpoints":[]}]"#).is_err(),
+            "node_id is required"
+        );
+    }
+
+    #[test]
+    fn mesh_roster_view_serializes_for_clients() {
+        let view = MeshRosterView {
+            hotels: vec![MeshRosterHotelView {
+                node_id: "mbp-jane".into(),
+                display_name: None,
+                endpoints: vec!["http://100.79.239.64:7700".into()],
+            }],
+            nodes: vec![],
+            source: "env".into(),
+        };
+        let value = serde_json::to_value(&view).unwrap();
+        assert_eq!(
+            value,
+            json!({
+                "hotels": [{
+                    "node_id": "mbp-jane",
+                    "endpoints": ["http://100.79.239.64:7700"],
+                }],
+                "source": "env",
+            })
+        );
+    }
+
+    #[test]
+    fn load_mesh_roster_reads_config_web_roster() {
+        let config_path = std::env::temp_dir().join(format!(
+            "philotic-web-roster-config-{}.json",
+            uuid::Uuid::new_v4()
+        ));
+        fs::write(
+            &config_path,
+            r#"{"web_roster":[{"node_id":"vps-jane","endpoints":["http://100.64.212.8:7700"]}]}"#,
+        )
+        .unwrap();
+        let mut state = test_state(None, ExposureTier::Local);
+        state.config_path = Arc::new(config_path.clone());
+
+        let view = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(load_mesh_roster(&state));
+        assert_eq!(view.source, "config");
+        assert_eq!(view.hotels.len(), 1);
+        assert_eq!(view.hotels[0].node_id, "vps-jane");
+
+        let _ = fs::remove_file(&config_path);
+    }
+
+    #[test]
+    fn load_mesh_roster_unconfigured_is_empty() {
+        let state = test_state(None, ExposureTier::Local);
+        let view = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(load_mesh_roster(&state));
+        assert_eq!(view.source, "unconfigured");
+        assert!(view.hotels.is_empty());
     }
 }

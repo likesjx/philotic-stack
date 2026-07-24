@@ -25,10 +25,49 @@ session-start:
     python3 scripts/muninn_mcp.py bootstrap
     just harness-drift 2>/dev/null || true
     bash scripts/session-start.sh
+    ./scripts/idea-sweep.sh pending || echo "⚠ idea sweep skipped (Memgraph unreachable) — run 'just idea-sweep' later"
+
+# Aria idea pipeline (stage 2): sweep + triage operator ideas in the LifeGraph.
+# Verbs: pending (default) | all | promote <idea:slug> <graph-ref> | decline <idea:slug> <reason> | ship <idea:slug> [note]
+idea-sweep *args="pending":
+    ./scripts/idea-sweep.sh {{args}}
+
+# Verify private native Muninn access, including the vps-jane SSH tunnel path.
+muninn-private-smoke:
+    ./scripts/muninn-private-access.sh smoke
+
+# Verify local/private MCP client credential posture without printing secrets.
+mcp-client-uat mode="safe":
+    ./scripts/mcp-client-uat.sh {{mode}}
+
+# Non-mutating Muninn cluster lab preflight. Does not enable cluster mode.
+muninn-cluster-preflight mode="local":
+    ./scripts/muninn-cluster-lab-preflight.sh {{mode}}
 
 # Show drift status for all managed harnesses.
 harness-drift:
     @phil graph harness drift
+
+# Verify every managed harness against its projection, then report drift.
+harness-verify-all:
+    #!/usr/bin/env bash
+    set -uo pipefail
+    phil graph harness list | awk 'NR>2 {print $1}' | while read -r h; do
+        [ -n "$h" ] && phil graph harness verify "$h" || true
+    done
+    phil graph harness drift
+
+# Sync the harness skill catalog in the graph from skills/*/SKILL.md.
+harness-skills-sync:
+    phil graph harness skills sync
+
+# Install the launchd schedule that refreshes graph scan + harness drift every 6 hours.
+intel-graph-freshness-schedule:
+    ./scripts/install-intel-graph-freshness-schedule.sh
+
+# Install the launchd service that SUPERVISES the graph server (KeepAlive, RunAtLoad).
+intel-graph-service:
+    ./scripts/install-intel-graph-service.sh
 
 # Re-apply the canonical profile to a harness (default: claude-local with philotic-operator).
 harness-apply harness="claude-local" profile="philotic-operator":
@@ -111,7 +150,7 @@ start-aiua hotel:
 
 # Rebuild the local runtime binaries that the hotel materializes during watched UAT.
 build-runtime:
-    cargo build -p aiua -p philote -p membrane -p model-router -p tool-runner -p graph-runner -p philotic-web
+    cargo build -p aiua -p philote -p membrane-telegram -p model-router -p tool-runner -p graph-datasource -p philotic-web
 
 # Kill local Philotic hotel/guest binaries from this checkout and clear stale sockets.
 kill-local-stack:
@@ -120,8 +159,13 @@ kill-local-stack:
     @pkill -KILL -f "target/debug/philote" 2>/dev/null || true
     @pkill -KILL -f "target/debug/model-controller-gemini" 2>/dev/null || true
     @pkill -KILL -f "target/debug/model-controller-elevenlabs" 2>/dev/null || true
+    @pkill -KILL -f "target/debug/model-controller-openrouter" 2>/dev/null || true
+    @pkill -KILL -f "target/debug/model-controller-anthropic" 2>/dev/null || true
+    @pkill -KILL -f "target/debug/model-controller-openai" 2>/dev/null || true
+    @pkill -KILL -f "target/debug/model-controller-ollama" 2>/dev/null || true
     @pkill -KILL -f "target/debug/tool-runner" 2>/dev/null || true
     @pkill -KILL -f "target/debug/graph-runner" 2>/dev/null || true
+    @pkill -KILL -f "target/debug/graph-datasource" 2>/dev/null || true
     @pkill -KILL -f "target/debug/model-controller-mlx" 2>/dev/null || true
     @sleep 0.3
     @rm -f /tmp/philotic-*.sock
@@ -198,7 +242,7 @@ start-aiua-uat:
 
 # Start the Gateway (Telegram Membrane)
 start-gateway:
-    cargo run -p membrane
+    cargo run -p membrane-telegram
 
 # Start the Persona (Philote)
 start-agent:
@@ -216,9 +260,9 @@ start-parakeet:
 start-tool:
     cargo run -p tool-runner
 
-# Start the Graph Runner (context graph + table adapter)
-start-graph-runner:
-    cargo run -p graph-runner
+# Start the Graph Datasource (Cypher-over-SQLite graph store guest)
+start-graph-datasource:
+    cargo run -p graph-datasource
 
 # Start the full stack in background (requires tmux or similar)
 start:
@@ -230,7 +274,7 @@ status:
     @echo "Checking Philotic Stack local status..."
     @# Ping the Aiua daemon port or check processes.
     @ps aux | grep -v grep | grep "cargo run -p aiua" || echo "Aiua daemon is not running."
-    @ps aux | grep -v grep | grep "cargo run -p membrane" || echo "Membrane gateway is not running."
+    @ps aux | grep -v grep | grep "cargo run -p membrane-telegram" || echo "Membrane gateway is not running."
 
 # Build and install phil symlink to /usr/local/bin (dev workflow shortcut)
 phil-install:
@@ -253,6 +297,7 @@ worktree-create slug base="main":
 # Bootstrap an implementation workstream with a dedicated sibling worktree and checklist.
 workstream-start slug base="develop":
     ./scripts/codex-workstream.sh start {{slug}} {{base}}
+    @echo "Tip: record slice telemetry — just harness-trial-start <seam-id> (close at slice end with harness-trial-close)"
 
 # Alias for the multi-role workstream workflow.
 start-workstream slug base="develop":
@@ -282,9 +327,30 @@ worktree-remove slug delete_branch="":
 worktree-prune:
     ./scripts/codex-worktree.sh prune
 
-# Run tests
+# Report which sibling worktrees are safe to garbage-collect (dry run — deletes nothing).
+worktree-gc:
+    ./scripts/worktree-gc.sh --dry-run
+
+# Garbage-collect merged+clean sibling worktrees to reclaim cargo target/ disk (real deletion).
+worktree-gc-apply:
+    ./scripts/worktree-gc.sh --apply
+
+# Install the launchd schedule that runs worktree-gc --apply every 2 hours (mac-jane / macOS).
+worktree-gc-schedule:
+    ./scripts/install-worktree-gc-schedule.sh
+
+# Run tests, then record pass/fail totals to the intel graph by default
+# (graceful no-op notice if the graph server at :8900 isn't running).
 test:
-    cargo test --workspace
+    ./scripts/test-and-record.sh
+
+# Build the Apple edge client (PhiloticKit + PhiloticApp for macOS and iOS Simulator).
+app-build:
+    ./scripts/apple-app-build.sh
+
+# Test the Apple edge client (PhiloticKit swift test, then both PhiloticApp builds).
+app-test:
+    ./scripts/apple-app-test.sh
 
 # Run the heavier binary-level smoke test
 smoke-binaries:
@@ -322,6 +388,10 @@ smoke-subagent:
 smoke-session-control:
     ./scripts/smoke-session-control-roundtrip.sh
 
+# Run the MCP client UAT (safe modes only; no live tokens required)
+smoke-mcp:
+    ./scripts/mcp-client-uat.sh safe
+
 # Run the session bindings binary smoke test
 smoke-session-bindings:
     ./scripts/smoke-session-bindings-roundtrip.sh
@@ -338,9 +408,9 @@ smoke-cognitive-reentry:
 smoke-embed:
     bash scripts/smoke-embed-roundtrip.sh
 
-# Run the graph-runner smoke (create → upsert node → get node → export round-trip)
-smoke-graph-runner:
-    bash scripts/smoke-graph-runner-roundtrip.sh
+# Run the graph-datasource smoke (create partition → CREATE node → MATCH → list round-trip)
+smoke-graph-datasource:
+    bash scripts/smoke-graph-datasource-roundtrip.sh
 
 # Run the LifeGraph runner through live hotel IPC.
 # Set PHILOTIC_HOTEL_SOCKET, PHILOTIC_TARGET_NODE, and PHILOTIC_REPLY_NODE for remote hotels.
@@ -354,6 +424,29 @@ smoke-agent-graph:
 # Run the desktop membrane management surface smoke (lease, REST API, auth, clean shutdown)
 smoke-desktop-membrane:
     bash scripts/smoke-desktop-membrane.sh
+
+# Run the `phil config get/set` IPC roundtrip smoke (ephemeral throwaway hotel)
+smoke-config:
+    bash scripts/smoke-config-roundtrip.sh
+
+# Substrate Hardening S4: run ONE bounded chaos-smoke scenario against a
+# designated hotel (guest-kill / config-corrupt / mesh-peer-drop, or omit to
+# round-robin the two real scenarios). Pass --dry-run to print the plan only.
+# See scripts/chaos-smoke.sh's header for the full env-var contract —
+# PHILOTIC_CHAOS_HOTEL / PHILOTIC_CHAOS_PROFILE / PHILOTIC_CHAOS_GUEST_ID in
+# particular must be set to match the real target hotel before a live run.
+chaos-smoke *args:
+    bash scripts/chaos-smoke.sh {{args}}
+
+# Install the OPT-IN weekly launchd schedule for chaos-smoke (macOS; never
+# auto-installed — see scripts/install-chaos-smoke-schedule.sh).
+chaos-smoke-schedule:
+    ./scripts/install-chaos-smoke-schedule.sh
+
+# Unit-test chaos-smoke.sh's assertion/parsing logic (denylists, JSON field
+# extraction, heal-queue counting) against fixture data — no real hotel touched.
+chaos-smoke-unit-test:
+    bash scripts/tests/chaos-smoke-unit-test.sh
 
 # Run the model-controller roundtrip smoke (requires mesh-config.json with model credentials)
 smoke-model-controller:
@@ -413,7 +506,7 @@ smoke-suite:
     bash scripts/smoke-cognitive-roundtrip.sh
     bash scripts/smoke-cognitive-reentry-roundtrip.sh
     bash scripts/smoke-gemini-live-roundtrip.sh
-    bash scripts/smoke-graph-runner-roundtrip.sh
+    bash scripts/smoke-graph-datasource-roundtrip.sh
     bash scripts/smoke-agent-graph-roundtrip.sh
     bash scripts/smoke-desktop-membrane.sh
 
@@ -459,9 +552,9 @@ local-push:
     set -euo pipefail
     AIUA_CELLAR=/opt/homebrew/Cellar/aiua/0.1.0-alpha/bin
     PHIL_CELLAR=/opt/homebrew/Cellar/philotic-web/0.1.0-alpha/bin
-    AIUA_BINS="aiua philote membrane membrane-telegram membrane-mcp model-router model-controller-gemini model-controller-elevenlabs model-controller-mlx model-controller-ollama model-controller-onnx model-controller-parakeet model-controller-vision philote-worker tool-runner graph-runner graph-datasource table-datasource router-listener agent-datasource heal-dispatcher life-graph-runner"
+    AIUA_BINS="aiua philote membrane-telegram membrane-discord membrane-mcp model-router model-controller-gemini model-controller-elevenlabs model-controller-openrouter model-controller-anthropic model-controller-openai model-controller-mlx model-controller-ollama model-controller-onnx model-controller-parakeet model-controller-vision philote-worker tool-runner graph-datasource table-datasource router-listener agent-datasource heal-dispatcher life-graph-runner"
     echo "▶ Building release binaries..."
-    cargo build --release -p aiua -p philote -p membrane -p membrane-telegram -p membrane-mcp -p model-router -p tool-runner -p graph-runner -p graph-datasource -p philotic-web -p table-datasource -p router-listener -p agent-datasource -p heal-dispatcher -p data-memorygraphrag
+    cargo build --release -p aiua -p philote -p membrane-telegram -p membrane-discord -p membrane-mcp -p model-router -p tool-runner -p graph-datasource -p philotic-web -p table-datasource -p router-listener -p agent-datasource -p heal-dispatcher -p data-memorygraphrag
     echo "▶ Installing aiua stack to ${AIUA_CELLAR}..."
     # Make bin dir writable so we can delete+recreate files (new inode avoids macOS codesign cache poisoning)
     chmod u+w "${AIUA_CELLAR}"
@@ -504,17 +597,42 @@ remote-homebrew-push remote hotel expected_host="":
     set -euo pipefail
     exec ./scripts/push-homebrew-remote.sh "{{remote}}" "{{hotel}}" "{{expected_host}}"
 
+# Stop a macOS hotel. DUAL-SUPERVISION HAZARD: mbp-jane / mac-jane run aiua under
+# a launchd LaunchAgent (KeepAlive=true). A bare `pkill` there just trips a
+# KeepAlive respawn — the process comes right back. So when a plist manages this
+# hotel, `bootout` the launchd service (stops it AND keeps it stopped); only
+# `pkill` on non-launchd (hand-started) hosts.
 remote-homebrew-stop remote hotel:
     #!/usr/bin/env bash
-    ssh "{{remote}}" "pkill -f 'aiua --hotel {{hotel}}' && echo '▶ aiua stopped for hotel {{hotel}}' || echo '▶ aiua was not running for hotel {{hotel}}'"
+    ssh "{{remote}}" "uid=\$(id -u); LABEL=com.philotic.aiua.{{hotel}}; \
+      if [ -f \"\$HOME/Library/LaunchAgents/\${LABEL}.plist\" ]; then \
+        launchctl bootout gui/\${uid}/\${LABEL} 2>/dev/null && echo '▶ launchd \${LABEL} booted out' || echo '▶ launchd \${LABEL} was not loaded'; \
+      else \
+        pkill -f '[a]iua --hotel {{hotel}}' 2>/dev/null && echo '▶ aiua stopped for hotel {{hotel}}' || echo '▶ aiua was not running for hotel {{hotel}}'; \
+      fi"
 
+# Start a macOS hotel. DUAL-SUPERVISION HAZARD: mbp-jane / mac-jane run aiua under
+# launchd (KeepAlive=true, RunAtLoad=true). Hand-starting with nohup on top of that
+# spawns a SECOND aiua that fights launchd's copy over the same IPC socket + mesh
+# port → crashes / respawn-budget exhaustion (the historical incident). So restart
+# THROUGH launchd when a plist exists (kickstart -k if loaded, else bootstrap so
+# RunAtLoad starts it); only hand-start via nohup when NO plist exists.
 remote-homebrew-start remote hotel:
     #!/usr/bin/env bash
     profile="{{hotel}}"
     if [[ "{{hotel}}" == "mbp-jane" || "{{hotel}}" == "mac-jane" ]]; then profile="jane"; fi
     if [[ "{{hotel}}" == "local-telegram" || "{{hotel}}" == "bjork" ]]; then profile="bjork"; fi
-    ssh "{{remote}}" "uid=\$(id -u); launchctl bootout gui/\${uid}/com.philotic.aiua.{{hotel}} 2>/dev/null || true; pkill -f '[a]iua --hotel {{hotel}}' 2>/dev/null || true"
-    ssh "{{remote}}" "mkdir -p ~/.philotic/${profile}/graphs && ulimit -n 65536; nohup env PHILOTIC_PROFILE=${profile} PHILOTIC_GRAPH_DATABASE_DIR=\$HOME/.philotic/${profile}/graphs PHILOTIC_LIFE_GRAPH_RUNNER_HOME_NODE=vps-jane-aiua-01 PHILOTIC_REMOTE_LIFE_GRAPH_RUNNER_NODE=vps-jane-aiua-01 PHILOTIC_ENABLE_RUST_AUTH=1 PHILOTIC_ENABLE_RUST_DISPATCHER=1 PHILOTIC_ENABLE_RUST_TASK_LIFECYCLE=1 /opt/homebrew/bin/aiua --hotel {{hotel}} >> ~/.philotic/${profile}/aiua.log 2>&1 & echo \$! > ~/.philotic/${profile}/aiua.pid && echo 'aiua started pid '\$(cat ~/.philotic/${profile}/aiua.pid)"
+    ssh "{{remote}}" "uid=\$(id -u); LABEL=com.philotic.aiua.{{hotel}}; PLIST=\"\$HOME/Library/LaunchAgents/\${LABEL}.plist\"; \
+      if [ -f \"\$PLIST\" ]; then \
+        if launchctl print gui/\${uid}/\${LABEL} >/dev/null 2>&1; then \
+          launchctl kickstart -k gui/\${uid}/\${LABEL} && echo '▶ \${LABEL} kickstarted under launchd'; \
+        else \
+          launchctl bootstrap gui/\${uid} \"\$PLIST\" 2>/dev/null || true; echo '▶ \${LABEL} bootstrapped under launchd (RunAtLoad starts it)'; \
+        fi; \
+      else \
+        mkdir -p ~/.philotic/${profile}/graphs; ulimit -n 65536; \
+        nohup env PHILOTIC_PROFILE=${profile} PHILOTIC_GRAPH_DATABASE_DIR=\$HOME/.philotic/${profile}/graphs PHILOTIC_LIFE_GRAPH_RUNNER_HOME_NODE=vps-jane-aiua-01 PHILOTIC_REMOTE_LIFE_GRAPH_RUNNER_NODE=vps-jane-aiua-01 PHILOTIC_ENABLE_RUST_AUTH=1 PHILOTIC_ENABLE_RUST_DISPATCHER=1 PHILOTIC_ENABLE_RUST_TASK_LIFECYCLE=1 /opt/homebrew/bin/aiua --hotel {{hotel}} >> ~/.philotic/${profile}/aiua.log 2>&1 & echo \$! > ~/.philotic/${profile}/aiua.pid && echo 'aiua started pid '\$(cat ~/.philotic/${profile}/aiua.pid); \
+      fi"
 
 remote-homebrew-status remote hotel:
     @ssh "{{remote}}" "ps aux | grep '[/]opt/homebrew/bin/aiua --hotel {{hotel}}' || echo 'aiua is not running for hotel {{hotel}} on {{remote}}'"
@@ -533,6 +651,108 @@ jane-start:
 # Check whether Jane (aiua) is running on mbp-jane.
 jane-status:
     @just remote-homebrew-status mbp-jane mbp-jane
+
+# ── mac-jane (LOCAL Air hotel) lifecycle ────────────────────────────────────
+# mac-jane runs on THIS machine under launchd. Do NOT use remote-homebrew-start
+# mac-jane — {{remote}} would be "mac-jane", which sshes to an unresolvable host
+# (255). These drive the local launchd job directly.
+mac-jane-stop:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    LABEL=com.philotic.aiua.mac-jane; uid=$(id -u)
+    launchctl bootout gui/${uid}/${LABEL} 2>/dev/null || true
+    # Wait for full exit — a graceful drain can take ~30s, and a launchd/DB
+    # maintenance step must not race a still-draining process.
+    for _ in $(seq 1 40); do pgrep -f 'aiua --hotel mac-jane' >/dev/null || break; sleep 1; done
+    if pgrep -f 'aiua --hotel mac-jane' >/dev/null; then echo "⚠ aiua --hotel mac-jane still running after 40s"; exit 1; fi
+    echo "▶ mac-jane stopped (launchd job booted out)"
+
+mac-jane-start:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    LABEL=com.philotic.aiua.mac-jane; uid=$(id -u); PLIST="$HOME/Library/LaunchAgents/${LABEL}.plist"
+    if launchctl print gui/${uid}/${LABEL} >/dev/null 2>&1; then
+      launchctl kickstart -k gui/${uid}/${LABEL} && echo "▶ mac-jane kickstarted under launchd"
+    else
+      launchctl bootstrap gui/${uid} "$PLIST" && echo "▶ mac-jane bootstrapped under launchd (RunAtLoad starts it)"
+    fi
+
+# Restart mac-jane cleanly (full stop + start), e.g. to load a freshly-installed
+# binary after `just local-push`.
+mac-jane-restart:
+    just mac-jane-stop
+    just mac-jane-start
+
+# Check whether mac-jane (aiua) is running locally.
+mac-jane-status:
+    @A=$(pgrep -f 'aiua --hotel mac-jane'|head -1); if [ -n "$A" ]; then echo "mac-jane aiua running: pid $A (launchd job: $(launchctl print gui/$(id -u)/com.philotic.aiua.mac-jane 2>/dev/null|grep -oE 'pid = [0-9]+'|head -1))"; else echo "mac-jane aiua is NOT running"; fi
+
+# ── Disk-space watch ────────────────────────────────────────────────────────
+# Install a launchd StartInterval job that runs scripts/disk-space-watch.sh
+# (which runs `phil doctor` and alerts when system.disk-space fires). Turns the
+# on-demand doctor check into an active guard so a filling disk is caught BEFORE
+# ENOSPC wedges the hotel. Alert-only — never deletes anything.
+disk-watch-install profile="bjork" interval="1800":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    LABEL=com.philotic.diskspacewatch
+    PLIST="$HOME/Library/LaunchAgents/${LABEL}.plist"
+    SCRIPT="{{justfile_directory()}}/scripts/disk-space-watch.sh"
+    chmod +x "$SCRIPT"
+    ALERT_LOG="$HOME/.philotic/{{profile}}/disk-space-alerts.log"
+    mkdir -p "$(dirname "$ALERT_LOG")"
+    cat > "$PLIST" <<EOF
+    <?xml version="1.0" encoding="UTF-8"?>
+    <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+    <plist version="1.0"><dict>
+      <key>Label</key><string>${LABEL}</string>
+      <key>ProgramArguments</key>
+      <array>
+        <string>/bin/bash</string>
+        <string>${SCRIPT}</string>
+        <string>{{profile}}</string>
+      </array>
+      <key>EnvironmentVariables</key>
+      <dict>
+        <key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+        <key>PHIL_BIN</key><string>/opt/homebrew/bin/phil</string>
+      </dict>
+      <key>StartInterval</key><integer>{{interval}}</integer>
+      <key>RunAtLoad</key><true/>
+      <key>StandardErrorPath</key><string>${ALERT_LOG}</string>
+      <key>StandardOutPath</key><string>/dev/null</string>
+    </dict></plist>
+    EOF
+    uid=$(id -u)
+    launchctl bootout gui/${uid}/${LABEL} 2>/dev/null || true
+    launchctl bootstrap gui/${uid} "$PLIST"
+    echo "▶ installed ${LABEL}: runs phil doctor every {{interval}}s (profile {{profile}}), alerts → ${ALERT_LOG}"
+
+# Remove the disk-space watch launchd job.
+disk-watch-uninstall:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    LABEL=com.philotic.diskspacewatch
+    uid=$(id -u)
+    launchctl bootout gui/${uid}/${LABEL} 2>/dev/null && echo "▶ ${LABEL} removed" || echo "▶ ${LABEL} was not loaded"
+    rm -f "$HOME/Library/LaunchAgents/${LABEL}.plist"
+
+# ── Logs (in-app daily rolling appender) ────────────────────────────────────
+# aiua now owns rotation: detailed logs live in ~/.philotic/<profile>/logs/
+# aiua.<date>.log (see crates/aiua/README.md). These recipes tail the newest
+# dated file. Retention: PHILOTIC_LOG_RETENTION_DAYS (default 14 days).
+
+# Tail the newest dated aiua log for a local profile (default: bjork).
+logs profile="bjork":
+    tail -f "$(ls -t ~/.philotic/{{profile}}/logs/aiua.*.log 2>/dev/null | head -1)"
+
+# Tail the newest dated aiua log on mbp-jane (jane profile).
+jane-logs:
+    ssh mbp-jane 'tail -f "$(ls -t ~/.philotic/jane/logs/aiua.*.log 2>/dev/null | head -1)"'
+
+# Tail the newest dated aiua log on vps-jane (default profile).
+vps-logs:
+    ssh deploy@jane-vps 'tail -f "$(ls -t ~/.philotic/default/logs/aiua.*.log 2>/dev/null | head -1)"'
 
 # ── VPS deploy (vps-jane / Linux x86_64 via Ansible) ────────────────────────
 # Strategy: rsync source to VPS → build there (VPS has rustup) → ansible
@@ -561,16 +781,16 @@ vps-push:
     ssh -n "${VPS}" "cd '${VPS_CODE}' && \$HOME/.cargo/bin/cargo build --release --bins \
       -p aiua \
       -p philote \
-      -p membrane \
       -p membrane-telegram \
+      -p membrane-discord \
       -p membrane-mcp \
       -p model-router \
       -p tool-runner \
-      -p graph-runner \
       -p graph-datasource \
       -p table-datasource \
       -p router-listener \
       -p agent-datasource \
+      -p heal-dispatcher \
       -p data-memorygraphrag"
 
     echo "▶ Deploying via ansible (binaries from VPS build at ${VPS_BUILD})..."
@@ -584,6 +804,71 @@ vps-push:
 # Does NOT rebuild or copy binaries — uses whatever is already in /opt/philotic/bin.
 vps-config:
     cd ansible && ansible-playbook -i inventory/hosts.ini deploy_hotel.yml --limit jane-vps --skip-tags binary
+
+# CI deploy to vps-jane: fetch the latest develop build-linux artifact and ship
+# it. No compilation anywhere — this replaces `vps-push` and avoids the VPS
+# OOM-killing release links (it has no swap and ~2 GB free). Requires the gh CLI
+# authed and a successful build-linux run on develop (.github/workflows/build-linux.yml).
+#
+# Default transfer path: the VPS pulls the artifact zip DIRECTLY from GitHub
+# (datacenter bandwidth, seconds) instead of downloading it locally and rsyncing
+# ~1.2GB over a residential uplink (measured ~37 KB/s, 4.5h+ unfinished on
+# 2026-07-03). Set PHILOTIC_VPS_DEPLOY_VIA_RSYNC=1 to fall back to the old
+# local-download + rsync path (for when the VPS cannot reach GitHub).
+vps-deploy-ci:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    ROOT_DIR="{{justfile_directory()}}"
+    VPS="${PHILOTIC_VPS_SSH_TARGET:-deploy@jane-vps}"
+    REMOTE_DIR="/home/deploy/ci-artifacts"
+    STAGE="${ROOT_DIR}/dist-ci"
+    REPO="${PHILOTIC_GH_REPO:-likesjx/philotic-stack}"
+    SSH_OPTS=(-o ConnectTimeout=15 -o ServerAliveInterval=15 -o ServerAliveCountMax=4)
+
+    echo "▶ Finding latest successful build-linux run on develop..."
+    RUN_ID=$(gh run list --workflow=build-linux.yml --branch develop --status success --limit 1 --json databaseId -q '.[0].databaseId')
+    if [ -z "${RUN_ID}" ]; then echo "✗ no successful build-linux run on develop — push to develop or run the workflow first"; exit 1; fi
+    echo "  run ${RUN_ID}"
+
+    if [ "${PHILOTIC_VPS_DEPLOY_VIA_RSYNC:-0}" = "1" ]; then
+      echo "▶ Fallback path (PHILOTIC_VPS_DEPLOY_VIA_RSYNC=1): downloading linux-x86_64 artifact locally..."
+      rm -rf "${STAGE}" && mkdir -p "${STAGE}"
+      gh run download "${RUN_ID}" --name linux-x86_64 --dir "${STAGE}"
+      chmod +x "${STAGE}"/* 2>/dev/null || true   # upload-artifact drops the +x bit
+      echo "  $(ls -1 "${STAGE}" | grep -vc SHA256SUMS) binaries staged"
+
+      echo "▶ Syncing binaries to ${VPS}:${REMOTE_DIR} (rsync over local uplink — slow)..."
+      ssh -n "${SSH_OPTS[@]}" "${VPS}" "mkdir -p '${REMOTE_DIR}'"
+      rsync -az --delete -e "ssh ${SSH_OPTS[*]}" "${STAGE}/" "${VPS}:${REMOTE_DIR}/"
+    else
+      echo "▶ Resolving linux-x86_64 artifact id for run ${RUN_ID}..."
+      ARTIFACT_ID=$(gh api "repos/${REPO}/actions/runs/${RUN_ID}/artifacts" -q '.artifacts[] | select(.name == "linux-x86_64") | .id')
+      if [ -z "${ARTIFACT_ID}" ]; then echo "✗ run ${RUN_ID} has no linux-x86_64 artifact (expired?)"; exit 1; fi
+      echo "  artifact ${ARTIFACT_ID}"
+
+      echo "▶ Capturing short-lived signed download URL..."
+      ZIP_URL=$(curl -sI -H "Authorization: Bearer $(gh auth token)" \
+        "https://api.github.com/repos/${REPO}/actions/artifacts/${ARTIFACT_ID}/zip" \
+        | grep -i '^location:' | tr -d '\r' | awk '{print $2}')
+      if [ -z "${ZIP_URL}" ]; then echo "✗ could not resolve artifact redirect URL (gh auth token valid?) — or set PHILOTIC_VPS_DEPLOY_VIA_RSYNC=1 to fall back"; exit 1; fi
+
+      echo "▶ ${VPS} pulling artifact directly from GitHub..."
+      ssh "${SSH_OPTS[@]}" "${VPS}" "set -e; rm -rf '${REMOTE_DIR}' && mkdir -p '${REMOTE_DIR}' && curl -fsSL --connect-timeout 15 -o /tmp/philotic-ci-artifact.zip '${ZIP_URL}' && unzip -o -q /tmp/philotic-ci-artifact.zip -d '${REMOTE_DIR}' && chmod +x '${REMOTE_DIR}'/* && rm -f /tmp/philotic-ci-artifact.zip"
+
+      echo "▶ Verifying SHA256SUMS on the remote..."
+      if ! ssh -n "${SSH_OPTS[@]}" "${VPS}" "cd '${REMOTE_DIR}' && test -f SHA256SUMS && sha256sum -c --quiet SHA256SUMS"; then
+        echo "✗ SHA256SUMS verification failed on ${VPS}:${REMOTE_DIR} — aborting before ansible"
+        exit 1
+      fi
+      echo "  ✓ $(ssh -n "${SSH_OPTS[@]}" "${VPS}" "ls -1 '${REMOTE_DIR}' | grep -vc SHA256SUMS") binaries pulled and verified"
+    fi
+
+    echo "▶ Deploying via ansible (remote artifacts; stats-and-skips any missing)..."
+    cd "${ROOT_DIR}/ansible" && ansible-playbook \
+      -i inventory/hosts.ini \
+      deploy_hotel.yml \
+      --limit jane-vps \
+      --extra-vars "philotic_artifacts_remote=true philotic_artifacts_dir=${REMOTE_DIR}"
 
 # Check that vps-jane host_vars peer ports match the live context graph.
 vps-port-drift-check:
@@ -670,44 +955,11 @@ intel-graph-embed-proposals:
 smoke-agent-workflow:
     bash scripts/smoke-agent-workflow.sh
 
-# Run tests and record results to the graph (Option C foundation)
-# Works even with partial compilation failures - records what tests did run
+# Run tests and record results to the graph against an explicit target_id
+# (thin wrapper over scripts/test-and-record.sh, which now backs `just test`
+# by default — kept for explicit target overrides / CI call sites).
 test-and-record target_id:
-    #!/bin/bash
-    set +e  # Don't fail on test errors
-    echo "Running tests for {{target_id}}..."
-    START_TIME=$(date +%s%N)
-    cargo test --workspace 2>&1 | tee /tmp/test-output.txt
-    EXIT_CODE=$?
-    END_TIME=$(date +%s%N)
-    DURATION_MS=$(( (END_TIME - START_TIME) / 1000000 ))
-    
-    # Parse test results from output
-    # Handle both "running N tests" and "test result: X passed Y failed"
-    TEST_COUNT=$(grep -oE "running [0-9]+ tests" /tmp/test-output.txt | awk '{sum+=$2} END {print sum+0}')
-    RESULT_LINE=$(grep "^test result:" /tmp/test-output.txt | tail -1)
-    
-    if [ -n "$RESULT_LINE" ]; then
-        PASS_COUNT=$(echo "$RESULT_LINE" | grep -oE "[0-9]+ passed" | grep -oE "[0-9]+")
-        FAIL_COUNT=$(echo "$RESULT_LINE" | grep -oE "[0-9]+ failed" | grep -oE "[0-9]+")
-    else
-        PASS_COUNT=$(grep -c "^test .* ... ok$" /tmp/test-output.txt || echo "0")
-        FAIL_COUNT=$(grep -c "^test .* ... FAILED$" /tmp/test-output.txt || echo "0")
-    fi
-    
-    # Ensure values are set
-    TEST_COUNT=${TEST_COUNT:-0}
-    PASS_COUNT=${PASS_COUNT:-0}
-    FAIL_COUNT=${FAIL_COUNT:-0}
-    
-    echo "Results: $PASS_COUNT/$TEST_COUNT passed, $FAIL_COUNT failed"
-    echo "Recording to graph..."
-    
-    curl -s -X POST http://127.0.0.1:8900/api/test-run \
-      -H "Content-Type: application/json" \
-      -d "{\"target_id\":\"{{target_id}}\",\"test_count\":$TEST_COUNT,\"pass_count\":$PASS_COUNT,\"fail_count\":$FAIL_COUNT,\"duration_ms\":$DURATION_MS}" | jq .
-    
-    exit $EXIT_CODE
+    GRAPH_TEST_TARGET={{target_id}} ./scripts/test-and-record.sh
 
 # Combined system health check (sessions + proposals + graph stats)
 intel-graph-health-check:

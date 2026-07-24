@@ -18,7 +18,7 @@ use tracing::{info, warn};
 use uuid::Uuid;
 
 use crate::auth::{
-    AllotmentTracker, VaultHashCache, VaultResolver, authorize_call, extract_bearer,
+    AllotmentTracker, AuthError, VaultHashCache, VaultResolver, authorize_call, extract_bearer,
     verify_bearer_token,
 };
 use crate::protocol::{
@@ -34,6 +34,22 @@ use ansible_mesh_core::mcp_route::McpAuthScheme;
 const DISPATCH_TIMEOUT: Duration = Duration::from_secs(30);
 /// Approval-required routes park the HTTP connection for up to 5 minutes.
 const APPROVAL_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// Protocol versions this server can speak. The client's requested version is
+/// echoed when supported; otherwise the newest supported version is advertised.
+const SUPPORTED_PROTOCOL_VERSIONS: &[&str] = &["2025-03-26", "2024-11-05"];
+
+// ── Dispatch outcome ──────────────────────────────────────────────────────────
+
+/// Terminal result of one dispatched tool call, delivered through the pending
+/// oneshot. `Err` carries a philote business error and surfaces to the MCP
+/// client as a successful JSON-RPC response whose result has `isError: true`,
+/// per the MCP tool-error convention.
+#[derive(Debug)]
+pub enum DispatchOutcome {
+    Ok(String),
+    Err(String),
+}
 
 // ── Application state ─────────────────────────────────────────────────────────
 
@@ -55,10 +71,21 @@ pub struct MembraneState {
     /// Channel into the runtime's IPC dispatch loop.
     pub inbound_tx: mpsc::Sender<InboundEnvelope>,
     /// Pending tool-call responses keyed by turn_id.
-    pub pending_responses: Arc<Mutex<HashMap<String, oneshot::Sender<String>>>>,
+    pub pending_responses: Arc<Mutex<HashMap<String, oneshot::Sender<DispatchOutcome>>>>,
+    /// Accumulated streaming tokens keyed by turn_id, folded into the final
+    /// result when the terminal reply carries no content of its own.
+    pub streaming_buffers: Arc<Mutex<HashMap<String, String>>>,
+    /// True when running without an IPC socket: `tools/call` cannot dispatch
+    /// and fails immediately instead of timing out.
+    pub static_mode: bool,
     /// Current exposure tier for this listener — drives the ingress fence gate.
     /// Updated via `update_perimeter` push from the hotel when the perimeter shifts.
     pub ingress_tier: Arc<std::sync::RwLock<ExposureTier>>,
+    /// Exposure tier the provisioned endpoint declared, when known. `None` for
+    /// legacy/static route-table mode. Together with `ingress_tier` (the hotel
+    /// ceiling) this drives the listener bind address: anything other than an
+    /// explicitly declared, ceiling-honored wide tier binds loopback-only.
+    pub declared_exposure: Arc<std::sync::RwLock<Option<ExposureTier>>>,
 }
 
 impl std::fmt::Debug for MembraneState {
@@ -78,10 +105,45 @@ pub fn build_router(state: SharedState) -> Router {
         .with_state(state)
 }
 
+// ── Ingress fence helper ──────────────────────────────────────────────────────
+
+/// Run the listener-level ingress fence for a request. Returns `None` when the
+/// request may proceed, or a ready-to-send denial response.
+fn ingress_fence_gate(
+    state: &SharedState,
+    headers: &HeaderMap,
+    is_loopback: bool,
+) -> Option<axum::response::Response> {
+    let auth_header = headers.get("authorization").and_then(|v| v.to_str().ok());
+    let tier = *state.ingress_tier.read().unwrap();
+    let decision = perimeter_core::fence::check_ingress(tier, auth_header, is_loopback);
+    match decision {
+        perimeter_core::IngressDecision::Allow => None,
+        perimeter_core::IngressDecision::Deny { status, message } => Some(
+            (
+                StatusCode::from_u16(status).unwrap_or(StatusCode::UNAUTHORIZED),
+                message,
+            )
+                .into_response(),
+        ),
+    }
+}
+
 // ── Health ────────────────────────────────────────────────────────────────────
 
-async fn handle_health() -> impl IntoResponse {
-    (StatusCode::OK, "membrane-mcp ok")
+// Health stays open on loopback only; every other source passes the fence.
+async fn handle_health(
+    State(state): State<SharedState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+) -> axum::response::Response {
+    let is_loopback = addr.ip().is_loopback();
+    if !is_loopback {
+        if let Some(denied) = ingress_fence_gate(&state, &headers, is_loopback) {
+            return denied;
+        }
+    }
+    (StatusCode::OK, "membrane-mcp ok").into_response()
 }
 
 // ── GET /mcp — Streamable HTTP SSE channel (MCP 2025-03-26) ──────────────────
@@ -90,7 +152,14 @@ async fn handle_health() -> impl IntoResponse {
 // server-initiated messages. We don't push server-initiated messages yet, so we
 // return a minimal SSE stream with a keepalive comment and then close it.
 // Clients will reconnect if they need more events.
-async fn handle_mcp_sse() -> impl IntoResponse {
+async fn handle_mcp_sse(
+    State(state): State<SharedState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+) -> axum::response::Response {
+    if let Some(denied) = ingress_fence_gate(&state, &headers, addr.ip().is_loopback()) {
+        return denied;
+    }
     let body = ": keepalive\n\n";
     let mut headers = HeaderMap::new();
     headers.insert(
@@ -99,7 +168,7 @@ async fn handle_mcp_sse() -> impl IntoResponse {
     );
     headers.insert("cache-control", HeaderValue::from_static("no-cache"));
     headers.insert("x-accel-buffering", HeaderValue::from_static("no"));
-    (StatusCode::OK, headers, body)
+    (StatusCode::OK, headers, body).into_response()
 }
 
 // ── MCP dispatcher ────────────────────────────────────────────────────────────
@@ -110,10 +179,23 @@ async fn handle_mcp(
     headers: HeaderMap,
     axum::Json(req): axum::Json<JsonRpcRequest>,
 ) -> axum::response::Response {
-    let is_notification = req.id.is_none();
-    let id = req.id.clone().unwrap_or(Value::Null);
     let is_loopback = addr.ip().is_loopback();
     let auth_header = headers.get("authorization").and_then(|v| v.to_str().ok());
+    dispatch_rpc(&state, req, auth_header, is_loopback).await
+}
+
+/// Full JSON-RPC dispatch for one request: ingress fence, notification
+/// handling, then method routing. Split from the axum handler so the dispatch
+/// surface is testable across fence tiers × auth schemes × source addresses
+/// without real sockets.
+pub(crate) async fn dispatch_rpc(
+    state: &SharedState,
+    req: JsonRpcRequest,
+    auth_header: Option<&str>,
+    is_loopback: bool,
+) -> axum::response::Response {
+    let is_notification = req.id.is_none();
+    let id = req.id.clone().unwrap_or(Value::Null);
 
     // Ingress fence: listener-level check before any per-route auth.
     {
@@ -139,7 +221,12 @@ async fn handle_mcp(
 
     match req.method.as_str() {
         // Notifications — JSON-RPC spec: MUST NOT send a response.
-        "initialized" | "notifications/cancelled" | "notifications/progress" => {
+        // "notifications/initialized" is the spec name; bare "initialized" is
+        // kept for clients that predate the namespaced form.
+        "notifications/initialized"
+        | "initialized"
+        | "notifications/cancelled"
+        | "notifications/progress" => {
             return (StatusCode::ACCEPTED, "").into_response();
         }
         _ => {}
@@ -153,8 +240,8 @@ async fn handle_mcp(
     let resp = match req.method.as_str() {
         "initialize" => handle_initialize(id, req.params),
         "ping" => JsonRpcResponse::ok(id, json!({})),
-        "tools/list" => handle_tools_list(&state, id, auth_header, is_loopback).await,
-        "tools/call" => handle_tools_call(&state, id, req.params, auth_header, is_loopback).await,
+        "tools/list" => handle_tools_list(state, id, auth_header, is_loopback).await,
+        "tools/call" => handle_tools_call(state, id, req.params, auth_header, is_loopback).await,
         _ => JsonRpcResponse::err(id, error_code::METHOD_NOT_FOUND, "method not found"),
     };
 
@@ -165,12 +252,21 @@ async fn handle_mcp(
 
 fn handle_initialize(id: Value, params: Option<Value>) -> JsonRpcResponse {
     // Params are optional — tolerate clients that omit them entirely.
-    let _params: Option<InitializeParams> = params.and_then(|p| serde_json::from_value(p).ok());
+    let params: Option<InitializeParams> = params.and_then(|p| serde_json::from_value(p).ok());
+
+    // Version negotiation: echo the client's requested version when we speak
+    // it; otherwise advertise our newest supported version.
+    let protocol_version = params
+        .as_ref()
+        .map(|p| p.protocol_version.as_str())
+        .filter(|v| SUPPORTED_PROTOCOL_VERSIONS.contains(v))
+        .unwrap_or(SUPPORTED_PROTOCOL_VERSIONS[0])
+        .to_string();
 
     JsonRpcResponse::ok(
         id,
         serde_json::to_value(InitializeResult {
-            protocol_version: "2024-11-05".into(),
+            protocol_version,
             server_info: ServerInfo {
                 name: "philotic-membrane-mcp".into(),
                 version: env!("CARGO_PKG_VERSION").into(),
@@ -193,17 +289,17 @@ async fn handle_tools_list(
 ) -> JsonRpcResponse {
     // Prefer config-driven endpoint table; fall back to legacy route table.
     let endpoint = state.endpoint_table.read().await;
-    let tools: Vec<McpToolDescriptor> = if endpoint.is_active() {
+    let tools: Vec<McpToolDescriptor> = if let Some(cfg) = endpoint.config() {
         let bearer = extract_bearer(auth_header);
-        endpoint.visible_tool_descriptors(|tool| {
-            let auth_scheme = tool.auth.as_ref().unwrap_or(&McpAuthScheme::None);
-            match auth_scheme {
+        cfg.tools
+            .iter()
+            .filter(|tool| match cfg.effective_auth(tool) {
                 McpAuthScheme::BearerToken { grants } => bearer
                     .and_then(|token| {
                         verify_bearer_token(
                             &tool.name,
                             token,
-                            grants,
+                            &grants,
                             &state.vault_cache,
                             state.vault.as_ref(),
                         )
@@ -211,9 +307,13 @@ async fn handle_tools_list(
                     })
                     .is_some(),
                 McpAuthScheme::None => is_loopback,
-                McpAuthScheme::HmacSha256 { .. } => false,
-            }
-        })
+            })
+            .map(|t| McpToolDescriptor {
+                name: t.name.clone(),
+                description: t.description.clone(),
+                input_schema: t.input_schema.clone(),
+            })
+            .collect()
     } else {
         drop(endpoint);
         let bearer = extract_bearer(auth_header);
@@ -232,11 +332,68 @@ async fn handle_tools_list(
                 })
                 .is_some(),
             McpAuthScheme::None => is_loopback,
-            McpAuthScheme::HmacSha256 { .. } => false,
         })
     };
 
     JsonRpcResponse::ok(id, serde_json::to_value(ToolsListResult { tools }).unwrap())
+}
+
+/// Map a classified auth failure to its MCP error code.
+fn auth_error_code(e: &AuthError) -> i32 {
+    match e {
+        AuthError::Missing(_) | AuthError::Invalid(_) => error_code::PERMISSION_DENIED,
+        AuthError::Expired(_) => error_code::TOKEN_EXPIRED,
+        AuthError::Allotment(_) => error_code::ALLOTMENT_EXCEEDED,
+    }
+}
+
+/// Await a dispatched call's terminal outcome and map it onto the MCP result
+/// shape: business errors become `isError: true` results, approval-window
+/// timeouts become `APPROVAL_REQUIRED`, transport failures stay JSON-RPC errors.
+async fn await_dispatch_outcome(
+    state: &SharedState,
+    id: Value,
+    tool_name: &str,
+    turn_id: &str,
+    timeout: Duration,
+    requires_approval: bool,
+    rx: oneshot::Receiver<DispatchOutcome>,
+    transform_ok: impl FnOnce(&str) -> Value,
+) -> JsonRpcResponse {
+    match tokio::time::timeout(timeout, rx).await {
+        Ok(Ok(DispatchOutcome::Ok(content))) => JsonRpcResponse::ok(
+            id,
+            serde_json::to_value(ToolCallResult::json(transform_ok(&content))).unwrap(),
+        ),
+        Ok(Ok(DispatchOutcome::Err(message))) => JsonRpcResponse::ok(
+            id,
+            serde_json::to_value(ToolCallResult::error(message)).unwrap(),
+        ),
+        Ok(Err(_)) => {
+            warn!(tool = tool_name, %turn_id, "pending oneshot sender dropped");
+            JsonRpcResponse::err(id, error_code::DISPATCH_ERROR, "IPC connection lost")
+        }
+        Err(_) => {
+            {
+                let mut pending = state.pending_responses.lock().await;
+                pending.remove(turn_id);
+            }
+            {
+                let mut buffers = state.streaming_buffers.lock().await;
+                buffers.remove(turn_id);
+            }
+            warn!(tool = tool_name, %turn_id, requires_approval, "dispatch timed out");
+            if requires_approval {
+                JsonRpcResponse::err(
+                    id,
+                    error_code::APPROVAL_REQUIRED,
+                    "operator approval was not granted within the approval window",
+                )
+            } else {
+                JsonRpcResponse::err(id, error_code::DISPATCH_ERROR, "tool call timed out")
+            }
+        }
+    }
 }
 
 async fn handle_tools_call(
@@ -257,6 +414,16 @@ async fn handle_tools_call(
         }
     };
 
+    // Static-only mode has no IPC dispatch path — fail immediately and
+    // honestly instead of parking the caller into a 30s timeout.
+    if state.static_mode {
+        return JsonRpcResponse::err(
+            id,
+            error_code::DISPATCH_ERROR,
+            "this membrane runs in static-only mode (no IPC socket); tools/call cannot dispatch",
+        );
+    }
+
     let tool_name = &params.name;
     let args = params.arguments.unwrap_or(json!({}));
 
@@ -274,7 +441,10 @@ async fn handle_tools_call(
             }
         };
 
-        let auth_scheme = tool_spec.auth.clone().unwrap_or(McpAuthScheme::None);
+        let auth_scheme = endpoint
+            .config()
+            .map(|cfg| cfg.effective_auth(&tool_spec))
+            .unwrap_or(McpAuthScheme::None);
         let caller = match authorize_call(
             tool_name,
             &auth_scheme,
@@ -287,7 +457,7 @@ async fn handle_tools_call(
             Ok(c) => c,
             Err(e) => {
                 warn!(tool = tool_name, err = %e, "config-driven auth rejected");
-                return JsonRpcResponse::err(id, error_code::PERMISSION_DENIED, e.to_string());
+                return JsonRpcResponse::err(id, auth_error_code(&e), e.to_string());
             }
         };
 
@@ -302,7 +472,10 @@ async fn handle_tools_call(
         let preapproved = endpoint.is_preapproved(&inbound.action);
         drop(endpoint);
 
-        let requires_approval = !preapproved && !is_loopback;
+        // Pre-approval rules are the only approval bypass. Loopback callers get
+        // no special treatment: the provisioning turn is the authorization event,
+        // and local processes are not implicitly the operator.
+        let requires_approval = !preapproved;
         let timeout = if requires_approval {
             APPROVAL_TIMEOUT
         } else {
@@ -352,9 +525,12 @@ async fn handle_tools_call(
             final_reply_to: Some(state.node_id.clone()),
             final_reply_role: Some("mcp-membrane".into()),
             final_reply_guest_id: Some(state.guest_id.clone()),
+            target_node: None,
+            target_guest_id: None,
+            extra: serde_json::Map::new(),
         };
 
-        let (tx, rx) = oneshot::channel::<String>();
+        let (tx, rx) = oneshot::channel::<DispatchOutcome>();
         {
             let mut pending = state.pending_responses.lock().await;
             pending.insert(turn_id.clone(), tx);
@@ -367,27 +543,20 @@ async fn handle_tools_call(
             return JsonRpcResponse::err(id, error_code::DISPATCH_ERROR, "IPC send failed");
         }
 
-        return match tokio::time::timeout(timeout, rx).await {
-            Ok(Ok(content)) => {
-                let transformed = transform::apply_outbound(&tool_spec, &content);
-                let result_value =
-                    serde_json::from_str(&transformed).unwrap_or(json!({ "text": transformed }));
-                JsonRpcResponse::ok(
-                    id,
-                    serde_json::to_value(ToolCallResult::json(result_value)).unwrap(),
-                )
-            }
-            Ok(Err(_)) => {
-                warn!(tool = tool_name, %turn_id, "pending oneshot sender dropped");
-                JsonRpcResponse::err(id, error_code::DISPATCH_ERROR, "IPC connection lost")
-            }
-            Err(_) => {
-                let mut pending = state.pending_responses.lock().await;
-                pending.remove(&turn_id);
-                warn!(tool = tool_name, %turn_id, "dispatch timed out");
-                JsonRpcResponse::err(id, error_code::DISPATCH_ERROR, "tool call timed out")
-            }
-        };
+        return await_dispatch_outcome(
+            state,
+            id,
+            tool_name,
+            &turn_id,
+            timeout,
+            requires_approval,
+            rx,
+            |content| {
+                let transformed = transform::apply_outbound(&tool_spec, content);
+                serde_json::from_str(&transformed).unwrap_or(json!({ "text": transformed }))
+            },
+        )
+        .await;
     }
     drop(endpoint);
 
@@ -417,7 +586,7 @@ async fn handle_tools_call(
         Ok(c) => c,
         Err(e) => {
             warn!(tool = tool_name, err = %e, "auth rejected");
-            return JsonRpcResponse::err(id, error_code::PERMISSION_DENIED, e.to_string());
+            return JsonRpcResponse::err(id, auth_error_code(&e), e.to_string());
         }
     };
 
@@ -475,9 +644,12 @@ async fn handle_tools_call(
         final_reply_to: Some(state.node_id.clone()),
         final_reply_role: Some("mcp-membrane".into()),
         final_reply_guest_id: Some(state.guest_id.clone()),
+        target_node: None,
+        target_guest_id: None,
+        extra: serde_json::Map::new(),
     };
 
-    let (tx, rx) = oneshot::channel::<String>();
+    let (tx, rx) = oneshot::channel::<DispatchOutcome>();
     {
         let mut pending = state.pending_responses.lock().await;
         pending.insert(turn_id.clone(), tx);
@@ -490,23 +662,15 @@ async fn handle_tools_call(
         return JsonRpcResponse::err(id, error_code::DISPATCH_ERROR, "IPC send failed");
     }
 
-    match tokio::time::timeout(timeout, rx).await {
-        Ok(Ok(content)) => JsonRpcResponse::ok(
-            id,
-            serde_json::to_value(ToolCallResult::json(
-                serde_json::from_str(&content).unwrap_or(json!({ "text": content })),
-            ))
-            .unwrap(),
-        ),
-        Ok(Err(_)) => {
-            warn!(tool = tool_name, %turn_id, "pending oneshot sender dropped");
-            JsonRpcResponse::err(id, error_code::DISPATCH_ERROR, "IPC connection lost")
-        }
-        Err(_) => {
-            let mut pending = state.pending_responses.lock().await;
-            pending.remove(&turn_id);
-            warn!(tool = tool_name, %turn_id, "dispatch timed out");
-            JsonRpcResponse::err(id, error_code::DISPATCH_ERROR, "tool call timed out")
-        }
-    }
+    await_dispatch_outcome(
+        state,
+        id,
+        tool_name,
+        &turn_id,
+        timeout,
+        requires_approval,
+        rx,
+        |content| serde_json::from_str(content).unwrap_or(json!({ "text": content })),
+    )
+    .await
 }

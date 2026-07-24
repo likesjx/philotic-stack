@@ -4,7 +4,7 @@
 //! instance backed by a temp file. No hotel IPC required — this tests the
 //! storage + dispatch stack that the runner exposes to the hotel.
 //!
-//! Run with: `cargo test -p agent-graph-runner`
+//! Run with: `cargo test -p agent-datasource`
 
 use agent_datasource::tools;
 use ansible_mesh_core::agent_graph_storage::SqliteAgentGraphStorage;

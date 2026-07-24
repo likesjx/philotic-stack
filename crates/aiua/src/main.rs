@@ -1,15 +1,12 @@
-use ansible_mesh_core::beacon::BeaconDaemon;
 use ansible_mesh_core::graph::{AbstractSkillRecord, AbstractToolRecord, ToolsetProfileRecord};
-use ansible_mesh_core::heartbeat::{
-    CapabilitySyncPayload, HeartbeatPayload, emit_capability_sync, emit_heartbeat,
-};
 use ansible_mesh_core::membership::{
     MeshMembershipAcceptPayload, derive_transport_session_key, fingerprint_from_base64url,
     now_epoch_secs, verify_join_request,
 };
+use ansible_mesh_core::provider_keys::{ProviderKeySpec, provider_key_specs};
 use ansible_mesh_core::registry::{CapabilityAdvertisement, ExecutionReachability, NodeRegistry};
 use ansible_mesh_core::storage::{
-    AgentIdentityRecord, CursorStorage, EventStorage, GuestRecord, HotelRecord,
+    AgentIdentityRecord, CursorStorage, EventStorage, GuestRecord, HotelRecord, VaultRegistryEntry,
 };
 use ansible_mesh_core::{NodeCapabilities, NodeHealthSnapshot, NodeRole};
 use anyhow::{Context, Result};
@@ -37,10 +34,14 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::sync::{Mutex, RwLock, broadcast, mpsc};
 use tracing::{debug, error, info, warn};
 
+mod architect_charter;
 mod auth;
+mod autonomy_sweep;
 mod dream;
 mod graph;
 mod memory;
+mod memory_delta_digest;
+mod memory_hygiene;
 mod mesh;
 mod muninn_provision;
 mod vault;
@@ -49,6 +50,7 @@ mod service;
 use service::blob::BlobService;
 use service::cron_ticker::CronTicker;
 use service::ipc::IpcServer;
+use service::mesh_runtime::{MeshRuntimeContext, activate_mesh_runtime};
 use std::sync::Arc;
 
 const DEFAULT_GRAPH_DATASOURCE_HOME_HOTEL: &str = "vps-jane";
@@ -77,6 +79,115 @@ fn profile_dir() -> Option<PathBuf> {
         .filter(|s| !s.is_empty())?;
     let home = std::env::var("HOME").ok()?;
     Some(PathBuf::from(home).join(".philotic").join(profile))
+}
+
+// ── Logging ─────────────────────────────────────────────────────────────────
+
+/// Resolve the number of dated log files the daily rolling appender keeps.
+///
+/// Rules (see `PHILOTIC_LOG_RETENTION_DAYS`):
+/// - unset / unparseable garbage -> default of 14
+/// - a valid number -> that number, clamped to a floor of 1 (so `"0"` -> 1)
+fn resolve_retention_days(env_val: Option<&str>) -> usize {
+    const DEFAULT_RETENTION_DAYS: usize = 14;
+    match env_val.and_then(|s| s.trim().parse::<usize>().ok()) {
+        Some(n) => n.max(1),
+        None => DEFAULT_RETENTION_DAYS,
+    }
+}
+
+/// Initialize tracing with a daily-rolling, size-bounded file appender that the
+/// hotel daemon owns end-to-end (no external newsyslog/logrotate dependency).
+///
+/// Detailed logs land in `${PHILOTIC_LOG_DIR}` (if set) else
+/// `~/.philotic/<profile>/logs/aiua.<date>.log`, where `<profile>` is
+/// `$PHILOTIC_PROFILE` (default `"default"`). Old dated files past
+/// `PHILOTIC_LOG_RETENTION_DAYS` (default 14) are pruned automatically.
+///
+/// No stdout/stderr tracing layer is installed on purpose: the launchd
+/// `StandardOutPath` (`aiua.log`) then only ever captures the tiny pre-init
+/// output and rare Rust panics, so it stops growing with zero plist/launch
+/// changes. Panics still reach stderr naturally.
+fn init_logging() {
+    use tracing_subscriber::layer::SubscriberExt;
+    use tracing_subscriber::util::SubscriberInitExt;
+
+    let profile = std::env::var("PHILOTIC_PROFILE")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "default".to_string());
+
+    let log_dir = match std::env::var("PHILOTIC_LOG_DIR")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+    {
+        Some(dir) => PathBuf::from(dir),
+        None => {
+            let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+            PathBuf::from(home)
+                .join(".philotic")
+                .join(&profile)
+                .join("logs")
+        }
+    };
+
+    if let Err(err) = std::fs::create_dir_all(&log_dir) {
+        eprintln!(
+            "aiua: failed to create log dir {}: {err}",
+            log_dir.display()
+        );
+    }
+
+    let retention_days =
+        resolve_retention_days(std::env::var("PHILOTIC_LOG_RETENTION_DAYS").ok().as_deref());
+
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+
+    // A logging-setup failure must NEVER crash the hotel. If the rolling file
+    // appender can't be built (e.g. a read-only or unwritable log dir under a
+    // hardened systemd unit), fall back to stdout logging and keep running.
+    match tracing_appender::rolling::RollingFileAppender::builder()
+        .rotation(tracing_appender::rolling::Rotation::DAILY)
+        .filename_prefix("aiua")
+        .filename_suffix("log")
+        .max_log_files(retention_days)
+        .build(&log_dir)
+    {
+        Ok(appender) => {
+            let (non_blocking, guard) = tracing_appender::non_blocking(appender);
+            // The WorkerGuard must live for the whole process or the background
+            // writer stops flushing. Leak it intentionally.
+            Box::leak(Box::new(guard));
+
+            tracing_subscriber::registry()
+                .with(filter)
+                .with(
+                    tracing_subscriber::fmt::layer()
+                        .with_ansi(false)
+                        .with_writer(non_blocking),
+                )
+                .init();
+
+            tracing::info!(
+                log_dir = %log_dir.display(),
+                retention_days,
+                "aiua logging initialized (daily rolling file appender)"
+            );
+        }
+        Err(err) => {
+            tracing_subscriber::registry()
+                .with(filter)
+                .with(tracing_subscriber::fmt::layer())
+                .init();
+
+            tracing::warn!(
+                log_dir = %log_dir.display(),
+                error = %err,
+                "rolling log appender unavailable; falling back to stdout logging (set PHILOTIC_LOG_DIR to a writable path to restore file logs)"
+            );
+        }
+    }
 }
 
 fn agent_graph_db_path(agent_id: &str) -> Option<String> {
@@ -132,40 +243,6 @@ pub enum LedgerCommand {
         consumer_node_id: String,
         acked_seq: u64,
     },
-}
-
-type BeaconInboxReceiver = Arc<Mutex<Option<mpsc::Receiver<ansible_mesh_core::BeaconMessage>>>>;
-type WebRtcSignalReceiver =
-    Arc<Mutex<Option<mpsc::Receiver<ansible_mesh_core::webrtc::WebRtcSignalMessage>>>>;
-
-#[derive(Clone)]
-struct MeshRuntimeContext {
-    hotel_name: String,
-    hotel: HotelRecord,
-    caps: NodeCapabilities,
-    mesh_addr: String,
-    execution_addr: String,
-    db_path: String,
-    enable_rust_auth: bool,
-    enable_rust_dispatcher: bool,
-    graph_domain: Arc<GraphDomain>,
-    registry: Arc<RwLock<NodeRegistry>>,
-    ledger: Arc<dyn EventStorage>,
-    tracker: Arc<dyn CursorStorage>,
-    dispatcher_tx: mpsc::Sender<LedgerCommand>,
-    ipc_inboxes: crate::service::ipc::InboxRegistry,
-    ipc_parked_inbound: crate::service::ipc::ParkedInboundRegistry,
-    ipc_materialization_requester:
-        Option<std::sync::Arc<dyn crate::service::guest_manager::GuestMaterializationRequester>>,
-    shutdown_tx: tokio::sync::broadcast::Sender<()>,
-    inbox_tx: mpsc::Sender<ansible_mesh_core::BeaconMessage>,
-    inbox_rx: BeaconInboxReceiver,
-    webrtc_signal_tx: mpsc::Sender<ansible_mesh_core::webrtc::WebRtcSignalMessage>,
-    webrtc_signal_rx: WebRtcSignalReceiver,
-    perimeter_svc: Arc<crate::service::perimeter::HotelPerimeterService>,
-    ipc_operator_surface_tx: Option<mpsc::Sender<String>>,
-    /// Shared hotel roster snapshot used by BeaconDaemon for anchor handshakes.
-    local_hotel_state: Arc<RwLock<Option<ansible_mesh_core::heartbeat::HotelStateSyncPayload>>>,
 }
 
 /// Operator surface query worker — receives tasks via in-process channel (no UDS
@@ -484,10 +561,37 @@ impl AnsibleCutoverFlags {
     }
 }
 
+/// Guest supervision (the 5s reconcile/respawn loop) is ON by default.
+/// Opt out with PHILOTIC_DISABLE_GUEST_SUPERVISOR=1. The legacy opt-in var
+/// PHILOTIC_ENABLE_GUEST_SUPERVISOR is still recognized (deprecated): a truthy
+/// value is now a no-op; an explicit falsy value keeps the old disabled behavior.
 fn guest_supervision_enabled() -> bool {
-    std::env::var("PHILOTIC_ENABLE_GUEST_SUPERVISOR")
-        .map(|v| v == "true" || v == "1")
-        .unwrap_or(false)
+    let disable = std::env::var("PHILOTIC_DISABLE_GUEST_SUPERVISOR").ok();
+    let legacy_enable = std::env::var("PHILOTIC_ENABLE_GUEST_SUPERVISOR").ok();
+    if legacy_enable.is_some() {
+        warn!(
+            "PHILOTIC_ENABLE_GUEST_SUPERVISOR is deprecated: the guest supervisor is now \
+             enabled by default. Use PHILOTIC_DISABLE_GUEST_SUPERVISOR=1 to opt out."
+        );
+    }
+    guest_supervision_enabled_from(disable.as_deref(), legacy_enable.as_deref())
+}
+
+/// Pure decision logic for the supervision gate (unit-testable without env races).
+fn guest_supervision_enabled_from(disable: Option<&str>, legacy_enable: Option<&str>) -> bool {
+    fn truthy(v: &str) -> bool {
+        v == "true" || v == "1"
+    }
+    if let Some(v) = disable {
+        if truthy(v) {
+            return false;
+        }
+    }
+    if let Some(v) = legacy_enable {
+        // Deprecated compat: honor an explicit falsy legacy value as opt-out.
+        return truthy(v);
+    }
+    true
 }
 
 fn smoke_mode_enabled() -> bool {
@@ -917,6 +1021,68 @@ fn resolve_internal_secret(graph: &GraphDomain, secret_ref: &str) -> Result<Stri
         },
     )?
     .ok_or_else(|| anyhow::anyhow!("vault secret not found: {secret_ref}"))
+}
+
+fn migrate_plaintext_provider_api_keys(graph: &GraphDomain) -> Result<usize> {
+    let mut migrated = 0usize;
+    for spec in provider_key_specs() {
+        if migrate_plaintext_provider_api_key(graph, spec)? {
+            migrated += 1;
+        }
+    }
+    if migrated > 0 {
+        info!(
+            count = migrated,
+            "Migrated plaintext provider API-key config entries into vault refs"
+        );
+    }
+    Ok(migrated)
+}
+
+fn migrate_plaintext_provider_api_key(graph: &GraphDomain, spec: &ProviderKeySpec) -> Result<bool> {
+    let Some(plaintext) = read_string_config(graph, spec.legacy_api_key_key)? else {
+        return Ok(false);
+    };
+
+    if read_string_config(graph, spec.api_key_ref_key)?.is_some() {
+        graph.remove_config_value(spec.legacy_api_key_key)?;
+        info!(
+            provider = spec.provider,
+            legacy_key = spec.legacy_api_key_key,
+            ref_key = spec.api_key_ref_key,
+            "Removed legacy plaintext provider API-key config; existing vault ref is authoritative"
+        );
+        return Ok(true);
+    }
+
+    let secret_ref = store_secret(
+        graph,
+        SecretInput {
+            secret_kind: spec.vault_name.to_string(),
+            scope: "hotel".into(),
+            allowed_roles: spec
+                .allowed_roles
+                .iter()
+                .map(|role| role.to_string())
+                .collect(),
+            allowed_guests: Vec::new(),
+            plaintext,
+        },
+    )
+    .with_context(|| format!("store provider API key secret for {}", spec.provider))?;
+    graph.upsert_vault_registry_entry(&VaultRegistryEntry {
+        vault_name: spec.vault_name.to_string(),
+        secret_ref: secret_ref.clone(),
+    })?;
+    graph.set_config_value(spec.api_key_ref_key, &serde_json::to_string(&secret_ref)?)?;
+    graph.remove_config_value(spec.legacy_api_key_key)?;
+    info!(
+        provider = spec.provider,
+        legacy_key = spec.legacy_api_key_key,
+        ref_key = spec.api_key_ref_key,
+        "Migrated legacy plaintext provider API-key config into the hotel vault"
+    );
+    Ok(true)
 }
 
 fn mesh_auth_key_for_node(graph: &GraphDomain, node_id: &str) -> Result<Option<String>> {
@@ -1374,629 +1540,6 @@ fn sample_node_health(
     }
 }
 
-async fn activate_mesh_runtime(ctx: MeshRuntimeContext) -> Result<()> {
-    let daemon = Arc::new(
-        BeaconDaemon::bind_with_registry(
-            &ctx.mesh_addr,
-            ctx.caps.clone(),
-            ctx.inbox_tx.clone(),
-            ctx.graph_domain.clone(),
-            &ctx.db_path,
-            ctx.enable_rust_auth,
-            ctx.registry.clone(),
-        )
-        .await?,
-    );
-    *daemon.local_hotel_state.write().await = ctx.local_hotel_state.read().await.clone();
-    // Keep beacon's snapshot in sync: whenever the shared Arc is updated, propagate here.
-    {
-        let beacon_state = daemon.local_hotel_state.clone();
-        let source_state = ctx.local_hotel_state.clone();
-        let mut shutdown_rx = ctx.shutdown_tx.subscribe();
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(5));
-            loop {
-                tokio::select! {
-                    _ = interval.tick() => {
-                        let snap = source_state.read().await.clone();
-                        *beacon_state.write().await = snap;
-                    }
-                    _ = shutdown_rx.recv() => break,
-                }
-            }
-        });
-    }
-
-    // Proactive hotel-state broadcast: push our roster to all backbone peers every 30s
-    // so they can route to our guests without waiting for an anchor handshake.
-    {
-        use ansible_mesh_core::heartbeat::emit_hotel_state_sync;
-        let hs_socket = daemon.socket();
-        let hs_state = ctx.local_hotel_state.clone();
-        let hs_graph = ctx.graph_domain.clone();
-        let hs_caps = ctx.caps.clone();
-        let mut hs_shutdown = ctx.shutdown_tx.subscribe();
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(30));
-            loop {
-                tokio::select! {
-                    _ = interval.tick() => {
-                        let Some(payload) = hs_state.read().await.clone() else { continue };
-                        let targets = match mesh_targets_for_graph(hs_graph.as_ref(), &hs_caps.node_id) {
-                            Ok(t) => t,
-                            Err(e) => { warn!("hotel-state broadcast: failed to resolve targets: {e}"); continue }
-                        };
-                        for (target_node_id, target_addr) in targets {
-                            let Ok(target) = target_addr.parse::<SocketAddr>() else { continue };
-                            let Some(auth_key) = mesh_auth_key_for_node(hs_graph.as_ref(), &target_node_id).ok().flatten() else { continue };
-                            if let Err(e) = emit_hotel_state_sync(&hs_socket, target, &hs_caps, payload.clone(), &auth_key).await {
-                                warn!("hotel-state broadcast to {}: {e}", target_addr);
-                            }
-                        }
-                    }
-                    _ = hs_shutdown.recv() => break,
-                }
-            }
-        });
-    }
-
-    let mut inbox_rx = {
-        let mut guard = ctx.inbox_rx.lock().await;
-        guard.take()
-    }
-    .context("mesh runtime activation missing beacon inbox receiver")?;
-
-    let mut webrtc_signal_rx = {
-        let mut guard = ctx.webrtc_signal_rx.lock().await;
-        guard.take()
-    }
-    .context("mesh runtime activation missing WebRTC signal receiver")?;
-
-    info!(
-        hotel = %ctx.hotel_name,
-        "Mesh transport antenna extended"
-    );
-
-    if ctx.enable_rust_dispatcher {
-        tokio::spawn(crate::service::mesh_dispatcher::outbound_dispatcher(
-            ctx.ledger.clone(),
-            ctx.tracker.clone(),
-            daemon.socket(),
-            ctx.graph_domain.clone(),
-            ctx.registry.clone(),
-            ctx.caps.node_id.clone(),
-            ctx.shutdown_tx.subscribe(),
-        ));
-    }
-
-    {
-        let execution_inbox_tx = daemon.inbox_tx();
-        let execution_caps = ctx.caps.clone();
-        let execution_db_path = ctx.db_path.clone();
-        let execution_graph = ctx.graph_domain.clone();
-        let execution_addr = ctx.execution_addr.clone();
-        let execution_enable_rust_auth = ctx.enable_rust_auth;
-        tokio::spawn(async move {
-            if let Err(e) = crate::service::execution_transport::serve_execution_plane(
-                &execution_addr,
-                execution_caps,
-                execution_inbox_tx,
-                execution_graph,
-                &execution_db_path,
-                execution_enable_rust_auth,
-            )
-            .await
-            {
-                error!("Hotel execution transport failed: {}", e);
-            }
-        });
-    }
-
-    {
-        let heartbeat_socket = daemon.socket();
-        let heartbeat_graph = ctx.graph_domain.clone();
-        let heartbeat_hotel = ctx.hotel.clone();
-        let heartbeat_caps = ctx.caps.clone();
-        let heartbeat_perimeter = ctx.perimeter_svc.clone();
-        let mut heartbeat_shutdown = ctx.shutdown_tx.subscribe();
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(3));
-            loop {
-                tokio::select! {
-                    _ = interval.tick() => {
-                        let targets = match mesh_targets_for_graph(heartbeat_graph.as_ref(), &heartbeat_caps.node_id) {
-                            Ok(targets) => targets,
-                            Err(err) => {
-                                warn!("Failed to resolve mesh heartbeat targets: {}", err);
-                                continue;
-                            }
-                        };
-                        if targets.is_empty() {
-                            continue;
-                        }
-                        let execution_reachability =
-                            execution_reachability_for_hotel(heartbeat_graph.as_ref(), &heartbeat_hotel);
-                        let node_health =
-                            sample_node_health(heartbeat_graph.as_ref(), &heartbeat_hotel.hotel_name, &heartbeat_perimeter);
-                        for (_target_node_id, target_addr) in targets {
-                            let Ok(target) = target_addr.parse::<SocketAddr>() else {
-                                warn!("Skipping invalid heartbeat target address {}", target_addr);
-                                continue;
-                            };
-                            let Some(auth_key) = mesh_auth_key_for_node(heartbeat_graph.as_ref(), &_target_node_id).ok().flatten() else {
-                                debug!("Skipping heartbeat to {} until mesh auth key exists", _target_node_id);
-                                continue;
-                            };
-                            if let Err(err) = emit_heartbeat(
-                                &heartbeat_socket,
-                                target,
-                                &heartbeat_caps,
-                                Some(execution_reachability.clone()),
-                                &auth_key,
-                                Some(node_health.clone()),
-                            )
-                            .await
-                            {
-                                warn!("Failed to emit heartbeat to {}: {}", target_addr, err);
-                            }
-                        }
-                    }
-                    _ = heartbeat_shutdown.recv() => break,
-                }
-            }
-        });
-    }
-
-    {
-        let capability_socket = daemon.socket();
-        let capability_graph = ctx.graph_domain.clone();
-        let capability_hotel = ctx.hotel.clone();
-        let capability_caps = ctx.caps.clone();
-        let mut capability_shutdown = ctx.shutdown_tx.subscribe();
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(10));
-            let mut last_sync_fingerprint: Option<String> = None;
-            let mut last_full_sync =
-                std::time::Instant::now() - std::time::Duration::from_secs(3600);
-            loop {
-                tokio::select! {
-                    _ = interval.tick() => {
-                        let targets = match mesh_targets_for_graph(capability_graph.as_ref(), &capability_caps.node_id) {
-                            Ok(targets) => targets,
-                            Err(err) => {
-                                warn!("Failed to resolve mesh capability-sync targets: {}", err);
-                                continue;
-                            }
-                        };
-                        if targets.is_empty() {
-                            continue;
-                        }
-
-                        let advertisements = match local_capability_advertisements(capability_graph.as_ref(), &capability_hotel) {
-                            Ok(advertisements) => advertisements,
-                            Err(err) => {
-                                warn!("Failed to build local capability advertisements: {}", err);
-                                continue;
-                            }
-                        };
-                        let execution_reachability =
-                            execution_reachability_for_hotel(capability_graph.as_ref(), &capability_hotel);
-                        let sync_fingerprint = capability_sync_fingerprint(&advertisements, &execution_reachability);
-                        let should_sync =
-                            last_sync_fingerprint.as_ref() != Some(&sync_fingerprint)
-                            || last_full_sync.elapsed() >= std::time::Duration::from_secs(3600);
-                        if !should_sync {
-                            continue;
-                        }
-
-                        for (target_node_id, target_addr) in targets {
-                            let Ok(target) = target_addr.parse::<SocketAddr>() else {
-                                warn!("Skipping invalid capability-sync target address {}", target_addr);
-                                continue;
-                            };
-                            let Some(auth_key) = mesh_auth_key_for_node(capability_graph.as_ref(), &target_node_id).ok().flatten() else {
-                                debug!("Skipping capability sync to {} until mesh auth key exists", target_node_id);
-                                continue;
-                            };
-                            if let Err(err) = emit_capability_sync(
-                                &capability_socket,
-                                target,
-                                &capability_caps,
-                                &advertisements,
-                                Some(execution_reachability.clone()),
-                                &auth_key,
-                            )
-                            .await
-                            {
-                                warn!("Failed to emit capability sync to {}: {}", target_addr, err);
-                            }
-                        }
-
-                        last_sync_fingerprint = Some(sync_fingerprint);
-                        last_full_sync = std::time::Instant::now();
-                    }
-                    _ = capability_shutdown.recv() => break,
-                }
-            }
-        });
-    }
-
-    {
-        let dispatcher_inbound_tx = ctx.dispatcher_tx.clone();
-        let inbound_graph = ctx.graph_domain.clone();
-        let inbound_inboxes = ctx.ipc_inboxes.clone();
-        let inbound_parked = ctx.ipc_parked_inbound.clone();
-        let inbound_mat_req = ctx.ipc_materialization_requester.clone();
-        let inbound_local_node_id = ctx.caps.node_id.clone();
-        let webrtc_signal_tx_inbound = ctx.webrtc_signal_tx.clone();
-        let local_node_id_webrtc_inbound = ctx.caps.node_id.clone();
-        let inbound_operator_surface_tx = ctx.ipc_operator_surface_tx.clone();
-        tokio::spawn(async move {
-            while let Some(msg) = inbox_rx.recv().await {
-                match msg.msg_type {
-                    ansible_mesh_core::MsgType::Heartbeat => {
-                        if let Ok(payload) =
-                            serde_json::from_slice::<HeartbeatPayload>(&msg.payload)
-                        {
-                            reconcile_peer_execution_reachability(
-                                inbound_graph.as_ref(),
-                                &payload.capabilities,
-                                payload.execution_reachability.as_ref(),
-                            );
-                        }
-                    }
-                    ansible_mesh_core::MsgType::CapabilitySync => {
-                        if let Ok(payload) =
-                            serde_json::from_slice::<CapabilitySyncPayload>(&msg.payload)
-                        {
-                            reconcile_peer_execution_reachability(
-                                inbound_graph.as_ref(),
-                                &payload.capabilities,
-                                payload.execution_reachability.as_ref(),
-                            );
-                        }
-                    }
-                    ansible_mesh_core::MsgType::MeshEventBatch
-                    | ansible_mesh_core::MsgType::ExecutionEventBatch => {
-                        if let Ok(events) =
-                            serde_json::from_slice::<Vec<EventEnvelope>>(&msg.payload)
-                        {
-                            if !events.is_empty() {
-                                let max_seq = events.iter().map(|e| e.seq).max().unwrap_or(0);
-                                for event in &events {
-                                    IpcServer::deliver_event_envelope_or_park(
-                                        &inbound_inboxes,
-                                        event,
-                                        inbound_operator_surface_tx.as_ref(),
-                                        inbound_graph.as_ref(),
-                                        &inbound_local_node_id,
-                                        &inbound_parked,
-                                        inbound_mat_req.as_deref(),
-                                    )
-                                    .await;
-                                    // Cron control-plane broadcasts.
-                                    match &event.kind {
-                                        ansible_mesh_core::event::EventKind::CronFired => {
-                                            if let ansible_mesh_core::event::EventPayload::Inline {
-                                                data,
-                                            } = &event.payload
-                                            {
-                                                handle_cron_fired_broadcast(
-                                                    inbound_graph.as_ref(),
-                                                    data,
-                                                );
-                                            }
-                                        }
-                                        ansible_mesh_core::event::EventKind::CronJobSync => {
-                                            if let ansible_mesh_core::event::EventPayload::Inline {
-                                                data,
-                                            } = &event.payload
-                                            {
-                                                handle_cron_job_sync(
-                                                    inbound_graph.as_ref(),
-                                                    data,
-                                                );
-                                            }
-                                        }
-                                        ansible_mesh_core::event::EventKind::ProjectedUserIdentitySync => {
-                                            if let ansible_mesh_core::event::EventPayload::Inline {
-                                                data,
-                                            } = &event.payload
-                                            {
-                                                handle_projected_user_identity_sync(
-                                                    inbound_graph.as_ref(),
-                                                    data,
-                                                );
-                                            }
-                                        }
-                                        ansible_mesh_core::event::EventKind::SessionControl => {
-                                            if let ansible_mesh_core::event::EventPayload::Inline {
-                                                data,
-                                            } = &event.payload
-                                            {
-                                                if let Ok(v) = serde_json::from_str::<
-                                                    serde_json::Value,
-                                                >(data)
-                                                {
-                                                    if v.get("action")
-                                                        .and_then(|a| a.as_str())
-                                                        == Some("session.handoff")
-                                                    {
-                                                        let graph = inbound_graph.clone();
-                                                        let inboxes = inbound_inboxes.clone();
-                                                        let parked = inbound_parked.clone();
-                                                        let mat_req = inbound_mat_req.clone();
-                                                        let node_id =
-                                                            inbound_local_node_id.clone();
-                                                        let data = data.clone();
-                                                        tokio::spawn(async move {
-                                                            IpcServer::handle_remote_role_handoff(
-                                                                graph.as_ref(),
-                                                                &inboxes,
-                                                                &parked,
-                                                                mat_req,
-                                                                &node_id,
-                                                                &data,
-                                                            )
-                                                            .await;
-                                                        });
-                                                    }
-                                                }
-                                            }
-                                        }
-                                        _ => {}
-                                    }
-                                }
-                                let _ = dispatcher_inbound_tx
-                                    .send(LedgerCommand::CommitInboundBatch {
-                                        events,
-                                        source_node: msg.src_node.clone(),
-                                    })
-                                    .await;
-
-                                let ack_payload =
-                                    serde_json::json!({ "acked_seq": max_seq }).to_string();
-                                if let Some(target_addr) =
-                                    mesh_target_addr_for_node(inbound_graph.as_ref(), &msg.src_node)
-                                        .ok()
-                                        .flatten()
-                                {
-                                    let Some(auth_key) = mesh_auth_key_for_node(
-                                        inbound_graph.as_ref(),
-                                        &msg.src_node,
-                                    )
-                                    .ok()
-                                    .flatten() else {
-                                        warn!(
-                                            "No mesh auth key found for ACK destination {}",
-                                            msg.src_node
-                                        );
-                                        continue;
-                                    };
-                                    let msg_id = uuid::Uuid::new_v4();
-                                    let seq = 0;
-                                    let timestamp = std::time::SystemTime::now()
-                                        .duration_since(std::time::UNIX_EPOCH)
-                                        .unwrap_or_default()
-                                        .as_secs();
-                                    let payload = ack_payload.into_bytes();
-                                    let hmac = ansible_mesh_core::authz::MeshAuth::new(auth_key)
-                                        .sign(&msg_id, seq as u64, &payload, timestamp);
-                                    let ack = ansible_mesh_core::BeaconMessage {
-                                        version: 1,
-                                        msg_id,
-                                        src_node: inbound_local_node_id.clone(),
-                                        dest_node: msg.src_node.clone(),
-                                        msg_type: ansible_mesh_core::MsgType::ExecutionEventAck,
-                                        seq,
-                                        total: 1,
-                                        payload,
-                                        timestamp,
-                                        hmac,
-                                    };
-                                    if let Err(err) =
-                                        crate::service::execution_transport::send_execution_message(
-                                            &target_addr,
-                                            &ack,
-                                        )
-                                        .await
-                                    {
-                                        warn!(
-                                            "Failed to return execution ACK to {} at {}: {}",
-                                            msg.src_node, target_addr, err
-                                        );
-                                    }
-                                } else {
-                                    warn!(
-                                        "No mesh target address found for ACK destination {}",
-                                        msg.src_node
-                                    );
-                                }
-                            }
-                        }
-                    }
-                    ansible_mesh_core::MsgType::MeshEventAck
-                    | ansible_mesh_core::MsgType::ExecutionEventAck => {
-                        debug!("Received MeshEventAck from {}", msg.src_node);
-                        if let Ok(ack_payload) =
-                            serde_json::from_slice::<serde_json::Value>(&msg.payload)
-                        {
-                            if let Some(acked_seq) =
-                                ack_payload.get("acked_seq").and_then(|v| v.as_u64())
-                            {
-                                let _ = dispatcher_inbound_tx
-                                    .send(LedgerCommand::ProcessAck {
-                                        consumer_node_id: msg.src_node.clone(),
-                                        acked_seq,
-                                    })
-                                    .await;
-                            }
-                        }
-                    }
-                    ansible_mesh_core::MsgType::MeshMembershipAccept => {
-                        if let Ok(payload_json) = String::from_utf8(msg.payload.clone()) {
-                            handle_mesh_membership_accept(inbound_graph.as_ref(), &payload_json);
-                        } else {
-                            warn!(
-                                "Received mesh membership acceptance from {} with non-UTF8 payload",
-                                msg.src_node
-                            );
-                        }
-                    }
-                    ansible_mesh_core::MsgType::WebRtcSignal => {
-                        info!("Received WebRTC Signaling Payload from {}", msg.src_node);
-                        if let Ok(signal_msg) = serde_json::from_slice::<
-                            ansible_mesh_core::webrtc::WebRtcSignalMessage,
-                        >(&msg.payload)
-                        {
-                            let webrtc_signal_tx = webrtc_signal_tx_inbound.clone();
-                            let local_node_id = local_node_id_webrtc_inbound.clone();
-                            tokio::spawn(async move {
-                                match signal_msg.signal {
-                                    ansible_mesh_core::webrtc::SignalPayload::Offer(sdp) => {
-                                        let guest =
-                                            crate::service::webrtc_guest::WebRtcGuest::new(
-                                                signal_msg.session_id,
-                                                local_node_id,
-                                                msg.src_node,
-                                                signal_msg.target_guest_id,
-                                                signal_msg.sender_guest_id,
-                                                webrtc_signal_tx,
-                                            );
-                                        if let Err(e) = guest.run_answering(sdp).await {
-                                            error!("WebRTC Transceiver Guest failed: {}", e);
-                                        }
-                                    }
-                                    ansible_mesh_core::webrtc::SignalPayload::Answer(sdp) => {
-                                        match crate::service::webrtc_guest::WebRtcGuest::apply_answer(
-                                            &signal_msg.session_id,
-                                            sdp,
-                                        )
-                                        .await
-                                        {
-                                            Ok(true) => {}
-                                            Ok(false) => debug!(
-                                                "Received WebRTC answer for unknown session {}",
-                                                signal_msg.session_id
-                                            ),
-                                            Err(e) => error!(
-                                                "Failed to apply WebRTC answer for session {}: {}",
-                                                signal_msg.session_id, e
-                                            ),
-                                        }
-                                    }
-                                    ansible_mesh_core::webrtc::SignalPayload::IceCandidate(candidate) => {
-                                        debug!(
-                                            "Received WebRTC ICE candidate for session {} but trickle ICE is not wired yet: {} bytes",
-                                            signal_msg.session_id,
-                                            candidate.len()
-                                        );
-                                    }
-                                    ansible_mesh_core::webrtc::SignalPayload::SessionEnded => {
-                                        match crate::service::webrtc_guest::WebRtcGuest::close_session(
-                                            &signal_msg.session_id,
-                                        )
-                                        .await
-                                        {
-                                            Ok(true) => {}
-                                            Ok(false) => debug!(
-                                                "Received WebRTC session end for unknown session {}",
-                                                signal_msg.session_id
-                                            ),
-                                            Err(e) => error!(
-                                                "Failed to close WebRTC session {}: {}",
-                                                signal_msg.session_id, e
-                                            ),
-                                        }
-                                    }
-                                }
-                            });
-                        }
-                    }
-                    _ => {}
-                }
-            }
-        });
-    }
-
-    {
-        let socket_webrtc = daemon.socket();
-        let webrtc_graph = ctx.graph_domain.clone();
-        let local_node_id_webrtc = ctx.caps.node_id.clone();
-        tokio::spawn(async move {
-            while let Some(signal) = webrtc_signal_rx.recv().await {
-                if let Ok(payload_bytes) = serde_json::to_vec(&signal) {
-                    let Some(auth_key) =
-                        mesh_auth_key_for_node(webrtc_graph.as_ref(), &signal.target_node_id)
-                            .ok()
-                            .flatten()
-                    else {
-                        debug!(
-                            "Skipping WebRTC signal for {} until mesh auth key exists",
-                            signal.target_node_id
-                        );
-                        continue;
-                    };
-                    let Some(target_addr) =
-                        mesh_target_addr_for_node(webrtc_graph.as_ref(), &signal.target_node_id)
-                            .ok()
-                            .flatten()
-                    else {
-                        debug!(
-                            "Skipping WebRTC signal for {} until mesh reachability exists",
-                            signal.target_node_id
-                        );
-                        continue;
-                    };
-                    let msg_id = uuid::Uuid::new_v4();
-                    let seq = 0;
-                    let timestamp = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_secs();
-
-                    let hmac = ansible_mesh_core::authz::MeshAuth::new(auth_key).sign(
-                        &msg_id,
-                        seq as u64,
-                        &payload_bytes,
-                        timestamp,
-                    );
-
-                    let msg = ansible_mesh_core::BeaconMessage {
-                        version: 1,
-                        msg_id,
-                        src_node: local_node_id_webrtc.clone(),
-                        dest_node: signal.target_node_id.clone(),
-                        msg_type: ansible_mesh_core::MsgType::WebRtcSignal,
-                        seq,
-                        total: 1,
-                        timestamp,
-                        payload: payload_bytes,
-                        hmac,
-                    };
-
-                    if let Ok(packet) = serde_json::to_vec(&msg) {
-                        if let Err(e) = socket_webrtc.send_to(&packet, &target_addr).await {
-                            tracing::error!("UDP WebRTC Signal send failed: {}", e);
-                        }
-                    }
-                }
-            }
-        });
-    }
-
-    {
-        let daemon = daemon.clone();
-        tokio::spawn(async move {
-            if let Err(e) = daemon.run_loop().await {
-                error!("Beacon Daemon error: {}", e);
-            }
-        });
-    }
-
-    Ok(())
-}
-
 fn local_capability_advertisements(
     graph: &GraphDomain,
     hotel: &HotelRecord,
@@ -2096,6 +1639,14 @@ struct AgentProfile {
     /// Operator-supplied turn loop config for the orchestrator role.
     /// When present, overrides the default (empty) TurnLoopConfig on every seed.
     orchestrator_turn_loop_config: Option<ansible_mesh_core::graph::TurnLoopConfig>,
+    /// Operator-supplied content policy for the orchestrator role, sourced from the
+    /// mesh-config agent stanza's optional `content_policy` field. `None` means
+    /// mesh-config didn't specify one for this seed pass — `seed_orchestrator_roles`
+    /// then falls back to preserving whatever is already in the DB (or "standard"
+    /// for a brand-new role) rather than wiping it, the same preserve-or-source
+    /// contract `role.configure` uses for `content_policy` and `fallback_tiers`
+    /// (see `role_materialization.rs`'s `resolved_content_policy`).
+    content_policy: Option<String>,
 }
 
 fn title_case_agent_name(agent_key: &str) -> String {
@@ -2130,6 +1681,7 @@ fn default_agent_profile_for_hotel(hotel_name: &str) -> AgentProfile {
         import_workspace: None,
         is_admin: false,
         orchestrator_turn_loop_config: None,
+        content_policy: None,
     }
 }
 
@@ -2358,6 +1910,13 @@ fn agent_profile_from_config(
         .get("turn_loop_config")
         .and_then(|v| serde_json::from_value(v.clone()).ok());
 
+    let content_policy = agent
+        .get("content_policy")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(str::to_string);
+
     Some(AgentProfile {
         agent_key,
         agent_id,
@@ -2365,6 +1924,7 @@ fn agent_profile_from_config(
         import_workspace,
         is_admin,
         orchestrator_turn_loop_config,
+        content_policy,
     })
 }
 
@@ -2411,6 +1971,12 @@ fn all_agent_profiles_from_config(
             let orchestrator_turn_loop_config = agent
                 .get("turn_loop_config")
                 .and_then(|v| serde_json::from_value(v.clone()).ok());
+            let content_policy = agent
+                .get("content_policy")
+                .and_then(serde_json::Value::as_str)
+                .map(str::trim)
+                .filter(|v| !v.is_empty())
+                .map(str::to_string);
             Some(AgentProfile {
                 agent_key,
                 agent_id,
@@ -2418,6 +1984,7 @@ fn all_agent_profiles_from_config(
                 import_workspace,
                 is_admin,
                 orchestrator_turn_loop_config,
+                content_policy,
             })
         })
         .collect()
@@ -2474,15 +2041,26 @@ fn agent_guests_for_profile(hotel_name: &str, profile: &AgentProfile) -> GuestRe
 /// One per agent; stores per-agent cognitive graph at ~/.philotic/agent-graph-{id}.db.
 fn agent_graph_runner_guest(hotel_name: &str, profile: &AgentProfile) -> GuestRecord {
     let hotel = default_hotel_record(hotel_name);
-    let socket_path = hotel.ipc_socket_path;
-    let guest_id = format!("{hotel_name}:agent-graph-{}", profile.agent_id);
+    agent_graph_guest_record(hotel_name, &profile.agent_id, &hotel.ipc_socket_path)
+}
+
+/// Canonical shape for the companion agent-graph guest. Single source of truth
+/// for the spawned binary (`agent-datasource`) so every seeding path — startup
+/// profile seeding (above) and on-demand role-incarnation materialization
+/// (service/ipc.rs) — converges on the same command, args, and env.
+pub(crate) fn agent_graph_guest_record(
+    hotel_name: &str,
+    agent_id: &str,
+    socket_path: &str,
+) -> GuestRecord {
+    let guest_id = format!("{hotel_name}:agent-graph-{agent_id}");
     let mut env = serde_json::json!({
-        "PHILOTIC_AGENT_ID": profile.agent_id,
+        "PHILOTIC_AGENT_ID": agent_id,
         "PHILOTIC_GRAPH_RUNNER_ID": guest_id,
         "PHILOTIC_HOTEL_SOCKET": socket_path,
         "PHILOTIC_IPC_SOCKET": socket_path
     });
-    if let Some(db_path) = agent_graph_db_path(&profile.agent_id) {
+    if let Some(db_path) = agent_graph_db_path(agent_id) {
         if let Some(env) = env.as_object_mut() {
             env.insert(
                 "PHILOTIC_AGENT_GRAPH_DB".into(),
@@ -2506,6 +2084,108 @@ fn agent_graph_runner_guest(hotel_name: &str, profile: &AgentProfile) -> GuestRe
     }
 }
 
+/// Activation gates for hotel-shared model controllers whose usefulness depends
+/// on operator-supplied keys (anthropic/openai) or a locally running service
+/// (ollama). Cloud controllers with no key are seeded `is_active: false` so the
+/// guest supervisor never spawns a controller that can only fail turns; the
+/// operator activates by providing the key and re-running `aiua load`.
+#[derive(Debug, Clone, Copy, Default)]
+struct SharedControllerGates {
+    anthropic_key_present: bool,
+    openai_key_present: bool,
+    ollama_reachable: bool,
+}
+
+/// True when the provider's API key is discoverable through any supported
+/// source: the endpoint-scoped env overrides (`PHILOTIC_<PROVIDER>_API_KEY[_REF]`),
+/// an optional vendor-standard bare env var (e.g. `ANTHROPIC_API_KEY`), or the
+/// vault-backed config refs already loaded into the Context Graph.
+fn provider_key_configured(graph: &GraphDomain, provider: &str, bare_env: Option<&str>) -> bool {
+    use ansible_mesh_core::provider_keys::provider_key_spec;
+    let Some(spec) = provider_key_spec(provider) else {
+        return false;
+    };
+    let env_set = |key: &str| {
+        std::env::var(key)
+            .map(|v| !v.trim().is_empty())
+            .unwrap_or(false)
+    };
+    if env_set(spec.env_api_key) || env_set(spec.env_api_key_ref) {
+        return true;
+    }
+    if bare_env.map(env_set).unwrap_or(false) {
+        return true;
+    }
+    let config_set = |key: &str| {
+        graph
+            .get_config_value(key)
+            .ok()
+            .flatten()
+            .map(|v| !v.trim().is_empty())
+            .unwrap_or(false)
+    };
+    config_set(spec.api_key_ref_key) || config_set(spec.legacy_api_key_key)
+}
+
+/// Ollama has no API key — gate on a configured base URL or the default local
+/// port answering a TCP connect (400ms budget, load-time only).
+fn ollama_available(graph: &GraphDomain) -> bool {
+    let env_set = std::env::var("PHILOTIC_OLLAMA_BASE_URL")
+        .map(|v| !v.trim().is_empty())
+        .unwrap_or(false);
+    if env_set {
+        return true;
+    }
+    let config_set = graph
+        .get_config_value("ollama_base_url")
+        .ok()
+        .flatten()
+        .map(|v| !v.trim().is_empty())
+        .unwrap_or(false);
+    if config_set {
+        return true;
+    }
+    std::net::TcpStream::connect_timeout(
+        &std::net::SocketAddr::from(([127, 0, 0, 1], 11434)),
+        std::time::Duration::from_millis(400),
+    )
+    .is_ok()
+}
+
+fn detect_shared_controller_gates(graph: &GraphDomain) -> SharedControllerGates {
+    let gates = SharedControllerGates {
+        anthropic_key_present: provider_key_configured(
+            graph,
+            "anthropic",
+            Some("ANTHROPIC_API_KEY"),
+        ),
+        openai_key_present: provider_key_configured(graph, "openai", Some("OPENAI_API_KEY")),
+        ollama_reachable: ollama_available(graph),
+    };
+    if !gates.anthropic_key_present {
+        info!(
+            "model-controller-anthropic seeded INACTIVE — provide an Anthropic key \
+             (vault ref `anthropic_api_key_ref`, or PHILOTIC_ANTHROPIC_API_KEY / \
+             ANTHROPIC_API_KEY env) and re-run `aiua load` to activate."
+        );
+    }
+    if !gates.openai_key_present {
+        info!(
+            "model-controller-openai seeded INACTIVE — provide an OpenAI key \
+             (vault ref `openai_api_key_ref`, or PHILOTIC_OPENAI_API_KEY / \
+             OPENAI_API_KEY env) and re-run `aiua load` to activate."
+        );
+    }
+    if !gates.ollama_reachable {
+        info!(
+            "model-controller-ollama seeded INACTIVE — no Ollama server detected \
+             (set `ollama_base_url` / PHILOTIC_OLLAMA_BASE_URL or start Ollama on \
+             127.0.0.1:11434) and re-run `aiua load` to activate."
+        );
+    }
+    gates
+}
+
 /// Hotel-level shared guests: one membrane for all agents, plus model controllers.
 /// `blob_port` must come from the stored hotel record (via `reconcile_hotel_record`),
 /// not from `default_hotel_record`, to avoid writing a stale hash-derived URL.
@@ -2513,6 +2193,7 @@ fn hotel_shared_guests(
     hotel_name: &str,
     profiles: &[AgentProfile],
     blob_port: u16,
+    controller_gates: SharedControllerGates,
 ) -> Vec<GuestRecord> {
     let hotel = default_hotel_record(hotel_name);
     let socket_path = hotel.ipc_socket_path;
@@ -2642,6 +2323,23 @@ fn hotel_shared_guests(
         },
         GuestRecord {
             hotel_name: hotel_name.to_string(),
+            guest_id: format!("{hotel_name}:model-controller-openrouter"),
+            role: "model.openrouter".into(),
+            config_json: serde_json::json!({
+                "command": "model-controller-openrouter",
+                "args": [],
+                "env": {
+                    "PHILOTIC_HOTEL_SOCKET": socket_path.clone(),
+                    "PHILOTIC_NODE_ID": node_id.clone()
+                }
+            })
+            .to_string(),
+            is_active: true,
+            active_pid: None,
+            last_active_at: None,
+        },
+        GuestRecord {
+            hotel_name: hotel_name.to_string(),
             guest_id: format!("{hotel_name}:model-controller-onnx"),
             role: "model.local".into(),
             config_json: serde_json::json!({
@@ -2661,6 +2359,64 @@ fn hotel_shared_guests(
             })
             .to_string(),
             is_active: true,
+            active_pid: None,
+            last_active_at: None,
+        },
+        // ── Full model suite: anthropic / openai / ollama controllers ────────
+        // Cloud controllers activate only when their key is discoverable
+        // (env override, bare vendor env var, or vault-backed config ref);
+        // ollama activates only when a local server is configured/reachable.
+        // detect_shared_controller_gates logs a "provide key to activate" hint
+        // for every gated-off controller at load time.
+        GuestRecord {
+            hotel_name: hotel_name.to_string(),
+            guest_id: format!("{hotel_name}:model-controller-anthropic"),
+            role: "model.anthropic".into(),
+            config_json: serde_json::json!({
+                "command": "model-controller-anthropic",
+                "args": [],
+                "env": {
+                    "PHILOTIC_HOTEL_SOCKET": socket_path.clone(),
+                    "PHILOTIC_NODE_ID": node_id.clone()
+                }
+            })
+            .to_string(),
+            is_active: controller_gates.anthropic_key_present,
+            active_pid: None,
+            last_active_at: None,
+        },
+        GuestRecord {
+            hotel_name: hotel_name.to_string(),
+            guest_id: format!("{hotel_name}:model-controller-openai"),
+            role: "model.openai".into(),
+            config_json: serde_json::json!({
+                "command": "model-controller-openai",
+                "args": [],
+                "env": {
+                    "PHILOTIC_HOTEL_SOCKET": socket_path.clone(),
+                    "PHILOTIC_NODE_ID": node_id.clone()
+                }
+            })
+            .to_string(),
+            is_active: controller_gates.openai_key_present,
+            active_pid: None,
+            last_active_at: None,
+        },
+        GuestRecord {
+            hotel_name: hotel_name.to_string(),
+            guest_id: format!("{hotel_name}:model-controller-ollama"),
+            role: "model.ollama".into(),
+            config_json: serde_json::json!({
+                "command": "model-controller-ollama",
+                "args": [],
+                "env": {
+                    "PHILOTIC_HOTEL_SOCKET": socket_path.clone(),
+                    "PHILOTIC_NODE_ID": node_id.clone(),
+                    "PHILOTIC_OLLAMA_GUEST_ID": format!("{hotel_name}:model-controller-ollama")
+                }
+            })
+            .to_string(),
+            is_active: controller_gates.ollama_reachable,
             active_pid: None,
             last_active_at: None,
         },
@@ -2699,24 +2455,9 @@ fn hotel_shared_guests(
             active_pid: None,
             last_active_at: None,
         },
-        GuestRecord {
-            hotel_name: hotel_name.to_string(),
-            guest_id: format!("{hotel_name}:graph-runner"),
-            role: "tool.graph".into(),
-            config_json: serde_json::json!({
-                "command": "graph-runner",
-                "args": [],
-                "env": {
-                    "PHILOTIC_HOTEL_SOCKET": socket_path.clone(),
-                    "PHILOTIC_NODE_ID": node_id.clone(),
-                    "PHILOTIC_GRAPH_RUNNER_ID": format!("{hotel_name}:graph-runner")
-                }
-            })
-            .to_string(),
-            is_active: true,
-            active_pid: None,
-            last_active_at: None,
-        },
+        // graph-runner is retired (codex/graph-runner-retire): its tools appear in
+        // zero toolset profiles and zero catalog ToolDefinitions, so no agent could
+        // reach it. graph-datasource (below) is the surviving graph store surface.
         GuestRecord {
             hotel_name: hotel_name.to_string(),
             guest_id: format!("{hotel_name}:graph-datasource"),
@@ -2792,6 +2533,14 @@ fn hotel_shared_guests(
     if !should_materialize_graph_datasource(hotel_name) {
         guests.retain(|guest| guest.role != "graph-datasource");
     }
+    // Gate the default membrane-mcp: only auto-materialize if MCP_MEMBRANE_REQUIRED is set.
+    // Otherwise it's spawned on-demand by ProvisionMcpEndpoint. This prevents unnecessary
+    // process spawning and orphan accumulation when MCP endpoints are not in use.
+    if std::env::var("MCP_MEMBRANE_REQUIRED").is_err() {
+        guests.retain(|guest| {
+            !(guest.role == "mcp-membrane" && guest.guest_id.ends_with(":membrane-mcp"))
+        });
+    }
 
     // life-graph-runner: paracrine → Memgraph observation pipeline.
     // Only materialized when a Memgraph URI is available (same gate as graph-datasource).
@@ -2849,6 +2598,7 @@ fn guest_seed_for_profile(hotel_name: &str, profile: &AgentProfile) -> Vec<Guest
         hotel_name,
         std::slice::from_ref(profile),
         default_hotel_record(hotel_name).blob_port,
+        SharedControllerGates::default(),
     );
     guests.push(agent_guests_for_profile(hotel_name, profile));
     guests.push(agent_graph_runner_guest(hotel_name, profile));
@@ -3195,6 +2945,12 @@ fn deactivate_legacy_managed_guests(
                 return false;
             }
             if guest.role == "graph-datasource" {
+                return true;
+            }
+            // graph-runner is retired (codex/graph-runner-retire): deactivate any
+            // stale hotel-seeded rows so fleets stop respawning the old binary.
+            if guest.role == "tool.graph" || guest.guest_id == format!("{hotel_name}:graph-runner")
+            {
                 return true;
             }
 
@@ -3961,6 +3717,52 @@ fn seed_abstract_tool_catalog(graph: &GraphDomain) -> anyhow::Result<()> {
             tool_markers: Vec::new(),
         },
         AbstractToolRecord {
+            tool_name: "life.recall.feedback".into(),
+            description: "Record retrieval reward or friction for a LifeGraph recall packet. \
+                          Ratings such as useful, stale, missing, noisy, overconfident, or \
+                          disconnected help the graph propose safe bridge/ranking/attention \
+                          improvements without confirming new life truth."
+                .into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "feedback_id": { "type": "string", "description": "Unique feedback event ID." },
+                    "packet_id": { "type": "string", "description": "Retrieval packet ID being evaluated." },
+                    "query_summary": { "type": "string", "description": "Short summary of the original recall query." },
+                    "rating": {
+                        "type": "string",
+                        "enum": ["useful", "stale", "missing", "noisy", "overconfident", "disconnected"]
+                    },
+                    "note": { "type": "string", "description": "Brief reason for the rating." },
+                    "candidate_count": { "type": "integer", "minimum": 0 },
+                    "connected_candidate_count": { "type": "integer", "minimum": 0 },
+                    "missing_context_refs": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "default": []
+                    },
+                    "noisy_node_refs": {
+                        "type": "array",
+                        "items": { "type": "object" },
+                        "default": []
+                    },
+                    "stale_node_refs": {
+                        "type": "array",
+                        "items": { "type": "object" },
+                        "default": []
+                    },
+                    "evidence_packets": {
+                        "type": "array",
+                        "items": { "type": "object" },
+                        "default": []
+                    }
+                },
+                "required": ["feedback_id", "packet_id", "rating"]
+            }),
+            class: "life_graph".into(),
+            tool_markers: vec!["feedback".into(), "self_improving".into()],
+        },
+        AbstractToolRecord {
             tool_name: "life.commit".into(),
             description: "Commit a proposed observation — advances its validation_state from \
                           'proposed' to 'accepted'. Use after confirming an observation is correct."
@@ -4412,11 +4214,40 @@ fn seed_abstract_skill_catalog(graph: &GraphDomain) -> anyhow::Result<()> {
                           Record grounded observations with life.observe, retrieve relevant open \
                           loops and commitments with life.recall, commit or resolve validated \
                           facts when appropriate, and propose governed LifeGraph patches when the \
-                          graph, skill, or policy surface needs to grow."
+                          graph, skill, or policy surface needs to grow. Bulk-write discipline: \
+                          when recording more than ~3 related nodes, FIRST declare a structured \
+                          plan (the loop raises the turn's iteration cap from the declared step \
+                          count), then use life.observe.batch (up to 25 observations per call) \
+                          instead of repeated life.observe calls. Completed writes are durable \
+                          per item — partial failure never rolls anything back, so never report \
+                          a rollback; re-check with life.recall and continue from what landed. \
+                          Idea steward: when the operator expresses a want, need, or idea for a \
+                          new capability (\"I need X\", \"build me Y\", \"idea: Z\"), capture it \
+                          with life.observe as a GrowthHypothesis node — id `idea:<slug>`, \
+                          claim_summary in one or two sentences preserving the operator's words. \
+                          This applies EVEN IF the idea arrives as a fleshed-out design or \
+                          project (2026-07-20: the Lyra design was captured only as a Project \
+                          node and the triage sweep missed it) — a Project/Decision node may \
+                          complement the capture but never replaces it; ONLY `idea:<slug>` \
+                          GrowthHypothesis nodes enter the idea triage pipeline. \
+                          Do NOT set lifecycle properties — the triage pipeline stamps \
+                          idea_status/graph_ref later; a node without idea_status counts as \
+                          captured. Batch with life.observe.batch when several ideas arrive at \
+                          once. Echo back the captured summary and id, ask at most ONE \
+                          clarifying question — capture first, refine later. Never silently drop \
+                          an idea. On \"what ideas are pending?\" or any idea-status question, \
+                          answer from life.recall over the idea nodes including idea_status, and \
+                          for declined ideas always relay idea_status_reason — the operator must \
+                          hear why, never silence. Closure delivery: when a turn touches the \
+                          operator's ideas or shipped work, digest which ideas reached \
+                          idea_status=shipped since you last told them — one digest, never \
+                          per-merge pings."
                 .into(),
             implied_tools: vec![
                 "life.observe".into(),
+                "life.observe.batch".into(),
                 "life.recall".into(),
+                "life.recall.feedback".into(),
                 "life.commit".into(),
                 "life.resolve".into(),
                 "life.conflict".into(),
@@ -4426,7 +4257,7 @@ fn seed_abstract_skill_catalog(graph: &GraphDomain) -> anyhow::Result<()> {
             skill_markers: vec!["governed".into(), "life_graph".into()],
             field_sources: serde_json::json!({
                 "repo_skill_path": "skills/lifegraph-truth-summarizer/SKILL.md",
-                "workflow": "life.recall -> provenance audit -> life.observe/life.commit/life.resolve/life.patch.propose"
+                "workflow": "life.recall -> provenance audit -> life.recall.feedback/life.observe/life.commit/life.resolve/life.patch.propose"
             }),
             ..Default::default()
         },
@@ -4536,6 +4367,55 @@ fn seed_abstract_skill_catalog(graph: &GraphDomain) -> anyhow::Result<()> {
             }),
             ..Default::default()
         },
+        // routing.refinement and mcp.manage were referenced by the orchestrator
+        // profile's on_demand_skills but only existed as hardcoded arms in
+        // philote's catalog (tools_for_skill / skill_is_relevant_for_turn) —
+        // never as DB records, so skill.list could not show them and their
+        // implied tools were absent from the abstract catalog. The implied
+        // tool lists below mirror the philote catalog arms.
+        AbstractSkillRecord {
+            skill_name: "routing.refinement".into(),
+            description: "Inspect and refine the agent's routing layer: propose routing policy \
+                          changes, set or read reflex rules, and manage routing pipelines. Use \
+                          router.stats to observe live routing behavior before proposing changes."
+                .into(),
+            implied_tools: vec![
+                "session.status".into(),
+                "routing.policy.propose".into(),
+                "routing.reflex.set".into(),
+                "routing.reflex.get".into(),
+                "routing.pipeline.set".into(),
+                "routing.pipeline.remove".into(),
+                "routing.pipeline.get".into(),
+                "router.stats".into(),
+            ],
+            validation_state: ansible_mesh_core::graph::SkillValidationState::Validated,
+            field_sources: serde_json::json!({
+                "source": "mirrors philote catalog tools_for_skill(\"routing.refinement\")"
+            }),
+            ..Default::default()
+        },
+        AbstractSkillRecord {
+            skill_name: "mcp.manage".into(),
+            description: "Provision, inspect, and revoke MCP endpoints and their access tokens. \
+                          mcp.provision declares or updates an endpoint this agent exposes; \
+                          mcp.grant_token / mcp.rotate_token / mcp.revoke_token manage caller \
+                          credentials; mcp.revoke retires an endpoint."
+                .into(),
+            implied_tools: vec![
+                "mcp.provision".into(),
+                "mcp.revoke".into(),
+                "mcp.grant_token".into(),
+                "mcp.rotate_token".into(),
+                "mcp.revoke_token".into(),
+                "mcp.status".into(),
+            ],
+            validation_state: ansible_mesh_core::graph::SkillValidationState::Validated,
+            field_sources: serde_json::json!({
+                "source": "mirrors philote catalog tools_for_skill(\"mcp.manage\")"
+            }),
+            ..Default::default()
+        },
     ];
 
     for skill in &catalog {
@@ -4564,10 +4444,15 @@ fn seed_toolset_profiles(graph: &GraphDomain) -> anyhow::Result<()> {
                 "routing.policy.propose".into(),
                 "mcp.provision".into(),
                 "mcp.revoke".into(),
+                "mcp.connect".into(),
+                "mcp.disconnect".into(),
+                "mcp.upstreams".into(),
+                "mcp.set_credential".into(),
                 "desktop.observe".into(),
                 "skill.register".into(),
                 "skill.list".into(),
                 "skill.assign".into(),
+                "skill.revoke".into(),
                 "subagent.spawn".into(),
                 "workspace.list".into(),
                 "workspace.read".into(),
@@ -4626,6 +4511,7 @@ fn seed_toolset_profiles(graph: &GraphDomain) -> anyhow::Result<()> {
                 "mcp.manage".into(),
             ],
             remote_tool_runners: vec![],
+            seed_baseline: None,
             description: Some("Default orchestrator role profile.".into()),
         },
         ToolsetProfileRecord {
@@ -4652,6 +4538,7 @@ fn seed_toolset_profiles(graph: &GraphDomain) -> anyhow::Result<()> {
             ],
             on_demand_skills: vec![],
             remote_tool_runners: vec![],
+            seed_baseline: None,
             description: Some("Codex specialist role profile — workspace read access.".into()),
         },
         ToolsetProfileRecord {
@@ -4676,6 +4563,7 @@ fn seed_toolset_profiles(graph: &GraphDomain) -> anyhow::Result<()> {
             ],
             on_demand_skills: vec![],
             remote_tool_runners: vec![],
+            seed_baseline: None,
             description: Some("Research specialist role profile — minimal tool surface.".into()),
         },
         ToolsetProfileRecord {
@@ -4698,6 +4586,7 @@ fn seed_toolset_profiles(graph: &GraphDomain) -> anyhow::Result<()> {
             ],
             on_demand_skills: vec![],
             remote_tool_runners: vec![],
+            seed_baseline: None,
             description: Some("Bare utility profile — session and echo only.".into()),
         },
         ToolsetProfileRecord {
@@ -4730,6 +4619,7 @@ fn seed_toolset_profiles(graph: &GraphDomain) -> anyhow::Result<()> {
             ],
             on_demand_skills: vec![],
             remote_tool_runners: vec![],
+            seed_baseline: None,
             description: Some(
                 "Scheduler specialist role profile — narrow cron scheduling and handoff-back authority."
                     .into(),
@@ -4757,6 +4647,10 @@ fn seed_toolset_profiles(graph: &GraphDomain) -> anyhow::Result<()> {
                 "routing.policy.propose".into(),
                 "mcp.provision".into(),
                 "mcp.revoke".into(),
+                "mcp.connect".into(),
+                "mcp.disconnect".into(),
+                "mcp.upstreams".into(),
+                "mcp.set_credential".into(),
                 "desktop.observe".into(),
                 "workspace.list".into(),
                 "workspace.read".into(),
@@ -4790,6 +4684,7 @@ fn seed_toolset_profiles(graph: &GraphDomain) -> anyhow::Result<()> {
                 "cron.disable".into(),
                 "cron.remove".into(),
                 "router.stats".into(),
+                "agent.migrate_to".into(),
             ],
             allowed_classes: vec![
                 "session".into(),
@@ -4829,6 +4724,7 @@ fn seed_toolset_profiles(graph: &GraphDomain) -> anyhow::Result<()> {
             ],
             on_demand_skills: vec![],
             remote_tool_runners: vec![],
+            seed_baseline: None,
             description: Some(
                 "Admin role profile — full skill crafting, role governance, training data authority, ASR provisioning, vision model provisioning, and cron scheduling.".into(),
             ),
@@ -4847,6 +4743,11 @@ fn seed_toolset_profiles(graph: &GraphDomain) -> anyhow::Result<()> {
                 "bash.exec".into(),
                 "memory.recall".into(),
                 "memory.remember".into(),
+                // Autopoiesis Slice A4 (`aria-architect-charter`): the
+                // architect-charter steward reuses this profile and its
+                // daily brief must call memory.delta_digest (Memory
+                // Transparency Slice M3) before composing the brief.
+                "memory.delta_digest".into(),
                 "agent.graph.read".into(),
                 "graph.query".into(),
                 "graph.create".into(),
@@ -4863,6 +4764,7 @@ fn seed_toolset_profiles(graph: &GraphDomain) -> anyhow::Result<()> {
             ],
             on_demand_skills: vec![],
             remote_tool_runners: vec![],
+            seed_baseline: None,
             description: Some(
                 "Architect specialist role profile — systems, infrastructure, debugging. \
                  bash.exec requires operator approval."
@@ -4907,6 +4809,7 @@ fn seed_toolset_profiles(graph: &GraphDomain) -> anyhow::Result<()> {
             ],
             on_demand_skills: vec![],
             remote_tool_runners: vec![],
+            seed_baseline: None,
             description: Some(
                 "Brain specialist role profile — synthesis, memory, graph reasoning, and LifeGraph context."
                     .into(),
@@ -4932,6 +4835,7 @@ fn seed_toolset_profiles(graph: &GraphDomain) -> anyhow::Result<()> {
             ],
             on_demand_skills: vec![],
             remote_tool_runners: vec![],
+            seed_baseline: None,
             description: Some(
                 "Virtuoso specialist role profile — creative and expressive. \
                  Minimal tools, focused on reflection and lyrical output."
@@ -4940,8 +4844,17 @@ fn seed_toolset_profiles(graph: &GraphDomain) -> anyhow::Result<()> {
         },
     ];
 
+    // Reconcile, don't overwrite: runtime grant mutations (skill.assign /
+    // skill.revoke, operator live-DB patches) must survive reboot, while new
+    // seed entries from a release still propagate to existing profiles. The
+    // stored seed_baseline lets the reconciler tell runtime deltas apart from
+    // seed changes. A plain upsert here previously wiped every runtime grant
+    // on each `aiua run` / `aiua load`.
     for profile in &profiles {
-        graph.upsert_toolset_profile(profile)?;
+        let existing = graph.get_toolset_profile(&profile.profile_name)?;
+        let reconciled =
+            ToolsetProfileRecord::reconcile_seed_with_existing(profile, existing.as_ref());
+        graph.upsert_toolset_profile(&reconciled)?;
     }
 
     // If PHILOTIC_REMOTE_LIFE_GRAPH_RUNNER_NODE is set, seed every LifeGraph-capable
@@ -4966,7 +4879,9 @@ fn seed_toolset_profiles(graph: &GraphDomain) -> anyhow::Result<()> {
                 "target_role": "life-graph-runner",
                 "supported_tools": [
                     "life.observe",
+                    "life.observe.batch",
                     "life.recall",
+                    "life.recall.feedback",
                     "life.commit",
                     "life.resolve",
                     "life.conflict",
@@ -4982,21 +4897,47 @@ fn seed_toolset_profiles(graph: &GraphDomain) -> anyhow::Result<()> {
                 {
                     continue;
                 }
-                let already_present = profile.remote_tool_runners.iter().any(|r| {
+                let existing_idx = profile.remote_tool_runners.iter().position(|r| {
                     r.get("incarnation_id").and_then(|v| v.as_str())
                         == Some(runner_incarnation_id.as_str())
                 });
-                if already_present {
-                    continue;
+                match existing_idx {
+                    Some(idx) => {
+                        // Reconcile the registered tool set in place. The runner is
+                        // keyed by a STABLE incarnation id, so an already-seeded
+                        // profile was previously never refreshed — which meant a
+                        // newly added tool (e.g. life.observe.batch) could be granted
+                        // to the model yet have NO route to the runner, and the turn
+                        // would hang until the watchdog evicted it. Keep only
+                        // supported_tools current; preserve any runtime-added fields
+                        // (availability_state, etc.).
+                        if profile.remote_tool_runners[idx].get("supported_tools")
+                            == runner.get("supported_tools")
+                        {
+                            continue;
+                        }
+                        if let Some(obj) = profile.remote_tool_runners[idx].as_object_mut() {
+                            obj.insert("supported_tools".into(), runner["supported_tools"].clone());
+                        }
+                        graph.upsert_toolset_profile(&profile)?;
+                        tracing::info!(
+                            node = %remote_node,
+                            hotel = %hotel_id,
+                            profile = %profile.profile_name,
+                            "refreshed remote life-graph-runner supported_tools"
+                        );
+                    }
+                    None => {
+                        profile.remote_tool_runners.push(runner.clone());
+                        graph.upsert_toolset_profile(&profile)?;
+                        tracing::info!(
+                            node = %remote_node,
+                            hotel = %hotel_id,
+                            profile = %profile.profile_name,
+                            "seeded remote life-graph-runner into LifeGraph-capable profile"
+                        );
+                    }
                 }
-                profile.remote_tool_runners.push(runner.clone());
-                graph.upsert_toolset_profile(&profile)?;
-                tracing::info!(
-                    node = %remote_node,
-                    hotel = %hotel_id,
-                    profile = %profile.profile_name,
-                    "seeded remote life-graph-runner into LifeGraph-capable profile"
-                );
             }
         }
     }
@@ -5078,7 +5019,8 @@ Tool preference:
 - If no tool is needed to answer a question, respond directly — do not call a tool just because one is available.
 
 Approval posture:
-- Governance tools (role.configure, role.list, skill.register, skill.assign, skill.list, handoff.to_role, handoff.back) run without per-action approval.
+- Governance tools (role.configure, role.list, skill.assign, skill.list, handoff.to_role, handoff.back) run without per-action approval.
+- skill.register ALWAYS requires live operator approval and cannot be preapproved or bypassed by policy; every accepted registration is audit-logged.
 - Self-configuration (agent.configure for approval_policy, profile, bindings) runs without approval.
 - Shell execution (bash.exec) and core identity field changes require operator approval.";
 
@@ -5100,6 +5042,30 @@ fn seed_orchestrator_roles(graph: &GraphDomain, profiles: &[AgentProfile]) -> an
             .clone()
             .or_else(|| existing.as_ref().map(|r| r.turn_loop_config.clone()))
             .unwrap_or_default();
+        // Content-policy resolution mirrors the turn_loop_config/fallback_tiers
+        // preserve-or-source contract above: a mesh-config `content_policy` on the
+        // agent stanza wins when present and valid; otherwise the existing DB row's
+        // content_policy is PRESERVED (this is the fix — `..Default::default()`
+        // below would otherwise silently reset content_policy to "standard" on
+        // every `aiua load`, wiping an operator-set "unrestricted" on every
+        // deploy); a brand-new role with neither falls back to "standard". Same
+        // shape as `role.configure`'s `resolved_content_policy`
+        // (role_materialization.rs).
+        let mesh_content_policy = profile.content_policy.as_deref().and_then(|policy| {
+            if ansible_mesh_core::graph::is_valid_content_policy(policy) {
+                Some(policy.to_string())
+            } else {
+                warn!(
+                    agent_id = %profile.agent_id,
+                    content_policy = %policy,
+                    "seed_orchestrator_roles: mesh-config content_policy is not one of unrestricted/standard/strict — ignoring or preserving existing DB value instead"
+                );
+                None
+            }
+        });
+        let content_policy = mesh_content_policy
+            .or_else(|| existing.as_ref().map(|r| r.content_policy.clone()))
+            .unwrap_or_else(ansible_mesh_core::graph::default_content_policy);
         let role_identity_addendum = existing.and_then(|r| r.role_identity_addendum);
 
         let record = ansible_mesh_core::graph::RoleIncarnationRecord {
@@ -5109,11 +5075,13 @@ fn seed_orchestrator_roles(graph: &GraphDomain, profiles: &[AgentProfile]) -> an
             toolset_profile: "orchestrator".into(),
             role_identity_addendum,
             role_manifest: Some(ORCHESTRATOR_MANIFEST.into()),
+            content_policy,
             is_admin: profile.is_admin,
             readiness_state: ansible_mesh_core::graph::RoleReadinessState::Configured,
             inactive_ttl_seconds: None,
             turn_loop_config,
             home_node: None,
+            ..Default::default()
         };
         // Always upsert — the hotel seed is the canonical source for the orchestrator manifest.
         // The manifest is institutional (same rules for all agents), not per-agent customizable.
@@ -5121,6 +5089,74 @@ fn seed_orchestrator_roles(graph: &GraphDomain, profiles: &[AgentProfile]) -> an
         graph.upsert_role_incarnation(&record)?;
     }
     Ok(())
+}
+
+/// Config-time coherence check: every fallback tier a ladder names must resolve
+/// to a live controller role on this hotel. A tier with no seeded+active guest
+/// escalates into a void — the exact failure the gemini thinking-hang incident
+/// escalated into. We do NOT auto-seed controllers here (provider keys may be
+/// absent); this slice is validation + visibility: a loud startup warning and a
+/// heal-queue entry per unreachable tier.
+fn validate_hotel_fallback_ladders(graph: &GraphDomain, hotel_name: &str, db_path: &Path) {
+    use ansible_mesh_core::heal_queue::{HealQueueStorage, SqliteHealQueueStorage};
+    use ansible_mesh_core::model_routing::{DEFAULT_FALLBACK_TIERS, validate_fallback_ladders};
+
+    // Reachability key = the guest `role` values the task router matches
+    // `target_role` against (exact match, no provider fallback).
+    let active_roles: std::collections::BTreeSet<String> = match graph.list_guests(hotel_name, true)
+    {
+        Ok(guests) => guests.into_iter().map(|g| g.role).collect(),
+        Err(e) => {
+            warn!("fallback-ladder validation: could not list guests: {e:#}");
+            return;
+        }
+    };
+
+    // Ladders in play: the default ladder every role without configured tiers
+    // actually runs, plus each role incarnation's configured tiers.
+    let mut ladders: Vec<(String, Vec<String>)> = vec![(
+        "default fallback ladder".to_string(),
+        DEFAULT_FALLBACK_TIERS
+            .iter()
+            .map(|t| t.to_string())
+            .collect(),
+    )];
+    if let Ok(incarnations) = graph.list_all_role_incarnations() {
+        for rec in incarnations {
+            let tiers = &rec.turn_loop_config.fallback_tiers;
+            if tiers.is_empty() {
+                continue;
+            }
+            ladders.push((
+                format!("role:{}:{}", rec.agent_id, rec.role_name),
+                tiers.clone(),
+            ));
+        }
+    }
+
+    let findings = validate_fallback_ladders(&active_roles, &ladders);
+    if findings.is_empty() {
+        return;
+    }
+
+    let heal = SqliteHealQueueStorage::open(db_path).ok();
+    for finding in &findings {
+        warn!(
+            ladder = %finding.ladder_label,
+            tier_role = %finding.tier_role,
+            hotel = %hotel_name,
+            "MODEL ROUTING GAP: fallback ladder names a tier with no seeded+active controller on this hotel — escalation to this tier targets a void"
+        );
+        if let Some(hq) = heal.as_ref() {
+            let text = format!(
+                "model-routing: fallback ladder '{}' names tier '{}' with no seeded+active controller on hotel '{}' — turns escalating to this tier target a void (seed a controller or remove the tier)",
+                finding.ladder_label, finding.tier_role, hotel_name
+            );
+            if let Err(e) = hq.push_error("model-routing-validation", &text) {
+                warn!("fallback-ladder validation: heal push failed: {e:#}");
+            }
+        }
+    }
 }
 
 fn enable_guest_test_overrides(
@@ -5156,11 +5192,6 @@ fn enable_guest_test_overrides(
             }
         }
         StartupTest::CognitiveRoundTrip => {
-            graph.set_config_value(
-                "gemini_api_key",
-                &serde_json::Value::String(STARTUP_TEST_GEMINI_API_KEY.into()).to_string(),
-            )?;
-
             // Clear vault registry so the startup test uses NullMemoryEngine.
             // This prevents philote from trying to activate against a real Muninn
             // instance when the hotel was seeded from a production mesh-config.json.
@@ -5182,6 +5213,10 @@ fn enable_guest_test_overrides(
                 env.insert(
                     "PHILOTIC_GEMINI_BASE_URL".into(),
                     serde_json::Value::String(startup_test_gemini_base_url(hotel_name)),
+                );
+                env.insert(
+                    "PHILOTIC_GEMINI_API_KEY".into(),
+                    serde_json::Value::String(STARTUP_TEST_GEMINI_API_KEY.into()),
                 );
                 guest.config_json = config.to_string();
             }
@@ -5250,12 +5285,6 @@ fn enable_guest_test_overrides(
                 "telegram_bot_token",
                 &serde_json::Value::String(STARTUP_TEST_TELEGRAM_TOKEN.into()).to_string(),
             )?;
-            if matches!(test, StartupTest::TelegramRoundTrip) {
-                graph.set_config_value(
-                    "gemini_api_key",
-                    &serde_json::Value::String(STARTUP_TEST_GEMINI_API_KEY.into()).to_string(),
-                )?;
-            }
 
             let telegram_api_base_url = startup_test_telegram_api_base_url(hotel_name);
             let gemini_api_base_url = startup_test_gemini_api_base_url(hotel_name);
@@ -5276,6 +5305,12 @@ fn enable_guest_test_overrides(
                         "PHILOTIC_GEMINI_BASE_URL".into(),
                         serde_json::Value::String(gemini_api_base_url.clone()),
                     );
+                    if matches!(test, StartupTest::TelegramRoundTrip) {
+                        env.insert(
+                            "PHILOTIC_GEMINI_API_KEY".into(),
+                            serde_json::Value::String(STARTUP_TEST_GEMINI_API_KEY.into()),
+                        );
+                    }
                 }
 
                 if guest.role == "membrane" {
@@ -5843,12 +5878,13 @@ fn startup_test_force_kill_pid(pid: u32) -> Result<()> {
 
 fn prepare_startup_test_binaries(_test: StartupTest) -> Result<()> {
     let existing_bins = [
-        "target/debug/membrane",
+        "target/debug/membrane-telegram",
         "target/debug/philote",
         "target/debug/tool-runner",
-        "target/debug/graph-runner",
+        "target/debug/graph-datasource",
         "target/debug/model-controller-gemini",
         "target/debug/model-controller-elevenlabs",
+        "target/debug/model-controller-openrouter",
     ];
     if existing_bins
         .iter()
@@ -5861,13 +5897,13 @@ fn prepare_startup_test_binaries(_test: StartupTest) -> Result<()> {
         .args([
             "build",
             "-p",
-            "membrane",
+            "membrane-telegram",
             "-p",
             "philote",
             "-p",
             "tool-runner",
             "-p",
-            "graph-runner",
+            "graph-datasource",
             "-p",
             "model-router",
             "--bins",
@@ -5916,18 +5952,21 @@ async fn run_startup_test(
                 other => anyhow::bail!("unexpected graph startup subscribe response: {other:?}"),
             }
 
-            let graph_id = startup_test_emit_graph_tool(
+            // The round-trip runs through graph-datasource (SqliteCypherProvider),
+            // the surviving graph store surface after graph-runner's retirement
+            // (codex/graph-runner-retire): create partition → CREATE node via
+            // Cypher → MATCH it back → list partitions.
+            let create_result = startup_test_emit_graph_tool(
                 &mut client,
                 &local_node_id,
                 "graph.create",
                 serde_json::json!({
-                    "name": graph_name,
-                    "default_visibility": "public",
+                    "graph_id": graph_name,
                     "caller_id": "aiua-startup-graph-client"
                 }),
             )
             .await?;
-            let graph_id = graph_id
+            let graph_id = create_result
                 .get("graph_id")
                 .and_then(serde_json::Value::as_str)
                 .context("graph.create startup reply missing graph_id")?
@@ -5936,69 +5975,77 @@ async fn run_startup_test(
             let node_result = startup_test_emit_graph_tool(
                 &mut client,
                 &local_node_id,
-                "graph.node.upsert",
+                "graph.query",
                 serde_json::json!({
                     "graph_id": graph_id,
-                    "node_type": "Smoke",
-                    "label": "startup smoke node",
-                    "visibility": ["public"],
+                    "query": "CREATE (n:Smoke {id: 'startup-smoke-node', name: 'startup smoke node'})",
                     "caller_id": "aiua-startup-graph-client"
                 }),
             )
             .await?;
             let node_id = node_result
-                .get("node_id")
+                .get("data")
+                .and_then(|data| data.get("id"))
                 .and_then(serde_json::Value::as_str)
-                .context("graph.node.upsert startup reply missing node_id")?
+                .context("graph.query CREATE startup reply missing data.id")?
                 .to_string();
 
-            let get_result = startup_test_emit_graph_tool(
+            let match_result = startup_test_emit_graph_tool(
                 &mut client,
                 &local_node_id,
-                "graph.node.get",
+                "graph.query",
                 serde_json::json!({
                     "graph_id": graph_id,
-                    "node_id": node_id,
+                    "query": "MATCH (n:Smoke {id: 'startup-smoke-node'}) RETURN n",
                     "caller_id": "aiua-startup-graph-client"
                 }),
             )
             .await?;
-            let label = get_result
-                .get("node")
-                .and_then(|node| node.get("label"))
+            let matched = match_result
+                .get("data")
+                .and_then(serde_json::Value::as_array)
+                .context("graph.query MATCH startup reply missing data array")?;
+            let name = matched
+                .first()
+                .and_then(|node| node.get("properties"))
+                .and_then(|props| props.get("name"))
                 .and_then(serde_json::Value::as_str)
-                .context("graph.node.get startup reply missing node.label")?;
-            if label != "startup smoke node" {
+                .context("graph.query MATCH startup reply missing node properties.name")?;
+            if name != "startup smoke node" {
                 anyhow::bail!(
-                    "unexpected graph.node.get startup label: expected {:?}, got {:?}",
+                    "unexpected graph.query MATCH startup name: expected {:?}, got {:?}",
                     "startup smoke node",
-                    label
+                    name
                 );
             }
 
-            let export_result = startup_test_emit_graph_tool(
+            let list_result = startup_test_emit_graph_tool(
                 &mut client,
                 &local_node_id,
-                "graph.export",
+                "graph.list",
                 serde_json::json!({
-                    "graph_id": graph_id,
                     "caller_id": "aiua-startup-graph-client"
                 }),
             )
             .await?;
-            let node_count = export_result
-                .get("node_count")
-                .and_then(serde_json::Value::as_u64)
-                .context("graph.export startup reply missing node_count")?;
-            if node_count < 1 {
-                anyhow::bail!("expected graph export node_count >= 1, got {}", node_count);
+            let graphs = list_result
+                .get("data")
+                .and_then(serde_json::Value::as_array)
+                .context("graph.list startup reply missing data array")?;
+            if !graphs.iter().any(|graph| {
+                graph.get("graph_id").and_then(serde_json::Value::as_str) == Some(graph_id.as_str())
+            }) {
+                anyhow::bail!(
+                    "graph.list startup reply did not include graph {:?}",
+                    graph_id
+                );
             }
 
             info!(
                 graph_id = %graph_id,
                 node_id = %node_id,
-                node_count,
-                "Startup graph round-trip succeeded through materialized graph-runner"
+                graph_count = graphs.len(),
+                "Startup graph round-trip succeeded through materialized graph-datasource"
             );
             Ok(())
         }
@@ -6987,6 +7034,10 @@ async fn run_startup_test(
     }
 }
 
+/// Emit a graph tool task at the graph-datasource role and decode the
+/// `datasource_response` envelope it replies with. Returns the `result`
+/// object (`{"status": "created", "graph_id": ...}` for partition creation,
+/// `{"status": "success", "data": ...}` for result sets).
 async fn startup_test_emit_graph_tool(
     client: &mut PhiloticClient,
     local_node_id: &str,
@@ -6999,7 +7050,7 @@ async fn startup_test_emit_graph_tool(
     let response = client
         .send_request(IpcRequest::EmitTask {
             target_node: local_node_id.to_string(),
-            target_role: format!("tool.{tool_name}"),
+            target_role: "graph-datasource".to_string(),
             target_guest_id: None,
             task_json: serde_json::json!({
                 "action": "execute_tool",
@@ -7012,9 +7063,7 @@ async fn startup_test_emit_graph_tool(
                 "caller_roles": ["aiua-startup-graph"],
                 "reply_to": local_node_id,
                 "reply_role": "aiua-startup-graph",
-                "final_reply_to": local_node_id,
-                "final_reply_role": "aiua-startup-graph",
-                "final_reply_guest_id": "aiua-startup-graph-client"
+                "reply_guest_id": "aiua-startup-graph-client"
             })
             .to_string(),
         })
@@ -7028,33 +7077,31 @@ async fn startup_test_emit_graph_tool(
     let reply = tokio::time::timeout(tokio::time::Duration::from_secs(15), client.recv_task())
         .await
         .with_context(|| {
-            format!("{tool_name}: timed out waiting for startup graph tool_result")
+            format!("{tool_name}: timed out waiting for startup graph datasource_response")
         })??;
 
     let IpcResponse::InboundTask { task_json, .. } = reply else {
         anyhow::bail!("{tool_name}: unexpected startup graph reply envelope: {reply:?}");
     };
 
-    let payload: serde_json::Value = serde_json::from_str(&task_json)
-        .with_context(|| format!("{tool_name}: failed to decode startup graph tool_result"))?;
-    let content_str = payload
-        .get("content")
-        .and_then(serde_json::Value::as_str)
-        .with_context(|| format!("{tool_name}: startup graph tool_result missing content"))?;
-    let content: serde_json::Value = serde_json::from_str(content_str).with_context(|| {
-        format!("{tool_name}: startup graph content was not valid JSON: {content_str}")
+    let payload: serde_json::Value = serde_json::from_str(&task_json).with_context(|| {
+        format!("{tool_name}: failed to decode startup graph datasource_response")
     })?;
-    if content.get("ok").and_then(serde_json::Value::as_bool) != Some(true) {
-        anyhow::bail!(
-            "{tool_name}: startup graph tool returned ok=false: {}",
-            content
-                .get("error")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or(content_str)
-        );
+    if let Some(error) = payload.get("error").filter(|value| !value.is_null()) {
+        anyhow::bail!("{tool_name}: startup graph datasource returned error: {error}");
+    }
+    let result = payload.get("result").cloned().with_context(|| {
+        format!("{tool_name}: startup graph datasource_response missing result")
+    })?;
+    let status = result
+        .get("status")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    if !matches!(status, "success" | "created" | "acknowledged") {
+        anyhow::bail!("{tool_name}: startup graph datasource returned unexpected status: {result}");
     }
 
-    Ok(content)
+    Ok(result)
 }
 
 fn assert_fake_gemini_media_request(
@@ -7197,6 +7244,7 @@ async fn run_load_command(file: &str, hotel_name: &str) -> Result<()> {
     } else {
         warn!("Config file has no context_graph entries.");
     }
+    migrate_plaintext_provider_api_keys(&graph_domain)?;
 
     let seeded_peer_hotels = seed_peer_hotels_from_config(&graph_domain, &config_json, hotel_name)?;
     if seeded_peer_hotels > 0 {
@@ -7259,6 +7307,7 @@ async fn run_load_command(file: &str, hotel_name: &str) -> Result<()> {
         hotel_name,
         &all_profiles,
         hotel.blob_port,
+        detect_shared_controller_gates(&graph_domain),
     ));
 
     deactivate_legacy_managed_guests(
@@ -7340,7 +7389,7 @@ async fn run_load_command(file: &str, hotel_name: &str) -> Result<()> {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    tracing_subscriber::fmt::init();
+    init_logging();
     let args = Args::parse();
 
     if std::env::var_os("PHILOTIC_BIN_DIR").is_none() {
@@ -7443,7 +7492,19 @@ async fn main() -> Result<()> {
         .hotel
         .context("--hotel is required unless using a subcommand such as `aiua load`")?;
 
+    // The graph round-trip startup test exercises graph-datasource, which is
+    // home-hotel-gated (default: vps-jane). Treat the hotel under test as the
+    // home hotel so the datasource materializes locally for the smoke.
+    if args.test == Some(StartupTest::GraphRoundTrip)
+        && std::env::var_os("PHILOTIC_GRAPH_DATASOURCE_HOME_HOTEL").is_none()
+    {
+        unsafe {
+            std::env::set_var("PHILOTIC_GRAPH_DATASOURCE_HOME_HOTEL", &hotel_name);
+        }
+    }
+
     enforce_graph_datasource_home(&graph_domain_arc, &hotel_name)?;
+    migrate_plaintext_provider_api_keys(&graph_domain_arc)?;
     let seeded_guests = graph_domain_arc.list_guests(&hotel_name, true)?;
     if seeded_guests.is_empty() {
         warn!(
@@ -7477,6 +7538,10 @@ async fn main() -> Result<()> {
     seed_abstract_skill_catalog(&graph_domain_arc)?;
     seed_toolset_profiles(&graph_domain_arc)?;
     seed_skill_crafting(&graph_domain_arc)?;
+
+    // Config-time model-routing coherence: warn + heal-queue any fallback tier
+    // that names a controller role with no seeded+active guest on this hotel.
+    validate_hotel_fallback_ladders(&graph_domain_arc, &hotel_name, db_path);
 
     if let Some(test) = startup_test {
         prepare_startup_test_binaries(test)?;
@@ -7597,6 +7662,60 @@ async fn main() -> Result<()> {
             None
         }
     };
+
+    // Memory Transparency Slice M4 (`memory.hygiene`): idempotent, operator
+    // opt-in registration of the nightly Muninn contradiction/staleness
+    // sweep cron job. No-op unless PHILOTIC_MEMORY_HYGIENE_ENABLED is set
+    // for this hotel process; never overwrites an operator-edited schedule.
+    if let Err(e) = memory_hygiene::ensure_scheduled(
+        &graph_domain_arc,
+        &hotel_name,
+        service::cron_ticker::now_ms(),
+        |k| std::env::var(k).ok(),
+    ) {
+        warn!(error = %e, "memory.hygiene: failed to ensure nightly sweep cron job");
+    }
+
+    // Autopoiesis Slice A4 (`aria-architect-charter`): idempotent, operator
+    // opt-in registration of the daily architect-charter steward role + cron
+    // job. No-op unless PHILOTIC_ARCHITECT_CHARTER_ENABLED and
+    // PHILOTIC_ARCHITECT_CHARTER_AGENT are set for this hotel process; never
+    // overwrites an operator-edited role manifest or cron schedule. See
+    // `architect_charter.rs` module docs.
+    if let Err(e) = architect_charter::ensure_scheduled(
+        &graph_domain_arc,
+        &hotel_name,
+        service::cron_ticker::now_ms(),
+        |k| std::env::var(k).ok(),
+    ) {
+        warn!(error = %e, "architect-charter: failed to ensure daily dev-brief cron job");
+    }
+
+    // Nightly dream sweep (consolidation): the shutdown-drain sweep alone
+    // never runs on a long-lived hotel, so near-duplicate engrams accumulate
+    // for days. Same opt-in/idempotency contract as memory.hygiene, gated on
+    // PHILOTIC_DREAM_SWEEP_ENABLED.
+    if let Err(e) = dream::ensure_scheduled(
+        &graph_domain_arc,
+        &hotel_name,
+        service::cron_ticker::now_ms(),
+        |k| std::env::var(k).ok(),
+    ) {
+        warn!(error = %e, "dream-sweep: failed to ensure nightly consolidation cron job");
+    }
+
+    // Autopoiesis Slice A9 outcome-stamping follow-up: idempotent, always-on
+    // registration of the daily timeout-to-Neutral sweep. Unlike
+    // memory.hygiene/dream-sweep there is no operator opt-in env var — the
+    // trust ledger's promotion arithmetic needs this running on every hotel,
+    // not just ones an operator remembered to flip on.
+    if let Err(e) = autonomy_sweep::ensure_scheduled(
+        &graph_domain_arc,
+        &hotel_name,
+        service::cron_ticker::now_ms(),
+    ) {
+        warn!(error = %e, "autonomy_sweep: failed to ensure daily timeout-to-neutral sweep cron job");
+    }
 
     if smoke_mode {
         warn!(
@@ -7846,11 +7965,30 @@ async fn main() -> Result<()> {
                         }
                     }
                 });
-                // Vacuum resolved rows older than 7 days once per hour.
+                // Vacuum terminal rows older than 7 days once per hour, and
+                // (F10) force-resolve pending/assigned rows older than the
+                // abandon ceiling so a stalled dispatcher can't grow the table
+                // without bound. Ceiling is env-overridable, defaulting to
+                // several days.
                 tokio::spawn(async move {
+                    use ansible_mesh_core::heal_queue::DEFAULT_ABANDON_CEILING_SECS;
                     const SEVEN_DAYS: u64 = 7 * 24 * 3600;
+                    let abandon_ceiling = std::env::var("PHILOTIC_HEAL_ABANDON_CEILING_SECS")
+                        .ok()
+                        .and_then(|v| v.parse::<u64>().ok())
+                        .filter(|v| *v > 0)
+                        .unwrap_or(DEFAULT_ABANDON_CEILING_SECS);
                     loop {
                         tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+                        // Abandon stuck pending/assigned rows first so this
+                        // pass's vacuum_old can reap the ones already past 7d.
+                        match hq_vacuum.vacuum_abandoned(abandon_ceiling) {
+                            Ok(n) if n > 0 => {
+                                warn!(abandoned = n, "heal_queue force-resolved stuck rows")
+                            }
+                            Ok(_) => {}
+                            Err(e) => warn!("heal_queue abandon-vacuum failed: {e}"),
+                        }
                         match hq_vacuum.vacuum_old(SEVEN_DAYS) {
                             Ok(n) if n > 0 => info!(deleted = n, "heal_queue vacuum complete"),
                             Ok(_) => {}
@@ -7874,11 +8012,16 @@ async fn main() -> Result<()> {
             .with_hotel_socket(&hotel.ipc_socket_path)
             .with_stderr_sink(stderr_tx),
     );
-    let guest_manager = Arc::new(crate::service::guest_manager::GuestManager::new(
+    let mut guest_manager_inner = crate::service::guest_manager::GuestManager::new(
         hotel_name.clone(),
         graph_domain_arc.clone(),
         materializer,
-    ));
+    );
+    if let Some(hq) = heal_queue_arc.clone() {
+        // Supervisor respawn-budget breaches surface through the heal queue.
+        guest_manager_inner = guest_manager_inner.with_heal_queue(hq);
+    }
+    let guest_manager = Arc::new(guest_manager_inner);
 
     let registry = Arc::new(RwLock::new(NodeRegistry::new()));
 
@@ -7929,11 +8072,18 @@ async fn main() -> Result<()> {
                                 persona_name: a.persona_name,
                             })
                             .collect();
+                        let model_profiles = sync_graph
+                            .list_model_profiles()
+                            .unwrap_or_default()
+                            .into_iter()
+                            .filter(|profile| profile.node_id == sync_caps.node_id)
+                            .collect();
                         let payload = HotelStateSyncPayload {
                             node_id: sync_caps.node_id.clone(),
                             hotel_name: sync_hotel.hotel_name.clone(),
                             guests,
                             agents,
+                            model_profiles,
                         };
                         *sync_state.write().await = Some(payload.clone());
                     }
@@ -7949,6 +8099,14 @@ async fn main() -> Result<()> {
     // Clone before moving into IpcServer so mesh inbound worker can also route to it.
     let inbound_operator_surface_tx = operator_surface_tx.clone();
 
+    // Agent-resource-broker registry (agent-resource-broker seam). Created here so
+    // it can be BOTH seeded by boot_reconcile below AND queried by the front desk
+    // via the shared Arc. Inert this slice: records grants/denials, answers routing
+    // queries; does not materialize/tear down guests (that stays with GuestManager).
+    let resource_registry_arc = std::sync::Arc::new(tokio::sync::Mutex::new(
+        crate::service::resource_registry::ResourceRegistry::new(),
+    ));
+
     let ipc_server = IpcServer::new(
         socket_path.clone(),
         caps.node_id.clone(),
@@ -7963,8 +8121,12 @@ async fn main() -> Result<()> {
     .with_operator_surface_channel(operator_surface_tx)
     .with_perimeter(perimeter_svc.clone())
     .with_egress(egress_gw.clone())
+    .with_resource_registry(resource_registry_arc.clone())
     .with_hotel_state_dirty_tx(ipc_dirty_tx);
-    let ipc_server = if let Some(hq) = heal_queue_arc {
+    // Cloned (not moved): the CronTicker wiring below also needs the heal
+    // queue, to push the A9 Piece 3 pending-outcome notice from the
+    // in-process memory.hygiene sweep.
+    let ipc_server = if let Some(hq) = heal_queue_arc.clone() {
         ipc_server.with_heal_queue(hq)
     } else {
         ipc_server
@@ -7972,6 +8134,9 @@ async fn main() -> Result<()> {
     let ipc_inboxes = ipc_server.inboxes();
     let ipc_parked_inbound = ipc_server.parked_inbound();
     let ipc_materialization_requester = ipc_server.materialization_requester_arc();
+    // One claim set per hotel process: CronTicker::fire and the mesh inbound
+    // consumer both consult it so a fired TaskInvoke has exactly one delivery owner.
+    let ipc_delivery_claims = crate::service::ipc::new_delivery_claim_registry();
     let network_broadcast_tx = ipc_server.network_broadcast_tx();
     let perimeter_broadcast_tx = network_broadcast_tx.clone();
 
@@ -8020,6 +8185,10 @@ async fn main() -> Result<()> {
             .and_then(|v| v.parse::<u64>().ok())
             .unwrap_or(0)
             * 1000;
+        let intel_graph_url = std::env::var("PHILOTIC_INTEL_GRAPH_URL")
+            .ok()
+            .map(|url| url.trim_end_matches('/').to_string())
+            .filter(|url| !url.is_empty());
         let cron_ticker = CronTicker::new(
             graph_domain_arc.clone(),
             dispatcher_tx.clone(),
@@ -8028,11 +8197,69 @@ async fn main() -> Result<()> {
             cron_offset_ms,
             ipc_parked_inbound.clone(),
             ipc_materialization_requester.clone(),
+            ipc_delivery_claims.clone(),
+        )
+        .with_memory_hygiene(
+            muninn_config_arc.clone(),
+            hotel_name.clone(),
+            intel_graph_url,
+            // Local-hotel opt-in, re-checked at fire time (not just at
+            // registration): CronJobSync replicates the job definition to
+            // every mesh peer regardless of that peer's own opt-in.
+            memory_hygiene::sweep_enabled(|k| std::env::var(k).ok()),
+            // A9 Piece 3: lets a fresh hygiene filing push an unresolved
+            // pending-outcome breadcrumb into the same heal queue A3 already
+            // uses for operator visibility.
+            heal_queue_arc.clone(),
+        )
+        .with_dream_sweep(
+            muninn_config_arc.clone(),
+            hotel_name.clone(),
+            dream::sweep_enabled(|k| std::env::var(k).ok()),
+        )
+        // Autopoiesis Slice A9 outcome-stamping follow-up: always-on (no
+        // opt-in flag — see `autonomy_sweep` module docs on why the
+        // mesh-trap gate is a job-id match, not a local-enabled re-check).
+        .with_autonomy_sweep(hotel_name.clone())
+        .with_architect_charter(
+            hotel_name.clone(),
+            // Local-hotel opt-in, re-checked at fire time by job id (not
+            // just target_role, unlike memory.hygiene — see
+            // `architect_charter.rs`'s "Fire-time re-check" module docs):
+            // CronJobSync replicates a hotel's charter job definition to
+            // every mesh peer regardless of that peer's own opt-in.
+            architect_charter::charter_enabled(&|k| std::env::var(k).ok())
+                && architect_charter::charter_agent_id(&|k| std::env::var(k).ok()).is_some(),
         );
         tokio::spawn(async move {
             cron_ticker.run().await;
         });
     }
+
+    // Model-catalog discovery: periodically pull provider model lists, diff
+    // against the last snapshot, and route retirements / thinking-flips into the
+    // self-heal queue for operator visibility.
+    crate::service::model_catalog_sync::spawn_loop(
+        graph_domain_arc.clone(),
+        db_path.to_string_lossy().to_string(),
+    );
+
+    // Host-health scan: samples host vitals (load/CPU/mem/disk) plus
+    // config-driven TCP service probes and routes threshold breaches into the
+    // self-heal queue — successor to the hand-rolled vps-jane cron monitors.
+    crate::service::host_health_scan::spawn_loop(
+        graph_domain_arc.clone(),
+        db_path.to_string_lossy().to_string(),
+        // A relative db_path (no PHILOTIC_PROFILE, e.g. the vps systemd unit
+        // with WorkingDirectory set) has `Some("")` as parent — `df -k ""`
+        // fails, so an empty parent must fall back to "." like a missing one.
+        db_path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| std::path::PathBuf::from(".")),
+        hotel_name.clone(),
+    );
 
     tokio::spawn(run_operator_surface_query_worker(
         operator_surface_rx,
@@ -8057,6 +8284,7 @@ async fn main() -> Result<()> {
         dispatcher_tx: dispatcher_tx.clone(),
         ipc_inboxes: ipc_inboxes.clone(),
         ipc_parked_inbound: ipc_parked_inbound.clone(),
+        ipc_delivery_claims: ipc_delivery_claims.clone(),
         ipc_materialization_requester: ipc_materialization_requester.clone(),
         shutdown_tx: shutdown_tx.clone(),
         inbox_tx: inbox_tx.clone(),
@@ -8150,8 +8378,11 @@ async fn main() -> Result<()> {
     // resource registry, and logs the demand-derived guest set. Does not yet replace the
     // materialize_all path below; that replacement lands when the registry is proven stable.
     {
-        use crate::service::resource_registry::{ResourceRegistry, boot_reconcile};
-        let mut resource_registry = ResourceRegistry::new();
+        use crate::service::resource_registry::boot_reconcile;
+        // Seed the SHARED registry the front desk already holds, so live
+        // ResourceRequest/ResourceReleased IPC and routing-table queries observe
+        // the demand-derived tenancy state instead of an empty table.
+        let mut resource_registry = resource_registry_arc.lock().await;
         match graph_domain_arc.list_agent_identities() {
             Ok(agents) => {
                 let results = boot_reconcile(&mut resource_registry, &agents);
@@ -8194,7 +8425,7 @@ async fn main() -> Result<()> {
         });
     } else {
         warn!(
-            "Guest supervisor loop is disabled by default until guest heartbeats are implemented."
+            "Guest supervisor loop is disabled via PHILOTIC_DISABLE_GUEST_SUPERVISOR (or a legacy falsy PHILOTIC_ENABLE_GUEST_SUPERVISOR). Dead guests will NOT be auto-respawned."
         );
     }
 
@@ -8296,29 +8527,79 @@ async fn main() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use super::resolve_retention_days;
     use super::{
-        AgentProfile, StartupTest, agent_identity_record_for_profile, agent_profile_from_config,
+        AgentProfile, BASE64_STANDARD, SecretAccess, StartupTest, agent_graph_guest_record,
+        agent_graph_runner_guest, agent_identity_record_for_profile, agent_profile_from_config,
         all_agent_profiles_from_config, deactivate_legacy_managed_guests,
         default_agent_profile_for_hotel, default_guest_seed, default_hotel_record,
         enable_guest_test_overrides, enforce_graph_datasource_home,
         execution_reachability_for_hotel, extract_context_graph_entries, guest_seed_for_profile,
-        guest_supervision_enabled, hotel_base_port, hotel_ipc_socket_path,
-        local_capability_advertisements, mesh_target_addr_for_node, nearest_available_base_port,
-        reconcile_peer_execution_reachability, resolve_runtime_ports, seed_toolset_profiles,
-        startup_test_gemini_base_url,
+        guest_supervision_enabled, guest_supervision_enabled_from, hotel_base_port,
+        hotel_ipc_socket_path, local_capability_advertisements, mesh_target_addr_for_node,
+        migrate_plaintext_provider_api_keys, nearest_available_base_port, read_string_config,
+        reconcile_peer_execution_reachability, resolve_runtime_ports, resolve_secret,
+        seed_abstract_skill_catalog, seed_orchestrator_roles, seed_skill_crafting,
+        seed_toolset_profiles, startup_test_gemini_base_url,
     };
+
+    #[test]
+    fn retention_days_defaults_to_14_when_unset() {
+        assert_eq!(resolve_retention_days(None), 14);
+    }
+
+    #[test]
+    fn retention_days_parses_valid_value() {
+        assert_eq!(resolve_retention_days(Some("7")), 7);
+        assert_eq!(resolve_retention_days(Some(" 30 ")), 30);
+    }
+
+    #[test]
+    fn retention_days_floors_zero_to_one() {
+        assert_eq!(resolve_retention_days(Some("0")), 1);
+    }
+
+    #[test]
+    fn retention_days_falls_back_on_garbage() {
+        assert_eq!(resolve_retention_days(Some("garbage")), 14);
+        assert_eq!(resolve_retention_days(Some("")), 14);
+        assert_eq!(resolve_retention_days(Some("-3")), 14);
+    }
+
     use ansible_mesh_core::domain::GraphDomain;
     use ansible_mesh_core::registry::ExecutionReachability;
     use ansible_mesh_core::sqlite_storage::SqliteGraphStorage;
     use ansible_mesh_core::storage::{GuestRecord, HotelRecord};
+    use base64::Engine;
     use std::sync::Arc;
 
     #[test]
-    fn guest_supervision_defaults_disabled() {
+    fn guest_supervision_defaults_enabled() {
         unsafe {
             std::env::remove_var("PHILOTIC_ENABLE_GUEST_SUPERVISOR");
+            std::env::remove_var("PHILOTIC_DISABLE_GUEST_SUPERVISOR");
         }
-        assert!(!guest_supervision_enabled());
+        assert!(guest_supervision_enabled());
+    }
+
+    #[test]
+    fn guest_supervision_gate_semantics() {
+        // Default: ON with no env vars.
+        assert!(guest_supervision_enabled_from(None, None));
+        // Opt-out via new var.
+        assert!(!guest_supervision_enabled_from(Some("1"), None));
+        assert!(!guest_supervision_enabled_from(Some("true"), None));
+        // A falsy disable value does not opt out.
+        assert!(guest_supervision_enabled_from(Some("0"), None));
+        assert!(guest_supervision_enabled_from(Some("false"), None));
+        // Legacy opt-in var: truthy is a no-op (still on).
+        assert!(guest_supervision_enabled_from(None, Some("1")));
+        assert!(guest_supervision_enabled_from(None, Some("true")));
+        // Legacy compat: explicit falsy legacy value keeps old disabled behavior.
+        assert!(!guest_supervision_enabled_from(None, Some("0")));
+        assert!(!guest_supervision_enabled_from(None, Some("false")));
+        // New disable var wins over legacy truthy.
+        assert!(!guest_supervision_enabled_from(Some("1"), Some("1")));
     }
 
     #[test]
@@ -8353,6 +8634,11 @@ mod tests {
 
     #[test]
     fn profile_socket_path_is_hotel_scoped() {
+        // Serialize with the IPC env tests: this test reads PHILOTIC_HOTEL_SOCKET
+        // (inside hotel_ipc_socket_path) and mutates HOME/PHILOTIC_PROFILE, so it
+        // must hold the shared env lock or it races with parallel tests that set
+        // PHILOTIC_HOTEL_SOCKET and can observe a leaked socket path.
+        let _env_guard = crate::service::ipc::tests::ipc_env_guard();
         unsafe {
             std::env::set_var("HOME", "/tmp/codex-home");
             std::env::set_var("PHILOTIC_PROFILE", "jane");
@@ -8375,6 +8661,9 @@ mod tests {
 
     #[test]
     fn explicit_socket_env_overrides_default_derivation() {
+        // Shares PHILOTIC_HOTEL_SOCKET / PHILOTIC_PROFILE with the sibling env
+        // tests; hold the shared lock so they do not race.
+        let _env_guard = crate::service::ipc::tests::ipc_env_guard();
         unsafe {
             std::env::remove_var("PHILOTIC_PROFILE");
             std::env::set_var("PHILOTIC_HOTEL_SOCKET", "/run/philotic/test.sock");
@@ -8413,7 +8702,7 @@ mod tests {
     #[test]
     fn default_guest_seed_injects_hotel_socket_env() {
         let guests = default_guest_seed("beta-hotel");
-        assert_eq!(guests.len(), 11); // shared guests omit graph-datasource off the configured home hotel; profile: agent, agent-datasource
+        assert_eq!(guests.len(), 14); // shared guests omit graph-datasource off the configured home hotel and the retired graph-runner; profile: agent, agent-datasource; +3 full-suite controllers (anthropic/openai/ollama)
         // Membrane is the first guest from hotel_shared_guests
         let membrane = guests
             .iter()
@@ -8427,6 +8716,7 @@ mod tests {
         assert!(guests.iter().all(|guest| guest.hotel_name == "beta-hotel"));
         assert!(guests.iter().any(|guest| guest.role == "model"));
         assert!(guests.iter().any(|guest| guest.role == "model.elevenlabs"));
+        assert!(guests.iter().any(|guest| guest.role == "model.openrouter"));
         assert!(guests.iter().any(|guest| guest.role == "tool"));
         assert!(!guests.iter().any(|guest| guest.role == "graph-datasource"));
         // Single membrane uses PHILOTIC_AGENT_ROSTER (not per-agent token key)
@@ -8441,7 +8731,72 @@ mod tests {
     }
 
     #[test]
+    fn full_suite_controllers_seed_inactive_without_keys() {
+        // Default gates = no cloud keys, no local ollama → the three new
+        // controllers are seeded (visible/activatable) but NOT active, so the
+        // supervisor never spawns a controller that can only fail turns.
+        let guests = default_guest_seed("gated-hotel");
+        for role in ["model.anthropic", "model.openai", "model.ollama"] {
+            let guest = guests
+                .iter()
+                .find(|g| g.role == role)
+                .unwrap_or_else(|| panic!("missing seeded controller for {role}"));
+            assert!(!guest.is_active, "{role} must seed inactive without a key");
+        }
+    }
+
+    #[test]
+    fn full_suite_controllers_activate_when_gated_on() {
+        let profile = default_agent_profile_for_hotel("keyed-hotel");
+        let guests = super::hotel_shared_guests(
+            "keyed-hotel",
+            std::slice::from_ref(&profile),
+            default_hotel_record("keyed-hotel").blob_port,
+            super::SharedControllerGates {
+                anthropic_key_present: true,
+                openai_key_present: true,
+                ollama_reachable: true,
+            },
+        );
+
+        let anthropic = guests
+            .iter()
+            .find(|g| g.role == "model.anthropic")
+            .expect("anthropic controller");
+        assert!(anthropic.is_active);
+        assert_eq!(anthropic.guest_id, "keyed-hotel:model-controller-anthropic");
+        let config: serde_json::Value = serde_json::from_str(&anthropic.config_json).unwrap();
+        assert_eq!(
+            config["command"].as_str(),
+            Some("model-controller-anthropic")
+        );
+        assert_eq!(
+            config["env"]["PHILOTIC_HOTEL_SOCKET"].as_str(),
+            Some("/tmp/philotic-keyed-hotel.sock")
+        );
+
+        assert!(
+            guests
+                .iter()
+                .any(|g| g.role == "model.openai" && g.is_active)
+        );
+        let ollama = guests
+            .iter()
+            .find(|g| g.role == "model.ollama")
+            .expect("ollama controller");
+        assert!(ollama.is_active);
+        let ollama_config: serde_json::Value = serde_json::from_str(&ollama.config_json).unwrap();
+        assert_eq!(
+            ollama_config["env"]["PHILOTIC_OLLAMA_GUEST_ID"].as_str(),
+            Some("keyed-hotel:model-controller-ollama")
+        );
+    }
+
+    #[test]
     fn graph_datasource_guest_env_is_profile_scoped() {
+        // Mutates HOME / PHILOTIC_PROFILE shared with the sibling env tests; hold
+        // the shared lock so they do not race.
+        let _env_guard = crate::service::ipc::tests::ipc_env_guard();
         unsafe {
             std::env::set_var("HOME", "/tmp/codex-home");
             std::env::set_var("PHILOTIC_PROFILE", "jane");
@@ -8523,6 +8878,210 @@ mod tests {
     }
 
     #[test]
+    fn seed_toolset_profiles_preserves_runtime_grant_mutations_across_reseed() {
+        let storage = SqliteGraphStorage::open(":memory:").expect("open sqlite");
+        let graph = GraphDomain::new(Arc::new(storage.adapter()));
+
+        // First boot.
+        seed_toolset_profiles(&graph).expect("seed toolset profiles");
+
+        // Runtime mutations between boots: a skill.assign, a skill.revoke of a
+        // seeded skill, and a runtime-registered remote runner.
+        let mut orchestrator = graph
+            .get_toolset_profile("orchestrator")
+            .expect("read orchestrator profile")
+            .expect("orchestrator profile should exist");
+        assert!(
+            orchestrator.seed_baseline.is_some(),
+            "boot seed should stamp a seed baseline"
+        );
+        orchestrator
+            .allowed_skills
+            .push("runtime.assigned.skill".into());
+        orchestrator.allowed_skills.retain(|s| s != "memory.fix");
+        orchestrator.remote_tool_runners.push(serde_json::json!({
+            "incarnation_id": "test-hotel:test-runner",
+            "supported_tools": ["test.tool"],
+        }));
+        graph
+            .upsert_toolset_profile(&orchestrator)
+            .expect("persist runtime mutation");
+
+        // Second boot: the reseed must reconcile, not overwrite.
+        seed_toolset_profiles(&graph).expect("reseed toolset profiles");
+
+        let orchestrator = graph
+            .get_toolset_profile("orchestrator")
+            .expect("read orchestrator profile")
+            .expect("orchestrator profile should exist");
+        assert!(
+            orchestrator
+                .allowed_skills
+                .iter()
+                .any(|s| s == "runtime.assigned.skill"),
+            "a skill assigned at runtime must survive reboot"
+        );
+        assert!(
+            !orchestrator
+                .allowed_skills
+                .iter()
+                .any(|s| s == "memory.fix"),
+            "a seeded skill revoked at runtime must stay revoked after reboot"
+        );
+        assert!(
+            orchestrator.remote_tool_runners.iter().any(|runner| {
+                runner.get("incarnation_id").and_then(|v| v.as_str())
+                    == Some("test-hotel:test-runner")
+            }),
+            "runtime-registered remote runners must survive reboot"
+        );
+        // Seeded grants are still fully present.
+        assert!(
+            orchestrator
+                .allowed_tools
+                .iter()
+                .any(|t| t == "skill.revoke"),
+            "orchestrator seed must grant skill.revoke so admins can remove capabilities"
+        );
+        assert!(
+            orchestrator
+                .allowed_skills
+                .iter()
+                .any(|s| s == "handoff.to_role")
+        );
+    }
+
+    #[test]
+    fn seed_toolset_profiles_reconciles_pre_baseline_records_without_losing_live_edits() {
+        let storage = SqliteGraphStorage::open(":memory:").expect("open sqlite");
+        let graph = GraphDomain::new(Arc::new(storage.adapter()));
+
+        // Simulate a live fleet record written by an OLD binary: seeded shape,
+        // no seed_baseline, plus an operator live-DB patch.
+        seed_toolset_profiles(&graph).expect("seed toolset profiles");
+        let mut legacy = graph
+            .get_toolset_profile("admin")
+            .expect("read admin profile")
+            .expect("admin profile should exist");
+        legacy.seed_baseline = None;
+        legacy.allowed_tools.push("operator.patched.tool".into());
+        graph
+            .upsert_toolset_profile(&legacy)
+            .expect("persist legacy-shaped record");
+
+        seed_toolset_profiles(&graph).expect("reseed toolset profiles");
+
+        let admin = graph
+            .get_toolset_profile("admin")
+            .expect("read admin profile")
+            .expect("admin profile should exist");
+        assert!(
+            admin
+                .allowed_tools
+                .iter()
+                .any(|t| t == "operator.patched.tool"),
+            "a live operator patch on a pre-baseline record must survive the first reseed"
+        );
+        assert!(
+            admin.seed_baseline.is_some(),
+            "the reseed must stamp a baseline on pre-baseline records"
+        );
+        assert!(
+            admin.allowed_tools.iter().any(|t| t == "agent.migrate_to"),
+            "admin seed must grant agent.migrate_to (the only class-admin tool)"
+        );
+    }
+
+    #[test]
+    fn seeded_skill_catalog_defines_all_on_demand_skills_of_seeded_profiles() {
+        let storage = SqliteGraphStorage::open(":memory:").expect("open sqlite");
+        let graph = GraphDomain::new(Arc::new(storage.adapter()));
+
+        seed_abstract_skill_catalog(&graph).expect("seed skill catalog");
+        seed_skill_crafting(&graph).expect("seed skill.crafting");
+        seed_toolset_profiles(&graph).expect("seed toolset profiles");
+
+        for profile in graph.list_toolset_profiles().expect("list profiles") {
+            for skill in profile
+                .allowed_skills
+                .iter()
+                .chain(profile.on_demand_skills.iter())
+            {
+                assert!(
+                    graph
+                        .get_abstract_skill(skill)
+                        .expect("skill lookup")
+                        .is_some(),
+                    "profile '{}' references skill '{}' that is not seeded in the abstract \
+                     skill catalog — ghost skills are invisible to skill.list",
+                    profile.profile_name,
+                    skill
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn life_graph_profiles_seed_remote_runner_with_full_toolset() {
+        unsafe {
+            std::env::set_var("PHILOTIC_REMOTE_LIFE_GRAPH_RUNNER_NODE", "vps-jane-aiua-01");
+        }
+        let storage = SqliteGraphStorage::open(":memory:").expect("open sqlite");
+        let graph = GraphDomain::new(Arc::new(storage.adapter()));
+
+        seed_toolset_profiles(&graph).expect("seed toolset profiles");
+
+        let profiles = graph
+            .list_toolset_profiles()
+            .expect("list toolset profiles");
+        let life_graph_profiles = profiles
+            .iter()
+            .filter(|profile| {
+                profile
+                    .allowed_classes
+                    .iter()
+                    .any(|class| class == "life_graph")
+            })
+            .collect::<Vec<_>>();
+
+        assert!(
+            !life_graph_profiles.is_empty(),
+            "seeded philote profiles should include LifeGraph-capable profiles"
+        );
+        for profile in life_graph_profiles {
+            let runner = profile
+                .remote_tool_runners
+                .iter()
+                .find(|runner| {
+                    runner
+                        .get("incarnation_id")
+                        .and_then(|value| value.as_str())
+                        == Some("vps-jane:life-graph-runner")
+                })
+                .unwrap_or_else(|| {
+                    panic!(
+                        "LifeGraph-capable profile {} should carry remote life-graph-runner",
+                        profile.profile_name
+                    )
+                });
+            let supported_tools = runner
+                .get("supported_tools")
+                .and_then(|value| value.as_array())
+                .expect("supported_tools array");
+            assert!(
+                supported_tools
+                    .iter()
+                    .any(|tool| tool.as_str() == Some("life.recall.feedback")),
+                "{} runner binding should include life.recall.feedback",
+                profile.profile_name
+            );
+        }
+        unsafe {
+            std::env::remove_var("PHILOTIC_REMOTE_LIFE_GRAPH_RUNNER_NODE");
+        }
+    }
+
+    #[test]
     fn agent_graph_guest_uses_writable_data_dir() {
         unsafe {
             std::env::set_var("PHILOTIC_GRAPH_DATABASE_DIR", "/opt/philotic/data/graphs");
@@ -8539,6 +9098,7 @@ mod tests {
                 import_workspace: None,
                 is_admin: false,
                 orchestrator_turn_loop_config: None,
+                content_policy: None,
             },
         );
         let agent_graph = guests
@@ -8557,6 +9117,52 @@ mod tests {
         }
     }
 
+    /// Both seeding paths (startup profile seeding and role-incarnation
+    /// materialization in service/ipc.rs) must spawn the same converged
+    /// `agent-datasource` binary with the same env shape.
+    #[test]
+    fn agent_graph_guest_record_spawns_agent_datasource() {
+        let rec = agent_graph_guest_record("test-hotel", "agent-beacon", "/tmp/test.sock");
+        assert_eq!(rec.guest_id, "test-hotel:agent-graph-agent-beacon");
+        assert_eq!(rec.role, "agent-graph");
+        let config: serde_json::Value = serde_json::from_str(&rec.config_json).unwrap();
+        assert_eq!(config["command"].as_str(), Some("agent-datasource"));
+        assert_eq!(
+            config["env"]["PHILOTIC_AGENT_ID"].as_str(),
+            Some("agent-beacon")
+        );
+        assert_eq!(
+            config["env"]["PHILOTIC_GRAPH_RUNNER_ID"].as_str(),
+            Some("test-hotel:agent-graph-agent-beacon")
+        );
+        assert_eq!(
+            config["env"]["PHILOTIC_HOTEL_SOCKET"].as_str(),
+            Some("/tmp/test.sock")
+        );
+        assert_eq!(
+            config["env"]["PHILOTIC_IPC_SOCKET"].as_str(),
+            Some("/tmp/test.sock")
+        );
+
+        // The profile-seeding wrapper must yield the identical command.
+        let profile_rec = agent_graph_runner_guest(
+            "test-hotel",
+            &AgentProfile {
+                agent_key: "beacon".into(),
+                agent_id: "agent-beacon".into(),
+                persona_name: "Beacon".into(),
+                import_workspace: None,
+                is_admin: false,
+                orchestrator_turn_loop_config: None,
+                content_policy: None,
+            },
+        );
+        let profile_config: serde_json::Value =
+            serde_json::from_str(&profile_rec.config_json).unwrap();
+        assert_eq!(profile_config["command"].as_str(), Some("agent-datasource"));
+        assert_eq!(profile_rec.guest_id, rec.guest_id);
+    }
+
     #[test]
     fn guest_seed_for_profile_targets_profile_agent_and_token_key() {
         let guests = guest_seed_for_profile(
@@ -8568,6 +9174,7 @@ mod tests {
                 import_workspace: None,
                 is_admin: false,
                 orchestrator_turn_loop_config: None,
+                content_policy: None,
             },
         );
         let membrane_guest = guests
@@ -8685,7 +9292,7 @@ mod tests {
             &serde_json::json!({
                 "context_graph": {
                     "telegram_bot_token": "token",
-                    "elevenlabs_api_key": "key"
+                    "elevenlabs_api_key_ref": "secret://hotel/default/elevenlabs_api_key/test"
                 },
                 "ignored": {
                     "not": "imported"
@@ -8696,7 +9303,11 @@ mod tests {
 
         assert_eq!(entries.len(), 2);
         assert!(entries.iter().any(|(key, _)| key == "telegram_bot_token"));
-        assert!(entries.iter().any(|(key, _)| key == "elevenlabs_api_key"));
+        assert!(
+            entries
+                .iter()
+                .any(|(key, _)| key == "elevenlabs_api_key_ref")
+        );
     }
 
     #[test]
@@ -8704,7 +9315,7 @@ mod tests {
         let entries = extract_context_graph_entries(
             &serde_json::json!({
                 "context_graph": {
-                    "gemini_api_key": "shared"
+                    "gemini_api_key_ref": "secret://hotel/default/gemini_api_key/shared"
                 },
                 "hotels": {
                     "default": {
@@ -8738,11 +9349,10 @@ mod tests {
             Some("aria-architect-hotel"),
         );
 
-        assert!(
-            entries.iter().any(|(key, value)| {
-                key == "gemini_api_key" && value.as_str() == Some("shared")
-            })
-        );
+        assert!(entries.iter().any(|(key, value)| {
+            key == "gemini_api_key_ref"
+                && value.as_str() == Some("secret://hotel/default/gemini_api_key/shared")
+        }));
         assert!(entries.iter().any(|(key, value)| {
             key == "telegram_bot_token" && value.as_str() == Some("aria-token")
         }));
@@ -8871,6 +9481,7 @@ mod tests {
             import_workspace: None,
             is_admin: false,
             orchestrator_turn_loop_config: None,
+            content_policy: None,
         };
         let guests = guest_seed_for_profile("default", &profile);
         let membrane = guests
@@ -8898,6 +9509,7 @@ mod tests {
             import_workspace: None,
             is_admin: false,
             orchestrator_turn_loop_config: None,
+            content_policy: None,
         };
         let mut agent_config = serde_json::Map::new();
         agent_config.insert(
@@ -8920,6 +9532,7 @@ mod tests {
             import_workspace: None,
             is_admin: false,
             orchestrator_turn_loop_config: None,
+            content_policy: None,
         };
         let mut agent_config = serde_json::Map::new();
         agent_config.insert("system_prompt".into(), "Fallback prompt.".into());
@@ -9244,6 +9857,83 @@ mod tests {
     }
 
     #[test]
+    fn provider_api_key_migration_moves_plaintext_to_vault_ref() {
+        unsafe {
+            std::env::set_var(
+                "PHILOTIC_VAULT_MASTER_KEY",
+                BASE64_STANDARD.encode([7u8; 32]),
+            );
+        }
+        let storage = SqliteGraphStorage::open(":memory:").expect("open sqlite");
+        let graph = GraphDomain::new(Arc::new(storage.adapter()));
+
+        graph
+            .set_config_value(
+                "openrouter_api_key",
+                &serde_json::json!("sk-test").to_string(),
+            )
+            .expect("seed legacy plaintext key");
+
+        let migrated = migrate_plaintext_provider_api_keys(&graph).expect("migrate provider keys");
+        assert_eq!(migrated, 1);
+        assert!(
+            graph
+                .get_config_value("openrouter_api_key")
+                .unwrap()
+                .is_none()
+        );
+
+        let secret_ref = read_string_config(&graph, "openrouter_api_key_ref")
+            .expect("read ref config")
+            .expect("secret ref configured");
+        let plaintext = resolve_secret(
+            &graph,
+            &secret_ref,
+            &SecretAccess {
+                role: "model.openrouter".into(),
+                guest_id: "test".into(),
+            },
+        )
+        .expect("resolve secret")
+        .expect("secret exists");
+        assert_eq!(plaintext, "sk-test");
+        assert!(
+            graph
+                .get_vault_registry()
+                .expect("vault registry")
+                .iter()
+                .any(|entry| entry.vault_name == "openrouter_api_key"
+                    && entry.secret_ref == secret_ref)
+        );
+    }
+
+    #[test]
+    fn provider_api_key_migration_deletes_plaintext_when_ref_exists() {
+        let storage = SqliteGraphStorage::open(":memory:").expect("open sqlite");
+        let graph = GraphDomain::new(Arc::new(storage.adapter()));
+
+        graph
+            .set_config_value("openai_api_key", &serde_json::json!("stale").to_string())
+            .expect("seed legacy plaintext key");
+        graph
+            .set_config_value(
+                "openai_api_key_ref",
+                &serde_json::json!("secret://hotel/default/openai_api_key/existing").to_string(),
+            )
+            .expect("seed existing ref");
+
+        let migrated = migrate_plaintext_provider_api_keys(&graph).expect("migrate provider keys");
+        assert_eq!(migrated, 1);
+        assert!(graph.get_config_value("openai_api_key").unwrap().is_none());
+        assert_eq!(
+            read_string_config(&graph, "openai_api_key_ref")
+                .unwrap()
+                .as_deref(),
+            Some("secret://hotel/default/openai_api_key/existing")
+        );
+    }
+
+    #[test]
     fn text_startup_test_injects_stub_response_into_model_guest() {
         let storage = SqliteGraphStorage::open(":memory:").expect("open sqlite");
         let graph_domain = GraphDomain::new(Arc::new(storage.adapter()));
@@ -9306,5 +9996,249 @@ mod tests {
             config["env"]["PHILOTIC_GEMINI_BASE_URL"].as_str(),
             Some(expected_base_url.as_str())
         );
+    }
+
+    // ── seed_orchestrator_roles: content_policy durability across `aiua load` ──
+    //
+    // Mirrors the `resolved_content_policy` preserve-or-source contract in
+    // `role_materialization.rs`'s `configure_role_sets_and_preserves_content_policy`
+    // test, but exercised through the startup reseed path instead of the
+    // ConfigureRole IPC. Before this fix, `seed_orchestrator_roles` built every
+    // record with `..Default::default()` and no `content_policy` override, so an
+    // operator-set "unrestricted" was silently reset to "standard" on every
+    // `aiua load` (i.e. every deploy).
+
+    fn content_policy_test_profile(content_policy: Option<&str>) -> AgentProfile {
+        AgentProfile {
+            agent_key: "jane".into(),
+            agent_id: "agent-jane".into(),
+            persona_name: "Jane".into(),
+            import_workspace: None,
+            is_admin: false,
+            orchestrator_turn_loop_config: None,
+            content_policy: content_policy.map(str::to_string),
+        }
+    }
+
+    // ── seed_orchestrator_roles: Layer 1 model_bindings durability ──────────
+    //
+    // `model_bindings` is a field on the SAME `TurnLoopConfig` struct as
+    // `fallback_tiers` and `model_profile`, so it rides the existing
+    // whole-struct preserve-or-source contract at `seed_orchestrator_roles`
+    // (`orchestrator_turn_loop_config.clone().or_else(|| existing ...)`) for
+    // free — no new preserve-on-None branch was needed. This test proves that
+    // holds for real: an operator-set binding (e.g. Jane's
+    // `model.openrouter` -> `z-ai/glm-5.2`, from the 2026-07-09 routing
+    // drill) must survive a reseed where mesh-config's agent stanza doesn't
+    // repeat `orchestrator_turn_loop_config` at all.
+
+    fn model_bindings_test_profile(
+        turn_loop_config: Option<ansible_mesh_core::graph::TurnLoopConfig>,
+    ) -> AgentProfile {
+        AgentProfile {
+            agent_key: "jane".into(),
+            agent_id: "agent-jane".into(),
+            persona_name: "Jane".into(),
+            import_workspace: None,
+            is_admin: false,
+            orchestrator_turn_loop_config: turn_loop_config,
+            content_policy: None,
+        }
+    }
+
+    #[test]
+    fn seed_orchestrator_roles_preserves_model_bindings_when_mesh_config_omits_turn_loop_config() {
+        let storage = SqliteGraphStorage::open(":memory:").expect("open sqlite graph");
+        let graph = GraphDomain::new(Arc::new(storage.adapter()));
+
+        let jane_turn_loop_config = ansible_mesh_core::graph::TurnLoopConfig {
+            fallback_tiers: vec![
+                "model.openrouter".to_string(),
+                "model".to_string(),
+                "model.ollama".to_string(),
+            ],
+            model_bindings: std::collections::BTreeMap::from([(
+                "model.openrouter".to_string(),
+                "z-ai/glm-5.2".to_string(),
+            )]),
+            ..Default::default()
+        };
+
+        // First seed: mesh-config (or a prior role.configure) set Jane's
+        // per-agent model binding.
+        seed_orchestrator_roles(
+            &graph,
+            &[model_bindings_test_profile(Some(
+                jane_turn_loop_config.clone(),
+            ))],
+        )
+        .expect("initial seed");
+        let seeded = graph
+            .get_role_incarnation("agent-jane", "orchestrator")
+            .expect("get role incarnation")
+            .expect("role exists");
+        assert_eq!(
+            seeded
+                .turn_loop_config
+                .model_bindings
+                .get("model.openrouter"),
+            Some(&"z-ai/glm-5.2".to_string())
+        );
+
+        // Reseed (simulating `aiua load` on every deploy) with mesh-config
+        // NOT specifying orchestrator_turn_loop_config at all — the DB's
+        // model_bindings must survive, matching the #179/#213-class
+        // preserve-or-source contract fallback_tiers and content_policy
+        // already have.
+        seed_orchestrator_roles(&graph, &[model_bindings_test_profile(None)])
+            .expect("reseed with mesh-config omitting turn_loop_config");
+        let reseeded = graph
+            .get_role_incarnation("agent-jane", "orchestrator")
+            .expect("get role incarnation")
+            .expect("role exists");
+        assert_eq!(
+            reseeded
+                .turn_loop_config
+                .model_bindings
+                .get("model.openrouter"),
+            Some(&"z-ai/glm-5.2".to_string()),
+            "model_bindings must survive a reseed where mesh-config doesn't specify turn_loop_config"
+        );
+        assert_eq!(
+            reseeded.turn_loop_config.fallback_tiers, jane_turn_loop_config.fallback_tiers,
+            "fallback_tiers must survive the same reseed"
+        );
+    }
+
+    #[test]
+    fn seed_orchestrator_roles_mesh_config_model_bindings_win_when_present() {
+        let storage = SqliteGraphStorage::open(":memory:").expect("open sqlite graph");
+        let graph = GraphDomain::new(Arc::new(storage.adapter()));
+
+        seed_orchestrator_roles(
+            &graph,
+            &[model_bindings_test_profile(Some(
+                ansible_mesh_core::graph::TurnLoopConfig {
+                    model_bindings: std::collections::BTreeMap::from([(
+                        "model.openrouter".to_string(),
+                        "old-model".to_string(),
+                    )]),
+                    ..Default::default()
+                },
+            ))],
+        )
+        .expect("initial seed");
+
+        // A reseed where mesh-config explicitly names a different binding
+        // must win over whatever is currently in the DB.
+        seed_orchestrator_roles(
+            &graph,
+            &[model_bindings_test_profile(Some(
+                ansible_mesh_core::graph::TurnLoopConfig {
+                    model_bindings: std::collections::BTreeMap::from([(
+                        "model.openrouter".to_string(),
+                        "new-model".to_string(),
+                    )]),
+                    ..Default::default()
+                },
+            ))],
+        )
+        .expect("reseed with explicit mesh-config model_bindings");
+        let reseeded = graph
+            .get_role_incarnation("agent-jane", "orchestrator")
+            .expect("get role incarnation")
+            .expect("role exists");
+        assert_eq!(
+            reseeded
+                .turn_loop_config
+                .model_bindings
+                .get("model.openrouter"),
+            Some(&"new-model".to_string()),
+            "an explicit mesh-config turn_loop_config must override the existing DB value"
+        );
+    }
+
+    #[test]
+    fn seed_orchestrator_roles_preserves_existing_content_policy_when_mesh_config_omits_it() {
+        let storage = SqliteGraphStorage::open(":memory:").expect("open sqlite graph");
+        let graph = GraphDomain::new(Arc::new(storage.adapter()));
+
+        // First seed: mesh-config (or role.configure) set content_policy = unrestricted.
+        seed_orchestrator_roles(&graph, &[content_policy_test_profile(Some("unrestricted"))])
+            .expect("initial seed");
+        let seeded = graph
+            .get_role_incarnation("agent-jane", "orchestrator")
+            .expect("get role incarnation")
+            .expect("role exists");
+        assert_eq!(seeded.content_policy, "unrestricted");
+
+        // Reseed (simulating `aiua load` on every deploy) with mesh-config NOT
+        // specifying content_policy at all — the DB value must survive.
+        seed_orchestrator_roles(&graph, &[content_policy_test_profile(None)])
+            .expect("reseed with mesh-config omitting content_policy");
+        let reseeded = graph
+            .get_role_incarnation("agent-jane", "orchestrator")
+            .expect("get role incarnation")
+            .expect("role exists");
+        assert_eq!(
+            reseeded.content_policy, "unrestricted",
+            "content_policy must survive a reseed where mesh-config doesn't specify it"
+        );
+    }
+
+    #[test]
+    fn seed_orchestrator_roles_mesh_config_value_wins_when_present() {
+        let storage = SqliteGraphStorage::open(":memory:").expect("open sqlite graph");
+        let graph = GraphDomain::new(Arc::new(storage.adapter()));
+
+        seed_orchestrator_roles(&graph, &[content_policy_test_profile(Some("unrestricted"))])
+            .expect("initial seed");
+
+        // A reseed where mesh-config explicitly names a different policy must win
+        // over whatever is currently in the DB.
+        seed_orchestrator_roles(&graph, &[content_policy_test_profile(Some("strict"))])
+            .expect("reseed with explicit mesh-config content_policy");
+        let reseeded = graph
+            .get_role_incarnation("agent-jane", "orchestrator")
+            .expect("get role incarnation")
+            .expect("role exists");
+        assert_eq!(
+            reseeded.content_policy, "strict",
+            "an explicit mesh-config content_policy must override the existing DB value"
+        );
+    }
+
+    #[test]
+    fn seed_orchestrator_roles_brand_new_role_defaults_to_standard_content_policy() {
+        let storage = SqliteGraphStorage::open(":memory:").expect("open sqlite graph");
+        let graph = GraphDomain::new(Arc::new(storage.adapter()));
+
+        // No existing DB row and mesh-config doesn't specify content_policy.
+        seed_orchestrator_roles(&graph, &[content_policy_test_profile(None)])
+            .expect("seed brand-new role");
+        let seeded = graph
+            .get_role_incarnation("agent-jane", "orchestrator")
+            .expect("get role incarnation")
+            .expect("role exists");
+        assert_eq!(seeded.content_policy, "standard");
+    }
+
+    #[test]
+    fn seed_orchestrator_roles_invalid_mesh_config_value_falls_back_to_preserve_or_default() {
+        let storage = SqliteGraphStorage::open(":memory:").expect("open sqlite graph");
+        let graph = GraphDomain::new(Arc::new(storage.adapter()));
+
+        seed_orchestrator_roles(&graph, &[content_policy_test_profile(Some("unrestricted"))])
+            .expect("initial seed");
+
+        // A garbled/typo'd mesh-config content_policy must not be written verbatim
+        // — it's ignored, and the existing DB value is preserved instead.
+        seed_orchestrator_roles(&graph, &[content_policy_test_profile(Some("permissive"))])
+            .expect("reseed with invalid mesh-config content_policy");
+        let reseeded = graph
+            .get_role_incarnation("agent-jane", "orchestrator")
+            .expect("get role incarnation")
+            .expect("role exists");
+        assert_eq!(reseeded.content_policy, "unrestricted");
     }
 }

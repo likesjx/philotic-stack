@@ -3,6 +3,7 @@ title: Context Graph Tool Runner
 doc_type: proposal
 domain: tooling-execution
 status: proposed
+disposition: accepted-current-slice
 last_updated: 2026-03-31
 tags:
 - graph

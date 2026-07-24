@@ -10,20 +10,22 @@ use crate::protocol::{
 };
 use crate::reflex::{IngressAction, ReflexEvent};
 use crate::session::{
-    ActivePlan, AgentProfile, ComponentRouteAssembly, GraphAnchors, MediaRoutingPolicy,
-    MemoryAuthority, MemoryShapingContext, MemorySpacetimeFrame, MemorySpatialScope,
-    MemoryTemporalKind, MemoryValidationLevel, ParacrineThreadStatus, RecalledMemoryRecord,
-    SessionState, ToolDefinition, ToolExecutionRoute, TtsMode, VoiceResponsePolicy, WorkingTurn,
-    merge_session_index,
+    ActivePlan, AgentProfile, ComponentRouteAssembly, FallbackOverride, GraphAnchors,
+    HANDOFF_CONTEXT_EXCERPT_MAX_CHARS, LifeRecallCacheEntry, MediaRoutingPolicy, MemoryAuthority,
+    MemoryShapingContext, MemorySpacetimeFrame, MemorySpatialScope, MemoryTemporalKind,
+    MemoryValidationLevel, PARACRINE_MERGE_CONTENT_MAX_CHARS, PARACRINE_WHISPER_PROMPT_MAX_CHARS,
+    ParacrineBudgetOutcome, ParacrineThreadStatus, RecalledMemoryRecord, SelectionSource,
+    SessionState, ToolDefinition, ToolExecutionRoute, ToolRunnerIncarnationBinding, TtsMode,
+    VoiceResponsePolicy, WorkingTurn, charge_paracrine_hop, merge_session_index, truncate_for_wire,
 };
-use anyhow::Result;
+use anyhow::{Context, Result};
 use memory_core::{
     Engram, MemoryScope, MuninnConfig, MuninnRestEngine, RecallContext, RecallTrigger,
     VaultResolver,
 };
 use philotic_client::{
     Exosome, HandoffBundle, IpcRequest, IpcResponse, ParacrineRouting, PhiloticClient,
-    TaskErrorPayload, UserProfileDataPayload, is_ipc_disconnect,
+    TaskErrorPayload, UserProfileDataPayload, is_ipc_disconnect, is_ipc_timeout,
 };
 use serde_json::{Map, Value, json};
 use std::collections::{BTreeSet, HashMap};
@@ -31,519 +33,79 @@ use std::time::Duration;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
+#[path = "turn_loop.rs"]
+mod turn_loop;
+
+#[path = "roles.rs"]
+mod roles;
+
+#[path = "paracrine.rs"]
+mod paracrine;
+
+#[path = "tool_exec.rs"]
+mod tool_exec;
+
+#[path = "memory_integration.rs"]
+mod memory_integration;
+use memory_integration::*;
+
+#[path = "life_capture.rs"]
+mod life_capture;
+use life_capture::*;
+
+#[path = "memory_explain_tool.rs"]
+mod memory_explain_tool;
+
+#[path = "voice_stream.rs"]
+mod voice_stream;
+use voice_stream::*;
+
 pub const DEFAULT_AGENT_ID: &str = "agent-bjork-01";
 const DEFAULT_REPLY_ROLE: &str = "membrane";
 const DEFAULT_TEXT_MODEL_ROLE: &str = "model";
 const DEFAULT_VOICE_MODEL_ROLE: &str = "model.elevenlabs";
+const MEMORY_CANDIDATE_POLICY: &str = "Emit memory_candidate only when this exchange contains \
+durable future-useful context: a user preference, explicit decision, stable fact, validation \
+outcome, reality gap, next seam, or recurring pattern. Omit it for greetings, acknowledgments, \
+readiness/status chatter, transient task progress, tool logs, transcripts, or routine task-list \
+churn. The candidate must be atomic: concept is a specific short slug, content is 1-3 sentences \
+and 24-700 characters, tags are optional with 10 or fewer short tags.";
 
-fn engram_metadata_string(metadata: &Value, keys: &[&str]) -> Option<String> {
-    keys.iter().find_map(|key| {
-        metadata
-            .get(*key)
-            .and_then(|value| value.as_str())
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(str::to_string)
+fn cognitive_response_contract(channels: &[&str]) -> Value {
+    json!({
+        "channels": channels,
+        "memory_candidate_policy": MEMORY_CANDIDATE_POLICY,
     })
 }
 
-fn engram_metadata_array(metadata: &Value, keys: &[&str]) -> Vec<Value> {
-    keys.iter()
-        .find_map(|key| metadata.get(*key).and_then(|value| value.as_array()))
-        .cloned()
-        .unwrap_or_default()
-}
-
-fn engram_annotations(metadata: &Value) -> Option<Value> {
-    metadata
-        .get("annotations")
-        .or_else(|| metadata.get("annotation"))
-        .cloned()
-        .filter(|value| !value.is_null())
-}
-
-fn engram_spacetime_frame(metadata: &Value) -> Option<MemorySpacetimeFrame> {
-    metadata
-        .get("spacetime_frame")
-        .or_else(|| metadata.get("memory_spacetime_frame"))
-        .cloned()
-        .and_then(|value| serde_json::from_value(value).ok())
-}
-
-fn recalled_memory_from_engram(
-    engram: Engram,
-    recall_reason: Option<&str>,
-) -> RecalledMemoryRecord {
-    let summary = engram_metadata_string(&engram.metadata, &["summary"]);
-    let memory_type = engram_metadata_string(&engram.metadata, &["memory_type", "type"]);
-    let trust = engram_metadata_string(&engram.metadata, &["trust", "trust_level"]);
-    let source = engram_metadata_string(&engram.metadata, &["source", "provenance_source"]);
-    let entities = engram_metadata_array(&engram.metadata, &["entities"]);
-    let relationships =
-        engram_metadata_array(&engram.metadata, &["relationships", "entity_relationships"]);
-    let annotations = engram_annotations(&engram.metadata);
-    let spacetime_frame = engram_spacetime_frame(&engram.metadata);
-
-    RecalledMemoryRecord {
-        id: Some(engram.id),
-        vault_id: if engram.vault_id.is_empty() {
-            None
-        } else {
-            Some(engram.vault_id)
-        },
-        concept: engram.concept,
-        content: engram.content,
-        tags: engram.tags,
-        summary,
-        memory_type,
-        confidence: Some(engram.confidence),
-        trust,
-        source,
-        created_at: Some(engram.created_at),
-        updated_at: Some(engram.updated_at),
-        entities,
-        relationships,
-        annotations,
-        recall_reason: recall_reason.map(str::to_string),
-        spacetime_frame,
-    }
-}
-
-fn turn_memory_user_id(state: &SessionState) -> String {
-    state
-        .active_turn
-        .as_ref()
-        .and_then(|turn| turn.primary_user_id.as_deref())
-        .map(str::trim)
-        .filter(|user_id| !user_id.is_empty())
-        .map(str::to_string)
-        .or_else(|| {
-            state
-                .active_turn
-                .as_ref()
-                .map(|turn| turn.chat_id.trim())
-                .filter(|chat_id| !chat_id.is_empty())
-                .map(str::to_string)
-        })
-        .unwrap_or_else(|| state.session_id.clone())
-}
-
-fn now_unix_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64
-}
-
-fn memory_enum_arg(value: Option<&Value>) -> Option<String> {
-    value
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(str::to_string)
-}
-
-fn memory_temporal_kind_from_arg(value: Option<&Value>) -> Option<MemoryTemporalKind> {
-    match memory_enum_arg(value)?.as_str() {
-        "event" => Some(MemoryTemporalKind::Event),
-        "state" => Some(MemoryTemporalKind::State),
-        "preference" => Some(MemoryTemporalKind::Preference),
-        "rule" => Some(MemoryTemporalKind::Rule),
-        "decision" => Some(MemoryTemporalKind::Decision),
-        "hypothesis" => Some(MemoryTemporalKind::Hypothesis),
-        "gap" => Some(MemoryTemporalKind::Gap),
-        "checkpoint" => Some(MemoryTemporalKind::Checkpoint),
-        _ => None,
-    }
-}
-
-fn memory_spatial_scope_from_arg(value: Option<&Value>, scope: &MemoryScope) -> MemorySpatialScope {
-    match memory_enum_arg(value).as_deref() {
-        Some("self") => MemorySpatialScope::SelfScope,
-        Some("agent") => MemorySpatialScope::Agent,
-        Some("user") => MemorySpatialScope::User,
-        Some("session") => MemorySpatialScope::Session,
-        Some("workspace") => MemorySpatialScope::Workspace,
-        Some("hotel") => MemorySpatialScope::Hotel,
-        Some("mesh") => MemorySpatialScope::Mesh,
-        Some("global") => MemorySpatialScope::Global,
-        _ => match scope {
-            MemoryScope::SharedUser => MemorySpatialScope::User,
-            MemoryScope::Session(_) => MemorySpatialScope::Session,
-            MemoryScope::CrossScope(_) => MemorySpatialScope::Mesh,
-            MemoryScope::SelfOnly => MemorySpatialScope::SelfScope,
-        },
-    }
-}
-
-fn memory_authority_from_arg(value: Option<&Value>) -> Option<MemoryAuthority> {
-    match memory_enum_arg(value)?.as_str() {
-        "observed_runtime" => Some(MemoryAuthority::ObservedRuntime),
-        "observed_repo" => Some(MemoryAuthority::ObservedRepo),
-        "graph_structured" => Some(MemoryAuthority::GraphStructured),
-        "user_stated" => Some(MemoryAuthority::UserStated),
-        "verified_memory" => Some(MemoryAuthority::VerifiedMemory),
-        "inferred_memory" => Some(MemoryAuthority::InferredMemory),
-        "external" => Some(MemoryAuthority::External),
-        "untrusted" => Some(MemoryAuthority::Untrusted),
-        _ => None,
-    }
-}
-
-fn memory_validation_level_from_arg(value: Option<&Value>) -> Option<MemoryValidationLevel> {
-    match memory_enum_arg(value)?.as_str() {
-        "unverified" => Some(MemoryValidationLevel::Unverified),
-        "check-green" | "check_green" => Some(MemoryValidationLevel::CheckGreen),
-        "test-green" | "test_green" => Some(MemoryValidationLevel::TestGreen),
-        "smoke-green" | "smoke_green" => Some(MemoryValidationLevel::SmokeGreen),
-        "watched-live-green" | "watched_live_green" => {
-            Some(MemoryValidationLevel::WatchedLiveGreen)
-        }
-        _ => None,
-    }
-}
-
-fn string_arg(args: &Value, key: &str) -> Option<String> {
-    args.get(key)
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(str::to_string)
-}
-
-fn string_array_arg(args: &Value, key: &str) -> Vec<String> {
-    args.get(key)
-        .and_then(Value::as_array)
-        .map(|arr| {
-            arr.iter()
-                .filter_map(Value::as_str)
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .map(str::to_string)
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
-fn graph_anchors_from_args(args: &Value) -> GraphAnchors {
-    let graph_anchors_arg = args.get("graph_anchors").filter(|v| v.is_object());
-    let value_for = |key: &str| -> Option<String> {
-        string_arg(args, key).or_else(|| graph_anchors_arg.and_then(|v| string_arg(v, key)))
-    };
-    let affected_nodes = {
-        let mut nodes = string_array_arg(args, "affected_nodes");
-        if nodes.is_empty() {
-            if let Some(v) = graph_anchors_arg {
-                nodes = string_array_arg(v, "affected_nodes");
-            }
-        }
-        nodes
-    };
-
-    GraphAnchors {
-        proposal_id: value_for("proposal_id"),
-        seam_id: value_for("seam_id"),
-        task_id: value_for("task_id"),
-        decision_id: value_for("decision_id"),
-        test_run_id: value_for("test_run_id"),
-        source_doc: value_for("source_doc"),
-        source_file: value_for("source_file"),
-        affected_nodes,
-    }
-}
-
-fn memory_shaping_context_for_write(
-    state: Option<&SessionState>,
-    args: &Value,
-    scope: &MemoryScope,
-) -> MemoryShapingContext {
-    let frame_arg = args.get("spacetime_frame").filter(|v| v.is_object());
-    let value_for = |key: &str| -> Option<String> {
-        string_arg(args, key).or_else(|| frame_arg.and_then(|v| string_arg(v, key)))
-    };
-    let number_for = |key: &str| -> Option<u64> {
-        args.get(key)
-            .and_then(Value::as_u64)
-            .or_else(|| frame_arg.and_then(|v| v.get(key)).and_then(Value::as_u64))
-    };
-    let primary_user_id = state
-        .and_then(|s| s.active_turn.as_ref())
-        .and_then(|turn| turn.primary_user_id.clone())
-        .or_else(|| value_for("primary_user_id"));
-
-    let frame = MemorySpacetimeFrame {
-        observed_at: number_for("observed_at").or_else(|| Some(now_unix_ms())),
-        valid_from: number_for("valid_from"),
-        valid_until: number_for("valid_until"),
-        last_verified_at: number_for("last_verified_at"),
-        temporal_kind: memory_temporal_kind_from_arg(
-            args.get("temporal_kind")
-                .or_else(|| frame_arg.and_then(|v| v.get("temporal_kind"))),
-        )
-        .or(Some(MemoryTemporalKind::State)),
-        spatial_scope: Some(memory_spatial_scope_from_arg(
-            args.get("spatial_scope")
-                .or_else(|| frame_arg.and_then(|v| v.get("spatial_scope"))),
-            scope,
-        )),
-        hotel_id: value_for("hotel_id")
-            .or_else(|| std::env::var("PHILOTIC_HOTEL_NAME").ok())
-            .or_else(|| std::env::var("PHILOTIC_HOTEL_ID").ok()),
-        node_id: value_for("node_id").or_else(|| std::env::var("PHILOTIC_NODE_ID").ok()),
-        workspace_path: value_for("workspace_path")
-            .or_else(|| std::env::var("PHILOTIC_WORKSPACE").ok()),
-        repo_id: value_for("repo_id"),
-        branch: value_for("branch"),
-        worktree_id: value_for("worktree_id"),
-        session_id: state.map(|s| s.session_id.clone()),
-        agent_id: state.map(|s| s.agent_id.clone()),
-        primary_user_id,
-        authority: memory_authority_from_arg(
-            args.get("authority")
-                .or_else(|| frame_arg.and_then(|v| v.get("authority"))),
-        )
-        .or(Some(MemoryAuthority::InferredMemory)),
-        validation_level: memory_validation_level_from_arg(
-            args.get("validation_level")
-                .or_else(|| args.get("validation"))
-                .or_else(|| frame_arg.and_then(|v| v.get("validation_level")))
-                .or_else(|| frame_arg.and_then(|v| v.get("validation"))),
-        ),
-    };
-
-    MemoryShapingContext {
-        frame,
-        graph_anchors: graph_anchors_from_args(args),
-        recall_policy: string_arg(args, "recall_policy"),
-        write_policy: string_arg(args, "write_policy"),
-        promotion_policy: string_arg(args, "promotion_policy"),
-    }
-}
-
-fn shaped_memory_tags(mut tags: Vec<String>, shaping: &MemoryShapingContext) -> Vec<String> {
-    if let Some(kind) = shaping.frame.temporal_kind {
-        tags.push(format!("temporal:{}", kind.as_str()));
-    }
-    if let Some(scope) = shaping.frame.spatial_scope {
-        tags.push(format!("scope:{}", scope.as_str()));
-    }
-    if let Some(authority) = shaping.frame.authority {
-        tags.push(format!("authority:{}", authority.as_str()));
-    }
-    if let Some(seam_id) = shaping.graph_anchors.seam_id.as_deref() {
-        tags.push(format!("seam:{seam_id}"));
-    }
-    if let Some(proposal_id) = shaping.graph_anchors.proposal_id.as_deref() {
-        tags.push(format!("proposal:{proposal_id}"));
-    }
-    tags.sort();
-    tags.dedup();
-    tags
-}
-
-fn shaped_memory_metadata(shaping: &MemoryShapingContext) -> Value {
-    let entities = shaped_memory_entities(shaping);
-    let relationships = shaped_memory_relationships(shaping, &entities);
-    serde_json::json!({
-        "spacetime_frame": shaping.frame,
-        "graph_anchors": shaping.graph_anchors,
-        "entities": entities,
-        "relationships": relationships,
-        "recall_policy": shaping.recall_policy,
-        "write_policy": shaping.write_policy,
-        "promotion_policy": shaping.promotion_policy,
-        "source": "philote.memory.remember",
-    })
-}
-
-fn shaped_memory_entities(shaping: &MemoryShapingContext) -> Vec<Value> {
-    let mut entities = Vec::new();
-    let mut push = |name: Option<&str>, entity_type: &str| {
-        if let Some(name) = name.map(str::trim).filter(|value| !value.is_empty()) {
-            entities.push(serde_json::json!({
-                "name": name,
-                "type": entity_type,
-            }));
-        }
-    };
-
-    push(shaping.graph_anchors.proposal_id.as_deref(), "proposal");
-    push(shaping.graph_anchors.seam_id.as_deref(), "seam");
-    push(shaping.graph_anchors.task_id.as_deref(), "task");
-    push(shaping.frame.session_id.as_deref(), "session");
-    push(shaping.frame.agent_id.as_deref(), "agent");
-    push(shaping.frame.primary_user_id.as_deref(), "user");
-    push(shaping.frame.hotel_id.as_deref(), "hotel");
-    push(shaping.frame.node_id.as_deref(), "node");
-
-    for affected in &shaping.graph_anchors.affected_nodes {
-        push(Some(affected), "graph_node");
-    }
-
-    entities
-}
-
-fn shaped_memory_relationships(shaping: &MemoryShapingContext, entities: &[Value]) -> Vec<Value> {
-    let mut relationships = Vec::new();
-    let has_entity = |name: &str| {
-        entities
-            .iter()
-            .any(|entity| entity.get("name").and_then(Value::as_str) == Some(name))
-    };
-    let mut push = |from: Option<&str>, rel_type: &str, to: Option<&str>| {
-        let Some(from) = from.map(str::trim).filter(|value| !value.is_empty()) else {
-            return;
-        };
-        let Some(to) = to.map(str::trim).filter(|value| !value.is_empty()) else {
-            return;
-        };
-        if has_entity(from) && has_entity(to) {
-            relationships.push(serde_json::json!({
-                "from_entity": from,
-                "rel_type": rel_type,
-                "to_entity": to,
-                "weight": 0.9,
-            }));
-        }
-    };
-
-    push(
-        shaping.graph_anchors.seam_id.as_deref(),
-        "belongs_to",
-        shaping.graph_anchors.proposal_id.as_deref(),
-    );
-    push(
-        shaping.graph_anchors.task_id.as_deref(),
-        "belongs_to",
-        shaping.graph_anchors.seam_id.as_deref(),
-    );
-    push(
-        shaping.frame.session_id.as_deref(),
-        "worked_by",
-        shaping.frame.agent_id.as_deref(),
-    );
-    push(
-        shaping.frame.session_id.as_deref(),
-        "serves_user",
-        shaping.frame.primary_user_id.as_deref(),
-    );
-    push(
-        shaping.frame.node_id.as_deref(),
-        "runs_in",
-        shaping.frame.hotel_id.as_deref(),
-    );
-
-    relationships
-}
-
-fn memory_text_arg(args: &Value, keys: &[&str]) -> Option<String> {
-    keys.iter().find_map(|key| string_arg(args, key))
-}
-
-fn classify_memory_true_up(args: &Value) -> Value {
-    let memory_claim = memory_text_arg(args, &["memory_claim", "claim"]);
-    let observed_truth = memory_text_arg(args, &["observed_truth", "observed"]);
-    let graph_truth = memory_text_arg(args, &["graph_truth", "graph"]);
-    let resolution = memory_text_arg(args, &["resolution"]);
-
-    let normalize = |value: &str| value.trim().to_ascii_lowercase();
-    let finding_type = match (&memory_claim, &observed_truth, &graph_truth) {
-        (Some(memory), Some(observed), _) if normalize(memory) == normalize(observed) => {
-            "confirmed"
-        }
-        (Some(memory), Some(observed), _) if normalize(memory) != normalize(observed) => {
-            "contradicted"
-        }
-        (Some(memory), None, Some(graph)) if normalize(memory) == normalize(graph) => "confirmed",
-        (Some(memory), None, Some(graph)) if normalize(memory) != normalize(graph) => {
-            "contradicted"
-        }
-        (Some(_), None, None) => "underspecified",
-        (None, Some(_), Some(_)) => "missing_memory",
-        _ => "needs_operator",
-    };
-
-    serde_json::json!({
-        "finding_type": finding_type,
-        "memory_claim": memory_claim,
-        "observed_truth": observed_truth,
-        "graph_truth": graph_truth,
-        "resolution": resolution,
-        "recommended_action": match finding_type {
-            "confirmed" => "keep",
-            "contradicted" => "true_up_required",
-            "missing_memory" => "consider_remember",
-            "underspecified" => "gather_evidence",
-            _ => "operator_review",
-        },
-        "requires_operator": matches!(finding_type, "contradicted" | "needs_operator"),
-    })
-}
-
-fn promotion_gate_report(args: &Value) -> Value {
-    let authority =
-        memory_authority_from_arg(args.get("authority")).unwrap_or(MemoryAuthority::InferredMemory);
-    let validation_level = memory_validation_level_from_arg(
-        args.get("validation_level")
-            .or_else(|| args.get("validation")),
-    )
-    .unwrap_or(MemoryValidationLevel::Unverified);
-    let evidence_refs = string_array_arg(args, "evidence_refs");
-    let operator_approved = args
-        .get("operator_approved")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
-
-    let authority_ok = !matches!(
-        authority,
-        MemoryAuthority::InferredMemory | MemoryAuthority::Untrusted
-    ) || operator_approved;
-    let validation_ok =
-        !matches!(validation_level, MemoryValidationLevel::Unverified) || operator_approved;
-    let evidence_ok = !evidence_refs.is_empty() || operator_approved;
-    let allowed = authority_ok && validation_ok && evidence_ok;
-
-    serde_json::json!({
-        "allowed": allowed,
-        "authority": authority.as_str(),
-        "validation_level": validation_level.as_str(),
-        "evidence_refs": evidence_refs,
-        "operator_approved": operator_approved,
-        "required_before_promotion": {
-            "authority": if authority_ok { Value::Null } else { Value::String("observed_runtime, observed_repo, graph_structured, user_stated, verified_memory, or operator approval".into()) },
-            "validation": if validation_ok { Value::Null } else { Value::String("check-green or stronger, or operator approval".into()) },
-            "evidence": if evidence_ok { Value::Null } else { Value::String("at least one evidence_ref, or operator approval".into()) },
-        }
-    })
-}
-
-fn inbound_primary_user_id(task: &InboundTaskPayload) -> Option<String> {
-    task.sender_id
-        .as_deref()
-        .or(task.sender_username.as_deref())
-        .map(str::trim)
-        .filter(|user_id| !user_id.is_empty())
-        .map(str::to_string)
-}
-
-fn default_turn_recall_scope(session_id: &str) -> MemoryScope {
-    MemoryScope::CrossScope(vec![
-        MemoryScope::SelfOnly,
-        MemoryScope::SharedUser,
-        MemoryScope::Session(session_id.to_string()),
-    ])
-}
-
-fn memory_scope_from_tool_arg(scope: Option<&str>, session_id: &str) -> MemoryScope {
-    match scope.unwrap_or("self") {
-        "shared_user" | "user" => MemoryScope::SharedUser,
-        "session" | "working" => MemoryScope::Session(session_id.to_string()),
-        "cross" | "all" => default_turn_recall_scope(session_id),
-        _ => MemoryScope::SelfOnly,
-    }
-}
 fn local_node_id() -> String {
     std::env::var("PHILOTIC_NODE_ID").unwrap_or_else(|_| "local-aiua-01".to_string())
+}
+
+/// The guest identity a philote registers under and stamps as `reply_guest_id`
+/// on its dispatches: the bare `agent_id` for a base philote, or
+/// `"{agent_id}:{role_name}"` for a role incarnation. Keeping the registration
+/// shape and the reply-address shape in one place is what lets the hotel deliver
+/// a response back to the subscription owned by the runtime that holds the turn
+/// (DEF-051).
+pub fn compose_guest_identity(agent_id: &str, role_name: Option<&str>) -> String {
+    match role_name {
+        Some(role_name) => format!("{agent_id}:{role_name}"),
+        None => agent_id.to_string(),
+    }
+}
+
+/// Best-effort chat_id recovery for out-of-turn dispatch, when there is no
+/// active `WorkingTurn` to read `chat_id` from directly. Mirrors the
+/// session_id encoding from `InboundTaskPayload::session_id_or_default`
+/// (`"{source}:{chat_id}:..."`), the same convention `handle_paracrine_response`
+/// relies on to route to an idle session.
+fn chat_id_from_session_id(session_id: &str, source: &str) -> Option<String> {
+    session_id
+        .strip_prefix(&format!("{source}:"))
+        .and_then(|rest| rest.split(':').next())
+        .filter(|c| !c.is_empty())
+        .map(str::to_string)
 }
 
 fn graph_datasource_node_id() -> String {
@@ -585,310 +147,6 @@ fn debug_model_requests_enabled() -> bool {
     )
 }
 
-#[derive(Debug, Clone, PartialEq)]
-struct DirectLifeObserveCommand {
-    label: String,
-    claim_summary: String,
-    source_id: String,
-    confidence: f64,
-}
-
-fn parse_direct_life_observe_command(content: &str) -> Option<DirectLifeObserveCommand> {
-    let trimmed = content.trim();
-    if trimmed.is_empty() {
-        return None;
-    }
-
-    let lower = trimmed.to_lowercase();
-    let explicit_life_observe = lower.contains("life.observe");
-    let explicit_record_open_loop =
-        lower.contains("record this open loop") || lower.contains("record an open loop");
-    if !explicit_life_observe && !explicit_record_open_loop {
-        return None;
-    }
-
-    let label = extract_direct_life_observe_field(trimmed, "label")
-        .unwrap_or_else(|| {
-            if lower.contains("open loop") {
-                "OpenLoop".into()
-            } else {
-                "Signal".into()
-            }
-        })
-        .trim_matches(|ch: char| ch == '.' || ch == ',' || ch == ';' || ch == ':')
-        .to_string();
-
-    let source_id = extract_direct_life_observe_source(trimmed)
-        .unwrap_or_else(|| "membrane:telegram".into())
-        .trim_matches(|ch: char| ch == '.' || ch == ',' || ch == ';')
-        .to_string();
-
-    let confidence = extract_direct_life_observe_confidence(trimmed).unwrap_or(0.8);
-
-    let claim_summary = extract_direct_life_observe_claim(trimmed)
-        .unwrap_or_else(|| trimmed.to_string())
-        .trim()
-        .trim_matches('"')
-        .trim()
-        .to_string();
-
-    if claim_summary.is_empty() {
-        return None;
-    }
-
-    Some(DirectLifeObserveCommand {
-        label,
-        claim_summary,
-        source_id,
-        confidence,
-    })
-}
-
-fn extract_direct_life_observe_claim(content: &str) -> Option<String> {
-    let lower = content.to_lowercase();
-    let start = lower
-        .find("record this open loop:")
-        .map(|idx| idx + "record this open loop:".len())
-        .or_else(|| {
-            lower
-                .find("record an open loop:")
-                .map(|idx| idx + "record an open loop:".len())
-        })
-        .or_else(|| {
-            lower
-                .find("record this:")
-                .map(|idx| idx + "record this:".len())
-        });
-
-    let mut claim = start
-        .and_then(|idx| content.get(idx..))
-        .map(str::trim)
-        .unwrap_or(content);
-
-    for marker in [" Use label", " use label", " Label", " label "] {
-        if let Some(idx) = claim.find(marker) {
-            claim = claim[..idx].trim();
-            break;
-        }
-    }
-
-    Some(
-        claim
-            .trim_matches(|ch: char| ch == '"' || ch == '\'' || ch.is_whitespace())
-            .trim_end_matches('.')
-            .to_string(),
-    )
-}
-
-fn extract_direct_life_observe_field(content: &str, field: &str) -> Option<String> {
-    let lower = content.to_lowercase();
-    let marker = format!("{field}");
-    let start = lower.find(&marker)?;
-    let after_marker = content.get(start + marker.len()..)?.trim_start();
-    let after_separator = after_marker
-        .strip_prefix(':')
-        .or_else(|| after_marker.strip_prefix('='))
-        .unwrap_or(after_marker)
-        .trim_start();
-    after_separator
-        .split_whitespace()
-        .next()
-        .map(|value| value.trim_matches(|ch: char| ch == ',' || ch == ';' || ch == '.'))
-        .filter(|value| !value.is_empty())
-        .map(str::to_string)
-}
-
-fn extract_direct_life_observe_source(content: &str) -> Option<String> {
-    let lower = content.to_lowercase();
-    let marker = "source";
-    let start = lower.find(marker)?;
-    let after_marker = content.get(start + marker.len()..)?.trim_start();
-    let after_separator = after_marker
-        .strip_prefix(':')
-        .or_else(|| after_marker.strip_prefix('='))
-        .unwrap_or(after_marker)
-        .trim_start();
-    let value = after_separator
-        .split_whitespace()
-        .take_while(|word| {
-            let word_lower = word
-                .trim_matches(|ch: char| ch == ',' || ch == ';' || ch == '.')
-                .to_lowercase();
-            !matches!(word_lower.as_str(), "confidence" | "label" | "use")
-        })
-        .collect::<Vec<_>>()
-        .join(" ")
-        .trim()
-        .trim_matches(|ch: char| ch == ',' || ch == ';' || ch == '.')
-        .to_string();
-
-    (!value.is_empty()).then_some(value)
-}
-
-fn extract_direct_life_observe_confidence(content: &str) -> Option<f64> {
-    let lower = content.to_lowercase();
-    let marker = "confidence";
-    let start = lower.find(marker)?;
-    let after_marker = content.get(start + marker.len()..)?.trim_start();
-    let after_separator = after_marker
-        .strip_prefix(':')
-        .or_else(|| after_marker.strip_prefix('='))
-        .unwrap_or(after_marker)
-        .trim_start();
-    after_separator
-        .split_whitespace()
-        .next()
-        .and_then(|value| {
-            value
-                .trim_matches(|ch: char| ch == ',' || ch == ';' || ch == '.')
-                .parse::<f64>()
-                .ok()
-        })
-        .map(|value| value.clamp(0.0, 1.0))
-}
-
-fn direct_life_observe_input(
-    command: &DirectLifeObserveCommand,
-    session_id: &str,
-    turn_id: &str,
-    chat_id: &str,
-    agent_id: &str,
-) -> Value {
-    let now_iso = chrono::Utc::now().to_rfc3339();
-    let suffix = Uuid::new_v4().simple().to_string();
-    let label_id = command.label.to_lowercase();
-    let node_id = format!("life:{}:{suffix}", label_id.replace('_', "-"));
-    let packet_id = format!("evidence:{suffix}");
-    let observation_id = format!("obs:{suffix}");
-
-    serde_json::json!({
-        "observation_id": observation_id,
-        "evidence": {
-            "packet_id": packet_id,
-            "claim_ref": {
-                "id": node_id,
-                "label": command.label,
-                "datasource": "life-graph"
-            },
-            "claim_summary": command.claim_summary,
-                "source_refs": [{
-                    "source_id": command.source_id,
-                    "source_kind": "runtime_observation",
-                    "reliability": {
-                        "score": 0.95,
-                        "basis": "direct_observation"
-                    }
-                }],
-            "passage_refs": [],
-            "confidence": command.confidence,
-            "validation_state": "proposed",
-            "observed_at": now_iso,
-            "source_reliability": 0.95,
-            "conflict_ids": [],
-            "adjudication_status": "not_needed",
-            "metadata": {
-                "route": "philote_direct_life_observe",
-                "session_id": session_id,
-                "turn_id": turn_id,
-                "chat_id": chat_id,
-                "agent_id": agent_id
-            }
-        },
-        "proposed_graph_refs": []
-    })
-}
-
-fn direct_life_observe_success_reply(
-    command: &DirectLifeObserveCommand,
-    tool_content: &str,
-) -> String {
-    let content = tool_content.trim();
-    if content.is_empty() {
-        return format!(
-            "Recorded this {} in LifeGraph: {}",
-            command.label, command.claim_summary
-        );
-    }
-
-    match serde_json::from_str::<Value>(content) {
-        Ok(value) => {
-            let node_id = value
-                .pointer("/node_id")
-                .or_else(|| value.pointer("/data/node_id"))
-                .or_else(|| value.pointer("/result/node_id"))
-                .and_then(Value::as_str);
-            if let Some(node_id) = node_id {
-                format!(
-                    "Recorded this {} in LifeGraph: {} (`{}`)",
-                    command.label, command.claim_summary, node_id
-                )
-            } else {
-                format!(
-                    "Recorded this {} in LifeGraph: {}",
-                    command.label, command.claim_summary
-                )
-            }
-        }
-        Err(_) => format!(
-            "Recorded this {} in LifeGraph: {}",
-            command.label, command.claim_summary
-        ),
-    }
-}
-
-fn direct_life_observe_failure_reply(
-    command: &DirectLifeObserveCommand,
-    tool_content: &str,
-) -> String {
-    let detail = tool_content.trim();
-    if detail.is_empty() {
-        return format!(
-            "I tried to record this {} in LifeGraph, but the runner did not return a successful result.",
-            command.label
-        );
-    }
-    format!(
-        "I tried to record this {} in LifeGraph, but the runner failed: {}",
-        command.label, detail
-    )
-}
-
-fn direct_life_observe_command_from_arguments(
-    arguments: &Value,
-) -> Option<DirectLifeObserveCommand> {
-    let evidence = arguments.get("evidence")?;
-    let label = evidence
-        .pointer("/claim_ref/label")
-        .and_then(Value::as_str)
-        .unwrap_or("OpenLoop")
-        .to_string();
-    let claim_summary = evidence
-        .get("claim_summary")
-        .and_then(Value::as_str)
-        .filter(|value| !value.trim().is_empty())?
-        .to_string();
-    let source_id = evidence
-        .get("source_refs")
-        .and_then(Value::as_array)
-        .and_then(|refs| refs.first())
-        .and_then(|source| source.get("source_id"))
-        .and_then(Value::as_str)
-        .unwrap_or("membrane:telegram")
-        .to_string();
-    let confidence = evidence
-        .get("confidence")
-        .and_then(Value::as_f64)
-        .unwrap_or(0.8)
-        .clamp(0.0, 1.0);
-
-    Some(DirectLifeObserveCommand {
-        label,
-        claim_summary,
-        source_id,
-        confidence,
-    })
-}
-
 #[cfg(test)]
 const LOCAL_NODE: &str = "local-aiua-01";
 
@@ -910,6 +168,21 @@ fn extract_model_error(task: &InboundTaskPayload) -> Option<String> {
     Some(payload.display_message())
 }
 
+/// Reads the `context_pressure_pct` field out of a serialized
+/// `ContextProjection` (as produced by `SessionState::model_request_payloads`)
+/// and clamps it to `u8::MAX`-safe 0..=100, matching the clamp already
+/// applied at assembly time in `session/mod.rs`. This is the literal
+/// extraction logic used at the `handle_user_message` turn-assembly call
+/// site to drive the live `ReflexEvent::ContextPressure` producer — pulled
+/// out as a pure function so a rename or removal of the field is caught by
+/// a plain unit test instead of requiring a full IPC-backed runtime harness.
+fn context_pressure_pct_from_projection(context_projection: &Value) -> Option<u8> {
+    context_projection
+        .get("context_pressure_pct")
+        .and_then(Value::as_u64)
+        .map(|pct| pct.min(100) as u8)
+}
+
 fn should_attempt_provider_repair(error: &TaskErrorPayload, state: Option<&SessionState>) -> bool {
     error.kind == "provider_failure"
         && error.retryable.unwrap_or(false)
@@ -925,22 +198,200 @@ fn is_content_error(error: &TaskErrorPayload) -> bool {
         || error.code.as_deref() == Some("MODEL_INVALID_TOOL_CALL")
 }
 
-/// True for errors that should escalate to the next provider fallback tier.
-fn should_escalate_tier(error: &TaskErrorPayload) -> bool {
-    matches!(
-        error.sub_kind.as_deref(),
-        Some("network_error")
-            | Some("streaming_timeout")
-            | Some("rate_limit")
-            | Some("provider_auth")
-            | Some("provider_error")
-    ) || (error.kind == "provider_failure"
-        && error.retryable.unwrap_or(false)
-        && !is_content_error(error))
+/// Escalation class for a provider failure — decides what the turn loop does
+/// with the error signal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ProviderErrorClass {
+    /// Transient (network / 5xx / streaming stall): a retry may succeed —
+    /// same-tier retry where the sub_kind allows it, otherwise next tier.
+    RetrySameProvider,
+    /// The request will fail identically on the same provider (4xx contract
+    /// errors, INVALID_ARGUMENT, refusals, rate limits): advance to the next
+    /// fallback tier, skipping tiers that dispatch to the failed provider.
+    SwitchProvider,
+    /// Auth/key misconfiguration: no retry against this provider can help
+    /// until an operator intervenes — surface to the user fast (plus a heal
+    /// event so the outage becomes an A3 work item).
+    Fatal,
+    /// The provider's own content/safety filter blocked the response (Gemini
+    /// `finishReason=SAFETY` / `promptFeedback.blockReason`, etc.) — a
+    /// deliberately DISTINCT outcome from `SwitchProvider`. Switching to a
+    /// different-behaving model mid-conversation is the jarring failover this
+    /// class exists to prevent (2026-07-09 operator report); for an
+    /// `unrestricted` agent this should essentially never fire since
+    /// `safetySettings` disables the filter, but if it does, fail the turn
+    /// cleanly with a clear message rather than silently hopping providers.
+    ContentBlocked,
+    /// Not a model-provider escalation signal (tool/transport/voice errors):
+    /// fall through to the generic fail path.
+    Unclassified,
+}
+
+/// Classify a provider failure into an escalation class.
+///
+/// Prefers the machine-readable `error_class` stamped by newer model-router
+/// controllers; falls back to `sub_kind` / HTTP `status` / kind heuristics for
+/// older controllers that predate the field. The final fallback maps any
+/// otherwise-unclassified `provider_failure` on the text path to
+/// `SwitchProvider`: an unrecognized provider error must engage the fallback
+/// ladder, not insta-fail the turn (forensic 2026-07-08 — nine Gemini 400s
+/// died as MODEL_EMPTY_RESPONSE while a healthy model.ollama tier sat idle).
+pub(crate) fn classify_provider_error(error: &TaskErrorPayload) -> ProviderErrorClass {
+    // 1. Machine-readable class from the controller wins.
+    match error.error_class.as_deref() {
+        Some("fatal") => return ProviderErrorClass::Fatal,
+        Some("content_blocked") => return ProviderErrorClass::ContentBlocked,
+        Some("switch_provider") => return ProviderErrorClass::SwitchProvider,
+        Some("retry_same_provider") => return ProviderErrorClass::RetrySameProvider,
+        _ => {}
+    }
+
+    // 2. sub_kind fallback (older controllers).
+    match error.sub_kind.as_deref() {
+        Some("provider_auth") => return ProviderErrorClass::Fatal,
+        Some("content_policy_block") => return ProviderErrorClass::ContentBlocked,
+        Some("network_error") | Some("streaming_timeout") | Some("provider_error") => {
+            return ProviderErrorClass::RetrySameProvider;
+        }
+        Some("rate_limit") | Some("invalid_request") => {
+            return ProviderErrorClass::SwitchProvider;
+        }
+        _ => {}
+    }
+
+    if error.kind != "provider_failure" {
+        return ProviderErrorClass::Unclassified;
+    }
+
+    // 3. HTTP status fallback.
+    if let Some(status) = error.status {
+        return match status {
+            401 | 403 => ProviderErrorClass::Fatal,
+            400..=499 => ProviderErrorClass::SwitchProvider,
+            _ => ProviderErrorClass::RetrySameProvider,
+        };
+    }
+
+    // 4. Un-annotated provider_failure. Only the text-generation path may
+    // engage the fallback ladder — voice/embedding failures have their own
+    // handling and must not re-dispatch generate_text. Content errors reach
+    // here only after the repair attempt is spent; switching providers is
+    // then the productive move.
+    let text_capability = matches!(error.capability.as_deref(), None | Some("text.generate"));
+    if text_capability {
+        ProviderErrorClass::SwitchProvider
+    } else {
+        ProviderErrorClass::Unclassified
+    }
 }
 
 /// Default tier ordering when none is configured in TurnLoopConfig.
-const DEFAULT_FALLBACK_TIERS: &[&str] = &["model", "model.ollama", "model.local"];
+///
+/// Single source of truth in core so the hotel's config-time ladder validation
+/// checks the exact ladder philote runs.
+use ansible_mesh_core::model_routing::DEFAULT_FALLBACK_TIERS;
+
+/// Why a turn is being treated as "the model did not answer". Carried into the
+/// shared policy so the escalation path and the watchdog can never pick
+/// divergent escalate-vs-evict thresholds for the same underlying event.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum NoResponseClass {
+    /// The provider returned an explicit retriable failure (network / timeout /
+    /// provider error) — fired immediately on the error signal.
+    ProviderFailure,
+    /// The provider rejected the request contract (4xx / INVALID_ARGUMENT /
+    /// refusal / rate limit): the same request fails identically on the same
+    /// provider, so the ladder walk skips tiers that dispatch to it.
+    ProviderContractFailure,
+    /// No signal arrived; the stuck-turn watchdog fired after the WaitingModel
+    /// deadline elapsed.
+    WatchdogTimeout,
+}
+
+/// What to do when the model did not produce a usable answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum NoResponseAction {
+    /// Re-dispatch the turn to the next fallback tier.
+    EscalateTier,
+    /// Give up on this turn (fail it with a user-visible notice).
+    EvictTurn,
+}
+
+/// The single "model didn't answer" decision table, consulted by BOTH the
+/// provider-failure escalation path and the WaitingModel watchdog (both funnel
+/// through `advance_turn_to_next_fallback_tier`). Keeping one table means their
+/// thresholds cannot silently diverge.
+///
+/// Initial values preserve pre-slice behavior exactly: escalate while a live
+/// fallback tier remains, otherwise evict. Failure class is threaded so a future
+/// slice can diverge (e.g. skip escalation on a hard auth failure) without
+/// re-introducing two uncoordinated code paths — it does not change the action
+/// today. The elapsed deadline is encoded by *which* trigger invoked the policy
+/// (the watchdog only fires past its deadline; provider failures fire on signal).
+pub(crate) fn decide_no_response_action(
+    class: NoResponseClass,
+    tiers_remaining: bool,
+) -> NoResponseAction {
+    match class {
+        NoResponseClass::ProviderFailure
+        | NoResponseClass::ProviderContractFailure
+        | NoResponseClass::WatchdogTimeout => {
+            if tiers_remaining {
+                NoResponseAction::EscalateTier
+            } else {
+                NoResponseAction::EvictTurn
+            }
+        }
+    }
+}
+
+/// Short cause string for a `NoResponseClass`, used both for the user-visible
+/// `provider_switch` turn event and as the `FallbackOverride.reason` recorded
+/// by `advance_turn_to_next_fallback_tier` on a successful escalation.
+pub(crate) fn no_response_reason_str(class: NoResponseClass) -> &'static str {
+    match class {
+        NoResponseClass::ProviderFailure => "provider_failure",
+        NoResponseClass::ProviderContractFailure => "provider_contract_failure",
+        NoResponseClass::WatchdogTimeout => "model_timeout",
+    }
+}
+
+/// The next ladder tier to dispatch after the currently active dispatch fails.
+///
+/// `last_ladder_tier` is the index of the last ladder tier that was actually
+/// *dispatched* — `None` when the ladder hasn't been consulted yet (the
+/// primary dispatch used a hotel route, an explicit binding, or the plain
+/// default role instead of `configured_tiers[0]`; see
+/// `primary_dispatch_used_ladder`). This is the off-by-one fix: without it, a
+/// turn whose primary dispatch bypassed the ladder would jump straight to
+/// tier 1 on failure and a single-tier ladder would never be tried at all.
+/// `Some(tier)` walks forward from `tier + 1` as before.
+///
+/// On a contract failure (`skip_failed_provider = true` with a known failed
+/// provider) tiers whose role dispatches to that same provider are skipped —
+/// the request would fail identically there. Returns a tier > `max_tier` when
+/// the ladder is exhausted (possibly *by* the skip). Pure so the skip contract
+/// is unit-testable without IPC.
+fn next_ladder_tier(
+    configured_tiers: &[String],
+    last_ladder_tier: Option<u8>,
+    max_tier: u8,
+    failed_provider: Option<&str>,
+    skip_failed_provider: bool,
+) -> u8 {
+    let mut next = last_ladder_tier.map_or(0, |tier| tier.saturating_add(1));
+    if skip_failed_provider {
+        if let Some(failed) = failed_provider {
+            while next <= max_tier
+                && provider_for_role(role_for_tier(configured_tiers, next)).as_deref()
+                    == Some(failed)
+            {
+                next = next.saturating_add(1);
+            }
+        }
+    }
+    next
+}
 
 /// Model role for a given tier index. Falls back gracefully when index is out of range.
 fn role_for_tier<'a>(configured_tiers: &'a [String], tier: u8) -> &'a str {
@@ -956,11 +407,67 @@ fn role_for_tier<'a>(configured_tiers: &'a [String], tier: u8) -> &'a str {
                     .unwrap_or("model.local")
             })
     } else {
+        // Out-of-range clamp mirrors the last tier of DEFAULT_FALLBACK_TIERS
+        // (the local last resort).
         DEFAULT_FALLBACK_TIERS
             .get(idx)
             .copied()
-            .unwrap_or("model.local")
+            .unwrap_or("model.ollama")
     }
+}
+
+/// Maximum extra dispatch attempts the routing oracle may add beneath an
+/// exhausted fallback ladder before the turn is evicted. Keeps a pathological
+/// oracle loop bounded (the 600 s CatchAll turn budget is the hard ceiling).
+pub(crate) const MAX_ORACLE_EXTRA_TIERS: u8 = 2;
+
+/// Inverse of the hotel's controller-role seeding: which provider a ladder
+/// tier role dispatches to. Used to build the oracle's exclude list from the
+/// tiers a turn has already burned through. Unknown roles map to `None`
+/// (nothing to exclude).
+fn provider_for_role(role: &str) -> Option<String> {
+    match role {
+        "model" => Some("gemini".to_string()),
+        "model.local" => Some("onnx".to_string()),
+        _ => role.strip_prefix("model.").map(str::to_string),
+    }
+}
+
+/// Capability guard for shadow-mode (`PHILOTIC_SHADOW_ORACLE`) oracle-vs-ladder
+/// logging at the FIRST-TURN dispatch (Model Oracle Primary Authority, slice 2).
+///
+/// The first-turn dispatch in `handle_user_message` multiplexes the cognitive
+/// text-generation ladder with aux `transform` tasks (voice transcription, media
+/// analysis / description / summarization). The shadow oracle comparison must
+/// fire ONLY for the cognitive text case — the same class of dispatch slice 1
+/// instruments in `turn_loop` — and NEVER for aux tasks (they don't ride the
+/// text fallback ladder, so an oracle-vs-ladder comparison is meaningless there).
+///
+/// Returns `true` only for `"text.generate"` / `"response.generate"`, the exact
+/// pair that also flags this dispatch's `request_class` as `"cognitive"`. Pure so
+/// the cognitive-eligible / aux-excluded contract is unit-testable without IPC.
+fn shadow_eligible_capability(capability: &str) -> bool {
+    matches!(capability, "text.generate" | "response.generate")
+}
+
+/// Pick the first oracle-ranked entry whose role is not already in the
+/// turn's ladder. Returns `(role, provider)`. Pure so the skip-tried-roles
+/// contract is unit-testable without IPC.
+fn pick_oracle_role(
+    data: &serde_json::Value,
+    tried_roles: &std::collections::HashSet<String>,
+) -> Option<(String, String)> {
+    data.get("ranked")?.as_array()?.iter().find_map(|entry| {
+        let role = entry.get("role")?.as_str()?;
+        if tried_roles.contains(role) {
+            return None;
+        }
+        let provider = entry
+            .get("provider")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown");
+        Some((role.to_string(), provider.to_string()))
+    })
 }
 
 fn provider_repair_note(error: &TaskErrorPayload) -> String {
@@ -998,6 +505,41 @@ fn recent_low_progress_tool_run(turn: &WorkingTurn) -> usize {
             low_progress_tool_name(&call.tool_name) || duplicate_tool_skip(result)
         })
         .count()
+}
+
+/// Absolute ceiling on the effective iteration cap — the same ceiling the
+/// plan-scaled cap enforces (`turn_loop.rs` plan handling). The earned-streak
+/// extension can never push a turn past this.
+const STREAK_CAP_CEILING: u32 = 50;
+
+/// Effective iteration cap for a turn: the configured (possibly plan-scaled)
+/// cap plus iterations earned by the turn's productive streak, bounded by
+/// [`STREAK_CAP_CEILING`]. A configured cap already at or above the ceiling
+/// is honoured unchanged — the extension only ever adds, never shrinks.
+fn effective_iteration_cap(configured_cap: u32, turn: &WorkingTurn) -> u32 {
+    configured_cap
+        .saturating_add(turn.streak_extension)
+        .min(STREAK_CAP_CEILING.max(configured_cap))
+}
+
+/// True when a completed tool step earns the turn one extra iteration
+/// (cognitive-loop-streak-extension seam): the step succeeded, was not a
+/// diagnostic/status call, was not a skipped duplicate, and is NOVEL — no
+/// prior call this turn used the same tool with the same arguments. Judged
+/// against the history BEFORE the step is pushed onto it.
+fn tool_step_earns_streak(
+    turn: &WorkingTurn,
+    call: &ToolCall,
+    result: &ToolResult,
+    step_failed: bool,
+) -> bool {
+    if step_failed || low_progress_tool_name(&call.tool_name) || duplicate_tool_skip(result) {
+        return false;
+    }
+    !turn
+        .working_tool_history
+        .iter()
+        .any(|(prior, _)| prior.tool_name == call.tool_name && prior.arguments == call.arguments)
 }
 
 fn loop_stop_reason(turn: &WorkingTurn, iteration_cap: u32) -> Option<&'static str> {
@@ -1046,64 +588,32 @@ fn loop_stop_fallback_reply(
     )
 }
 
-#[derive(Debug, Clone)]
-struct MemoryCandidate {
-    concept: String,
-    content: String,
-    tags: Vec<String>,
-}
-
-fn parse_memory_candidate(value: Option<&Value>) -> Option<MemoryCandidate> {
-    let candidate = value?;
-    let concept = candidate
-        .get("concept")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|s| !s.is_empty())?
-        .to_string();
-    let content = candidate
-        .get("content")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|s| !s.is_empty())?
-        .to_string();
-    let tags = candidate
-        .get("tags")
-        .and_then(Value::as_array)
-        .map(|items| {
-            items
-                .iter()
-                .filter_map(Value::as_str)
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .map(str::to_string)
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
-
-    Some(MemoryCandidate {
-        concept,
-        content,
-        tags,
-    })
-}
-
+/// Maps an `effective_model_controller` / component-route `implementation`
+/// string to the model-router role that dispatches it. Mirrors the hotel-side
+/// `component_implementation_to_role` (`crates/aiua/src/service/ipc.rs`):
+/// already-role-shaped values (`"model.openrouter"`) pass through unchanged,
+/// `"gemini"` maps to the default `"model"` role, and every other known
+/// provider (`"openrouter"`, `"openai"`, `"ollama"`, `"mlx"`, ...) gets its
+/// own dedicated `"model.<provider>"` role instead of collapsing onto the
+/// gemini default. `"onnx"` / `"kokoro"` / `"local"` remain a special case
+/// mapping to the shared local-backend role.
 fn implementation_to_model_role(implementation: &str) -> String {
-    let normalized = implementation
+    let normalized = implementation.trim().to_ascii_lowercase();
+
+    if normalized.starts_with("model.") {
+        return normalized;
+    }
+
+    let segment = normalized
         .split(['.', '-', '@', '/'])
         .find(|segment| !segment.is_empty())
         .unwrap_or("gemini");
 
-    if normalized == "elevenlabs" {
-        "model.elevenlabs".into()
-    } else if matches!(normalized, "onnx" | "kokoro" | "local") {
-        "model.local".into()
-    } else if normalized == "ollama" {
-        "model.ollama".into()
-    } else if normalized == "mlx" {
-        "model.mlx".into()
-    } else {
-        "model".into()
+    match segment {
+        "gemini" => "model".into(),
+        "elevenlabs" => "model.elevenlabs".into(),
+        "onnx" | "kokoro" | "local" => "model.local".into(),
+        other => format!("model.{other}"),
     }
 }
 
@@ -1134,16 +644,55 @@ fn voice_response_provider_options(policy: &VoiceResponsePolicy) -> Map<String, 
     options
 }
 
+/// Threads the turn's effective content-filtering posture into the
+/// `provider_options` bag the same way `voice_response_provider_options`
+/// threads voice settings — the model-router's `ControllerTask::provider_options`
+/// is the existing generic per-turn knob channel (see `response_modalities`,
+/// `voice_id`, `model` above). `"standard"` omits the key entirely so the
+/// wire payload — and downstream provider behavior — is byte-for-byte
+/// unchanged for every agent that hasn't opted into this feature.
+fn content_policy_provider_options(effective_content_policy: &str) -> Map<String, Value> {
+    let mut options = Map::new();
+    if effective_content_policy != "standard" {
+        options.insert("content_policy".into(), json!(effective_content_policy));
+    }
+    options
+}
+
+/// Session-lookup wrapper matching the `Option<&SessionState>` convention used
+/// by `model_response_route` / `planning_ligand` / `model_affordances` below —
+/// call sites already have `self.sessions.get(&session_id)` in scope for those,
+/// so this drops in alongside them at every `action: "generate_text"`
+/// `ModelRequestPayload` construction. A missing session (shouldn't happen on
+/// this path, but mirrors the other helpers' fail-open behavior) resolves to
+/// `"standard"` — i.e. no `provider_options` change, current behavior.
+pub(crate) fn resolve_content_policy_provider_options(
+    state: Option<&SessionState>,
+) -> Map<String, Value> {
+    content_policy_provider_options(
+        state
+            .map(|s| s.effective_content_policy())
+            .unwrap_or("standard"),
+    )
+}
+
 fn voice_response_contract(policy: &VoiceResponsePolicy) -> Value {
     if policy.delivery_mode.is_native_audio() {
-        json!({
-            "channels": ["spoken_text", "memory_candidate", "active_plan", "memory_concept"],
-            "modalities": ["text", "audio"]
-        })
+        let mut contract = cognitive_response_contract(&[
+            "spoken_text",
+            "memory_candidate",
+            "active_plan",
+            "memory_concept",
+        ]);
+        contract["modalities"] = json!(["text", "audio"]);
+        contract
     } else {
-        json!({
-            "channels": ["spoken_text", "memory_candidate", "active_plan", "memory_concept"]
-        })
+        cognitive_response_contract(&[
+            "spoken_text",
+            "memory_candidate",
+            "active_plan",
+            "memory_concept",
+        ])
     }
 }
 
@@ -1351,26 +900,207 @@ fn extract_audio_artifact(model_result: Option<&Value>) -> Option<String> {
     None
 }
 
+/// Resolves the model-router dispatch target for `capability`.
+///
+/// Precedence (highest wins):
+///   1. The operator pin (`/model <tier>`, `SessionState.pinned_tier_role`) —
+///      explicit operator intent for text-generation dispatch, wins over
+///      everything, including the fallback override below.
+///   2. The persisted fallback override (`SessionState.fallback_override`,
+///      Slice 2) — a session degraded by a prior escalation stays on the
+///      tier that last worked until the origin-tier probe clears it.
+///   3. The hotel-computed execution route (`resolve_component_execution_route`)
+///      — but for ladder-governed capabilities (`fallback_role ==
+///      DEFAULT_TEXT_MODEL_ROLE`), ONLY when it reflects genuine explicit
+///      routing intent: a remote/cross-hotel placement (`target_node` !=
+///      local — e.g. cross-hotel park, an oracle remote pick), or an
+///      operator/reflex `component_routes` pin (`route.explicit_pin`).
+///      Non-ladder capabilities (voice synthesis, ...) always trust the
+///      hotel route, as before.
+///   4. An explicit per-session `component_routes` pin
+///      (`SessionState.component_route_for_capability`) — an operator/reflex
+///      binding to a specific implementation. More specific than a role-wide
+///      default, so it outranks the ladder too. This does NOT include the
+///      legacy `effective_model_controller` fallback (step 6 below).
+///   5. The active role's configured fallback ladder primary
+///      (`role_activation.turn_loop_config.fallback_tiers[0]`) — only consulted
+///      for text-generation dispatch (`fallback_role == DEFAULT_TEXT_MODEL_ROLE`)
+///      and only when neither of the above is set. This is what lets a
+///      configured ladder (e.g. `["model.openrouter", "model.ollama"]`) govern
+///      the *initial* dispatch, not just failure escalation.
+///   6. The legacy `preferred_component_implementation` fallback (e.g.
+///      `bindings.effective_model_controller` for text-generation, or the
+///      agent-profile voice provider policy for voice capabilities) — a last
+///      resort *below* the ladder for agents with no ladder configured.
+///   7. `fallback_role` (`DEFAULT_TEXT_MODEL_ROLE` for text turns) — the very
+///      last resort when nothing else is configured.
+///
+/// Routing drill 2026-07-09: steps 3 and 6 used to sit *above* the ladder
+/// unconditionally. In production, aiua's `compose_component_route_assembly`
+/// always populates a `text.generate` execution route (`declared_component_
+/// capabilities` unconditionally includes it), defaulting to plain "model"
+/// (gemini) via `default_component_role` when nothing is explicitly pinned —
+/// so step 3 silently outranked every agent's ladder for the *primary*
+/// dispatch, and a stale legacy `effective_model_controller` (step 6) did
+/// too. Both are now demoted below the ladder unless they represent genuine
+/// explicit routing intent, so a role's `fallback_tiers[0]` (Layer 1's
+/// per-agent model binding surface) is actually authoritative.
 fn resolve_model_execution_target(
     state: Option<&SessionState>,
     capability: &str,
     fallback_role: &str,
 ) -> (String, String, Option<String>) {
-    if let Some(route) = state.and_then(|state| state.resolve_component_execution_route(capability))
+    // Operator pin (`/model <tier>`) wins over everything else for text
+    // generation dispatch — it is the single choke point every initial model
+    // dispatch funnels through, so slotting the pin in here (rather than at
+    // each of the 8+ call sites) is enough to make it actually route, not
+    // just gate fallback in advance_turn_to_next_fallback_tier.
+    if matches!(capability, "text.generate" | "response.generate") {
+        if let Some(pinned) = state.and_then(|state| state.pinned_tier_role.as_deref()) {
+            return (local_node_id(), pinned.to_string(), None);
+        }
+
+        // Sticky fallback (Slice 2): a session degraded by a prior escalation
+        // stays on the tier that last worked until the periodic origin-tier
+        // probe (`turn_loop::probe_degraded_sessions`) clears the override —
+        // otherwise every new turn would re-probe a known-bad primary at full
+        // latency/failure cost. Beneath the operator pin, above everything
+        // else (hotel route, component binding, ladder primary).
+        if let Some(active) = state
+            .and_then(|state| state.fallback_override.as_ref())
+            .map(|ov| ov.active_tier_role.clone())
+        {
+            return (local_node_id(), active, None);
+        }
+    }
+
+    if let Some(target) = pre_ladder_dispatch_target(state, capability, fallback_role) {
+        return target;
+    }
+
+    // The text fallback ladder serves TEXT capabilities only. Media
+    // capabilities (voice.transcribe, image.describe, media.analyze, …) must
+    // fall through: ladder tiers are text controllers (openrouter/ollama/…)
+    // with no media providers, and routing a voice note there yields
+    // "no provider registered for voice.transcribe".
+    if matches!(capability, "text.generate" | "response.generate") {
+        if let Some(role) = ladder_primary_role(state, fallback_role) {
+            return (local_node_id(), role, None);
+        }
+    }
+
+    if let Some(implementation) =
+        state.and_then(|state| state.preferred_component_implementation(capability))
     {
         return (
-            route.target_node.clone(),
-            route.target_role.clone(),
-            route.incarnation_id.clone(),
+            local_node_id(),
+            implementation_to_model_role(implementation),
+            None,
         );
     }
 
-    let target_role = state
-        .and_then(|state| state.preferred_component_implementation(capability))
-        .map(implementation_to_model_role)
-        .unwrap_or_else(|| fallback_role.into());
+    (local_node_id(), fallback_role.into(), None)
+}
 
-    (local_node_id(), target_role, None)
+/// Steps 3–4 of [`resolve_model_execution_target`]'s precedence (operator
+/// pin and sticky fallback override excluded — those are checked separately
+/// by callers that need them). Returns `Some` when a pre-ladder step
+/// resolved a target; `None` means the ladder (step 5, if configured) or the
+/// legacy fallback (step 6) governs. Shared by `resolve_model_execution_target`
+/// and `primary_dispatch_used_ladder` so the two precedence computations can
+/// never drift out of sync (see the off-by-one defect their docs reference).
+fn pre_ladder_dispatch_target(
+    state: Option<&SessionState>,
+    capability: &str,
+    fallback_role: &str,
+) -> Option<(String, String, Option<String>)> {
+    let ladder_governed = fallback_role == DEFAULT_TEXT_MODEL_ROLE;
+
+    if let Some(route) = state.and_then(|state| state.resolve_component_execution_route(capability))
+    {
+        if !ladder_governed || route.target_node != local_node_id() || route.explicit_pin {
+            return Some((
+                route.target_node.clone(),
+                route.target_role.clone(),
+                route.incarnation_id.clone(),
+            ));
+        }
+        // Ladder-governed capability, local target, no explicit pin: this is
+        // the hotel's implicit default (e.g. `default_component_role`) —
+        // fall through so the ladder gets a chance to govern instead.
+    }
+
+    if let Some(role) = state
+        .and_then(|state| state.component_route_for_capability(capability))
+        .and_then(|route| route.implementation.as_deref())
+        .map(implementation_to_model_role)
+    {
+        return Some((local_node_id(), role, None));
+    }
+
+    None
+}
+
+/// The active role's configured fallback ladder (`turn_loop_config.fallback_tiers`),
+/// when the session has a role active with a non-empty custom ladder. `None`
+/// when no role is active, the role has no `turn_loop_config`, or its ladder is
+/// empty (the `DEFAULT_FALLBACK_TIERS` constant governs those cases elsewhere).
+fn role_ladder_tiers(state: Option<&SessionState>) -> Option<&[String]> {
+    state
+        .and_then(|state| state.role_activation.as_ref())
+        .and_then(|ra| ra.turn_loop_config.as_ref())
+        .map(|tlc| tlc.fallback_tiers.as_slice())
+        .filter(|tiers| !tiers.is_empty())
+}
+
+/// Resolves the per-agent model NAME bound to `target_role` (a provider
+/// role such as `"model.openrouter"`) from the active role's
+/// `turn_loop_config.model_bindings` (Layer 1 — see
+/// `TurnLoopConfig::model_bindings`). `None` when no role is active, the
+/// role has no `turn_loop_config`, or the role has no binding for this
+/// specific provider role — callers then leave `ModelRequestPayload.model`
+/// unset, so model-router falls back to the provider's own global default
+/// (`openrouter_default_model`, etc). Called with whichever `target_role`
+/// `resolve_model_execution_target` (or the fallback-tier advance walk)
+/// resolved, so each fallback tier gets its own binding, not just the
+/// primary.
+fn role_model_binding(state: Option<&SessionState>, target_role: &str) -> Option<String> {
+    state
+        .and_then(|state| state.role_activation.as_ref())
+        .and_then(|ra| ra.turn_loop_config.as_ref())
+        .and_then(|tlc| tlc.model_bindings.get(target_role))
+        .cloned()
+}
+
+/// `role_ladder_tiers(state)[0]`, gated to text-generation dispatch. The
+/// ladder is a text-model routing construct (`"model"`, `"model.openrouter"`,
+/// ...); non-text capabilities (voice synthesis, media analysis, ...) pass a
+/// different `fallback_role` and never consult it.
+fn ladder_primary_role(state: Option<&SessionState>, fallback_role: &str) -> Option<String> {
+    if fallback_role != DEFAULT_TEXT_MODEL_ROLE {
+        return None;
+    }
+    role_ladder_tiers(state).and_then(|tiers| tiers.first().cloned())
+}
+
+/// True when, given the current session state, the *primary* dispatch for
+/// text generation would resolve to the role ladder's `tiers[0]` (per
+/// [`resolve_model_execution_target`]'s precedence) rather than an explicit
+/// hotel route or component binding. Lets
+/// [`turn_loop::advance_turn_to_next_fallback_tier`] tell whether ladder tier
+/// 0 was already attempted as the primary dispatch (skip it) or never
+/// attempted (try it before advancing further) — see DEF: off-by-one on
+/// single-tier ladders.
+fn primary_dispatch_used_ladder(state: Option<&SessionState>, capability: &str) -> bool {
+    // Media capabilities never dispatch via the ladder (see the gating in
+    // resolve_model_execution_target) — keep the two computations in sync.
+    if !matches!(capability, "text.generate" | "response.generate") {
+        return false;
+    }
+    if pre_ladder_dispatch_target(state, capability, DEFAULT_TEXT_MODEL_ROLE).is_some() {
+        return false;
+    }
+    role_ladder_tiers(state).is_some()
 }
 
 /// Returns `(action, effective_capability)` for model dispatch.
@@ -1842,6 +1572,11 @@ struct CachedRoleConfig {
     iteration_cap: Option<u32>,
     approval_policy: Option<String>,
     turn_loop_config: ansible_mesh_core::graph::TurnLoopConfig,
+    /// Content-filtering posture for this role — `"unrestricted"` | `"standard"`
+    /// | `"strict"`. Defaults to `"standard"` (current behavior) so caches built
+    /// before this field existed, or roles that never set it, behave exactly as
+    /// before.
+    content_policy: String,
 }
 
 pub struct AgentRuntime {
@@ -1855,9 +1590,20 @@ pub struct AgentRuntime {
     muninn_available: bool,
     /// Role configurations registered via `role.configure`, keyed by role_name.
     configured_roles: HashMap<String, CachedRoleConfig>,
+    /// Cached OpenRouter catalog snapshot for `/model` display: the set of
+    /// model ids whose endpoints accept tool calls, plus the set of all known
+    /// ids (absent-from-catalog models stay unannotated). Refreshed lazily
+    /// when older than [`OPENROUTER_CATALOG_TTL`]; `None` until first fetch or
+    /// when the last fetch failed (annotation is best-effort — dispatch-time
+    /// tools handling lives in model-router, not here).
+    openrouter_tools_catalog: Option<OpenRouterToolsCatalog>,
     /// Agent profile (identity_text, soul_text, etc.) fetched from hotel at startup.
     /// Applied to every new session so the correct persona is used from the first turn.
     default_agent_profile: AgentProfile,
+    /// Projected upstream MCP tools (`mcp:<upstream>.<tool>`) this agent owns
+    /// or is granted, cached from `GetMcpUpstreams`. Copied into each session's
+    /// bindings so the tool assembly projects them (proposal mcp-client-fabric).
+    mcp_upstream_tools: Vec<crate::session::McpUpstreamToolBinding>,
     /// Tasks dequeued from a session's pending_user_tasks after a turn completed.
     /// Dispatched at the top of the main event loop to avoid async recursion.
     pending_drains: std::collections::VecDeque<(Uuid, InboundTaskPayload)>,
@@ -1883,9 +1629,346 @@ pub struct AgentRuntime {
     /// paracrine whispers so the specialist's response routes back to this role instance
     /// rather than to the membrane seat that initiated the user turn.
     role_name: Option<String>,
+    /// Per-session recent role-switch timestamps (epoch millis). Used to throttle a
+    /// burst of `/role`/`/back` commands (e.g. a membrane redelivery storm) so a
+    /// rapid switch storm cannot drive an endless role-handoff ping-pong.
+    role_switch_history: HashMap<String, std::collections::VecDeque<i64>>,
+    /// Dedup + budget ledger for the LifeGraph auto-capture lane (Slice E2).
+    /// Live-only (never checkpointed), mirroring the prefetch-dispatched flag.
+    life_capture_ledger: LifeCaptureLedger,
+    /// Correlation id of an in-flight origin-tier probe per session (Slice 2
+    /// fallback-override auto-recovery — see `turn_loop::probe_degraded_sessions`).
+    /// Bounds "at most one probe in flight per session": a session_id present
+    /// here has an outstanding probe and is skipped by the next eligible tick.
+    /// Live-only — never checkpointed. A probe lost across a restart is not a
+    /// correctness issue: the next eligible tick simply sends a fresh one.
+    pending_fallback_probes: HashMap<String, String>,
+    /// Per-session sentence-pipelined TTS state for operator-chat voice turns.
+    /// Live-only (never checkpointed): armed at turn start when the transport
+    /// is `operator_chat` and the voice policy allows streaming, dropped when
+    /// the turn completes/fails/evicts. See `voice_stream.rs`.
+    voice_chunk_pipelines: HashMap<String, VoiceChunkPipeline>,
 }
 
+/// One model row from the hotel's compact catalog (config node
+/// `model_catalog.openrouter`, written by aiua's model-catalog-sync job) or
+/// from the direct-OpenRouter fallback fetch. Backs both the `/models`
+/// drill-down and the `/model` tool badges.
+#[derive(Debug, Clone)]
+struct CatalogModelEntry {
+    id: String,
+    name: Option<String>,
+    tools: Option<bool>,
+    ctx: Option<u32>,
+}
+
+/// OpenRouter catalog snapshot. See the field docs on
+/// `AgentRuntime::openrouter_tools_catalog`.
+struct OpenRouterToolsCatalog {
+    fetched_at: std::time::Instant,
+    entries: Vec<CatalogModelEntry>,
+}
+
+impl OpenRouterToolsCatalog {
+    /// `Some(bool)` when the catalog lists the model AND reports its tool
+    /// capability; `None` for unknown models or unreported capability.
+    fn supports_tools(&self, model_id: &str) -> Option<bool> {
+        self.entries
+            .iter()
+            .find(|e| e.id == model_id)
+            .and_then(|e| e.tools)
+    }
+}
+
+/// Refresh cadence for the `/model` tool-capability annotation catalog.
+const OPENROUTER_CATALOG_TTL: Duration = Duration::from_secs(600);
+/// Buttons per drill-down page in `/models` (Telegram keyboards stay usable
+/// around this size; more matches get a "refine the search" hint instead).
+const MODELS_PAGE_SIZE: usize = 10;
+/// Telegram rejects `callback_data` over 64 bytes — a model whose `/model
+/// <id>` callback would exceed that is listed as text instead of a button.
+const TELEGRAM_CALLBACK_LIMIT: usize = 64;
+
 impl AgentRuntime {
+    /// Live merged `/model` preset list: the hotel config key `model_presets`
+    /// (JSON array of `{alias, label, tier, model, description}`) merged over
+    /// the compiled-in defaults. Config edits apply on the next `/model` —
+    /// no restart, no redeploy.
+    async fn load_model_presets(&mut self) -> Vec<crate::commands::ResolvedModelPreset> {
+        let config_json = match self
+            .ipc_client
+            .send_request_with_timeout(
+                IpcRequest::GetConfig {
+                    key: "model_presets".into(),
+                },
+                Duration::from_secs(5),
+            )
+            .await
+        {
+            Ok(IpcResponse::ConfigData { value_json, .. }) => value_json,
+            _ => None,
+        };
+        crate::commands::merge_config_model_presets(config_json.as_deref())
+    }
+
+    /// Best-effort tool-capability lookup for `/model` display. `Some(bool)`
+    /// when the catalog knows the model; `None` when the catalog is
+    /// unreachable or the model isn't listed (annotation is skipped — the
+    /// dispatch-time no-tools handling lives in model-router, not here).
+    async fn openrouter_model_supports_tools(&mut self, model_id: &str) -> Option<bool> {
+        self.ensure_openrouter_catalog().await;
+        self.openrouter_tools_catalog
+            .as_ref()
+            .and_then(|c| c.supports_tools(model_id))
+    }
+
+    /// Refresh the cached catalog if stale. HOTEL-FIRST: reads the compact
+    /// catalog aiua's model-catalog-sync job persists to the config node
+    /// `model_catalog.openrouter` (one fetch per hotel, mesh-consistent);
+    /// falls back to a direct OpenRouter fetch when the hotel hasn't run
+    /// discovery yet. A failed refresh keeps the previous snapshot.
+    async fn ensure_openrouter_catalog(&mut self) {
+        let stale = self
+            .openrouter_tools_catalog
+            .as_ref()
+            .map(|c| c.fetched_at.elapsed() > OPENROUTER_CATALOG_TTL)
+            .unwrap_or(true);
+        if !stale {
+            return;
+        }
+        let fresh = match self.fetch_hotel_catalog().await {
+            Some(entries) => Some(entries),
+            None => self.fetch_openrouter_catalog_direct().await,
+        };
+        if let Some(entries) = fresh {
+            self.openrouter_tools_catalog = Some(OpenRouterToolsCatalog {
+                fetched_at: std::time::Instant::now(),
+                entries,
+            });
+        }
+    }
+
+    /// Read the hotel's compact model catalog (config node
+    /// `model_catalog.openrouter`): a JSON array of
+    /// `{"id","name"?,"tools"?,"ctx"?,...}` objects.
+    async fn fetch_hotel_catalog(&mut self) -> Option<Vec<CatalogModelEntry>> {
+        let raw = match self
+            .ipc_client
+            .send_request_with_timeout(
+                IpcRequest::GetConfig {
+                    key: "model_catalog.openrouter".into(),
+                },
+                Duration::from_secs(5),
+            )
+            .await
+        {
+            Ok(IpcResponse::ConfigData {
+                value_json: Some(v),
+                ..
+            }) => v,
+            _ => return None,
+        };
+        let rows: Vec<serde_json::Value> = serde_json::from_str(&raw).ok()?;
+        let entries: Vec<CatalogModelEntry> = rows
+            .iter()
+            .filter_map(|row| {
+                Some(CatalogModelEntry {
+                    id: row.get("id")?.as_str()?.to_string(),
+                    name: row.get("name").and_then(|n| n.as_str()).map(str::to_string),
+                    tools: row.get("tools").and_then(|t| t.as_bool()),
+                    ctx: row.get("ctx").and_then(|c| c.as_u64()).map(|c| c as u32),
+                })
+            })
+            .collect();
+        if entries.is_empty() {
+            None
+        } else {
+            Some(entries)
+        }
+    }
+
+    /// Direct OpenRouter fallback for hotels that haven't run catalog
+    /// discovery yet (public endpoint, no key).
+    async fn fetch_openrouter_catalog_direct(&mut self) -> Option<Vec<CatalogModelEntry>> {
+        let base = match self
+            .ipc_client
+            .send_request_with_timeout(
+                IpcRequest::GetConfig {
+                    key: "openrouter_base_url".into(),
+                },
+                Duration::from_secs(3),
+            )
+            .await
+        {
+            Ok(IpcResponse::ConfigData {
+                value_json: Some(v),
+                ..
+            }) => v,
+            _ => "https://openrouter.ai/api".to_string(),
+        };
+        let base = base
+            .trim()
+            .trim_matches('"')
+            .trim_end_matches('/')
+            .trim_end_matches("/v1")
+            .trim_end_matches('/')
+            .to_string();
+        let url = format!("{base}/v1/models");
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(4))
+            .build()
+            .ok()?;
+        let body: serde_json::Value = client.get(&url).send().await.ok()?.json().await.ok()?;
+        let entries: Vec<CatalogModelEntry> = body
+            .get("data")
+            .and_then(|d| d.as_array())?
+            .iter()
+            .filter_map(|model| {
+                let id = model.get("id").and_then(|i| i.as_str())?.to_string();
+                let tools = model
+                    .get("supported_parameters")
+                    .and_then(|p| p.as_array())
+                    .map(|params| {
+                        params
+                            .iter()
+                            .filter_map(|p| p.as_str())
+                            .any(|p| p == "tools")
+                    });
+                Some(CatalogModelEntry {
+                    id,
+                    name: model
+                        .get("name")
+                        .and_then(|n| n.as_str())
+                        .map(str::to_string),
+                    tools,
+                    ctx: model
+                        .get("context_length")
+                        .and_then(|c| c.as_u64())
+                        .map(|c| c as u32),
+                })
+            })
+            .collect();
+        if entries.is_empty() {
+            None
+        } else {
+            Some(entries)
+        }
+    }
+
+    /// Build the `/models` drill-down reply: bare → vendor buttons; with a
+    /// query → matching-model buttons whose taps fire `/model <id>`.
+    async fn build_models_browse_reply(
+        &mut self,
+        query: Option<&str>,
+    ) -> (String, Option<serde_json::Value>) {
+        self.ensure_openrouter_catalog().await;
+        let Some(catalog) = self.openrouter_tools_catalog.as_ref() else {
+            return (
+                "Model catalog unavailable — the hotel's discovery job hasn't run yet and \
+                 OpenRouter is unreachable. You can still bind directly: /model <vendor/model>."
+                    .to_string(),
+                None,
+            );
+        };
+
+        let query = query.map(str::trim).filter(|q| !q.is_empty());
+        match query {
+            None => {
+                // Vendor page: group by the id's vendor prefix, largest first.
+                let mut counts: std::collections::BTreeMap<&str, usize> =
+                    std::collections::BTreeMap::new();
+                for entry in &catalog.entries {
+                    let vendor = entry.id.split('/').next().unwrap_or(&entry.id);
+                    *counts.entry(vendor).or_default() += 1;
+                }
+                let mut vendors: Vec<(&str, usize)> = counts.into_iter().collect();
+                vendors.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(b.0)));
+                let shown = vendors.len().min(24);
+                let rows: Vec<Vec<serde_json::Value>> = vendors[..shown]
+                    .chunks(3)
+                    .map(|chunk| {
+                        chunk
+                            .iter()
+                            .map(|(vendor, count)| {
+                                serde_json::json!({
+                                    "text": format!("{vendor} ({count})"),
+                                    "callback_data": format!("/models {vendor}"),
+                                })
+                            })
+                            .collect()
+                    })
+                    .collect();
+                let text = format!(
+                    "🗂 {} models from {} vendors. Tap a vendor to drill down, or search with \
+                     /models <text>.",
+                    catalog.entries.len(),
+                    vendors.len(),
+                );
+                (text, Some(serde_json::json!({ "inline_keyboard": rows })))
+            }
+            Some(q) => {
+                let lowered = q.to_lowercase();
+                let matches: Vec<&CatalogModelEntry> = catalog
+                    .entries
+                    .iter()
+                    .filter(|e| {
+                        let vendor = e.id.split('/').next().unwrap_or("");
+                        vendor.eq_ignore_ascii_case(&lowered)
+                            || e.id.to_lowercase().contains(&lowered)
+                            || e.name
+                                .as_deref()
+                                .map(|n| n.to_lowercase().contains(&lowered))
+                                .unwrap_or(false)
+                    })
+                    .collect();
+                if matches.is_empty() {
+                    return (
+                        format!(
+                            "No catalog models match `{q}`. Try /models for the vendor list, or \
+                             bind directly with /model <vendor/model>."
+                        ),
+                        None,
+                    );
+                }
+                let total = matches.len();
+                let mut rows: Vec<Vec<serde_json::Value>> = Vec::new();
+                for entry in matches.iter().take(MODELS_PAGE_SIZE) {
+                    let callback = format!("/model {}", entry.id);
+                    if callback.len() > TELEGRAM_CALLBACK_LIMIT {
+                        continue;
+                    }
+                    let badge = match entry.tools {
+                        Some(true) => " 🔧",
+                        Some(false) => " 💬",
+                        None => "",
+                    };
+                    let ctx = entry
+                        .ctx
+                        .map(|c| format!(" · {}k", c / 1000))
+                        .unwrap_or_default();
+                    rows.push(vec![serde_json::json!({
+                        "text": format!("{}{}{}", entry.id, badge, ctx),
+                        "callback_data": callback,
+                    })]);
+                }
+                let mut text = format!(
+                    "🎯 {total} match(es) for `{q}` — tap to bind (🔧 tools · 💬 chat-only):"
+                );
+                if total > MODELS_PAGE_SIZE {
+                    text.push_str(&format!(
+                        "\nShowing {MODELS_PAGE_SIZE} — refine with /models <more specific>."
+                    ));
+                }
+                let keyboard = if rows.is_empty() {
+                    None
+                } else {
+                    Some(serde_json::json!({ "inline_keyboard": rows }))
+                };
+                (text, keyboard)
+            }
+        }
+    }
+
     pub fn new(ipc_client: PhiloticClient, agent_id: impl Into<String>) -> Self {
         Self {
             ipc_client,
@@ -1894,13 +1977,19 @@ impl AgentRuntime {
             muninn_config: None,
             muninn_available: true,
             configured_roles: HashMap::new(),
+            openrouter_tools_catalog: None,
             default_agent_profile: AgentProfile::default(),
+            mcp_upstream_tools: Vec::new(),
             pending_drains: std::collections::VecDeque::new(),
             stuck_turn_first_seen: HashMap::new(),
             stuck_turn_signature: HashMap::new(),
             total_active_since: HashMap::new(),
+            role_switch_history: HashMap::new(),
             network_offline: false,
             role_name: None,
+            life_capture_ledger: LifeCaptureLedger::default(),
+            pending_fallback_probes: HashMap::new(),
+            voice_chunk_pipelines: HashMap::new(),
         }
     }
 
@@ -1908,20 +1997,36 @@ impl AgentRuntime {
         self.role_name = Some(rn.into());
     }
 
+    /// This philote's own registered guest identity — the value stamped as
+    /// `reply_guest_id` on every model/tool/life dispatch so the hotel delivers
+    /// the response back to the subscription owned by THIS runtime (the one
+    /// holding the active turn).
+    ///
+    /// For a role-incarnation philote (a separate process running as
+    /// `{agent_id}:{role_name}`, e.g. a whisper specialist) this is its own
+    /// incarnation id, so the reply returns to THIS process — which subscribes
+    /// to role `agent` under that incarnation guest id. For the base philote it
+    /// is the bare `agent_id`, matching its own registration. Without stamping
+    /// it, `ReturnRoute::from_task` falls back to the bare `agent_id` and a role
+    /// specialist's reply is addressed to the base agent — the wrong process —
+    /// hanging the specialist's turn (DEF-051).
+    pub(super) fn own_guest_id(&self) -> String {
+        compose_guest_identity(&self.agent_id, self.role_name.as_deref())
+    }
+
     /// Fetch this agent's identity bundle from the hotel and store it as the default profile.
     /// Applied to every new session so the correct persona is used from the first message.
     async fn fetch_agent_profile(&mut self) {
         let key = format!("__agent_bundle__:{}", self.agent_id);
-        match tokio::time::timeout(
-            Duration::from_secs(5),
-            self.ipc_client.send_request(IpcRequest::GetConfig { key }),
-        )
-        .await
+        match self
+            .ipc_client
+            .send_request_with_timeout(IpcRequest::GetConfig { key }, Duration::from_secs(5))
+            .await
         {
-            Ok(Ok(IpcResponse::ConfigData {
+            Ok(IpcResponse::ConfigData {
                 value_json: Some(json),
                 ..
-            })) => match serde_json::from_str::<AgentProfile>(&json) {
+            }) => match serde_json::from_str::<AgentProfile>(&json) {
                 Ok(mut profile) => {
                     info!(agent_id = %self.agent_id, "Agent profile loaded from hotel.");
                     profile.voice_response_policy.seed_voice_ids();
@@ -1929,12 +2034,12 @@ impl AgentRuntime {
                 }
                 Err(e) => warn!("Failed to parse agent profile bundle: {}", e),
             },
-            Ok(Ok(IpcResponse::ConfigData {
+            Ok(IpcResponse::ConfigData {
                 value_json: None, ..
-            })) => {
+            }) => {
                 info!(agent_id = %self.agent_id, "No agent identity bundle found in hotel — using default profile.");
             }
-            Ok(Ok(_)) | Ok(Err(_)) => {
+            Ok(_) => {
                 warn!("Unexpected response to agent bundle fetch — using default profile.");
             }
             Err(_) => {
@@ -1945,15 +2050,17 @@ impl AgentRuntime {
         // Fetch hotel-level user profile and inject into agent profile when the
         // agent-specific profile doesn't already override the field.
         if let Some(hotel_name) = local_hotel_name() {
-            match tokio::time::timeout(
-                Duration::from_secs(5),
-                self.ipc_client.send_request(IpcRequest::GetUserProfile {
-                    hotel_name: hotel_name.clone(),
-                }),
-            )
-            .await
+            match self
+                .ipc_client
+                .send_request_with_timeout(
+                    IpcRequest::GetUserProfile {
+                        hotel_name: hotel_name.clone(),
+                    },
+                    Duration::from_secs(5),
+                )
+                .await
             {
-                Ok(Ok(IpcResponse::UserProfileData(p))) => {
+                Ok(IpcResponse::UserProfileData(p)) => {
                     if self.default_agent_profile.user_timezone.is_none() {
                         if let Some(tz) = p.timezone.clone() {
                             info!(hotel = %hotel_name, tz = %tz, "Injecting user timezone from hotel user profile.");
@@ -1980,7 +2087,7 @@ impl AgentRuntime {
                         }
                     }
                 }
-                Ok(Ok(_)) | Ok(Err(_)) => {
+                Ok(_) => {
                     // Non-fatal — hotel may not have a user profile configured yet.
                 }
                 Err(_) => {
@@ -1992,116 +2099,38 @@ impl AgentRuntime {
         // Apply operator-persisted policy overrides from hotel config keys.
         // These take precedence over the bundle so /voice and agent.configure persist
         // correctly across restarts without requiring a bundle rebuild.
-        if let Ok(Ok(IpcResponse::ConfigData {
+        if let Ok(IpcResponse::ConfigData {
             value_json: Some(ref json),
             ..
-        })) = tokio::time::timeout(
-            Duration::from_secs(5),
-            self.ipc_client.send_request(IpcRequest::GetConfig {
-                key: "config:voice_response_policy".into(),
-            }),
-        )
-        .await
+        }) = self
+            .ipc_client
+            .send_request_with_timeout(
+                IpcRequest::GetConfig {
+                    key: "config:voice_response_policy".into(),
+                },
+                Duration::from_secs(5),
+            )
+            .await
         {
             if let Ok(policy) = serde_json::from_str::<VoiceResponsePolicy>(json) {
                 self.default_agent_profile.voice_response_policy = policy;
             }
         }
-        if let Ok(Ok(IpcResponse::ConfigData {
+        if let Ok(IpcResponse::ConfigData {
             value_json: Some(ref json),
             ..
-        })) = tokio::time::timeout(
-            Duration::from_secs(5),
-            self.ipc_client.send_request(IpcRequest::GetConfig {
-                key: "config:media_routing_policy".into(),
-            }),
-        )
-        .await
+        }) = self
+            .ipc_client
+            .send_request_with_timeout(
+                IpcRequest::GetConfig {
+                    key: "config:media_routing_policy".into(),
+                },
+                Duration::from_secs(5),
+            )
+            .await
         {
             if let Ok(policy) = serde_json::from_str::<MediaRoutingPolicy>(json) {
                 self.default_agent_profile.media_routing_policy = policy;
-            }
-        }
-    }
-
-    /// Fetch a role incarnation from the hotel and return a `RoleActivation` for it.
-    /// Used by `ensure_session_loaded` to auto-activate the agent's default role.
-    async fn fetch_role_activation(
-        &mut self,
-        role_name: &str,
-    ) -> Option<crate::session::RoleActivation> {
-        match tokio::time::timeout(
-            Duration::from_secs(5),
-            self.ipc_client
-                .send_request(IpcRequest::ListRoleIncarnations {
-                    agent_id: self.agent_id.clone(),
-                }),
-        )
-        .await
-        .ok()
-        .and_then(|r| r.ok())
-        .unwrap_or(IpcResponse::Standard {
-            ok: false,
-            code: String::new(),
-            message: String::new(),
-            corr_id: String::new(),
-            data: None,
-        }) {
-            IpcResponse::Standard {
-                ok: true,
-                data: Some(data),
-                ..
-            } => {
-                let roles = data.get("roles").and_then(|v| v.as_array())?;
-                let rec = roles
-                    .iter()
-                    .find(|r| r.get("role_name").and_then(|n| n.as_str()) == Some(role_name))?;
-
-                let toolset_profile = rec
-                    .get("toolset_profile")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("orchestrator")
-                    .to_string();
-                let role_manifest = rec
-                    .get("role_manifest")
-                    .and_then(|v| v.as_str())
-                    .map(str::to_string);
-                let role_addendum = rec
-                    .get("role_identity_addendum")
-                    .and_then(|v| v.as_str())
-                    .map(str::to_string);
-
-                let turn_loop_config = rec.get("turn_loop_config").and_then(|v| {
-                    serde_json::from_value::<ansible_mesh_core::graph::TurnLoopConfig>(v.clone())
-                        .ok()
-                });
-
-                Some(crate::session::RoleActivation {
-                    role_name: role_name.to_string(),
-                    active_incarnation_id: None,
-                    activation_reason: "default_role_auto_activation".into(),
-                    requested_by: None,
-                    role_addendum,
-                    role_manifest,
-                    base_identity_ref: None,
-                    activation_requester_class: Some("default_role".into()),
-                    activation_policy_owner: None,
-                    toolset_profile_ref: Some(toolset_profile),
-                    skillset_profile_ref: None,
-                    effective_skillset: vec![],
-                    effective_skill_guidance: vec![],
-                    working_memory_policy: None,
-                    memory_projection_policy: None,
-                    turn_loop_config,
-                })
-            }
-            _ => {
-                warn!(
-                    agent_id = %self.agent_id,
-                    role = %role_name,
-                    "Failed to fetch role incarnation for default activation."
-                );
-                None
             }
         }
     }
@@ -2110,20 +2139,21 @@ impl AgentRuntime {
     /// on the default agent profile. Called once at startup so every session gets
     /// the authoritative list injected into its system prompt.
     async fn fetch_role_names(&mut self) {
-        let result = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            self.ipc_client
-                .send_request(IpcRequest::ListRoleIncarnations {
+        let result = self
+            .ipc_client
+            .send_request_with_timeout(
+                IpcRequest::ListRoleIncarnations {
                     agent_id: self.agent_id.clone(),
-                }),
-        )
-        .await;
+                },
+                std::time::Duration::from_secs(5),
+            )
+            .await;
         match result {
-            Ok(Ok(IpcResponse::Standard {
+            Ok(IpcResponse::Standard {
                 ok: true,
                 data: Some(data),
                 ..
-            })) => {
+            }) => {
                 if let Some(roles) = data.get("roles").and_then(|v| v.as_array()) {
                     let names: Vec<String> = roles
                         .iter()
@@ -2151,91 +2181,24 @@ impl AgentRuntime {
         }
     }
 
-    /// Fetch MuninnDB config from hotel IPC and store it for session use.
-    async fn fetch_memory_config(&mut self) {
-        // Retry up to 3 times with a 3-second timeout each attempt.
-        // Background: during hotel startup several guests register concurrently. The IPC
-        // response for FetchMemoryConfig can be consumed by a racing guest's send_request
-        // loop before this philote reads it (no per-request correlation ID on this path).
-        // A short timeout + retry window clears that race without hanging indefinitely.
-        for attempt in 1u8..=3 {
-            info!("Requesting MuninnDB config from hotel (attempt {attempt})...");
-            let result = tokio::time::timeout(
-                std::time::Duration::from_secs(3),
-                self.ipc_client.send_request(IpcRequest::FetchMemoryConfig),
-            )
-            .await;
-            match result {
-                Ok(Ok(IpcResponse::MemoryConfig(config))) if config.config_json.is_some() => {
-                    let json = config.config_json.expect("checked is_some");
-                    match serde_json::from_str::<MuninnConfig>(&json) {
-                        Ok(cfg) => {
-                            info!(endpoint = %cfg.base_url, vaults = cfg.vault_tokens.len(), "MuninnDB config loaded");
-                            self.muninn_config = Some(cfg);
-                        }
-                        Err(e) => warn!("Failed to parse MuninnConfig from hotel: {}", e),
-                    }
-                    return;
-                }
-                Ok(Ok(IpcResponse::MemoryConfig(config))) if config.config_json.is_none() => {
-                    info!("Hotel has no MuninnDB config — running without memory");
-                    return;
-                }
-                Ok(Ok(_)) | Ok(Err(_)) => {
-                    warn!(
-                        "Unexpected response to FetchMemoryConfig (attempt {attempt}) — retrying"
-                    );
-                }
-                Err(_) => {
-                    warn!(
-                        "FetchMemoryConfig timed out (attempt {attempt}) — response likely consumed by concurrent guest registration; retrying"
-                    );
-                }
-            }
-        }
-        warn!("FetchMemoryConfig failed after 3 attempts — running without memory");
-    }
-
-    /// Build a `MuninnRestEngine` scoped to the given agent and user.
-    /// Returns `None` if MuninnDB is not configured or the hotel has reported it unreachable.
-    fn memory_engine_for(&self, agent_id: &str, user_id: &str) -> Option<MuninnRestEngine> {
-        if !self.muninn_available {
-            return None;
-        }
-        self.muninn_config.clone().map(|cfg| {
-            MuninnRestEngine::new(
-                cfg,
-                VaultResolver {
-                    agent_id: agent_id.to_string(),
-                    user_id: user_id.to_string(),
-                },
-            )
-        })
-    }
-
-    /// Build `McpRouteRecord`s from the agent's effective toolset.
+    /// Fetch operator-stored MCP route overrides (key `__mcp_routes__:<agent_id>`).
     ///
-    /// Operator-stored overrides (key `__mcp_routes__:<agent_id>`) take precedence.
-    /// When no overrides are stored, every tool in `default_toolset` that has a real
-    /// catalog entry is projected as a self-targeting `Philote` route. Tools with no
-    /// catalog entry are skipped — they are model-internal only.
-    async fn mcp_routes_from_profile(
+    /// These represent an explicit operator provisioning decision, so they publish
+    /// regardless of the `mcp_auto_publish` gate.
+    async fn operator_mcp_route_overrides(
         &mut self,
-    ) -> Vec<ansible_mesh_core::mcp_route::McpRouteRecord> {
-        use ansible_mesh_core::mcp_route::{
-            McpAuthScheme, McpRouteRecord, McpRouteSecurity, McpRouteTarget,
-        };
+    ) -> Option<Vec<ansible_mesh_core::mcp_route::McpRouteRecord>> {
+        use ansible_mesh_core::mcp_route::McpRouteRecord;
 
-        // Operator override takes precedence.
         let key = format!("__mcp_routes__:{}", self.agent_id);
-        let mcp_override = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            self.ipc_client
-                .send_request(IpcRequest::GetConfig { key: key.clone() }),
-        )
-        .await
-        .ok()
-        .and_then(|r| r.ok());
+        let mcp_override = self
+            .ipc_client
+            .send_request_with_timeout(
+                IpcRequest::GetConfig { key: key.clone() },
+                std::time::Duration::from_secs(5),
+            )
+            .await
+            .ok();
         if let Some(IpcResponse::ConfigData {
             value_json: Some(json),
             ..
@@ -2244,7 +2207,7 @@ impl AgentRuntime {
             match serde_json::from_str::<Vec<McpRouteRecord>>(&json) {
                 Ok(r) if !r.is_empty() => {
                     info!(agent_id = %self.agent_id, count = r.len(), "Using operator-stored MCP route overrides.");
-                    return r;
+                    return Some(r);
                 }
                 Ok(_) => {}
                 Err(e) => {
@@ -2252,8 +2215,21 @@ impl AgentRuntime {
                 }
             }
         }
+        None
+    }
 
-        // Derive from default_toolset — catalog entries only.
+    /// Build `McpRouteRecord`s from the agent's effective toolset.
+    ///
+    /// Every tool in `default_toolset` that has a real catalog entry is projected
+    /// as a self-targeting `Philote` route. Tools with no catalog entry are
+    /// skipped — they are model-internal only. All derived routes are published
+    /// with `require_approval` forced on: startup publication is a convenience,
+    /// not an authorization event.
+    fn derived_mcp_routes(&self) -> Vec<ansible_mesh_core::mcp_route::McpRouteRecord> {
+        use ansible_mesh_core::mcp_route::{
+            McpAuthScheme, McpRouteRecord, McpRouteSecurity, McpRouteTarget,
+        };
+
         let catalog = crate::catalog::tool_catalog();
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -2277,7 +2253,7 @@ impl AgentRuntime {
                     security: McpRouteSecurity {
                         auth: McpAuthScheme::None,
                         global_allotment: None,
-                        require_approval: crate::catalog::tool_requires_approval(tool_name),
+                        require_approval: true,
                     },
                     updated_at: now,
                 })
@@ -2285,35 +2261,81 @@ impl AgentRuntime {
             .collect()
     }
 
-    /// At startup, derive `McpRouteRecord`s from the agent profile and push them to
-    /// the hotel so the `membrane-mcp` guest advertises this philote's tools
-    /// immediately after restart. Operator-stored overrides take precedence over
-    /// the profile-derived set.
+    /// At startup, publish this philote's MCP routes to the hotel.
+    ///
+    /// Publication policy (MCP membrane hardening, S2):
+    /// - Operator-stored overrides always publish — they are an explicit decision.
+    /// - Toolset-derived routes publish only when the agent profile opts in via
+    ///   `mcp_auto_publish`; they carry `require_approval = true`.
+    /// - With the gate off, any previously auto-published route set is revoked
+    ///   so stale publications from earlier releases do not stay live.
     async fn register_mcp_routes(&mut self) {
-        let routes = self.mcp_routes_from_profile().await;
-        if routes.is_empty() {
+        if let Some(routes) = self.operator_mcp_route_overrides().await {
+            self.push_mcp_routes(routes).await;
+            return;
+        }
+
+        let derived = self.derived_mcp_routes();
+        if !self.default_agent_profile.mcp_auto_publish {
+            if !derived.is_empty() {
+                warn!(
+                    agent_id = %self.agent_id,
+                    suppressed = derived.len(),
+                    "MCP startup auto-publication is opt-in and OFF for this agent — \
+                     publishing nothing and revoking any previously auto-published routes. \
+                     Set `mcp_auto_publish: true` on the agent profile to re-enable."
+                );
+            }
+            // Fail-closed cleanup: remove any route set a previous release
+            // auto-published for this agent.
+            let result = self
+                .ipc_client
+                .send_request_with_timeout(
+                    IpcRequest::RevokeMcpRoutes {
+                        agent_id: self.agent_id.clone(),
+                    },
+                    std::time::Duration::from_secs(5),
+                )
+                .await;
+            if let Err(e) = result {
+                if is_ipc_timeout(&e) {
+                    warn!(agent_id = %self.agent_id, "MCP route revoke timed out (startup race) — continuing");
+                } else {
+                    warn!(agent_id = %self.agent_id, err = %e, "Failed to revoke stale MCP routes");
+                }
+            }
+            return;
+        }
+
+        if derived.is_empty() {
             info!(agent_id = %self.agent_id, "No MCP routes to register (empty default_toolset or no catalog matches).");
             return;
         }
+        self.push_mcp_routes(derived).await;
+    }
+
+    async fn push_mcp_routes(&mut self, routes: Vec<ansible_mesh_core::mcp_route::McpRouteRecord>) {
         let count = routes.len();
-        let result = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            self.ipc_client.send_request(IpcRequest::UpdateMcpRoutes {
-                agent_id: self.agent_id.clone(),
-                routes,
-                vault_ref: None,
-            }),
-        )
-        .await;
+        let result = self
+            .ipc_client
+            .send_request_with_timeout(
+                IpcRequest::UpdateMcpRoutes {
+                    agent_id: self.agent_id.clone(),
+                    routes,
+                    vault_ref: None,
+                },
+                std::time::Duration::from_secs(5),
+            )
+            .await;
         match result {
-            Ok(Ok(_)) => {
+            Ok(_) => {
                 info!(agent_id = %self.agent_id, count, "MCP routes registered with hotel.")
             }
-            Ok(Err(e)) => {
-                warn!(agent_id = %self.agent_id, err = %e, "Failed to register MCP routes")
-            }
-            Err(_) => {
+            Err(e) if is_ipc_timeout(&e) => {
                 warn!(agent_id = %self.agent_id, "MCP route registration timed out (startup race) — continuing")
+            }
+            Err(e) => {
+                warn!(agent_id = %self.agent_id, err = %e, "Failed to register MCP routes")
             }
         }
     }
@@ -2323,17 +2345,18 @@ impl AgentRuntime {
     /// sessions are not blocked before the first inbound message arrives.
     async fn sweep_stale_session_turns(&mut self) {
         let list_key = format!("__session_apartments__:{}", self.agent_id);
-        let memory_types: Vec<String> = match tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            self.ipc_client
-                .send_request(IpcRequest::GetConfig { key: list_key }),
-        )
-        .await
+        let memory_types: Vec<String> = match self
+            .ipc_client
+            .send_request_with_timeout(
+                IpcRequest::GetConfig { key: list_key },
+                std::time::Duration::from_secs(5),
+            )
+            .await
         {
-            Ok(Ok(IpcResponse::ConfigData {
+            Ok(IpcResponse::ConfigData {
                 value_json: Some(json),
                 ..
-            })) => serde_json::from_str::<Vec<String>>(&json).unwrap_or_default(),
+            }) => serde_json::from_str::<Vec<String>>(&json).unwrap_or_default(),
             Err(_) => {
                 warn!("sweep_stale_session_turns: apartment list fetch timed out — skipping sweep");
                 return;
@@ -2360,17 +2383,18 @@ impl AgentRuntime {
                 continue;
             };
             let snapshot_key = format!("__session_snapshot__:{session_id}");
-            let checkpoint = match tokio::time::timeout(
-                std::time::Duration::from_secs(5),
-                self.ipc_client
-                    .send_request(IpcRequest::GetConfig { key: snapshot_key }),
-            )
-            .await
+            let checkpoint = match self
+                .ipc_client
+                .send_request_with_timeout(
+                    IpcRequest::GetConfig { key: snapshot_key },
+                    std::time::Duration::from_secs(5),
+                )
+                .await
             {
-                Ok(Ok(IpcResponse::ConfigData {
+                Ok(IpcResponse::ConfigData {
                     value_json: Some(json),
                     ..
-                })) => match serde_json::from_str::<serde_json::Value>(&json) {
+                }) => match serde_json::from_str::<serde_json::Value>(&json) {
                     Ok(v) => v,
                     Err(_) => continue,
                 },
@@ -2391,13 +2415,16 @@ impl AgentRuntime {
                 continue;
             }
 
-            let Some(state) = SessionState::from_checkpoint(&checkpoint) else {
+            let Some(mut state) = SessionState::from_checkpoint(&checkpoint) else {
                 continue;
             };
 
             if state.active_turn.is_some() {
-                // Phase is resumable — leave it alone.
-                continue;
+                // from_checkpoint keeps WaitingTool turns as "resumable", but after a
+                // process restart the tool runner connection is gone — the response will
+                // never arrive. Evict the turn now so the checkpoint gets cleaned below
+                // instead of leaving this session outside eviction coverage forever.
+                state.active_turn = None;
             }
 
             let stale_phase = checkpoint
@@ -2424,338 +2451,6 @@ impl AgentRuntime {
         }
     }
 
-    /// Scan all active sessions and evict any turn stuck in a waiting phase past its
-    /// deadline. Deadlines:
-    ///   WaitingModel  — 120 s  (accounts for slow/retriable model calls)
-    ///   WaitingTool   — 90 s   (tool runners should be fast)
-    ///   WaitingVoice  — 60 s   (ElevenLabs is normally < 10 s)
-    ///
-    /// Uses `stuck_turn_first_seen` to track when a waiting-phase turn was first
-    /// observed. This map is reconciled each tick — entries are added on first
-    /// observation and cleared when the session leaves the waiting phase or has no
-    /// active turn. This approach works regardless of which code path set the phase.
-    ///
-    /// On eviction: clear the active turn, persist a clean checkpoint, and send the
-    /// user a brief notice so they know the session is unblocked.
-    async fn evict_timed_out_turns(&mut self) {
-        const WAITING_MODEL_SECS: u64 = 300;
-        const THINKING_SECS: u64 = 90; // post-model, dispatching actions or building reply
-        const WAITING_TOOL_SECS: u64 = 90;
-        const WAITING_VOICE_SECS: u64 = 60;
-        const WAITING_APPROVAL_SECS: u64 = 300; // 5 min — operator may be slow
-        // Hard ceiling: any active turn alive longer than this in ANY phase gets
-        // evicted. Prevents InProgress or unknown-phase turns from sticking forever.
-        const MAX_TOTAL_ACTIVE_SECS: u64 = 600; // 10 min overall budget
-
-        let now = std::time::Instant::now();
-
-        // Step 0: maintain total_active_since — track ALL sessions with an active
-        // turn, regardless of phase, so InProgress turns are also bounded.
-        let all_session_ids: Vec<String> = self.sessions.keys().cloned().collect();
-        for sid in &all_session_ids {
-            if self
-                .sessions
-                .get(sid)
-                .map(|s| s.active_turn.is_some())
-                .unwrap_or(false)
-            {
-                self.total_active_since.entry(sid.clone()).or_insert(now);
-            } else {
-                self.total_active_since.remove(sid);
-            }
-        }
-        self.total_active_since
-            .retain(|id, _| self.sessions.contains_key(id));
-
-        // Step 1: reconcile stuck_turn_first_seen against current session state.
-        // Add sessions newly in a waiting phase; reset when the exact wait signature changes.
-        // Parked approval turns count as waiting (they live in parked_approval_turn, not active_turn).
-        let session_ids: Vec<String> = self.sessions.keys().cloned().collect();
-        for session_id in &session_ids {
-            let wait_signature = self.sessions.get(session_id).and_then(|s| {
-                if let Some(turn) = s.active_turn.as_ref() {
-                    if matches!(
-                        turn.phase,
-                        TurnPhase::WaitingModel
-                            | TurnPhase::Thinking
-                            | TurnPhase::WaitingTool
-                            | TurnPhase::WaitingVoice
-                    ) {
-                        let pending_tool = turn
-                            .pending_tool_call
-                            .as_ref()
-                            .map(|tool| tool.tool_name.as_str())
-                            .unwrap_or("-");
-                        return Some(format!(
-                            "active:{}:{:?}:{}:{}",
-                            turn.turn_id, turn.phase, turn.iteration, pending_tool
-                        ));
-                    }
-                }
-                if let Some(turn) = s.parked_approval_turn.as_ref() {
-                    return Some(format!("parked_approval:{}", turn.turn_id));
-                }
-                if let Some(turn) = s.parked_plan_turn.as_ref() {
-                    return Some(format!("parked_plan:{}", turn.turn_id));
-                }
-                None
-            });
-
-            if let Some(signature) = wait_signature {
-                let signature_changed = self
-                    .stuck_turn_signature
-                    .get(session_id)
-                    .map(|current| current != &signature)
-                    .unwrap_or(true);
-                if signature_changed {
-                    self.stuck_turn_first_seen.insert(session_id.clone(), now);
-                    self.stuck_turn_signature
-                        .insert(session_id.clone(), signature);
-                } else {
-                    self.stuck_turn_first_seen
-                        .entry(session_id.clone())
-                        .or_insert(now);
-                }
-            } else {
-                self.stuck_turn_first_seen.remove(session_id);
-                self.stuck_turn_signature.remove(session_id);
-            }
-        }
-        // Also remove entries for sessions that no longer exist.
-        self.stuck_turn_first_seen
-            .retain(|id, _| self.sessions.contains_key(id));
-        self.stuck_turn_signature
-            .retain(|id, _| self.sessions.contains_key(id));
-
-        // Step 2: collect sessions whose waiting turn has exceeded the deadline.
-        // Parked approval turns (in parked_approval_turn) use WAITING_APPROVAL_SECS.
-        let timed_out: Vec<(
-            String,
-            uuid::Uuid,
-            String,
-            String,
-            String,
-            Option<String>,
-            String,
-            String,
-            u64,
-        )> = self
-            .sessions
-            .iter()
-            .filter_map(|(session_id, state)| {
-                let first_seen = *self.stuck_turn_first_seen.get(session_id)?;
-                let elapsed = first_seen.elapsed().as_secs();
-                // Parked approval turn: check it first, since active_turn is None when parked.
-                if let Some(turn) = state.parked_approval_turn.as_ref() {
-                    if elapsed >= WAITING_APPROVAL_SECS {
-                        return Some((
-                            session_id.clone(),
-                            turn.task_id,
-                            turn.turn_id.clone(),
-                            turn.final_reply_to.clone(),
-                            turn.final_reply_role.clone(),
-                            turn.final_reply_guest_id.clone(),
-                            turn.chat_id.clone(),
-                            "WaitingApproval(parked)".into(),
-                            elapsed,
-                        ));
-                    }
-                    return None;
-                }
-                // Parked plan turn: same timeout budget as approval — operator may be slow.
-                if let Some(turn) = state.parked_plan_turn.as_ref() {
-                    if elapsed >= WAITING_APPROVAL_SECS {
-                        return Some((
-                            session_id.clone(),
-                            turn.task_id,
-                            turn.turn_id.clone(),
-                            turn.final_reply_to.clone(),
-                            turn.final_reply_role.clone(),
-                            turn.final_reply_guest_id.clone(),
-                            turn.chat_id.clone(),
-                            "PlanningDiscussion(parked)".into(),
-                            elapsed,
-                        ));
-                    }
-                    return None;
-                }
-                let turn = state.active_turn.as_ref()?;
-                let limit = match turn.phase {
-                    TurnPhase::WaitingModel => WAITING_MODEL_SECS,
-                    TurnPhase::Thinking => THINKING_SECS,
-                    TurnPhase::WaitingTool
-                        if turn
-                            .pending_tool_call
-                            .as_ref()
-                            .map(|tool| tool.tool_name == "delegate.whisper")
-                            .unwrap_or(false) =>
-                    {
-                        WAITING_APPROVAL_SECS
-                    }
-                    TurnPhase::WaitingTool => WAITING_TOOL_SECS,
-                    TurnPhase::WaitingVoice => WAITING_VOICE_SECS,
-                    _ => return None,
-                };
-                if elapsed < limit {
-                    return None;
-                }
-                Some((
-                    session_id.clone(),
-                    turn.task_id,
-                    turn.turn_id.clone(),
-                    turn.final_reply_to.clone(),
-                    turn.final_reply_role.clone(),
-                    turn.final_reply_guest_id.clone(),
-                    turn.chat_id.clone(),
-                    format!("{:?}", turn.phase),
-                    elapsed,
-                ))
-            })
-            .collect();
-
-        // Step 2b: catch-all — any active turn alive longer than MAX_TOTAL_ACTIVE_SECS
-        // in any phase (including InProgress) that wasn't already caught above.
-        let already_caught: std::collections::HashSet<String> =
-            timed_out.iter().map(|(id, ..)| id.clone()).collect();
-        let catch_all: Vec<(
-            String,
-            uuid::Uuid,
-            String,
-            String,
-            String,
-            Option<String>,
-            String,
-            String,
-            u64,
-        )> = self
-            .total_active_since
-            .iter()
-            .filter_map(|(session_id, &started)| {
-                if already_caught.contains(session_id) {
-                    return None;
-                }
-                let elapsed = started.elapsed().as_secs();
-                if elapsed < MAX_TOTAL_ACTIVE_SECS {
-                    return None;
-                }
-                let state = self.sessions.get(session_id)?;
-                let turn = state.active_turn.as_ref()?;
-                Some((
-                    session_id.clone(),
-                    turn.task_id,
-                    turn.turn_id.clone(),
-                    turn.final_reply_to.clone(),
-                    turn.final_reply_role.clone(),
-                    turn.final_reply_guest_id.clone(),
-                    turn.chat_id.clone(),
-                    format!("CatchAll({:?})", turn.phase),
-                    elapsed,
-                ))
-            })
-            .collect();
-        let timed_out: Vec<_> = timed_out.into_iter().chain(catch_all).collect();
-
-        // Step 3: evict.
-        for (
-            session_id,
-            task_id,
-            turn_id,
-            reply_to,
-            reply_role,
-            reply_guest_id,
-            chat_id,
-            phase,
-            elapsed_secs,
-        ) in timed_out
-        {
-            let has_pending_tool = self
-                .sessions
-                .get(&session_id)
-                .and_then(|s| s.active_turn.as_ref())
-                .map(|t| t.pending_tool_call.is_some())
-                .unwrap_or(false);
-            warn!(
-                session_id = %session_id,
-                phase = %phase,
-                elapsed_secs = %elapsed_secs,
-                has_pending_tool = %has_pending_tool,
-                "Turn watchdog: evicting stuck turn"
-            );
-
-            self.stuck_turn_first_seen.remove(&session_id);
-            self.stuck_turn_signature.remove(&session_id);
-            self.total_active_since.remove(&session_id);
-
-            if let Some(state) = self.sessions.get_mut(&session_id) {
-                state.active_turn = None;
-                state.parked_approval_turn = None;
-                state.parked_approval_since = None;
-                state.turn_waiting_since = None;
-
-                // Persist clean checkpoint so a restart also starts unblocked.
-                let mem_type = state.checkpoint_memory_type();
-                let clean_checkpoint = state.checkpoint_json();
-                if let Err(e) = self
-                    .ipc_client
-                    .sync_apartment(&self.agent_id, &mem_type, clean_checkpoint)
-                    .await
-                {
-                    warn!("Turn watchdog: failed to persist clean checkpoint: {}", e);
-                }
-            }
-
-            let reason =
-                format!("Turn watchdog evicted stuck turn after {elapsed_secs}s in {phase}.");
-            if let Err(e) = self
-                .ipc_client
-                .send_request(IpcRequest::FailTask {
-                    task_id,
-                    error_code: "TURN_WATCHDOG_TIMEOUT".into(),
-                    reason: reason.clone(),
-                })
-                .await
-            {
-                warn!("Turn watchdog: failed to mark task failed: {}", e);
-            }
-
-            // Notify the user that the session is unblocked.
-            let notify_req = IpcRequest::EmitTask {
-                target_node: reply_to,
-                target_role: reply_role,
-                target_guest_id: reply_guest_id,
-                task_json: serde_json::json!({
-                    "action": "send_reply",
-                    "session_id": session_id,
-                    "turn_id": turn_id,
-                    "chat_id": chat_id,
-                    "content": "*(I seem to have gotten stuck waiting for a response. The session is unblocked — please try again.)*",
-                    "final": true,
-                })
-                .to_string(),
-            };
-            if let Err(e) = self.ipc_client.send_request(notify_req).await {
-                warn!("Turn watchdog: failed to send unblock notification: {}", e);
-            }
-        }
-
-        // Step 4: evict stale queued tasks from all sessions.
-        const QUEUE_STALE_SECS: u64 = 120;
-        let session_ids_for_stale: Vec<String> = self.sessions.keys().cloned().collect();
-        for session_id in session_ids_for_stale {
-            if let Some(state) = self.sessions.get_mut(&session_id) {
-                let dropped = state.evict_stale_queued_tasks(QUEUE_STALE_SECS);
-                if dropped > 0 {
-                    warn!(
-                        session_id = %session_id,
-                        dropped = dropped,
-                        "Watchdog: evicted stale queued tasks older than {}s",
-                        QUEUE_STALE_SECS
-                    );
-                }
-            }
-        }
-    }
-
     /// Test-only: inspect session state by id.
     #[doc(hidden)]
     pub fn session(&self, session_id: &str) -> Option<&crate::session::SessionState> {
@@ -2771,277 +2466,6 @@ impl AgentRuntime {
         self.sessions.get_mut(session_id)
     }
 
-    pub async fn run(&mut self) -> Result<()> {
-        info!("Listening for inbound Persona tasks from the Philotic Web...");
-        self.fetch_agent_profile().await;
-        self.fetch_role_names().await;
-        self.fetch_memory_config().await;
-
-        // Publish command manifest to the hotel so membrane can discover it.
-        let manifest = command_manifest(&[]);
-        if let Ok(content_json) = serde_json::to_value(&manifest) {
-            let sync_result = tokio::time::timeout(
-                std::time::Duration::from_secs(5),
-                self.ipc_client.send_request(IpcRequest::SyncApartment {
-                    agent_id: self.agent_id.clone(),
-                    memory_type: "command_manifest".into(),
-                    content_json,
-                }),
-            )
-            .await;
-            match sync_result {
-                Ok(Ok(_)) => info!("Command manifest published ({} entries).", manifest.len()),
-                Ok(Err(e)) => warn!("Failed to publish command manifest: {}", e),
-                Err(_) => warn!("Command manifest sync timed out (startup race) — continuing"),
-            }
-        }
-
-        // Sweep all session apartments for stale active turns left over from a prior
-        // crash or unclean shutdown. This runs once at startup so callers don't have
-        // to wait for the next inbound message to get a clean checkpoint.
-        self.sweep_stale_session_turns().await;
-
-        // Re-advertise this philote's MCP tool routes to the hotel so that the
-        // membrane-mcp guest picks them up immediately on restart.
-        self.register_mcp_routes().await;
-
-        loop {
-            // Run the watchdog every loop, not only on an idle receive timeout. A busy
-            // inbox must not keep a stuck active turn alive indefinitely.
-            self.evict_timed_out_turns().await;
-
-            // Dispatch any tasks that were dequeued from a session's pending_user_tasks
-            // after the previous turn completed. Processed before blocking on IPC so that
-            // back-to-back voice memos are handled in order without additional round-trips.
-            while let Some((drain_task_id, drain_task)) = self.pending_drains.pop_front() {
-                if let Err(e) = self.handle_user_message(drain_task, drain_task_id).await {
-                    warn!("Failed to dispatch drained queued task: {}", e);
-                }
-            }
-
-            match tokio::time::timeout(Duration::from_secs(5), self.ipc_client.recv_task()).await {
-                Ok(Ok(IpcResponse::InboundTask {
-                    source_node,
-                    task_id,
-                    task_json,
-                })) => {
-                    info!(
-                        "Agent [{}] received task [{}] from [{}]",
-                        self.agent_id, task_id, source_node
-                    );
-
-                    if let Ok(peek) = serde_json::from_str::<serde_json::Value>(&task_json) {
-                        let peeked_action = peek
-                            .get("action")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("<none>");
-                        let snippet: String = task_json.chars().take(300).collect();
-                        info!(
-                            task_id = %task_id,
-                            action = %peeked_action,
-                            payload_bytes = %task_json.len(),
-                            snippet = %snippet,
-                            "Agent dispatch: action peek"
-                        );
-                    }
-
-                    match serde_json::from_str::<InboundTaskPayload>(&task_json) {
-                        Ok(task) if task.is_model_response() => {
-                            let task_ref = task.clone();
-                            if let Err(err) = self.handle_model_response(task).await {
-                                error!("Failed to handle model response: {}", err);
-                                let _ = self.emit_error_reply(&task_ref, task_id, err).await;
-                            }
-                        }
-                        Ok(task) if task.is_tool_result() => {
-                            let task_ref = task.clone();
-                            if let Err(err) = self.handle_tool_result(task).await {
-                                error!("Failed to handle tool result: {}", err);
-                                let _ = self.emit_error_reply(&task_ref, task_id, err).await;
-                            }
-                        }
-                        Ok(task) if task.action.as_deref() == Some("handoff_bundle") => {
-                            let task_ref = task.clone();
-                            if let Err(err) = self.handle_handoff_bundle(task, task_id).await {
-                                error!("Failed to handle handoff_bundle: {}", err);
-                                let _ = self.emit_error_reply(&task_ref, task_id, err).await;
-                            }
-                        }
-                        Ok(task) if task.action.as_deref() == Some("handoff_return") => {
-                            let task_ref = task.clone();
-                            if let Err(err) = self.handle_handoff_return(task, task_id).await {
-                                error!("Failed to handle handoff_return: {}", err);
-                                let _ = self.emit_error_reply(&task_ref, task_id, err).await;
-                            }
-                        }
-                        Ok(task) if task.action.as_deref() == Some("peer.delegate") => {
-                            let task_ref = task.clone();
-                            if let Err(err) = self.handle_user_message(task, task_id).await {
-                                error!("Failed to handle peer delegation as user message: {}", err);
-                                let _ = self.emit_error_reply(&task_ref, task_id, err).await;
-                            }
-                        }
-                        Ok(task) if task.action.as_deref() == Some("voice.dialogue") => {
-                            let _task_ref = task.clone();
-                            if let Err(err) = self.handle_voice_dialogue(task, task_id).await {
-                                error!("Failed to handle voice.dialogue: {}", err);
-                            }
-                        }
-                        Ok(task) if task.action.as_deref() == Some("paracrine_request") => {
-                            // Paracrine sub-call — this philote is the specialist receiving
-                            // an Exosome from a peer or Orchestrator. final_reply_to/role
-                            // are set by the ParacrineEmit caller to route the response.
-                            let task_ref = task.clone();
-                            if let Err(err) = self.handle_user_message(task, task_id).await {
-                                error!("Failed to handle paracrine_request: {}", err);
-                                let _ = self.emit_error_reply(&task_ref, task_id, err).await;
-                            }
-                        }
-                        Ok(task) if task.action.as_deref() == Some("paracrine_response") => {
-                            // Exosome response arriving back from a prior paracrine
-                            // dispatch. Route through the lookaside reflex — not the
-                            // main user-message path.
-                            let task_ref = task.clone();
-                            if let Err(err) = self.handle_paracrine_response(task, task_id).await {
-                                error!("Failed to handle paracrine_response: {}", err);
-                                let _ = self.emit_error_reply(&task_ref, task_id, err).await;
-                            }
-                        }
-                        Ok(task) if task.action.as_deref() == Some("paracrine_signal") => {
-                            // Low-agency heartbeat/background signal. Observe it, but do
-                            // not enter the conversational model path.
-                            if let Err(err) = self.handle_paracrine_signal(task, task_id).await {
-                                warn!("Failed to handle paracrine_signal: {}", err);
-                            }
-                        }
-                        Ok(task) if task.action.as_deref() == Some("streaming_token") => {
-                            // LLM token fragment emitted by model-router during a streaming
-                            // response. Forward immediately to membrane for progressive display.
-                            if let Err(err) = self.handle_streaming_token(task).await {
-                                warn!("Failed to forward streaming_token: {}", err);
-                            }
-                        }
-                        Ok(task) if task.action.as_deref() == Some("model_dispatch_status") => {
-                            // Transient dispatch state from the model controller retry loop.
-                            // Forward to membrane so the user sees "(retrying...)" etc.
-                            if let Err(err) = self.handle_model_dispatch_status(task).await {
-                                warn!("Failed to forward model_dispatch_status: {}", err);
-                            }
-                        }
-                        Ok(task) if task.action.as_deref() == Some("datasource_response") => {
-                            let task_ref = task.clone();
-                            if let Err(err) = self.handle_datasource_response(task).await {
-                                error!("Failed to handle datasource_response: {}", err);
-                                let _ = self.emit_error_reply(&task_ref, task_id, err).await;
-                            }
-                        }
-                        Ok(task) if task.command.as_deref() == Some("context.capture") => {
-                            let task_ref = task.clone();
-                            if let Err(err) = self.handle_context_capture(task, task_id).await {
-                                error!("Failed to handle context.capture: {}", err);
-                                let _ = self.emit_error_reply(&task_ref, task_id, err).await;
-                            }
-                        }
-                        Ok(task) => {
-                            let task_ref = task.clone();
-                            if let Err(err) = self.handle_user_message(task, task_id).await {
-                                error!("Failed to handle user message: {}", err);
-                                let _ = self.emit_error_reply(&task_ref, task_id, err).await;
-                            }
-                        }
-                        Err(err) => warn!("Could not parse inbound task payload: {}", err),
-                    }
-                }
-                Ok(Ok(IpcResponse::NetworkState { online })) => {
-                    self.network_offline = !online;
-                    if !online {
-                        warn!("Network offline — routing text.generate to local fallback tier");
-                    } else {
-                        info!("Network restored — cloud model tiers re-enabled");
-                    }
-                }
-                Ok(Ok(IpcResponse::MuninnStatus {
-                    available,
-                    endpoint,
-                })) => {
-                    self.muninn_available = available;
-                    if !available {
-                        warn!(
-                            endpoint = %endpoint,
-                            "MuninnDB unreachable — memory tools will return empty until restored"
-                        );
-                    } else {
-                        info!(endpoint = %endpoint, "MuninnDB restored — memory tools re-enabled");
-                    }
-                }
-                Ok(Ok(IpcResponse::PerimeterShift { previous, current })) => {
-                    use ansible_mesh_core::ExposureTier;
-                    if current > previous {
-                        // Ceiling rose: enforcement tightened (e.g. Lan → Internet).
-                        // In-flight turns that assumed lower-trust access may now require
-                        // re-authentication. Log and let the turn complete — the fence on
-                        // the listener side will enforce on the next inbound request.
-                        warn!(
-                            ?previous,
-                            ?current,
-                            "Security perimeter ceiling raised — stricter enforcement now active"
-                        );
-                    } else {
-                        // Ceiling dropped: less exposed (e.g. Internet → Lan). Relax.
-                        info!(?previous, ?current, "Security perimeter ceiling lowered");
-                    }
-                    // Fail any in-flight turns that were operating at a tier above the
-                    // new ceiling. This is conservative but prevents stale-auth continuations.
-                    if current < ExposureTier::Mesh {
-                        // Below Mesh means no external callers — but if we had in-flight
-                        // mesh-origin turns, they should be re-evaluated. For now, log only.
-                        // Active turn interruption (if needed) would go here.
-                    }
-                }
-                Ok(Ok(IpcResponse::GracefulShutdown { drain_timeout_secs })) => {
-                    info!(
-                        "Hotel requested graceful shutdown (drain window: {}s). \
-                         Finishing in-flight work then exiting.",
-                        drain_timeout_secs
-                    );
-                    // Wait up to drain_timeout_secs for any active turns to complete,
-                    // then exit. We poll once per second.
-                    let deadline = std::time::Instant::now()
-                        + std::time::Duration::from_secs(drain_timeout_secs);
-                    loop {
-                        let has_active = self.sessions.values().any(|s| s.active_turn.is_some());
-                        if !has_active || std::time::Instant::now() >= deadline {
-                            break;
-                        }
-                        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-                    }
-                    info!("Graceful shutdown drain complete; philote exiting.");
-                    return Ok(());
-                }
-                Ok(Ok(other)) => {
-                    info!("Jane received non-task IPC message: {:?}", other);
-                }
-                Ok(Err(err)) => {
-                    if is_ipc_disconnect(&err) {
-                        info!("Hotel IPC disconnected; philote exiting.");
-                        return Ok(());
-                    }
-                    warn!("IPC Recv error: {}", err);
-                }
-                Err(_) => {
-                    // 5-second tick — no task arrived. Check for stuck turns.
-                    self.evict_timed_out_turns().await;
-                }
-            }
-        }
-    }
-
-    /// Lookaside routing reflex — dispatches an incoming `paracrine_response`
-    /// based on the [`ParacrineRouting`] hint carried in the exosome.
-    ///
-    /// This is a separate path from [`handle_user_message`]: the main cognitive
-    /// loop is not re-entered unless the routing explicitly calls for it. The
-    /// `paracrine_id` threads through every branch for cross-mesh provenance.
     async fn persist_session_checkpoint(&mut self, session_id: &str) -> Result<()> {
         let Some(state) = self.sessions.get(session_id) else {
             return Ok(());
@@ -3053,405 +2477,6 @@ impl AgentRuntime {
             .sync_apartment(&self.agent_id, &checkpoint_memory_type, checkpoint_json)
             .await?;
         self.sync_session_index(&index_state).await
-    }
-
-    async fn handle_paracrine_signal(
-        &mut self,
-        task: InboundTaskPayload,
-        task_id: Uuid,
-    ) -> Result<()> {
-        use ansible_mesh_core::attention_steward::{
-            AttentionStewardPolicy, AttentionStewardResponse, AttentionStewardSignal,
-        };
-        use data_memorygraphrag::attention_observer;
-
-        let signal = task
-            .paracrine_signal
-            .as_ref()
-            .cloned()
-            .unwrap_or_else(|| serde_json::json!({}));
-        let attention_signal = match AttentionStewardSignal::from_value(signal) {
-            Ok(signal) => signal,
-            Err(err) => {
-                warn!(
-                    task_id = %task_id,
-                    error = %err,
-                    "paracrine signal deferred: invalid attention steward envelope"
-                );
-                return Ok(());
-            }
-        };
-        let decision = AttentionStewardPolicy::default().evaluate_now(&attention_signal);
-        let response = match decision.response {
-            AttentionStewardResponse::RecordObservation => "record_observation",
-            AttentionStewardResponse::ProposeSilEntry => "propose_sil_entry",
-            AttentionStewardResponse::UpdateSilMetadata => "update_sil_metadata",
-            AttentionStewardResponse::DeferSignal => "defer_signal",
-        };
-
-        info!(
-            task_id = %task_id,
-            signal_id = %attention_signal.signal_id,
-            signal_type = %attention_signal.signal_type,
-            scope = %attention_signal.scope,
-            response = %response,
-            reason = %decision.reason,
-            "attention steward observed paracrine signal"
-        );
-
-        let now_iso = chrono::Utc::now().to_rfc3339();
-        if let Some(observe_input) =
-            attention_observer::decision_to_observe_input(&decision, &attention_signal, &now_iso)
-        {
-            let node_id = local_node_id();
-            let target_node = life_graph_runner_node_id();
-            let task_json = serde_json::json!({
-                "action": "execute_tool",
-                "tool_name": "life.observe",
-                "arguments": serde_json::to_value(&observe_input)?,
-                "reply_to": node_id,
-                "reply_role": "agent",
-                "session_id": "",
-                "turn_id": "",
-                "chat_id": "",
-            });
-            let _ = self
-                .ipc_client
-                .send_request(IpcRequest::EmitTask {
-                    target_node,
-                    target_role: "life-graph-runner".into(),
-                    target_guest_id: None,
-                    task_json: task_json.to_string(),
-                })
-                .await;
-        }
-
-        Ok(())
-    }
-
-    async fn handle_paracrine_response(
-        &mut self,
-        task: InboundTaskPayload,
-        task_id: Uuid,
-    ) -> Result<()> {
-        // Extract the exosome envelope from the task payload so we can read the
-        // paracrine_id and response_routing hint set at dispatch time.
-        let exosome: Option<Exosome> = task
-            .exosome
-            .as_ref()
-            .and_then(|v| serde_json::from_value::<Exosome>(v.clone()).ok());
-
-        let paracrine_id = exosome.as_ref().and_then(|e| e.paracrine_id.clone());
-
-        let routing = exosome
-            .as_ref()
-            .and_then(|e| e.response_routing.clone())
-            .unwrap_or(ParacrineRouting::ReflectiveReEntry);
-
-        // Locate the owning turn by matching paracrine_id against active turns,
-        // falling back to the task's session_id field.
-        let owner_turn = paracrine_id.as_ref().and_then(|pid| {
-            self.sessions.iter().find_map(|(sid, state)| {
-                state.active_turn.as_ref().and_then(|turn| {
-                    turn.associated_paracrine_ids
-                        .contains(pid)
-                        .then(|| (sid.clone(), turn.turn_id.clone(), turn.chat_id.clone()))
-                })
-            })
-        });
-        let owner_thread = paracrine_id.as_ref().and_then(|pid| {
-            self.sessions.iter().find_map(|(sid, state)| {
-                state
-                    .paracrine_threads
-                    .iter()
-                    .find(|thread| thread.id == pid.as_str())
-                    .map(|thread| (sid.clone(), thread.origin_turn_id.clone()))
-            })
-        });
-        let session_id = task
-            .session_id
-            .as_deref()
-            .filter(|s| !s.is_empty())
-            .map(str::to_string)
-            .or_else(|| owner_turn.as_ref().map(|(sid, _, _)| sid.clone()))
-            .or_else(|| owner_thread.as_ref().map(|(sid, _)| sid.clone()));
-
-        match routing {
-            ParacrineRouting::RawForward => {
-                // Emit content directly to membrane — no model loop.
-                let content = task.content.clone().unwrap_or_default();
-                if let (Some(sid), Some(pid)) = (&session_id, &paracrine_id) {
-                    if let Some(state) = self.sessions.get_mut(sid) {
-                        state.close_paracrine_thread(
-                            pid,
-                            ParacrineThreadStatus::Completed,
-                            Some(content.clone()),
-                            Some("raw_forward".into()),
-                        );
-                    }
-                    self.persist_session_checkpoint(sid).await?;
-                }
-                let node_id = local_node_id();
-                let _ = self
-                    .ipc_client
-                    .send_request(IpcRequest::EmitTask {
-                        target_node: node_id,
-                        target_role: "membrane".into(),
-                        target_guest_id: None,
-                        task_json: serde_json::json!({
-                            "action": "send_message",
-                            "content": content,
-                            "paracrine_id": paracrine_id,
-                        })
-                        .to_string(),
-                    })
-                    .await;
-            }
-
-            ParacrineRouting::ProgressUpdate => {
-                // Emit a partial/ephemeral update to membrane without closing
-                // or interrupting the active turn.
-                let content = task.content.clone().unwrap_or_default();
-                if let Some(sid) = &session_id {
-                    if let Some(pid) = &paracrine_id {
-                        if let Some(state) = self.sessions.get_mut(sid) {
-                            state.signal_paracrine_thread(pid, content.clone());
-                        }
-                        self.persist_session_checkpoint(sid).await?;
-                    }
-                    let _ = self.emit_partial_reply(sid, content).await;
-                }
-            }
-
-            ParacrineRouting::Heartbeat => {
-                // No model involvement — just log and acknowledge.
-                info!(
-                    paracrine_id = paracrine_id.as_deref().unwrap_or("?"),
-                    "paracrine heartbeat received"
-                );
-                if let (Some(sid), Some(pid)) = (&session_id, &paracrine_id) {
-                    if let Some(state) = self.sessions.get_mut(sid) {
-                        state.signal_paracrine_thread(pid, "heartbeat".into());
-                    }
-                    self.persist_session_checkpoint(sid).await?;
-                }
-            }
-
-            ParacrineRouting::MemoryEnrichment => {
-                // Push specialist content into the session memory window.
-                // Falls through to CognitiveReEntry if no session found.
-                if session_id.is_none() {
-                    warn!(
-                        paracrine_id = paracrine_id.as_deref().unwrap_or("?"),
-                        "MemoryEnrichment: no session found, dropping"
-                    );
-                    return Ok(());
-                }
-                // Memory injection handled by model re-entry with enriched context.
-                if let (Some(sid), Some(pid)) = (&session_id, &paracrine_id) {
-                    if let Some(state) = self.sessions.get_mut(sid) {
-                        state.close_paracrine_thread(
-                            pid,
-                            ParacrineThreadStatus::Completed,
-                            task.content.clone(),
-                            Some("memory_enrichment".into()),
-                        );
-                    }
-                }
-                self.handle_user_message(task, task_id).await?;
-            }
-
-            ParacrineRouting::DatasourceInjection => {
-                // Structured retrieval — inject into session context and re-enter
-                // the model so it can reason over the data.
-                if session_id.is_none() {
-                    warn!(
-                        paracrine_id = paracrine_id.as_deref().unwrap_or("?"),
-                        "DatasourceInjection: no session found, dropping"
-                    );
-                    return Ok(());
-                }
-                if let (Some(sid), Some(pid)) = (&session_id, &paracrine_id) {
-                    if let Some(state) = self.sessions.get_mut(sid) {
-                        state.close_paracrine_thread(
-                            pid,
-                            ParacrineThreadStatus::Completed,
-                            task.content.clone(),
-                            Some("datasource_injection".into()),
-                        );
-                    }
-                }
-                self.handle_user_message(task, task_id).await?;
-            }
-
-            ParacrineRouting::EnrichedToolResult => {
-                // Replace the "paracrine dispatched" placeholder with the real
-                // specialist response and re-enter the model as if the tool call
-                // completed normally.
-                let owner_turn_id = owner_turn.as_ref().map(|(_, tid, _)| tid.clone());
-                let owner_chat_id = owner_turn.as_ref().map(|(_, _, cid)| cid.clone());
-                if let (Some(sid), Some(pid)) = (&session_id, &paracrine_id) {
-                    if let Some(state) = self.sessions.get_mut(sid) {
-                        state.close_paracrine_thread(
-                            pid,
-                            ParacrineThreadStatus::Completed,
-                            task.content.clone(),
-                            Some("enriched_tool_result".into()),
-                        );
-                        // Reset the iteration counter: the turn was waiting for an external
-                        // response, not thinking. Give it a fresh budget to process the reply.
-                        if let Some(turn) = state.active_turn.as_mut() {
-                            turn.iteration = 0;
-                        }
-                    }
-                }
-                self.handle_tool_result(InboundTaskPayload {
-                    action: Some("tool_result".into()),
-                    tool_name: Some("delegate.whisper".into()),
-                    content: task.content.clone(),
-                    session_id: session_id.clone().or(task.session_id.clone()),
-                    turn_id: owner_turn_id.or(task.turn_id.clone()),
-                    chat_id: owner_chat_id.or(task.chat_id.clone()),
-                    source: Some("paracrine".into()),
-                    final_reply_to: task.final_reply_to.clone(),
-                    final_reply_role: task.final_reply_role.clone(),
-                    ..task
-                })
-                .await?;
-            }
-
-            ParacrineRouting::ReflectiveReEntry => {
-                // Reflective path: feed brain's reply back into the orchestrator's
-                // own paracrine layer. The exosome's paracrine_id is preserved so
-                // the resulting turn gets paracrine_origin set, which auto-injects
-                // delegate.merge. The orchestrator reasons about the reply and either
-                // calls delegate.merge to surface it or completes silently to absorb.
-                if let (Some(sid), Some(pid)) = (&session_id, &paracrine_id) {
-                    if let Some(state) = self.sessions.get_mut(sid) {
-                        state.close_paracrine_thread(
-                            pid,
-                            ParacrineThreadStatus::Completed,
-                            task.content.clone(),
-                            Some("reflective_re_entry".into()),
-                        );
-                    }
-                }
-                self.handle_user_message(task, task_id).await?;
-            }
-
-            ParacrineRouting::CognitiveReEntry => {
-                // Standard path: feed into cognitive re-entry.
-                // If there is an active turn, the re-entry will merge this
-                // response into its context. If not, a new synthesis turn begins.
-                if let (Some(sid), Some(pid)) = (&session_id, &paracrine_id) {
-                    if let Some(state) = self.sessions.get_mut(sid) {
-                        state.close_paracrine_thread(
-                            pid,
-                            ParacrineThreadStatus::Completed,
-                            task.content.clone(),
-                            Some("cognitive_re_entry".into()),
-                        );
-                    }
-                }
-                self.handle_user_message(task, task_id).await?;
-            }
-
-            ParacrineRouting::PriorityReEntry => {
-                // Arbiter-promoted: prepend to the session queue so this task is
-                // processed NEXT, ahead of any already-waiting messages.
-                let session_id = task.session_id_or_default(&self.agent_id);
-                if let Some(pid) = &paracrine_id {
-                    if let Some(state) = self.sessions.get_mut(&session_id) {
-                        state.close_paracrine_thread(
-                            pid,
-                            ParacrineThreadStatus::Completed,
-                            task.content.clone(),
-                            Some("priority_re_entry".into()),
-                        );
-                    }
-                }
-                if let Some(state) = self.sessions.get_mut(&session_id) {
-                    if state.is_turn_active() {
-                        info!(
-                            session_id = %session_id,
-                            "PriorityReEntry: prepending arbiter-promoted task to front of queue"
-                        );
-                        state.prepend_user_task(task_id, task);
-                    } else {
-                        // No active turn — dispatch immediately.
-                        self.handle_user_message(task, task_id).await?;
-                    }
-                }
-            }
-
-            ParacrineRouting::ApprovalResolution => {
-                // The operator role (e.g. membrane + human) has sent an approval decision
-                // for a parked turn. Extract `decision` and optional `note` from the content
-                // field (parsed as JSON), then synthesize a SlashCommand to reuse the existing
-                // approval resolution path.
-                let session_id =
-                    session_id.unwrap_or_else(|| task.session_id_or_default(&self.agent_id));
-                if let Some(pid) = &paracrine_id {
-                    if let Some(state) = self.sessions.get_mut(&session_id) {
-                        state.close_paracrine_thread(
-                            pid,
-                            ParacrineThreadStatus::Completed,
-                            task.content.clone(),
-                            Some("approval_resolution".into()),
-                        );
-                    }
-                }
-                // The sender encodes the decision as JSON in `content`, e.g.:
-                //   {"decision": "approved", "note": "looks good"}
-                let parsed_content = task
-                    .content
-                    .as_deref()
-                    .and_then(|c| serde_json::from_str::<serde_json::Value>(c).ok());
-                let decision = parsed_content
-                    .as_ref()
-                    .and_then(|p| p.get("decision"))
-                    .and_then(|d| d.as_str())
-                    .unwrap_or("approved");
-                let note = parsed_content
-                    .as_ref()
-                    .and_then(|p| p.get("note"))
-                    .and_then(|n| n.as_str())
-                    .map(str::to_string);
-                let command = if decision == "denied" {
-                    SlashCommand::Deny { note }
-                } else {
-                    SlashCommand::Approve { note }
-                };
-                // Use inbound routing fields for the command reply; handle_approval_command
-                // extracts the real turn values from the restored parked turn.
-                let local_node = local_node_id();
-                let cmd_chat_id = task.chat_id.clone().unwrap_or_default();
-                let cmd_reply_to = task.final_reply_to.clone().unwrap_or(local_node);
-                let cmd_reply_role = task
-                    .final_reply_role
-                    .clone()
-                    .unwrap_or_else(|| "membrane".into());
-                let cmd_reply_guest_id = task.final_reply_guest_id.clone();
-                info!(
-                    session_id = %session_id,
-                    decision = %decision,
-                    "paracrine ApprovalResolution: applying operator decision to parked turn"
-                );
-                self.handle_approval_command(
-                    task_id,
-                    session_id,
-                    task.turn_id.clone().unwrap_or_default(),
-                    cmd_chat_id,
-                    cmd_reply_to,
-                    cmd_reply_role,
-                    cmd_reply_guest_id,
-                    command,
-                )
-                .await?;
-            }
-        }
-
-        Ok(())
     }
 
     async fn handle_user_message(&mut self, task: InboundTaskPayload, task_id: Uuid) -> Result<()> {
@@ -3480,45 +2505,11 @@ impl AgentRuntime {
 
         self.ensure_session_loaded(&session_id, &source).await?;
         self.refresh_bindings_from_snapshot(&session_id).await;
-
-        // Fire-and-forget: fetch the agent's personal knowledge graph once per session load.
-        let should_preload = self
-            .sessions
-            .get_mut(&session_id)
-            .map(|s| {
-                if !s.graph_preload_dispatched {
-                    s.graph_preload_dispatched = true;
-                    true
-                } else {
-                    false
-                }
-            })
-            .unwrap_or(false);
-
-        if should_preload {
-            let local_node_id = local_node_id();
-            let graph_datasource_node_id = graph_datasource_node_id();
-            let agent_id = self.agent_id.clone();
-            let _ = self
-                .ipc_client
-                .send_request(IpcRequest::EmitTask {
-                    target_node: graph_datasource_node_id,
-                    target_role: "graph-datasource".into(),
-                    target_guest_id: None,
-                    task_json: serde_json::json!({
-                        "action": "graph.query",
-                        "graph_id": agent_id,
-                        "query": "MATCH (n) RETURN n",
-                        "reply_to": local_node_id,
-                        "reply_role": "agent",
-                        "session_id": session_id,
-                        "turn_id": "",
-                        "chat_id": "",
-                    })
-                    .to_string(),
-                })
-                .await;
-        }
+        self.dispatch_graph_preload_once(&session_id).await;
+        // LifeGraph auto-recall lane: prime the cache once per session load so
+        // the first turn can already inject graph context (fire-and-forget).
+        self.dispatch_life_recall_prefetch_once(&session_id, &content)
+            .await;
 
         let (final_reply_to, final_reply_role, final_reply_guest_id) = {
             let state = self.sessions.entry(session_id.clone()).or_insert_with(|| {
@@ -3540,6 +2531,25 @@ impl AgentRuntime {
                 target.target_guest_id,
             )
         };
+
+        // Plan-continuation hygiene: a synthesized continuation is only valid
+        // while its carryover still exists (it may have been cleared via
+        // `/plan drop`) and while no new plan proposal is parked awaiting the
+        // operator — a pending proposal is a redirect and wins over the old plan.
+        if task.action.as_deref() == Some("plan_continuation") {
+            let valid = self
+                .sessions
+                .get(&session_id)
+                .map(|s| s.carryover_plan.is_some() && !s.has_parked_plan_turn())
+                .unwrap_or(false);
+            if !valid {
+                info!(
+                    session_id = %session_id,
+                    "Dropping orphaned plan continuation (carryover cleared or a new plan is parked)."
+                );
+                return Ok(());
+            }
+        }
 
         if let Some(command) = parse_slash_command(&content) {
             match command {
@@ -3654,7 +2664,26 @@ impl AgentRuntime {
                 | SlashCommand::ApprovalReset => {}
                 SlashCommand::Tts { .. } => {}
                 SlashCommand::Voice { .. } => {}
+                SlashCommand::Model { .. } => {}
+                SlashCommand::ModelPreset { .. } => {}
+                SlashCommand::Models { .. } => {}
+                SlashCommand::Dirty | SlashCommand::Sfw => {}
                 SlashCommand::Abandon { .. } => {}
+                SlashCommand::Plan { drop } => {
+                    // Resolved without starting a turn so it works mid-turn too.
+                    return self
+                        .handle_plan_command(
+                            task_id,
+                            session_id,
+                            turn_id,
+                            chat_id,
+                            final_reply_to,
+                            final_reply_role,
+                            final_reply_guest_id,
+                            drop,
+                        )
+                        .await;
+                }
                 SlashCommand::Correct {
                     turn_id: voice_turn_id,
                     text,
@@ -3676,7 +2705,7 @@ impl AgentRuntime {
             }
         }
 
-        if let Some(life_observe) = parse_direct_life_observe_command(&content) {
+        if let Some(life_observe) = direct_life_observe_command_for_task(&task, &content) {
             return self
                 .handle_direct_life_observe_command(
                     task_id,
@@ -3784,9 +2813,11 @@ impl AgentRuntime {
                     .sync_apartment(&self.agent_id, &checkpoint_memory_type, checkpoint_json)
                     .await?;
                 self.sync_session_index(&index_state).await?;
-                let response_contract = Some(serde_json::json!({
-                    "channels": ["spoken_text", "memory_candidate", "active_plan"]
-                }));
+                let response_contract = Some(cognitive_response_contract(&[
+                    "spoken_text",
+                    "memory_candidate",
+                    "active_plan",
+                ]));
                 let response_route = Some(model_response_route(
                     self.sessions.get(&session_id),
                     response_contract.as_ref(),
@@ -3799,7 +2830,7 @@ impl AgentRuntime {
                     &restored_user_content,
                     &tools,
                 );
-                let model_req = ModelRequestPayload {
+                let mut model_req = ModelRequestPayload {
                     action: "generate_text".to_string(),
                     request_class: Some("cognitive".to_string()),
                     session_id: session_id.clone(),
@@ -3814,19 +2845,27 @@ impl AgentRuntime {
                     response_contract,
                     response_route,
                     ligand,
-                    provider_options: serde_json::Map::new(),
+                    model: None,
+                    provider_options: resolve_content_policy_provider_options(
+                        self.sessions.get(&session_id),
+                    ),
                     chat_id: restored_chat_id,
                     reply_to: local_node_id(),
                     reply_role: "agent".into(),
+                    reply_guest_id: Some(self.own_guest_id()),
                     final_reply_to: restored_reply_to,
                     final_reply_role: restored_reply_role,
                     final_reply_guest_id: restored_reply_guest_id,
+                    agent_id: Some(self.agent_id.clone()),
+                    oracle_pick: None,
+                    oracle_agreement: None,
                 };
                 let (target_node, target_role, target_guest_id) = resolve_model_execution_target(
                     self.sessions.get(&session_id),
                     "text.generate",
                     DEFAULT_TEXT_MODEL_ROLE,
                 );
+                model_req.model = role_model_binding(self.sessions.get(&session_id), &target_role);
                 self.ipc_client
                     .send_request(IpcRequest::EmitTask {
                         target_node,
@@ -3992,6 +3031,63 @@ impl AgentRuntime {
                 )
             };
 
+            // Plan continuation turns are seeded with the carried-over plan
+            // (completed steps marked done) so the model sees exactly what is
+            // left, and enter pre-confirmed so the plan gate does not re-park.
+            let is_plan_continuation = task.action.as_deref() == Some("plan_continuation");
+            let (seeded_plan, seeded_plan_confirmed) = if is_plan_continuation {
+                match state.carryover_plan.as_ref() {
+                    Some(carry) => {
+                        let mut plan = carry.plan.clone();
+                        for (i, step) in plan.steps.iter_mut().enumerate() {
+                            if carry.steps_done.get(i).copied().unwrap_or(false) {
+                                step.status = "done".into();
+                            }
+                        }
+                        if plan.status == "planning" {
+                            plan.status = "executing".into();
+                        }
+                        (Some(plan), true)
+                    }
+                    None => (None, false),
+                }
+            } else {
+                (None, false)
+            };
+
+            // Cron-triggered turns get CronPrimary (the honest marker is
+            // `cron_job_id`, not corr_id/source string-sniffing); an operator
+            // pin on the session takes precedence over the configured default.
+            // A session with an active fallback override (Slice 2) is dispatched
+            // to `active_tier_role` at the `resolve_model_execution_target`
+            // choke point, so the turn is tagged AutoFallback to match — it is
+            // not the session's configured default, even though the operator
+            // never explicitly pinned it.
+            // Operator-authored cron jobs carry a narrow standing tool
+            // preapproval (`cron_preapproved_tools` — aiua forwards it only
+            // for jobs with created_by=Operator, see
+            // CronTicker::build_cron_task_json). Seed it into this session's
+            // approval policy so the unattended fire can execute the tools
+            // its instruction names instead of parking WaitingApproval with
+            // no operator awake and riding the watchdog to eviction.
+            if task.cron_job_id.is_some() {
+                for tool in &task.cron_preapproved_tools {
+                    if !state.approval_policy.preapproved_tools.contains(tool) {
+                        state.approval_policy.preapproved_tools.push(tool.clone());
+                    }
+                }
+            }
+
+            let selection_source = if task.cron_job_id.is_some() {
+                SelectionSource::CronPrimary
+            } else if state.pinned_tier_role.is_some() {
+                SelectionSource::OperatorExplicit
+            } else if state.fallback_override.is_some() {
+                SelectionSource::AutoFallback
+            } else {
+                SelectionSource::ConfiguredDefault
+            };
+
             state.start_turn(WorkingTurn {
                 task_id,
                 turn_id: turn_id.clone(),
@@ -4007,8 +3103,9 @@ impl AgentRuntime {
                 pending_approval: None,
                 working_tool_history: Vec::new(),
                 recalled_memories: Vec::new(),
-                active_plan: None,
+                active_plan: seeded_plan,
                 consecutive_step_failures: 0,
+                streak_extension: 0,
                 provider_repair_note: None,
                 provider_repair_attempts: 0,
                 pending_text_reply: None,
@@ -4021,12 +3118,36 @@ impl AgentRuntime {
                 paracrine_reply_chat_id,
                 paracrine_response_routing,
                 paracrine_merge_completed: false,
-                plan_confirmed: false,
+                plan_confirmed: seeded_plan_confirmed,
                 plan_confirm_note: None,
                 fallback_tier: if self.network_offline { 1 } else { 0 },
+                ladder_tier0_dispatched: false,
                 streaming_retry_attempts: 0,
+                streamed_content: String::new(),
+                paracrine_hop_count: 0,
+                paracrine_chain_started_at: None,
+                selection_source,
             });
             state.set_active_turn_phase(TurnPhase::LoadingContext);
+
+            // Sentence-pipelined streaming TTS (operator_chat only): arm the
+            // per-turn voice chunk pipeline so streamed tokens are synthesized
+            // per sentence while generation continues. Any pipeline left over
+            // from a previous turn in this session is stale either way.
+            if streaming_voice_eligible(
+                task.transport.as_deref(),
+                task.source.as_deref(),
+                &state.agent_profile.voice_response_policy,
+                had_voice_input,
+            ) {
+                // NOTE: direct field insert (not a helper method) — `state`
+                // still mutably borrows `self.sessions` in this scope, so only
+                // a disjoint field access compiles here.
+                self.voice_chunk_pipelines
+                    .insert(session_id.clone(), VoiceChunkPipeline::new(turn_id.clone()));
+            } else {
+                self.voice_chunk_pipelines.remove(&session_id);
+            }
 
             // Paracrine context: inject delegate.merge into execution_routes so the specialist
             // can call it without needing it in her toolset profile. The tool is already injected
@@ -4130,6 +3251,9 @@ impl AgentRuntime {
         }
 
         self.maybe_auto_recall_turn_memory(&session_id).await?;
+        // LifeGraph auto-recall lane: inject cached graph context beside the
+        // Muninn lane. Cache-only — never blocks the turn on the runner.
+        self.maybe_inject_life_graph_context(&session_id).await;
 
         let (
             checkpoint_memory_type,
@@ -4147,6 +3271,14 @@ impl AgentRuntime {
             let tools_for_model = state.project_tools_for_turn(&content);
             let (model_prompt, model_context, context_projection) =
                 state.model_request_payloads(&content, &tools_for_model);
+            // First live producer of ReflexEvent::ContextPressure (reflex.rs:309/460
+            // has handled it, unfired, since the reflex engine was introduced).
+            // context_pressure_pct_from_projection is a pure wrapper around this
+            // exact field read, unit-tested below so a rename/removal fails a
+            // plain test instead of only manifesting as a silent no-op here.
+            if let Some(used_pct) = context_pressure_pct_from_projection(&context_projection) {
+                state.fire_reflex_event(ReflexEvent::ContextPressure { used_pct });
+            }
             (
                 state.checkpoint_memory_type(),
                 state.checkpoint_json(),
@@ -4197,7 +3329,13 @@ impl AgentRuntime {
                 SlashCommand::ApprovalClear { .. } => Ok(()),
                 // Correct always returns from the pre-turn gate above; unreachable here.
                 SlashCommand::Correct { .. } => Ok(()),
-                SlashCommand::Tts { .. } | SlashCommand::Voice { .. } => {
+                // Plan always returns from the pre-turn gate above; unreachable here.
+                SlashCommand::Plan { .. } => Ok(()),
+                SlashCommand::Tts { .. }
+                | SlashCommand::Voice { .. }
+                | SlashCommand::Model { .. }
+                | SlashCommand::ModelPreset { .. }
+                | SlashCommand::Models { .. } => {
                     self.handle_session_control_command(
                         task_id, session_id, turn_id, chat_id, command,
                     )
@@ -4205,6 +3343,10 @@ impl AgentRuntime {
                 }
                 SlashCommand::Role { .. } | SlashCommand::Roles | SlashCommand::Back => {
                     self.handle_role_command(task_id, session_id, turn_id, chat_id, command)
+                        .await
+                }
+                SlashCommand::Dirty | SlashCommand::Sfw => {
+                    self.handle_dirty_command(task_id, session_id, turn_id, chat_id, command)
                         .await
                 }
                 SlashCommand::Approve { .. } | SlashCommand::Deny { .. } => Ok(()),
@@ -4311,18 +3453,58 @@ impl AgentRuntime {
                 dispatch_cap,
             )
         };
-        let (response_contract, provider_options) = voice_delivery_envelope(
+        let (response_contract, mut provider_options) = voice_delivery_envelope(
             self.sessions.get(&session_id),
-            Some(serde_json::json!({
-                "channels": ["spoken_text", "memory_candidate", "active_plan", "memory_concept"]
-            })),
+            Some(cognitive_response_contract(&[
+                "spoken_text",
+                "memory_candidate",
+                "active_plan",
+                "memory_concept",
+            ])),
         );
-        let (target_node, target_role, target_guest_id) = {
-            let (node, role, guest_id) = resolve_model_execution_target(
+        // Thread the turn's effective content-filtering posture into the same
+        // generic provider_options bag voice settings already use — this is the
+        // primary turn-dispatch path (handles most user messages), so it must
+        // not be skipped even though it shares an envelope with voice/transform
+        // capabilities that don't need it.
+        if matches!(capability.as_str(), "text.generate" | "response.generate") {
+            provider_options.extend(resolve_content_policy_provider_options(
                 self.sessions.get(&session_id),
-                &capability,
-                DEFAULT_TEXT_MODEL_ROLE,
-            );
+            ));
+        }
+        let (target_node, target_role, target_guest_id) = {
+            let (node, role, guest_id) = if capability == "voice.transcribe"
+                && media_policy
+                    .transcription_provider
+                    .as_deref()
+                    .map(|p| !p.trim().is_empty())
+                    .unwrap_or(false)
+            {
+                // The agent's media policy names an STT provider — dispatch
+                // straight to that provider's controller role (e.g.
+                // "elevenlabs" → model.elevenlabs / Scribe). Transcription
+                // must never ride the text fallback ladder: its tiers are
+                // text controllers with no media providers.
+                let provider = media_policy
+                    .transcription_provider
+                    .as_deref()
+                    .unwrap()
+                    .trim()
+                    .to_ascii_lowercase();
+                let role = if provider == "gemini" {
+                    // Gemini's controller registers the plain "model" role.
+                    DEFAULT_TEXT_MODEL_ROLE.to_string()
+                } else {
+                    format!("model.{provider}")
+                };
+                (local_node_id(), role, None)
+            } else {
+                resolve_model_execution_target(
+                    self.sessions.get(&session_id),
+                    &capability,
+                    DEFAULT_TEXT_MODEL_ROLE,
+                )
+            };
             // Network-offline fast-path: skip cloud tiers entirely and go straight
             // to the local model. Uses the last entry in the configured fallback
             // tiers, falling back to DEFAULT_FALLBACK_TIERS.
@@ -4401,7 +3583,7 @@ impl AgentRuntime {
         let ligand = planning_ligand(self.sessions.get(&session_id), &content, &tools_for_model);
         let affordances =
             model_affordances(self.sessions.get(&session_id), &content, &tools_for_model);
-        let model_req = ModelRequestPayload {
+        let mut model_req = ModelRequestPayload {
             action,
             request_class: Some(
                 if matches!(capability.as_str(), "text.generate" | "response.generate") {
@@ -4423,14 +3605,35 @@ impl AgentRuntime {
             response_contract,
             response_route,
             ligand,
+            model: role_model_binding(self.sessions.get(&session_id), &target_role),
             provider_options,
             chat_id,
             reply_to: local_node_id(),
             reply_role: "agent".into(),
+            reply_guest_id: Some(self.own_guest_id()),
             final_reply_to,
             final_reply_role,
             final_reply_guest_id,
+            agent_id: Some(self.agent_id.clone()),
+            oracle_pick: None,
+            oracle_agreement: None,
         };
+
+        // Shadow-mode (PHILOTIC_SHADOW_ORACLE, default OFF): log-only oracle-vs-
+        // ladder annotation on the FIRST-TURN dispatch (Model Oracle Primary
+        // Authority, slice 2). Capability-guarded so it fires ONLY for the
+        // cognitive text-generation case — the same dispatch class slice 1
+        // instruments in `turn_loop` — and NEVER for the aux/transform tasks
+        // this site also multiplexes (voice.transcribe, media.analyze, ...).
+        // `shadow_oracle_pick` is itself flag-gated (returns before any
+        // ipc_client access when off), so aux tasks stay completely untouched
+        // and the cognitive OFF path costs nothing beyond this string compare.
+        // Never alters the dispatch target (target_node/role/guest_id unchanged).
+        if shadow_eligible_capability(&capability) {
+            let (shadow_pick, shadow_agreement) = self.shadow_oracle_pick(&target_role).await;
+            model_req.oracle_pick = shadow_pick;
+            model_req.oracle_agreement = shadow_agreement;
+        }
 
         if debug_model_requests_enabled()
             && matches!(capability.as_str(), "text.generate" | "response.generate")
@@ -4458,358 +3661,6 @@ impl AgentRuntime {
             .await?;
 
         Ok(())
-    }
-
-    async fn handle_model_response(&mut self, task: InboundTaskPayload) -> Result<()> {
-        let session_id = match task.session_id.as_deref().filter(|s| !s.is_empty()) {
-            Some(session_id) => session_id.to_string(),
-            None => return Ok(()),
-        };
-        let turn_id = match task.turn_id.as_deref().filter(|s| !s.is_empty()) {
-            Some(turn_id) => turn_id.to_string(),
-            None => return Ok(()),
-        };
-        self.ensure_session_loaded(&session_id, "unknown").await?;
-
-        // Guard: if the active turn's turn_id doesn't match the incoming response, drop it.
-        // This prevents stale model or synthesis responses from corrupting a newer active turn
-        // (e.g., two overlapping voice memos where VM1's synthesis arrives after VM2's turn started).
-        let active_turn_id = self
-            .sessions
-            .get(&session_id)
-            .and_then(|s| s.active_turn.as_ref())
-            .map(|t| t.turn_id.clone());
-
-        match active_turn_id {
-            None => {
-                // No active turn — the turn may have already completed (e.g. a duplicate
-                // response from a second controller on the same role inbox arriving after
-                // the first one already resolved the turn). Drop silently.
-                return Ok(());
-            }
-            Some(ref active_id) if active_id != &turn_id => {
-                warn!(
-                    "handle_model_response: dropping stale response for turn {} (active turn is {})",
-                    turn_id, active_id
-                );
-                return Ok(());
-            }
-            Some(_) => {}
-        }
-
-        // If the turn is waiting for voice synthesis, this is the audio response — route it
-        // directly to the voice handler regardless of the agent_action kind.
-        let waiting_voice = self
-            .sessions
-            .get(&session_id)
-            .and_then(|s| s.active_turn.as_ref())
-            .map(|t| t.phase == TurnPhase::WaitingVoice)
-            .unwrap_or(false);
-
-        if waiting_voice {
-            if let Some(model_error) = extract_model_error(&task) {
-                warn!(
-                    "Session [{}] voice synthesis failed before audio delivery: {}",
-                    session_id, model_error
-                );
-                // Fire TTS failure reflex — ensures fallback_to_text is on and
-                // any future turns know synthesis is unreliable.
-                if let Some(state) = self.sessions.get_mut(&session_id) {
-                    state.fire_reflex_event(ReflexEvent::TtsFailure {
-                        provider: state
-                            .agent_profile
-                            .voice_response_policy
-                            .provider
-                            .clone()
-                            .unwrap_or_else(|| "unknown".into()),
-                    });
-                }
-
-                let voice_policy = self
-                    .sessions
-                    .get(&session_id)
-                    .map(|s| s.agent_profile.voice_response_policy.clone())
-                    .unwrap_or_default();
-
-                if !voice_policy.fallback_to_text {
-                    return self
-                        .fail_active_turn(
-                            session_id,
-                            turn_id,
-                            format!("Voice synthesis failed: {}", model_error),
-                        )
-                        .await;
-                }
-            }
-
-            let raw_content = task.content.unwrap_or_default();
-            return self
-                .handle_voice_synthesis_response(session_id, turn_id, raw_content)
-                .await;
-        }
-
-        if let Some(error_payload) = extract_model_error_payload(&task) {
-            let sub_kind = error_payload.sub_kind.as_deref().unwrap_or("unknown");
-            // Content errors (malformed tool call): repair with prompt injection, once.
-            if is_content_error(&error_payload)
-                && should_attempt_provider_repair(&error_payload, self.sessions.get(&session_id))
-            {
-                warn!(
-                    session_id = %session_id,
-                    sub_kind = %sub_kind,
-                    "Retrying model turn with corrective note after content error"
-                );
-                return self
-                    .retry_active_turn_after_provider_failure(
-                        session_id,
-                        turn_id,
-                        Some(provider_repair_note(&error_payload)),
-                    )
-                    .await;
-            }
-            // Network / timeout / rate-limit errors: escalate to next fallback tier.
-            if should_escalate_tier(&error_payload) {
-                // For streaming_timeout specifically, allow one same-tier retry before
-                // escalating — handles transient empty SSE responses from Gemini.
-                if error_payload.sub_kind.as_deref() == Some("streaming_timeout") {
-                    let attempts = self
-                        .sessions
-                        .get(&session_id)
-                        .map(|s| s.streaming_retry_attempts())
-                        .unwrap_or(0);
-                    if attempts < 1 {
-                        if let Some(state) = self.sessions.get_mut(&session_id) {
-                            state.increment_streaming_retry_attempts();
-                        }
-                        warn!(
-                            session_id = %session_id,
-                            "Retrying same tier after streaming_timeout (attempt 1)"
-                        );
-                        return self
-                            .retry_active_turn_after_provider_failure(session_id, turn_id, None)
-                            .await;
-                    }
-                }
-                warn!(
-                    session_id = %session_id,
-                    sub_kind = %sub_kind,
-                    provider = %error_payload.provider.as_deref().unwrap_or("unknown"),
-                    "Escalating to next fallback tier after provider failure"
-                );
-                return self
-                    .advance_turn_to_next_fallback_tier(session_id, turn_id)
-                    .await;
-            }
-        }
-
-        if let Some(model_error) = extract_model_error(&task) {
-            warn!(
-                "Session [{}] model request failed before turn completion: {}",
-                session_id, model_error
-            );
-            return self
-                .fail_active_turn(
-                    session_id,
-                    turn_id,
-                    format!("Model failed: {}", model_error),
-                )
-                .await;
-        }
-
-        if let Some(state) = self.sessions.get_mut(&session_id) {
-            state.set_active_turn_phase(TurnPhase::Thinking);
-        }
-
-        let model_result = task
-            .agent_action
-            .as_ref()
-            .and_then(|a| a.get("model_result"))
-            .and_then(|mr| mr.get("result"));
-
-        let spoken_text = model_result
-            .and_then(|r| r.get("spoken_text"))
-            .and_then(serde_json::Value::as_str)
-            .filter(|s| !s.trim().is_empty())
-            .map(str::to_string);
-
-        let partial_replies = model_result
-            .and_then(|r| r.get("partial_replies"))
-            .and_then(serde_json::Value::as_array)
-            .map(|items| {
-                items
-                    .iter()
-                    .filter_map(serde_json::Value::as_str)
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty())
-                    .map(str::to_string)
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
-
-        let memory_concept = model_result
-            .and_then(|r| r.get("memory_concept"))
-            .and_then(serde_json::Value::as_str)
-            .filter(|s| !s.trim().is_empty())
-            .map(str::to_string);
-        let memory_candidate =
-            parse_memory_candidate(model_result.and_then(|r| r.get("memory_candidate")));
-        let audio_artifact = extract_audio_artifact(model_result);
-
-        // Capture active_plan from the model response and store it on the turn.
-        // Present whenever the model outputs a structured plan — optional on all turns.
-        if let Some(plan_value) = model_result.and_then(|r| r.get("active_plan")) {
-            if let Ok(plan) = serde_json::from_value::<ActivePlan>(plan_value.clone()) {
-                if let Some(state) = self.sessions.get_mut(&session_id) {
-                    let is_first = state
-                        .active_turn
-                        .as_ref()
-                        .map(|t| t.active_plan.is_none())
-                        .unwrap_or(false);
-                    state.set_active_plan(plan);
-                    // Expand the iteration cap based on declared step count so complex
-                    // plans don't hit the cap mid-execution. 4 iterations per step gives
-                    // headroom for retries/recalls; hard ceiling 50, never shrinks.
-                    let n_steps = state
-                        .active_turn
-                        .as_ref()
-                        .and_then(|t| t.active_plan.as_ref())
-                        .map(|p| p.steps.len() as u32)
-                        .unwrap_or(0);
-                    if n_steps > 0 {
-                        let plan_cap = (n_steps * 4)
-                            .max(state.settings.execution.iteration_cap)
-                            .min(50);
-                        if plan_cap > state.settings.execution.iteration_cap {
-                            info!(
-                                session_id = %session_id,
-                                n_steps,
-                                old_cap = state.settings.execution.iteration_cap,
-                                new_cap = plan_cap,
-                                "Plan-scaled iteration cap"
-                            );
-                            state.settings.execution.iteration_cap = plan_cap;
-                        }
-                    }
-                    // state last used above; NLL ends the borrow before emit_turn_event.
-                    if is_first {
-                        let _ = self.emit_turn_event(&session_id, "plan_ready", None).await;
-                    }
-                }
-            }
-        }
-
-        let awaiting_transcription_reentry = self
-            .sessions
-            .get(&session_id)
-            .map(|state| state.active_turn_awaiting_transcription_reentry())
-            .unwrap_or(false);
-
-        let action = interpret_model_payload(task.agent_action.as_ref(), task.content.as_deref());
-        if awaiting_transcription_reentry {
-            return match action {
-                AgentAction::Respond { content } => {
-                    self.reenter_turn_after_transcription(session_id, turn_id, content)
-                        .await
-                }
-                AgentAction::Fail { message } => {
-                    self.fail_active_turn(session_id, turn_id, message).await
-                }
-                other => {
-                    self.fail_active_turn(
-                        session_id,
-                        turn_id,
-                        format!(
-                            "voice.transcribe returned unexpected action {:?}; expected transcript text",
-                            other
-                        ),
-                    )
-                    .await
-                }
-            };
-        }
-
-        // Scripted loop fork: when the turn is running under a LoopScript,
-        // model responses are consumed by the ScriptedLoopExecutor rather than
-        // dispatched through the standard AgentAction match below.
-        // Full routing (ParkForApproval, ExecuteNextTool, etc.) is implemented
-        // in handle_scripted_loop_model_response — stubbed here until Phase 1b.
-        let is_scripted = self
-            .sessions
-            .get(&session_id)
-            .and_then(|s| s.active_turn.as_ref())
-            .map(|t| t.scripted_loop_context.is_some())
-            .unwrap_or(false);
-
-        if is_scripted {
-            let model_result_owned = model_result.cloned();
-            return self
-                .handle_scripted_loop_model_response(
-                    session_id,
-                    turn_id,
-                    model_result_owned,
-                    spoken_text,
-                    memory_concept,
-                    memory_candidate,
-                )
-                .await;
-        }
-
-        match action {
-            AgentAction::Respond { content } => {
-                for partial in partial_replies {
-                    self.emit_partial_reply(&session_id, partial).await?;
-                }
-                self.complete_agent_response(
-                    session_id,
-                    turn_id,
-                    content,
-                    spoken_text,
-                    audio_artifact,
-                    memory_concept,
-                    memory_candidate,
-                )
-                .await
-            }
-            AgentAction::ToolCall(tool_call) => {
-                let forced_stop_reply = self.sessions.get(&session_id).and_then(|state| {
-                    let turn = state.active_turn.as_ref()?;
-                    let iteration_cap = state.settings.execution.iteration_cap;
-                    let reason = if turn.iteration >= iteration_cap {
-                        Some("the turn reached its maximum tool-iteration limit")
-                    } else {
-                        loop_stop_reason(turn, iteration_cap)
-                    }?;
-                    Some(loop_stop_fallback_reply(
-                        &turn.user_content,
-                        &turn.working_tool_history,
-                        reason,
-                    ))
-                });
-
-                if let Some(reply) = forced_stop_reply {
-                    warn!(
-                        session_id = %session_id,
-                        tool_name = %tool_call.tool_name,
-                        "Suppressing tool call after loop stop condition; delivering fallback reply."
-                    );
-                    return self
-                        .deliver_text_reply(session_id, turn_id, reply, None, false, None, None)
-                        .await;
-                }
-                self.handle_tool_call(session_id, turn_id, tool_call).await
-            }
-            AgentAction::RequestApproval(approval) => {
-                self.handle_approval_request(session_id, turn_id, approval, false)
-                    .await
-            }
-            AgentAction::PlanProposal(proposal) => {
-                self.handle_plan_proposal(session_id, turn_id, proposal)
-                    .await
-            }
-            AgentAction::Fail { message } => {
-                self.fail_active_turn(session_id, turn_id, message).await
-            }
-        }
     }
 
     /// Handle a model plan_proposal: surface the plan to the operator, park the turn
@@ -4847,6 +3698,14 @@ impl AgentRuntime {
             let final_reply_to = active_turn.final_reply_to.clone();
             let final_reply_role = active_turn.final_reply_role.clone();
             let final_reply_guest_id = active_turn.final_reply_guest_id.clone();
+            // A new plan proposal is a redirect: it replaces any plan the
+            // plan-eval-repeat loop was still carrying over.
+            if state.carryover_plan.take().is_some() {
+                info!(
+                    session_id = %session_id,
+                    "New plan proposal replaces the existing plan carryover."
+                );
+            }
             state.set_active_turn_phase(TurnPhase::PlanningDiscussion);
             state.park_active_turn_for_plan();
             (
@@ -5020,229 +3879,6 @@ impl AgentRuntime {
         Ok(())
     }
 
-    async fn handle_approval_request(
-        &mut self,
-        session_id: String,
-        turn_id: String,
-        approval: ApprovalRequest,
-        always_require_human: bool,
-    ) -> Result<()> {
-        let approval = Self::normalize_approval_request(approval);
-        // `always_require_human` bypasses the approval policy entirely — the human operator
-        // must approve in this session. Used for admin role creation, which cannot be
-        // preapproved or bypassed by `auto_approve_all`.
-        let preapproved = if always_require_human {
-            false
-        } else {
-            self.sessions
-                .get(&session_id)
-                .map(|state| {
-                    let tool = state
-                        .active_turn
-                        .as_ref()
-                        .and_then(|t| t.pending_tool_call.as_ref());
-                    state.approval_policy_allows(&approval, tool)
-                })
-                .unwrap_or(false)
-        };
-
-        let (
-            task_id,
-            chat_id,
-            final_reply_to,
-            final_reply_role,
-            final_reply_guest_id,
-            checkpoint_memory_type,
-            checkpoint_json,
-            index_state,
-            approval_active_plan,
-            approval_pending_tool_call,
-        ) = {
-            let Some(state) = self.sessions.get_mut(&session_id) else {
-                warn!(
-                    "Received approval request for unknown session {}",
-                    session_id
-                );
-                return Ok(());
-            };
-            let Some(active_turn) = state.active_turn.as_ref() else {
-                warn!(
-                    "Received approval request for session {} with no active turn",
-                    session_id
-                );
-                return Ok(());
-            };
-            let task_id = active_turn.task_id;
-            let chat_id = active_turn.chat_id.clone();
-            let final_reply_to = active_turn.final_reply_to.clone();
-            let final_reply_role = active_turn.final_reply_role.clone();
-            let final_reply_guest_id = active_turn.final_reply_guest_id.clone();
-            let approval_active_plan = active_turn.active_plan.clone();
-            let approval_pending_tool_call = active_turn.pending_tool_call.clone();
-            if preapproved {
-                state.clear_pending_approval();
-                state.set_active_turn_phase(TurnPhase::Thinking);
-            } else {
-                state.set_pending_approval(approval.clone());
-                state.set_active_turn_phase(TurnPhase::WaitingApproval);
-                // Park the turn so this session can accept new work while the operator
-                // decides. active_turn becomes None; parked_approval_turn holds the state.
-                state.park_active_turn_for_approval();
-            }
-            (
-                task_id,
-                chat_id,
-                final_reply_to,
-                final_reply_role,
-                final_reply_guest_id,
-                state.checkpoint_memory_type(),
-                state.checkpoint_json(),
-                state.clone(),
-                approval_active_plan,
-                approval_pending_tool_call,
-            )
-        };
-
-        self.ipc_client
-            .sync_apartment(&self.agent_id, &checkpoint_memory_type, checkpoint_json)
-            .await?;
-        self.sync_session_index(&index_state).await?;
-
-        if preapproved {
-            let pending_tool_call = self
-                .sessions
-                .get(&session_id)
-                .and_then(|state| state.active_turn.as_ref())
-                .and_then(|turn| turn.pending_tool_call.clone());
-            let _ = self
-                .ipc_client
-                .send_request(IpcRequest::UpdateTask {
-                    task_id,
-                    state: "approval_preapproved".into(),
-                    payload: serde_json::json!({
-                        "session_id": session_id,
-                        "turn_id": turn_id,
-                        "chat_id": chat_id,
-                        "approval_request": {
-                            "approval_id": approval.approval_id,
-                            "reason": approval.reason,
-                            "approved_response": approval.approved_response,
-                        },
-                        "approval_resolution": {
-                            "approval_id": approval.approval_id,
-                            "decision": "approved",
-                            "reason": approval.reason,
-                            "resolution_mode": "preapproved",
-                        }
-                    }),
-                })
-                .await?;
-
-            let reply_payload = FinalReplyPayload {
-                action: "send_reply",
-                session_id: session_id.clone(),
-                turn_id: turn_id.clone(),
-                chat_id,
-                content: approval.approved_response.clone(),
-                audio_artifact: None,
-                send_text_caption: false,
-                reply_markup: None,
-            };
-
-            self.ipc_client
-                .send_request(IpcRequest::EmitTask {
-                    target_node: final_reply_to,
-                    target_role: final_reply_role,
-                    target_guest_id: final_reply_guest_id,
-                    task_json: serde_json::to_string(&reply_payload)?,
-                })
-                .await?;
-
-            if let Some(tool_call) = pending_tool_call {
-                // bypass_approval=true: preapproved path, no re-gate needed.
-                return self
-                    .route_tool_call_execution(session_id, turn_id, tool_call, true)
-                    .await;
-            }
-
-            return self
-                .complete_agent_response(
-                    session_id,
-                    turn_id,
-                    approval.approved_response,
-                    None,
-                    None,
-                    None,
-                    None,
-                )
-                .await;
-        }
-
-        let _ = self
-            .ipc_client
-            .send_request(IpcRequest::UpdateTask {
-                task_id,
-                state: "waiting_approval".into(),
-                payload: serde_json::json!({
-                    "session_id": session_id,
-                    "turn_id": turn_id,
-                    "chat_id": chat_id,
-                    "approval_request": {
-                        "approval_id": approval.approval_id,
-                        "reason": approval.reason,
-                        "approved_response": approval.approved_response,
-                    }
-                }),
-            })
-            .await?;
-
-        let _ = self
-            .emit_turn_event(
-                &session_id,
-                "waiting_approval",
-                Some(approval.reason.clone()),
-            )
-            .await;
-
-        let approval_keyboard = serde_json::json!({
-            "inline_keyboard": [
-                [
-                    {"text": "✅ Approve", "callback_data": "approve"},
-                    {"text": "❌ Deny", "callback_data": "deny"}
-                ],
-                [
-                    {"text": "🔓 Trust for session", "callback_data": "trust"}
-                ]
-            ]
-        });
-
-        let reply_payload = FinalReplyPayload {
-            action: "send_reply",
-            session_id,
-            turn_id,
-            chat_id,
-            content: Self::format_approval_message(
-                &approval,
-                approval_active_plan.as_ref(),
-                approval_pending_tool_call.as_ref(),
-            ),
-            audio_artifact: None,
-            send_text_caption: false,
-            reply_markup: Some(approval_keyboard),
-        };
-
-        self.ipc_client
-            .send_request(IpcRequest::EmitTask {
-                target_node: final_reply_to,
-                target_role: final_reply_role,
-                target_guest_id: final_reply_guest_id,
-                task_json: serde_json::to_string(&reply_payload)?,
-            })
-            .await?;
-
-        Ok(())
-    }
-
     async fn emit_partial_reply(&mut self, session_id: &str, content: String) -> Result<()> {
         let (turn_id, chat_id, final_reply_to, final_reply_role, final_reply_guest_id) = {
             let Some(state) = self.sessions.get(session_id) else {
@@ -5305,438 +3941,20 @@ impl AgentRuntime {
             status,
         };
 
-        tokio::time::timeout(
-            Duration::from_secs(10),
-            self.ipc_client.send_request(IpcRequest::EmitTask {
-                target_node: final_reply_to,
-                target_role: final_reply_role,
-                target_guest_id: final_reply_guest_id,
-                task_json: serde_json::to_string(&payload)?,
-            }),
-        )
-        .await
-        .map_err(|_| anyhow::anyhow!("emit_turn_status: ipc ack timeout after 10s"))??;
-
-        Ok(())
-    }
-
-    fn route_tool_call_execution(
-        &mut self,
-        session_id: String,
-        turn_id: String,
-        tool_call: ToolCall,
-        // When `true`, the approval gate is skipped entirely — the caller has already
-        // obtained a manual or preapproved resolution and must not re-gate the tool.
-        bypass_approval: bool,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + '_>> {
-        Box::pin(async move {
-            // Agent-level approval enforcement: if the tool's policy annotation marks it as
-            // requiring approval, and the current approval policy does not preapprove it,
-            // synthesize an ApprovalRequest before executing. This runs independently of
-            // whether the model itself requested approval — it is the agent's safety gate.
-            // Skipped when bypass_approval is true (i.e. we are resuming after a resolution).
-            let force_approval = if bypass_approval {
-                false
-            } else {
-                self.sessions
-                    .get(&session_id)
-                    .map(|state| {
-                        let requires = state
-                            .tool_assembly
-                            .policy_annotations
-                            .get(&tool_call.tool_name)
-                            .map(|a| a.approval_required)
-                            .unwrap_or(false);
-                        if requires {
-                            let synthetic = ApprovalRequest {
-                                approval_id: None,
-                                reason: format!(
-                                    "Tool '{}' requires approval before execution.",
-                                    tool_call.tool_name
-                                ),
-                                approved_response: format!("Executing {}.", tool_call.tool_name),
-                            };
-                            !state.approval_policy_allows(&synthetic, Some(&tool_call))
-                        } else {
-                            false
-                        }
-                    })
-                    .unwrap_or(false)
-            };
-
-            // Admin role creation requires live operator approval regardless of any approval policy.
-            // This check runs before the normal force_approval gate so it can set always_require_human.
-            // Bypassed when bypass_approval is true (already resolved by the operator).
-            let is_admin_role_creation = !bypass_approval
-                && tool_call.tool_name == "role.configure"
-                && tool_call
-                    .arguments
-                    .get("is_admin")
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(false);
-
-            // rule.propose always requires live operator approval — cannot be preapproved or bypassed.
-            // Rules are durable and permanently affect agent behavior, so human confirmation is required.
-            // (bypass_approval does NOT bypass rule.propose — that one is unconditional.)
-            let is_rule_propose = !bypass_approval && tool_call.tool_name == "rule.propose";
-
-            // routing.policy.propose requires the same live-approval gate: proposals are stored
-            // durably in the hotel graph and influence future routing decisions, so they must
-            // not be silently submitted without operator visibility.
-            let is_routing_policy_propose =
-                !bypass_approval && tool_call.tool_name == "routing.policy.propose";
-
-            if is_admin_role_creation
-                || is_rule_propose
-                || is_routing_policy_propose
-                || force_approval
-            {
-                // Set pending_tool_call so the approval handler can read it for class lookup.
-                if let Some(state) = self.sessions.get_mut(&session_id) {
-                    state.set_pending_tool_call(tool_call.clone());
-                }
-                let role_name_hint = if is_admin_role_creation {
-                    tool_call
-                        .arguments
-                        .get("role_name")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("unknown")
-                        .to_string()
-                } else {
-                    String::new()
-                };
-                let (reason, approved_response) = if is_admin_role_creation {
-                    (
-                        format!(
-                            "Admin role '{}' creation requires your explicit live approval. \
-                         This cannot be preapproved or bypassed by policy.",
-                            role_name_hint
-                        ),
-                        format!("Admin role '{}' approved.", role_name_hint),
-                    )
-                } else if is_rule_propose {
-                    (
-                        "Rule proposal requires your explicit live approval.".to_string(),
-                        "Rule proposal approved.".to_string(),
-                    )
-                } else if is_routing_policy_propose {
-                    (
-                        "Routing policy proposal requires your explicit live approval.".to_string(),
-                        "Routing policy proposal approved.".to_string(),
-                    )
-                } else {
-                    (
-                        format!(
-                            "Tool '{}' requires approval before execution.",
-                            tool_call.tool_name
-                        ),
-                        format!("Executing {}.", tool_call.tool_name),
-                    )
-                };
-                let synthetic = ApprovalRequest {
-                    approval_id: Some(uuid::Uuid::new_v4().to_string()),
-                    reason,
-                    approved_response,
-                };
-                return self
-                    .handle_approval_request(
-                        session_id,
-                        turn_id,
-                        synthetic,
-                        is_admin_role_creation || is_rule_propose || is_routing_policy_propose,
-                    )
-                    .await;
-            }
-
-            // Dedup guard: if (tool_name, canonical_args) already appears in this
-            // turn's history with a non-error result, inject a correction note and
-            // re-enter the model without dispatching the tool again. This prevents
-            // spin loops where the model calls an idempotent tool (e.g. role.create_or_update)
-            // repeatedly after it already succeeded.
-            let canonical_args = serde_json::to_string(&tool_call.arguments).unwrap_or_default();
-            let (
-                already_succeeded,
-                dedup_chat_id,
-                dedup_reply_to,
-                dedup_reply_role,
-                dedup_reply_guest_id,
-            ) = {
-                let state = self.sessions.get(&session_id);
-                let prev_success = state
-                    .and_then(|s| s.active_turn.as_ref())
-                    .map(|turn| {
-                        turn.working_tool_history
-                            .iter()
-                            .any(|(prev_call, prev_result)| {
-                                prev_call.tool_name == tool_call.tool_name
-                                    && serde_json::to_string(&prev_call.arguments)
-                                        .unwrap_or_default()
-                                        == canonical_args
-                                    && !prev_result.content.to_lowercase().contains("error")
-                                    && !prev_result.content.to_lowercase().contains("failed")
-                            })
-                    })
-                    .unwrap_or(false);
-                let (chat_id, reply_to, reply_role, reply_guest) = state
-                    .and_then(|s| s.active_turn.as_ref())
-                    .map(|t| {
-                        (
-                            t.chat_id.clone(),
-                            t.final_reply_to.clone(),
-                            t.final_reply_role.clone(),
-                            t.final_reply_guest_id.clone(),
-                        )
-                    })
-                    .unwrap_or_default();
-                (prev_success, chat_id, reply_to, reply_role, reply_guest)
-            };
-
-            if already_succeeded {
-                warn!(
-                    "Session [{}] dedup guard: `{}` already succeeded this turn; \
-                     injecting correction note instead of re-dispatching.",
-                    session_id, tool_call.tool_name
-                );
-                if let Some(state) = self.sessions.get_mut(&session_id) {
-                    state.set_provider_repair_note(format!(
-                        "`{}` with these arguments already succeeded earlier in this turn. \
-                         Do not call it again. Review the tool history and either proceed \
-                         to the next plan step or deliver your final response.",
-                        tool_call.tool_name
-                    ));
-                }
-                return self
-                    .handle_tool_result(InboundTaskPayload {
-                        action: Some("tool_result".into()),
-                        source: Some("agent".into()),
-                        session_id: Some(session_id),
-                        turn_id: Some(turn_id),
-                        chat_id: Some(dedup_chat_id),
-                        content: Some(format!(
-                            "[Duplicate call skipped] `{}` already ran and succeeded \
-                             earlier in this turn with these arguments.",
-                            tool_call.tool_name
-                        )),
-                        tool_name: Some(tool_call.tool_name),
-                        final_reply_to: Some(dedup_reply_to),
-                        final_reply_role: Some(dedup_reply_role),
-                        final_reply_guest_id: dedup_reply_guest_id,
-                        ..Default::default()
-                    })
-                    .await;
-            }
-
-            // Emit step_started if streaming is enabled.
-            let stream_events = self
-                .sessions
-                .get(&session_id)
-                .map(|s| s.settings.execution.stream_tool_events)
-                .unwrap_or(true);
-            if stream_events {
-                let step_info = Some(tool_call.tool_name.clone());
-                let _ = self
-                    .emit_turn_event(&session_id, "step_started", step_info)
-                    .await;
-            }
-            let (
-                chat_id,
-                final_reply_to,
-                final_reply_role,
-                final_reply_guest_id,
-                workspace_ref,
-                route,
-                session_user_id,
-            ) = {
-                let Some(state) = self.sessions.get(&session_id) else {
-                    warn!(
-                        "Tool execution requested for unknown session {}",
-                        session_id
-                    );
-                    return Ok(());
-                };
-                let route = match Self::execute_bound_tool(state, &tool_call) {
-                    Ok(route) => route.clone(),
-                    Err(err) => {
-                        return self
-                            .fail_active_turn(session_id, turn_id, err.to_string())
-                            .await;
-                    }
-                };
-                let Some(active_turn) = state.active_turn.as_ref() else {
-                    warn!(
-                        "Dropping tool execution routing for session {} turn {} after active turn disappeared",
-                        session_id, turn_id
-                    );
-                    return Ok(());
-                };
-                (
-                    active_turn.chat_id.clone(),
-                    active_turn.final_reply_to.clone(),
-                    active_turn.final_reply_role.clone(),
-                    active_turn.final_reply_guest_id.clone(),
-                    state.bindings.effective_workspace_ref.clone(),
-                    route,
-                    state.source.clone(),
-                )
-            };
-
-            // Store the tool call on the active turn BEFORE dispatching so that when the
-            // result returns, handle_tool_result can recover the full (name + arguments)
-            // pair for the working_tool_history. Without this, the fallback uses empty args.
-            let pending_checkpoint = if let Some(state) = self.sessions.get_mut(&session_id) {
-                state.set_pending_tool_call(tool_call.clone());
-                state.set_active_turn_phase(TurnPhase::WaitingTool);
-                Some((
-                    state.checkpoint_memory_type(),
-                    state.checkpoint_json(),
-                    state.clone(),
-                ))
-            } else {
-                None
-            };
-            if let Some((checkpoint_memory_type, checkpoint_json, index_state)) = pending_checkpoint
-            {
-                if let Err(e) = tokio::time::timeout(
-                    Duration::from_secs(15),
-                    self.ipc_client.sync_apartment(
-                        &self.agent_id,
-                        &checkpoint_memory_type,
-                        checkpoint_json,
-                    ),
-                )
-                .await
-                .map_err(|_| anyhow::anyhow!("sync_apartment: ipc ack timeout after 15s"))
-                .and_then(|r| r)
-                {
-                    warn!("route_tool_call_execution: sync_apartment failed: {e}; continuing");
-                }
-                if let Err(e) = tokio::time::timeout(
-                    Duration::from_secs(15),
-                    self.sync_session_index(&index_state),
-                )
-                .await
-                .map_err(|_| anyhow::anyhow!("sync_session_index: ipc ack timeout after 15s"))
-                .and_then(|r| r)
-                {
-                    warn!("route_tool_call_execution: sync_session_index failed: {e}; continuing");
-                }
-            }
-
-            // Emit a status message to membrane so the user sees what's happening.
-            let status_label = tool_status_label(&tool_call.tool_name);
-            let _ = tokio::time::timeout(
+        self.ipc_client
+            .send_request_with_timeout(
+                IpcRequest::EmitTask {
+                    target_node: final_reply_to,
+                    target_role: final_reply_role,
+                    target_guest_id: final_reply_guest_id,
+                    task_json: serde_json::to_string(&payload)?,
+                },
                 Duration::from_secs(10),
-                self.emit_turn_status(&session_id, status_label),
-            )
-            .await;
-
-            let tool_req = ToolExecutionPayload {
-                action: "execute_tool",
-                session_id: session_id.clone(),
-                turn_id: turn_id.clone(),
-                chat_id,
-                tool_name: tool_call.tool_name,
-                arguments: tool_call.arguments,
-                execution_mode: route.execution_mode.clone(),
-                agent_id: self.agent_id.clone(),
-                user_id: Some(session_user_id),
-                runner_id: route.runner_id.clone(),
-                incarnation_id: route.incarnation_id.clone(),
-                hotel_id: route.hotel_id.clone(),
-                environment_id: route.environment_id.clone(),
-                task_runner_kind: route.task_runner_kind.clone(),
-                task_runner_config: route.task_runner_config.clone(),
-                selection_reason: route.selection_reason.clone(),
-                workspace_ref: workspace_ref.clone(),
-                task_runner_overlay: route.task_runner_kind.as_deref().map(|kind| {
-                    TaskRunnerOverlay {
-                        workspace_ref: if kind == "workspace" {
-                            workspace_ref
-                        } else {
-                            None
-                        },
-                        allowed_tools: None,
-                        max_read_bytes: None,
-                        max_search_results: None,
-                    }
-                }),
-                return_route: Some(philotic_client::ReturnRoute {
-                    node: local_node_id(),
-                    role: "agent".into(),
-                    guest_id: Some(self.agent_id.clone()),
-                    session_id: Some(session_id.clone()),
-                    turn_id: Some(turn_id.clone()),
-                    correlation_id: None,
-                }),
-                reply_to: local_node_id(),
-                reply_role: "agent".into(),
-                reply_guest_id: Some(self.agent_id.clone()),
-                final_reply_to,
-                final_reply_role,
-                final_reply_guest_id,
-            };
-
-            if route.execution_mode == "local_agent" {
-                return self.execute_local_agent_tool(tool_req).await;
-            }
-
-            // Capability primitives (image.*, audio.*, etc.) use the synchronous hotel router.
-            if route.execution_mode == "capability_invoke" {
-                let capability_req = build_capability_request(
-                    &tool_req.tool_name,
-                    &tool_req.arguments,
-                    &tool_req.session_id,
-                    &tool_req.agent_id,
-                );
-                let ipc_resp = self
-                    .ipc_client
-                    .send_request(IpcRequest::CapabilityInvoke {
-                        request: capability_req,
-                    })
-                    .await?;
-                let content = match ipc_resp {
-                    IpcResponse::Standard {
-                        ok: true,
-                        data: Some(result),
-                        ..
-                    } => {
-                        serde_json::to_string_pretty(&result).unwrap_or_else(|_| result.to_string())
-                    }
-                    IpcResponse::Standard {
-                        ok: false, message, ..
-                    } => format!("Capability call failed: {message}"),
-                    other => format!(
-                        "Unexpected hotel response for capability '{}': {other:?}",
-                        tool_req.tool_name
-                    ),
-                };
-                return self
-                    .handle_tool_result(crate::protocol::InboundTaskPayload {
-                        action: Some("tool_result".into()),
-                        session_id: Some(tool_req.session_id),
-                        turn_id: Some(tool_req.turn_id),
-                        chat_id: Some(tool_req.chat_id),
-                        tool_name: Some(tool_req.tool_name),
-                        content: Some(content),
-                        ..Default::default()
-                    })
-                    .await;
-            }
-
-            tokio::time::timeout(
-                Duration::from_secs(30),
-                self.ipc_client.send_request(IpcRequest::EmitTask {
-                    target_node: route.target_node,
-                    target_role: route.target_role,
-                    target_guest_id: route.incarnation_id.clone(),
-                    task_json: serde_json::to_string(&tool_req)?,
-                }),
             )
             .await
-            .map_err(|_| anyhow::anyhow!("tool dispatch: ipc ack timeout after 30s"))??;
+            .context("emit_turn_status: ipc ack failed or timed out after 10s")?;
 
-            Ok(())
-        })
+        Ok(())
     }
 
     async fn handle_tool_call(
@@ -5748,817 +3966,6 @@ impl AgentRuntime {
         // bypass_approval=false: this is the normal model-driven path; gate applies.
         self.route_tool_call_execution(session_id, turn_id, tool_call, false)
             .await
-    }
-
-    async fn handle_tool_result(&mut self, task: InboundTaskPayload) -> Result<()> {
-        let session_id = match task.session_id.as_deref().filter(|s| !s.is_empty()) {
-            Some(session_id) => session_id.to_string(),
-            None => return Ok(()),
-        };
-        let (turn_id, pending_tool_name) = {
-            let active_turn = self
-                .sessions
-                .get(&session_id)
-                .and_then(|state| state.active_turn.as_ref());
-            let pending_tool_name = active_turn
-                .and_then(|turn| turn.pending_tool_call.as_ref())
-                .map(|tool| tool.tool_name.clone());
-            let turn_id = task
-                .turn_id
-                .as_deref()
-                .filter(|s| !s.is_empty())
-                .map(str::to_string)
-                .or_else(|| active_turn.map(|turn| turn.turn_id.clone()));
-            let Some(turn_id) = turn_id else {
-                warn!(
-                    session_id = %session_id,
-                    "Dropping tool result without turn_id and without active turn"
-                );
-                return Ok(());
-            };
-            (turn_id, pending_tool_name)
-        };
-        let tool_name = task
-            .tool_name
-            .clone()
-            .filter(|name| !name.is_empty())
-            .or(pending_tool_name)
-            .or_else(|| task.capability.clone().filter(|name| !name.is_empty()))
-            .unwrap_or_else(|| "unknown".into());
-        let tool_result = ToolResult {
-            tool_name,
-            content: task.content.clone().unwrap_or_default(),
-        };
-
-        // step_failed is determined by the presence of a non-empty error payload.
-        let step_failed = task.error.is_some();
-        let stream_events = self
-            .sessions
-            .get(&session_id)
-            .map(|s| s.settings.execution.stream_tool_events)
-            .unwrap_or(true);
-
-        // Scripted-loop fork: if this turn is running under a LoopScript, accumulate
-        // the tool result into the executor and dispatch the next scripted action
-        // instead of re-entering the open-ended model loop.
-        let is_scripted_turn = self
-            .sessions
-            .get(&session_id)
-            .and_then(|s| s.active_turn.as_ref())
-            .map(|t| t.scripted_loop_context.is_some())
-            .unwrap_or(false);
-
-        // Only treat an incoming datasource response as the life.observe result when
-        // the response's own tool_name confirms it — prevents a co-occurring
-        // graph-datasource failure (tool_name="unknown") from completing a WaitingTool
-        // turn that is legitimately waiting for the life-graph-runner response.
-        let response_is_life_observe =
-            matches!(tool_result.tool_name.as_str(), "life.observe" | "");
-        let direct_life_observe_command = self
-            .sessions
-            .get(&session_id)
-            .and_then(|s| s.active_turn.as_ref())
-            .and_then(|turn| {
-                turn.pending_tool_call.as_ref().and_then(|call| {
-                    (call.tool_name == "life.observe" && response_is_life_observe)
-                        .then(|| direct_life_observe_command_from_arguments(&call.arguments))
-                        .flatten()
-                })
-            })
-            .filter(|command| !command.claim_summary.trim().is_empty());
-
-        if let Some(command) = direct_life_observe_command {
-            {
-                let Some(state) = self.sessions.get_mut(&session_id) else {
-                    warn!("Tool result returned for unknown session {}", session_id);
-                    return Ok(());
-                };
-                let tool_call = state
-                    .active_turn
-                    .as_ref()
-                    .and_then(|t| t.pending_tool_call.clone())
-                    .unwrap_or_else(|| ToolCall {
-                        tool_name: tool_result.tool_name.clone(),
-                        arguments: serde_json::json!({}),
-                    });
-                state.push_tool_history(tool_call, tool_result.clone());
-                state.clear_pending_tool_call();
-                if let Some(turn) = state.active_turn.as_mut() {
-                    turn.iteration += 1;
-                }
-            }
-
-            let reply = if step_failed {
-                direct_life_observe_failure_reply(&command, &tool_result.content)
-            } else {
-                direct_life_observe_success_reply(&command, &tool_result.content)
-            };
-            return self
-                .deliver_text_reply(session_id, turn_id, reply, None, false, None, None)
-                .await;
-        }
-
-        if is_scripted_turn {
-            let (checkpoint_memory_type, checkpoint_json, index_state) = {
-                let Some(state) = self.sessions.get_mut(&session_id) else {
-                    return Ok(());
-                };
-                let tool_call = state
-                    .active_turn
-                    .as_ref()
-                    .and_then(|t| t.pending_tool_call.clone())
-                    .unwrap_or_else(|| ToolCall {
-                        tool_name: tool_result.tool_name.clone(),
-                        arguments: serde_json::json!({}),
-                    });
-                state.push_tool_history(tool_call, tool_result.clone());
-                state.clear_pending_tool_call();
-                let result_value = Value::String(tool_result.content.clone());
-                state.with_scripted_executor_mut(|exec| {
-                    exec.record_tool_result(result_value);
-                    exec.advance_tool_cursor();
-                });
-                (
-                    state.checkpoint_memory_type(),
-                    state.checkpoint_json(),
-                    state.clone(),
-                )
-            };
-            if stream_events {
-                let event = if step_failed {
-                    "step_failed"
-                } else {
-                    "step_completed"
-                };
-                let _ = self.emit_turn_event(&session_id, event, None).await;
-            }
-            self.ipc_client
-                .sync_apartment(&self.agent_id, &checkpoint_memory_type, checkpoint_json)
-                .await?;
-            self.sync_session_index(&index_state).await?;
-            return self
-                .scripted_dispatch_after_advance(session_id, turn_id, None, None, None)
-                .await;
-        }
-
-        // Pair the result with the pending tool call, push to history, check iteration cap.
-        let mut is_finalizing = false;
-        let loop_outcome = {
-            let Some(state) = self.sessions.get_mut(&session_id) else {
-                warn!("Tool result returned for unknown session {}", session_id);
-                return Ok(());
-            };
-
-            let tool_call = state
-                .active_turn
-                .as_ref()
-                .and_then(|t| t.pending_tool_call.clone())
-                .unwrap_or_else(|| ToolCall {
-                    tool_name: tool_result.tool_name.clone(),
-                    arguments: serde_json::json!({}),
-                });
-
-            state.push_tool_history(tool_call.clone(), tool_result.clone());
-            state.clear_pending_tool_call();
-
-            // Update conditional-preapproval streak tracking.
-            if step_failed {
-                state.record_tool_streak_failure(&tool_call.tool_name);
-            } else {
-                state.record_tool_streak_success(&tool_call.tool_name);
-            }
-
-            // Track consecutive failures for stall detection.
-            let consecutive_failures = if step_failed {
-                state.increment_step_failures()
-            } else {
-                state.reset_step_failures();
-                0
-            };
-            let stall_threshold = state.settings.execution.stall_detection_threshold;
-
-            // Increment iteration before building the envelope so the context projection
-            // carries the correct (post-increment) iteration number. This ensures
-            // turn/iteration-aware stubs and any model-side telemetry see the right value.
-            if let Some(turn) = state.active_turn.as_mut() {
-                turn.iteration += 1;
-                turn.phase = TurnPhase::WaitingModel;
-            }
-
-            let iteration = state.active_turn.as_ref().map(|t| t.iteration).unwrap_or(0);
-            let iteration_cap = state.settings.execution.iteration_cap;
-            let stop_reason = state
-                .active_turn
-                .as_ref()
-                .and_then(|turn| loop_stop_reason(turn, iteration_cap));
-
-            if consecutive_failures >= stall_threshold {
-                Err(format!(
-                    "Stall detected: {consecutive_failures} consecutive step failures \
-                     (threshold: {stall_threshold}). Surfacing to user."
-                ))
-            } else if let Some(stop_reason) = stop_reason {
-                // No-progress stop: give the model one stripped-tool chance to answer
-                // before the hard cap. This catches diagnostic/status spirals while
-                // preserving the useful evidence already collected.
-                warn!(
-                    session_id = %session_id,
-                    iteration,
-                    iteration_cap,
-                    stop_reason,
-                    "Session reached loop stop condition; doing final no-tool wrap-up."
-                );
-                is_finalizing = true;
-                match state.build_reentry_context_envelope() {
-                    Some((mut prompt, context, context_projection, _tools)) => {
-                        prompt.push_str(&format!(
-                            "\n\n[Loop control: {stop_reason}. Do not call any more tools. \
-                             Review the tool history and provide your final response to the user now.]"
-                        ));
-                        let active_turn = state.active_turn.as_ref().expect("turn exists");
-                        Ok((
-                            prompt,
-                            context,
-                            context_projection,
-                            active_turn.task_id,
-                            active_turn.user_content.clone(),
-                            active_turn.chat_id.clone(),
-                            active_turn.final_reply_to.clone(),
-                            active_turn.final_reply_role.clone(),
-                            active_turn.final_reply_guest_id.clone(),
-                            vec![], // strip tools — forces text-only reply
-                            state.checkpoint_memory_type(),
-                            state.checkpoint_json(),
-                            state.clone(),
-                        ))
-                    }
-                    None => Err("Active turn vanished at loop stop wrap-up".into()),
-                }
-            } else if iteration == iteration_cap {
-                // Soft cap: one final no-tool call so the model can wrap up gracefully.
-                warn!(
-                    "Session [{}] reached iteration cap ({}); doing final no-tool wrap-up.",
-                    session_id, iteration_cap
-                );
-                is_finalizing = true;
-                match state.build_reentry_context_envelope() {
-                    Some((mut prompt, context, context_projection, _tools)) => {
-                        prompt.push_str(
-                            "\n\n[You have reached the maximum number of tool calls for this turn. \
-                             Do not call any more tools. Provide your final response to the user now.]",
-                        );
-                        let active_turn = state.active_turn.as_ref().expect("turn exists");
-                        Ok((
-                            prompt,
-                            context,
-                            context_projection,
-                            active_turn.task_id,
-                            active_turn.user_content.clone(),
-                            active_turn.chat_id.clone(),
-                            active_turn.final_reply_to.clone(),
-                            active_turn.final_reply_role.clone(),
-                            active_turn.final_reply_guest_id.clone(),
-                            vec![], // strip tools — forces text-only reply
-                            state.checkpoint_memory_type(),
-                            state.checkpoint_json(),
-                            state.clone(),
-                        ))
-                    }
-                    None => Err("Active turn vanished at iteration cap".into()),
-                }
-            } else if iteration > iteration_cap {
-                // Hard cap: finalizing call itself produced another tool call (shouldn't happen
-                // with empty tool list, but guard anyway).
-                Err(format!(
-                    "Turn exceeded maximum tool iterations ({iteration_cap}). Aborting."
-                ))
-            } else if state
-                .active_turn
-                .as_ref()
-                .and_then(|t| t.active_plan.as_ref())
-                .map(|plan| {
-                    plan.status == "done"
-                        || (!plan.steps.is_empty()
-                            && plan
-                                .steps
-                                .iter()
-                                .all(|s| s.status == "done" || s.status == "failed"))
-                })
-                .unwrap_or(false)
-            {
-                // Plan-done early exit: the model has declared its plan complete.
-                // Force a final no-tool wrap-up so the model delivers its summary
-                // without being prompted to call more tools.
-                info!(
-                    "Session [{}] plan marked done after tool result; doing no-tool wrap-up.",
-                    session_id
-                );
-                is_finalizing = true;
-                match state.build_reentry_context_envelope() {
-                    Some((mut prompt, context, context_projection, _tools)) => {
-                        prompt.push_str(
-                            "\n\n[Your plan is complete. All steps have been executed. \
-                             Do not call any more tools. Provide your final response to the user now.]",
-                        );
-                        let active_turn = state.active_turn.as_ref().expect("turn exists");
-                        Ok((
-                            prompt,
-                            context,
-                            context_projection,
-                            active_turn.task_id,
-                            active_turn.user_content.clone(),
-                            active_turn.chat_id.clone(),
-                            active_turn.final_reply_to.clone(),
-                            active_turn.final_reply_role.clone(),
-                            active_turn.final_reply_guest_id.clone(),
-                            vec![], // strip tools — forces text-only reply
-                            state.checkpoint_memory_type(),
-                            state.checkpoint_json(),
-                            state.clone(),
-                        ))
-                    }
-                    None => Err("Active turn vanished at plan-done wrap-up".into()),
-                }
-            } else {
-                // Build the full cognitive context envelope for re-entry.
-                // This ensures identity, instructions, memory, dialogue_window, active_turn,
-                // and tool_history all reach model-router — not just a flat prompt.
-                match state.build_reentry_context_envelope() {
-                    Some((prompt, context, context_projection, tools)) => {
-                        let active_turn = state.active_turn.as_ref().expect("turn exists");
-                        Ok((
-                            prompt,
-                            context,
-                            context_projection,
-                            active_turn.task_id,
-                            active_turn.user_content.clone(),
-                            active_turn.chat_id.clone(),
-                            active_turn.final_reply_to.clone(),
-                            active_turn.final_reply_role.clone(),
-                            active_turn.final_reply_guest_id.clone(),
-                            tools,
-                            state.checkpoint_memory_type(),
-                            state.checkpoint_json(),
-                            state.clone(),
-                        ))
-                    }
-                    None => {
-                        Err("Active turn vanished before re-entry context could be built".into())
-                    }
-                }
-            }
-        };
-
-        // Emit step_completed or step_failed event before continuing the loop.
-        if stream_events {
-            let event = if step_failed {
-                "step_failed"
-            } else {
-                "step_completed"
-            };
-            let _ = self.emit_turn_event(&session_id, event, None).await;
-        }
-
-        if is_finalizing && stream_events {
-            let _ = self
-                .emit_turn_event(&session_id, "loop_finalizing", None)
-                .await;
-        }
-
-        match loop_outcome {
-            Err(msg) => {
-                if stream_events && !step_failed && !is_finalizing {
-                    // stall/hard-cap hit — emit loop_recovering so observers know we stopped
-                    let _ = self
-                        .emit_turn_event(&session_id, "loop_recovering", None)
-                        .await;
-                }
-                let fallback_reply = if msg.contains("maximum tool iterations") {
-                    self.sessions.get(&session_id).and_then(|state| {
-                        let turn = state.active_turn.as_ref()?;
-                        Some(loop_stop_fallback_reply(
-                            &turn.user_content,
-                            &turn.working_tool_history,
-                            "the turn reached its maximum tool-iteration limit",
-                        ))
-                    })
-                } else {
-                    None
-                };
-                if let Some(reply) = fallback_reply {
-                    warn!(
-                        session_id = %session_id,
-                        "Delivering loop-stop fallback instead of failing active turn."
-                    );
-                    return self
-                        .deliver_text_reply(session_id, turn_id, reply, None, false, None, None)
-                        .await;
-                }
-                self.fail_active_turn(session_id, turn_id, msg).await
-            }
-            Ok((
-                prompt,
-                context,
-                context_projection,
-                _task_id,
-                user_content,
-                chat_id,
-                final_reply_to,
-                final_reply_role,
-                final_reply_guest_id,
-                tools_for_model,
-                checkpoint_memory_type,
-                checkpoint_json,
-                index_state,
-            )) => {
-                self.ipc_client
-                    .sync_apartment(&self.agent_id, &checkpoint_memory_type, checkpoint_json)
-                    .await?;
-                self.sync_session_index(&index_state).await?;
-
-                let _ = self
-                    .emit_turn_event(&session_id, "waiting_tool", None)
-                    .await;
-
-                let response_contract = Some(
-                    serde_json::json!({ "channels": ["spoken_text", "memory_candidate", "active_plan"] }),
-                );
-                let response_route = Some(model_response_route(
-                    self.sessions.get(&session_id),
-                    response_contract.as_ref(),
-                    &Map::new(),
-                    &Vec::new(),
-                ));
-                let ligand =
-                    planning_ligand(self.sessions.get(&session_id), &prompt, &tools_for_model);
-                let affordances = model_affordances(
-                    self.sessions.get(&session_id),
-                    &user_content,
-                    &tools_for_model,
-                );
-                let model_req = ModelRequestPayload {
-                    action: "generate_text".to_string(),
-                    request_class: Some("cognitive".to_string()),
-                    session_id: session_id.clone(),
-                    turn_id,
-                    prompt,
-                    user_content,
-                    context: Some(context),
-                    context_projection: Some(context_projection),
-                    affordances,
-                    attachments: Vec::new(),
-                    tools_for_model,
-                    response_contract,
-                    response_route,
-                    ligand,
-                    provider_options: Map::new(),
-                    chat_id,
-                    reply_to: local_node_id(),
-                    reply_role: "agent".into(),
-                    final_reply_to,
-                    final_reply_role,
-                    final_reply_guest_id,
-                };
-
-                let (target_node, target_role, target_guest_id) = resolve_model_execution_target(
-                    self.sessions.get(&session_id),
-                    "text.generate",
-                    DEFAULT_TEXT_MODEL_ROLE,
-                );
-
-                info!(
-                    "Session [{}] re-entering model loop (iteration {})",
-                    session_id,
-                    self.sessions
-                        .get(&session_id)
-                        .and_then(|s| s.active_turn.as_ref())
-                        .map(|t| t.iteration)
-                        .unwrap_or(0)
-                );
-
-                self.ipc_client
-                    .send_request(IpcRequest::EmitTask {
-                        target_node,
-                        target_role,
-                        target_guest_id,
-                        task_json: serde_json::to_string(&model_req)?,
-                    })
-                    .await?;
-
-                Ok(())
-            }
-        }
-    }
-
-    async fn retry_active_turn_after_provider_failure(
-        &mut self,
-        session_id: String,
-        turn_id: String,
-        note: Option<String>,
-    ) -> Result<()> {
-        let retry_plan = {
-            let Some(state) = self.sessions.get_mut(&session_id) else {
-                return Ok(());
-            };
-            if let Some(n) = note {
-                state.set_provider_repair_note(n);
-            }
-            state.increment_provider_repair_attempts();
-
-            match state.build_reentry_context_envelope() {
-                Some((prompt, context, context_projection, tools_for_model)) => {
-                    if let Some(turn) = state.active_turn.as_mut() {
-                        turn.iteration += 1;
-                        turn.phase = TurnPhase::WaitingModel;
-                    }
-                    let active_turn = state.active_turn.as_ref().expect("turn exists");
-                    Ok((
-                        prompt,
-                        context,
-                        context_projection,
-                        active_turn.user_content.clone(),
-                        active_turn.chat_id.clone(),
-                        active_turn.final_reply_to.clone(),
-                        active_turn.final_reply_role.clone(),
-                        active_turn.final_reply_guest_id.clone(),
-                        tools_for_model,
-                        state.checkpoint_memory_type(),
-                        state.checkpoint_json(),
-                        state.clone(),
-                    ))
-                }
-                None => Err(anyhow::anyhow!(
-                    "Active turn vanished before provider-failure retry context could be built"
-                )),
-            }
-        }?;
-
-        let (
-            prompt,
-            context,
-            context_projection,
-            user_content,
-            chat_id,
-            final_reply_to,
-            final_reply_role,
-            final_reply_guest_id,
-            tools_for_model,
-            checkpoint_memory_type,
-            checkpoint_json,
-            index_state,
-        ) = retry_plan;
-
-        self.ipc_client
-            .sync_apartment(&self.agent_id, &checkpoint_memory_type, checkpoint_json)
-            .await?;
-        self.sync_session_index(&index_state).await?;
-
-        let _ = self
-            .emit_turn_event(&session_id, "loop_recovering", None)
-            .await;
-
-        let response_contract = Some(
-            serde_json::json!({ "channels": ["spoken_text", "memory_candidate", "active_plan"] }),
-        );
-        let response_route = Some(model_response_route(
-            self.sessions.get(&session_id),
-            response_contract.as_ref(),
-            &Map::new(),
-            &Vec::new(),
-        ));
-        let ligand = planning_ligand(self.sessions.get(&session_id), &prompt, &tools_for_model);
-        let affordances = model_affordances(
-            self.sessions.get(&session_id),
-            &user_content,
-            &tools_for_model,
-        );
-        let model_req = ModelRequestPayload {
-            action: "generate_text".to_string(),
-            request_class: Some("cognitive".to_string()),
-            session_id: session_id.clone(),
-            turn_id,
-            prompt,
-            user_content,
-            context: Some(context),
-            context_projection: Some(context_projection),
-            affordances,
-            attachments: Vec::new(),
-            tools_for_model,
-            response_contract,
-            response_route,
-            ligand,
-            provider_options: serde_json::Map::new(),
-            chat_id,
-            reply_to: local_node_id(),
-            reply_role: "agent".into(),
-            final_reply_to,
-            final_reply_role,
-            final_reply_guest_id,
-        };
-
-        if debug_model_requests_enabled() {
-            match serde_json::to_string_pretty(&model_req) {
-                Ok(json) => info!(
-                    "PHILOTIC_DEBUG_MODEL_REQUESTS philote retry model request session={} turn={}:\n{}",
-                    session_id, model_req.turn_id, json
-                ),
-                Err(err) => warn!(
-                    "PHILOTIC_DEBUG_MODEL_REQUESTS could not serialize retry model request: {}",
-                    err
-                ),
-            }
-        }
-
-        let (target_node, target_role, target_guest_id) = resolve_model_execution_target(
-            self.sessions.get(&session_id),
-            "text.generate",
-            DEFAULT_TEXT_MODEL_ROLE,
-        );
-
-        self.ipc_client
-            .send_request(IpcRequest::EmitTask {
-                target_node,
-                target_role,
-                target_guest_id,
-                task_json: serde_json::to_string(&model_req)?,
-            })
-            .await?;
-
-        Ok(())
-    }
-
-    /// Advance the active turn to the next fallback tier and re-dispatch the
-    /// model request to that tier's role. If already at the last tier, fails
-    /// the turn with a user-visible error.
-    async fn advance_turn_to_next_fallback_tier(
-        &mut self,
-        session_id: String,
-        turn_id: String,
-    ) -> Result<()> {
-        // Extract configured tiers before any mutable session borrow.
-        let active_role_name: Option<String> = self
-            .sessions
-            .get(&session_id)
-            .and_then(|s| s.role_activation.as_ref())
-            .map(|ra| ra.role_name.clone());
-        // Prefer configured_roles (set via ConfigureRole tool calls); fall back to the
-        // turn_loop_config embedded in the active role_activation (set at session load
-        // from the DB record via fetch_role_activation).
-        let configured_tiers: Vec<String> = active_role_name
-            .as_deref()
-            .and_then(|rn| self.configured_roles.get(rn))
-            .map(|c| c.turn_loop_config.fallback_tiers.clone())
-            .or_else(|| {
-                self.sessions
-                    .get(&session_id)
-                    .and_then(|s| s.role_activation.as_ref())
-                    .and_then(|ra| ra.turn_loop_config.as_ref())
-                    .map(|tlc| tlc.fallback_tiers.clone())
-            })
-            .unwrap_or_default();
-
-        // Check tier boundaries before any mutable borrow.
-        let current_tier = self
-            .sessions
-            .get(&session_id)
-            .and_then(|s| s.active_turn.as_ref())
-            .map(|t| t.fallback_tier)
-            .unwrap_or(0);
-        let max_tier = if !configured_tiers.is_empty() {
-            configured_tiers.len().saturating_sub(1) as u8
-        } else {
-            DEFAULT_FALLBACK_TIERS.len().saturating_sub(1) as u8
-        };
-
-        if current_tier >= max_tier {
-            return self
-                .fail_active_turn(
-                    session_id,
-                    turn_id,
-                    "All model providers failed. Please try again later.".into(),
-                )
-                .await;
-        }
-
-        let next_tier = current_tier + 1;
-        let next_role = role_for_tier(&configured_tiers, next_tier).to_string();
-
-        // Gather everything we need before dropping the mutable state borrow.
-        let plan = {
-            let Some(state) = self.sessions.get_mut(&session_id) else {
-                return Ok(());
-            };
-
-            if let Some(turn) = state.active_turn.as_mut() {
-                turn.fallback_tier = next_tier;
-                turn.phase = TurnPhase::WaitingModel;
-                turn.iteration += 1;
-            }
-
-            match state.build_reentry_context_envelope() {
-                Some((prompt, context, context_projection, tools_for_model)) => {
-                    let active_turn = state.active_turn.as_ref().expect("turn exists");
-                    Ok((
-                        prompt,
-                        context,
-                        context_projection,
-                        active_turn.user_content.clone(),
-                        active_turn.chat_id.clone(),
-                        active_turn.final_reply_to.clone(),
-                        active_turn.final_reply_role.clone(),
-                        active_turn.final_reply_guest_id.clone(),
-                        tools_for_model,
-                        state.checkpoint_memory_type(),
-                        state.checkpoint_json(),
-                        state.clone(),
-                    ))
-                }
-                None => Err(anyhow::anyhow!(
-                    "Active turn vanished before fallback tier re-dispatch"
-                )),
-            }
-        }?;
-
-        let (
-            prompt,
-            context,
-            context_projection,
-            user_content,
-            chat_id,
-            final_reply_to,
-            final_reply_role,
-            final_reply_guest_id,
-            tools_for_model,
-            checkpoint_memory_type,
-            checkpoint_json,
-            index_state,
-        ) = plan;
-
-        self.ipc_client
-            .sync_apartment(&self.agent_id, &checkpoint_memory_type, checkpoint_json)
-            .await?;
-        self.sync_session_index(&index_state).await?;
-
-        let _ = self
-            .emit_turn_event(&session_id, "loop_recovering", None)
-            .await;
-
-        let response_contract = Some(
-            serde_json::json!({ "channels": ["spoken_text", "memory_candidate", "active_plan"] }),
-        );
-        let response_route = Some(model_response_route(
-            self.sessions.get(&session_id),
-            response_contract.as_ref(),
-            &Map::new(),
-            &Vec::new(),
-        ));
-        let ligand = planning_ligand(self.sessions.get(&session_id), &prompt, &tools_for_model);
-        let affordances = model_affordances(
-            self.sessions.get(&session_id),
-            &user_content,
-            &tools_for_model,
-        );
-        let model_req = ModelRequestPayload {
-            action: "generate_text".to_string(),
-            request_class: Some("cognitive".to_string()),
-            session_id: session_id.clone(),
-            turn_id,
-            prompt,
-            user_content,
-            context: Some(context),
-            context_projection: Some(context_projection),
-            affordances,
-            attachments: Vec::new(),
-            tools_for_model,
-            response_contract,
-            response_route,
-            ligand,
-            provider_options: serde_json::Map::new(),
-            chat_id,
-            reply_to: local_node_id(),
-            reply_role: "agent".into(),
-            final_reply_to,
-            final_reply_role,
-            final_reply_guest_id,
-        };
-
-        info!(
-            session_id = %session_id,
-            fallback_tier = next_tier,
-            target_role = %next_role,
-            "Dispatching model request to fallback tier"
-        );
-
-        self.ipc_client
-            .send_request(IpcRequest::EmitTask {
-                target_node: local_node_id(),
-                target_role: next_role,
-                target_guest_id: None,
-                task_json: serde_json::to_string(&model_req)?,
-            })
-            .await?;
-
-        Ok(())
     }
 
     async fn reenter_turn_after_transcription(
@@ -6640,9 +4047,12 @@ impl AgentRuntime {
             state.clear_handoff_summary();
         }
 
-        let response_contract = Some(
-            serde_json::json!({ "channels": ["spoken_text", "memory_candidate", "active_plan", "memory_concept"] }),
-        );
+        let response_contract = Some(cognitive_response_contract(&[
+            "spoken_text",
+            "memory_candidate",
+            "active_plan",
+            "memory_concept",
+        ]));
         let response_route = Some(model_response_route(
             self.sessions.get(&session_id),
             response_contract.as_ref(),
@@ -6659,7 +4069,7 @@ impl AgentRuntime {
             &reentry.user_content,
             &reentry.tools_for_model,
         );
-        let model_req = ModelRequestPayload {
+        let mut model_req = ModelRequestPayload {
             action: "generate_text".to_string(),
             request_class: Some("cognitive".to_string()),
             session_id: session_id.clone(),
@@ -6674,20 +4084,56 @@ impl AgentRuntime {
             response_contract,
             response_route,
             ligand,
-            provider_options: serde_json::Map::new(),
+            model: None,
+            provider_options: resolve_content_policy_provider_options(
+                self.sessions.get(&session_id),
+            ),
             chat_id: reentry.chat_id,
             reply_to: local_node_id(),
             reply_role: "agent".into(),
+            reply_guest_id: Some(self.own_guest_id()),
             final_reply_to: reentry.final_reply_to,
             final_reply_role: reentry.final_reply_role,
             final_reply_guest_id: reentry.final_reply_guest_id,
+            agent_id: Some(self.agent_id.clone()),
+            oracle_pick: None,
+            oracle_agreement: None,
         };
 
+        // Bound once so the routing resolution below and the shadow-mode
+        // capability guard can never drift apart.
+        let capability = "text.generate";
         let (target_node, target_role, target_guest_id) = resolve_model_execution_target(
             self.sessions.get(&session_id),
-            "text.generate",
+            capability,
             DEFAULT_TEXT_MODEL_ROLE,
         );
+        model_req.model = role_model_binding(self.sessions.get(&session_id), &target_role);
+
+        // Shadow-mode (PHILOTIC_SHADOW_ORACLE, default OFF): log-only oracle-vs-
+        // ladder annotation on the TRANSCRIPTION-REENTRY dispatch (Model Oracle
+        // Primary Authority, slice 3).
+        //
+        // This is the cognitive leg of a voice-originated turn. The preceding
+        // `voice.transcribe` leg was dispatched by `handle_user_message`, whose
+        // slice-2 hook excludes it via the same `shadow_eligible_capability`
+        // guard; this function then emits its OWN `EmitTask` rather than
+        // re-entering `handle_user_message` or the two instrumented `turn_loop`
+        // sites — so without this hook a healthy voice turn logged ZERO shadow
+        // rows for the leg that actually rides the text fallback ladder.
+        //
+        // Unlike the slice-2 site this dispatch is unconditionally cognitive
+        // (`request_class` is hardcoded "cognitive"), so the guard is trivially
+        // true here; it is applied for uniformity and to stay correct if this
+        // site ever starts multiplexing aux capabilities. `shadow_oracle_pick`
+        // is itself flag-gated — its first statement returns (None, None)
+        // before any ipc_client access — so the OFF path performs no oracle IPC.
+        // Never alters the dispatch target (target_node/role/guest_id unchanged).
+        if shadow_eligible_capability(capability) {
+            let (shadow_pick, shadow_agreement) = self.shadow_oracle_pick(&target_role).await;
+            model_req.oracle_pick = shadow_pick;
+            model_req.oracle_agreement = shadow_agreement;
+        }
 
         info!(
             "Session [{}] re-entering normal reasoning after voice transcription",
@@ -6755,112 +4201,6 @@ impl AgentRuntime {
         Ok(())
     }
 
-    /// Handles a `context.capture` tool call arriving from membrane-mcp.
-    ///
-    /// Bypasses the LLM: parses the capture payload, stores it in Muninn, and
-    /// emits a `send_reply` back to the mcp-membrane so the HTTP caller gets a
-    /// response.
-    async fn handle_context_capture(
-        &mut self,
-        task: InboundTaskPayload,
-        task_id: Uuid,
-    ) -> Result<()> {
-        use memory_core::MemoryEngine as _;
-
-        // Content is JSON: {"tool": "context.capture", "args": {...}}
-        let args: serde_json::Value = task
-            .content
-            .as_deref()
-            .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
-            .and_then(|v| v.get("args").cloned())
-            .unwrap_or_default();
-
-        let capture_text = args
-            .get("content")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
-
-        let category = args
-            .get("category")
-            .and_then(|v| v.as_str())
-            .unwrap_or("note")
-            .to_string();
-
-        let mut tags: Vec<String> = args
-            .get("tags")
-            .and_then(|v| v.as_array())
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|t| t.as_str().map(str::to_string))
-                    .collect()
-            })
-            .unwrap_or_default();
-        tags.push("perplexity".to_string());
-        if !tags.contains(&category) {
-            tags.push(category.clone());
-        }
-
-        let first_line: String = capture_text
-            .lines()
-            .next()
-            .unwrap_or("")
-            .chars()
-            .take(50)
-            .collect();
-        let concept = format!("perplexity.{}: {}", category, first_line);
-
-        let result_text = match self.memory_engine_for(&self.agent_id, &self.agent_id) {
-            None => "Captured (Muninn not configured on this node).".to_string(),
-            Some(engine) => {
-                match engine
-                    .remember(MemoryScope::SelfOnly, &concept, &capture_text, tags)
-                    .await
-                {
-                    Ok(engram_ref) => format!("Captured to memory (id: {}).", engram_ref.id),
-                    Err(e) => format!("context.capture: memory error — {e}"),
-                }
-            }
-        };
-
-        info!(turn_id = ?task.turn_id, result = %result_text, "context.capture handled");
-
-        let final_reply_to = task
-            .final_reply_to
-            .clone()
-            .unwrap_or_else(|| local_node_id());
-        let final_reply_role = task
-            .final_reply_role
-            .clone()
-            .unwrap_or_else(|| DEFAULT_REPLY_ROLE.to_string());
-        let final_reply_guest_id = task.final_reply_guest_id.clone();
-        let session_id = task.session_id_or_default(&self.agent_id);
-        let turn_id = task.turn_id.clone().unwrap_or_else(|| task_id.to_string());
-        let chat_id = task.chat_id.clone().unwrap_or_default();
-
-        let payload = FinalReplyPayload {
-            action: "send_reply",
-            session_id,
-            turn_id,
-            chat_id,
-            content: result_text,
-            audio_artifact: None,
-            send_text_caption: false,
-            reply_markup: None,
-        };
-
-        self.ipc_client
-            .send_request(IpcRequest::EmitTask {
-                target_node: final_reply_to,
-                target_role: final_reply_role,
-                target_guest_id: final_reply_guest_id,
-                task_json: serde_json::to_string(&payload)?,
-            })
-            .await?;
-
-        Ok(())
-    }
-
     async fn emit_turn_event(
         &mut self,
         session_id: &str,
@@ -6871,16 +4211,37 @@ impl AgentRuntime {
             let Some(state) = self.sessions.get(session_id) else {
                 return Ok(());
             };
-            let Some(active_turn) = state.active_turn.as_ref() else {
-                return Ok(());
-            };
-            (
-                active_turn.turn_id.clone(),
-                active_turn.chat_id.clone(),
-                active_turn.final_reply_to.clone(),
-                active_turn.final_reply_role.clone(),
-                active_turn.final_reply_guest_id.clone(),
-            )
+            match state.active_turn.as_ref() {
+                Some(active_turn) => (
+                    active_turn.turn_id.clone(),
+                    active_turn.chat_id.clone(),
+                    active_turn.final_reply_to.clone(),
+                    active_turn.final_reply_role.clone(),
+                    active_turn.final_reply_guest_id.clone(),
+                ),
+                // No active turn (e.g. a fallback-recovery notice fired from the
+                // origin-tier probe in `handle_fallback_probe_response`, which by
+                // construction only runs on idle sessions — see
+                // `probe_degraded_sessions`'s eligibility filter). Fall back to
+                // the session's persisted transport target and a chat_id inferred
+                // from the session_id encoding, mirroring the idle-session
+                // routing `handle_paracrine_response` already uses to reach a
+                // session with no in-flight turn.
+                None => {
+                    let Some(chat_id) = chat_id_from_session_id(session_id, &state.source) else {
+                        return Ok(());
+                    };
+                    let target =
+                        state.resolved_transport_reply_target(local_node_id(), "membrane", None);
+                    (
+                        String::new(),
+                        chat_id,
+                        target.target_node,
+                        target.target_role,
+                        target.target_guest_id,
+                    )
+                }
+            }
         };
 
         let event_payload = TurnEventPayload {
@@ -6902,225 +4263,6 @@ impl AgentRuntime {
             .await?;
 
         Ok(())
-    }
-
-    async fn maybe_auto_recall_turn_memory(&mut self, session_id: &str) -> Result<()> {
-        use memory_core::MemoryEngine as _;
-
-        let Some(state) = self.sessions.get(session_id) else {
-            return Ok(());
-        };
-        let Some(active_turn) = state.active_turn.as_ref() else {
-            return Ok(());
-        };
-        if active_turn.user_content.trim_start().starts_with('/') {
-            return Ok(());
-        }
-
-        let recall_context = RecallContext {
-            trigger: RecallTrigger::UserTurnStart,
-            scope: default_turn_recall_scope(session_id),
-            recall_seed_text: active_turn.user_content.clone(),
-            active_goal: active_turn
-                .active_plan
-                .as_ref()
-                .map(|plan| plan.goal.clone()),
-            role_name: state
-                .role_activation
-                .as_ref()
-                .map(|role| role.role_name.clone()),
-            recent_turns: state
-                .recent_turns
-                .iter()
-                .rev()
-                .take(3)
-                .map(|turn| turn.user_content.clone())
-                .collect(),
-            local_memory_summaries: state
-                .agent_profile
-                .memory_summary
-                .as_deref()
-                .map(|text| vec![text.to_string()])
-                .unwrap_or_default(),
-            tool_history_summary: active_turn
-                .working_tool_history
-                .iter()
-                .map(|(call, _)| call.tool_name.clone())
-                .collect(),
-            lens: None,
-        };
-
-        let memory_user_id = turn_memory_user_id(state);
-        let Some(engine) = self.memory_engine_for(&self.agent_id, &memory_user_id) else {
-            let decision = memory_core::evaluate_recall(&recall_context);
-            info!(
-                session_id = %session_id,
-                reason = %decision.reason,
-                "Auto recall skipped: no Muninn memory backend configured."
-            );
-            let _ = self
-                .emit_turn_event(
-                    session_id,
-                    "memory_auto_recall_skipped",
-                    Some(format!("Skipped auto recall: no memory backend configured")),
-                )
-                .await;
-            return Ok(());
-        };
-
-        let decision = match engine.evaluate_recall(&recall_context).await {
-            Ok(d) => d,
-            Err(err) => {
-                warn!(session_id = %session_id, error = %err, "Auto recall skipped: memory engine unavailable.");
-                let _ = self
-                    .emit_turn_event(
-                        session_id,
-                        "memory_auto_recall_skipped",
-                        Some(format!("Skipped auto recall: memory engine unavailable")),
-                    )
-                    .await;
-                return Ok(());
-            }
-        };
-        if !decision.should_recall() {
-            info!(
-                session_id = %session_id,
-                reason = %decision.reason,
-                "Auto recall skipped for turn."
-            );
-            let _ = self
-                .emit_turn_event(
-                    session_id,
-                    "memory_auto_recall_skipped",
-                    Some(format!("Skipped auto recall: {}", decision.reason)),
-                )
-                .await;
-            return Ok(());
-        }
-
-        info!(
-            session_id = %session_id,
-            reason = %decision.reason,
-            query = %decision.query.as_deref().unwrap_or(""),
-            limit = ?decision.limit,
-            "Running auto recall for turn."
-        );
-
-        let result = match engine.recall_for_turn(&recall_context).await {
-            Ok(r) => r,
-            Err(err) => {
-                warn!(session_id = %session_id, error = %err, "Auto recall failed: memory engine error.");
-                return Ok(());
-            }
-        };
-        let recall_reason = result.decision.reason.clone();
-        let recalled_memories = result
-            .engrams
-            .into_iter()
-            .map(|engram| recalled_memory_from_engram(engram, Some(recall_reason.as_str())))
-            .collect::<Vec<_>>();
-        let recalled_count = recalled_memories.len();
-        let concept_summary = recalled_memories
-            .iter()
-            .take(3)
-            .map(|memory| memory.concept.clone())
-            .collect::<Vec<_>>()
-            .join(", ");
-
-        if let Some(state) = self.sessions.get_mut(session_id) {
-            if let Some(active_turn) = state.active_turn.as_mut() {
-                active_turn.recalled_memories = recalled_memories;
-            }
-        }
-
-        info!(
-            session_id = %session_id,
-            total = recalled_count,
-            concepts = %concept_summary,
-            "Auto recall completed for turn."
-        );
-        let _ = self
-            .emit_turn_event(
-                session_id,
-                "memory_auto_recall_completed",
-                Some(format!(
-                    "Recalled {} memory item(s){}",
-                    recalled_count,
-                    if concept_summary.is_empty() {
-                        String::new()
-                    } else {
-                        format!(": {concept_summary}")
-                    }
-                )),
-            )
-            .await;
-
-        Ok(())
-    }
-
-    async fn complete_agent_response(
-        &mut self,
-        session_id: String,
-        turn_id: String,
-        content: String,
-        spoken_text: Option<String>,
-        audio_artifact: Option<String>,
-        memory_concept: Option<String>,
-        memory_candidate: Option<MemoryCandidate>,
-    ) -> Result<()> {
-        let voice_policy = self
-            .sessions
-            .get(&session_id)
-            .map(|s| s.agent_profile.voice_response_policy.clone())
-            .unwrap_or_default();
-
-        let had_voice_input = self
-            .sessions
-            .get(&session_id)
-            .and_then(|s| s.active_turn.as_ref())
-            .map(|t| t.had_voice_input)
-            .unwrap_or(false);
-
-        if voice_policy.is_active(had_voice_input) {
-            if voice_policy.delivery_mode.is_native_audio() {
-                if audio_artifact.is_none() && !voice_policy.fallback_to_text {
-                    return self
-                        .fail_active_turn(
-                            session_id,
-                            turn_id,
-                            "Provider-native audio response was requested but no audio artifact was returned.".into(),
-                        )
-                        .await;
-                }
-
-                return self
-                    .deliver_text_reply(
-                        session_id,
-                        turn_id,
-                        content,
-                        audio_artifact,
-                        voice_policy.caption_enabled(),
-                        memory_concept,
-                        memory_candidate,
-                    )
-                    .await;
-            }
-
-            return self
-                .start_voice_synthesis(session_id, turn_id, content, spoken_text, voice_policy)
-                .await;
-        }
-
-        self.deliver_text_reply(
-            session_id,
-            turn_id,
-            content,
-            None,
-            false,
-            memory_concept,
-            memory_candidate,
-        )
-        .await
     }
 
     /// Stashes the text, sets `WaitingVoice`, and emits a `voice.synthesize` task.
@@ -7366,287 +4508,6 @@ impl AgentRuntime {
         }
 
         self.handle_user_message(synthetic, task_id).await
-    }
-
-    /// Final step: complete the turn, sync state, and emit `FinalReplyPayload` to membrane.
-    async fn deliver_text_reply(
-        &mut self,
-        session_id: String,
-        turn_id: String,
-        content: String,
-        audio_artifact: Option<String>,
-        send_text_caption: bool,
-        memory_concept: Option<String>,
-        memory_candidate: Option<MemoryCandidate>,
-    ) -> Result<()> {
-        let (completed_turn, checkpoint_memory_type, checkpoint_json, index_state) = {
-            let Some(state) = self.sessions.get_mut(&session_id) else {
-                warn!("deliver_text_reply: unknown session {}", session_id);
-                return Ok(());
-            };
-
-            let Some(completed_turn) = state.complete_active_turn(content.clone()) else {
-                warn!(
-                    "deliver_text_reply: no active turn for session {}",
-                    session_id
-                );
-                return Ok(());
-            };
-
-            if completed_turn.turn_id != turn_id {
-                warn!(
-                    "Turn mismatch for session {}: active={} response={}",
-                    session_id, completed_turn.turn_id, turn_id
-                );
-            }
-            state.set_active_turn_phase(TurnPhase::Completed);
-
-            (
-                completed_turn,
-                state.checkpoint_memory_type(),
-                state.checkpoint_json(),
-                state.clone(),
-            )
-        };
-
-        self.ipc_client
-            .sync_apartment(&self.agent_id, &checkpoint_memory_type, checkpoint_json)
-            .await?;
-        self.sync_session_index(&index_state).await?;
-
-        let _ = self
-            .ipc_client
-            .send_request(IpcRequest::CompleteTask {
-                task_id: completed_turn.task_id,
-                result: serde_json::json!({
-                    "session_id": session_id,
-                    "turn_id": turn_id,
-                    "chat_id": completed_turn.chat_id,
-                    "content": content,
-                }),
-            })
-            .await?;
-
-        // Capture for attend hook before moving into reply_payload.
-        let _attend_turn_id = turn_id.clone();
-        let _attend_content = content.clone();
-        let attend_session_id = session_id.clone();
-
-        // Named specialist philotes always append an @agent attribution tag so the
-        // membrane (or receiving philote) knows which role secreted this Exosome.
-        // Format: `@agent:<role_name>` on its own line at the end of content.
-        // Membrane strips the tag before transport delivery and attaches an affordance.
-        let content = if let Ok(role_name) = std::env::var("PHILOTIC_ROLE_NAME") {
-            if !role_name.is_empty() {
-                format!("{}\n\n@agent:{}", content, role_name)
-            } else {
-                content
-            }
-        } else {
-            content
-        };
-
-        // If this turn was triggered by a paracrine_request, reply as a
-        // `paracrine_response` so A's routing reflex handles it correctly.
-        // Use source_session_id / source_chat_id from the exosome (stored on the turn)
-        // so the orchestrator routes the reply to the originating conversation channel
-        // rather than to this specialist's ephemeral session.
-        //
-        // If delegate.merge was called explicitly during this turn, the paracrine_response
-        // was already emitted — skip the auto-emit to avoid double-delivery.
-        // Otherwise use the normal `send_reply` path.
-        let task_json = if let Some(ref pid) = completed_turn.paracrine_origin {
-            if completed_turn.paracrine_merge_completed {
-                // Explicit merge already fired — complete the task but don't re-send.
-                info!(
-                    "deliver_text_reply: delegate.merge already emitted paracrine_response for turn {}; skipping auto-emit",
-                    turn_id
-                );
-                self.drain_next_user_task(&attend_session_id);
-                return Ok(());
-            }
-            let reply_session_id = completed_turn
-                .paracrine_reply_session_id
-                .as_deref()
-                .unwrap_or(&session_id);
-            let reply_chat_id = completed_turn
-                .paracrine_reply_chat_id
-                .as_deref()
-                .unwrap_or(&completed_turn.chat_id);
-            // Reflective re-entry, top-of-chain: reply_session_id loops back to our
-            // own session, meaning this was Astrid's reflection turn after receiving
-            // brain's response. She chose not to call delegate.merge → absorb silently.
-            if reply_session_id == session_id {
-                info!(
-                    "deliver_text_reply: reflective re-entry turn {} completed without delegate.merge — absorbing silently",
-                    turn_id
-                );
-                self.drain_next_user_task(&attend_session_id);
-                return Ok(());
-            }
-            serde_json::json!({
-                "action": "paracrine_response",
-                "session_id": reply_session_id,
-                "turn_id": turn_id,
-                "chat_id": reply_chat_id,
-                "content": content,
-                "exosome": {
-                    "prompt": "",
-                    "paracrine_id": pid,
-                    "response_routing": completed_turn.paracrine_response_routing,
-                    "source_session_id": reply_session_id,
-                    "source_chat_id": reply_chat_id,
-                },
-            })
-            .to_string()
-        } else {
-            let reply_payload = FinalReplyPayload {
-                action: "send_reply",
-                session_id,
-                turn_id,
-                chat_id: completed_turn.chat_id,
-                content,
-                audio_artifact,
-                send_text_caption,
-                reply_markup: None,
-            };
-            serde_json::to_string(&reply_payload)?
-        };
-
-        self.ipc_client
-            .send_request(IpcRequest::EmitTask {
-                target_node: completed_turn.final_reply_to,
-                target_role: completed_turn.final_reply_role,
-                target_guest_id: completed_turn.final_reply_guest_id,
-                task_json,
-            })
-            .await?;
-
-        // After completing this turn, schedule the next pending user task for dispatch.
-        self.drain_next_user_task(&attend_session_id);
-
-        // Attend hook (Slice E): fire-and-forget autobiographical memory write.
-        // Only saves when the model provided an explicit memory_candidate — raw turn
-        // content is never written as a fallback so the vault stays signal-only.
-        if let (Some(engine), Some(candidate)) = (
-            self.memory_engine_for(&self.agent_id, &self.agent_id),
-            memory_candidate,
-        ) {
-            let agent_id = self.agent_id.clone();
-            let mut tags = vec![
-                format!("agent:{}", agent_id),
-                format!("session:{}", attend_session_id),
-            ];
-            tags.extend(candidate.tags);
-            let concept = memory_concept.unwrap_or(candidate.concept);
-            let content_snapshot = candidate.content;
-            tokio::spawn(async move {
-                use memory_core::MemoryEngine as _;
-                if let Err(e) = engine
-                    .remember(MemoryScope::SelfOnly, &concept, &content_snapshot, tags)
-                    .await
-                {
-                    warn!(agent = %agent_id, error = %e, "Attend: memory write failed (non-fatal)");
-                }
-            });
-        }
-
-        Ok(())
-    }
-
-    async fn fail_active_turn(
-        &mut self,
-        session_id: String,
-        turn_id: String,
-        message: String,
-    ) -> Result<()> {
-        let (
-            task_id,
-            checkpoint_memory_type,
-            checkpoint_json,
-            index_state,
-            chat_id,
-            final_reply_to,
-            final_reply_role,
-            final_reply_guest_id,
-        ) = {
-            let Some(state) = self.sessions.get_mut(&session_id) else {
-                warn!("Received fail action for unknown session {}", session_id);
-                return Ok(());
-            };
-            let Some(active_turn) = state.active_turn.as_ref() else {
-                warn!(
-                    "Received fail action for session {} with no active turn",
-                    session_id
-                );
-                return Ok(());
-            };
-            let task_id = active_turn.task_id;
-            let chat_id = active_turn.chat_id.clone();
-            let final_reply_to = active_turn.final_reply_to.clone();
-            let final_reply_role = active_turn.final_reply_role.clone();
-            let final_reply_guest_id = active_turn.final_reply_guest_id.clone();
-            state.set_active_turn_phase(TurnPhase::Failed);
-            let checkpoint_memory_type = state.checkpoint_memory_type();
-            let checkpoint_json = state.checkpoint_json();
-            let index_state = state.clone();
-            // Clear the active turn NOW so is_turn_active() returns false before the
-            // drain runs. Without this, drain_next_user_task moves the next queued task
-            // into pending_drains, then handle_user_message sees an active turn and
-            // re-queues it — creating an infinite queue/drain loop.
-            state.active_turn = None;
-            state.turn_waiting_since = None;
-            (
-                task_id,
-                checkpoint_memory_type,
-                checkpoint_json,
-                index_state,
-                chat_id,
-                final_reply_to,
-                final_reply_role,
-                final_reply_guest_id,
-            )
-        };
-
-        self.ipc_client
-            .sync_apartment(&self.agent_id, &checkpoint_memory_type, checkpoint_json)
-            .await?;
-        self.sync_session_index(&index_state).await?;
-
-        let _ = self
-            .ipc_client
-            .send_request(IpcRequest::FailTask {
-                task_id,
-                error_code: "MODEL_EMPTY_RESPONSE".into(),
-                reason: message.clone(),
-            })
-            .await?;
-
-        let drain_session_id = session_id.clone();
-        let reply_payload = FinalReplyPayload {
-            action: "send_reply",
-            session_id,
-            turn_id,
-            chat_id,
-            content: message,
-            audio_artifact: None,
-            send_text_caption: false,
-            reply_markup: None,
-        };
-
-        self.ipc_client
-            .send_request(IpcRequest::EmitTask {
-                target_node: final_reply_to,
-                target_role: final_reply_role,
-                target_guest_id: final_reply_guest_id,
-                task_json: serde_json::to_string(&reply_payload)?,
-            })
-            .await?;
-
-        // After failing this turn, schedule the next pending user task for dispatch.
-        self.drain_next_user_task(&drain_session_id);
-
-        Ok(())
     }
 
     /// Move the next queued user task into `pending_drains` so the main event loop
@@ -7928,9 +4789,11 @@ impl AgentRuntime {
             .await?;
         self.sync_session_index(&index_state).await?;
 
-        let response_contract = Some(
-            serde_json::json!({ "channels": ["spoken_text", "memory_candidate", "active_plan"] }),
-        );
+        let response_contract = Some(cognitive_response_contract(&[
+            "spoken_text",
+            "memory_candidate",
+            "active_plan",
+        ]));
         let response_route = Some(model_response_route(
             self.sessions.get(&session_id),
             response_contract.as_ref(),
@@ -7939,7 +4802,7 @@ impl AgentRuntime {
         ));
         let ligand = planning_ligand(self.sessions.get(&session_id), &prompt, &tools);
         let affordances = model_affordances(self.sessions.get(&session_id), &user_content, &tools);
-        let model_req = ModelRequestPayload {
+        let mut model_req = ModelRequestPayload {
             action: "generate_text".to_string(),
             request_class: Some("cognitive".to_string()),
             session_id: session_id.clone(),
@@ -7954,13 +4817,20 @@ impl AgentRuntime {
             response_contract,
             response_route,
             ligand,
-            provider_options: Map::new(),
+            model: None,
+            provider_options: resolve_content_policy_provider_options(
+                self.sessions.get(&session_id),
+            ),
             chat_id,
             reply_to: local_node_id(),
             reply_role: "agent".into(),
+            reply_guest_id: Some(self.own_guest_id()),
             final_reply_to,
             final_reply_role,
             final_reply_guest_id,
+            agent_id: Some(self.agent_id.clone()),
+            oracle_pick: None,
+            oracle_agreement: None,
         };
 
         let (target_node, target_role, target_guest_id) = resolve_model_execution_target(
@@ -7968,6 +4838,7 @@ impl AgentRuntime {
             "text.generate",
             DEFAULT_TEXT_MODEL_ROLE,
         );
+        model_req.model = role_model_binding(self.sessions.get(&session_id), &target_role);
 
         info!(
             "Scripted loop [{}] emitting model call for phase '{}'",
@@ -8039,368 +4910,6 @@ impl AgentRuntime {
             .await
     }
 
-    async fn handle_approval_command(
-        &mut self,
-        command_task_id: Uuid,
-        session_id: String,
-        command_turn_id: String,
-        command_chat_id: String,
-        command_reply_to: String,
-        command_reply_role: String,
-        command_reply_guest_id: Option<String>,
-        command: SlashCommand,
-    ) -> Result<()> {
-        // Approval turns are parked in `parked_approval_turn` while the session stays free.
-        // Restore the parked turn into active_turn so the resolution logic proceeds normally.
-        if let Some(state) = self.sessions.get_mut(&session_id) {
-            if state.has_parked_approval_turn() && !state.is_turn_active() {
-                state.restore_parked_approval_turn();
-            }
-        }
-
-        let pending = self
-            .sessions
-            .get(&session_id)
-            .and_then(|state| state.active_turn.as_ref())
-            .and_then(|turn| {
-                if turn.phase == TurnPhase::WaitingApproval {
-                    turn.pending_approval.clone().map(|approval| {
-                        (
-                            turn.task_id,
-                            turn.turn_id.clone(),
-                            turn.chat_id.clone(),
-                            turn.final_reply_to.clone(),
-                            turn.final_reply_role.clone(),
-                            turn.final_reply_guest_id.clone(),
-                            turn.pending_tool_call.clone(),
-                            approval,
-                        )
-                    })
-                } else {
-                    None
-                }
-            });
-
-        let Some((
-            original_task_id,
-            original_turn_id,
-            original_chat_id,
-            original_reply_to,
-            original_reply_role,
-            original_reply_guest_id,
-            original_pending_tool_call,
-            approval,
-        )) = pending
-        else {
-            let _ = self
-                .ipc_client
-                .send_request(IpcRequest::CompleteTask {
-                    task_id: command_task_id,
-                    result: serde_json::json!({
-                        "session_id": session_id,
-                        "turn_id": command_turn_id,
-                        "chat_id": command_chat_id,
-                        "content": "No approval pending."
-                    }),
-                })
-                .await?;
-            let reply_payload = FinalReplyPayload {
-                action: "send_reply",
-                session_id,
-                turn_id: command_turn_id,
-                chat_id: command_chat_id,
-                content: "No approval pending.".into(),
-                audio_artifact: None,
-                send_text_caption: false,
-                reply_markup: None,
-            };
-            self.ipc_client
-                .send_request(IpcRequest::EmitTask {
-                    target_node: command_reply_to,
-                    target_role: command_reply_role,
-                    target_guest_id: command_reply_guest_id,
-                    task_json: serde_json::to_string(&reply_payload)?,
-                })
-                .await?;
-            return Ok(());
-        };
-
-        let command_has_steering = command.steering_note().is_some();
-        let (checkpoint_memory_type, checkpoint_json, index_state) = {
-            let state = self
-                .sessions
-                .get_mut(&session_id)
-                .expect("session should exist while resolving approval");
-            state.clear_pending_approval();
-            match command {
-                SlashCommand::Approve { .. } => state.set_active_turn_phase(TurnPhase::Thinking),
-                SlashCommand::Deny { .. } => {
-                    if command_has_steering {
-                        state.set_active_turn_phase(TurnPhase::Thinking);
-                    } else {
-                        state.set_active_turn_phase(TurnPhase::Failed);
-                    }
-                }
-                SlashCommand::Ping
-                | SlashCommand::Status
-                | SlashCommand::Context
-                | SlashCommand::Pause
-                | SlashCommand::Resume
-                | SlashCommand::Role { .. }
-                | SlashCommand::Roles
-                | SlashCommand::Back
-                | SlashCommand::ToolsAdd { .. }
-                | SlashCommand::ToolsClear
-                | SlashCommand::SkillsAdd { .. }
-                | SlashCommand::SkillsClear
-                | SlashCommand::WorkspaceSet { .. }
-                | SlashCommand::WorkspaceClear
-                | SlashCommand::PreapproveThisSession
-                | SlashCommand::Preapprove { .. }
-                | SlashCommand::ApprovalStatus
-                | SlashCommand::ApprovalReset
-                | SlashCommand::ApprovalClear { .. }
-                | SlashCommand::Abandon { .. }
-                | SlashCommand::Tts { .. }
-                | SlashCommand::Voice { .. }
-                | SlashCommand::Correct { .. } => {}
-            }
-            (
-                state.checkpoint_memory_type(),
-                state.checkpoint_json(),
-                state.clone(),
-            )
-        };
-
-        self.ipc_client
-            .sync_apartment(&self.agent_id, &checkpoint_memory_type, checkpoint_json)
-            .await?;
-        self.sync_session_index(&index_state).await?;
-
-        let _ = self
-            .ipc_client
-            .send_request(IpcRequest::CompleteTask {
-                task_id: command_task_id,
-                result: serde_json::json!({
-                    "session_id": session_id,
-                    "turn_id": command_turn_id,
-                    "chat_id": command_chat_id,
-                    "content": command.reply_text().unwrap_or("ok"),
-                }),
-            })
-            .await?;
-
-        match command {
-            SlashCommand::Approve { note } => {
-                let _ = self
-                    .ipc_client
-                    .send_request(IpcRequest::UpdateTask {
-                        task_id: original_task_id,
-                        state: "resuming".into(),
-                        payload: serde_json::json!({
-                            "session_id": session_id,
-                            "turn_id": original_turn_id,
-                            "chat_id": original_chat_id,
-                            "approval_resolution": {
-                                "approval_id": approval.approval_id,
-                                "decision": "approved",
-                                "reason": approval.reason,
-                                "resolution_mode": "manual",
-                                "note": note,
-                            }
-                        }),
-                    })
-                    .await?;
-                if let Some(note) = note {
-                    return self
-                        .resume_turn_with_steering(
-                            session_id,
-                            original_turn_id,
-                            original_chat_id,
-                            note,
-                            "resuming_with_steering",
-                            "[User approval steering]",
-                        )
-                        .await;
-                }
-                let _ = self
-                    .ipc_client
-                    .send_request(IpcRequest::CompleteTask {
-                        task_id: original_task_id,
-                        result: serde_json::json!({
-                            "session_id": session_id,
-                            "turn_id": original_turn_id,
-                            "chat_id": original_chat_id,
-                            "content": approval.approved_response,
-                        }),
-                    })
-                    .await?;
-
-                let reply_payload = FinalReplyPayload {
-                    action: "send_reply",
-                    session_id: session_id.clone(),
-                    turn_id: original_turn_id.clone(),
-                    chat_id: original_chat_id,
-                    content: approval.approved_response.clone(),
-                    audio_artifact: None,
-                    send_text_caption: false,
-                    reply_markup: None,
-                };
-
-                self.ipc_client
-                    .send_request(IpcRequest::EmitTask {
-                        target_node: original_reply_to,
-                        target_role: original_reply_role,
-                        target_guest_id: original_reply_guest_id.clone(),
-                        task_json: serde_json::to_string(&reply_payload)?,
-                    })
-                    .await?;
-
-                // Scripted gate: record approval as the current step's output and
-                // let the executor drive what comes next.
-                if approval
-                    .approval_id
-                    .as_deref()
-                    .map(|id| id.starts_with("scripted_gate:"))
-                    .unwrap_or(false)
-                {
-                    if let Some(state) = self.sessions.get_mut(&session_id) {
-                        state.with_scripted_executor_mut(|exec| {
-                            exec.record_step_output(serde_json::json!({"approved": true}));
-                        });
-                    }
-                    return self
-                        .scripted_dispatch_after_advance(
-                            session_id,
-                            original_turn_id,
-                            None,
-                            None,
-                            None,
-                        )
-                        .await;
-                }
-
-                if let Some(tool_call) = original_pending_tool_call {
-                    // bypass_approval=true: this tool was already manually approved above.
-                    return self
-                        .route_tool_call_execution(session_id, original_turn_id, tool_call, true)
-                        .await;
-                }
-            }
-            SlashCommand::Deny { note } => {
-                let _ = self
-                    .ipc_client
-                    .send_request(IpcRequest::UpdateTask {
-                        task_id: original_task_id,
-                        state: "approval_denied".into(),
-                        payload: serde_json::json!({
-                            "session_id": session_id,
-                            "turn_id": original_turn_id,
-                            "chat_id": original_chat_id,
-                            "approval_resolution": {
-                                "approval_id": approval.approval_id,
-                                "decision": "denied",
-                                "reason": approval.reason,
-                                "resolution_mode": "manual",
-                                "note": note,
-                            }
-                        }),
-                    })
-                    .await?;
-                if let Some(note) = note {
-                    return self
-                        .resume_turn_with_steering(
-                            session_id,
-                            original_turn_id,
-                            original_chat_id,
-                            note,
-                            "redirecting_after_denial",
-                            "[User denied the proposed action. Do this instead]",
-                        )
-                        .await;
-                }
-                let _ = self
-                    .ipc_client
-                    .send_request(IpcRequest::FailTask {
-                        task_id: original_task_id,
-                        error_code: "APPROVAL_DENIED".into(),
-                        reason: approval.reason.clone(),
-                    })
-                    .await?;
-
-                let reply_payload = FinalReplyPayload {
-                    action: "send_reply",
-                    session_id: session_id.clone(),
-                    turn_id: original_turn_id.clone(),
-                    chat_id: original_chat_id,
-                    content: format!("Denied: {}", approval.reason),
-                    audio_artifact: None,
-                    send_text_caption: false,
-                    reply_markup: None,
-                };
-
-                self.ipc_client
-                    .send_request(IpcRequest::EmitTask {
-                        target_node: original_reply_to,
-                        target_role: original_reply_role,
-                        target_guest_id: original_reply_guest_id,
-                        task_json: serde_json::to_string(&reply_payload)?,
-                    })
-                    .await?;
-
-                // Scripted gate denial: fail the turn (default reject_action = fail_turn).
-                if approval
-                    .approval_id
-                    .as_deref()
-                    .map(|id| id.starts_with("scripted_gate:"))
-                    .unwrap_or(false)
-                {
-                    return self
-                        .fail_active_turn(
-                            session_id,
-                            original_turn_id,
-                            format!("Plan rejected: {}", approval.reason),
-                        )
-                        .await;
-                }
-            }
-            SlashCommand::Ping
-            | SlashCommand::Status
-            | SlashCommand::Context
-            | SlashCommand::Pause
-            | SlashCommand::Resume
-            | SlashCommand::Role { .. }
-            | SlashCommand::Roles
-            | SlashCommand::Back
-            | SlashCommand::ToolsAdd { .. }
-            | SlashCommand::ToolsClear
-            | SlashCommand::SkillsAdd { .. }
-            | SlashCommand::SkillsClear
-            | SlashCommand::WorkspaceSet { .. }
-            | SlashCommand::WorkspaceClear
-            | SlashCommand::PreapproveThisSession
-            | SlashCommand::Preapprove { .. }
-            | SlashCommand::ApprovalStatus
-            | SlashCommand::ApprovalReset
-            | SlashCommand::ApprovalClear { .. }
-            | SlashCommand::Abandon { .. }
-            | SlashCommand::Tts { .. }
-            | SlashCommand::Voice { .. }
-            | SlashCommand::Correct { .. } => {}
-        }
-
-        Ok(())
-    }
-
-    fn should_defer_parked_approval_command(state: &SessionState) -> bool {
-        state.has_parked_approval_turn()
-            && state
-                .active_turn
-                .as_ref()
-                .map(|turn| turn.phase != TurnPhase::WaitingApproval)
-                .unwrap_or(false)
-    }
-
     /// Forward a streaming LLM token fragment to membrane for progressive display.
     ///
     /// model-router emits `action = "streaming_token"` tasks as the Gemini SSE stream
@@ -8418,28 +4927,26 @@ impl AgentRuntime {
             _ => return Ok(()),
         };
 
-        // Resolve routing from the active turn of the session.
-        let routing = self
-            .sessions
-            .get(&session_id)
-            .and_then(|s| s.active_turn.as_ref())
-            .map(|t| {
-                (
-                    t.final_reply_to.clone(),
-                    t.final_reply_role.clone(),
-                    t.final_reply_guest_id.clone(),
-                    t.turn_id.clone(),
-                    t.chat_id.clone(),
-                    t.paracrine_origin.is_some(),
-                )
-            });
-
-        let Some((reply_to, reply_role, reply_guest_id, turn_id, chat_id, is_paracrine_turn)) =
-            routing
-        else {
+        // Accumulate the delta into the active turn and resolve routing. The
+        // model-router emits one `streaming_token` per SSE delta, but membrane's
+        // draft edit replaces the message with `content` — so we must emit the
+        // *cumulative* text built up so far, not the isolated token, or the
+        // Telegram message flickers between fragments instead of growing.
+        let Some(state) = self.sessions.get_mut(&session_id) else {
             // No active turn — token arrived after turn completed; drop silently.
             return Ok(());
         };
+        let Some(turn) = state.active_turn.as_mut() else {
+            return Ok(());
+        };
+        turn.streamed_content.push_str(&token);
+        let accumulated = turn.streamed_content.clone();
+        let reply_to = turn.final_reply_to.clone();
+        let reply_role = turn.final_reply_role.clone();
+        let reply_guest_id = turn.final_reply_guest_id.clone();
+        let turn_id = turn.turn_id.clone();
+        let chat_id = turn.chat_id.clone();
+        let is_paracrine_turn = turn.paracrine_origin.is_some();
 
         if is_paracrine_turn {
             // Paracrine specialist output is private until it is wrapped as a
@@ -8454,7 +4961,7 @@ impl AgentRuntime {
             "session_id": session_id,
             "turn_id": turn_id,
             "chat_id": chat_id,
-            "content": token,
+            "content": accumulated,
         }))?;
 
         self.ipc_client
@@ -8465,6 +4972,16 @@ impl AgentRuntime {
                 task_json,
             })
             .await?;
+
+        // Sentence-pipelined TTS: feed the voice chunk pipeline (no-op unless
+        // one is armed for this turn). Synthesis trouble never fails the
+        // streaming path — text delivery always wins.
+        if let Err(err) = self.ingest_streaming_tokens_for_voice(&session_id).await {
+            warn!(
+                session_id = %session_id,
+                "voice chunk pipeline ingest failed (non-fatal): {err}"
+            );
+        }
 
         Ok(())
     }
@@ -8526,6 +5043,20 @@ impl AgentRuntime {
     /// Store the result from a fire-and-forget graph.query preload into the session snapshot.
     /// The snapshot is then injected as an AgentGraph context layer on the next model call.
     async fn handle_datasource_response(&mut self, task: InboundTaskPayload) -> Result<()> {
+        // LifeGraph auto-recall prefetch responses carry a sentinel turn id and
+        // are pure cache refreshes — they must never be routed as tool results.
+        if task.turn_id.as_deref() == Some(LIFE_AUTORECALL_PREFETCH_TURN_ID) {
+            self.handle_life_recall_prefetch_response(&task);
+            return Ok(());
+        }
+
+        // LifeGraph auto-capture acks carry their own sentinel turn id and are
+        // pure observability — they must never be routed as tool results.
+        if task.turn_id.as_deref() == Some(LIFE_AUTOCAPTURE_TURN_ID) {
+            self.handle_life_autocapture_response(&task);
+            return Ok(());
+        }
+
         let session_id = match &task.session_id {
             Some(s) if !s.is_empty() => s.clone(),
             _ => return Ok(()),
@@ -8731,6 +5262,8 @@ impl AgentRuntime {
                 task_id: original_task_id,
                 error_code: "APPROVAL_CANCELLED".into(),
                 reason: cancel_reason.to_string(),
+                session_id: None,
+                turn_id: None,
             })
             .await?;
 
@@ -8778,426 +5311,6 @@ impl AgentRuntime {
             "Parked approval cleared.".into(),
             None,
             None,
-        )
-        .await
-    }
-
-    /// Receive an inbound `handoff_bundle` task — the hotel is asking this philote
-    /// to take over the session in the requested role. Apply the role context swap
-    /// and acknowledge back to the original turn's reply target.
-    pub async fn handle_handoff_bundle(
-        &mut self,
-        task: InboundTaskPayload,
-        task_id: Uuid,
-    ) -> Result<()> {
-        let session_id = task.session_id_or_default(&self.agent_id);
-        let turn_id = task.turn_id.clone().unwrap_or_else(|| task_id.to_string());
-
-        let bundle: HandoffBundle = match task.handoff_bundle {
-            Some(b) => b,
-            None => {
-                warn!(
-                    "Received handoff_bundle for session [{}] with no parseable bundle; ignoring.",
-                    session_id
-                );
-                return Ok(());
-            }
-        };
-
-        let to_role = match bundle.to_role.as_deref() {
-            Some(r) => r.to_string(),
-            None => {
-                warn!(
-                    "handoff_bundle for session [{}] has no to_role; ignoring.",
-                    session_id
-                );
-                return Ok(());
-            }
-        };
-
-        info!(
-            "Philote [{}] applying role context swap: {:?} → {} for session [{}]",
-            self.agent_id, bundle.from_role, to_role, session_id
-        );
-
-        self.ensure_session_loaded(&session_id, "handoff").await?;
-
-        let role_config = self.configured_roles.get(&to_role).cloned();
-
-        {
-            let state = self.sessions.entry(session_id.clone()).or_insert_with(|| {
-                SessionState::new(session_id.clone(), self.agent_id.clone(), "handoff".into())
-            });
-
-            let activation = crate::session::RoleActivation {
-                role_name: to_role.clone(),
-                active_incarnation_id: None,
-                activation_reason: bundle
-                    .handoff_reason
-                    .clone()
-                    .unwrap_or_else(|| "handoff".into()),
-                requested_by: bundle.from_role.clone(),
-                role_addendum: role_config
-                    .as_ref()
-                    .and_then(|c| c.role_identity_addendum.clone()),
-                role_manifest: role_config.as_ref().and_then(|c| c.role_manifest.clone()),
-                base_identity_ref: None,
-                activation_requester_class: Some("role_handoff".into()),
-                activation_policy_owner: None,
-                toolset_profile_ref: role_config.as_ref().map(|c| c.toolset_profile.clone()),
-                skillset_profile_ref: None,
-                effective_skillset: vec![],
-                effective_skill_guidance: vec![],
-                working_memory_policy: None,
-                memory_projection_policy: None,
-                turn_loop_config: role_config.as_ref().map(|c| c.turn_loop_config.clone()),
-            };
-
-            if let Some(cap) = activation
-                .turn_loop_config
-                .as_ref()
-                .and_then(|c| c.iteration_cap)
-            {
-                state.settings.execution.iteration_cap = cap.clamp(1, 50);
-            }
-            state.role_activation = Some(activation);
-            // Carry over the handoff context as the working summary for the new role.
-            if let Some(summary) = bundle.working_summary {
-                if state.active_turn.is_none() {
-                    state.last_handoff_summary = Some(summary);
-                }
-            }
-        }
-
-        let reply = format!("Switched to role {}.", to_role);
-        self.complete_local_command(session_id, turn_id, reply)
-            .await
-    }
-
-    /// Receive an inbound `handoff_return` task — a role is handing control back
-    /// to the orchestrator. Clear role activation and acknowledge.
-    pub async fn handle_handoff_return(
-        &mut self,
-        task: InboundTaskPayload,
-        task_id: Uuid,
-    ) -> Result<()> {
-        let session_id = task.session_id_or_default(&self.agent_id);
-        let turn_id = task.turn_id.clone().unwrap_or_else(|| task_id.to_string());
-
-        info!(
-            "Philote [{}] handling handoff_return for session [{}]",
-            self.agent_id, session_id
-        );
-
-        self.ensure_session_loaded(&session_id, "handoff_return")
-            .await?;
-
-        let previous_role = {
-            let state = self.sessions.entry(session_id.clone()).or_insert_with(|| {
-                SessionState::new(
-                    session_id.clone(),
-                    self.agent_id.clone(),
-                    "handoff_return".into(),
-                )
-            });
-            let prev = state.role_activation.as_ref().map(|r| r.role_name.clone());
-            state.role_activation = None;
-            prev
-        };
-
-        let reply = match previous_role {
-            Some(role) => format!("Returned from role {}. Back to orchestrator.", role),
-            None => "Back to orchestrator.".into(),
-        };
-        self.complete_local_command(session_id, turn_id, reply)
-            .await
-    }
-
-    async fn handle_role_command(
-        &mut self,
-        command_task_id: Uuid,
-        session_id: String,
-        command_turn_id: String,
-        command_chat_id: String,
-        command: SlashCommand,
-    ) -> Result<()> {
-        // Set by the Roles arm of the match below to carry the inline keyboard to the reply.
-        let mut roles_keyboard_holder: Option<serde_json::Value> = None;
-
-        const HANDOFF_MAX_RETRIES: u32 = 12;
-        const HANDOFF_DEFAULT_WAIT_MS: u64 = 250;
-
-        let response = match &command {
-            SlashCommand::Role { role_name } => {
-                let handoff_bundle = self
-                    .sessions
-                    .get(&session_id)
-                    .map(|state| {
-                        state.build_same_identity_handoff_bundle(
-                            role_name,
-                            &command_turn_id,
-                            "manual_role_switch",
-                            Some("orchestrator".into()),
-                        )
-                    })
-                    .unwrap_or_else(|| HandoffBundle {
-                        goal: format!("Switch active role to {role_name} for this session."),
-                        context_excerpt: "Manual role switch requested by user slash command."
-                            .into(),
-                        session_id: session_id.clone(),
-                        initiating_turn_id: command_turn_id.clone(),
-                        return_to: Some("orchestrator".into()),
-                        handoff_reason: Some("manual_role_switch".into()),
-                        from_role: Some("orchestrator".into()),
-                        to_role: Some(role_name.clone()),
-                        active_goal: None,
-                        active_constraints: vec!["same_identity_role_handoff".into()],
-                        relevant_session_facts: Vec::new(),
-                        working_summary: None,
-                        suggested_memory_refs: Vec::new(),
-                        expected_return_mode: Some("required".into()),
-                        cleanup_actions: vec!["switch_active_role".into()],
-                    });
-                let req = IpcRequest::HandoffToRole {
-                    session_id: session_id.clone(),
-                    role_name: role_name.clone(),
-                    handoff_bundle,
-                };
-                let mut attempt = 0u32;
-                loop {
-                    let resp = self.ipc_client.send_request(req.clone()).await?;
-                    match resp {
-                        IpcResponse::HandoffPending { retry_after_ms, .. } => {
-                            attempt += 1;
-                            if attempt >= HANDOFF_MAX_RETRIES {
-                                break resp;
-                            }
-                            let wait_ms = retry_after_ms.unwrap_or(HANDOFF_DEFAULT_WAIT_MS);
-                            tokio::time::sleep(std::time::Duration::from_millis(wait_ms)).await;
-                        }
-                        other => break other,
-                    }
-                }
-            }
-            SlashCommand::Back => {
-                let req = IpcRequest::HandoffBack {
-                    session_id: session_id.clone(),
-                    summary: "Manual return to orchestrator requested by user slash command."
-                        .into(),
-                    return_to: None,
-                };
-                let mut attempt = 0u32;
-                loop {
-                    let resp = self.ipc_client.send_request(req.clone()).await?;
-                    match resp {
-                        IpcResponse::HandoffPending { retry_after_ms, .. } => {
-                            attempt += 1;
-                            if attempt >= HANDOFF_MAX_RETRIES {
-                                break resp;
-                            }
-                            let wait_ms = retry_after_ms.unwrap_or(HANDOFF_DEFAULT_WAIT_MS);
-                            tokio::time::sleep(std::time::Duration::from_millis(wait_ms)).await;
-                        }
-                        other => break other,
-                    }
-                }
-            }
-            SlashCommand::Roles => {
-                self.ipc_client
-                    .send_request(IpcRequest::ListRoleIncarnations {
-                        agent_id: self.agent_id.clone(),
-                    })
-                    .await?
-            }
-            _ => unreachable!("handle_role_command only accepts role handoff commands"),
-        };
-
-        let (reply_content, update_state, payload, next_active_incarnation) = match response {
-            IpcResponse::HandoffAck {
-                handoff_guest_id,
-                became_active,
-            } => (
-                format_role_command_reply(&command, became_active),
-                if became_active {
-                    "role_handoff_completed"
-                } else {
-                    "role_handoff_materializing"
-                },
-                serde_json::json!({
-                    "session_id": session_id,
-                    "turn_id": command_turn_id,
-                    "chat_id": command_chat_id,
-                    "role_command": "handoff_to_role",
-                    "handoff_guest_id": handoff_guest_id,
-                    "became_active": became_active,
-                }),
-                became_active.then_some(handoff_guest_id),
-            ),
-            IpcResponse::HandoffBackAck {
-                return_guest_id,
-                became_active,
-            } => (
-                format_role_command_reply(&command, became_active),
-                if became_active {
-                    "role_handoff_completed"
-                } else {
-                    "role_handoff_materializing"
-                },
-                serde_json::json!({
-                    "session_id": session_id,
-                    "turn_id": command_turn_id,
-                    "chat_id": command_chat_id,
-                    "role_command": "handoff_back",
-                    "return_guest_id": return_guest_id,
-                    "became_active": became_active,
-                }),
-                became_active.then_some(return_guest_id),
-            ),
-            IpcResponse::Standard { ok: true, data, .. }
-                if matches!(command, SlashCommand::Roles) =>
-            {
-                let roles = data
-                    .as_ref()
-                    .and_then(|value| value.get("roles"))
-                    .and_then(serde_json::Value::as_array)
-                    .cloned()
-                    .unwrap_or_default();
-                let active_incarnation_id = self
-                    .sessions
-                    .get(&session_id)
-                    .and_then(|state| state.active_incarnation_id.clone());
-                // Build an inline keyboard with one button per role so the user can
-                // tap directly in Telegram to fire `/role <name>`.
-                let keyboard_rows: Vec<Vec<serde_json::Value>> = roles
-                    .iter()
-                    .filter_map(|r| {
-                        let role_name = r.get("role_name")?.as_str()?;
-                        Some(vec![serde_json::json!({
-                            "text": format!("🎭 {role_name}"),
-                            "callback_data": format!("/role {role_name}"),
-                        })])
-                    })
-                    .collect();
-                let roles_keyboard = if keyboard_rows.is_empty() {
-                    None
-                } else {
-                    Some(serde_json::json!({ "inline_keyboard": keyboard_rows }))
-                };
-                roles_keyboard_holder = roles_keyboard;
-                let active_role_name = active_incarnation_id
-                    .as_deref()
-                    .and_then(|id| id.rsplit(':').next())
-                    .unwrap_or("orchestrator");
-                let reply_text = if roles.is_empty() {
-                    format!("Active: {active_role_name}. No configured roles.")
-                } else {
-                    format!("Active: {active_role_name}")
-                };
-                (
-                    reply_text,
-                    "role_list_reported",
-                    serde_json::json!({
-                        "session_id": session_id,
-                        "turn_id": command_turn_id,
-                        "chat_id": command_chat_id,
-                        "role_command": "list_roles",
-                        "role_count": roles.len(),
-                        "active_incarnation_id": active_incarnation_id,
-                    }),
-                    None,
-                )
-            }
-            IpcResponse::HandoffPending { role_name, .. } => (
-                format!(
-                    "Role '{role_name}' is still materializing — please try again in a moment."
-                ),
-                "role_handoff_failed",
-                serde_json::json!({
-                    "session_id": session_id,
-                    "turn_id": command_turn_id,
-                    "chat_id": command_chat_id,
-                    "error": "handoff_pending_timeout",
-                }),
-                None,
-            ),
-            IpcResponse::Error(message) => (
-                format!("Couldn't switch roles: {message}"),
-                "role_handoff_failed",
-                serde_json::json!({
-                    "session_id": session_id,
-                    "turn_id": command_turn_id,
-                    "chat_id": command_chat_id,
-                    "error": message,
-                }),
-                None,
-            ),
-            IpcResponse::Standard {
-                ok: false,
-                code,
-                message,
-                ..
-            } => (
-                format!("Couldn't switch roles: {message} ({code})"),
-                "role_handoff_failed",
-                serde_json::json!({
-                    "session_id": session_id,
-                    "turn_id": command_turn_id,
-                    "chat_id": command_chat_id,
-                    "error_code": code,
-                    "error": message,
-                }),
-                None,
-            ),
-            other => (
-                format!("Couldn't handle role command: unexpected hotel response {other:?}"),
-                "role_handoff_failed",
-                serde_json::json!({
-                    "session_id": session_id,
-                    "turn_id": command_turn_id,
-                    "chat_id": command_chat_id,
-                    "error": format!("unexpected hotel response: {other:?}"),
-                }),
-                None,
-            ),
-        };
-
-        if let Some(active_incarnation_id) = next_active_incarnation {
-            if let Some(state) = self.sessions.get_mut(&session_id) {
-                state.active_incarnation_id = Some(active_incarnation_id);
-            }
-        }
-
-        let (checkpoint_memory_type, checkpoint_json, index_state) = {
-            let Some(state) = self.sessions.get(&session_id) else {
-                warn!("Received role command for unknown session {}", session_id);
-                return Ok(());
-            };
-            (
-                state.checkpoint_memory_type(),
-                state.checkpoint_json(),
-                state.clone(),
-            )
-        };
-
-        self.ipc_client
-            .sync_apartment(&self.agent_id, &checkpoint_memory_type, checkpoint_json)
-            .await?;
-        self.sync_session_index(&index_state).await?;
-
-        let _ = self
-            .ipc_client
-            .send_request(IpcRequest::UpdateTask {
-                task_id: command_task_id,
-                state: update_state.into(),
-                payload,
-            })
-            .await?;
-
-        self.complete_local_command_with_markup(
-            session_id,
-            command_turn_id,
-            reply_content,
-            roles_keyboard_holder,
         )
         .await
     }
@@ -9313,7 +5426,7 @@ impl AgentRuntime {
             &user_content,
             &tools_for_model,
         );
-        let model_req = ModelRequestPayload {
+        let mut model_req = ModelRequestPayload {
             action: "generate_text".to_string(),
             request_class: Some("cognitive".to_string()),
             session_id: session_id.clone(),
@@ -9328,13 +5441,20 @@ impl AgentRuntime {
             response_contract: None,
             response_route,
             ligand,
-            provider_options: Map::new(),
+            model: None,
+            provider_options: resolve_content_policy_provider_options(
+                self.sessions.get(&session_id),
+            ),
             chat_id,
             reply_to: local_node_id(),
             reply_role: "agent".into(),
+            reply_guest_id: Some(self.own_guest_id()),
             final_reply_to,
             final_reply_role,
             final_reply_guest_id,
+            agent_id: Some(self.agent_id.clone()),
+            oracle_pick: None,
+            oracle_agreement: None,
         };
 
         let (target_node, target_role, target_guest_id) = resolve_model_execution_target(
@@ -9342,6 +5462,7 @@ impl AgentRuntime {
             "text.generate",
             DEFAULT_TEXT_MODEL_ROLE,
         );
+        model_req.model = role_model_binding(self.sessions.get(&session_id), &target_role);
 
         self.ipc_client
             .send_request(IpcRequest::EmitTask {
@@ -9574,6 +5695,305 @@ impl AgentRuntime {
                 .await?;
             return self
                 .complete_local_command(session_id, command_turn_id, reply)
+                .await;
+        }
+
+        // Handle /model — pins this session to a model tier role, or with no
+        // argument reports (and clears) the current pin. A pin tags new turns
+        // OperatorExplicit (see handle_user_message), which disables automatic
+        // fallback escalation in advance_turn_to_next_fallback_tier, and is
+        // routed at the resolve_model_execution_target choke point.
+        // Handle /models — catalog drill-down. Bare: vendor buttons; with a
+        // query: matching-model buttons that fire `/model <id>` on tap
+        // (membrane passes inline-button callback_data through as a slash
+        // command, same path as the /roles keyboard).
+        if let SlashCommand::Models { ref query } = command {
+            let (reply, keyboard) = self.build_models_browse_reply(query.as_deref()).await;
+            let _ = self
+                .ipc_client
+                .send_request(IpcRequest::UpdateTask {
+                    task_id: command_task_id,
+                    state: "session_policy_updated".into(),
+                    payload: serde_json::json!({
+                        "session_id": session_id,
+                        "turn_id": command_turn_id,
+                        "chat_id": command_chat_id,
+                    }),
+                })
+                .await?;
+            return self
+                .complete_local_command_with_markup(session_id, command_turn_id, reply, keyboard)
+                .await;
+        }
+
+        if let SlashCommand::ModelPreset { ref alias } = command {
+            // Resolve against the LIVE merged preset list (hotel config over
+            // built-ins) — or any direct `vendor/model` OpenRouter slug — so
+            // the swappable model set is operator-editable without a redeploy.
+            let presets = self.load_model_presets().await;
+            let reply = match crate::commands::resolve_model_preset(alias, &presets) {
+                None => format!(
+                    "Unknown model preset `{alias}`. Send /model to see the presets, \
+                     use any OpenRouter id directly (e.g. /model sao10k/l3.1-euryale-70b), \
+                     or /model model.<tier> to pin a session tier."
+                ),
+                Some(preset) => {
+                    // Read the active role + its current turn-loop config so we
+                    // change ONLY the model routing and preserve everything else
+                    // (toolset, manifest, content policy). This keeps the
+                    // ConfigureRole a "model-selection-only" change, which the
+                    // hotel gate lets any role (orchestrator or not) apply to
+                    // its own record (see role_materialization.rs).
+                    let (role_name, mut tlc, toolset_profile) = {
+                        match self.sessions.get(&session_id) {
+                            Some(state) => {
+                                let ra = state.role_activation.as_ref();
+                                let role_name = ra
+                                    .map(|r| r.role_name.clone())
+                                    .unwrap_or_else(|| "orchestrator".to_string());
+                                let tlc = ra
+                                    .and_then(|r| r.turn_loop_config.clone())
+                                    .or_else(|| {
+                                        self.configured_roles
+                                            .get(&role_name)
+                                            .map(|c| c.turn_loop_config.clone())
+                                    })
+                                    .unwrap_or_default();
+                                let toolset_profile = ra
+                                    .and_then(|r| r.toolset_profile_ref.clone())
+                                    .or_else(|| {
+                                        self.configured_roles
+                                            .get(&role_name)
+                                            .map(|c| c.toolset_profile.clone())
+                                    })
+                                    .unwrap_or_else(|| "default".to_string());
+                                (role_name, tlc, toolset_profile)
+                            }
+                            None => (
+                                "orchestrator".to_string(),
+                                ansible_mesh_core::graph::TurnLoopConfig::default(),
+                                "default".to_string(),
+                            ),
+                        }
+                    };
+
+                    // Make the preset's provider tier primary, then bind the
+                    // concrete model name to that tier (Layer 1 model_bindings).
+                    let tier = preset.tier_role.clone();
+                    let mut tiers: Vec<String> = tlc.fallback_tiers.clone();
+                    tiers.retain(|t| t != &tier);
+                    tiers.insert(0, tier.clone());
+                    if let Some(model_id) = preset.model_id.as_ref() {
+                        tlc.model_bindings.insert(tier.clone(), model_id.clone());
+                    }
+                    tlc.fallback_tiers = tiers.clone();
+
+                    let req = IpcRequest::ConfigureRole {
+                        agent_id: self.agent_id.clone(),
+                        role_name: role_name.clone(),
+                        guest_id: format!("{}:{}", self.agent_id, role_name),
+                        calling_role: role_name.clone(),
+                        toolset_profile,
+                        role_identity_addendum: None,
+                        role_manifest: None,
+                        is_admin: false,
+                        inactive_ttl_seconds: None,
+                        iteration_cap: None,
+                        approval_policy: None,
+                        model_profile: None,
+                        context_window_policy: None,
+                        fallback_tiers: Some(tiers),
+                        model_bindings: Some(tlc.model_bindings.clone()),
+                        content_policy: None,
+                    };
+
+                    match self.ipc_client.send_request(req).await {
+                        Ok(IpcResponse::ConfigureRoleOk { .. }) => {
+                            // Live: update the active session's role config so the
+                            // very next turn routes through the new model — no
+                            // restart, mirroring role.configure's cache update.
+                            if let Some(state) = self.sessions.get_mut(&session_id) {
+                                if let Some(ra) = state.role_activation.as_mut() {
+                                    ra.turn_loop_config = Some(tlc.clone());
+                                }
+                            }
+                            if let Some(cached) = self.configured_roles.get_mut(&role_name) {
+                                cached.turn_loop_config = tlc;
+                            }
+                            format!("✅ Switched to {}. (live — no restart)", preset.label)
+                        }
+                        Ok(IpcResponse::Standard {
+                            ok: false, message, ..
+                        }) => {
+                            warn!("/model preset swap denied: {message}");
+                            format!("Couldn't switch to {}: {message}", preset.label)
+                        }
+                        Ok(other) => {
+                            warn!("/model preset swap unexpected response: {other:?}");
+                            format!(
+                                "Couldn't switch to {} — unexpected hotel response.",
+                                preset.label
+                            )
+                        }
+                        Err(e) => {
+                            warn!("/model preset swap failed: {e}");
+                            format!("Couldn't switch to {}: {e}", preset.label)
+                        }
+                    }
+                }
+            };
+            let _ = self
+                .ipc_client
+                .send_request(IpcRequest::UpdateTask {
+                    task_id: command_task_id,
+                    state: "session_policy_updated".into(),
+                    payload: serde_json::json!({
+                        "session_id": session_id,
+                        "turn_id": command_turn_id,
+                        "chat_id": command_chat_id,
+                    }),
+                })
+                .await?;
+            return self
+                .complete_local_command(session_id, command_turn_id, reply)
+                .await;
+        }
+
+        if let SlashCommand::Model { ref tier } = command {
+            // Bare `/model` lists the live merged presets with best-effort
+            // tool-capability notes. Both need `&mut self` (IPC + catalog
+            // fetch), so gather them BEFORE borrowing the session state.
+            let (presets, tool_notes) = if tier.is_none() {
+                let presets = self.load_model_presets().await;
+                let mut notes: HashMap<String, bool> = HashMap::new();
+                for preset in &presets {
+                    if preset.tier_role != "model.openrouter" {
+                        continue;
+                    }
+                    let Some(model_id) = preset.model_id.clone() else {
+                        continue;
+                    };
+                    if let Some(supports) = self.openrouter_model_supports_tools(&model_id).await {
+                        notes.insert(preset.alias.clone(), supports);
+                    }
+                }
+                (presets, notes)
+            } else {
+                (Vec::new(), HashMap::new())
+            };
+            // One-tap swap keyboard for the bare listing: preset buttons fire
+            // `/model <alias>`, plus a drill-down into the full catalog.
+            let preset_keyboard: Option<serde_json::Value> = if tier.is_none() {
+                let mut rows: Vec<Vec<serde_json::Value>> = presets
+                    .chunks(3)
+                    .map(|chunk| {
+                        chunk
+                            .iter()
+                            .map(|p| {
+                                let badge = match tool_notes.get(&p.alias) {
+                                    Some(true) => " 🔧",
+                                    Some(false) => " 💬",
+                                    None => "",
+                                };
+                                serde_json::json!({
+                                    "text": format!("{}{}", p.alias, badge),
+                                    "callback_data": format!("/model {}", p.alias),
+                                })
+                            })
+                            .collect()
+                    })
+                    .collect();
+                rows.push(vec![serde_json::json!({
+                    "text": "📚 Browse all models",
+                    "callback_data": "/models",
+                })]);
+                Some(serde_json::json!({ "inline_keyboard": rows }))
+            } else {
+                None
+            };
+            let reply = if let Some(state) = self.sessions.get_mut(&session_id) {
+                // Any `/model` invocation (pin or clear) resets the persisted
+                // fallback override (Slice 2) — the operator is taking explicit
+                // control of tier selection, so a stale auto-fallback record
+                // from a prior escalation must not linger underneath it.
+                state.fallback_override = None;
+                match tier.as_deref() {
+                    Some(t) => {
+                        state.pinned_tier_role = Some(t.to_string());
+                        format!(
+                            "Pinned this session to model tier `{t}`. Fallback escalation is disabled until you clear the pin with a bare `/model`."
+                        )
+                    }
+                    None => {
+                        // Bare `/model`: clear any session tier pin and show the
+                        // current model plus the swappable presets.
+                        let cleared = state.pinned_tier_role.take();
+                        let current = state
+                            .role_activation
+                            .as_ref()
+                            .and_then(|ra| ra.turn_loop_config.as_ref())
+                            .and_then(|tlc| {
+                                tlc.fallback_tiers.first().map(|primary| {
+                                    tlc.model_bindings
+                                        .get(primary)
+                                        .cloned()
+                                        .unwrap_or_else(|| primary.clone())
+                                })
+                            });
+                        let current_label = current
+                            .as_deref()
+                            .map(|id| {
+                                presets
+                                    .iter()
+                                    .find(|p| p.model_id.as_deref() == Some(id))
+                                    .map(|p| p.label.clone())
+                                    .unwrap_or_else(|| id.to_string())
+                            })
+                            .unwrap_or_else(|| "provider default".to_string());
+                        let mut list = String::new();
+                        if let Some(prev) = cleared {
+                            list.push_str(&format!("Cleared session tier pin (was `{prev}`).\n"));
+                        }
+                        list.push_str(&format!(
+                            "🧠 Current: {current_label}\nSwap with /model <name>:"
+                        ));
+                        for p in &presets {
+                            let note = match tool_notes.get(&p.alias) {
+                                Some(true) => " 🔧",
+                                Some(false) => " 💬 chat-only (no tools)",
+                                None => "",
+                            };
+                            list.push_str(&format!("\n • {} — {}{}", p.alias, p.description, note));
+                        }
+                        list.push_str(
+                            "\n • <vendor/model> — any OpenRouter id \
+                             (e.g. /model sao10k/l3.1-euryale-70b)",
+                        );
+                        list
+                    }
+                }
+            } else {
+                "No active session.".to_string()
+            };
+            let _ = self
+                .ipc_client
+                .send_request(IpcRequest::UpdateTask {
+                    task_id: command_task_id,
+                    state: "session_policy_updated".into(),
+                    payload: serde_json::json!({
+                        "session_id": session_id,
+                        "turn_id": command_turn_id,
+                        "chat_id": command_chat_id,
+                    }),
+                })
+                .await?;
+            return self
+                .complete_local_command_with_markup(
+                    session_id,
+                    command_turn_id,
+                    reply,
+                    preset_keyboard,
+                )
                 .await;
         }
 
@@ -9814,6 +6234,11 @@ impl AgentRuntime {
                 SlashCommand::Ping
                 | SlashCommand::Tts { .. }
                 | SlashCommand::Voice { .. }
+                | SlashCommand::Model { .. }
+                | SlashCommand::ModelPreset { .. }
+                | SlashCommand::Models { .. }
+                | SlashCommand::Dirty
+                | SlashCommand::Sfw
                 | SlashCommand::Role { .. }
                 | SlashCommand::Roles
                 | SlashCommand::Back
@@ -9821,7 +6246,8 @@ impl AgentRuntime {
                 | SlashCommand::Deny { .. }
                 | SlashCommand::ApprovalClear { .. }
                 | SlashCommand::Abandon { .. }
-                | SlashCommand::Correct { .. } => (
+                | SlashCommand::Correct { .. }
+                | SlashCommand::Plan { .. } => (
                     "Unsupported session control command.".to_string(),
                     "session_control_unsupported",
                     serde_json::json!({
@@ -9923,6 +6349,58 @@ impl AgentRuntime {
         .await
     }
 
+    /// `/plan` — show plan/carryover status; `/plan drop` — clear the carryover.
+    /// Resolved without starting a turn so the command works while a turn (or a
+    /// synthesized plan continuation) is in flight.
+    #[allow(clippy::too_many_arguments)]
+    async fn handle_plan_command(
+        &mut self,
+        task_id: Uuid,
+        session_id: String,
+        turn_id: String,
+        chat_id: String,
+        reply_to: String,
+        reply_role: String,
+        reply_guest_id: Option<String>,
+        drop: bool,
+    ) -> Result<()> {
+        let (reply, dropped) = {
+            let Some(state) = self.sessions.get_mut(&session_id) else {
+                warn!("handle_plan_command: unknown session {}", session_id);
+                return Ok(());
+            };
+            if drop {
+                if state.carryover_plan.take().is_some() {
+                    (
+                        "Plan carryover dropped — no further auto-continuations.".to_string(),
+                        true,
+                    )
+                } else {
+                    ("No plan carryover to drop.".to_string(), false)
+                }
+            } else {
+                (state.plan_status_text(), false)
+            }
+        };
+        if dropped {
+            // Persist immediately so the drop survives a restart.
+            self.persist_session_checkpoint(&session_id).await?;
+        }
+        self.complete_command_without_turn(
+            task_id,
+            session_id,
+            turn_id,
+            chat_id,
+            reply_to,
+            reply_role,
+            reply_guest_id,
+            reply,
+            None,
+            None,
+        )
+        .await
+    }
+
     async fn complete_command_without_turn(
         &mut self,
         command_task_id: Uuid,
@@ -9986,208 +6464,6 @@ impl AgentRuntime {
             })
             .await?;
         Ok(())
-    }
-
-    async fn handle_direct_life_observe_command(
-        &mut self,
-        command_task_id: Uuid,
-        session_id: String,
-        turn_id: String,
-        chat_id: String,
-        reply_to: String,
-        reply_role: String,
-        reply_guest_id: Option<String>,
-        command: DirectLifeObserveCommand,
-        user_id: Option<String>,
-    ) -> Result<()> {
-        let route = self.sessions.get(&session_id).and_then(|state| {
-            state
-                .tool_is_enabled("life.observe")
-                .then(|| state.resolve_tool_route("life.observe"))
-                .flatten()
-                .cloned()
-        });
-
-        let Some(route) = route else {
-            warn!(
-                session_id = %session_id,
-                "Direct life.observe command could not run because life.observe is not enabled"
-            );
-            return self
-                .complete_command_without_turn(
-                    command_task_id,
-                    session_id,
-                    turn_id,
-                    chat_id,
-                    reply_to,
-                    reply_role,
-                    reply_guest_id,
-                    "I could not record that because life.observe is not enabled for this session."
-                        .into(),
-                    Some("failed"),
-                    None,
-                )
-                .await;
-        };
-
-        let arguments =
-            direct_life_observe_input(&command, &session_id, &turn_id, &chat_id, &self.agent_id);
-        let payload = ToolExecutionPayload {
-            action: "execute_tool",
-            session_id: session_id.clone(),
-            turn_id: turn_id.clone(),
-            chat_id: chat_id.clone(),
-            tool_name: "life.observe".into(),
-            arguments: arguments.clone(),
-            execution_mode: route.execution_mode.clone(),
-            agent_id: self.agent_id.clone(),
-            user_id: user_id.clone(),
-            runner_id: route.runner_id.clone(),
-            incarnation_id: route.incarnation_id.clone(),
-            hotel_id: route.hotel_id.clone(),
-            environment_id: route.environment_id.clone(),
-            task_runner_kind: route.task_runner_kind.clone(),
-            task_runner_config: route.task_runner_config.clone(),
-            selection_reason: route.selection_reason.clone(),
-            workspace_ref: None,
-            task_runner_overlay: None,
-            return_route: Some(philotic_client::ReturnRoute {
-                node: local_node_id(),
-                role: "agent".into(),
-                guest_id: Some(self.agent_id.clone()),
-                session_id: Some(session_id.clone()),
-                turn_id: Some(turn_id.clone()),
-                correlation_id: None,
-            }),
-            reply_to: local_node_id(),
-            reply_role: "agent".into(),
-            reply_guest_id: Some(self.agent_id.clone()),
-            final_reply_to: reply_to.clone(),
-            final_reply_role: reply_role.clone(),
-            final_reply_guest_id: reply_guest_id.clone(),
-        };
-
-        let tool_call = ToolCall {
-            tool_name: "life.observe".into(),
-            arguments: arguments.clone(),
-        };
-        let checkpoint = if let Some(state) = self.sessions.get_mut(&session_id) {
-            state.start_turn(WorkingTurn {
-                task_id: command_task_id,
-                turn_id: turn_id.clone(),
-                chat_id: chat_id.clone(),
-                primary_user_id: user_id.clone(),
-                user_content: format!("life.observe direct command: {}", command.claim_summary),
-                final_reply_to: reply_to.clone(),
-                final_reply_role: reply_role.clone(),
-                final_reply_guest_id: reply_guest_id.clone(),
-                phase: TurnPhase::WaitingTool,
-                iteration: 0,
-                pending_tool_call: Some(tool_call),
-                pending_approval: None,
-                working_tool_history: Vec::new(),
-                recalled_memories: Vec::new(),
-                active_plan: None,
-                consecutive_step_failures: 0,
-                provider_repair_note: None,
-                provider_repair_attempts: 0,
-                pending_text_reply: None,
-                had_voice_input: false,
-                awaiting_transcription_reentry: false,
-                scripted_loop_context: None,
-                associated_paracrine_ids: Vec::new(),
-                paracrine_origin: None,
-                paracrine_reply_session_id: None,
-                paracrine_reply_chat_id: None,
-                paracrine_response_routing: None,
-                paracrine_merge_completed: false,
-                plan_confirmed: false,
-                plan_confirm_note: None,
-                fallback_tier: if self.network_offline { 1 } else { 0 },
-                streaming_retry_attempts: 0,
-            });
-            Some((
-                state.checkpoint_memory_type(),
-                state.checkpoint_json(),
-                state.clone(),
-            ))
-        } else {
-            None
-        };
-        if let Some((checkpoint_memory_type, checkpoint_json, index_state)) = checkpoint {
-            self.ipc_client
-                .sync_apartment(&self.agent_id, &checkpoint_memory_type, checkpoint_json)
-                .await?;
-            self.sync_session_index(&index_state).await?;
-        }
-
-        self.ipc_client
-            .send_request(IpcRequest::UpdateTask {
-                task_id: command_task_id,
-                state: "waiting_tool".into(),
-                payload: serde_json::json!({
-                    "session_id": session_id,
-                    "turn_id": turn_id,
-                    "chat_id": chat_id,
-                    "tool_name": "life.observe",
-                    "direct_route": true,
-                }),
-            })
-            .await?;
-
-        self.ipc_client
-            .send_request(IpcRequest::EmitTask {
-                target_node: route.target_node,
-                target_role: route.target_role,
-                target_guest_id: route.incarnation_id.clone(),
-                task_json: serde_json::to_string(&payload)?,
-            })
-            .await?;
-
-        info!(
-            session_id = %session_id,
-            label = %command.label,
-            source_id = %command.source_id,
-            confidence = command.confidence,
-            "Direct life.observe command routed without model turn"
-        );
-        Ok(())
-    }
-
-    fn execute_bound_tool<'a>(
-        state: &'a SessionState,
-        tool_call: &ToolCall,
-    ) -> Result<&'a ToolExecutionRoute> {
-        if !state.tool_is_enabled(&tool_call.tool_name) {
-            anyhow::bail!(
-                "Tool {} is not enabled for this session",
-                tool_call.tool_name
-            );
-        }
-        state
-            .resolve_tool_route(&tool_call.tool_name)
-            .and_then(|route| {
-                if route.execution_mode != "local_agent" && route.availability_state != "live" {
-                    None
-                } else {
-                    Some(route)
-                }
-            })
-            .ok_or_else(|| {
-                if let Some(route) = state.resolve_tool_route(&tool_call.tool_name) {
-                    anyhow::anyhow!(
-                        "Tool {} requires runner materialization (availability: {}, runner: {})",
-                        tool_call.tool_name,
-                        route.availability_state,
-                        route.runner_id.as_deref().unwrap_or("unknown")
-                    )
-                } else {
-                    anyhow::anyhow!(
-                        "Tool {} has no assembled execution route",
-                        tool_call.tool_name
-                    )
-                }
-            })
     }
 
     /// Build the Telegram-facing approval message from the approval request plus any
@@ -10269,5538 +6545,6 @@ impl AgentRuntime {
             approval.approval_id = Some(Uuid::new_v4().to_string());
         }
         approval
-    }
-
-    async fn execute_local_agent_tool(&mut self, payload: ToolExecutionPayload) -> Result<()> {
-        match payload.tool_name.as_str() {
-            "session.status" => {
-                let content = self
-                    .sessions
-                    .get(&payload.session_id)
-                    .map(SessionState::session_status_text)
-                    .unwrap_or_else(|| "Session status unavailable.".into());
-
-                self.handle_tool_result(InboundTaskPayload {
-                    action: Some("tool_result".into()),
-                    agent_action: None,
-                    handoff_bundle: None,
-                    source: Some("agent".into()),
-                    session_id: Some(payload.session_id),
-                    turn_id: Some(payload.turn_id),
-                    transport: None,
-                    chat_id: Some(payload.chat_id),
-                    thread_id: None,
-                    sender_id: None,
-                    sender_username: None,
-                    message_kind: None,
-                    content: Some(content),
-                    attachments: Vec::new(),
-                    command: None,
-                    callback_data: None,
-                    raw_transport_event: None,
-                    error: None,
-                    tool_name: Some(payload.tool_name),
-                    arguments: None,
-                    final_reply_to: Some(payload.final_reply_to),
-                    final_reply_role: Some(payload.final_reply_role),
-                    final_reply_guest_id: payload.final_reply_guest_id,
-                    ..Default::default()
-                })
-                .await
-            }
-            "hotel.status" => {
-                let (content, tool_err) = match self
-                    .ipc_client
-                    .send_request(IpcRequest::GetHotelStatus)
-                    .await
-                {
-                    Ok(IpcResponse::Standard {
-                        ok: true,
-                        data: Some(data),
-                        ..
-                    }) => {
-                        let text = serde_json::to_string_pretty(&data)
-                            .unwrap_or_else(|_| data.to_string());
-                        (text, None)
-                    }
-                    Ok(IpcResponse::Standard {
-                        ok: false,
-                        code,
-                        message,
-                        ..
-                    }) => {
-                        let e = TaskErrorPayload::ipc_failure("aiua", &*code, message);
-                        (e.display_message(), Some(e))
-                    }
-                    Ok(_) => ("Hotel status unavailable.".into(), None),
-                    Err(e) => {
-                        let err = TaskErrorPayload::transport_error(
-                            "philote",
-                            format!("hotel.status: IPC transport error — {e}"),
-                        );
-                        (err.display_message(), Some(err))
-                    }
-                };
-                self.handle_tool_result(InboundTaskPayload {
-                    action: Some("tool_result".into()),
-                    source: Some("agent".into()),
-                    session_id: Some(payload.session_id),
-                    turn_id: Some(payload.turn_id),
-                    chat_id: Some(payload.chat_id),
-                    content: Some(content),
-                    error: tool_err,
-                    tool_name: Some(payload.tool_name),
-                    final_reply_to: Some(payload.final_reply_to),
-                    final_reply_role: Some(payload.final_reply_role),
-                    final_reply_guest_id: payload.final_reply_guest_id,
-                    ..Default::default()
-                })
-                .await
-            }
-            "hotel.perimeter.status" => {
-                let (content, tool_err) = match self
-                    .ipc_client
-                    .send_request(IpcRequest::GetPerimeterStatus)
-                    .await
-                {
-                    Ok(IpcResponse::PerimeterStatus { snapshot_json }) => {
-                        let text = serde_json::from_str::<serde_json::Value>(&snapshot_json)
-                            .ok()
-                            .and_then(|v| serde_json::to_string_pretty(&v).ok())
-                            .unwrap_or(snapshot_json);
-                        (text, None)
-                    }
-                    Ok(_) => ("Perimeter status unavailable.".into(), None),
-                    Err(e) => {
-                        let err = TaskErrorPayload::transport_error(
-                            "philote",
-                            format!("hotel.perimeter.status: IPC transport error — {e}"),
-                        );
-                        (err.display_message(), Some(err))
-                    }
-                };
-                self.handle_tool_result(InboundTaskPayload {
-                    action: Some("tool_result".into()),
-                    source: Some("agent".into()),
-                    session_id: Some(payload.session_id),
-                    turn_id: Some(payload.turn_id),
-                    chat_id: Some(payload.chat_id),
-                    content: Some(content),
-                    error: tool_err,
-                    tool_name: Some(payload.tool_name),
-                    final_reply_to: Some(payload.final_reply_to),
-                    final_reply_role: Some(payload.final_reply_role),
-                    final_reply_guest_id: payload.final_reply_guest_id,
-                    ..Default::default()
-                })
-                .await
-            }
-            "hotel.perimeter.refresh" => {
-                let (content, tool_err) = match self
-                    .ipc_client
-                    .send_request(IpcRequest::RefreshPerimeter)
-                    .await
-                {
-                    Ok(IpcResponse::PerimeterStatus { snapshot_json }) => {
-                        let text = serde_json::from_str::<serde_json::Value>(&snapshot_json)
-                            .ok()
-                            .and_then(|v| serde_json::to_string_pretty(&v).ok())
-                            .unwrap_or(snapshot_json);
-                        (format!("Perimeter refreshed.\n{text}"), None)
-                    }
-                    Ok(_) => ("Perimeter refresh unavailable.".into(), None),
-                    Err(e) => {
-                        let err = TaskErrorPayload::transport_error(
-                            "philote",
-                            format!("hotel.perimeter.refresh: IPC transport error — {e}"),
-                        );
-                        (err.display_message(), Some(err))
-                    }
-                };
-                self.handle_tool_result(InboundTaskPayload {
-                    action: Some("tool_result".into()),
-                    source: Some("agent".into()),
-                    session_id: Some(payload.session_id),
-                    turn_id: Some(payload.turn_id),
-                    chat_id: Some(payload.chat_id),
-                    content: Some(content),
-                    error: tool_err,
-                    tool_name: Some(payload.tool_name),
-                    final_reply_to: Some(payload.final_reply_to),
-                    final_reply_role: Some(payload.final_reply_role),
-                    final_reply_guest_id: payload.final_reply_guest_id,
-                    ..Default::default()
-                })
-                .await
-            }
-            "hotel.egress.check" => {
-                let target_url = payload
-                    .arguments
-                    .get("target_url")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                let method = payload
-                    .arguments
-                    .get("method")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("GET")
-                    .to_string();
-                let agent_id = payload
-                    .arguments
-                    .get("agent_id")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("unknown")
-                    .to_string();
-                let (content, tool_err) = match self
-                    .ipc_client
-                    .send_request(IpcRequest::CheckEgress {
-                        agent_id,
-                        target_url,
-                        method,
-                    })
-                    .await
-                {
-                    Ok(IpcResponse::EgressGrant {
-                        allowed,
-                        audit,
-                        deny_reason,
-                        inject_headers,
-                    }) => {
-                        let text = serde_json::to_string_pretty(&serde_json::json!({
-                            "allowed": allowed,
-                            "audit": audit,
-                            "deny_reason": deny_reason,
-                            "inject_headers": inject_headers,
-                        }))
-                        .unwrap_or_else(|_| format!("allowed={allowed}"));
-                        (text, None)
-                    }
-                    Ok(_) => ("Egress check unavailable.".into(), None),
-                    Err(e) => {
-                        let err = TaskErrorPayload::transport_error(
-                            "philote",
-                            format!("hotel.egress.check: IPC transport error — {e}"),
-                        );
-                        (err.display_message(), Some(err))
-                    }
-                };
-                self.handle_tool_result(InboundTaskPayload {
-                    action: Some("tool_result".into()),
-                    source: Some("agent".into()),
-                    session_id: Some(payload.session_id),
-                    turn_id: Some(payload.turn_id),
-                    chat_id: Some(payload.chat_id),
-                    content: Some(content),
-                    error: tool_err,
-                    tool_name: Some(payload.tool_name),
-                    final_reply_to: Some(payload.final_reply_to),
-                    final_reply_role: Some(payload.final_reply_role),
-                    final_reply_guest_id: payload.final_reply_guest_id,
-                    ..Default::default()
-                })
-                .await
-            }
-            "hotel.logs" => {
-                let lines = payload
-                    .arguments
-                    .get("lines")
-                    .and_then(|v| v.as_u64())
-                    .map(|v| v.min(500) as u32)
-                    .unwrap_or(50);
-                let (content, tool_err) = match self
-                    .ipc_client
-                    .send_request(IpcRequest::GetHotelLogs { lines })
-                    .await
-                {
-                    Ok(IpcResponse::Standard {
-                        ok: true,
-                        data: Some(data),
-                        ..
-                    }) => {
-                        let log = data
-                            .get("log")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("")
-                            .to_string();
-                        (log, None)
-                    }
-                    Ok(IpcResponse::Standard {
-                        ok: false,
-                        code,
-                        message,
-                        ..
-                    }) => {
-                        let e = TaskErrorPayload::ipc_failure("aiua", &*code, message);
-                        (e.display_message(), Some(e))
-                    }
-                    Ok(_) => ("Hotel logs unavailable.".into(), None),
-                    Err(e) => {
-                        let err = TaskErrorPayload::transport_error(
-                            "philote",
-                            format!("hotel.logs: IPC transport error — {e}"),
-                        );
-                        (err.display_message(), Some(err))
-                    }
-                };
-                self.handle_tool_result(InboundTaskPayload {
-                    action: Some("tool_result".into()),
-                    source: Some("agent".into()),
-                    session_id: Some(payload.session_id),
-                    turn_id: Some(payload.turn_id),
-                    chat_id: Some(payload.chat_id),
-                    content: Some(content),
-                    error: tool_err,
-                    tool_name: Some(payload.tool_name),
-                    final_reply_to: Some(payload.final_reply_to),
-                    final_reply_role: Some(payload.final_reply_role),
-                    final_reply_guest_id: payload.final_reply_guest_id,
-                    ..Default::default()
-                })
-                .await
-            }
-            "hotel.best_place_to_run" => {
-                let args = &payload.arguments;
-                let agent_id = args
-                    .get("agent_id")
-                    .and_then(|v| v.as_str())
-                    .map(str::to_string);
-                let role_name = args
-                    .get("role_name")
-                    .and_then(|v| v.as_str())
-                    .map(str::to_string);
-                let tool_name = args
-                    .get("tool_name")
-                    .and_then(|v| v.as_str())
-                    .map(str::to_string);
-                let required_markers = args
-                    .get("required_markers")
-                    .and_then(|v| v.as_array())
-                    .map(|arr| {
-                        arr.iter()
-                            .filter_map(|v| v.as_str().map(str::to_string))
-                            .collect::<Vec<_>>()
-                    })
-                    .unwrap_or_default();
-                let prefer_locality = args
-                    .get("prefer_locality")
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(false);
-                let (content, tool_err) = match self
-                    .ipc_client
-                    .send_request(IpcRequest::BestPlaceToRun {
-                        agent_id,
-                        role_name,
-                        tool_name,
-                        required_markers,
-                        prefer_locality,
-                    })
-                    .await
-                {
-                    Ok(IpcResponse::Standard {
-                        ok: true,
-                        data: Some(data),
-                        ..
-                    }) => {
-                        let hotel = data
-                            .get("recommended_hotel")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("unknown");
-                        let node = data
-                            .get("recommended_node_id")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("unknown");
-                        let reason = data
-                            .get("reason")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("no reason recorded");
-                        let candidate_lines = data
-                            .get("candidates")
-                            .and_then(|v| v.as_array())
-                            .map(|items| {
-                                items
-                                    .iter()
-                                    .take(5)
-                                    .map(|c| {
-                                        let h = c
-                                            .get("hotel_name")
-                                            .and_then(|v| v.as_str())
-                                            .unwrap_or("unknown");
-                                        let n = c
-                                            .get("node_id")
-                                            .and_then(|v| v.as_str())
-                                            .unwrap_or("unknown");
-                                        let s =
-                                            c.get("score").and_then(|v| v.as_i64()).unwrap_or(0);
-                                        format!("- {} ({}) score={}", h, n, s)
-                                    })
-                                    .collect::<Vec<_>>()
-                                    .join("\n")
-                            })
-                            .unwrap_or_default();
-                        let msg = if candidate_lines.is_empty() {
-                            format!("Best placement: {} ({}).\nReason: {}", hotel, node, reason)
-                        } else {
-                            format!(
-                                "Best placement: {} ({}).\nReason: {}\nCandidates:\n{}",
-                                hotel, node, reason, candidate_lines
-                            )
-                        };
-                        (msg, None)
-                    }
-                    Ok(IpcResponse::Standard {
-                        ok: false,
-                        code,
-                        message,
-                        ..
-                    }) => {
-                        let e = TaskErrorPayload::ipc_failure("aiua", &*code, message);
-                        (e.display_message(), Some(e))
-                    }
-                    Ok(_) => ("Placement recommendation unavailable.".into(), None),
-                    Err(e) => {
-                        let err = TaskErrorPayload::transport_error(
-                            "philote",
-                            format!("hotel.best_place_to_run: IPC transport error — {e}"),
-                        );
-                        (err.display_message(), Some(err))
-                    }
-                };
-                self.handle_tool_result(InboundTaskPayload {
-                    action: Some("tool_result".into()),
-                    source: Some("agent".into()),
-                    session_id: Some(payload.session_id),
-                    turn_id: Some(payload.turn_id),
-                    chat_id: Some(payload.chat_id),
-                    content: Some(content),
-                    error: tool_err,
-                    tool_name: Some(payload.tool_name),
-                    final_reply_to: Some(payload.final_reply_to),
-                    final_reply_role: Some(payload.final_reply_role),
-                    final_reply_guest_id: payload.final_reply_guest_id,
-                    ..Default::default()
-                })
-                .await
-            }
-            "router.stats" => {
-                let window_secs = payload
-                    .arguments
-                    .get("window_hours")
-                    .and_then(|v| v.as_f64())
-                    .map(|h| (h * 3600.0) as u64);
-                let (content, tool_err) = match self
-                    .ipc_client
-                    .send_request(IpcRequest::GetRouterStats { window_secs })
-                    .await
-                {
-                    Ok(IpcResponse::RouterStats {
-                        stats,
-                        generated_at,
-                    }) => {
-                        let text = serde_json::to_string_pretty(&serde_json::json!({
-                            "generated_at": generated_at,
-                            "stats": stats
-                        }))
-                        .unwrap_or_else(|_| "Router stats unavailable.".into());
-                        (text, None)
-                    }
-                    Ok(IpcResponse::Standard {
-                        ok: false,
-                        code,
-                        message,
-                        ..
-                    }) => {
-                        let e = TaskErrorPayload::ipc_failure("aiua", &*code, message);
-                        (e.display_message(), Some(e))
-                    }
-                    Ok(_) => ("Router stats unavailable.".into(), None),
-                    Err(e) => {
-                        let err = TaskErrorPayload::transport_error(
-                            "philote",
-                            format!("router.stats: IPC transport error — {e}"),
-                        );
-                        (err.display_message(), Some(err))
-                    }
-                };
-                self.handle_tool_result(InboundTaskPayload {
-                    action: Some("tool_result".into()),
-                    source: Some("agent".into()),
-                    session_id: Some(payload.session_id),
-                    turn_id: Some(payload.turn_id),
-                    chat_id: Some(payload.chat_id),
-                    content: Some(content),
-                    error: tool_err,
-                    tool_name: Some(payload.tool_name),
-                    final_reply_to: Some(payload.final_reply_to),
-                    final_reply_role: Some(payload.final_reply_role),
-                    final_reply_guest_id: payload.final_reply_guest_id,
-                    ..Default::default()
-                })
-                .await
-            }
-            "agent.configure" => {
-                let args = &payload.arguments;
-                let config_path = match args.get("config_path").and_then(|v| v.as_str()) {
-                    Some(p) => p.to_string(),
-                    None => {
-                        return self
-                            .fail_active_turn(
-                                payload.session_id,
-                                payload.turn_id,
-                                "agent.configure: missing required argument 'config_path'".into(),
-                            )
-                            .await;
-                    }
-                };
-                let value = match args.get("value") {
-                    Some(v) => v.clone(),
-                    None => {
-                        return self
-                            .fail_active_turn(
-                                payload.session_id,
-                                payload.turn_id,
-                                "agent.configure: missing required argument 'value'".into(),
-                            )
-                            .await;
-                    }
-                };
-                let operation = args
-                    .get("operation")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("set")
-                    .to_string();
-
-                let configure_result = {
-                    let Some(state) = self.sessions.get_mut(&payload.session_id) else {
-                        return self
-                            .fail_active_turn(
-                                payload.session_id,
-                                payload.turn_id,
-                                "agent.configure: session not found".into(),
-                            )
-                            .await;
-                    };
-                    let bindings_before = state.bindings.clone();
-                    match state.apply_configure(&config_path, &value, &operation) {
-                        Ok(msg) => {
-                            let changed = state.bindings != bindings_before;
-                            Ok((msg, changed))
-                        }
-                        Err(err) => Err(err),
-                    }
-                };
-                let (content, bindings_changed) = match configure_result {
-                    Ok(result) => result,
-                    Err(err) => {
-                        return self
-                            .fail_active_turn(payload.session_id, payload.turn_id, err)
-                            .await;
-                    }
-                };
-
-                // Rebuild tool assembly if bindings changed so the new toolset takes effect
-                // immediately within the same session.
-                if bindings_changed {
-                    if let Some(state) = self.sessions.get_mut(&payload.session_id) {
-                        state.rebuild_default_tool_assembly();
-                    }
-                }
-
-                self.handle_tool_result(InboundTaskPayload {
-                    action: Some("tool_result".into()),
-                    agent_action: None,
-                    handoff_bundle: None,
-                    source: Some("agent".into()),
-                    session_id: Some(payload.session_id),
-                    turn_id: Some(payload.turn_id),
-                    transport: None,
-                    chat_id: Some(payload.chat_id),
-                    thread_id: None,
-                    sender_id: None,
-                    sender_username: None,
-                    message_kind: None,
-                    content: Some(content),
-                    attachments: Vec::new(),
-                    command: None,
-                    callback_data: None,
-                    raw_transport_event: None,
-                    error: None,
-                    tool_name: Some(payload.tool_name),
-                    arguments: None,
-                    final_reply_to: Some(payload.final_reply_to),
-                    final_reply_role: Some(payload.final_reply_role),
-                    final_reply_guest_id: payload.final_reply_guest_id,
-                    ..Default::default()
-                })
-                .await
-            }
-            "agent.migrate_to" => {
-                let dest_hotel = match payload.arguments.get("dest_hotel").and_then(|v| v.as_str())
-                {
-                    Some(h) => h.to_string(),
-                    None => {
-                        return self
-                            .fail_active_turn(
-                                payload.session_id,
-                                payload.turn_id,
-                                "agent.migrate_to: missing required argument 'dest_hotel'".into(),
-                            )
-                            .await;
-                    }
-                };
-                let result = self
-                    .ipc_client
-                    .send_request(IpcRequest::AgentMigrateToHotel {
-                        agent_id: self.agent_id.clone(),
-                        dest_hotel: dest_hotel.clone(),
-                    })
-                    .await;
-                let content = match result {
-                    Ok(IpcResponse::Standard {
-                        ok: true, message, ..
-                    }) => {
-                        if message.is_empty() {
-                            format!("Migration to '{}' dispatched.", dest_hotel)
-                        } else {
-                            message
-                        }
-                    }
-                    Ok(IpcResponse::Standard {
-                        ok: false, message, ..
-                    }) => {
-                        return self
-                            .fail_active_turn(
-                                payload.session_id,
-                                payload.turn_id,
-                                if message.is_empty() {
-                                    format!(
-                                        "agent.migrate_to: migration to '{}' failed",
-                                        dest_hotel
-                                    )
-                                } else {
-                                    message
-                                },
-                            )
-                            .await;
-                    }
-                    Ok(other) => {
-                        return self
-                            .fail_active_turn(
-                                payload.session_id,
-                                payload.turn_id,
-                                format!("agent.migrate_to: unexpected response: {other:?}"),
-                            )
-                            .await;
-                    }
-                    Err(e) => {
-                        return self
-                            .fail_active_turn(
-                                payload.session_id,
-                                payload.turn_id,
-                                format!("agent.migrate_to: IPC error — {e}"),
-                            )
-                            .await;
-                    }
-                };
-                self.handle_tool_result(InboundTaskPayload {
-                    action: Some("tool_result".into()),
-                    agent_action: None,
-                    handoff_bundle: None,
-                    source: Some("agent".into()),
-                    session_id: Some(payload.session_id),
-                    turn_id: Some(payload.turn_id),
-                    transport: None,
-                    chat_id: Some(payload.chat_id),
-                    thread_id: None,
-                    sender_id: None,
-                    sender_username: None,
-                    message_kind: None,
-                    content: Some(content),
-                    attachments: Vec::new(),
-                    command: None,
-                    callback_data: None,
-                    raw_transport_event: None,
-                    error: None,
-                    tool_name: Some(payload.tool_name),
-                    arguments: None,
-                    final_reply_to: Some(payload.final_reply_to),
-                    final_reply_role: Some(payload.final_reply_role),
-                    final_reply_guest_id: payload.final_reply_guest_id,
-                    ..Default::default()
-                })
-                .await
-            }
-            "role.configure" => {
-                let args = &payload.arguments;
-
-                macro_rules! require_str_arg {
-                    ($key:literal) => {
-                        match args.get($key).and_then(|v| v.as_str()) {
-                            Some(s) => s.to_string(),
-                            None => {
-                                return self
-                                    .fail_active_turn(
-                                        payload.session_id,
-                                        payload.turn_id,
-                                        format!(
-                                            "role.configure: missing required argument '{}'",
-                                            $key
-                                        ),
-                                    )
-                                    .await;
-                            }
-                        }
-                    };
-                }
-
-                let role_name = require_str_arg!("role_name");
-                let toolset_profile = require_str_arg!("toolset_profile");
-
-                if let None = args.get("reasoning").and_then(|v| v.as_object()) {
-                    return self
-                        .fail_active_turn(
-                            payload.session_id,
-                            payload.turn_id,
-                            "role.configure: missing required object argument 'reasoning'".into(),
-                        )
-                        .await;
-                }
-
-                let role_identity_addendum = args
-                    .get("role_identity_addendum")
-                    .and_then(|v| v.as_str())
-                    .map(str::to_string);
-                let role_manifest = args
-                    .get("role_manifest")
-                    .and_then(|v| v.as_str())
-                    .map(str::to_string);
-                let is_admin = args
-                    .get("is_admin")
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(false);
-                let inactive_ttl_seconds =
-                    args.get("inactive_ttl_seconds").and_then(|v| v.as_u64());
-                let iteration_cap = args
-                    .get("iteration_cap")
-                    .and_then(|v| v.as_u64())
-                    .map(|v| v as u32);
-                let approval_policy = args
-                    .get("approval_policy")
-                    .and_then(|v| v.as_str())
-                    .map(str::to_string);
-                let model_profile = args
-                    .get("model_profile")
-                    .and_then(|v| v.as_str())
-                    .map(str::to_string);
-                let context_window_policy = args
-                    .get("context_window_policy")
-                    .and_then(|v| v.as_str())
-                    .map(str::to_string);
-
-                // Read the active persona role from session state to pass as calling authority.
-                // Falls back to "orchestrator" when no role is active (default persona).
-                let calling_role = self
-                    .sessions
-                    .get(&payload.session_id)
-                    .and_then(|s| s.role_activation.as_ref())
-                    .map(|r| r.role_name.clone())
-                    .unwrap_or_else(|| "orchestrator".to_string());
-
-                let req = IpcRequest::ConfigureRole {
-                    agent_id: self.agent_id.clone(),
-                    role_name: role_name.clone(),
-                    guest_id: format!("{}:{}", self.agent_id, role_name),
-                    calling_role,
-                    toolset_profile,
-                    role_identity_addendum,
-                    role_manifest,
-                    is_admin,
-                    inactive_ttl_seconds,
-                    iteration_cap,
-                    approval_policy,
-                    model_profile,
-                    context_window_policy,
-                };
-
-                let (content, tool_err) = match self.ipc_client.send_request(req).await {
-                    Ok(IpcResponse::ConfigureRoleOk { role_name: name }) => {
-                        self.configured_roles.insert(
-                            name.clone(),
-                            CachedRoleConfig {
-                                toolset_profile: args
-                                    .get("toolset_profile")
-                                    .and_then(|v| v.as_str())
-                                    .unwrap_or("default")
-                                    .to_string(),
-                                role_identity_addendum: args
-                                    .get("role_identity_addendum")
-                                    .and_then(|v| v.as_str())
-                                    .map(str::to_string),
-                                role_manifest: args
-                                    .get("role_manifest")
-                                    .and_then(|v| v.as_str())
-                                    .map(str::to_string),
-                                iteration_cap: args
-                                    .get("iteration_cap")
-                                    .and_then(|v| v.as_u64())
-                                    .map(|v| v as u32),
-                                approval_policy: args
-                                    .get("approval_policy")
-                                    .and_then(|v| v.as_str())
-                                    .map(str::to_string),
-                                turn_loop_config: args
-                                    .get("turn_loop_config")
-                                    .and_then(|v| {
-                                        serde_json::from_value::<
-                                            ansible_mesh_core::graph::TurnLoopConfig,
-                                        >(v.clone())
-                                        .ok()
-                                    })
-                                    .unwrap_or_default(),
-                            },
-                        );
-                        // Refresh the delegation roster so new/updated roles appear
-                        // in the system prompt for subsequent sessions without a restart.
-                        self.fetch_role_names().await;
-                        (
-                            format!("Successfully configured role incarnation for '{}'.", name),
-                            None,
-                        )
-                    }
-                    Ok(IpcResponse::Standard {
-                        ok: false,
-                        code,
-                        message,
-                        ..
-                    }) => {
-                        let e = TaskErrorPayload::ipc_failure("aiua", &*code, message);
-                        (e.display_message(), Some(e))
-                    }
-                    Ok(IpcResponse::Error(msg)) => {
-                        let e = TaskErrorPayload::ipc_failure("aiua", "IPC_ERROR", msg);
-                        (e.display_message(), Some(e))
-                    }
-                    Ok(_) => {
-                        let e = TaskErrorPayload::ipc_failure(
-                            "aiua",
-                            "UNEXPECTED_RESPONSE",
-                            "role.configure: unexpected hotel response",
-                        );
-                        (e.display_message(), Some(e))
-                    }
-                    Err(e) => {
-                        let err = TaskErrorPayload::transport_error(
-                            "philote",
-                            format!("role.configure: IPC transport error — {e}"),
-                        );
-                        (err.display_message(), Some(err))
-                    }
-                };
-
-                self.handle_tool_result(InboundTaskPayload {
-                    action: Some("tool_result".into()),
-                    agent_action: None,
-                    handoff_bundle: None,
-                    source: Some("agent".into()),
-                    session_id: Some(payload.session_id),
-                    turn_id: Some(payload.turn_id),
-                    transport: None,
-                    chat_id: Some(payload.chat_id),
-                    thread_id: None,
-                    sender_id: None,
-                    sender_username: None,
-                    message_kind: None,
-                    content: Some(content),
-                    attachments: Vec::new(),
-                    command: None,
-                    callback_data: None,
-                    raw_transport_event: None,
-                    error: tool_err,
-                    tool_name: Some(payload.tool_name),
-                    arguments: None,
-                    final_reply_to: Some(payload.final_reply_to),
-                    final_reply_role: Some(payload.final_reply_role),
-                    final_reply_guest_id: payload.final_reply_guest_id,
-                    ..Default::default()
-                })
-                .await
-            }
-            // role.create_or_update is the governed workflow surface for role authoring.
-            // It validates the same required fields as role.configure and resolves through
-            // the same IpcRequest::ConfigureRole hotel path — no external subscriber needed.
-            "role.create_or_update" => {
-                let args = &payload.arguments;
-
-                macro_rules! require_str_arg {
-                    ($key:literal) => {
-                        match args.get($key).and_then(|v| v.as_str()) {
-                            Some(s) => s.to_string(),
-                            None => {
-                                return self
-                                    .fail_active_turn(
-                                        payload.session_id,
-                                        payload.turn_id,
-                                        format!(
-                                            "role.create_or_update: missing required argument '{}'",
-                                            $key
-                                        ),
-                                    )
-                                    .await;
-                            }
-                        }
-                    };
-                }
-
-                let role_name = require_str_arg!("role_name");
-                let toolset_profile = require_str_arg!("toolset_profile");
-
-                if args.get("reasoning").and_then(|v| v.as_object()).is_none() {
-                    return self
-                        .fail_active_turn(
-                            payload.session_id,
-                            payload.turn_id,
-                            "role.create_or_update: missing required object argument 'reasoning'"
-                                .into(),
-                        )
-                        .await;
-                }
-
-                let role_identity_addendum = args
-                    .get("role_identity_addendum")
-                    .and_then(|v| v.as_str())
-                    .map(str::to_string);
-                let role_manifest = args
-                    .get("role_manifest")
-                    .and_then(|v| v.as_str())
-                    .map(str::to_string);
-                let is_admin = args
-                    .get("is_admin")
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(false);
-                let inactive_ttl_seconds =
-                    args.get("inactive_ttl_seconds").and_then(|v| v.as_u64());
-                let iteration_cap = args
-                    .get("iteration_cap")
-                    .and_then(|v| v.as_u64())
-                    .map(|v| v as u32);
-                let approval_policy = args
-                    .get("approval_policy")
-                    .and_then(|v| v.as_str())
-                    .map(str::to_string);
-                let model_profile = args
-                    .get("model_profile")
-                    .and_then(|v| v.as_str())
-                    .map(str::to_string);
-                let context_window_policy = args
-                    .get("context_window_policy")
-                    .and_then(|v| v.as_str())
-                    .map(str::to_string);
-
-                let calling_role = self
-                    .sessions
-                    .get(&payload.session_id)
-                    .and_then(|s| s.role_activation.as_ref())
-                    .map(|r| r.role_name.clone())
-                    .unwrap_or_else(|| "orchestrator".to_string());
-
-                let req = IpcRequest::ConfigureRole {
-                    agent_id: self.agent_id.clone(),
-                    role_name: role_name.clone(),
-                    guest_id: format!("{}:{}", self.agent_id, role_name),
-                    calling_role,
-                    toolset_profile,
-                    role_identity_addendum,
-                    role_manifest,
-                    is_admin,
-                    inactive_ttl_seconds,
-                    iteration_cap,
-                    approval_policy,
-                    model_profile,
-                    context_window_policy,
-                };
-
-                let (content, tool_err) = match self.ipc_client.send_request(req).await {
-                    Ok(IpcResponse::ConfigureRoleOk { role_name: name }) => {
-                        self.configured_roles.insert(
-                            name.clone(),
-                            CachedRoleConfig {
-                                toolset_profile: args
-                                    .get("toolset_profile")
-                                    .and_then(|v| v.as_str())
-                                    .unwrap_or("default")
-                                    .to_string(),
-                                role_identity_addendum: args
-                                    .get("role_identity_addendum")
-                                    .and_then(|v| v.as_str())
-                                    .map(str::to_string),
-                                role_manifest: args
-                                    .get("role_manifest")
-                                    .and_then(|v| v.as_str())
-                                    .map(str::to_string),
-                                iteration_cap: args
-                                    .get("iteration_cap")
-                                    .and_then(|v| v.as_u64())
-                                    .map(|v| v as u32),
-                                approval_policy: args
-                                    .get("approval_policy")
-                                    .and_then(|v| v.as_str())
-                                    .map(str::to_string),
-                                turn_loop_config: args
-                                    .get("turn_loop_config")
-                                    .and_then(|v| {
-                                        serde_json::from_value::<
-                                            ansible_mesh_core::graph::TurnLoopConfig,
-                                        >(v.clone())
-                                        .ok()
-                                    })
-                                    .unwrap_or_default(),
-                            },
-                        );
-                        self.fetch_role_names().await;
-                        (
-                            format!("Role '{}' created/updated successfully.", name),
-                            None,
-                        )
-                    }
-                    Ok(IpcResponse::Standard {
-                        ok: false,
-                        code,
-                        message,
-                        ..
-                    }) => {
-                        let e = TaskErrorPayload::ipc_failure("aiua", &*code, message);
-                        (e.display_message(), Some(e))
-                    }
-                    Ok(IpcResponse::Error(msg)) => {
-                        let e = TaskErrorPayload::ipc_failure("aiua", "IPC_ERROR", msg);
-                        (e.display_message(), Some(e))
-                    }
-                    Ok(_) => {
-                        let e = TaskErrorPayload::ipc_failure(
-                            "aiua",
-                            "UNEXPECTED_RESPONSE",
-                            "role.create_or_update: unexpected hotel response",
-                        );
-                        (e.display_message(), Some(e))
-                    }
-                    Err(e) => {
-                        let err = TaskErrorPayload::transport_error(
-                            "philote",
-                            format!("role.create_or_update: IPC transport error — {e}"),
-                        );
-                        (err.display_message(), Some(err))
-                    }
-                };
-
-                self.handle_tool_result(InboundTaskPayload {
-                    action: Some("tool_result".into()),
-                    agent_action: None,
-                    handoff_bundle: None,
-                    source: Some("agent".into()),
-                    session_id: Some(payload.session_id),
-                    turn_id: Some(payload.turn_id),
-                    transport: None,
-                    chat_id: Some(payload.chat_id),
-                    thread_id: None,
-                    sender_id: None,
-                    sender_username: None,
-                    message_kind: None,
-                    content: Some(content),
-                    attachments: Vec::new(),
-                    command: None,
-                    callback_data: None,
-                    raw_transport_event: None,
-                    error: tool_err,
-                    tool_name: Some(payload.tool_name),
-                    arguments: None,
-                    final_reply_to: Some(payload.final_reply_to),
-                    final_reply_role: Some(payload.final_reply_role),
-                    final_reply_guest_id: payload.final_reply_guest_id,
-                    ..Default::default()
-                })
-                .await
-            }
-            "skill.register" => {
-                let args = &payload.arguments;
-
-                macro_rules! require_str_arg {
-                    ($key:literal) => {
-                        match args.get($key).and_then(|v| v.as_str()) {
-                            Some(s) => s.to_string(),
-                            None => {
-                                return self
-                                    .fail_active_turn(
-                                        payload.session_id,
-                                        payload.turn_id,
-                                        format!(
-                                            "skill.register: missing required argument '{}'",
-                                            $key
-                                        ),
-                                    )
-                                    .await;
-                            }
-                        }
-                    };
-                }
-
-                let skill_name = require_str_arg!("skill_name");
-                let description = require_str_arg!("description");
-                let subagent_kind = require_str_arg!("subagent_kind");
-                let goal = require_str_arg!("goal");
-
-                let str_vec = |key: &str| -> Vec<String> {
-                    args.get(key)
-                        .and_then(|v| v.as_array())
-                        .map(|arr| {
-                            arr.iter()
-                                .filter_map(|v| v.as_str().map(|s| s.to_string()))
-                                .collect()
-                        })
-                        .unwrap_or_default()
-                };
-                let allowed_tools = str_vec("allowed_tools");
-                let allowed_classes = str_vec("allowed_classes");
-
-                let response = self
-                    .ipc_client
-                    .send_request(IpcRequest::RegisterSkill {
-                        skill_name: skill_name.clone(),
-                        description,
-                        subagent_kind,
-                        goal,
-                        allowed_tools,
-                        allowed_classes,
-                        hook_subscriptions: vec![],
-                        completion_route: Default::default(),
-                        failure_route: Default::default(),
-                        idle_behavior: Default::default(),
-                        lease_terms: Default::default(),
-                    })
-                    .await;
-
-                let (content, tool_err) = match response {
-                    Ok(IpcResponse::SkillRegistered {
-                        skill_name: name,
-                        validation_state,
-                        validation_errors,
-                    }) => {
-                        let msg = if validation_errors.is_empty() {
-                            format!("Skill '{}' registered (state: {}).", name, validation_state)
-                        } else {
-                            format!(
-                                "Skill '{}' registered with state '{}'. Validation issues:\n{}",
-                                name,
-                                validation_state,
-                                validation_errors
-                                    .iter()
-                                    .map(|e| format!("- {e}"))
-                                    .collect::<Vec<_>>()
-                                    .join("\n")
-                            )
-                        };
-                        (msg, None)
-                    }
-                    Ok(IpcResponse::Standard {
-                        ok: false,
-                        code,
-                        message,
-                        ..
-                    }) => {
-                        let e = TaskErrorPayload::ipc_failure("aiua", &*code, message);
-                        (e.display_message(), Some(e))
-                    }
-                    Ok(IpcResponse::Error(msg)) => {
-                        let e = TaskErrorPayload::ipc_failure("aiua", "IPC_ERROR", msg);
-                        (e.display_message(), Some(e))
-                    }
-                    Ok(_) => {
-                        let e = TaskErrorPayload::ipc_failure(
-                            "aiua",
-                            "UNEXPECTED_RESPONSE",
-                            "skill.register: unexpected hotel response",
-                        );
-                        (e.display_message(), Some(e))
-                    }
-                    Err(e) => {
-                        let err = TaskErrorPayload::transport_error(
-                            "philote",
-                            format!("skill.register: IPC transport error — {e}"),
-                        );
-                        (err.display_message(), Some(err))
-                    }
-                };
-
-                self.handle_tool_result(InboundTaskPayload {
-                    action: Some("tool_result".into()),
-                    agent_action: None,
-                    handoff_bundle: None,
-                    source: Some("agent".into()),
-                    session_id: Some(payload.session_id),
-                    turn_id: Some(payload.turn_id),
-                    transport: None,
-                    chat_id: Some(payload.chat_id),
-                    thread_id: None,
-                    sender_id: None,
-                    sender_username: None,
-                    message_kind: None,
-                    content: Some(content),
-                    attachments: Vec::new(),
-                    command: None,
-                    callback_data: None,
-                    raw_transport_event: None,
-                    error: tool_err,
-                    tool_name: Some(payload.tool_name),
-                    arguments: None,
-                    final_reply_to: Some(payload.final_reply_to),
-                    final_reply_role: Some(payload.final_reply_role),
-                    final_reply_guest_id: payload.final_reply_guest_id,
-                    ..Default::default()
-                })
-                .await
-            }
-
-            "skill.list" => {
-                let (content, tool_err) = match self
-                    .ipc_client
-                    .send_request(IpcRequest::ListSkills {})
-                    .await
-                {
-                    Ok(IpcResponse::SkillList { skills }) => {
-                        let msg = if skills.is_empty() {
-                            "No skills registered.".to_string()
-                        } else {
-                            let lines: Vec<String> = skills
-                                .iter()
-                                .map(|s| {
-                                    let name =
-                                        s.get("skill_name").and_then(|v| v.as_str()).unwrap_or("?");
-                                    let state = s
-                                        .get("validation_state")
-                                        .and_then(|v| v.as_str())
-                                        .unwrap_or("?");
-                                    let desc =
-                                        s.get("description").and_then(|v| v.as_str()).unwrap_or("");
-                                    let brief: String = desc.chars().take(80).collect();
-                                    format!("- {} [{}] — {}", name, state, brief)
-                                })
-                                .collect();
-                            format!("Registered skills:\n{}", lines.join("\n"))
-                        };
-                        (msg, None)
-                    }
-                    Ok(IpcResponse::Standard {
-                        ok: false,
-                        code,
-                        message,
-                        ..
-                    }) => {
-                        let e = TaskErrorPayload::ipc_failure("aiua", &*code, message);
-                        (e.display_message(), Some(e))
-                    }
-                    Ok(IpcResponse::Error(msg)) => {
-                        let e = TaskErrorPayload::ipc_failure("aiua", "IPC_ERROR", msg);
-                        (e.display_message(), Some(e))
-                    }
-                    Ok(_) => {
-                        let e = TaskErrorPayload::ipc_failure(
-                            "aiua",
-                            "UNEXPECTED_RESPONSE",
-                            "skill.list: unexpected hotel response",
-                        );
-                        (e.display_message(), Some(e))
-                    }
-                    Err(e) => {
-                        let err = TaskErrorPayload::transport_error(
-                            "philote",
-                            format!("skill.list: IPC transport error — {e}"),
-                        );
-                        (err.display_message(), Some(err))
-                    }
-                };
-
-                self.handle_tool_result(InboundTaskPayload {
-                    action: Some("tool_result".into()),
-                    agent_action: None,
-                    handoff_bundle: None,
-                    source: Some("agent".into()),
-                    session_id: Some(payload.session_id),
-                    turn_id: Some(payload.turn_id),
-                    transport: None,
-                    chat_id: Some(payload.chat_id),
-                    thread_id: None,
-                    sender_id: None,
-                    sender_username: None,
-                    message_kind: None,
-                    content: Some(content),
-                    attachments: Vec::new(),
-                    command: None,
-                    callback_data: None,
-                    raw_transport_event: None,
-                    error: tool_err,
-                    tool_name: Some(payload.tool_name),
-                    arguments: None,
-                    final_reply_to: Some(payload.final_reply_to),
-                    final_reply_role: Some(payload.final_reply_role),
-                    final_reply_guest_id: payload.final_reply_guest_id,
-                    ..Default::default()
-                })
-                .await
-            }
-
-            "skill.assign" | "skill.revoke" => {
-                let args = &payload.arguments;
-                let op = payload.tool_name.as_str();
-
-                let role_name = match args.get("role_name").and_then(|v| v.as_str()) {
-                    Some(s) => s.to_string(),
-                    None => {
-                        return self
-                            .fail_active_turn(
-                                payload.session_id,
-                                payload.turn_id,
-                                format!("{op}: missing required argument 'role_name'"),
-                            )
-                            .await;
-                    }
-                };
-                let skill_name = match args.get("skill_name").and_then(|v| v.as_str()) {
-                    Some(s) => s.to_string(),
-                    None => {
-                        return self
-                            .fail_active_turn(
-                                payload.session_id,
-                                payload.turn_id,
-                                format!("{op}: missing required argument 'skill_name'"),
-                            )
-                            .await;
-                    }
-                };
-
-                let req = if op == "skill.assign" {
-                    IpcRequest::AssignSkill {
-                        agent_id: self.agent_id.clone(),
-                        role_name: role_name.clone(),
-                        skill_name: skill_name.clone(),
-                    }
-                } else {
-                    IpcRequest::RevokeSkill {
-                        agent_id: self.agent_id.clone(),
-                        role_name: role_name.clone(),
-                        skill_name: skill_name.clone(),
-                    }
-                };
-
-                let (content, tool_err) = match self.ipc_client.send_request(req).await {
-                    Ok(IpcResponse::SkillAssigned {
-                        role_name: rn,
-                        skill_name: sn,
-                        operation,
-                    }) => (format!("Skill '{}' {} role '{}'.", sn, operation, rn), None),
-                    Ok(IpcResponse::Standard {
-                        ok: false,
-                        code,
-                        message,
-                        ..
-                    }) => {
-                        let e = TaskErrorPayload::ipc_failure("aiua", &*code, message);
-                        (e.display_message(), Some(e))
-                    }
-                    Ok(IpcResponse::Error(msg)) => {
-                        let e = TaskErrorPayload::ipc_failure("aiua", "IPC_ERROR", msg);
-                        (e.display_message(), Some(e))
-                    }
-                    Ok(_) => {
-                        let e = TaskErrorPayload::ipc_failure(
-                            "aiua",
-                            "UNEXPECTED_RESPONSE",
-                            &format!("{op}: unexpected hotel response"),
-                        );
-                        (e.display_message(), Some(e))
-                    }
-                    Err(e) => {
-                        let err = TaskErrorPayload::transport_error(
-                            "philote",
-                            format!("{op}: IPC transport error — {e}"),
-                        );
-                        (err.display_message(), Some(err))
-                    }
-                };
-
-                self.handle_tool_result(InboundTaskPayload {
-                    action: Some("tool_result".into()),
-                    agent_action: None,
-                    handoff_bundle: None,
-                    source: Some("agent".into()),
-                    session_id: Some(payload.session_id),
-                    turn_id: Some(payload.turn_id),
-                    transport: None,
-                    chat_id: Some(payload.chat_id),
-                    thread_id: None,
-                    sender_id: None,
-                    sender_username: None,
-                    message_kind: None,
-                    content: Some(content),
-                    attachments: Vec::new(),
-                    command: None,
-                    callback_data: None,
-                    raw_transport_event: None,
-                    error: tool_err,
-                    tool_name: Some(payload.tool_name),
-                    arguments: None,
-                    final_reply_to: Some(payload.final_reply_to),
-                    final_reply_role: Some(payload.final_reply_role),
-                    final_reply_guest_id: payload.final_reply_guest_id,
-                    ..Default::default()
-                })
-                .await
-            }
-
-            "subagent.spawn" => {
-                let args = &payload.arguments;
-
-                let goal = match args.get("goal").and_then(|v| v.as_str()) {
-                    Some(s) => s.to_string(),
-                    None => {
-                        return self
-                            .fail_active_turn(
-                                payload.session_id,
-                                payload.turn_id,
-                                "subagent.spawn: missing required argument 'goal'".into(),
-                            )
-                            .await;
-                    }
-                };
-                let subagent_kind = args
-                    .get("subagent_kind")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("philote-worker")
-                    .to_string();
-                let context_summary = args
-                    .get("context_summary")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                let allowed_tools: Vec<String> = args
-                    .get("allowed_tools")
-                    .and_then(|v| v.as_array())
-                    .map(|arr| {
-                        arr.iter()
-                            .filter_map(|v| v.as_str().map(|s| s.to_string()))
-                            .collect()
-                    })
-                    .unwrap_or_default();
-                let iteration_budget = args
-                    .get("iteration_budget")
-                    .and_then(|v| v.as_u64())
-                    .map(|n| n as u32);
-
-                let delegation = philotic_client::SubagentDelegation {
-                    parent_agent_id: self.agent_id.clone(),
-                    parent_role: "agent".to_string(),
-                    subagent_kind,
-                    goal,
-                    context_packet: philotic_client::SubagentContextPacket {
-                        summary: context_summary,
-                        ..Default::default()
-                    },
-                    allowed_tools,
-                    iteration_budget,
-                    ..Default::default()
-                };
-
-                let response = self
-                    .ipc_client
-                    .send_request(IpcRequest::SpawnSubagent {
-                        session_id: payload.session_id.clone(),
-                        delegation,
-                    })
-                    .await;
-
-                let (content, tool_err) = match response {
-                    Ok(IpcResponse::SpawnSubagentOk {
-                        subagent_guest_id,
-                        confirmed_lease,
-                    }) => (
-                        format!(
-                            "Subagent spawned.\nGuest ID: {}\nLease expires at: {} (epoch {})",
-                            subagent_guest_id,
-                            confirmed_lease.lease_expires_at,
-                            confirmed_lease.lease_epoch,
-                        ),
-                        None,
-                    ),
-                    Ok(IpcResponse::SpawnSubagentProposal {
-                        subagent_guest_id,
-                        confirmed_lease,
-                        delta,
-                    }) => (
-                        format!(
-                            "Subagent spawned (TTL adjusted: {}s → {}s).\nGuest ID: {}\nLease expires at: {}",
-                            delta.requested_ttl,
-                            delta.confirmed_ttl,
-                            subagent_guest_id,
-                            confirmed_lease.lease_expires_at,
-                        ),
-                        None,
-                    ),
-                    Ok(IpcResponse::Standard {
-                        ok: false,
-                        code,
-                        message,
-                        ..
-                    }) => {
-                        let e = TaskErrorPayload::ipc_failure("aiua", &*code, message);
-                        (e.display_message(), Some(e))
-                    }
-                    Ok(IpcResponse::Error(msg)) => {
-                        let e = TaskErrorPayload::ipc_failure("aiua", "IPC_ERROR", msg);
-                        (e.display_message(), Some(e))
-                    }
-                    Ok(_) => {
-                        let e = TaskErrorPayload::ipc_failure(
-                            "aiua",
-                            "UNEXPECTED_RESPONSE",
-                            "subagent.spawn: unexpected hotel response",
-                        );
-                        (e.display_message(), Some(e))
-                    }
-                    Err(e) => {
-                        let err = TaskErrorPayload::transport_error(
-                            "philote",
-                            format!("subagent.spawn: IPC transport error — {e}"),
-                        );
-                        (err.display_message(), Some(err))
-                    }
-                };
-
-                self.handle_tool_result(InboundTaskPayload {
-                    action: Some("tool_result".into()),
-                    agent_action: None,
-                    handoff_bundle: None,
-                    source: Some("agent".into()),
-                    session_id: Some(payload.session_id),
-                    turn_id: Some(payload.turn_id),
-                    transport: None,
-                    chat_id: Some(payload.chat_id),
-                    thread_id: None,
-                    sender_id: None,
-                    sender_username: None,
-                    message_kind: None,
-                    content: Some(content),
-                    attachments: Vec::new(),
-                    command: None,
-                    callback_data: None,
-                    raw_transport_event: None,
-                    error: tool_err,
-                    tool_name: Some(payload.tool_name),
-                    arguments: None,
-                    final_reply_to: Some(payload.final_reply_to),
-                    final_reply_role: Some(payload.final_reply_role),
-                    final_reply_guest_id: payload.final_reply_guest_id,
-                    ..Default::default()
-                })
-                .await
-            }
-
-            "role.set_home" => {
-                let args = payload.arguments.as_object();
-                let role_name = args
-                    .and_then(|a| a.get("role_name"))
-                    .and_then(|v| v.as_str())
-                    .map(str::to_string);
-                let target_hotel = args
-                    .and_then(|a| a.get("target_hotel"))
-                    .and_then(|v| v.as_str())
-                    .filter(|s| !s.is_empty() && s.to_lowercase() != "null")
-                    .map(str::to_string);
-                let reason = args
-                    .and_then(|a| a.get("reason"))
-                    .and_then(|v| v.as_str())
-                    .map(str::to_string);
-
-                let Some(role_name) = role_name else {
-                    return self
-                        .fail_active_turn(
-                            payload.session_id,
-                            payload.turn_id,
-                            "role.set_home: missing required argument 'role_name'".into(),
-                        )
-                        .await;
-                };
-                let Some(reason) = reason else {
-                    return self
-                        .fail_active_turn(
-                            payload.session_id,
-                            payload.turn_id,
-                            "role.set_home: missing required argument 'reason'".into(),
-                        )
-                        .await;
-                };
-
-                // Resolve the calling role from active session state.
-                let calling_role = self
-                    .sessions
-                    .get(&payload.session_id)
-                    .and_then(|s| s.role_activation.as_ref())
-                    .map(|r| r.role_name.clone())
-                    .unwrap_or_else(|| "orchestrator".into());
-
-                let _ = reason; // recorded for operator visibility in approval surface
-                let (content, tool_err) = match self
-                    .ipc_client
-                    .send_request(IpcRequest::SetRoleHome {
-                        agent_id: self.agent_id.clone(),
-                        role_name: role_name.clone(),
-                        calling_role,
-                        target_hotel: target_hotel.clone(),
-                    })
-                    .await
-                {
-                    Ok(IpcResponse::RoleHomeSet {
-                        role_name: name,
-                        home_node,
-                    }) => {
-                        let msg = match home_node {
-                            Some(ref node) => format!(
-                                "Role '{name}' pinned to hotel '{node}'. Next handoff.to_role will route there."
-                            ),
-                            None => {
-                                format!("Role '{name}' home cleared — will run on authority hotel.")
-                            }
-                        };
-                        (msg, None)
-                    }
-                    Ok(IpcResponse::Error(msg)) => {
-                        let e = TaskErrorPayload::tool_execution(
-                            "role.set_home",
-                            msg,
-                            Some("SET_ROLE_HOME_REJECTED"),
-                        );
-                        (e.display_message(), Some(e))
-                    }
-                    Ok(_) => {
-                        let e = TaskErrorPayload::ipc_failure(
-                            "aiua",
-                            "UNEXPECTED_RESPONSE",
-                            "role.set_home: unexpected hotel response",
-                        );
-                        (e.display_message(), Some(e))
-                    }
-                    Err(e) => {
-                        let err = TaskErrorPayload::transport_error(
-                            "philote",
-                            format!("role.set_home: IPC transport error — {e}"),
-                        );
-                        (err.display_message(), Some(err))
-                    }
-                };
-
-                if let Some(err) = tool_err {
-                    self.handle_tool_result(InboundTaskPayload {
-                        action: Some("tool_result".into()),
-                        agent_action: None,
-                        handoff_bundle: None,
-                        source: Some("agent".into()),
-                        session_id: Some(payload.session_id),
-                        turn_id: Some(payload.turn_id),
-                        transport: None,
-                        chat_id: Some(payload.chat_id),
-                        thread_id: None,
-                        sender_id: None,
-                        sender_username: None,
-                        message_kind: None,
-                        content: Some(content),
-                        attachments: Vec::new(),
-                        command: None,
-                        callback_data: None,
-                        raw_transport_event: None,
-                        error: Some(err),
-                        tool_name: Some(payload.tool_name),
-                        arguments: None,
-                        final_reply_to: Some(payload.final_reply_to),
-                        final_reply_role: Some(payload.final_reply_role),
-                        final_reply_guest_id: payload.final_reply_guest_id,
-                        ..Default::default()
-                    })
-                    .await
-                } else {
-                    self.complete_local_command(payload.session_id, payload.turn_id, content)
-                        .await
-                }
-            }
-
-            "transport.set_home" => {
-                let args = payload.arguments.as_object();
-                let transport = args
-                    .and_then(|a| a.get("transport"))
-                    .and_then(|v| v.as_str())
-                    .map(str::to_string);
-                let resource_ref = args
-                    .and_then(|a| a.get("resource_ref"))
-                    .and_then(|v| v.as_str())
-                    .map(str::to_string);
-                let target_hotel = args
-                    .and_then(|a| a.get("target_hotel"))
-                    .and_then(|v| v.as_str())
-                    .map(str::to_string);
-                let standby_hotels = args
-                    .and_then(|a| a.get("standby_hotels"))
-                    .and_then(|v| v.as_array())
-                    .map(|values| {
-                        values
-                            .iter()
-                            .filter_map(|value| value.as_str())
-                            .map(str::trim)
-                            .filter(|value| !value.is_empty())
-                            .map(str::to_string)
-                            .collect::<Vec<_>>()
-                    })
-                    .unwrap_or_default();
-                let reason = args
-                    .and_then(|a| a.get("reason"))
-                    .and_then(|v| v.as_str())
-                    .map(str::to_string);
-
-                let Some(transport) = transport else {
-                    return self
-                        .fail_active_turn(
-                            payload.session_id,
-                            payload.turn_id,
-                            "transport.set_home: missing required argument 'transport'".into(),
-                        )
-                        .await;
-                };
-                let Some(resource_ref) = resource_ref else {
-                    return self
-                        .fail_active_turn(
-                            payload.session_id,
-                            payload.turn_id,
-                            "transport.set_home: missing required argument 'resource_ref'".into(),
-                        )
-                        .await;
-                };
-                let Some(target_hotel) = target_hotel else {
-                    return self
-                        .fail_active_turn(
-                            payload.session_id,
-                            payload.turn_id,
-                            "transport.set_home: missing required argument 'target_hotel'".into(),
-                        )
-                        .await;
-                };
-                let Some(reason) = reason else {
-                    return self
-                        .fail_active_turn(
-                            payload.session_id,
-                            payload.turn_id,
-                            "transport.set_home: missing required argument 'reason'".into(),
-                        )
-                        .await;
-                };
-
-                let calling_role = self
-                    .sessions
-                    .get(&payload.session_id)
-                    .and_then(|s| s.role_activation.as_ref())
-                    .map(|r| r.role_name.clone())
-                    .unwrap_or_else(|| "orchestrator".into());
-
-                let _ = reason;
-                let (content, tool_err) = match self
-                    .ipc_client
-                    .send_request(IpcRequest::SetTransportHome {
-                        agent_id: self.agent_id.clone(),
-                        transport: transport.clone(),
-                        resource_ref: resource_ref.clone(),
-                        calling_role,
-                        target_hotel: target_hotel.clone(),
-                        standby_hotels,
-                    })
-                    .await
-                {
-                    Ok(IpcResponse::TransportHomeSet {
-                        transport,
-                        resource_ref,
-                        active_home_hotel,
-                        standby_hotels,
-                        ..
-                    }) => {
-                        let standby = if standby_hotels.is_empty() {
-                            "no standby hotels".to_string()
-                        } else {
-                            format!("standby hotels: {}", standby_hotels.join(", "))
-                        };
-                        (
-                            format!(
-                                "Transport '{transport}' resource '{resource_ref}' now homes on hotel '{active_home_hotel}' ({standby})."
-                            ),
-                            None,
-                        )
-                    }
-                    Ok(IpcResponse::Error(msg)) => {
-                        let e = TaskErrorPayload::tool_execution(
-                            "transport.set_home",
-                            msg,
-                            Some("SET_TRANSPORT_HOME_REJECTED"),
-                        );
-                        (e.display_message(), Some(e))
-                    }
-                    Ok(_) => {
-                        let e = TaskErrorPayload::ipc_failure(
-                            "aiua",
-                            "UNEXPECTED_RESPONSE",
-                            "transport.set_home: unexpected hotel response",
-                        );
-                        (e.display_message(), Some(e))
-                    }
-                    Err(e) => {
-                        let err = TaskErrorPayload::transport_error(
-                            "philote",
-                            format!("transport.set_home: IPC transport error — {e}"),
-                        );
-                        (err.display_message(), Some(err))
-                    }
-                };
-
-                if let Some(err) = tool_err {
-                    self.handle_tool_result(InboundTaskPayload {
-                        action: Some("tool_result".into()),
-                        agent_action: None,
-                        handoff_bundle: None,
-                        source: Some("agent".into()),
-                        session_id: Some(payload.session_id),
-                        turn_id: Some(payload.turn_id),
-                        transport: None,
-                        chat_id: Some(payload.chat_id),
-                        thread_id: None,
-                        sender_id: None,
-                        sender_username: None,
-                        message_kind: None,
-                        content: Some(content),
-                        attachments: Vec::new(),
-                        command: None,
-                        callback_data: None,
-                        raw_transport_event: None,
-                        error: Some(err),
-                        tool_name: Some(payload.tool_name),
-                        arguments: None,
-                        final_reply_to: Some(payload.final_reply_to),
-                        final_reply_role: Some(payload.final_reply_role),
-                        final_reply_guest_id: payload.final_reply_guest_id,
-                        ..Default::default()
-                    })
-                    .await
-                } else {
-                    self.complete_local_command(payload.session_id, payload.turn_id, content)
-                        .await
-                }
-            }
-
-            "role.list" => {
-                let (content, tool_err) = match self
-                    .ipc_client
-                    .send_request(IpcRequest::ListRoleIncarnations {
-                        agent_id: self.agent_id.clone(),
-                    })
-                    .await
-                {
-                    Ok(IpcResponse::Standard {
-                        ok: true,
-                        data: Some(data),
-                        ..
-                    }) => {
-                        let roles = data
-                            .get("roles")
-                            .and_then(|v| v.as_array())
-                            .cloned()
-                            .unwrap_or_default();
-                        if roles.is_empty() {
-                            ("No roles configured for this agent.".into(), None)
-                        } else {
-                            let mut lines = vec![format!(
-                                "Role roster for {} ({} roles):",
-                                self.agent_id,
-                                roles.len()
-                            )];
-                            for role in &roles {
-                                let name = role
-                                    .get("role_name")
-                                    .and_then(|v| v.as_str())
-                                    .unwrap_or("?");
-                                let profile = role
-                                    .get("toolset_profile")
-                                    .and_then(|v| v.as_str())
-                                    .unwrap_or("?");
-                                let state = role
-                                    .get("readiness_state")
-                                    .and_then(|v| v.as_str())
-                                    .unwrap_or("unknown");
-                                let home = role
-                                    .get("home_node")
-                                    .and_then(|v| v.as_str())
-                                    .unwrap_or("(authority hotel)");
-                                lines.push(format!(
-                                    "  {name}  profile={profile}  state={state}  home={home}"
-                                ));
-                            }
-                            (lines.join("\n"), None)
-                        }
-                    }
-                    Ok(IpcResponse::Standard {
-                        ok: false,
-                        code,
-                        message,
-                        ..
-                    }) => {
-                        let e = TaskErrorPayload::ipc_failure("aiua", &*code, message);
-                        (e.display_message(), Some(e))
-                    }
-                    Ok(_) => ("Role list unavailable.".into(), None),
-                    Err(e) => {
-                        let err = TaskErrorPayload::transport_error(
-                            "philote",
-                            format!("role.list: IPC transport error — {e}"),
-                        );
-                        (err.display_message(), Some(err))
-                    }
-                };
-                self.handle_tool_result(InboundTaskPayload {
-                    action: Some("tool_result".into()),
-                    source: Some("agent".into()),
-                    session_id: Some(payload.session_id),
-                    turn_id: Some(payload.turn_id),
-                    chat_id: Some(payload.chat_id),
-                    content: Some(content),
-                    error: tool_err,
-                    tool_name: Some(payload.tool_name),
-                    final_reply_to: Some(payload.final_reply_to),
-                    final_reply_role: Some(payload.final_reply_role),
-                    final_reply_guest_id: payload.final_reply_guest_id,
-                    ..Default::default()
-                })
-                .await
-            }
-
-            "training.list" => {
-                use ansible_mesh_core::whisper_training::TrainingFilter;
-                use philotic_client::IpcRequest;
-                let args = payload.arguments.as_object();
-                let limit = args
-                    .and_then(|a| a.get("limit"))
-                    .and_then(|v| v.as_u64())
-                    .map(|n| n as usize)
-                    .unwrap_or(20);
-                let filter_str = args
-                    .and_then(|a| a.get("filter"))
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("all");
-                let filter = match filter_str {
-                    "uncorrected" => TrainingFilter::Uncorrected,
-                    "eligible" => TrainingFilter::Eligible,
-                    "exported" => TrainingFilter::Exported,
-                    _ => TrainingFilter::All,
-                };
-                let agent_id_filter = args
-                    .and_then(|a| a.get("agent_id"))
-                    .and_then(|v| v.as_str())
-                    .map(str::to_string);
-                let (content, tool_err) = match self
-                    .ipc_client
-                    .send_request(IpcRequest::ListTrainingSamples {
-                        agent_id: agent_id_filter,
-                        limit,
-                        filter,
-                    })
-                    .await
-                {
-                    Ok(IpcResponse::Standard {
-                        ok: true,
-                        data: Some(data),
-                        ..
-                    }) => {
-                        let count = data.get("count").and_then(|v| v.as_u64()).unwrap_or(0);
-                        let samples = data
-                            .get("samples")
-                            .and_then(|v| v.as_array())
-                            .cloned()
-                            .unwrap_or_default();
-                        if samples.is_empty() {
-                            (
-                                format!("No training samples found (filter: {filter_str})."),
-                                None,
-                            )
-                        } else {
-                            let lines: Vec<String> = std::iter::once(format!(
-                                "{count} training sample(s) (filter: {filter_str}):"
-                            ))
-                            .chain(samples.iter().map(|s| {
-                                let sid =
-                                    s.get("sample_id").and_then(|v| v.as_str()).unwrap_or("?");
-                                let turn = s.get("turn_id").and_then(|v| v.as_str()).unwrap_or("?");
-                                let raw = s
-                                    .get("raw_transcript")
-                                    .and_then(|v| v.as_str())
-                                    .unwrap_or("");
-                                let corrected =
-                                    s.get("corrected_transcript").and_then(|v| v.as_str());
-                                let eligible = s
-                                    .get("training_eligible")
-                                    .and_then(|v| v.as_bool())
-                                    .unwrap_or(false);
-                                let exported =
-                                    s.get("exported_at").and_then(|v| v.as_u64()).is_some();
-                                let state = if exported {
-                                    "exported"
-                                } else if eligible {
-                                    "eligible"
-                                } else if corrected.is_some() {
-                                    "corrected"
-                                } else {
-                                    "uncorrected"
-                                };
-                                let transcript = corrected.unwrap_or(raw);
-                                format!(
-                                    "  [{state}] {sid}  turn={turn}  transcript={transcript:.80}"
-                                )
-                            }))
-                            .collect();
-                            (lines.join("\n"), None)
-                        }
-                    }
-                    Ok(IpcResponse::Standard {
-                        ok: false,
-                        code,
-                        message,
-                        ..
-                    }) => {
-                        let e = TaskErrorPayload::ipc_failure("aiua", &*code, message);
-                        (e.display_message(), Some(e))
-                    }
-                    Ok(_) => ("training.list: unexpected response".into(), None),
-                    Err(e) => {
-                        let err = TaskErrorPayload::transport_error(
-                            "philote",
-                            format!("training.list: IPC transport error — {e}"),
-                        );
-                        (err.display_message(), Some(err))
-                    }
-                };
-                self.handle_tool_result(InboundTaskPayload {
-                    action: Some("tool_result".into()),
-                    source: Some("agent".into()),
-                    session_id: Some(payload.session_id),
-                    turn_id: Some(payload.turn_id),
-                    chat_id: Some(payload.chat_id),
-                    content: Some(content),
-                    error: tool_err,
-                    tool_name: Some(payload.tool_name),
-                    final_reply_to: Some(payload.final_reply_to),
-                    final_reply_role: Some(payload.final_reply_role),
-                    final_reply_guest_id: payload.final_reply_guest_id,
-                    ..Default::default()
-                })
-                .await
-            }
-
-            "training.correct" => {
-                use philotic_client::IpcRequest;
-                let args = payload.arguments.as_object();
-                let turn_id = args
-                    .and_then(|a| a.get("turn_id"))
-                    .and_then(|v| v.as_str())
-                    .map(str::to_string);
-                let corrected_transcript = args
-                    .and_then(|a| a.get("corrected_transcript"))
-                    .and_then(|v| v.as_str())
-                    .map(str::to_string);
-                let (Some(turn_id), Some(corrected_transcript)) = (turn_id, corrected_transcript)
-                else {
-                    let err = TaskErrorPayload::ipc_failure(
-                        "philote",
-                        "MISSING_ARGS",
-                        "training.correct requires 'turn_id' and 'corrected_transcript'",
-                    );
-                    return self
-                        .handle_tool_result(InboundTaskPayload {
-                            action: Some("tool_result".into()),
-                            source: Some("agent".into()),
-                            session_id: Some(payload.session_id),
-                            turn_id: Some(payload.turn_id),
-                            chat_id: Some(payload.chat_id),
-                            content: Some(err.display_message()),
-                            error: Some(err),
-                            tool_name: Some(payload.tool_name),
-                            final_reply_to: Some(payload.final_reply_to),
-                            final_reply_role: Some(payload.final_reply_role),
-                            final_reply_guest_id: payload.final_reply_guest_id,
-                            ..Default::default()
-                        })
-                        .await;
-                };
-                let (content, tool_err) = match self
-                    .ipc_client
-                    .send_request(IpcRequest::CorrectTrainingSample {
-                        turn_id: turn_id.clone(),
-                        corrected_transcript,
-                    })
-                    .await
-                {
-                    Ok(IpcResponse::Standard { ok: true, .. }) => (
-                        format!(
-                            "Correction applied to turn '{turn_id}'. Sample marked training_eligible."
-                        ),
-                        None,
-                    ),
-                    Ok(IpcResponse::Standard {
-                        ok: false,
-                        code,
-                        message,
-                        ..
-                    }) => {
-                        let e = TaskErrorPayload::ipc_failure("aiua", &*code, message);
-                        (e.display_message(), Some(e))
-                    }
-                    Ok(_) => ("training.correct: unexpected response".into(), None),
-                    Err(e) => {
-                        let err = TaskErrorPayload::transport_error(
-                            "philote",
-                            format!("training.correct: IPC transport error — {e}"),
-                        );
-                        (err.display_message(), Some(err))
-                    }
-                };
-                self.handle_tool_result(InboundTaskPayload {
-                    action: Some("tool_result".into()),
-                    source: Some("agent".into()),
-                    session_id: Some(payload.session_id),
-                    turn_id: Some(payload.turn_id),
-                    chat_id: Some(payload.chat_id),
-                    content: Some(content),
-                    error: tool_err,
-                    tool_name: Some(payload.tool_name),
-                    final_reply_to: Some(payload.final_reply_to),
-                    final_reply_role: Some(payload.final_reply_role),
-                    final_reply_guest_id: payload.final_reply_guest_id,
-                    ..Default::default()
-                })
-                .await
-            }
-
-            "training.export" => {
-                use ansible_mesh_core::whisper_training::TrainingExportFormat;
-                use philotic_client::IpcRequest;
-                let args = payload.arguments.as_object();
-                let format_str = args
-                    .and_then(|a| a.get("format"))
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("huggingface");
-                let output_path = args
-                    .and_then(|a| a.get("output_path"))
-                    .and_then(|v| v.as_str())
-                    .map(str::to_string);
-                let limit = args
-                    .and_then(|a| a.get("limit"))
-                    .and_then(|v| v.as_u64())
-                    .map(|n| n as usize);
-                let Some(output_path) = output_path else {
-                    let err = TaskErrorPayload::ipc_failure(
-                        "philote",
-                        "MISSING_ARGS",
-                        "training.export requires 'format' and 'output_path'",
-                    );
-                    return self
-                        .handle_tool_result(InboundTaskPayload {
-                            action: Some("tool_result".into()),
-                            source: Some("agent".into()),
-                            session_id: Some(payload.session_id),
-                            turn_id: Some(payload.turn_id),
-                            chat_id: Some(payload.chat_id),
-                            content: Some(err.display_message()),
-                            error: Some(err),
-                            tool_name: Some(payload.tool_name),
-                            final_reply_to: Some(payload.final_reply_to),
-                            final_reply_role: Some(payload.final_reply_role),
-                            final_reply_guest_id: payload.final_reply_guest_id,
-                            ..Default::default()
-                        })
-                        .await;
-                };
-                let format = if format_str == "nemo" {
-                    TrainingExportFormat::Nemo
-                } else {
-                    TrainingExportFormat::HuggingFace
-                };
-                let (content, tool_err) = match self
-                    .ipc_client
-                    .send_request(IpcRequest::ExportTrainingSamples {
-                        format,
-                        output_path: output_path.clone(),
-                        limit,
-                    })
-                    .await
-                {
-                    Ok(IpcResponse::Standard { ok: true, data, .. }) => {
-                        let count = data
-                            .as_ref()
-                            .and_then(|d| d.get("exported_count"))
-                            .and_then(|v| v.as_u64())
-                            .unwrap_or(0);
-                        (
-                            format!(
-                                "Exported {count} sample(s) ({format_str} format) → {output_path}"
-                            ),
-                            None,
-                        )
-                    }
-                    Ok(IpcResponse::Standard {
-                        ok: false,
-                        code,
-                        message,
-                        ..
-                    }) => {
-                        let e = TaskErrorPayload::ipc_failure("aiua", &*code, message);
-                        (e.display_message(), Some(e))
-                    }
-                    Ok(_) => ("training.export: unexpected response".into(), None),
-                    Err(e) => {
-                        let err = TaskErrorPayload::transport_error(
-                            "philote",
-                            format!("training.export: IPC transport error — {e}"),
-                        );
-                        (err.display_message(), Some(err))
-                    }
-                };
-                self.handle_tool_result(InboundTaskPayload {
-                    action: Some("tool_result".into()),
-                    source: Some("agent".into()),
-                    session_id: Some(payload.session_id),
-                    turn_id: Some(payload.turn_id),
-                    chat_id: Some(payload.chat_id),
-                    content: Some(content),
-                    error: tool_err,
-                    tool_name: Some(payload.tool_name),
-                    final_reply_to: Some(payload.final_reply_to),
-                    final_reply_role: Some(payload.final_reply_role),
-                    final_reply_guest_id: payload.final_reply_guest_id,
-                    ..Default::default()
-                })
-                .await
-            }
-
-            "training.status" => {
-                use philotic_client::IpcRequest;
-                let args = payload.arguments.as_object();
-                let agent_id_filter = args
-                    .and_then(|a| a.get("agent_id"))
-                    .and_then(|v| v.as_str())
-                    .map(str::to_string);
-                let (content, tool_err) = match self
-                    .ipc_client
-                    .send_request(IpcRequest::GetTrainingStatus {
-                        agent_id: agent_id_filter,
-                    })
-                    .await
-                {
-                    Ok(IpcResponse::Standard {
-                        ok: true,
-                        data: Some(data),
-                        ..
-                    }) => {
-                        let status = data.get("status").cloned().unwrap_or_default();
-                        let total = status.get("total").and_then(|v| v.as_u64()).unwrap_or(0);
-                        let uncorrected = status
-                            .get("uncorrected")
-                            .and_then(|v| v.as_u64())
-                            .unwrap_or(0);
-                        let eligible = status.get("eligible").and_then(|v| v.as_u64()).unwrap_or(0);
-                        let exported = status.get("exported").and_then(|v| v.as_u64()).unwrap_or(0);
-                        let content = format!(
-                            "Training data status:\n  total captured: {total}\n  uncorrected: {uncorrected}\n  eligible for export: {eligible}\n  exported: {exported}"
-                        );
-                        (content, None)
-                    }
-                    Ok(IpcResponse::Standard {
-                        ok: false,
-                        code,
-                        message,
-                        ..
-                    }) => {
-                        let e = TaskErrorPayload::ipc_failure("aiua", &*code, message);
-                        (e.display_message(), Some(e))
-                    }
-                    Ok(_) => ("training.status: unexpected response".into(), None),
-                    Err(e) => {
-                        let err = TaskErrorPayload::transport_error(
-                            "philote",
-                            format!("training.status: IPC transport error — {e}"),
-                        );
-                        (err.display_message(), Some(err))
-                    }
-                };
-                self.handle_tool_result(InboundTaskPayload {
-                    action: Some("tool_result".into()),
-                    source: Some("agent".into()),
-                    session_id: Some(payload.session_id),
-                    turn_id: Some(payload.turn_id),
-                    chat_id: Some(payload.chat_id),
-                    content: Some(content),
-                    error: tool_err,
-                    tool_name: Some(payload.tool_name),
-                    final_reply_to: Some(payload.final_reply_to),
-                    final_reply_role: Some(payload.final_reply_role),
-                    final_reply_guest_id: payload.final_reply_guest_id,
-                    ..Default::default()
-                })
-                .await
-            }
-
-            "asr.setup" => {
-                use philotic_client::IpcRequest;
-                let args = payload.arguments.as_object();
-                let python_path = args
-                    .and_then(|a| a.get("python_path"))
-                    .and_then(|v| v.as_str())
-                    .map(str::to_string);
-                let model_name = args
-                    .and_then(|a| a.get("model_name"))
-                    .and_then(|v| v.as_str())
-                    .map(str::to_string);
-                let auto_install = args
-                    .and_then(|a| a.get("auto_install"))
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(true);
-                let (content, tool_err) = match self
-                    .ipc_client
-                    .send_request(IpcRequest::AsrSetup {
-                        python_path,
-                        model_name,
-                        auto_install,
-                    })
-                    .await
-                {
-                    Ok(IpcResponse::Standard {
-                        ok: true,
-                        data: Some(data),
-                        ..
-                    }) => {
-                        let msg = data
-                            .get("message")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("ASR provider configured.")
-                            .to_string();
-                        (msg, None)
-                    }
-                    Ok(IpcResponse::Standard {
-                        ok: false,
-                        code,
-                        message,
-                        ..
-                    }) => {
-                        let e = TaskErrorPayload::ipc_failure("aiua", &*code, message);
-                        (e.display_message(), Some(e))
-                    }
-                    Ok(_) => ("asr.setup: unexpected response".into(), None),
-                    Err(e) => {
-                        let err = TaskErrorPayload::transport_error(
-                            "philote",
-                            format!("asr.setup: IPC transport error — {e}"),
-                        );
-                        (err.display_message(), Some(err))
-                    }
-                };
-                self.handle_tool_result(InboundTaskPayload {
-                    action: Some("tool_result".into()),
-                    source: Some("agent".into()),
-                    session_id: Some(payload.session_id),
-                    turn_id: Some(payload.turn_id),
-                    chat_id: Some(payload.chat_id),
-                    content: Some(content),
-                    error: tool_err,
-                    tool_name: Some(payload.tool_name),
-                    final_reply_to: Some(payload.final_reply_to),
-                    final_reply_role: Some(payload.final_reply_role),
-                    final_reply_guest_id: payload.final_reply_guest_id,
-                    ..Default::default()
-                })
-                .await
-            }
-
-            "asr.status" => {
-                use philotic_client::IpcRequest;
-                let (content, tool_err) = match self
-                    .ipc_client
-                    .send_request(IpcRequest::AsrStatus {})
-                    .await
-                {
-                    Ok(IpcResponse::Standard {
-                        ok: true,
-                        data: Some(data),
-                        ..
-                    }) => {
-                        let registered = data
-                            .get("registered")
-                            .and_then(|v| v.as_bool())
-                            .unwrap_or(false);
-                        let active = data
-                            .get("active")
-                            .and_then(|v| v.as_bool())
-                            .unwrap_or(false);
-                        let pid = data.get("pid").and_then(|v| v.as_str()).unwrap_or("none");
-                        let nemo = data
-                            .get("nemo_available")
-                            .and_then(|v| v.as_bool())
-                            .unwrap_or(false);
-                        let guest_id = data.get("guest_id").and_then(|v| v.as_str()).unwrap_or("?");
-                        let content = format!(
-                            "Parakeet ASR status:\n  guest: {guest_id}\n  registered: {registered}\n  active: {active}\n  pid: {pid}\n  nemo_available: {nemo}"
-                        );
-                        (content, None)
-                    }
-                    Ok(IpcResponse::Standard {
-                        ok: false,
-                        code,
-                        message,
-                        ..
-                    }) => {
-                        let e = TaskErrorPayload::ipc_failure("aiua", &*code, message);
-                        (e.display_message(), Some(e))
-                    }
-                    Ok(_) => ("asr.status: unexpected response".into(), None),
-                    Err(e) => {
-                        let err = TaskErrorPayload::transport_error(
-                            "philote",
-                            format!("asr.status: IPC transport error — {e}"),
-                        );
-                        (err.display_message(), Some(err))
-                    }
-                };
-                self.handle_tool_result(InboundTaskPayload {
-                    action: Some("tool_result".into()),
-                    source: Some("agent".into()),
-                    session_id: Some(payload.session_id),
-                    turn_id: Some(payload.turn_id),
-                    chat_id: Some(payload.chat_id),
-                    content: Some(content),
-                    error: tool_err,
-                    tool_name: Some(payload.tool_name),
-                    final_reply_to: Some(payload.final_reply_to),
-                    final_reply_role: Some(payload.final_reply_role),
-                    final_reply_guest_id: payload.final_reply_guest_id,
-                    ..Default::default()
-                })
-                .await
-            }
-
-            "vision.setup" => {
-                use philotic_client::IpcRequest;
-                let repo_id = payload
-                    .arguments
-                    .get("repo_id")
-                    .and_then(|v| v.as_str())
-                    .map(String::from);
-                let (content, tool_err) = match self
-                    .ipc_client
-                    .send_request(IpcRequest::VisionSetup { repo_id })
-                    .await
-                {
-                    Ok(IpcResponse::Standard {
-                        ok: true,
-                        data: Some(data),
-                        ..
-                    }) => {
-                        let msg = data
-                            .get("message")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("Vision provider configured.")
-                            .to_string();
-                        (msg, None)
-                    }
-                    Ok(IpcResponse::Standard {
-                        ok: false,
-                        code,
-                        message,
-                        ..
-                    }) => {
-                        let e = TaskErrorPayload::ipc_failure("aiua", &*code, message);
-                        (e.display_message(), Some(e))
-                    }
-                    Ok(_) => ("vision.setup: unexpected response".into(), None),
-                    Err(e) => {
-                        let err = TaskErrorPayload::transport_error(
-                            "philote",
-                            format!("vision.setup: IPC transport error — {e}"),
-                        );
-                        (err.display_message(), Some(err))
-                    }
-                };
-                self.handle_tool_result(InboundTaskPayload {
-                    action: Some("tool_result".into()),
-                    source: Some("agent".into()),
-                    session_id: Some(payload.session_id),
-                    turn_id: Some(payload.turn_id),
-                    chat_id: Some(payload.chat_id),
-                    content: Some(content),
-                    error: tool_err,
-                    tool_name: Some(payload.tool_name),
-                    final_reply_to: Some(payload.final_reply_to),
-                    final_reply_role: Some(payload.final_reply_role),
-                    final_reply_guest_id: payload.final_reply_guest_id,
-                    ..Default::default()
-                })
-                .await
-            }
-
-            "vision.status" => {
-                use philotic_client::IpcRequest;
-                let (content, tool_err) = match self
-                    .ipc_client
-                    .send_request(IpcRequest::VisionStatus {})
-                    .await
-                {
-                    Ok(IpcResponse::Standard {
-                        ok: true,
-                        data: Some(data),
-                        ..
-                    }) => {
-                        let registered = data
-                            .get("registered")
-                            .and_then(|v| v.as_bool())
-                            .unwrap_or(false);
-                        let active = data
-                            .get("active")
-                            .and_then(|v| v.as_bool())
-                            .unwrap_or(false);
-                        let pid = data.get("pid").and_then(|v| v.as_str()).unwrap_or("none");
-                        let libs = data
-                            .get("libs_available")
-                            .and_then(|v| v.as_bool())
-                            .unwrap_or(false);
-                        let guest_id = data.get("guest_id").and_then(|v| v.as_str()).unwrap_or("?");
-                        let profile_status = data
-                            .get("model_profile_status")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("not registered");
-                        let content = format!(
-                            "Vision provider status:\n  guest: {guest_id}\n  registered: {registered}\n  active: {active}\n  pid: {pid}\n  libs_available: {libs}\n  model_profile: {profile_status}"
-                        );
-                        (content, None)
-                    }
-                    Ok(IpcResponse::Standard {
-                        ok: false,
-                        code,
-                        message,
-                        ..
-                    }) => {
-                        let e = TaskErrorPayload::ipc_failure("aiua", &*code, message);
-                        (e.display_message(), Some(e))
-                    }
-                    Ok(_) => ("vision.status: unexpected response".into(), None),
-                    Err(e) => {
-                        let err = TaskErrorPayload::transport_error(
-                            "philote",
-                            format!("vision.status: IPC transport error — {e}"),
-                        );
-                        (err.display_message(), Some(err))
-                    }
-                };
-                self.handle_tool_result(InboundTaskPayload {
-                    action: Some("tool_result".into()),
-                    source: Some("agent".into()),
-                    session_id: Some(payload.session_id),
-                    turn_id: Some(payload.turn_id),
-                    chat_id: Some(payload.chat_id),
-                    content: Some(content),
-                    error: tool_err,
-                    tool_name: Some(payload.tool_name),
-                    final_reply_to: Some(payload.final_reply_to),
-                    final_reply_role: Some(payload.final_reply_role),
-                    final_reply_guest_id: payload.final_reply_guest_id,
-                    ..Default::default()
-                })
-                .await
-            }
-
-            "cron.list" => {
-                use philotic_client::IpcRequest;
-                let (content, tool_err) = match self
-                    .ipc_client
-                    .send_request(IpcRequest::ListCronJobs)
-                    .await
-                {
-                    Ok(IpcResponse::CronJobList { jobs }) => {
-                        if jobs.is_empty() {
-                            ("No cron jobs registered on this hotel.".into(), None)
-                        } else {
-                            let lines: Vec<String> = jobs
-                                .iter()
-                                .map(|j| {
-                                    format!(
-                                        "- id={} role={} schedule={} enabled={} next_fire={}",
-                                        j.id, j.target_role, j.schedule, j.enabled, j.next_fire_at,
-                                    )
-                                })
-                                .collect();
-                            (
-                                format!("Cron jobs ({}):\n{}", jobs.len(), lines.join("\n")),
-                                None,
-                            )
-                        }
-                    }
-                    Ok(IpcResponse::Standard {
-                        ok: false,
-                        code,
-                        message,
-                        ..
-                    }) => {
-                        let e = TaskErrorPayload::ipc_failure("aiua", &*code, message);
-                        (e.display_message(), Some(e))
-                    }
-                    Ok(_) => ("cron.list: unexpected response".into(), None),
-                    Err(e) => {
-                        let err = TaskErrorPayload::transport_error(
-                            "philote",
-                            format!("cron.list: IPC transport error — {e}"),
-                        );
-                        (err.display_message(), Some(err))
-                    }
-                };
-                self.handle_tool_result(InboundTaskPayload {
-                    action: Some("tool_result".into()),
-                    source: Some("agent".into()),
-                    session_id: Some(payload.session_id),
-                    turn_id: Some(payload.turn_id),
-                    chat_id: Some(payload.chat_id),
-                    content: Some(content),
-                    error: tool_err,
-                    tool_name: Some(payload.tool_name),
-                    final_reply_to: Some(payload.final_reply_to),
-                    final_reply_role: Some(payload.final_reply_role),
-                    final_reply_guest_id: payload.final_reply_guest_id,
-                    ..Default::default()
-                })
-                .await
-            }
-
-            "cron.register" => {
-                use ansible_mesh_core::cron::{CronJob, CronJobSource};
-                use philotic_client::IpcRequest;
-                let args = &payload.arguments;
-                let schedule = match args.get("schedule").and_then(|v| v.as_str()) {
-                    Some(s) => s.to_string(),
-                    None => {
-                        return self
-                            .fail_active_turn(
-                                payload.session_id,
-                                payload.turn_id,
-                                "cron.register: missing required argument 'schedule'".into(),
-                            )
-                            .await;
-                    }
-                };
-                let target_role = match args.get("target_role").and_then(|v| v.as_str()) {
-                    Some(s) => s.to_string(),
-                    None => {
-                        return self
-                            .fail_active_turn(
-                                payload.session_id,
-                                payload.turn_id,
-                                "cron.register: missing required argument 'target_role'".into(),
-                            )
-                            .await;
-                    }
-                };
-                let payload_str = match args.get("payload").and_then(|v| v.as_str()) {
-                    Some(s) => s.to_string(),
-                    None => {
-                        return self
-                            .fail_active_turn(
-                                payload.session_id,
-                                payload.turn_id,
-                                "cron.register: missing required argument 'payload'".into(),
-                            )
-                            .await;
-                    }
-                };
-                let guaranteed = args
-                    .get("guaranteed")
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(false);
-
-                let now_ms = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_millis() as u64)
-                    .unwrap_or(0);
-
-                let next_fire = match ansible_mesh_core::cron::next_fire_after(&schedule, now_ms) {
-                    Ok(t) => t,
-                    Err(e) => {
-                        return self
-                            .fail_active_turn(
-                                payload.session_id,
-                                payload.turn_id,
-                                format!("cron.register: invalid schedule — {e}"),
-                            )
-                            .await;
-                    }
-                };
-
-                let job = CronJob {
-                    id: uuid::Uuid::new_v4().to_string(),
-                    schedule,
-                    target_role,
-                    target_node_id: None,
-                    payload: payload_str,
-                    guaranteed,
-                    enabled: true,
-                    last_fired_epoch: None,
-                    next_fire_at: next_fire,
-                    created_at: now_ms,
-                    created_by: CronJobSource::Guest(self.agent_id.clone()),
-                };
-                let job_id = job.id.clone();
-
-                let (content, tool_err) = match self
-                    .ipc_client
-                    .send_request(IpcRequest::RegisterCronJob { job })
-                    .await
-                {
-                    Ok(IpcResponse::Standard { ok: true, .. }) => {
-                        (format!("Cron job registered. id={job_id}"), None)
-                    }
-                    Ok(IpcResponse::Standard {
-                        ok: false,
-                        code,
-                        message,
-                        ..
-                    }) => {
-                        let e = TaskErrorPayload::ipc_failure("aiua", &*code, message);
-                        (e.display_message(), Some(e))
-                    }
-                    Ok(_) => ("cron.register: unexpected response".into(), None),
-                    Err(e) => {
-                        let err = TaskErrorPayload::transport_error(
-                            "philote",
-                            format!("cron.register: IPC transport error — {e}"),
-                        );
-                        (err.display_message(), Some(err))
-                    }
-                };
-                self.handle_tool_result(InboundTaskPayload {
-                    action: Some("tool_result".into()),
-                    source: Some("agent".into()),
-                    session_id: Some(payload.session_id),
-                    turn_id: Some(payload.turn_id),
-                    chat_id: Some(payload.chat_id),
-                    content: Some(content),
-                    error: tool_err,
-                    tool_name: Some(payload.tool_name),
-                    final_reply_to: Some(payload.final_reply_to),
-                    final_reply_role: Some(payload.final_reply_role),
-                    final_reply_guest_id: payload.final_reply_guest_id,
-                    ..Default::default()
-                })
-                .await
-            }
-
-            "cron.enable" => {
-                use philotic_client::IpcRequest;
-                let job_id = match payload.arguments.get("job_id").and_then(|v| v.as_str()) {
-                    Some(s) => s.to_string(),
-                    None => {
-                        return self
-                            .fail_active_turn(
-                                payload.session_id,
-                                payload.turn_id,
-                                "cron.enable: missing required argument 'job_id'".into(),
-                            )
-                            .await;
-                    }
-                };
-                let (content, tool_err) = match self
-                    .ipc_client
-                    .send_request(IpcRequest::EnableCronJob {
-                        job_id: job_id.clone(),
-                    })
-                    .await
-                {
-                    Ok(IpcResponse::Standard { ok: true, .. }) => {
-                        (format!("Cron job {job_id} enabled."), None)
-                    }
-                    Ok(IpcResponse::Standard {
-                        ok: false,
-                        code,
-                        message,
-                        ..
-                    }) => {
-                        let e = TaskErrorPayload::ipc_failure("aiua", &*code, message);
-                        (e.display_message(), Some(e))
-                    }
-                    Ok(_) => ("cron.enable: unexpected response".into(), None),
-                    Err(e) => {
-                        let err = TaskErrorPayload::transport_error(
-                            "philote",
-                            format!("cron.enable: IPC transport error — {e}"),
-                        );
-                        (err.display_message(), Some(err))
-                    }
-                };
-                self.handle_tool_result(InboundTaskPayload {
-                    action: Some("tool_result".into()),
-                    source: Some("agent".into()),
-                    session_id: Some(payload.session_id),
-                    turn_id: Some(payload.turn_id),
-                    chat_id: Some(payload.chat_id),
-                    content: Some(content),
-                    error: tool_err,
-                    tool_name: Some(payload.tool_name),
-                    final_reply_to: Some(payload.final_reply_to),
-                    final_reply_role: Some(payload.final_reply_role),
-                    final_reply_guest_id: payload.final_reply_guest_id,
-                    ..Default::default()
-                })
-                .await
-            }
-
-            "cron.disable" => {
-                use philotic_client::IpcRequest;
-                let job_id = match payload.arguments.get("job_id").and_then(|v| v.as_str()) {
-                    Some(s) => s.to_string(),
-                    None => {
-                        return self
-                            .fail_active_turn(
-                                payload.session_id,
-                                payload.turn_id,
-                                "cron.disable: missing required argument 'job_id'".into(),
-                            )
-                            .await;
-                    }
-                };
-                let (content, tool_err) = match self
-                    .ipc_client
-                    .send_request(IpcRequest::DisableCronJob {
-                        job_id: job_id.clone(),
-                    })
-                    .await
-                {
-                    Ok(IpcResponse::Standard { ok: true, .. }) => {
-                        (format!("Cron job {job_id} disabled."), None)
-                    }
-                    Ok(IpcResponse::Standard {
-                        ok: false,
-                        code,
-                        message,
-                        ..
-                    }) => {
-                        let e = TaskErrorPayload::ipc_failure("aiua", &*code, message);
-                        (e.display_message(), Some(e))
-                    }
-                    Ok(_) => ("cron.disable: unexpected response".into(), None),
-                    Err(e) => {
-                        let err = TaskErrorPayload::transport_error(
-                            "philote",
-                            format!("cron.disable: IPC transport error — {e}"),
-                        );
-                        (err.display_message(), Some(err))
-                    }
-                };
-                self.handle_tool_result(InboundTaskPayload {
-                    action: Some("tool_result".into()),
-                    source: Some("agent".into()),
-                    session_id: Some(payload.session_id),
-                    turn_id: Some(payload.turn_id),
-                    chat_id: Some(payload.chat_id),
-                    content: Some(content),
-                    error: tool_err,
-                    tool_name: Some(payload.tool_name),
-                    final_reply_to: Some(payload.final_reply_to),
-                    final_reply_role: Some(payload.final_reply_role),
-                    final_reply_guest_id: payload.final_reply_guest_id,
-                    ..Default::default()
-                })
-                .await
-            }
-
-            "cron.remove" => {
-                use philotic_client::IpcRequest;
-                let job_id = match payload.arguments.get("job_id").and_then(|v| v.as_str()) {
-                    Some(s) => s.to_string(),
-                    None => {
-                        return self
-                            .fail_active_turn(
-                                payload.session_id,
-                                payload.turn_id,
-                                "cron.remove: missing required argument 'job_id'".into(),
-                            )
-                            .await;
-                    }
-                };
-                let (content, tool_err) = match self
-                    .ipc_client
-                    .send_request(IpcRequest::RemoveCronJob {
-                        job_id: job_id.clone(),
-                    })
-                    .await
-                {
-                    Ok(IpcResponse::Standard { ok: true, .. }) => {
-                        (format!("Cron job {job_id} removed."), None)
-                    }
-                    Ok(IpcResponse::Standard {
-                        ok: false,
-                        code,
-                        message,
-                        ..
-                    }) => {
-                        let e = TaskErrorPayload::ipc_failure("aiua", &*code, message);
-                        (e.display_message(), Some(e))
-                    }
-                    Ok(_) => ("cron.remove: unexpected response".into(), None),
-                    Err(e) => {
-                        let err = TaskErrorPayload::transport_error(
-                            "philote",
-                            format!("cron.remove: IPC transport error — {e}"),
-                        );
-                        (err.display_message(), Some(err))
-                    }
-                };
-                self.handle_tool_result(InboundTaskPayload {
-                    action: Some("tool_result".into()),
-                    source: Some("agent".into()),
-                    session_id: Some(payload.session_id),
-                    turn_id: Some(payload.turn_id),
-                    chat_id: Some(payload.chat_id),
-                    content: Some(content),
-                    error: tool_err,
-                    tool_name: Some(payload.tool_name),
-                    final_reply_to: Some(payload.final_reply_to),
-                    final_reply_role: Some(payload.final_reply_role),
-                    final_reply_guest_id: payload.final_reply_guest_id,
-                    ..Default::default()
-                })
-                .await
-            }
-
-            "handoff.to_role" => {
-                let args = payload.arguments.as_object();
-                let role_name = args
-                    .and_then(|a| a.get("role_name"))
-                    .and_then(|v| v.as_str())
-                    .map(str::to_string);
-                let reason = args
-                    .and_then(|a| a.get("reason"))
-                    .and_then(|v| v.as_str())
-                    .map(str::to_string);
-
-                let Some(role_name) = role_name else {
-                    return self
-                        .fail_active_turn(
-                            payload.session_id,
-                            payload.turn_id,
-                            "handoff.to_role: missing required argument 'role_name'".into(),
-                        )
-                        .await;
-                };
-                let Some(reason) = reason else {
-                    return self
-                        .fail_active_turn(
-                            payload.session_id,
-                            payload.turn_id,
-                            "handoff.to_role: missing required argument 'reason'".into(),
-                        )
-                        .await;
-                };
-
-                let active_goal = args
-                    .and_then(|a| a.get("active_goal"))
-                    .and_then(|v| v.as_str())
-                    .map(str::to_string);
-                let context_summary = args
-                    .and_then(|a| a.get("context_summary"))
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
-
-                let target_focus_framing = args
-                    .and_then(|a| a.get("target_focus_framing"))
-                    .and_then(|v| v.as_str())
-                    .map(str::to_string);
-
-                let Some(target_focus_framing) = target_focus_framing else {
-                    return self
-                        .fail_active_turn(
-                            payload.session_id,
-                            payload.turn_id,
-                            "handoff.to_role: missing required argument 'target_focus_framing'"
-                                .into(),
-                        )
-                        .await;
-                };
-
-                let active_goal = active_goal
-                    .map(|g| format!("{}\n\nTarget Focus Framing:\n{}", g, target_focus_framing));
-
-                let expected_return_mode = args
-                    .and_then(|a| a.get("expected_return_mode"))
-                    .and_then(|v| v.as_str())
-                    .map(str::to_string);
-                let cleanup_actions: Vec<String> = args
-                    .and_then(|a| a.get("cleanup_actions"))
-                    .and_then(|v| v.as_array())
-                    .map(|arr| {
-                        arr.iter()
-                            .filter_map(|v| v.as_str().map(str::to_string))
-                            .collect()
-                    })
-                    .unwrap_or_default();
-
-                let from_role = self
-                    .sessions
-                    .get(&payload.session_id)
-                    .and_then(|s| s.role_activation.as_ref())
-                    .map(|r| r.role_name.clone())
-                    .or_else(|| Some("orchestrator".into()));
-
-                let handoff_bundle = HandoffBundle {
-                    goal: active_goal.clone().unwrap_or_else(|| reason.clone()),
-                    context_excerpt: context_summary,
-                    session_id: payload.session_id.clone(),
-                    initiating_turn_id: payload.turn_id.clone(),
-                    handoff_reason: Some(reason),
-                    from_role,
-                    to_role: Some(role_name.clone()),
-                    active_goal,
-                    expected_return_mode,
-                    cleanup_actions,
-                    ..Default::default()
-                };
-
-                // Retry HandoffPending up to ~3 seconds while the target role materializes.
-                const HANDOFF_MAX_RETRIES: u32 = 12;
-                const HANDOFF_DEFAULT_WAIT_MS: u64 = 250;
-                let handoff_req = IpcRequest::HandoffToRole {
-                    session_id: payload.session_id.clone(),
-                    role_name: role_name.clone(),
-                    handoff_bundle,
-                };
-                let mut handoff_attempt = 0u32;
-                let (content, tool_err) = loop {
-                    let resp = self.ipc_client.send_request(handoff_req.clone()).await;
-                    match resp {
-                        Ok(IpcResponse::HandoffAck {
-                            handoff_guest_id, ..
-                        }) => {
-                            break (
-                                format!(
-                                    "Handed off to role '{role_name}' (guest {handoff_guest_id})."
-                                ),
-                                None,
-                            );
-                        }
-                        Ok(IpcResponse::HandoffPending { retry_after_ms, .. }) => {
-                            handoff_attempt += 1;
-                            if handoff_attempt >= HANDOFF_MAX_RETRIES {
-                                let e = TaskErrorPayload::tool_execution(
-                                    "handoff.to_role",
-                                    format!(
-                                        "Role '{role_name}' did not become live after {HANDOFF_MAX_RETRIES} retries"
-                                    ),
-                                    Some("HANDOFF_TIMEOUT"),
-                                );
-                                break (e.display_message(), Some(e));
-                            }
-                            let wait_ms = retry_after_ms.unwrap_or(HANDOFF_DEFAULT_WAIT_MS);
-                            tokio::time::sleep(std::time::Duration::from_millis(wait_ms)).await;
-                        }
-                        Ok(IpcResponse::Error(msg)) => {
-                            let e = TaskErrorPayload::tool_execution(
-                                "handoff.to_role",
-                                msg,
-                                Some("HANDOFF_REJECTED"),
-                            );
-                            break (e.display_message(), Some(e));
-                        }
-                        Ok(_) => {
-                            let e = TaskErrorPayload::ipc_failure(
-                                "aiua",
-                                "UNEXPECTED_RESPONSE",
-                                "handoff.to_role: unexpected hotel response",
-                            );
-                            break (e.display_message(), Some(e));
-                        }
-                        Err(e) => {
-                            let err = TaskErrorPayload::transport_error(
-                                "philote",
-                                format!("handoff.to_role: IPC transport error — {e}"),
-                            );
-                            break (err.display_message(), Some(err));
-                        }
-                    }
-                };
-
-                if let Some(err) = tool_err {
-                    self.handle_tool_result(InboundTaskPayload {
-                        action: Some("tool_result".into()),
-                        agent_action: None,
-                        handoff_bundle: None,
-                        source: Some("agent".into()),
-                        session_id: Some(payload.session_id),
-                        turn_id: Some(payload.turn_id),
-                        transport: None,
-                        chat_id: Some(payload.chat_id),
-                        thread_id: None,
-                        sender_id: None,
-                        sender_username: None,
-                        message_kind: None,
-                        content: Some(content),
-                        attachments: Vec::new(),
-                        command: None,
-                        callback_data: None,
-                        raw_transport_event: None,
-                        error: Some(err),
-                        tool_name: Some(payload.tool_name),
-                        arguments: None,
-                        final_reply_to: Some(payload.final_reply_to),
-                        final_reply_role: Some(payload.final_reply_role),
-                        final_reply_guest_id: payload.final_reply_guest_id,
-                        ..Default::default()
-                    })
-                    .await
-                } else {
-                    self.complete_local_command(payload.session_id, payload.turn_id, content)
-                        .await
-                }
-            }
-
-            "handoff.back" => {
-                let args = payload.arguments.as_object();
-                let summary = args
-                    .and_then(|a| a.get("summary"))
-                    .and_then(|v| v.as_str())
-                    .map(str::to_string);
-
-                let Some(summary) = summary else {
-                    return self
-                        .fail_active_turn(
-                            payload.session_id,
-                            payload.turn_id,
-                            "handoff.back: missing required argument 'summary'".into(),
-                        )
-                        .await;
-                };
-
-                let return_to = args
-                    .and_then(|a| a.get("return_to"))
-                    .and_then(|v| v.as_str())
-                    .map(str::to_string);
-
-                const HANDOFF_BACK_MAX_RETRIES: u32 = 12;
-                const HANDOFF_BACK_DEFAULT_WAIT_MS: u64 = 250;
-                let handoff_back_req = IpcRequest::HandoffBack {
-                    session_id: payload.session_id.clone(),
-                    summary: summary.clone(),
-                    return_to,
-                };
-                let mut handoff_back_attempt = 0u32;
-                let (content, tool_err) = loop {
-                    match self.ipc_client.send_request(handoff_back_req.clone()).await {
-                        Ok(IpcResponse::HandoffBackAck {
-                            return_guest_id, ..
-                        }) => {
-                            break (
-                                format!(
-                                    "Returned control (to guest {return_guest_id}). Summary: {summary}"
-                                ),
-                                None,
-                            );
-                        }
-                        Ok(IpcResponse::HandoffPending { retry_after_ms, .. }) => {
-                            handoff_back_attempt += 1;
-                            if handoff_back_attempt >= HANDOFF_BACK_MAX_RETRIES {
-                                let e = TaskErrorPayload::tool_execution(
-                                    "handoff.back",
-                                    format!(
-                                        "Return role did not become live after {HANDOFF_BACK_MAX_RETRIES} retries"
-                                    ),
-                                    Some("HANDOFF_BACK_TIMEOUT"),
-                                );
-                                break (e.display_message(), Some(e));
-                            }
-                            let wait_ms = retry_after_ms.unwrap_or(HANDOFF_BACK_DEFAULT_WAIT_MS);
-                            tokio::time::sleep(std::time::Duration::from_millis(wait_ms)).await;
-                        }
-                        Ok(IpcResponse::Error(msg)) => {
-                            let e = TaskErrorPayload::tool_execution(
-                                "handoff.back",
-                                msg,
-                                Some("HANDOFF_BACK_REJECTED"),
-                            );
-                            break (e.display_message(), Some(e));
-                        }
-                        Ok(_) => {
-                            let e = TaskErrorPayload::ipc_failure(
-                                "aiua",
-                                "UNEXPECTED_RESPONSE",
-                                "handoff.back: unexpected hotel response",
-                            );
-                            break (e.display_message(), Some(e));
-                        }
-                        Err(e) => {
-                            let err = TaskErrorPayload::transport_error(
-                                "philote",
-                                format!("handoff.back: IPC transport error — {e}"),
-                            );
-                            break (err.display_message(), Some(err));
-                        }
-                    }
-                };
-
-                if let Some(err) = tool_err {
-                    self.handle_tool_result(InboundTaskPayload {
-                        action: Some("tool_result".into()),
-                        agent_action: None,
-                        handoff_bundle: None,
-                        source: Some("agent".into()),
-                        session_id: Some(payload.session_id),
-                        turn_id: Some(payload.turn_id),
-                        transport: None,
-                        chat_id: Some(payload.chat_id),
-                        thread_id: None,
-                        sender_id: None,
-                        sender_username: None,
-                        message_kind: None,
-                        content: Some(content),
-                        attachments: Vec::new(),
-                        command: None,
-                        callback_data: None,
-                        raw_transport_event: None,
-                        error: Some(err),
-                        tool_name: Some(payload.tool_name),
-                        arguments: None,
-                        final_reply_to: Some(payload.final_reply_to),
-                        final_reply_role: Some(payload.final_reply_role),
-                        final_reply_guest_id: payload.final_reply_guest_id,
-                        ..Default::default()
-                    })
-                    .await
-                } else {
-                    self.complete_local_command(payload.session_id, payload.turn_id, content)
-                        .await
-                }
-            }
-
-            "delegate.to_peer" => {
-                let args = payload.arguments.as_object();
-                let target_agent_id = args
-                    .and_then(|a| a.get("target_agent_id"))
-                    .and_then(|v| v.as_str())
-                    .map(str::to_string);
-                let task_description = args
-                    .and_then(|a| a.get("task_description"))
-                    .and_then(|v| v.as_str())
-                    .map(str::to_string);
-                let context_package = args
-                    .and_then(|a| a.get("context_package"))
-                    .and_then(|v| v.as_str())
-                    .map(str::to_string);
-
-                let Some(target_agent_id) = target_agent_id else {
-                    return self
-                        .fail_active_turn(
-                            payload.session_id,
-                            payload.turn_id,
-                            "delegate.to_peer: missing required argument 'target_agent_id'".into(),
-                        )
-                        .await;
-                };
-                let Some(task_description) = task_description else {
-                    return self
-                        .fail_active_turn(
-                            payload.session_id,
-                            payload.turn_id,
-                            "delegate.to_peer: missing required argument 'task_description'".into(),
-                        )
-                        .await;
-                };
-                let Some(context_package) = context_package else {
-                    return self
-                        .fail_active_turn(
-                            payload.session_id,
-                            payload.turn_id,
-                            "delegate.to_peer: missing required argument 'context_package'".into(),
-                        )
-                        .await;
-                };
-
-                let expected_artifacts: Vec<String> = args
-                    .and_then(|a| a.get("expected_artifacts"))
-                    .and_then(|v| v.as_array())
-                    .map(|arr| {
-                        arr.iter()
-                            .filter_map(|v| v.as_str().map(str::to_string))
-                            .collect()
-                    })
-                    .unwrap_or_default();
-                let timeout_secs = args
-                    .and_then(|a| a.get("timeout_secs"))
-                    .and_then(|v| v.as_u64());
-
-                let _ = self
-                    .emit_partial_reply(
-                        &payload.session_id,
-                        format!(
-                            "Let me hand you over to {} to help with this...",
-                            target_agent_id
-                        ),
-                    )
-                    .await;
-
-                let (content, tool_err) = match self
-                    .ipc_client
-                    .send_request(IpcRequest::DelegateToPeer {
-                        target_agent_id: target_agent_id.clone(),
-                        task_description,
-                        context_package,
-                        chat_id: payload.chat_id.clone(),
-                        source: Some("peer".into()),
-                        expected_artifacts,
-                        timeout_secs,
-                    })
-                    .await
-                {
-                    Ok(IpcResponse::DelegationAck {
-                        delegation_id,
-                        status,
-                    }) => (
-                        format!(
-                            "Delegated task to peer '{target_agent_id}' (delegation {delegation_id}, status: {status})."
-                        ),
-                        None,
-                    ),
-                    Ok(IpcResponse::Error(msg)) => {
-                        let e = TaskErrorPayload::tool_execution(
-                            "delegate.to_peer",
-                            msg,
-                            Some("DELEGATION_REJECTED"),
-                        );
-                        (e.display_message(), Some(e))
-                    }
-                    Ok(_) => {
-                        let e = TaskErrorPayload::ipc_failure(
-                            "aiua",
-                            "UNEXPECTED_RESPONSE",
-                            "delegate.to_peer: unexpected hotel response",
-                        );
-                        (e.display_message(), Some(e))
-                    }
-                    Err(e) => {
-                        let err = TaskErrorPayload::transport_error(
-                            "philote",
-                            format!("delegate.to_peer: IPC transport error — {e}"),
-                        );
-                        (err.display_message(), Some(err))
-                    }
-                };
-
-                self.handle_tool_result(InboundTaskPayload {
-                    action: Some("tool_result".into()),
-                    agent_action: None,
-                    handoff_bundle: None,
-                    source: Some("agent".into()),
-                    session_id: Some(payload.session_id),
-                    turn_id: Some(payload.turn_id),
-                    transport: None,
-                    chat_id: Some(payload.chat_id),
-                    thread_id: None,
-                    sender_id: None,
-                    sender_username: None,
-                    message_kind: None,
-                    content: Some(content),
-                    attachments: Vec::new(),
-                    command: None,
-                    callback_data: None,
-                    raw_transport_event: None,
-                    error: tool_err,
-                    tool_name: Some(payload.tool_name),
-                    arguments: None,
-                    final_reply_to: Some(payload.final_reply_to),
-                    final_reply_role: Some(payload.final_reply_role),
-                    final_reply_guest_id: payload.final_reply_guest_id,
-                    ..Default::default()
-                })
-                .await
-            }
-
-            "delegate.to_external_cognitive_peer" => {
-                let args = payload.arguments.as_object();
-                let target_peer_type = args
-                    .and_then(|a| a.get("target_peer_type"))
-                    .and_then(|v| v.as_str())
-                    .map(str::to_string);
-                let task_description = args
-                    .and_then(|a| a.get("task_description"))
-                    .and_then(|v| v.as_str())
-                    .map(str::to_string);
-                let context_package = args
-                    .and_then(|a| a.get("context_package"))
-                    .and_then(|v| v.as_str())
-                    .map(str::to_string);
-
-                let Some(target_peer_type) = target_peer_type else {
-                    return self
-                        .fail_active_turn(
-                            payload.session_id,
-                            payload.turn_id,
-                            "delegate.to_external_cognitive_peer: missing required argument 'target_peer_type'".into(),
-                        )
-                        .await;
-                };
-                let Some(task_description) = task_description else {
-                    return self
-                        .fail_active_turn(
-                            payload.session_id,
-                            payload.turn_id,
-                            "delegate.to_external_cognitive_peer: missing required argument 'task_description'".into(),
-                        )
-                        .await;
-                };
-                let Some(context_package) = context_package else {
-                    return self
-                        .fail_active_turn(
-                            payload.session_id,
-                            payload.turn_id,
-                            "delegate.to_external_cognitive_peer: missing required argument 'context_package'".into(),
-                        )
-                        .await;
-                };
-
-                let expected_artifacts: Vec<String> = args
-                    .and_then(|a| a.get("expected_artifacts"))
-                    .and_then(|v| v.as_array())
-                    .map(|arr| {
-                        arr.iter()
-                            .filter_map(|v| v.as_str().map(str::to_string))
-                            .collect()
-                    })
-                    .unwrap_or_default();
-
-                let (content, tool_err) = match self
-                    .ipc_client
-                    .send_request(IpcRequest::DelegateToExternalPeer {
-                        target_peer_type: target_peer_type.clone(),
-                        task_description,
-                        context_package,
-                        expected_artifacts,
-                    })
-                    .await
-                {
-                    Ok(IpcResponse::DelegationAck {
-                        delegation_id,
-                        status,
-                    }) => (
-                        format!(
-                            "Delegated task to external peer type '{target_peer_type}' (delegation {delegation_id}, status: {status})."
-                        ),
-                        None,
-                    ),
-                    Ok(IpcResponse::Error(msg)) => {
-                        let e = TaskErrorPayload::tool_execution(
-                            "delegate.to_external_cognitive_peer",
-                            msg,
-                            Some("DELEGATION_REJECTED"),
-                        );
-                        (e.display_message(), Some(e))
-                    }
-                    Ok(_) => {
-                        let e = TaskErrorPayload::ipc_failure(
-                            "aiua",
-                            "UNEXPECTED_RESPONSE",
-                            "delegate.to_external_cognitive_peer: unexpected hotel response",
-                        );
-                        (e.display_message(), Some(e))
-                    }
-                    Err(e) => {
-                        let err = TaskErrorPayload::transport_error(
-                            "philote",
-                            format!(
-                                "delegate.to_external_cognitive_peer: IPC transport error — {e}"
-                            ),
-                        );
-                        (err.display_message(), Some(err))
-                    }
-                };
-
-                self.handle_tool_result(InboundTaskPayload {
-                    action: Some("tool_result".into()),
-                    agent_action: None,
-                    handoff_bundle: None,
-                    source: Some("agent".into()),
-                    session_id: Some(payload.session_id),
-                    turn_id: Some(payload.turn_id),
-                    transport: None,
-                    chat_id: Some(payload.chat_id),
-                    thread_id: None,
-                    sender_id: None,
-                    sender_username: None,
-                    message_kind: None,
-                    content: Some(content),
-                    attachments: Vec::new(),
-                    command: None,
-                    callback_data: None,
-                    raw_transport_event: None,
-                    error: tool_err,
-                    tool_name: Some(payload.tool_name),
-                    arguments: None,
-                    final_reply_to: Some(payload.final_reply_to),
-                    final_reply_role: Some(payload.final_reply_role),
-                    final_reply_guest_id: payload.final_reply_guest_id,
-                    ..Default::default()
-                })
-                .await
-            }
-
-            "bash.exec" => {
-                let args = &payload.arguments;
-
-                let command = match args.get("command").and_then(|v| v.as_str()) {
-                    Some(c) => c.to_string(),
-                    None => {
-                        return self
-                            .fail_active_turn(
-                                payload.session_id,
-                                payload.turn_id,
-                                "bash.exec: missing required argument 'command'".into(),
-                            )
-                            .await;
-                    }
-                };
-
-                let working_dir = args
-                    .get("working_dir")
-                    .and_then(|v| v.as_str())
-                    .map(str::to_string)
-                    .or_else(|| {
-                        // Fall back to the agent session's import_workspace path if set.
-                        self.sessions
-                            .get(&payload.session_id)
-                            .and_then(|s| s.agent_profile.import_workspace.as_deref())
-                            .map(str::to_string)
-                    });
-
-                let timeout_secs = args
-                    .get("timeout_secs")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(30);
-
-                let exec_result = self
-                    .execute_bash_command(command, working_dir, timeout_secs)
-                    .await;
-
-                let (content, tool_err) = match exec_result {
-                    Ok(json) => (json.to_string(), None),
-                    Err(e) => {
-                        let err = TaskErrorPayload::tool_execution(
-                            "bash.exec",
-                            e.to_string(),
-                            Some("EXEC_ERROR"),
-                        );
-                        (err.display_message(), Some(err))
-                    }
-                };
-
-                self.handle_tool_result(InboundTaskPayload {
-                    action: Some("tool_result".into()),
-                    agent_action: None,
-                    handoff_bundle: None,
-                    source: Some("agent".into()),
-                    session_id: Some(payload.session_id),
-                    turn_id: Some(payload.turn_id),
-                    transport: None,
-                    chat_id: Some(payload.chat_id),
-                    thread_id: None,
-                    sender_id: None,
-                    sender_username: None,
-                    message_kind: None,
-                    content: Some(content),
-                    attachments: Vec::new(),
-                    command: None,
-                    callback_data: None,
-                    raw_transport_event: None,
-                    error: tool_err,
-                    tool_name: Some(payload.tool_name),
-                    arguments: None,
-                    final_reply_to: Some(payload.final_reply_to),
-                    final_reply_role: Some(payload.final_reply_role),
-                    final_reply_guest_id: payload.final_reply_guest_id,
-                    ..Default::default()
-                })
-                .await
-            }
-
-            "memory.recall" => {
-                use memory_core::MemoryEngine as _;
-
-                let query = payload
-                    .arguments
-                    .get("query")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                let explicit_limit = payload
-                    .arguments
-                    .get("limit")
-                    .and_then(|v| v.as_u64())
-                    .map(|n| n as usize);
-
-                let recall_limit = self
-                    .sessions
-                    .get(&payload.session_id)
-                    .map(|s| s.settings.memory.recall_limit)
-                    .unwrap_or(5);
-                let limit = explicit_limit.unwrap_or(recall_limit).clamp(1, 20);
-
-                let memory_user_id = self
-                    .sessions
-                    .get(&payload.session_id)
-                    .map(turn_memory_user_id)
-                    .unwrap_or_else(|| self.agent_id.clone());
-                let scope = memory_scope_from_tool_arg(
-                    payload.arguments.get("scope").and_then(|v| v.as_str()),
-                    &payload.session_id,
-                );
-
-                let content = match self.memory_engine_for(&self.agent_id, &memory_user_id) {
-                    None => "Memory unavailable: MuninnDB not configured.".to_string(),
-                    Some(engine) => match engine.activate(&query, scope, Some(limit)).await {
-                        Err(e) => format!("memory.recall error: {e}"),
-                        Ok(result) if result.engrams.is_empty() => {
-                            "No relevant memories found.".to_string()
-                        }
-                        Ok(result) => {
-                            let mut out = format!("{} engram(s) recalled:\n", result.engrams.len());
-                            for (i, eng) in result.engrams.iter().enumerate() {
-                                out.push_str(&format!(
-                                    "{}. [{}] {} — {}{}\n",
-                                    i + 1,
-                                    eng.concept,
-                                    eng.content,
-                                    eng.tags.join(", "),
-                                    if eng.vault_id.is_empty() {
-                                        String::new()
-                                    } else {
-                                        format!(" (vault: {})", eng.vault_id)
-                                    }
-                                ));
-                            }
-                            out
-                        }
-                    },
-                };
-
-                self.handle_tool_result(InboundTaskPayload {
-                    action: Some("tool_result".into()),
-                    agent_action: None,
-                    handoff_bundle: None,
-                    source: Some("agent".into()),
-                    session_id: Some(payload.session_id),
-                    turn_id: Some(payload.turn_id),
-                    transport: None,
-                    chat_id: Some(payload.chat_id),
-                    thread_id: None,
-                    sender_id: None,
-                    sender_username: None,
-                    message_kind: None,
-                    content: Some(content),
-                    attachments: Vec::new(),
-                    command: None,
-                    callback_data: None,
-                    raw_transport_event: None,
-                    error: None,
-                    tool_name: Some(payload.tool_name),
-                    arguments: None,
-                    final_reply_to: Some(payload.final_reply_to),
-                    final_reply_role: Some(payload.final_reply_role),
-                    final_reply_guest_id: payload.final_reply_guest_id,
-                    ..Default::default()
-                })
-                .await
-            }
-
-            "memory.remember" => {
-                use memory_core::MemoryEngine as _;
-
-                let concept = payload
-                    .arguments
-                    .get("concept")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("untitled")
-                    .to_string();
-                let content_str = payload
-                    .arguments
-                    .get("content")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                let tags: Vec<String> = payload
-                    .arguments
-                    .get("tags")
-                    .and_then(|v| v.as_array())
-                    .map(|arr| {
-                        arr.iter()
-                            .filter_map(|t| t.as_str().map(str::to_string))
-                            .collect()
-                    })
-                    .unwrap_or_default();
-                let scope = memory_scope_from_tool_arg(
-                    payload.arguments.get("scope").and_then(|v| v.as_str()),
-                    &payload.session_id,
-                );
-
-                let memory_user_id = self
-                    .sessions
-                    .get(&payload.session_id)
-                    .map(turn_memory_user_id)
-                    .unwrap_or_else(|| self.agent_id.clone());
-                let shaping = memory_shaping_context_for_write(
-                    self.sessions.get(&payload.session_id),
-                    &payload.arguments,
-                    &scope,
-                );
-                let tags = shaped_memory_tags(tags, &shaping);
-                let metadata = shaped_memory_metadata(&shaping);
-                let result_text = match self.memory_engine_for(&self.agent_id, &memory_user_id) {
-                    None => "Memory unavailable: MuninnDB not configured.".to_string(),
-                    Some(engine) => {
-                        match engine
-                            .remember_with_metadata(scope, &concept, &content_str, tags, metadata)
-                            .await
-                        {
-                            Ok(engram_ref) => {
-                                let _ = engine.retry_enrich(&engram_ref.id).await;
-                                format!(
-                                    "Stored memory '{}' (id: {}, vault: {}).",
-                                    concept, engram_ref.id, engram_ref.vault_id
-                                )
-                            }
-                            Err(e) => format!("memory.remember error: {e}"),
-                        }
-                    }
-                };
-
-                self.handle_tool_result(InboundTaskPayload {
-                    action: Some("tool_result".into()),
-                    agent_action: None,
-                    handoff_bundle: None,
-                    source: Some("agent".into()),
-                    session_id: Some(payload.session_id),
-                    turn_id: Some(payload.turn_id),
-                    transport: None,
-                    chat_id: Some(payload.chat_id),
-                    thread_id: None,
-                    sender_id: None,
-                    sender_username: None,
-                    message_kind: None,
-                    content: Some(result_text),
-                    attachments: Vec::new(),
-                    command: None,
-                    callback_data: None,
-                    raw_transport_event: None,
-                    error: None,
-                    tool_name: Some(payload.tool_name),
-                    arguments: None,
-                    final_reply_to: Some(payload.final_reply_to),
-                    final_reply_role: Some(payload.final_reply_role),
-                    final_reply_guest_id: payload.final_reply_guest_id,
-                    ..Default::default()
-                })
-                .await
-            }
-
-            "memory.cultivate" => {
-                use memory_core::MemoryEngine as _;
-
-                let query = payload
-                    .arguments
-                    .get("query")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("memory cultivation candidates")
-                    .to_string();
-                let limit = payload
-                    .arguments
-                    .get("limit")
-                    .and_then(|v| v.as_u64())
-                    .map(|n| n as usize)
-                    .unwrap_or(8)
-                    .clamp(1, 20);
-                let mode = payload
-                    .arguments
-                    .get("mode")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("report");
-                let scope = memory_scope_from_tool_arg(
-                    payload.arguments.get("scope").and_then(|v| v.as_str()),
-                    &payload.session_id,
-                );
-                let memory_user_id = self
-                    .sessions
-                    .get(&payload.session_id)
-                    .map(turn_memory_user_id)
-                    .unwrap_or_else(|| self.agent_id.clone());
-
-                let report = match self.memory_engine_for(&self.agent_id, &memory_user_id) {
-                    None => serde_json::json!({
-                        "ok": false,
-                        "error": "MuninnDB not configured",
-                    }),
-                    Some(engine) => match engine.activate(&query, scope, Some(limit)).await {
-                        Err(e) => serde_json::json!({
-                            "ok": false,
-                            "error": e.to_string(),
-                        }),
-                        Ok(result) => {
-                            let candidates = result
-                                .engrams
-                                .iter()
-                                .map(|engram| {
-                                    let has_frame =
-                                        engram_spacetime_frame(&engram.metadata).is_some();
-                                    let has_entities =
-                                        !engram_metadata_array(&engram.metadata, &["entities"])
-                                            .is_empty();
-                                    serde_json::json!({
-                                        "id": engram.id,
-                                        "concept": engram.concept,
-                                        "vault_id": engram.vault_id,
-                                        "needs_spacetime_frame": !has_frame,
-                                        "needs_entity_overlay": !has_entities,
-                                        "recommended_action": if !has_frame || !has_entities {
-                                            "enrich_metadata"
-                                        } else {
-                                            "keep"
-                                        },
-                                    })
-                                })
-                                .collect::<Vec<_>>();
-                            serde_json::json!({
-                                "ok": true,
-                                "mode": mode,
-                                "query": query,
-                                "mutation_performed": false,
-                                "candidates": candidates,
-                            })
-                        }
-                    },
-                };
-
-                self.handle_tool_result(InboundTaskPayload {
-                    action: Some("tool_result".into()),
-                    agent_action: None,
-                    handoff_bundle: None,
-                    source: Some("agent".into()),
-                    session_id: Some(payload.session_id),
-                    turn_id: Some(payload.turn_id),
-                    transport: None,
-                    chat_id: Some(payload.chat_id),
-                    thread_id: None,
-                    sender_id: None,
-                    sender_username: None,
-                    message_kind: None,
-                    content: Some(report.to_string()),
-                    attachments: Vec::new(),
-                    command: None,
-                    callback_data: None,
-                    raw_transport_event: None,
-                    error: None,
-                    tool_name: Some(payload.tool_name),
-                    arguments: None,
-                    final_reply_to: Some(payload.final_reply_to),
-                    final_reply_role: Some(payload.final_reply_role),
-                    final_reply_guest_id: payload.final_reply_guest_id,
-                    ..Default::default()
-                })
-                .await
-            }
-
-            "memory.true_up" => {
-                let report = classify_memory_true_up(&payload.arguments);
-
-                self.handle_tool_result(InboundTaskPayload {
-                    action: Some("tool_result".into()),
-                    agent_action: None,
-                    handoff_bundle: None,
-                    source: Some("agent".into()),
-                    session_id: Some(payload.session_id),
-                    turn_id: Some(payload.turn_id),
-                    transport: None,
-                    chat_id: Some(payload.chat_id),
-                    thread_id: None,
-                    sender_id: None,
-                    sender_username: None,
-                    message_kind: None,
-                    content: Some(report.to_string()),
-                    attachments: Vec::new(),
-                    command: None,
-                    callback_data: None,
-                    raw_transport_event: None,
-                    error: None,
-                    tool_name: Some(payload.tool_name),
-                    arguments: None,
-                    final_reply_to: Some(payload.final_reply_to),
-                    final_reply_role: Some(payload.final_reply_role),
-                    final_reply_guest_id: payload.final_reply_guest_id,
-                    ..Default::default()
-                })
-                .await
-            }
-
-            "memory.promote_candidate" => {
-                let report = promotion_gate_report(&payload.arguments);
-
-                self.handle_tool_result(InboundTaskPayload {
-                    action: Some("tool_result".into()),
-                    agent_action: None,
-                    handoff_bundle: None,
-                    source: Some("agent".into()),
-                    session_id: Some(payload.session_id),
-                    turn_id: Some(payload.turn_id),
-                    transport: None,
-                    chat_id: Some(payload.chat_id),
-                    thread_id: None,
-                    sender_id: None,
-                    sender_username: None,
-                    message_kind: None,
-                    content: Some(report.to_string()),
-                    attachments: Vec::new(),
-                    command: None,
-                    callback_data: None,
-                    raw_transport_event: None,
-                    error: None,
-                    tool_name: Some(payload.tool_name),
-                    arguments: None,
-                    final_reply_to: Some(payload.final_reply_to),
-                    final_reply_role: Some(payload.final_reply_role),
-                    final_reply_guest_id: payload.final_reply_guest_id,
-                    ..Default::default()
-                })
-                .await
-            }
-
-            "memory.status" => {
-                let content = match &self.muninn_config {
-                    Some(cfg) => {
-                        let status = if self.muninn_available {
-                            "connected"
-                        } else {
-                            "unreachable"
-                        };
-                        format!(
-                            "MuninnDB {status} — endpoint: {}, {} vault(s) configured.",
-                            cfg.base_url,
-                            cfg.vault_tokens.len()
-                        )
-                    }
-                    None => "MuninnDB not configured on this hotel.".into(),
-                };
-                self.handle_tool_result(InboundTaskPayload {
-                    action: Some("tool_result".into()),
-                    source: Some("agent".into()),
-                    session_id: Some(payload.session_id),
-                    turn_id: Some(payload.turn_id),
-                    chat_id: Some(payload.chat_id),
-                    content: Some(content),
-                    tool_name: Some(payload.tool_name),
-                    final_reply_to: Some(payload.final_reply_to),
-                    final_reply_role: Some(payload.final_reply_role),
-                    final_reply_guest_id: payload.final_reply_guest_id,
-                    ..Default::default()
-                })
-                .await
-            }
-
-            "memory.fix" => {
-                let (content, tool_err) = match self
-                    .ipc_client
-                    .send_request(IpcRequest::RefreshMemoryConfig)
-                    .await
-                {
-                    Ok(IpcResponse::MuninnStatus {
-                        available,
-                        endpoint,
-                    }) => {
-                        self.muninn_available = available;
-                        let msg = if available {
-                            format!(
-                                "MuninnDB probe succeeded — connected to {endpoint}. Memory tools re-enabled."
-                            )
-                        } else {
-                            format!(
-                                "MuninnDB probe failed — {endpoint} is unreachable. Hotel will retry every 60s. Outage recorded in heal queue."
-                            )
-                        };
-                        (msg, None)
-                    }
-                    Ok(_) => ("MuninnDB probe response unrecognized.".into(), None),
-                    Err(e) => {
-                        let err = TaskErrorPayload::transport_error(
-                            "philote",
-                            format!("memory.fix: IPC transport error — {e}"),
-                        );
-                        (err.display_message(), Some(err))
-                    }
-                };
-                self.handle_tool_result(InboundTaskPayload {
-                    action: Some("tool_result".into()),
-                    source: Some("agent".into()),
-                    session_id: Some(payload.session_id),
-                    turn_id: Some(payload.turn_id),
-                    chat_id: Some(payload.chat_id),
-                    content: Some(content),
-                    error: tool_err,
-                    tool_name: Some(payload.tool_name),
-                    final_reply_to: Some(payload.final_reply_to),
-                    final_reply_role: Some(payload.final_reply_role),
-                    final_reply_guest_id: payload.final_reply_guest_id,
-                    ..Default::default()
-                })
-                .await
-            }
-
-            "rule.propose" => {
-                let description = payload
-                    .arguments
-                    .get("description")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                let rationale = payload
-                    .arguments
-                    .get("rationale")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
-
-                if description.is_empty() {
-                    return self
-                        .fail_active_turn(
-                            payload.session_id,
-                            payload.turn_id,
-                            "rule.propose: 'description' is required.".into(),
-                        )
-                        .await;
-                }
-
-                let agent_id = self.agent_id.clone();
-                let result_text = match self
-                    .ipc_client
-                    .send_request(IpcRequest::ProposeRule {
-                        agent_id: agent_id.clone(),
-                        description: description.clone(),
-                        rationale: rationale.clone(),
-                    })
-                    .await
-                {
-                    Ok(IpcResponse::RuleProposed { rule_id }) => {
-                        // Optimistically push the new rule into session state so it is visible
-                        // in the next turn's context without requiring a restart.
-                        if let Some(state) = self.sessions.get_mut(&payload.session_id) {
-                            state.rules.push(serde_json::json!({
-                                "rule_id": rule_id,
-                                "description": description,
-                                "rationale": rationale,
-                            }));
-                        }
-                        format!(
-                            "Rule stored permanently (id: {rule_id}). It will be injected into every future cognitive turn."
-                        )
-                    }
-                    Ok(IpcResponse::Standard {
-                        ok: true, message, ..
-                    }) => message,
-                    Ok(IpcResponse::Standard {
-                        ok: false, message, ..
-                    }) => {
-                        format!("rule.propose: hotel rejected — {message}")
-                    }
-                    Ok(_) => "rule.propose: unexpected response from hotel.".into(),
-                    Err(e) => format!("rule.propose: IPC error — {e}"),
-                };
-
-                self.handle_tool_result(InboundTaskPayload {
-                    action: Some("tool_result".into()),
-                    agent_action: None,
-                    handoff_bundle: None,
-                    source: Some("agent".into()),
-                    session_id: Some(payload.session_id),
-                    turn_id: Some(payload.turn_id),
-                    transport: None,
-                    chat_id: Some(payload.chat_id),
-                    thread_id: None,
-                    sender_id: None,
-                    sender_username: None,
-                    message_kind: None,
-                    content: Some(result_text),
-                    attachments: Vec::new(),
-                    command: None,
-                    callback_data: None,
-                    raw_transport_event: None,
-                    error: None,
-                    tool_name: Some(payload.tool_name),
-                    arguments: None,
-                    final_reply_to: Some(payload.final_reply_to),
-                    final_reply_role: Some(payload.final_reply_role),
-                    final_reply_guest_id: payload.final_reply_guest_id,
-                    ..Default::default()
-                })
-                .await
-            }
-
-            "delegate.whisper" => {
-                let args = &payload.arguments;
-                let role = match args.get("role").and_then(|v| v.as_str()) {
-                    Some(r) => r.to_string(),
-                    None => {
-                        return self
-                            .fail_active_turn(
-                                payload.session_id,
-                                payload.turn_id,
-                                "delegate.whisper: missing required argument 'role'".into(),
-                            )
-                            .await;
-                    }
-                };
-                let prompt = match args.get("prompt").and_then(|v| v.as_str()) {
-                    Some(p) => p.to_string(),
-                    None => {
-                        return self
-                            .fail_active_turn(
-                                payload.session_id,
-                                payload.turn_id,
-                                "delegate.whisper: missing required argument 'prompt'".into(),
-                            )
-                            .await;
-                    }
-                };
-
-                // `reply_to` controls where the specialist's response goes.
-                // "self"     → back to this philote as paracrine_response
-                // "membrane" → directly to the membrane role
-                // "<node>/<role>" → explicit routing
-                // default    → "self"
-                let reply_to_str = args
-                    .get("reply_to")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("self");
-
-                let node_id = local_node_id();
-                let (reply_to_node, reply_to_role) = match reply_to_str {
-                    "membrane" => (node_id.clone(), "membrane".to_string()),
-                    "self" | "" => (node_id.clone(), "agent".to_string()),
-                    other => {
-                        if let Some((node, role_part)) = other.split_once('/') {
-                            (node.to_string(), role_part.to_string())
-                        } else {
-                            (node_id.clone(), other.to_string())
-                        }
-                    }
-                };
-
-                // Parse optional response_routing hint from arguments.
-                // Defaults to ReflectiveReEntry if absent or unrecognised.
-                let explicit_response_routing =
-                    args.get("routing").and_then(|v| v.as_str()).and_then(|s| {
-                        serde_json::from_value::<ParacrineRouting>(serde_json::Value::String(
-                            s.to_string(),
-                        ))
-                        .ok()
-                    });
-                let wait_requested = args
-                    .get("wait_for_response")
-                    .or_else(|| args.get("blocking"))
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(false);
-                let response_routing = if wait_requested && explicit_response_routing.is_none() {
-                    Some(ParacrineRouting::EnrichedToolResult)
-                } else {
-                    explicit_response_routing
-                };
-                let wait_for_response = wait_requested
-                    || matches!(response_routing, Some(ParacrineRouting::EnrichedToolResult));
-                let authority = args
-                    .get("authority")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("advice_only")
-                    .to_string();
-                let tool_policy = args
-                    .get("tool_policy")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("role_default")
-                    .to_string();
-                let approval_scope = args
-                    .get("approval_scope")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("originating_session")
-                    .to_string();
-
-                // Always generate a paracrine_id — it threads through the full
-                // thought graph and ties the response back to this turn.
-                let paracrine_id = Uuid::new_v4().to_string();
-
-                // Log the outbound exosome ID on the active turn so the routing
-                // reflex can correlate the response when it arrives.
-                // Also capture the current session_id and chat_id so the specialist's
-                // response carries the right conversation context.
-                let (source_session_id, source_chat_id, source_reply_guest_id) = {
-                    let mut sess_id = None;
-                    let mut chat_id = None;
-                    let mut reply_guest_id = None;
-                    if let Some(state) = self.sessions.get_mut(&payload.session_id) {
-                        if let Some(turn) = state.active_turn.as_mut() {
-                            turn.associated_paracrine_ids.push(paracrine_id.clone());
-                            sess_id = Some(state.session_id.clone());
-                            if !turn.chat_id.is_empty() {
-                                chat_id = Some(turn.chat_id.clone());
-                            }
-                            reply_guest_id = turn.final_reply_guest_id.clone();
-                        }
-                    }
-                    (sess_id, chat_id, reply_guest_id)
-                };
-
-                let exosome = Exosome {
-                    prompt: prompt.clone(),
-                    context: None,
-                    paracrine_id: Some(paracrine_id.clone()),
-                    response_routing: response_routing.clone(),
-                    source_session_id,
-                    source_chat_id,
-                };
-
-                // When reply_to="self", target this philote's own guest_id so the
-                // specialist's paracrine_response routes back here specifically instead
-                // of to the membrane seat (which has no paracrine_response handler).
-                // Role incarnations use "{agent_id}:{role_name}"; default philotes use
-                // "{agent_id}" directly.
-                let effective_reply_guest_id = if matches!(reply_to_str, "self" | "") {
-                    Some(
-                        self.role_name
-                            .as_ref()
-                            .map(|rn| format!("{}:{}", self.agent_id, rn))
-                            .unwrap_or_else(|| self.agent_id.clone()),
-                    )
-                } else {
-                    source_reply_guest_id
-                };
-
-                let emit_result = self
-                    .ipc_client
-                    .send_request(IpcRequest::ParacrineEmit {
-                        role: role.clone(),
-                        exosome,
-                        reply_to_node,
-                        reply_to_role,
-                        reply_to_guest_id: effective_reply_guest_id,
-                        timeout_secs: None,
-                    })
-                    .await;
-
-                if emit_result.is_ok() {
-                    if let Some(state) = self.sessions.get_mut(&payload.session_id) {
-                        state.open_paracrine_thread(
-                            paracrine_id.clone(),
-                            role.clone(),
-                            prompt.clone(),
-                            response_routing
-                                .clone()
-                                .unwrap_or(ParacrineRouting::ReflectiveReEntry),
-                            authority,
-                            tool_policy,
-                            approval_scope,
-                        );
-                    }
-                }
-
-                let (content, tool_err) = match emit_result {
-                    Ok(_) if wait_for_response => {
-                        if let Some(state) = self.sessions.get(&payload.session_id) {
-                            let checkpoint_memory_type = state.checkpoint_memory_type();
-                            let checkpoint_json = state.checkpoint_json();
-                            let index_state = state.clone();
-                            self.ipc_client
-                                .sync_apartment(
-                                    &self.agent_id,
-                                    &checkpoint_memory_type,
-                                    checkpoint_json,
-                                )
-                                .await?;
-                            self.sync_session_index(&index_state).await?;
-                        }
-                        let _ = self
-                            .emit_turn_event(
-                                &payload.session_id,
-                                "waiting_paracrine",
-                                Some(paracrine_id.clone()),
-                            )
-                            .await;
-                        return Ok(());
-                    }
-                    Ok(_) => (
-                        format!(
-                            "Whisper sent to specialist (paracrine_id: {paracrine_id}). \
-                             The specialist is processing asynchronously — their response \
-                             will arrive separately. Do NOT call delegate.whisper again. \
-                             Respond to the user now with a brief acknowledgment."
-                        ),
-                        None,
-                    ),
-                    Err(e) => {
-                        let err = TaskErrorPayload::transport_error(
-                            "philote",
-                            format!("delegate.whisper: IPC transport error — {e}"),
-                        );
-                        (err.display_message(), Some(err))
-                    }
-                };
-
-                self.handle_tool_result(InboundTaskPayload {
-                    action: Some("tool_result".into()),
-                    agent_action: None,
-                    handoff_bundle: None,
-                    source: Some("agent".into()),
-                    session_id: Some(payload.session_id),
-                    turn_id: Some(payload.turn_id),
-                    transport: None,
-                    chat_id: Some(payload.chat_id),
-                    thread_id: None,
-                    sender_id: None,
-                    sender_username: None,
-                    message_kind: None,
-                    content: Some(content),
-                    attachments: Vec::new(),
-                    command: None,
-                    callback_data: None,
-                    raw_transport_event: None,
-                    error: tool_err,
-                    tool_name: Some(payload.tool_name),
-                    arguments: None,
-                    final_reply_to: Some(payload.final_reply_to),
-                    final_reply_role: Some(payload.final_reply_role),
-                    final_reply_guest_id: payload.final_reply_guest_id,
-                    ..Default::default()
-                })
-                .await
-            }
-
-            // ── delegate.merge ───────────────────────────────────────────────
-            // Explicit paracrine merge: emit a paracrine_response back to the
-            // orchestrator immediately, without waiting for turn completion.
-            // Sets paracrine_merge_completed on the turn so deliver_text_reply
-            // does not auto-emit a duplicate response when the turn later closes.
-            //
-            // Call signature: { "content": "<response to send to orchestrator>" }
-            // Available in specialist (paracrine) toolsets.
-            "delegate.merge" => {
-                let session_id = payload.session_id.clone();
-                let turn_id = payload.turn_id.clone();
-                let args = &payload.arguments;
-
-                let content = match args.get("content").and_then(|v| v.as_str()) {
-                    Some(c) if !c.trim().is_empty() => c.to_string(),
-                    _ => {
-                        return self
-                            .fail_active_turn(
-                                session_id,
-                                turn_id,
-                                "delegate.merge: missing required argument 'content'".into(),
-                            )
-                            .await;
-                    }
-                };
-
-                // Capture routing info from the active turn before muting it.
-                let (
-                    paracrine_id,
-                    reply_session_id,
-                    reply_chat_id,
-                    response_routing,
-                    final_reply_to,
-                    final_reply_role,
-                    final_reply_guest_id,
-                ) = {
-                    let Some(state) = self.sessions.get_mut(&session_id) else {
-                        warn!("delegate.merge: unknown session {}", session_id);
-                        return Ok(());
-                    };
-                    let Some(turn) = state.active_turn.as_mut() else {
-                        warn!("delegate.merge: no active turn for session {}", session_id);
-                        return Ok(());
-                    };
-                    if turn.paracrine_origin.is_none() {
-                        return self
-                            .fail_active_turn(
-                                session_id,
-                                turn_id,
-                                "delegate.merge: not in a paracrine context — this tool is only available to specialist roles".into(),
-                            )
-                            .await;
-                    }
-                    let pid = turn.paracrine_origin.clone().unwrap();
-                    let rs = turn
-                        .paracrine_reply_session_id
-                        .clone()
-                        .unwrap_or_else(|| session_id.clone());
-                    let rc = turn
-                        .paracrine_reply_chat_id
-                        .clone()
-                        .unwrap_or_else(|| turn.chat_id.clone());
-                    let rr = turn.paracrine_response_routing.clone();
-                    let frt = turn.final_reply_to.clone();
-                    let frr = turn.final_reply_role.clone();
-                    let frg = turn.final_reply_guest_id.clone();
-                    // Mark merge as done so deliver_text_reply suppresses the auto-emit.
-                    turn.paracrine_merge_completed = true;
-                    (pid, rs, rc, rr, frt, frr, frg)
-                };
-
-                // Append role attribution tag (same as deliver_text_reply does).
-                let attributed_content = if let Ok(role_name) = std::env::var("PHILOTIC_ROLE_NAME")
-                {
-                    if !role_name.is_empty() {
-                        format!("{}\n\n@agent:{}", content, role_name)
-                    } else {
-                        content.clone()
-                    }
-                } else {
-                    content.clone()
-                };
-
-                // Determine position in chain: if reply_session_id == session_id,
-                // this is a top-of-chain reflection turn (Astrid surfacing brain's
-                // reply). Otherwise it's a specialist turn (brain replying to Astrid).
-                let is_top_of_chain = reply_session_id == session_id;
-
-                if is_top_of_chain {
-                    // Reflective surface: emit send_reply directly to membrane so the
-                    // content goes to the user's Telegram chat.
-                    let surface_task = serde_json::json!({
-                        "action": "send_reply",
-                        "session_id": reply_session_id,
-                        "turn_id": turn_id,
-                        "chat_id": reply_chat_id,
-                        "content": attributed_content,
-                    });
-                    info!(
-                        session_id = %session_id,
-                        "delegate.merge: reflective surface — emitting send_reply to membrane"
-                    );
-                    let _ = self
-                        .ipc_client
-                        .send_request(IpcRequest::EmitTask {
-                            target_node: final_reply_to,
-                            target_role: final_reply_role,
-                            target_guest_id: final_reply_guest_id,
-                            task_json: surface_task.to_string(),
-                        })
-                        .await;
-                } else {
-                    // Specialist merge: emit paracrine_response back to the orchestrator.
-                    let merge_task = serde_json::json!({
-                        "action": "paracrine_response",
-                        "session_id": reply_session_id,
-                        "turn_id": turn_id,
-                        "chat_id": reply_chat_id,
-                        "content": attributed_content,
-                        "exosome": {
-                            "prompt": "",
-                            "paracrine_id": paracrine_id,
-                            "response_routing": response_routing,
-                            "source_session_id": reply_session_id,
-                            "source_chat_id": reply_chat_id,
-                        },
-                    });
-                    info!(
-                        session_id = %session_id,
-                        reply_session = %reply_session_id,
-                        "delegate.merge: emitting paracrine_response to orchestrator"
-                    );
-                    let _ = self
-                        .ipc_client
-                        .send_request(IpcRequest::EmitTask {
-                            target_node: final_reply_to,
-                            target_role: final_reply_role,
-                            target_guest_id: final_reply_guest_id,
-                            task_json: merge_task.to_string(),
-                        })
-                        .await;
-                }
-
-                // Return a tool result so the specialist's turn can continue or close.
-                let result_content = format!(
-                    "Merge sent to orchestrator (paracrine_id: {}). Your response has been delivered to the main conversation. Complete your turn now.",
-                    paracrine_id
-                );
-                self.handle_tool_result(InboundTaskPayload {
-                    action: Some("tool_result".into()),
-                    agent_action: None,
-                    handoff_bundle: None,
-                    source: Some("agent".into()),
-                    session_id: Some(session_id),
-                    turn_id: Some(turn_id),
-                    transport: None,
-                    chat_id: Some(payload.chat_id),
-                    thread_id: None,
-                    sender_id: None,
-                    sender_username: None,
-                    message_kind: None,
-                    content: Some(result_content),
-                    attachments: Vec::new(),
-                    command: None,
-                    callback_data: None,
-                    raw_transport_event: None,
-                    error: None,
-                    tool_name: Some("delegate.merge".into()),
-                    arguments: None,
-                    final_reply_to: Some(payload.final_reply_to),
-                    final_reply_role: Some(payload.final_reply_role),
-                    final_reply_guest_id: payload.final_reply_guest_id,
-                    ..Default::default()
-                })
-                .await
-            }
-
-            "approval.request_standing" => {
-                let session_id = payload.session_id.clone();
-                let turn_id = payload.turn_id.clone();
-                let tool_name = payload
-                    .arguments
-                    .get("tool_name")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                let required_successes = payload
-                    .arguments
-                    .get("required_successes")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(3) as u32;
-
-                if tool_name.is_empty() {
-                    return self
-                        .fail_active_turn(
-                            session_id,
-                            turn_id,
-                            "approval.request_standing: missing required argument 'tool_name'"
-                                .into(),
-                        )
-                        .await;
-                }
-
-                let content = if let Some(state) = self.sessions.get_mut(&session_id) {
-                    state.register_standing_preapproval(&tool_name, required_successes);
-                    let current_streak = *state.tool_success_streak.get(&tool_name).unwrap_or(&0);
-                    if state.approval_policy.preapproved_tools.contains(&tool_name) {
-                        format!(
-                            "Standing approval granted immediately for '{}' — \
-                             current streak ({}) already meets the threshold ({}).",
-                            tool_name, current_streak, required_successes
-                        )
-                    } else {
-                        format!(
-                            "Standing approval registered for '{}'. \
-                             It will be auto-granted after {} successive successes \
-                             (current streak: {}).",
-                            tool_name, required_successes, current_streak
-                        )
-                    }
-                } else {
-                    "Session not found.".into()
-                };
-
-                self.handle_tool_result(InboundTaskPayload {
-                    action: Some("tool_result".into()),
-                    source: Some("agent".into()),
-                    session_id: Some(session_id),
-                    turn_id: Some(turn_id),
-                    chat_id: Some(payload.chat_id),
-                    content: Some(content),
-                    tool_name: Some("approval.request_standing".into()),
-                    final_reply_to: Some(payload.final_reply_to),
-                    final_reply_role: Some(payload.final_reply_role),
-                    final_reply_guest_id: payload.final_reply_guest_id,
-                    ..Default::default()
-                })
-                .await
-            }
-
-            // ── mcp.provision ────────────────────────────────────────────────
-            "mcp.provision" => {
-                let session_id = payload.session_id.clone();
-                let turn_id = payload.turn_id.clone();
-                let args = &payload.arguments;
-
-                let endpoint_id = match args.get("endpoint_id").and_then(|v| v.as_str()) {
-                    Some(s) if !s.trim().is_empty() => s.to_string(),
-                    _ => {
-                        return self
-                            .fail_active_turn(
-                                session_id,
-                                turn_id,
-                                "mcp.provision: missing required argument 'endpoint_id'".into(),
-                            )
-                            .await;
-                    }
-                };
-                let port = match args.get("port").and_then(|v| v.as_u64()) {
-                    Some(p) if p > 0 && p < 65536 => p as u16,
-                    _ => {
-                        return self
-                            .fail_active_turn(
-                                session_id,
-                                turn_id,
-                                "mcp.provision: missing or invalid 'port' (must be 1–65535)".into(),
-                            )
-                            .await;
-                    }
-                };
-
-                let tools_raw = args.get("tools").cloned().unwrap_or(serde_json::json!([]));
-                let tools: Vec<ansible_mesh_core::mcp_endpoint::McpToolSpec> =
-                    match serde_json::from_value(tools_raw) {
-                        Ok(t) => t,
-                        Err(e) => {
-                            return self
-                                .fail_active_turn(
-                                    session_id,
-                                    turn_id,
-                                    format!("mcp.provision: invalid 'tools' shape — {e}"),
-                                )
-                                .await;
-                        }
-                    };
-
-                let preapproval_rules: Vec<ansible_mesh_core::mcp_endpoint::McpPreapprovalRule> =
-                    args.get("preapproval_rules")
-                        .and_then(|v| {
-                            serde_json::from_value::<
-                                Vec<ansible_mesh_core::mcp_endpoint::McpPreapprovalRule>,
-                            >(v.clone())
-                            .ok()
-                        })
-                        .unwrap_or_default()
-                        .into_iter()
-                        .map(
-                            |mut rule: ansible_mesh_core::mcp_endpoint::McpPreapprovalRule| {
-                                rule.approved_by_turn = turn_id.clone();
-                                rule.approved_at = std::time::SystemTime::now()
-                                    .duration_since(std::time::UNIX_EPOCH)
-                                    .map(|d| d.as_secs())
-                                    .unwrap_or(0);
-                                rule
-                            },
-                        )
-                        .collect();
-
-                let updated_at = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_secs())
-                    .unwrap_or(0);
-
-                let exposure = args
-                    .get("exposure")
-                    .and_then(|v| {
-                        serde_json::from_value::<ansible_mesh_core::ExposureTier>(v.clone()).ok()
-                    })
-                    .unwrap_or(ansible_mesh_core::ExposureTier::Local);
-
-                let config = ansible_mesh_core::mcp_endpoint::McpEndpointConfig {
-                    endpoint_id: endpoint_id.clone(),
-                    owner_agent_id: self.agent_id.clone(),
-                    port,
-                    path: None,
-                    exposure,
-                    tools,
-                    preapproval_rules,
-                    updated_at,
-                };
-
-                let response = self
-                    .ipc_client
-                    .send_request(IpcRequest::ProvisionMcpEndpoint { config })
-                    .await;
-
-                let (content, tool_err) = match response {
-                    Ok(IpcResponse::McpEndpointProvisioned {
-                        endpoint_id: ref eid,
-                        port: p,
-                        materialized,
-                    }) => {
-                        let status = if materialized {
-                            "spawned a new membrane-mcp guest"
-                        } else {
-                            "updated config on existing membrane-mcp guest"
-                        };
-                        (
-                            format!(
-                                "MCP endpoint provisioned.\n\
-                                 Endpoint ID: {eid}\n\
-                                 Port: {p}\n\
-                                 Status: {status}\n\
-                                 Pre-approval rules for this endpoint are now active."
-                            ),
-                            None,
-                        )
-                    }
-                    Ok(IpcResponse::Standard {
-                        ok: false,
-                        code,
-                        message,
-                        ..
-                    }) => {
-                        let e =
-                            philotic_client::TaskErrorPayload::ipc_failure("aiua", &*code, message);
-                        (e.display_message(), Some(e))
-                    }
-                    Ok(IpcResponse::Error(msg)) => {
-                        let e = philotic_client::TaskErrorPayload::ipc_failure(
-                            "aiua",
-                            "IPC_ERROR",
-                            msg,
-                        );
-                        (e.display_message(), Some(e))
-                    }
-                    Ok(_) => {
-                        let e = philotic_client::TaskErrorPayload::ipc_failure(
-                            "aiua",
-                            "UNEXPECTED_RESPONSE",
-                            "mcp.provision: unexpected hotel response",
-                        );
-                        (e.display_message(), Some(e))
-                    }
-                    Err(e) => {
-                        let err = philotic_client::TaskErrorPayload::transport_error(
-                            "philote",
-                            format!("mcp.provision: IPC transport error — {e}"),
-                        );
-                        (err.display_message(), Some(err))
-                    }
-                };
-
-                self.handle_tool_result(InboundTaskPayload {
-                    action: Some("tool_result".into()),
-                    agent_action: None,
-                    handoff_bundle: None,
-                    source: Some("agent".into()),
-                    session_id: Some(session_id),
-                    turn_id: Some(turn_id),
-                    transport: None,
-                    chat_id: Some(payload.chat_id),
-                    thread_id: None,
-                    sender_id: None,
-                    sender_username: None,
-                    message_kind: None,
-                    content: Some(content),
-                    attachments: Vec::new(),
-                    command: None,
-                    callback_data: None,
-                    raw_transport_event: None,
-                    error: tool_err,
-                    tool_name: Some("mcp.provision".into()),
-                    arguments: None,
-                    final_reply_to: Some(payload.final_reply_to),
-                    final_reply_role: Some(payload.final_reply_role),
-                    final_reply_guest_id: payload.final_reply_guest_id,
-                    ..Default::default()
-                })
-                .await
-            }
-
-            // ── mcp.revoke ───────────────────────────────────────────────────
-            "mcp.revoke" => {
-                let session_id = payload.session_id.clone();
-                let turn_id = payload.turn_id.clone();
-
-                let endpoint_id = match payload
-                    .arguments
-                    .get("endpoint_id")
-                    .and_then(|v| v.as_str())
-                {
-                    Some(s) if !s.trim().is_empty() => s.to_string(),
-                    _ => {
-                        return self
-                            .fail_active_turn(
-                                session_id,
-                                turn_id,
-                                "mcp.revoke: missing required argument 'endpoint_id'".into(),
-                            )
-                            .await;
-                    }
-                };
-
-                let response = self
-                    .ipc_client
-                    .send_request(IpcRequest::RevokeMcpEndpoint {
-                        endpoint_id: endpoint_id.clone(),
-                        owner_agent_id: self.agent_id.clone(),
-                    })
-                    .await;
-
-                let (content, tool_err) = match response {
-                    Ok(IpcResponse::McpEndpointProvisioned {
-                        endpoint_id: ref eid,
-                        ..
-                    }) => (
-                        format!(
-                            "MCP endpoint '{eid}' revoked. The membrane-mcp guest has been signalled to shut down."
-                        ),
-                        None,
-                    ),
-                    Ok(IpcResponse::Standard {
-                        ok: false,
-                        code,
-                        message,
-                        ..
-                    }) => {
-                        let e =
-                            philotic_client::TaskErrorPayload::ipc_failure("aiua", &*code, message);
-                        (e.display_message(), Some(e))
-                    }
-                    Ok(IpcResponse::Error(msg)) => {
-                        let e = philotic_client::TaskErrorPayload::ipc_failure(
-                            "aiua",
-                            "IPC_ERROR",
-                            msg,
-                        );
-                        (e.display_message(), Some(e))
-                    }
-                    Ok(_) => {
-                        let e = philotic_client::TaskErrorPayload::ipc_failure(
-                            "aiua",
-                            "UNEXPECTED_RESPONSE",
-                            "mcp.revoke: unexpected hotel response",
-                        );
-                        (e.display_message(), Some(e))
-                    }
-                    Err(e) => {
-                        let err = philotic_client::TaskErrorPayload::transport_error(
-                            "philote",
-                            format!("mcp.revoke: IPC transport error — {e}"),
-                        );
-                        (err.display_message(), Some(err))
-                    }
-                };
-
-                self.handle_tool_result(InboundTaskPayload {
-                    action: Some("tool_result".into()),
-                    agent_action: None,
-                    handoff_bundle: None,
-                    source: Some("agent".into()),
-                    session_id: Some(session_id),
-                    turn_id: Some(turn_id),
-                    transport: None,
-                    chat_id: Some(payload.chat_id),
-                    thread_id: None,
-                    sender_id: None,
-                    sender_username: None,
-                    message_kind: None,
-                    content: Some(content),
-                    attachments: Vec::new(),
-                    command: None,
-                    callback_data: None,
-                    raw_transport_event: None,
-                    error: tool_err,
-                    tool_name: Some("mcp.revoke".into()),
-                    arguments: None,
-                    final_reply_to: Some(payload.final_reply_to),
-                    final_reply_role: Some(payload.final_reply_role),
-                    final_reply_guest_id: payload.final_reply_guest_id,
-                    ..Default::default()
-                })
-                .await
-            }
-
-            // ── mcp.status ───────────────────────────────────────────────────
-            "mcp.status" => {
-                let endpoint_id = match payload
-                    .arguments
-                    .get("endpoint_id")
-                    .and_then(|v| v.as_str())
-                {
-                    Some(s) if !s.trim().is_empty() => s.to_string(),
-                    _ => {
-                        return self
-                            .fail_active_turn(
-                                payload.session_id,
-                                payload.turn_id,
-                                "mcp.status: missing required argument 'endpoint_id'".into(),
-                            )
-                            .await;
-                    }
-                };
-                let (content, tool_err) = match self
-                    .ipc_client
-                    .send_request(IpcRequest::GetMcpEndpointStatus {
-                        endpoint_id: endpoint_id.clone(),
-                    })
-                    .await
-                {
-                    Ok(IpcResponse::Standard {
-                        ok: true,
-                        data: Some(data),
-                        ..
-                    }) => {
-                        let text = serde_json::to_string_pretty(&data)
-                            .unwrap_or_else(|_| data.to_string());
-                        (text, None)
-                    }
-                    Ok(IpcResponse::Standard {
-                        ok: false,
-                        code,
-                        message,
-                        ..
-                    }) => {
-                        let e = TaskErrorPayload::ipc_failure("aiua", &*code, message);
-                        (e.display_message(), Some(e))
-                    }
-                    Ok(_) => ("MCP endpoint status unavailable.".into(), None),
-                    Err(e) => {
-                        let err = TaskErrorPayload::transport_error(
-                            "philote",
-                            format!("mcp.status: IPC transport error — {e}"),
-                        );
-                        (err.display_message(), Some(err))
-                    }
-                };
-                self.handle_tool_result(InboundTaskPayload {
-                    action: Some("tool_result".into()),
-                    source: Some("agent".into()),
-                    session_id: Some(payload.session_id),
-                    turn_id: Some(payload.turn_id),
-                    chat_id: Some(payload.chat_id),
-                    content: Some(content),
-                    error: tool_err,
-                    tool_name: Some(payload.tool_name),
-                    final_reply_to: Some(payload.final_reply_to),
-                    final_reply_role: Some(payload.final_reply_role),
-                    final_reply_guest_id: payload.final_reply_guest_id,
-                    ..Default::default()
-                })
-                .await
-            }
-
-            // ── table.add_listener ───────────────────────────────────────────
-            "table.add_listener" => {
-                let args = payload.arguments.as_object();
-
-                let event_kind = match args
-                    .and_then(|a| a.get("event_kind"))
-                    .and_then(|v| v.as_str())
-                {
-                    Some(s) if !s.is_empty() => s.to_string(),
-                    _ => {
-                        return self
-                            .fail_active_turn(
-                                payload.session_id,
-                                payload.turn_id,
-                                "table.add_listener: missing required argument 'event_kind'".into(),
-                            )
-                            .await;
-                    }
-                };
-
-                let table_name = match args
-                    .and_then(|a| a.get("table_name"))
-                    .and_then(|v| v.as_str())
-                {
-                    Some(s) if !s.is_empty() => s.to_string(),
-                    _ => {
-                        return self
-                            .fail_active_turn(
-                                payload.session_id,
-                                payload.turn_id,
-                                "table.add_listener: missing required argument 'table_name'".into(),
-                            )
-                            .await;
-                    }
-                };
-
-                let schema_map = args
-                    .and_then(|a| a.get("schema_map"))
-                    .and_then(|v| v.as_object())
-                    .cloned();
-                let filter_keys = args
-                    .and_then(|a| a.get("filter_keys"))
-                    .and_then(|v| v.as_object())
-                    .cloned();
-                let adapter_script = args
-                    .and_then(|a| a.get("adapter_script"))
-                    .and_then(|v| v.as_str())
-                    .map(str::to_string);
-                let target_role = args
-                    .and_then(|a| a.get("target_role"))
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("table-datasource")
-                    .to_string();
-
-                // Read current listener config.
-                let mut config: serde_json::Value = match self
-                    .ipc_client
-                    .send_request(IpcRequest::GetConfig {
-                        key: "router_listener.config".into(),
-                    })
-                    .await
-                {
-                    Ok(IpcResponse::ConfigData {
-                        value_json: Some(raw),
-                        ..
-                    }) => serde_json::from_str(&raw).unwrap_or(serde_json::json!({
-                        "filter_keys": {},
-                        "event_kinds": {}
-                    })),
-                    _ => serde_json::json!({ "filter_keys": {}, "event_kinds": {} }),
-                };
-
-                // Merge filter_keys if provided.
-                if let Some(fk) = filter_keys {
-                    if let Some(obj) = config
-                        .get_mut("filter_keys")
-                        .and_then(|v| v.as_object_mut())
-                    {
-                        obj.extend(fk);
-                    }
-                }
-
-                // Ensure event_kinds map exists.
-                if config.get("event_kinds").is_none() {
-                    config["event_kinds"] = serde_json::json!({});
-                }
-
-                // Build and insert the event handler.
-                let mut handler = serde_json::json!({
-                    "mode": "table_insert",
-                    "table_name": table_name,
-                    "target_role": target_role,
-                });
-                if let Some(sm) = schema_map {
-                    handler["schema_map"] = serde_json::Value::Object(sm);
-                }
-                if let Some(script) = adapter_script {
-                    handler["adapter_script"] = serde_json::Value::String(script);
-                }
-
-                if let Some(kinds) = config
-                    .get_mut("event_kinds")
-                    .and_then(|v| v.as_object_mut())
-                {
-                    kinds.insert(event_kind.clone(), handler);
-                }
-
-                // Write back.
-                let (content_str, tool_err) = match self
-                    .ipc_client
-                    .send_request(IpcRequest::SetConfig {
-                        key: "router_listener.config".into(),
-                        value_json: config.to_string(),
-                    })
-                    .await
-                {
-                    Ok(IpcResponse::Standard { ok: true, .. }) => (
-                        format!(
-                            "Listener registered: event_kind='{event_kind}' → table='{table_name}'. \
-                             The router-listener applies this on its next reconnect. \
-                             Next: call graph.query to CREATE a (TableConfig {{id:'table_config:{table_name}', \
-                             name:'{table_name}'}}) node in your partition so this table appears in \
-                             your cognitive envelope on future sessions."
-                        ),
-                        None,
-                    ),
-                    Ok(IpcResponse::Standard {
-                        ok: false,
-                        code,
-                        message,
-                        ..
-                    }) => {
-                        let e =
-                            philotic_client::TaskErrorPayload::ipc_failure("aiua", &*code, message);
-                        (e.display_message(), Some(e))
-                    }
-                    Ok(_) => ("table.add_listener: unexpected hotel response".into(), None),
-                    Err(e) => {
-                        let err = philotic_client::TaskErrorPayload::transport_error(
-                            "philote",
-                            format!("table.add_listener: IPC transport error — {e}"),
-                        );
-                        (err.display_message(), Some(err))
-                    }
-                };
-
-                self.handle_tool_result(InboundTaskPayload {
-                    action: Some("tool_result".into()),
-                    source: Some("agent".into()),
-                    session_id: Some(payload.session_id),
-                    turn_id: Some(payload.turn_id),
-                    chat_id: Some(payload.chat_id),
-                    content: Some(content_str),
-                    error: tool_err,
-                    tool_name: Some(payload.tool_name),
-                    final_reply_to: Some(payload.final_reply_to),
-                    final_reply_role: Some(payload.final_reply_role),
-                    final_reply_guest_id: payload.final_reply_guest_id,
-                    ..Default::default()
-                })
-                .await
-            }
-
-            // ── routing.policy.propose ───────────────────────────────────────
-            "routing.policy.propose" => {
-                let args = payload.arguments.as_object();
-                let problem = args
-                    .and_then(|a| a.get("problem"))
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                let proposed_change = args
-                    .and_then(|a| a.get("proposed_change"))
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                let evidence = args
-                    .and_then(|a| a.get("evidence"))
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                let affected_stage = args
-                    .and_then(|a| a.get("affected_stage"))
-                    .and_then(|v| v.as_str())
-                    .map(str::to_string);
-                let affected_capability = args
-                    .and_then(|a| a.get("affected_capability"))
-                    .and_then(|v| v.as_str())
-                    .map(str::to_string);
-                let learned_reflex_preference_key = args
-                    .and_then(|a| a.get("learned_reflex_preference_key"))
-                    .and_then(|v| v.as_str())
-                    .map(str::to_string);
-
-                if problem.is_empty() || proposed_change.is_empty() {
-                    return self
-                        .fail_active_turn(
-                            payload.session_id,
-                            payload.turn_id,
-                            "routing.policy.propose: 'problem' and 'proposed_change' are required."
-                                .into(),
-                        )
-                        .await;
-                }
-
-                let result_text = match self
-                    .ipc_client
-                    .send_request(IpcRequest::RecordRoutingPolicyProposal {
-                        agent_id: self.agent_id.clone(),
-                        problem: problem.clone(),
-                        proposed_change,
-                        evidence,
-                        affected_stage,
-                        affected_capability,
-                        learned_reflex_preference_key,
-                    })
-                    .await
-                {
-                    Ok(IpcResponse::RoutingPolicyRecorded { proposal_id }) => {
-                        format!(
-                            "Routing policy proposal recorded (id: {proposal_id}). \
-                             An operator will review and approve or reject the proposed change."
-                        )
-                    }
-                    Ok(IpcResponse::Standard {
-                        ok: true, message, ..
-                    }) => message,
-                    Ok(IpcResponse::Standard {
-                        ok: false, message, ..
-                    }) => {
-                        format!("routing.policy.propose: hotel rejected — {message}")
-                    }
-                    Ok(_) => "routing.policy.propose: unexpected response from hotel.".into(),
-                    Err(e) => format!("routing.policy.propose: IPC error — {e}"),
-                };
-
-                self.handle_tool_result(InboundTaskPayload {
-                    action: Some("tool_result".into()),
-                    agent_action: None,
-                    handoff_bundle: None,
-                    source: Some("agent".into()),
-                    session_id: Some(payload.session_id),
-                    turn_id: Some(payload.turn_id),
-                    transport: None,
-                    chat_id: Some(payload.chat_id),
-                    thread_id: None,
-                    sender_id: None,
-                    sender_username: None,
-                    message_kind: None,
-                    content: Some(result_text),
-                    attachments: Vec::new(),
-                    command: None,
-                    callback_data: None,
-                    raw_transport_event: None,
-                    error: None,
-                    tool_name: Some("routing.policy.propose".into()),
-                    arguments: None,
-                    final_reply_to: Some(payload.final_reply_to),
-                    final_reply_role: Some(payload.final_reply_role),
-                    final_reply_guest_id: payload.final_reply_guest_id,
-                    ..Default::default()
-                })
-                .await
-            }
-
-            // ── routing.reflex.set ───────────────────────────────────────────
-            "routing.reflex.set" => {
-                let args = payload.arguments.as_object();
-                let preference_key = args
-                    .and_then(|a| a.get("preference_key"))
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("generation_capability_preference")
-                    .to_string();
-                let reflexes_json = args
-                    .and_then(|a| a.get("reflexes"))
-                    .cloned()
-                    .unwrap_or_else(|| serde_json::json!({}));
-                let reason = args
-                    .and_then(|a| a.get("reason"))
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
-
-                let result_text = match self
-                    .ipc_client
-                    .send_request(IpcRequest::UpsertAgentReflexPreference {
-                        agent_id: self.agent_id.clone(),
-                        preference_key: preference_key.clone(),
-                        precedence: 70,
-                        reflexes_json,
-                        config_json: serde_json::json!({ "reason": reason }),
-                    })
-                    .await
-                {
-                    Ok(IpcResponse::Standard { ok: true, .. }) => {
-                        format!(
-                            "Routing reflex '{preference_key}' stored. Takes effect on the next turn."
-                        )
-                    }
-                    Ok(IpcResponse::Standard {
-                        ok: false, message, ..
-                    }) => {
-                        format!("routing.reflex.set: hotel rejected — {message}")
-                    }
-                    Ok(_) => "routing.reflex.set: unexpected response from hotel.".into(),
-                    Err(e) => format!("routing.reflex.set: IPC error — {e}"),
-                };
-
-                self.handle_tool_result(InboundTaskPayload {
-                    action: Some("tool_result".into()),
-                    agent_action: None,
-                    handoff_bundle: None,
-                    source: Some("agent".into()),
-                    session_id: Some(payload.session_id),
-                    turn_id: Some(payload.turn_id),
-                    transport: None,
-                    chat_id: Some(payload.chat_id),
-                    thread_id: None,
-                    sender_id: None,
-                    sender_username: None,
-                    message_kind: None,
-                    content: Some(result_text),
-                    attachments: Vec::new(),
-                    command: None,
-                    callback_data: None,
-                    raw_transport_event: None,
-                    error: None,
-                    tool_name: Some("routing.reflex.set".into()),
-                    arguments: None,
-                    final_reply_to: Some(payload.final_reply_to),
-                    final_reply_role: Some(payload.final_reply_role),
-                    final_reply_guest_id: payload.final_reply_guest_id,
-                    ..Default::default()
-                })
-                .await
-            }
-
-            // ── routing.reflex.get ───────────────────────────────────────────
-            "routing.reflex.get" => {
-                let args = payload.arguments.as_object();
-                let filter_key = args
-                    .and_then(|a| a.get("preference_key"))
-                    .and_then(|v| v.as_str())
-                    .map(str::to_string);
-
-                let result_text = match self
-                    .ipc_client
-                    .send_request(IpcRequest::GetAgentReflexPreferences {
-                        agent_id: self.agent_id.clone(),
-                        preference_key: filter_key,
-                    })
-                    .await
-                {
-                    Ok(IpcResponse::AgentReflexPreferences { rows }) => {
-                        serde_json::to_string_pretty(&rows).unwrap_or_else(|_| "[]".into())
-                    }
-                    Ok(IpcResponse::Standard {
-                        ok: true, message, ..
-                    }) => message,
-                    Ok(_) => "routing.reflex.get: unexpected response from hotel.".into(),
-                    Err(e) => format!("routing.reflex.get: IPC error — {e}"),
-                };
-
-                self.handle_tool_result(InboundTaskPayload {
-                    action: Some("tool_result".into()),
-                    agent_action: None,
-                    handoff_bundle: None,
-                    source: Some("agent".into()),
-                    session_id: Some(payload.session_id),
-                    turn_id: Some(payload.turn_id),
-                    transport: None,
-                    chat_id: Some(payload.chat_id),
-                    thread_id: None,
-                    sender_id: None,
-                    sender_username: None,
-                    message_kind: None,
-                    content: Some(result_text),
-                    attachments: Vec::new(),
-                    command: None,
-                    callback_data: None,
-                    raw_transport_event: None,
-                    error: None,
-                    tool_name: Some("routing.reflex.get".into()),
-                    arguments: None,
-                    final_reply_to: Some(payload.final_reply_to),
-                    final_reply_role: Some(payload.final_reply_role),
-                    final_reply_guest_id: payload.final_reply_guest_id,
-                    ..Default::default()
-                })
-                .await
-            }
-
-            // ── routing.pipeline.set ────────────────────────────────────────
-            "routing.pipeline.set" => {
-                let args = payload.arguments.as_object();
-                let rule_id = args
-                    .and_then(|a| a.get("rule_id"))
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("default")
-                    .to_string();
-                let rule_json = payload.arguments.clone();
-
-                let result_text = match self
-                    .ipc_client
-                    .send_request(IpcRequest::UpsertRoutingPipelineRule {
-                        agent_id: self.agent_id.clone(),
-                        rule_id: rule_id.clone(),
-                        rule_json,
-                    })
-                    .await
-                {
-                    Ok(IpcResponse::Standard { ok: true, .. }) => {
-                        format!(
-                            "Pipeline rule '{rule_id}' stored. Takes effect on the next inbound turn."
-                        )
-                    }
-                    Ok(IpcResponse::Standard {
-                        ok: false, message, ..
-                    }) => {
-                        format!("routing.pipeline.set: hotel rejected — {message}")
-                    }
-                    Ok(_) => "routing.pipeline.set: unexpected response from hotel.".into(),
-                    Err(e) => format!("routing.pipeline.set: IPC error — {e}"),
-                };
-
-                self.handle_tool_result(InboundTaskPayload {
-                    action: Some("tool_result".into()),
-                    agent_action: None,
-                    handoff_bundle: None,
-                    source: Some("agent".into()),
-                    session_id: Some(payload.session_id),
-                    turn_id: Some(payload.turn_id),
-                    transport: None,
-                    chat_id: Some(payload.chat_id),
-                    thread_id: None,
-                    sender_id: None,
-                    sender_username: None,
-                    message_kind: None,
-                    content: Some(result_text),
-                    attachments: Vec::new(),
-                    command: None,
-                    callback_data: None,
-                    raw_transport_event: None,
-                    error: None,
-                    tool_name: Some("routing.pipeline.set".into()),
-                    arguments: None,
-                    final_reply_to: Some(payload.final_reply_to),
-                    final_reply_role: Some(payload.final_reply_role),
-                    final_reply_guest_id: payload.final_reply_guest_id,
-                    ..Default::default()
-                })
-                .await
-            }
-
-            // ── routing.pipeline.remove ──────────────────────────────────────
-            "routing.pipeline.remove" => {
-                let args = payload.arguments.as_object();
-                let rule_id = args
-                    .and_then(|a| a.get("rule_id"))
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
-
-                let result_text = match self
-                    .ipc_client
-                    .send_request(IpcRequest::RemoveRoutingPipelineRule {
-                        agent_id: self.agent_id.clone(),
-                        rule_id: rule_id.clone(),
-                    })
-                    .await
-                {
-                    Ok(IpcResponse::Standard {
-                        ok: true, message, ..
-                    }) => message,
-                    Ok(IpcResponse::Standard {
-                        ok: false, message, ..
-                    }) => {
-                        format!("routing.pipeline.remove: hotel rejected — {message}")
-                    }
-                    Ok(_) => "routing.pipeline.remove: unexpected response from hotel.".into(),
-                    Err(e) => format!("routing.pipeline.remove: IPC error — {e}"),
-                };
-
-                self.handle_tool_result(InboundTaskPayload {
-                    action: Some("tool_result".into()),
-                    agent_action: None,
-                    handoff_bundle: None,
-                    source: Some("agent".into()),
-                    session_id: Some(payload.session_id),
-                    turn_id: Some(payload.turn_id),
-                    transport: None,
-                    chat_id: Some(payload.chat_id),
-                    thread_id: None,
-                    sender_id: None,
-                    sender_username: None,
-                    message_kind: None,
-                    content: Some(result_text),
-                    attachments: Vec::new(),
-                    command: None,
-                    callback_data: None,
-                    raw_transport_event: None,
-                    error: None,
-                    tool_name: Some("routing.pipeline.remove".into()),
-                    arguments: None,
-                    final_reply_to: Some(payload.final_reply_to),
-                    final_reply_role: Some(payload.final_reply_role),
-                    final_reply_guest_id: payload.final_reply_guest_id,
-                    ..Default::default()
-                })
-                .await
-            }
-
-            // ── routing.pipeline.get ─────────────────────────────────────────
-            "routing.pipeline.get" => {
-                let args = payload.arguments.as_object();
-                let filter_id = args
-                    .and_then(|a| a.get("rule_id"))
-                    .and_then(|v| v.as_str())
-                    .map(str::to_string);
-
-                let result_text = match self
-                    .ipc_client
-                    .send_request(IpcRequest::GetRoutingPipelineRules {
-                        agent_id: self.agent_id.clone(),
-                        rule_id: filter_id,
-                    })
-                    .await
-                {
-                    Ok(IpcResponse::RoutingPipelineRules { pipeline_rules }) => {
-                        serde_json::to_string_pretty(&pipeline_rules)
-                            .unwrap_or_else(|_| "[]".into())
-                    }
-                    Ok(IpcResponse::Standard {
-                        ok: true, message, ..
-                    }) => message,
-                    Ok(_) => "routing.pipeline.get: unexpected response from hotel.".into(),
-                    Err(e) => format!("routing.pipeline.get: IPC error — {e}"),
-                };
-
-                self.handle_tool_result(InboundTaskPayload {
-                    action: Some("tool_result".into()),
-                    agent_action: None,
-                    handoff_bundle: None,
-                    source: Some("agent".into()),
-                    session_id: Some(payload.session_id),
-                    turn_id: Some(payload.turn_id),
-                    transport: None,
-                    chat_id: Some(payload.chat_id),
-                    thread_id: None,
-                    sender_id: None,
-                    sender_username: None,
-                    message_kind: None,
-                    content: Some(result_text),
-                    attachments: Vec::new(),
-                    command: None,
-                    callback_data: None,
-                    raw_transport_event: None,
-                    error: None,
-                    tool_name: Some("routing.pipeline.get".into()),
-                    arguments: None,
-                    final_reply_to: Some(payload.final_reply_to),
-                    final_reply_role: Some(payload.final_reply_role),
-                    final_reply_guest_id: payload.final_reply_guest_id,
-                    ..Default::default()
-                })
-                .await
-            }
-
-            // ── desktop.observe ──────────────────────────────────────────────
-            "desktop.observe" => {
-                // Observe-only: returns desktop runner metadata. No screenshot or interaction.
-                // A real desktop guest is not required — this tool describes what would be observed.
-                let result_text = serde_json::json!({
-                    "status": "no_desktop_guest",
-                    "message": "No desktop guest is currently materialised on this hotel. \
-                                Desktop observation requires a desktop runner guest to be active.",
-                    "tool": "desktop.observe",
-                })
-                .to_string();
-
-                self.handle_tool_result(InboundTaskPayload {
-                    action: Some("tool_result".into()),
-                    agent_action: None,
-                    handoff_bundle: None,
-                    source: Some("agent".into()),
-                    session_id: Some(payload.session_id),
-                    turn_id: Some(payload.turn_id),
-                    transport: None,
-                    chat_id: Some(payload.chat_id),
-                    thread_id: None,
-                    sender_id: None,
-                    sender_username: None,
-                    message_kind: None,
-                    content: Some(result_text),
-                    attachments: Vec::new(),
-                    command: None,
-                    callback_data: None,
-                    raw_transport_event: None,
-                    error: None,
-                    tool_name: Some("desktop.observe".into()),
-                    arguments: None,
-                    final_reply_to: Some(payload.final_reply_to),
-                    final_reply_role: Some(payload.final_reply_role),
-                    final_reply_guest_id: payload.final_reply_guest_id,
-                    ..Default::default()
-                })
-                .await
-            }
-
-            other => {
-                self.fail_active_turn(
-                    payload.session_id,
-                    payload.turn_id,
-                    format!("Agent-local tool {} is not implemented", other),
-                )
-                .await
-            }
-        }
     }
 
     /// Executes a shell command via `sh -c`, capturing stdout/stderr and enforcing a timeout.
@@ -15900,18 +6644,77 @@ impl AgentRuntime {
     /// effective_toolset, effective_skillset, and component routing into the live session state.
     /// This ensures tool grants and runtime routing changes take effect immediately on the next
     /// message without requiring a session restart or reconnect.
-    async fn refresh_bindings_from_snapshot(&mut self, session_id: &str) {
-        let response = match tokio::time::timeout(
-            Duration::from_secs(10),
-            self.ipc_client.send_request(IpcRequest::GetConfig {
-                key: format!("__session_snapshot__:{session_id}"),
-            }),
-        )
-        .await
+    /// Refresh the projected upstream MCP tool cache from the hotel and apply
+    /// it to every live session (proposal mcp-client-fabric). Sessions whose
+    /// projection changed get their tool assembly rebuilt, so revoked
+    /// upstreams disappear and newly reported catalogs appear.
+    pub(crate) async fn refresh_mcp_upstream_projection(&mut self) {
+        let entries = match self
+            .ipc_client
+            .send_request_with_timeout(IpcRequest::GetMcpUpstreams {}, Duration::from_secs(5))
+            .await
         {
-            Ok(result) => result,
-            Err(_) => return, // timeout — skip the bindings refresh
+            Ok(IpcResponse::McpUpstreamsState { mcp_upstreams }) => mcp_upstreams,
+            Ok(_) => return,
+            Err(e) => {
+                warn!("refresh_mcp_upstream_projection: GetMcpUpstreams failed: {e}");
+                return;
+            }
         };
+
+        let mut projected = Vec::new();
+        for entry in entries {
+            let cfg = entry.config;
+            let granted = cfg.owner_agent_id == self.agent_id
+                || cfg.grant_agents.iter().any(|a| a == &self.agent_id);
+            if !granted {
+                continue;
+            }
+            let Some(catalog) = entry.catalog else {
+                continue;
+            };
+            for tool in catalog.tools {
+                projected.push(crate::session::McpUpstreamToolBinding {
+                    upstream_id: cfg.upstream_id.clone(),
+                    remote_name: tool.remote_name,
+                    description: tool.description,
+                    input_schema: tool.input_schema,
+                });
+            }
+        }
+
+        self.mcp_upstream_tools = projected;
+        let cache = self.mcp_upstream_tools.clone();
+        for state in self.sessions.values_mut() {
+            if state.bindings.mcp_upstream_tools != cache {
+                state.bindings.mcp_upstream_tools = cache.clone();
+                state.rebuild_default_tool_assembly();
+            }
+        }
+    }
+
+    /// Copy the cached upstream projection into one session's bindings if it
+    /// drifted (e.g. a session restored from a pre-projection checkpoint).
+    fn apply_mcp_upstream_projection(&mut self, session_id: &str) {
+        let cache = self.mcp_upstream_tools.clone();
+        if let Some(state) = self.sessions.get_mut(session_id) {
+            if state.bindings.mcp_upstream_tools != cache {
+                state.bindings.mcp_upstream_tools = cache;
+                state.rebuild_default_tool_assembly();
+            }
+        }
+    }
+
+    async fn refresh_bindings_from_snapshot(&mut self, session_id: &str) {
+        let response = self
+            .ipc_client
+            .send_request_with_timeout(
+                IpcRequest::GetConfig {
+                    key: format!("__session_snapshot__:{session_id}"),
+                },
+                Duration::from_secs(10),
+            )
+            .await;
 
         let snapshot = match response {
             Ok(IpcResponse::ConfigData {
@@ -15982,6 +6785,7 @@ impl AgentRuntime {
         fallback_source: &str,
     ) -> Result<()> {
         if self.sessions.contains_key(session_id) {
+            self.apply_mcp_upstream_projection(session_id);
             return Ok(());
         }
 
@@ -15996,16 +6800,16 @@ impl AgentRuntime {
                 None => format!("__session_snapshot__:{session_id}"),
             }
         };
-        let response = match tokio::time::timeout(
-            Duration::from_secs(15),
-            self.ipc_client
-                .send_request(IpcRequest::GetConfig { key: snapshot_key }),
-        )
-        .await
+        let response = match self
+            .ipc_client
+            .send_request_with_timeout(
+                IpcRequest::GetConfig { key: snapshot_key },
+                Duration::from_secs(15),
+            )
+            .await
         {
-            Ok(Ok(r)) => r,
-            Ok(Err(e)) => return Err(e),
-            Err(_) => {
+            Ok(r) => r,
+            Err(e) if is_ipc_timeout(&e) => {
                 warn!(
                     session_id = %session_id,
                     "ensure_session_loaded: GetConfig timed out after 15s — starting fresh session"
@@ -16015,6 +6819,7 @@ impl AgentRuntime {
                     value_json: None,
                 }
             }
+            Err(e) => return Err(e),
         };
 
         if let IpcResponse::ConfigData {
@@ -16103,8 +6908,22 @@ impl AgentRuntime {
                         {
                             state.settings.execution.iteration_cap = cap.clamp(1, 50);
                         }
+                        if let Some(tlc) = state
+                            .role_activation
+                            .as_ref()
+                            .and_then(|ra| ra.turn_loop_config.clone())
+                        {
+                            state.settings.execution.apply_paracrine_overrides(&tlc);
+                            // Load-time re-derivation: apply the restored role's
+                            // context-window overrides directly (no baseline
+                            // snapshot — this is base derivation, not a return).
+                            if let Some(ov) = tlc.context_window.as_ref() {
+                                state.settings.context_window.apply_overrides(ov);
+                            }
+                        }
 
                         self.sessions.insert(session_id.to_string(), state);
+                        self.apply_mcp_upstream_projection(session_id);
                         return Ok(());
                     }
                 }
@@ -16124,8 +6943,15 @@ impl AgentRuntime {
         // Auto-activate the agent's default role incarnation on fresh sessions so the
         // correct manifest, toolset, and skill guidance are present from turn zero
         // without requiring an explicit handoff.to_role call.
-        if let Some(ref default_role) = self.default_agent_profile.default_role_name.clone() {
-            if let Some(activation) = self.fetch_role_activation(default_role).await {
+        let default_role = self
+            .default_agent_profile
+            .default_role_name
+            .clone()
+            .filter(|role| !role.trim().is_empty())
+            .unwrap_or_else(|| "orchestrator".into());
+        {
+            if let Some(activation) = self.fetch_role_activation(&default_role).await {
+                let toolset_profile_ref = activation.toolset_profile_ref.clone();
                 if let Some(cap) = activation
                     .turn_loop_config
                     .as_ref()
@@ -16133,7 +6959,24 @@ impl AgentRuntime {
                 {
                     state.settings.execution.iteration_cap = cap.clamp(1, 50);
                 }
+                if let Some(tlc) = activation.turn_loop_config.as_ref() {
+                    state.settings.execution.apply_paracrine_overrides(tlc);
+                }
+                // Fresh-session default-role activation is base derivation: apply
+                // the default role's context-window overrides directly, without a
+                // baseline snapshot, so they define the session's own default.
+                if let Some(ov) = activation
+                    .turn_loop_config
+                    .as_ref()
+                    .and_then(|c| c.context_window.as_ref())
+                {
+                    state.settings.context_window.apply_overrides(ov);
+                }
                 state.role_activation = Some(activation);
+                if let Some(profile_name) = toolset_profile_ref.as_deref() {
+                    self.hydrate_bindings_from_toolset_profile(&mut state, profile_name)
+                        .await;
+                }
                 info!(
                     session_id = %session_id,
                     role = %default_role,
@@ -16143,6 +6986,7 @@ impl AgentRuntime {
         }
 
         self.sessions.insert(session_id.to_string(), state);
+        self.apply_mcp_upstream_projection(session_id);
         Ok(())
     }
 
@@ -16154,15 +6998,16 @@ impl AgentRuntime {
         agent_id: &str,
         state: &mut SessionState,
     ) {
-        match tokio::time::timeout(
-            Duration::from_secs(5),
-            ipc_client.send_request(IpcRequest::ListRules {
-                agent_id: agent_id.to_string(),
-            }),
-        )
-        .await
+        match ipc_client
+            .send_request_with_timeout(
+                IpcRequest::ListRules {
+                    agent_id: agent_id.to_string(),
+                },
+                Duration::from_secs(5),
+            )
+            .await
         {
-            Ok(Ok(IpcResponse::RuleList { rules })) => {
+            Ok(IpcResponse::RuleList { rules }) => {
                 state.rules = rules;
             }
             Ok(_) | Err(_) => {
@@ -16192,6 +7037,30 @@ impl AgentRuntime {
             .sync_apartment(&self.agent_id, "short", merged_index)
             .await?;
         Ok(())
+    }
+
+    /// Best-effort push of a turn-level failure event into the hotel's
+    /// self-heal queue (turn-failure heal intake). Used for failures only the
+    /// agent loop can see: watchdog evictions (`stuck_turn_evicted:{phase}`),
+    /// fallback-ladder exhaustion (`fallback_exhausted:{last_provider}`), and
+    /// paracrine budget breaches (`paracrine_budget_exhausted`).
+    ///
+    /// Never fails the caller — heal intake is diagnostics, not control flow.
+    /// An older hotel that does not know `PushHealEvent` answers with an
+    /// error (or drops the frame); both are swallowed here.
+    pub(crate) async fn push_heal_event(&mut self, pattern_tag: &str, detail: &str) {
+        let request = IpcRequest::PushHealEvent {
+            guest_id: self.agent_id.clone(),
+            severity: "medium".into(),
+            pattern_tag: pattern_tag.to_string(),
+            detail: detail.to_string(),
+        };
+        if let Err(e) = self.ipc_client.send_request(request).await {
+            warn!(
+                pattern_tag = %pattern_tag,
+                "heal event push failed (best-effort): {e}"
+            );
+        }
     }
 }
 
@@ -16264,6 +7133,19 @@ async fn run_bash_command(
     use tokio::process::Command;
     use tokio::time::{Duration, timeout};
 
+    // L0 execution safety floor: compiled-in, non-configurable, evaluated
+    // before any approval/session state is consulted and before the shell
+    // is ever spawned. No policy record or `auto_approve_all` can reach
+    // this — see crates/exec-guard for the blocklist and rationale.
+    if let Some(hardline) = exec_guard::detect_hardline(&command) {
+        return Ok(serde_json::json!({
+            "stdout": "",
+            "stderr": hardline.denial_message(),
+            "exit_code": 126,
+            "success": false,
+        }));
+    }
+
     let mut cmd = Command::new("sh");
     cmd.arg("-c").arg(&command);
     cmd.stdout(std::process::Stdio::piped());
@@ -16298,25 +7180,174 @@ async fn run_bash_command(
 #[cfg(test)]
 mod tests {
     use super::{
-        AgentRuntime, DEFAULT_TEXT_MODEL_ROLE, LOCAL_NODE, extract_model_error,
-        extract_model_error_payload, format_role_command_reply, format_roles_report,
-        loop_stop_fallback_reply, loop_stop_reason, media_analysis_attachments,
-        normalized_user_content, parse_memory_candidate, resolve_media_routing,
-        resolve_model_execution_target, should_attempt_provider_repair,
+        AgentRuntime, CachedRoleConfig, DEFAULT_TEXT_MODEL_ROLE, LOCAL_NODE,
+        MAX_ORACLE_EXTRA_TIERS, NoResponseAction, NoResponseClass, ProviderErrorClass,
+        STREAK_CAP_CEILING, classify_provider_error, cognitive_response_contract,
+        context_pressure_pct_from_projection, decide_no_response_action, effective_iteration_cap,
+        extract_model_error, extract_model_error_payload, format_role_command_reply,
+        format_roles_report, loop_stop_fallback_reply, loop_stop_reason,
+        media_analysis_attachments, next_ladder_tier, normalized_user_content,
+        parse_memory_candidate, pick_oracle_role, primary_dispatch_used_ladder, provider_for_role,
+        resolve_media_routing, resolve_model_execution_target, role_model_binding,
+        shadow_eligible_capability, should_attempt_provider_repair, tool_step_earns_streak,
     };
     use crate::commands::SlashCommand;
-    use crate::r#loop::{ApprovalRequest, ToolCall, ToolResult, TurnPhase};
+    use crate::r#loop::{ApprovalRequest, PlanProposalAction, ToolCall, ToolResult, TurnPhase};
     use crate::protocol::{
         FinalReplyPayload, InboundTaskPayload, ModelRequestPayload, TransportAttachment,
     };
+    use crate::reflex::ReflexEvent;
     use crate::session::{
-        ApprovalPolicy, ComponentExecutionRoute, ComponentRouteAssembly, ComponentRouteBinding,
-        ResponseRouteMode, SessionState, WorkingTurn,
+        ActivePlan, ApprovalPolicy, CarryoverPlan, ComponentExecutionRoute, ComponentRouteAssembly,
+        ComponentRouteBinding, FallbackOverride, PlanStep, ResponseRouteMode, RoleActivation,
+        SelectionSource, SessionState, WorkingTurn,
     };
     use philotic_client::{TaskErrorPayload, UserProfileDataPayload};
     use uuid::Uuid;
 
-    fn test_working_turn(phase: TurnPhase) -> WorkingTurn {
+    // ── Routing-oracle helpers ────────────────────────────────────────────
+
+    #[test]
+    fn provider_for_role_inverts_hotel_seeding() {
+        assert_eq!(provider_for_role("model").as_deref(), Some("gemini"));
+        assert_eq!(provider_for_role("model.local").as_deref(), Some("onnx"));
+        assert_eq!(
+            provider_for_role("model.anthropic").as_deref(),
+            Some("anthropic")
+        );
+        assert_eq!(
+            provider_for_role("model.openrouter").as_deref(),
+            Some("openrouter")
+        );
+        assert_eq!(provider_for_role("tool"), None);
+    }
+
+    #[test]
+    fn pick_oracle_role_skips_roles_already_in_the_ladder() {
+        let data = serde_json::json!({
+            "ranked": [
+                { "role": "model", "provider": "gemini", "score": 0.9 },
+                { "role": "model.anthropic", "provider": "anthropic", "score": 0.8 },
+                { "role": "model.openrouter", "provider": "openrouter", "score": 0.7 }
+            ]
+        });
+        let tried: std::collections::HashSet<String> =
+            ["model".to_string(), "model.local".to_string()].into();
+        let (role, provider) = pick_oracle_role(&data, &tried).expect("pick");
+        assert_eq!(role, "model.anthropic");
+        assert_eq!(provider, "anthropic");
+    }
+
+    #[test]
+    fn pick_oracle_role_none_when_all_options_tried_or_empty() {
+        let tried: std::collections::HashSet<String> = ["model.anthropic".to_string()].into();
+        let data = serde_json::json!({
+            "ranked": [ { "role": "model.anthropic", "provider": "anthropic", "score": 0.8 } ]
+        });
+        assert!(pick_oracle_role(&data, &tried).is_none());
+        assert!(pick_oracle_role(&serde_json::json!({ "ranked": [] }), &tried).is_none());
+        assert!(pick_oracle_role(&serde_json::json!({}), &tried).is_none());
+    }
+
+    #[test]
+    fn pick_oracle_role_tolerates_malformed_entries() {
+        // Entries missing role are skipped, not fatal; missing provider
+        // degrades to "unknown".
+        let data = serde_json::json!({
+            "ranked": [
+                { "provider": "gemini", "score": 0.9 },
+                { "role": "model.openai", "score": 0.7 }
+            ]
+        });
+        let tried = std::collections::HashSet::new();
+        let (role, provider) = pick_oracle_role(&data, &tried).expect("pick");
+        assert_eq!(role, "model.openai");
+        assert_eq!(provider, "unknown");
+    }
+
+    #[test]
+    fn shadow_eligible_capability_fires_only_on_cognitive_text() {
+        // (a) The cognitive text-generation dispatch — the same class slice 1
+        // instruments in turn_loop — is shadow-eligible. Firing here makes a
+        // first-turn cognitive dispatch stamp oracle_pick/agreement onto the
+        // outgoing task (recorded downstream by the model-router trace store,
+        // proven by from_task_threads_agent_id_and_shadow_into_recorded_trace).
+        assert!(shadow_eligible_capability("text.generate"));
+        assert!(shadow_eligible_capability("response.generate"));
+    }
+
+    #[test]
+    fn shadow_eligible_capability_excludes_aux_transform_tasks() {
+        // (b) The aux/transform tasks the first-turn dispatch also multiplexes
+        // must NEVER be compared against the oracle — they don't ride the text
+        // fallback ladder. These are the exact capability strings produced by
+        // resolve_media_routing / action_to_capability at this site.
+        for aux in [
+            "voice.transcribe",
+            "media.analyze",
+            "image.describe",
+            "document.summarize",
+            "voice.synthesize",
+        ] {
+            assert!(
+                !shadow_eligible_capability(aux),
+                "aux capability {aux} must be excluded from shadow-oracle logging"
+            );
+        }
+    }
+
+    #[test]
+    fn oracle_extra_tier_budget_bounds_reroutes() {
+        // The consult gate: current_tier >= max_tier + MAX_ORACLE_EXTRA_TIERS
+        // stops further oracle dispatches. With a 1-tier ladder (max_tier 0)
+        // and the default budget of 2, tiers 0 and 1 may consult; tier 2 may
+        // not.
+        let max_tier: u8 = 0;
+        assert!(0 < max_tier.saturating_add(MAX_ORACLE_EXTRA_TIERS));
+        assert!(1 < max_tier.saturating_add(MAX_ORACLE_EXTRA_TIERS));
+        assert!(2 >= max_tier.saturating_add(MAX_ORACLE_EXTRA_TIERS));
+    }
+
+    #[test]
+    fn no_response_table_matches_pre_slice_behavior() {
+        // Pre-slice: both the provider-failure path and the WaitingModel watchdog
+        // funnel through advance_turn_to_next_fallback_tier, which escalates while
+        // a tier remains and fails (evicts) only when the last tier is exhausted —
+        // identical for both failure classes.
+        for class in [
+            NoResponseClass::ProviderFailure,
+            NoResponseClass::WatchdogTimeout,
+        ] {
+            assert_eq!(
+                decide_no_response_action(class, true),
+                NoResponseAction::EscalateTier,
+                "{class:?} with a tier remaining must escalate"
+            );
+            assert_eq!(
+                decide_no_response_action(class, false),
+                NoResponseAction::EvictTurn,
+                "{class:?} with no tier remaining must evict"
+            );
+        }
+    }
+
+    #[test]
+    fn cognitive_response_contract_carries_memory_candidate_policy() {
+        let contract = cognitive_response_contract(&["spoken_text", "memory_candidate"]);
+
+        assert_eq!(
+            contract["channels"],
+            serde_json::json!(["spoken_text", "memory_candidate"])
+        );
+        let policy = contract["memory_candidate_policy"]
+            .as_str()
+            .expect("memory candidate policy should be present");
+        assert!(policy.contains("durable future-useful context"));
+        assert!(policy.contains("readiness/status chatter"));
+        assert!(policy.contains("24-700 characters"));
+    }
+
+    pub(super) fn test_working_turn(phase: TurnPhase) -> WorkingTurn {
         WorkingTurn {
             task_id: Uuid::nil(),
             turn_id: "turn-1".into(),
@@ -16334,6 +7365,7 @@ mod tests {
             recalled_memories: Vec::new(),
             active_plan: None,
             consecutive_step_failures: 0,
+            streak_extension: 0,
             provider_repair_note: None,
             provider_repair_attempts: 0,
             pending_text_reply: None,
@@ -16349,7 +7381,12 @@ mod tests {
             plan_confirmed: false,
             plan_confirm_note: None,
             fallback_tier: 0,
+            ladder_tier0_dispatched: false,
             streaming_retry_attempts: 0,
+            streamed_content: String::new(),
+            paracrine_hop_count: 0,
+            paracrine_chain_started_at: None,
+            selection_source: SelectionSource::default(),
         }
     }
 
@@ -16365,6 +7402,77 @@ mod tests {
             },
         ));
         turn.iteration += 1;
+    }
+
+    #[test]
+    fn tool_step_earns_streak_only_for_novel_successful_work() {
+        let mut turn = test_working_turn(TurnPhase::WaitingModel);
+        let call = |name: &str, args: serde_json::Value| ToolCall {
+            tool_name: name.into(),
+            arguments: args,
+        };
+        let ok = |name: &str| ToolResult {
+            tool_name: name.into(),
+            content: "ok".into(),
+        };
+        let observe_a = call("life.observe", serde_json::json!({"observation_id": "a"}));
+
+        // Novel successful work earns.
+        assert!(tool_step_earns_streak(
+            &turn,
+            &observe_a,
+            &ok("life.observe"),
+            false
+        ));
+        // A failed step never earns.
+        assert!(!tool_step_earns_streak(
+            &turn,
+            &observe_a,
+            &ok("life.observe"),
+            true
+        ));
+        // Diagnostic/status tools never earn — they are the loop signature.
+        assert!(!tool_step_earns_streak(
+            &turn,
+            &call("hotel.status", serde_json::json!({})),
+            &ok("hotel.status"),
+            false
+        ));
+        // Skipped duplicates never earn.
+        let dup = ToolResult {
+            tool_name: "life.observe".into(),
+            content: "[Duplicate call skipped] identical call already ran".into(),
+        };
+        assert!(!tool_step_earns_streak(&turn, &observe_a, &dup, false));
+
+        // An identical repeat of a prior call never earns; new arguments do.
+        turn.working_tool_history
+            .push((observe_a.clone(), ok("life.observe")));
+        assert!(!tool_step_earns_streak(
+            &turn,
+            &observe_a,
+            &ok("life.observe"),
+            false
+        ));
+        assert!(tool_step_earns_streak(
+            &turn,
+            &call("life.observe", serde_json::json!({"observation_id": "b"})),
+            &ok("life.observe"),
+            false
+        ));
+    }
+
+    #[test]
+    fn effective_iteration_cap_adds_streak_and_respects_ceiling() {
+        let mut turn = test_working_turn(TurnPhase::WaitingModel);
+        assert_eq!(effective_iteration_cap(10, &turn), 10);
+        turn.streak_extension = 5;
+        assert_eq!(effective_iteration_cap(10, &turn), 15);
+        turn.streak_extension = 100;
+        assert_eq!(effective_iteration_cap(10, &turn), STREAK_CAP_CEILING);
+        // A configured cap already at the ceiling is honoured unchanged —
+        // the extension only adds headroom below it, never shrinks.
+        assert_eq!(effective_iteration_cap(50, &turn), 50);
     }
 
     #[test]
@@ -16433,17 +7541,23 @@ mod tests {
             response_contract: None,
             response_route: Some("text_only".into()),
             ligand: None,
+            model: None,
             provider_options: serde_json::Map::new(),
             chat_id: "123".into(),
             reply_to: LOCAL_NODE.into(),
             reply_role: "agent".into(),
+            reply_guest_id: None,
             final_reply_to: LOCAL_NODE.into(),
             final_reply_role: "membrane".into(),
             final_reply_guest_id: None,
+            agent_id: Some("jane".into()),
+            oracle_pick: None,
+            oracle_agreement: None,
         };
 
         let json = serde_json::to_value(&request).expect("serialize request");
         assert_eq!(json["reply_role"], "agent");
+        assert_eq!(json["agent_id"], "jane");
         assert_eq!(json["final_reply_role"], "membrane");
         assert_eq!(json["request_class"], "cognitive");
         assert_eq!(json["response_route"], "text_only");
@@ -16451,6 +7565,61 @@ mod tests {
         assert_eq!(
             json["context_projection"]["conversation_turn"]["conversation_turn_id"],
             "turn-1"
+        );
+    }
+
+    #[test]
+    fn context_pressure_pct_from_projection_reads_the_field_runtime_depends_on() {
+        // Pins the exact JSON field name + clamping behavior that
+        // handle_user_message's turn-assembly call site depends on to fire
+        // the live ReflexEvent::ContextPressure producer. If the field is
+        // renamed or removed on the session-side producer, this fails
+        // instead of the runtime call silently becoming a permanent no-op.
+        let present = serde_json::json!({"context_pressure_pct": 87});
+        assert_eq!(context_pressure_pct_from_projection(&present), Some(87));
+
+        let missing = serde_json::json!({"other_field": 1});
+        assert_eq!(context_pressure_pct_from_projection(&missing), None);
+
+        let wrong_type = serde_json::json!({"context_pressure_pct": "87"});
+        assert_eq!(context_pressure_pct_from_projection(&wrong_type), None);
+
+        // Assembly already clamps to 100 (session/mod.rs), but the runtime-side
+        // read clamps too, defense in depth against a future producer regression.
+        let over_100 = serde_json::json!({"context_pressure_pct": 150});
+        assert_eq!(context_pressure_pct_from_projection(&over_100), Some(100));
+    }
+
+    #[test]
+    fn context_pressure_projection_to_emit_path_fires_reflex_through_the_runtime_extractor() {
+        // Integration-style coverage of the exact path handle_user_message
+        // drives at its turn-assembly call site: build a real
+        // ContextProjection through SessionState, serialize it the same way
+        // model_request_payloads does, extract used_pct with the same
+        // runtime.rs helper the live call site uses, then fire the reflex
+        // event and assert the known downstream effect. This fails if either
+        // the field name drifts or the runtime extraction/emit wiring is
+        // removed — not just a data-structure assertion.
+        let mut state =
+            SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
+        state
+            .agent_profile
+            .media_routing_policy
+            .strip_tools_on_media = false;
+        state.settings.injection_budget.total_envelope_chars = 1;
+
+        let (_, _, context_projection) = state.model_request_payloads("hello", &[]);
+        let used_pct = context_pressure_pct_from_projection(&context_projection)
+            .expect("runtime.rs call site expects this field to be present");
+        assert_eq!(used_pct, 100);
+
+        state.fire_reflex_event(ReflexEvent::ContextPressure { used_pct });
+        assert!(
+            state
+                .agent_profile
+                .media_routing_policy
+                .strip_tools_on_media,
+            "the runtime.rs extractor -> fire_reflex_event path should trip the reflex.rs:460 media-strip handler exactly like the live call site does"
         );
     }
 
@@ -16494,6 +7663,325 @@ mod tests {
         assert_eq!(super::implementation_to_model_role("onnx"), "model.local");
     }
 
+    /// Implementation-mapping matrix (defect 3): openrouter (and other
+    /// non-enumerated providers) must get their own dedicated role instead of
+    /// collapsing onto the gemini default — mirrors the hotel-side
+    /// `component_implementation_to_role` (ipc.rs).
+    #[test]
+    fn implementation_mapping_matrix_covers_openrouter_and_passthrough() {
+        assert_eq!(
+            super::implementation_to_model_role("openrouter"),
+            "model.openrouter"
+        );
+        assert_eq!(
+            super::implementation_to_model_role("openrouter/anthropic/claude-3"),
+            "model.openrouter"
+        );
+        // Already role-shaped values pass through unchanged (case-insensitively).
+        assert_eq!(
+            super::implementation_to_model_role("model.openrouter"),
+            "model.openrouter"
+        );
+        assert_eq!(
+            super::implementation_to_model_role("MODEL.OpenRouter"),
+            "model.openrouter"
+        );
+        // Any other known provider name also gets a dedicated role.
+        assert_eq!(
+            super::implementation_to_model_role("openai"),
+            "model.openai"
+        );
+        assert_eq!(
+            super::implementation_to_model_role("anthropic"),
+            "model.anthropic"
+        );
+        // gemini still maps to the plain default role.
+        assert_eq!(super::implementation_to_model_role("gemini"), "model");
+    }
+
+    // ── Ladder-primary precedence matrix (defect 1) ──────────────────────────
+
+    fn role_activation_with_ladder(tiers: &[&str]) -> RoleActivation {
+        RoleActivation {
+            role_name: "researcher".into(),
+            activation_reason: "test".into(),
+            turn_loop_config: Some(ansible_mesh_core::graph::TurnLoopConfig {
+                fallback_tiers: tiers.iter().map(|t| t.to_string()).collect(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    /// Explicit hotel execution route always wins, even with a ladder
+    /// configured.
+    #[test]
+    fn ladder_precedence_hotel_route_wins_over_ladder() {
+        let mut state =
+            SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
+        state.role_activation = Some(role_activation_with_ladder(&["model.openrouter"]));
+        state.component_route_assembly = ComponentRouteAssembly {
+            execution_routes: std::collections::BTreeMap::from([(
+                "text.generate".into(),
+                ComponentExecutionRoute {
+                    target_node: "aria-node".into(),
+                    target_role: "model".into(),
+                    incarnation_id: None,
+                    hotel_id: Some("aria-architect-hotel".into()),
+                    environment_id: None,
+                    execution_mode: "capability".into(),
+                    availability_state: "live".into(),
+                    selection_reason: Some("remote_latency_capacity".into()),
+                    target_capability: None,
+                    explicit_pin: false,
+                },
+            )]),
+        };
+
+        let target =
+            resolve_model_execution_target(Some(&state), "text.generate", DEFAULT_TEXT_MODEL_ROLE);
+        assert_eq!(target.0, "aria-node");
+        assert_eq!(target.1, "model");
+    }
+
+    /// Reversed by the routing drill 2026-07-09 fix: `effective_model_controller`
+    /// is a legacy fallback (see its `[legacy]` label in
+    /// `component_route_summary`), not a genuine per-session pin. A
+    /// configured role ladder is the intended per-agent primary-model lever
+    /// and must now win over a stale `effective_model_controller`, not sit
+    /// below it — this was proven live on mbp-jane (Jane's
+    /// `fallback_tiers[0]=model.openrouter` was silently losing to a stale
+    /// controller binding). Previously this test asserted the opposite
+    /// ("model.elevenlabs" wins); see `ladder_precedence_ladder_wins_over_hotel_default_route`
+    /// and `ladder_precedence_explicit_pin_hotel_route_still_wins_locally`
+    /// below for the full precedence matrix this change preserves.
+    #[test]
+    fn ladder_precedence_ladder_beats_legacy_effective_model_controller() {
+        let mut state =
+            SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
+        state.role_activation = Some(role_activation_with_ladder(&["model.openrouter"]));
+        state.bindings.effective_model_controller = Some("elevenlabs".into());
+
+        let target =
+            resolve_model_execution_target(Some(&state), "text.generate", DEFAULT_TEXT_MODEL_ROLE);
+        assert_eq!(target.0, LOCAL_NODE.to_string());
+        assert_eq!(
+            target.1, "model.openrouter",
+            "a configured ladder must beat the legacy effective_model_controller fallback"
+        );
+    }
+
+    /// A role with NO configured ladder still honors `effective_model_controller`
+    /// as a legacy fallback — this mechanism isn't removed, only demoted
+    /// below the ladder when one is configured.
+    #[test]
+    fn ladder_precedence_legacy_effective_model_controller_still_applies_without_ladder() {
+        let mut state =
+            SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
+        state.bindings.effective_model_controller = Some("elevenlabs".into());
+
+        let target =
+            resolve_model_execution_target(Some(&state), "text.generate", DEFAULT_TEXT_MODEL_ROLE);
+        assert_eq!(target.0, LOCAL_NODE.to_string());
+        assert_eq!(target.1, "model.elevenlabs");
+    }
+
+    /// Regression (routing drill 2026-07-09): production always populates a
+    /// hotel-computed `text.generate` execution route (aiua's
+    /// `compose_component_route_assembly` — `declared_component_capabilities`
+    /// unconditionally includes "text.generate", and `select_component_route`
+    /// always returns a route, defaulting to "model"/gemini when nothing is
+    /// explicitly pinned). Before this fix, that implicit-default route —
+    /// `selection_reason: "live_local_fallback"`, `explicit_pin: false` —
+    /// silently outranked every agent's ladder for the *primary* dispatch,
+    /// making `fallback_tiers[0]` dead in production even though the bare
+    /// `ladder_precedence_tiers_zero_used_when_set` fixture (no hotel route
+    /// at all) passed.
+    #[test]
+    fn ladder_precedence_ladder_wins_over_hotel_default_route() {
+        let mut state =
+            SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
+        state.role_activation = Some(role_activation_with_ladder(&["model.openrouter"]));
+        state.component_route_assembly = ComponentRouteAssembly {
+            execution_routes: std::collections::BTreeMap::from([(
+                "text.generate".into(),
+                ComponentExecutionRoute {
+                    target_node: LOCAL_NODE.into(),
+                    target_role: "model".into(),
+                    incarnation_id: None,
+                    hotel_id: Some(LOCAL_NODE.into()),
+                    environment_id: None,
+                    execution_mode: "capability".into(),
+                    availability_state: "live".into(),
+                    selection_reason: Some("live_local_fallback".into()),
+                    target_capability: None,
+                    explicit_pin: false,
+                },
+            )]),
+        };
+
+        let target =
+            resolve_model_execution_target(Some(&state), "text.generate", DEFAULT_TEXT_MODEL_ROLE);
+        assert_eq!(
+            target.1, "model.openrouter",
+            "the role's ladder must govern the primary dispatch when the hotel \
+             route is only its implicit local default, not an explicit pin"
+        );
+    }
+
+    /// A genuine explicit `component_routes` pin (`explicit_pin: true` —
+    /// operator/reflex-set, not the hotel's implicit default) still wins
+    /// over the ladder even when it resolves to a local live guest.
+    #[test]
+    fn ladder_precedence_explicit_pin_hotel_route_still_wins_locally() {
+        let mut state =
+            SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
+        state.role_activation = Some(role_activation_with_ladder(&["model.openrouter"]));
+        state.component_route_assembly = ComponentRouteAssembly {
+            execution_routes: std::collections::BTreeMap::from([(
+                "text.generate".into(),
+                ComponentExecutionRoute {
+                    target_node: LOCAL_NODE.into(),
+                    target_role: "model.elevenlabs".into(),
+                    incarnation_id: None,
+                    hotel_id: Some(LOCAL_NODE.into()),
+                    environment_id: None,
+                    execution_mode: "capability".into(),
+                    availability_state: "live".into(),
+                    selection_reason: Some("live_local_capability".into()),
+                    target_capability: None,
+                    explicit_pin: true,
+                },
+            )]),
+        };
+
+        let target =
+            resolve_model_execution_target(Some(&state), "text.generate", DEFAULT_TEXT_MODEL_ROLE);
+        assert_eq!(target.1, "model.elevenlabs");
+    }
+
+    /// With no hotel route and no explicit binding, the role ladder's
+    /// `tiers[0]` governs the *primary* dispatch.
+    #[test]
+    fn ladder_precedence_tiers_zero_used_when_set() {
+        let mut state =
+            SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
+        state.role_activation = Some(role_activation_with_ladder(&[
+            "model.openrouter",
+            "model.ollama",
+        ]));
+
+        let target =
+            resolve_model_execution_target(Some(&state), "text.generate", DEFAULT_TEXT_MODEL_ROLE);
+        assert_eq!(target.1, "model.openrouter");
+
+        assert!(primary_dispatch_used_ladder(Some(&state), "text.generate"));
+    }
+
+    /// With no hotel route, no explicit binding, and no configured ladder,
+    /// the plain default text-model role is used.
+    #[test]
+    fn ladder_precedence_default_when_nothing_configured() {
+        let state = SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
+
+        let target =
+            resolve_model_execution_target(Some(&state), "text.generate", DEFAULT_TEXT_MODEL_ROLE);
+        assert_eq!(target.1, DEFAULT_TEXT_MODEL_ROLE);
+        assert!(!primary_dispatch_used_ladder(Some(&state), "text.generate"));
+    }
+
+    // ── Layer 1: per-agent model NAME binding ─────────────────────────────
+
+    fn role_activation_with_ladder_and_bindings(
+        tiers: &[&str],
+        bindings: &[(&str, &str)],
+    ) -> RoleActivation {
+        RoleActivation {
+            role_name: "researcher".into(),
+            activation_reason: "test".into(),
+            turn_loop_config: Some(ansible_mesh_core::graph::TurnLoopConfig {
+                fallback_tiers: tiers.iter().map(|t| t.to_string()).collect(),
+                model_bindings: bindings
+                    .iter()
+                    .map(|(k, v)| (k.to_string(), v.to_string()))
+                    .collect(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    /// `role_model_binding` resolves independently per provider role — the
+    /// core requirement that per-agent model selection covers both the
+    /// primary dispatch AND every fallback tier, not just tier 0.
+    #[test]
+    fn role_model_binding_resolves_per_provider_role() {
+        let mut state =
+            SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
+        state.role_activation = Some(role_activation_with_ladder_and_bindings(
+            &["model.openrouter", "model"],
+            &[
+                ("model.openrouter", "z-ai/glm-5.2"),
+                ("model", "gemini-flash-latest"),
+            ],
+        ));
+
+        assert_eq!(
+            role_model_binding(Some(&state), "model.openrouter").as_deref(),
+            Some("z-ai/glm-5.2")
+        );
+        assert_eq!(
+            role_model_binding(Some(&state), "model").as_deref(),
+            Some("gemini-flash-latest")
+        );
+        // No binding configured for this role — falls through to None so the
+        // caller leaves ModelRequestPayload.model unset (provider global default).
+        assert_eq!(role_model_binding(Some(&state), "model.ollama"), None);
+    }
+
+    #[test]
+    fn role_model_binding_none_without_role_or_bindings() {
+        assert_eq!(role_model_binding(None, "model.openrouter"), None);
+
+        let state = SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
+        assert_eq!(role_model_binding(Some(&state), "model.openrouter"), None);
+    }
+
+    /// End-to-end wiring: `resolve_model_execution_target` resolves the
+    /// provider ROLE, and `role_model_binding` resolves the model NAME for
+    /// that same role — the two compose correctly for the primary dispatch.
+    #[test]
+    fn role_model_binding_composes_with_ladder_primary_dispatch() {
+        let mut state =
+            SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
+        state.role_activation = Some(role_activation_with_ladder_and_bindings(
+            &["model.openrouter"],
+            &[("model.openrouter", "z-ai/glm-5.2")],
+        ));
+
+        let target =
+            resolve_model_execution_target(Some(&state), "text.generate", DEFAULT_TEXT_MODEL_ROLE);
+        assert_eq!(target.1, "model.openrouter");
+        assert_eq!(
+            role_model_binding(Some(&state), &target.1).as_deref(),
+            Some("z-ai/glm-5.2")
+        );
+    }
+
+    /// The ladder is a text-generation construct: a non-text `fallback_role`
+    /// (e.g. voice synthesis) must never consult it, even when one is
+    /// configured.
+    #[test]
+    fn ladder_precedence_does_not_apply_to_non_text_capability() {
+        let mut state =
+            SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
+        state.role_activation = Some(role_activation_with_ladder(&["model.openrouter"]));
+
+        let target =
+            resolve_model_execution_target(Some(&state), "voice.synthesize", "model.elevenlabs");
+        assert_eq!(target.1, "model.elevenlabs");
+    }
+
     #[test]
     fn session_component_route_can_override_text_model_implementation() {
         let mut state =
@@ -16531,6 +8019,7 @@ mod tests {
                     availability_state: "live".into(),
                     selection_reason: Some("remote_latency_capacity".into()),
                     target_capability: None,
+                    explicit_pin: false,
                 },
             )]),
         };
@@ -16542,6 +8031,116 @@ mod tests {
         assert_eq!(
             target.2.as_deref(),
             Some("aria-architect-hotel:model-controller-gemini")
+        );
+    }
+
+    /// The headline Slice 1 routing behavior: `/model <tier>` must not just
+    /// gate fallback escalation, it must actually dispatch there. Verifies
+    /// the `resolve_model_execution_target` choke point directly rather than
+    /// only indirectly through a full turn.
+    #[test]
+    fn operator_pin_routes_text_generation_to_pinned_tier() {
+        let mut state = SessionState::new("s".into(), "a".into(), "telegram".into());
+        state.pinned_tier_role = Some("model.ollama".into());
+
+        let (node, role, incarnation) =
+            resolve_model_execution_target(Some(&state), "text.generate", DEFAULT_TEXT_MODEL_ROLE);
+        assert_eq!(node, LOCAL_NODE);
+        assert_eq!(role, "model.ollama");
+        assert!(incarnation.is_none());
+
+        let (_, role, _) = resolve_model_execution_target(
+            Some(&state),
+            "response.generate",
+            DEFAULT_TEXT_MODEL_ROLE,
+        );
+        assert_eq!(
+            role, "model.ollama",
+            "Gemini Live dispatch honors the pin too"
+        );
+
+        // Scoping guard: a model pin must not hijack unrelated capabilities.
+        state.agent_profile.voice_response_policy.provider = Some("elevenlabs".into());
+        let (_, voice_role, _) =
+            resolve_model_execution_target(Some(&state), "voice.synthesize", "model.local");
+        assert_ne!(
+            voice_role, "model.ollama",
+            "a model tier pin must not affect voice provider routing"
+        );
+    }
+
+    fn test_fallback_override(origin: &str, active: &str) -> FallbackOverride {
+        FallbackOverride {
+            origin_tier_role: origin.into(),
+            active_tier_role: active.into(),
+            reason: "provider_failure".into(),
+            since_epoch_ms: 1_000,
+            last_probe_epoch_ms: 1_000,
+            notice_sent: false,
+        }
+    }
+
+    /// The headline Slice 2 routing behavior: a session degraded by a prior
+    /// escalation must start NEW turns on `active_tier_role`, not re-probe the
+    /// known-bad primary — and clearing the override restores the normal
+    /// resolution chain (ladder primary).
+    #[test]
+    fn fallback_override_routes_new_dispatch_to_active_tier() {
+        let mut state = SessionState::new("s".into(), "a".into(), "telegram".into());
+        state.role_activation = Some(role_activation_with_ladder(&["model", "model.openrouter"]));
+        state.fallback_override = Some(test_fallback_override("model", "model.openrouter"));
+
+        let (node, role, incarnation) =
+            resolve_model_execution_target(Some(&state), "text.generate", DEFAULT_TEXT_MODEL_ROLE);
+        assert_eq!(node, LOCAL_NODE);
+        assert_eq!(
+            role, "model.openrouter",
+            "sticky dispatch to the fallback tier"
+        );
+        assert!(incarnation.is_none());
+
+        let (_, role, _) = resolve_model_execution_target(
+            Some(&state),
+            "response.generate",
+            DEFAULT_TEXT_MODEL_ROLE,
+        );
+        assert_eq!(
+            role, "model.openrouter",
+            "Gemini Live dispatch honors the override too"
+        );
+
+        // Scoping guard: the override must not hijack unrelated capabilities.
+        let (_, voice_role, _) =
+            resolve_model_execution_target(Some(&state), "voice.synthesize", "model.local");
+        assert_ne!(
+            voice_role, "model.openrouter",
+            "a fallback override must not affect voice provider routing"
+        );
+
+        // Cleared override: the next turn resolves back to the origin (the
+        // ladder primary here) through the normal chain.
+        state.fallback_override = None;
+        let (_, role, _) =
+            resolve_model_execution_target(Some(&state), "text.generate", DEFAULT_TEXT_MODEL_ROLE);
+        assert_eq!(
+            role, "model",
+            "clearing the override restores primary resolution"
+        );
+    }
+
+    /// Precedence at the choke point: the operator pin (`/model <tier>`) is
+    /// explicit intent and must beat the automatic fallback override.
+    #[test]
+    fn operator_pin_beats_fallback_override_at_choke_point() {
+        let mut state = SessionState::new("s".into(), "a".into(), "telegram".into());
+        state.fallback_override = Some(test_fallback_override("model", "model.openrouter"));
+        state.pinned_tier_role = Some("model.ollama".into());
+
+        let (_, role, _) =
+            resolve_model_execution_target(Some(&state), "text.generate", DEFAULT_TEXT_MODEL_ROLE);
+        assert_eq!(
+            role, "model.ollama",
+            "the operator pin outranks the fallback override"
         );
     }
 
@@ -16605,6 +8204,7 @@ mod tests {
                     availability_state: "live".into(),
                     selection_reason: None,
                     target_capability: Some("response.generate".into()),
+                    explicit_pin: false,
                 },
             )]),
         };
@@ -16676,6 +8276,8 @@ mod tests {
                 capability: Some("voice.synthesize".into()),
                 retryable: Some(false),
                 sub_kind: None,
+                status: None,
+                error_class: None,
             }),
             ..Default::default()
         };
@@ -16725,6 +8327,8 @@ mod tests {
                 capability: Some("text.generate".into()),
                 retryable: Some(true),
                 sub_kind: None,
+                status: None,
+                error_class: None,
             }),
             ..Default::default()
         };
@@ -16733,57 +8337,6 @@ mod tests {
             extract_model_error_payload(&payload).expect("structured payload should be extracted");
         assert_eq!(error.retryable, Some(true));
         assert_eq!(error.code.as_deref(), Some("MODEL_INVALID_TOOL_CALL"));
-    }
-
-    #[test]
-    fn direct_life_observe_parser_handles_telegram_open_loop_request() {
-        let parsed = super::parse_direct_life_observe_command(
-            "Beacon, please use life.observe to record this open loop: \
-             I need to schedule the rowing habit for weekly Saturdays. \
-             Use label OpenLoop, source membrane:telegram, confidence 0.8",
-        )
-        .expect("explicit life.observe request should parse");
-
-        assert_eq!(parsed.label, "OpenLoop");
-        assert_eq!(
-            parsed.claim_summary,
-            "I need to schedule the rowing habit for weekly Saturdays"
-        );
-        assert_eq!(parsed.source_id, "membrane:telegram");
-        assert_eq!(parsed.confidence, 0.8);
-    }
-
-    #[test]
-    fn direct_life_observe_input_has_runner_shape() {
-        let command = super::DirectLifeObserveCommand {
-            label: "OpenLoop".into(),
-            claim_summary: "Schedule rowing habit on weekly Saturdays".into(),
-            source_id: "membrane:telegram".into(),
-            confidence: 0.8,
-        };
-
-        let value = super::direct_life_observe_input(
-            &command,
-            "telegram:123:agent-beacon",
-            "turn-1",
-            "123",
-            "agent-beacon",
-        );
-
-        assert_eq!(value["evidence"]["claim_ref"]["label"], "OpenLoop");
-        assert_eq!(
-            value["evidence"]["claim_summary"],
-            "Schedule rowing habit on weekly Saturdays"
-        );
-        assert_eq!(
-            value["evidence"]["source_refs"][0]["source_id"],
-            "membrane:telegram"
-        );
-        assert_eq!(value["evidence"]["confidence"], 0.8);
-        assert_eq!(
-            value["evidence"]["metadata"]["route"],
-            "philote_direct_life_observe"
-        );
     }
 
     #[test]
@@ -16798,6 +8351,8 @@ mod tests {
             capability: Some("text.generate".into()),
             retryable: Some(true),
             sub_kind: None,
+            status: None,
+            error_class: None,
         };
 
         let mut state =
@@ -16819,6 +8374,7 @@ mod tests {
             recalled_memories: Vec::new(),
             active_plan: None,
             consecutive_step_failures: 0,
+            streak_extension: 0,
             provider_repair_note: None,
             provider_repair_attempts: 0,
             pending_text_reply: None,
@@ -16834,7 +8390,12 @@ mod tests {
             plan_confirmed: false,
             plan_confirm_note: None,
             fallback_tier: 0,
+            ladder_tier0_dispatched: false,
             streaming_retry_attempts: 0,
+            streamed_content: String::new(),
+            paracrine_hop_count: 0,
+            paracrine_chain_started_at: None,
+            selection_source: SelectionSource::default(),
         });
 
         assert!(should_attempt_provider_repair(&error, Some(&state)));
@@ -16843,7 +8404,7 @@ mod tests {
     }
 
     #[test]
-    fn provider_auth_failure_escalates_fallback_tier_without_same_provider_repair() {
+    fn provider_auth_failure_is_fatal_without_same_provider_repair() {
         let error = TaskErrorPayload {
             kind: "provider_failure".into(),
             message: "Gemini API error (400): API key expired. Please renew the API key.".into(),
@@ -16853,45 +8414,183 @@ mod tests {
             capability: Some("text.generate".into()),
             retryable: Some(false),
             sub_kind: Some("provider_auth".into()),
+            status: None,
+            error_class: None,
         };
 
         let state = SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
 
         assert!(!should_attempt_provider_repair(&error, Some(&state)));
-        assert!(super::should_escalate_tier(&error));
+        assert_eq!(classify_provider_error(&error), ProviderErrorClass::Fatal);
     }
 
-    #[test]
-    fn parses_memory_candidate_from_model_result() {
-        let candidate = parse_memory_candidate(Some(&serde_json::json!({
-            "concept": "ready-for-task-selection",
-            "content": "The assistant confirmed readiness and offered the next work options.",
-            "tags": ["status", "readiness"]
-        })))
-        .expect("memory candidate should parse");
+    // ── Provider-error classification matrix ─────────────────────────────
 
-        assert_eq!(candidate.concept, "ready-for-task-selection");
+    fn provider_error(sub_kind: Option<&str>, status: Option<u16>) -> TaskErrorPayload {
+        TaskErrorPayload {
+            kind: "provider_failure".into(),
+            message: "Provider invocation failed".into(),
+            component: Some("model-router".into()),
+            provider: Some("gemini".into()),
+            capability: Some("text.generate".into()),
+            sub_kind: sub_kind.map(str::to_string),
+            status,
+            ..Default::default()
+        }
+    }
+
+    /// The forensic 2026-07-08 gap: a Gemini 400 with no sub_kind and no
+    /// error_class (old-controller envelope) must engage the fallback ladder
+    /// — never insta-fail the turn as MODEL_EMPTY_RESPONSE.
+    #[test]
+    fn classification_matrix_routes_each_error_class() {
+        // 4xx contract errors → switch provider.
         assert_eq!(
-            candidate.content,
-            "The assistant confirmed readiness and offered the next work options."
+            classify_provider_error(&provider_error(Some("invalid_request"), Some(400))),
+            ProviderErrorClass::SwitchProvider
         );
-        assert_eq!(candidate.tags, vec!["status", "readiness"]);
+        assert_eq!(
+            classify_provider_error(&provider_error(None, Some(400))),
+            ProviderErrorClass::SwitchProvider,
+            "status-only 400 must switch providers"
+        );
+        assert_eq!(
+            classify_provider_error(&provider_error(Some("rate_limit"), Some(429))),
+            ProviderErrorClass::SwitchProvider
+        );
+        // The exact forensic shape: kind=provider_failure, nothing else set.
+        assert_eq!(
+            classify_provider_error(&provider_error(None, None)),
+            ProviderErrorClass::SwitchProvider,
+            "un-annotated provider_failure on the text path must engage the ladder"
+        );
+
+        // 5xx / timeout / network → retryable (existing escalate behavior).
+        assert_eq!(
+            classify_provider_error(&provider_error(Some("provider_error"), Some(503))),
+            ProviderErrorClass::RetrySameProvider
+        );
+        assert_eq!(
+            classify_provider_error(&provider_error(Some("streaming_timeout"), None)),
+            ProviderErrorClass::RetrySameProvider
+        );
+        assert_eq!(
+            classify_provider_error(&provider_error(Some("network_error"), None)),
+            ProviderErrorClass::RetrySameProvider
+        );
+        assert_eq!(
+            classify_provider_error(&provider_error(None, Some(500))),
+            ProviderErrorClass::RetrySameProvider,
+            "status-only 5xx is transient"
+        );
+
+        // Auth → fatal.
+        assert_eq!(
+            classify_provider_error(&provider_error(Some("provider_auth"), Some(401))),
+            ProviderErrorClass::Fatal
+        );
+        assert_eq!(
+            classify_provider_error(&provider_error(None, Some(401))),
+            ProviderErrorClass::Fatal,
+            "status-only 401 is fatal"
+        );
+
+        // Machine-readable error_class from a new controller wins over everything.
+        let mut annotated = provider_error(Some("provider_error"), Some(503));
+        annotated.error_class = Some("switch_provider".into());
+        assert_eq!(
+            classify_provider_error(&annotated),
+            ProviderErrorClass::SwitchProvider
+        );
+        let mut fatal_annotated = provider_error(None, None);
+        fatal_annotated.error_class = Some("fatal".into());
+        assert_eq!(
+            classify_provider_error(&fatal_annotated),
+            ProviderErrorClass::Fatal
+        );
+
+        // Content/safety block (the second fix): a DISTINCT outcome from
+        // SwitchProvider — the whole point is that a blocked turn does NOT
+        // silently hop to a different-behaving provider mid-conversation.
+        let mut content_blocked_annotated = provider_error(Some("content_policy_block"), None);
+        content_blocked_annotated.error_class = Some("content_blocked".into());
+        assert_eq!(
+            classify_provider_error(&content_blocked_annotated),
+            ProviderErrorClass::ContentBlocked
+        );
+        assert_ne!(
+            classify_provider_error(&content_blocked_annotated),
+            ProviderErrorClass::SwitchProvider
+        );
+        // sub_kind fallback (older/un-annotated controller envelope) must also
+        // classify as ContentBlocked, not fall through to the un-annotated
+        // provider_failure → SwitchProvider default.
+        assert_eq!(
+            classify_provider_error(&provider_error(Some("content_policy_block"), None)),
+            ProviderErrorClass::ContentBlocked
+        );
+
+        // Non-text capabilities and non-provider kinds fall through to the
+        // generic fail path.
+        let mut voice = provider_error(None, None);
+        voice.capability = Some("voice.synthesize".into());
+        assert_eq!(
+            classify_provider_error(&voice),
+            ProviderErrorClass::Unclassified
+        );
+        let transport = TaskErrorPayload::transport_error("philote", "socket closed");
+        assert_eq!(
+            classify_provider_error(&transport),
+            ProviderErrorClass::Unclassified
+        );
     }
 
+    /// A contract failure must skip remaining ladder tiers that dispatch to
+    /// the failed provider — the same request fails identically there.
     #[test]
-    fn bound_tool_execution_allows_listed_tools() {
-        let mut state =
-            SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
-        state.add_tool_binding("echo");
-        let route = super::AgentRuntime::execute_bound_tool(
-            &state,
-            &ToolCall {
-                tool_name: "echo".into(),
-                arguments: serde_json::json!({ "text": "hello" }),
-            },
-        )
-        .expect("echo tool should be allowed");
-        assert_eq!(route.target_role, "tool.echo");
+    fn next_ladder_tier_skips_failed_provider_tiers_on_contract_failure() {
+        let ladder: Vec<String> = vec![
+            "model".into(),        // gemini
+            "model.gemini".into(), // gemini again — must be skipped
+            "model.ollama".into(), // ollama
+        ];
+
+        // Contract failure on gemini at tier 0 → tier 2 (model.ollama).
+        assert_eq!(
+            next_ladder_tier(&ladder, Some(0), 2, Some("gemini"), true),
+            2
+        );
+        // Transient failure keeps the plain +1 walk (no skip).
+        assert_eq!(
+            next_ladder_tier(&ladder, Some(0), 2, Some("gemini"), false),
+            1
+        );
+        // Skip can exhaust the ladder: gemini fails at tier 0 of an all-gemini tail.
+        let gemini_only: Vec<String> = vec!["model".into(), "model.gemini".into()];
+        assert_eq!(
+            next_ladder_tier(&gemini_only, Some(0), 1, Some("gemini"), true),
+            2,
+            "skipping past the end signals exhaustion (oracle next)"
+        );
+        // Unknown failed provider → no skip.
+        assert_eq!(next_ladder_tier(&ladder, Some(0), 2, None, true), 1);
+    }
+
+    /// The off-by-one fix: `last_ladder_tier = None` means the ladder hasn't
+    /// been consulted yet (primary dispatch bypassed it), so the walk must
+    /// start at tier 0 — not tier 1.
+    #[test]
+    fn next_ladder_tier_starts_at_zero_when_ladder_not_yet_engaged() {
+        let ladder: Vec<String> = vec!["model.openrouter".into()];
+        assert_eq!(
+            next_ladder_tier(&ladder, None, 0, None, false),
+            0,
+            "a single-tier ladder must be reachable when the primary dispatch \
+             didn't come from the ladder"
+        );
+
+        // Once engaged (Some(tier)), the walk resumes as a plain +1 as before.
+        assert_eq!(next_ladder_tier(&ladder, Some(0), 0, None, false), 1);
     }
 
     #[test]
@@ -16902,29 +8601,6 @@ mod tests {
             approved_response: "Approved: deploy the thing".into(),
         });
         assert!(approval.approval_id.is_some());
-    }
-
-    #[test]
-    fn parked_approval_command_defers_behind_active_turn() {
-        let mut state =
-            SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
-        state.parked_approval_turn = Some(test_working_turn(TurnPhase::WaitingApproval));
-        state.start_turn(test_working_turn(TurnPhase::WaitingModel));
-
-        assert!(super::AgentRuntime::should_defer_parked_approval_command(
-            &state
-        ));
-    }
-
-    #[test]
-    fn parked_approval_command_does_not_defer_when_session_is_free() {
-        let mut state =
-            SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
-        state.parked_approval_turn = Some(test_working_turn(TurnPhase::WaitingApproval));
-
-        assert!(!super::AgentRuntime::should_defer_parked_approval_command(
-            &state
-        ));
     }
 
     #[test]
@@ -16945,61 +8621,6 @@ mod tests {
             },
             None
         ));
-    }
-
-    #[test]
-    fn bound_tool_execution_rejects_unlisted_tools() {
-        let mut state =
-            SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
-        state.add_tool_binding("echo");
-
-        let err = super::AgentRuntime::execute_bound_tool(
-            &state,
-            &ToolCall {
-                tool_name: "workspace.read".into(),
-                arguments: serde_json::json!({}),
-            },
-        )
-        .expect_err("tool should be blocked");
-        assert!(err.to_string().contains("not enabled"));
-    }
-
-    #[test]
-    fn bound_tool_execution_requires_live_route() {
-        let mut state =
-            SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
-        state.add_tool_binding("echo");
-        if let Some(route) = state.tool_assembly.execution_routes.get_mut("echo") {
-            route.availability_state = "materialization_required".into();
-        }
-
-        let err = super::AgentRuntime::execute_bound_tool(
-            &state,
-            &ToolCall {
-                tool_name: "echo".into(),
-                arguments: serde_json::json!({ "text": "hello" }),
-            },
-        )
-        .expect_err("dormant route should not execute");
-        assert!(err.to_string().contains("requires runner materialization"));
-    }
-
-    #[test]
-    fn local_agent_route_executes_without_external_runner_liveness() {
-        let mut state =
-            SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
-        state.clear_tool_bindings();
-        state.add_tool_binding("session.status");
-
-        let route = super::AgentRuntime::execute_bound_tool(
-            &state,
-            &ToolCall {
-                tool_name: "session.status".into(),
-                arguments: serde_json::json!({}),
-            },
-        )
-        .expect("local agent tools should not require an external runner");
-        assert_eq!(route.execution_mode, "local_agent");
     }
 
     #[test]
@@ -17229,6 +8850,20 @@ mod tests {
     }
 
     #[test]
+    fn media_capabilities_never_ride_the_text_fallback_ladder() {
+        // No session state at all: text capability may consult the (absent)
+        // ladder and still lands on the fallback role; media capabilities
+        // must land on the fallback role WITHOUT ladder consultation. The
+        // regression this guards: a session whose text ladder starts at
+        // model.openrouter sent voice.transcribe to a text-only controller
+        // ("no provider registered for voice.transcribe").
+        let (_, role, _) = resolve_model_execution_target(None, "voice.transcribe", "model");
+        assert_eq!(role, "model");
+        let (_, role, _) = resolve_model_execution_target(None, "media.analyze", "model");
+        assert_eq!(role, "model");
+    }
+
+    #[test]
     fn image_action_describe_routes_to_image_describe_capability() {
         use crate::session::MediaRoutingPolicy;
 
@@ -17414,5 +9049,4101 @@ mod tests {
             err.to_string().contains("timed out"),
             "unexpected error: {err}"
         );
+    }
+
+    // ── L0 execution safety floor (exec-guard) ─────────────────────────────
+    //
+    // The floor is checked at the top of `run_bash_command` itself — the
+    // function that a parked-turn `/approve` (or `auto_approve_all`)
+    // ultimately calls to spawn `sh -c`. There is no approval/session
+    // parameter this function accepts that could route around the check,
+    // so a passing test here demonstrates the floor sits below approvals:
+    // no caller of this function, however it got here, can avoid it.
+
+    #[tokio::test]
+    async fn bash_exec_hardline_blocks_root_delete_without_spawning() {
+        let result = super::run_bash_command("rm -rf /".into(), None, 10)
+            .await
+            .expect("denial is a tool result, not an Err");
+        assert!(!result["success"].as_bool().unwrap());
+        assert_eq!(result["stdout"].as_str().unwrap(), "");
+        let stderr = result["stderr"].as_str().unwrap();
+        assert!(
+            stderr.contains("Do not retry"),
+            "unexpected stderr: {stderr}"
+        );
+        assert!(
+            stderr.contains("recursive delete of root filesystem"),
+            "unexpected stderr: {stderr}"
+        );
+    }
+
+    #[tokio::test]
+    async fn bash_exec_hardline_blocks_even_when_command_would_otherwise_run() {
+        // A hardline shutdown command must be denied rather than executed —
+        // if the floor were bypassed this would attempt to power off the
+        // test host, which is exactly what must never happen.
+        let result = super::run_bash_command("shutdown -h now".into(), None, 10)
+            .await
+            .expect("denial is a tool result, not an Err");
+        assert!(!result["success"].as_bool().unwrap());
+        assert_eq!(result["exit_code"].as_i64().unwrap(), 126);
+    }
+
+    #[tokio::test]
+    async fn bash_exec_hardline_does_not_block_ordinary_commands() {
+        let result = super::run_bash_command("echo hello".into(), None, 10)
+            .await
+            .expect("should succeed");
+        assert!(result["success"].as_bool().unwrap());
+    }
+
+    // ── DEF-004 regression: multi-tool re-entry must surface the final reply ──
+    //
+    // Drives a turn through two tool_result re-entries and a final model Respond,
+    // over a recording stub hotel, and asserts exactly one `send_reply` task is
+    // emitted to the turn's final_reply_* transport target with the synthesized text.
+
+    /// Minimal hotel harness that records every EmitTask envelope it receives
+    /// (target fields + parsed task_json) and acks everything else generically.
+    pub(super) async fn run_recording_hotel(
+        listener: tokio::net::UnixListener,
+        emitted: std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
+    ) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let (mut stream, _) = listener.accept().await.expect("accept");
+        loop {
+            let buf = match async {
+                let mut len_buf = [0u8; 4];
+                stream.read_exact(&mut len_buf).await?;
+                let len = u32::from_be_bytes(len_buf) as usize;
+                let mut buf = vec![0u8; len];
+                stream.read_exact(&mut buf).await?;
+                Ok::<_, std::io::Error>(buf)
+            }
+            .await
+            {
+                Ok(b) => b,
+                Err(_) => return, // client disconnected
+            };
+
+            let req: philotic_client::IpcRequest =
+                serde_json::from_slice(&buf).expect("decode request");
+            let reply = match &req {
+                philotic_client::IpcRequest::GetConfig { key } => {
+                    serde_json::to_vec(&philotic_client::IpcResponse::ConfigData {
+                        key: key.clone(),
+                        value_json: None,
+                    })
+                    .unwrap()
+                }
+                philotic_client::IpcRequest::EmitTask {
+                    target_node,
+                    target_role,
+                    target_guest_id,
+                    task_json,
+                } => {
+                    let task: serde_json::Value =
+                        serde_json::from_str(task_json).unwrap_or(serde_json::Value::Null);
+                    emitted.lock().unwrap().push(serde_json::json!({
+                        "target_node": target_node,
+                        "target_role": target_role,
+                        "target_guest_id": target_guest_id,
+                        "task": task,
+                    }));
+                    serde_json::to_vec(&philotic_client::IpcResponse::success("ok", None)).unwrap()
+                }
+                philotic_client::IpcRequest::PushHealEvent {
+                    guest_id,
+                    severity,
+                    pattern_tag,
+                    detail,
+                } => {
+                    emitted.lock().unwrap().push(serde_json::json!({
+                        "heal_event": {
+                            "guest_id": guest_id,
+                            "severity": severity,
+                            "pattern_tag": pattern_tag,
+                            "detail": detail,
+                        },
+                    }));
+                    serde_json::to_vec(&philotic_client::IpcResponse::success("ok", None)).unwrap()
+                }
+                philotic_client::IpcRequest::ConfigureRole {
+                    role_name,
+                    fallback_tiers,
+                    ..
+                } => {
+                    emitted.lock().unwrap().push(serde_json::json!({
+                        "configure_role": {
+                            "role_name": role_name,
+                            "fallback_tiers": fallback_tiers,
+                        },
+                    }));
+                    serde_json::to_vec(&philotic_client::IpcResponse::ConfigureRoleOk {
+                        role_name: role_name.clone(),
+                    })
+                    .unwrap()
+                }
+                _ => {
+                    serde_json::to_vec(&philotic_client::IpcResponse::success("ok", None)).unwrap()
+                }
+            };
+
+            let len = u32::try_from(reply.len()).expect("frame length fits u32");
+            stream
+                .write_all(&len.to_be_bytes())
+                .await
+                .expect("write header");
+            stream.write_all(&reply).await.expect("write payload");
+        }
+    }
+
+    pub(super) fn def004_working_turn(turn_id: &str, first_tool: &str) -> WorkingTurn {
+        let mut turn = test_working_turn(TurnPhase::WaitingTool);
+        turn.turn_id = turn_id.into();
+        turn.chat_id = "555".into();
+        turn.user_content = "compare hotel and session status".into();
+        turn.final_reply_to = "membrane-node-01".into();
+        turn.final_reply_role = "membrane".into();
+        turn.final_reply_guest_id = Some("membrane-seat-1".into());
+        turn.pending_tool_call = Some(ToolCall {
+            tool_name: first_tool.into(),
+            arguments: serde_json::json!({}),
+        });
+        turn
+    }
+
+    /// DEF-051: `own_guest_id` is both the hotel registration identity AND the
+    /// `reply_guest_id` stamped on every dispatch — the bare agent id for a base
+    /// philote, `{agent_id}:{role_name}` for a role incarnation. A role
+    /// specialist must stamp its incarnation id so its model reply returns to
+    /// THIS process instead of the base agent's (which would hang its turn).
+    #[test]
+    fn compose_guest_identity_matches_registration_shapes() {
+        use super::compose_guest_identity;
+        assert_eq!(
+            compose_guest_identity("agent-bjork-01", None),
+            "agent-bjork-01"
+        );
+        assert_eq!(
+            compose_guest_identity("agent-bjork-01", Some("theoretician")),
+            "agent-bjork-01:theoretician"
+        );
+    }
+
+    /// End-to-end shape of the reply address a role-incarnation runtime stamps.
+    #[tokio::test]
+    async fn own_guest_id_targets_own_incarnation() {
+        let socket_path = format!("/tmp/philote-mrg-{}.sock", Uuid::new_v4().simple());
+        let listener = tokio::net::UnixListener::bind(&socket_path).expect("bind");
+        let emitted = std::sync::Arc::new(std::sync::Mutex::new(Vec::<serde_json::Value>::new()));
+        let server = tokio::spawn(run_recording_hotel(listener, emitted.clone()));
+
+        let identity = philotic_client::GuestIdentity {
+            guest_id: "agent-bjork-01".into(),
+            role: "agent".into(),
+            supported_tools: Vec::new(),
+        };
+        let client = philotic_client::PhiloticClient::connect_at(&socket_path, identity)
+            .await
+            .expect("connect to stub hotel");
+        let mut runtime = AgentRuntime::new(client, "agent-bjork-01");
+
+        // Base philote → bare agent id (matches its own registration).
+        assert_eq!(runtime.own_guest_id(), "agent-bjork-01");
+
+        // Role incarnation → its own "{agent_id}:{role_name}" id.
+        runtime.set_role_name("theoretician");
+        assert_eq!(runtime.own_guest_id(), "agent-bjork-01:theoretician");
+
+        drop(runtime);
+        let _ = server.await;
+        let _ = std::fs::remove_file(&socket_path);
+    }
+
+    #[tokio::test]
+    async fn multi_tool_reentry_surfaces_final_send_reply() {
+        let socket_path = format!("/tmp/philote-def004-{}.sock", Uuid::new_v4().simple());
+        let listener = tokio::net::UnixListener::bind(&socket_path).expect("bind");
+        let emitted = std::sync::Arc::new(std::sync::Mutex::new(Vec::<serde_json::Value>::new()));
+        let server = tokio::spawn(run_recording_hotel(listener, emitted.clone()));
+
+        let identity = philotic_client::GuestIdentity {
+            guest_id: "agent-def004".into(),
+            role: "agent".into(),
+            supported_tools: Vec::new(),
+        };
+        let client = philotic_client::PhiloticClient::connect_at(&socket_path, identity)
+            .await
+            .expect("connect to stub hotel");
+        let mut runtime = AgentRuntime::new(client, "agent-def004");
+
+        let session_id = "sess-def004";
+        let turn_id = "turn-def004";
+        runtime
+            .ensure_session_loaded(session_id, "telegram")
+            .await
+            .expect("session load");
+
+        // Seed an active turn waiting on its first tool result, bound to a
+        // membrane transport target (the real final_reply_* shape).
+        runtime
+            .sessions
+            .get_mut(session_id)
+            .expect("session exists")
+            .start_turn(def004_working_turn(turn_id, "hotel.status"));
+
+        // Tool result #1 → first model re-entry (iteration 1).
+        runtime
+            .handle_tool_result(InboundTaskPayload {
+                action: Some("tool_result".into()),
+                session_id: Some(session_id.into()),
+                turn_id: Some(turn_id.into()),
+                tool_name: Some("hotel.status".into()),
+                content: Some("hotel green".into()),
+                ..Default::default()
+            })
+            .await
+            .expect("tool result 1");
+
+        // Simulate the model dispatching a second tool call.
+        {
+            let state = runtime.sessions.get_mut(session_id).expect("session");
+            state.set_pending_tool_call(ToolCall {
+                tool_name: "session.status".into(),
+                arguments: serde_json::json!({}),
+            });
+            state.set_active_turn_phase(TurnPhase::WaitingTool);
+        }
+
+        // Tool result #2 → second model re-entry (iteration 2).
+        runtime
+            .handle_tool_result(InboundTaskPayload {
+                action: Some("tool_result".into()),
+                session_id: Some(session_id.into()),
+                turn_id: Some(turn_id.into()),
+                tool_name: Some("session.status".into()),
+                content: Some("session green".into()),
+                ..Default::default()
+            })
+            .await
+            .expect("tool result 2");
+
+        // Sanity: both results are in the working tool history and iteration advanced.
+        {
+            let state = runtime.sessions.get(session_id).expect("session");
+            let turn = state.active_turn.as_ref().expect("turn still active");
+            assert_eq!(turn.iteration, 2, "two re-entries must advance iteration");
+            assert_eq!(turn.working_tool_history.len(), 2);
+        }
+
+        // Final model Respond with the synthesized summary.
+        let final_text = "Final synthesized summary: hotel green, session green.";
+        runtime
+            .handle_model_response(InboundTaskPayload {
+                action: Some("model_response".into()),
+                session_id: Some(session_id.into()),
+                turn_id: Some(turn_id.into()),
+                agent_action: Some(serde_json::json!({
+                    "kind": "respond",
+                    "content": final_text,
+                })),
+                content: Some(final_text.into()),
+                ..Default::default()
+            })
+            .await
+            .expect("final model respond");
+
+        // The turn must be completed and out of the active slot.
+        {
+            let state = runtime.sessions.get(session_id).expect("session");
+            assert!(
+                state.active_turn.is_none(),
+                "turn must complete after final respond"
+            );
+            let last = state.recent_turns.last().expect("turn recorded");
+            assert_eq!(last.assistant_content.as_deref(), Some(final_text));
+        }
+
+        drop(runtime); // closes socket → server exits
+        let _ = server.await;
+        let _ = std::fs::remove_file(&socket_path);
+
+        let emitted = emitted.lock().unwrap();
+
+        let reentries: Vec<_> = emitted
+            .iter()
+            .filter(|e| e["task"]["action"] == "generate_text")
+            .collect();
+        assert!(
+            reentries.len() >= 2,
+            "expected >=2 model re-entries, got {}: {:#?}",
+            reentries.len(),
+            *emitted
+        );
+
+        let send_replies: Vec<_> = emitted
+            .iter()
+            .filter(|e| e["task"]["action"] == "send_reply")
+            .collect();
+        assert_eq!(
+            send_replies.len(),
+            1,
+            "exactly one send_reply must surface: {:#?}",
+            *emitted
+        );
+        let reply = send_replies[0];
+        assert_eq!(reply["task"]["session_id"], session_id);
+        assert_eq!(reply["task"]["turn_id"], turn_id);
+        assert!(
+            reply["task"]["content"]
+                .as_str()
+                .expect("send_reply content")
+                .contains("Final synthesized summary"),
+            "send_reply must carry the synthesized text: {reply:#?}"
+        );
+        // The reply must go to the turn's bound transport target, not fan out.
+        assert_eq!(reply["target_node"], "membrane-node-01");
+        assert_eq!(reply["target_role"], "membrane");
+        assert_eq!(reply["target_guest_id"], "membrane-seat-1");
+    }
+
+    // ── life.observe contract-error retry (2026-07-10 LifeGraph forensic) ────
+    //
+    // A model-invoked `life.observe` call whose payload fails datasource's
+    // pre-write contract validation (CONTRACT_ERROR_MARKER, tagged
+    // `sub_kind: "invalid_request"` — see FIX 1 in datasource/runtime.rs and
+    // data-memorygraphrag/provider.rs) must get exactly one bounded model
+    // retry with the cause surfaced, instead of being silently apologized
+    // away. If the retry also fails — or the payload came from philote's own
+    // direct-command parser, which has no model in the loop to act on a
+    // retry — the failure must escalate to heal_queue (`life_observe_parse_failed`)
+    // and still reach the user. Non-contract errors (transport/routing) must
+    // not retry at all; that class already has its own handling.
+
+    fn life_observe_arguments(claim_summary: &str, direct_origin: bool) -> serde_json::Value {
+        let mut evidence = serde_json::json!({
+            "packet_id": "pkt-1",
+            "claim_ref": { "id": "life:openloop:1", "label": "OpenLoop", "datasource": "life-graph" },
+            "claim_summary": claim_summary,
+            "source_refs": [{
+                "source_id": "membrane:telegram",
+                "source_kind": "runtime_observation",
+                "reliability": { "score": 0.9, "basis": "direct_observation" },
+            }],
+            "passage_refs": [],
+            "confidence": 0.8,
+            "validation_state": "proposed",
+            "source_reliability": 0.9,
+            "conflict_ids": [],
+            "adjudication_status": "not_needed",
+        });
+        if direct_origin {
+            evidence["metadata"] = serde_json::json!({
+                "route": "philote_direct_life_observe",
+                "session_id": "sess-lifeobs",
+                "turn_id": "turn-lifeobs",
+                "chat_id": "555",
+                "agent_id": "agent-lifeobs",
+            });
+        }
+        serde_json::json!({
+            "observation_id": "obs-1",
+            "evidence": evidence,
+            "proposed_graph_refs": [],
+        })
+    }
+
+    fn life_observe_working_turn(turn_id: &str, direct_origin: bool) -> WorkingTurn {
+        let mut turn = test_working_turn(TurnPhase::WaitingTool);
+        turn.turn_id = turn_id.into();
+        turn.chat_id = "555".into();
+        turn.user_content = "Toastmasters OpenLoop capture".into();
+        turn.final_reply_to = "membrane-node-01".into();
+        turn.final_reply_role = "membrane".into();
+        turn.final_reply_guest_id = Some("membrane-seat-1".into());
+        turn.pending_tool_call = Some(ToolCall {
+            tool_name: "life.observe".into(),
+            arguments: life_observe_arguments(
+                "Toastmasters: own the Toastmaster role next meeting",
+                direct_origin,
+            ),
+        });
+        turn
+    }
+
+    fn life_observe_error_task(
+        session_id: &str,
+        turn_id: &str,
+        sub_kind: Option<&str>,
+        message: &str,
+    ) -> InboundTaskPayload {
+        InboundTaskPayload {
+            action: Some("tool_result".into()),
+            session_id: Some(session_id.into()),
+            turn_id: Some(turn_id.into()),
+            tool_name: Some("life.observe".into()),
+            content: Some(format!(
+                "Tool call failed: {message} (provider: life-graph-runner, capability: life.observe)"
+            )),
+            error: Some(philotic_client::TaskErrorPayload {
+                kind: "provider_failure".into(),
+                message: message.into(),
+                code: None,
+                component: Some("datasource_controller".into()),
+                provider: Some("life-graph-runner".into()),
+                capability: Some("life.observe".into()),
+                retryable: None,
+                sub_kind: sub_kind.map(str::to_string),
+                status: None,
+                error_class: None,
+            }),
+            ..Default::default()
+        }
+    }
+
+    /// FIX 2, case 1: a model-invoked life.observe call fails with a
+    /// contract error → exactly one model re-entry with the cause surfaced,
+    /// no user-facing reply yet, no heal event yet.
+    #[tokio::test]
+    async fn life_observe_contract_error_retries_model_once_with_cause() {
+        let socket_path = format!(
+            "/tmp/philote-lifeobs-retry-{}.sock",
+            Uuid::new_v4().simple()
+        );
+        let listener = tokio::net::UnixListener::bind(&socket_path).expect("bind");
+        let emitted = std::sync::Arc::new(std::sync::Mutex::new(Vec::<serde_json::Value>::new()));
+        let server = tokio::spawn(run_recording_hotel(listener, emitted.clone()));
+
+        let identity = philotic_client::GuestIdentity {
+            guest_id: "agent-lifeobs-retry".into(),
+            role: "agent".into(),
+            supported_tools: Vec::new(),
+        };
+        let client = philotic_client::PhiloticClient::connect_at(&socket_path, identity)
+            .await
+            .expect("connect to stub hotel");
+        let mut runtime = AgentRuntime::new(client, "agent-lifeobs-retry");
+
+        let session_id = "sess-lifeobs-retry";
+        let turn_id = "turn-lifeobs-retry";
+        runtime
+            .ensure_session_loaded(session_id, "telegram")
+            .await
+            .expect("session load");
+        runtime
+            .sessions
+            .get_mut(session_id)
+            .expect("session exists")
+            .start_turn(life_observe_working_turn(turn_id, false));
+
+        runtime
+            .handle_tool_result(life_observe_error_task(
+                session_id,
+                turn_id,
+                Some("invalid_request"),
+                "provider failed: contract_error: failed to parse life.observe parameters as \
+                 LifeObserveInput: invalid type: string \"maybe\", expected f64 at line 1 column 42",
+            ))
+            .await
+            .expect("tool result handled");
+
+        {
+            let state = runtime.sessions.get(session_id).expect("session");
+            let turn = state
+                .active_turn
+                .as_ref()
+                .expect("turn must still be active for a retry, not finalized to the user");
+            assert_eq!(turn.phase, TurnPhase::WaitingModel);
+            assert_eq!(
+                turn.provider_repair_attempts, 1,
+                "one retry attempt must be recorded"
+            );
+            assert_eq!(
+                turn.iteration, 1,
+                "the retried round-trip must count as exactly one iteration \
+                 against iteration_cap, not two"
+            );
+        }
+
+        drop(runtime);
+        let _ = server.await;
+        let _ = std::fs::remove_file(&socket_path);
+
+        let emitted = emitted.lock().unwrap();
+        let reentries: Vec<_> = emitted
+            .iter()
+            .filter(|e| e["task"]["action"] == "generate_text")
+            .collect();
+        assert_eq!(
+            reentries.len(),
+            1,
+            "exactly one model re-entry expected: {:#?}",
+            *emitted
+        );
+        let reentry_json = serde_json::to_string(&reentries[0]["task"]).unwrap();
+        assert!(
+            reentry_json.contains("Your life.observe call failed"),
+            "reentry must surface the life.observe repair note: {reentry_json}"
+        );
+        assert!(
+            reentry_json.contains("invalid type: string"),
+            "reentry must surface the actual cause, not a generic message: {reentry_json}"
+        );
+
+        assert!(
+            emitted.iter().all(|e| e.get("heal_event").is_none()),
+            "no heal event should fire on the first, retried failure: {:#?}",
+            *emitted
+        );
+        assert!(
+            emitted.iter().all(|e| e["task"]["action"] != "send_reply"),
+            "no user-facing reply should fire before the retry is exhausted: {:#?}",
+            *emitted
+        );
+    }
+
+    /// FIX 2, case 2: the model's one retry also fails → surfaced to the
+    /// user AND a `life_observe_parse_failed` heal event is filed; no second
+    /// retry is attempted.
+    #[tokio::test]
+    async fn life_observe_contract_error_after_retry_exhausted_heals_and_tells_user() {
+        let socket_path = format!(
+            "/tmp/philote-lifeobs-exhausted-{}.sock",
+            Uuid::new_v4().simple()
+        );
+        let listener = tokio::net::UnixListener::bind(&socket_path).expect("bind");
+        let emitted = std::sync::Arc::new(std::sync::Mutex::new(Vec::<serde_json::Value>::new()));
+        let server = tokio::spawn(run_recording_hotel(listener, emitted.clone()));
+
+        let identity = philotic_client::GuestIdentity {
+            guest_id: "agent-lifeobs-exhausted".into(),
+            role: "agent".into(),
+            supported_tools: Vec::new(),
+        };
+        let client = philotic_client::PhiloticClient::connect_at(&socket_path, identity)
+            .await
+            .expect("connect to stub hotel");
+        let mut runtime = AgentRuntime::new(client, "agent-lifeobs-exhausted");
+
+        let session_id = "sess-lifeobs-exhausted";
+        let turn_id = "turn-lifeobs-exhausted";
+        runtime
+            .ensure_session_loaded(session_id, "telegram")
+            .await
+            .expect("session load");
+
+        // Simulate the retry budget already being spent (as it would be
+        // after case 1's one bounded retry came back with a second failure).
+        let mut turn = life_observe_working_turn(turn_id, false);
+        turn.provider_repair_attempts = 1;
+        runtime
+            .sessions
+            .get_mut(session_id)
+            .expect("session exists")
+            .start_turn(turn);
+
+        runtime
+            .handle_tool_result(life_observe_error_task(
+                session_id,
+                turn_id,
+                Some("invalid_request"),
+                "provider failed: contract_error: life.observe plan validation failed: \
+                 observation_id must not be empty",
+            ))
+            .await
+            .expect("tool result handled");
+
+        drop(runtime);
+        let _ = server.await;
+        let _ = std::fs::remove_file(&socket_path);
+
+        let emitted = emitted.lock().unwrap();
+
+        let reentries: Vec<_> = emitted
+            .iter()
+            .filter(|e| e["task"]["action"] == "generate_text")
+            .collect();
+        assert!(
+            reentries.is_empty(),
+            "must not attempt a second model retry: {:#?}",
+            *emitted
+        );
+
+        let heal_events: Vec<_> = emitted
+            .iter()
+            .filter(|e| e.get("heal_event").is_some())
+            .collect();
+        assert_eq!(
+            heal_events.len(),
+            1,
+            "exactly one heal event expected: {:#?}",
+            *emitted
+        );
+        assert_eq!(
+            heal_events[0]["heal_event"]["pattern_tag"],
+            "life_observe_parse_failed"
+        );
+        assert!(
+            heal_events[0]["heal_event"]["detail"]
+                .as_str()
+                .unwrap()
+                .contains("retry exhausted")
+        );
+
+        let send_replies: Vec<_> = emitted
+            .iter()
+            .filter(|e| e["task"]["action"] == "send_reply")
+            .collect();
+        assert_eq!(
+            send_replies.len(),
+            1,
+            "the user must still be told, not left with a silent drop: {:#?}",
+            *emitted
+        );
+        assert!(
+            send_replies[0]["task"]["content"]
+                .as_str()
+                .unwrap()
+                .contains("I tried to record this")
+        );
+    }
+
+    /// FIX 2, case 3: a non-contract error (transport/routing — unmarked
+    /// `sub_kind`) must never trigger the retry or the new heal path; that
+    /// class already has its own handling elsewhere.
+    #[tokio::test]
+    async fn life_observe_non_contract_error_does_not_retry_or_heal() {
+        let socket_path = format!(
+            "/tmp/philote-lifeobs-transport-{}.sock",
+            Uuid::new_v4().simple()
+        );
+        let listener = tokio::net::UnixListener::bind(&socket_path).expect("bind");
+        let emitted = std::sync::Arc::new(std::sync::Mutex::new(Vec::<serde_json::Value>::new()));
+        let server = tokio::spawn(run_recording_hotel(listener, emitted.clone()));
+
+        let identity = philotic_client::GuestIdentity {
+            guest_id: "agent-lifeobs-transport".into(),
+            role: "agent".into(),
+            supported_tools: Vec::new(),
+        };
+        let client = philotic_client::PhiloticClient::connect_at(&socket_path, identity)
+            .await
+            .expect("connect to stub hotel");
+        let mut runtime = AgentRuntime::new(client, "agent-lifeobs-transport");
+
+        let session_id = "sess-lifeobs-transport";
+        let turn_id = "turn-lifeobs-transport";
+        runtime
+            .ensure_session_loaded(session_id, "telegram")
+            .await
+            .expect("session load");
+        runtime
+            .sessions
+            .get_mut(session_id)
+            .expect("session exists")
+            .start_turn(life_observe_working_turn(turn_id, false));
+
+        runtime
+            .handle_tool_result(life_observe_error_task(
+                session_id,
+                turn_id,
+                None, // no sub_kind: e.g. a Memgraph connection failure, not a contract error
+                "provider failed: Memgraph connection refused",
+            ))
+            .await
+            .expect("tool result handled");
+
+        drop(runtime);
+        let _ = server.await;
+        let _ = std::fs::remove_file(&socket_path);
+
+        let emitted = emitted.lock().unwrap();
+        assert!(
+            emitted
+                .iter()
+                .all(|e| e["task"]["action"] != "generate_text"),
+            "a non-contract error must never trigger the life.observe retry: {:#?}",
+            *emitted
+        );
+        assert!(
+            emitted.iter().all(|e| e.get("heal_event").is_none()),
+            "a non-contract error must not use the new life.observe heal path: {:#?}",
+            *emitted
+        );
+        let send_replies: Vec<_> = emitted
+            .iter()
+            .filter(|e| e["task"]["action"] == "send_reply")
+            .collect();
+        assert_eq!(
+            send_replies.len(),
+            1,
+            "existing apology-to-user behavior must be unchanged: {:#?}",
+            *emitted
+        );
+    }
+
+    /// FIX 2, case 4: a contract error on a payload built by philote's own
+    /// direct-command parser (no model in the loop) must skip the retry
+    /// entirely and go straight to heal_queue + user notification.
+    #[tokio::test]
+    async fn life_observe_direct_command_origin_contract_error_skips_retry() {
+        let socket_path = format!(
+            "/tmp/philote-lifeobs-direct-{}.sock",
+            Uuid::new_v4().simple()
+        );
+        let listener = tokio::net::UnixListener::bind(&socket_path).expect("bind");
+        let emitted = std::sync::Arc::new(std::sync::Mutex::new(Vec::<serde_json::Value>::new()));
+        let server = tokio::spawn(run_recording_hotel(listener, emitted.clone()));
+
+        let identity = philotic_client::GuestIdentity {
+            guest_id: "agent-lifeobs-direct".into(),
+            role: "agent".into(),
+            supported_tools: Vec::new(),
+        };
+        let client = philotic_client::PhiloticClient::connect_at(&socket_path, identity)
+            .await
+            .expect("connect to stub hotel");
+        let mut runtime = AgentRuntime::new(client, "agent-lifeobs-direct");
+
+        let session_id = "sess-lifeobs-direct";
+        let turn_id = "turn-lifeobs-direct";
+        runtime
+            .ensure_session_loaded(session_id, "telegram")
+            .await
+            .expect("session load");
+        runtime
+            .sessions
+            .get_mut(session_id)
+            .expect("session exists")
+            .start_turn(life_observe_working_turn(turn_id, true));
+
+        runtime
+            .handle_tool_result(life_observe_error_task(
+                session_id,
+                turn_id,
+                Some("invalid_request"),
+                "provider failed: contract_error: failed to parse life.observe parameters as \
+                 LifeObserveInput: missing field `claim_summary`",
+            ))
+            .await
+            .expect("tool result handled");
+
+        drop(runtime);
+        let _ = server.await;
+        let _ = std::fs::remove_file(&socket_path);
+
+        let emitted = emitted.lock().unwrap();
+        assert!(
+            emitted
+                .iter()
+                .all(|e| e["task"]["action"] != "generate_text"),
+            "direct-command origin must never get a model retry: {:#?}",
+            *emitted
+        );
+
+        let heal_events: Vec<_> = emitted
+            .iter()
+            .filter(|e| e.get("heal_event").is_some())
+            .collect();
+        assert_eq!(
+            heal_events.len(),
+            1,
+            "expected one heal event: {:#?}",
+            *emitted
+        );
+        assert_eq!(
+            heal_events[0]["heal_event"]["pattern_tag"],
+            "life_observe_parse_failed"
+        );
+        assert!(
+            heal_events[0]["heal_event"]["detail"]
+                .as_str()
+                .unwrap()
+                .contains("direct-command origin")
+        );
+
+        let send_replies: Vec<_> = emitted
+            .iter()
+            .filter(|e| e["task"]["action"] == "send_reply")
+            .collect();
+        assert_eq!(
+            send_replies.len(),
+            1,
+            "user must still be told: {:#?}",
+            *emitted
+        );
+    }
+
+    // ── Turn-failure heal intake (self-heal) ─────────────────────────────────
+
+    /// A watchdog eviction must push a `stuck_turn_evicted:{phase}` heal
+    /// event to the hotel (turn-failure heal intake) in addition to failing
+    /// the task and unblocking the session.
+    #[tokio::test]
+    async fn watchdog_eviction_pushes_stuck_turn_heal_event() {
+        let socket_path = format!("/tmp/philote-healevict-{}.sock", Uuid::new_v4().simple());
+        let listener = tokio::net::UnixListener::bind(&socket_path).expect("bind");
+        let emitted = std::sync::Arc::new(std::sync::Mutex::new(Vec::<serde_json::Value>::new()));
+        let server = tokio::spawn(run_recording_hotel(listener, emitted.clone()));
+
+        let identity = philotic_client::GuestIdentity {
+            guest_id: "agent-heal-evict".into(),
+            role: "agent".into(),
+            supported_tools: Vec::new(),
+        };
+        let client = philotic_client::PhiloticClient::connect_at(&socket_path, identity)
+            .await
+            .expect("connect to stub hotel");
+        let mut runtime = AgentRuntime::new(client, "agent-heal-evict");
+
+        let session_id = "sess-heal-evict";
+        runtime
+            .ensure_session_loaded(session_id, "telegram")
+            .await
+            .expect("session load");
+
+        // Seed an active turn stuck waiting on a tool.
+        let turn = def004_working_turn("turn-heal-evict", "hotel.status");
+        let signature = format!(
+            "active:{}:{:?}:{}:{}",
+            turn.turn_id, turn.phase, turn.iteration, "hotel.status"
+        );
+        runtime
+            .sessions
+            .get_mut(session_id)
+            .expect("session exists")
+            .start_turn(turn);
+
+        // Backdate the watchdog bookkeeping past the WaitingTool deadline,
+        // with the matching wait signature so reconcile keeps the timestamp.
+        let past = std::time::Instant::now()
+            .checked_sub(std::time::Duration::from_secs(120))
+            .expect("backdate instant");
+        runtime
+            .stuck_turn_first_seen
+            .insert(session_id.to_string(), past);
+        runtime
+            .stuck_turn_signature
+            .insert(session_id.to_string(), signature);
+
+        runtime.evict_timed_out_turns().await;
+
+        assert!(
+            runtime
+                .sessions
+                .get(session_id)
+                .expect("session")
+                .active_turn
+                .is_none(),
+            "eviction must clear the active turn"
+        );
+
+        drop(runtime);
+        let _ = server.await;
+        let _ = std::fs::remove_file(&socket_path);
+
+        let emitted = emitted.lock().unwrap();
+        let heal_events: Vec<_> = emitted
+            .iter()
+            .filter(|e| !e["heal_event"].is_null())
+            .collect();
+        assert_eq!(
+            heal_events.len(),
+            1,
+            "exactly one heal event must be pushed: {:#?}",
+            *emitted
+        );
+        let heal = &heal_events[0]["heal_event"];
+        assert_eq!(heal["guest_id"], "agent-heal-evict");
+        assert_eq!(heal["severity"], "medium");
+        assert_eq!(heal["pattern_tag"], "stuck_turn_evicted:WaitingTool");
+        assert!(
+            heal["detail"]
+                .as_str()
+                .expect("detail")
+                .contains("watchdog evicted stuck turn"),
+            "detail must carry the eviction reason: {heal:#?}"
+        );
+
+        // The unblock notice still reaches the user.
+        assert!(
+            emitted.iter().any(|e| e["task"]["action"] == "send_reply"),
+            "eviction must still emit the unblock send_reply: {:#?}",
+            *emitted
+        );
+    }
+
+    /// Fallback-ladder + oracle exhaustion must push a
+    /// `fallback_exhausted:{last_provider}` heal event before failing the turn.
+    #[tokio::test]
+    async fn fallback_exhaustion_pushes_heal_event() {
+        let socket_path = format!("/tmp/philote-healfb-{}.sock", Uuid::new_v4().simple());
+        let listener = tokio::net::UnixListener::bind(&socket_path).expect("bind");
+        let emitted = std::sync::Arc::new(std::sync::Mutex::new(Vec::<serde_json::Value>::new()));
+        let server = tokio::spawn(run_recording_hotel(listener, emitted.clone()));
+
+        let identity = philotic_client::GuestIdentity {
+            guest_id: "agent-heal-fb".into(),
+            role: "agent".into(),
+            supported_tools: Vec::new(),
+        };
+        let client = philotic_client::PhiloticClient::connect_at(&socket_path, identity)
+            .await
+            .expect("connect to stub hotel");
+        let mut runtime = AgentRuntime::new(client, "agent-heal-fb");
+
+        let session_id = "sess-heal-fb";
+        let turn_id = "turn-heal-fb";
+        runtime
+            .ensure_session_loaded(session_id, "telegram")
+            .await
+            .expect("session load");
+
+        // Seed a WaitingModel turn already past every static tier AND past
+        // the oracle extra-tier budget, so exhaustion is immediate (no
+        // QueryModelRoute round trip).
+        let mut turn = test_working_turn(TurnPhase::WaitingModel);
+        turn.turn_id = turn_id.into();
+        turn.fallback_tier = u8::MAX - 1;
+        runtime
+            .sessions
+            .get_mut(session_id)
+            .expect("session exists")
+            .start_turn(turn);
+
+        runtime
+            .advance_turn_to_next_fallback_tier(
+                session_id.to_string(),
+                turn_id.to_string(),
+                NoResponseClass::ProviderFailure,
+                Some("gemini".into()),
+                "provider failed".into(),
+            )
+            .await
+            .expect("advance");
+
+        assert!(
+            runtime
+                .sessions
+                .get(session_id)
+                .expect("session")
+                .active_turn
+                .is_none(),
+            "exhaustion must fail (clear) the active turn"
+        );
+
+        drop(runtime);
+        let _ = server.await;
+        let _ = std::fs::remove_file(&socket_path);
+
+        let emitted = emitted.lock().unwrap();
+        let heal_events: Vec<_> = emitted
+            .iter()
+            .filter(|e| !e["heal_event"].is_null())
+            .collect();
+        assert_eq!(
+            heal_events.len(),
+            1,
+            "exactly one heal event must be pushed: {:#?}",
+            *emitted
+        );
+        let heal = &heal_events[0]["heal_event"];
+        assert_eq!(heal["pattern_tag"], "fallback_exhausted:gemini");
+        assert_eq!(heal["severity"], "medium");
+        assert!(
+            heal["detail"]
+                .as_str()
+                .expect("detail")
+                .contains("All model providers failed"),
+            "detail must describe the exhaustion: {heal:#?}"
+        );
+    }
+
+    /// An operator-pinned session (`SelectionSource::OperatorExplicit`) must
+    /// never silently escalate to the next fallback tier — that would violate
+    /// the operator's explicit `/model <tier>` intent. Instead the turn fails
+    /// fast with the real trigger message, and `fallback_tier` is left
+    /// untouched (no ladder/oracle consultation, no heal event).
+    #[tokio::test]
+    async fn operator_pinned_turn_fails_fast_instead_of_escalating() {
+        let socket_path = format!("/tmp/philote-pinfail-{}.sock", Uuid::new_v4().simple());
+        let listener = tokio::net::UnixListener::bind(&socket_path).expect("bind");
+        let emitted = std::sync::Arc::new(std::sync::Mutex::new(Vec::<serde_json::Value>::new()));
+        let server = tokio::spawn(run_recording_hotel(listener, emitted.clone()));
+
+        let identity = philotic_client::GuestIdentity {
+            guest_id: "agent-pin-fail".into(),
+            role: "agent".into(),
+            supported_tools: Vec::new(),
+        };
+        let client = philotic_client::PhiloticClient::connect_at(&socket_path, identity)
+            .await
+            .expect("connect to stub hotel");
+        let mut runtime = AgentRuntime::new(client, "agent-pin-fail");
+
+        let session_id = "sess-pin-fail";
+        let turn_id = "turn-pin-fail";
+        runtime
+            .ensure_session_loaded(session_id, "telegram")
+            .await
+            .expect("session load");
+
+        let mut turn = test_working_turn(TurnPhase::WaitingModel);
+        turn.turn_id = turn_id.into();
+        turn.fallback_tier = 0;
+        turn.selection_source = SelectionSource::OperatorExplicit;
+        runtime
+            .sessions
+            .get_mut(session_id)
+            .expect("session exists")
+            .start_turn(turn);
+        runtime
+            .sessions
+            .get_mut(session_id)
+            .expect("session exists")
+            .pinned_tier_role = Some("model.ollama".into());
+
+        runtime
+            .advance_turn_to_next_fallback_tier(
+                session_id.to_string(),
+                turn_id.to_string(),
+                NoResponseClass::ProviderFailure,
+                Some("gemini".into()),
+                "the pinned provider did not respond".into(),
+            )
+            .await
+            .expect("advance");
+
+        assert!(
+            runtime
+                .sessions
+                .get(session_id)
+                .expect("session")
+                .active_turn
+                .is_none(),
+            "an operator-pinned session must fail fast, not stay parked mid-escalation"
+        );
+
+        drop(runtime);
+        let _ = server.await;
+        let _ = std::fs::remove_file(&socket_path);
+
+        let emitted = emitted.lock().unwrap();
+        assert!(
+            !emitted.iter().any(|e| !e["heal_event"].is_null()),
+            "operator-pinned fail-fast must not push a fallback_exhausted heal event: {:#?}",
+            *emitted
+        );
+        assert!(
+            emitted.iter().any(|e| e["task"]["action"] == "send_reply"
+                && e["task"]["content"] == "the pinned provider did not respond"),
+            "must fail with the real trigger message, not a generic exhaustion notice: {:#?}",
+            *emitted
+        );
+    }
+
+    // ── Slice 2: persisted FallbackOverride + origin probe ───────────────────
+
+    /// A successful escalation must write the session's `FallbackOverride`
+    /// (origin = the ladder primary, active = the newly dispatched tier,
+    /// reason = the failure class); a SECOND escalation on the same degraded
+    /// session must update `active_tier_role`/`reason` only, keeping the
+    /// original `origin_tier_role` and `since_epoch_ms`.
+    #[tokio::test]
+    async fn escalation_writes_fallback_override_then_updates_active_only() {
+        let socket_path = format!("/tmp/philote-ovwrite-{}.sock", Uuid::new_v4().simple());
+        let listener = tokio::net::UnixListener::bind(&socket_path).expect("bind");
+        let emitted = std::sync::Arc::new(std::sync::Mutex::new(Vec::<serde_json::Value>::new()));
+        let server = tokio::spawn(run_recording_hotel(listener, emitted.clone()));
+
+        let identity = philotic_client::GuestIdentity {
+            guest_id: "agent-ov-write".into(),
+            role: "agent".into(),
+            supported_tools: Vec::new(),
+        };
+        let client = philotic_client::PhiloticClient::connect_at(&socket_path, identity)
+            .await
+            .expect("connect to stub hotel");
+        let mut runtime = AgentRuntime::new(client, "agent-ov-write");
+
+        let session_id = "sess-ov-write";
+        let turn_id = "turn-ov-write";
+        runtime
+            .ensure_session_loaded(session_id, "telegram")
+            .await
+            .expect("session load");
+        {
+            let state = runtime.sessions.get_mut(session_id).expect("session");
+            state.role_activation = Some(role_activation_with_ladder(&[
+                "model",
+                "model.openrouter",
+                "model.ollama",
+            ]));
+        }
+
+        let mut turn = test_working_turn(TurnPhase::WaitingModel);
+        turn.turn_id = turn_id.into();
+        runtime
+            .sessions
+            .get_mut(session_id)
+            .expect("session exists")
+            .start_turn(turn);
+
+        runtime
+            .advance_turn_to_next_fallback_tier(
+                session_id.to_string(),
+                turn_id.to_string(),
+                NoResponseClass::ProviderFailure,
+                Some("gemini".into()),
+                "gemini did not respond".into(),
+            )
+            .await
+            .expect("first escalation");
+
+        let (first_since, first_probe_ms) = {
+            let state = runtime.sessions.get(session_id).expect("session");
+            let ov = state
+                .fallback_override
+                .as_ref()
+                .expect("escalation must write the fallback override");
+            assert_eq!(ov.origin_tier_role, "model", "origin = ladder primary");
+            assert_eq!(
+                ov.active_tier_role, "model.openrouter",
+                "active = the newly dispatched tier"
+            );
+            assert_eq!(ov.reason, "provider_failure");
+            assert!(ov.since_epoch_ms > 0);
+            assert_eq!(ov.since_epoch_ms, ov.last_probe_epoch_ms);
+            // Slice 3: the first escalation on a fresh override also fires
+            // (and latches) the `model_fallback` operational notice — see
+            // `escalation_emits_model_fallback_notice_once_then_latches_silent`.
+            assert!(ov.notice_sent);
+            (ov.since_epoch_ms, ov.last_probe_epoch_ms)
+        };
+
+        // Second escalation on the same degraded session (tier 1 → tier 2).
+        runtime
+            .advance_turn_to_next_fallback_tier(
+                session_id.to_string(),
+                turn_id.to_string(),
+                NoResponseClass::WatchdogTimeout,
+                None,
+                "openrouter timed out".into(),
+            )
+            .await
+            .expect("second escalation");
+
+        {
+            let state = runtime.sessions.get(session_id).expect("session");
+            let ov = state
+                .fallback_override
+                .as_ref()
+                .expect("override survives the second escalation");
+            assert_eq!(
+                ov.origin_tier_role, "model",
+                "origin must stay the original primary"
+            );
+            assert_eq!(
+                ov.active_tier_role, "model.ollama",
+                "active tracks the newest dispatched tier"
+            );
+            assert_eq!(
+                ov.reason, "model_timeout",
+                "reason tracks the newest failure"
+            );
+            assert_eq!(
+                ov.since_epoch_ms, first_since,
+                "since must not reset on re-escalation"
+            );
+            assert_eq!(
+                ov.last_probe_epoch_ms, first_probe_ms,
+                "re-escalation must not consume the probe cadence"
+            );
+        }
+
+        drop(runtime);
+        let _ = server.await;
+        let _ = std::fs::remove_file(&socket_path);
+    }
+
+    /// Helper: pull every `turn_event` EmitTask recorded by `run_recording_hotel`
+    /// whose `event` field matches `event_name`.
+    fn recorded_turn_events<'a>(
+        emitted: &'a [serde_json::Value],
+        event_name: &str,
+    ) -> Vec<&'a serde_json::Value> {
+        emitted
+            .iter()
+            .filter(|e| e["task"]["action"] == "turn_event" && e["task"]["event"] == event_name)
+            .collect()
+    }
+
+    /// Slice 3: the first escalation on a fresh session (no override yet, so
+    /// `notice_sent` starts false) must emit exactly one `model_fallback`
+    /// turn_event and latch `notice_sent`; a second escalation on the same
+    /// already-notified session (sticky-turn / further tier walk) must emit
+    /// nothing more.
+    #[tokio::test]
+    async fn escalation_emits_model_fallback_notice_once_then_latches_silent() {
+        let socket_path = format!("/tmp/philote-ovnotice-{}.sock", Uuid::new_v4().simple());
+        let listener = tokio::net::UnixListener::bind(&socket_path).expect("bind");
+        let emitted = std::sync::Arc::new(std::sync::Mutex::new(Vec::<serde_json::Value>::new()));
+        let server = tokio::spawn(run_recording_hotel(listener, emitted.clone()));
+
+        let identity = philotic_client::GuestIdentity {
+            guest_id: "agent-ov-notice".into(),
+            role: "agent".into(),
+            supported_tools: Vec::new(),
+        };
+        let client = philotic_client::PhiloticClient::connect_at(&socket_path, identity)
+            .await
+            .expect("connect to stub hotel");
+        let mut runtime = AgentRuntime::new(client, "agent-ov-notice");
+
+        let session_id = "sess-ov-notice";
+        let turn_id = "turn-ov-notice";
+        runtime
+            .ensure_session_loaded(session_id, "telegram")
+            .await
+            .expect("session load");
+        {
+            let state = runtime.sessions.get_mut(session_id).expect("session");
+            state.role_activation = Some(role_activation_with_ladder(&[
+                "model",
+                "model.openrouter",
+                "model.ollama",
+            ]));
+        }
+
+        let mut turn = test_working_turn(TurnPhase::WaitingModel);
+        turn.turn_id = turn_id.into();
+        runtime
+            .sessions
+            .get_mut(session_id)
+            .expect("session exists")
+            .start_turn(turn);
+
+        runtime
+            .advance_turn_to_next_fallback_tier(
+                session_id.to_string(),
+                turn_id.to_string(),
+                NoResponseClass::ProviderFailure,
+                Some("gemini".into()),
+                "gemini did not respond".into(),
+            )
+            .await
+            .expect("first escalation");
+
+        {
+            let recorded = emitted.lock().unwrap().clone();
+            let notices = recorded_turn_events(&recorded, "model_fallback");
+            assert_eq!(
+                notices.len(),
+                1,
+                "first escalation (notice_sent=false) must emit exactly one model_fallback event: {recorded:#?}"
+            );
+            let message = notices[0]["task"]["partial_content"]
+                .as_str()
+                .expect("partial_content");
+            assert_eq!(
+                message,
+                "\u{21aa}\u{fe0f} Model fallback: model.openrouter (was model; provider_failure)"
+            );
+        }
+        assert!(
+            runtime
+                .sessions
+                .get(session_id)
+                .expect("session")
+                .fallback_override
+                .as_ref()
+                .expect("override")
+                .notice_sent,
+            "notice_sent must latch true after the first emission"
+        );
+
+        // Second escalation on the same already-notified session — sticky
+        // turn / further tier walk. Must not emit a second notice.
+        runtime
+            .advance_turn_to_next_fallback_tier(
+                session_id.to_string(),
+                turn_id.to_string(),
+                NoResponseClass::WatchdogTimeout,
+                None,
+                "openrouter timed out".into(),
+            )
+            .await
+            .expect("second escalation");
+
+        {
+            let recorded = emitted.lock().unwrap().clone();
+            let notices = recorded_turn_events(&recorded, "model_fallback");
+            assert_eq!(
+                notices.len(),
+                1,
+                "an already-latched session must not emit a second model_fallback notice: {recorded:#?}"
+            );
+        }
+
+        drop(runtime);
+        let _ = server.await;
+        let _ = std::fs::remove_file(&socket_path);
+    }
+
+    /// Probe eligibility: `probe_degraded_sessions` fires only for a session
+    /// that has an override, no active turn, and a stale `last_probe_epoch_ms`
+    /// (>= 300s). A fresh override is not probed; a degraded session with an
+    /// active turn is not probed; a fired probe is a degenerate one-shot
+    /// `generate_text` ("ping") at the ORIGIN tier, and the in-flight marker
+    /// plus the send-time stamp prevent a second probe on the next tick.
+    #[tokio::test]
+    async fn probe_fires_only_past_cadence_and_with_no_active_turn() {
+        let socket_path = format!("/tmp/philote-ovprobe-{}.sock", Uuid::new_v4().simple());
+        let listener = tokio::net::UnixListener::bind(&socket_path).expect("bind");
+        let emitted = std::sync::Arc::new(std::sync::Mutex::new(Vec::<serde_json::Value>::new()));
+        let server = tokio::spawn(run_recording_hotel(listener, emitted.clone()));
+
+        let identity = philotic_client::GuestIdentity {
+            guest_id: "agent-ov-probe".into(),
+            role: "agent".into(),
+            supported_tools: Vec::new(),
+        };
+        let client = philotic_client::PhiloticClient::connect_at(&socket_path, identity)
+            .await
+            .expect("connect to stub hotel");
+        let mut runtime = AgentRuntime::new(client, "agent-ov-probe");
+
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+
+        // Session A: degraded, idle, fresh probe stamp — must NOT probe yet.
+        runtime
+            .ensure_session_loaded("sess-probe-a", "telegram")
+            .await
+            .expect("session load");
+        runtime
+            .sessions
+            .get_mut("sess-probe-a")
+            .expect("session")
+            .fallback_override = Some(test_fallback_override("model", "model.openrouter"));
+        runtime
+            .sessions
+            .get_mut("sess-probe-a")
+            .expect("session")
+            .fallback_override
+            .as_mut()
+            .expect("override")
+            .last_probe_epoch_ms = now_ms;
+
+        // Session B: degraded, stale stamp, but an ACTIVE turn — must not probe.
+        runtime
+            .ensure_session_loaded("sess-probe-b", "telegram")
+            .await
+            .expect("session load");
+        {
+            let state = runtime.sessions.get_mut("sess-probe-b").expect("session");
+            state.fallback_override = Some(test_fallback_override("model", "model.openrouter"));
+            state.start_turn(test_working_turn(TurnPhase::WaitingModel));
+        }
+
+        runtime.probe_degraded_sessions().await;
+        assert!(
+            emitted
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|e| e["task"]["action"] != "generate_text"),
+            "no probe may fire before the 300s cadence or while a turn is active: {:#?}",
+            *emitted.lock().unwrap()
+        );
+
+        // Age session A past the cadence — exactly one probe must fire.
+        runtime
+            .sessions
+            .get_mut("sess-probe-a")
+            .expect("session")
+            .fallback_override
+            .as_mut()
+            .expect("override")
+            .last_probe_epoch_ms = now_ms.saturating_sub(301_000);
+
+        runtime.probe_degraded_sessions().await;
+        // Second tick immediately after: in-flight marker + send-time stamp
+        // must prevent a duplicate probe.
+        runtime.probe_degraded_sessions().await;
+
+        drop(runtime);
+        let _ = server.await;
+        let _ = std::fs::remove_file(&socket_path);
+
+        let emitted = emitted.lock().unwrap();
+        let probes: Vec<_> = emitted
+            .iter()
+            .filter(|e| e["task"]["action"] == "generate_text")
+            .collect();
+        assert_eq!(probes.len(), 1, "exactly one probe: {:#?}", *emitted);
+        let probe = &probes[0];
+        assert_eq!(
+            probe["target_role"], "model",
+            "the probe must target the ORIGIN tier, not the active fallback tier"
+        );
+        assert_eq!(probe["task"]["session_id"], "sess-probe-a");
+        assert!(
+            probe["task"]["turn_id"]
+                .as_str()
+                .expect("probe turn_id")
+                .starts_with("probe-"),
+            "probe turns carry a dedicated probe- turn_id: {probe:#?}"
+        );
+        assert_eq!(probe["task"]["user_content"], "ping");
+        assert_eq!(
+            probe["task"]["provider_options"]["probe"], true,
+            "the payload carries the probe marker"
+        );
+    }
+
+    /// Probe outcome handling: an error response correlated to the probe
+    /// leaves the session degraded (only the in-flight marker clears); a
+    /// successful response clears the override, after which dispatch resolves
+    /// back to the origin tier. Neither outcome touches the (absent) active
+    /// turn.
+    #[tokio::test]
+    async fn probe_success_clears_override_and_probe_failure_keeps_it() {
+        let socket_path = format!("/tmp/philote-ovclear-{}.sock", Uuid::new_v4().simple());
+        let listener = tokio::net::UnixListener::bind(&socket_path).expect("bind");
+        let emitted = std::sync::Arc::new(std::sync::Mutex::new(Vec::<serde_json::Value>::new()));
+        let server = tokio::spawn(run_recording_hotel(listener, emitted.clone()));
+
+        let identity = philotic_client::GuestIdentity {
+            guest_id: "agent-ov-clear".into(),
+            role: "agent".into(),
+            supported_tools: Vec::new(),
+        };
+        let client = philotic_client::PhiloticClient::connect_at(&socket_path, identity)
+            .await
+            .expect("connect to stub hotel");
+        let mut runtime = AgentRuntime::new(client, "agent-ov-clear");
+
+        let session_id = "sess-ov-clear";
+        runtime
+            .ensure_session_loaded(session_id, "telegram")
+            .await
+            .expect("session load");
+        {
+            let state = runtime.sessions.get_mut(session_id).expect("session");
+            state.role_activation =
+                Some(role_activation_with_ladder(&["model", "model.openrouter"]));
+            let mut ov = test_fallback_override("model", "model.openrouter");
+            ov.last_probe_epoch_ms = 0; // long past the cadence
+            state.fallback_override = Some(ov);
+        }
+
+        // First probe → origin still failing.
+        runtime.probe_degraded_sessions().await;
+        let probe_id = runtime
+            .pending_fallback_probes
+            .get(session_id)
+            .cloned()
+            .expect("probe in flight");
+        runtime
+            .handle_model_response(InboundTaskPayload {
+                action: Some("model_response".into()),
+                session_id: Some(session_id.into()),
+                turn_id: Some(probe_id),
+                error: Some(TaskErrorPayload {
+                    kind: "provider_failure".into(),
+                    message: "still down".into(),
+                    provider: Some("gemini".into()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            })
+            .await
+            .expect("probe failure handled");
+        assert!(
+            runtime
+                .sessions
+                .get(session_id)
+                .expect("session")
+                .fallback_override
+                .is_some(),
+            "a failed probe must leave the session degraded"
+        );
+        assert!(
+            !runtime.pending_fallback_probes.contains_key(session_id),
+            "the in-flight marker must clear on any probe outcome"
+        );
+
+        // Second probe → origin recovered.
+        runtime
+            .sessions
+            .get_mut(session_id)
+            .expect("session")
+            .fallback_override
+            .as_mut()
+            .expect("override")
+            .last_probe_epoch_ms = 0;
+        runtime.probe_degraded_sessions().await;
+        let probe_id = runtime
+            .pending_fallback_probes
+            .get(session_id)
+            .cloned()
+            .expect("second probe in flight");
+        runtime
+            .handle_model_response(InboundTaskPayload {
+                action: Some("model_response".into()),
+                session_id: Some(session_id.into()),
+                turn_id: Some(probe_id),
+                agent_action: Some(serde_json::json!({
+                    "kind": "respond",
+                    "content": "pong",
+                })),
+                content: Some("pong".into()),
+                ..Default::default()
+            })
+            .await
+            .expect("probe success handled");
+
+        {
+            let state = runtime.sessions.get(session_id).expect("session");
+            assert!(
+                state.fallback_override.is_none(),
+                "a successful probe must clear the override"
+            );
+            assert!(
+                state.active_turn.is_none(),
+                "probes must never materialize a WorkingTurn"
+            );
+            let (_, role, _) = resolve_model_execution_target(
+                Some(state),
+                "text.generate",
+                DEFAULT_TEXT_MODEL_ROLE,
+            );
+            assert_eq!(
+                role, "model",
+                "after recovery the next turn resolves to the origin tier"
+            );
+        }
+        assert!(!runtime.pending_fallback_probes.contains_key(session_id));
+
+        drop(runtime);
+        let _ = server.await;
+        let _ = std::fs::remove_file(&socket_path);
+    }
+
+    /// Slice 3: the origin-tier probe clearing the override must announce
+    /// recovery via `model_fallback_cleared` — but ONLY when the degradation
+    /// was actually announced in the first place (`notice_sent == true`). A
+    /// fallback the user never heard about doesn't need a recovery
+    /// announcement. `session_id` follows the `"{source}:{chat_id}:{...}"`
+    /// encoding so `emit_turn_event`'s no-active-turn fallback (there is no
+    /// `WorkingTurn` on a probe-cleared, idle session) can recover a chat_id.
+    #[tokio::test]
+    async fn probe_clear_emits_notice_only_when_previously_notified() {
+        async fn run_probe_clear_case(
+            session_id: &str,
+            notice_sent: bool,
+        ) -> Vec<serde_json::Value> {
+            let socket_path = format!("/tmp/philote-ovclearn-{}.sock", Uuid::new_v4().simple());
+            let listener = tokio::net::UnixListener::bind(&socket_path).expect("bind");
+            let emitted =
+                std::sync::Arc::new(std::sync::Mutex::new(Vec::<serde_json::Value>::new()));
+            let server = tokio::spawn(run_recording_hotel(listener, emitted.clone()));
+
+            let identity = philotic_client::GuestIdentity {
+                guest_id: "agent-ov-clear-notice".into(),
+                role: "agent".into(),
+                supported_tools: Vec::new(),
+            };
+            let client = philotic_client::PhiloticClient::connect_at(&socket_path, identity)
+                .await
+                .expect("connect to stub hotel");
+            let mut runtime = AgentRuntime::new(client, "agent-ov-clear-notice");
+
+            runtime
+                .ensure_session_loaded(session_id, "telegram")
+                .await
+                .expect("session load");
+            {
+                let state = runtime.sessions.get_mut(session_id).expect("session");
+                state.role_activation =
+                    Some(role_activation_with_ladder(&["model", "model.openrouter"]));
+                let mut ov = test_fallback_override("model", "model.openrouter");
+                ov.notice_sent = notice_sent;
+                ov.last_probe_epoch_ms = 0; // long past the cadence
+                state.fallback_override = Some(ov);
+            }
+
+            runtime.probe_degraded_sessions().await;
+            let probe_id = runtime
+                .pending_fallback_probes
+                .get(session_id)
+                .cloned()
+                .expect("probe in flight");
+            runtime
+                .handle_model_response(InboundTaskPayload {
+                    action: Some("model_response".into()),
+                    session_id: Some(session_id.into()),
+                    turn_id: Some(probe_id),
+                    agent_action: Some(serde_json::json!({
+                        "kind": "respond",
+                        "content": "pong",
+                    })),
+                    content: Some("pong".into()),
+                    ..Default::default()
+                })
+                .await
+                .expect("probe success handled");
+
+            assert!(
+                runtime
+                    .sessions
+                    .get(session_id)
+                    .expect("session")
+                    .fallback_override
+                    .is_none(),
+                "a successful probe must clear the override"
+            );
+
+            let recorded = emitted.lock().unwrap().clone();
+            drop(runtime);
+            let _ = server.await;
+            let _ = std::fs::remove_file(&socket_path);
+            recorded
+        }
+
+        let with_notice = run_probe_clear_case("telegram:98765:agent-ov-clear-a", true).await;
+        let notices = recorded_turn_events(&with_notice, "model_fallback_cleared");
+        assert_eq!(
+            notices.len(),
+            1,
+            "a previously-notified session must emit exactly one model_fallback_cleared event: {with_notice:#?}"
+        );
+        let message = notices[0]["task"]["partial_content"]
+            .as_str()
+            .expect("partial_content");
+        assert_eq!(
+            message,
+            "\u{21aa}\u{fe0f} Model fallback cleared: model (was model.openrouter)"
+        );
+
+        let without_notice = run_probe_clear_case("telegram:98766:agent-ov-clear-b", false).await;
+        let notices = recorded_turn_events(&without_notice, "model_fallback_cleared");
+        assert!(
+            notices.is_empty(),
+            "a session whose degradation was never announced must not emit a recovery notice: {without_notice:#?}"
+        );
+    }
+
+    /// A role change (inbound handoff_bundle — the application path of
+    /// `/role <name>`) must clear the fallback override and ONLY that field.
+    #[tokio::test]
+    async fn role_change_clears_fallback_override() {
+        let socket_path = format!("/tmp/philote-ovrole-{}.sock", Uuid::new_v4().simple());
+        let listener = tokio::net::UnixListener::bind(&socket_path).expect("bind");
+        let emitted = std::sync::Arc::new(std::sync::Mutex::new(Vec::<serde_json::Value>::new()));
+        let server = tokio::spawn(run_recording_hotel(listener, emitted.clone()));
+
+        let identity = philotic_client::GuestIdentity {
+            guest_id: "agent-ov-role".into(),
+            role: "agent".into(),
+            supported_tools: Vec::new(),
+        };
+        let client = philotic_client::PhiloticClient::connect_at(&socket_path, identity)
+            .await
+            .expect("connect to stub hotel");
+        let mut runtime = AgentRuntime::new(client, "agent-ov-role");
+
+        let session_id = "sess-ov-role";
+        runtime
+            .ensure_session_loaded(session_id, "telegram")
+            .await
+            .expect("session load");
+        {
+            let state = runtime.sessions.get_mut(session_id).expect("session");
+            state.fallback_override = Some(test_fallback_override("model", "model.openrouter"));
+            state.pinned_tier_role = Some("model.ollama".into());
+        }
+
+        runtime
+            .handle_handoff_bundle(
+                InboundTaskPayload {
+                    action: Some("handoff_bundle".into()),
+                    session_id: Some(session_id.into()),
+                    handoff_bundle: Some(philotic_client::HandoffBundle {
+                        to_role: Some("developer".into()),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+                Uuid::new_v4(),
+            )
+            .await
+            .expect("handoff bundle");
+
+        let state = runtime.sessions.get(session_id).expect("session");
+        assert!(
+            state.fallback_override.is_none(),
+            "a role change must clear the fallback override"
+        );
+        assert_eq!(
+            state.pinned_tier_role.as_deref(),
+            Some("model.ollama"),
+            "clearing the override must not touch other session state"
+        );
+
+        drop(runtime);
+        let _ = server.await;
+        let _ = std::fs::remove_file(&socket_path);
+    }
+
+    /// Any `/model` invocation — setting a pin or clearing it — resets the
+    /// fallback override: the operator is taking explicit control of tier
+    /// selection. This is an operator-driven clear, so — unlike the
+    /// origin-tier probe path — it must never emit `model_fallback_cleared`
+    /// even when `notice_sent` was true (the operator caused it; they know).
+    #[tokio::test]
+    async fn model_pin_command_clears_fallback_override() {
+        let socket_path = format!("/tmp/philote-ovpin-{}.sock", Uuid::new_v4().simple());
+        let listener = tokio::net::UnixListener::bind(&socket_path).expect("bind");
+        let emitted = std::sync::Arc::new(std::sync::Mutex::new(Vec::<serde_json::Value>::new()));
+        let server = tokio::spawn(run_recording_hotel(listener, emitted.clone()));
+
+        let identity = philotic_client::GuestIdentity {
+            guest_id: "agent-ov-pin".into(),
+            role: "agent".into(),
+            supported_tools: Vec::new(),
+        };
+        let client = philotic_client::PhiloticClient::connect_at(&socket_path, identity)
+            .await
+            .expect("connect to stub hotel");
+        let mut runtime = AgentRuntime::new(client, "agent-ov-pin");
+
+        let session_id = "sess-ov-pin";
+        runtime
+            .ensure_session_loaded(session_id, "telegram")
+            .await
+            .expect("session load");
+        let mut notified_override = test_fallback_override("model", "model.openrouter");
+        notified_override.notice_sent = true;
+        runtime
+            .sessions
+            .get_mut(session_id)
+            .expect("session")
+            .fallback_override = Some(notified_override);
+
+        // Setting a pin clears the override.
+        runtime
+            .handle_session_control_command(
+                Uuid::new_v4(),
+                session_id.to_string(),
+                "turn-ov-pin-1".into(),
+                "123".into(),
+                SlashCommand::Model {
+                    tier: Some("model.ollama".into()),
+                },
+            )
+            .await
+            .expect("pin command");
+        {
+            let state = runtime.sessions.get(session_id).expect("session");
+            assert!(
+                state.fallback_override.is_none(),
+                "setting a pin must clear the fallback override"
+            );
+            assert_eq!(state.pinned_tier_role.as_deref(), Some("model.ollama"));
+        }
+
+        // A bare /model (pin clear) also clears a lingering override.
+        let mut notified_override = test_fallback_override("model", "model.openrouter");
+        notified_override.notice_sent = true;
+        runtime
+            .sessions
+            .get_mut(session_id)
+            .expect("session")
+            .fallback_override = Some(notified_override);
+        runtime
+            .handle_session_control_command(
+                Uuid::new_v4(),
+                session_id.to_string(),
+                "turn-ov-pin-2".into(),
+                "123".into(),
+                SlashCommand::Model { tier: None },
+            )
+            .await
+            .expect("pin clear command");
+        {
+            let state = runtime.sessions.get(session_id).expect("session");
+            assert!(
+                state.fallback_override.is_none(),
+                "clearing the pin must also clear the fallback override"
+            );
+            assert!(state.pinned_tier_role.is_none());
+        }
+
+        let recorded = emitted.lock().unwrap().clone();
+        assert!(
+            recorded_turn_events(&recorded, "model_fallback_cleared").is_empty(),
+            "operator-driven /model clears must never emit model_fallback_cleared, \
+             even when notice_sent was true: {recorded:#?}"
+        );
+
+        drop(runtime);
+        let _ = server.await;
+        let _ = std::fs::remove_file(&socket_path);
+    }
+
+    // ── Provider 4xx mid-turn switch (forensic 2026-07-08) ───────────────────
+
+    /// The forensic gap end-to-end: a Gemini 400 arriving as an old-controller
+    /// envelope (kind=provider_failure, no sub_kind, no error_class) must NOT
+    /// fail the turn — the SAME turn must be re-dispatched to the next ladder
+    /// tier (model.openrouter under the post-#175 default ladder), a
+    /// `provider_switch` turn event must surface, and the fallback reply must
+    /// be delivered to the user.
+    #[tokio::test]
+    async fn provider_400_switches_provider_mid_turn_and_delivers_reply() {
+        let socket_path = format!("/tmp/philote-4xxswitch-{}.sock", Uuid::new_v4().simple());
+        let listener = tokio::net::UnixListener::bind(&socket_path).expect("bind");
+        let emitted = std::sync::Arc::new(std::sync::Mutex::new(Vec::<serde_json::Value>::new()));
+        let server = tokio::spawn(run_recording_hotel(listener, emitted.clone()));
+
+        let identity = philotic_client::GuestIdentity {
+            guest_id: "agent-4xx-switch".into(),
+            role: "agent".into(),
+            supported_tools: Vec::new(),
+        };
+        let client = philotic_client::PhiloticClient::connect_at(&socket_path, identity)
+            .await
+            .expect("connect to stub hotel");
+        let mut runtime = AgentRuntime::new(client, "agent-4xx-switch");
+
+        let session_id = "sess-4xx-switch";
+        let turn_id = "turn-4xx-switch";
+        runtime
+            .ensure_session_loaded(session_id, "telegram")
+            .await
+            .expect("session load");
+
+        // Seed an in-flight turn waiting on the tier-0 (gemini) model, bound
+        // to a membrane transport target.
+        let mut turn = def004_working_turn(turn_id, "hotel.status");
+        turn.phase = TurnPhase::WaitingModel;
+        turn.pending_tool_call = None;
+        runtime
+            .sessions
+            .get_mut(session_id)
+            .expect("session exists")
+            .start_turn(turn);
+
+        // Gemini 400 arrives — old-controller shape: no sub_kind, no
+        // error_class, no status. Exactly what died as MODEL_EMPTY_RESPONSE.
+        runtime
+            .handle_model_response(InboundTaskPayload {
+                action: Some("model_response".into()),
+                session_id: Some(session_id.into()),
+                turn_id: Some(turn_id.into()),
+                error: Some(TaskErrorPayload {
+                    kind: "provider_failure".into(),
+                    message: "Gemini API error (400): Request contains an invalid argument.".into(),
+                    component: Some("model-router".into()),
+                    provider: Some("gemini".into()),
+                    capability: Some("text.generate".into()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            })
+            .await
+            .expect("400 must not error the loop");
+
+        // The turn survives, advanced to tier 1 (model.openrouter), still WaitingModel.
+        {
+            let state = runtime.sessions.get(session_id).expect("session");
+            let turn = state
+                .active_turn
+                .as_ref()
+                .expect("turn must survive the 400 — it switches providers, not fails");
+            assert_eq!(
+                turn.fallback_tier, 1,
+                "must advance to the next ladder tier"
+            );
+            assert_eq!(turn.phase, TurnPhase::WaitingModel);
+        }
+
+        // The fallback tier answers on the same turn → reply delivered.
+        let final_text = "Openrouter fallback answer.";
+        runtime
+            .handle_model_response(InboundTaskPayload {
+                action: Some("model_response".into()),
+                session_id: Some(session_id.into()),
+                turn_id: Some(turn_id.into()),
+                agent_action: Some(serde_json::json!({
+                    "kind": "respond",
+                    "content": final_text,
+                })),
+                content: Some(final_text.into()),
+                ..Default::default()
+            })
+            .await
+            .expect("fallback respond");
+
+        drop(runtime);
+        let _ = server.await;
+        let _ = std::fs::remove_file(&socket_path);
+
+        let emitted = emitted.lock().unwrap();
+
+        // The re-dispatch went to the model.openrouter controller role.
+        let redispatches: Vec<_> = emitted
+            .iter()
+            .filter(|e| e["task"]["action"] == "generate_text")
+            .collect();
+        assert_eq!(
+            redispatches.len(),
+            1,
+            "exactly one fallback re-dispatch: {:#?}",
+            *emitted
+        );
+        assert_eq!(
+            redispatches[0]["target_role"], "model.openrouter",
+            "the 400 must engage the static ladder's next tier"
+        );
+
+        // A provider_switch turn event surfaced from → to → reason.
+        let switches: Vec<_> = emitted
+            .iter()
+            .filter(|e| {
+                e["task"]["action"] == "turn_event" && e["task"]["event"] == "provider_switch"
+            })
+            .collect();
+        assert_eq!(
+            switches.len(),
+            1,
+            "one provider_switch event: {:#?}",
+            *emitted
+        );
+        let detail = switches[0]["task"]["partial_content"]
+            .as_str()
+            .expect("switch detail");
+        assert!(
+            detail.contains("gemini") && detail.contains("openrouter"),
+            "switch detail must carry from/to providers: {detail}"
+        );
+
+        // No failure surfaced — the user got the fallback answer.
+        let replies: Vec<_> = emitted
+            .iter()
+            .filter(|e| e["task"]["action"] == "send_reply")
+            .collect();
+        assert_eq!(replies.len(), 1, "one final reply: {:#?}", *emitted);
+        assert!(
+            replies[0]["task"]["content"]
+                .as_str()
+                .expect("reply content")
+                .contains("Openrouter fallback answer"),
+            "user must see the fallback answer, not an error: {:#?}",
+            replies[0]
+        );
+        // A successful switch still means a tier is DOWN: it must file exactly
+        // one provider_fallback heal event (2026-07-20: a schema 400 silenced
+        // the gemini tier for hours with zero heal rows because the ladder
+        // kept answering) — and nothing stronger (no fallback_exhausted).
+        let heal_tags: Vec<&str> = emitted
+            .iter()
+            .filter_map(|e| e["heal_event"]["pattern_tag"].as_str())
+            .collect();
+        assert_eq!(
+            heal_tags,
+            vec!["provider_fallback:gemini"],
+            "mid-ladder degradation must file provider_fallback and nothing else: {:#?}",
+            *emitted
+        );
+    }
+
+    // ── Single-tier ladder reachability (defect 2: off-by-one) ───────────────
+
+    /// Regression for the off-by-one: a role with a single-tier ladder whose
+    /// *primary* dispatch bypassed the ladder (an explicit per-session
+    /// `component_routes` pin won precedence — see
+    /// `resolve_model_execution_target`; routing drill 2026-07-09 demoted
+    /// the legacy `effective_model_controller` fallback this test used to
+    /// use for the bypass below the ladder, so a genuine explicit pin is
+    /// used here instead to keep exercising the same bypass class) must
+    /// still get a shot at that one ladder tier on failure. Before the fix,
+    /// `fallback_tier` started at 0 unconditionally and the walk jumped
+    /// straight to tier 1, which immediately exceeded a single-tier
+    /// ladder's `max_tier` (0) and skipped
+    /// the ladder entirely.
+    #[tokio::test]
+    async fn single_tier_ladder_reachable_when_primary_bypassed_it() {
+        let socket_path = format!("/tmp/philote-1tier-bypass-{}.sock", Uuid::new_v4().simple());
+        let listener = tokio::net::UnixListener::bind(&socket_path).expect("bind");
+        let emitted = std::sync::Arc::new(std::sync::Mutex::new(Vec::<serde_json::Value>::new()));
+        let server = tokio::spawn(run_recording_hotel(listener, emitted.clone()));
+
+        let identity = philotic_client::GuestIdentity {
+            guest_id: "agent-1tier-bypass".into(),
+            role: "agent".into(),
+            supported_tools: Vec::new(),
+        };
+        let client = philotic_client::PhiloticClient::connect_at(&socket_path, identity)
+            .await
+            .expect("connect to stub hotel");
+        let mut runtime = AgentRuntime::new(client, "agent-1tier-bypass");
+
+        let session_id = "sess-1tier-bypass";
+        let turn_id = "turn-1tier-bypass";
+        runtime
+            .ensure_session_loaded(session_id, "telegram")
+            .await
+            .expect("session load");
+
+        // A 1-tier ladder is configured, but an explicit per-session
+        // `component_routes` pin (higher precedence than the ladder) is what
+        // actually drove the primary dispatch to gemini — the
+        // "default-primary role with a 1-tier ladder" case.
+        {
+            let state = runtime.sessions.get_mut(session_id).expect("session");
+            state.role_activation = Some(role_activation_with_ladder(&["model.openrouter"]));
+            state.bindings.component_routes.push(ComponentRouteBinding {
+                capability: "text.generate".into(),
+                selection_mode: "preferred".into(),
+                implementation: Some("gemini".into()),
+                incarnation: None,
+                preferred_hotel_id: None,
+                preferred_environment_id: None,
+            });
+        }
+
+        let mut turn = def004_working_turn(turn_id, "hotel.status");
+        turn.phase = TurnPhase::WaitingModel;
+        turn.pending_tool_call = None;
+        turn.fallback_tier = 0;
+        runtime
+            .sessions
+            .get_mut(session_id)
+            .expect("session exists")
+            .start_turn(turn);
+
+        runtime
+            .handle_model_response(InboundTaskPayload {
+                action: Some("model_response".into()),
+                session_id: Some(session_id.into()),
+                turn_id: Some(turn_id.into()),
+                error: Some(TaskErrorPayload {
+                    kind: "provider_failure".into(),
+                    message: "Gemini API error (400): Request contains an invalid argument.".into(),
+                    component: Some("model-router".into()),
+                    provider: Some("gemini".into()),
+                    capability: Some("text.generate".into()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            })
+            .await
+            .expect("400 must not error the loop");
+
+        // The turn survives and the single ladder tier gets tried, not skipped.
+        {
+            let state = runtime.sessions.get(session_id).expect("session");
+            let turn = state
+                .active_turn
+                .as_ref()
+                .expect("the single ladder tier must be reachable, not skipped to exhaustion");
+            assert_eq!(turn.phase, TurnPhase::WaitingModel);
+        }
+
+        drop(runtime);
+        let _ = server.await;
+        let _ = std::fs::remove_file(&socket_path);
+
+        let emitted = emitted.lock().unwrap();
+        let redispatches: Vec<_> = emitted
+            .iter()
+            .filter(|e| e["task"]["action"] == "generate_text")
+            .collect();
+        assert_eq!(
+            redispatches.len(),
+            1,
+            "exactly one fallback re-dispatch: {:#?}",
+            *emitted
+        );
+        assert_eq!(
+            redispatches[0]["target_role"], "model.openrouter",
+            "the single configured ladder tier must be tried on failure: {:#?}",
+            *emitted
+        );
+        // One tier failure files a provider_fallback (degradation visibility)
+        // but must NOT claim exhaustion — the single configured tier is still
+        // being tried.
+        assert!(
+            emitted
+                .iter()
+                .filter_map(|e| e["heal_event"]["pattern_tag"].as_str())
+                .all(|tag| !tag.starts_with("fallback_exhausted")),
+            "the ladder must not be exhausted after only one failure: {:#?}",
+            *emitted
+        );
+    }
+
+    /// Deeper regression on the same bypass case: `primary_dispatch_used_ladder`
+    /// is re-derived from *static* session config on every call, so on its own
+    /// it can't distinguish "virgin primary" from "tier 0 already dispatched
+    /// via this same bypass path" — both look identical (`current_tier == 0`,
+    /// primary still bypasses the ladder per session config). Without a
+    /// per-turn marker, a second failure would re-derive the same "None"
+    /// verdict and redispatch tier 0 forever, leaking every later tier
+    /// (`model.ollama` here) and the routing oracle. `WatchdogTimeout` is used
+    /// deliberately — it carries no `failed_provider`, so the contract-failure
+    /// skip (which happens to rescue the single-tier case) cannot mask this.
+    #[tokio::test]
+    async fn multi_tier_bypassed_ladder_walks_forward_across_repeated_failures() {
+        let socket_path = format!("/tmp/philote-2tier-bypass-{}.sock", Uuid::new_v4().simple());
+        let listener = tokio::net::UnixListener::bind(&socket_path).expect("bind");
+        let emitted = std::sync::Arc::new(std::sync::Mutex::new(Vec::<serde_json::Value>::new()));
+        let server = tokio::spawn(run_recording_hotel(listener, emitted.clone()));
+
+        let identity = philotic_client::GuestIdentity {
+            guest_id: "agent-2tier-bypass".into(),
+            role: "agent".into(),
+            supported_tools: Vec::new(),
+        };
+        let client = philotic_client::PhiloticClient::connect_at(&socket_path, identity)
+            .await
+            .expect("connect to stub hotel");
+        let mut runtime = AgentRuntime::new(client, "agent-2tier-bypass");
+
+        let session_id = "sess-2tier-bypass";
+        let turn_id = "turn-2tier-bypass";
+        runtime
+            .ensure_session_loaded(session_id, "telegram")
+            .await
+            .expect("session load");
+
+        // Two-tier ladder configured, but an explicit per-session
+        // `component_routes` pin wins precedence for the primary dispatch
+        // (bypasses the ladder entirely) — see the single-tier variant above
+        // for why this uses a genuine explicit pin rather than the legacy
+        // `effective_model_controller` fallback this test used pre-routing-drill.
+        {
+            let state = runtime.sessions.get_mut(session_id).expect("session");
+            state.role_activation = Some(role_activation_with_ladder(&[
+                "model.openrouter",
+                "model.ollama",
+            ]));
+            state.bindings.component_routes.push(ComponentRouteBinding {
+                capability: "text.generate".into(),
+                selection_mode: "preferred".into(),
+                implementation: Some("gemini".into()),
+                incarnation: None,
+                preferred_hotel_id: None,
+                preferred_environment_id: None,
+            });
+        }
+
+        let mut turn = def004_working_turn(turn_id, "hotel.status");
+        turn.phase = TurnPhase::WaitingModel;
+        turn.pending_tool_call = None;
+        turn.fallback_tier = 0;
+        runtime
+            .sessions
+            .get_mut(session_id)
+            .expect("session exists")
+            .start_turn(turn);
+
+        // First WatchdogTimeout: the bypassed ladder's tiers[0] must be tried.
+        runtime
+            .advance_turn_to_next_fallback_tier(
+                session_id.to_string(),
+                turn_id.to_string(),
+                NoResponseClass::WatchdogTimeout,
+                None,
+                "watchdog timeout".into(),
+            )
+            .await
+            .expect("first escalation");
+        {
+            let state = runtime.sessions.get(session_id).expect("session");
+            let turn = state.active_turn.as_ref().expect("turn survives tier 0");
+            assert_eq!(turn.fallback_tier, 0, "lands on ladder tier 0");
+            assert!(
+                turn.ladder_tier0_dispatched,
+                "the ladder-engaged marker must flip once tier 0 is dispatched"
+            );
+        }
+
+        // Second WatchdogTimeout: must advance to tiers[1] ("model.ollama"),
+        // not redispatch tiers[0] again.
+        runtime
+            .advance_turn_to_next_fallback_tier(
+                session_id.to_string(),
+                turn_id.to_string(),
+                NoResponseClass::WatchdogTimeout,
+                None,
+                "watchdog timeout".into(),
+            )
+            .await
+            .expect("second escalation");
+        {
+            let state = runtime.sessions.get(session_id).expect("session");
+            let turn = state.active_turn.as_ref().expect("turn survives tier 1");
+            assert_eq!(
+                turn.fallback_tier, 1,
+                "must advance past tier 0, not redispatch it"
+            );
+        }
+
+        drop(runtime);
+        let _ = server.await;
+        let _ = std::fs::remove_file(&socket_path);
+
+        let emitted = emitted.lock().unwrap();
+        let redispatches: Vec<_> = emitted
+            .iter()
+            .filter(|e| e["task"]["action"] == "generate_text")
+            .map(|e| e["target_role"].as_str().unwrap_or("").to_string())
+            .collect();
+        assert_eq!(
+            redispatches,
+            vec!["model.openrouter".to_string(), "model.ollama".to_string()],
+            "the walk must cover each ladder entry exactly once, in order: {:#?}",
+            redispatches
+        );
+    }
+
+    /// Layer 1 isolation, driven through the real fallback-tier *advance*
+    /// dispatch (`turn_loop.rs`'s `configured_model_bindings`, not just the
+    /// primary-dispatch helper covered by the `role_model_binding_*` tests
+    /// above): "Aria" has her OWN `model_bindings`, distinct per tier and
+    /// distinct from any other agent's or the provider's global default.
+    /// Proves each fallback tier resolves its own bound model — the routing
+    /// drill's headline complaint was Aria's openrouter *fallback* silently
+    /// inheriting Jane's GLM-5.2 via the shared global
+    /// `openrouter_default_model`; per-agent `model_bindings` is the fix.
+    #[tokio::test]
+    async fn aria_fallback_tier_uses_her_own_model_binding_not_a_shared_default() {
+        let socket_path = format!("/tmp/philote-aria-binding-{}.sock", Uuid::new_v4().simple());
+        let listener = tokio::net::UnixListener::bind(&socket_path).expect("bind");
+        let emitted = std::sync::Arc::new(std::sync::Mutex::new(Vec::<serde_json::Value>::new()));
+        let server = tokio::spawn(run_recording_hotel(listener, emitted.clone()));
+
+        let identity = philotic_client::GuestIdentity {
+            guest_id: "agent-aria".into(),
+            role: "agent".into(),
+            supported_tools: Vec::new(),
+        };
+        let client = philotic_client::PhiloticClient::connect_at(&socket_path, identity)
+            .await
+            .expect("connect to stub hotel");
+        let mut runtime = AgentRuntime::new(client, "agent-aria");
+
+        let session_id = "sess-aria-binding";
+        let turn_id = "turn-aria-binding";
+        runtime
+            .ensure_session_loaded(session_id, "telegram")
+            .await
+            .expect("session load");
+
+        // Two-tier ladder, primary dispatch bypassed (explicit component_routes
+        // pin, same harness pattern as the off-by-one tests above) so both
+        // tier 0 and tier 1 get a real dispatch through
+        // `advance_turn_to_next_fallback_tier` in this synthetic test. Aria's
+        // bindings are deliberately NOT "z-ai/glm-5.2" (Jane's model from the
+        // routing drill) to prove isolation, not just presence.
+        {
+            let state = runtime.sessions.get_mut(session_id).expect("session");
+            state.role_activation = Some(role_activation_with_ladder_and_bindings(
+                &["model.openrouter", "model.ollama"],
+                &[
+                    ("model.openrouter", "aria/openrouter-preferred"),
+                    ("model.ollama", "aria/ollama-preferred"),
+                ],
+            ));
+            state.bindings.component_routes.push(ComponentRouteBinding {
+                capability: "text.generate".into(),
+                selection_mode: "preferred".into(),
+                implementation: Some("gemini".into()),
+                incarnation: None,
+                preferred_hotel_id: None,
+                preferred_environment_id: None,
+            });
+        }
+
+        let mut turn = def004_working_turn(turn_id, "hotel.status");
+        turn.phase = TurnPhase::WaitingModel;
+        turn.pending_tool_call = None;
+        turn.fallback_tier = 0;
+        runtime
+            .sessions
+            .get_mut(session_id)
+            .expect("session exists")
+            .start_turn(turn);
+
+        // Tier 0 (bypassed primary gets its shot): must carry Aria's
+        // model.openrouter binding, not Jane's glm-5.2 or an unset default.
+        runtime
+            .advance_turn_to_next_fallback_tier(
+                session_id.to_string(),
+                turn_id.to_string(),
+                NoResponseClass::WatchdogTimeout,
+                None,
+                "watchdog timeout".into(),
+            )
+            .await
+            .expect("first escalation");
+
+        // Tier 1: must carry Aria's OWN model.ollama binding — a distinct
+        // value per tier, not a single agent-wide model pinned once.
+        runtime
+            .advance_turn_to_next_fallback_tier(
+                session_id.to_string(),
+                turn_id.to_string(),
+                NoResponseClass::WatchdogTimeout,
+                None,
+                "watchdog timeout".into(),
+            )
+            .await
+            .expect("second escalation");
+
+        drop(runtime);
+        let _ = server.await;
+        let _ = std::fs::remove_file(&socket_path);
+
+        let emitted = emitted.lock().unwrap();
+        let dispatches: Vec<(String, Option<String>)> = emitted
+            .iter()
+            .filter(|e| e["task"]["action"] == "generate_text")
+            .map(|e| {
+                (
+                    e["target_role"].as_str().unwrap_or("").to_string(),
+                    e["task"]["model"].as_str().map(str::to_string),
+                )
+            })
+            .collect();
+
+        assert_eq!(
+            dispatches,
+            vec![
+                (
+                    "model.openrouter".to_string(),
+                    Some("aria/openrouter-preferred".to_string())
+                ),
+                (
+                    "model.ollama".to_string(),
+                    Some("aria/ollama-preferred".to_string())
+                ),
+            ],
+            "each fallback tier must carry Aria's OWN per-tier bound model, \
+             not Jane's z-ai/glm-5.2 or a shared global default: {:#?}",
+            dispatches
+        );
+        assert!(
+            dispatches
+                .iter()
+                .all(|(_, model)| model.as_deref() != Some("z-ai/glm-5.2")),
+            "Aria's dispatches must never carry Jane's bound model: {:#?}",
+            dispatches
+        );
+    }
+
+    /// Counterpart: when the primary dispatch *did* come from the ladder
+    /// (tiers[0], per defect-1's fixed precedence), a single-tier ladder is
+    /// correctly exhausted on the next failure — there is nothing left to
+    /// retry, so the turn falls through to the routing oracle (which the stub
+    /// hotel answers with no ranked data) and fails cleanly instead of
+    /// looping back onto the tier it already tried.
+    #[tokio::test]
+    async fn single_tier_ladder_engaged_as_primary_exhausts_cleanly_on_failure() {
+        let socket_path = format!(
+            "/tmp/philote-1tier-engaged-{}.sock",
+            Uuid::new_v4().simple()
+        );
+        let listener = tokio::net::UnixListener::bind(&socket_path).expect("bind");
+        let emitted = std::sync::Arc::new(std::sync::Mutex::new(Vec::<serde_json::Value>::new()));
+        let server = tokio::spawn(run_recording_hotel(listener, emitted.clone()));
+
+        let identity = philotic_client::GuestIdentity {
+            guest_id: "agent-1tier-engaged".into(),
+            role: "agent".into(),
+            supported_tools: Vec::new(),
+        };
+        let client = philotic_client::PhiloticClient::connect_at(&socket_path, identity)
+            .await
+            .expect("connect to stub hotel");
+        let mut runtime = AgentRuntime::new(client, "agent-1tier-engaged");
+
+        let session_id = "sess-1tier-engaged";
+        let turn_id = "turn-1tier-engaged";
+        runtime
+            .ensure_session_loaded(session_id, "telegram")
+            .await
+            .expect("session load");
+
+        // No hotel route, no explicit binding: per resolve_model_execution_target's
+        // precedence the 1-tier ladder's tiers[0] ("model.openrouter") IS the
+        // primary dispatch.
+        {
+            let state = runtime.sessions.get_mut(session_id).expect("session");
+            state.role_activation = Some(role_activation_with_ladder(&["model.openrouter"]));
+        }
+        assert!(
+            primary_dispatch_used_ladder(runtime.sessions.get(session_id), "text.generate"),
+            "sanity: the ladder must be the primary source in this fixture"
+        );
+
+        let mut turn = def004_working_turn(turn_id, "hotel.status");
+        turn.phase = TurnPhase::WaitingModel;
+        turn.pending_tool_call = None;
+        turn.fallback_tier = 0;
+        runtime
+            .sessions
+            .get_mut(session_id)
+            .expect("session exists")
+            .start_turn(turn);
+
+        runtime
+            .handle_model_response(InboundTaskPayload {
+                action: Some("model_response".into()),
+                session_id: Some(session_id.into()),
+                turn_id: Some(turn_id.into()),
+                error: Some(TaskErrorPayload {
+                    kind: "provider_failure".into(),
+                    message: "OpenRouter API error (500): upstream unavailable.".into(),
+                    component: Some("model-router".into()),
+                    provider: Some("openrouter".into()),
+                    capability: Some("text.generate".into()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            })
+            .await
+            .expect("failure must not error the loop");
+
+        drop(runtime);
+        let _ = server.await;
+        let _ = std::fs::remove_file(&socket_path);
+
+        let emitted = emitted.lock().unwrap();
+        // No second ladder dispatch — the single tier already served as
+        // primary, so there was nothing left in the ladder to retry.
+        let redispatches: Vec<_> = emitted
+            .iter()
+            .filter(|e| e["task"]["action"] == "generate_text")
+            .collect();
+        assert!(
+            redispatches.is_empty(),
+            "no ladder tier remains to redispatch to: {:#?}",
+            *emitted
+        );
+        let heal_events: Vec<_> = emitted
+            .iter()
+            .filter(|e| !e["heal_event"].is_null())
+            .collect();
+        assert_eq!(
+            heal_events.len(),
+            1,
+            "exhaustion must push exactly one heal event: {:#?}",
+            *emitted
+        );
+    }
+
+    /// Fatal auth failures fail the turn fast (no pointless provider ladder
+    /// walk with a dead key) and flag the heal queue so the outage becomes an
+    /// operator work item.
+    #[tokio::test]
+    async fn fatal_auth_failure_fails_fast_and_pushes_heal_event() {
+        let socket_path = format!("/tmp/philote-authfatal-{}.sock", Uuid::new_v4().simple());
+        let listener = tokio::net::UnixListener::bind(&socket_path).expect("bind");
+        let emitted = std::sync::Arc::new(std::sync::Mutex::new(Vec::<serde_json::Value>::new()));
+        let server = tokio::spawn(run_recording_hotel(listener, emitted.clone()));
+
+        let identity = philotic_client::GuestIdentity {
+            guest_id: "agent-auth-fatal".into(),
+            role: "agent".into(),
+            supported_tools: Vec::new(),
+        };
+        let client = philotic_client::PhiloticClient::connect_at(&socket_path, identity)
+            .await
+            .expect("connect to stub hotel");
+        let mut runtime = AgentRuntime::new(client, "agent-auth-fatal");
+
+        let session_id = "sess-auth-fatal";
+        let turn_id = "turn-auth-fatal";
+        runtime
+            .ensure_session_loaded(session_id, "telegram")
+            .await
+            .expect("session load");
+
+        let mut turn = def004_working_turn(turn_id, "hotel.status");
+        turn.phase = TurnPhase::WaitingModel;
+        turn.pending_tool_call = None;
+        runtime
+            .sessions
+            .get_mut(session_id)
+            .expect("session exists")
+            .start_turn(turn);
+
+        runtime
+            .handle_model_response(InboundTaskPayload {
+                action: Some("model_response".into()),
+                session_id: Some(session_id.into()),
+                turn_id: Some(turn_id.into()),
+                error: Some(TaskErrorPayload {
+                    kind: "provider_failure".into(),
+                    message: "Gemini API error (400): API key expired.".into(),
+                    provider: Some("gemini".into()),
+                    capability: Some("text.generate".into()),
+                    retryable: Some(false),
+                    sub_kind: Some("provider_auth".into()),
+                    error_class: Some("fatal".into()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            })
+            .await
+            .expect("auth failure handled");
+
+        assert!(
+            runtime
+                .sessions
+                .get(session_id)
+                .expect("session")
+                .active_turn
+                .is_none(),
+            "fatal auth must fail the turn fast"
+        );
+
+        drop(runtime);
+        let _ = server.await;
+        let _ = std::fs::remove_file(&socket_path);
+
+        let emitted = emitted.lock().unwrap();
+        assert!(
+            !emitted
+                .iter()
+                .any(|e| e["task"]["action"] == "generate_text"),
+            "no ladder walk with a dead key: {:#?}",
+            *emitted
+        );
+        let heal_events: Vec<_> = emitted
+            .iter()
+            .filter(|e| !e["heal_event"].is_null())
+            .collect();
+        assert_eq!(heal_events.len(), 1, "one heal event: {:#?}", *emitted);
+        assert_eq!(
+            heal_events[0]["heal_event"]["pattern_tag"],
+            "provider_auth:gemini"
+        );
+        assert!(
+            emitted.iter().any(|e| {
+                e["task"]["action"] == "send_reply"
+                    && e["task"]["content"]
+                        .as_str()
+                        .is_some_and(|c| c.contains("rejected its credentials"))
+            }),
+            "user must get a fast, clear auth notice: {:#?}",
+            *emitted
+        );
+    }
+
+    /// Wiring guard: a role whose `TurnLoopConfig` carries paracrine-budget
+    /// overrides must have them applied to the live session's `ExecutionPolicy`
+    /// when the role is activated via a handoff bundle — not merely stored on the
+    /// role record. This is the assertion that survives refactors of the
+    /// activation sites.
+    #[tokio::test]
+    async fn role_activation_applies_paracrine_budget_override() {
+        let socket_path = format!("/tmp/philote-roleovr-{}.sock", Uuid::new_v4().simple());
+        let listener = tokio::net::UnixListener::bind(&socket_path).expect("bind");
+        let emitted = std::sync::Arc::new(std::sync::Mutex::new(Vec::<serde_json::Value>::new()));
+        let server = tokio::spawn(run_recording_hotel(listener, emitted.clone()));
+
+        let identity = philotic_client::GuestIdentity {
+            guest_id: "agent-roleovr".into(),
+            role: "agent".into(),
+            supported_tools: Vec::new(),
+        };
+        let client = philotic_client::PhiloticClient::connect_at(&socket_path, identity)
+            .await
+            .expect("connect to stub hotel");
+        let mut runtime = AgentRuntime::new(client, "agent-roleovr");
+
+        // Register a role whose TurnLoopConfig tightens the paracrine budgets.
+        runtime.configured_roles.insert(
+            "specialist".to_string(),
+            CachedRoleConfig {
+                toolset_profile: "default".into(),
+                role_identity_addendum: None,
+                role_manifest: None,
+                iteration_cap: None,
+                approval_policy: None,
+                turn_loop_config: ansible_mesh_core::graph::TurnLoopConfig {
+                    paracrine_hop_budget: Some(9),
+                    paracrine_chain_budget_secs: Some(120),
+                    ..Default::default()
+                },
+                content_policy: "standard".into(),
+            },
+        );
+
+        let session_id = "sess-roleovr";
+        let task_id = Uuid::new_v4();
+        let bundle = philotic_client::HandoffBundle {
+            to_role: Some("specialist".into()),
+            from_role: Some("orchestrator".into()),
+            handoff_reason: Some("test".into()),
+            working_summary: Some("do the thing".into()),
+            ..Default::default()
+        };
+        runtime
+            .handle_handoff_bundle(
+                InboundTaskPayload {
+                    action: Some("handoff_bundle".into()),
+                    session_id: Some(session_id.into()),
+                    turn_id: Some("turn-roleovr".into()),
+                    handoff_bundle: Some(bundle),
+                    ..Default::default()
+                },
+                task_id,
+            )
+            .await
+            .expect("handoff bundle");
+
+        let exec = &runtime
+            .session(session_id)
+            .expect("session exists")
+            .settings
+            .execution;
+        assert_eq!(
+            exec.paracrine_hop_budget, 9,
+            "role TurnLoopConfig hop budget must be applied at activation"
+        );
+        assert_eq!(
+            exec.paracrine_chain_budget_secs, 120,
+            "role TurnLoopConfig time budget must be applied at activation"
+        );
+
+        drop(runtime);
+        let _ = server.await;
+        let _ = std::fs::remove_file(&socket_path);
+    }
+
+    /// Wiring guard: a role whose `TurnLoopConfig` carries context-window
+    /// overrides must have them applied to the live session's `ContextWindowPolicy`
+    /// at handoff-bundle activation, and reverted to the session baseline on
+    /// handoff-return. This is the assertion that survives refactors of the
+    /// activation/return sites — a helper-only test would miss the wire-up.
+    #[tokio::test]
+    async fn role_activation_applies_and_restores_context_window() {
+        let socket_path = format!("/tmp/philote-ctxwin-{}.sock", Uuid::new_v4().simple());
+        let listener = tokio::net::UnixListener::bind(&socket_path).expect("bind");
+        let emitted = std::sync::Arc::new(std::sync::Mutex::new(Vec::<serde_json::Value>::new()));
+        let server = tokio::spawn(run_recording_hotel(listener, emitted.clone()));
+
+        let identity = philotic_client::GuestIdentity {
+            guest_id: "agent-ctxwin".into(),
+            role: "agent".into(),
+            supported_tools: Vec::new(),
+        };
+        let client = philotic_client::PhiloticClient::connect_at(&socket_path, identity)
+            .await
+            .expect("connect to stub hotel");
+        let mut runtime = AgentRuntime::new(client, "agent-ctxwin");
+
+        // Register a terse specialist that tightens the dialogue-window budgets.
+        runtime.configured_roles.insert(
+            "specialist".to_string(),
+            CachedRoleConfig {
+                toolset_profile: "default".into(),
+                role_identity_addendum: None,
+                role_manifest: None,
+                iteration_cap: None,
+                approval_policy: None,
+                turn_loop_config: ansible_mesh_core::graph::TurnLoopConfig {
+                    context_window: Some(ansible_mesh_core::graph::ContextWindowOverrides {
+                        dialogue_window_chars: Some(2_000),
+                        max_tool_history_entries: Some(5),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+                content_policy: "standard".into(),
+            },
+        );
+
+        let session_id = "sess-ctxwin";
+        let bundle = philotic_client::HandoffBundle {
+            to_role: Some("specialist".into()),
+            from_role: Some("orchestrator".into()),
+            handoff_reason: Some("test".into()),
+            working_summary: Some("do the thing".into()),
+            ..Default::default()
+        };
+        runtime
+            .handle_handoff_bundle(
+                InboundTaskPayload {
+                    action: Some("handoff_bundle".into()),
+                    session_id: Some(session_id.into()),
+                    turn_id: Some("turn-ctxwin".into()),
+                    handoff_bundle: Some(bundle),
+                    ..Default::default()
+                },
+                Uuid::new_v4(),
+            )
+            .await
+            .expect("handoff bundle");
+
+        {
+            let cw = &runtime
+                .session(session_id)
+                .expect("session exists")
+                .settings
+                .context_window;
+            assert_eq!(
+                cw.dialogue_window_chars, 2_000,
+                "role context-window override must be applied at activation"
+            );
+            assert_eq!(
+                cw.max_tool_history_entries, 5,
+                "role tool-history override must be applied at activation"
+            );
+        }
+
+        // Now hand control back to the orchestrator; the baseline must return.
+        runtime
+            .handle_handoff_return(
+                InboundTaskPayload {
+                    action: Some("handoff_return".into()),
+                    session_id: Some(session_id.into()),
+                    turn_id: Some("turn-ctxwin-return".into()),
+                    ..Default::default()
+                },
+                Uuid::new_v4(),
+            )
+            .await
+            .expect("handoff return");
+
+        {
+            let state = runtime.session(session_id).expect("session exists");
+            let defaults = crate::session::ContextWindowPolicy::default();
+            assert_eq!(
+                state.settings.context_window, defaults,
+                "context-window policy must be restored to the session baseline on return"
+            );
+            assert!(
+                state.base_context_window.is_none(),
+                "baseline snapshot must be cleared on return"
+            );
+        }
+
+        drop(runtime);
+        let _ = server.await;
+        let _ = std::fs::remove_file(&socket_path);
+    }
+
+    // ── Plan-eval-repeat loop ───────────────────────────────────────────────
+
+    /// Serializes tests that read or mutate PHILOTIC_DISABLE_PLAN_CONTINUATION,
+    /// since env vars are process-global and tests run concurrently.
+    static PLAN_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn plan_env_guard() -> std::sync::MutexGuard<'static, ()> {
+        PLAN_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    fn plan_with_statuses(goal: &str, statuses: &[&str]) -> ActivePlan {
+        ActivePlan {
+            goal: goal.into(),
+            steps: statuses
+                .iter()
+                .enumerate()
+                .map(|(i, st)| PlanStep {
+                    id: i as u32 + 1,
+                    description: format!("work item {}", i + 1),
+                    tool_name: None,
+                    status: (*st).to_string(),
+                })
+                .collect(),
+            status: "executing".into(),
+            context_1_advisory: None,
+        }
+    }
+
+    async fn plan_test_runtime(
+        tag: &str,
+    ) -> (
+        AgentRuntime,
+        std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
+        tokio::task::JoinHandle<()>,
+        String,
+    ) {
+        let socket_path = format!("/tmp/philote-{}-{}.sock", tag, Uuid::new_v4().simple());
+        let listener = tokio::net::UnixListener::bind(&socket_path).expect("bind");
+        let emitted = std::sync::Arc::new(std::sync::Mutex::new(Vec::<serde_json::Value>::new()));
+        let server = tokio::spawn(run_recording_hotel(listener, emitted.clone()));
+        let identity = philotic_client::GuestIdentity {
+            guest_id: format!("agent-{tag}"),
+            role: "agent".into(),
+            supported_tools: Vec::new(),
+        };
+        let client = philotic_client::PhiloticClient::connect_at(&socket_path, identity)
+            .await
+            .expect("connect to stub hotel");
+        let runtime = AgentRuntime::new(client, format!("agent-{tag}"));
+        (runtime, emitted, server, socket_path)
+    }
+
+    fn respond_payload(session_id: &str, turn_id: &str, text: &str) -> InboundTaskPayload {
+        InboundTaskPayload {
+            action: Some("model_response".into()),
+            session_id: Some(session_id.into()),
+            turn_id: Some(turn_id.into()),
+            agent_action: Some(serde_json::json!({
+                "kind": "respond",
+                "content": text,
+            })),
+            content: Some(text.into()),
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn plan_continuation_synthesized_after_partial_plan_respond() {
+        let _guard = plan_env_guard();
+        unsafe {
+            std::env::remove_var("PHILOTIC_DISABLE_PLAN_CONTINUATION");
+        }
+        let (mut runtime, emitted, server, socket_path) = plan_test_runtime("plancont").await;
+        let session_id = "sess-plancont";
+        runtime
+            .ensure_session_loaded(session_id, "telegram")
+            .await
+            .expect("session load");
+
+        // Turn completing with a 3-step plan, only step 1 model-reported done.
+        {
+            let mut turn = test_working_turn(TurnPhase::WaitingModel);
+            turn.turn_id = "turn-plan-1".into();
+            turn.active_plan = Some(plan_with_statuses(
+                "ship it",
+                &["done", "pending", "pending"],
+            ));
+            runtime
+                .sessions
+                .get_mut(session_id)
+                .expect("session")
+                .start_turn(turn);
+        }
+
+        runtime
+            .handle_model_response(respond_payload(
+                session_id,
+                "turn-plan-1",
+                "progress so far",
+            ))
+            .await
+            .expect("respond");
+
+        // Carryover persisted with the eval flags; one continuation charged.
+        {
+            let state = runtime.session(session_id).expect("session");
+            let carry = state.carryover_plan.as_ref().expect("carryover persisted");
+            assert_eq!(carry.steps_done, vec![true, false, false]);
+            assert_eq!(carry.continuations_used, 1);
+            assert_eq!(carry.created_turn_id, "turn-plan-1");
+        }
+
+        // Exactly one continuation task queued through pending_drains.
+        assert_eq!(runtime.pending_drains.len(), 1, "one continuation queued");
+        let (drain_id, drain_task) = runtime.pending_drains.pop_front().expect("drain");
+        assert_eq!(drain_task.action.as_deref(), Some("plan_continuation"));
+        let brief = drain_task.content.clone().expect("brief content");
+        assert!(brief.contains("[Plan continuation 1/3]"), "{brief}");
+        assert!(brief.contains("work item 2"), "{brief}");
+        assert!(brief.contains("work item 3"), "{brief}");
+        assert!(
+            !brief.contains("Completed steps:\n- step 2"),
+            "done list must not include pending steps: {brief}"
+        );
+
+        // Dispatching the continuation seeds the new turn with the carried-over
+        // plan (done steps marked) and enters pre-confirmed.
+        runtime
+            .handle_user_message(drain_task, drain_id)
+            .await
+            .expect("continuation turn starts");
+        {
+            let state = runtime.session(session_id).expect("session");
+            let turn = state.active_turn.as_ref().expect("continuation turn");
+            assert!(turn.plan_confirmed, "continuation must be pre-confirmed");
+            let plan = turn.active_plan.as_ref().expect("plan seeded");
+            assert_eq!(plan.steps[0].status, "done");
+            assert_eq!(plan.steps[1].status, "pending");
+        }
+
+        drop(runtime);
+        let _ = server.await;
+        let _ = std::fs::remove_file(&socket_path);
+
+        let emitted = emitted.lock().unwrap();
+        let plan_evals: Vec<_> = emitted
+            .iter()
+            .filter(|e| e["task"]["action"] == "turn_event" && e["task"]["event"] == "plan_eval")
+            .collect();
+        assert_eq!(plan_evals.len(), 1, "one plan_eval event: {:#?}", *emitted);
+        let detail: serde_json::Value = serde_json::from_str(
+            plan_evals[0]["task"]["partial_content"]
+                .as_str()
+                .expect("plan_eval detail"),
+        )
+        .expect("plan_eval detail is JSON");
+        assert_eq!(detail["verdict"], "continue");
+        assert_eq!(detail["basis"], "model_reported");
+        assert_eq!(detail["steps_done"], 1);
+        assert_eq!(detail["steps_total"], 3);
+        assert!(
+            emitted.iter().any(|e| e["task"]["action"] == "turn_event"
+                && e["task"]["event"] == "plan_continuation"),
+            "plan_continuation event must be emitted: {:#?}",
+            *emitted
+        );
+        assert!(
+            emitted
+                .iter()
+                .any(|e| e["task"]["action"] == "generate_text"),
+            "continuation turn must re-enter the model"
+        );
+    }
+
+    #[tokio::test]
+    async fn plan_continuation_budget_exhaustion_notifies_and_clears() {
+        let _guard = plan_env_guard();
+        unsafe {
+            std::env::remove_var("PHILOTIC_DISABLE_PLAN_CONTINUATION");
+        }
+        let (mut runtime, emitted, server, socket_path) = plan_test_runtime("planbudget").await;
+        let session_id = "sess-planbudget";
+        runtime
+            .ensure_session_loaded(session_id, "telegram")
+            .await
+            .expect("session load");
+
+        {
+            let state = runtime.sessions.get_mut(session_id).expect("session");
+            // Carryover already spent the full default budget (3).
+            state.carryover_plan = Some(CarryoverPlan {
+                plan: plan_with_statuses("ship it", &["done", "pending", "pending"]),
+                steps_done: vec![true, false, false],
+                continuations_used: 3,
+                created_turn_id: "turn-origin".into(),
+            });
+            // This continuation made progress (step 2 done) but one step remains.
+            let mut turn = test_working_turn(TurnPhase::WaitingModel);
+            turn.turn_id = "turn-plan-4".into();
+            turn.active_plan = Some(plan_with_statuses("ship it", &["done", "done", "pending"]));
+            state.start_turn(turn);
+        }
+
+        runtime
+            .handle_model_response(respond_payload(session_id, "turn-plan-4", "more progress"))
+            .await
+            .expect("respond");
+
+        let state = runtime.session(session_id).expect("session");
+        assert!(
+            state.carryover_plan.is_none(),
+            "carryover must be cleared when the budget is exhausted"
+        );
+        assert!(
+            runtime.pending_drains.is_empty(),
+            "no further continuation may be synthesized"
+        );
+
+        drop(runtime);
+        let _ = server.await;
+        let _ = std::fs::remove_file(&socket_path);
+
+        let emitted = emitted.lock().unwrap();
+        let notices: Vec<_> = emitted
+            .iter()
+            .filter(|e| {
+                e["task"]["action"] == "send_reply"
+                    && e["task"]["content"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .contains("budget")
+            })
+            .collect();
+        assert_eq!(notices.len(), 1, "one stop notice: {:#?}", *emitted);
+        let notice = notices[0]["task"]["content"].as_str().unwrap();
+        assert!(notice.contains("2/3 steps done"), "{notice}");
+        assert!(notice.contains("work item 3"), "{notice}");
+        assert!(notice.contains("/plan drop"), "{notice}");
+    }
+
+    #[tokio::test]
+    async fn plan_continuation_kill_switch_disables_carryover() {
+        let _guard = plan_env_guard();
+        unsafe {
+            std::env::set_var("PHILOTIC_DISABLE_PLAN_CONTINUATION", "1");
+        }
+        let (mut runtime, emitted, server, socket_path) = plan_test_runtime("plankill").await;
+        let session_id = "sess-plankill";
+        runtime
+            .ensure_session_loaded(session_id, "telegram")
+            .await
+            .expect("session load");
+
+        {
+            let mut turn = test_working_turn(TurnPhase::WaitingModel);
+            turn.turn_id = "turn-plan-k".into();
+            turn.active_plan = Some(plan_with_statuses("ship it", &["done", "pending"]));
+            runtime
+                .sessions
+                .get_mut(session_id)
+                .expect("session")
+                .start_turn(turn);
+        }
+
+        let result = runtime
+            .handle_model_response(respond_payload(session_id, "turn-plan-k", "partial"))
+            .await;
+        unsafe {
+            std::env::remove_var("PHILOTIC_DISABLE_PLAN_CONTINUATION");
+        }
+        result.expect("respond");
+
+        let state = runtime.session(session_id).expect("session");
+        assert!(
+            state.carryover_plan.is_none(),
+            "kill switch must prevent carryover persistence"
+        );
+        assert!(
+            runtime.pending_drains.is_empty(),
+            "kill switch must prevent continuation synthesis"
+        );
+
+        drop(runtime);
+        let _ = server.await;
+        let _ = std::fs::remove_file(&socket_path);
+
+        let emitted = emitted.lock().unwrap();
+        assert!(
+            emitted
+                .iter()
+                .any(|e| e["task"]["action"] == "turn_event" && e["task"]["event"] == "plan_eval"),
+            "plan_eval event still emitted for observability"
+        );
+        assert!(
+            !emitted.iter().any(|e| e["task"]["action"] == "turn_event"
+                && e["task"]["event"] == "plan_continuation"),
+            "no continuation event under kill switch"
+        );
+    }
+
+    #[tokio::test]
+    async fn new_plan_proposal_replaces_carryover() {
+        let (mut runtime, _emitted, server, socket_path) = plan_test_runtime("planredir").await;
+        let session_id = "sess-planredir";
+        runtime
+            .ensure_session_loaded(session_id, "telegram")
+            .await
+            .expect("session load");
+
+        {
+            let state = runtime.sessions.get_mut(session_id).expect("session");
+            state.carryover_plan = Some(CarryoverPlan {
+                plan: plan_with_statuses("old goal", &["done", "pending"]),
+                steps_done: vec![true, false],
+                continuations_used: 1,
+                created_turn_id: "turn-old".into(),
+            });
+            let mut turn = test_working_turn(TurnPhase::Thinking);
+            turn.turn_id = "turn-redirect".into();
+            state.start_turn(turn);
+        }
+
+        runtime
+            .handle_plan_proposal(
+                session_id.to_string(),
+                "turn-redirect".to_string(),
+                PlanProposalAction {
+                    summary: "brand new direction".into(),
+                    steps: vec![serde_json::json!({"description": "step one"})],
+                    approval_risk_hint: None,
+                },
+            )
+            .await
+            .expect("plan proposal");
+
+        let state = runtime.session(session_id).expect("session");
+        assert!(
+            state.carryover_plan.is_none(),
+            "a new plan proposal must replace the carried-over plan"
+        );
+        assert!(
+            state.parked_plan_turn.is_some(),
+            "proposal parks the turn for operator confirmation"
+        );
+
+        drop(runtime);
+        let _ = server.await;
+        let _ = std::fs::remove_file(&socket_path);
+    }
+
+    #[tokio::test]
+    async fn queued_user_task_defers_plan_continuation() {
+        let _guard = plan_env_guard();
+        unsafe {
+            std::env::remove_var("PHILOTIC_DISABLE_PLAN_CONTINUATION");
+        }
+        let (mut runtime, _emitted, server, socket_path) = plan_test_runtime("plandefer").await;
+        let session_id = "sess-plandefer";
+        runtime
+            .ensure_session_loaded(session_id, "telegram")
+            .await
+            .expect("session load");
+
+        {
+            let state = runtime.sessions.get_mut(session_id).expect("session");
+            let mut turn = test_working_turn(TurnPhase::WaitingModel);
+            turn.turn_id = "turn-plan-d".into();
+            turn.active_plan = Some(plan_with_statuses("ship it", &["done", "pending"]));
+            state.start_turn(turn);
+            // A user message arrived mid-turn and was queued.
+            state.enqueue_user_task(
+                Uuid::new_v4(),
+                InboundTaskPayload {
+                    session_id: Some(session_id.into()),
+                    content: Some("quick interrupt question".into()),
+                    ..Default::default()
+                },
+            );
+        }
+
+        runtime
+            .handle_model_response(respond_payload(session_id, "turn-plan-d", "partial"))
+            .await
+            .expect("respond");
+
+        // The drained task must be the user's, not a continuation.
+        assert_eq!(runtime.pending_drains.len(), 1);
+        let (_, drained) = runtime.pending_drains.pop_front().expect("drain");
+        assert_ne!(drained.action.as_deref(), Some("plan_continuation"));
+        assert_eq!(drained.content.as_deref(), Some("quick interrupt question"));
+        // Carryover retained with the budget uncharged — resumes later.
+        {
+            let carry = runtime
+                .session(session_id)
+                .expect("session")
+                .carryover_plan
+                .clone()
+                .expect("carryover retained during deferral");
+            assert_eq!(carry.continuations_used, 0);
+        }
+
+        // The interleaved user turn completes without a plan of its own →
+        // the deferred carryover resumes with a synthesized continuation.
+        {
+            let state = runtime.sessions.get_mut(session_id).expect("session");
+            let mut turn = test_working_turn(TurnPhase::WaitingModel);
+            turn.turn_id = "turn-user-1".into();
+            state.start_turn(turn);
+        }
+        runtime
+            .handle_model_response(respond_payload(session_id, "turn-user-1", "answered"))
+            .await
+            .expect("user turn respond");
+
+        assert_eq!(runtime.pending_drains.len(), 1, "carryover resumed");
+        let (_, resumed) = runtime.pending_drains.pop_front().expect("drain");
+        assert_eq!(resumed.action.as_deref(), Some("plan_continuation"));
+        assert_eq!(
+            runtime
+                .session(session_id)
+                .expect("session")
+                .carryover_plan
+                .as_ref()
+                .expect("carryover still present")
+                .continuations_used,
+            1
+        );
+
+        drop(runtime);
+        let _ = server.await;
+        let _ = std::fs::remove_file(&socket_path);
+    }
+
+    #[tokio::test]
+    async fn plan_command_shows_and_drops_carryover() {
+        let (mut runtime, emitted, server, socket_path) = plan_test_runtime("plancmd").await;
+        let session_id = "sess-plancmd";
+        runtime
+            .ensure_session_loaded(session_id, "telegram")
+            .await
+            .expect("session load");
+
+        runtime
+            .sessions
+            .get_mut(session_id)
+            .expect("session")
+            .carryover_plan = Some(CarryoverPlan {
+            plan: plan_with_statuses("ship it", &["done", "pending"]),
+            steps_done: vec![true, false],
+            continuations_used: 1,
+            created_turn_id: "turn-origin".into(),
+        });
+
+        // /plan → status report.
+        runtime
+            .handle_plan_command(
+                Uuid::new_v4(),
+                session_id.to_string(),
+                "turn-cmd-1".to_string(),
+                "555".to_string(),
+                "membrane-node-01".to_string(),
+                "membrane".to_string(),
+                None,
+                false,
+            )
+            .await
+            .expect("plan status");
+        assert!(
+            runtime
+                .session(session_id)
+                .expect("session")
+                .carryover_plan
+                .is_some(),
+            "status must not clear the carryover"
+        );
+
+        // /plan drop → cleared.
+        runtime
+            .handle_plan_command(
+                Uuid::new_v4(),
+                session_id.to_string(),
+                "turn-cmd-2".to_string(),
+                "555".to_string(),
+                "membrane-node-01".to_string(),
+                "membrane".to_string(),
+                None,
+                true,
+            )
+            .await
+            .expect("plan drop");
+        assert!(
+            runtime
+                .session(session_id)
+                .expect("session")
+                .carryover_plan
+                .is_none(),
+            "drop must clear the carryover"
+        );
+
+        drop(runtime);
+        let _ = server.await;
+        let _ = std::fs::remove_file(&socket_path);
+
+        let emitted = emitted.lock().unwrap();
+        let replies: Vec<&str> = emitted
+            .iter()
+            .filter(|e| e["task"]["action"] == "send_reply")
+            .filter_map(|e| e["task"]["content"].as_str())
+            .collect();
+        assert!(
+            replies.iter().any(|r| r.contains("ship it")
+                && r.contains("1/2 steps done")
+                && r.contains("work item 2")),
+            "status reply must describe the carryover: {replies:#?}"
+        );
+        assert!(
+            replies.iter().any(|r| r.contains("dropped")),
+            "drop reply must confirm: {replies:#?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn orphaned_plan_continuation_is_dropped() {
+        let (mut runtime, _emitted, server, socket_path) = plan_test_runtime("planorphan").await;
+        let session_id = "sess-planorphan";
+        runtime
+            .ensure_session_loaded(session_id, "telegram")
+            .await
+            .expect("session load");
+
+        // No carryover exists (e.g. operator ran /plan drop) — a stale
+        // continuation task must be dropped without starting a turn.
+        runtime
+            .handle_user_message(
+                InboundTaskPayload {
+                    action: Some("plan_continuation".into()),
+                    session_id: Some(session_id.into()),
+                    content: Some("[Plan continuation 1/3] Continue executing".into()),
+                    ..Default::default()
+                },
+                Uuid::new_v4(),
+            )
+            .await
+            .expect("orphan handled");
+
+        assert!(
+            runtime
+                .session(session_id)
+                .expect("session")
+                .active_turn
+                .is_none(),
+            "orphaned continuation must not start a turn"
+        );
+
+        drop(runtime);
+        let _ = server.await;
+        let _ = std::fs::remove_file(&socket_path);
+    }
+
+    /// A session with an operator pin (`/model <tier>`) must tag new turns
+    /// `OperatorExplicit` — this is what makes `advance_turn_to_next_fallback_tier`
+    /// refuse to auto-escalate a pinned session.
+    #[tokio::test]
+    async fn pinned_session_new_turn_gets_operator_explicit_selection_source() {
+        let (mut runtime, _emitted, server, socket_path) = plan_test_runtime("pinselect").await;
+        let session_id = "sess-pinselect";
+        runtime
+            .ensure_session_loaded(session_id, "telegram")
+            .await
+            .expect("session load");
+        runtime
+            .sessions
+            .get_mut(session_id)
+            .expect("session exists")
+            .pinned_tier_role = Some("model.ollama".into());
+
+        runtime
+            .handle_user_message(
+                InboundTaskPayload {
+                    session_id: Some(session_id.into()),
+                    content: Some("hello".into()),
+                    ..Default::default()
+                },
+                Uuid::new_v4(),
+            )
+            .await
+            .expect("turn started");
+
+        let turn = runtime
+            .session(session_id)
+            .expect("session")
+            .active_turn
+            .as_ref()
+            .expect("turn started");
+        assert_eq!(turn.selection_source, SelectionSource::OperatorExplicit);
+
+        drop(runtime);
+        let _ = server.await;
+        let _ = std::fs::remove_file(&socket_path);
+    }
+
+    /// A task delivered by the aiua CronTicker (`cron_job_id` set) must tag
+    /// its turn `CronPrimary` — the honest marker per `InboundTaskPayload`,
+    /// not string-sniffing corr_id/source.
+    #[tokio::test]
+    async fn cron_task_new_turn_gets_cron_primary_selection_source() {
+        let (mut runtime, _emitted, server, socket_path) = plan_test_runtime("cronselect").await;
+        let session_id = "sess-cronselect";
+        runtime
+            .ensure_session_loaded(session_id, "telegram")
+            .await
+            .expect("session load");
+
+        runtime
+            .handle_user_message(
+                InboundTaskPayload {
+                    session_id: Some(session_id.into()),
+                    content: Some("scheduled heartbeat".into()),
+                    cron_job_id: Some("job-1".into()),
+                    ..Default::default()
+                },
+                Uuid::new_v4(),
+            )
+            .await
+            .expect("turn started");
+
+        let turn = runtime
+            .session(session_id)
+            .expect("session")
+            .active_turn
+            .as_ref()
+            .expect("turn started");
+        assert_eq!(turn.selection_source, SelectionSource::CronPrimary);
+
+        drop(runtime);
+        let _ = server.await;
+        let _ = std::fs::remove_file(&socket_path);
+    }
+
+    /// Muninn-cluster single-writer routing: with `shared_write_route` set, a
+    /// SharedUser-scope write must be forwarded to the Cortex hotel as an
+    /// EmitTask (role `hotel.memory_write_forward`) instead of hitting the
+    /// local replica, where it would strand (scrypster/muninndb#631).
+    #[tokio::test]
+    async fn shared_scope_write_forwards_to_cortex_when_routed() {
+        let (mut runtime, emitted, server, socket_path) = plan_test_runtime("memroute").await;
+        let mut cfg = memory_core::MuninnConfig::local("default");
+        cfg.shared_write_route = Some("cortex-node-01".into());
+        runtime.muninn_config = Some(cfg);
+
+        let routed = runtime
+            .forward_shared_memory_write(
+                &memory_core::MemoryScope::SharedUser,
+                "likesjx",
+                "test concept",
+                "test content",
+                &["tag-a".into()],
+                &serde_json::Value::Null,
+                "sess-memroute",
+            )
+            .await;
+        assert!(routed.is_some(), "SharedUser write must be forwarded");
+
+        {
+            let emitted = emitted.lock().unwrap();
+            let fwd = emitted
+                .iter()
+                .find(|e| e["target_role"] == philotic_client::MEMORY_WRITE_FORWARD_ROLE)
+                .expect("forwarded EmitTask present");
+            assert_eq!(fwd["target_node"], "cortex-node-01");
+            assert_eq!(fwd["task"]["action"], "memory.write_forward");
+            assert_eq!(fwd["task"]["op"], "remember");
+            assert_eq!(fwd["task"]["vault"], "user_likesjx");
+            assert_eq!(fwd["task"]["concept"], "test concept");
+        }
+
+        // A session-principal fallback (user id == session id, e.g. a cron
+        // session) must route shared writes to the fleet `default` vault,
+        // not mint a junk per-session user_* vault on the primary.
+        let routed_fallback = runtime
+            .forward_shared_memory_write(
+                &memory_core::MemoryScope::SharedUser,
+                "sess-memroute-fallback",
+                "fallback concept",
+                "fallback content",
+                &[],
+                &serde_json::Value::Null,
+                "sess-memroute-fallback",
+            )
+            .await;
+        assert!(routed_fallback.is_some());
+        {
+            let emitted = emitted.lock().unwrap();
+            let fwd = emitted
+                .iter()
+                .filter(|e| e["target_role"] == philotic_client::MEMORY_WRITE_FORWARD_ROLE)
+                .last()
+                .expect("fallback forward present");
+            assert_eq!(
+                fwd["task"]["vault"], "default",
+                "session-fallback shared writes must target the default vault"
+            );
+        }
+
+        // Self-scope writes stay local even with a route configured — agent
+        // vaults are per-host by design (the vault registry never replicates).
+        let not_routed = runtime
+            .forward_shared_memory_write(
+                &memory_core::MemoryScope::SelfOnly,
+                "likesjx",
+                "self concept",
+                "self content",
+                &[],
+                &serde_json::Value::Null,
+                "sess-memroute",
+            )
+            .await;
+        assert!(not_routed.is_none(), "SelfOnly write must stay local");
+
+        drop(runtime);
+        let _ = server.await;
+        let _ = std::fs::remove_file(&socket_path);
+    }
+
+    /// No route configured (the default, and the Cortex hotel itself):
+    /// every write proceeds locally.
+    #[tokio::test]
+    async fn shared_scope_write_stays_local_without_route() {
+        let (mut runtime, emitted, server, socket_path) = plan_test_runtime("memnoroute").await;
+        runtime.muninn_config = Some(memory_core::MuninnConfig::local("default"));
+
+        let routed = runtime
+            .forward_shared_memory_write(
+                &memory_core::MemoryScope::SharedUser,
+                "likesjx",
+                "c",
+                "x",
+                &[],
+                &serde_json::Value::Null,
+                "sess-memnoroute",
+            )
+            .await;
+        assert!(routed.is_none());
+        assert!(
+            emitted
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|e| e["target_role"] != philotic_client::MEMORY_WRITE_FORWARD_ROLE),
+            "no forward envelope may be emitted without a route"
+        );
+
+        drop(runtime);
+        let _ = server.await;
+        let _ = std::fs::remove_file(&socket_path);
+    }
+
+    /// Operator-authored cron preapproval: `cron_preapproved_tools` on a
+    /// cron-delivered task must seed the session's approval policy so the
+    /// unattended fire can execute its named tools instead of parking
+    /// WaitingApproval. (aiua only forwards the field for operator-created
+    /// jobs — see CronTicker tests.)
+    #[tokio::test]
+    async fn cron_preapproved_tools_seed_session_approval_policy() {
+        let (mut runtime, _emitted, server, socket_path) = plan_test_runtime("cronpreapp").await;
+        let session_id = "cron:ephemeral:agent-cronpreapp";
+        runtime
+            .ensure_session_loaded(session_id, "cron")
+            .await
+            .expect("session load");
+
+        runtime
+            .handle_user_message(
+                InboundTaskPayload {
+                    session_id: Some(session_id.into()),
+                    content: Some("run the nightly backup".into()),
+                    cron_job_id: Some("job-backup".into()),
+                    cron_preapproved_tools: vec!["bash.exec".into(), "bash.exec".into()],
+                    ..Default::default()
+                },
+                Uuid::new_v4(),
+            )
+            .await
+            .expect("turn started");
+
+        let policy = &runtime
+            .session(session_id)
+            .expect("session")
+            .approval_policy;
+        assert_eq!(
+            policy.preapproved_tools,
+            vec!["bash.exec".to_string()],
+            "cron preapproval must seed the session policy exactly once"
+        );
+
+        drop(runtime);
+        let _ = server.await;
+        let _ = std::fs::remove_file(&socket_path);
+    }
+
+    /// A non-cron task must ignore `cron_preapproved_tools` even if present —
+    /// only the CronTicker delivery path is trusted to carry it.
+    #[tokio::test]
+    async fn non_cron_task_ignores_preapproved_tools() {
+        let (mut runtime, _emitted, server, socket_path) = plan_test_runtime("nocronpre").await;
+        let session_id = "sess-nocronpre";
+        runtime
+            .ensure_session_loaded(session_id, "telegram")
+            .await
+            .expect("session load");
+
+        runtime
+            .handle_user_message(
+                InboundTaskPayload {
+                    session_id: Some(session_id.into()),
+                    content: Some("hello".into()),
+                    cron_preapproved_tools: vec!["bash.exec".into()],
+                    ..Default::default()
+                },
+                Uuid::new_v4(),
+            )
+            .await
+            .expect("turn started");
+
+        assert!(
+            runtime
+                .session(session_id)
+                .expect("session")
+                .approval_policy
+                .preapproved_tools
+                .is_empty(),
+            "non-cron tasks must not seed approval policy"
+        );
+
+        drop(runtime);
+        let _ = server.await;
+        let _ = std::fs::remove_file(&socket_path);
+    }
+
+    /// DEF-051: the model request must carry the dispatching philote's exact
+    /// IPC guest identity as `reply_guest_id`. With a roster philote and a
+    /// role-incarnation philote both subscribed under role="agent" for the
+    /// same agent, aiua's `agent_id` routing fallback is ambiguous — the
+    /// response can be consumed (and dropped as "no active turn") by the
+    /// sibling process, stranding the real turn in WaitingModel until the
+    /// 600s watchdog eviction. `reply_guest_id` feeds aiua's
+    /// `explicit_response_guest_from_payload`, which routes the response back
+    /// to the instance that owns the turn.
+    #[tokio::test]
+    async fn model_request_carries_incarnation_guest_identity() {
+        let (mut runtime, emitted, server, socket_path) = plan_test_runtime("guestroute").await;
+        runtime.set_role_name("orchestrator");
+        let session_id = "cron:ephemeral:agent-guestroute";
+        runtime
+            .ensure_session_loaded(session_id, "cron")
+            .await
+            .expect("session load");
+
+        runtime
+            .handle_user_message(
+                InboundTaskPayload {
+                    session_id: Some(session_id.into()),
+                    content: Some("run the nightly backup".into()),
+                    cron_job_id: Some("job-backup".into()),
+                    ..Default::default()
+                },
+                Uuid::new_v4(),
+            )
+            .await
+            .expect("turn started");
+
+        {
+            let emitted = emitted.lock().unwrap();
+            let model_req = emitted
+                .iter()
+                .find(|e| e["task"]["action"] == "generate_text")
+                .expect("model request emitted");
+            assert_eq!(
+                model_req["task"]["reply_guest_id"], "agent-guestroute:orchestrator",
+                "model request must carry the incarnation's exact guest identity"
+            );
+        }
+
+        drop(runtime);
+        let _ = server.await;
+        let _ = std::fs::remove_file(&socket_path);
+    }
+
+    /// Roster (base) philote: every dispatch — model, tool, and life.* — now
+    /// explicitly stamps `reply_guest_id = own_guest_id()`, which for a base
+    /// philote is the bare agent id matching its IPC registration in `main.rs`.
+    /// (Converged onto always-stamp: consistent with the tool/life paths and no
+    /// longer dependent on aiua's `agent_id` fallback inference.)
+    #[tokio::test]
+    async fn model_request_carries_roster_guest_identity() {
+        let (mut runtime, emitted, server, socket_path) = plan_test_runtime("rosterroute").await;
+        let session_id = "sess-rosterroute";
+        runtime
+            .ensure_session_loaded(session_id, "telegram")
+            .await
+            .expect("session load");
+
+        runtime
+            .handle_user_message(
+                InboundTaskPayload {
+                    session_id: Some(session_id.into()),
+                    content: Some("hello".into()),
+                    ..Default::default()
+                },
+                Uuid::new_v4(),
+            )
+            .await
+            .expect("turn started");
+
+        {
+            let emitted = emitted.lock().unwrap();
+            let model_req = emitted
+                .iter()
+                .find(|e| e["task"]["action"] == "generate_text")
+                .expect("model request emitted");
+            // Converged contract: every dispatch explicitly stamps its own guest
+            // identity. For a base philote that is the bare agent id (its own
+            // registration), so the response routes back to this runtime.
+            assert_eq!(
+                model_req["task"]["reply_guest_id"].as_str(),
+                Some("agent-rosterroute"),
+                "base philote must stamp its bare agent id as reply_guest_id"
+            );
+        }
+
+        drop(runtime);
+        let _ = server.await;
+        let _ = std::fs::remove_file(&socket_path);
+    }
+
+    // ── Model Oracle Primary Authority, slice 3 ─────────────────────────────
+    //
+    // Wiring proof for the TRANSCRIPTION-REENTRY shadow hook. A pure predicate
+    // test would pass even if the hook were absent, so this drives both legs of
+    // a real voice turn over a stub hotel and asserts on the emitted envelopes.
+
+    /// Serializes tests that mutate PHILOTIC_SHADOW_ORACLE, since env vars are
+    /// process-global and tests run concurrently.
+    static SHADOW_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn shadow_env_guard() -> std::sync::MutexGuard<'static, ()> {
+        SHADOW_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// Stub hotel that records every EmitTask envelope and answers the shadow
+    /// oracle's `QueryModelRoute` with a fixed ranking topped by
+    /// `model.anthropic` — deliberately DIFFERENT from the text ladder's
+    /// default role, so an `agreement: false` annotation is unambiguous
+    /// evidence that the shadow path actually executed (rather than a field
+    /// that happened to match).
+    async fn run_shadow_oracle_hotel(
+        listener: tokio::net::UnixListener,
+        emitted: std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
+    ) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let (mut stream, _) = listener.accept().await.expect("accept");
+        loop {
+            let buf = match async {
+                let mut len_buf = [0u8; 4];
+                stream.read_exact(&mut len_buf).await?;
+                let len = u32::from_be_bytes(len_buf) as usize;
+                let mut buf = vec![0u8; len];
+                stream.read_exact(&mut buf).await?;
+                Ok::<_, std::io::Error>(buf)
+            }
+            .await
+            {
+                Ok(b) => b,
+                Err(_) => return, // client disconnected
+            };
+
+            let req: philotic_client::IpcRequest =
+                serde_json::from_slice(&buf).expect("decode request");
+            let reply = match &req {
+                philotic_client::IpcRequest::GetConfig { key } => {
+                    serde_json::to_vec(&philotic_client::IpcResponse::ConfigData {
+                        key: key.clone(),
+                        value_json: None,
+                    })
+                    .unwrap()
+                }
+                philotic_client::IpcRequest::QueryModelRoute {
+                    exclude_providers, ..
+                } => {
+                    // Shadow queries must use an EMPTY exclude list so the hotel
+                    // stays on its read-only path (no heal-queue reroute write).
+                    emitted.lock().unwrap().push(serde_json::json!({
+                        "query_model_route": { "exclude_providers": exclude_providers },
+                    }));
+                    serde_json::to_vec(&philotic_client::IpcResponse::success(
+                        "ok",
+                        Some(serde_json::json!({
+                            "ranked": [
+                                { "role": "model.anthropic", "provider": "anthropic", "score": 0.9 },
+                                { "role": "model", "provider": "gemini", "score": 0.5 }
+                            ]
+                        })),
+                    ))
+                    .unwrap()
+                }
+                philotic_client::IpcRequest::EmitTask {
+                    target_node,
+                    target_role,
+                    target_guest_id,
+                    task_json,
+                } => {
+                    let task: serde_json::Value =
+                        serde_json::from_str(task_json).unwrap_or(serde_json::Value::Null);
+                    emitted.lock().unwrap().push(serde_json::json!({
+                        "target_node": target_node,
+                        "target_role": target_role,
+                        "target_guest_id": target_guest_id,
+                        "task": task,
+                    }));
+                    serde_json::to_vec(&philotic_client::IpcResponse::success("ok", None)).unwrap()
+                }
+                _ => {
+                    serde_json::to_vec(&philotic_client::IpcResponse::success("ok", None)).unwrap()
+                }
+            };
+
+            let len = u32::try_from(reply.len()).expect("frame length fits u32");
+            stream
+                .write_all(&len.to_be_bytes())
+                .await
+                .expect("write header");
+            stream.write_all(&reply).await.expect("write payload");
+        }
+    }
+
+    async fn shadow_test_runtime(
+        tag: &str,
+    ) -> (
+        AgentRuntime,
+        std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
+        tokio::task::JoinHandle<()>,
+        String,
+    ) {
+        let socket_path = format!("/tmp/philote-{}-{}.sock", tag, Uuid::new_v4().simple());
+        let listener = tokio::net::UnixListener::bind(&socket_path).expect("bind");
+        let emitted = std::sync::Arc::new(std::sync::Mutex::new(Vec::<serde_json::Value>::new()));
+        let server = tokio::spawn(run_shadow_oracle_hotel(listener, emitted.clone()));
+        let identity = philotic_client::GuestIdentity {
+            guest_id: format!("agent-{tag}"),
+            role: "agent".into(),
+            supported_tools: Vec::new(),
+        };
+        let client = philotic_client::PhiloticClient::connect_at(&socket_path, identity)
+            .await
+            .expect("connect to stub hotel");
+        let runtime = AgentRuntime::new(client, format!("agent-{tag}"));
+        (runtime, emitted, server, socket_path)
+    }
+
+    /// A blob-backed voice attachment, the shape `media_analysis_attachments`
+    /// accepts and `resolve_media_routing` routes to `voice.transcribe`.
+    fn voice_attachment() -> TransportAttachment {
+        TransportAttachment {
+            kind: "voice".into(),
+            file_id: "voice-1".into(),
+            mime_type: Some("audio/ogg".into()),
+            blob_id: Some("sha256-voice".into()),
+            blob_download_url: Some("http://127.0.0.1:9001/download/sha256-voice".into()),
+            transport_error: None,
+            ..Default::default()
+        }
+    }
+
+    /// Drives BOTH legs of a voice-originated turn with the shadow flag ON:
+    ///
+    ///   leg 1 — `handle_user_message` dispatches `voice.transcribe` (aux).
+    ///   leg 2 — the transcript comes back and `reenter_turn_after_transcription`
+    ///           dispatches the cognitive `generate_text` follow-on.
+    ///
+    /// Asserts leg 1 carries NO shadow fields (the slice-2 capability guard
+    /// excludes aux transforms) and leg 2 DOES (the slice-3 hook). Because both
+    /// legs run in the same process under the same flag, this proves the guard
+    /// discriminates rather than the flag simply being off — and it fails if
+    /// the slice-3 hook is removed.
+    #[tokio::test]
+    async fn transcription_reentry_records_shadow_fields_while_transcribe_leg_does_not() {
+        let _guard = shadow_env_guard();
+        unsafe {
+            std::env::set_var("PHILOTIC_SHADOW_ORACLE", "1");
+        }
+
+        let (mut runtime, emitted, server, socket_path) = shadow_test_runtime("shadow3").await;
+        let session_id = "sess-shadow3";
+        let turn_id = "turn-shadow3";
+
+        let result = async {
+            runtime
+                .ensure_session_loaded(session_id, "telegram")
+                .await?;
+
+            // Route voice attachments to transcription (the path that arms
+            // awaiting_transcription_reentry).
+            {
+                let state = runtime.sessions.get_mut(session_id).expect("session");
+                state
+                    .agent_profile
+                    .media_routing_policy
+                    .forward_media_to_model = true;
+                state.agent_profile.media_routing_policy.voice_action = Some("transcribe".into());
+            }
+
+            // ── Leg 1: the voice.transcribe dispatch ──
+            runtime
+                .handle_user_message(
+                    InboundTaskPayload {
+                        source: Some("telegram".into()),
+                        transport: Some("telegram".into()),
+                        session_id: Some(session_id.into()),
+                        turn_id: Some(turn_id.into()),
+                        chat_id: Some("123".into()),
+                        message_kind: Some("voice".into()),
+                        content: Some("voice message".into()),
+                        attachments: vec![voice_attachment()],
+                        ..Default::default()
+                    },
+                    Uuid::new_v4(),
+                )
+                .await?;
+
+            // ── Leg 2: transcript returns → cognitive re-entry ──
+            runtime
+                .handle_model_response(respond_payload(
+                    session_id,
+                    turn_id,
+                    "what is the weather tomorrow",
+                ))
+                .await
+        }
+        .await;
+
+        unsafe {
+            std::env::remove_var("PHILOTIC_SHADOW_ORACLE");
+        }
+        result.expect("both legs dispatch");
+
+        let emitted = emitted.lock().unwrap();
+
+        // Leg 1 must be an aux voice.transcribe task with NO shadow annotation.
+        let transcribe: Vec<_> = emitted
+            .iter()
+            .filter(|e| {
+                e["task"]["action"] == "transcribe" || e["task"]["kind"] == "voice.transcribe"
+            })
+            .collect();
+        assert_eq!(
+            transcribe.len(),
+            1,
+            "exactly one voice.transcribe dispatch: {:#?}",
+            *emitted
+        );
+        assert!(
+            transcribe[0]["task"]["oracle_pick"].is_null(),
+            "aux voice.transcribe leg must carry NO oracle_pick even with the flag ON: {:#?}",
+            transcribe[0]
+        );
+        assert!(
+            transcribe[0]["task"]["oracle_agreement"].is_null(),
+            "aux voice.transcribe leg must carry NO oracle_agreement: {:#?}",
+            transcribe[0]
+        );
+
+        // Leg 2 — the transcription re-entry — is the cognitive dispatch and
+        // MUST carry the shadow annotation. This assertion is what fails if the
+        // slice-3 hook is missing.
+        let cognitive: Vec<_> = emitted
+            .iter()
+            .filter(|e| {
+                e["task"]["action"] == "generate_text" && e["task"]["request_class"] == "cognitive"
+            })
+            .collect();
+        assert_eq!(
+            cognitive.len(),
+            1,
+            "exactly one cognitive re-entry dispatch: {:#?}",
+            *emitted
+        );
+        assert_eq!(
+            cognitive[0]["task"]["oracle_pick"], "model.anthropic:anthropic",
+            "re-entry must record the oracle's top pick: {:#?}",
+            cognitive[0]
+        );
+        assert_eq!(
+            cognitive[0]["task"]["oracle_agreement"], false,
+            "oracle ranked model.anthropic but the ladder resolved its default \
+             role — divergence must be recorded as agreement=false: {:#?}",
+            cognitive[0]
+        );
+
+        // Routing is UNCHANGED: the re-entry still goes to the ladder's role,
+        // never the oracle's pick. This is the log-only invariant.
+        assert_ne!(
+            cognitive[0]["target_role"], "model.anthropic",
+            "shadow mode must NEVER redirect the dispatch to the oracle pick: {:#?}",
+            cognitive[0]
+        );
+
+        // The shadow query must use an empty exclude list (read-only path).
+        let queries: Vec<_> = emitted
+            .iter()
+            .filter(|e| e.get("query_model_route").is_some())
+            .collect();
+        assert_eq!(
+            queries.len(),
+            1,
+            "exactly one shadow oracle query — the aux leg must not query: {:#?}",
+            *emitted
+        );
+        assert_eq!(
+            queries[0]["query_model_route"]["exclude_providers"],
+            serde_json::json!([]),
+            "shadow query must keep the hotel on its read-only path"
+        );
+
+        drop(emitted);
+        drop(runtime);
+        let _ = server.await;
+        let _ = std::fs::remove_file(&socket_path);
+    }
+
+    /// OFF path (the default): the same re-entry emits NO shadow fields and
+    /// issues NO oracle query at all.
+    #[tokio::test]
+    async fn transcription_reentry_records_nothing_when_shadow_flag_is_off() {
+        let _guard = shadow_env_guard();
+        unsafe {
+            std::env::remove_var("PHILOTIC_SHADOW_ORACLE");
+        }
+
+        let (mut runtime, emitted, server, socket_path) = shadow_test_runtime("shadow3off").await;
+        let session_id = "sess-shadow3off";
+        let turn_id = "turn-shadow3off";
+
+        runtime
+            .ensure_session_loaded(session_id, "telegram")
+            .await
+            .expect("session load");
+        {
+            let state = runtime.sessions.get_mut(session_id).expect("session");
+            state
+                .agent_profile
+                .media_routing_policy
+                .forward_media_to_model = true;
+            state.agent_profile.media_routing_policy.voice_action = Some("transcribe".into());
+        }
+        runtime
+            .handle_user_message(
+                InboundTaskPayload {
+                    source: Some("telegram".into()),
+                    transport: Some("telegram".into()),
+                    session_id: Some(session_id.into()),
+                    turn_id: Some(turn_id.into()),
+                    chat_id: Some("123".into()),
+                    message_kind: Some("voice".into()),
+                    content: Some("voice message".into()),
+                    attachments: vec![voice_attachment()],
+                    ..Default::default()
+                },
+                Uuid::new_v4(),
+            )
+            .await
+            .expect("transcribe leg");
+        runtime
+            .handle_model_response(respond_payload(session_id, turn_id, "hello there"))
+            .await
+            .expect("re-entry leg");
+
+        let emitted = emitted.lock().unwrap();
+        let cognitive: Vec<_> = emitted
+            .iter()
+            .filter(|e| {
+                e["task"]["action"] == "generate_text" && e["task"]["request_class"] == "cognitive"
+            })
+            .collect();
+        assert_eq!(cognitive.len(), 1, "one re-entry dispatch: {:#?}", *emitted);
+        assert!(
+            cognitive[0]["task"]["oracle_pick"].is_null()
+                && cognitive[0]["task"]["oracle_agreement"].is_null(),
+            "flag OFF must leave the re-entry unannotated: {:#?}",
+            cognitive[0]
+        );
+        assert!(
+            !emitted.iter().any(|e| e.get("query_model_route").is_some()),
+            "flag OFF must issue ZERO oracle IPC: {:#?}",
+            *emitted
+        );
+
+        drop(emitted);
+        drop(runtime);
+        let _ = server.await;
+        let _ = std::fs::remove_file(&socket_path);
     }
 }

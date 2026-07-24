@@ -59,12 +59,16 @@ For Perplexity:
 - `context.capture`: write to Muninn continuity memory.
 - Optional `life.recall`: read-only LifeGraph context, if the endpoint and bearer scope explicitly allow it.
 - Optional `life.patch.propose`: propose governed improvements, not apply them.
+- Optional Muninn retrieval should use a separate scoped `observe` API key or
+  endpoint grant. Do not reuse the `context.capture` write bearer for broader
+  retrieval or LifeGraph authority.
 
 For Claude or Codex outside the hotel runtime:
 
 - Prefer `life.recall` and `life.observe` through a governed endpoint.
 - Keep `life.commit` and `life.resolve` unavailable or approval-gated.
 - Use native projected tools when already running inside Philotic.
+- For trusted local continuity memory, native Muninn MCP may be used directly through `muninn mcp` over loopback or a private tunnel; do not expose native Muninn MCP publicly.
 
 ## Review Checklist
 

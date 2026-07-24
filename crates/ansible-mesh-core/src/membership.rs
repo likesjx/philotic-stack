@@ -468,6 +468,8 @@ mod tests {
                 allowed_skills: vec!["role.governance".into()],
                 on_demand_skills: vec![],
                 description: Some("admin defaults".into()),
+                remote_tool_runners: vec![],
+                seed_baseline: None,
             }],
         };
 

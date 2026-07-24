@@ -68,9 +68,12 @@ async fn main() -> anyhow::Result<()> {
     for pivot in &recall_query.semantic_pivots {
         for label in space_labels(&pivot.space) {
             let index = projection::index_name(&pivot.space, label);
-            let cypher = projection::semantic_expand_cypher(&index, top_k, &embedding, min_sim);
+            let cypher = projection::semantic_expand_cypher(&index, top_k, min_sim);
+            let vec_param: Vec<f64> = embedding.iter().map(|v| f64::from(*v)).collect();
 
-            let mut rows_stream = graph.execute(neo_query(&cypher)).await?;
+            let mut rows_stream = graph
+                .execute(neo_query(&cypher).param("vec", vec_param))
+                .await?;
             let mut raw_rows = Vec::new();
             while let Some(row) = rows_stream.next().await? {
                 raw_rows.push(row_to_json(&row)?);
@@ -91,7 +94,7 @@ async fn main() -> anyhow::Result<()> {
         drop_log.len()
     );
 
-    let scored: Vec<(projection::VectorHit, f32, Vec<PolicyFilter>)> = surviving
+    let scored: Vec<projection::ScoredHit> = surviving
         .into_iter()
         .map(|hit| {
             let age_secs = hit
@@ -102,8 +105,17 @@ async fn main() -> anyhow::Result<()> {
                     elapsed.num_seconds().max(0) as u64
                 })
                 .unwrap_or(0);
-            let score = projection::ranking_score(&hit, &recall_query.ranking_weights, age_secs);
-            (hit, score, vec![])
+            let role_matched = recall_query
+                .active_role
+                .as_deref()
+                .is_some_and(|slug| projection::hit_matches_domain(&hit, slug));
+            let score = projection::ranking_score(
+                &hit,
+                &recall_query.ranking_weights,
+                age_secs,
+                role_matched,
+            );
+            projection::ScoredHit::from((hit, score, vec![]))
         })
         .collect();
 

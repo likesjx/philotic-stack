@@ -254,6 +254,7 @@
     PHILOTIC_ENABLE_RUST_AUTH: "{{ philotic_enable_rust_auth }}"
     PHILOTIC_ENABLE_RUST_DISPATCHER: "{{ philotic_enable_rust_dispatcher }}"
     PHILOTIC_ENABLE_RUST_TASK_LIFECYCLE: "{{ philotic_enable_rust_task_lifecycle }}"
+    PHILOTIC_REMOTE_LIFE_GRAPH_RUNNER_NODE: "{{ philotic_remote_life_graph_runner_node }}"
   changed_when: false
 
 - name: Remove stale records for previous hotel identities

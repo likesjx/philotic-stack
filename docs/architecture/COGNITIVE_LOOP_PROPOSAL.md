@@ -3,6 +3,7 @@ title: Cognitive Loop Architecture
 doc_type: proposal
 domain: runtime-sessions
 status: accepted-current-slice
+disposition: implemented
 last_updated: 2026-03-31
 tags:
 - agent-loop

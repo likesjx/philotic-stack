@@ -7,6 +7,7 @@ pub mod agent;
 pub mod agent_graph_storage;
 pub mod attention_steward;
 pub mod authz;
+pub mod autonomy;
 pub mod beacon;
 pub mod capability;
 pub mod catalog_rights;
@@ -22,9 +23,16 @@ pub mod ledger;
 pub mod materializer;
 pub mod mcp_endpoint;
 pub mod mcp_route;
+pub mod mcp_upstream;
 pub mod membership;
+pub mod memory_explain;
 pub mod meshops;
+pub mod model_catalog_discovery;
 pub mod model_manager;
+pub mod model_oracle;
+pub mod model_routing;
+pub mod provenance;
+pub mod provider_keys;
 pub mod registry;
 pub mod resources;
 pub mod router_trace;
@@ -36,7 +44,7 @@ pub mod validation;
 pub mod webrtc;
 pub mod whisper_training;
 
-pub use philotic_primitives_mesh::beacon::{BeaconMessage, MsgType};
+pub use philotic_primitives_mesh::beacon::{BeaconMessage, BeaconPayload, MsgType, WireEncoding};
 
 /// Represents a unique identifier for a node in the mesh network.
 pub type NodeId = String;

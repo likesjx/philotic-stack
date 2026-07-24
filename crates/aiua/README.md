@@ -19,6 +19,7 @@ Source-of-truth note: this README is a convenience overview. For current impleme
 | **Outbound dispatch**     | Polls `EventLedger`, ships unacked routed events to peer hotels over TCP         |
 | **Blob service**          | HTTP server on port 9001 — content-addressed large payload store                 |
 | **State sync**            | `SyncApartment` IPC → LWW upsert into `memory_apartments`                        |
+| **Host health scan**      | Periodic vitals sample (load/CPU/mem/disk) + config-driven TCP service probes; threshold breaches file pre-classified self-heal entries (`host_*`, `service_probe_failed:*`) that the heal-dispatcher escalates to the operator. Config node `host_health.config` (live-tunable), status snapshot in `host_health.status`. |
 
 ## Key Services (`src/service/`)
 
@@ -28,6 +29,7 @@ Source-of-truth note: this README is a convenience overview. For current impleme
 - **`mesh_dispatcher.rs`** — Outbound inter-hotel routed-event dispatcher
 - **`execution_transport.rs`** — TCP execution-plane listener and point-to-point sender
 - **`webrtc_guest.rs`** — WebRTC transceiver for SDP signaling
+- **`host_health_scan.rs`** — host vitals + service-probe scan feeding the self-heal queue (successor to the vps-jane openclaw-era cron monitors)
 
 ## Environment Variables
 
@@ -38,6 +40,27 @@ Source-of-truth note: this README is a convenience overview. For current impleme
 | `PHILOTIC_ENABLE_RUST_AUTH`           | `0`                        | 1 = enforce HMAC auth on mesh         |
 | `PHILOTIC_ENABLE_RUST_DISPATCHER`     | `0`                        | 1 = start outbound inter-hotel dispatcher |
 | `PHILOTIC_ENABLE_RUST_TASK_LIFECYCLE` | `0`                        | 1 = start durable event ledger writer |
+| `PHILOTIC_LOG_DIR`                    | `~/.philotic/<profile>/logs` | override the directory for dated log files |
+| `PHILOTIC_LOG_RETENTION_DAYS`         | `14`                       | number of dated `aiua.<date>.log` files to keep (floor 1) |
+
+## Logging
+
+`aiua` owns its own log rotation via an in-app daily rolling file appender
+(`tracing-appender`). Detailed logs are written to
+`~/.philotic/<profile>/logs/aiua.<date>.log` (e.g. `aiua.2026-07-09.log`), where
+`<profile>` is `$PHILOTIC_PROFILE` (default `default`). Set `PHILOTIC_LOG_DIR` to
+point the log directory elsewhere.
+
+Files roll over daily; `PHILOTIC_LOG_RETENTION_DAYS` (default 14, clamped to a
+floor of 1) controls how many dated files are kept before old ones are pruned.
+`RUST_LOG` still controls the level filter (defaults to `info`).
+
+No stdout/stderr tracing layer is installed, so the launchd `StandardOutPath`
+`aiua.log` only captures tiny pre-init output and rare Rust panics and no longer
+grows unbounded — no plist or launch-script changes are needed. Tail the newest
+dated file with `just logs [profile]` (or `just jane-logs` / `just vps-logs`).
+The size-based newsyslog drop-in (`scripts/install-log-rotation.sh`) remains as a
+belt-and-suspenders cap on the now-tiny `aiua.log`/`aiua.err.log`.
 
 ## Running
 

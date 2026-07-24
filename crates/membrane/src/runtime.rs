@@ -231,6 +231,14 @@ impl MembraneRuntime {
 /// `InboundTaskPayload` expects. The two structs serve different layers
 /// (protocol-agnostic vs. philote-specific) so names don't match directly.
 async fn dispatch_inbound(client: &mut PhiloticClient, envelope: InboundEnvelope) -> Result<()> {
+    let req = build_inbound_request(&envelope);
+    client.send_request(req).await?;
+    Ok(())
+}
+
+/// Build the IPC request for an inbound envelope. Pure so variants can unit-test
+/// their dispatch payload shape without a live IPC connection.
+fn build_inbound_request(envelope: &InboundEnvelope) -> philotic_client::IpcRequest {
     use philotic_client::IpcRequest;
 
     // Extract transport hint from raw_transport metadata.
@@ -240,20 +248,26 @@ async fn dispatch_inbound(client: &mut PhiloticClient, envelope: InboundEnvelope
         .and_then(|v| v.as_str())
         .map(str::to_string);
 
-    // Cross-hotel routing: present when the MCP route target specifies a remote node.
-    let target_node = envelope
-        .raw_transport
-        .get("target_node")
-        .and_then(|v| v.as_str())
-        .filter(|s| !s.is_empty())
-        .map(str::to_string);
+    // Cross-hotel routing: explicit envelope field first (e.g. Telegram
+    // seats emitting to the local node), then the raw_transport hint used
+    // by MCP route targets.
+    let target_node = envelope.target_node.clone().or_else(|| {
+        envelope
+            .raw_transport
+            .get("target_node")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+    });
 
-    let hinted_target_id = envelope
-        .raw_transport
-        .get("target_id")
-        .and_then(|v| v.as_str())
-        .filter(|s| !s.is_empty())
-        .map(str::to_string);
+    let hinted_target_id = envelope.target_guest_id.clone().or_else(|| {
+        envelope
+            .raw_transport
+            .get("target_id")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+    });
 
     let target_kind = envelope
         .raw_transport
@@ -263,8 +277,8 @@ async fn dispatch_inbound(client: &mut PhiloticClient, envelope: InboundEnvelope
 
     let (target_role, target_guest_id) = resolve_target(target_kind, hinted_target_id);
 
-    let payload = if target_kind == Some("datasource") {
-        datasource_payload(&envelope, transport)
+    let mut payload = if target_kind == Some("datasource") {
+        datasource_payload(envelope, transport)
     } else {
         serde_json::json!({
         "session_id":             envelope.session_id,
@@ -284,8 +298,18 @@ async fn dispatch_inbound(client: &mut PhiloticClient, envelope: InboundEnvelope
         })
     };
 
-    let req = if let Some(node) = target_node {
-        // Route to a specific remote hotel via mesh dispatch.
+    // Transport-specific extras override same-named standard fields
+    // (e.g. Telegram sets "transport": "telegram" and adds chat_id).
+    if !envelope.extra.is_empty() {
+        if let Some(obj) = payload.as_object_mut() {
+            for (key, value) in &envelope.extra {
+                obj.insert(key.clone(), value.clone());
+            }
+        }
+    }
+
+    if let Some(node) = target_node {
+        // Route to a specific node (possibly the local one) via mesh dispatch.
         IpcRequest::EmitTask {
             target_node: node,
             target_role,
@@ -297,9 +321,7 @@ async fn dispatch_inbound(client: &mut PhiloticClient, envelope: InboundEnvelope
             target_role,
             payload,
         }
-    };
-    client.send_request(req).await?;
-    Ok(())
+    }
 }
 
 fn resolve_target(
@@ -456,6 +478,9 @@ mod tests {
             final_reply_to: Some("vps-jane-aiua-01".into()),
             final_reply_role: Some("mcp-membrane".into()),
             final_reply_guest_id: Some("mcp-membrane-lifegraph-readonly".into()),
+            target_node: None,
+            target_guest_id: None,
+            extra: serde_json::Map::new(),
         }
     }
 
@@ -477,5 +502,72 @@ mod tests {
         assert_eq!(payload["reply_to"], "vps-jane-aiua-01");
         assert_eq!(payload["reply_role"], "mcp-membrane");
         assert_eq!(payload["reply_guest_id"], "mcp-membrane-lifegraph-readonly");
+    }
+
+    #[test]
+    fn explicit_target_node_routes_via_emit_task_with_extra_merged() {
+        use philotic_client::IpcRequest;
+
+        let mut envelope = mcp_datasource_envelope();
+        // Telegram-style dispatch: explicit local-node routing + transport extras.
+        envelope.raw_transport = serde_json::json!({ "update_id": 42 });
+        envelope.content = "hello".into();
+        envelope.target_node = Some("mac-jane-aiua-01".into());
+        envelope.target_guest_id = Some("agent-bjork-01".into());
+        envelope.extra = serde_json::json!({
+            "source": "telegram",
+            "transport": "telegram",
+            "chat_id": "12345",
+            "thread_id": null,
+            "message_kind": "text",
+        })
+        .as_object()
+        .cloned()
+        .unwrap();
+
+        let req = build_inbound_request(&envelope);
+        let IpcRequest::EmitTask {
+            target_node,
+            target_role,
+            target_guest_id,
+            task_json,
+        } = req
+        else {
+            panic!("expected EmitTask, got {req:?}");
+        };
+        assert_eq!(target_node, "mac-jane-aiua-01");
+        assert_eq!(target_role, "agent");
+        assert_eq!(target_guest_id.as_deref(), Some("agent-bjork-01"));
+
+        let payload: serde_json::Value = serde_json::from_str(&task_json).unwrap();
+        // Extra fields land at the top level and override standard ones.
+        assert_eq!(payload["source"], "telegram");
+        assert_eq!(payload["transport"], "telegram");
+        assert_eq!(payload["chat_id"], "12345");
+        assert_eq!(payload["message_kind"], "text");
+        // Standard fields still present.
+        assert_eq!(payload["session_id"], "mcp-lifegraph");
+        assert_eq!(payload["content"], "hello");
+        assert_eq!(payload["raw_transport_event"]["update_id"], 42);
+    }
+
+    #[test]
+    fn empty_extra_and_no_target_keeps_local_create_task() {
+        use philotic_client::IpcRequest;
+
+        let mut envelope = mcp_datasource_envelope();
+        envelope.raw_transport = serde_json::json!({ "transport": "mcp" });
+
+        let req = build_inbound_request(&envelope);
+        let IpcRequest::CreateTask {
+            target_role,
+            payload,
+        } = req
+        else {
+            panic!("expected CreateTask, got {req:?}");
+        };
+        assert_eq!(target_role, "agent");
+        assert_eq!(payload["transport"], "mcp");
+        assert_eq!(payload["requires_approval"], false);
     }
 }

@@ -13,7 +13,7 @@ use tokio_tungstenite::{
         http::header::{AUTHORIZATION, HeaderValue},
     },
 };
-use tracing::info;
+use tracing::{info, warn};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OpenAIAuth {
@@ -21,13 +21,38 @@ pub enum OpenAIAuth {
     OAuthBearer(String),
 }
 
+/// Provider-catalog snapshot of which models accept tool calls, fetched from
+/// the OpenAI-compatible `/v1/models` endpoint (OpenRouter publishes
+/// `supported_parameters` per model). `known` distinguishes "listed without
+/// tool support" (strip tools proactively) from "not in the catalog at all"
+/// (stay optimistic and let the reactive retry handle it).
+struct ToolsCatalog {
+    fetched_at: std::time::Instant,
+    tool_capable: std::collections::HashSet<String>,
+    known: std::collections::HashSet<String>,
+}
+
+/// Refresh cadence for the tools-capability catalog.
+const TOOLS_CATALOG_TTL: std::time::Duration = std::time::Duration::from_secs(3600);
+
 pub struct OpenAIProvider {
     http_client: reqwest::Client,
     auth: Option<OpenAIAuth>,
     base_url: String,
+    provider_id: &'static str,
     project_id: Option<String>,
     default_model: String,
     default_embedding_model: String,
+    fallback_models: Vec<String>,
+    fallback_route: Option<String>,
+    /// Models learned (from a tools-unsupported API error) or catalog-known to
+    /// have no tool-capable endpoints. Requests to these are sent WITHOUT the
+    /// tool declarations instead of 404ing every turn (an RP finetune like
+    /// Cydonia then simply answers in prose — the loop already handles a
+    /// text-only response).
+    no_tools_models: std::sync::RwLock<std::collections::HashSet<String>>,
+    /// Lazily fetched `/v1/models` tools-capability catalog (openrouter only).
+    tools_catalog: tokio::sync::RwLock<Option<ToolsCatalog>>,
 }
 
 impl OpenAIProvider {
@@ -39,6 +64,31 @@ impl OpenAIProvider {
         default_model: Option<String>,
         default_embedding_model: Option<String>,
     ) -> Self {
+        Self::new_compatible(
+            "openai",
+            http_client,
+            auth,
+            base_url,
+            project_id,
+            default_model,
+            default_embedding_model,
+            Vec::new(),
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_compatible(
+        provider_id: &'static str,
+        http_client: reqwest::Client,
+        auth: Option<OpenAIAuth>,
+        base_url: Option<String>,
+        project_id: Option<String>,
+        default_model: Option<String>,
+        default_embedding_model: Option<String>,
+        fallback_models: Vec<String>,
+        fallback_route: Option<String>,
+    ) -> Self {
         Self {
             http_client,
             auth,
@@ -48,10 +98,17 @@ impl OpenAIProvider {
                 let b = b.trim_end_matches("/v1");
                 b.trim_end_matches('/').to_string()
             },
+            provider_id,
             project_id,
             default_model: default_model.unwrap_or_else(|| "gpt-4.1-mini".into()),
             default_embedding_model: default_embedding_model
                 .unwrap_or_else(|| "text-embedding-3-small".into()),
+            fallback_models,
+            fallback_route: fallback_route
+                .map(|route| route.trim().to_string())
+                .filter(|route| !route.is_empty()),
+            no_tools_models: std::sync::RwLock::new(std::collections::HashSet::new()),
+            tools_catalog: tokio::sync::RwLock::new(None),
         }
     }
 
@@ -347,6 +404,37 @@ impl OpenAIProvider {
 
         if let Some(stop) = task.provider_options.get("stop") {
             body["stop"] = stop.clone();
+        }
+
+        if self.provider_id == "openrouter" {
+            let fallback_models = task.provider_options.get("models").cloned().or_else(|| {
+                if self.fallback_models.is_empty() {
+                    None
+                } else {
+                    Some(Value::Array(
+                        self.fallback_models
+                            .iter()
+                            .map(|model| Value::String(model.clone()))
+                            .collect(),
+                    ))
+                }
+            });
+            if let Some(models) = fallback_models {
+                body["models"] = models;
+            }
+
+            let route = task.provider_options.get("route").cloned().or_else(|| {
+                self.fallback_route
+                    .as_ref()
+                    .map(|route| Value::String(route.clone()))
+            });
+            if let Some(route) = route {
+                body["route"] = route;
+            }
+
+            if let Some(provider) = task.provider_options.get("provider") {
+                body["provider"] = provider.clone();
+            }
         }
 
         if let Some(stream) = task.provider_options.get("stream") {
@@ -853,6 +941,106 @@ impl OpenAIProvider {
         })
     }
 
+    /// Remove tool declarations from a chat request body (in place).
+    fn strip_tools(body: &mut Value) {
+        if let Some(obj) = body.as_object_mut() {
+            obj.remove("tools");
+            obj.remove("tool_choice");
+        }
+    }
+
+    /// Does this API error mean "the selected model has no endpoint that
+    /// accepts tool declarations"? Matched against provider error text
+    /// (OpenRouter: 404 "No endpoints found that support tool use").
+    fn is_tools_unsupported_error(message: &str) -> bool {
+        let m = message.to_ascii_lowercase();
+        m.contains("support tool use")
+            || m.contains("does not support tools")
+            || m.contains("tool use is not supported")
+            || m.contains("tools are not supported")
+    }
+
+    fn remember_no_tools_model(&self, model: &str) {
+        if let Ok(mut set) = self.no_tools_models.write() {
+            set.insert(model.to_string());
+        }
+    }
+
+    /// Whether `model` accepts tool declarations, best-effort. Consults the
+    /// learned no-tools set first, then (openrouter only) the `/v1/models`
+    /// catalog's `supported_parameters`. Unknown models and catalog failures
+    /// stay optimistic — the reactive retry in `invoke` covers those.
+    async fn model_supports_tools(&self, model: &str) -> bool {
+        if self
+            .no_tools_models
+            .read()
+            .map(|set| set.contains(model))
+            .unwrap_or(false)
+        {
+            return false;
+        }
+        if self.provider_id != "openrouter" {
+            return true;
+        }
+        {
+            let guard = self.tools_catalog.read().await;
+            if let Some(catalog) = guard.as_ref() {
+                if catalog.fetched_at.elapsed() < TOOLS_CATALOG_TTL {
+                    return !catalog.known.contains(model) || catalog.tool_capable.contains(model);
+                }
+            }
+        }
+        let fresh = self.fetch_tools_catalog().await;
+        let mut guard = self.tools_catalog.write().await;
+        if fresh.is_some() {
+            *guard = fresh;
+        }
+        match guard.as_ref() {
+            Some(catalog) if catalog.known.contains(model) => catalog.tool_capable.contains(model),
+            _ => true,
+        }
+    }
+
+    async fn fetch_tools_catalog(&self) -> Option<ToolsCatalog> {
+        let mut request = self
+            .http_client
+            .get(self.endpoint_url("/v1/models"))
+            .timeout(std::time::Duration::from_secs(5));
+        if let Some(auth_header) = self.auth_header() {
+            request = request.header(reqwest::header::AUTHORIZATION, auth_header);
+        }
+        let body: Value = request.send().await.ok()?.json().await.ok()?;
+        let mut known = std::collections::HashSet::new();
+        let mut tool_capable = std::collections::HashSet::new();
+        for model in body.get("data").and_then(Value::as_array)? {
+            let Some(id) = model.get("id").and_then(Value::as_str) else {
+                continue;
+            };
+            known.insert(id.to_string());
+            let supports = model
+                .get("supported_parameters")
+                .and_then(Value::as_array)
+                .map(|params| {
+                    params
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .any(|param| param == "tools")
+                })
+                .unwrap_or(false);
+            if supports {
+                tool_capable.insert(id.to_string());
+            }
+        }
+        if known.is_empty() {
+            return None;
+        }
+        Some(ToolsCatalog {
+            fetched_at: std::time::Instant::now(),
+            tool_capable,
+            known,
+        })
+    }
+
     async fn send_json(&self, path: &str, body: &Value) -> Result<reqwest::Response> {
         let mut request = self.http_client.post(self.endpoint_url(path)).json(body);
         if let Some(auth_header) = self.auth_header() {
@@ -873,7 +1061,7 @@ impl OpenAIProvider {
 #[async_trait]
 impl ModelProvider for OpenAIProvider {
     fn id(&self) -> &'static str {
-        "openai"
+        self.provider_id
     }
 
     fn supports(&self, task: &ControllerTask) -> bool {
@@ -892,7 +1080,22 @@ impl ModelProvider for OpenAIProvider {
                     return self.invoke_realtime_websocket(task).await;
                 }
 
-                let body = self.chat_request_body(task)?;
+                let mut body = self.chat_request_body(task)?;
+                // No-tools handler, proactive half: a model with no
+                // tool-capable endpoints gets the request WITHOUT tool
+                // declarations instead of a guaranteed 404 (it answers in
+                // prose; the agent loop handles text-only responses).
+                let capability_model = self.default_model(task).to_string();
+                if body.get("tools").is_some()
+                    && !self.model_supports_tools(&capability_model).await
+                {
+                    info!(
+                        provider = self.id(),
+                        model = %capability_model,
+                        "Model has no tool-capable endpoints — sending request without tools (chat-only)."
+                    );
+                    Self::strip_tools(&mut body);
+                }
                 if std::env::var("PHILOTIC_DEBUG_MODEL_REQUESTS")
                     .ok()
                     .as_deref()
@@ -909,19 +1112,51 @@ impl ModelProvider for OpenAIProvider {
 
                 let response = self.send_json("/v1/chat/completions", &body).await?;
                 let status = response.status();
-                let body = response.json::<Value>().await?;
+                let response_body = response.json::<Value>().await?;
 
                 if !status.is_success() {
-                    let error_message = body
+                    let error_message = response_body
                         .get("error")
                         .and_then(|error| error.get("message"))
                         .and_then(Value::as_str)
                         .map(str::to_string)
-                        .unwrap_or_else(|| body.to_string());
+                        .unwrap_or_else(|| response_body.to_string());
+                    // No-tools handler, reactive half: on a tools-unsupported
+                    // error, learn the model and retry once without tools.
+                    // Covers catalog staleness and providers with no catalog.
+                    if body.get("tools").is_some()
+                        && Self::is_tools_unsupported_error(&error_message)
+                    {
+                        warn!(
+                            provider = self.id(),
+                            model = %capability_model,
+                            "Provider rejected tool declarations ({}); retrying without tools and remembering the model as chat-only.",
+                            error_message
+                        );
+                        self.remember_no_tools_model(&capability_model);
+                        Self::strip_tools(&mut body);
+                        let retry = self.send_json("/v1/chat/completions", &body).await?;
+                        let retry_status = retry.status();
+                        let retry_body = retry.json::<Value>().await?;
+                        if !retry_status.is_success() {
+                            let retry_message = retry_body
+                                .get("error")
+                                .and_then(|error| error.get("message"))
+                                .and_then(Value::as_str)
+                                .map(str::to_string)
+                                .unwrap_or_else(|| retry_body.to_string());
+                            bail!(
+                                "OpenAI API error ({}): {}",
+                                retry_status.as_u16(),
+                                retry_message
+                            );
+                        }
+                        return Self::parse_chat_response(task, &retry_body);
+                    }
                     bail!("OpenAI API error ({}): {}", status.as_u16(), error_message);
                 }
 
-                Self::parse_chat_response(task, &body)
+                Self::parse_chat_response(task, &response_body)
             }
             TaskKind::Embed => {
                 let text = task
@@ -997,6 +1232,47 @@ mod tests {
         assert_eq!(
             provider.endpoint_url("/v1/chat/completions"),
             "http://localhost:11434/v1/chat/completions"
+        );
+    }
+
+    /// Layer 1 precedence at the provider boundary: an explicit
+    /// `ControllerTask.model` (set from philote's per-agent `model_bindings`
+    /// — see `ModelRequestPayload.model` / `role_model_binding` in
+    /// `crates/philote/src/runtime.rs`) wins over the provider's own global
+    /// default (`openrouter_default_model` / `self.default_model`); when the
+    /// task carries no model, the global default governs. This is the
+    /// consuming end of the wire: philote sets the top-level `"model"` JSON
+    /// key, `ControllerTask::from_value` reads it into `task.model`
+    /// (controller.rs), and `default_model` here is the final precedence
+    /// choke point every non-realtime/non-audio text/media task funnels
+    /// through.
+    #[test]
+    fn default_model_prefers_explicit_task_model_over_provider_default() {
+        let provider = OpenAIProvider::new(
+            reqwest::Client::new(),
+            None,
+            None,
+            None,
+            Some("global-default-model".into()),
+            None,
+        );
+
+        let bound_task = ControllerTask::from_value(&json!({
+            "kind": "text.generate",
+            "prompt": "hello",
+            "model": "z-ai/glm-5.2",
+        }))
+        .expect("valid task");
+        assert_eq!(provider.default_model(&bound_task), "z-ai/glm-5.2");
+
+        let unbound_task = ControllerTask::from_value(&json!({
+            "kind": "text.generate",
+            "prompt": "hello",
+        }))
+        .expect("valid task");
+        assert_eq!(
+            provider.default_model(&unbound_task),
+            "global-default-model"
         );
     }
 
@@ -1083,6 +1359,174 @@ mod tests {
         assert_eq!(body["tools"][0]["function"]["name"], "workspace.read");
     }
 
+    #[test]
+    fn tools_unsupported_error_detection() {
+        assert!(OpenAIProvider::is_tools_unsupported_error(
+            "No endpoints found that support tool use. Try disabling \"session.status\"."
+        ));
+        assert!(OpenAIProvider::is_tools_unsupported_error(
+            "model X does not support tools"
+        ));
+        assert!(!OpenAIProvider::is_tools_unsupported_error(
+            "rate limit exceeded"
+        ));
+        assert!(!OpenAIProvider::is_tools_unsupported_error(
+            "invalid api key"
+        ));
+    }
+
+    /// No-tools handler, reactive half: a tools-unsupported API error (e.g.
+    /// OpenRouter's 404 "No endpoints found that support tool use") triggers
+    /// exactly ONE retry without tool declarations, and the model is
+    /// remembered as chat-only so the NEXT request strips proactively.
+    #[tokio::test]
+    async fn retries_without_tools_and_learns_chat_only_model() {
+        let bodies = Arc::new(Mutex::new(Vec::<Value>::new()));
+        let bodies_for_handler = Arc::clone(&bodies);
+        let app = Router::new().route(
+            "/v1/chat/completions",
+            post(move |Json(body): Json<Value>| {
+                let bodies = Arc::clone(&bodies_for_handler);
+                async move {
+                    let had_tools = body.get("tools").is_some();
+                    bodies.lock().await.push(body);
+                    if had_tools {
+                        (
+                            axum::http::StatusCode::NOT_FOUND,
+                            Json(json!({"error": {"message":
+                                "No endpoints found that support tool use. Try disabling \"session.status\"."}})),
+                        )
+                    } else {
+                        (
+                            axum::http::StatusCode::OK,
+                            Json(json!({"choices": [{"message": {"content": "prose reply"}}]})),
+                        )
+                    }
+                }
+            }),
+        );
+        let (base_url, _handle) = spawn_test_server(app).await;
+
+        let provider = OpenAIProvider::new_compatible(
+            "openrouter",
+            reqwest::Client::new(),
+            Some(OpenAIAuth::ApiKey("secret".into())),
+            Some(base_url),
+            None,
+            Some("thedrummer/cydonia-24b-v4.1".into()),
+            None,
+            Vec::new(),
+            None,
+        );
+        let task = ControllerTask::from_value(&json!({
+            "kind": "text.generate",
+            "prompt": "hello",
+            "tools_for_model": [{
+                "tool_name": "session.status",
+                "description": "Session status",
+                "input_schema": {"type": "object", "properties": {}}
+            }]
+        }))
+        .unwrap();
+
+        // First invoke: tools → 404 → retried without tools → text.
+        let output = provider.invoke(&task).await.unwrap();
+        assert!(matches!(output, ProviderOutput::Text { .. }));
+        // Second invoke: the model is now known chat-only → no 404 round-trip.
+        let output = provider.invoke(&task).await.unwrap();
+        assert!(matches!(output, ProviderOutput::Text { .. }));
+
+        let bodies = bodies.lock().await.clone();
+        assert_eq!(bodies.len(), 3, "expected initial + retry + proactive");
+        assert!(
+            bodies[0].get("tools").is_some(),
+            "first attempt keeps tools"
+        );
+        assert!(bodies[1].get("tools").is_none(), "retry must strip tools");
+        assert!(bodies[1].get("tool_choice").is_none());
+        assert!(
+            bodies[2].get("tools").is_none(),
+            "learned chat-only model must strip proactively"
+        );
+    }
+
+    /// No-tools handler, proactive half (openrouter): the `/v1/models`
+    /// catalog's `supported_parameters` marks a model chat-only, so the very
+    /// FIRST request goes out without tool declarations — no 404 round-trip —
+    /// while a tool-capable model keeps its tools.
+    #[tokio::test]
+    async fn catalog_strips_tools_proactively_for_chat_only_model() {
+        let bodies = Arc::new(Mutex::new(Vec::<Value>::new()));
+        let bodies_for_handler = Arc::clone(&bodies);
+        let app = Router::new()
+            .route(
+                "/v1/models",
+                axum::routing::get(|| async {
+                    Json(json!({"data": [
+                        {"id": "thedrummer/cydonia-24b-v4.1",
+                         "supported_parameters": ["temperature"]},
+                        {"id": "sao10k/l3.1-euryale-70b",
+                         "supported_parameters": ["temperature", "tools"]}
+                    ]}))
+                }),
+            )
+            .route(
+                "/v1/chat/completions",
+                post(move |Json(body): Json<Value>| {
+                    let bodies = Arc::clone(&bodies_for_handler);
+                    async move {
+                        bodies.lock().await.push(body);
+                        Json(json!({"choices": [{"message": {"content": "ok"}}]}))
+                    }
+                }),
+            );
+        let (base_url, _handle) = spawn_test_server(app).await;
+
+        let provider = OpenAIProvider::new_compatible(
+            "openrouter",
+            reqwest::Client::new(),
+            None,
+            Some(base_url),
+            None,
+            Some("thedrummer/cydonia-24b-v4.1".into()),
+            None,
+            Vec::new(),
+            None,
+        );
+        let tools_task = |model: Option<&str>| {
+            let mut spec = json!({
+                "kind": "text.generate",
+                "prompt": "hello",
+                "tools_for_model": [{
+                    "tool_name": "session.status",
+                    "description": "Session status",
+                    "input_schema": {"type": "object", "properties": {}}
+                }]
+            });
+            if let Some(model) = model {
+                spec["model"] = json!(model);
+            }
+            ControllerTask::from_value(&spec).unwrap()
+        };
+
+        provider.invoke(&tools_task(None)).await.unwrap();
+        provider
+            .invoke(&tools_task(Some("sao10k/l3.1-euryale-70b")))
+            .await
+            .unwrap();
+
+        let bodies = bodies.lock().await.clone();
+        assert_eq!(bodies.len(), 2);
+        assert!(
+            bodies[0].get("tools").is_none(),
+            "catalog-known chat-only model strips tools on the FIRST attempt"
+        );
+        assert!(
+            bodies[1].get("tools").is_some(),
+            "tool-capable model keeps its tool declarations"
+        );
+    }
+
     #[tokio::test]
     async fn chat_request_includes_openai_capability_overrides() {
         let captured = Arc::new(Mutex::new(None::<Value>));
@@ -1139,6 +1583,70 @@ mod tests {
         assert_eq!(body["verbosity"], "low");
         assert_eq!(body["background"], true);
         assert_eq!(body["tools"][0]["type"], "web_search_preview");
+    }
+
+    #[tokio::test]
+    async fn openrouter_request_includes_fallback_routing_fields() {
+        let captured = Arc::new(Mutex::new(None::<Value>));
+        let captured_for_handler = Arc::clone(&captured);
+        let app = Router::new().route(
+            "/v1/chat/completions",
+            post(move |Json(body): Json<Value>| {
+                let captured_for_handler = Arc::clone(&captured_for_handler);
+                async move {
+                    *captured_for_handler.lock().await = Some(body);
+                    Json(json!({
+                        "choices": [{
+                            "message": {
+                                "content": "done"
+                            }
+                        }]
+                    }))
+                }
+            }),
+        );
+        let (base_url, _handle) = spawn_test_server(app).await;
+
+        let provider = OpenAIProvider::new_compatible(
+            "openrouter",
+            reqwest::Client::new(),
+            Some(OpenAIAuth::ApiKey("secret".into())),
+            Some(base_url),
+            None,
+            Some("anthropic/claude-sonnet-4.5".into()),
+            None,
+            vec![
+                "anthropic/claude-sonnet-4.5".into(),
+                "openai/gpt-4.1-mini".into(),
+            ],
+            Some("fallback".into()),
+        );
+        assert_eq!(provider.id(), "openrouter");
+
+        let task = ControllerTask::from_value(&json!({
+            "kind": "text.generate",
+            "prompt": "Summarize this",
+            "provider_options": {
+                "provider": {
+                    "allow_fallbacks": true
+                }
+            }
+        }))
+        .unwrap();
+
+        let output = provider.invoke(&task).await.unwrap();
+        assert!(matches!(output, ProviderOutput::Text { .. }));
+
+        let body = captured
+            .lock()
+            .await
+            .clone()
+            .expect("request body captured");
+        assert_eq!(body["model"], "anthropic/claude-sonnet-4.5");
+        assert_eq!(body["models"][0], "anthropic/claude-sonnet-4.5");
+        assert_eq!(body["models"][1], "openai/gpt-4.1-mini");
+        assert_eq!(body["route"], "fallback");
+        assert_eq!(body["provider"]["allow_fallbacks"], true);
     }
 
     #[tokio::test]

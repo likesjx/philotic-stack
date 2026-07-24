@@ -35,6 +35,16 @@ faster and provides richer context than manual file reading.
 
 Start the graph server with `just intel-graph-start`. MCP endpoint: `http://127.0.0.1:8901/mcp`.
 REST API: `http://127.0.0.1:8900`. Use `just intel-graph-ensure` to start only if not already running.
+On macOS prefer the supervised service (`just intel-graph-service` — launchd KeepAlive; upgrade =
+copy the new binary to `~/.philotic/bin/graph-intelligence` and `launchctl kickstart -k`).
+
+**Topology (decided 2026-07-20): graphs are per-machine.** Each machine's graph is a local
+context engine scanning that machine's checkout; its harness registry describes the harnesses
+used *on that machine*. Graphs are not replicated and node counts legitimately differ across
+machines — do not treat another machine's graph as canonical for local work, and do not
+register harnesses on machines that will never materialize them. Cross-machine visibility of
+decisions/telemetry, if ever needed, is a future export/sync concern — not a reason to point
+clients at a remote graph.
 
 **Standard agent workflow** (when graph is available — see `$graph-intelligence` skill):
 
@@ -103,7 +113,7 @@ Use this split:
 
 Default memory lanes:
 
-1. **Session orientation**: before meaningful work, run the Muninn bootstrap and recall the triad: who am I, who am I talking to, what matters about this topic right now.
+1. **Session orientation**: before meaningful work, run the Muninn bootstrap and recall the triad: who am I, who am I talking to, what matters about this topic right now. `just session-start` also sweeps pending operator ideas from the LifeGraph (`just idea-sweep`) — triage them per the `$graph-intelligence` skill's Idea Sweep section.
 2. **Durable decisions**: use `muninn_decide` when there is a decision with rationale.
 3. **Reality gaps**: use `muninn_remember` for mismatches between assumption and observed repo/runtime truth.
 4. **Closeout bursts**: at slice/session end, store only the durable delta, not the whole story.

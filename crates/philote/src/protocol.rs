@@ -112,6 +112,21 @@ pub struct InboundTaskPayload {
     /// before model invocation and emit `approval_required` back to the sender.
     #[serde(default)]
     pub requires_approval: bool,
+    /// Present on tasks delivered by the aiua CronTicker (both the legacy
+    /// message shape and the paracrine_signal shape carry it). Used to
+    /// distinguish synthetic/scheduled prompts from operator-authored ones.
+    #[serde(default)]
+    pub cron_job_id: Option<String>,
+    /// Standing tool preapproval carried by OPERATOR-authored cron jobs: the
+    /// operator approved these tools when they authored the job's payload.
+    /// aiua's `CronTicker::build_cron_task_json` forwards the payload's
+    /// `preapproved_tools` under this key only when the job's `created_by`
+    /// is `Operator` — guest-created jobs can never self-grant approval.
+    /// Seeded into the cron session's approval policy at turn start so an
+    /// unattended fire (e.g. a 02:30 nightly backup) doesn't park
+    /// WaitingApproval with nobody awake and ride the watchdog to eviction.
+    #[serde(default)]
+    pub cron_preapproved_tools: Vec<String>,
 }
 
 // Transitional note: older emitters may still carry failures in
@@ -157,6 +172,18 @@ pub struct ModelRequestPayload {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub attachments: Vec<TransportAttachment>,
     pub tools_for_model: Vec<ToolDefinition>,
+    /// The specific model NAME to request from the dispatched provider role,
+    /// resolved from the active role's per-agent `model_bindings` (Layer 1 —
+    /// see `TurnLoopConfig::model_bindings`, `role_model_binding` in
+    /// `runtime.rs`) for whichever provider role
+    /// `resolve_model_execution_target` chose. `None` when the agent has no
+    /// binding for that role — model-router then falls back to the
+    /// provider's own global default (`openrouter_default_model`, etc; see
+    /// `ControllerTask::from_value` / `OpenAIProvider::default_model` /
+    /// `GeminiProvider::request_model`, which already read this top-level
+    /// `model` field via `task.model`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
     /// Forwarded verbatim to the model controller as `response_contract`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub response_contract: Option<serde_json::Value>,
@@ -171,10 +198,37 @@ pub struct ModelRequestPayload {
     pub chat_id: String,
     pub reply_to: String,
     pub reply_role: String,
+    /// Guest id the model RESPONSE must be delivered back to. Set to this
+    /// philote's own incarnation guest id (`{agent_id}:{role_name}`) for role
+    /// incarnations so the reply returns to THIS process. Without it,
+    /// `ReturnRoute::from_task` falls back to `agent_id` (the bare base agent),
+    /// so a role specialist's model reply is delivered to the BASE philote — a
+    /// different process — where it is dropped and the specialist's turn hangs
+    /// in `waiting_model` until the watchdog reaps it. `None` for the base
+    /// philote (the `agent_id` fallback is correct there).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reply_guest_id: Option<String>,
     pub final_reply_to: String,
     pub final_reply_role: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub final_reply_guest_id: Option<String>,
+    /// Persona/agent that owns this turn (e.g. `"jane"`). Threaded through so
+    /// the model-router's training-tap trace can record the real agent instead
+    /// of an empty string, enabling per-agent routing analysis. `None` only
+    /// for legacy/interop payloads that predate this field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_id: Option<String>,
+    /// Shadow-mode (`PHILOTIC_SHADOW_ORACLE`) annotation: the routing oracle's
+    /// top pick (`"role:provider"`) at dispatch time. `None` when shadow mode
+    /// is off. Log-only — the model-router persists it to the trace store; it
+    /// never influences routing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oracle_pick: Option<String>,
+    /// Shadow-mode annotation: whether the oracle's top pick agreed with the
+    /// ladder's resolved role. `None` when shadow mode is off or the oracle was
+    /// unavailable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oracle_agreement: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize)]

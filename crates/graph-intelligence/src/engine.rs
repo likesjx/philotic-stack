@@ -3,6 +3,16 @@ use rusqlite::{params, Connection, Transaction};
 
 use crate::schema::*;
 
+/// One stored embedding, snapshotted before a destructive rescan.
+pub struct EmbeddingSnapshotRow {
+    pub id: String,
+    pub embedding: Vec<u8>,
+    pub embedding_model: Option<String>,
+    pub embedding_dims: Option<i64>,
+    pub embedding_updated: Option<String>,
+    pub embedding_hash: Option<String>,
+}
+
 pub struct GraphEngine {
     conn: Connection,
 }
@@ -648,6 +658,54 @@ impl GraphEngine {
 
     // ── Bulk operations ──
 
+    /// Snapshot every stored embedding (id → columns) so a destructive rescan
+    /// can restore them. Scans delete+reinsert nodes, and the upsert COALESCE
+    /// only preserves embeddings when the old row still exists — without this,
+    /// every scan silently wiped all semantic-search state (DEF-066).
+    pub fn snapshot_embeddings(&self) -> Result<Vec<EmbeddingSnapshotRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, embedding, embedding_model, embedding_dims, embedding_updated, embedding_hash
+             FROM nodes WHERE embedding IS NOT NULL",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(EmbeddingSnapshotRow {
+                id: row.get(0)?,
+                embedding: row.get(1)?,
+                embedding_model: row.get(2)?,
+                embedding_dims: row.get(3)?,
+                embedding_updated: row.get(4)?,
+                embedding_hash: row.get(5)?,
+            })
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    /// Restore snapshotted embeddings into nodes that survived the rescan and
+    /// came back without one. Returns how many rows were restored.
+    pub fn restore_embeddings(&self, snapshot: &[EmbeddingSnapshotRow]) -> Result<usize> {
+        let mut restored = 0;
+        for row in snapshot {
+            restored += self.conn.execute(
+                "UPDATE nodes SET embedding=?2, embedding_model=?3, embedding_dims=?4,
+                        embedding_updated=?5, embedding_hash=?6
+                 WHERE id=?1 AND embedding IS NULL",
+                params![
+                    row.id,
+                    row.embedding,
+                    row.embedding_model,
+                    row.embedding_dims,
+                    row.embedding_updated,
+                    row.embedding_hash,
+                ],
+            )?;
+        }
+        Ok(restored)
+    }
+
     pub fn clear_worktree(&self, worktree: &str) -> Result<()> {
         self.conn.execute(
             "DELETE FROM snippets WHERE node_id IN (SELECT id FROM nodes WHERE worktree = ?1)",
@@ -1284,6 +1342,54 @@ fn row_to_mutation(row: &rusqlite::Row) -> Result<Mutation> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn embeddings_survive_destructive_rescan() {
+        let engine = GraphEngine::open(":memory:").unwrap();
+        let now = chrono::Utc::now();
+        let mk = |embedding: Option<Vec<f32>>| Node {
+            id: "doc:proposal-a".into(),
+            kind: NodeKind::Proposal,
+            name: "Proposal A".into(),
+            properties: serde_json::json!({}),
+            file_path: None,
+            worktree: "develop".into(),
+            created_at: now,
+            updated_at: now,
+            embedding,
+            embedding_model: embedding_model_for_test(),
+            embedding_dims: Some(384),
+            embedding_updated: Some(now),
+            embedding_hash: Some("abc".into()),
+        };
+
+        engine.upsert_node(&mk(Some(vec![0.1, 0.2, 0.3]))).unwrap();
+        let snapshot = engine.snapshot_embeddings().unwrap();
+        assert_eq!(snapshot.len(), 1);
+
+        // Simulate a scan: node deleted, then reinserted without an embedding.
+        engine.clear_worktree("develop").unwrap();
+        engine.upsert_node(&mk(None)).unwrap();
+        assert!(engine
+            .get_node("doc:proposal-a")
+            .unwrap()
+            .unwrap()
+            .embedding
+            .is_none());
+
+        let restored = engine.restore_embeddings(&snapshot).unwrap();
+        assert_eq!(restored, 1);
+        let node = engine.get_node("doc:proposal-a").unwrap().unwrap();
+        assert_eq!(node.embedding.unwrap().len(), 3);
+
+        // A node whose id vanished entirely is simply not restored.
+        engine.clear_worktree("develop").unwrap();
+        assert_eq!(engine.restore_embeddings(&snapshot).unwrap(), 0);
+    }
+
+    fn embedding_model_for_test() -> Option<String> {
+        Some("test-model".into())
+    }
 
     #[test]
     fn test_engine_basic_crud() {

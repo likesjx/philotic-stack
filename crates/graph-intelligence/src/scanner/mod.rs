@@ -19,6 +19,7 @@ pub struct ScanConfig {
 }
 
 /// Aggregate results from a full scan.
+#[derive(serde::Serialize)]
 pub struct ScanResult {
     pub crates: usize,
     pub modules: usize,
@@ -35,6 +36,10 @@ pub struct ScanResult {
 /// Run all scanners against the workspace.
 pub fn full_scan(root: &Path, config: &ScanConfig, engine: &mut GraphEngine) -> Result<ScanResult> {
     let start = Instant::now();
+
+    // Scans are destructive (delete + reinsert); hold embeddings aside so
+    // semantic-search state survives nodes being recreated (DEF-066).
+    let embedding_snapshot = engine.snapshot_embeddings().unwrap_or_default();
 
     // Clear existing data for this worktree before re-scanning
     engine.clear_worktree(&config.worktree)?;
@@ -154,7 +159,7 @@ pub fn full_scan(root: &Path, config: &ScanConfig, engine: &mut GraphEngine) -> 
         }
     }
 
-    Ok(ScanResult {
+    let result = ScanResult {
         crates: total_crates,
         modules: total_modules,
         types: total_types,
@@ -165,5 +170,26 @@ pub fn full_scan(root: &Path, config: &ScanConfig, engine: &mut GraphEngine) -> 
         commits,
         branches,
         duration_ms: duration.as_millis() as u64,
-    })
+    };
+
+    let restored = engine.restore_embeddings(&embedding_snapshot).unwrap_or(0);
+    if restored > 0 {
+        eprintln!("[scan] restored {} embeddings across rescan", restored);
+    }
+
+    // Record scan completion so freshness is observable (surfaced as last_scan in /api/status)
+    let _ = engine.record_mutation(&crate::schema::Mutation {
+        id: uuid::Uuid::new_v4().to_string(),
+        timestamp: Utc::now(),
+        agent: None,
+        session: None,
+        action: "full_scan".to_string(),
+        target_node: Some("system:scan".to_string()),
+        from_value: None,
+        to_value: None,
+        reason: None,
+        details: serde_json::to_value(&result).unwrap_or(serde_json::Value::Null),
+    });
+
+    Ok(result)
 }

@@ -2,7 +2,7 @@
 title: Hotel User Identity And Operator Auth Proposal
 doc_type: proposal
 domain: operator-control-plane
-status: accepted for current slice
+status: accepted-current-slice
 last_updated: 2026-05-16
 tags:
 - operator

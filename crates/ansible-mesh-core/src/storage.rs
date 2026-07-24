@@ -266,6 +266,10 @@ pub struct GraphRunnerInstanceRecord {
 /// Context Graph config key: MuninnDB REST endpoint URL.
 /// Value is a JSON string, e.g. `"http://127.0.0.1:8475"`.
 pub const CONFIG_MUNINN_ENDPOINT: &str = "muninn_endpoint";
+/// Muninn-cluster single-writer routing: node id of the hotel that owns the
+/// cluster PRIMARY. Set on lobe/observer hotels only; absent (the default)
+/// means memory writes stay local. See `MuninnConfig::shared_write_route`.
+pub const CONFIG_MUNINN_WRITE_ROUTE: &str = "muninn_write_route";
 
 /// Context Graph config key: vault registry.
 /// Value is a JSON array of [`VaultRegistryEntry`].

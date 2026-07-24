@@ -10,7 +10,7 @@ use axum::{
 };
 use rust_embed::RustEmbed;
 use serde::{Deserialize, Serialize};
-use tower_http::cors::CorsLayer;
+use tower_http::cors::{AllowOrigin, Any, CorsLayer};
 use tracing;
 
 use crate::engine::ManageProposalRequest;
@@ -96,6 +96,24 @@ pub struct DecideBody {
     pub reason: String,
     pub agent: String,
     pub session: Option<String>,
+    /// Memory Transparency Slice M1 (`MEMORY_TRANSPARENCY_PROPOSAL.md`):
+    /// evidence pointer strings backing this decision — log refs, graph
+    /// node ids, PR/commit shas, signal ids. Additive/optional so existing
+    /// callers that predate M1 keep working unchanged.
+    #[serde(default)]
+    pub evidence: Vec<String>,
+    /// Named undo path for this decision (soft-delete id, revert edge,
+    /// restore point), when one exists.
+    #[serde(default)]
+    pub reversal: Option<String>,
+    /// Trust tier of the fact behind this decision — `"observed"`,
+    /// `"inferred"`, or `"told"` (mirrors
+    /// `ansible_mesh_core::provenance::TrustTier`; kept as a plain string
+    /// here so this crate does not take a dependency on ansible-mesh-core
+    /// for one enum). Absent/unrecognized values are stored as-is and not
+    /// validated server-side.
+    #[serde(default)]
+    pub trust: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -138,6 +156,7 @@ struct StatusResponse {
     edge_count: usize,
     snippet_count: usize,
     last_scan: Option<String>,
+    server: serde_json::Value,
 }
 
 #[derive(Serialize)]
@@ -224,7 +243,24 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/scan", post(trigger_scan))
         .route("/api/edges", post(post_upsert_edge))
         .route("/api/mempalace/turn", post(post_mempalace_turn))
-        .layer(CorsLayer::permissive())
+        // Local-origin CORS only: permissive CORS let any web page POST JSON to
+        // the unauthenticated write endpoints (drive-by graph mutation).
+        .layer(
+            CorsLayer::new()
+                .allow_origin(AllowOrigin::predicate(|origin, _| {
+                    origin
+                        .to_str()
+                        .map(|o| {
+                            o.starts_with("http://localhost")
+                                || o.starts_with("http://127.0.0.1")
+                                || o.starts_with("https://localhost")
+                                || o.starts_with("https://127.0.0.1")
+                        })
+                        .unwrap_or(false)
+                }))
+                .allow_methods(Any)
+                .allow_headers(Any),
+        )
         .fallback(get(handle_ui_static))
         .with_state(state)
 }
@@ -367,11 +403,18 @@ async fn get_status(
     let edge_count = engine.count_edges().map_err(internal_error)?;
     let snippet_count = engine.count_snippets().map_err(internal_error)?;
 
+    let last_scan = engine
+        .get_mutations(Some("system:scan"), 1)
+        .ok()
+        .and_then(|m| m.into_iter().next())
+        .map(|m| m.timestamp.to_rfc3339());
+
     Ok(Json(StatusResponse {
         node_counts: serde_json::Value::Object(counts),
         edge_count,
         snippet_count,
-        last_scan: None,
+        last_scan,
+        server: state.server_info.clone(),
     }))
 }
 
@@ -1332,6 +1375,12 @@ async fn post_decide(
             "agent": body.agent,
             "session": body.session,
             "timestamp": chrono::Utc::now().to_rfc3339(),
+            // Memory Transparency Slice M1: provenance envelope fields
+            // adopted on the decision record — empty/null when the caller
+            // predates M1 or omitted them.
+            "evidence": body.evidence,
+            "reversal": body.reversal,
+            "trust": body.trust,
         }),
         file_path: None,
         worktree: String::new(),
@@ -1366,7 +1415,11 @@ async fn post_decide(
         from_value: body.from_value.clone(),
         to_value: body.to_value.clone(),
         reason: Some(body.reason.clone()),
-        details: serde_json::json!({}),
+        details: serde_json::json!({
+            "evidence": body.evidence,
+            "reversal": body.reversal,
+            "trust": body.trust,
+        }),
     };
     engine.record_mutation(&mutation).map_err(internal_error)?;
 

@@ -36,11 +36,34 @@ pub struct McpEndpointConfig {
     pub exposure: ExposureTier,
     /// Tools advertised to MCP clients via `tools/list`.
     pub tools: Vec<McpToolSpec>,
+    /// Endpoint-wide default auth scheme. A tool without its own `auth`
+    /// inherits this; absent means `McpAuthScheme::None` (loopback-only
+    /// callers). Token grants added via `mcp.grant_token` without a
+    /// `tool_name` land here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_auth: Option<McpAuthScheme>,
+    /// Explicit operator acknowledgment that this endpoint intentionally
+    /// serves unauthenticated tools beyond loopback. Without it, provisioning
+    /// a `Lan`/`Mesh`/`Internet` endpoint with any effective-auth-`None` tool
+    /// is rejected. Surfaced in the approval prompt via the provisioning args.
+    #[serde(default)]
+    pub allow_unauthenticated: bool,
     /// Pre-approval rules established by the philote's provisioning turn.
     #[serde(default)]
     pub preapproval_rules: Vec<McpPreapprovalRule>,
     /// Unix epoch (seconds). LWW merge key.
     pub updated_at: u64,
+}
+
+impl McpEndpointConfig {
+    /// The auth scheme actually enforced for a tool: per-tool override,
+    /// else the endpoint default, else `None` (loopback-only).
+    pub fn effective_auth<'a>(&'a self, tool: &'a McpToolSpec) -> McpAuthScheme {
+        tool.auth
+            .clone()
+            .or_else(|| self.default_auth.clone())
+            .unwrap_or(McpAuthScheme::None)
+    }
 }
 
 // ── Tool specification ────────────────────────────────────────────────────────
@@ -207,6 +230,8 @@ mod tests {
                 outbound_transform: McpOutboundTransform::PassThrough,
                 auth: None,
             }],
+            default_auth: None,
+            allow_unauthenticated: false,
             preapproval_rules: vec![McpPreapprovalRule {
                 action_pattern: "datasource.query".into(),
                 target: None,

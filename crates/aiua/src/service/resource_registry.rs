@@ -17,8 +17,8 @@
 //! - Provide a `boot_reconcile` entry point that replays agent static declarations
 
 use ansible_mesh_core::resources::{
-    ResourceDeclaration, ResourceDenied, ResourceGranted, ResourceMaterializing, ResourceRequest,
-    ResourceRevoked, ResourceType,
+    ResourceDeclaration, ResourceDenied, ResourceGranted, ResourceMaterializing, ResourceReleased,
+    ResourceRequest, ResourceRevoked, ResourceType,
 };
 use ansible_mesh_core::storage::AgentIdentityRecord;
 use std::collections::{HashMap, HashSet};
@@ -84,6 +84,9 @@ pub struct ResourceRegistry {
     by_type: HashMap<ResourceType, Vec<String>>,
     /// Per-agent index: agent_id → instance_ids the agent holds grants for.
     by_agent: HashMap<String, HashSet<String>>,
+    /// Optional per-type tenant ceiling. When present, a request that would
+    /// admit a *new* tenant beyond this count is denied. Absent = unbounded.
+    max_tenants: HashMap<ResourceType, usize>,
 }
 
 impl ResourceRegistry {
@@ -92,7 +95,16 @@ impl ResourceRegistry {
             instances: HashMap::new(),
             by_type: HashMap::new(),
             by_agent: HashMap::new(),
+            max_tenants: HashMap::new(),
         }
+    }
+
+    /// Configure a tenant ceiling for a resource type. This is the enforcement
+    /// hook the broker uses to produce `ResourceDenied` when a shared instance
+    /// is at capacity (see Component 3 of the proposal). Rights-based denial
+    /// lands in a later seam; this is the first honest deny path.
+    pub fn set_max_tenants(&mut self, resource_type: ResourceType, max: usize) {
+        self.max_tenants.insert(resource_type, max);
     }
 
     // ── public API ────────────────────────────────────────────────────────────
@@ -107,6 +119,29 @@ impl ResourceRegistry {
     /// - Rights checks are stubbed permissive (enforced in a later seam).
     pub fn register_request(&mut self, req: ResourceRequest) -> RegistryOutcome {
         if let Some(instance_id) = self.find_instance_for_type(&req.resource_type) {
+            // Capacity enforcement: only reject a genuinely *new* tenant. A
+            // duplicate request from an existing tenant is idempotent and must
+            // never be denied for capacity.
+            let already_tenant = self
+                .instances
+                .get(&instance_id)
+                .map(|i| i.tenants.contains(&req.agent_id))
+                .unwrap_or(false);
+            if !already_tenant {
+                if let Some(&cap) = self.max_tenants.get(&req.resource_type) {
+                    let current = self.tenant_count(&instance_id);
+                    if current >= cap {
+                        return RegistryOutcome::Denied(ResourceDenied {
+                            agent_id: req.agent_id,
+                            resource_type: req.resource_type,
+                            reason: format!(
+                                "resource at capacity: {current}/{cap} tenants for this type"
+                            ),
+                        });
+                    }
+                }
+            }
+
             let instance = self.instances.get_mut(&instance_id).unwrap();
             instance.tenants.insert(req.agent_id.clone());
             self.by_agent
@@ -127,6 +162,15 @@ impl ResourceRegistry {
                     resource_type: req.resource_type,
                 });
             }
+        }
+
+        // No instance yet. A ceiling of zero forbids the type outright.
+        if let Some(&0) = self.max_tenants.get(&req.resource_type) {
+            return RegistryOutcome::Denied(ResourceDenied {
+                agent_id: req.agent_id,
+                resource_type: req.resource_type,
+                reason: "resource type disabled (max_tenants=0)".to_string(),
+            });
         }
 
         // No instance yet — create one.
@@ -211,12 +255,50 @@ impl ResourceRegistry {
         revocations
     }
 
-    /// All instance_ids granted to an agent.
+    /// Routing table projection: **agent → resources**. All instance_ids the
+    /// agent currently holds a tenancy on. Used for lifecycle (when an agent is
+    /// removed, which resources lose a tenant).
     pub fn grants_for_agent(&self, agent_id: &str) -> Vec<String> {
         self.by_agent
             .get(agent_id)
             .map(|s| s.iter().cloned().collect())
             .unwrap_or_default()
+    }
+
+    /// Routing table projection: **resource → tenants**. The union of tenant
+    /// agent_ids across every instance of `resource_type`. Used for dispatch
+    /// (a Telegram message arrives — which agents receive it?).
+    pub fn tenants_for_resource_type(&self, resource_type: &ResourceType) -> Vec<String> {
+        let mut tenants = HashSet::new();
+        if let Some(instance_ids) = self.by_type.get(resource_type) {
+            for id in instance_ids {
+                if let Some(instance) = self.instances.get(id) {
+                    tenants.extend(instance.tenants.iter().cloned());
+                }
+            }
+        }
+        tenants.into_iter().collect()
+    }
+
+    /// Routing table projection: the set of resource *types* an agent holds a
+    /// tenancy on (deduplicated across instances).
+    pub fn resource_types_for_agent(&self, agent_id: &str) -> Vec<ResourceType> {
+        let mut types = HashSet::new();
+        if let Some(instance_ids) = self.by_agent.get(agent_id) {
+            for id in instance_ids {
+                if let Some(instance) = self.instances.get(id) {
+                    types.insert(instance.resource_type.clone());
+                }
+            }
+        }
+        types.into_iter().collect()
+    }
+
+    /// Apply an agent-initiated `ResourceReleased`. Returns `true` if the
+    /// instance now has zero tenants (teardown eligible — but teardown itself
+    /// stays with the GuestManager path this slice).
+    pub fn apply_release(&mut self, rel: &ResourceReleased) -> bool {
+        self.release_tenant(&rel.agent_id, &rel.instance_id)
     }
 
     /// Current tenant count for an instance.
@@ -462,6 +544,123 @@ mod tests {
         reg.register_request(req("a1", ResourceType::ToolRunner));
         assert_eq!(reg.instance_count(), 2);
         assert_eq!(reg.grants_for_agent("a1").len(), 2);
+    }
+
+    #[test]
+    fn duplicate_request_is_idempotent() {
+        let mut reg = ResourceRegistry::new();
+        let o1 = reg.register_request(req("a1", ResourceType::ModelRouter));
+        let instance_id = match o1 {
+            RegistryOutcome::Materializing(m) => m.instance_id,
+            _ => panic!("expected materializing"),
+        };
+        // Same agent, same type, again — must not double-count.
+        let o2 = reg.register_request(req("a1", ResourceType::ModelRouter));
+        assert!(matches!(o2, RegistryOutcome::Materializing(_)));
+        assert_eq!(
+            reg.tenant_count(&instance_id),
+            1,
+            "duplicate must not add a second tenant"
+        );
+        assert_eq!(
+            reg.grants_for_agent("a1").len(),
+            1,
+            "agent holds exactly one grant"
+        );
+    }
+
+    #[test]
+    fn deny_reason_propagates_when_at_capacity() {
+        let mut reg = ResourceRegistry::new();
+        reg.set_max_tenants(ResourceType::TelegramMembrane, 1);
+        // First tenant admitted.
+        let o1 = reg.register_request(req("a1", ResourceType::TelegramMembrane));
+        assert!(matches!(o1, RegistryOutcome::Materializing(_)));
+        // Second distinct agent exceeds the ceiling → denied with a reason.
+        let o2 = reg.register_request(req("a2", ResourceType::TelegramMembrane));
+        match o2 {
+            RegistryOutcome::Denied(d) => {
+                assert_eq!(d.agent_id, "a2");
+                assert_eq!(d.resource_type, ResourceType::TelegramMembrane);
+                assert!(
+                    d.reason.contains("capacity"),
+                    "deny reason should explain the refusal, got: {}",
+                    d.reason
+                );
+            }
+            other => panic!("expected denied, got {other:?}"),
+        }
+        // The original tenant is untouched.
+        assert_eq!(
+            reg.tenants_for_resource_type(&ResourceType::TelegramMembrane),
+            vec!["a1".to_string()]
+        );
+    }
+
+    #[test]
+    fn existing_tenant_not_denied_by_capacity() {
+        let mut reg = ResourceRegistry::new();
+        reg.set_max_tenants(ResourceType::ModelRouter, 1);
+        reg.register_request(req("a1", ResourceType::ModelRouter));
+        // a1 re-requesting must still succeed even though the type is at cap.
+        let again = reg.register_request(req("a1", ResourceType::ModelRouter));
+        assert!(matches!(again, RegistryOutcome::Materializing(_)));
+    }
+
+    #[test]
+    fn routing_tables_answer_both_projections() {
+        let mut reg = ResourceRegistry::new();
+        // a1 uses model-router + tool-runner; a2 uses model-router.
+        reg.register_request(req("a1", ResourceType::ModelRouter));
+        reg.register_request(req("a1", ResourceType::ToolRunner));
+        reg.register_request(req("a2", ResourceType::ModelRouter));
+
+        // resource → tenants
+        let mut mr_tenants = reg.tenants_for_resource_type(&ResourceType::ModelRouter);
+        mr_tenants.sort();
+        assert_eq!(mr_tenants, vec!["a1".to_string(), "a2".to_string()]);
+        assert_eq!(
+            reg.tenants_for_resource_type(&ResourceType::ToolRunner),
+            vec!["a1".to_string()]
+        );
+        assert!(
+            reg.tenants_for_resource_type(&ResourceType::AgentGraph)
+                .is_empty()
+        );
+
+        // agent → resources (types)
+        let mut a1_types = reg.resource_types_for_agent("a1");
+        a1_types.sort_by_key(|t| format!("{t:?}"));
+        assert_eq!(a1_types.len(), 2);
+        assert!(a1_types.contains(&ResourceType::ModelRouter));
+        assert!(a1_types.contains(&ResourceType::ToolRunner));
+        assert_eq!(
+            reg.resource_types_for_agent("a2"),
+            vec![ResourceType::ModelRouter]
+        );
+    }
+
+    #[test]
+    fn apply_release_removes_tenant_from_routing_table() {
+        let mut reg = ResourceRegistry::new();
+        let o = reg.register_request(req("a1", ResourceType::ToolRunner));
+        reg.register_request(req("a2", ResourceType::ToolRunner));
+        let instance_id = match o {
+            RegistryOutcome::Materializing(m) => m.instance_id,
+            _ => panic!(),
+        };
+        let rel = ResourceReleased {
+            agent_id: "a1".to_string(),
+            instance_id: instance_id.clone(),
+            resource_type: ResourceType::ToolRunner,
+        };
+        let zero = reg.apply_release(&rel);
+        assert!(!zero, "a2 still holds the instance");
+        assert_eq!(
+            reg.tenants_for_resource_type(&ResourceType::ToolRunner),
+            vec!["a2".to_string()]
+        );
+        assert!(reg.resource_types_for_agent("a1").is_empty());
     }
 
     // ── boot_reconcile tests ──────────────────────────────────────────────────

@@ -9,11 +9,234 @@
 //! forward-compatible with dynamically registered tools from tool-runner guests.
 
 use crate::session::ToolDefinition;
-use serde_json::json;
+use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::sync::OnceLock;
 
 static TOOL_CATALOG: OnceLock<HashMap<String, ToolDefinition>> = OnceLock::new();
+
+fn graph_record_ref_schema() -> Value {
+    json!({
+        "type": "object",
+        "required": ["id", "label"],
+        "properties": {
+            "id": {
+                "type": "string",
+                "description": "Life Graph node ID (e.g. 'life:open_loop:rowing')."
+            },
+            "label": {
+                "type": "string",
+                "description": "Life Graph node type. Examples: Person, Role, Goal, System, Habit, Project, Commitment, OpenLoop, NextAction, Routine, Decision, Preference, Value, Concern, Event, Signal, GrowthHypothesis, GrowthExperiment, DriftFinding, CapabilityPatch, SkillPatch, ToolPatch, SchemaPatch, AttentionPatch, SystemPatch, StewardshipInstruction."
+            },
+            "datasource": {
+                "type": "string",
+                "description": "Usually 'life-graph'.",
+                "default": "life-graph"
+            }
+        }
+    })
+}
+
+fn source_ref_schema() -> Value {
+    json!({
+        "type": "object",
+        "required": ["source_id", "source_kind", "reliability"],
+        "properties": {
+            "source_id": {
+                "type": "string",
+                "description": "Source membrane, agent, or memory ID (e.g. 'membrane:telegram')."
+            },
+            "source_kind": {
+                "type": "string",
+                "enum": [
+                    "operator_confirmation", "membrane_event",
+                    "muninn_engram", "graph_passage",
+                    "imported_record", "agent_inference",
+                    "runtime_observation"
+                ]
+            },
+            "reliability": {
+                "type": "object",
+                "required": ["score", "basis"],
+                "properties": {
+                    "score": {
+                        "type": "number",
+                        "minimum": 0,
+                        "maximum": 1
+                    },
+                    "basis": {
+                        "type": "string",
+                        "enum": [
+                            "operator_confirmed", "direct_observation",
+                            "muninn_trust", "imported_authority",
+                            "agent_inferred", "unknown"
+                        ]
+                    }
+                }
+            },
+            "uri": { "type": "string" },
+            "captured_at": {
+                "type": "string",
+                "description": "ISO 8601 timestamp when this source was captured."
+            }
+        }
+    })
+}
+
+fn passage_ref_schema() -> Value {
+    json!({
+        "type": "object",
+        "required": ["passage_id"],
+        "properties": {
+            "passage_id": { "type": "string" },
+            "source_ref_id": { "type": "string" },
+            "excerpt_hash": { "type": "string" },
+            "muninn_engram_id": { "type": "string" },
+            "graph_node_id": { "type": "string" }
+        }
+    })
+}
+
+fn evidence_packet_schema() -> Value {
+    json!({
+        "type": "object",
+        // Only the claim itself is hard-required: advisory metadata parses
+        // with documented defaults, and identity fields are auto-generated
+        // when omitted (2026-07-19: model-authored observes were rejected
+        // wholesale over a missing source_reliability).
+        "required": ["claim_ref", "claim_summary"],
+        "properties": {
+            "packet_id": {
+                "type": "string",
+                "description": "Unique ID for this evidence packet. Optional — auto-generated when omitted."
+            },
+            "claim_ref": graph_record_ref_schema(),
+            "claim_summary": {
+                "type": "string",
+                "description": "One or two sentence summary of what was observed."
+            },
+            "source_refs": {
+                "type": "array",
+                "items": source_ref_schema(),
+                "default": []
+            },
+            "passage_refs": {
+                "type": "array",
+                "items": passage_ref_schema(),
+                "default": []
+            },
+            "confidence": {
+                "type": "number",
+                "minimum": 0,
+                "maximum": 1,
+                "default": 0.6,
+                "description": "How confident the observer is in the claim. Optional — defaults to 0.6 (agent-inferred tier)."
+            },
+            "validation_state": {
+                "type": "string",
+                "enum": ["inferred", "proposed", "confirmed", "retired", "conflicted"],
+                "default": "proposed"
+            },
+            "source_reliability": {
+                "type": "number",
+                "minimum": 0,
+                "maximum": 1,
+                "default": 0.6,
+                "description": "How reliable the underlying source is. Optional — defaults to 0.6 (agent-inferred tier)."
+            },
+            "adjudication_status": {
+                "type": "string",
+                "enum": [
+                    "not_needed", "pending", "muninn_first",
+                    "graph_review", "operator_required", "resolved", "rejected"
+                ],
+                "default": "not_needed"
+            },
+            "observed_at": {
+                "type": "string",
+                "description": "ISO 8601 timestamp when this was observed."
+            },
+            "valid_time_range": {
+                "type": "object",
+                "properties": {
+                    "starts_at": { "type": "string" },
+                    "ends_at": { "type": "string" }
+                }
+            },
+            "conflict_ids": {
+                "type": "array",
+                "items": {"type": "string"},
+                "default": []
+            },
+            "metadata": {
+                "type": "object",
+                "default": {}
+            }
+        },
+        "description": "EvidencePacket. Provide at least one source_ref or passage_ref; ungrounded evidence is rejected by the runner."
+    })
+}
+
+fn conflict_handoff_schema() -> Value {
+    json!({
+        "type": "object",
+        "required": [
+            "handoff_id", "conflict_id", "finding_type", "summary",
+            "recommended_owner", "requested_muninn_action", "risk",
+            "requires_operator", "status"
+        ],
+        "properties": {
+            "handoff_id": { "type": "string" },
+            "conflict_id": { "type": "string" },
+            "finding_type": {
+                "type": "string",
+                "enum": [
+                    "direct_contradiction", "temporal_conflict",
+                    "granularity_conflict", "identity_ambiguity",
+                    "staleness", "policy_risk"
+                ]
+            },
+            "summary": { "type": "string" },
+            "graph_fact_refs": {
+                "type": "array",
+                "items": graph_record_ref_schema(),
+                "default": []
+            },
+            "evidence_packets": {
+                "type": "array",
+                "items": evidence_packet_schema(),
+                "default": []
+            },
+            "muninn_engram_ids": {
+                "type": "array",
+                "items": { "type": "string" },
+                "default": []
+            },
+            "recommended_owner": {
+                "type": "string",
+                "enum": ["muninn", "data_memory_graph_rag", "shared_gate", "operator"]
+            },
+            "requested_muninn_action": {
+                "type": "string",
+                "enum": ["none", "true_up", "contradiction_review", "trust_update", "cultivate"]
+            },
+            "risk": {
+                "type": "string",
+                "enum": ["low", "medium", "high"]
+            },
+            "requires_operator": { "type": "boolean" },
+            "status": {
+                "type": "string",
+                "enum": ["open", "sent_to_muninn", "awaiting_operator", "resolved", "closed_no_action"]
+            },
+            "metadata": {
+                "type": "object",
+                "default": {}
+            }
+        },
+        "description": "ConflictHandoff. Include graph_fact_refs, evidence_packets, or muninn_engram_ids so the conflict is grounded."
+    })
+}
 
 /// Returns the static built-in tool catalog.
 ///
@@ -50,6 +273,8 @@ pub fn skill_implied_tools(skill_name: &str) -> &'static [&'static str] {
             "memory.promote_candidate",
             "memory.status",
             "memory.fix",
+            "memory.explain",
+            "memory.delta_digest",
         ],
         "routing.refinement" => &[
             "session.status",
@@ -72,7 +297,9 @@ pub fn skill_implied_tools(skill_name: &str) -> &'static [&'static str] {
         ],
         "life.steward" => &[
             "life.observe",
+            "life.observe.batch",
             "life.recall",
+            "life.recall.feedback",
             "life.commit",
             "life.resolve",
             "life.conflict",
@@ -94,7 +321,9 @@ pub fn tools_for_skill(skill_name: &str) -> &'static [&'static str] {
     match skill_name {
         "life.steward" => &[
             "life.observe",
+            "life.observe.batch",
             "life.recall",
+            "life.recall.feedback",
             "life.commit",
             "life.resolve",
             "life.conflict",
@@ -146,7 +375,17 @@ pub fn tools_for_skill(skill_name: &str) -> &'static [&'static str] {
         "context.synthesize" => &["workspace.list", "workspace.read"],
         "agent.initiate" => &["agent.graph.write", "agent.graph.recall"],
         "profile.manage" => &["role.configure"],
-        "mcp.manage" => &["mcp.provision", "mcp.revoke"],
+        "mcp.manage" => &[
+            "mcp.provision",
+            "mcp.revoke",
+            "mcp.grant_token",
+            "mcp.rotate_token",
+            "mcp.revoke_token",
+            "mcp.connect",
+            "mcp.disconnect",
+            "mcp.upstreams",
+            "mcp.set_credential",
+        ],
         _ => &[],
     }
 }
@@ -163,21 +402,66 @@ pub fn skill_is_relevant_for_turn(skill_name: &str, turn_text: &str) -> bool {
             t.contains("life.")
                 || t.contains("lifegraph")
                 || t.contains("life graph")
+                // "live graph" is a common mishearing/typo of "life graph" — voice
+                // transcription and fast typing both produce it routinely.
+                || t.contains("live graph")
                 || t.contains("openloop")
                 || t.contains("open loop")
+                || t.contains("re-enter")
+                || t.contains("reenter")
+                || t.contains("re-entry")
+                || t.contains("follow-through")
+                || t.contains("follow through")
+                || t.contains("commitment")
+                || t.contains("commitments")
+                || t.contains("goals")
+                || t.contains("habits")
                 || t.contains("signal node")
                 || t.contains("life.observe")
                 || t.contains("life.recall")
+                || t.contains("life.recall.feedback")
                 || t.contains("life.commit")
                 || t.contains("record this")
                 || t.contains("observe this")
                 || t.contains("note this")
                 || t.contains("remember this")
                 || t.contains("log this")
+                // Loop-lifecycle verbs: the words an operator actually types when
+                // closing something out or ratifying a proposed item. Without these,
+                // "Confirm for both. Finished my YPT." projects zero life.* tools —
+                // the model has no way to call life.commit even though the
+                // life.steward charter explicitly instructs it to close/confirm
+                // loops when the operator reports them done.
+                || t.contains("confirm")
+                || t.contains("confirmed")
+                || t.contains("done")
+                || t.contains("finished")
+                || t.contains("complete")
+                || t.contains("completed")
+                || t.contains("resolved")
+                || t.contains("close the loop")
+                || t.contains("close it out")
+                || t.contains("mark done")
+                || t.contains("mark complete")
+                || t.contains("mark it done")
+                || t.contains("cross the finish line")
+                // Idea-intake language (aria-idea-pipeline, stage 1): operator
+                // wants/needs/ideas for new capabilities are captured as
+                // GrowthHypothesis idea:<slug> nodes via life.observe. Without
+                // these keywords the idea-steward charter is dead text — the
+                // life.* tools never get projected on an "I need X" turn.
+                || t.contains("idea")
+                || t.contains("implement")
+                || t.contains("build me")
+                || t.contains("i need")
+                || t.contains("feature")
+                || t.contains("capture this")
+                || t.contains("backlog")
         }
         "lifegraph.truth_summarizer" => {
             t.contains("lifegraph")
                 || t.contains("life graph")
+                || t.contains("live graph")
                 || t.contains("what is in my graph")
                 || t.contains("what's in my graph")
                 || t.contains("summarize my graph")
@@ -299,6 +583,8 @@ pub fn skill_is_relevant_for_turn(skill_name: &str, turn_text: &str) -> bool {
                 || t.contains("mcp.provision")
                 || t.contains("mcp server")
                 || t.contains("mcp route")
+                || t.contains("upstream")
+                || t.contains("connect mcp")
         }
         _ => false,
     }
@@ -319,6 +605,11 @@ pub fn tool_class(tool_name: &str) -> Option<&'static str> {
 pub fn tool_requires_approval(tool_name: &str) -> bool {
     if matches!(tool_name, "handoff.to_role" | "handoff.back") {
         return false;
+    }
+    // Projected upstream MCP tools (`mcp:<upstream>.<tool>`) are not in the
+    // catalog; they always require approval (class `mcp_remote`).
+    if tool_name.starts_with(ansible_mesh_core::mcp_upstream::MCP_PROJECTED_TOOL_PREFIX) {
+        return true;
     }
     matches!(tool_class(tool_name), Some("config") | Some("shell"))
 }
@@ -503,7 +794,10 @@ fn build_catalog() -> HashMap<String, ToolDefinition> {
                         "description": "Resource type to declare, matching the shared resource enum."
                     },
                     "config_hint": {
-                        "type": ["string", "null"],
+                        // Not ["string","null"]: union types 400 the entire
+                        // Gemini request (proto rejects type lists). Optionality
+                        // is expressed by omission from `required`.
+                        "type": "string",
                         "description": "Optional configuration hint to store with the declaration."
                     }
                 },
@@ -1044,6 +1338,10 @@ fn build_catalog() -> HashMap<String, ToolDefinition> {
                     "guaranteed": {
                         "type": "boolean",
                         "description": "Mesh-coordinated delivery flag. Optional; defaults to false."
+                    },
+                    "silent_ok": {
+                        "type": "boolean",
+                        "description": "When true, a fire's reply is suppressed (never delivered to the operator channel) if it matches the Hermes [SILENT]/NO_REPLY convention (whole response, or standing alone on the first/last line). Optional; defaults to false."
                     }
                 },
                 "required": ["schedule", "target_role", "payload"]
@@ -1615,6 +1913,21 @@ fn build_catalog() -> HashMap<String, ToolDefinition> {
                         "type": "string",
                         "description": "Stringified JSON describing context packaging rules."
                     },
+                    "fallback_tiers": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Ordered model-role fallback ladder for this role (e.g. ['model', 'model.openrouter', 'model.ollama']). OMIT this field to leave the role's existing ladder untouched — omitting it never clears a previously configured ladder. Pass an explicit non-empty list only when you intend to replace it."
+                    },
+                    "model_bindings": {
+                        "type": "object",
+                        "additionalProperties": { "type": "string" },
+                        "description": "Per-agent model NAME binding, keyed by provider role from fallback_tiers (e.g. {\"model.openrouter\": \"z-ai/glm-5.2\", \"model\": \"gemini-flash-latest\"}). Consumed at dispatch: whichever provider role resolve_model_execution_target picks (primary or a fallback tier) uses this role's bound model name instead of that provider's global default. OMIT this field to leave the role's existing bindings untouched — omitting it never clears previously configured bindings. Pass an explicit object only when you intend to replace it."
+                    },
+                    "content_policy": {
+                        "type": "string",
+                        "enum": ["unrestricted", "standard", "strict"],
+                        "description": "Content-filtering posture for this role. 'standard' (the default) preserves current provider defaults. 'unrestricted' disables provider-level safety filtering where the provider exposes a toggle (Gemini safetySettings at BLOCK_NONE) — only set this when the operator has explicitly asked for it for a specific role/agent. 'strict' tightens filtering. OMIT this field to leave the role's existing policy untouched — omitting it never resets a previously configured policy back to 'standard'."
+                    },
                     "reasoning": {
                         "type": "object",
                         "description": "Required reasoning for this role's existence, purpose, and capability posture.",
@@ -1656,7 +1969,7 @@ fn build_catalog() -> HashMap<String, ToolDefinition> {
                     },
                     "prompt": {
                         "type": "string",
-                        "description": "The prompt or question for the specialist."
+                        "description": "A succinct structured brief for the specialist — state the goal, the minimum essential context, any constraints, and the expected return format. Do NOT paste conversation transcripts, tool output, or your full working context; the specialist keeps its own session context per conversation. Budget: ~4000 characters — anything longer is truncated before dispatch."
                     },
                     "reply_to": {
                         "type": "string",
@@ -1664,8 +1977,8 @@ fn build_catalog() -> HashMap<String, ToolDefinition> {
                     },
                     "routing": {
                         "type": "string",
-                        "enum": ["cognitive_re_entry", "enriched_tool_result", "datasource_injection", "memory_enrichment", "progress_update", "heartbeat", "raw_forward", "priority_re_entry", "approval_resolution"],
-                        "description": "How to handle the specialist's response when it arrives. Defaults to cognitive_re_entry."
+                        "enum": ["reflective_re_entry", "cognitive_re_entry", "enriched_tool_result", "datasource_injection", "memory_enrichment", "progress_update", "heartbeat", "raw_forward", "priority_re_entry", "approval_resolution"],
+                        "description": "How to handle the specialist's response when it arrives. Defaults to reflective_re_entry: the specialist's reply comes back into your own loop as a fresh turn — reason about it, then reply with the text you want the user to see (that reply is surfaced automatically) or call delegate.merge. Complete with NO text only if the user should see nothing."
                     },
                     "wait_for_response": {
                         "type": "boolean",
@@ -1745,6 +2058,21 @@ fn build_catalog() -> HashMap<String, ToolDefinition> {
                     "context_window_policy": {
                         "type": "string",
                         "description": "Stringified JSON describing context packaging rules."
+                    },
+                    "fallback_tiers": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Ordered model-role fallback ladder for this role (e.g. ['model', 'model.openrouter', 'model.ollama']). OMIT this field to leave the role's existing ladder untouched — omitting it never clears a previously configured ladder. Pass an explicit non-empty list only when you intend to replace it."
+                    },
+                    "model_bindings": {
+                        "type": "object",
+                        "additionalProperties": { "type": "string" },
+                        "description": "Per-agent model NAME binding, keyed by provider role from fallback_tiers (e.g. {\"model.openrouter\": \"z-ai/glm-5.2\", \"model\": \"gemini-flash-latest\"}). Consumed at dispatch: whichever provider role resolve_model_execution_target picks (primary or a fallback tier) uses this role's bound model name instead of that provider's global default. OMIT this field to leave the role's existing bindings untouched — omitting it never clears previously configured bindings. Pass an explicit object only when you intend to replace it."
+                    },
+                    "content_policy": {
+                        "type": "string",
+                        "enum": ["unrestricted", "standard", "strict"],
+                        "description": "Content-filtering posture for this role. 'standard' (the default) preserves current provider defaults. 'unrestricted' disables provider-level safety filtering where the provider exposes a toggle (Gemini safetySettings at BLOCK_NONE) — only set this when the operator has explicitly asked for it for a specific role/agent. 'strict' tightens filtering. OMIT this field to leave the role's existing policy untouched — omitting it never resets a previously configured policy back to 'standard'."
                     },
                     "reasoning": {
                         "type": "object",
@@ -2314,6 +2642,72 @@ fn build_catalog() -> HashMap<String, ToolDefinition> {
     );
 
     m.insert(
+        "memory.explain".into(),
+        ToolDefinition {
+            tool_name: "memory.explain".into(),
+            description: "Answer 'why do you believe X?' by fanning a claim out across all \
+                          three memory planes — Muninn (MuninnDB engrams), the intel graph \
+                          (decision trail), and LifeGraph (the session's cached life.recall \
+                          evidence) — and merging the result into confirmed / inferred / \
+                          told-or-seeded / pre-provenance bands. Any plane that could not be \
+                          reached is reported as a labeled gap, never silently omitted. Use \
+                          when asked to justify a belief, decision, or remembered fact."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "claim": {
+                        "type": "string",
+                        "description": "The belief/fact/decision to explain, in natural language \
+                                        (e.g. 'the vps deploy key rotates monthly')."
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Maximum Muninn engrams to consider. Defaults to 8. Range 1–20."
+                    },
+                    "entity": {
+                        "type": "string",
+                        "description": "Optional intel-graph target id hint (e.g. 'seam:role-handoff-seam', \
+                                        'doc:memory-transparency-proposal') to scope the intel-graph plane \
+                                        precisely instead of an untargeted recent-decisions scan. Use when \
+                                        you already know the seam/proposal/doc the claim concerns."
+                    }
+                },
+                "required": ["claim"]
+            }),
+            class: Some("memory".into()),
+        },
+    );
+
+    m.insert(
+        "memory.delta_digest".into(),
+        ToolDefinition {
+            tool_name: "memory.delta_digest".into(),
+            description: "Memory Transparency Slice M3: return a digest of what the fleet's \
+                          Muninn vaults remembered, forgot, and found contradictory in a \
+                          trailing window (default 24h), each notable line carrying its \
+                          provenance (author/trust) when known and a textual revert hint \
+                          (e.g. 'muninn_restore <id>'). Also reports the most recent \
+                          memory.hygiene sweep's findings. 'Evolved' memories are always 0 \
+                          today — MuninnDB has no queryable evolution history yet; this is a \
+                          named gap in the digest itself, not a missing feature of this tool. \
+                          Use this before composing an operator morning brief, or whenever the \
+                          operator asks what the system's memory has changed recently."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "window_hours": {
+                        "type": "integer",
+                        "description": "Trailing window size in hours. Defaults to 24 if omitted."
+                    }
+                }
+            }),
+            class: Some("memory".into()),
+        },
+    );
+
+    m.insert(
         "approval.request_standing".into(),
         ToolDefinition {
             tool_name: "approval.request_standing".into(),
@@ -2418,11 +2812,40 @@ fn build_catalog() -> HashMap<String, ToolDefinition> {
                                         "path": { "type": "string" }
                                     },
                                     "required": ["kind"]
+                                },
+                                "auth": {
+                                    "type": "object",
+                                    "description": "Per-tool auth override. Usually {scheme:'bearer_token',grants:[]} \
+                                                    then mint credentials with mcp.grant_token. Omit to inherit \
+                                                    default_auth; {scheme:'none'} = loopback-only callers.",
+                                    "properties": {
+                                        "scheme": { "type": "string", "enum": ["bearer_token", "none"] },
+                                        "grants": { "type": "array", "items": { "type": "object" } }
+                                    },
+                                    "required": ["scheme"]
                                 }
                             },
                             "required": ["name", "description", "input_schema",
                                          "inbound_transform", "outbound_transform"]
                         }
+                    },
+                    "default_auth": {
+                        "type": "object",
+                        "description": "Endpoint-wide default auth for tools without their own 'auth'. \
+                                        Use {scheme:'bearer_token',grants:[]} and mint credentials with \
+                                        mcp.grant_token. Absent = none (loopback-only callers).",
+                        "properties": {
+                            "scheme": { "type": "string", "enum": ["bearer_token", "none"] },
+                            "grants": { "type": "array", "items": { "type": "object" } }
+                        },
+                        "required": ["scheme"]
+                    },
+                    "allow_unauthenticated": {
+                        "type": "boolean",
+                        "description": "Explicit acknowledgment that this endpoint intentionally serves \
+                                        unauthenticated tools beyond loopback. Without it, provisioning a \
+                                        lan/mesh/internet endpoint with any no-auth tool is REJECTED. \
+                                        Surfaced in the operator approval prompt."
                     },
                     "exposure": {
                         "type": "string",
@@ -2453,6 +2876,117 @@ fn build_catalog() -> HashMap<String, ToolDefinition> {
                     }
                 },
                 "required": ["endpoint_id", "port", "tools"]
+            }),
+            class: Some("config".into()),
+        },
+    );
+
+    m.insert(
+        "mcp.grant_token".into(),
+        ToolDefinition {
+            tool_name: "mcp.grant_token".into(),
+            description: "Mint a bearer-token credential for an MCP endpoint this agent owns. \
+                          The hotel generates the token, stores only its BLAKE3 hash in the \
+                          vault, attaches the grant to the named tool (or the endpoint's \
+                          default auth), and pushes the updated config to the membrane. The \
+                          raw token is returned ONCE in the tool result — relay it to the \
+                          operator immediately with a storage warning; it cannot be shown again."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "endpoint_id": {
+                        "type": "string",
+                        "description": "The MCP endpoint to attach the grant to (must be owned by this agent)."
+                    },
+                    "token_id": {
+                        "type": "string",
+                        "description": "Stable opaque label for this credential (e.g. 'claude-desktop', 'n8n-prod')."
+                    },
+                    "tool_name": {
+                        "type": "string",
+                        "description": "Attach to this specific tool's auth. Omit to attach to the endpoint's default_auth (covers every tool without its own auth)."
+                    },
+                    "scopes": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Optional capability scopes granted to this token."
+                    },
+                    "expires_at": {
+                        "type": "integer",
+                        "description": "Optional unix epoch expiry. Absent = no expiry."
+                    },
+                    "allotment": {
+                        "type": "object",
+                        "description": "Optional per-token call budget.",
+                        "properties": {
+                            "max_per_window": { "type": "integer" },
+                            "window_secs": { "type": "integer" }
+                        },
+                        "required": ["max_per_window", "window_secs"]
+                    }
+                },
+                "required": ["endpoint_id", "token_id"]
+            }),
+            class: Some("config".into()),
+        },
+    );
+
+    m.insert(
+        "mcp.rotate_token".into(),
+        ToolDefinition {
+            tool_name: "mcp.rotate_token".into(),
+            description: "Rotate the credential behind an existing MCP token grant in place: \
+                          same token_id and grant scope, new secret. The old token stops \
+                          working (the membrane's vault cache may honor it for up to 60s). \
+                          The new raw token is returned ONCE — relay it to the operator \
+                          immediately."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "endpoint_id": {
+                        "type": "string",
+                        "description": "The MCP endpoint holding the grant (must be owned by this agent)."
+                    },
+                    "token_id": {
+                        "type": "string",
+                        "description": "The existing grant label to rotate."
+                    },
+                    "tool_name": {
+                        "type": "string",
+                        "description": "Tool whose auth holds the grant. Omit if the grant lives on default_auth."
+                    }
+                },
+                "required": ["endpoint_id", "token_id"]
+            }),
+            class: Some("config".into()),
+        },
+    );
+
+    m.insert(
+        "mcp.revoke_token".into(),
+        ToolDefinition {
+            tool_name: "mcp.revoke_token".into(),
+            description: "Revoke an MCP token grant by token_id. Removes the grant from every \
+                          tool auth and the endpoint default; callers holding the token lose \
+                          access (the membrane's vault cache may honor it for up to 60s). An \
+                          emptied bearer grant list stays bearer — it does not degrade to \
+                          unauthenticated."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "endpoint_id": {
+                        "type": "string",
+                        "description": "The MCP endpoint holding the grant (must be owned by this agent)."
+                    },
+                    "token_id": {
+                        "type": "string",
+                        "description": "The grant label to revoke."
+                    }
+                },
+                "required": ["endpoint_id", "token_id"]
             }),
             class: Some("config".into()),
         },
@@ -2506,6 +3040,146 @@ fn build_catalog() -> HashMap<String, ToolDefinition> {
     );
 
     m.insert(
+        "mcp.connect".into(),
+        ToolDefinition {
+            tool_name: "mcp.connect".into(),
+            description: "Register an upstream MCP server whose tools this agent consumes. \
+                          The hotel checks the egress policy (loopback + tailnet by default), \
+                          persists the registration, and the mcp-client guest connects, lists \
+                          the server's tools, and projects the allowlisted ones into this \
+                          agent's catalog as mcp:<upstream_id>.<tool> (approval-gated). \
+                          Each remote tool must be explicitly allowlisted — nothing is \
+                          projected by default. Connection happens asynchronously; run \
+                          mcp.upstreams afterwards to see the projected tools."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "upstream_id": {
+                        "type": "string",
+                        "description": "Stable ID for this upstream (e.g. 'intel-graph')."
+                    },
+                    "url": {
+                        "type": "string",
+                        "description": "HTTP(S) URL of the MCP server's JSON-RPC endpoint \
+                                        (e.g. 'http://127.0.0.1:8901/mcp'). Must be loopback, \
+                                        tailnet, or operator-allowlisted."
+                    },
+                    "tools": {
+                        "type": "array",
+                        "description": "Remote tools to allowlist for projection. Each item is \
+                                        a name string, or an object {name, allotment, \
+                                        max_response_bytes} to set a per-tool hourly call \
+                                        budget and response-size cap.",
+                        "items": {
+                            "anyOf": [
+                                { "type": "string" },
+                                {
+                                    "type": "object",
+                                    "properties": {
+                                        "name": { "type": "string" },
+                                        "allotment": { "type": "integer", "description": "Max calls per sliding hour." },
+                                        "max_response_bytes": { "type": "integer", "description": "Response size cap (default 262144)." }
+                                    },
+                                    "required": ["name"]
+                                }
+                            ]
+                        }
+                    },
+                    "refresh_interval_secs": {
+                        "type": "integer",
+                        "description": "Optionally re-list the server's tools every N seconds \
+                                        (min 30). Tools whose description or schema changed \
+                                        since approval are dropped as stale until mcp.connect \
+                                        is re-run. Absent = refresh only on connect."
+                    },
+                    "grant_agents": {
+                        "type": "array",
+                        "description": "Additional agent IDs allowed to call the projected \
+                                        tools. Absent = owner only.",
+                        "items": { "type": "string" }
+                    },
+                    "credential_ref": {
+                        "type": "string",
+                        "description": "Optional vault secret ref holding the bearer token \
+                                        for this upstream (operator-provisioned)."
+                    }
+                },
+                "required": ["upstream_id", "url", "tools"]
+            }),
+            class: Some("config".into()),
+        },
+    );
+
+    m.insert(
+        "mcp.disconnect".into(),
+        ToolDefinition {
+            tool_name: "mcp.disconnect".into(),
+            description: "Remove an upstream MCP server registration this agent owns. \
+                          Projected mcp:<upstream>.<tool> entries disappear from the \
+                          catalog and the mcp-client guest drops the connection."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "upstream_id": {
+                        "type": "string",
+                        "description": "The upstream ID to remove (must be owned by this agent)."
+                    }
+                },
+                "required": ["upstream_id"]
+            }),
+            class: Some("config".into()),
+        },
+    );
+
+    m.insert(
+        "mcp.set_credential".into(),
+        ToolDefinition {
+            tool_name: "mcp.set_credential".into(),
+            description: "Store or rotate the outbound credential (bearer token) for an \
+                          upstream MCP server this agent owns. The value passes through to \
+                          the hotel vault (kind mcp_upstream_credential, readable only by \
+                          the mcp-client guest) and is never stored in the graph, logged, \
+                          or echoed back. The guest reconnects authenticated immediately. \
+                          Ask the operator for the token value — never invent one."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "upstream_id": {
+                        "type": "string",
+                        "description": "The upstream this credential is for (must be owned by this agent)."
+                    },
+                    "credential": {
+                        "type": "string",
+                        "description": "The raw bearer token/credential value, exactly as provided by the operator."
+                    }
+                },
+                "required": ["upstream_id", "credential"]
+            }),
+            class: Some("config".into()),
+        },
+    );
+
+    m.insert(
+        "mcp.upstreams".into(),
+        ToolDefinition {
+            tool_name: "mcp.upstreams".into(),
+            description: "List registered upstream MCP servers: connection state, owner, \
+                          allowlisted and projected tools, and any stale grants. Also \
+                          refreshes this agent's projected mcp:<upstream>.<tool> catalog \
+                          entries from the latest reported state."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {}
+            }),
+            class: Some("session".into()),
+        },
+    );
+
+    m.insert(
         "agent.migrate_to".into(),
         ToolDefinition {
             tool_name: "agent.migrate_to".into(),
@@ -2542,7 +3216,7 @@ fn build_catalog() -> HashMap<String, ToolDefinition> {
                 .into(),
             input_schema: json!({
                 "type": "object",
-                "required": ["observation_id", "evidence"],
+                "required": ["evidence"],
                 "properties": {
                     "observation_id": {
                         "type": "string",
@@ -2550,9 +3224,7 @@ fn build_catalog() -> HashMap<String, ToolDefinition> {
                     },
                     "evidence": {
                         "type": "object",
-                        "required": ["packet_id", "claim_ref", "claim_summary", "source_refs",
-                                     "confidence", "validation_state", "source_reliability",
-                                     "adjudication_status"],
+                        "required": ["claim_ref", "claim_summary"],
                         "properties": {
                             "packet_id": {
                                 "type": "string",
@@ -2681,6 +3353,43 @@ fn build_catalog() -> HashMap<String, ToolDefinition> {
     );
 
     m.insert(
+        "life.observe.batch".into(),
+        ToolDefinition {
+            tool_name: "life.observe.batch".into(),
+            description: "Propose UP TO 25 Life Graph observations in ONE tool call. Use this \
+                          instead of repeated life.observe calls whenever recording more than \
+                          ~3 related nodes (e.g. seeding goals + systems + open loops): one \
+                          batch call costs one model round-trip regardless of item count, so \
+                          large structures never exhaust the turn's iteration budget. Each item \
+                          is a complete life.observe input (observation_id + evidence, same \
+                          provenance requirements) and is gated and written INDIVIDUALLY — \
+                          results report per-item success/failure and completed writes are \
+                          durable; there is NO rollback on partial failure. For structures \
+                          larger than 25 nodes, declare a plan and split into multiple batch \
+                          calls."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "required": ["observations"],
+                "properties": {
+                    "observations": {
+                        "type": "array",
+                        "minItems": 1,
+                        "maxItems": 25,
+                        "description": "Each item is a full life.observe input: \
+                            {observation_id, evidence:{packet_id, claim_ref:{id,label}, \
+                            claim_summary, source_refs, confidence, validation_state, \
+                            source_reliability, adjudication_status}, edges?}. See the \
+                            life.observe schema for field details.",
+                        "items": {"type": "object"}
+                    }
+                }
+            }),
+            class: Some("life_graph".into()),
+        },
+    );
+
+    m.insert(
         "life.recall".into(),
         ToolDefinition {
             tool_name: "life.recall".into(),
@@ -2694,15 +3403,15 @@ fn build_catalog() -> HashMap<String, ToolDefinition> {
                 .into(),
             input_schema: json!({
                 "type": "object",
-                "required": ["query_id", "query_text", "strategy", "semantic_pivots",
-                             "expansion_policy", "ranking_weights", "max_context_packets"],
+                "required": ["query_id", "query_text"],
                 "properties": {
                     "query_id": {"type": "string"},
                     "query_text": {"type": "string", "description": "Human-language query."},
                     "strategy": {
                         "type": "string",
                         "enum": ["semantic_pivot", "vector_then_expand", "memory_aware_graph_rank"],
-                        "default": "memory_aware_graph_rank"
+                        "default": "memory_aware_graph_rank",
+                        "description": "Defaults to memory_aware_graph_rank when omitted."
                     },
                     "operator_intent": {
                         "type": "string",
@@ -2710,7 +3419,7 @@ fn build_catalog() -> HashMap<String, ToolDefinition> {
                     },
                     "semantic_pivots": {
                         "type": "array",
-                        "minItems": 1,
+                        "description": "Optional. The runner can auto-embed query_text when this is omitted.",
                         "items": {
                             "type": "object",
                             "required": ["space", "embedding_model", "embedding_dims", "query_text_hash"],
@@ -2751,7 +3460,8 @@ fn build_catalog() -> HashMap<String, ToolDefinition> {
                             "graph_specificity": {"type": "number", "default": 0.2},
                             "recency": {"type": "number", "default": 0.1},
                             "confirmation": {"type": "number", "default": 0.15},
-                            "active_commitment": {"type": "number", "default": 0.1}
+                            "active_commitment": {"type": "number", "default": 0.1},
+                            "role_relevance": {"type": "number", "default": 0.15}
                         }
                     },
                     "active_role": {"type": "string"},
@@ -2763,23 +3473,162 @@ fn build_catalog() -> HashMap<String, ToolDefinition> {
     );
 
     m.insert(
+        "life.recall.feedback".into(),
+        ToolDefinition {
+            tool_name: "life.recall.feedback".into(),
+            description: "Record whether a LifeGraph recall packet was useful, stale, missing \
+                          context, noisy, overconfident, or disconnected. Use this after a \
+                          LifeGraph recall result influences or fails to influence the turn so \
+                          the graph can improve bridge/ranking/attention behavior without \
+                          silently confirming new life truth."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "required": ["feedback_id", "packet_id", "rating"],
+                "properties": {
+                    "feedback_id": {
+                        "type": "string",
+                        "description": "Unique ID for this retrieval feedback event."
+                    },
+                    "packet_id": {
+                        "type": "string",
+                        "description": "The RetrievalContextPacket or recall packet ID being evaluated."
+                    },
+                    "query_summary": {
+                        "type": "string",
+                        "description": "Short summary of the original recall query."
+                    },
+                    "rating": {
+                        "type": "string",
+                        "enum": ["useful", "stale", "missing", "noisy", "overconfident", "disconnected"]
+                    },
+                    "note": {
+                        "type": "string",
+                        "description": "Brief reason for the rating."
+                    },
+                    "candidate_count": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "default": 0
+                    },
+                    "connected_candidate_count": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "default": 0
+                    },
+                    "missing_context_refs": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "default": []
+                    },
+                    "noisy_node_refs": {
+                        "type": "array",
+                        "items": {"type": "object"},
+                        "default": []
+                    },
+                    "stale_node_refs": {
+                        "type": "array",
+                        "items": {"type": "object"},
+                        "default": []
+                    },
+                    "evidence_packets": {
+                        "type": "array",
+                        "items": {"type": "object"},
+                        "default": []
+                    }
+                }
+            }),
+            class: Some("life_graph".into()),
+        },
+    );
+
+    m.insert(
         "life.commit".into(),
         ToolDefinition {
             tool_name: "life.commit".into(),
             description: "Promote a validated Life Graph evidence node to confirmed truth. \
-                          Requires either confirmed evidence or explicit operator approval."
+                          Requires either confirmed evidence or explicit operator approval. \
+                          This is also the tool for closing a loop: when the operator says a \
+                          previously-observed OpenLoop/Commitment/Goal is done, life.recall it \
+                          first to get its exact node id, then call life.commit on that id with \
+                          loop_status set to \"resolved\" and an up-to-date claim_summary — do \
+                          NOT leave stale recalled content (e.g. yesterday's \"paused/halfway\" \
+                          note) standing as the record once the operator has reported it done. \
+                          life.resolve is a SEPARATE tool for governed conflict handoffs only — \
+                          it cannot close an ordinary loop."
                 .into(),
             input_schema: json!({
                 "type": "object",
                 "required": ["evidence", "operator_approved"],
                 "properties": {
-                    "evidence": {
-                        "type": "object",
-                        "description": "The EvidencePacket to commit (same shape as life.observe)."
-                    },
+                    "evidence": evidence_packet_schema(),
                     "operator_approved": {
                         "type": "boolean",
                         "description": "True if operator has explicitly approved this commit."
+                    },
+                    "loop_status": {
+                        "type": "string",
+                        "description": "Optional. Set to \"resolved\" when the operator has \
+                            reported this node's underlying loop/commitment/goal as done — \
+                            marks it closed (distinct from validation_state, which tracks \
+                            evidence trust, not lifecycle). Omit to leave lifecycle status \
+                            unchanged."
+                    },
+                    "resolution_note": {
+                        "type": "string",
+                        "description": "Optional. Short note on how/why this closed, in the \
+                            operator's own words where possible (e.g. \"operator reported \
+                            complete 2026-07-09\"). Only meaningful alongside loop_status."
+                    }
+                }
+            }),
+            class: Some("life_graph".into()),
+        },
+    );
+
+    m.insert(
+        "life.conflict".into(),
+        ToolDefinition {
+            tool_name: "life.conflict".into(),
+            description: "Open a governed Life Graph conflict handoff when graph evidence, \
+                          Muninn memory, or operator context disagrees. Use this to record \
+                          the conflict and route it toward Muninn, graph review, shared gate, \
+                          or operator resolution; do not use it for ordinary observations."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "required": ["handoff"],
+                "properties": {
+                    "handoff": conflict_handoff_schema()
+                }
+            }),
+            class: Some("life_graph".into()),
+        },
+    );
+
+    m.insert(
+        "life.resolve".into(),
+        ToolDefinition {
+            tool_name: "life.resolve".into(),
+            description: "Resolve a Life Graph CONFLICT HANDOFF after review — operates only \
+                          on ConflictHandoff nodes opened via life.conflict. This is a \
+                          governance tool: high-risk or operator-required handoffs need \
+                          explicit operator approval before resolution. It does NOT close an \
+                          ordinary OpenLoop/Commitment/Goal — for \"the operator says this is \
+                          done\", use life.commit with loop_status=\"resolved\" instead."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "required": ["handoff", "resolution_summary", "operator_approved"],
+                "properties": {
+                    "handoff": conflict_handoff_schema(),
+                    "resolution_summary": {
+                        "type": "string",
+                        "description": "Concise explanation of how the conflict should be resolved."
+                    },
+                    "operator_approved": {
+                        "type": "boolean",
+                        "description": "True only when the operator explicitly approved this resolution."
                     }
                 }
             }),
@@ -2810,7 +3659,7 @@ fn build_catalog() -> HashMap<String, ToolDefinition> {
                     "evidence_packets": {
                         "type": "array",
                         "minItems": 1,
-                        "items": {"type": "object"}
+                        "items": evidence_packet_schema()
                     },
                     "risk": {
                         "type": "string",
@@ -2831,7 +3680,8 @@ fn build_catalog() -> HashMap<String, ToolDefinition> {
 
 #[cfg(test)]
 mod tests {
-    use super::tool_catalog;
+    use super::{skill_implied_tools, skill_is_relevant_for_turn, tool_catalog};
+    use serde_json::json;
 
     #[test]
     fn role_list_has_specific_model_facing_description() {
@@ -2856,11 +3706,220 @@ mod tests {
 
         assert!(life_recall.description.contains("operator's LifeGraph"));
         assert!(life_recall.description.contains("text/fallback recall"));
+        assert_eq!(
+            life_recall.input_schema["required"],
+            json!(["query_id", "query_text"])
+        );
+        assert_eq!(
+            life_recall.input_schema["properties"]["semantic_pivots"]["description"],
+            "Optional. The runner can auto-embed query_text when this is omitted."
+        );
         assert!(
             !life_recall
                 .description
                 .contains("Requires an embedding vector")
         );
+    }
+
+    #[test]
+    fn life_steward_implied_tools_have_catalog_entries() {
+        let catalog = tool_catalog();
+        for tool in skill_implied_tools("life.steward") {
+            assert!(
+                catalog.contains_key(*tool),
+                "life.steward implied tool {tool} should have a real catalog schema"
+            );
+        }
+    }
+
+    /// Memory Transparency Slice M3: `memory.delta_digest` must have a real
+    /// catalog entry and be projected via the `memory` skill grouping — the
+    /// same grouping a future architect-charter steward would carry, so the
+    /// tool is reachable without a bespoke toolset entry per role.
+    #[test]
+    fn memory_delta_digest_is_cataloged_and_skill_projected() {
+        let catalog = tool_catalog();
+        for tool in skill_implied_tools("memory") {
+            assert!(
+                catalog.contains_key(*tool),
+                "memory implied tool {tool} should have a real catalog schema"
+            );
+        }
+
+        let digest = catalog
+            .get("memory.delta_digest")
+            .expect("memory.delta_digest catalog entry");
+        assert_eq!(digest.class.as_deref(), Some("memory"));
+        assert!(
+            digest.input_schema["properties"]["window_hours"].is_object(),
+            "memory.delta_digest should accept an optional window_hours argument"
+        );
+        assert!(
+            skill_implied_tools("memory").contains(&"memory.delta_digest"),
+            "memory.delta_digest should be projected by the memory skill"
+        );
+    }
+
+    #[test]
+    fn life_write_tools_expose_governance_payloads() {
+        let catalog = tool_catalog();
+        let commit = catalog
+            .get("life.commit")
+            .expect("life.commit catalog entry");
+        assert_eq!(
+            commit.input_schema["required"],
+            json!(["evidence", "operator_approved"])
+        );
+        // life.commit relaxed its required evidence fields to just the claim
+        // identity + summary (commit 7b5622b: model-authored life.observe parses
+        // with documented defaults rather than failing wholesale over a missing
+        // source_reliability). The richer governance fields are optional.
+        assert_eq!(
+            commit.input_schema["properties"]["evidence"]["required"],
+            json!(["claim_ref", "claim_summary"])
+        );
+
+        let conflict = catalog
+            .get("life.conflict")
+            .expect("life.conflict catalog entry");
+        assert_eq!(conflict.input_schema["required"], json!(["handoff"]));
+        assert_eq!(
+            conflict.input_schema["properties"]["handoff"]["required"],
+            json!([
+                "handoff_id",
+                "conflict_id",
+                "finding_type",
+                "summary",
+                "recommended_owner",
+                "requested_muninn_action",
+                "risk",
+                "requires_operator",
+                "status"
+            ])
+        );
+
+        let resolve = catalog
+            .get("life.resolve")
+            .expect("life.resolve catalog entry");
+        assert_eq!(
+            resolve.input_schema["required"],
+            json!(["handoff", "resolution_summary", "operator_approved"])
+        );
+    }
+
+    #[test]
+    fn life_graph_feedback_tool_is_model_visible_and_skill_granted() {
+        let catalog = tool_catalog();
+        let feedback = catalog
+            .get("life.recall.feedback")
+            .expect("life.recall.feedback catalog entry");
+
+        assert_eq!(feedback.class.as_deref(), Some("life_graph"));
+        assert!(feedback.description.contains("recall packet"));
+        assert!(
+            skill_implied_tools("life.steward")
+                .iter()
+                .any(|tool| *tool == "life.recall.feedback")
+        );
+    }
+
+    #[test]
+    fn life_steward_tolerates_live_graph_typo() {
+        // "live graph" is a one-letter typo of "life graph"/"lifegraph" that real
+        // users hit (Telegram, voice transcription). skill_is_relevant_for_turn
+        // intentionally errs on the side of inclusion, so this near-miss must still
+        // count as relevant rather than silently falling through to zero tools.
+        assert!(skill_is_relevant_for_turn(
+            "life.steward",
+            "can you take a look at the live graph and see what we have on for today"
+        ));
+        assert!(skill_is_relevant_for_turn(
+            "lifegraph.truth_summarizer",
+            "what's on the live graph"
+        ));
+    }
+
+    #[test]
+    fn life_steward_relevant_for_loop_lifecycle_verbs() {
+        // Regression for the "done means done" bug: an operator turn like
+        // "Confirm for both. Finished my YPT." contains none of the older
+        // domain-noun keywords (no "life.", "openloop", "commitment", etc.),
+        // so life.steward's whole tool group — including life.commit — was
+        // silently suppressed and the model had no way to close the loop.
+        // Callers normalize turn text to lowercase (see normalized_turn_text
+        // in session/mod.rs) before reaching this function.
+        for turn in [
+            "confirm for both. finished my ypt.",
+            "done with the taxes",
+            "i finished that",
+            "mark it done",
+            "that's complete now",
+            "yep, resolved",
+        ] {
+            assert!(
+                skill_is_relevant_for_turn("life.steward", turn),
+                "expected life.steward to be relevant for {turn:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn life_steward_relevant_for_idea_intake_language() {
+        // aria-idea-pipeline stage 1: the operator texting an idea ("I need
+        // HealthKit pulling my data") must project the life.* tools so the
+        // idea-steward charter can capture it as an idea:<slug> node. The
+        // Coach incident (2026-07-14) showed a charter without matching
+        // relevance keywords is dead text. Turn text reaches this function
+        // already lowercased (normalized_turn_text in session/mod.rs).
+        for turn in [
+            "i need healthkit pulling my data into the lifegraph",
+            "idea: let beacon summarize my mornings",
+            "can you implement a weekly review digest",
+            "build me a dashboard for the rowing data",
+            "feature request: dark mode on the life tab",
+            "capture this for later",
+            "add that one to the backlog",
+            "what ideas are pending?",
+        ] {
+            assert!(
+                skill_is_relevant_for_turn("life.steward", turn),
+                "expected life.steward to be relevant for {turn:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn no_catalog_schema_uses_union_type_arrays() {
+        // '"type": ["string","null"]' is valid JSON Schema but proto-invalid
+        // for Gemini — ONE such property 400s the whole request and silences
+        // the agent's Gemini tier (live incident 2026-07-20, agent.graph.declare).
+        // The gemini provider now collapses unions defensively, but the
+        // catalog should never emit them in the first place: optionality is
+        // expressed by omission from `required`.
+        fn assert_no_union_types(name: &str, value: &serde_json::Value) {
+            match value {
+                serde_json::Value::Object(map) => {
+                    if let Some(t) = map.get("type") {
+                        assert!(
+                            !t.is_array(),
+                            "tool {name} declares a union type array: {t}"
+                        );
+                    }
+                    for v in map.values() {
+                        assert_no_union_types(name, v);
+                    }
+                }
+                serde_json::Value::Array(items) => {
+                    for v in items {
+                        assert_no_union_types(name, v);
+                    }
+                }
+                _ => {}
+            }
+        }
+        for (name, tool) in tool_catalog() {
+            assert_no_union_types(&name, &tool.input_schema);
+        }
     }
 
     #[test]

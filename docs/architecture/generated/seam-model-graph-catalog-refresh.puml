@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - model-graph-catalog-refresh
+
+rectangle "model-graph-catalog-refresh" as model_graph_catalog_refresh #Orange {
+}
+
+
+@enduml

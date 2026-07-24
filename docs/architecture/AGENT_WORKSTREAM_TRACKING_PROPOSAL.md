@@ -3,7 +3,7 @@ doc_type: proposal
 domain: operator-control-plane
 status: in-progress
 last_updated: 2026-03-31
-disposition: accepted for current slice
+disposition: accepted-current-slice
 tags:
 - workstream
 - session

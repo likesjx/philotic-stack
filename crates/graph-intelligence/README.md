@@ -19,6 +19,41 @@ cargo run -p philotic-web -- graph serve
 # - WebSocket: ws://localhost:8900/ws
 ```
 
+## Supervision (macOS)
+
+Run the server under launchd so crashes restart it and reboots start it:
+
+```bash
+cp target/release/graph-intelligence ~/.philotic/bin/
+just intel-graph-service        # installs com.philotic.intel-graph (KeepAlive)
+# upgrade: cp new binary to ~/.philotic/bin/, then
+launchctl kickstart -k gui/$(id -u)/com.philotic.intel-graph
+```
+
+`/api/status` reports the running server's identity (`version`, `started_at`,
+`binary_path`, `binary_sha256`, `pid`) so stale-binary drift is observable —
+compare `binary_sha256` against the deployed file to prove a rollout.
+
+Graphs are **per-machine** (see AGENTS.md § Project Graph): each machine scans
+its own checkout and owns its own harness registry.
+
+## Binding & Auth
+
+The server binds **127.0.0.1** by default. The REST and MCP surfaces expose
+unauthenticated write endpoints (node/edge upserts, decisions, test runs,
+scans), so non-loopback exposure requires an explicit choice:
+
+- `--bind <addr>` / `PHILOTIC_GRAPH_BIND` — bind another interface (e.g. a
+  Tailscale IP for cross-machine MCP clients).
+- `--token <t>` / `PHILOTIC_GRAPH_TOKEN` — bearer token required on all
+  mutating REST calls and every MCP call (`Authorization: Bearer <t>` or
+  `x-philotic-graph-token`). GET/HEAD stay open so the read-only web UI works.
+- `--insecure-bind` / `PHILOTIC_GRAPH_INSECURE=1` — explicit opt-out: allow a
+  non-loopback bind without a token. Without it the server refuses to start.
+
+CORS is restricted to localhost origins (permissive CORS previously allowed
+any web page to POST JSON to the write endpoints).
+
 ---
 
 ## Architecture

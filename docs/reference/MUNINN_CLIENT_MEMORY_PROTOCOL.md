@@ -218,9 +218,29 @@ Use a helper or wrapper that:
 - initializes the session
 - invokes tools consistently
 
+For direct client wiring, prefer the native stdio proxy:
+
+```bash
+MUNINN_MCP_URL=http://127.0.0.1:8750/mcp muninn mcp
+```
+
+Remote native Muninn access should use a private overlay or SSH tunnel to the
+remote loopback listener. Do not expose native Muninn MCP on a public interface.
+See [MUNINN_DIRECT_CLIENT_ACCESS.md](/Users/jaredlikes/code/philotic-stack/docs/reference/MUNINN_DIRECT_CLIENT_ACCESS.md).
+
 Recommended shared helper:
 
 - [muninn_mcp.py](/Users/jaredlikes/code/philotic-stack/scripts/muninn_mcp.py)
+
+When a client needs a cross-agent context envelope from helper recall output, add `--context-packet`:
+
+```bash
+python3 scripts/muninn_mcp.py recall \
+  --context "who am I talking to and what matters about this topic" \
+  --context-packet
+```
+
+The helper attaches `cross_agent_context_packet` with all Muninn engrams labeled as `muninn_continuity`. Treat those refs as continuity handles, not confirmed LifeGraph truth.
 
 ## Minimum Implementation Contract
 

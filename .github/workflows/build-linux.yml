@@ -1,0 +1,165 @@
+name: Build Linux (develop)
+
+# Builds the vps-jane binary set on a GitHub-hosted runner (16 GB RAM) so the
+# resource-constrained VPS never has to compile (it OOM-kills release links).
+# The produced binaries are uploaded as a workflow artifact that `just
+# vps-deploy-ci` downloads and ships to vps-jane via the ansible remote path.
+#
+# Trigger: every push to develop, plus manual dispatch.
+# Consume: gh run download --name linux-x86_64 (see justfile: vps-deploy-ci).
+
+on:
+  push:
+    branches: [develop]
+    paths-ignore:
+      - "docs/**"
+      - "**/*.md"
+  workflow_dispatch: {}
+
+env:
+  CARGO_TERM_COLOR: always
+  # The exact binaries vps-jane installs. Mirrors the package set built by
+  # `just vps-push`; missing entries (e.g. mlx, apple-only) are tolerated by
+  # the ansible remote path which stats-and-skips.
+  TARGET: x86_64-unknown-linux-gnu
+
+jobs:
+  build-linux:
+    name: Build x86_64-unknown-linux-gnu
+    # ubuntu-24.04 = glibc 2.39, matching vps-jane (Ubuntu 24.04, glibc 2.39).
+    # The prebuilt onnxruntime static libs pulled in by the `ort` crate
+    # (download-binaries) are built against glibc >= 2.38 (__isoc23_strto*),
+    # which fails to link on ubuntu-22.04 (glibc 2.35). Do not downgrade the
+    # runner below the glibc of both the ort binaries and vps-jane.
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-gnu
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: linux-x86_64-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: linux-x86_64-cargo-
+
+      - name: Check out jaredlikes-desktop (private UI)
+        id: desktop_checkout
+        continue-on-error: true
+        uses: actions/checkout@v4
+        with:
+          repository: likesjx/jaredlikes-desktop
+          ref: main
+          token: ${{ secrets.DESKTOP_REPO_TOKEN }}
+          path: jaredlikes-desktop
+          persist-credentials: false
+
+      - name: Report desktop checkout outcome
+        run: |
+          if [ "${{ steps.desktop_checkout.outcome }}" = "success" ]; then
+            echo "::notice::desktop UI checked out — will attempt to prebuild and embed real UI"
+          else
+            echo "::warning::desktop checkout failed (token?) — building placeholder UI, job stays green"
+          fi
+
+      # The jaredlikes-desktop repo commits its built dist/ into its tree, and
+      # its CI `npm run build` is broken (Rollup/dynamic-import resolution), so
+      # we do NOT rebuild. We stage the committed dist/ directly into
+      # crates/philotic-web/ui-dist/. Resilient: a missing dist/ leaves ui-dist
+      # as-is so build.rs falls back to the placeholder and the job stays green.
+      # We deliberately do NOT set PHILOTIC_DESKTOP_DIR — that would make
+      # build.rs run npm itself and panic (fatal). Instead build.rs reuses
+      # whatever ui-dist we stage here (reuse-cached path, no npm).
+      - name: Stage committed desktop dist into ui-dist
+        if: steps.desktop_checkout.outcome == 'success'
+        run: |
+          set -euo pipefail
+          if [ -f jaredlikes-desktop/dist/index.html ]; then
+            rm -rf crates/philotic-web/ui-dist
+            mkdir -p crates/philotic-web/ui-dist
+            cp -R jaredlikes-desktop/dist/. crates/philotic-web/ui-dist/
+            echo "::notice::staged committed desktop dist into ui-dist ($(ls crates/philotic-web/ui-dist | tr '\n' ' '))"
+          else
+            echo "::warning::jaredlikes-desktop/dist/index.html missing — leaving ui-dist as-is (placeholder fallback)"
+          fi
+
+      - name: Build release binaries
+        run: |
+          cargo build --release --target "${TARGET}" --bins \
+            -p aiua \
+            -p philote \
+            -p membrane-telegram \
+            -p membrane-discord \
+            -p membrane-mcp \
+            -p model-router \
+            -p tool-runner \
+            -p graph-datasource \
+            -p table-datasource \
+            -p router-listener \
+            -p agent-datasource \
+            -p heal-dispatcher \
+            -p data-memorygraphrag \
+            -p philotic-web
+
+      - name: Assemble dist/
+        run: |
+          set -euo pipefail
+          SRC="target/${TARGET}/release"
+          mkdir -p dist
+          # Copy every produced binary (top-level files marked executable, no
+          # extension, excluding build scripts/.d files). This captures all the
+          # per-crate bins (model-controller-*, agent-core, hegemon, etc.).
+          found=0
+          for f in "$SRC"/*; do
+            [ -f "$f" ] || continue
+            case "$f" in *.d|*.rlib|*.so) continue;; esac
+            if [ -x "$f" ]; then
+              cp "$f" "dist/$(basename "$f")"
+              found=$((found + 1))
+            fi
+          done
+          echo "Copied $found binaries to dist/"
+          ( cd dist && sha256sum * > SHA256SUMS )
+          echo "=== dist/ contents ==="
+          ls -la dist/
+
+      - name: Verify core vps-jane binaries are present
+        run: |
+          set -euo pipefail
+          missing=0
+          # Only binaries the package set actually emits. agent-core/hegemon are
+          # in philotic_binaries but are not build outputs (the ansible remote
+          # path stats-and-skips them), so they are intentionally NOT required here.
+          for bin in aiua philote philote-worker membrane-telegram membrane-discord membrane-mcp \
+                     model-router model-controller-elevenlabs \
+                     model-controller-gemini model-controller-openai \
+                     model-controller-anthropic \
+                     model-controller-onnx model-controller-ollama \
+                     tool-runner graph-datasource \
+                     agent-datasource heal-dispatcher life-graph-runner \
+                     philotic-web; do
+            if [ ! -f "dist/$bin" ]; then
+              echo "::error::expected binary missing from dist/: $bin"
+              missing=$((missing + 1))
+            fi
+          done
+          if [ "$missing" -gt 0 ]; then
+            echo "$missing expected binaries missing — failing build."
+            exit 1
+          fi
+          echo "All core binaries present."
+
+      - name: Upload linux-x86_64 artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-x86_64
+          path: dist/
+          retention-days: 14
+          if-no-files-found: error

@@ -1,4 +1,3 @@
-use crate::muninn_bridge::MuninnBridgeConfig;
 use graph_intelligence::scanner::ScanConfig;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -41,9 +40,6 @@ pub struct PhiloticGraphConfig {
     /// Documentation directories to scan
     pub doc_roots: Vec<String>,
 
-    /// Muninn bridge configuration
-    pub muninn: MuninnBridgeConfig,
-
     /// Auto-scan on file changes
     pub watch: bool,
 }
@@ -56,7 +52,6 @@ impl Default for PhiloticGraphConfig {
             mcp_port: 8901,
             rust_roots: vec!["crates/".into()],
             doc_roots: vec!["docs/".into()],
-            muninn: MuninnBridgeConfig::default(),
             watch: false,
         }
     }
@@ -74,11 +69,19 @@ impl PhiloticGraphConfig {
 
     pub fn to_server_config(&self, repo_root: &str) -> graph_intelligence::server::ServerConfig {
         graph_intelligence::server::ServerConfig {
+            bind_addr: std::env::var("PHILOTIC_GRAPH_BIND")
+                .unwrap_or_else(|_| "127.0.0.1".to_string()),
             http_port: self.http_port,
             mcp_port: self.mcp_port,
             db_path: self.db_path.clone(),
             scan_config: self.to_scan_config(),
             repo_root: repo_root.to_string(),
+            auth_token: std::env::var("PHILOTIC_GRAPH_TOKEN")
+                .ok()
+                .filter(|t| !t.is_empty()),
+            allow_insecure_bind: std::env::var("PHILOTIC_GRAPH_INSECURE")
+                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                .unwrap_or(false),
         }
     }
 }

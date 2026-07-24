@@ -24,12 +24,12 @@
 
   <!-- Progress Bar -->
   <text x="28" y="119" font-size="9" fill="#8892b0" font-family="Inter, system-ui, -apple-system, sans-serif">Overall implementation progress (by surface area)</text>
-  <text x="1372" y="119" text-anchor="end" font-size="9" font-weight="600" fill="#00e676" font-family="Inter, system-ui, -apple-system, sans-serif">~70% complete</text>
+  <text x="1372" y="119" text-anchor="end" font-size="9" font-weight="600" fill="#00e676" font-family="Inter, system-ui, -apple-system, sans-serif">~88% complete</text>
   <rect x="28" y="126" width="1344" height="6" rx="3" fill="#161b2e"/>
-  <rect x="28" y="126" width="941" height="6" fill="#00e676" opacity="1.0"/>
-  <rect x="969" y="126" width="134" height="6" fill="#ffc107" opacity="1.0"/>
-  <rect x="1103" y="126" width="67" height="6" fill="#ff6d00" opacity="1.0"/>
-  <rect x="1170" y="126" width="202" height="6" fill="#4a5370" opacity="0.4"/>
+  <rect x="28" y="126" width="1182" height="6" fill="#00e676" opacity="1.0"/>
+  <rect x="1210" y="126" width="80" height="6" fill="#ffc107" opacity="1.0"/>
+  <rect x="1290" y="126" width="40" height="6" fill="#ff6d00" opacity="1.0"/>
+  <rect x="1330" y="126" width="42" height="6" fill="#4a5370" opacity="0.4"/>
 
   <!-- Physical Node -->
   <rect x="20" y="152" width="1360" height="720" rx="12" fill="#00e5ff" fill-opacity="0.04" stroke="#00e5ff" stroke-opacity="0.4" stroke-width="1.5"/>
@@ -126,10 +126,10 @@
   <rect x="372" y="272" width="220" height="58" rx="7" fill="#161b2e" stroke="#ff6d00" stroke-width="1"/>
   <circle cx="582" cy="284" r="6" fill="#00e676" opacity="0.2"/>
   <circle cx="582" cy="284" r="3.5" fill="#00e676"/>
-  <text x="381" y="288" font-size="11" font-weight="600" fill="#e8eaf0" font-family="Inter, system-ui, -apple-system, sans-serif">Agent Graph</text>
+  <text x="381" y="288" font-size="11" font-weight="600" fill="#e8eaf0" font-family="Inter, system-ui, -apple-system, sans-serif">Agent Datasource</text>
   <rect x="381" y="293" width="34.4" height="13" rx="3" fill="#00e676" fill-opacity="0.18" stroke="#00e676" stroke-opacity="0.5" stroke-width="0.7"/>
   <text x="386" y="302" font-size="7.5" font-weight="700" fill="#00e676" font-family="Inter, system-ui, -apple-system, sans-serif" letter-spacing="0.5">DONE</text>
-  <text x="381" y="313" font-size="8.5" fill="#8892b0" font-family="JetBrains Mono, monospace">per-agent cognitive graph  SQLite</text>
+  <text x="381" y="313" font-size="8.5" fill="#8892b0" font-family="JetBrains Mono, monospace">per-agent SQLite partitions</text>
   <rect x="372" y="336" width="220" height="58" rx="7" fill="#161b2e" stroke="#ff6d00" stroke-width="1"/>
   <circle cx="582" cy="348" r="6" fill="#00e676" opacity="0.2"/>
   <circle cx="582" cy="348" r="3.5" fill="#00e676"/>
@@ -152,12 +152,12 @@
   <text x="386" y="494" font-size="7.5" font-weight="700" fill="#00e676" font-family="Inter, system-ui, -apple-system, sans-serif" letter-spacing="0.5">DONE</text>
   <text x="381" y="505" font-size="8.5" fill="#8892b0" font-family="JetBrains Mono, monospace">REST :8475  MCP :8750</text>
   <rect x="372" y="528" width="220" height="58" rx="7" fill="#161b2e" stroke="#ff6d00" stroke-width="1"/>
-  <circle cx="582" cy="540" r="6" fill="#ffc107" opacity="0.2"/>
-  <circle cx="582" cy="540" r="3.5" fill="#ffc107"/>
+  <circle cx="582" cy="540" r="6" fill="#00e676" opacity="0.2"/>
+  <circle cx="582" cy="540" r="3.5" fill="#00e676"/>
   <text x="381" y="544" font-size="11" font-weight="600" fill="#e8eaf0" font-family="Inter, system-ui, -apple-system, sans-serif">Memory Core</text>
-  <rect x="381" y="549" width="28" height="13" rx="3" fill="#ffc107" fill-opacity="0.18" stroke="#ffc107" stroke-opacity="0.5" stroke-width="0.7"/>
-  <text x="386" y="558" font-size="7.5" font-weight="700" fill="#ffc107" font-family="Inter, system-ui, -apple-system, sans-serif" letter-spacing="0.5">WIP</text>
-  <text x="381" y="569" font-size="8.5" fill="#8892b0" font-family="JetBrains Mono, monospace">MemoryEngine  CognitiveEngine</text>
+  <rect x="381" y="549" width="34.4" height="13" rx="3" fill="#00e676" fill-opacity="0.18" stroke="#00e676" stroke-opacity="0.5" stroke-width="0.7"/>
+  <text x="386" y="558" font-size="7.5" font-weight="700" fill="#00e676" font-family="Inter, system-ui, -apple-system, sans-serif" letter-spacing="0.5">DONE</text>
+  <text x="381" y="569" font-size="8.5" fill="#8892b0" font-family="JetBrains Mono, monospace">cultivation + spacetime frames</text>
   <rect x="372" y="592" width="220" height="58" rx="7" fill="#161b2e" stroke="#ff6d00" stroke-width="1"/>
   <circle cx="582" cy="604" r="6" fill="#00e676" opacity="0.2"/>
   <circle cx="582" cy="604" r="3.5" fill="#00e676"/>
@@ -172,13 +172,13 @@
   <rect x="381" y="677" width="34.4" height="13" rx="3" fill="#00e676" fill-opacity="0.18" stroke="#00e676" stroke-opacity="0.5" stroke-width="0.7"/>
   <text x="386" y="686" font-size="7.5" font-weight="700" fill="#00e676" font-family="Inter, system-ui, -apple-system, sans-serif" letter-spacing="0.5">DONE</text>
   <text x="381" y="697" font-size="8.5" fill="#8892b0" font-family="JetBrains Mono, monospace">mesh_cursors table</text>
-  <rect x="372" y="720" width="220" height="58" rx="7" fill="#111" stroke="#ff6d00" stroke-width="1"/>
-  <circle cx="582" cy="732" r="6" fill="#4a5370" opacity="0.2"/>
-  <circle cx="582" cy="732" r="3.5" fill="#4a5370"/>
-  <text x="381" y="736" font-size="11" font-weight="600" fill="#e8eaf0" font-family="Inter, system-ui, -apple-system, sans-serif">Alt Backends</text>
-  <rect x="381" y="741" width="51.2" height="13" rx="3" fill="#4a5370" fill-opacity="0.18" stroke="#4a5370" stroke-opacity="0.5" stroke-width="0.7"/>
-  <text x="386" y="750" font-size="7.5" font-weight="700" fill="#4a5370" font-family="Inter, system-ui, -apple-system, sans-serif" letter-spacing="0.5">PLANNED</text>
-  <text x="381" y="761" font-size="8.5" fill="#8892b0" font-family="JetBrains Mono, monospace">PebbleDB / RocksDB / Postgres</text>
+  <rect x="372" y="720" width="220" height="58" rx="7" fill="#161b2e" stroke="#ff6d00" stroke-width="1"/>
+  <circle cx="582" cy="732" r="6" fill="#ffc107" opacity="0.2"/>
+  <circle cx="582" cy="732" r="3.5" fill="#ffc107"/>
+  <text x="381" y="736" font-size="11" font-weight="600" fill="#e8eaf0" font-family="Inter, system-ui, -apple-system, sans-serif">Memgraph Store</text>
+  <rect x="381" y="741" width="28" height="13" rx="3" fill="#ffc107" fill-opacity="0.18" stroke="#ffc107" stroke-opacity="0.5" stroke-width="0.7"/>
+  <text x="386" y="750" font-size="7.5" font-weight="700" fill="#ffc107" font-family="Inter, system-ui, -apple-system, sans-serif" letter-spacing="0.5">WIP</text>
+  <text x="381" y="761" font-size="8.5" fill="#8892b0" font-family="JetBrains Mono, monospace">Bolt connection provider</text>
 
   <!-- Networking & Primitives -->
   <rect x="618" y="182" width="280" height="330" rx="12" fill="#d500f9" fill-opacity="0.04" stroke="#d500f9" stroke-opacity="0.4" stroke-width="1.5"/>
@@ -239,13 +239,13 @@
   <text x="642" y="640" font-size="7.5" font-weight="700" fill="#00e676" font-family="Inter, system-ui, -apple-system, sans-serif" letter-spacing="0.5">DONE</text>
   <text x="637" y="651" font-size="8.5" fill="#8892b0" font-family="JetBrains Mono, monospace">SpawnSubagent  worker binary</text>
   <rect x="628" y="666" width="260" height="58" rx="7" fill="#161b2e" stroke="#1de9b6" stroke-width="1"/>
-  <circle cx="878" cy="678" r="6" fill="#ffc107" opacity="0.2"/>
-  <circle cx="878" cy="678" r="3.5" fill="#ffc107"/>
+  <circle cx="878" cy="678" r="6" fill="#00e676" opacity="0.2"/>
+  <circle cx="878" cy="678" r="3.5" fill="#00e676"/>
   <text x="637" y="682" font-size="11" font-weight="600" fill="#e8eaf0" font-family="Inter, system-ui, -apple-system, sans-serif">Desktop Membrane</text>
-  <rect x="637" y="687" width="28" height="13" rx="3" fill="#ffc107" fill-opacity="0.18" stroke="#ffc107" stroke-opacity="0.5" stroke-width="0.7"/>
-  <text x="642" y="696" font-size="7.5" font-weight="700" fill="#ffc107" font-family="Inter, system-ui, -apple-system, sans-serif" letter-spacing="0.5">WIP</text>
+  <rect x="637" y="687" width="34.4" height="13" rx="3" fill="#00e676" fill-opacity="0.18" stroke="#00e676" stroke-opacity="0.5" stroke-width="0.7"/>
+  <text x="642" y="696" font-size="7.5" font-weight="700" fill="#00e676" font-family="Inter, system-ui, -apple-system, sans-serif" letter-spacing="0.5">DONE</text>
   <text x="637" y="707" font-size="8.5" fill="#8892b0" font-family="JetBrains Mono, monospace">philotic-web serve  REST + WS</text>
-  <text x="637" y="718" font-size="8" fill="#ff6d00" font-family="Inter, system-ui, -apple-system, sans-serif">Streaming pending</text>
+  <text x="637" y="718" font-size="8" fill="#8892b0" font-family="Inter, system-ui, -apple-system, sans-serif">Streaming &amp; Admin parity complete</text>
   <text x="628" y="744" font-size="8" fill="#4a5370" font-family="Inter, system-ui, -apple-system, sans-serif">Docs-only proposals pending:</text>
   <text x="628" y="757" font-size="8" fill="#4a5370" font-family="Inter, system-ui, -apple-system, sans-serif">· forked sessions</text>
   <text x="628" y="769" font-size="8" fill="#4a5370" font-family="Inter, system-ui, -apple-system, sans-serif">· approval UX</text>
@@ -325,21 +325,21 @@
   <text x="1166" y="462" font-size="7.5" font-weight="700" fill="#00e676" font-family="Inter, system-ui, -apple-system, sans-serif" letter-spacing="0.5">DONE</text>
   <text x="1161" y="473" font-size="8.5" fill="#8892b0" font-family="JetBrains Mono, monospace">subagent delegation worker</text>
   <rect x="924" y="488" width="218" height="58" rx="7" fill="#161b2e" stroke="#00e676" stroke-width="1"/>
-  <circle cx="1132" cy="500" r="6" fill="#ffc107" opacity="0.2"/>
-  <circle cx="1132" cy="500" r="3.5" fill="#ffc107"/>
+  <circle cx="1132" cy="500" r="6" fill="#00e676" opacity="0.2"/>
+  <circle cx="1132" cy="500" r="3.5" fill="#00e676"/>
   <text x="933" y="504" font-size="11" font-weight="600" fill="#e8eaf0" font-family="Inter, system-ui, -apple-system, sans-serif">Cognitive Loop</text>
-  <rect x="933" y="509" width="28" height="13" rx="3" fill="#ffc107" fill-opacity="0.18" stroke="#ffc107" stroke-opacity="0.5" stroke-width="0.7"/>
-  <text x="938" y="518" font-size="7.5" font-weight="700" fill="#ffc107" font-family="Inter, system-ui, -apple-system, sans-serif" letter-spacing="0.5">WIP</text>
-  <text x="933" y="529" font-size="8.5" fill="#8892b0" font-family="JetBrains Mono, monospace">context envelope landed</text>
-  <text x="933" y="540" font-size="8" fill="#ff6d00" font-family="Inter, system-ui, -apple-system, sans-serif">memory tools pending</text>
+  <rect x="933" y="509" width="34.4" height="13" rx="3" fill="#00e676" fill-opacity="0.18" stroke="#00e676" stroke-opacity="0.5" stroke-width="0.7"/>
+  <text x="938" y="518" font-size="7.5" font-weight="700" fill="#00e676" font-family="Inter, system-ui, -apple-system, sans-serif" letter-spacing="0.5">DONE</text>
+  <text x="933" y="529" font-size="8.5" fill="#8892b0" font-family="JetBrains Mono, monospace">context envelope v2 complete</text>
+  <text x="933" y="540" font-size="8" fill="#8892b0" font-family="Inter, system-ui, -apple-system, sans-serif">memory cultivation active</text>
   <rect x="1152" y="488" width="218" height="58" rx="7" fill="#161b2e" stroke="#00e676" stroke-width="1"/>
-  <circle cx="1360" cy="500" r="6" fill="#ffc107" opacity="0.2"/>
-  <circle cx="1360" cy="500" r="3.5" fill="#ffc107"/>
+  <circle cx="1360" cy="500" r="6" fill="#00e676" opacity="0.2"/>
+  <circle cx="1360" cy="500" r="3.5" fill="#00e676"/>
   <text x="1161" y="504" font-size="11" font-weight="600" fill="#e8eaf0" font-family="Inter, system-ui, -apple-system, sans-serif">Skill Lifecycle</text>
-  <rect x="1161" y="509" width="28" height="13" rx="3" fill="#ffc107" fill-opacity="0.18" stroke="#ffc107" stroke-opacity="0.5" stroke-width="0.7"/>
-  <text x="1166" y="518" font-size="7.5" font-weight="700" fill="#ffc107" font-family="Inter, system-ui, -apple-system, sans-serif" letter-spacing="0.5">WIP</text>
-  <text x="1161" y="529" font-size="8.5" fill="#8892b0" font-family="JetBrains Mono, monospace">SpawnSubagent works</text>
-  <text x="1161" y="540" font-size="8" fill="#ff6d00" font-family="Inter, system-ui, -apple-system, sans-serif">governance pending</text>
+  <rect x="1161" y="509" width="34.4" height="13" rx="3" fill="#00e676" fill-opacity="0.18" stroke="#00e676" stroke-opacity="0.5" stroke-width="0.7"/>
+  <text x="1166" y="518" font-size="7.5" font-weight="700" fill="#00e676" font-family="Inter, system-ui, -apple-system, sans-serif" letter-spacing="0.5">DONE</text>
+  <text x="1161" y="529" font-size="8.5" fill="#8892b0" font-family="JetBrains Mono, monospace">governed role handoffs active</text>
+  <text x="1161" y="540" font-size="8" fill="#8892b0" font-family="Inter, system-ui, -apple-system, sans-serif">SpawnSubagent + RegisterSkill</text>
   <rect x="924" y="552" width="218" height="50" rx="7" fill="#161b2e" stroke="#00e676" stroke-width="1"/>
   <circle cx="1132" cy="564" r="6" fill="#00e676" opacity="0.2"/>
   <circle cx="1132" cy="564" r="3.5" fill="#00e676"/>

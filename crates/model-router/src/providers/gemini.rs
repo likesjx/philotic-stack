@@ -1,6 +1,6 @@
 use crate::controller::{
-    AttachmentInput, AttemptPolicy, ControllerTask, ModelProvider, NativeLiveProvider,
-    NativeLiveTurnOutput, ProviderOutput, RetryPolicy, TaskKind,
+    AttachmentInput, AttemptPolicy, ControllerTask, DEFAULT_MEMORY_CANDIDATE_POLICY, ModelProvider,
+    NativeLiveProvider, NativeLiveTurnOutput, ProviderOutput, RetryPolicy, TaskKind,
 };
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
@@ -21,7 +21,7 @@ use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::protocol::Message as WsMessage;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 /// Seconds without a byte chunk from the SSE stream before we abort and escalate.
 const STREAMING_IDLE_SECS: u64 = 8;
@@ -37,8 +37,33 @@ const STREAMING_CONNECT_SECS: u64 = 25;
 /// with the philote WaitingModel watchdog (also 120s).
 const STREAMING_TOTAL_SECS: u64 = 32;
 
+/// Thinking-token budget sent as `generationConfig.thinkingConfig.thinkingBudget`.
+/// Set to 0 to DISABLE model "thinking". Thinking models (e.g. gemini-3.5-flash, which
+/// `gemini-flash-latest` currently resolves to) otherwise drip empty thinking keep-alive SSE
+/// chunks that reset STREAMING_IDLE_SECS without emitting output, hanging the turn until the
+/// philote WaitingModel watchdog evicts it at ~300s. Disabling thinking removes the drip at
+/// the source (the hotel has no live fallback provider to escalate to). Tunable via the
+/// PHILOTIC_GEMINI_THINKING_BUDGET env var; -1 lets Gemini choose (dynamic thinking).
+const GEMINI_THINKING_BUDGET: i64 = 0;
+
+/// Resolve the Gemini thinking budget, allowing an operator override without a rebuild.
+fn gemini_thinking_budget() -> i64 {
+    std::env::var("PHILOTIC_GEMINI_THINKING_BUDGET")
+        .ok()
+        .and_then(|v| v.trim().parse::<i64>().ok())
+        .unwrap_or(GEMINI_THINKING_BUDGET)
+}
+
 const GEMINI_LIVE_DEFAULT_MODEL: &str = "gemini-3.1-flash-live-preview";
 const GEMINI_AUDIO_TRANSCRIBE_DEFAULT_MODEL: &str = "gemini-3-flash-preview";
+/// Default model for text.generate (agent cognition). `gemini-3.5-flash` is the capable
+/// tier — it emits well-formed tool/function calls (which agents like the orchestrator rely
+/// on) and richer prose. It is a thinking model that can drip empty keep-alive SSE bytes for
+/// a long time, but that is now bounded by the provider's per-attempt cap (attempt_policy
+/// total_secs=35) plus the retry loop, so a dripping turn bails and retries fast instead of
+/// hanging. `gemini-3.1-flash-lite` was tried but mangles structured/tool turns (wraps plain
+/// replies as malformed function calls), stalling the orchestrator — do not use it here.
+const GEMINI_TEXT_DEFAULT_MODEL: &str = "gemini-3.5-flash";
 const GEMINI_LIVE_PROTOCOL: &str = "gemini-live-v1beta";
 const GEMINI_LIVE_MESSAGE_TIMEOUT: Duration = Duration::from_secs(30);
 type GeminiLiveSocket = WebSocketStream<MaybeTlsStream<TcpStream>>;
@@ -163,6 +188,7 @@ impl GeminiProvider {
     fn request_model<'a>(&'a self, task: &'a ControllerTask) -> &'a str {
         task.model.as_deref().unwrap_or_else(|| match task.kind {
             TaskKind::AudioTranscribe => GEMINI_AUDIO_TRANSCRIBE_DEFAULT_MODEL,
+            TaskKind::TextGenerate => GEMINI_TEXT_DEFAULT_MODEL,
             _ => &self.default_model,
         })
     }
@@ -235,8 +261,101 @@ impl GeminiProvider {
 
     fn request_payload(prompt: &str) -> Value {
         json!({
-            "contents": [{"parts": [{"text": prompt}]}]
+            "contents": [{"parts": [{"text": prompt}]}],
+            "generationConfig": {
+                "thinkingConfig": { "thinkingBudget": gemini_thinking_budget() }
+            }
         })
+    }
+
+    /// Builds the Gemini `safetySettings` array for a per-agent `content_policy`
+    /// (`"unrestricted"` | `"standard"` | `"strict"`, threaded down from philote
+    /// via `ControllerTask.provider_options["content_policy"]` —
+    /// `RoleIncarnationRecord.content_policy` → `SessionState::effective_content_policy`
+    /// → `resolve_content_policy_provider_options`).
+    ///
+    /// - `"unrestricted"` → every `HarmCategory` at `BLOCK_NONE` — this is a
+    ///   private, single-operator system; the operator has explicitly opted a
+    ///   specific agent (e.g. a companion persona) out of Gemini's default
+    ///   safety filtering.
+    /// - `"strict"` → tightens to `BLOCK_MEDIUM_AND_ABOVE`.
+    /// - `"standard"` / `None` / any unrecognized value → `None` (omit the key
+    ///   entirely), which is the exact pre-feature wire shape — Gemini applies
+    ///   its own server-side defaults. This is the fail-safe branch: a typo'd
+    ///   or missing policy value never accidentally loosens filtering.
+    fn safety_settings_for_content_policy(content_policy: Option<&str>) -> Option<Value> {
+        match content_policy {
+            Some("unrestricted") => Some(json!([
+                { "category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE" },
+                { "category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE" },
+                { "category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_NONE" },
+                { "category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE" },
+                { "category": "HARM_CATEGORY_CIVIC_INTEGRITY", "threshold": "BLOCK_NONE" },
+            ])),
+            Some("strict") => Some(json!([
+                { "category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_MEDIUM_AND_ABOVE" },
+                { "category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_MEDIUM_AND_ABOVE" },
+                { "category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_MEDIUM_AND_ABOVE" },
+                { "category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_MEDIUM_AND_ABOVE" },
+            ])),
+            _ => None,
+        }
+    }
+
+    /// Applies `safetySettings` to an already-built request payload, in place,
+    /// as a single post-processing step so all three payload shapes
+    /// (`request_payload` / `tool_aware_request_payload` /
+    /// `structured_text_request_payload`) get identical treatment without
+    /// duplicating the injection three times. No-op when the policy resolves
+    /// to `None` (standard/unset) — the wire payload is then byte-for-byte
+    /// unchanged from before this feature existed.
+    fn apply_safety_settings(payload: &mut Value, content_policy: Option<&str>) {
+        if let Some(settings) = Self::safety_settings_for_content_policy(content_policy) {
+            if let Value::Object(map) = payload {
+                map.insert("safetySettings".to_string(), settings);
+            }
+        }
+    }
+
+    /// Detects a Gemini safety block on an otherwise-2xx response — either an
+    /// empty `candidates` array with `promptFeedback.blockReason` set, or a
+    /// candidate whose `finishReason` is `SAFETY` / `PROHIBITED_CONTENT`.
+    ///
+    /// Returns a `Some(reason)` string carrying the stable
+    /// `"gemini_content_policy_block"` marker substring that
+    /// `classify_provider_failure` (model-router/src/runtime.rs) matches on to
+    /// stamp `error_class = "content_blocked"` — a distinct outcome from the
+    /// generic `"Gemini returned an empty response"` bail, which today falls
+    /// through to `switch_provider` and causes the jarring silent provider hop
+    /// this detection exists to prevent (2026-07-09 operator report: an
+    /// intermittent Gemini safety block on an `unrestricted`-intent
+    /// conversation silently escalated to OpenRouter mid-turn).
+    fn detect_content_policy_block(body: &Value) -> Option<String> {
+        if let Some(reason) = body
+            .get("promptFeedback")
+            .and_then(|pf| pf.get("blockReason"))
+            .and_then(Value::as_str)
+            .filter(|r| !r.is_empty() && *r != "BLOCK_REASON_UNSPECIFIED")
+        {
+            return Some(format!(
+                "gemini_content_policy_block: promptFeedback.blockReason={reason}"
+            ));
+        }
+
+        let finish_reason = body
+            .get("candidates")
+            .and_then(Value::as_array)
+            .and_then(|candidates| candidates.first())
+            .and_then(|candidate| candidate.get("finishReason"))
+            .and_then(Value::as_str);
+        if matches!(finish_reason, Some("SAFETY") | Some("PROHIBITED_CONTENT")) {
+            return Some(format!(
+                "gemini_content_policy_block: finishReason={}",
+                finish_reason.unwrap_or_default()
+            ));
+        }
+
+        None
     }
 
     fn gemini_function_aliases(tools: &[serde_json::Value]) -> Vec<(String, String)> {
@@ -289,11 +408,62 @@ impl GeminiProvider {
         aliases
     }
 
-    fn normalize_function_parameters(schema: &Value) -> Value {
+    /// JSON Schema keys that Gemini's FunctionDeclaration `Schema` reliably
+    /// accepts across API variants (v1beta REST with API key or OAuth bearer).
+    ///
+    /// Anything else — `default`, `minItems`, `minimum`/`maximum`,
+    /// `additionalProperties`, `$schema`, `title`, `oneOf`/`anyOf`, ... — must
+    /// be stripped before the request is sent: Gemini rejects declarations
+    /// carrying unsupported keywords with a bare
+    /// `400 INVALID_ARGUMENT: Request contains an invalid argument.`
+    /// (observed live on vps-jane when the life.* tool contracts landed exact
+    /// JSON schemas; every tool-bearing turn failed, including the daily
+    /// steward cron).
+    const GEMINI_FUNCTION_SCHEMA_KEYS: &'static [&'static str] = &[
+        "type",
+        "description",
+        "nullable",
+        "enum",
+        "items",
+        "properties",
+        "required",
+    ];
+
+    /// Sanitize a tool `input_schema` into a Gemini-valid function declaration
+    /// parameter schema:
+    /// - drop every keyword outside [`Self::GEMINI_FUNCTION_SCHEMA_KEYS`],
+    ///   recursively (Gemini 400s on unsupported keywords like `default`);
+    /// - fold a stripped `default` into the description so the hint still
+    ///   reaches the model;
+    /// - infer a missing `type` from shape;
+    /// - keep `enum` only on string schemas (Gemini restricts enum to STRING);
+    /// - keep `required` entries only when they name declared properties;
+    /// - repair structurally invalid residue that keyword-stripping alone
+    ///   leaves behind (see below).
+    ///
+    /// The last step is the fix for the residual live 400s: even after stripping
+    /// unsupported keywords, Gemini's FunctionDeclaration schema subset rejects
+    /// an OBJECT with empty/missing `properties` (`should be non-empty for OBJECT
+    /// type`) and an ARRAY with no `items`, both with an empty-details
+    /// `INVALID_ARGUMENT`. The catalog carries free-form `{"type":"object"}`
+    /// blobs (e.g. `metadata`, `passage_refs.items`, `*_node_refs.items`) that
+    /// Gemini's subset cannot express, so:
+    /// - a NON-root OBJECT with empty/missing properties is downgraded to a
+    ///   JSON-encoded `string` (the field stays present so `required` remains
+    ///   satisfiable, and the runner already handles these as `serde_json::Value`);
+    /// - an ARRAY missing `items` gets `items: {"type":"string"}`.
+    ///
+    /// The ROOT parameters object is left as `{"type":"object","properties":{}}`
+    /// when empty — Gemini accepts empty properties only at the top level, and
+    /// no-argument tools rely on that shape.
+    fn normalize_function_parameters(schema: &Value, is_root: bool) -> Value {
         match schema {
             Value::Object(map) => {
                 let mut normalized = serde_json::Map::new();
                 for (key, value) in map {
+                    if !Self::GEMINI_FUNCTION_SCHEMA_KEYS.contains(&key.as_str()) {
+                        continue;
+                    }
                     let normalized_value = match key.as_str() {
                         "properties" => Value::Object(
                             value
@@ -304,17 +474,60 @@ impl GeminiProvider {
                                         .map(|(prop_name, prop_schema)| {
                                             (
                                                 prop_name.clone(),
-                                                Self::normalize_function_parameters(prop_schema),
+                                                Self::normalize_function_parameters(
+                                                    prop_schema,
+                                                    false,
+                                                ),
                                             )
                                         })
                                         .collect::<serde_json::Map<String, Value>>()
                                 })
                                 .unwrap_or_default(),
                         ),
-                        "items" => Self::normalize_function_parameters(value),
+                        "items" => Self::normalize_function_parameters(value, false),
+                        // JSON Schema union types ('"type": ["string","null"]')
+                        // are proto-invalid for Gemini ("Proto field is not
+                        // repeating, cannot start list" → HTTP 400 for the
+                        // WHOLE request, killing every turn that projects the
+                        // tool). Collapse to the first non-"null" entry;
+                        // nullability is already conveyed by absence from
+                        // `required`. Live incident 2026-07-20: agent.graph.declare
+                        // took down Aria's Gemini tier fleet-wide.
+                        "type" => match value {
+                            Value::Array(entries) => Value::String(
+                                entries
+                                    .iter()
+                                    .filter_map(Value::as_str)
+                                    .find(|t| !t.eq_ignore_ascii_case("null"))
+                                    .unwrap_or("string")
+                                    .to_string(),
+                            ),
+                            other => other.clone(),
+                        },
                         _ => value.clone(),
                     };
                     normalized.insert(key.clone(), normalized_value);
+                }
+
+                // Fold a stripped "default" into the description so the hint
+                // still reaches the model. Skip null/empty composites — they
+                // carry no signal worth the tokens.
+                if let Some(default) = map.get("default").filter(|value| !value.is_null()) {
+                    let rendered = match default {
+                        Value::String(text) => text.clone(),
+                        other => other.to_string(),
+                    };
+                    if !rendered.is_empty() && rendered != "[]" && rendered != "{}" {
+                        let suffix = format!("Defaults to {rendered}.");
+                        let description =
+                            match normalized.get("description").and_then(Value::as_str) {
+                                Some(existing) if !existing.trim().is_empty() => {
+                                    format!("{} {}", existing.trim_end(), suffix)
+                                }
+                                _ => suffix,
+                            };
+                        normalized.insert("description".into(), Value::String(description));
+                    }
                 }
 
                 if !normalized.contains_key("type") {
@@ -328,10 +541,171 @@ impl GeminiProvider {
                     normalized.insert("type".into(), Value::String(inferred.into()));
                 }
 
+                // Gemini only accepts "enum" on string schemas.
+                let is_string_type = normalized
+                    .get("type")
+                    .and_then(Value::as_str)
+                    .map(|declared| declared.eq_ignore_ascii_case("string"))
+                    .unwrap_or(false);
+                if !is_string_type {
+                    normalized.remove("enum");
+                }
+
+                // "required" may only name declared properties.
+                let filtered_required =
+                    normalized
+                        .get("required")
+                        .and_then(Value::as_array)
+                        .map(|required| {
+                            let property_names: std::collections::HashSet<&str> = normalized
+                                .get("properties")
+                                .and_then(Value::as_object)
+                                .map(|props| props.keys().map(String::as_str).collect())
+                                .unwrap_or_default();
+                            required
+                                .iter()
+                                .filter(|entry| {
+                                    entry
+                                        .as_str()
+                                        .map(|name| property_names.contains(name))
+                                        .unwrap_or(false)
+                                })
+                                .cloned()
+                                .collect::<Vec<Value>>()
+                        });
+                match filtered_required {
+                    Some(filtered) if filtered.is_empty() => {
+                        normalized.remove("required");
+                    }
+                    Some(filtered) => {
+                        normalized.insert("required".into(), Value::Array(filtered));
+                    }
+                    None => {}
+                }
+
+                // Repair structurally invalid residue that keyword-stripping
+                // leaves behind (Gemini rejects these with empty-details 400s).
+                let declared_type = normalized
+                    .get("type")
+                    .and_then(Value::as_str)
+                    .map(|t| t.to_ascii_lowercase());
+                match declared_type.as_deref() {
+                    Some("object") if !is_root => {
+                        let has_properties = normalized
+                            .get("properties")
+                            .and_then(Value::as_object)
+                            .map(|props| !props.is_empty())
+                            .unwrap_or(false);
+                        if !has_properties {
+                            // A free-form object Gemini's subset cannot express.
+                            // Downgrade to a JSON-encoded string so the field
+                            // stays present and Gemini-valid.
+                            let note = "Provide as a JSON-encoded object.";
+                            let description = match normalized
+                                .get("description")
+                                .and_then(Value::as_str)
+                                .map(str::trim)
+                                .filter(|text| !text.is_empty())
+                            {
+                                Some(existing) if existing.contains(note) => existing.to_string(),
+                                Some(existing) => format!("{existing} {note}"),
+                                None => note.to_string(),
+                            };
+                            let mut repaired = serde_json::Map::new();
+                            repaired.insert("type".into(), Value::String("string".into()));
+                            repaired.insert("description".into(), Value::String(description));
+                            return Value::Object(repaired);
+                        }
+                    }
+                    Some("array") => {
+                        if !normalized.contains_key("items") {
+                            normalized.insert("items".into(), json!({ "type": "string" }));
+                        }
+                    }
+                    _ => {}
+                }
+
                 Value::Object(normalized)
             }
             _ => schema.clone(),
         }
+    }
+
+    /// Strict structural validator for a sanitized Gemini function-declaration
+    /// parameter schema. Returns `Err(reason)` when the schema violates the
+    /// FunctionDeclaration Schema subset Gemini accepts:
+    /// - only [`Self::GEMINI_FUNCTION_SCHEMA_KEYS`] keywords;
+    /// - a non-root OBJECT must have non-empty `properties`;
+    /// - an ARRAY must declare `items`;
+    /// - `enum` only on STRING;
+    /// - `required` entries must name declared properties.
+    ///
+    /// Used as a `debug_assert` gate in [`Self::function_declarations`] and as
+    /// the test gate, so any future catalog schema that sanitizes to invalid
+    /// fails at build/test time instead of live.
+    fn validate_gemini_declaration_schema(
+        schema: &Value,
+        path: &str,
+        is_root: bool,
+    ) -> Result<(), String> {
+        let Value::Object(map) = schema else {
+            return Ok(());
+        };
+        for key in map.keys() {
+            if !Self::GEMINI_FUNCTION_SCHEMA_KEYS.contains(&key.as_str()) {
+                return Err(format!("unsupported schema keyword [{key}] at [{path}]"));
+            }
+        }
+        let declared_type = map
+            .get("type")
+            .and_then(Value::as_str)
+            .map(|t| t.to_ascii_lowercase());
+        match declared_type.as_deref() {
+            Some("object") => {
+                let props = map.get("properties").and_then(Value::as_object);
+                let non_empty = props.map(|p| !p.is_empty()).unwrap_or(false);
+                if !is_root && !non_empty {
+                    return Err(format!("OBJECT with empty/missing properties at [{path}]"));
+                }
+                if let Some(props) = props {
+                    for (name, prop) in props {
+                        Self::validate_gemini_declaration_schema(
+                            prop,
+                            &format!("{path}.{name}"),
+                            false,
+                        )?;
+                    }
+                }
+            }
+            Some("array") => match map.get("items") {
+                None => return Err(format!("ARRAY without items at [{path}]")),
+                Some(items) => {
+                    Self::validate_gemini_declaration_schema(items, &format!("{path}[]"), false)?;
+                }
+            },
+            _ => {}
+        }
+        if map.contains_key("enum") && declared_type.as_deref() != Some("string") {
+            return Err(format!("enum on non-STRING type at [{path}]"));
+        }
+        if let Some(required) = map.get("required").and_then(Value::as_array) {
+            let empty = serde_json::Map::new();
+            let props = map
+                .get("properties")
+                .and_then(Value::as_object)
+                .unwrap_or(&empty);
+            for entry in required {
+                let name = entry
+                    .as_str()
+                    .ok_or_else(|| format!("required entry is not a string at [{path}]"))?;
+                if !props.contains_key(name) {
+                    return Err(format!(
+                        "required [{name}] not among properties at [{path}]"
+                    ));
+                }
+            }
+        }
+        Ok(())
     }
 
     fn function_declarations(tools: &[serde_json::Value]) -> Vec<Value> {
@@ -351,8 +725,24 @@ impl GeminiProvider {
                     .unwrap_or(tool_name);
                 let parameters = tool
                     .get("input_schema")
-                    .map(Self::normalize_function_parameters)
+                    .map(|schema| Self::normalize_function_parameters(schema, true))
                     .unwrap_or_else(|| json!({ "type": "object", "properties": {} }));
+
+                // Fail loud in debug/test builds if a sanitized declaration is
+                // still structurally invalid for Gemini, so catalog schema drift
+                // is caught at build time instead of as a live empty-details 400.
+                if cfg!(debug_assertions) {
+                    if let Err(reason) = Self::validate_gemini_declaration_schema(
+                        &parameters,
+                        &format!("{alias}.parameters"),
+                        true,
+                    ) {
+                        debug_assert!(
+                            false,
+                            "sanitized Gemini declaration [{alias}] is invalid: {reason}"
+                        );
+                    }
+                }
 
                 Some(json!({
                     "name": alias,
@@ -375,6 +765,7 @@ impl GeminiProvider {
         tools: &[serde_json::Value],
         wants_concept: bool,
         wants_plan: bool,
+        memory_candidate_policy: Option<&str>,
     ) -> Value {
         let tool_list: String = tools
             .iter()
@@ -403,75 +794,45 @@ impl GeminiProvider {
             .join("\n");
 
         let memory_instruction = if wants_concept {
-            " If — and only if — this exchange contains something genuinely worth remembering \
-             (a user preference, a decision made, a fact learned, or a pattern worth recalling later), \
-             include \"memory_candidate\" with fields: \"concept\" (short kebab-case slug), \
-             \"content\" (one or two sentences distilling what is worth keeping), and optional \
-             \"tags\" (array of short strings). Omit memory_candidate entirely for routine \
-             exchanges, simple questions, greetings, or transient state."
+            let policy = memory_candidate_policy.unwrap_or(DEFAULT_MEMORY_CANDIDATE_POLICY);
+            format!(
+                " Follow the Memory candidate policy in the prompt. If and only if the policy says \
+                 this exchange is worth remembering, include \"memory_candidate\" with fields: \
+                 \"concept\" (short slug), \"content\" (atomic durable memory), and optional \
+                 \"tags\" (array of short strings). Policy: {policy}"
+            )
         } else {
-            ""
+            String::new()
         };
 
         let plan_instruction = if wants_plan {
-            " When starting a multi-step task, describe your plan briefly in natural language before or after tool use when helpful."
+            " When working a multi-step task, also include \"active_plan\" in that JSON object: \
+             {\"goal\": string, \"status\": string, \"steps\": [{\"id\": integer, \"description\": string, \
+             \"tool_name\": string, \"status\": string}]}. Omit active_plan for single-step exchanges."
         } else {
             ""
         };
 
+        // IMPORTANT: this payload must NEVER combine controlled generation
+        // (generationConfig.responseMimeType/responseSchema) with
+        // tools.functionDeclarations. Gemini documents the two features as
+        // mutually exclusive, and combining them is exactly what 400'd every
+        // tool-bearing turn live (tool-less turns on the same model — which
+        // send responseSchema without tools — succeeded). Function-calling
+        // mode wins: tools stay native, and the structured-output contract
+        // moves into the system instruction. Downstream parsing already
+        // tolerates plain-JSON-in-text via parse_structured_response /
+        // parse_tool_call_candidate fallbacks.
         let system_text = format!(
             "You are an agent with tools. When a tool is needed, call one of the declared functions \
              instead of writing a JSON tool_call object by hand. Use function parameters exactly as \
-             declared and include every required field.{}{}\n\
-             When no tool is needed, output a JSON object with \"display_text\" (your reply, markdown fine) \
-             and \"spoken_text\" (conversational version for voice, no markdown).\n\n\
+             declared and include every required field.\n\
+             When no tool is needed, reply with ONLY a raw JSON object — no markdown code fences, \
+             no text outside the JSON — containing \"display_text\" (your reply, markdown fine) \
+             and \"spoken_text\" (conversational version for voice, no markdown).{}{}\n\n\
              Available tools:\n{}",
             memory_instruction, plan_instruction, tool_list,
         );
-
-        let mut properties = json!({
-            "display_text": { "type": "STRING" },
-            "spoken_text": { "type": "STRING" }
-        });
-        let required = vec!["display_text", "spoken_text"];
-
-        if wants_concept {
-            properties["memory_candidate"] = json!({
-                "type": "OBJECT",
-                "nullable": true,
-                "properties": {
-                    "concept": { "type": "STRING" },
-                    "content": { "type": "STRING" },
-                    "tags": {
-                        "type": "ARRAY",
-                        "items": { "type": "STRING" }
-                    }
-                },
-                "required": ["concept", "content"]
-            });
-            // Not pushed to required — model omits it when there's nothing worth saving.
-        }
-        if wants_plan {
-            properties["active_plan"] = json!({
-                "type": "OBJECT",
-                "properties": {
-                    "goal": { "type": "STRING" },
-                    "status": { "type": "STRING" },
-                    "steps": {
-                        "type": "ARRAY",
-                        "items": {
-                            "type": "OBJECT",
-                            "properties": {
-                                "id": { "type": "INTEGER" },
-                                "description": { "type": "STRING" },
-                                "tool_name": { "type": "STRING" },
-                                "status": { "type": "STRING" }
-                            }
-                        }
-                    }
-                }
-            });
-        }
 
         json!({
             "system_instruction": {
@@ -479,12 +840,7 @@ impl GeminiProvider {
             },
             "contents": [{"parts": [{"text": prompt}]}],
             "generationConfig": {
-                "responseMimeType": "application/json",
-                "responseSchema": {
-                    "type": "OBJECT",
-                    "properties": properties,
-                    "required": required
-                }
+                "thinkingConfig": { "thinkingBudget": gemini_thinking_budget() }
             },
             "tools": [
                 {
@@ -503,22 +859,24 @@ impl GeminiProvider {
         prompt: &str,
         wants_concept: bool,
         wants_plan: bool,
+        memory_candidate_policy: Option<&str>,
     ) -> Value {
         let system_text = if wants_concept {
-            "When generating your response, produce a JSON object with \"display_text\" \
-             (your full response formatted for text display, markdown is fine) and \
-             \"spoken_text\" (a natural, expressive version for voice delivery — no markdown, \
-             conversational tone, written to be heard). If — and only if — this exchange contains \
-             something genuinely worth remembering (a user preference, a decision, a fact learned, \
-             or a recurring pattern), also include \"memory_candidate\" (an object with \"concept\" \
-             as a short kebab-case slug, \"content\" as one or two sentences distilling what is \
-             worth keeping, and optional \"tags\"). Omit memory_candidate entirely for routine \
-             exchanges, greetings, or transient state."
+            let policy = memory_candidate_policy.unwrap_or(DEFAULT_MEMORY_CANDIDATE_POLICY);
+            format!(
+                "When generating your response, produce a JSON object with \"display_text\" \
+                 (your full response formatted for text display, markdown is fine) and \
+                 \"spoken_text\" (a natural, expressive version for voice delivery, no markdown). \
+                 Follow the Memory candidate policy in the prompt. If and only if the policy says \
+                 this exchange is worth remembering, include \"memory_candidate\" with \
+                 \"concept\", \"content\", and optional \"tags\". Policy: {policy}"
+            )
         } else {
             "When generating your response, produce a JSON object with two fields: \
              \"display_text\" (your full response formatted for text display, \
              markdown is fine) and \"spoken_text\" (a natural, expressive version \
-             for voice delivery — no markdown, conversational tone, written to be heard)."
+             for voice delivery, no markdown, conversational tone, written to be heard)."
+                .to_string()
         };
 
         let mut properties = json!({
@@ -576,9 +934,27 @@ impl GeminiProvider {
                     "type": "OBJECT",
                     "properties": properties,
                     "required": required
-                }
+                },
+                "thinkingConfig": { "thinkingBudget": gemini_thinking_budget() }
             }
         })
+    }
+
+    /// Strip a surrounding markdown code fence (```json ... ``` or ``` ... ```)
+    /// from a model reply. Tool-bearing turns no longer use controlled
+    /// generation (responseSchema), so the JSON contract is enforced only by
+    /// the system instruction — models occasionally fence the object anyway.
+    fn strip_json_code_fences(raw: &str) -> &str {
+        let trimmed = raw.trim();
+        let Some(rest) = trimmed.strip_prefix("```") else {
+            return trimmed;
+        };
+        // Drop an optional language tag (e.g. `json`) up to the first newline.
+        let body = match rest.find('\n') {
+            Some(idx) => &rest[idx + 1..],
+            None => rest,
+        };
+        body.trim_end().strip_suffix("```").unwrap_or(body).trim()
     }
 
     /// Parse a structured JSON response from Gemini.
@@ -594,7 +970,9 @@ impl GeminiProvider {
         Option<Value>,
     ) {
         let raw = Self::parse_response_text(status, body);
-        if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&raw) {
+        if let Ok(parsed) =
+            serde_json::from_str::<serde_json::Value>(Self::strip_json_code_fences(&raw))
+        {
             let display = parsed
                 .get("display_text")
                 .and_then(Value::as_str)
@@ -706,6 +1084,66 @@ impl GeminiProvider {
         Ok(json!({
             "contents": [{"parts": parts}]
         }))
+    }
+
+    /// Render a Gemini error body as its message plus any structured detail
+    /// the API attached (`error.status`, `error.details`).
+    ///
+    /// Gemini's top-level message is often just "Request contains an invalid
+    /// argument." — when present, the details name the offending field, so
+    /// keep them in the surfaced error instead of dropping them.
+    fn api_error_detail(body: &Value) -> String {
+        let error = body.get("error");
+        let message = error
+            .and_then(|e| e.get("message"))
+            .and_then(Value::as_str)
+            .unwrap_or("unknown error");
+        let mut rendered = message.to_string();
+        if let Some(status) = error.and_then(|e| e.get("status")).and_then(Value::as_str) {
+            rendered.push_str(&format!(" [{status}]"));
+        }
+        if let Some(details) = error
+            .and_then(|e| e.get("details"))
+            .filter(|d| !d.is_null())
+        {
+            let details_text: String = details.to_string().chars().take(600).collect();
+            rendered.push_str(&format!(" details={details_text}"));
+        }
+        rendered
+    }
+
+    /// Cap (in bytes) on the request-payload dump attached to HTTP-failure
+    /// evidence logs. Payloads carry no secrets (auth rides headers/query),
+    /// so nothing is redacted — only truncated for log hygiene.
+    const HTTP_FAILURE_PAYLOAD_LOG_CAP: usize = 16 * 1024;
+
+    /// Definitive-evidence log for any non-2xx Gemini response.
+    ///
+    /// Emitted unconditionally at ERROR level from both `invoke` and
+    /// `invoke_streaming` so a live 400 can never again escape with only
+    /// "Request contains an invalid argument.": the FULL error body (no
+    /// detail cap, unlike `api_error_detail`'s 600-char user-facing render)
+    /// plus the exact request payload (capped at 16KB) land in the log.
+    fn log_http_failure(site: &str, status: reqwest::StatusCode, body: &Value, payload: &Value) {
+        let body_text = body.to_string();
+        let mut payload_text = serde_json::to_string(payload)
+            .unwrap_or_else(|err| format!("<payload serialization failed: {err}>"));
+        let payload_bytes = payload_text.len();
+        if payload_text.len() > Self::HTTP_FAILURE_PAYLOAD_LOG_CAP {
+            let mut cut = Self::HTTP_FAILURE_PAYLOAD_LOG_CAP;
+            while !payload_text.is_char_boundary(cut) {
+                cut -= 1;
+            }
+            payload_text.truncate(cut);
+            payload_text.push_str("…<truncated>");
+        }
+        error!(
+            "gemini {site} HTTP {} — full error body: {} — request payload ({}B): {}",
+            status.as_u16(),
+            body_text,
+            payload_bytes,
+            payload_text,
+        );
     }
 
     fn parse_response_text(status: reqwest::StatusCode, body: Value) -> String {
@@ -1190,6 +1628,21 @@ impl GeminiProvider {
         }
     }
 
+    /// Detects a safety block on a single SSE chunk (`data: {...}`), reusing
+    /// `detect_content_policy_block` since each streamed chunk is shaped like
+    /// the batch response body. `None` for non-data lines, unparseable JSON,
+    /// or a chunk that isn't a block.
+    fn detect_content_policy_block_in_sse_line(line: &str) -> Option<String> {
+        let json_str = line
+            .strip_prefix("data: ")
+            .or_else(|| line.strip_prefix("data:"))?;
+        if json_str.trim() == "[DONE]" {
+            return None;
+        }
+        let chunk: Value = serde_json::from_str(json_str).ok()?;
+        Self::detect_content_policy_block(&chunk)
+    }
+
     /// Parse one SSE line (`data: {...}`) and extract the text fragment from
     /// `candidates[0].content.parts[0].text`. Returns `None` for non-data lines
     /// or lines with no text part (e.g. finish-reason-only chunks).
@@ -1404,7 +1857,7 @@ impl ModelProvider for GeminiProvider {
         let use_structured = task.kind == TaskKind::TextGenerate
             && (has_tools || task.wants_channel("spoken_text") || wants_concept || wants_plan);
 
-        let payload = match task.kind {
+        let mut payload = match task.kind {
             TaskKind::TextGenerate => {
                 let prompt = task
                     .composed_prompt_text()
@@ -1415,9 +1868,15 @@ impl ModelProvider for GeminiProvider {
                         &task.tools,
                         wants_concept,
                         wants_plan,
+                        task.response_contract.memory_candidate_policy.as_deref(),
                     )
                 } else if use_structured {
-                    Self::structured_text_request_payload(&prompt, wants_concept, wants_plan)
+                    Self::structured_text_request_payload(
+                        &prompt,
+                        wants_concept,
+                        wants_plan,
+                        task.response_contract.memory_candidate_policy.as_deref(),
+                    )
                 } else {
                     Self::request_payload(&prompt)
                 }
@@ -1434,6 +1893,11 @@ impl ModelProvider for GeminiProvider {
             TaskKind::VoiceSynthesize => bail!("Gemini does not support voice synthesis"),
             TaskKind::Embed => bail!("Gemini does not support local embedding (use OnnxProvider)"),
         };
+
+        // Per-agent content policy → safetySettings. A single post-processing
+        // step covers all payload shapes above (see `apply_safety_settings`
+        // doc). No-op for "standard"/unset — wire-identical to pre-feature.
+        Self::apply_safety_settings(&mut payload, task.provider_option_str("content_policy"));
 
         if Self::debug_model_requests_enabled() && task.kind == TaskKind::TextGenerate {
             let prompt = task
@@ -1466,12 +1930,23 @@ impl ModelProvider for GeminiProvider {
         let body = response.json::<Value>().await?;
 
         if !status.is_success() {
-            let message = body
-                .get("error")
-                .and_then(|e| e.get("message"))
-                .and_then(Value::as_str)
-                .unwrap_or("unknown error");
-            bail!("Gemini API error ({}): {}", status.as_u16(), message);
+            Self::log_http_failure("invoke", status, &body, &payload);
+            bail!(
+                "Gemini API error ({}): {}",
+                status.as_u16(),
+                Self::api_error_detail(&body)
+            );
+        }
+
+        // A safety block is a 2xx response with an empty/absent `candidates`
+        // array — distinguish it explicitly from a generic empty response so
+        // it never falls through to the generic "Gemini returned an empty
+        // response" bail, which `classify_provider_failure` maps to
+        // `switch_provider` (a jarring silent provider hop mid-turn). Checked
+        // for both response shapes (structured and plain) since the block can
+        // occur before any candidate-shape branching.
+        if let Some(block_reason) = Self::detect_content_policy_block(&body) {
+            bail!(block_reason);
         }
 
         if use_structured {
@@ -1484,7 +1959,9 @@ impl ModelProvider for GeminiProvider {
             let (content, spoken_text, memory_concept, memory_candidate, active_plan) =
                 Self::parse_structured_response(status, body.clone());
 
-            if let Ok(parsed) = serde_json::from_str::<Value>(&content) {
+            if let Ok(parsed) =
+                serde_json::from_str::<Value>(Self::strip_json_code_fences(&content))
+            {
                 if let Some(tool_call) = Self::parse_tool_call_candidate(task, &parsed)? {
                     return Ok(tool_call);
                 }
@@ -1550,18 +2027,57 @@ impl ModelProvider for GeminiProvider {
         let use_structured =
             has_tools || task.wants_channel("spoken_text") || wants_concept || wants_plan;
 
-        let payload = {
+        let mut payload = {
             let prompt = task
                 .composed_prompt_text()
                 .context("Gemini streaming text task missing prompt")?;
             if has_tools {
-                Self::tool_aware_request_payload(&prompt, &task.tools, wants_concept, wants_plan)
+                Self::tool_aware_request_payload(
+                    &prompt,
+                    &task.tools,
+                    wants_concept,
+                    wants_plan,
+                    task.response_contract.memory_candidate_policy.as_deref(),
+                )
             } else if use_structured {
-                Self::structured_text_request_payload(&prompt, wants_concept, wants_plan)
+                Self::structured_text_request_payload(
+                    &prompt,
+                    wants_concept,
+                    wants_plan,
+                    task.response_contract.memory_candidate_policy.as_deref(),
+                )
             } else {
                 Self::request_payload(&prompt)
             }
         };
+        // Same per-agent content policy → safetySettings projection as batch
+        // `invoke` — streaming builds its own payload above and must not be
+        // skipped (see `apply_safety_settings` doc).
+        Self::apply_safety_settings(&mut payload, task.provider_option_str("content_policy"));
+
+        if Self::debug_model_requests_enabled() {
+            let prompt = task
+                .composed_prompt_text()
+                .unwrap_or_else(|| "<missing prompt>".into());
+            info!(
+                "PHILOTIC_DEBUG_MODEL_REQUESTS gemini streaming composed prompt provider={} model={:?}:\n{}",
+                ModelProvider::id(self),
+                task.model,
+                prompt
+            );
+            match serde_json::to_string_pretty(&payload) {
+                Ok(json) => info!(
+                    "PHILOTIC_DEBUG_MODEL_REQUESTS gemini streaming provider payload provider={} model={:?}:\n{}",
+                    ModelProvider::id(self),
+                    task.model,
+                    json
+                ),
+                Err(err) => info!(
+                    "PHILOTIC_DEBUG_MODEL_REQUESTS gemini streaming payload serialization failed: {}",
+                    err
+                ),
+            }
+        }
 
         let payload_bytes = serde_json::to_vec(&payload).map(|v| v.len()).unwrap_or(0);
         let url = self.streaming_endpoint_url(Some(self.request_model(task)))?;
@@ -1592,12 +2108,12 @@ impl ModelProvider for GeminiProvider {
             // On HTTP error, read the full body and propagate as a failure so
             // the philote tier-escalation logic can route to a fallback provider.
             let body = response.json::<Value>().await.unwrap_or_default();
-            let message = body
-                .get("error")
-                .and_then(|e| e.get("message"))
-                .and_then(Value::as_str)
-                .unwrap_or("unknown error");
-            bail!("Gemini API error ({}): {}", status.as_u16(), message);
+            Self::log_http_failure("invoke_streaming", status, &body, &payload);
+            bail!(
+                "Gemini API error ({}): {}",
+                status.as_u16(),
+                Self::api_error_detail(&body)
+            );
         }
 
         // Read the SSE byte stream, splitting on newlines.
@@ -1627,6 +2143,11 @@ impl ModelProvider for GeminiProvider {
         // calls via streaming without any text content; we capture them here so the
         // empty-full_text check below can return them instead of bailing.
         let mut pending_function_call: Option<ProviderOutput> = None;
+        // Same safety-block detection as batch `invoke`, applied per SSE chunk —
+        // each `data: {...}` line is a full response-shaped JSON object. Sticky
+        // (first hit wins) since a block can arrive on a later chunk than the
+        // one carrying any partial text.
+        let mut content_policy_block: Option<String> = None;
         loop {
             // Hard wall-clock cap: Gemini can drip keep-alive SSE bytes every ~7s,
             // resetting the idle timer without making progress. Bail if the whole
@@ -1647,6 +2168,10 @@ impl ModelProvider for GeminiProvider {
                             line_buf.clear();
                             if line.is_empty() {
                                 continue;
+                            }
+                            if content_policy_block.is_none() {
+                                content_policy_block =
+                                    Self::detect_content_policy_block_in_sse_line(&line);
                             }
                             if let Some(text_chunk) = Self::parse_sse_text_chunk(&line) {
                                 full_text.push_str(&text_chunk);
@@ -1700,6 +2225,9 @@ impl ModelProvider for GeminiProvider {
         if !line_buf.is_empty() {
             let line = String::from_utf8_lossy(&line_buf).trim().to_string();
             if !line.is_empty() {
+                if content_policy_block.is_none() {
+                    content_policy_block = Self::detect_content_policy_block_in_sse_line(&line);
+                }
                 if let Some(text_chunk) = Self::parse_sse_text_chunk(&line) {
                     full_text.push_str(&text_chunk);
                 }
@@ -1727,7 +2255,15 @@ impl ModelProvider for GeminiProvider {
         }
 
         if full_text.trim().is_empty() {
-            // Stream completed without delivering text content (safety block, quota, etc.).
+            // A safety block takes priority over the generic empty-stream bail —
+            // without this, a blocked turn was tagged "streaming_timeout" (a
+            // transient/retry-same-provider signal) and, after one pointless
+            // same-provider retry that fails identically, still escalated to
+            // switch_provider: the exact jarring hop this detection removes.
+            if let Some(block_reason) = content_policy_block {
+                bail!(block_reason);
+            }
+            // Stream completed without delivering text content (quota, etc.).
             // Do NOT fall back to batch — that path has no timeout and caused a 27-minute hang.
             // Return a streaming_timeout error so philote escalates to the next fallback tier.
             warn!("Gemini streaming returned no content; escalating to fallback tier");
@@ -1753,7 +2289,9 @@ impl ModelProvider for GeminiProvider {
             }
             let (content, spoken_text, memory_concept, memory_candidate, active_plan) =
                 Self::parse_structured_response(reqwest::StatusCode::OK, body.clone());
-            if let Ok(parsed) = serde_json::from_str::<Value>(&content) {
+            if let Ok(parsed) =
+                serde_json::from_str::<Value>(Self::strip_json_code_fences(&content))
+            {
                 if let Some(tool_call) = Self::parse_tool_call_candidate(task, &parsed)? {
                     return Ok(tool_call);
                 }
@@ -2083,6 +2621,38 @@ impl GeminiProvider {
 #[cfg(test)]
 mod tests {
     use super::{GeminiAuth, GeminiProvider};
+
+    #[test]
+    fn union_type_arrays_collapse_to_first_non_null() {
+        // Regression for the 2026-07-20 incident: '"type": ["string","null"]'
+        // in one projected tool schema 400s the ENTIRE Gemini request
+        // ("Proto field is not repeating, cannot start list"), killing every
+        // turn of every agent that projects the tool. Union types must
+        // collapse to their first non-null member at this boundary — schemas
+        // arrive from the philote catalog AND from arbitrary upstream MCP
+        // servers via the client fabric, so the provider cannot trust its
+        // callers to pre-sanitize.
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "config_hint": {
+                    "type": ["string", "null"],
+                    "description": "hint"
+                },
+                "count": { "type": ["null", "integer"] }
+            },
+            "required": ["count"]
+        });
+        let normalized = GeminiProvider::normalize_function_parameters(&schema, true);
+        assert_eq!(
+            normalized["properties"]["config_hint"]["type"],
+            serde_json::json!("string")
+        );
+        assert_eq!(
+            normalized["properties"]["count"]["type"],
+            serde_json::json!("integer")
+        );
+    }
     use crate::controller::{
         AttachmentInput, ContextEnvelope, ControllerTask, NativeLiveProvider, RequestClass,
         RoutingHints, TaskKind,
@@ -2640,6 +3210,7 @@ mod tests {
             })],
             false,
             false,
+            None,
         );
 
         let declaration = &payload["tools"][0]["functionDeclarations"][0];
@@ -2652,6 +3223,439 @@ mod tests {
             declaration["parameters"]["properties"]["text"]["type"],
             serde_json::json!("string")
         );
+    }
+
+    fn sample_echo_tool() -> serde_json::Value {
+        serde_json::json!({
+            "tool_name": "echo",
+            "description": "Echo text",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "text": { "type": "string" }
+                },
+                "required": ["text"]
+            }
+        })
+    }
+
+    #[test]
+    fn tool_aware_payload_omits_controlled_generation() {
+        // Regression for the live tool-turn 400s (2026-07-08): combining
+        // generationConfig.responseMimeType/responseSchema with
+        // tools.functionDeclarations is unsupported by Gemini — every
+        // tool-bearing turn 400'd while tool-less turns (schema, no tools)
+        // succeeded on the same model. Function-calling mode wins.
+        let payload = GeminiProvider::tool_aware_request_payload(
+            "hello",
+            &[sample_echo_tool()],
+            true,
+            true,
+            None,
+        );
+
+        let generation_config = payload["generationConfig"]
+            .as_object()
+            .expect("generationConfig must be present");
+        assert!(
+            !generation_config.contains_key("responseMimeType"),
+            "tool-bearing payload must not set responseMimeType"
+        );
+        assert!(
+            !generation_config.contains_key("responseSchema"),
+            "tool-bearing payload must not set responseSchema"
+        );
+        // thinkingConfig rides successful tool-less requests too — it stays.
+        assert!(generation_config.contains_key("thinkingConfig"));
+        // Native function calling remains fully wired.
+        assert!(payload["tools"][0]["functionDeclarations"].is_array());
+        assert_eq!(
+            payload["toolConfig"]["functionCallingConfig"]["mode"],
+            serde_json::json!("AUTO")
+        );
+        // The structured-output contract moved into the system instruction.
+        let system_text = payload["system_instruction"]["parts"][0]["text"]
+            .as_str()
+            .expect("system instruction text");
+        assert!(system_text.contains("display_text"));
+        assert!(system_text.contains("spoken_text"));
+        assert!(system_text.contains("memory_candidate"));
+        assert!(system_text.contains("active_plan"));
+    }
+
+    #[test]
+    fn structured_text_payload_keeps_response_schema() {
+        // Tool-less structured turns keep controlled generation exactly as before.
+        let payload = GeminiProvider::structured_text_request_payload("hello", true, true, None);
+
+        let generation_config = payload["generationConfig"]
+            .as_object()
+            .expect("generationConfig must be present");
+        assert_eq!(
+            generation_config["responseMimeType"],
+            serde_json::json!("application/json")
+        );
+        assert!(generation_config["responseSchema"].is_object());
+        assert!(generation_config.contains_key("thinkingConfig"));
+        assert!(payload.get("tools").is_none());
+        assert!(payload.get("toolConfig").is_none());
+    }
+
+    #[test]
+    fn strip_json_code_fences_handles_fenced_and_plain_json() {
+        let fenced = "```json\n{\"display_text\": \"hi\", \"spoken_text\": \"hi\"}\n```";
+        assert_eq!(
+            GeminiProvider::strip_json_code_fences(fenced),
+            "{\"display_text\": \"hi\", \"spoken_text\": \"hi\"}"
+        );
+        let bare_fence = "```\n{\"a\":1}\n```";
+        assert_eq!(
+            GeminiProvider::strip_json_code_fences(bare_fence),
+            "{\"a\":1}"
+        );
+        let plain = "{\"a\":1}";
+        assert_eq!(GeminiProvider::strip_json_code_fences(plain), "{\"a\":1}");
+        let prose = "just a normal reply";
+        assert_eq!(GeminiProvider::strip_json_code_fences(prose), prose);
+    }
+
+    #[test]
+    fn parse_structured_response_tolerates_fenced_json_reply() {
+        // Without responseSchema the JSON contract is instruction-enforced,
+        // so a model may fence the object despite being told not to.
+        let body = serde_json::json!({
+            "candidates": [{
+                "content": {
+                    "parts": [{
+                        "text": "```json\n{\"display_text\": \"Hello there\", \"spoken_text\": \"Hello\"}\n```"
+                    }]
+                }
+            }]
+        });
+        let (display, spoken, _, _, _) =
+            GeminiProvider::parse_structured_response(reqwest::StatusCode::OK, body);
+        assert_eq!(display, "Hello there");
+        assert_eq!(spoken.as_deref(), Some("Hello"));
+    }
+
+    /// Invariant: a Gemini request payload must NEVER combine controlled
+    /// generation (generationConfig.responseMimeType / responseSchema) with
+    /// function calling (tools.functionDeclarations / toolConfig). Gemini
+    /// rejects the combination with an empty-detail 400 INVALID_ARGUMENT —
+    /// this is what killed every live tool-bearing turn (2026-07-08).
+    fn assert_no_controlled_generation_with_tools(payload: &serde_json::Value, label: &str) {
+        let has_tools = payload.get("tools").is_some() || payload.get("toolConfig").is_some();
+        if !has_tools {
+            return;
+        }
+        let Some(config) = payload
+            .get("generationConfig")
+            .and_then(serde_json::Value::as_object)
+        else {
+            return;
+        };
+        assert!(
+            !config.contains_key("responseSchema"),
+            "[{label}] combines tools with generationConfig.responseSchema — Gemini 400s this"
+        );
+        assert!(
+            !config.contains_key("responseMimeType"),
+            "[{label}] combines tools with generationConfig.responseMimeType — Gemini 400s this"
+        );
+    }
+
+    #[test]
+    fn gemini_payloads_never_combine_controlled_generation_with_tools() {
+        for wants_concept in [false, true] {
+            for wants_plan in [false, true] {
+                let tool_aware = GeminiProvider::tool_aware_request_payload(
+                    "hello",
+                    &[sample_echo_tool()],
+                    wants_concept,
+                    wants_plan,
+                    None,
+                );
+                assert_no_controlled_generation_with_tools(
+                    &tool_aware,
+                    &format!("tool_aware(concept={wants_concept},plan={wants_plan})"),
+                );
+
+                // Tool-less payload shapes hold the invariant vacuously —
+                // asserted anyway so any future addition of tools to these
+                // builders trips the guard immediately.
+                let structured = GeminiProvider::structured_text_request_payload(
+                    "hello",
+                    wants_concept,
+                    wants_plan,
+                    None,
+                );
+                assert_no_controlled_generation_with_tools(
+                    &structured,
+                    &format!("structured_text(concept={wants_concept},plan={wants_plan})"),
+                );
+            }
+        }
+        let basic = GeminiProvider::request_payload("hello");
+        assert_no_controlled_generation_with_tools(&basic, "request_payload");
+    }
+
+    /// Recursively assert a function-declaration parameter schema only uses
+    /// keywords Gemini accepts, and that `required` names declared properties.
+    fn assert_gemini_valid_schema(schema: &serde_json::Value, path: &str) {
+        let serde_json::Value::Object(map) = schema else {
+            panic!("schema at [{path}] is not an object: {schema}");
+        };
+        for (key, value) in map {
+            assert!(
+                GeminiProvider::GEMINI_FUNCTION_SCHEMA_KEYS.contains(&key.as_str()),
+                "Gemini-unsupported schema keyword [{key}] at [{path}]"
+            );
+            match key.as_str() {
+                "properties" => {
+                    for (name, prop_schema) in
+                        value.as_object().expect("properties must be an object")
+                    {
+                        assert_gemini_valid_schema(prop_schema, &format!("{path}.{name}"));
+                    }
+                }
+                "items" => assert_gemini_valid_schema(value, &format!("{path}[]")),
+                _ => {}
+            }
+        }
+        if let Some(required) = map.get("required").and_then(serde_json::Value::as_array) {
+            let properties = map
+                .get("properties")
+                .and_then(serde_json::Value::as_object)
+                .unwrap_or_else(|| panic!("required without properties at [{path}]"));
+            for entry in required {
+                let name = entry.as_str().expect("required entries must be strings");
+                assert!(
+                    properties.contains_key(name),
+                    "required [{name}] not among properties at [{path}]"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn sanitizes_gemini_rejected_schema_keywords() {
+        // Regression for the live vps-jane failure (2026-07-05): once the
+        // life.* tool contracts landed exact JSON schemas, Gemini rejected
+        // every tool-bearing turn with
+        // `400 INVALID_ARGUMENT: Request contains an invalid argument.`
+        // because the declarations carried keywords like "default" that
+        // FunctionDeclaration schemas do not support.
+        let declarations = GeminiProvider::function_declarations(&[serde_json::json!({
+            "tool_name": "life.observe",
+            "description": "Propose a grounded observation.",
+            "input_schema": {
+                "type": "object",
+                "required": ["observation_id", "evidence", "ghost_field"],
+                "properties": {
+                    "observation_id": { "type": "string" },
+                    "evidence": {
+                        "type": "object",
+                        "required": ["validation_state"],
+                        "properties": {
+                            "confidence": { "type": "number", "minimum": 0, "maximum": 1 },
+                            "validation_state": {
+                                "type": "string",
+                                "enum": ["inferred", "proposed"],
+                                "default": "proposed"
+                            },
+                            "source_refs": {
+                                "type": "array",
+                                "minItems": 1,
+                                "items": { "type": "object", "default": {} }
+                            },
+                            "metadata": {
+                                "type": "object",
+                                "default": {},
+                                "additionalProperties": true
+                            }
+                        }
+                    },
+                    "count": { "type": "integer", "enum": [1, 2], "default": 1 }
+                }
+            }
+        })]);
+
+        assert_eq!(declarations.len(), 1);
+        let parameters = &declarations[0]["parameters"];
+        assert_gemini_valid_schema(parameters, "life_observe.parameters");
+
+        // A stripped "default" survives as a description hint.
+        let validation_state =
+            &parameters["properties"]["evidence"]["properties"]["validation_state"];
+        assert!(validation_state.get("default").is_none());
+        assert!(
+            validation_state["description"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("Defaults to proposed.")
+        );
+        // "enum" on non-string types is dropped.
+        assert!(parameters["properties"]["count"].get("enum").is_none());
+        // "required" entries that do not name declared properties are dropped.
+        assert_eq!(
+            parameters["required"],
+            serde_json::json!(["observation_id", "evidence"])
+        );
+    }
+
+    #[test]
+    fn life_tool_catalog_schemas_produce_gemini_valid_declarations() {
+        // The exact schemas Beacon's steward turns project — straight from the
+        // philote catalog — must sanitize into Gemini-valid declarations.
+        let tools: Vec<serde_json::Value> = agent_core::catalog::tool_catalog()
+            .values()
+            .filter(|definition| definition.tool_name.starts_with("life."))
+            .map(|definition| serde_json::to_value(definition).expect("serialize ToolDefinition"))
+            .collect();
+        assert!(
+            tools.len() >= 6,
+            "expected the life.* catalog tools, found {}",
+            tools.len()
+        );
+
+        let declarations = GeminiProvider::function_declarations(&tools);
+        assert_eq!(declarations.len(), tools.len());
+        for declaration in &declarations {
+            let name = declaration["name"].as_str().unwrap_or("?");
+            assert_gemini_valid_schema(&declaration["parameters"], &format!("{name}.parameters"));
+        }
+    }
+
+    #[test]
+    fn full_catalog_schemas_sanitize_to_valid_gemini_declarations() {
+        // Build-time gate for the WHOLE catalog (not just life.*): the residual
+        // live 400 (2026-07-07, Beacon "open loops") came from schema residue
+        // that #148's life.*-only test never exercised. Any tool whose schema
+        // sanitizes to a structurally invalid Gemini declaration must fail here,
+        // not in production with an empty-details INVALID_ARGUMENT.
+        let tools: Vec<serde_json::Value> = agent_core::catalog::tool_catalog()
+            .values()
+            .map(|definition| serde_json::to_value(definition).expect("serialize ToolDefinition"))
+            .collect();
+        assert!(!tools.is_empty(), "catalog must expose tools");
+
+        let declarations = GeminiProvider::function_declarations(&tools);
+        assert_eq!(declarations.len(), tools.len());
+        let mut failures = Vec::new();
+        for declaration in &declarations {
+            let name = declaration["name"].as_str().unwrap_or("?");
+            if let Err(reason) = GeminiProvider::validate_gemini_declaration_schema(
+                &declaration["parameters"],
+                &format!("{name}.parameters"),
+                true,
+            ) {
+                failures.push(reason);
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "invalid Gemini declarations after sanitization:\n{}",
+            failures.join("\n")
+        );
+    }
+
+    #[test]
+    fn sanitizer_repairs_empty_object_property_to_string() {
+        // Residue class 1: a free-form `{"type":"object"}` property (e.g. the
+        // catalog's `metadata`) sanitizes to a JSON-encoded string.
+        let declarations = GeminiProvider::function_declarations(&[serde_json::json!({
+            "tool_name": "life.observe",
+            "description": "Propose an observation.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "metadata": { "type": "object", "default": {} }
+                }
+            }
+        })]);
+        let metadata = &declarations[0]["parameters"]["properties"]["metadata"];
+        assert_eq!(metadata["type"], serde_json::json!("string"));
+        assert!(metadata.get("properties").is_none());
+        assert!(
+            metadata["description"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("JSON-encoded object")
+        );
+        GeminiProvider::validate_gemini_declaration_schema(
+            &declarations[0]["parameters"],
+            "life_observe.parameters",
+            true,
+        )
+        .expect("repaired declaration must validate");
+    }
+
+    #[test]
+    fn sanitizer_repairs_array_of_empty_objects() {
+        // Residue class 2: `items: {"type":"object"}` (e.g. `passage_refs`,
+        // `*_node_refs`) — the empty-object item is downgraded to a string.
+        let declarations = GeminiProvider::function_declarations(&[serde_json::json!({
+            "tool_name": "life.recall.feedback",
+            "description": "Record feedback.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "noisy_node_refs": {
+                        "type": "array",
+                        "items": { "type": "object" },
+                        "default": []
+                    }
+                }
+            }
+        })]);
+        let items = &declarations[0]["parameters"]["properties"]["noisy_node_refs"]["items"];
+        assert_eq!(items["type"], serde_json::json!("string"));
+        GeminiProvider::validate_gemini_declaration_schema(
+            &declarations[0]["parameters"],
+            "feedback.parameters",
+            true,
+        )
+        .expect("repaired declaration must validate");
+    }
+
+    #[test]
+    fn sanitizer_adds_items_to_array_without_items() {
+        // Residue class 3: an ARRAY that declares no `items` gets a string item.
+        let declarations = GeminiProvider::function_declarations(&[serde_json::json!({
+            "tool_name": "media.transform",
+            "description": "Transform media.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "stages": { "type": "array", "description": "Ordered stages." }
+                }
+            }
+        })]);
+        let stages = &declarations[0]["parameters"]["properties"]["stages"];
+        assert_eq!(stages["items"]["type"], serde_json::json!("string"));
+        GeminiProvider::validate_gemini_declaration_schema(
+            &declarations[0]["parameters"],
+            "transform.parameters",
+            true,
+        )
+        .expect("repaired declaration must validate");
+    }
+
+    #[test]
+    fn root_empty_object_parameters_are_preserved() {
+        // The ROOT params object stays `{type:object, properties:{}}` — Gemini
+        // accepts empty properties only at the top level and no-arg tools rely
+        // on it; the empty-object repair must NOT fire at the root.
+        let declarations = GeminiProvider::function_declarations(&[serde_json::json!({
+            "tool_name": "noop",
+            "description": "No args.",
+            "input_schema": { "type": "object", "properties": {} }
+        })]);
+        let params = &declarations[0]["parameters"];
+        assert_eq!(params["type"], serde_json::json!("object"));
+        assert!(params["properties"].is_object());
+        GeminiProvider::validate_gemini_declaration_schema(params, "noop.parameters", true)
+            .expect("root empty-object params are valid");
     }
 
     #[test]
@@ -2794,6 +3798,168 @@ mod tests {
             payload["toolResponse"]["functionResponses"][0]["response"]["ok"],
             serde_json::json!(true)
         );
+    }
+
+    #[test]
+    fn request_payload_includes_thinking_budget() {
+        let payload = GeminiProvider::request_payload("hello");
+        assert_eq!(
+            payload["generationConfig"]["thinkingConfig"]["thinkingBudget"],
+            serde_json::json!(super::gemini_thinking_budget())
+        );
+    }
+
+    #[test]
+    fn request_model_defaults_text_generate_to_text_default_model() {
+        let provider = GeminiProvider::new(reqwest::Client::new(), None, None);
+        let task = minimal_text_task_with_tools(vec![]);
+        assert_eq!(
+            provider.request_model(&task),
+            super::GEMINI_TEXT_DEFAULT_MODEL
+        );
+    }
+
+    // ── content_policy → safetySettings ───────────────────────────────────
+
+    fn harm_categories(settings: &serde_json::Value) -> std::collections::HashSet<String> {
+        settings
+            .as_array()
+            .expect("safetySettings is an array")
+            .iter()
+            .map(|entry| {
+                entry
+                    .get("category")
+                    .and_then(serde_json::Value::as_str)
+                    .expect("category present")
+                    .to_string()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn unrestricted_policy_sets_block_none_for_all_five_categories() {
+        let settings =
+            GeminiProvider::safety_settings_for_content_policy(Some("unrestricted")).unwrap();
+        let categories = harm_categories(&settings);
+        for expected in [
+            "HARM_CATEGORY_HARASSMENT",
+            "HARM_CATEGORY_HATE_SPEECH",
+            "HARM_CATEGORY_SEXUALLY_EXPLICIT",
+            "HARM_CATEGORY_DANGEROUS_CONTENT",
+            "HARM_CATEGORY_CIVIC_INTEGRITY",
+        ] {
+            assert!(
+                categories.contains(expected),
+                "missing {expected} in {categories:?}"
+            );
+        }
+        for entry in settings.as_array().unwrap() {
+            assert_eq!(
+                entry.get("threshold").and_then(serde_json::Value::as_str),
+                Some("BLOCK_NONE")
+            );
+        }
+    }
+
+    #[test]
+    fn strict_policy_sets_block_medium_and_above() {
+        let settings = GeminiProvider::safety_settings_for_content_policy(Some("strict")).unwrap();
+        assert!(!settings.as_array().unwrap().is_empty());
+        for entry in settings.as_array().unwrap() {
+            assert_eq!(
+                entry.get("threshold").and_then(serde_json::Value::as_str),
+                Some("BLOCK_MEDIUM_AND_ABOVE")
+            );
+        }
+    }
+
+    #[test]
+    fn standard_and_unset_and_unknown_policy_omit_safety_settings() {
+        assert!(GeminiProvider::safety_settings_for_content_policy(Some("standard")).is_none());
+        assert!(GeminiProvider::safety_settings_for_content_policy(None).is_none());
+        assert!(
+            GeminiProvider::safety_settings_for_content_policy(Some("typo-value")).is_none(),
+            "an unrecognized value must fail safe (omit), never accidentally loosen filtering"
+        );
+    }
+
+    #[test]
+    fn apply_safety_settings_is_noop_for_standard_payload_shape() {
+        let mut payload = GeminiProvider::request_payload("hi");
+        let before = payload.clone();
+        GeminiProvider::apply_safety_settings(&mut payload, Some("standard"));
+        assert_eq!(payload, before, "standard must not touch the wire payload");
+        assert!(payload.get("safetySettings").is_none());
+    }
+
+    #[test]
+    fn apply_safety_settings_injects_into_all_three_payload_shapes() {
+        let mut plain = GeminiProvider::request_payload("hi");
+        GeminiProvider::apply_safety_settings(&mut plain, Some("unrestricted"));
+        assert!(plain.get("safetySettings").is_some());
+
+        let mut tool_bearing = GeminiProvider::tool_aware_request_payload(
+            "hi",
+            &[serde_json::json!({"tool_name": "echo", "description": "d"})],
+            false,
+            false,
+            None,
+        );
+        GeminiProvider::apply_safety_settings(&mut tool_bearing, Some("unrestricted"));
+        assert!(tool_bearing.get("safetySettings").is_some());
+
+        let mut structured =
+            GeminiProvider::structured_text_request_payload("hi", false, false, None);
+        GeminiProvider::apply_safety_settings(&mut structured, Some("unrestricted"));
+        assert!(structured.get("safetySettings").is_some());
+    }
+
+    // ── safety-block detection ─────────────────────────────────────────────
+
+    #[test]
+    fn detect_content_policy_block_recognizes_prompt_feedback_block_reason() {
+        let body = serde_json::json!({
+            "promptFeedback": { "blockReason": "SAFETY" },
+            "candidates": []
+        });
+        let reason = GeminiProvider::detect_content_policy_block(&body).unwrap();
+        assert!(reason.contains("gemini_content_policy_block"));
+        assert!(reason.contains("blockReason=SAFETY"));
+    }
+
+    #[test]
+    fn detect_content_policy_block_recognizes_finish_reason_safety() {
+        let body = serde_json::json!({
+            "candidates": [{ "finishReason": "SAFETY", "content": { "parts": [] } }]
+        });
+        let reason = GeminiProvider::detect_content_policy_block(&body).unwrap();
+        assert!(reason.contains("gemini_content_policy_block"));
+        assert!(reason.contains("finishReason=SAFETY"));
+    }
+
+    #[test]
+    fn detect_content_policy_block_recognizes_prohibited_content() {
+        let body = serde_json::json!({
+            "candidates": [{ "finishReason": "PROHIBITED_CONTENT" }]
+        });
+        assert!(GeminiProvider::detect_content_policy_block(&body).is_some());
+    }
+
+    #[test]
+    fn detect_content_policy_block_ignores_normal_stop_and_generic_empty() {
+        let normal = serde_json::json!({
+            "candidates": [{ "finishReason": "STOP", "content": { "parts": [{"text": "hi"}] } }]
+        });
+        assert!(GeminiProvider::detect_content_policy_block(&normal).is_none());
+
+        let generic_empty = serde_json::json!({ "candidates": [] });
+        assert!(GeminiProvider::detect_content_policy_block(&generic_empty).is_none());
+
+        let unspecified = serde_json::json!({
+            "promptFeedback": { "blockReason": "BLOCK_REASON_UNSPECIFIED" },
+            "candidates": []
+        });
+        assert!(GeminiProvider::detect_content_policy_block(&unspecified).is_none());
     }
 }
 

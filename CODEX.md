@@ -12,6 +12,7 @@ This file provides guidance to OpenAI Codex when working with code in this repos
    - `graph_digest` → compressed domain→proposal→seam→verification overview
    - `graph_next_task` → scored work recommendation with conflict avoidance
 3. **Orient and Recall**: Run `just session-start` or `python3 scripts/muninn_mcp.py bootstrap`, then use `$muninn-memory-habit` for the Muninn triad: self, user, topic. If Muninn cannot bootstrap, stop and require explicit operator approval before meaningful work.
+   - Trusted local Codex clients may use the `muninn-local` MCP server in `.mcp.json`; it runs `muninn mcp` against the loopback Muninn listener.
 4. **Verify Green Status**: Run `just check` and `cargo test --workspace` to confirm the baseline is stable.
 5. **Record Decisions**: After completing work, use `graph_decide` for graph audit and `muninn_decide` / `muninn_remember` for the durable memory delta.
 
@@ -124,3 +125,4 @@ Do not store transcripts, logs, or task-list churn. Muninn answers "why this mat
 - `docs/architecture/ARCHITECTURE.md` — system design & data flows
 - `docs/process/WORKFLOW.md` — SVE operating loop
 - `docs/task.md` — active execution surface
+- `docs/reference/MUNINN_DIRECT_CLIENT_ACCESS.md` — private native Muninn MCP access for trusted clients

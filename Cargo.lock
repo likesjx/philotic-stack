@@ -95,6 +95,8 @@ dependencies = [
  "async-trait",
  "axum 0.7.9",
  "base64 0.22.1",
+ "blake3",
+ "chrono",
  "clap",
  "ed25519-dalek",
  "hex",
@@ -112,6 +114,7 @@ dependencies = [
  "tokio",
  "tower-http 0.5.2",
  "tracing",
+ "tracing-appender",
  "tracing-subscriber",
  "uuid",
  "webrtc",
@@ -938,6 +941,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "crossbeam-channel"
+version = "0.5.16"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d85363c37faeca707aef026efa9f3b34d077bce547e48f770770625c6013679e"
+dependencies = [
+ "crossbeam-utils",
+]
+
+[[package]]
 name = "crossbeam-deque"
 version = "0.8.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1165,7 +1177,9 @@ dependencies = [
  "async-trait",
  "chrono",
  "datasource",
+ "futures",
  "neo4rs",
+ "philotic-client",
  "reqwest",
  "serde",
  "serde_json",
@@ -1523,6 +1537,13 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d817e038c30374a4bcb22f94d0a8a0e216958d4c3dcde369b1439fec4bdda6e6"
 
 [[package]]
+name = "exec-guard"
+version = "0.1.0"
+dependencies = [
+ "regex",
+]
+
+[[package]]
 name = "fallible-iterator"
 version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1857,23 +1878,6 @@ dependencies = [
  "tracing",
  "uuid",
  "walkdir",
-]
-
-[[package]]
-name = "graph-runner"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "clap",
- "philotic-client",
- "rusqlite",
- "serde",
- "serde_json",
- "tempfile",
- "tokio",
- "tracing",
- "tracing-subscriber",
- "ulid",
 ]
 
 [[package]]
@@ -2679,11 +2683,13 @@ version = "0.1.0"
 dependencies = [
  "aes-gcm",
  "anyhow",
+ "async-trait",
  "base64 0.22.1",
  "byteorder",
  "chacha20poly1305",
  "clap",
  "futures-util",
+ "membrane",
  "opus",
  "philotic-client",
  "rand 0.8.5",
@@ -2714,10 +2720,24 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
- "tower-http 0.5.2",
  "tracing",
  "tracing-subscriber",
  "uuid",
+]
+
+[[package]]
+name = "membrane-mcp-client"
+version = "0.1.0"
+dependencies = [
+ "ansible-mesh-core",
+ "anyhow",
+ "philotic-client",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
@@ -2725,10 +2745,15 @@ name = "membrane-telegram"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "base64 0.22.1",
+ "blake3",
  "clap",
+ "hex",
+ "membrane",
  "philotic-client",
  "pulldown-cmark",
+ "rand 0.8.5",
  "reqwest",
  "serde_json",
  "sha2",
@@ -2758,6 +2783,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "futures",
  "reqwest",
  "serde",
  "serde_json",
@@ -2852,6 +2878,7 @@ dependencies = [
  "mlx-runner",
  "onnx-runner",
  "parakeet-runner",
+ "philote",
  "philotic-client",
  "reqwest",
  "serde",
@@ -3366,9 +3393,11 @@ dependencies = [
  "chrono",
  "clap",
  "data-memorygraphrag",
+ "exec-guard",
  "media-prep",
  "memory-core",
  "philotic-client",
+ "reqwest",
  "serde",
  "serde_json",
  "tokio",
@@ -3393,6 +3422,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "philotic-edge-protocol"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "philotic-graph"
 version = "0.1.0"
 dependencies = [
@@ -3414,6 +3451,7 @@ dependencies = [
 name = "philotic-primitives-mesh"
 version = "0.1.0"
 dependencies = [
+ "base64 0.22.1",
  "serde",
  "serde_json",
  "uuid",
@@ -3445,6 +3483,7 @@ dependencies = [
 name = "philotic-web"
 version = "0.1.0"
 dependencies = [
+ "aes-gcm",
  "ansible-mesh-core",
  "anyhow",
  "axum 0.7.9",
@@ -3453,11 +3492,15 @@ dependencies = [
  "clap",
  "dirs 5.0.1",
  "ed25519-dalek",
+ "exec-guard",
+ "futures-util",
  "glob",
  "graph-intelligence",
  "hex",
  "inquire",
+ "perimeter-core",
  "philotic-client",
+ "philotic-edge-protocol",
  "philotic-graph",
  "rand 0.8.5",
  "reqwest",
@@ -3466,6 +3509,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "tempfile",
  "tokio",
  "tokio-tungstenite",
  "tower-http 0.5.2",
@@ -4679,6 +4723,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "13c2bddecc57b384dee18652358fb23172facb8a2c51ccc10d74c157bdea3292"
 
 [[package]]
+name = "symlink"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a7973cce6668464ea31f176d85b13c7ab3bba2cb3b77a2ed26abd7801688010a"
+
+[[package]]
 name = "syn"
 version = "2.0.117"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5031,6 +5081,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "exec-guard",
  "memory-core",
  "philotic-client",
  "philotic-sandbox",
@@ -5124,6 +5175,19 @@ dependencies = [
  "pin-project-lite",
  "tracing-attributes",
  "tracing-core",
+]
+
+[[package]]
+name = "tracing-appender"
+version = "0.2.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "050686193eb999b4bb3bc2acfa891a13da00f79734704c4b8b4ef1a10b368a3c"
+dependencies = [
+ "crossbeam-channel",
+ "symlink",
+ "thiserror 2.0.18",
+ "time",
+ "tracing-subscriber",
 ]
 
 [[package]]

@@ -22,6 +22,98 @@ use memory_core::MuninnConfig;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
 
+// ──── Nightly cron scheduling ─────────────────────────────────────────────────
+//
+// The shutdown-drain sweep alone leaves long-lived hotels accumulating
+// near-duplicate engrams for days (audit finding): a hotel that never
+// restarts never consolidates. Mirroring `memory_hygiene`, the sweep can
+// also run on a nightly in-process cron job — same sentinel-role
+// interception in `CronTicker::fire`, same per-hotel operator opt-in
+// re-checked at fire time (CronJobSync replicates job definitions to every
+// mesh peer regardless of that peer's own opt-in).
+
+/// Sentinel `target_role` intercepted by `CronTicker::fire` — never resolves
+/// to a guest inbox; the `internal:` prefix keeps it out of
+/// `resolve_target_role_record`'s `role:{agent}:{role}` parsing.
+pub const CRON_TARGET_ROLE: &str = "internal:dream_sweep";
+
+/// Env var gating whether the hotel registers/runs the nightly sweep.
+/// Operator opt-in per hotel — disabled unless explicitly truthy. The
+/// shutdown-drain sweep is unaffected by this flag.
+pub const ENV_ENABLED: &str = "PHILOTIC_DREAM_SWEEP_ENABLED";
+
+/// Env override for the nightly cron schedule (7-field `cron` crate syntax).
+pub const ENV_SCHEDULE: &str = "PHILOTIC_DREAM_SWEEP_SCHEDULE";
+
+/// Default: nightly at 03:30 UTC — offset from memory-hygiene's 03:00 so the
+/// two sweeps never hammer Muninn concurrently.
+pub const DEFAULT_SCHEDULE: &str = "0 30 3 * * * *";
+
+/// Deterministic id for the auto-registered per-hotel cron job — stable
+/// across restarts so `ensure_scheduled` is idempotent.
+pub fn cron_job_id(hotel_name: &str) -> String {
+    format!("dream-sweep:{hotel_name}")
+}
+
+/// True when the operator has opted this hotel into the nightly sweep.
+pub fn sweep_enabled(env: impl Fn(&str) -> Option<String>) -> bool {
+    match env(ENV_ENABLED) {
+        None => false,
+        Some(v) => {
+            let v = v.trim().to_ascii_lowercase();
+            v == "1" || v == "true" || v == "yes"
+        }
+    }
+}
+
+/// Idempotent, operator-opt-in registration of the nightly dream-sweep cron
+/// job. No-op unless [`ENV_ENABLED`] is truthy for this hotel process; never
+/// overwrites an operator-edited schedule.
+pub fn ensure_scheduled(
+    graph: &GraphDomain,
+    hotel_name: &str,
+    now_ms: u64,
+    env: impl Fn(&str) -> Option<String>,
+) -> anyhow::Result<()> {
+    if !sweep_enabled(&env) {
+        debug!(
+            hotel = %hotel_name,
+            "dream-sweep: not enabled for this hotel (PHILOTIC_DREAM_SWEEP_ENABLED unset)"
+        );
+        return Ok(());
+    }
+
+    let job_id = cron_job_id(hotel_name);
+    if graph.get_cron_job(&job_id)?.is_some() {
+        debug!(hotel = %hotel_name, "dream-sweep: cron job already registered");
+        return Ok(());
+    }
+
+    let schedule = env(ENV_SCHEDULE)
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| DEFAULT_SCHEDULE.to_string());
+    let next_fire_at = ansible_mesh_core::cron::next_fire_after(&schedule, now_ms)?;
+
+    let job = ansible_mesh_core::cron::CronJob {
+        id: job_id.clone(),
+        schedule,
+        target_role: CRON_TARGET_ROLE.to_string(),
+        target_node_id: None,
+        payload: "{}".to_string(),
+        guaranteed: false,
+        enabled: true,
+        last_fired_epoch: None,
+        next_fire_at,
+        created_at: now_ms,
+        created_by: ansible_mesh_core::cron::CronJobSource::Operator,
+        silent_ok: true,
+        session_target: ansible_mesh_core::cron::CronSessionTarget::Isolated,
+    };
+    graph.upsert_cron_job(&job)?;
+    info!(hotel = %hotel_name, job_id = %job_id, next_fire_at, "dream-sweep: nightly consolidation cron job registered");
+    Ok(())
+}
+
 // ──── Public entry point ──────────────────────────────────────────────────────
 
 /// Run the dream sweep across all active agent vaults.
@@ -432,7 +524,10 @@ async fn evolve_all(
 // ──── Helpers ─────────────────────────────────────────────────────────────────
 
 /// Derive `self_{agent_id}` vault names for all active guests in the hotel.
-fn collect_agent_vault_names(graph: &GraphDomain, hotel_name: &str) -> Vec<String> {
+///
+/// `pub(crate)` so the memory.hygiene sweep (`crate::memory_hygiene`) can
+/// reuse the same vault-derivation logic instead of duplicating it.
+pub(crate) fn collect_agent_vault_names(graph: &GraphDomain, hotel_name: &str) -> Vec<String> {
     graph
         .list_guests(hotel_name, true)
         .unwrap_or_default()
@@ -515,5 +610,38 @@ mod tests {
     #[test]
     fn cosine_cluster_empty_input() {
         assert!(cosine_cluster(&[], 0.82).is_empty());
+    }
+
+    #[test]
+    fn nightly_sweep_enabled_requires_explicit_truthy_value() {
+        assert!(!sweep_enabled(|_| None));
+        assert!(!sweep_enabled(
+            |k| (k == ENV_ENABLED).then(|| "0".to_string())
+        ));
+        assert!(!sweep_enabled(
+            |k| (k == ENV_ENABLED).then(|| "false".to_string())
+        ));
+        assert!(sweep_enabled(
+            |k| (k == ENV_ENABLED).then(|| "1".to_string())
+        ));
+        assert!(sweep_enabled(
+            |k| (k == ENV_ENABLED).then(|| "TRUE".to_string())
+        ));
+    }
+
+    #[test]
+    fn nightly_default_schedule_parses_and_is_offset_from_hygiene() {
+        // Both sweeps hit Muninn; keep them staggered.
+        assert_ne!(DEFAULT_SCHEDULE, crate::memory_hygiene::DEFAULT_SCHEDULE);
+        let next = ansible_mesh_core::cron::next_fire_after(DEFAULT_SCHEDULE, 1_750_000_000_000)
+            .expect("default schedule parses");
+        assert!(next > 1_750_000_000_000);
+    }
+
+    #[test]
+    fn cron_sentinel_role_stays_internal() {
+        assert!(CRON_TARGET_ROLE.starts_with("internal:"));
+        assert_ne!(CRON_TARGET_ROLE, crate::memory_hygiene::CRON_TARGET_ROLE);
+        assert_eq!(cron_job_id("mac-jane"), "dream-sweep:mac-jane");
     }
 }

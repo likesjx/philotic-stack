@@ -2,12 +2,20 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
+mod autonomy;
 mod component;
+mod config;
+mod doctor;
+mod explain;
 mod flush;
 mod footprint;
 mod harness;
+mod heal;
 mod init;
+mod keys;
 mod load;
+mod mcp;
+mod memory_explain;
 mod mesh;
 mod muninn;
 mod onboard;
@@ -84,6 +92,64 @@ enum Command {
         hotel: String,
     },
 
+    /// Self-diagnosis: detect known failure patterns, optionally repairing them
+    ///
+    /// Without --fix this is read-only: prints each finding's repair plan
+    /// (Planned/NeedsConfirm/NotRepairable) but never writes. With --fix,
+    /// auto-repairable checks (logs rotation, stale IPC sockets) are applied;
+    /// checks that need an operator decision (port drift, orphan processes)
+    /// still only print NeedsConfirm — they are never auto-applied. The
+    /// context DB itself is always opened read-only.
+    Doctor {
+        /// Hotel name to inspect (default: default). Display/label only —
+        /// does not select which context DB is opened; see --profile/--db.
+        #[arg(long, default_value = "default")]
+        hotel: String,
+
+        /// Emit machine-readable JSON instead of human-readable output
+        #[arg(long)]
+        json: bool,
+
+        /// Minimum severity to report and gate the exit code on
+        #[arg(long, default_value = "warning")]
+        severity_min: String,
+
+        /// Run only these check IDs (repeatable)
+        #[arg(long = "only")]
+        only: Vec<String>,
+
+        /// Skip these check IDs (repeatable)
+        #[arg(long = "skip")]
+        skip: Vec<String>,
+
+        /// Print the check catalog (id + severity) and exit without running anything
+        #[arg(long)]
+        list_checks: bool,
+
+        /// Apply auto-repairable fixes (logs rotation, stale IPC sockets).
+        /// Checks that need operator confirmation (ports, orphan processes)
+        /// are never auto-applied even with this flag; vault divergence is
+        /// never touched by doctor at all.
+        #[arg(long)]
+        fix: bool,
+
+        /// Target this profile's context DB (~/.philotic/<name>/context.db),
+        /// independent of the PHILOTIC_PROFILE env var. Overridden by --db.
+        #[arg(long)]
+        profile: Option<String>,
+
+        /// Open this exact context DB path, bypassing --profile and
+        /// PHILOTIC_PROFILE entirely. Highest-precedence targeting option.
+        #[arg(long)]
+        db: Option<PathBuf>,
+    },
+
+    /// Explain the decision chain behind an agent-facing action
+    Explain {
+        #[command(subcommand)]
+        action: explain::ExplainAction,
+    },
+
     /// List configured agents
     Agents {
         /// Path to mesh-config.json (default: ./mesh-config.json)
@@ -142,6 +208,44 @@ enum Command {
     Mesh {
         #[command(subcommand)]
         action: MeshAction,
+    },
+
+    /// MCP credential and client UAT helpers
+    Mcp {
+        #[command(subcommand)]
+        action: mcp::McpAction,
+    },
+
+    /// Manage provider keys and model configuration in the hotel vault/config plane
+    Keys {
+        #[command(subcommand)]
+        action: keys::KeysAction,
+    },
+
+    /// Inspect and close self-heal circuit work items (Autopoiesis Slice A3)
+    Heal {
+        #[command(subcommand)]
+        action: heal::HealAction,
+    },
+
+    /// Read/write a `node_config` key/value (operator/management-only IPC)
+    Config {
+        #[command(subcommand)]
+        action: config::ConfigAction,
+    },
+
+    /// Autonomy trust ledger — per-lane posture, budget, and promotion
+    /// eligibility (Autopoiesis Slice A9)
+    Autonomy {
+        #[command(subcommand)]
+        action: autonomy::AutonomyAction,
+    },
+
+    /// Memory Transparency — merged provenance query across Muninn, the intel
+    /// graph, and LifeGraph (Memory Transparency Slice M2)
+    Memory {
+        #[command(subcommand)]
+        action: memory_explain::MemoryAction,
     },
 
     /// Project intelligence graph — scan, query, and serve the codebase graph
@@ -215,6 +319,11 @@ enum GraphAction {
     /// List all seams
     Seams,
 
+    /// Show what is green right now: active proposals + their latest recorded
+    /// test run (pass/fail counts, age), read straight from recorded
+    /// TestRun/TestedBy evidence rather than the prose verification_level field.
+    Green,
+
     /// Search the graph
     Search {
         /// Search query
@@ -223,6 +332,11 @@ enum GraphAction {
 
     /// Manage local external harnesses and record desired/rendered/observed state in intel-graph
     Harness {
+        /// Graph DB to operate on (default: live DB; env: PHILOTIC_GRAPH_DB).
+        /// Use a scratch path when testing so dev iterations never pollute
+        /// the live registry.
+        #[arg(long, global = true)]
+        db: Option<String>,
         #[command(subcommand)]
         action: harness::HarnessAction,
     },
@@ -351,6 +465,20 @@ enum ServiceAction {
     },
 }
 
+/// Format a chrono::Duration as a short human-readable age string (e.g. "5m", "3h", "2d").
+fn format_age(age: chrono::Duration) -> String {
+    let secs = age.num_seconds().max(0);
+    if secs < 60 {
+        format!("{secs}s")
+    } else if secs < 3600 {
+        format!("{}m", secs / 60)
+    } else if secs < 86400 {
+        format!("{}h", secs / 3600)
+    } else {
+        format!("{}d", secs / 86400)
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -407,6 +535,28 @@ async fn main() -> Result<()> {
         Command::Start { hotel, detach } => start::run(hotel, detach).await,
         Command::Stop => stop::run().await,
         Command::Status { config, hotel } => status::run(config, hotel).await,
+        Command::Doctor {
+            hotel,
+            json,
+            severity_min,
+            only,
+            skip,
+            list_checks,
+            fix,
+            profile,
+            db,
+        } => doctor::run(
+            hotel,
+            json,
+            severity_min,
+            only,
+            skip,
+            list_checks,
+            fix,
+            profile,
+            db,
+        ),
+        Command::Explain { action } => explain::run(action),
         Command::Agents { config } => status::run_agents(config).await,
         Command::Reset { keep_identity } => reset::run(keep_identity).await,
         Command::Service { action } => match action {
@@ -432,6 +582,12 @@ async fn main() -> Result<()> {
                 host,
             } => mesh::accept(invite, hotel, host).await,
         },
+        Command::Mcp { action } => mcp::run(action).await,
+        Command::Keys { action } => keys::run(action).await,
+        Command::Heal { action } => heal::run(action).await,
+        Command::Config { action } => config::run(action).await,
+        Command::Autonomy { action } => autonomy::run(action).await,
+        Command::Memory { action } => memory_explain::run(action).await,
         Command::Graph { action } => {
             use graph_intelligence::{scanner, GraphEngine};
             use philotic_graph::PhiloticGraphConfig;
@@ -539,6 +695,87 @@ async fn main() -> Result<()> {
                     }
                     Ok(())
                 }
+                GraphAction::Green => {
+                    use graph_intelligence::schema::{EdgeRelation, NodeKind};
+
+                    let engine = GraphEngine::open(&config.db_path)?;
+                    let mut proposals = engine.query_nodes(Some(NodeKind::Proposal), None)?;
+                    proposals.retain(|p| {
+                        p.properties.get("status").and_then(|v| v.as_str()) == Some("active")
+                    });
+                    proposals.sort_by(|a, b| a.name.cmp(&b.name));
+
+                    let now = chrono::Utc::now();
+                    println!(
+                        "{:<42} {:<12} {:<10} {}",
+                        "PROPOSAL", "RUN", "AGE", "STATUS"
+                    );
+                    println!("{}", "\u{2500}".repeat(80));
+
+                    if proposals.is_empty() {
+                        println!("(no active proposals found)");
+                        return Ok(());
+                    }
+
+                    for p in &proposals {
+                        let mut latest: Option<graph_intelligence::schema::Node> = None;
+                        for e in engine
+                            .get_edges_to(&p.id)?
+                            .into_iter()
+                            .filter(|e| e.relation == EdgeRelation::TestedBy)
+                        {
+                            if let Some(run) = engine.get_node(&e.source_id)? {
+                                if run.kind == NodeKind::TestRun
+                                    && latest
+                                        .as_ref()
+                                        .map(|l| run.created_at > l.created_at)
+                                        .unwrap_or(true)
+                                {
+                                    latest = Some(run);
+                                }
+                            }
+                        }
+
+                        match latest {
+                            Some(run) => {
+                                let pass = run
+                                    .properties
+                                    .get("pass_count")
+                                    .and_then(|v| v.as_i64())
+                                    .unwrap_or(0);
+                                let total = run
+                                    .properties
+                                    .get("test_count")
+                                    .and_then(|v| v.as_i64())
+                                    .unwrap_or(0);
+                                let fail = run
+                                    .properties
+                                    .get("fail_count")
+                                    .and_then(|v| v.as_i64())
+                                    .unwrap_or(0);
+                                let age = now.signed_duration_since(run.created_at);
+                                let status = if total == 0 {
+                                    "empty"
+                                } else if fail == 0 {
+                                    "green"
+                                } else {
+                                    "red"
+                                };
+                                println!(
+                                    "{:<42} {:<12} {:<10} {}",
+                                    p.name,
+                                    format!("{}/{}", pass, total),
+                                    format_age(age),
+                                    status
+                                );
+                            }
+                            None => {
+                                println!("{:<42} {:<12} {:<10} {}", p.name, "-", "-", "none");
+                            }
+                        }
+                    }
+                    Ok(())
+                }
                 GraphAction::Search { query } => {
                     let engine = GraphEngine::open(&config.db_path)?;
                     let nodes = engine.search_nodes(&query)?;
@@ -560,7 +797,7 @@ async fn main() -> Result<()> {
                     }
                     Ok(())
                 }
-                GraphAction::Harness { action } => harness::run(action),
+                GraphAction::Harness { db, action } => harness::run(action, db),
             }
         }
         Command::Role { action } => {

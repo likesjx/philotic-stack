@@ -1,8 +1,35 @@
 use anyhow::{bail, Context, Result};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::init::{active_profile, profile_dir};
 use crate::start::find_aiua_binary;
+
+/// Build the `<key>EnvironmentVariables</key>` block for the launchd plist.
+///
+/// Returns an empty string when no profile is active (backward-compatible with
+/// legacy single-hotel installs that never set `PHILOTIC_PROFILE`).
+///
+/// When a profile IS active we pin two variables:
+///   - `PHILOTIC_PROFILE` — the hotel's profile namespace.
+///   - `PHILOTIC_GRAPH_DB_PATH` — the hotel's per-profile `context.db`. This is
+///     the same DB the hotel daemon owns; the model-router guest opens it as a
+///     sidecar (WAL) to persist model latency/error signals that feed the model
+///     oracle's health-aware ranking. On macOS this var was never set (only the
+///     Linux systemd unit set it), so the oracle health feed was dormant on all
+///     Mac hotels. See `crates/model-router/src/runtime.rs` (reads the env var
+///     directly) and the oracle read path in `crates/aiua/src/service/ipc.rs`.
+fn render_env_block(profile: Option<&str>, graph_db_path: &Path) -> String {
+    let Some(profile) = profile else {
+        return String::new();
+    };
+    let entries = format!(
+        "        <key>PHILOTIC_PROFILE</key>\n        <string>{profile}</string>\n\
+         \x20       <key>PHILOTIC_GRAPH_DB_PATH</key>\n        <string>{db}</string>",
+        profile = profile,
+        db = graph_db_path.display(),
+    );
+    format!("\n    <key>EnvironmentVariables</key>\n    <dict>\n{entries}\n    </dict>")
+}
 
 fn plist_label(hotel: &str) -> String {
     match active_profile() {
@@ -27,7 +54,7 @@ fn launchd_domain() -> String {
     format!("gui/{uid}")
 }
 
-fn service_target(hotel: &str) -> String {
+pub(crate) fn service_target(hotel: &str) -> String {
     format!("{}/{}", launchd_domain(), plist_label(hotel))
 }
 
@@ -55,16 +82,10 @@ pub async fn install(hotel: String) -> Result<()> {
     std::fs::create_dir_all(&log_dir)
         .with_context(|| format!("create log dir {}", log_dir.display()))?;
 
-    let profile_env = match active_profile() {
-        Some(ref p) => format!("        <key>PHILOTIC_PROFILE</key>\n        <string>{p}</string>"),
-        None => String::new(),
-    };
-
-    let env_block = if profile_env.is_empty() {
-        String::new()
-    } else {
-        format!("\n    <key>EnvironmentVariables</key>\n    <dict>\n{profile_env}\n    </dict>")
-    };
+    // Pin the per-profile context.db as PHILOTIC_GRAPH_DB_PATH so the model
+    // oracle health feed (fed by the model-router sidecar) works on macOS.
+    let graph_db_path = profile_dir().join("context.db");
+    let env_block = render_env_block(active_profile().as_deref(), &graph_db_path);
 
     let plist_xml = format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
@@ -272,4 +293,46 @@ pub async fn status(hotel: String) -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    #[test]
+    fn env_block_pins_profile_and_graph_db_path() {
+        let db = PathBuf::from("/Users/test/.philotic/jane/context.db");
+        let block = render_env_block(Some("jane"), &db);
+
+        assert!(block.contains("<key>EnvironmentVariables</key>"));
+        assert!(block.contains("<key>PHILOTIC_PROFILE</key>"));
+        assert!(block.contains("<string>jane</string>"));
+        // The oracle health feed regression fix: the generated plist must carry
+        // PHILOTIC_GRAPH_DB_PATH pointing at the hotel's per-profile context.db.
+        assert!(block.contains("<key>PHILOTIC_GRAPH_DB_PATH</key>"));
+        assert!(
+            block.contains("<string>/Users/test/.philotic/jane/context.db</string>"),
+            "graph db path missing/wrong in env block:\n{block}"
+        );
+    }
+
+    #[test]
+    fn env_block_uses_per_profile_path() {
+        let bjork = render_env_block(
+            Some("bjork"),
+            &PathBuf::from("/Users/test/.philotic/bjork/context.db"),
+        );
+        assert!(bjork.contains("<string>/Users/test/.philotic/bjork/context.db</string>"));
+        assert!(!bjork.contains("/jane/"));
+    }
+
+    #[test]
+    fn env_block_empty_without_profile() {
+        let block = render_env_block(None, &PathBuf::from("/x/context.db"));
+        assert!(
+            block.is_empty(),
+            "no-profile installs must not emit an env block"
+        );
+    }
 }

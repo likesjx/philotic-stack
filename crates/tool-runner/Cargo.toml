@@ -5,6 +5,7 @@ edition = "2021"
 
 [dependencies]
 anyhow = "1"
+exec-guard = { path = "../exec-guard" }
 memory-core = { path = "../memory-core" }
 clap = { version = "4", features = ["derive"] }
 philotic-client = { path = "../philotic-client" }

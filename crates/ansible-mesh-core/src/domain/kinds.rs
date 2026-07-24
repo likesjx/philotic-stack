@@ -23,6 +23,8 @@ pub const NODE_KIND_MEMBRANE_TRANSPORT_HOME: &str = "membrane_transport_home";
 pub const NODE_KIND_SECRET: &str = "secret";
 pub const NODE_KIND_ABSTRACT_SKILL: &str = "abstract_skill";
 pub const NODE_KIND_WORKFLOW_SKILL: &str = "workflow_skill";
+/// Append-only audit trail for accepted `skill.register` calls (who / what / when).
+pub const NODE_KIND_SKILL_REGISTRATION_AUDIT: &str = "skill_registration_audit";
 pub const NODE_KIND_TOOLSET_PROFILE: &str = "toolset_profile";
 pub const NODE_KIND_NODE_CAPABILITIES: &str = "node_capabilities";
 pub const NODE_KIND_CONFIG: &str = "config";
@@ -34,3 +36,13 @@ pub const NODE_KIND_USER_TASK: &str = "user_task";
 
 // Model graph (doc:model-graph-flywheel / doc:hardened-model-dispatch)
 pub const NODE_KIND_MODEL_PROFILE: &str = "model_profile";
+
+// Autopoiesis Slice A1 (doc:AUTOPOIESIS_PROPOSAL)
+/// Per-lane earned-autonomy grant (posture, budget, earned counters).
+pub const NODE_KIND_AUTONOMY_GRANT: &str = "autonomy_grant";
+/// Append-only decision record for autonomous actions (what/why/evidence/undo).
+pub const NODE_KIND_AUTONOMY_AUDIT: &str = "autonomy_audit";
+
+// Autopoiesis Slice A3 (doc:AUTOPOIESIS_PROPOSAL)
+/// Fix request filed by the heal-dispatcher for a recurring failure pattern.
+pub const NODE_KIND_HEAL_WORK_ITEM: &str = "heal_work_item";

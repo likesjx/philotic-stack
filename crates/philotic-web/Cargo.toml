@@ -23,14 +23,22 @@ hex = "0.4"
 base64 = "0.22"
 sha2 = "0.10"
 glob = "0.3"
+aes-gcm = "0.10"
 rusqlite = { version = "0.37", features = ["bundled"] }
 axum = { version = "0.7", features = ["ws"] }
 tower-http = { version = "0.5", features = ["cors", "fs"] }
 tokio-tungstenite = "0.24"
 rust-embed = { version = "8", features = ["mime-guess"] }
-reqwest = { version = "0.12", features = ["json", "rustls-tls"] }
+reqwest = { version = "0.12", features = ["json", "multipart", "rustls-tls"] }
 philotic-client = { path = "../philotic-client" }
+philotic-edge-protocol = { path = "../philotic-edge-protocol" }
 philotic-graph = { path = "../philotic-graph" }
 graph-intelligence = { path = "../graph-intelligence" }
 ansible-mesh-core = { path = "../ansible-mesh-core" }
+perimeter-core = { path = "../perimeter-core" }
+exec-guard = { path = "../exec-guard" }
 inquire = "0.7"
+
+[dev-dependencies]
+futures-util = "0.3"
+tempfile = "3"

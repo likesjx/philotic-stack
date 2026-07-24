@@ -195,9 +195,21 @@
   <text x="530" y="502" text-anchor="middle" fill="#8892b0" font-size="7.5" font-family="'JetBrains Mono', monospace">UDP :8999 gossip</text>
   <circle cx="603" cy="484" r="3" fill="#00e676"/>
 
+  <!-- Ingress Fence inside hotel -->
+  <rect x="268" y="520" width="165" height="36" rx="6" fill="#0c1525" stroke="#00e5ff" stroke-width="0.8"/>
+  <text x="350" y="536" text-anchor="middle" fill="#00e5ff" font-size="9" font-weight="600">Ingress Fence</text>
+  <text x="350" y="548" text-anchor="middle" fill="#8892b0" font-size="7.5">HotelPerimeterService rules</text>
+  <circle cx="423" cy="530" r="3" fill="#00e676"/>
+
+  <!-- HealDispatcher inside hotel -->
+  <rect x="448" y="520" width="165" height="36" rx="6" fill="#0c1525" stroke="#00e5ff" stroke-width="0.8"/>
+  <text x="530" y="536" text-anchor="middle" fill="#00e5ff" font-size="9" font-weight="600">HealDispatcher</text>
+  <text x="530" y="548" text-anchor="middle" fill="#8892b0" font-size="7.5">Self-healing queue service</text>
+  <circle cx="603" cy="530" r="3" fill="#00e676"/>
+
   <!-- IPC label below hotel -->
-  <text x="440" y="548" text-anchor="middle" fill="#00e5ff" font-size="7.5" font-weight="600" opacity="0.7">IPC / Unix Domain Socket</text>
-  <text x="440" y="560" text-anchor="middle" fill="#8892b0" font-size="7">Hotel ↔ Guest bidirectional</text>
+  <text x="440" y="572" text-anchor="middle" fill="#00e5ff" font-size="7.5" font-weight="600" opacity="0.7">IPC / Unix Domain Socket</text>
+  <text x="440" y="582" text-anchor="middle" fill="#8892b0" font-size="7">Hotel ↔ Guest bidirectional</text>
 
   <!-- ─── RIGHT: Guest Processes ─── -->
   <rect x="660" y="198" width="420" height="380" rx="8" fill="#161b2e" stroke="#00e676" stroke-width="1.2" filter="url(#shadow)"/>
@@ -222,9 +234,9 @@
   <rect x="878" y="296" width="190" height="62" rx="6" fill="#0c2010" stroke="#00e676" stroke-width="0.8"/>
   <text x="973" y="314" text-anchor="middle" fill="#00e676" font-size="10" font-weight="600">Model Controllers</text>
   <text x="973" y="328" text-anchor="middle" fill="#8892b0" font-size="8" font-family="'JetBrains Mono', monospace">model-router</text>
-  <text x="973" y="341" text-anchor="middle" fill="#8892b0" font-size="7.5">Gemini · ElevenLabs</text>
-  <text x="973" y="352" text-anchor="middle" fill="#8892b0" font-size="7.5">ONNX · MLX</text>
-  <circle cx="1058" cy="308" r="3" fill="#ffc107"/>
+  <text x="973" y="341" text-anchor="middle" fill="#8892b0" font-size="7.5">Gemini · OpenAI · OpenRouter</text>
+  <text x="973" y="352" text-anchor="middle" fill="#8892b0" font-size="7.5">ElevenLabs · Parakeet ASR</text>
+  <circle cx="1058" cy="308" r="3" fill="#00e676"/>
 
   <!-- Tool Runner -->
   <rect x="678" y="340" width="190" height="52" rx="6" fill="#0c2010" stroke="#00e676" stroke-width="0.8"/>
@@ -239,10 +251,10 @@
   <text x="773" y="436" text-anchor="middle" fill="#8892b0" font-size="7.5">Shared project graph store</text>
   <circle cx="858" cy="414" r="3" fill="#00e676"/>
 
-  <!-- Agent Graph Runner -->
+  <!-- Agent Datasource -->
   <rect x="878" y="370" width="190" height="42" rx="6" fill="#0c2010" stroke="#00e676" stroke-width="0.8"/>
-  <text x="973" y="388" text-anchor="middle" fill="#00e676" font-size="10" font-weight="600">Agent Graph Runner</text>
-  <text x="973" y="404" text-anchor="middle" fill="#8892b0" font-size="7.5">Per-agent cognitive graph</text>
+  <text x="973" y="388" text-anchor="middle" fill="#00e676" font-size="10" font-weight="600">Agent Datasource</text>
+  <text x="973" y="404" text-anchor="middle" fill="#8892b0" font-size="7.5">Per-agent cognitive CRUD partition</text>
   <circle cx="1058" cy="382" r="3" fill="#00e676"/>
 
   <!-- Membrane (guest) -->
@@ -265,42 +277,42 @@
   <!-- ═══════════════════════════════════════════ -->
   <rect x="20" y="600" width="1060" height="170" rx="8" fill="#161b2e" stroke="#ffc107" stroke-width="1" opacity="0.9"/>
   <text x="40" y="620" fill="#ffc107" font-size="9" font-weight="700" letter-spacing="1.6">STORAGE LAYER</text>
-  <text x="215" y="620" fill="#8892b0" font-size="8">All SQLite · Zero external databases</text>
+  <text x="215" y="620" fill="#8892b0" font-size="8">SQLite local databases + optional Memgraph central Cypher store</text>
 
   <!-- Context Graph -->
-  <rect x="40" y="636" width="205" height="68" rx="6" fill="#1a1800" stroke="#ffc107" stroke-width="0.8"/>
-  <text x="142" y="656" text-anchor="middle" fill="#ffc107" font-size="11" font-weight="600">Context Graph</text>
-  <text x="142" y="671" text-anchor="middle" fill="#8892b0" font-size="8" font-family="'JetBrains Mono', monospace">GraphDomain / SQLite</text>
-  <text x="142" y="685" text-anchor="middle" fill="#8892b0" font-size="7.5">Source of truth · all hotel state</text>
-  <text x="142" y="697" text-anchor="middle" fill="#8892b0" font-size="7.5">Entity-typed graph layer</text>
+  <rect x="40" y="636" width="160" height="68" rx="6" fill="#1a1800" stroke="#ffc107" stroke-width="0.8"/>
+  <text x="120" y="656" text-anchor="middle" fill="#ffc107" font-size="11" font-weight="600">Context Graph</text>
+  <text x="120" y="671" text-anchor="middle" fill="#8892b0" font-size="8" font-family="'JetBrains Mono', monospace">GraphDomain / SQLite</text>
+  <text x="120" y="685" text-anchor="middle" fill="#8892b0" font-size="7.5">Source of truth · hotel state</text>
+  <text x="120" y="697" text-anchor="middle" fill="#8892b0" font-size="7.5">Entity-typed local graph</text>
 
-  <!-- Agent Graph -->
-  <rect x="260" y="636" width="195" height="68" rx="6" fill="#1a1800" stroke="#ffc107" stroke-width="0.8"/>
-  <text x="357" y="656" text-anchor="middle" fill="#ffc107" font-size="11" font-weight="600">Agent Graph</text>
-  <text x="357" y="671" text-anchor="middle" fill="#8892b0" font-size="8" font-family="'JetBrains Mono', monospace">SQLite per-agent</text>
-  <text x="357" y="685" text-anchor="middle" fill="#8892b0" font-size="7.5">Cognitive graph · agent.graph.*</text>
-  <text x="357" y="697" text-anchor="middle" fill="#8892b0" font-size="7.5">tool surface</text>
+  <!-- Agent Datasource -->
+  <rect x="210" y="636" width="160" height="68" rx="6" fill="#1a1800" stroke="#ffc107" stroke-width="0.8"/>
+  <text x="290" y="656" text-anchor="middle" fill="#ffc107" font-size="11" font-weight="600">Agent Datasource</text>
+  <text x="290" y="671" text-anchor="middle" fill="#8892b0" font-size="8" font-family="'JetBrains Mono', monospace">SQLite per-agent CRUD</text>
+  <text x="290" y="685" text-anchor="middle" fill="#8892b0" font-size="7.5">Partitioned database files</text>
+  <text x="290" y="697" text-anchor="middle" fill="#8892b0" font-size="7.5">for independent cognitive state</text>
 
   <!-- Vault -->
-  <rect x="470" y="636" width="175" height="68" rx="6" fill="#1a1800" stroke="#ffc107" stroke-width="0.8"/>
-  <text x="557" y="656" text-anchor="middle" fill="#ffc107" font-size="11" font-weight="600">Vault</text>
-  <text x="557" y="671" text-anchor="middle" fill="#8892b0" font-size="8" font-family="'JetBrains Mono', monospace">Encrypted SQLite</text>
-  <text x="557" y="685" text-anchor="middle" fill="#8892b0" font-size="7.5">Secrets · tokens · keys</text>
-  <text x="557" y="697" text-anchor="middle" fill="#8892b0" font-size="7.5">VaultService interface</text>
+  <rect x="380" y="636" width="150" height="68" rx="6" fill="#1a1800" stroke="#ffc107" stroke-width="0.8"/>
+  <text x="455" y="656" text-anchor="middle" fill="#ffc107" font-size="11" font-weight="600">Vault</text>
+  <text x="455" y="671" text-anchor="middle" fill="#8892b0" font-size="8" font-family="'JetBrains Mono', monospace">Encrypted SQLite</text>
+  <text x="455" y="685" text-anchor="middle" fill="#8892b0" font-size="7.5">Secrets · tokens · keys</text>
+  <text x="455" y="697" text-anchor="middle" fill="#8892b0" font-size="7.5">VaultService interface</text>
+
+  <!-- Memgraph (Optional) -->
+  <rect x="540" y="636" width="160" height="68" rx="6" fill="#1a1800" stroke="#ffc107" stroke-width="0.8"/>
+  <text x="620" y="656" text-anchor="middle" fill="#ffc107" font-size="11" font-weight="600">Memgraph (Opt)</text>
+  <text x="620" y="671" text-anchor="middle" fill="#8892b0" font-size="8" font-family="'JetBrains Mono', monospace">Cypher property graph</text>
+  <text x="620" y="685" text-anchor="middle" fill="#8892b0" font-size="7.5">Central queryable database</text>
+  <text x="620" y="697" text-anchor="middle" fill="#8892b0" font-size="7.5">Bolt-connection protocol</text>
 
   <!-- Muninn -->
-  <rect x="660" y="636" width="195" height="68" rx="6" fill="#1a1800" stroke="#ffc107" stroke-width="0.8"/>
-  <text x="757" y="656" text-anchor="middle" fill="#ffc107" font-size="11" font-weight="600">Muninn</text>
-  <text x="757" y="671" text-anchor="middle" fill="#8892b0" font-size="8" font-family="'JetBrains Mono', monospace">REST :8475 · MCP :8750</text>
-  <text x="757" y="685" text-anchor="middle" fill="#8892b0" font-size="7.5">Cognitive memory engine</text>
-  <text x="757" y="697" text-anchor="middle" fill="#8892b0" font-size="7.5">Ebbinghaus decay model</text>
-
-  <!-- Router Trace -->
-  <rect x="870" y="636" width="195" height="68" rx="6" fill="#1a1800" stroke="#ffc107" stroke-width="0.8"/>
-  <text x="967" y="656" text-anchor="middle" fill="#ffc107" font-size="11" font-weight="600">Router Trace</text>
-  <text x="967" y="671" text-anchor="middle" fill="#8892b0" font-size="8" font-family="'JetBrains Mono', monospace">SQLite</text>
-  <text x="967" y="685" text-anchor="middle" fill="#8892b0" font-size="7.5">Model routing decisions</text>
-  <text x="967" y="697" text-anchor="middle" fill="#8892b0" font-size="7.5">RL training data</text>
+  <rect x="710" y="636" width="160" height="68" rx="6" fill="#1a1800" stroke="#ffc107" stroke-width="0.8"/>
+  <text x="790" y="656" text-anchor="middle" fill="#ffc107" font-size="11" font-weight="600">Muninn</text>
+  <text x="790" y="671" text-anchor="middle" fill="#8892b0" font-size="8" font-family="'JetBrains Mono', monospace">REST :8475 · MCP :8750</text>
+  <text x="790" y="685" text-anchor="middle" fill="#8892b0" font-size="7.5">Cognitive memory engine</text>
+  <text x="790" y="697" text-anchor="middle" fill="#8892b0" font-size="7.5">Ebbinghaus decay model</text>
 
   <!-- Storage layer library labels -->
   <text x="285" y="728" text-anchor="middle" fill="#8892b0" font-size="7.5" font-style="italic">philotic-primitives-* · memory-core · philotic-client</text>

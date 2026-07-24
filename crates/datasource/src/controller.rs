@@ -3,6 +3,24 @@ use async_trait::async_trait;
 use serde_json::Value;
 use std::sync::Arc;
 
+/// Prefix a `DatasourceProvider::invoke` implementation puts on an error's
+/// message/context chain to mark it as a *pre-write contract/parameter*
+/// failure — bad, missing, or invalid-shaped input that a model can
+/// reasonably repair by adjusting its next tool-call arguments (e.g. a
+/// missing required field, a blocked plan, an unknown edge rel_type) — as
+/// opposed to an infra failure (DB unreachable, IO error) that no amount of
+/// payload editing fixes.
+///
+/// `datasource::runtime::run_datasource_controller` looks for this prefix in
+/// the invocation error's chain Display (`{err:#}`) to decide whether the
+/// resulting `TaskErrorPayload` gets `sub_kind: Some("invalid_request")` —
+/// which downstream consumers (e.g. philote's life.observe dispatch) use to
+/// grant one bounded model self-correction retry instead of dropping the
+/// call. Providers should only use this marker on failures that occur
+/// strictly before any durable write, so a retry can't double-apply a
+/// partial effect.
+pub const CONTRACT_ERROR_MARKER: &str = "contract_error:";
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TaskKind {
     Query,

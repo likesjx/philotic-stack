@@ -49,7 +49,7 @@ hot_file_patterns() {
 crates/aiua/src/main.rs
 crates/aiua/src/service/ipc.rs
 crates/philote/src/runtime.rs
-crates/membrane/src/main.rs
+crates/membrane-telegram/src/main.rs
 crates/model-router/src/main.rs
 crates/model-router/src/runtime.rs
 crates/model-router/src/controller.rs

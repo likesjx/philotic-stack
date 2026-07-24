@@ -14,9 +14,11 @@
 
 ## New Project: Primitives Crate Split
 
-- [ ] Review [PHILOTIC_PRIMITIVES_CRATE_STRUCTURE.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/PHILOTIC_PRIMITIVES_CRATE_STRUCTURE.md).
-- [ ] Map the current `ansible-mesh-core` modules to the target primitive crates and identify the first extraction boundary.
-- [ ] Extract the smallest safe primitive crate boundary once the interface map is stable.
+**CLOSED 2026-07-06** — the split was folded back. `philotic-primitives-mesh` (consumed by `ansible-mesh-core`) is the only primitives crate; the five empty stub crates were deleted (codex/crate-cleanup). See ARCHITECTURE_STATUS.md.
+
+- [ ] ~~Review [PHILOTIC_PRIMITIVES_CRATE_STRUCTURE.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/PHILOTIC_PRIMITIVES_CRATE_STRUCTURE.md).~~
+- [ ] ~~Map the current `ansible-mesh-core` modules to the target primitive crates and identify the first extraction boundary.~~
+- [ ] ~~Extract the smallest safe primitive crate boundary once the interface map is stable.~~
 
 ## Current Work Item Split
 
@@ -24,15 +26,11 @@ Stable seam refs live in [SEAM_REGISTRY.md](/Users/jaredlikes/code/philotic-stac
 
 ### Primitives Refactor
 
+**CLOSED 2026-07-06** — split folded back; the five stub crates (`-agent`, `-data`, `-hotel`, `-model`, `-tool`) were empty scaffolds and are deleted. Only the two completed extractions below remain true.
+
 - [x] Extract mesh envelope primitives into `philotic-primitives-mesh`.
-- [x] Extract hotel/runtime capability and registry primitives into `philotic-primitives-hotel` behind compatibility shims.
-- [x] Extract graph/storage primitives into `philotic-primitives-data` behind compatibility shims.
-- [x] Extract agent/session/memory primitives into `philotic-primitives-agent` behind compatibility shims.
-- [x] Extract tool/skill primitives into `philotic-primitives-tool` behind compatibility shims.
-- [x] Extract tool execution route/config envelopes into `philotic-primitives-tool` where they are shared by session shaping and tool routing.
-- [x] Extract model-routing DTOs into `philotic-primitives-model` behind compatibility shims.
 - [x] Extract the `ModelManagerInvoker` wiring out of `ansible-mesh-core`.
-- [ ] Migrate downstream crates off the remaining `ansible-mesh-core` compatibility imports where direct primitive crates are now clearer.
+- ~~Extract hotel/runtime, graph/storage, agent/session, tool, and model-routing primitives into per-domain crates behind compatibility shims.~~ <!-- FOLDED BACK 2026-07-06: stubs deleted (codex/crate-cleanup); `ansible-mesh-core` stays the shared library. -->
 
 ## Current Mesh / Transport Pressure
 
@@ -64,10 +62,40 @@ Seam IDs: `model-catalog-schema`, `model-catalog-seed`, `model-catalog-projectio
 
 - [ ] Treat `origin/codex/model-graph-catalog` as stale source material, not a merge target.
 - [ ] Audit the stale branch and classify changed files as catalog schema, catalog projection, unrelated runtime drift, test-only update, or obsolete conflict.
-- [ ] Re-slice the provider-neutral model catalog schema onto current `develop`.
-- [ ] Seed the minimal supported provider families: Gemini, OpenAI, Ollama-compatible, ElevenLabs, ONNX, and MLX.
-- [ ] Add focused schema/seed tests and run touched-crate checks before merging.
-- [ ] Add one read-only projection surface before any routing integration.
+- [x] Re-slice the provider-neutral model catalog schema onto current `develop`.
+- [x] Reuse existing provider/model metadata instead of adding another provider table:
+  - `ProviderKeySpec` for provider ids, env/config/ref names, and allowed roles
+  - `ModelProfileRecord` for live per-node operational health
+  - model-router provider ids for execution identity
+- [x] Seed the minimal supported provider families: Gemini, OpenAI, OpenRouter, Ollama-compatible, ElevenLabs, ONNX, and MLX.
+- [x] Add focused schema/seed tests and run touched-crate checks before merging.
+- [x] Add one read-only projection surface before any routing integration:
+  - show static catalog facts
+  - join live `ModelProfileRecord` status/latency/error-rate when present
+  - do not alter provider selection or fallback behavior in this slice
+- [x] Share live model profile facts across hotels through hotel-state sync:
+  - advertise only the sender hotel's own `ModelProfileRecord` entries
+  - replicate remote profiles into each receiving hotel graph
+  - keep the static catalog code-owned and provider-neutral
+- [x] Add seeded trust guidance to the model catalog projection:
+  - public data may use proxy providers
+  - personal data blocks proxy providers by default
+  - LifeGraph and secret data require local providers by default
+  - trust decisions are explainable records, not hidden router behavior
+- [ ] Route through the shared model graph only via an explicit routing-policy slice:
+  - local healthy providers remain preferred for ordinary turns
+  - explicit provider hints stay authoritative
+  - cross-hotel model selection must verify peer reachability and return-route support
+  - model-router fallback should stay provider-local until hotel capability routing owns remote dispatch
+- [ ] Build the follow-on centralized `model-graph-controller`:
+  - ingest OpenRouter model/pricing/context metadata
+  - ingest Hugging Face model/task/license metadata
+  - ingest llm-stats-style benchmark/ranking feeds when a stable source is chosen
+  - normalize external facts into model catalog provenance and trust inputs
+- [ ] Move active development posture toward `mbp-jane`:
+  - treat `mbp-jane` as the preferred development seat for new implementation work
+  - keep Bjork/mac-jane available for local runtime verification and operator desktop work
+  - keep Beacon/vps-jane as the hosted durability and remote-service target
 - [ ] Delete `origin/codex/model-graph-catalog` after valid catalog work lands or is explicitly abandoned.
 
 ## New Project: Cypher-First Graph Datasource
@@ -93,22 +121,29 @@ Proposal: [LIFE_GRAPH_OS_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs
 Seam IDs: `life-graph-schema`, `life-graph-memorygraphrag-runner`, `life-graph-attention-steward`, `life-graph-agentic-growth-loop`, `life-graph-semantic-retrieval`, `life-graph-evidence-conflict`, `life-graph-paracrine-heartbeat`
 
 - [ ] Keep `graph-datasource` generic and define `data-memorygraphrag` as the Life Graph / MemoryGraphRAG runner/toolset layer.
-  - [x] Add the first `data-memorygraphrag` runner planning surface for `life.observe`, `life.recall`, `life.commit`, `life.resolve`, and `life.patch.propose`.
+  - [x] Add the first `data-memorygraphrag` runner planning surface for `life.observe`, `life.recall`, `life.recall.feedback`, `life.commit`, `life.resolve`, and `life.patch.propose`.
 - [ ] Define the first Life Graph schema for `Role`, `Goal`, `System`, `Habit`, `Commitment`, `OpenLoop`, `NextAction`, and `GrowthExperiment`.
 - [ ] Decide whether Life Graph records live as a dedicated datasource partition, central graph labels, or a tiered model.
-- [ ] Add the first Life Graph tool surface: `life.observe`, `life.recall`, `life.commit`, `life.resolve`, and `life.patch.propose`.
-  - [x] Define the tool catalog and typed runner requests/plans in `data-memorygraphrag`; runtime/hotel projection remains next.
+- [ ] Add the first Life Graph tool surface: `life.observe`, `life.recall`, `life.recall.feedback`, `life.commit`, `life.resolve`, and `life.patch.propose`.
+  - [x] Define the tool catalog and typed runner requests/plans in `data-memorygraphrag`.
+  - [x] Wire runtime/hotel projection: `life.recall.feedback` in `philote`'s tool catalog, abstract tool/skill seeding, toolset-profile `remote_tool_runners` bindings, and `aiua`'s `tools_for_allowed_class("life_graph")`.
+  - [x] Hydrate a fresh session's bindings (`effective_toolset`/`on_demand_skills`/`allowed_classes`/`remote_tool_runners`) from its role's toolset profile on first activation, so cold sessions get correct LifeGraph tool access from turn zero instead of relying on partial defaults.
+  - [x] Harden `project_tools_for_turn`'s conversational-filler gate: an `on_demand_relevant` escape valve keeps LifeGraph (and other on-demand-skill) tools visible when the turn matches the skill's keywords even if it also looks like a question/filler phrase, and `life.steward`/`lifegraph.truth_summarizer` keyword matching now tolerates the "live graph" typo of "life graph"/"lifegraph". Root-caused from a real production denial spiral where Jane lost all tool access on every question-containing turn and hallucinated LifeGraph contents instead.
   - [x] Implement provider handlers for `life.commit`, `life.resolve`, `life.conflict`, and `life.patch.propose`, mirroring `handle_observe` with runner gates and Memgraph MERGE/SET writes.
   - [x] Add a clean external MCP surface: keep Perplexity `context.capture` routed to Muninn continuity memory, add `mcp-surface-hygiene`, enforce auth on config-driven `membrane-mcp` tools, and provide a separate LifeGraph endpoint provisioner for governed `life.recall` / opt-in `life.observe`.
   - [x] Deploy and smoke the LifeGraph MCP endpoint against the live `life-graph-runner` before claiming `watched-live-green`.
+  - [x] Harden the model-facing LifeGraph tool contracts: `life.recall` now supports the advertised text-only auto-embed path, governed patch approval defaults safely to false, and every `life.steward` implied tool has a concrete catalog schema.
 - [ ] Add semantic indexing for Life Graph nodes with a `768`-dimension baseline, explicit embedding model generation, vector space, and source-text hash metadata.
 - [ ] Define the embeddings flywheel: retrieval outcome capture, useful/stale/missing/noisy feedback, ranking/bridge tuning, and re-embedding triggers.
+  - [x] Add `life.recall.feedback` contracts/provider handler to record retrieval reward/friction as `Signal` nodes and emit governed improvement-candidate steps from usefulness, staleness, missing context, noise, overconfidence, and low connectivity.
+  - [x] Consume `life.recall.feedback` improvement-candidate steps into concrete bridge/ranking/attention patch proposals.
 - [ ] Implement one MemGraphRAG-inspired retrieval strategy: semantic pivot, bounded graph expansion, memory-aware ranking, policy filtering, and context packet projection.
   - [x] Land the first `data-memorygraphrag` semantic retrieval contracts for semantic pivots, bounded expansion, policy filters, ranking weights, and evidence-backed context packets.
   - [x] Add provider dispatch for the five named retrieval strategies from `SEMANTIC_RETRIEVAL.md`: `open_loops_by_context`, `goals_and_next_actions`, `commitments_approaching`, `re_entry_context`, and `cross_domain_entanglement`.
 - [ ] Add the first `EvidencePacket` and conflict handoff contract between `data-memorygraphrag` and Muninn.
   - [x] Land the initial `data-memorygraphrag` contract crate with validated `EvidencePacket` and `ConflictHandoff` wire types.
   - [x] Add provider `handle_conflict` and `handle_resolve` execution paths for ConflictHandoff persistence and resolution status updates.
+  - [x] Route LifeGraph resolve plans for `contradiction_review` and `trust_update` through the implemented `memory.true_up` surface instead of phantom Muninn tools, preserving the requested action in payload metadata.
 - [x] Define the cron-backed heartbeat job shape for Life Graph maintenance, using the existing distributed cron subsystem as the first durable clock source.
 - [x] Define the paracrine heartbeat signal shape for Life Graph maintenance, including scope, target role-type, priority, expiry, and policy tags.
 - [ ] Build the Attention Steward paracrine subscriber in observe-only mode before broad notifications or autonomous follow-up.
@@ -118,6 +153,7 @@ Seam IDs: `life-graph-schema`, `life-graph-memorygraphrag-runner`, `life-graph-a
 - [ ] Define the Attention Steward SIL as reinforced, situation-aware stewardship instructions with evidence, exceptions, friction, and reinforcement counters.
 - [ ] Define the agentic growth loop for skills, tools, schema, and policy patches with risk-tiered confirmation gates and negative-drift checks.
   - [x] Add `data-memorygraphrag` growth-loop policy contracts for observed needs, drift findings, capability gaps, growth experiments, patch gates, and drift checks.
+  - [x] Wire retrieval feedback into the growth-loop policy so disconnected/missing/noisy/stale packets reinforce safe maintenance while overconfident packets require operator confirmation.
 - [ ] Wire Beacon as the first Life Graph steward / chief-of-staff role once schema and retrieval are test-green.
 - [ ] Let specialized roles such as Coach consume and contribute to Life Graph OS through governed tools without owning the canonical cross-domain graph posture.
 
@@ -130,10 +166,76 @@ Seam IDs: `memory-spacetime-frame`, `memory-shaping-context`, `memory-cultivatio
 - [x] Implement `MemorySpacetimeFrame` and `MemoryShapingContext` for Philote memory recall shaping.
 - [x] Project temporal scope, spatial scope, authority, validation level, and space anchors into recalled memory sections.
 - [x] Attach graph-derived anchors as Muninn entities/relationships during `memory.remember`.
+- [x] Add `memory_candidate_policy` to cognitive response contracts so model-router/provider prompts ask for only atomic durable memory candidates.
 - [x] Add the first low-risk `memory.cultivate` path for closeout and staleness review.
 - [x] Add graph-intelligence true-up finding records using existing node/mutation primitives before introducing new node kinds.
 - [x] Gate promotion from Muninn into AgentGraph/docs/code behind validation evidence or explicit operator approval.
 - [x] Deploy and watched-live verify on `mbp-jane` and `vps-jane` before claiming runtime truth.
+
+## New Project: Memory Transparency
+
+Proposal: [MEMORY_TRANSPARENCY_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/MEMORY_TRANSPARENCY_PROPOSAL.md)
+
+Seam IDs: `memory.hygiene` (AutonomyGrant lane)
+
+- [x] M4 `memory.hygiene` lane, first slice (`codex/memory-m4-hygiene-lane`): nightly per-hotel Muninn contradiction sweep + age-based staleness proxy, aggregated annotation-only filing via a new `memory.hygiene` `AutonomyGrant` lane, opt-in `CronJob` scheduling intercepted in-process by `CronTicker`, with a per-hotel fire-time opt-in re-check so mesh `CronJobSync` replication can't silently sweep peer hotels. Test-green (25 new unit tests); not yet deployed/watched-live.
+  - [ ] Deploy + operator opt-in on one hotel; watch a real nightly cycle.
+  - [ ] Land M1 `provenance-envelope` so M4 filings carry richer evidence.
+  - [ ] Consider a real MuninnDB REST addition for access-recency staleness (current proxy is `created_at` age only — see `crates/aiua/src/memory_hygiene.rs` module doc).
+
+## Muninn v0.7 Capability Adoption
+
+Proposal: [MUNINN_V07_CAPABILITY_ADOPTION_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/MUNINN_V07_CAPABILITY_ADOPTION_PROPOSAL.md)
+
+Seam IDs: `muninn-scoped-client-keys`, `muninn-tagged-recall-lanes`, `muninn-concept-evolution-hygiene`, `muninn-hotel-cluster-authority`
+
+- [ ] Adopt scoped Muninn API keys for external clients.
+  - [x] Create one short-lived `observe` key for retrieval testing.
+  - [x] Verify observe-mode keys can recall but cannot write.
+  - [x] Document key labels, modes, expiries, and revocation path without storing raw tokens.
+  - [x] Add MCP credential lifecycle rules for external bearer grants, rotation, revocation, and UAT evidence.
+  - [x] Remove raw bearer-token terminal echoing from the Perplexity `context.capture` provisioner.
+  - [x] Add token-backed `just mcp-client-uat live` modes for positive-path `context.capture` and `life.recall` calls without printing bearer material.
+  - [x] Make `just mcp-client-uat live` fail loudly when required bearer tokens are not exported, while `all` remains safe/opportunistic.
+  - [x] Add explicit token-file inputs for live UAT so large bearers can be supplied without shell history exposure.
+  - [x] Add `phil mcp uat` as the operator-facing wrapper around the MCP client UAT gate.
+- [ ] Add tag-filtered recall lanes.
+  - [x] Add `tags_all`, `tags_any`, and `tag_filter` support to the shared Muninn helper.
+  - [x] Smoke filtered recall against known Perplexity and Muninn-upgrade memories.
+  - [x] Update repo-local Muninn guidance with the lane vocabulary if the smoke improves retrieval.
+- [ ] Trial `muninn_evolve` concept cleanup.
+  - [x] Pick a small candidate list of low-risk vague memory labels.
+  - [x] Evolve labels while preserving lineage.
+  - [x] Compare recall before/after and record whether the cleanup helped.
+- [ ] Evaluate Muninn cluster mode as a lab slice, not production continuity authority.
+  - [x] Draft the isolated test-vault/data-dir checklist.
+  - [x] Add `just muninn-cluster-preflight` for non-mutating cluster CLI/health/binding readiness checks before cluster enablement.
+  - [x] Run `RUN_REMOTE=1 just muninn-cluster-preflight all` across local, `mbp-jane`, and `vps-jane`.
+  - [x] Prove disposable same-host Muninn daemon isolation with alternate REST/UI/MCP/MBP/gRPC bindings and `/tmp` data.
+  - [x] Record the current cluster enablement blocker: the CLI reaches the admin endpoint but does not attach an admin session cookie, so unauthenticated enablement fails with HTTP 401.
+  - [ ] Validate failover, returning-primary deference, and no accidental secret replication.
+  - [ ] Record a decision before enabling cluster mode for real continuity vaults.
+
+## Cross-Agent Knowledge Architecture
+
+Proposal: [KNOWLEDGE_ARCHITECTURE_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/KNOWLEDGE_ARCHITECTURE_PROPOSAL.md)
+
+Seam IDs: `muninn-native-client-access`, `lifegraph-muninn-promotion`, `cross-agent-context-packet`
+
+- [x] Define the authority split between Muninn continuity memory, LifeGraph structured life truth, Intel Graph project truth, and the Philotic MCP frontdoor.
+- [x] Add a private direct-client runbook for native Muninn MCP over loopback or SSH/private-overlay tunnel.
+- [x] Add Codex local `muninn-local` MCP config using Muninn's stdio proxy.
+- [x] Add a typed `ContextPacket` contract that carries Muninn memory IDs, LifeGraph node IDs, and Intel Graph references with explicit authority labels.
+  - [x] Return a `cross_agent_context_packet` from `life.recall` alongside the LifeGraph retrieval packet.
+  - [x] Validate that Muninn engram refs cannot claim LifeGraph truth authority.
+  - [x] Deploy to `vps-jane` and live-smoke `life.recall` through `/run/philotic/vps-jane.sock`, confirming `cross_agent_context_packet` is returned by the installed runner.
+  - [x] Add `ContextPacket::from_muninn_recall` and `scripts/muninn_mcp.py recall --context-packet` so Muninn helper recall can emit `muninn_continuity` context refs for cross-agent use.
+- [x] Decide whether remote trusted native Muninn access should standardize on SSH tunnels, Tailscale-only routing, or private HTTPS ingress with scoped keys.
+  - [x] Standardize current remote trusted native path on SSH tunnel to loopback.
+  - [x] Add `just muninn-private-smoke` to prove local health, remote private binding, and tunneled MCP health.
+  - [x] Add `just mcp-client-uat` to prove local Codex/Muninn posture and token-scoped external MCP tool projection when live bearers are supplied.
+  - [x] Run `just mcp-client-uat remote-native` against `vps-jane`, confirming loopback-only native binding and SSH-tunneled MCP health.
+  - [ ] Revisit Tailscale-only/private HTTPS only after credential lifecycle and client config are explicit.
 
 ### WI 1: Session Management
 
@@ -1060,6 +1162,21 @@ This workstream includes a quick look at the OpenAI websocket/realtime API becau
   - background mode
   - built-in tools gated behind explicit provider options
   - realtime/audio kept as a follow-on slice, not part of the first parity path
+- [x] Add a first-class OpenRouter model-controller path:
+  - separate `openrouter` provider id for routing traces and health
+  - `model-controller-openrouter` guest on role `model.openrouter`
+  - OpenRouter-specific config keys for API key, base URL, default model, fallback model list, and route
+  - pass-through request fields for OpenRouter fallback routing (`models`, `route`, `provider`)
+- [x] Add operator key/config management for provider credentials:
+  - `phil keys configure <provider>` stores API keys through hotel vault IPC and writes provider config refs
+  - `phil keys status [provider]` reports configured/missing state without exposing secret values
+  - desktop backend exposes `GET/POST /api/provider-configs/:provider` plus provider status inventory
+  - OpenRouter appears as a first-class component template with vault-only key guidance
+- [x] Close provider API-key at-rest plaintext gap:
+  - shared `ProviderKeySpec` owns provider vault names, ref keys, env overrides, config keys, and allowed roles
+  - model controllers resolve API keys from env or `*_api_key_ref` only; plaintext `*_api_key` config is migration input
+  - aiua load/startup migrates legacy plaintext provider keys into vault refs and removes the plaintext config entry
+  - desktop mutable provider-config keys derive from the shared provider spec instead of a second hand-written table
 - [x] Define the provider-family strategy for OpenAI-compatible endpoints:
   - OpenAI remains the canonical first-class provider path
   - OpenRouter and similar hosted endpoints should usually ride the same adapter family with different endpoint/auth settings
@@ -1074,6 +1191,14 @@ Seam IDs: `vault-secret-refs`, `remote-vault-delegation`
 - [x] Define the first vault record schema and context-graph secret references.
 - [x] Begin removing new OAuth access-token storage from plain `node_config` by storing secret refs instead.
 - [x] Define and implement the first hotel-local secret fetch API for guests.
+- [x] Add first operator UX for API-key secrets:
+  - CLI provider setup writes raw keys only via `AddVaultEntry`, then persists secret refs in config
+  - desktop provider config endpoints reuse the same vault/config boundary
+  - secret inventory includes provider API-key refs without returning values
+- [x] Add one-time legacy provider-key migration:
+  - plaintext `gemini/openai/openrouter/elevenlabs_api_key` config values are stored through `store_secret`
+  - migrated secrets are registered in `vault_registry`, ref config is written, and plaintext config is deleted
+  - when a ref already exists, stale plaintext is deleted and the existing ref remains authoritative
 - [x] Define and implement the first envelope-encryption and root-key strategy:
   - OS keychain / TPM / Secure Enclave preferred
   - cloud KMS/HSM for hosted hotels

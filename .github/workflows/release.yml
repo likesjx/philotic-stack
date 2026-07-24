@@ -164,7 +164,7 @@ jobs:
             -p philotic-web \
             -p aiua \
             -p philote \
-            -p membrane \
+            -p membrane-telegram \
             -p model-router \
             -p tool-runner
 
@@ -180,7 +180,7 @@ jobs:
             EXT=".exe"
           fi
 
-          for bin in philotic-web aiua philote membrane model-router tool-runner; do
+          for bin in philotic-web aiua philote membrane-telegram model-router tool-runner; do
             SRC="target/${{ matrix.target }}/release/${bin}${EXT}"
             if [ -f "$SRC" ]; then
               cp "$SRC" "$STAGING/${bin}-${{ matrix.artifact }}${EXT}"

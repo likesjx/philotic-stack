@@ -620,6 +620,15 @@ async fn execute_bash_tool(arguments: &serde_json::Value, mode: &ShellExecutionM
         Some(cmd) => cmd,
         None => return "bash.exec error: missing `command`".into(),
     };
+
+    // L0 execution safety floor: compiled-in, non-configurable, evaluated
+    // before an ExecuteCommandRequest is even built — so it covers both
+    // Direct and Sandboxed ShellExecutor modes from this single dispatch
+    // point. See crates/exec-guard for the blocklist and rationale.
+    if let Some(hardline) = exec_guard::detect_hardline(command) {
+        return format!("bash.exec denied: {}", hardline.denial_message());
+    }
+
     let working_dir = arguments.get("working_dir").and_then(|v| v.as_str());
     let timeout_secs = arguments
         .get("timeout_secs")
@@ -1188,5 +1197,63 @@ mod tests {
         server.await.expect("server task");
         assert!(output.contains("sandboxed"));
         assert!(output.contains("exit_code: 0"));
+    }
+
+    // ── L0 execution safety floor (exec-guard) ─────────────────────────────
+    //
+    // `execute_bash_tool` is the single dispatch point before
+    // `ShellExecutor::execute` for both Direct and Sandboxed modes (see
+    // `shell_executor_for_mode`), so gating here covers both without a
+    // per-executor check. The Sandboxed-mode test below proves that: no
+    // sandbox worker is spun up, and the denial still comes back — the
+    // hardline check never gets far enough to open a socket connection.
+
+    #[tokio::test]
+    async fn bash_exec_hardline_blocks_in_direct_mode() {
+        let output = execute_bash_tool(
+            &json!({ "command": "rm -rf /" }),
+            &ShellExecutionMode::Direct,
+        )
+        .await;
+        assert!(
+            output.starts_with("bash.exec denied:"),
+            "unexpected output: {output}"
+        );
+        assert!(
+            output.contains("Do not retry"),
+            "unexpected output: {output}"
+        );
+    }
+
+    #[tokio::test]
+    async fn bash_exec_hardline_blocks_in_sandboxed_mode_without_dialing_socket() {
+        // Deliberately do not bind a listener on this socket path — if the
+        // hardline check were bypassed, this would fail with a connection
+        // error instead of a clean denial.
+        let output = execute_bash_tool(
+            &json!({ "command": "shutdown -h now" }),
+            &ShellExecutionMode::Sandboxed {
+                socket_path: "/nonexistent/exec-guard-test.sock".to_string(),
+            },
+        )
+        .await;
+        assert!(
+            output.starts_with("bash.exec denied:"),
+            "unexpected output: {output}"
+        );
+    }
+
+    #[tokio::test]
+    async fn bash_exec_hardline_does_not_block_ordinary_commands_in_direct_mode() {
+        let output = execute_bash_tool(
+            &json!({ "command": "echo hello" }),
+            &ShellExecutionMode::Direct,
+        )
+        .await;
+        assert!(output.contains("hello"), "unexpected output: {output}");
+        assert!(
+            !output.starts_with("bash.exec denied:"),
+            "unexpected output: {output}"
+        );
     }
 }

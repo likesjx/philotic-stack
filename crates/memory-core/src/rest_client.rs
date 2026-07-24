@@ -1,6 +1,8 @@
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tracing::{debug, instrument};
 
@@ -32,6 +34,26 @@ pub struct MuninnConfig {
     pub default_token: Option<String>,
     /// Default vault when MemoryScope does not resolve to a named vault.
     pub default_vault: String,
+    /// Muninn-cluster single-writer routing: node id of the hotel that owns
+    /// the cluster PRIMARY (Cortex). When set — and the resolved vault is
+    /// fleet-shared (see [`is_fleet_shared_vault`]) — guests forward the
+    /// write through the hotel mesh to that node instead of writing to the
+    /// local replica, where it would strand: observer/lobe muninn daemons
+    /// accept local writes but never forward them, and only Cortex writes
+    /// replicate (scrypster/muninndb#631). `None` (the default, and the
+    /// correct value on the Cortex hotel itself) preserves direct local
+    /// writes. Rides inside `MemoryConfigPayload.config_json`, so adding it
+    /// is wire-compatible with older guests.
+    #[serde(default)]
+    pub shared_write_route: Option<String>,
+}
+
+/// True for vaults whose contents are fleet-visible and therefore must be
+/// written on the cluster PRIMARY: the shared `default` vault and `user_*`
+/// vaults. Agent (`self_*`) and `session_*` vaults are per-host by design —
+/// the muninn vault registry does not replicate — and always write locally.
+pub fn is_fleet_shared_vault(vault: &str) -> bool {
+    vault == "default" || vault.starts_with("user_")
 }
 
 impl MuninnConfig {
@@ -41,6 +63,7 @@ impl MuninnConfig {
             vault_tokens: HashMap::new(),
             default_token: None,
             default_vault: default_vault.into(),
+            shared_write_route: None,
         }
     }
 
@@ -65,12 +88,42 @@ pub struct VaultResolver {
     pub user_id: String,
 }
 
+/// Coerce a vault-name component into MuninnDB's allowed alphabet
+/// (`[a-z0-9_-]`, max 64 chars total for the full name). Session-derived
+/// fallback ids (`cron:ephemeral:agent-aria`, `telegram:123:agent-jane`)
+/// contain `:` and uppercase, which MuninnDB rejects outright — before this,
+/// every shared/session-scope write from such a session failed at the vault
+/// layer. Mapping is deterministic so the same session always resolves to
+/// the same vault.
+fn sanitize_vault_component(raw: &str) -> String {
+    let mut out: String = raw
+        .to_ascii_lowercase()
+        .chars()
+        .map(|c| {
+            if c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-' {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    // Leave room for the "{scope}_" prefix within MuninnDB's 64-char limit.
+    out.truncate(56);
+    out
+}
+
 impl VaultResolver {
     pub fn resolve(&self, scope: &MemoryScope) -> Vec<VaultId> {
         match scope {
-            MemoryScope::SelfOnly => vec![format!("self_{}", self.agent_id)],
-            MemoryScope::SharedUser => vec![format!("user_{}", self.user_id)],
-            MemoryScope::Session(id) => vec![format!("session_{}", id)],
+            MemoryScope::SelfOnly => {
+                vec![format!("self_{}", sanitize_vault_component(&self.agent_id))]
+            }
+            MemoryScope::SharedUser => {
+                vec![format!("user_{}", sanitize_vault_component(&self.user_id))]
+            }
+            MemoryScope::Session(id) => {
+                vec![format!("session_{}", sanitize_vault_component(id))]
+            }
             MemoryScope::CrossScope(scopes) => {
                 scopes.iter().flat_map(|s| self.resolve(s)).collect()
             }
@@ -163,6 +216,11 @@ struct ActivationItem {
     #[serde(default)]
     tags: Vec<String>,
     confidence: f32,
+    /// Server-side activation relevance for the query (semantic + graph
+    /// blend). Defaults to 0.0 against servers that predate the field, in
+    /// which case cross-scope ranking degrades to recency + confidence.
+    #[serde(default)]
+    score: f64,
     created_at: i64,
     updated_at: Option<i64>,
     #[serde(default)]
@@ -227,6 +285,26 @@ impl From<ReadResponse> for Engram {
     }
 }
 
+/// Cross-scope merge ranking. Each vault's activations arrive already ranked
+/// by the server's query relevance; merging on raw `confidence` (the old
+/// behavior) let a high-confidence but irrelevant memory outrank an exact
+/// match from another vault. Relevance dominates here; recency (exponential
+/// decay, ~14-day scale, mirroring the LifeGraph ranking model) and
+/// confidence act as bounded tiebreakers.
+fn cross_scope_rank_score(
+    server_score: f64,
+    confidence: f32,
+    updated_at_secs: u64,
+    now_secs: u64,
+) -> f64 {
+    const RECENCY_DECAY_DAYS: f64 = 14.0;
+    const RECENCY_WEIGHT: f64 = 0.25;
+    const CONFIDENCE_WEIGHT: f64 = 0.15;
+    let age_days = now_secs.saturating_sub(updated_at_secs) as f64 / 86_400.0;
+    let recency = (-age_days / RECENCY_DECAY_DAYS).exp();
+    server_score + RECENCY_WEIGHT * recency + CONFIDENCE_WEIGHT * f64::from(confidence)
+}
+
 fn link_kind_to_relation(kind: &LinkKind) -> &'static str {
     match kind {
         LinkKind::Related => "relates_to",
@@ -235,6 +313,136 @@ fn link_kind_to_relation(kind: &LinkKind) -> &'static str {
         LinkKind::Supports => "supports",
         LinkKind::DerivedFrom => "depends_on",
         LinkKind::Custom(_) => "user_defined",
+    }
+}
+
+// ──── Recall Cache ─────────────────────────────────────────────────────────────
+
+/// Env var overriding the recall cache TTL (seconds). `0` disables caching entirely.
+const RECALL_CACHE_TTL_ENV: &str = "MUNINN_RECALL_CACHE_TTL_SECS";
+const RECALL_CACHE_DEFAULT_TTL_SECS: u64 = 45;
+const RECALL_CACHE_CAPACITY: usize = 32;
+
+/// Normalizes a recall context string into a cache key component:
+/// lowercased alphanumeric tokens joined by a single space. This makes
+/// whitespace/punctuation variation between otherwise-identical turns
+/// collapse onto the same cache entry.
+fn normalize_recall_context(context: &str) -> String {
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    for ch in context.chars() {
+        if ch.is_alphanumeric() {
+            current.extend(ch.to_lowercase());
+        } else if !current.is_empty() {
+            tokens.push(std::mem::take(&mut current));
+        }
+    }
+    if !current.is_empty() {
+        tokens.push(current);
+    }
+    tokens.join(" ")
+}
+
+struct RecallCacheEntry {
+    key: String,
+    value: ActivationResult,
+    inserted_at: Instant,
+}
+
+/// Short-TTL cache for `activate()` results, keyed on `(normalized context,
+/// scope-derived vault list, effective max_results)`.
+///
+/// `activate()` runs in the philote turn path before context composition —
+/// every turn pays the per-vault HTTP round-trip(s) even when consecutive
+/// turns carry near-identical recall context. A short cache window (default
+/// 45s, overridable via `MUNINN_RECALL_CACHE_TTL_SECS`, `0` disables caching)
+/// amortizes that cost.
+///
+/// Staleness up to the TTL is acceptable for reads EXCEPT immediately after
+/// this engine performs a write of its own — read-your-own-write matters for
+/// UX (the agent should see a memory it just wrote reflected in the very
+/// next recall). So every successful write path (`remember`,
+/// `remember_batch`, `forget`, `link`, `evolve`) clears the cache outright
+/// rather than waiting out the TTL.
+///
+/// Bounded to `RECALL_CACHE_CAPACITY` entries, LRU-evicted (oldest insert
+/// first) via a `VecDeque` — no new dependency needed for 32 entries.
+struct RecallCache {
+    ttl: Duration,
+    capacity: usize,
+    entries: Mutex<VecDeque<RecallCacheEntry>>,
+}
+
+impl RecallCache {
+    fn from_env() -> Self {
+        let ttl_secs = std::env::var(RECALL_CACHE_TTL_ENV)
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(RECALL_CACHE_DEFAULT_TTL_SECS);
+        Self::new(Duration::from_secs(ttl_secs), RECALL_CACHE_CAPACITY)
+    }
+
+    fn new(ttl: Duration, capacity: usize) -> Self {
+        Self {
+            ttl,
+            capacity,
+            entries: Mutex::new(VecDeque::new()),
+        }
+    }
+
+    fn make_key(context: &str, vaults: &[VaultId], max_results: Option<usize>) -> String {
+        format!(
+            "{}|{}|{:?}",
+            normalize_recall_context(context),
+            vaults.join(","),
+            max_results
+        )
+    }
+
+    /// Returns a clone of the cached value if present and still fresh.
+    /// A stale entry is evicted on lookup. The clone happens under the lock;
+    /// HTTP never happens under the lock.
+    fn get(&self, key: &str) -> Option<ActivationResult> {
+        if self.ttl.is_zero() {
+            return None;
+        }
+        let mut entries = self.entries.lock().unwrap();
+        let pos = entries.iter().position(|e| e.key == key)?;
+        if entries[pos].inserted_at.elapsed() < self.ttl {
+            Some(entries[pos].value.clone())
+        } else {
+            entries.remove(pos);
+            None
+        }
+    }
+
+    /// Insert or refresh an entry, evicting the oldest entry once over
+    /// capacity.
+    fn insert(&self, key: String, value: ActivationResult) {
+        if self.ttl.is_zero() || self.capacity == 0 {
+            return;
+        }
+        let mut entries = self.entries.lock().unwrap();
+        entries.retain(|e| e.key != key);
+        if entries.len() >= self.capacity {
+            entries.pop_front();
+        }
+        entries.push_back(RecallCacheEntry {
+            key,
+            value,
+            inserted_at: Instant::now(),
+        });
+    }
+
+    /// Invalidates all cached recall results. Called after every successful
+    /// write so the next `activate()` reflects it immediately.
+    fn clear(&self) {
+        self.entries.lock().unwrap().clear();
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.entries.lock().unwrap().len()
     }
 }
 
@@ -265,6 +473,8 @@ pub struct MuninnRestEngine {
     /// id → vault_id populated by every write. Eliminates vault-discovery
     /// overhead on the read side for the common case.
     id_vault_cache: tokio::sync::RwLock<HashMap<EngramId, VaultId>>,
+    /// Short-TTL cache of recent activate() results. See `RecallCache` docs.
+    recall_cache: RecallCache,
 }
 
 impl MuninnRestEngine {
@@ -275,6 +485,7 @@ impl MuninnRestEngine {
             resolver,
             lens: tokio::sync::RwLock::new(None),
             id_vault_cache: tokio::sync::RwLock::new(HashMap::new()),
+            recall_cache: RecallCache::from_env(),
         }
     }
 
@@ -389,6 +600,54 @@ impl MuninnRestEngine {
             anyhow::bail!("unauthorized on all vault token pairs")
         }
     }
+
+    /// Write an engram directly into a NAMED vault, bypassing the
+    /// `MemoryScope` → `VaultResolver` mapping. This is the apply side of
+    /// mesh-forwarded shared writes (`memory.write_forward`): the Cortex
+    /// hotel receives the originating guest's already-resolved vault name in
+    /// the forwarded payload and must write to exactly that vault, not one
+    /// re-resolved against its own agent/user identity.
+    ///
+    /// Same idempotency contract as `remember_with_metadata`
+    /// (`idempotent_id = "{vault}:{concept}"`), so a mesh envelope that is
+    /// redelivered reinforces the existing engram instead of duplicating it.
+    pub async fn remember_in_vault(
+        &self,
+        vault: &str,
+        concept: &str,
+        content: &str,
+        tags: Vec<String>,
+        metadata: serde_json::Value,
+    ) -> anyhow::Result<EngramRef> {
+        let tags = self.apply_lens_tags(tags).await;
+        let metadata = match metadata {
+            serde_json::Value::Null => None,
+            other => Some(other),
+        };
+        let body = WriteRequest {
+            vault: vault.to_string(),
+            concept: concept.to_string(),
+            content: content.to_string(),
+            tags,
+            confidence: None,
+            metadata,
+            idempotent_id: Some(format!("{}:{}", vault, concept)),
+        };
+        let resp: WriteResponse = self
+            .with_auth(self.client.post(self.url("/api/engrams")), vault)
+            .json(&body)
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        self.cache_vault(&resp.id, &vault.to_string()).await;
+        self.recall_cache.clear();
+        Ok(EngramRef {
+            id: resp.id,
+            vault_id: vault.to_string(),
+        })
+    }
 }
 
 #[async_trait]
@@ -449,6 +708,9 @@ impl MemoryEngine for MuninnRestEngine {
         }
 
         self.cache_vault(&resp.id, &vault).await;
+        // Read-your-own-write: a fresh recall must reflect what was just
+        // written rather than serving a pre-write cache entry for its TTL.
+        self.recall_cache.clear();
         Ok(EngramRef {
             id: resp.id,
             vault_id: vault,
@@ -486,6 +748,13 @@ impl MemoryEngine for MuninnRestEngine {
             .error_for_status()?
             .json()
             .await?;
+
+        // Read-your-own-write: clear the recall cache now that the batch
+        // write round-trip has completed, regardless of individual item
+        // outcomes below (a successful round-trip means at least the server
+        // processed the batch; per-item failures are surfaced via the
+        // returned Result but don't change the invalidation need).
+        self.recall_cache.clear();
 
         resp.results
             .into_iter()
@@ -546,6 +815,7 @@ impl MemoryEngine for MuninnRestEngine {
                 return Ok(()); // already gone — idempotent
             }
             resp.error_for_status()?;
+            self.recall_cache.clear();
             return Ok(());
         }
 
@@ -558,6 +828,7 @@ impl MemoryEngine for MuninnRestEngine {
             .await?
         {
             resp.error_for_status()?;
+            self.recall_cache.clear();
         }
         Ok(())
     }
@@ -640,58 +911,120 @@ impl MemoryEngine for MuninnRestEngine {
     ) -> anyhow::Result<ActivationResult> {
         let vaults = self.resolver.resolve(&scope);
         let max = self.effective_max_results(max_results).await;
+        let is_cross_scope = matches!(scope, MemoryScope::CrossScope(_));
+
+        let cache_key = RecallCache::make_key(context, &vaults, max);
+        if let Some(cached) = self.recall_cache.get(&cache_key) {
+            debug!("recall cache hit");
+            return Ok(cached);
+        }
 
         let mut all_engrams = Vec::new();
         let mut total = 0usize;
-        let is_cross_scope = matches!(scope, MemoryScope::CrossScope(_));
+        let mut had_vault_error = false;
 
-        for vault in vaults {
-            if is_cross_scope && !self.has_auth_for_vault(&vault) {
-                debug!(
-                    vault = %vault,
-                    "Skipping cross-scope activation for vault without token"
-                );
-                continue;
-            }
+        // Cross-scope recall runs in the turn path before context composition:
+        // the per-vault activations are independent, so fire them concurrently
+        // instead of paying up to three serial round-trips per turn.
+        let fetches = vaults
+            .iter()
+            .filter(|vault| {
+                if is_cross_scope && !self.has_auth_for_vault(vault) {
+                    debug!(
+                        vault = %vault,
+                        "Skipping cross-scope activation for vault without token"
+                    );
+                    return false;
+                }
+                true
+            })
+            .map(|vault| {
+                let body = ActivateRequest {
+                    vault: Some(vault.clone()),
+                    context: vec![context.to_string()],
+                    max_results: max,
+                };
+                async move {
+                    let resp: anyhow::Result<ActivateResponse> = async {
+                        Ok(self
+                            .with_auth(self.client.post(self.url("/api/activate")), vault)
+                            .json(&body)
+                            .send()
+                            .await?
+                            .error_for_status()?
+                            .json()
+                            .await?)
+                    }
+                    .await;
+                    (vault, resp)
+                }
+            });
 
-            let body = ActivateRequest {
-                vault: Some(vault.clone()),
-                context: vec![context.to_string()],
-                max_results: max,
+        for (vault, resp) in futures::future::join_all(fetches).await {
+            let resp = match resp {
+                Ok(resp) => resp,
+                // Cross-scope recall is advisory: one failing vault degrades
+                // to partial results instead of killing recall for the rest.
+                Err(err) if is_cross_scope => {
+                    tracing::warn!(
+                        vault = %vault,
+                        error = %err,
+                        "Cross-scope activation failed for vault; continuing with others"
+                    );
+                    had_vault_error = true;
+                    continue;
+                }
+                Err(err) => return Err(err),
             };
-            let resp: ActivateResponse = self
-                .with_auth(self.client.post(self.url("/api/activate")), &vault)
-                .json(&body)
-                .send()
-                .await?
-                .error_for_status()?
-                .json()
-                .await?;
 
             total += resp.total_found;
             // Populate cache from activation results so subsequent ops are fast.
             for item in &resp.activations {
-                self.cache_vault(&item.id, &vault).await;
+                self.cache_vault(&item.id, vault).await;
             }
             all_engrams.extend(resp.activations.into_iter().map(|item| {
+                let server_score = item.score;
                 let mut engram: Engram = item.into();
                 engram.vault_id = vault.clone();
-                engram
+                (server_score, engram)
             }));
         }
 
-        // If cross-scope, re-sort by confidence descending and truncate.
+        // Cross-scope: merge on combined relevance/recency/confidence and
+        // truncate. Within a single vault the server's ordering stands.
         if is_cross_scope {
-            all_engrams.sort_by(|a, b| b.confidence.partial_cmp(&a.confidence).unwrap());
+            let now_secs = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            all_engrams.sort_by(|(score_a, a), (score_b, b)| {
+                cross_scope_rank_score(*score_b, b.confidence, b.updated_at, now_secs).total_cmp(
+                    &cross_scope_rank_score(*score_a, a.confidence, a.updated_at, now_secs),
+                )
+            });
             if let Some(m) = max {
                 all_engrams.truncate(m);
             }
         }
 
-        Ok(ActivationResult {
-            engrams: all_engrams,
+        let result = ActivationResult {
+            engrams: all_engrams.into_iter().map(|(_, engram)| engram).collect(),
             total,
-        })
+        };
+
+        // Cache the result unless it's a cross-scope call that degraded to
+        // nothing because every vault errored — that's not a genuine "no
+        // memories" answer, just the absence of a good one. A partial
+        // cross-scope result with at least some data, or a clean empty
+        // result from vaults that all responded successfully, is the best
+        // known answer and is worth caching.
+        let is_empty_degraded_result =
+            is_cross_scope && had_vault_error && result.engrams.is_empty() && result.total == 0;
+        if !is_empty_degraded_result {
+            self.recall_cache.insert(cache_key, result.clone());
+        }
+
+        Ok(result)
     }
 
     async fn read(&self, id: &EngramId) -> anyhow::Result<Option<Engram>> {
@@ -781,6 +1114,7 @@ impl MemoryEngine for MuninnRestEngine {
             .send()
             .await?
             .error_for_status()?;
+        self.recall_cache.clear();
         Ok(())
     }
 
@@ -876,5 +1210,186 @@ mod tests {
         assert!(engine.has_auth_for_vault("self_agent-aria"));
         assert!(engine.has_auth_for_vault("user_likesjx"));
         assert!(!engine.has_auth_for_vault("session_telegram:7898847424:agent-aria"));
+    }
+
+    const DAY: u64 = 86_400;
+
+    #[test]
+    fn cross_scope_rank_relevance_beats_stale_confidence() {
+        let now = 1_800_000_000;
+        // Old behavior: a fully-confident but irrelevant memory (score 0.05)
+        // outranked a strong match (score 0.7, confidence 0.6). Relevance
+        // must dominate the merge.
+        let irrelevant_confident = cross_scope_rank_score(0.05, 1.0, now - 30 * DAY, now);
+        let relevant_match = cross_scope_rank_score(0.7, 0.6, now - 30 * DAY, now);
+        assert!(relevant_match > irrelevant_confident);
+    }
+
+    #[test]
+    fn cross_scope_rank_recency_tiebreaks_equal_relevance() {
+        let now = 1_800_000_000;
+        let fresh = cross_scope_rank_score(0.5, 0.8, now - DAY, now);
+        let stale = cross_scope_rank_score(0.5, 0.8, now - 60 * DAY, now);
+        assert!(fresh > stale);
+    }
+
+    #[test]
+    fn cross_scope_rank_degrades_without_server_score() {
+        // Servers that predate the score field default every item to 0.0 —
+        // ranking must still order by recency + confidence, not collapse.
+        let now = 1_800_000_000;
+        let fresh_confident = cross_scope_rank_score(0.0, 0.9, now - DAY, now);
+        let stale_unconfident = cross_scope_rank_score(0.0, 0.3, now - 90 * DAY, now);
+        assert!(fresh_confident > stale_unconfident);
+        // Clock skew (updated_at in the future) must not panic or NaN.
+        let skewed = cross_scope_rank_score(0.2, 0.5, now + DAY, now);
+        assert!(skewed.is_finite());
+    }
+
+    // ──── RecallCache ───────────────────────────────────────────────────
+
+    fn dummy_activation_result(engram_id: &str) -> ActivationResult {
+        ActivationResult {
+            engrams: vec![Engram {
+                id: engram_id.to_string(),
+                vault_id: "self_test".to_string(),
+                concept: "concept".to_string(),
+                content: "content".to_string(),
+                tags: vec![],
+                confidence: 0.5,
+                created_at: 0,
+                updated_at: 0,
+                metadata: serde_json::Value::Null,
+            }],
+            total: 1,
+        }
+    }
+
+    #[test]
+    fn normalize_recall_context_collapses_whitespace_case_and_punctuation() {
+        let a = normalize_recall_context("  Hello,   World!! ");
+        let b = normalize_recall_context("hello world");
+        assert_eq!(a, b);
+        assert_eq!(a, "hello world");
+    }
+
+    #[test]
+    fn recall_cache_hit_returns_clone_within_ttl() {
+        let cache = RecallCache::new(Duration::from_millis(200), 8);
+        let key = RecallCache::make_key("ctx", &["self_a".to_string()], Some(5));
+        cache.insert(key.clone(), dummy_activation_result("e1"));
+        let hit = cache.get(&key);
+        assert!(hit.is_some());
+        assert_eq!(hit.unwrap().engrams[0].id, "e1");
+    }
+
+    #[test]
+    fn recall_cache_entry_expires_after_ttl() {
+        let cache = RecallCache::new(Duration::from_millis(20), 8);
+        let key = RecallCache::make_key("ctx", &["self_a".to_string()], None);
+        cache.insert(key.clone(), dummy_activation_result("e1"));
+        assert!(cache.get(&key).is_some());
+        std::thread::sleep(Duration::from_millis(60));
+        assert!(cache.get(&key).is_none());
+        // Stale entry is evicted on lookup, not left dangling.
+        assert_eq!(cache.len(), 0);
+    }
+
+    #[test]
+    fn recall_cache_evicts_oldest_over_capacity() {
+        let cache = RecallCache::new(Duration::from_secs(60), 2);
+        cache.insert("k1".to_string(), dummy_activation_result("e1"));
+        cache.insert("k2".to_string(), dummy_activation_result("e2"));
+        cache.insert("k3".to_string(), dummy_activation_result("e3"));
+        assert_eq!(cache.len(), 2);
+        assert!(cache.get("k1").is_none()); // oldest evicted
+        assert!(cache.get("k2").is_some());
+        assert!(cache.get("k3").is_some());
+    }
+
+    #[test]
+    fn recall_cache_clear_invalidates_all_entries() {
+        let cache = RecallCache::new(Duration::from_secs(60), 8);
+        cache.insert("k1".to_string(), dummy_activation_result("e1"));
+        cache.insert("k2".to_string(), dummy_activation_result("e2"));
+        assert_eq!(cache.len(), 2);
+        cache.clear();
+        assert_eq!(cache.len(), 0);
+        assert!(cache.get("k1").is_none());
+    }
+
+    #[test]
+    fn recall_cache_ttl_zero_env_disables_caching() {
+        // SAFETY: test-local env mutation; this var is not read by any other
+        // test's assertions (only by RecallCache::from_env() at construction).
+        unsafe {
+            std::env::set_var(RECALL_CACHE_TTL_ENV, "0");
+        }
+        let cache = RecallCache::from_env();
+        unsafe {
+            std::env::remove_var(RECALL_CACHE_TTL_ENV);
+        }
+        assert!(cache.ttl.is_zero());
+        cache.insert("k1".to_string(), dummy_activation_result("e1"));
+        // insert() is a no-op when ttl is zero — nothing to hit, ever.
+        assert!(cache.get("k1").is_none());
+        assert_eq!(cache.len(), 0);
+    }
+}
+
+#[cfg(test)]
+mod shared_write_route_tests {
+    use super::*;
+
+    #[test]
+    fn vault_components_are_sanitized_to_muninn_alphabet() {
+        let r = VaultResolver {
+            agent_id: "agent-aria".into(),
+            user_id: "cron:ephemeral:agent-aria".into(),
+        };
+        assert_eq!(
+            r.resolve_primary(&MemoryScope::SharedUser),
+            "user_cron-ephemeral-agent-aria",
+            "colons must be mapped, not passed through to MuninnDB"
+        );
+        assert_eq!(
+            r.resolve_primary(&MemoryScope::Session("telegram:123:agent-jane".into())),
+            "session_telegram-123-agent-jane"
+        );
+        // Clean ids pass through unchanged.
+        let r = VaultResolver {
+            agent_id: "agent-aria".into(),
+            user_id: "likesjx".into(),
+        };
+        assert_eq!(r.resolve_primary(&MemoryScope::SharedUser), "user_likesjx");
+        assert_eq!(r.resolve_primary(&MemoryScope::SelfOnly), "self_agent-aria");
+    }
+
+    #[test]
+    fn fleet_shared_vault_predicate() {
+        assert!(is_fleet_shared_vault("default"));
+        assert!(is_fleet_shared_vault("user_likesjx"));
+        assert!(!is_fleet_shared_vault("self_agent-aria"));
+        assert!(!is_fleet_shared_vault("session_01abc"));
+        assert!(!is_fleet_shared_vault("user")); // no underscore suffix — not a user vault
+    }
+
+    /// Wire compat: configs serialized before `shared_write_route` existed
+    /// (e.g. an older hotel's MemoryConfigPayload.config_json) must still
+    /// deserialize, defaulting to no routing.
+    #[test]
+    fn config_without_route_field_deserializes_to_none() {
+        let legacy = r#"{"base_url":"http://127.0.0.1:8475","vault_tokens":{},"default_token":null,"default_vault":"default"}"#;
+        let cfg: MuninnConfig = serde_json::from_str(legacy).expect("legacy config parses");
+        assert_eq!(cfg.shared_write_route, None);
+    }
+
+    #[test]
+    fn config_route_round_trips() {
+        let mut cfg = MuninnConfig::local("default");
+        cfg.shared_write_route = Some("vps-jane-aiua-01".into());
+        let json = serde_json::to_string(&cfg).unwrap();
+        let back: MuninnConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.shared_write_route.as_deref(), Some("vps-jane-aiua-01"));
     }
 }

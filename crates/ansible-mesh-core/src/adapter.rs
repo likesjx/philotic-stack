@@ -1,5 +1,5 @@
 use crate::runtime::AgentInput;
-use crate::{AgentId, BeaconMessage, MsgType, NodeId, ToolRef};
+use crate::{AgentId, BeaconMessage, BeaconPayload, MsgType, NodeId, ToolRef};
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -45,8 +45,8 @@ impl MeshAdapter {
             seq: 0,
             total: 1,
             timestamp: 0,
-            payload: serde_json::to_vec(&payload)?,
-            hmac: vec![],
+            payload: serde_json::to_vec(&payload)?.into(),
+            hmac: BeaconPayload::default(),
         };
 
         let data = serde_json::to_vec(&msg)?;

@@ -1,4 +1,5 @@
 use ansible_mesh_core::catalog_rights::{has_right, tool_right};
+use ansible_mesh_core::provider_keys::{ProviderKeySpec, provider_key_spec};
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
 use media_prep::serialize_audio_artifact_envelope;
@@ -104,7 +105,15 @@ pub struct ResponseContract {
     pub modalities: Vec<String>,
     pub style: Option<String>,
     pub channels: Vec<String>,
+    pub memory_candidate_policy: Option<String>,
 }
+
+pub const DEFAULT_MEMORY_CANDIDATE_POLICY: &str = "Emit memory_candidate only when this exchange \
+contains durable future-useful context: a user preference, explicit decision, stable fact, \
+validation outcome, reality gap, next seam, or recurring pattern. Omit it for greetings, \
+acknowledgments, readiness/status chatter, transient task progress, tool logs, transcripts, \
+or routine task-list churn. The candidate must be atomic: concept is a specific short slug, \
+content is 1-3 sentences and 24-700 characters, tags are optional with 10 or fewer short tags.";
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ProjectionItem {
@@ -171,6 +180,10 @@ pub struct AttachmentInput {
     pub inline_audio_b64: Option<String>,
     pub inline_audio_sample_rate: Option<u32>,
     pub inline_audio_channels: Option<u16>,
+    /// Clip length in whole seconds for audio/video attachments (e.g. Telegram's
+    /// `voice.duration`). Used to size the `voice.transcribe` dispatch budget so a
+    /// long voice memo is not cut off by the default timeout. `None` when unknown.
+    pub duration_secs: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -447,6 +460,17 @@ impl ControllerTask {
             if !text.is_empty() {
                 sections.push(format!("[Recalled memory]\n{text}"));
             }
+        }
+
+        if self.wants_channel("memory_candidate") {
+            let policy = self
+                .response_contract
+                .memory_candidate_policy
+                .as_deref()
+                .map(str::trim)
+                .filter(|text| !text.is_empty())
+                .unwrap_or(DEFAULT_MEMORY_CANDIDATE_POLICY);
+            sections.push(format!("[Memory candidate policy]\n{policy}"));
         }
 
         if !self.context.dialogue_window.is_empty() {
@@ -813,6 +837,12 @@ fn parse_response_contract(value: Option<&Value>) -> ResponseContract {
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default(),
+        memory_candidate_policy: object
+            .get("memory_candidate_policy")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+            .map(str::to_string),
     }
 }
 
@@ -965,6 +995,9 @@ fn parse_attachments(value: Option<&Value>) -> Vec<AttachmentInput> {
                             .and_then(|obj| obj.get("inline_audio_channels"))
                             .and_then(Value::as_u64)
                             .map(|v| v as u16),
+                        duration_secs: object
+                            .and_then(|obj| obj.get("duration_secs"))
+                            .and_then(Value::as_u64),
                     }
                 })
                 .collect()
@@ -1391,6 +1424,9 @@ fn serialize_text_result(task: &ControllerTask, result: &TextResult) -> Value {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ProviderConfigs {
+    pub anthropic_api_key: Option<String>,
+    pub anthropic_base_url: Option<String>,
+    pub anthropic_default_model: Option<String>,
     pub gemini_api_key: Option<String>,
     pub gemini_oauth_access_token: Option<String>,
     pub gemini_oauth_project_id: Option<String>,
@@ -1407,23 +1443,46 @@ pub struct ProviderConfigs {
     pub openai_project_id: Option<String>,
     pub openai_default_model: Option<String>,
     pub openai_default_embedding_model: Option<String>,
+    pub openrouter_api_key: Option<String>,
+    pub openrouter_base_url: Option<String>,
+    pub openrouter_default_model: Option<String>,
+    pub openrouter_default_embedding_model: Option<String>,
+    pub openrouter_fallback_models: Vec<String>,
+    pub openrouter_route: Option<String>,
 }
 
 impl ProviderConfigs {
     pub async fn load(ipc_client: &mut PhiloticClient) -> Result<Self> {
         Ok(Self {
-            gemini_api_key: env_override("PHILOTIC_GEMINI_API_KEY").or(
-                fetch_config_or_secret_string(ipc_client, "gemini_api_key", "gemini_api_key_ref")
-                    .await?,
+            // Endpoint-scoped vault ref / PHILOTIC_ANTHROPIC_API_KEY first;
+            // the vendor-standard bare ANTHROPIC_API_KEY is the last-resort
+            // fallback for ephemeral/CI runs.
+            anthropic_api_key: match isolate_provider_key_failure(
+                "anthropic",
+                load_provider_api_key(ipc_client, "anthropic").await,
+            ) {
+                Some(key) => Some(key),
+                None => env_override("ANTHROPIC_API_KEY"),
+            },
+            anthropic_base_url: env_override("PHILOTIC_ANTHROPIC_BASE_URL")
+                .or(fetch_config_string(ipc_client, "anthropic_base_url").await?),
+            anthropic_default_model: env_override("PHILOTIC_ANTHROPIC_DEFAULT_MODEL")
+                .or(fetch_config_string(ipc_client, "anthropic_default_model").await?),
+            gemini_api_key: isolate_provider_key_failure(
+                "gemini",
+                load_provider_api_key(ipc_client, "gemini").await,
             ),
-            gemini_oauth_access_token: load_env_or_config_secret_string(
-                ipc_client,
-                "PHILOTIC_GEMINI_OAUTH_ACCESS_TOKEN",
-                "PHILOTIC_GEMINI_OAUTH_ACCESS_TOKEN_REF",
-                "gemini_oauth_access_token",
-                "gemini_oauth_access_token_ref",
-            )
-            .await?,
+            gemini_oauth_access_token: isolate_provider_key_failure(
+                "gemini_oauth",
+                load_env_or_config_secret_string(
+                    ipc_client,
+                    "PHILOTIC_GEMINI_OAUTH_ACCESS_TOKEN",
+                    "PHILOTIC_GEMINI_OAUTH_ACCESS_TOKEN_REF",
+                    "gemini_oauth_access_token",
+                    "gemini_oauth_access_token_ref",
+                )
+                .await,
+            ),
             gemini_oauth_project_id: env_override("PHILOTIC_GEMINI_OAUTH_PROJECT_ID")
                 .or(fetch_config_string(ipc_client, "gemini_oauth_project_id").await?),
             gemini_base_url: env_override("PHILOTIC_GEMINI_BASE_URL").or(fetch_config_string(
@@ -1431,12 +1490,10 @@ impl ProviderConfigs {
                 "gemini_base_url",
             )
             .await?),
-            elevenlabs_api_key: fetch_config_or_secret_string(
-                ipc_client,
-                "elevenlabs_api_key",
-                "elevenlabs_api_key_ref",
-            )
-            .await?,
+            elevenlabs_api_key: isolate_provider_key_failure(
+                "elevenlabs",
+                load_provider_api_key(ipc_client, "elevenlabs").await,
+            ),
             elevenlabs_default_voice_id: fetch_config_string(ipc_client, "elevenlabs_voice_id")
                 .await?,
             ollama_base_url: env_override("PHILOTIC_OLLAMA_BASE_URL").or(fetch_config_string(
@@ -1449,20 +1506,21 @@ impl ProviderConfigs {
                 "ollama_model",
             )
             .await?),
-            openai_oauth_access_token: load_env_or_config_secret_string(
-                ipc_client,
-                "PHILOTIC_OPENAI_OAUTH_ACCESS_TOKEN",
-                "PHILOTIC_OPENAI_OAUTH_ACCESS_TOKEN_REF",
-                "openai_oauth_access_token",
-                "openai_oauth_access_token_ref",
-            )
-            .await?,
-            openai_api_key: fetch_config_or_secret_string(
-                ipc_client,
-                "openai_api_key",
-                "openai_api_key_ref",
-            )
-            .await?,
+            openai_oauth_access_token: isolate_provider_key_failure(
+                "openai_oauth",
+                load_env_or_config_secret_string(
+                    ipc_client,
+                    "PHILOTIC_OPENAI_OAUTH_ACCESS_TOKEN",
+                    "PHILOTIC_OPENAI_OAUTH_ACCESS_TOKEN_REF",
+                    "openai_oauth_access_token",
+                    "openai_oauth_access_token_ref",
+                )
+                .await,
+            ),
+            openai_api_key: isolate_provider_key_failure(
+                "openai",
+                load_provider_api_key(ipc_client, "openai").await,
+            ),
             openai_base_url: env_override("PHILOTIC_OPENAI_BASE_URL").or(fetch_config_string(
                 ipc_client,
                 "openai_base_url",
@@ -1477,8 +1535,159 @@ impl ProviderConfigs {
                 .or(fetch_config_string(ipc_client, "openai_default_model").await?),
             openai_default_embedding_model: env_override("PHILOTIC_OPENAI_DEFAULT_EMBEDDING_MODEL")
                 .or(fetch_config_string(ipc_client, "openai_default_embedding_model").await?),
+            openrouter_api_key: isolate_provider_key_failure(
+                "openrouter",
+                load_provider_api_key(ipc_client, "openrouter").await,
+            ),
+            openrouter_base_url: env_override("PHILOTIC_OPENROUTER_BASE_URL")
+                .or(fetch_config_string(ipc_client, "openrouter_base_url").await?),
+            openrouter_default_model: env_override("PHILOTIC_OPENROUTER_DEFAULT_MODEL")
+                .or(fetch_config_string(ipc_client, "openrouter_default_model").await?),
+            openrouter_default_embedding_model: env_override(
+                "PHILOTIC_OPENROUTER_DEFAULT_EMBEDDING_MODEL",
+            )
+            .or(fetch_config_string(ipc_client, "openrouter_default_embedding_model").await?),
+            openrouter_fallback_models: env_override("PHILOTIC_OPENROUTER_FALLBACK_MODELS")
+                .or(fetch_config_string(ipc_client, "openrouter_fallback_models").await?)
+                .map(|raw| parse_model_list(&raw))
+                .unwrap_or_default(),
+            openrouter_route: env_override("PHILOTIC_OPENROUTER_ROUTE").or(fetch_config_string(
+                ipc_client,
+                "openrouter_route",
+            )
+            .await?),
         })
     }
+
+    /// Overwrite one provider's resolved API key (credential-pool rotation).
+    /// Only pool-enabled providers have an arm; others are a no-op.
+    pub fn set_provider_api_key(&mut self, provider: &str, key: String) {
+        if provider == "gemini" {
+            self.gemini_api_key = Some(key);
+        }
+    }
+}
+
+/// Refresh a provider's credential pool from env + config + vault, then point
+/// the resolved config key at the pool's active member (Layer 1 of the Model
+/// Failover Layers proposal; gemini-only in slice 0).
+///
+/// Member ring order matches the pre-pool precedence so single-key setups
+/// behave identically: env break-glass (`PHILOTIC_GEMINI_API_KEY`) first, then
+/// the scalar `gemini_api_key_ref`, then each `gemini_api_key_pool` entry.
+/// A member whose vault resolution fails (decrypt error under a mismatched
+/// master key, ACL denial) enters an auth cooldown instead of sinking the
+/// provider — the surviving members carry it.
+pub async fn refresh_gemini_credential_pool(
+    ipc_client: &mut PhiloticClient,
+    pool: &mut crate::credential_pool::CredentialPool,
+    configs: &mut ProviderConfigs,
+) -> Result<()> {
+    use crate::credential_pool::MemberSource;
+
+    let spec = provider_key_spec("gemini").context("gemini provider key spec missing")?;
+    let mut resolved: Vec<(String, MemberSource, Option<String>)> = Vec::new();
+    let mut failed_labels: Vec<String> = Vec::new();
+
+    if let Some(key) = env_override(spec.env_api_key) {
+        resolved.push((
+            "env".to_string(),
+            MemberSource::Env(spec.env_api_key.to_string()),
+            Some(key),
+        ));
+    }
+
+    let primary_ref = match env_override(spec.env_api_key_ref) {
+        Some(secret_ref) => Some(secret_ref),
+        None => fetch_config_string(ipc_client, spec.api_key_ref_key).await?,
+    };
+    if let Some(secret_ref) = primary_ref {
+        let plaintext = match fetch_provider_secret_soft_on_denial(
+            ipc_client,
+            &secret_ref,
+            spec.provider,
+        )
+        .await
+        {
+            Ok(value) => value,
+            Err(err) => {
+                tracing::error!(
+                    provider = spec.provider,
+                    member = "primary",
+                    error = %err,
+                    "Credential pool member failed to resolve; cooling it and continuing on siblings"
+                );
+                failed_labels.push("primary".to_string());
+                None
+            }
+        };
+        resolved.push((
+            "primary".to_string(),
+            MemberSource::SecretRef(secret_ref),
+            plaintext,
+        ));
+    }
+
+    let pool_refs: Vec<String> = fetch_config_string(ipc_client, "gemini_api_key_pool")
+        .await?
+        .map(|raw| parse_model_list(&raw))
+        .unwrap_or_default();
+    for (i, secret_ref) in pool_refs.into_iter().enumerate() {
+        let label = format!("pool[{i}]");
+        let plaintext = match fetch_provider_secret_soft_on_denial(
+            ipc_client,
+            &secret_ref,
+            spec.provider,
+        )
+        .await
+        {
+            Ok(value) => value,
+            Err(err) => {
+                tracing::error!(
+                    provider = spec.provider,
+                    member = %label,
+                    error = %err,
+                    "Credential pool member failed to resolve; cooling it and continuing on siblings"
+                );
+                failed_labels.push(label.clone());
+                None
+            }
+        };
+        resolved.push((label, MemberSource::SecretRef(secret_ref), plaintext));
+    }
+
+    pool.reconcile(resolved);
+    for label in &failed_labels {
+        pool.mark_resolution_failed(label);
+    }
+
+    // The pool is now the single source of truth for the gemini key.
+    configs.gemini_api_key = pool.active_member().map(|(_, key)| key.to_string());
+    Ok(())
+}
+
+fn parse_model_list(raw: &str) -> Vec<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Vec::new();
+    }
+
+    if let Ok(Value::Array(items)) = serde_json::from_str::<Value>(trimmed) {
+        return items
+            .iter()
+            .filter_map(Value::as_str)
+            .map(str::trim)
+            .filter(|model| !model.is_empty())
+            .map(str::to_string)
+            .collect();
+    }
+
+    trimmed
+        .split(',')
+        .map(str::trim)
+        .filter(|model| !model.is_empty())
+        .map(str::to_string)
+        .collect()
 }
 
 /// Per-attempt timing budget declared by each provider.
@@ -1703,7 +1912,10 @@ pub fn serialize_audio_artifact(artifact: &AudioArtifact) -> Result<String> {
     )
 }
 
-async fn fetch_config_string(ipc_client: &mut PhiloticClient, key: &str) -> Result<Option<String>> {
+pub(crate) async fn fetch_config_string(
+    ipc_client: &mut PhiloticClient,
+    key: &str,
+) -> Result<Option<String>> {
     let response = ipc_client
         .send_request(IpcRequest::GetConfig { key: key.into() })
         .await?;
@@ -1748,6 +1960,90 @@ async fn load_env_or_config_secret_string(
     }
 
     fetch_config_or_secret_string(ipc_client, value_key, ref_key).await
+}
+
+async fn load_provider_api_key(
+    ipc_client: &mut PhiloticClient,
+    provider: &str,
+) -> Result<Option<String>> {
+    let spec = provider_key_spec(provider)
+        .with_context(|| format!("unknown provider key spec: {provider}"))?;
+    load_provider_api_key_by_spec(ipc_client, spec).await
+}
+
+async fn load_provider_api_key_by_spec(
+    ipc_client: &mut PhiloticClient,
+    spec: &ProviderKeySpec,
+) -> Result<Option<String>> {
+    if let Some(value) = env_override(spec.env_api_key) {
+        return Ok(Some(value));
+    }
+
+    if let Some(secret_ref) = env_override(spec.env_api_key_ref) {
+        return fetch_provider_secret_soft_on_denial(ipc_client, &secret_ref, spec.provider).await;
+    }
+
+    let Some(secret_ref) = fetch_config_string(ipc_client, spec.api_key_ref_key).await? else {
+        return Ok(None);
+    };
+
+    fetch_provider_secret_soft_on_denial(ipc_client, &secret_ref, spec.provider).await
+}
+
+/// Fetch a provider API key, degrading an ACL *denial* to `None` instead of a fatal error.
+///
+/// A model controller reloads *every* provider's config on each task
+/// (`ProviderConfigs::load`), yet each provider key is ACL-scoped to its own
+/// role via `ProviderKeySpec::allowed_roles` (e.g. `openai_api_key` →
+/// `["model","model.openai"]`). A specialized controller such as
+/// `model.elevenlabs` therefore hits a legitimate cross-provider denial when it
+/// reaches for `openai_api_key` — that denial must NOT sink the whole config
+/// load (which would silently break voice synthesis). Only the "is not
+/// accessible" ACL case is softened; every other failure (decrypt, transport,
+/// malformed response, or a denial of the controller's *own* key) stays fatal.
+/// Isolate a per-provider key-fetch failure so it cannot sink the whole
+/// provider-config refresh.
+///
+/// `ProviderConfigs::load` reloads *every* provider's key on each task. Before
+/// this guard, a single undecryptable vault row (e.g. a stale `openai_api_key`
+/// encrypted under a rotated master key) hard-failed the entire refresh and
+/// took down ALL providers — a bad OpenAI key broke Gemini turns. Instead, the
+/// failed provider's key degrades to `None` (its own dispatch path will report
+/// "provider not configured" and tiered fallback can escalate) while every
+/// other provider stays live. The failure is logged at ERROR so it stays
+/// visible. Transport-level IPC failures still fail the overall load through
+/// the plain-config fetches, which remain fatal.
+fn isolate_provider_key_failure(provider: &str, result: Result<Option<String>>) -> Option<String> {
+    match result {
+        Ok(value) => value,
+        Err(err) => {
+            tracing::error!(
+                provider,
+                error = %err,
+                "Provider key fetch failed during config refresh; continuing without this provider so the others stay live"
+            );
+            None
+        }
+    }
+}
+
+async fn fetch_provider_secret_soft_on_denial(
+    ipc_client: &mut PhiloticClient,
+    secret_ref: &str,
+    provider: &str,
+) -> Result<Option<String>> {
+    match fetch_secret_string(ipc_client, secret_ref).await {
+        Ok(value) => Ok(value),
+        Err(err) if err.to_string().contains("is not accessible") => {
+            tracing::debug!(
+                provider,
+                secret_ref,
+                "Provider key not accessible to this controller role; skipping (expected for cross-provider keys)."
+            );
+            Ok(None)
+        }
+        Err(err) => Err(err),
+    }
 }
 
 async fn fetch_config_or_secret_string(
@@ -2300,7 +2596,8 @@ mod tests {
                 }
             },
             "response_contract": {
-                "channels": ["display_text", "spoken_text", "working_memory_delta"]
+                "channels": ["display_text", "spoken_text", "working_memory_delta"],
+                "memory_candidate_policy": "Only store durable operator preferences."
             }
         }))
         .unwrap();
@@ -2308,6 +2605,31 @@ mod tests {
         assert!(task.wants_channel("spoken_text"));
         assert!(task.wants_channel("working_memory_delta"));
         assert!(!task.wants_channel("follow_up_questions"));
+        assert_eq!(
+            task.response_contract.memory_candidate_policy.as_deref(),
+            Some("Only store durable operator preferences.")
+        );
+    }
+
+    #[test]
+    fn composed_prompt_includes_memory_candidate_policy_when_requested() {
+        let task = ControllerTask::from_value(&json!({
+            "kind": "text.generate",
+            "context": {
+                "active_turn": {
+                    "text": "remember the operator preference"
+                }
+            },
+            "response_contract": {
+                "channels": ["spoken_text", "memory_candidate"],
+                "memory_candidate_policy": "Only store durable operator preferences."
+            }
+        }))
+        .unwrap();
+
+        let prompt = task.composed_prompt_text().expect("prompt should compose");
+        assert!(prompt.contains("[Memory candidate policy]"));
+        assert!(prompt.contains("Only store durable operator preferences."));
     }
 
     #[test]
@@ -2474,5 +2796,30 @@ mod tests {
 
         assert!(payload.contains("\"kind\":\"audio_artifact\""));
         assert!(payload.contains("\"audio_base64\":\"aGVsbG8=\""));
+    }
+
+    #[test]
+    fn isolate_provider_key_failure_passes_through_success() {
+        assert_eq!(
+            super::isolate_provider_key_failure("gemini", Ok(Some("key-123".into()))),
+            Some("key-123".to_string())
+        );
+        assert_eq!(
+            super::isolate_provider_key_failure("gemini", Ok(None)),
+            None
+        );
+    }
+
+    #[test]
+    fn isolate_provider_key_failure_degrades_errors_to_none() {
+        // A single undecryptable vault row (e.g. a stale openai key encrypted
+        // under a rotated master key) must not sink the whole config refresh.
+        let result = super::isolate_provider_key_failure(
+            "openai",
+            Err(anyhow::anyhow!(
+                "secret fetch failed: failed to decrypt vault secret"
+            )),
+        );
+        assert_eq!(result, None);
     }
 }

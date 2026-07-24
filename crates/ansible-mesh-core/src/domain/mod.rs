@@ -13,18 +13,26 @@
 //! `"abstract_tool:bash.exec"`, `"rule:rule-001"`. This keeps keys globally
 //! unique within a store and makes kind-scoped lookups fast.
 
+use crate::autonomy::{
+    record_outcome, AuditOutcome, AutonomyAuditRecord, AutonomyGrant, AutonomyLane, Outcome,
+    Transition,
+};
 use crate::cron::CronJob;
 use crate::graph::{
     AbstractModelRecord, AbstractRightRecord, AbstractSkillRecord, AbstractToolRecord, GraphNode,
     MembraneTransportHomeRecord, ModelProfileRecord, RoleIncarnationRecord, RoleReadinessState,
-    RoutingPolicyEvaluationRecord, RoutingPolicyRecord, RuleRecord, ToolsetProfileRecord,
-    WorkflowSkillRecord,
+    RoutingPolicyEvaluationRecord, RoutingPolicyRecord, RuleRecord, SkillRegistrationAuditRecord,
+    ToolsetProfileRecord, WorkflowSkillRecord,
+};
+use crate::heal_queue::{
+    HealWorkItemRecord, HEAL_WORK_ITEM_STATUS_CLOSED, HEAL_WORK_ITEM_STATUS_OPEN,
 };
 use crate::storage::{
     AgentIdentityRecord, GraphAdapter, GraphRunnerInstanceRecord, GuestRecord, HotelRecord,
     ProjectedUserIdentityRecord, SecretRecord, SessionEventRecord, SessionParticipantRecord,
     SessionRecord, SessionTurnRecord, UserProfile, VaultRegistryEntry,
-    CONFIG_GRAPH_RUNNER_REGISTRY, CONFIG_MUNINN_ENDPOINT, CONFIG_VAULT_REGISTRY,
+    CONFIG_GRAPH_RUNNER_REGISTRY, CONFIG_MUNINN_ENDPOINT, CONFIG_MUNINN_WRITE_ROUTE,
+    CONFIG_VAULT_REGISTRY,
 };
 use crate::NodeCapabilities;
 use anyhow::{Context, Result};
@@ -517,6 +525,24 @@ impl GraphDomain {
         }
     }
 
+    /// List all session records. Malformed rows are skipped with a warning
+    /// instead of failing the whole listing (same hardening as
+    /// [`Self::list_session_turns`]).
+    pub fn list_sessions(&self) -> Result<Vec<SessionRecord>> {
+        let mut out: Vec<SessionRecord> = Vec::new();
+        for node in self.adapter.list_nodes_by_kind(NODE_KIND_SESSION)? {
+            match serde_json::from_value::<SessionRecord>(node.data) {
+                Ok(record) => out.push(record),
+                Err(e) => warn!(
+                    node_key = %node.node_key,
+                    error = %e,
+                    "list_sessions: skipping malformed record"
+                ),
+            }
+        }
+        Ok(out)
+    }
+
     // ── Session participant methods ────────────────────────────────────────────
 
     fn session_participant_key(session_id: &str, component_id: &str) -> String {
@@ -612,6 +638,26 @@ impl GraphDomain {
         }
         if limit > 0 && out.len() > limit {
             out.drain(..out.len() - limit);
+        }
+        Ok(out)
+    }
+
+    /// Returns all session_turn records with status="running" and started_at <= max_started_at.
+    /// Used by the hotel's zombie-turn repair sweep.
+    pub fn list_zombie_session_turns(&self, max_started_at: u64) -> Result<Vec<SessionTurnRecord>> {
+        let mut out = Vec::new();
+        for node in self.adapter.list_nodes_by_kind(NODE_KIND_SESSION_TURN)? {
+            let record = match serde_json::from_value::<SessionTurnRecord>(node.data) {
+                Ok(r) => r,
+                Err(_) => continue,
+            };
+            if record.status == "running" {
+                if let Some(started_at) = record.started_at {
+                    if started_at <= max_started_at {
+                        out.push(record);
+                    }
+                }
+            }
         }
         Ok(out)
     }
@@ -741,6 +787,35 @@ impl GraphDomain {
         Ok(out)
     }
 
+    /// List every role incarnation record across all agents. Used by the
+    /// role-handoff-loop self-heal detector to find agents with more than one
+    /// `ActiveInSession` incarnation.
+    pub fn list_all_role_incarnations(&self) -> Result<Vec<RoleIncarnationRecord>> {
+        let mut out = Vec::new();
+        for node in self
+            .adapter
+            .list_nodes_by_kind(NODE_KIND_ROLE_INCARNATION)?
+        {
+            out.push(serde_json::from_value(node.data).context(
+                "GraphDomain::list_all_role_incarnations: deserialize RoleIncarnationRecord",
+            )?);
+        }
+        Ok(out)
+    }
+
+    /// List every session record. Used by the role-handoff-loop self-heal
+    /// detector to clear pins that point at a demoted incarnation.
+    pub fn list_all_sessions(&self) -> Result<Vec<SessionRecord>> {
+        let mut out = Vec::new();
+        for node in self.adapter.list_nodes_by_kind(NODE_KIND_SESSION)? {
+            out.push(
+                serde_json::from_value(node.data)
+                    .context("GraphDomain::list_all_sessions: deserialize SessionRecord")?,
+            );
+        }
+        Ok(out)
+    }
+
     pub fn set_role_incarnation_readiness(
         &self,
         agent_id: &str,
@@ -752,6 +827,36 @@ impl GraphDomain {
             self.upsert_role_incarnation(&rec)?;
         }
         Ok(())
+    }
+
+    /// Promote a single role incarnation to `ActiveInSession`, enforcing the
+    /// single-active invariant: at most ONE incarnation per agent may be
+    /// `ActiveInSession` at a time. Any sibling incarnation of the same agent
+    /// currently `ActiveInSession` is demoted to `Routable`.
+    ///
+    /// Without this invariant, distinct role handoffs (e.g. orchestrator then
+    /// Chronos) each set their own target active without clearing the previous
+    /// one, leaving two incarnations active simultaneously — the corrupt state
+    /// that seeds the role-handoff ping-pong loop.
+    pub fn promote_role_incarnation_active(&self, agent_id: &str, role_name: &str) -> Result<()> {
+        // Demote any OTHER incarnation of this agent that is currently active.
+        for sibling in self.list_role_incarnations(agent_id)? {
+            if sibling.role_name != role_name
+                && matches!(sibling.readiness_state, RoleReadinessState::ActiveInSession)
+            {
+                self.set_role_incarnation_readiness(
+                    agent_id,
+                    &sibling.role_name,
+                    RoleReadinessState::Routable,
+                )?;
+            }
+        }
+        // Promote the target.
+        self.set_role_incarnation_readiness(
+            agent_id,
+            role_name,
+            RoleReadinessState::ActiveInSession,
+        )
     }
 
     /// Find the first role incarnation record with the given role_name, across all agents.
@@ -926,6 +1031,52 @@ impl GraphDomain {
             }
         }
         Ok(skills)
+    }
+
+    // ── Skill registration audit methods ──────────────────────────────────────
+
+    fn skill_registration_audit_key(audit_id: &str) -> String {
+        format!("{}:{}", NODE_KIND_SKILL_REGISTRATION_AUDIT, audit_id)
+    }
+
+    /// Append an audit entry for an accepted skill registration. Entries are
+    /// keyed by a unique `audit_id`, so this never overwrites prior entries —
+    /// the collection behaves as an append-only trail.
+    pub fn record_skill_registration_audit(
+        &self,
+        record: &SkillRegistrationAuditRecord,
+    ) -> Result<()> {
+        let data = serde_json::to_value(record).context(
+            "GraphDomain::record_skill_registration_audit: serialize SkillRegistrationAuditRecord",
+        )?;
+        self.adapter.upsert_node(&GraphNode {
+            node_key: Self::skill_registration_audit_key(&record.audit_id),
+            kind: NODE_KIND_SKILL_REGISTRATION_AUDIT.to_string(),
+            label: Some(record.skill_name.clone()),
+            data,
+        })
+    }
+
+    /// List all recorded skill-registration audit entries. Malformed records are
+    /// skipped with a warning rather than failing the whole listing.
+    pub fn list_skill_registration_audits(&self) -> Result<Vec<SkillRegistrationAuditRecord>> {
+        let mut audits = Vec::new();
+        for node in self
+            .adapter
+            .list_nodes_by_kind(NODE_KIND_SKILL_REGISTRATION_AUDIT)?
+        {
+            match serde_json::from_value::<SkillRegistrationAuditRecord>(node.data.clone()) {
+                Ok(rec) => audits.push(rec),
+                Err(err) => {
+                    warn!(
+                        node_key = %node.node_key,
+                        "Skipping incompatible skill_registration_audit record during list: {}",
+                        err
+                    );
+                }
+            }
+        }
+        Ok(audits)
     }
 
     // ── Workflow skill methods ────────────────────────────────────────────────
@@ -1196,6 +1347,19 @@ impl GraphDomain {
         self.set_config_value(CONFIG_MUNINN_ENDPOINT, &serde_json::to_string(url)?)
     }
 
+    /// Muninn-cluster single-writer routing target (Cortex hotel node id), or
+    /// `None` when this hotel writes its own muninn directly. Stored as a
+    /// JSON string config value under `muninn_write_route`.
+    pub fn get_muninn_write_route(&self) -> Result<Option<String>> {
+        self.get_config_value(CONFIG_MUNINN_WRITE_ROUTE)?
+            .map(|raw| serde_json::from_str::<String>(&raw).map_err(anyhow::Error::from))
+            .transpose()
+    }
+
+    pub fn set_muninn_write_route(&self, node_id: &str) -> Result<()> {
+        self.set_config_value(CONFIG_MUNINN_WRITE_ROUTE, &serde_json::to_string(node_id)?)
+    }
+
     // ── Graph runner registry (stored as a config value) ──────────────────────
 
     pub fn get_graph_runner_registry(&self) -> Result<Vec<GraphRunnerInstanceRecord>> {
@@ -1436,7 +1600,9 @@ impl GraphDomain {
     }
 
     /// Record the outcome of a single dispatch attempt, updating the profile's
-    /// latency_p50_ms (EMA α=0.25) and error_rate (EMA α=0.1).
+    /// latency_p50_ms (EMA α=0.25) and error_rate (EMA α=0.1), degrading after
+    /// N consecutive failures and recovering on the first success (the shared
+    /// state machine in [`crate::model_oracle::apply_model_outcome`]).
     pub fn observe_model_outcome(
         &self,
         model_ref: &str,
@@ -1451,37 +1617,30 @@ impl GraphDomain {
 
         let mut profile = self
             .get_model_profile(model_ref, node_id)?
-            .unwrap_or_else(|| ModelProfileRecord {
-                model_ref: model_ref.to_string(),
-                node_id: node_id.to_string(),
-                provider: model_ref.to_string(),
-                task_kinds: Vec::new(),
-                trust_tier: String::new(),
-                max_context_tokens: 0,
-                latency_p50_ms: latency_ms,
-                error_rate: 0.0,
-                status: "healthy".to_string(),
-                last_healthy_secs: 0,
-                updated_secs: now,
+            .unwrap_or_else(|| {
+                // The provider id doubles as the model_ref at this granularity;
+                // seed capability flags honestly from the provider name.
+                let (supports_tools, supports_structured) =
+                    crate::model_oracle::seed_capabilities_for_provider(model_ref);
+                ModelProfileRecord {
+                    model_ref: model_ref.to_string(),
+                    node_id: node_id.to_string(),
+                    provider: model_ref.to_string(),
+                    latency_p50_ms: latency_ms,
+                    updated_secs: now,
+                    supports_tools,
+                    supports_structured,
+                    ..Default::default()
+                }
             });
 
-        // Exponential moving averages
-        const LATENCY_ALPHA: f64 = 0.25;
-        const ERROR_ALPHA: f32 = 0.1;
-        profile.latency_p50_ms = ((1.0 - LATENCY_ALPHA) * profile.latency_p50_ms as f64
-            + LATENCY_ALPHA * latency_ms as f64) as u64;
-        let outcome = if success { 0.0f32 } else { 1.0f32 };
-        profile.error_rate = (1.0 - ERROR_ALPHA) * profile.error_rate + ERROR_ALPHA * outcome;
-
-        if success {
-            profile.last_healthy_secs = now;
-        }
-        profile.status = if profile.error_rate > 0.5 {
-            "degraded".to_string()
-        } else {
-            "healthy".to_string()
-        };
-        profile.updated_secs = now;
+        crate::model_oracle::apply_model_outcome(
+            &mut profile,
+            latency_ms,
+            success,
+            now,
+            crate::model_oracle::degrade_threshold_from_env(),
+        );
 
         self.upsert_model_profile(&profile)
     }
@@ -1512,6 +1671,262 @@ impl GraphDomain {
 
         Ok(profiles)
     }
+
+    // ── Autonomy grant methods (Autopoiesis Slice A1) ─────────────────────────
+
+    fn autonomy_grant_key(lane: &str) -> String {
+        format!("{}:{}", NODE_KIND_AUTONOMY_GRANT, lane)
+    }
+
+    fn autonomy_audit_key(audit_id: &str) -> String {
+        format!("{}:{}", NODE_KIND_AUTONOMY_AUDIT, audit_id)
+    }
+
+    /// Upsert a per-lane autonomy grant as a graph node.
+    pub fn upsert_autonomy_grant(&self, grant: &AutonomyGrant) -> Result<()> {
+        let data = serde_json::to_value(grant)
+            .context("GraphDomain::upsert_autonomy_grant: serialize AutonomyGrant")?;
+        self.adapter.upsert_node(&GraphNode {
+            node_key: Self::autonomy_grant_key(grant.lane.as_str()),
+            kind: NODE_KIND_AUTONOMY_GRANT.to_string(),
+            label: Some(grant.lane.as_str().to_string()),
+            data,
+        })
+    }
+
+    /// Load the autonomy grant for `lane`.
+    pub fn get_autonomy_grant(&self, lane: &str) -> Result<Option<AutonomyGrant>> {
+        match self.adapter.get_node(&Self::autonomy_grant_key(lane))? {
+            None => Ok(None),
+            Some(node) => Ok(Some(
+                serde_json::from_value(node.data)
+                    .context("GraphDomain::get_autonomy_grant: deserialize AutonomyGrant")?,
+            )),
+        }
+    }
+
+    /// Load the grant for `lane`, creating it at the safest posture
+    /// ([`crate::autonomy::AutonomyPosture::ProposalOnly`]) if absent.
+    ///
+    /// Grants are never created above ProposalOnly — trust is earned per-lane
+    /// via operator-confirmed outcomes (Autonomy Contract rule 2).
+    pub fn get_or_create_autonomy_grant(&self, lane: &str, now: u64) -> Result<AutonomyGrant> {
+        if let Some(grant) = self.get_autonomy_grant(lane)? {
+            return Ok(grant);
+        }
+        let grant = AutonomyGrant::new(AutonomyLane::new(lane), now);
+        self.upsert_autonomy_grant(&grant)?;
+        Ok(grant)
+    }
+
+    /// List all autonomy grants.
+    pub fn list_autonomy_grants(&self) -> Result<Vec<AutonomyGrant>> {
+        self.adapter
+            .list_nodes_by_kind(NODE_KIND_AUTONOMY_GRANT)?
+            .into_iter()
+            .map(|n| {
+                serde_json::from_value(n.data)
+                    .context("GraphDomain::list_autonomy_grants: deserialize AutonomyGrant")
+            })
+            .collect()
+    }
+
+    /// Apply an [`Outcome`] to the grant for `lane` and persist the result.
+    ///
+    /// When the transition freezes the lane (consecutive-failure ceiling),
+    /// this also writes an `autonomy_audit` record describing the freeze so
+    /// operator review has an anchor. Returns the transition.
+    pub fn record_autonomy_outcome(
+        &self,
+        lane: &str,
+        outcome: Outcome,
+        now: u64,
+    ) -> Result<Transition> {
+        let mut grant = self.get_or_create_autonomy_grant(lane, now)?;
+        let transition = record_outcome(&mut grant, outcome, now);
+        self.upsert_autonomy_grant(&grant)?;
+        if transition == Transition::Frozen {
+            let audit = AutonomyAuditRecord::new(
+                format!("freeze:{}:{}", lane, now),
+                grant.lane.clone(),
+                format!(
+                    "lane frozen: {} consecutive failures reached ceiling {}",
+                    grant.earned.consecutive_failures, grant.budget.max_consecutive_failures
+                ),
+                &format!(
+                    "consecutive_failures={} max_consecutive_failures={} posture retained at {:?}",
+                    grant.earned.consecutive_failures,
+                    grant.budget.max_consecutive_failures,
+                    grant.posture
+                ),
+                "operator review: clear via GraphDomain::clear_autonomy_freeze",
+                grant.posture,
+                now,
+            );
+            self.record_autonomy_audit(&audit)?;
+        }
+        Ok(transition)
+    }
+
+    /// Explicit operator action: clear a lane's freeze flag and reset its
+    /// consecutive-failure streak. Returns `false` when no grant exists.
+    pub fn clear_autonomy_freeze(&self, lane: &str, now: u64) -> Result<bool> {
+        let Some(mut grant) = self.get_autonomy_grant(lane)? else {
+            return Ok(false);
+        };
+        grant.frozen_until_operator_review = false;
+        grant.earned.consecutive_failures = 0;
+        grant.updated_at = now;
+        self.upsert_autonomy_grant(&grant)?;
+        Ok(true)
+    }
+
+    /// Record an autonomy audit entry. Distinct `audit_id`s never overwrite —
+    /// the trail is append-only by construction.
+    pub fn record_autonomy_audit(&self, audit: &AutonomyAuditRecord) -> Result<()> {
+        let data = serde_json::to_value(audit)
+            .context("GraphDomain::record_autonomy_audit: serialize AutonomyAuditRecord")?;
+        self.adapter.upsert_node(&GraphNode {
+            node_key: Self::autonomy_audit_key(&audit.audit_id),
+            kind: NODE_KIND_AUTONOMY_AUDIT.to_string(),
+            label: Some(audit.lane.as_str().to_string()),
+            data,
+        })
+    }
+
+    /// Load one audit record by id.
+    pub fn get_autonomy_audit(&self, audit_id: &str) -> Result<Option<AutonomyAuditRecord>> {
+        match self.adapter.get_node(&Self::autonomy_audit_key(audit_id))? {
+            None => Ok(None),
+            Some(node) => Ok(Some(serde_json::from_value(node.data).context(
+                "GraphDomain::get_autonomy_audit: deserialize AutonomyAuditRecord",
+            )?)),
+        }
+    }
+
+    /// List all audit records for `lane`, oldest first.
+    pub fn list_autonomy_audits_by_lane(&self, lane: &str) -> Result<Vec<AutonomyAuditRecord>> {
+        let mut out = Vec::new();
+        for node in self.adapter.list_nodes_by_kind(NODE_KIND_AUTONOMY_AUDIT)? {
+            let record: AutonomyAuditRecord = serde_json::from_value(node.data).context(
+                "GraphDomain::list_autonomy_audits_by_lane: deserialize AutonomyAuditRecord",
+            )?;
+            if record.lane.as_str() == lane {
+                out.push(record);
+            }
+        }
+        out.sort_by_key(|r| r.created_at);
+        Ok(out)
+    }
+
+    /// List every audit record across **all** lanes, oldest first. Unlike
+    /// [`Self::list_autonomy_audits_by_lane`], which scopes to one lane, this
+    /// crosses lanes — used by the A9 timeout-to-Neutral sweep
+    /// (`aiua::autonomy_sweep`, which must consider every lane's `Pending`
+    /// backlog in one pass) and by the `phil autonomy pending` operator
+    /// surface (`GetConfig("__autonomy_pending__")`).
+    pub fn list_all_autonomy_audits(&self) -> Result<Vec<AutonomyAuditRecord>> {
+        let mut out = Vec::new();
+        for node in self.adapter.list_nodes_by_kind(NODE_KIND_AUTONOMY_AUDIT)? {
+            let record: AutonomyAuditRecord = serde_json::from_value(node.data).context(
+                "GraphDomain::list_all_autonomy_audits: deserialize AutonomyAuditRecord",
+            )?;
+            out.push(record);
+        }
+        out.sort_by_key(|r| r.created_at);
+        Ok(out)
+    }
+
+    /// Update the review outcome on an existing audit record. Returns `false`
+    /// when the record does not exist.
+    pub fn set_autonomy_audit_outcome(
+        &self,
+        audit_id: &str,
+        outcome: AuditOutcome,
+        now: u64,
+    ) -> Result<bool> {
+        let Some(mut record) = self.get_autonomy_audit(audit_id)? else {
+            return Ok(false);
+        };
+        record.outcome = outcome;
+        record.updated_at = now;
+        self.record_autonomy_audit(&record)?;
+        Ok(true)
+    }
+
+    // ── Heal work items (Autopoiesis Slice A3) ────────────────────────────────
+
+    fn heal_work_item_key(work_item_id: &str) -> String {
+        format!("{}:{}", NODE_KIND_HEAL_WORK_ITEM, work_item_id)
+    }
+
+    /// Upsert a heal work item as a graph node.
+    pub fn upsert_heal_work_item(&self, item: &HealWorkItemRecord) -> Result<()> {
+        let data = serde_json::to_value(item)
+            .context("GraphDomain::upsert_heal_work_item: serialize HealWorkItemRecord")?;
+        self.adapter.upsert_node(&GraphNode {
+            node_key: Self::heal_work_item_key(&item.work_item_id),
+            kind: NODE_KIND_HEAL_WORK_ITEM.to_string(),
+            label: Some(format!("{}@{}", item.pattern_tag, item.guest_id)),
+            data,
+        })
+    }
+
+    /// Load one heal work item by id.
+    pub fn get_heal_work_item(&self, work_item_id: &str) -> Result<Option<HealWorkItemRecord>> {
+        match self
+            .adapter
+            .get_node(&Self::heal_work_item_key(work_item_id))?
+        {
+            None => Ok(None),
+            Some(node) => Ok(Some(serde_json::from_value(node.data).context(
+                "GraphDomain::get_heal_work_item: deserialize HealWorkItemRecord",
+            )?)),
+        }
+    }
+
+    /// List all heal work items, oldest first.
+    pub fn list_heal_work_items(&self) -> Result<Vec<HealWorkItemRecord>> {
+        let mut out: Vec<HealWorkItemRecord> = self
+            .adapter
+            .list_nodes_by_kind(NODE_KIND_HEAL_WORK_ITEM)?
+            .into_iter()
+            .map(|n| {
+                serde_json::from_value(n.data)
+                    .context("GraphDomain::list_heal_work_items: deserialize HealWorkItemRecord")
+            })
+            .collect::<Result<_>>()?;
+        out.sort_by_key(|item| item.created_at);
+        Ok(out)
+    }
+
+    /// Find the OPEN heal work item for `(pattern_tag, guest_id)`, if any.
+    ///
+    /// This is the dedup lookup: the filing path bumps the open item instead
+    /// of creating a second one for the same recurring pattern.
+    pub fn find_open_heal_work_item(
+        &self,
+        pattern_tag: &str,
+        guest_id: &str,
+    ) -> Result<Option<HealWorkItemRecord>> {
+        Ok(self.list_heal_work_items()?.into_iter().find(|item| {
+            item.status == HEAL_WORK_ITEM_STATUS_OPEN
+                && item.pattern_tag == pattern_tag
+                && item.guest_id == guest_id
+        }))
+    }
+
+    /// Close a heal work item (the reversal path named in the filing's audit
+    /// record). Returns `false` when the item does not exist.
+    pub fn close_heal_work_item(&self, work_item_id: &str, now: u64) -> Result<bool> {
+        let Some(mut item) = self.get_heal_work_item(work_item_id)? else {
+            return Ok(false);
+        };
+        item.status = HEAL_WORK_ITEM_STATUS_CLOSED.to_string();
+        item.last_seen = now;
+        self.upsert_heal_work_item(&item)?;
+        Ok(true)
+    }
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -1521,7 +1936,7 @@ mod tests {
     use super::*;
     use crate::graph::{
         AbstractModelRecord, AbstractRightRecord, AbstractSkillRecord, RoleIncarnationRecord,
-        ToolsetProfileRecord,
+        SkillRegistrationAuditRecord, ToolsetProfileRecord,
     };
     use crate::sqlite_storage::SqliteGraphStorage;
     use crate::storage::{
@@ -1533,6 +1948,269 @@ mod tests {
         let storage =
             SqliteGraphStorage::open_in_memory().expect("in-memory SqliteGraphStorage failed");
         GraphDomain::new(Arc::new(storage.adapter()))
+    }
+
+    #[test]
+    fn autonomy_grant_storage_round_trip() {
+        let domain = make_domain();
+        let lane = crate::autonomy::LANE_GRAPH_BRIDGE_EDGES;
+        assert!(domain.get_autonomy_grant(lane).expect("get").is_none());
+
+        // First creation always starts at ProposalOnly — the safest level.
+        let created = domain
+            .get_or_create_autonomy_grant(lane, 1_000)
+            .expect("create");
+        assert_eq!(
+            created.posture,
+            crate::autonomy::AutonomyPosture::ProposalOnly
+        );
+        assert_eq!(created.earned.required_for_promotion, 5);
+
+        // Round-trip: what we stored is what we load.
+        let loaded = domain
+            .get_autonomy_grant(lane)
+            .expect("get")
+            .expect("grant exists");
+        assert_eq!(loaded, created);
+
+        // get_or_create is idempotent — no reset of an existing grant.
+        let mut mutated = loaded.clone();
+        mutated.posture = crate::autonomy::AutonomyPosture::ConfirmFirst;
+        mutated.earned.confirmed_good_outcomes = 3;
+        mutated.updated_at = 2_000;
+        domain.upsert_autonomy_grant(&mutated).expect("upsert");
+        let again = domain
+            .get_or_create_autonomy_grant(lane, 9_999)
+            .expect("get_or_create existing");
+        assert_eq!(again, mutated);
+
+        // Second lane shows up alongside the first in list.
+        domain
+            .get_or_create_autonomy_grant(crate::autonomy::LANE_FLEET_HEAL_SLICES, 3_000)
+            .expect("create second");
+        let mut grants = domain.list_autonomy_grants().expect("list");
+        grants.sort_by(|a, b| a.lane.as_str().cmp(b.lane.as_str()));
+        assert_eq!(grants.len(), 2);
+        assert_eq!(
+            grants[0].lane.as_str(),
+            crate::autonomy::LANE_FLEET_HEAL_SLICES
+        );
+        assert_eq!(grants[1].lane.as_str(), lane);
+    }
+
+    #[test]
+    fn autonomy_outcome_persists_and_freeze_writes_audit() {
+        let domain = make_domain();
+        let lane = crate::autonomy::LANE_WORK_FILE_PROPOSALS;
+
+        // Failures up to the ceiling freeze the lane and write an audit record.
+        let mut last = Transition::NoChange;
+        let cap = crate::autonomy::AutonomyBudget::default().max_consecutive_failures;
+        for i in 0..cap {
+            last = domain
+                .record_autonomy_outcome(lane, Outcome::Failure, 1_000 + u64::from(i))
+                .expect("record failure");
+        }
+        assert_eq!(last, Transition::Frozen);
+        let grant = domain
+            .get_autonomy_grant(lane)
+            .expect("get")
+            .expect("grant exists");
+        assert!(grant.frozen_until_operator_review);
+        let audits = domain
+            .list_autonomy_audits_by_lane(lane)
+            .expect("list audits");
+        assert_eq!(audits.len(), 1);
+        assert!(audits[0].audit_id.starts_with("freeze:"));
+        assert_eq!(audits[0].outcome, AuditOutcome::Pending);
+
+        // Unfreeze semantics: explicit operator action clears the flag and
+        // resets the failure streak.
+        assert!(domain.clear_autonomy_freeze(lane, 5_000).expect("clear"));
+        let grant = domain
+            .get_autonomy_grant(lane)
+            .expect("get")
+            .expect("grant exists");
+        assert!(!grant.frozen_until_operator_review);
+        assert_eq!(grant.earned.consecutive_failures, 0);
+        assert_eq!(grant.updated_at, 5_000);
+
+        // Clearing an unknown lane reports false.
+        assert!(!domain
+            .clear_autonomy_freeze("no.such_lane", 5_001)
+            .expect("clear unknown"));
+    }
+
+    #[test]
+    fn autonomy_audit_round_trip_and_list_by_lane() {
+        let domain = make_domain();
+        let lane_a = crate::autonomy::LANE_STEWARD_ACTIVE_CHECKINS;
+        let lane_b = crate::autonomy::LANE_WORK_EXECUTE_SLICES;
+
+        let newer = AutonomyAuditRecord::new(
+            "audit-2",
+            AutonomyLane::new(lane_a),
+            "sent active check-in",
+            "5 confirmed SIL entries",
+            "retract the check-in message",
+            crate::autonomy::AutonomyPosture::AutoWithAudit,
+            2_000,
+        );
+        let older = AutonomyAuditRecord::new(
+            "audit-1",
+            AutonomyLane::new(lane_a),
+            "sent active check-in",
+            "operator confirmed entry",
+            "retract the check-in message",
+            crate::autonomy::AutonomyPosture::ConfirmFirst,
+            1_000,
+        );
+        let other_lane = AutonomyAuditRecord::new(
+            "audit-3",
+            AutonomyLane::new(lane_b),
+            "drafted slice plan",
+            "top scored proposal",
+            "close the draft PR",
+            crate::autonomy::AutonomyPosture::ProposalOnly,
+            1_500,
+        );
+        // Insert out of order to prove created_at sorting.
+        domain.record_autonomy_audit(&newer).expect("record newer");
+        domain.record_autonomy_audit(&older).expect("record older");
+        domain
+            .record_autonomy_audit(&other_lane)
+            .expect("record other lane");
+
+        let audits = domain.list_autonomy_audits_by_lane(lane_a).expect("list");
+        assert_eq!(audits.len(), 2);
+        assert_eq!(audits[0], older);
+        assert_eq!(audits[1], newer);
+
+        // Outcome update round-trips.
+        assert!(domain
+            .set_autonomy_audit_outcome("audit-1", AuditOutcome::ConfirmedGood, 3_000)
+            .expect("set outcome"));
+        let updated = domain
+            .get_autonomy_audit("audit-1")
+            .expect("get")
+            .expect("exists");
+        assert_eq!(updated.outcome, AuditOutcome::ConfirmedGood);
+        assert_eq!(updated.updated_at, 3_000);
+        assert_eq!(updated.created_at, 1_000);
+        assert!(!domain
+            .set_autonomy_audit_outcome("missing", AuditOutcome::Reversed, 3_001)
+            .expect("set missing"));
+    }
+
+    #[test]
+    fn list_all_autonomy_audits_crosses_lanes_oldest_first() {
+        let domain = make_domain();
+        let lane_a = crate::autonomy::LANE_STEWARD_ACTIVE_CHECKINS;
+        let lane_b = crate::autonomy::LANE_WORK_EXECUTE_SLICES;
+
+        let a = AutonomyAuditRecord::new(
+            "audit-a",
+            AutonomyLane::new(lane_a),
+            "did a thing",
+            "evidence",
+            "revert",
+            crate::autonomy::AutonomyPosture::ConfirmFirst,
+            2_000,
+        );
+        let b = AutonomyAuditRecord::new(
+            "audit-b",
+            AutonomyLane::new(lane_b),
+            "did another thing",
+            "evidence",
+            "revert",
+            crate::autonomy::AutonomyPosture::ProposalOnly,
+            1_000,
+        );
+        domain.record_autonomy_audit(&a).expect("record a");
+        domain.record_autonomy_audit(&b).expect("record b");
+
+        let all = domain.list_all_autonomy_audits().expect("list all");
+        assert_eq!(all.len(), 2);
+        // Oldest first, across lanes — unlike list_autonomy_audits_by_lane,
+        // no lane filter is applied.
+        assert_eq!(all[0].audit_id, "audit-b");
+        assert_eq!(all[1].audit_id, "audit-a");
+    }
+
+    #[test]
+    fn autonomy_state_machine_round_trips_through_storage() {
+        // Pure-function transitions survive persistence: promote a lane to
+        // ConfirmFirst through stored outcomes, then reverse it back down.
+        let domain = make_domain();
+        let lane = crate::autonomy::LANE_GRAPH_BRIDGE_EDGES;
+        let mut last = Transition::NoChange;
+        for i in 0..5u64 {
+            last = domain
+                .record_autonomy_outcome(lane, Outcome::ConfirmedGood, 100 + i)
+                .expect("confirm");
+        }
+        assert_eq!(
+            last,
+            Transition::Promoted {
+                from: crate::autonomy::AutonomyPosture::ProposalOnly,
+                to: crate::autonomy::AutonomyPosture::ConfirmFirst,
+            }
+        );
+        let t = domain
+            .record_autonomy_outcome(lane, Outcome::OperatorReversal, 200)
+            .expect("reversal");
+        assert_eq!(
+            t,
+            Transition::Demoted {
+                from: crate::autonomy::AutonomyPosture::ConfirmFirst,
+                to: crate::autonomy::AutonomyPosture::ProposalOnly,
+            }
+        );
+        let grant = domain
+            .get_autonomy_grant(lane)
+            .expect("get")
+            .expect("exists");
+        assert_eq!(grant.earned.confirmed_good_outcomes, 0);
+    }
+
+    #[test]
+    fn skill_registration_audits_are_append_only() {
+        let domain = make_domain();
+        assert!(domain
+            .list_skill_registration_audits()
+            .expect("list")
+            .is_empty());
+
+        let first = SkillRegistrationAuditRecord {
+            audit_id: "audit-1".into(),
+            skill_name: "research".into(),
+            registered_by: "agent-jane-01:orchestrator".into(),
+            registered_by_role: "orchestrator".into(),
+            validation_state: "validated".into(),
+            registered_at: 1000,
+        };
+        domain
+            .record_skill_registration_audit(&first)
+            .expect("record first audit");
+
+        let second = SkillRegistrationAuditRecord {
+            audit_id: "audit-2".into(),
+            skill_name: "summarize".into(),
+            registered_by: "mgmt-01".into(),
+            registered_by_role: "management".into(),
+            validation_state: "draft".into(),
+            registered_at: 2000,
+        };
+        domain
+            .record_skill_registration_audit(&second)
+            .expect("record second audit");
+
+        // Distinct audit_ids never overwrite — both entries survive.
+        let mut audits = domain.list_skill_registration_audits().expect("list");
+        audits.sort_by(|a, b| a.audit_id.cmp(&b.audit_id));
+        assert_eq!(audits.len(), 2);
+        assert_eq!(audits[0], first);
+        assert_eq!(audits[1], second);
     }
 
     fn caps() -> NodeCapabilities {
@@ -1878,6 +2556,7 @@ mod tests {
             inactive_ttl_seconds: None,
             turn_loop_config: TurnLoopConfig::default(),
             home_node: None,
+            ..Default::default()
         };
         d.upsert_role_incarnation(&r).unwrap();
         let loaded = d.get_role_incarnation("bjork", "coder").unwrap().unwrap();
@@ -1888,6 +2567,69 @@ mod tests {
 
         let by_guest = d.list_role_incarnations_by_guest_id("guest-1").unwrap();
         assert_eq!(by_guest.len(), 1);
+    }
+
+    #[test]
+    fn promote_role_incarnation_active_enforces_single_active() {
+        use crate::graph::TurnLoopConfig;
+        let d = make_domain();
+        let mk = |role: &str| RoleIncarnationRecord {
+            agent_id: "agent-beacon".to_string(),
+            role_name: role.to_string(),
+            guest_id: format!("agent-beacon:{role}"),
+            toolset_profile: "default".to_string(),
+            role_identity_addendum: None,
+            role_manifest: None,
+            is_admin: false,
+            readiness_state: RoleReadinessState::Configured,
+            inactive_ttl_seconds: None,
+            turn_loop_config: TurnLoopConfig::default(),
+            home_node: None,
+            ..Default::default()
+        };
+        d.upsert_role_incarnation(&mk("orchestrator")).unwrap();
+        d.upsert_role_incarnation(&mk("Chronos")).unwrap();
+
+        // Promote orchestrator → it is active, Chronos untouched.
+        d.promote_role_incarnation_active("agent-beacon", "orchestrator")
+            .unwrap();
+        assert!(matches!(
+            d.get_role_incarnation("agent-beacon", "orchestrator")
+                .unwrap()
+                .unwrap()
+                .readiness_state,
+            RoleReadinessState::ActiveInSession
+        ));
+
+        // Promote Chronos → orchestrator MUST be demoted (single-active invariant).
+        d.promote_role_incarnation_active("agent-beacon", "Chronos")
+            .unwrap();
+        assert!(matches!(
+            d.get_role_incarnation("agent-beacon", "Chronos")
+                .unwrap()
+                .unwrap()
+                .readiness_state,
+            RoleReadinessState::ActiveInSession
+        ));
+        assert!(
+            matches!(
+                d.get_role_incarnation("agent-beacon", "orchestrator")
+                    .unwrap()
+                    .unwrap()
+                    .readiness_state,
+                RoleReadinessState::Routable
+            ),
+            "previous active incarnation must be demoted, never two active at once"
+        );
+
+        // Exactly one incarnation is ActiveInSession.
+        let active = d
+            .list_role_incarnations("agent-beacon")
+            .unwrap()
+            .into_iter()
+            .filter(|r| matches!(r.readiness_state, RoleReadinessState::ActiveInSession))
+            .count();
+        assert_eq!(active, 1);
     }
 
     #[test]
@@ -1955,6 +2697,7 @@ mod tests {
             inactive_ttl_seconds: None,
             turn_loop_config: TurnLoopConfig::default(),
             home_node: Some("mac-jane".to_string()),
+            ..Default::default()
         })
         .unwrap();
         d.upsert_membrane_transport_home(&MembraneTransportHomeRecord {
@@ -2404,5 +3147,97 @@ mod tests {
     fn get_user_task_returns_none_when_absent() {
         let d = make_domain();
         assert!(d.get_user_task("nonexistent").unwrap().is_none());
+    }
+
+    fn work_item(id: &str, pattern: &str, guest: &str, status: &str) -> HealWorkItemRecord {
+        HealWorkItemRecord {
+            work_item_id: id.to_string(),
+            pattern_tag: pattern.to_string(),
+            guest_id: guest.to_string(),
+            count: 5,
+            window_secs: 1800,
+            evidence: vec!["connection refused".to_string()],
+            status: status.to_string(),
+            filed_by: "heal-dispatcher".to_string(),
+            audit_id: Some(format!("heal_filing:{id}")),
+            created_at: 1_000,
+            last_seen: 1_000,
+        }
+    }
+
+    #[test]
+    fn heal_work_item_round_trip_and_open_lookup() {
+        let d = make_domain();
+        assert!(d.get_heal_work_item("wi-1").expect("get").is_none());
+        assert!(d
+            .find_open_heal_work_item("connection_refused", "membrane-01")
+            .expect("find")
+            .is_none());
+
+        d.upsert_heal_work_item(&work_item(
+            "wi-1",
+            "connection_refused",
+            "membrane-01",
+            HEAL_WORK_ITEM_STATUS_OPEN,
+        ))
+        .expect("upsert");
+        // Closed items and different keys never match the open lookup.
+        d.upsert_heal_work_item(&work_item(
+            "wi-2",
+            "connection_refused",
+            "membrane-01",
+            HEAL_WORK_ITEM_STATUS_CLOSED,
+        ))
+        .expect("upsert closed");
+        d.upsert_heal_work_item(&work_item(
+            "wi-3",
+            "panic",
+            "membrane-01",
+            HEAL_WORK_ITEM_STATUS_OPEN,
+        ))
+        .expect("upsert other pattern");
+
+        let found = d
+            .find_open_heal_work_item("connection_refused", "membrane-01")
+            .expect("find")
+            .expect("open item");
+        assert_eq!(found.work_item_id, "wi-1");
+        assert!(d
+            .find_open_heal_work_item("connection_refused", "other-guest")
+            .expect("find")
+            .is_none());
+        assert_eq!(d.list_heal_work_items().expect("list").len(), 3);
+    }
+
+    #[test]
+    fn close_heal_work_item_flips_status_and_frees_dedup_slot() {
+        let d = make_domain();
+        d.upsert_heal_work_item(&work_item(
+            "wi-1",
+            "oom",
+            "philote-01",
+            HEAL_WORK_ITEM_STATUS_OPEN,
+        ))
+        .expect("upsert");
+
+        assert!(d.close_heal_work_item("wi-1", 2_000).expect("close"));
+        let item = d.get_heal_work_item("wi-1").expect("get").expect("present");
+        assert_eq!(item.status, HEAL_WORK_ITEM_STATUS_CLOSED);
+        assert_eq!(item.last_seen, 2_000);
+        // Dedup slot is free again after closure.
+        assert!(d
+            .find_open_heal_work_item("oom", "philote-01")
+            .expect("find")
+            .is_none());
+
+        // Idempotent (F8): closing an already-closed item still reports true and
+        // leaves it closed — the autonomy-lane loop can retry a close safely.
+        assert!(d.close_heal_work_item("wi-1", 2_500).expect("re-close"));
+        let item = d.get_heal_work_item("wi-1").expect("get").expect("present");
+        assert_eq!(item.status, HEAL_WORK_ITEM_STATUS_CLOSED);
+        assert_eq!(item.last_seen, 2_500, "re-close still stamps last_seen");
+
+        // Closing a missing item reports false.
+        assert!(!d.close_heal_work_item("missing", 2_001).expect("close"));
     }
 }

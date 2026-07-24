@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - Muninn Cluster Evaluation Checklist
+
+rectangle "Muninn Cluster Evaluation Checklist" as Muninn_Cluster_Evaluation_Checklist #Orange {
+}
+
+
+@enduml

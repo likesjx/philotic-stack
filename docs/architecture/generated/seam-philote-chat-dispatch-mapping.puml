@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - philote-chat-dispatch-mapping
+
+rectangle "philote-chat-dispatch-mapping" as philote_chat_dispatch_mapping #Orange {
+}
+
+
+@enduml

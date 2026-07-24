@@ -3,6 +3,7 @@ title: Memory Enrichment — Port to Rust via model-router
 doc_type: proposal
 domain: cognitive-plane
 status: proposed
+disposition: deferred
 last_updated: 2026-04-08
 proposal_id: memory-enrichment-rust-port
 tags:
