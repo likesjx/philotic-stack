@@ -1519,6 +1519,19 @@ impl SessionState {
     }
 
     pub fn tool_is_enabled(&self, tool_name: &str) -> bool {
+        // Policy gate at dispatch, not just at projection. Hiding a tool from the
+        // model is not the same as stopping it: a model that saw the tool on an
+        // earlier turn can still emit a call for it, and the assembly it was
+        // routed through outlives that turn. A disabled tool must be
+        // unexecutable, not merely unlisted.
+        //
+        // In-flight caveat: `disabled_tools` arrives on the bindings, so this
+        // takes effect for a session once its bindings are recomposed — the same
+        // refresh boundary the projection filter observes.
+        if self.bindings.is_tool_disabled(tool_name) {
+            return false;
+        }
+
         if self
             .tool_assembly
             .tools_for_model
@@ -8416,6 +8429,35 @@ mod tests {
         assert!(
             projected_names.contains(&"life.observe"),
             "disabling one tool must not disturb its siblings, got {projected_names:?}"
+        );
+    }
+
+    /// Disabling a tool must stop it, not just hide it.
+    ///
+    /// A model that saw the tool on an earlier turn can still emit a call for it,
+    /// and the assembly it routes through outlives that turn — so the projection
+    /// filter alone would leave a disabled tool executable.
+    #[test]
+    fn disabled_tool_is_rejected_at_dispatch_not_just_hidden() {
+        let mut state =
+            SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
+        state.clear_tool_bindings();
+        state.add_tool_binding("life.observe");
+        state.add_tool_binding("life.observe.batch");
+        assert!(
+            state.tool_is_enabled("life.observe.batch"),
+            "precondition: the tool is bound and executable"
+        );
+
+        state.bindings.disabled_tools = vec!["life.observe.batch".into()];
+
+        assert!(
+            !state.tool_is_enabled("life.observe.batch"),
+            "a disabled tool must be unexecutable, not merely unlisted"
+        );
+        assert!(
+            state.tool_is_enabled("life.observe"),
+            "disabling one tool must not disturb its siblings"
         );
     }
 

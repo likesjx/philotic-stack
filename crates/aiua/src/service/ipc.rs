@@ -14318,6 +14318,15 @@ fn compose_tool_assembly_from_incarnations(
                 .collect::<Vec<_>>()
         }
     };
+    // The runner branch above builds the toolset straight from each
+    // incarnation's `supported_tools`, bypassing `default_visible_toolset` and
+    // therefore its policy strip. Re-apply the policy here so a disabled tool
+    // cannot re-enter through a remote runner grant — this also drops the tool's
+    // execution route below, so it is unreachable rather than merely unlisted.
+    let disabled = disabled_tools_from_bindings(bindings);
+    if !disabled.is_empty() {
+        toolset.retain(|tool_name| !disabled.iter().any(|denied| denied == tool_name));
+    }
     if !rights.is_empty() {
         toolset.retain(|tool_name| has_right(&rights, &tool_right(tool_name)));
     }
