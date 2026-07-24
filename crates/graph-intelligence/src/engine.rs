@@ -737,17 +737,40 @@ impl GraphEngine {
     /// Clear all scanner-created doc nodes (worktree='', doc-like kinds).
     /// Called before doc rescan to prevent ghost nodes from renamed/deleted files.
     /// Preserves agent-created nodes (decisions, sessions, workstreams, test runs).
+    ///
+    /// Only nodes materialized FROM a file are cleared. A doc-kind node with no
+    /// `file_path` was authored directly in the graph (`graph_create_node`) and is
+    /// not reproducible from disk — the rebuild loop is driven by the on-disk
+    /// `md_files` list, so deleting it here would destroy it permanently and
+    /// silently on the next scan. The graph is the source of truth for such nodes.
     pub fn clear_scanned_doc_nodes(&self) -> Result<()> {
         let doc_kinds = "'proposal','domain','seam','task','document','skill','sver'";
+        // File-backed doc nodes only; see the doc comment above.
+        let scanned_doc_nodes = format!(
+            "SELECT id FROM nodes WHERE worktree = '' AND kind IN ({doc_kinds}) \
+             AND file_path IS NOT NULL AND file_path != ''"
+        );
+        // Doc nodes authored in the graph rather than scanned from a file.
+        let authored_doc_nodes = format!(
+            "SELECT id FROM nodes WHERE worktree = '' AND kind IN ({doc_kinds}) \
+             AND (file_path IS NULL OR file_path = '')"
+        );
+        // Scanner-derived edges originate from a doc file's frontmatter and are
+        // recreated by the rebuild. Edges whose SOURCE is a graph-authored node
+        // are not declared in any file, so nothing would recreate them.
         self.conn.execute(
             &format!(
-                "DELETE FROM edges WHERE source_id IN (SELECT id FROM nodes WHERE worktree = '' AND kind IN ({doc_kinds})) \
-                 OR target_id IN (SELECT id FROM nodes WHERE worktree = '' AND kind IN ({doc_kinds}))"
+                "DELETE FROM edges WHERE (source_id IN ({scanned_doc_nodes}) \
+                 OR target_id IN ({scanned_doc_nodes})) \
+                 AND source_id NOT IN ({authored_doc_nodes})"
             ),
             [],
         )?;
         self.conn.execute(
-            &format!("DELETE FROM nodes WHERE worktree = '' AND kind IN ({doc_kinds})"),
+            &format!(
+                "DELETE FROM nodes WHERE worktree = '' AND kind IN ({doc_kinds}) \
+                 AND file_path IS NOT NULL AND file_path != ''"
+            ),
             [],
         )?;
         Ok(())
