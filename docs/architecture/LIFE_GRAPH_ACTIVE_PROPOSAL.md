@@ -54,6 +54,17 @@ observation-content-specific rather than batch machinery.
 - **Verification:** repro driver green against a live runner with the previously-failing
   payload shapes; node count observed to increase by exactly the batch size.
 
+**LIVE RESULT (2026-07-24, vps-jane, run 421aadc8):** the defect did **not reproduce**.
+All flight/Mali fixture shapes landed with `embed=ok` in BOTH single and batch phases
+against the deployed develop runner — the three already-shipped layers (batch routing
+PR #271, pool churn PR #275/#277, embed timeout) evidently resolved it. The only
+failures were the agenda-edge fixture, correctly rejected by plan validation because the
+deployed runner predates S2 (`ADVANCES … not a living-cycle relation`) — itself a live
+proof that unknown rel_types are rejected before the node write. The driver now serves
+as the regression harness; re-run after S2 deploys to confirm the agenda-edge fixture
+flips to `proposed` + `target_missing`. Test nodes (`life:isolation:*`) were deleted
+from the live graph after the run.
+
 ### S2 — Agenda edge vocabulary (typed, validated, still closed)
 
 Add the schema-documented agenda relationships to the enforced `life.observe` edge write
