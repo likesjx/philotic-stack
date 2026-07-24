@@ -243,11 +243,12 @@ Proposal: [MEMPALACE_EPISODIC_MEMORY_PROPOSAL.md](/Users/jaredlikes/code/philoti
 
 Seam ID: `mempalace-episodic-lane`
 
-- [ ] Define the versioned episode envelope with stable episode/session IDs, client provenance, privacy class, retention class, and content hash.
-- [ ] Enable idempotent `Stop`, `Save`, or `PreCompact` capture for one trusted local client.
-- [ ] Add redact-before-store, no-capture, and delete-by-session behavior with sensitive fixtures.
-- [ ] Prove recall by session, client, and topic with bounded excerpts and explicit `episodic_evidence` authority.
-- [ ] Project MemPalace results into the shared `ContextPacket` without promoting raw episodes into Muninn or LifeGraph.
+- [x] Define the versioned episode envelope with stable episode/session IDs, client provenance, privacy class, retention class, and content hash.
+- [x] Implement and isolated-smoke an idempotent lifecycle capture hook whose default local client is Codex.
+- [ ] Install the hook on one verified Codex lifecycle surface and measure eligible-session capture success.
+- [x] Add redact-before-store, no-capture, private-result filtering, ID-conflict detection, and delete-by-session behavior with sensitive fixtures.
+- [x] Prove recall by session, client, and topic with bounded excerpts and explicit `episodic_evidence` authority.
+- [x] Project MemPalace results into the shared `ContextPacket` without promoting raw episodes into Muninn or LifeGraph.
 - [ ] Measure capture success, duplicate rate, local recall latency, and re-entry usefulness before adding another client.
 
 ## Obsidian Knowledge Garden

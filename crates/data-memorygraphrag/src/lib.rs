@@ -626,6 +626,7 @@ impl RetrievalContextPacket {
 #[serde(rename_all = "snake_case")]
 pub enum ContextAuthority {
     MuninnContinuity,
+    EpisodicEvidence,
     LifeGraphTruth,
     LifeGraphEvidence,
     IntelGraphProjectTruth,
@@ -637,6 +638,7 @@ pub enum ContextAuthority {
 #[serde(rename_all = "snake_case")]
 pub enum ContextRefKind {
     MuninnEngram,
+    MemPalaceEpisode,
     LifeGraphNode,
     LifeGraphEvidencePacket,
     LifeGraphRetrievalPacket,
@@ -667,6 +669,7 @@ impl ContextRef {
 
         match (&self.kind, &self.authority) {
             (ContextRefKind::MuninnEngram, ContextAuthority::MuninnContinuity)
+            | (ContextRefKind::MemPalaceEpisode, ContextAuthority::EpisodicEvidence)
             | (ContextRefKind::LifeGraphNode, ContextAuthority::LifeGraphTruth)
             | (ContextRefKind::LifeGraphNode, ContextAuthority::LifeGraphEvidence)
             | (ContextRefKind::LifeGraphEvidencePacket, ContextAuthority::LifeGraphEvidence)
@@ -732,8 +735,119 @@ pub struct MuninnRecallMemory {
     pub metadata: serde_json::Value,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EpisodicPrivacyClass {
+    Normal,
+    Sensitive,
+    Private,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EpisodicRetentionClass {
+    Session,
+    Days30,
+    Days90,
+    Durable,
+    UserManaged,
+}
+
+/// Stable envelope for an automatically captured MemPalace episode.
+///
+/// Episodes are evidence about what happened. They are not canonical life
+/// truth and must be promoted through the LifeGraph governance tools before a
+/// life claim can acquire that authority.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct EpisodicEpisode {
+    pub episode_id: String,
+    pub session_id: String,
+    pub client: String,
+    pub agent_or_role: String,
+    pub captured_at: String,
+    pub source_event: String,
+    pub content_or_summary: String,
+    pub content_hash: String,
+    #[serde(default)]
+    pub provenance: serde_json::Value,
+    pub privacy_class: EpisodicPrivacyClass,
+    pub retention_class: EpisodicRetentionClass,
+    #[serde(default)]
+    pub related_context_refs: Vec<String>,
+    #[serde(default)]
+    pub metadata: serde_json::Value,
+}
+
+impl EpisodicEpisode {
+    pub fn validate(&self) -> Result<(), ContractError> {
+        let mut violations = Vec::new();
+        require_non_empty(&mut violations, "episode_id", &self.episode_id);
+        require_non_empty(&mut violations, "session_id", &self.session_id);
+        require_non_empty(&mut violations, "client", &self.client);
+        require_non_empty(&mut violations, "agent_or_role", &self.agent_or_role);
+        require_non_empty(&mut violations, "captured_at", &self.captured_at);
+        require_non_empty(&mut violations, "source_event", &self.source_event);
+        require_non_empty(
+            &mut violations,
+            "content_or_summary",
+            &self.content_or_summary,
+        );
+        require_non_empty(&mut violations, "content_hash", &self.content_hash);
+
+        if chrono::DateTime::parse_from_rfc3339(&self.captured_at).is_err() {
+            violations.push("captured_at must be RFC3339".into());
+        }
+
+        let hash = self
+            .content_hash
+            .strip_prefix("sha256:")
+            .unwrap_or_default();
+        if hash.len() != 64
+            || !hash
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            violations.push("content_hash must be sha256:<64 lowercase hex chars>".into());
+        }
+
+        for (idx, context_ref) in self.related_context_refs.iter().enumerate() {
+            require_non_empty(
+                &mut violations,
+                &format!("related_context_refs[{idx}]"),
+                context_ref,
+            );
+        }
+
+        finish_validation(violations)
+    }
+}
+
+/// Bounded episodic evidence returned by MemPalace semantic recall.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MemPalaceRecallEpisode {
+    pub episode_id: String,
+    pub session_id: String,
+    pub client: String,
+    pub agent_or_role: String,
+    pub captured_at: String,
+    pub source_event: String,
+    pub excerpt: String,
+    pub content_hash: String,
+    pub score: f32,
+    pub retrieval_rationale: String,
+    pub privacy_class: EpisodicPrivacyClass,
+    pub retention_class: EpisodicRetentionClass,
+    #[serde(default)]
+    pub related_context_refs: Vec<String>,
+    #[serde(default)]
+    pub provenance: serde_json::Value,
+    #[serde(default)]
+    pub metadata: serde_json::Value,
+}
+
 /// Cross-agent context envelope that can carry Muninn, LifeGraph, Intel Graph,
-/// repo, and runtime references without erasing their authority boundaries.
+/// MemPalace, repo, and runtime references without erasing their authority
+/// boundaries.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ContextPacket {
     pub packet_id: String,
@@ -962,6 +1076,68 @@ impl ContextPacket {
             ],
             metadata: serde_json::json!({
                 "source": "muninn_recall",
+            }),
+        }
+    }
+
+    pub fn from_mempalace_recall(
+        packet_id: impl Into<String>,
+        generated_at: impl Into<String>,
+        query_id: Option<String>,
+        summary: impl Into<String>,
+        episodes: &[MemPalaceRecallEpisode],
+    ) -> Self {
+        let refs: Vec<_> = episodes
+            .iter()
+            .map(|episode| ContextRef {
+                ref_id: episode.episode_id.clone(),
+                kind: ContextRefKind::MemPalaceEpisode,
+                authority: ContextAuthority::EpisodicEvidence,
+                summary: Some(episode.excerpt.clone()),
+                validation_state: None,
+                uri: None,
+                metadata: serde_json::json!({
+                    "session_id": episode.session_id,
+                    "client": episode.client,
+                    "agent_or_role": episode.agent_or_role,
+                    "captured_at": episode.captured_at,
+                    "source_event": episode.source_event,
+                    "content_hash": episode.content_hash,
+                    "score": episode.score,
+                    "retrieval_rationale": episode.retrieval_rationale,
+                    "privacy_class": episode.privacy_class,
+                    "retention_class": episode.retention_class,
+                    "related_context_refs": episode.related_context_refs,
+                    "provenance": episode.provenance,
+                    "extra": episode.metadata,
+                }),
+            })
+            .collect();
+        let ref_ids = refs
+            .iter()
+            .map(|context_ref| context_ref.ref_id.clone())
+            .collect();
+
+        Self {
+            packet_id: packet_id.into(),
+            generated_at: generated_at.into(),
+            query_id,
+            audience_role: None,
+            summary: summary.into(),
+            refs,
+            sections: vec![ContextPacketSection {
+                title: "MemPalace episodic recall".into(),
+                authority: ContextAuthority::EpisodicEvidence,
+                ref_ids,
+                text: None,
+            }],
+            policy_notes: vec![
+                "MemPalace refs are episodic evidence about what happened, not canonical LifeGraph truth.".into(),
+                "Current-turn observations and governed LifeGraph truth outrank stale episodic recall.".into(),
+                "Promote extracted candidates through life.observe; never promote raw transcripts automatically.".into(),
+            ],
+            metadata: serde_json::json!({
+                "source": "mempalace_recall",
             }),
         }
     }
@@ -2705,6 +2881,116 @@ mod tests {
                 .unwrap()
                 .contains("continuity memory")
         );
+    }
+
+    #[test]
+    fn episodic_episode_envelope_validates_governed_capture_fields() {
+        let episode = EpisodicEpisode {
+            episode_id: "episode_codex_session-stop_abc123".into(),
+            session_id: "session-123".into(),
+            client: "codex".into(),
+            agent_or_role: "codex".into(),
+            captured_at: "2026-07-24T15:30:00Z".into(),
+            source_event: "stop".into(),
+            content_or_summary: "Implemented the episodic evidence boundary.".into(),
+            content_hash: format!("sha256:{}", "a".repeat(64)),
+            provenance: serde_json::json!({"hook": "mempalace_reflex_hook"}),
+            privacy_class: EpisodicPrivacyClass::Normal,
+            retention_class: EpisodicRetentionClass::Days90,
+            related_context_refs: vec!["seam:mempalace-episodic-lane".into()],
+            metadata: serde_json::json!({}),
+        };
+
+        episode
+            .validate()
+            .expect("complete episodic envelope should validate");
+    }
+
+    #[test]
+    fn episodic_episode_rejects_invalid_hash_and_timestamp() {
+        let episode = EpisodicEpisode {
+            episode_id: "episode:test".into(),
+            session_id: "session:test".into(),
+            client: "codex".into(),
+            agent_or_role: "codex".into(),
+            captured_at: "sometime yesterday".into(),
+            source_event: "stop".into(),
+            content_or_summary: "A remembered event.".into(),
+            content_hash: "not-a-hash".into(),
+            provenance: serde_json::json!({}),
+            privacy_class: EpisodicPrivacyClass::Normal,
+            retention_class: EpisodicRetentionClass::Days30,
+            related_context_refs: vec![],
+            metadata: serde_json::json!({}),
+        };
+
+        let err = episode
+            .validate()
+            .expect_err("invalid episode envelope must be rejected");
+        assert!(err.violations.iter().any(|v| v.contains("RFC3339")));
+        assert!(err.violations.iter().any(|v| v.contains("content_hash")));
+    }
+
+    #[test]
+    fn mempalace_recall_context_packet_uses_episodic_evidence_authority() {
+        let episodes = vec![MemPalaceRecallEpisode {
+            episode_id: "episode:codex:abc123".into(),
+            session_id: "session-123".into(),
+            client: "codex".into(),
+            agent_or_role: "codex".into(),
+            captured_at: "2026-07-24T15:30:00Z".into(),
+            source_event: "stop".into(),
+            excerpt: "The capture bridge must preserve provenance.".into(),
+            content_hash: format!("sha256:{}", "b".repeat(64)),
+            score: 0.93,
+            retrieval_rationale: "semantic similarity".into(),
+            privacy_class: EpisodicPrivacyClass::Normal,
+            retention_class: EpisodicRetentionClass::Days90,
+            related_context_refs: vec!["seam:mempalace-episodic-lane".into()],
+            provenance: serde_json::json!({"client": "codex"}),
+            metadata: serde_json::json!({}),
+        }];
+
+        let packet = ContextPacket::from_mempalace_recall(
+            "context:mempalace:test",
+            "2026-07-24T15:31:00Z",
+            Some("mempalace:recall:test".into()),
+            "Episodic recall for the MemPalace seam",
+            &episodes,
+        );
+
+        packet
+            .validate()
+            .expect("MemPalace context packet should validate");
+        assert_eq!(packet.refs[0].kind, ContextRefKind::MemPalaceEpisode);
+        assert_eq!(packet.refs[0].authority, ContextAuthority::EpisodicEvidence);
+        assert_eq!(
+            packet.sections[0].authority,
+            ContextAuthority::EpisodicEvidence
+        );
+        assert!(packet.policy_notes[0].contains("not canonical LifeGraph truth"));
+
+        let json = serde_json::to_value(packet).expect("serialize context packet");
+        assert_eq!(json["refs"][0]["kind"], "mem_palace_episode");
+        assert_eq!(json["refs"][0]["authority"], "episodic_evidence");
+    }
+
+    #[test]
+    fn mempalace_ref_cannot_claim_lifegraph_truth() {
+        let context_ref = ContextRef {
+            ref_id: "episode:codex:abc123".into(),
+            kind: ContextRefKind::MemPalaceEpisode,
+            authority: ContextAuthority::LifeGraphTruth,
+            summary: Some("An episode is evidence, not truth.".into()),
+            validation_state: Some(ValidationState::Confirmed),
+            uri: None,
+            metadata: serde_json::json!({}),
+        };
+
+        let err = context_ref
+            .validate()
+            .expect_err("MemPalace episodes must not claim LifeGraph truth authority");
+        assert!(err.violations.iter().any(|v| v.contains("cannot claim")));
     }
 
     #[test]

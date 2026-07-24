@@ -3,7 +3,7 @@ title: Philotic Architecture Status
 doc_type: status
 domain: runtime-sessions
 status: active
-last_updated: 2026-07-11
+last_updated: 2026-07-24
 tags:
 - source-of-truth
 - current-state
@@ -17,6 +17,7 @@ related_docs:
 - GRAPH_INTELLIGENCE_STATUS.md
 - LIFE_GRAPH_OS_PROPOSAL.md
 - MEMORY_CULTIVATION_TRUE_UP_PROPOSAL.md
+- MEMPALACE_EPISODIC_MEMORY_PROPOSAL.md
 - SESSION_LOOP_PROPOSAL.md
 - TELEGRAM_POLL_LEASE_PROPOSAL.md
 - DESKTOP_MEMBRANE_PROPOSAL.md
@@ -174,6 +175,7 @@ Primary references:
 ### Graph Intelligence and Context
 
 - the SQLite context graph is now the canonical source of truth for proposals, seams, tasks, and architectural state
+- MemPalace now has a governed episodic adapter with deterministic capture, redaction/no-capture handling, private-result filtering, semantic recall, scoped deletion, and explicit `episodic_evidence` `ContextPacket` projection; targeted tests and an isolated real-MemPalace smoke are green, while installation on a verified Codex/Claude/Perplexity lifecycle surface remains incomplete
 - agents mutate state via MCP tools (`graph_create_node`, `graph_update_node`, `graph_create_edge`) rather than editing files directly
 - optional writeback (`graph_writeback`) synchronizes graph state to markdown for human readability
 - web UI provides real-time visibility into proposals, seams, tasks with drill-down architecture diagrams
@@ -224,6 +226,7 @@ These are the most clearly active seams as of 2026-07-08:
 | Tool execution envelope | catalog-backed tools and approval policy exist | extend structured error behavior across more routed components instead of falling back to ad hoc strings |
 | Autopoiesis / earned autonomy | the `AutonomyGrant` per-lane posture/budget/audit substrate is real (Slice A1, PR #156), with four lanes wired on top: `graph.bridge_edges` (A2, PR #163), `fleet.heal_slices` (A3, PR #161), `steward.active_checkins` (A5, PR #165), and `memory.hygiene` (Memory Transparency M4, `codex/memory-m4-hygiene-lane`, test-green only) | A4 `aria-architect-charter` and A6 `scheduled-slice-executor` are unstarted; A7/A8 exist only as proposal-doc slices (PR #181) with no lane implementation yet; `memory.hygiene` needs a deployed/watched-live nightly cycle before it counts as proven |
 | LifeGraph retrieval and self-heal loops | read+write loop is live end to end: auto-recall into turn prefetch (PR #152), auto-capture of turn outcomes (PR #168), Muninn provenance edges (PR #149), cross-domain/role-ranked/read-expanded retrieval (PRs #153/#154/#157/#159) with a calibrated recall threshold (PR #160); turn-level failures now feed the self-heal queue (PR #173) and repeated provider 4xx escalates fallback tiers (PR #176); routing now has a health-aware oracle beneath the static ladders (PR #167) and a native Anthropic model controller (PR #166, key not yet provisioned) | prove live feedback smoke beyond test-green, and provision the Anthropic provider key on at least one deployed hotel |
+| MemPalace episodic lane | deterministic local episode capture, duplicate/conflict handling, redaction/no-capture rules, privacy filtering, scoped deletion, semantic recall, and `episodic_evidence` context projection are test-green and isolated-smoke-green; the legacy Intel Graph turn route is now only a compatibility adapter | install the hook on one verified client lifecycle surface and measure capture success, recall latency, duplicate rate, and re-entry usefulness before expanding to another client |
 | Perimeter egress control | proposal exists and the lack of a unified egress plane is explicitly called out | define the first policy object and classify current egress exceptions |
 | Deployment hardening | VPS boundary and peer rendering contract are defined | remove plaintext secret assumptions and prove real VPS smokes |
 
