@@ -1,9 +1,9 @@
 ---
 title: Seam Roadmap
 doc_type: reference
-domain: governance
+domain: workflow-docs
 status: active
-last_updated: 2026-07-05
+last_updated: 2026-07-24
 tags:
 - roadmap
 - seams
@@ -48,6 +48,18 @@ See [ARCH_RULES_AND_ROADMAP_PROPOSAL.md](ARCH_RULES_AND_ROADMAP_PROPOSAL.md) for
 
 ---
 
+## Personal Knowledge Growth
+
+| seam_id | source_proposal | depends_on | status | summary |
+|---|---|---|---|---|
+| `mempalace-episodic-lane` | `MEMPALACE_EPISODIC_MEMORY_PROPOSAL` | `cross-agent-context-packet` | not-started | Idempotent local lifecycle capture, provenance-rich episode recall, redaction and retention policy, and bounded `ContextPacket` projection |
+| `obsidian-knowledge-projection` | `OBSIDIAN_KNOWLEDGE_GARDEN_PROPOSAL` | `cross-agent-context-packet`, `life-graph-memorygraphrag-runner` | not-started | Incremental note indexing, stable document identity, rename and tombstone handling, and reviewed LifeGraph relationship proposals |
+| `creative-learning-flywheel` | `CREATIVE_LEARNING_FLYWHEEL_PROPOSAL` | `mempalace-episodic-lane`, `obsidian-knowledge-projection`, `life-graph-agentic-growth-loop` | not-started | One-domain pilot connecting questions and ideas to experiments, artifacts, reusable learning, and retrieval feedback |
+
+The dependencies intentionally put capture and provenance before automated synthesis. Otherwise the system would become impressively creative about remembering things that never happened.
+
+---
+
 ## Cross-Proposal Dependencies (Summary)
 
 ```
@@ -62,6 +74,12 @@ agent-resource-broker ──────► agent-graph-toolrunner
   ├─► demand-derived-materialization
   └─► router-training-tap
            └─ functions-gemma-onnx
+
+cross-agent-context-packet ✅ ──► mempalace-episodic-lane ───────┐
+              │                                                  │
+              └─► obsidian-knowledge-projection ─────────────────┤
+life-graph-memorygraphrag-runner ✅ ────────────────┘             ▼
+life-graph-agentic-growth-loop ───────────────────► creative-learning-flywheel
 ```
 
 The graph layer foundation (`graph-domain-layer`, `graph-adapter-migration`) has landed — `GraphDomain` is the storage abstraction across production callers — so the agent resource model is unblocked on that dependency. `graph-store-instances` (backend as config choice) remains open but does not gate the agent resource seams.

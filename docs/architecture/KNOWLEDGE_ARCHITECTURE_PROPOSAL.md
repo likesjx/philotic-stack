@@ -1,17 +1,22 @@
 ---
-title: Cross-Agent Knowledge Architecture Proposal
+title: Personal Knowledge And Growth Architecture Proposal
 doc_type: proposal
 domain: memory-context
 status: accepted-current-slice
-last_updated: 2026-06-28
+last_updated: 2026-07-24
 tags:
   - muninn
   - lifegraph
   - mcp
   - memory
   - client-access
+  - creativity
+  - learning
 related_docs:
   - LIFE_GRAPH_OS_PROPOSAL.md
+  - MEMPALACE_EPISODIC_MEMORY_PROPOSAL.md
+  - OBSIDIAN_KNOWLEDGE_GARDEN_PROPOSAL.md
+  - CREATIVE_LEARNING_FLYWHEEL_PROPOSAL.md
   - MUNINN_V07_CAPABILITY_ADOPTION_PROPOSAL.md
   - MUNINN_CLUSTER_EVALUATION_CHECKLIST.md
   - MUNINN_MEMORY_PROTOCOL_PROPOSAL.md
@@ -27,27 +32,98 @@ active_seams:
   - muninn-native-client-access
   - lifegraph-muninn-promotion
   - cross-agent-context-packet
+  - mempalace-episodic-lane
+  - obsidian-knowledge-projection
+  - creative-learning-flywheel
 source_of_truth_targets:
   - ARCHITECTURE_STATUS.md
 ---
 
-# Cross-Agent Knowledge Architecture Proposal
+# Personal Knowledge And Growth Architecture Proposal
 
 ## Goal
 
-Make Codex, Claude, Perplexity, Beacon, and future harnesses knowledgeable about Jared's life, decisions, and active work without flattening every memory surface into one unsafe global write path.
+Make Codex, Claude, Perplexity, Beacon, and future harnesses knowledgeable about Jared's life, decisions, and active work while reducing re-entry cost and turning experience into compounding creativity, learning, and completed work.
+
+The system should make it easy to remember, connect, explore, create, test, and learn. Organization is infrastructure for that motion, not the final product.
+
+## Disposition
+
+Accepted as the umbrella authority model. Its already-implemented cross-agent and `ContextPacket` slices remain current.
+
+The MemPalace episodic lane, Obsidian projection, and creative-learning flywheel are proposed follow-on slices. Their intended behavior must not be described as live until their own validation gates pass.
 
 ## Core Recommendation
 
-Use a layered knowledge model:
+Use one coordinated system with explicit owners:
 
-1. **Muninn:** continuity memory, preference recall, decisions, reality gaps, and compact session handoff.
-2. **LifeGraph:** structured life truth, evidence, commitments, goals, open loops, relationships, and governed updates.
-3. **Intel Graph / repo docs:** project structure, code facts, proposals, seams, verification, and implementation truth.
-4. **Philotic MCP frontdoor:** public HTTPS coordination surface with deliberately projected tools and bearer scopes.
-5. **Native Muninn MCP:** private trusted-client surface over loopback, private overlay, or SSH tunnel only.
+1. **LifeGraph:** canonical structured life truth, evidence, commitments, goals, open loops, relationships, and growth loops.
+2. **Muninn:** compact continuity, preferences, decisions, reality gaps, and fast re-entry.
+3. **MemPalace:** automatically captured episodic history with source and session provenance.
+4. **Obsidian:** human-readable notes, synthesis, research, and creative artifacts.
+5. **Intel Graph / repo docs:** project structure, code facts, proposals, seams, verification, and implementation truth.
+6. **Philotic MCP frontdoor:** deliberately projected capture, recall, proposal, and commit tools with scoped authority.
 
 The architecture should be local-vault-first for Muninn. A hotel's native Muninn vault is its local continuity substrate. Cross-hotel synthesis should move through LifeGraph, Intel Graph, or explicit governed exports until a Muninn cluster decision proves authority, replication, and secret handling.
+
+## Proposal Family
+
+| Proposal | Primary outcome | Stable owner |
+| --- | --- | --- |
+| [LIFE_GRAPH_OS_PROPOSAL.md](LIFE_GRAPH_OS_PROPOSAL.md) | governed life truth, goals, commitments, attention, and growth structure | LifeGraph |
+| [MUNINN_MEMORY_PROTOCOL_PROPOSAL.md](MUNINN_MEMORY_PROTOCOL_PROPOSAL.md) | compact continuity and super-quick re-entry | Muninn |
+| [MEMPALACE_EPISODIC_MEMORY_PROPOSAL.md](MEMPALACE_EPISODIC_MEMORY_PROPOSAL.md) | automatic, provenance-rich episodic history | MemPalace |
+| [OBSIDIAN_KNOWLEDGE_GARDEN_PROPOSAL.md](OBSIDIAN_KNOWLEDGE_GARDEN_PROPOSAL.md) | readable notes, synthesis, and artifacts | Obsidian |
+| [CREATIVE_LEARNING_FLYWHEEL_PROPOSAL.md](CREATIVE_LEARNING_FLYWHEEL_PROPOSAL.md) | ideas converted into experiments, artifacts, and reusable learning | coordinated behavior across the owners |
+
+## Compounding Loop
+
+The architecture should make this loop progressively easier:
+
+```text
+Capture → Orient → Connect → Create → Experiment → Reflect → Reinforce
+```
+
+- **Capture:** MemPalace records the episode automatically; quick LifeGraph capture accepts a question, idea, or commitment.
+- **Orient:** Muninn and LifeGraph provide a bounded `ContextPacket` to any authorized agent.
+- **Connect:** LifeGraph relationships and Obsidian links surface relevant people, projects, sources, and prior learnings.
+- **Create:** the agent helps produce a note, plan, prototype, essay, decision, or other artifact.
+- **Experiment:** LifeGraph tracks the bounded test and its evidence.
+- **Reflect:** Obsidian holds the authored synthesis; LifeGraph records reusable learning.
+- **Reinforce:** Muninn stores the compact continuity delta and recall feedback improves the next retrieval.
+
+The loop is healthy when it increases finished artifacts, useful learning, and ease of re-entry. A rising note or node count alone is not success.
+
+## Authority And Promotion Rules
+
+| State | Canonical owner | Other systems may hold |
+| --- | --- | --- |
+| confirmed life fact, commitment, goal, relationship, or resolution | LifeGraph | pointers, projections, and evidence |
+| compact preference, decision rationale, reality gap, or next seam | Muninn | source references |
+| conversation or working-turn history | MemPalace | bounded summaries and promotion candidates |
+| note body, research synthesis, or authored artifact | Obsidian | document references and relationships |
+| repository and implementation truth | repo docs/code plus Intel Graph | continuity pointers |
+
+Promotion is always explicit:
+
+1. MemPalace or Obsidian supplies provenance-backed evidence.
+2. The agent extracts a bounded candidate.
+3. `life.observe` records a proposed life signal, not confirmed truth.
+4. governed `life.commit` or `life.resolve` establishes canonical LifeGraph truth.
+5. Muninn receives only the compact decision or continuity delta.
+
+Current-turn evidence and observed repo/runtime truth outrank stale recall.
+
+## Current Slice
+
+This documentation slice:
+
+- preserves the implemented cross-agent authority and `ContextPacket` contracts
+- corrects the Muninn/MemPalace ownership boundary
+- defines first-class proposals for automatic episodic capture, Obsidian projection, and the creative-learning flywheel
+- registers the stable seams, dependencies, and executable task slices
+
+It does not claim the three new integration seams are implemented.
 
 ## Current Decision
 
@@ -70,6 +146,8 @@ The live-safe posture is:
 | `life.observe` | LifeGraph runner | proposed evidence signals | n/a | governed, may require approval |
 | `life.commit` / `life.resolve` | LifeGraph runner | confirmed graph truth | n/a | unavailable or approval-gated externally |
 | `life.recall` | LifeGraph runner | recall feedback only if invoked | governed context packets | HTTPS bearer, scoped endpoint |
+| MemPalace episode adapter | MemPalace | episodic records and retention metadata | bounded provenance-rich episode recall | local-first, client-scoped |
+| governed knowledge tools | Obsidian adapter | proposed note and relationship changes | indexed note content and metadata | read-first, write approval-gated |
 | graph-intelligence MCP | Intel Graph | project decisions and verification | repo/project structure | local/dev or operator-scoped |
 
 ## Muninn To LifeGraph Flow
@@ -201,3 +279,6 @@ This keeps LifeGraph/Muninn reconciliation behind the same promotion gates as ot
 
 - Teach Intel Graph recall/projection output to project into `ContextPacket` when it is used together with Muninn or LifeGraph in a model turn.
 - Revisit Tailscale-only or private HTTPS native Muninn access only after credential lifecycle and client config are explicit.
+- Implement idempotent episodic capture and bounded recall through `mempalace-episodic-lane`.
+- Implement incremental, provenance-preserving Obsidian indexing through `obsidian-knowledge-projection`.
+- Pilot `creative-learning-flywheel` in one domain and judge it by completed experiments, artifacts, learning reuse, and reduced re-entry time.
