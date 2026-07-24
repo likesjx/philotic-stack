@@ -11,7 +11,8 @@ path = "src/main.rs"
 anyhow = "1.0"
 async-trait = "0.1"
 datasource = { path = "../datasource" }
-rusqlite = { version = "0.37", features = ["bundled"] }
+rusqlite = { version = "0.37", features = ["bundled", "hooks", "backup"] }
+serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 tokio = { version = "1.42", features = ["macros", "rt-multi-thread"] }
 tracing = "0.1"

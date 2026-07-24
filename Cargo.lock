@@ -4788,6 +4788,7 @@ dependencies = [
  "async-trait",
  "datasource",
  "rusqlite",
+ "serde",
  "serde_json",
  "tempfile",
  "tokio",
