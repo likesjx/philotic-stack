@@ -627,6 +627,7 @@ impl RetrievalContextPacket {
 pub enum ContextAuthority {
     MuninnContinuity,
     EpisodicEvidence,
+    AuthoredKnowledge,
     LifeGraphTruth,
     LifeGraphEvidence,
     IntelGraphProjectTruth,
@@ -639,6 +640,7 @@ pub enum ContextAuthority {
 pub enum ContextRefKind {
     MuninnEngram,
     MemPalaceEpisode,
+    ObsidianDocument,
     LifeGraphNode,
     LifeGraphEvidencePacket,
     LifeGraphRetrievalPacket,
@@ -670,6 +672,7 @@ impl ContextRef {
         match (&self.kind, &self.authority) {
             (ContextRefKind::MuninnEngram, ContextAuthority::MuninnContinuity)
             | (ContextRefKind::MemPalaceEpisode, ContextAuthority::EpisodicEvidence)
+            | (ContextRefKind::ObsidianDocument, ContextAuthority::AuthoredKnowledge)
             | (ContextRefKind::LifeGraphNode, ContextAuthority::LifeGraphTruth)
             | (ContextRefKind::LifeGraphNode, ContextAuthority::LifeGraphEvidence)
             | (ContextRefKind::LifeGraphEvidencePacket, ContextAuthority::LifeGraphEvidence)
@@ -839,6 +842,30 @@ pub struct MemPalaceRecallEpisode {
     pub retention_class: EpisodicRetentionClass,
     #[serde(default)]
     pub related_context_refs: Vec<String>,
+    #[serde(default)]
+    pub provenance: serde_json::Value,
+    #[serde(default)]
+    pub metadata: serde_json::Value,
+}
+
+/// Bounded reference to an authored Obsidian note. The note body remains
+/// canonical in the vault and is intentionally not copied into LifeGraph.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct KnowledgeRecallDocument {
+    pub document_id: String,
+    pub vault_id: String,
+    pub relative_path: String,
+    pub content_hash: String,
+    pub title: String,
+    pub excerpt: String,
+    pub score: f32,
+    pub modified_at: String,
+    #[serde(default)]
+    pub headings: Vec<String>,
+    #[serde(default)]
+    pub tags: Vec<String>,
+    #[serde(default)]
+    pub outbound_links: Vec<String>,
     #[serde(default)]
     pub provenance: serde_json::Value,
     #[serde(default)]
@@ -1138,6 +1165,69 @@ impl ContextPacket {
             ],
             metadata: serde_json::json!({
                 "source": "mempalace_recall",
+            }),
+        }
+    }
+
+    pub fn from_knowledge_recall(
+        packet_id: impl Into<String>,
+        generated_at: impl Into<String>,
+        query_id: Option<String>,
+        summary: impl Into<String>,
+        documents: &[KnowledgeRecallDocument],
+    ) -> Self {
+        let refs: Vec<_> = documents
+            .iter()
+            .map(|document| ContextRef {
+                ref_id: document.document_id.clone(),
+                kind: ContextRefKind::ObsidianDocument,
+                authority: ContextAuthority::AuthoredKnowledge,
+                summary: Some(document.excerpt.clone()),
+                validation_state: None,
+                uri: Some(format!(
+                    "obsidian://open?vault={}&file={}",
+                    document.vault_id, document.relative_path
+                )),
+                metadata: serde_json::json!({
+                    "vault_id": document.vault_id,
+                    "relative_path": document.relative_path,
+                    "content_hash": document.content_hash,
+                    "title": document.title,
+                    "score": document.score,
+                    "modified_at": document.modified_at,
+                    "headings": document.headings,
+                    "tags": document.tags,
+                    "outbound_links": document.outbound_links,
+                    "provenance": document.provenance,
+                    "extra": document.metadata,
+                }),
+            })
+            .collect();
+        let ref_ids = refs
+            .iter()
+            .map(|context_ref| context_ref.ref_id.clone())
+            .collect();
+
+        Self {
+            packet_id: packet_id.into(),
+            generated_at: generated_at.into(),
+            query_id,
+            audience_role: None,
+            summary: summary.into(),
+            refs,
+            sections: vec![ContextPacketSection {
+                title: "Obsidian authored knowledge".into(),
+                authority: ContextAuthority::AuthoredKnowledge,
+                ref_ids,
+                text: None,
+            }],
+            policy_notes: vec![
+                "Obsidian Markdown remains canonical for note bodies and authored structure.".into(),
+                "Backlinks and extracted entity links are candidates, not confirmed LifeGraph truth.".into(),
+                "Create, patch, and LifeGraph-link operations require a reviewable proposal before application.".into(),
+            ],
+            metadata: serde_json::json!({
+                "source": "knowledge_search",
             }),
         }
     }
@@ -2990,6 +3080,69 @@ mod tests {
         let err = context_ref
             .validate()
             .expect_err("MemPalace episodes must not claim LifeGraph truth authority");
+        assert!(err.violations.iter().any(|v| v.contains("cannot claim")));
+    }
+
+    #[test]
+    fn knowledge_recall_context_packet_preserves_authored_knowledge_authority() {
+        let documents = vec![KnowledgeRecallDocument {
+            document_id: "document:obsidian:brain:abc123".into(),
+            vault_id: "Brain".into(),
+            relative_path: "Efforts/Ongoing/Playing the Piano.md".into(),
+            content_hash: format!("sha256:{}", "c".repeat(64)),
+            title: "Playing the Piano".into(),
+            excerpt: "Practice small musical ideas and turn them into artifacts.".into(),
+            score: 0.89,
+            modified_at: "2026-07-24T15:30:00Z".into(),
+            headings: vec!["Practice loop".into()],
+            tags: vec!["music".into(), "creative".into()],
+            outbound_links: vec!["Creative Learning".into()],
+            provenance: serde_json::json!({"indexer": "obsidian_knowledge"}),
+            metadata: serde_json::json!({}),
+        }];
+
+        let packet = ContextPacket::from_knowledge_recall(
+            "context:knowledge:test",
+            "2026-07-24T15:31:00Z",
+            Some("knowledge:search:test".into()),
+            "Authored knowledge about piano practice",
+            &documents,
+        );
+
+        packet
+            .validate()
+            .expect("Obsidian context packet should validate");
+        assert_eq!(packet.refs[0].kind, ContextRefKind::ObsidianDocument);
+        assert_eq!(
+            packet.refs[0].authority,
+            ContextAuthority::AuthoredKnowledge
+        );
+        assert_eq!(
+            packet.sections[0].authority,
+            ContextAuthority::AuthoredKnowledge
+        );
+        assert_eq!(
+            packet.refs[0].uri.as_deref(),
+            Some("obsidian://open?vault=Brain&file=Efforts/Ongoing/Playing the Piano.md")
+        );
+        assert!(packet.policy_notes[1].contains("not confirmed LifeGraph truth"));
+    }
+
+    #[test]
+    fn obsidian_document_cannot_claim_lifegraph_truth() {
+        let context_ref = ContextRef {
+            ref_id: "document:obsidian:brain:abc123".into(),
+            kind: ContextRefKind::ObsidianDocument,
+            authority: ContextAuthority::LifeGraphTruth,
+            summary: Some("Authored notes do not become canonical life claims.".into()),
+            validation_state: Some(ValidationState::Confirmed),
+            uri: None,
+            metadata: serde_json::json!({}),
+        };
+
+        let err = context_ref
+            .validate()
+            .expect_err("Obsidian documents must not claim LifeGraph truth authority");
         assert!(err.violations.iter().any(|v| v.contains("cannot claim")));
     }
 

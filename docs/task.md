@@ -257,11 +257,11 @@ Proposal: [OBSIDIAN_KNOWLEDGE_GARDEN_PROPOSAL.md](/Users/jaredlikes/code/philoti
 
 Seam ID: `obsidian-knowledge-projection`
 
-- [ ] Select one high-value folder in the `Brain` vault for the first governed projection.
-- [ ] Define stable document identity, content hash, provenance, rename lineage, and tombstone contracts.
-- [ ] Implement incremental create, edit, rename, and delete indexing while skipping unchanged notes.
-- [ ] Add read-only `knowledge.search`, `knowledge.read`, and `knowledge.sync.status` tools.
-- [ ] Add an approval-gated review queue for proposed LifeGraph entity and relationship links.
+- [x] Select `Brain/Efforts/Ongoing` as the high-value folder for the first governed projection.
+- [x] Define stable document identity, content hash, provenance, rename lineage, and tombstone contracts.
+- [x] Implement incremental create, edit, rename, and delete indexing while skipping unchanged notes.
+- [x] Add read-only `knowledge.search`, `knowledge.read`, and `knowledge.sync.status` tools.
+- [x] Add a review-only queue for proposed LifeGraph entity and relationship links; no apply path is projected.
 - [ ] Measure source traceability, indexing latency, duplicate rate, and accepted cross-note connections before expanding vault scope.
 
 ## Creative Learning Flywheel
