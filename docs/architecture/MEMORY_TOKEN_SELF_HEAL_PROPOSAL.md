@@ -177,8 +177,13 @@ here to keep one canonical proposal per `proposal_id`.
   config — after the first guest's heal rotated the secret, every other
   guest of a shared vault heals off the same rotation instead of being
   stranded with a bare `HEAL_BUDGET_EXHAUSTED` for the rest of the window.
-  On vps the mint path still needs the `muninn-vps-reharden` admin
-  credential; until then it escalates loudly.
+  The mint path resolves an admin credential fleet-wide now that
+  `muninn-vps-reharden` (PR #346) renders `context_graph.muninn` from the
+  vaulted admin password — that lands as the `muninn` config key the
+  `resolve_admin_credential` fallback reads. **Not yet exercised against a
+  real vps token-401**; until a live heal (or the S4 drill) confirms it,
+  treat end-to-end vps re-mint as unverified. The no-credential escalation
+  path is retained deliberately for hosts that lack one.
 - S3 `config-propagation-without-restart` — implemented (this PR):
   `FetchMemoryConfig` loads live from the Context Graph; heal response
   carries refreshed config; philote replaces cached `muninn_config` and
