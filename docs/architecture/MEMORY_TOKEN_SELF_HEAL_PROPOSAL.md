@@ -6,7 +6,7 @@ domain: memory-context
 status: accepted-current-slice
 disposition: accepted for current slice
 last_updated: 2026-07-24
-verification_level: smoke-green
+verification_level: smoke-green (S1-S3 live); S4 drill destructive path unexercised
 tags:
 - muninn
 - memory
@@ -152,7 +152,8 @@ after the second manual resync in two days (see
 [`proposal:muninn-vps-reharden`](MUNINN_VPS_REHARDEN_PROPOSAL.md), the admin
 credential source — **implemented and applied live 2026-07-21** (PR #346).
 
-**Accepted for the current slice**: S1–S4 implemented. S1–S3 are merged
+**Accepted for the current slice**: S1–S3 smoke-green and live; S4
+implemented but its destructive path is unexercised. S1–S3 are merged
 (PR #342) and live on mac-jane — running binary sha verified against the
 build, probe green. S4's drill is implemented with its rails and unit tests,
 but its destructive path has never executed; see the slice status below for
