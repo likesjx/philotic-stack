@@ -3,6 +3,7 @@ members = [
     "crates/aiua",
     "crates/membrane-mcp",
     "crates/membrane-mcp-client",
+    "crates/egress-http-runner",
     "crates/membrane",
     "crates/membrane-discord",
     "crates/membrane-telegram",

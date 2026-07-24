@@ -1790,6 +1790,37 @@ pub enum IpcRequest {
         owner_agent_id: String,
         credential: String,
     },
+    /// Register or update a governed outbound integration binding.
+    RegisterIntegrationBinding {
+        binding: ansible_mesh_core::integration::IntegrationBinding,
+    },
+    /// Revoke a binding owned by the calling agent.
+    RevokeIntegrationBinding {
+        binding_id: String,
+        owner_agent_id: String,
+    },
+    /// Return bindings with placement resolved against current mesh state.
+    GetIntegrationBindings {},
+    /// Store or rotate a binding credential at its selected execution hotel.
+    ///
+    /// Plaintext is accepted only on this operator/owner IPC mutation surface;
+    /// responses and durable binding records contain only the vault reference.
+    ProvisionIntegrationCredential {
+        binding_id: String,
+        owner_agent_id: String,
+        credential: String,
+    },
+    /// Append secret-free, content-free egress execution evidence.
+    RecordIntegrationAudit {
+        audit: ansible_mesh_core::integration::HttpIntegrationAudit,
+    },
+    /// Read recent integration audit records, newest first.
+    GetIntegrationAudit {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        binding_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        limit: Option<u32>,
+    },
     // ── Training data admin IPC ───────────────────────────────────────────────
     /// List voice training samples. Responds with [`IpcResponse::Standard`] (data.samples).
     ListTrainingSamples {
@@ -2626,6 +2657,18 @@ pub enum IpcResponse {
     McpUpstreamsState {
         mcp_upstreams: Vec<McpUpstreamEntry>,
     },
+    /// Response to integration binding mutations.
+    IntegrationBindingRegistered {
+        binding_id: String,
+        materialized_node_id: Option<String>,
+    },
+    /// Response to [`IpcRequest::GetIntegrationBindings`].
+    IntegrationBindingsState {
+        integration_bindings: Vec<IntegrationBindingEntry>,
+    },
+    IntegrationAuditState {
+        integration_audits: Vec<ansible_mesh_core::integration::HttpIntegrationAudit>,
+    },
     DiscordGatewayLease {
         granted: bool,
         lease: Option<LeaseEnvelope>,
@@ -2782,6 +2825,16 @@ pub struct McpUpstreamEntry {
     /// Last catalog report from the mcp-client guest, if any yet.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub catalog: Option<ansible_mesh_core::mcp_upstream::McpUpstreamCatalog>,
+}
+
+/// One integration binding plus its current placement resolution.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct IntegrationBindingEntry {
+    pub binding: ansible_mesh_core::integration::IntegrationBinding,
+    pub placement: ansible_mesh_core::integration::EgressPlacementDecision,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_node_id: Option<String>,
+    pub exit_hotel_reachable: bool,
 }
 
 impl IpcResponse {
@@ -4885,8 +4938,7 @@ mod tests {
             "egress check responses must not carry resolved credential headers"
         );
 
-        let decoded: IpcResponse =
-            serde_json::from_value(wire).expect("deserialize egress grant");
+        let decoded: IpcResponse = serde_json::from_value(wire).expect("deserialize egress grant");
         assert!(matches!(
             decoded,
             IpcResponse::EgressGrant {

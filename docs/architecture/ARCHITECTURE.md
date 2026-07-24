@@ -3,7 +3,7 @@ title: Philotic Stack Architecture Reference
 doc_type: reference
 domain: runtime-sessions
 status: active
-last_updated: 2026-07-14
+last_updated: 2026-07-24
 tags:
 - runtime
 - reference
@@ -30,7 +30,7 @@ tracks_domains:
 
 # Philotic Stack — Architecture Reference
 
-> **Status:** Living Document | **Last Updated:** 2026-03-12
+> **Status:** Living Document | **Last Updated:** 2026-07-24
 
 This document describes the full runtime architecture of the Philotic Stack —
 a distributed AI agent operating system built in Rust. It is built around a powerful and intuitive **Hotel & Guest** metaphor. It covers The Hotel daemon (the orchestrator), all crates, all materialized Guest processes (the agents and gateways), the IPC and mesh transports,
@@ -116,6 +116,8 @@ Generated UML/PlantUML diagrams for the graph-visible hierarchy live under
 | `membrane-*`        | Protocol gateway guests (Telegram, Discord, MCP)             |
 | `philote`           | Persona/agent cognitive loop guest binary                    |
 | `model-router`      | Shared LLM inference routing SDK and provider controllers     |
+| `membrane-mcp-client` | Outgoing MCP protocol manager; delegates HTTP wire exchange to governed egress |
+| `egress-http-runner` | Binding-scoped HTTP executor with vault injection, placement, limits, and audit |
 | `philotic-web`      | Desktop operator surface (Next.js)                           |
 | `tool-runner`       | Workspace tool executor guest                                |
 | `agent-datasource`  | Per-agent cognitive graph partition datasource               |

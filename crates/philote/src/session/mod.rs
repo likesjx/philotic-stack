@@ -4638,6 +4638,7 @@ pub fn default_tool_assembly_for_bindings(bindings: &SessionBindings) -> ToolAss
     if !bindings.allowed_tool_runner_incarnations.is_empty() {
         let mut assembly = tool_assembly_from_allowed_incarnations(bindings);
         append_mcp_upstream_projection(&mut assembly, bindings);
+        append_http_integration_projection(&mut assembly, bindings);
         return assembly;
     }
 
@@ -4689,6 +4690,7 @@ pub fn default_tool_assembly_for_bindings(bindings: &SessionBindings) -> ToolAss
         policy_annotations,
     };
     append_mcp_upstream_projection(&mut assembly, bindings);
+    append_http_integration_projection(&mut assembly, bindings);
     assembly
 }
 
@@ -4746,6 +4748,96 @@ fn append_mcp_upstream_projection(assembly: &mut ToolAssembly, bindings: &Sessio
             ToolPolicyAnnotation {
                 policy_class: "mcp_remote".into(),
                 approval_required: true,
+            },
+        );
+    }
+}
+
+fn append_http_integration_projection(assembly: &mut ToolAssembly, bindings: &SessionBindings) {
+    use ansible_mesh_core::integration::{IntegrationTarget, projected_http_tool_name};
+
+    for projected in &bindings.http_integration_tools {
+        let binding = &projected.binding;
+        let IntegrationTarget::Http(target) = &binding.target else {
+            continue;
+        };
+        let name = projected_http_tool_name(&binding.binding_id);
+        if assembly.execution_routes.contains_key(&name) {
+            continue;
+        }
+        let label = binding
+            .display_name
+            .as_deref()
+            .unwrap_or(&binding.binding_id);
+        assembly.tools_for_model.push(ToolDefinition {
+            tool_name: name.clone(),
+            description: format!(
+                "Send one governed HTTP request through the '{}' integration. \
+                 The hotel fixes the base URL, allowed methods and paths, byte limits, \
+                 credentials, and exit placement; provide only the request details.",
+                label
+            ),
+            input_schema: json!({
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["method"],
+                "properties": {
+                    "method": {
+                        "type": "string",
+                        "enum": target.allowed_methods
+                    },
+                    "path": {
+                        "type": "string",
+                        "description": format!(
+                            "Absolute path constrained to: {}",
+                            if target.allowed_path_prefixes.is_empty() {
+                                target.base_url.as_str().to_string()
+                            } else {
+                                target.allowed_path_prefixes.join(", ")
+                            }
+                        )
+                    },
+                    "query": {
+                        "type": "object",
+                        "additionalProperties": {"type": "string"}
+                    },
+                    "headers": {
+                        "type": "object",
+                        "description": format!(
+                            "Optional caller headers; allowed names: {}",
+                            target.allowed_request_headers.join(", ")
+                        ),
+                        "additionalProperties": {"type": "string"}
+                    },
+                    "body": {}
+                }
+            }),
+            class: Some("http_remote".into()),
+        });
+        assembly.execution_routes.insert(
+            name.clone(),
+            ToolExecutionRoute {
+                target_node: projected.execution_node_id.clone(),
+                target_role: "egress-http-runner".into(),
+                runner_id: None,
+                incarnation_id: None,
+                hotel_id: Some(projected.execution_node_id.clone()),
+                environment_id: None,
+                task_runner_kind: None,
+                task_runner_config: None,
+                execution_mode: "http_integration".into(),
+                availability_state: "live".into(),
+                selection_reason: Some(format!(
+                    "integration binding '{}' placement",
+                    binding.binding_id
+                )),
+            },
+        );
+        assembly.policy_annotations.insert(
+            name,
+            ToolPolicyAnnotation {
+                policy_class: "http_remote".into(),
+                approval_required: binding.requires_approval,
             },
         );
     }
@@ -4839,6 +4931,9 @@ fn is_local_agent_tool(tool_name: &str) -> bool {
             | "mcp.disconnect"
             | "mcp.upstreams"
             | "mcp.set_credential"
+            | "integration.bind_http"
+            | "integration.unbind"
+            | "integration.list"
             | "desktop.observe"
             | "skill.register"
             | "skill.list"
@@ -5473,7 +5568,8 @@ mod tests {
         ActivePlan, ApprovalPolicy, ApprovalRiskHint, CarryoverPlan, ComponentExecutionRoute,
         ComponentRouteAssembly, ComponentRouteBinding, Context1Advisory, ContextAuthority,
         ContextLayerId, ContextMutability, FallbackOverride, HookRequest, HookResult,
-        LIFE_RECALL_TRUNCATION_MARKER, LifeRecallCacheEntry, McpUpstreamToolBinding,
+        HttpIntegrationToolBinding, LIFE_RECALL_TRUNCATION_MARKER, LifeRecallCacheEntry,
+        McpUpstreamToolBinding,
         MemoryAuthority, MemorySpacetimeFrame, MemorySpatialScope, MemoryTemporalKind,
         MemoryValidationLevel, ParacrineThreadStatus, PlanStep, PromotionAction,
         RecalledMemoryRecord, RefreshRequest, ResponseRouteMode, RoleActivation, SelectionSource,
@@ -6284,6 +6380,7 @@ mod tests {
                 allowed_tool_runner_incarnations: Vec::new(),
                 allowed_classes: Vec::new(),
                 mcp_upstream_tools: Vec::new(),
+                http_integration_tools: Vec::new(),
                 on_demand_skills: Vec::new(),
             }
         );
@@ -6905,6 +7002,7 @@ mod tests {
             allowed_tool_runner_incarnations: Vec::new(),
             allowed_classes: Vec::new(),
             mcp_upstream_tools: Vec::new(),
+            http_integration_tools: Vec::new(),
             on_demand_skills: Vec::new(),
         };
 
@@ -10412,6 +10510,76 @@ mod tests {
                 .iter()
                 .any(|t| t.tool_name.starts_with("mcp:")),
             "no projected tools without upstream bindings"
+        );
+    }
+
+    #[test]
+    fn http_integration_binding_projects_bounded_remote_route() {
+        use ansible_mesh_core::integration::{
+            EgressPlacementDecision, EgressPlacementPolicy, EgressTrafficClass,
+            HttpIntegrationTarget, HttpNetworkScope, IntegrationBinding, IntegrationTarget,
+        };
+
+        let binding = IntegrationBinding {
+            binding_id: "weather".into(),
+            owner_agent_id: "agent-jane".into(),
+            display_name: Some("Weather".into()),
+            target: IntegrationTarget::Http(HttpIntegrationTarget {
+                base_url: "https://api.weather.example/v1".into(),
+                allowed_methods: vec!["GET".into()],
+                allowed_path_prefixes: vec!["/v1/forecast".into()],
+                allowed_request_headers: vec![],
+                default_headers: Default::default(),
+                response_header_allowlist: vec!["content-type".into()],
+                allowed_redirect_hosts: vec![],
+                network_scope: HttpNetworkScope::Public,
+                credential: None,
+                timeout_secs: 30,
+                max_request_bytes: 1024,
+                max_response_bytes: 8192,
+                max_redirects: 0,
+            }),
+            grant_agents: vec![],
+            grant_skills: vec!["weather.research".into()],
+            traffic_class: EgressTrafficClass::GeneralApi,
+            placement: EgressPlacementPolicy::RequireHotel {
+                hotel_id: "vps-jane".into(),
+            },
+            requires_approval: true,
+            enabled: true,
+            updated_at: 1,
+        };
+        let bindings = SessionBindings {
+            effective_toolset: vec!["echo".into()],
+            effective_skillset: vec!["weather.research".into()],
+            http_integration_tools: vec![HttpIntegrationToolBinding {
+                binding,
+                placement: EgressPlacementDecision::ExecuteAtHotel {
+                    hotel_id: "vps-jane".into(),
+                },
+                execution_node_id: "vps-jane-aiua-01".into(),
+            }],
+            ..Default::default()
+        };
+        let assembly = default_tool_assembly_for_bindings(&bindings);
+        let name = "http:weather.request";
+        let route = assembly.execution_routes.get(name).unwrap();
+        assert_eq!(route.target_node, "vps-jane-aiua-01");
+        assert_eq!(route.target_role, "egress-http-runner");
+        assert_eq!(route.execution_mode, "http_integration");
+        let definition = assembly
+            .tools_for_model
+            .iter()
+            .find(|tool| tool.tool_name == name)
+            .unwrap();
+        assert_eq!(definition.class.as_deref(), Some("http_remote"));
+        assert!(!definition.description.contains("api.weather.example"));
+        assert!(
+            assembly
+                .policy_annotations
+                .get(name)
+                .unwrap()
+                .approval_required
         );
     }
 }

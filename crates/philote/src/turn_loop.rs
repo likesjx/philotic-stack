@@ -662,6 +662,7 @@ impl AgentRuntime {
         // Load projected upstream MCP tools (mcp:<upstream>.<tool>) so granted
         // remote tools are in the catalog from the first turn.
         self.refresh_mcp_upstream_projection().await;
+        self.refresh_http_integration_projection().await;
 
         loop {
             // Run the watchdog every loop, not only on an idle receive timeout. A busy

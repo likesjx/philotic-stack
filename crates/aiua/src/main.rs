@@ -2437,6 +2437,28 @@ fn hotel_shared_guests(
             active_pid: None,
             last_active_at: None,
         },
+        // Governed outbound HTTP executor. Seeded on every hotel so placement
+        // can activate it locally or at an exit hotel without copying runtime
+        // configuration across the mesh. It stays dormant until a binding
+        // selects this hotel.
+        GuestRecord {
+            hotel_name: hotel_name.to_string(),
+            guest_id: format!("{hotel_name}:egress-http"),
+            role: "egress-http-runner".into(),
+            config_json: serde_json::json!({
+                "command": "egress-http-runner",
+                "args": [],
+                "env": {
+                    "PHILOTIC_HOTEL_SOCKET": socket_path.clone(),
+                    "PHILOTIC_NODE_ID": node_id.clone(),
+                    "PHILOTIC_GUEST_ID": format!("{hotel_name}:egress-http")
+                }
+            })
+            .to_string(),
+            is_active: false,
+            active_pid: None,
+            last_active_at: None,
+        },
         GuestRecord {
             hotel_name: hotel_name.to_string(),
             guest_id: format!("{hotel_name}:heal-dispatcher"),
@@ -8702,7 +8724,7 @@ mod tests {
     #[test]
     fn default_guest_seed_injects_hotel_socket_env() {
         let guests = default_guest_seed("beta-hotel");
-        assert_eq!(guests.len(), 14); // shared guests omit graph-datasource off the configured home hotel and the retired graph-runner; profile: agent, agent-datasource; +3 full-suite controllers (anthropic/openai/ollama)
+        assert_eq!(guests.len(), 15); // shared guests omit graph-datasource off the configured home hotel and the retired graph-runner; profile: agent, agent-datasource; +3 full-suite controllers (anthropic/openai/ollama); dormant egress HTTP runner
         // Membrane is the first guest from hotel_shared_guests
         let membrane = guests
             .iter()
@@ -8718,6 +8740,11 @@ mod tests {
         assert!(guests.iter().any(|guest| guest.role == "model.elevenlabs"));
         assert!(guests.iter().any(|guest| guest.role == "model.openrouter"));
         assert!(guests.iter().any(|guest| guest.role == "tool"));
+        assert!(
+            guests
+                .iter()
+                .any(|guest| guest.role == "egress-http-runner" && !guest.is_active)
+        );
         assert!(!guests.iter().any(|guest| guest.role == "graph-datasource"));
         // Single membrane uses PHILOTIC_AGENT_ROSTER (not per-agent token key)
         let roster_json = config["env"]["PHILOTIC_AGENT_ROSTER"]

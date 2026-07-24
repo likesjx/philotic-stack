@@ -1,14 +1,17 @@
 //! Outbound MCP JSON-RPC client for one upstream server (HTTP transport).
 //!
-//! Hand-rolled on reqwest, mirroring the wire shapes `membrane-mcp` serves:
-//! `initialize` → `tools/list` → `tools/call` over `POST <url>` JSON-RPC 2.0.
+//! The MCP manager owns the protocol state machine (`initialize` →
+//! `tools/list` → `tools/call`). HTTP I/O is delegated through
+//! [`HttpTransportExecutor`], implemented by the guest using the hotel's
+//! bounded egress runner. Stdio remains local to this process.
 
 use crate::stdio::StdioTransport;
 use ansible_mesh_core::mcp_upstream::{
     McpProjectedTool, McpUpstreamConfig, McpUpstreamState, McpUpstreamToolGrant,
     McpUpstreamTransport, DEFAULT_UPSTREAM_CALL_TIMEOUT_SECS, DEFAULT_UPSTREAM_MAX_RESPONSE_BYTES,
 };
-use anyhow::{bail, Context, Result};
+use anyhow::{bail, Result};
+use async_trait::async_trait;
 use serde_json::{json, Value};
 use std::time::Duration;
 use tracing::{info, warn};
@@ -18,18 +21,21 @@ const MCP_PROTOCOL_VERSION: &str = "2024-11-05";
 
 /// Transport backend for one upstream: HTTP JSON-RPC or a spawned stdio child.
 enum Backend {
-    Http {
-        http: reqwest::Client,
-        url: String,
-        /// Raw bearer credential resolved from the vault, if any.
-        bearer: Option<String>,
-    },
+    Http,
     Stdio {
         /// Lazily spawned on first use / respawned after exit.
         transport: Option<StdioTransport>,
         command: String,
         args: Vec<String>,
     },
+}
+
+#[async_trait]
+pub trait HttpTransportExecutor {
+    /// Execute one MCP HTTP JSON-RPC envelope through the governed egress
+    /// boundary and return the decoded response envelope. Notifications may
+    /// return `Value::Null`.
+    async fn post_json(&mut self, config: &McpUpstreamConfig, body: Value) -> Result<Value>;
 }
 
 pub struct UpstreamClient {
@@ -103,19 +109,9 @@ pub fn filter_listing(
 }
 
 impl UpstreamClient {
-    pub fn new(config: McpUpstreamConfig, bearer: Option<String>) -> Result<Self> {
+    pub fn new(config: McpUpstreamConfig) -> Result<Self> {
         let backend = match &config.transport {
-            McpUpstreamTransport::Http { url } => {
-                let http = reqwest::Client::builder()
-                    .timeout(Duration::from_secs(DEFAULT_UPSTREAM_CALL_TIMEOUT_SECS))
-                    .build()
-                    .context("building http client")?;
-                Backend::Http {
-                    http,
-                    url: url.clone(),
-                    bearer,
-                }
-            }
+            McpUpstreamTransport::Http { .. } => Backend::Http,
             McpUpstreamTransport::Stdio { command, args } => Backend::Stdio {
                 transport: None,
                 command: command.clone(),
@@ -130,38 +126,23 @@ impl UpstreamClient {
         })
     }
 
-    async fn rpc(&mut self, method: &str, params: Value) -> Result<Value> {
+    async fn rpc(
+        &mut self,
+        executor: &mut dyn HttpTransportExecutor,
+        method: &str,
+        params: Value,
+    ) -> Result<Value> {
         let id = self.next_id;
         self.next_id += 1;
         match &mut self.backend {
-            Backend::Http { http, url, bearer } => {
+            Backend::Http => {
                 let body = json!({
                     "jsonrpc": "2.0",
                     "id": id,
                     "method": method,
                     "params": params,
                 });
-                let mut req = http.post(url.as_str()).json(&body);
-                if let Some(token) = bearer {
-                    req = req.bearer_auth(token);
-                }
-                let resp = req.send().await.context("upstream request failed")?;
-                let status = resp.status();
-                let bytes = resp.bytes().await.context("reading upstream response")?;
-                if bytes.len() as u64 > DEFAULT_UPSTREAM_MAX_RESPONSE_BYTES * 4 {
-                    bail!(
-                        "upstream response too large ({} bytes) for method {method}",
-                        bytes.len()
-                    );
-                }
-                if !status.is_success() {
-                    bail!(
-                        "upstream returned HTTP {status} for {method}: {}",
-                        String::from_utf8_lossy(&bytes[..bytes.len().min(512)])
-                    );
-                }
-                let envelope: Value =
-                    serde_json::from_slice(&bytes).context("upstream response is not JSON")?;
+                let envelope = executor.post_json(&self.config, body).await?;
                 if let Some(err) = envelope.get("error") {
                     bail!("upstream JSON-RPC error for {method}: {err}");
                 }
@@ -192,18 +173,14 @@ impl UpstreamClient {
         }
     }
 
-    async fn send_initialized_notification(&mut self) {
+    async fn send_initialized_notification(&mut self, executor: &mut dyn HttpTransportExecutor) {
         let res = match &mut self.backend {
-            Backend::Http { http, url, bearer } => {
+            Backend::Http => {
                 let notify = json!({
                     "jsonrpc": "2.0",
                     "method": "notifications/initialized",
                 });
-                let mut req = http.post(url.as_str()).json(&notify);
-                if let Some(token) = bearer {
-                    req = req.bearer_auth(token);
-                }
-                req.send().await.map(|_| ()).map_err(anyhow::Error::from)
+                executor.post_json(&self.config, notify).await.map(|_| ())
             }
             Backend::Stdio { transport, .. } => match transport.as_mut() {
                 Some(t) => t.notify("notifications/initialized").await,
@@ -216,9 +193,10 @@ impl UpstreamClient {
     }
 
     /// `initialize` + `notifications/initialized` handshake.
-    async fn initialize(&mut self) -> Result<()> {
+    async fn initialize(&mut self, executor: &mut dyn HttpTransportExecutor) -> Result<()> {
         let result = self
             .rpc(
+                executor,
                 "initialize",
                 json!({
                     "protocolVersion": MCP_PROTOCOL_VERSION,
@@ -238,7 +216,7 @@ impl UpstreamClient {
             upstream = self.config.upstream_id,
             server_version, "upstream initialized"
         );
-        self.send_initialized_notification().await;
+        self.send_initialized_notification(executor).await;
         Ok(())
     }
 
@@ -248,8 +226,12 @@ impl UpstreamClient {
     /// (config update / `mcp.connect` re-run — the approval event);
     /// `false` (periodic refresh) diffs against the stored baseline and marks
     /// changed tools stale instead of projecting them.
-    pub async fn connect_and_list(&mut self, reset_baseline: bool) -> ConnectOutcome {
-        match self.try_connect_and_list(reset_baseline).await {
+    pub async fn connect_and_list(
+        &mut self,
+        executor: &mut dyn HttpTransportExecutor,
+        reset_baseline: bool,
+    ) -> ConnectOutcome {
+        match self.try_connect_and_list(executor, reset_baseline).await {
             Ok(outcome) => outcome,
             Err(e) => {
                 warn!(upstream = self.config.upstream_id, err = %format!("{e:#}"), "upstream connect failed");
@@ -275,9 +257,13 @@ impl UpstreamClient {
         }
     }
 
-    async fn try_connect_and_list(&mut self, reset_baseline: bool) -> Result<ConnectOutcome> {
-        self.initialize().await?;
-        let result = self.rpc("tools/list", json!({})).await?;
+    async fn try_connect_and_list(
+        &mut self,
+        executor: &mut dyn HttpTransportExecutor,
+        reset_baseline: bool,
+    ) -> Result<ConnectOutcome> {
+        self.initialize(executor).await?;
+        let result = self.rpc(executor, "tools/list", json!({})).await?;
         let advertised = result
             .get("tools")
             .and_then(Value::as_array)
@@ -333,11 +319,13 @@ impl UpstreamClient {
     /// Execute a remote tool call. Returns the MCP result content on success.
     pub async fn call_tool(
         &mut self,
+        executor: &mut dyn HttpTransportExecutor,
         grant: &McpUpstreamToolGrant,
         arguments: Value,
     ) -> Result<Value> {
         let result = self
             .rpc(
+                executor,
                 "tools/call",
                 json!({
                     "name": grant.remote_name,

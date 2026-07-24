@@ -136,6 +136,11 @@ pub struct IntegrationBinding {
     pub target: IntegrationTarget,
     #[serde(default)]
     pub grant_agents: Vec<String>,
+    /// Optional SkillDAG dependency gate. Empty means the binding is available
+    /// whenever its agent grant is active; otherwise at least one named skill
+    /// must be present in the session's effective skill set.
+    #[serde(default)]
+    pub grant_skills: Vec<String>,
     #[serde(default)]
     pub traffic_class: EgressTrafficClass,
     #[serde(default)]
@@ -159,6 +164,15 @@ impl IntegrationBinding {
                     .any(|candidate| candidate == agent_id))
     }
 
+    pub fn is_available_to(&self, agent_id: &str, effective_skills: &[String]) -> bool {
+        self.is_granted_to(agent_id)
+            && (self.grant_skills.is_empty()
+                || self
+                    .grant_skills
+                    .iter()
+                    .any(|required| effective_skills.iter().any(|active| active == required)))
+    }
+
     pub fn projected_tool_name(&self) -> Option<String> {
         matches!(self.target, IntegrationTarget::Http(_))
             .then(|| projected_http_tool_name(&self.binding_id))
@@ -167,6 +181,12 @@ impl IntegrationBinding {
     pub fn validate(&self) -> Result<(), String> {
         validate_identifier("binding_id", &self.binding_id)?;
         validate_identifier("owner_agent_id", &self.owner_agent_id)?;
+        for agent_id in &self.grant_agents {
+            validate_identifier("grant agent_id", agent_id)?;
+        }
+        for skill_id in &self.grant_skills {
+            validate_identifier("grant skill_id", skill_id)?;
+        }
         if self.updated_at == 0 {
             return Err("updated_at must be non-zero".into());
         }
@@ -182,6 +202,35 @@ impl IntegrationBinding {
             }
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CompiledIntegrationDependency {
+    pub binding_id: String,
+    pub projected_tool_name: String,
+}
+
+/// Compile the active SkillDAG edge into concrete binding-scoped tool
+/// dependencies. Invalid, disabled, ungranted, denied, or non-HTTP bindings
+/// produce no executable projection.
+pub fn compile_integration_dependencies<'a>(
+    bindings: impl IntoIterator<Item = &'a IntegrationBinding>,
+    agent_id: &str,
+    effective_skills: &[String],
+) -> Vec<CompiledIntegrationDependency> {
+    let mut compiled: Vec<_> = bindings
+        .into_iter()
+        .filter(|binding| binding.validate().is_ok())
+        .filter(|binding| binding.is_available_to(agent_id, effective_skills))
+        .filter(|binding| matches!(binding.target, IntegrationTarget::Http(_)))
+        .filter(|binding| !matches!(binding.placement, EgressPlacementPolicy::Deny))
+        .map(|binding| CompiledIntegrationDependency {
+            binding_id: binding.binding_id.clone(),
+            projected_tool_name: projected_http_tool_name(&binding.binding_id),
+        })
+        .collect();
+    compiled.sort_by(|left, right| left.binding_id.cmp(&right.binding_id));
+    compiled
 }
 
 fn default_true() -> bool {
@@ -283,6 +332,13 @@ impl HttpIntegrationTarget {
                 ));
             }
         }
+        for header in self.default_headers.keys() {
+            if forbidden_caller_header(header) {
+                return Err(format!(
+                    "static header '{header}' must use the credential binding or executor-owned transport handling"
+                ));
+            }
+        }
         for host in &self.allowed_redirect_hosts {
             validate_host(host)?;
         }
@@ -348,6 +404,7 @@ fn default_http_max_redirects() -> u8 {
 /// Model-facing arguments accepted by `http:<binding>.request`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct HttpIntegrationRequest {
+    #[serde(default)]
     pub binding_id: String,
     pub method: String,
     #[serde(default)]
@@ -377,17 +434,34 @@ pub struct HttpIntegrationResponse {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HttpIntegrationAudit {
     pub binding_id: String,
+    pub tool_name: String,
+    pub agent_id: String,
+    pub caller_role: String,
+    pub session_id: String,
+    pub turn_id: String,
+    pub correlation_id: String,
     pub traffic_class: EgressTrafficClass,
     pub executor_node_id: String,
     pub placement: EgressPlacementDecision,
     pub target_origin: String,
     pub method: String,
     pub path: String,
+    pub policy_revision: u64,
+    pub approval_required: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential_ref: Option<String>,
     pub credential_injected: bool,
     pub redirect_count: u8,
+    pub request_bytes: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub response_status: Option<u16>,
+    pub response_bytes: u64,
     pub started_at_ms: u64,
     pub finished_at_ms: u64,
+    pub duration_ms: u64,
     pub outcome: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure_code: Option<String>,
 }
 
 pub fn projected_http_tool_name(binding_id: &str) -> String {
@@ -602,6 +676,7 @@ mod tests {
                 max_redirects: 0,
             }),
             grant_agents: vec!["agent-bjork".into()],
+            grant_skills: vec![],
             traffic_class: EgressTrafficClass::GeneralApi,
             placement: EgressPlacementPolicy::PreferHotel {
                 hotel_id: "vps-jane".into(),
@@ -711,6 +786,24 @@ mod tests {
             EgressPlacementDecision::ExecuteLocal {
                 audit_fallback: true
             }
+        );
+    }
+
+    #[test]
+    fn skill_dependencies_compile_only_for_active_grants() {
+        let mut weather = binding();
+        weather.grant_skills = vec!["weather.research".into()];
+        assert!(compile_integration_dependencies([&weather], "agent-bjork", &[]).is_empty());
+        assert_eq!(
+            compile_integration_dependencies(
+                [&weather],
+                "agent-bjork",
+                &["weather.research".into()]
+            ),
+            vec![CompiledIntegrationDependency {
+                binding_id: "weather-api".into(),
+                projected_tool_name: "http:weather-api.request".into(),
+            }]
         );
     }
 }

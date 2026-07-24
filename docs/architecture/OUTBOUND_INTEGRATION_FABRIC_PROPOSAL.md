@@ -2,7 +2,7 @@
 title: Outbound Integration Fabric — SkillDAG Bindings, HTTP Egress, and Exit Placement
 doc_type: proposal
 domain: tooling-execution
-status: in-progress
+status: accepted-current-slice
 disposition: accepted-current-slice
 last_updated: 2026-07-24
 tags:
@@ -16,17 +16,29 @@ tags:
 proposal_id: outbound-integration-fabric
 implements: []
 implemented_by:
-- crates/perimeter-core/src/egress.rs
-- crates/aiua/src/service/egress.rs
+- crates/ansible-mesh-core/src/integration.rs
+- crates/egress-http-runner/src/lib.rs
+- crates/egress-http-runner/src/main.rs
+- crates/aiua/src/main.rs
 - crates/aiua/src/service/ipc.rs
 - crates/philotic-client/src/lib.rs
+- crates/philote/src/catalog.rs
+- crates/philote/src/runtime.rs
+- crates/philote/src/session/mod.rs
 - crates/philote/src/tool_exec.rs
+- crates/membrane-mcp-client/src/main.rs
+- crates/membrane-mcp-client/src/upstream.rs
+- crates/philotic-web/src/integration.rs
+- scripts/smoke-integration-http-roundtrip.sh
+- scripts/smoke-mcp-http-egress-roundtrip.sh
 active_seams:
 - integration-binding-contract
 - http-egress-execution-boundary
 - exit-hotel-placement-policy
 - mcp-egress-policy
 related_docs:
+- ARCHITECTURE_STATUS.md
+- ARCHITECTURE.md
 - DATA_DRIVEN_TOOL_GRANTS_PROPOSAL.md
 - MCP_CLIENT_FABRIC_PROPOSAL.md
 - PERIMETER_EGRESS_CONTROL_PROPOSAL.md
@@ -76,18 +88,30 @@ network exit merely because it already has "router" in its name.
 
 ## Disposition
 
-Accepted for the current slice.
+Implemented in source through the local binary-smoke boundary.
 
-The current slice:
+The completed implementation:
 
-- establishes typed traffic-class and exit-placement decisions
-- makes `hotel.egress.check` authorization-only
-- stops returning resolved credential headers to a philote/model tool result
-- records the real current MCP client implementation and the remaining HTTP
-  execution gap
+- defines the canonical `IntegrationBinding`, HTTP request/response, placement,
+  SkillDAG dependency, and content-free audit contracts
+- persists owner-governed bindings in the hotel and resolves placement against
+  current mesh reachability
+- materializes a dedicated `egress-http-runner` locally or through the existing
+  remote operator target surface
+- resolves credentials only from the executing hotel's vault
+- projects binding-scoped `http:<binding>.request` tools only when both agent
+  grants and effective SkillDAG dependencies are satisfied
+- keeps MCP protocol lifecycle in `mcp-client-runner` while delegating its HTTP
+  wire exchange to the selected egress runner
+- exposes operator list/apply/remove/credential/audit commands and
+  approval-gated philote binding/list/revoke tools; plaintext credential
+  provisioning is deliberately operator-only
+- installs both outbound runtime binaries through the declared build and
+  deployment inventories
 
-The first runtime proxy, MCP adoption of the shared boundary, and fleet rollout
-remain follow-on slices.
+The isolated hotel HTTP and MCP-over-HTTP smokes are green. Installed two-hotel
+rollout and a watched `vps-jane` exit proof remain a deployment gate, not an
+unimplemented source boundary.
 
 ## Current Truth
 
@@ -100,31 +124,46 @@ remain follow-on slices.
   are implemented and have scratch-hotel smoke evidence.
 - MCP calls use ordinary routed tool execution through
   `ToolExecutionRoute`; there is no bespoke cognitive re-entry path.
+- General HTTP calls use binding-scoped `http:<binding>.request` projections
+  and route to `egress-http-runner`.
+- The runner disables ambient proxies and automatic redirects, pins DNS to an
+  address in the declared network scope, rechecks redirect authority, enforces
+  method/path/header/time/byte limits, injects vault credentials, and returns
+  only allowlisted response headers.
+- Successful and failed executions emit durable, secret-free audit records
+  with binding, agent, role, session, turn, policy revision, placement,
+  destination, byte/timing, status, and failure evidence.
+- MCP-over-HTTP now delegates raw JSON-RPC exchange to the shared executor;
+  stdio MCP remains local and command-allowlisted.
+- `phil integration` provides diffable JSON apply, owner-bound revoke,
+  file/stdin-only credential provisioning, list, and audit inspection.
+- A philote may propose or revoke an approval-gated binding, but credential
+  values never enter the model tool surface.
 - `perimeter-core` defines an `EgressPolicy`, policy evaluation, and
   vault-backed credential binding.
 - `aiua` exposes `CheckEgress` and a hotel-owned `HotelEgressGateway`.
 
 ### Proven Gap
 
-- The current hotel egress surface checks policy but does not execute HTTP.
 - Direct HTTP clients remain distributed across membranes, MCP, models, memory,
-  graph, web, and other runners.
+  graph, web, and other runners. Model/provider and communication paths remain
+  named transitional exceptions.
 - Before this slice, `CheckEgress` resolved credentials and returned raw
   injection headers through IPC; `hotel.egress.check` rendered those headers
   into a model-facing tool result.
-- MCP-over-HTTP checks its own host allowlist and then executes directly from
-  `mcp-client-runner`; it does not yet use the shared perimeter executor.
-- The existing MCP client fabric is not proven deployed across production
-  hotels.
+- The updated MCP client and HTTP runner are present in deployment inventories,
+  but this branch has not yet been proven as the installed runtime on every
+  hotel.
+- Preferred/required exit selection is implemented, including explicit audited
+  local fallback and fail-closed required placement, but a watched two-hotel
+  `vps-jane` run is still required for installed-runtime proof.
 
 ### Intended
 
-- General API and MCP-over-HTTP requests execute through a shared,
-  hotel-owned HTTP egress runner.
 - `vps-jane` is the normal Internet exit for selected integration classes,
   subject to health, trust, latency, and explicit fallback policy.
-- SkillDAG bindings compile to local graph records so runtime resolution does
-  not depend on remote LifeGraph availability.
+- Remaining direct clients migrate by traffic class rather than by pretending
+  all network activity has identical semantics.
 
 ## Answer: Should All Traffic Exit Through `vps-jane`?
 
@@ -189,20 +228,10 @@ envelopes carry binding IDs and request data, not resolved credentials.
 
 ### `IntegrationBinding`
 
-The tool-management plane should own a data record with at least:
-
-```text
-binding_id
-kind: http_api | mcp_http | mcp_stdio | local_service
-owner_agent_id
-tool_names / capability markers
-destination policy reference
-credential_ref
-placement policy
-request and response limits
-grant policy reference
-revision and approval provenance
-```
+The tool-management plane owns a typed record containing the binding identity
+and owner, HTTP or MCP target, agent and skill grants, traffic class, placement,
+approval posture, enabled state, revision timestamp, destination authority,
+credential reference, and request/response limits.
 
 MCP's existing `McpUpstreamConfig` remains the protocol-specific record in the
 near term. It should implement or compile to the shared binding contract rather
@@ -304,13 +333,13 @@ Near-term:
 - retain its upstream registry, grants, refresh, and stale-schema approval
 - attach shared traffic class and placement policy to HTTP upstreams
 
-Migration:
+The migration is implemented:
 
-1. use the shared placement decision before materializing/calling an HTTP
-   upstream
-2. move raw MCP HTTP exchange behind the selected hotel's egress boundary
-3. preserve MCP-specific initialization, catalog refresh, schema pinning, and
-   tool-call semantics in `mcp-client-runner`
+1. shared placement is resolved before an HTTP upstream call
+2. raw MCP HTTP exchange is executed by the selected hotel's
+   `egress-http-runner`
+3. MCP initialization, catalog refresh, schema pinning, grants, and tool-call
+   semantics remain in `mcp-client-runner`
 
 This avoids creating a generic proxy that accidentally becomes an MCP protocol
 implementation.
@@ -329,7 +358,8 @@ implementation.
 9. Request and response sizes, timeouts, and call budgets are per binding.
 10. Tool results are untrusted external content with provenance.
 11. Model/provider egress remains a named exception until it is migrated.
-12. Operator policy widening is not exposed as an ordinary philote tool.
+12. Policy widening is approval-gated; plaintext credential provisioning and
+    fleet-wide placement defaults remain operator-only surfaces.
 
 ## Failure Semantics
 
@@ -384,8 +414,9 @@ tests/checks. This is `test-green`, not runtime proxy proof.
 - migrate one non-model API path
 - prove credential injection stays inside the runner
 
-Proof: scratch-hotel smoke against an authenticated stub with a redirect and
-response-limit drill.
+Status: implemented and smoke-green. The scratch-hotel binary smoke proves
+vault injection, bounded execution, sanitized response, durable audit, and
+revocation. Runner tests prove redirect-host denial and response limits.
 
 ### Slice 2 — Exit-Hotel Routing
 
@@ -393,8 +424,9 @@ response-limit drill.
 - route execution to `vps-jane` when policy selects it
 - prove fail-closed and audited fallback behavior
 
-Proof: watched two-hotel run for local, preferred-available,
-preferred-unavailable, and required-unavailable cases.
+Status: source-implemented and test-green. Local execution is smoke-green;
+installed preferred/required `vps-jane` execution remains unproven until a
+watched two-hotel rollout.
 
 ### Slice 3 — MCP HTTP Adoption
 
@@ -402,8 +434,11 @@ preferred-unavailable, and required-unavailable cases.
 - execute MCP HTTP transport through the shared boundary
 - retain MCP registry/catalog/grant semantics
 
-Proof: real graph-intelligence and authenticated Muninn MCP calls through both
-local and `vps-jane` exits.
+Status: source-implemented and local smoke-green. The smoke proves
+initialization, notification, tool catalog, credentialed tool call, sanitized
+result, durable egress audit, and revoke with the MCP manager retaining
+protocol ownership. A live authenticated `vps-jane` MCP call remains part of
+the installed rollout gate.
 
 ### Slice 4 — SkillDAG Binding Compiler
 
@@ -412,7 +447,10 @@ local and `vps-jane` exits.
 - report unresolved dependency and approval states
 - expose operator diff/apply/revoke ceremony
 
-Proof: add, disable, reroute, and revoke an integration without a deploy.
+Status: implemented. Effective SkillDAG dependencies and agent grants compile
+to binding-scoped projections; operator and philote management surfaces can add,
+list, reroute, credential, and revoke without rebuilding a service-specific
+client.
 
 ### Slice 5 — Fleet Rollout And Enforcement
 
@@ -423,6 +461,9 @@ Proof: add, disable, reroute, and revoke an integration without a deploy.
 
 Model/provider and communication paths move only under their own explicit
 slices.
+
+Status: deployment inventory implemented; fleet installation, direct-client
+inventory, and class-by-class migration remain operational follow-through.
 
 ## Verification Ladder
 

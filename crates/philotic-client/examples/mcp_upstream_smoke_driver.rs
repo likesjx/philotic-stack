@@ -54,7 +54,9 @@ async fn main() -> Result<()> {
         .ok()
         .and_then(|s| s.parse::<u64>().ok());
     let inspect_only = std::env::var("MCP_SMOKE_MODE").as_deref() == Ok("inspect");
-    let stdio_cmd = std::env::var("MCP_SMOKE_STDIO_CMD").ok().filter(|s| !s.is_empty());
+    let stdio_cmd = std::env::var("MCP_SMOKE_STDIO_CMD")
+        .ok()
+        .filter(|s| !s.is_empty());
     let stdio_args: Vec<String> = std::env::var("MCP_SMOKE_STDIO_ARGS")
         .ok()
         .map(|s| s.split_whitespace().map(str::to_string).collect())
@@ -113,10 +115,12 @@ async fn main() -> Result<()> {
                 command: cmd.clone(),
                 args: stdio_args.clone(),
             },
-            None => ansible_mesh_core::mcp_upstream::McpUpstreamTransport::Http {
-                url: url.clone(),
-            },
+            None => {
+                ansible_mesh_core::mcp_upstream::McpUpstreamTransport::Http { url: url.clone() }
+            }
         },
+        placement: Default::default(),
+        http_network_scope: Some(ansible_mesh_core::integration::HttpNetworkScope::Loopback),
         credential_ref: None,
         tool_allowlist: vec![ansible_mesh_core::mcp_upstream::McpUpstreamToolGrant {
             remote_name: tool.clone(),
@@ -254,7 +258,44 @@ async fn main() -> Result<()> {
                     rendered.len(),
                     &rendered[..rendered.len().min(400)]
                 );
-                println!("SMOKE-GREEN: mcp-client-fabric Phase-1 loop proven end to end");
+                if std::env::var("MCP_SMOKE_EXPECT_EGRESS_AUDIT").as_deref() == Ok("1") {
+                    let mut operator = PhiloticClient::connect(GuestIdentity {
+                        guest_id: "mcp-egress-smoke-operator".into(),
+                        role: "operator".into(),
+                        supported_tools: vec![],
+                    })
+                    .await?;
+                    match operator
+                        .send_request(IpcRequest::GetIntegrationAudit {
+                            binding_id: Some(format!("mcp:{UPSTREAM_ID}")),
+                            limit: Some(20),
+                        })
+                        .await?
+                    {
+                        IpcResponse::IntegrationAuditState {
+                            integration_audits,
+                        } if integration_audits.iter().any(|audit| {
+                            audit.binding_id == format!("mcp:{UPSTREAM_ID}")
+                                && audit.outcome == "http_200"
+                                && audit.caller_role == "mcp-client-runner"
+                        }) => println!(
+                            "      governed egress audit observed ({} MCP HTTP exchanges)",
+                            integration_audits.len()
+                        ),
+                        other => bail!("MCP governed egress audit was not observable: {other:?}"),
+                    }
+                }
+                match client
+                    .send_request(IpcRequest::RevokeMcpUpstream {
+                        upstream_id: UPSTREAM_ID.into(),
+                        owner_agent_id: OWNER.into(),
+                    })
+                    .await?
+                {
+                    IpcResponse::McpUpstreamRegistered { .. } => {}
+                    other => bail!("RevokeMcpUpstream unexpected response: {other:?}"),
+                }
+                println!("SMOKE-GREEN: MCP protocol manager used governed HTTP egress end to end");
                 return Ok(());
             }
             Ok(Ok(_)) => continue,
