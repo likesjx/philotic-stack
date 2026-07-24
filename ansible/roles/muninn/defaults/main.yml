@@ -1,0 +1,23 @@
+# MuninnDB (fleet-primary cognitive memory) — hardened baseline defaults.
+# The role never touches the data directory contents: engrams, API keys,
+# vault configs, and auth_secret all live under muninn_data_dir and must
+# survive redeploys untouched (see docs/muninn-vps-reharden.md).
+
+muninn_user: deploy
+muninn_group: deploy
+muninn_home: "/home/{{ muninn_user }}/.muninn"
+muninn_data_dir: "{{ muninn_home }}/data"
+muninn_binary: /usr/local/bin/muninn
+
+# Automated internal backups (written by the muninn daemon itself).
+# Backups include the Pebble store AND auth_secret, so a wiped instance can
+# be restored with tokens intact — the durable answer to the 2026-07-20
+# "rebuild wiped the key store" incident.
+muninn_backup_dir: "{{ muninn_home }}/backups"
+muninn_backup_interval: "24h"
+muninn_backup_retain: 7
+
+# REST/UI ports (loopback-bound by muninn's own defaults; the role verifies
+# the admin login works after deploy).
+muninn_rest_port: 8475
+muninn_ui_port: 8476

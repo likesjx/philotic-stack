@@ -1,0 +1,17 @@
+[Unit]
+Description=MuninnDB cognitive memory daemon (philotic fleet primary)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User={{ muninn_user }}
+# Secrets + hardened baseline live in muninn.env (0600), never inline here.
+EnvironmentFile={{ muninn_home }}/muninn.env
+ExecStart={{ muninn_binary }} --daemon --data {{ muninn_data_dir }}
+Restart=always
+RestartSec=5
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

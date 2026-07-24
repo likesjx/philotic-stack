@@ -73,6 +73,12 @@ pub struct CronTicker {
     /// fleet-safety rules as `memory_hygiene`; `None` when
     /// `with_dream_sweep` was never called.
     dream_sweep: Option<DreamSweepCronContext>,
+    /// Autopoiesis Slice A9 outcome-stamping follow-up
+    /// (`crate::autonomy_sweep`) context. `None` when `with_autonomy_sweep`
+    /// was never called — `fire()` logs and skips instead of panicking if a
+    /// job somehow targets [`crate::autonomy_sweep::CRON_TARGET_ROLE`]
+    /// without it.
+    autonomy_sweep: Option<AutonomySweepCronContext>,
     /// Autopoiesis Slice A4 (`aria-architect-charter`) fire-time gate.
     /// `None` when `with_architect_charter` was never called. Unlike
     /// `memory_hygiene`/`dream_sweep`, this does NOT intercept delivery —
@@ -112,6 +118,24 @@ struct MemoryHygieneCronContext {
     /// mesh is involved; without it, one hotel's opt-in silently sweeps the
     /// whole fleet.
     enabled_locally: bool,
+    /// A9 Piece 3: lets a fresh hygiene filing push an unresolved
+    /// pending-outcome breadcrumb into the same heal queue the A3
+    /// heal-pattern-filing site already uses for operator visibility.
+    /// `None` when no heal queue is configured on this hotel — the sweep
+    /// still files the `autonomy_audit` record either way; this is
+    /// visibility-only, best-effort.
+    heal_queue: Option<Arc<dyn ansible_mesh_core::heal_queue::HealQueueStorage>>,
+}
+
+/// Wiring the in-process A9 outcome-stamping timeout-to-Neutral sweep needs
+/// at fire time (`crate::autonomy_sweep`). Deliberately no `enabled_locally`
+/// flag, unlike [`MemoryHygieneCronContext`]/[`DreamSweepCronContext`] — this
+/// sweep is always-on, so the mesh-trap gate in
+/// [`CronTicker::fire_autonomy_sweep`] compares the fired job's id against
+/// this hotel's own deterministic job id instead (see `autonomy_sweep`
+/// module docs).
+struct AutonomySweepCronContext {
+    hotel_name: String,
 }
 
 /// Wiring the Autopoiesis A4 architect-charter fire-time gate needs. Unlike
@@ -156,6 +180,7 @@ impl CronTicker {
             delivery_claims,
             memory_hygiene: None,
             dream_sweep: None,
+            autonomy_sweep: None,
             architect_charter: None,
         }
     }
@@ -167,18 +192,35 @@ impl CronTicker {
     /// `enabled_locally` is true (this hotel's own
     /// `PHILOTIC_MEMORY_HYGIENE_ENABLED`, not just a locally-present job
     /// record — see [`MemoryHygieneCronContext::enabled_locally`]).
+    #[allow(clippy::too_many_arguments)]
     pub fn with_memory_hygiene(
         mut self,
         muninn_config: Option<Arc<memory_core::MuninnConfig>>,
         hotel_name: impl Into<String>,
         intel_graph_url: Option<String>,
         enabled_locally: bool,
+        heal_queue: Option<Arc<dyn ansible_mesh_core::heal_queue::HealQueueStorage>>,
     ) -> Self {
         self.memory_hygiene = Some(MemoryHygieneCronContext {
             muninn_config,
             hotel_name: hotel_name.into(),
             intel_graph_url,
             enabled_locally,
+            heal_queue,
+        });
+        self
+    }
+
+    /// Wire the A9 outcome-stamping timeout-to-Neutral sweep context
+    /// (`crate::autonomy_sweep`). `fire()` intercepts jobs whose
+    /// `target_role` is `crate::autonomy_sweep::CRON_TARGET_ROLE` and runs
+    /// the sweep in-process. Unlike `with_memory_hygiene`/`with_dream_sweep`
+    /// there is no `enabled_locally` flag to pass — this sweep is always-on;
+    /// see [`AutonomySweepCronContext`] and `crate::autonomy_sweep` module
+    /// docs for the mesh-trap gate this implies at fire time.
+    pub fn with_autonomy_sweep(mut self, hotel_name: impl Into<String>) -> Self {
+        self.autonomy_sweep = Some(AutonomySweepCronContext {
+            hotel_name: hotel_name.into(),
         });
         self
     }
@@ -373,6 +415,21 @@ impl CronTicker {
             return;
         }
 
+        // Autopoiesis Slice A9 outcome-stamping follow-up: same in-process
+        // sentinel interception, gated on this hotel's own job id rather than
+        // a local-enabled flag (see `fire_autonomy_sweep` and
+        // `crate::autonomy_sweep` module docs — this sweep has no opt-in).
+        if job.target_role == crate::autonomy_sweep::CRON_TARGET_ROLE {
+            self.fire_autonomy_sweep(job, now_ms).await;
+            if let Err(e) = self.advance_schedule(job, fire_epoch) {
+                error!(
+                    "CronTicker: autonomy_sweep advance failed for job {}: {e}",
+                    job.id
+                );
+            }
+            return;
+        }
+
         // Autopoiesis Slice A4 (`aria-architect-charter`): unlike the
         // in-process sentinels above, a charter job DOES go through the
         // normal role-delivery path below — but only for THIS hotel's own
@@ -561,6 +618,7 @@ impl CronTicker {
             ctx.muninn_config.as_deref(),
             &ctx.hotel_name,
             ctx.intel_graph_url.as_deref(),
+            ctx.heal_queue.as_deref(),
             now_ms / 1000,
         )
         .await;
@@ -589,6 +647,45 @@ impl CronTicker {
             return;
         };
         crate::dream::dream_sweep(config, &self.graph, &ctx.hotel_name).await;
+    }
+
+    /// Run the A9 outcome-stamping timeout-to-Neutral sweep in-process
+    /// (`crate::autonomy_sweep`). Logs and returns if `with_autonomy_sweep`
+    /// was never called — should not happen in practice since
+    /// `autonomy_sweep::ensure_scheduled` runs unconditionally at boot, but a
+    /// defensive no-op beats a panic on a cron tick.
+    ///
+    /// **Mesh trap (load-bearing):** unlike [`Self::fire_memory_hygiene`]/
+    /// [`Self::fire_dream_sweep`], there is no `enabled_locally` flag to
+    /// re-check — this sweep has no opt-in. Instead the gate is the fired
+    /// job's id: `CronJobSync` replicates job *definitions* to every
+    /// mesh-connected peer unconditionally, so a job with a peer hotel's
+    /// deterministic id (`autonomy-outcome-sweep:{peer}`) can become locally
+    /// due here too. Only a job whose id matches *this* hotel's own
+    /// (`crate::autonomy_sweep::cron_job_id(&ctx.hotel_name)`) is swept —
+    /// anything else is a replicated definition and is silently skipped, so
+    /// each hotel only ever sweeps its own audit records under its own name.
+    async fn fire_autonomy_sweep(&self, job: &CronJob, now_ms: u64) {
+        let Some(ctx) = &self.autonomy_sweep else {
+            warn!(
+                "CronTicker: autonomy_sweep job fired but no context was wired \
+                 (with_autonomy_sweep not called) — skipping"
+            );
+            return;
+        };
+        let own_job_id = crate::autonomy_sweep::cron_job_id(&ctx.hotel_name);
+        if job.id != own_job_id {
+            debug!(
+                job_id = %job.id,
+                own_job_id = %own_job_id,
+                hotel = %ctx.hotel_name,
+                "CronTicker: autonomy_sweep job fired but its id does not match this hotel's \
+                 own job — job definition was likely replicated via CronJobSync from a peer \
+                 hotel; skipping sweep"
+            );
+            return;
+        }
+        crate::autonomy_sweep::run_scheduled_sweep(&self.graph, &ctx.hotel_name, now_ms / 1000);
     }
 
     async fn broadcast_cron_fired(&self, job: &CronJob, fire_epoch: u64, now_ms: u64) {
@@ -1412,7 +1509,7 @@ mod tests {
         let (ticker, parked_inbound, mut dispatcher_rx) = memory_hygiene_ticker(graph.clone());
         // Context wired but NOT locally enabled — the state a peer hotel is
         // in after CronJobSync replicates a job it never opted into.
-        let ticker = ticker.with_memory_hygiene(None, "local-hotel", None, false);
+        let ticker = ticker.with_memory_hygiene(None, "local-hotel", None, false, None);
 
         let job = memory_hygiene_job("local-hotel", 1_000);
         graph.upsert_cron_job(&job).expect("seed job");
@@ -1463,7 +1560,7 @@ mod tests {
         let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
         let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
         let (ticker, parked_inbound, mut dispatcher_rx) = memory_hygiene_ticker(graph.clone());
-        let ticker = ticker.with_memory_hygiene(None, "local-hotel", None, true);
+        let ticker = ticker.with_memory_hygiene(None, "local-hotel", None, true, None);
 
         let job = memory_hygiene_job("local-hotel", 1_000);
         graph.upsert_cron_job(&job).expect("seed job");
@@ -1666,6 +1763,178 @@ mod tests {
         assert_eq!(
             envelope.target_agent_id.as_deref(),
             Some("role:agent-test:architect")
+        );
+    }
+
+    // ── Autopoiesis Slice A9 outcome-stamping follow-up (`autonomy_sweep`) ──
+
+    fn autonomy_sweep_ticker(
+        graph: Arc<GraphDomain>,
+    ) -> (
+        CronTicker,
+        crate::service::ipc::ParkedInboundRegistry,
+        tokio::sync::mpsc::UnboundedReceiver<crate::LedgerCommand>,
+    ) {
+        use std::collections::HashMap;
+        use tokio::sync::Mutex;
+
+        let (dispatcher_tx, dispatcher_rx) = crate::service::ipc::test_dispatcher_channel();
+        let parked_inbound: crate::service::ipc::ParkedInboundRegistry =
+            Arc::new(Mutex::new(HashMap::new()));
+        let inboxes: InboxRegistry = Arc::new(Mutex::new(HashMap::new()));
+        let ticker = CronTicker::new(
+            graph,
+            dispatcher_tx,
+            inboxes,
+            "local-aiua-01",
+            0,
+            parked_inbound.clone(),
+            None,
+            crate::service::ipc::new_delivery_claim_registry(),
+        );
+        (ticker, parked_inbound, dispatcher_rx)
+    }
+
+    fn autonomy_sweep_job(job_id_hotel: &str, next_fire_at: u64) -> CronJob {
+        CronJob {
+            id: crate::autonomy_sweep::cron_job_id(job_id_hotel),
+            schedule: crate::autonomy_sweep::DEFAULT_SCHEDULE.to_string(),
+            target_role: crate::autonomy_sweep::CRON_TARGET_ROLE.to_string(),
+            target_node_id: None,
+            payload: "{}".into(),
+            guaranteed: false,
+            enabled: true,
+            last_fired_epoch: None,
+            next_fire_at,
+            created_at: 0,
+            created_by: CronJobSource::Operator,
+            silent_ok: true,
+            session_target: ansible_mesh_core::cron::CronSessionTarget::Isolated,
+        }
+    }
+
+    fn seed_old_pending_audit(graph: &GraphDomain, created_at: u64) {
+        let record = ansible_mesh_core::autonomy::AutonomyAuditRecord::new(
+            "old-pending",
+            ansible_mesh_core::autonomy::AutonomyLane::new(
+                ansible_mesh_core::autonomy::LANE_GRAPH_BRIDGE_EDGES,
+            ),
+            "did a thing",
+            "evidence",
+            "revert the thing",
+            ansible_mesh_core::autonomy::AutonomyPosture::ConfirmFirst,
+            created_at,
+        );
+        graph.record_autonomy_audit(&record).expect("seed audit");
+    }
+
+    const EIGHT_DAYS_SECS: u64 = 8 * 86_400;
+
+    /// The load-bearing mesh-trap regression: `CronJobSync` replicates a
+    /// `CronJob` *definition* to every peer hotel unconditionally, so
+    /// `hotel-a`'s `autonomy-outcome-sweep:hotel-a` job can become locally
+    /// due on `hotel-b` too. Because this sweep has no `enabled_locally`
+    /// opt-in (unlike memory.hygiene/dream-sweep), the only thing preventing
+    /// `hotel-b` from sweeping (and mis-attributing) `hotel-a`'s audit
+    /// records is the job-id match in `fire_autonomy_sweep`. Behavioral
+    /// proof, not a marker check: seed an aged Pending audit, fire the
+    /// mismatched job on `hotel-b`'s ticker, assert the record is still
+    /// Pending.
+    #[tokio::test]
+    async fn autonomy_sweep_fire_skips_a_replicated_peer_hotel_job() {
+        use ansible_mesh_core::autonomy::AuditOutcome;
+        use ansible_mesh_core::sqlite_storage::SqliteGraphStorage;
+
+        let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
+        let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
+        // now_ms/1000 - EIGHT_DAYS_SECS puts the record 8 days before "now".
+        let now_ms: u64 = (EIGHT_DAYS_SECS + 1_000) * 1000;
+        seed_old_pending_audit(&graph, 1_000);
+
+        let (ticker, parked_inbound, mut dispatcher_rx) = autonomy_sweep_ticker(graph.clone());
+        // This ticker believes it is hotel-b.
+        let ticker = ticker.with_autonomy_sweep("hotel-b");
+
+        // But the fired job carries hotel-a's deterministic id — exactly
+        // what a CronJobSync replication of hotel-a's own registration
+        // looks like once it lands in hotel-b's local cron_jobs table.
+        let job = autonomy_sweep_job("hotel-a", 1_000);
+        graph.upsert_cron_job(&job).expect("seed job");
+
+        tokio::time::timeout(Duration::from_secs(2), ticker.fire(&job, now_ms))
+            .await
+            .expect("fire() must not hang when the sweep is skipped");
+
+        // Schedule still advances — a skipped sweep must not wedge the job
+        // into permanently re-firing at the same due time.
+        let after = graph
+            .get_cron_job(&job.id)
+            .expect("lookup")
+            .expect("job still present");
+        assert!(after.next_fire_at > 1_000);
+
+        // The load-bearing assertion: the aged Pending record must be
+        // UNTOUCHED — hotel-b never entered the sweep body for hotel-a's job.
+        let record = graph
+            .get_autonomy_audit("old-pending")
+            .expect("lookup")
+            .expect("record exists");
+        assert_eq!(
+            record.outcome,
+            AuditOutcome::Pending,
+            "a mismatched job id must never stamp another hotel's audit records"
+        );
+
+        assert!(parked_inbound.lock().await.is_empty());
+        assert!(dispatcher_rx.try_recv().is_err());
+    }
+
+    /// Companion to the skip test: when the fired job's id matches this
+    /// hotel's own deterministic job id, the sweep runs and stamps the aged
+    /// Pending record Neutral.
+    #[tokio::test]
+    async fn autonomy_sweep_fire_runs_for_this_hotels_own_job() {
+        use ansible_mesh_core::autonomy::AuditOutcome;
+        use ansible_mesh_core::sqlite_storage::SqliteGraphStorage;
+
+        let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
+        let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
+        let now_ms: u64 = (EIGHT_DAYS_SECS + 1_000) * 1000;
+        seed_old_pending_audit(&graph, 1_000);
+
+        let (ticker, parked_inbound, mut dispatcher_rx) = autonomy_sweep_ticker(graph.clone());
+        let ticker = ticker.with_autonomy_sweep("hotel-a");
+
+        let job = autonomy_sweep_job("hotel-a", 1_000);
+        graph.upsert_cron_job(&job).expect("seed job");
+
+        tokio::time::timeout(Duration::from_secs(2), ticker.fire(&job, now_ms))
+            .await
+            .expect("fire() must not hang");
+
+        let record = graph
+            .get_autonomy_audit("old-pending")
+            .expect("lookup")
+            .expect("record exists");
+        assert_eq!(
+            record.outcome,
+            AuditOutcome::Neutral,
+            "this hotel's own job id must run the sweep and stamp the aged Pending record"
+        );
+
+        assert!(parked_inbound.lock().await.is_empty());
+        assert!(dispatcher_rx.try_recv().is_err());
+    }
+
+    /// Same independence-from-role-routing proof as
+    /// `memory_hygiene_target_role_is_not_a_role_routing_key`.
+    #[test]
+    fn autonomy_sweep_target_role_is_not_a_role_routing_key() {
+        assert!(
+            crate::autonomy_sweep::CRON_TARGET_ROLE
+                .strip_prefix("role:")
+                .is_none(),
+            "the sentinel must never be mistaken for a role incarnation routing key"
         );
     }
 }

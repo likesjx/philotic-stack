@@ -4,7 +4,12 @@
     "gemini_api_key": "{{ vault_gemini_api_key }}"{% endif %}{% if vault_elevenlabs_api_key is defined and vault_elevenlabs_api_key %},
     "elevenlabs_api_key": "{{ vault_elevenlabs_api_key }}"{% endif %}{% if vault_elevenlabs_voice_id is defined and vault_elevenlabs_voice_id %},
     "elevenlabs_voice_id": "{{ vault_elevenlabs_voice_id }}"{% endif %}{% if philotic_oidc_public_base_url is defined and philotic_oidc_public_base_url | trim %},
-    "oidc_public_base_url": "{{ philotic_oidc_public_base_url | trim }}"{% endif %}
+    "oidc_public_base_url": "{{ philotic_oidc_public_base_url | trim }}"{% endif %}{% if vault_muninn_admin_password is defined %},
+    "muninn": {
+      "endpoint": "http://127.0.0.1:8475",
+      "admin_username": "root",
+      "admin_password": "{{ vault_muninn_admin_password }}"
+    }{% endif %}
   },
   "hotels": {
     "{{ philotic_hotel_runtime_name }}": {

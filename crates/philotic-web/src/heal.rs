@@ -15,6 +15,14 @@ pub enum HealAction {
         /// Include closed items as well as open ones.
         #[arg(long)]
         all: bool,
+
+        /// Hotel name to target (default: "default"). Previously hardcoded
+        /// to "aiua" — any caller scripting against a hotel whose real name
+        /// differs (the common case; "default" is `phil`'s own CLI default
+        /// everywhere else) silently connected to a socket that doesn't
+        /// exist and got a plain IPC error back, not "no heal work items."
+        #[arg(long, default_value = "default")]
+        hotel: String,
     },
 
     /// Close a filed heal work item once its underlying fault is repaired.
@@ -24,18 +32,25 @@ pub enum HealAction {
     Close {
         /// The `work_item_id` printed by `phil heal list`.
         work_item_id: String,
+
+        /// Hotel name to target (default: "default").
+        #[arg(long, default_value = "default")]
+        hotel: String,
     },
 }
 
 pub async fn run(action: HealAction) -> Result<()> {
     match action {
-        HealAction::List { all } => list(all).await,
-        HealAction::Close { work_item_id } => close(work_item_id).await,
+        HealAction::List { all, hotel } => list(&hotel, all).await,
+        HealAction::Close {
+            work_item_id,
+            hotel,
+        } => close(&hotel, work_item_id).await,
     }
 }
 
-async fn ipc_client() -> Result<PhiloticClient> {
-    let socket = socket_path("aiua");
+async fn ipc_client(hotel_name: &str) -> Result<PhiloticClient> {
+    let socket = socket_path(hotel_name);
     let identity = GuestIdentity {
         guest_id: "phil-heal".into(),
         // "management" is the read/ops role other `phil` IPC verbs use.
@@ -44,14 +59,14 @@ async fn ipc_client() -> Result<PhiloticClient> {
     };
     PhiloticClient::connect_at(&socket, identity)
         .await
-        .with_context(|| format!("connect to aiua at {socket}"))
+        .with_context(|| format!("connect to hotel IPC at {socket}"))
 }
 
-async fn close(work_item_id: String) -> Result<()> {
+async fn close(hotel: &str, work_item_id: String) -> Result<()> {
     if work_item_id.trim().is_empty() {
         anyhow::bail!("work_item_id cannot be empty");
     }
-    let mut client = ipc_client().await?;
+    let mut client = ipc_client(hotel).await?;
     match client
         .send_request(IpcRequest::CloseHealWorkItem {
             work_item_id: work_item_id.clone(),
@@ -79,8 +94,8 @@ async fn close(work_item_id: String) -> Result<()> {
     }
 }
 
-async fn list(all: bool) -> Result<()> {
-    let mut client = ipc_client().await?;
+async fn list(hotel: &str, all: bool) -> Result<()> {
+    let mut client = ipc_client(hotel).await?;
     // Reuse the existing management read surface: the graph exposes heal work
     // items through GetConfig("__heal_work_items__"). If that key is not served
     // by this hotel build, fall back to a clear message rather than erroring.

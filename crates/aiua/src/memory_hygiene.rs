@@ -1,12 +1,29 @@
 //! Memory Hygiene sweep — Memory Transparency Slice M4 (`memory.hygiene`).
 //!
-//! A scheduled, **non-destructive** per-hotel Muninn sweep: for every active
-//! agent vault, (a) list open contradiction pairs (`GET /api/contradictions`)
-//! and (b) list old-but-still-active engrams as a staleness proxy
-//! (`GET /api/engrams?sort=created&before=...`). Findings above a threshold
-//! are filed as ONE aggregated `autonomy_audit` record on lane
-//! [`ansible_mesh_core::autonomy::LANE_MEMORY_HYGIENE`] — annotation/flagging
-//! only, never forget or consolidate-merge.
+//! A scheduled, **non-destructive** per-hotel Muninn sweep: for every vault
+//! this hotel can discover ([`discover_vaults`] — MuninnDB's own vault
+//! listing, filtered by the hotel's `vault_registry` tokens; see "Vault
+//! discovery" below), (a) list open contradiction pairs
+//! (`GET /api/contradictions`) and (b) list old-but-still-active engrams as a
+//! staleness proxy (`GET /api/engrams?sort=created&before=...`). Findings
+//! above a threshold are filed as ONE aggregated `autonomy_audit` record on
+//! lane [`ansible_mesh_core::autonomy::LANE_MEMORY_HYGIENE`] —
+//! annotation/flagging only, never forget or consolidate-merge.
+//!
+//! # Vault discovery (DEF-067)
+//!
+//! Discovery used to derive vault names from materialized guest configs
+//! (`dream::collect_agent_vault_names`, keyed on a guest config's top-level
+//! `agent_id` field). No real guest config carries that field at the top
+//! level — it lives under `env.PHILOTIC_AGENT_ID` — so that scheme matched
+//! zero guests on every real hotel and the sweep silently ran as an empty
+//! no-op that read as "clean" (`vaults=0 contradictions=0 stale=0` every
+//! night since the sweep was first enabled). [`discover_vaults`] instead
+//! intersects the hotel's `vault_registry` tokens with MuninnDB's own
+//! `GET /api/vaults` ground truth, and surfaces an explicit
+//! [`HygieneReport::discovery_warning`] (logged at WARN, carried onto the
+//! last-run marker) whenever that intersection is empty — an empty sweep
+//! must never look identical to a clean one.
 //!
 //! # What this deliberately does NOT do (reality gap, noted honestly)
 //!
@@ -56,6 +73,8 @@
 //! `PHILOTIC_MEMORY_HYGIENE_ENABLED` at fire time
 //! (`MemoryHygieneCronContext::enabled_locally`) so one hotel opting in never
 //! silently sweeps its peers.
+
+use std::collections::HashSet;
 
 use ansible_mesh_core::autonomy::{
     AutonomyAuditRecord, AutonomyLane, LANE_MEMORY_HYGIENE, lane_enabled, try_consume_daily_action,
@@ -192,6 +211,13 @@ pub struct VaultSweepResult {
 pub struct HygieneReport {
     pub hotel_name: String,
     pub vaults: Vec<VaultSweepResult>,
+    /// `Some(reason)` when vault *discovery* itself found nothing to sweep —
+    /// distinct from a clean sweep of N vaults that simply had no findings.
+    /// Set by [`discover_vaults`]; carried through to the last-run marker
+    /// ([`LastRunRecord::discovery_warning`]) so an empty sweep is never
+    /// silently indistinguishable from a genuinely clean one. `None` whenever
+    /// at least one vault was discovered and scanned.
+    pub discovery_warning: Option<String>,
 }
 
 impl HygieneReport {
@@ -436,26 +462,166 @@ pub(crate) fn urlencoding_light(s: &str) -> String {
     s.replace(':', "%3A").replace('+', "%2B")
 }
 
+// ── Vault discovery ─────────────────────────────────────────────────────────────
+
+/// `GET /api/vaults` — MuninnDB's own ground-truth vault listing. Same call
+/// `muninn_provision::provision_muninn_vaults` makes (after an admin login,
+/// for the create-vs-exists check); as a read-only list it needs no session —
+/// verified live against a loopback Lobe (`curl 127.0.0.1:8475/api/vaults`
+/// with no `Authorization` header returns 200 with the vault name array).
+pub(crate) async fn fetch_muninn_vault_names(
+    client: &reqwest::Client,
+    base_url: &str,
+) -> anyhow::Result<Vec<String>> {
+    let url = format!("{}/api/vaults", base_url.trim_end_matches('/'));
+    let resp = client.get(&url).send().await?;
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        anyhow::bail!("list vaults returned {status}: {body}");
+    }
+    Ok(resp.json::<Vec<String>>().await?)
+}
+
+/// Discover which Muninn vaults this hotel can sweep this run.
+///
+/// Ground truth is MuninnDB's own [`fetch_muninn_vault_names`] listing; the
+/// hotel's `vault_registry` — surfaced here as `config.vault_tokens`, already
+/// filtered to `muninn_vault_token`-kind secrets and resolved at boot by
+/// `memory::load_muninn_config` — is the filter: we can only sweep a vault we
+/// hold a bearer token for, and MuninnDB may know about vaults (`default`,
+/// other tenants' vaults) this hotel has no business reading.
+///
+/// Deliberately does **not** derive vault names from materialized guest
+/// configs (the scheme `dream::collect_agent_vault_names` uses for the
+/// unrelated Dreams consolidation pass). That scheme keys off a guest
+/// config's top-level `agent_id` field, but every real guest config in this
+/// codebase carries the agent id nested under `env.PHILOTIC_AGENT_ID`
+/// (`crates/aiua/src/main.rs::agent_guests_for_profile`), not at the top
+/// level — so it matches zero guests on every real hotel and silently
+/// starves any sweep that depends on it. Confirmed live on mac-jane: zero
+/// `materialized_guests` rows carry a top-level `agent_id`, while
+/// `config:vault_registry` holds valid `muninn_vault_token` entries for
+/// `self_agent-bjork-01`, `self_agent-coach`, and `user_likesjx`.
+///
+/// Returns the sweepable vault names and, when that list is empty, `Some`
+/// with a human-readable reason — the caller logs this at WARN and carries
+/// it onto [`HygieneReport::discovery_warning`] so an empty sweep is never
+/// silently indistinguishable from a clean one.
+pub(crate) async fn discover_vaults(
+    client: &reqwest::Client,
+    config: &MuninnConfig,
+) -> (Vec<String>, Option<String>) {
+    let registry_vaults: Vec<String> = config.vault_tokens.keys().cloned().collect();
+
+    let live_vaults = match fetch_muninn_vault_names(client, &config.base_url).await {
+        Ok(v) => Some(v),
+        Err(e) => {
+            warn!(
+                error = %e,
+                "memory.hygiene: MuninnDB /api/vaults unreachable — sweeping the vault_registry \
+                 token list without ground-truth cross-check"
+            );
+            None
+        }
+    };
+
+    resolve_vaults_to_sweep(&registry_vaults, live_vaults.as_deref())
+}
+
+/// Pure decision logic behind [`discover_vaults`], split out so it is
+/// unit-testable against fixture inputs without a live HTTP call — the
+/// network call itself (`fetch_muninn_vault_names`) has no local mock-server
+/// dependency available in this crate, matching how the rest of this module
+/// tests REST-adjacent logic (e.g. `evidence_summary`) against fixtures
+/// rather than mocking the wire calls.
+///
+/// `registry_vaults` is every vault name this hotel holds a
+/// `muninn_vault_token` for (i.e. `config.vault_tokens.keys()`).
+/// `live_vaults` is MuninnDB's own `GET /api/vaults` listing when reachable,
+/// `None` when the call failed (network error, non-2xx, bad body).
+///
+/// - `registry_vaults` empty → nothing to sweep, full stop (empty-with-warn).
+/// - `live_vaults` reachable → sweep the intersection; a registry vault
+///   absent from the live listing is a stale-registry signal, logged and
+///   dropped rather than swept blind. If the intersection is empty, that is
+///   also empty-with-warn (registry entirely stale).
+/// - `live_vaults` unreachable → fall back to trusting the registry token
+///   list as-is (best-effort continuity; the caller already warned about the
+///   unreachable ground truth).
+pub(crate) fn resolve_vaults_to_sweep(
+    registry_vaults: &[String],
+    live_vaults: Option<&[String]>,
+) -> (Vec<String>, Option<String>) {
+    let mut candidates: Vec<String> = registry_vaults.to_vec();
+    candidates.sort();
+
+    if candidates.is_empty() {
+        let reason = "vault_registry has no muninn_vault_token entries — nothing to sweep \
+             (check vault provisioning / `phil graph`; a hotel with agents materialized \
+             should hold one muninn_vault_token per agent vault)"
+            .to_string();
+        return (Vec::new(), Some(reason));
+    }
+
+    let Some(live_vaults) = live_vaults else {
+        // MuninnDB unreachable this run — the caller already logged why;
+        // sweep what the registry says we hold tokens for rather than
+        // discovering nothing just because the ground-truth check failed.
+        return (candidates, None);
+    };
+
+    let live: HashSet<&str> = live_vaults.iter().map(String::as_str).collect();
+    let (present, missing): (Vec<String>, Vec<String>) = candidates
+        .into_iter()
+        .partition(|v| live.contains(v.as_str()));
+    for vault in &missing {
+        warn!(
+            vault = %vault,
+            "memory.hygiene: vault_registry holds a token for this vault but MuninnDB \
+             does not report it in /api/vaults — stale registry entry? skipping"
+        );
+    }
+    if present.is_empty() {
+        let reason = format!(
+            "MuninnDB /api/vaults reports {} vault(s), none matching the {} \
+             vault_registry token(s) held by this hotel — registry looks stale",
+            live_vaults.len(),
+            missing.len()
+        );
+        (Vec::new(), Some(reason))
+    } else {
+        (present, None)
+    }
+}
+
 // ── Sweep ──────────────────────────────────────────────────────────────────────
 
-/// Sweep every active agent vault in `hotel_name` for contradictions and
-/// aging-but-active memories. Read-only — no Muninn write calls. Per-vault
-/// failures are captured on the `VaultSweepResult` and do not abort the rest
-/// of the sweep.
+/// Sweep every Muninn vault this hotel can discover ([`discover_vaults`]) for
+/// contradictions and aging-but-active memories. Read-only — no Muninn write
+/// calls. Per-vault failures are captured on the `VaultSweepResult` and do
+/// not abort the rest of the sweep.
 pub async fn sweep(
     client: &reqwest::Client,
     config: &MuninnConfig,
-    graph: &GraphDomain,
     hotel_name: &str,
     thresholds: &HygieneThresholds,
     now: chrono::DateTime<chrono::Utc>,
 ) -> HygieneReport {
-    let vault_names = crate::dream::collect_agent_vault_names(graph, hotel_name);
+    let (vault_names, discovery_warning) = discover_vaults(client, config).await;
+    if let Some(reason) = &discovery_warning {
+        warn!(
+            hotel = %hotel_name,
+            reason = %reason,
+            "memory.hygiene: sweep discovered zero vaults — this is an empty discovery, not a clean sweep"
+        );
+    }
     let before = (now - chrono::Duration::days(thresholds.stale_days)).to_rfc3339();
 
     let mut report = HygieneReport {
         hotel_name: hotel_name.to_string(),
         vaults: Vec::with_capacity(vault_names.len()),
+        discovery_warning,
     };
 
     for vault_name in &vault_names {
@@ -466,7 +632,10 @@ pub async fn sweep(
         {
             Some(t) => t.clone(),
             None => {
-                debug!(vault = %vault_name, "memory.hygiene: no token — skipping");
+                // discover_vaults only returns names drawn from
+                // config.vault_tokens, so this should be unreachable in
+                // practice; kept as a defensive skip rather than an unwrap.
+                warn!(vault = %vault_name, "memory.hygiene: discovered vault has no token — skipping (unexpected)");
                 continue;
             }
         };
@@ -531,6 +700,14 @@ pub struct LastRunRecord {
     pub stale: usize,
     pub filed: bool,
     pub audit_id: Option<String>,
+    /// Carried from [`HygieneReport::discovery_warning`]. `Some(reason)`
+    /// means `vaults_scanned == 0` because vault *discovery* found nothing,
+    /// not because the hotel genuinely has no findings — a dashboard/digest
+    /// consumer must not read a zero-vault marker as "clean" without
+    /// checking this field. `#[serde(default)]` so markers written before
+    /// this field existed still deserialize.
+    #[serde(default)]
+    pub discovery_warning: Option<String>,
 }
 
 /// Record that a sweep ran, regardless of whether it filed anything.
@@ -551,6 +728,7 @@ pub fn record_sweep_run(
         stale: report.total_stale(),
         filed: filed_audit_id.is_some(),
         audit_id: filed_audit_id.map(str::to_string),
+        discovery_warning: report.discovery_warning.clone(),
     };
     let key = format!("{CONFIG_KEY_LAST_RUN_PREFIX}{}", report.hotel_name);
     graph.set_config_value(&key, &serde_json::to_string(&record)?)
@@ -731,11 +909,20 @@ pub async fn push_intel_graph_record(
 /// Run one scheduled sweep for `hotel_name`. No-op (logged) when Muninn is
 /// not configured on this hotel. Never panics or propagates — cron fires are
 /// fire-and-forget from the ticker's perspective.
+///
+/// `heal_queue` is optional and wired for Piece 3 of the A9 outcome-stamping
+/// follow-up slice: when a fresh filing happens, an unresolved, throttled
+/// pending-outcome notice is pushed alongside the `autonomy_audit` record so
+/// the finding surfaces via the existing heal-queue channel (not just
+/// `phil autonomy pending`) — the same breadcrumb the A3 heal-filing site
+/// pushes, but deliberately left unresolved instead of immediately
+/// `.resolve()`d, since this one is *awaiting* an operator stamp.
 pub async fn run_scheduled_sweep(
     graph: &GraphDomain,
     muninn_config: Option<&MuninnConfig>,
     hotel_name: &str,
     intel_graph_url: Option<&str>,
+    heal_queue: Option<&dyn ansible_mesh_core::heal_queue::HealQueueStorage>,
     now_secs: u64,
 ) {
     let Some(config) = muninn_config else {
@@ -758,12 +945,13 @@ pub async fn run_scheduled_sweep(
     let now_dt =
         chrono::DateTime::from_timestamp(now_secs as i64, 0).unwrap_or_else(chrono::Utc::now);
 
-    let report = sweep(&client, config, graph, hotel_name, &thresholds, now_dt).await;
+    let report = sweep(&client, config, hotel_name, &thresholds, now_dt).await;
     info!(
         hotel = %hotel_name,
         vaults = report.vaults_scanned(),
         contradictions = report.total_contradictions(),
         stale = report.total_stale(),
+        discovery_warning = report.discovery_warning.as_deref().unwrap_or(""),
         "memory.hygiene: sweep complete"
     );
 
@@ -772,6 +960,32 @@ pub async fn run_scheduled_sweep(
     if let Some(audit_id) = &audit_id {
         if let Some(url) = intel_graph_url {
             push_intel_graph_record(&client, url, &report, audit_id).await;
+        }
+        // A9 Piece 3: push the pending-outcome breadcrumb for this fresh
+        // filing. Best-effort and non-blocking — the `autonomy_audit` record
+        // above is the durable one; this is visibility only.
+        if let Some(hq) = heal_queue {
+            let notice = ansible_mesh_core::autonomy::pending_outcome_notice(
+                audit_id,
+                LANE_MEMORY_HYGIENE,
+                &report.action_summary(),
+            );
+            match hq.push_classified(
+                LANE_MEMORY_HYGIENE,
+                &notice,
+                "info",
+                "autonomy_outcome_pending",
+            ) {
+                Ok(Some(id)) => info!(
+                    id,
+                    audit_id, "memory.hygiene: pending-outcome notice pushed to heal queue"
+                ),
+                Ok(None) => debug!(
+                    audit_id,
+                    "memory.hygiene: pending-outcome notice collapsed (flood window)"
+                ),
+                Err(e) => warn!("memory.hygiene: pending-outcome notice push failed: {e:#}"),
+            }
         }
     }
 
@@ -904,6 +1118,7 @@ mod tests {
                 vault: "self_agent-1".to_string(),
                 ..Default::default()
             }],
+            ..Default::default()
         };
         assert!(!report.should_file(&HygieneThresholds::default()));
     }
@@ -917,6 +1132,7 @@ mod tests {
                 contradictions: vec![contradiction("self_agent-1", "a", "b")],
                 ..Default::default()
             }],
+            ..Default::default()
         };
         assert!(report.should_file(&HygieneThresholds::default()));
     }
@@ -930,6 +1146,7 @@ mod tests {
                 stale: vec![stale("self_agent-1", "1"), stale("self_agent-1", "2")],
                 ..Default::default()
             }],
+            ..Default::default()
         };
         let thresholds = HygieneThresholds {
             stale_threshold: 5,
@@ -950,6 +1167,7 @@ mod tests {
                 stale: stale_items,
                 ..Default::default()
             }],
+            ..Default::default()
         };
         let thresholds = HygieneThresholds {
             stale_threshold: 5,
@@ -968,6 +1186,7 @@ mod tests {
                 stale: vec![stale("self_bjork", "abc123")],
                 error: None,
             }],
+            ..Default::default()
         };
         let summary = report.evidence_summary();
         assert!(summary.contains("mac-jane"));
@@ -986,6 +1205,7 @@ mod tests {
                 error: Some("contradictions: connection refused".to_string()),
                 ..Default::default()
             }],
+            ..Default::default()
         };
         assert!(report.evidence_summary().contains("connection refused"));
     }
@@ -999,6 +1219,7 @@ mod tests {
                 stale: vec![stale("v", "1")],
                 ..Default::default()
             }],
+            ..Default::default()
         };
         assert!(report.action_summary().contains("1 stale/aging memory"));
         report.vaults[0].stale.push(stale("v", "2"));
@@ -1010,6 +1231,85 @@ mod tests {
         assert_eq!(
             urlencoding_light("2026-07-11T00:00:00+00:00"),
             "2026-07-11T00%3A00%3A00%2B00%3A00"
+        );
+    }
+
+    // ── resolve_vaults_to_sweep (vault discovery decision logic) ────────────
+
+    fn vaults(names: &[&str]) -> Vec<String> {
+        names.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn multi_vault_registry_confirmed_live_sweeps_all() {
+        let registry = vaults(&["self_agent-bjork-01", "self_agent-coach", "user_likesjx"]);
+        let live = vaults(&[
+            "default",
+            "self_agent-bjork-01",
+            "self_agent-coach",
+            "user_likesjx",
+        ]);
+        let (swept, warning) = resolve_vaults_to_sweep(&registry, Some(&live));
+        assert_eq!(
+            swept,
+            vec!["self_agent-bjork-01", "self_agent-coach", "user_likesjx"]
+        );
+        assert!(warning.is_none());
+    }
+
+    #[test]
+    fn empty_registry_is_empty_with_warn_not_silently_clean() {
+        let (swept, warning) = resolve_vaults_to_sweep(&[], Some(&vaults(&["default"])));
+        assert!(swept.is_empty());
+        assert!(
+            warning
+                .as_deref()
+                .is_some_and(|w| w.contains("no muninn_vault_token entries"))
+        );
+    }
+
+    #[test]
+    fn zero_vault_regression_no_guest_derived_names_used() {
+        // Regression for the original bug: discovery must never depend on
+        // materialized guest configs (a guest config's top-level `agent_id`
+        // field, which no real guest config carries). An empty registry
+        // yields empty-with-warn regardless of what MuninnDB reports live.
+        let live = vaults(&["self_agent-bjork-01", "self_agent-coach", "user_likesjx"]);
+        let (swept, warning) = resolve_vaults_to_sweep(&[], Some(&live));
+        assert!(swept.is_empty(), "empty registry must never sweep anything");
+        assert!(warning.is_some(), "empty discovery must carry a reason");
+    }
+
+    #[test]
+    fn stale_registry_entries_are_dropped_not_swept_blind() {
+        let registry = vaults(&["self_agent-bjork-01", "self_agent-retired"]);
+        let live = vaults(&["self_agent-bjork-01", "user_likesjx"]);
+        let (swept, warning) = resolve_vaults_to_sweep(&registry, Some(&live));
+        assert_eq!(swept, vec!["self_agent-bjork-01"]);
+        assert!(warning.is_none(), "at least one vault survived — not empty");
+    }
+
+    #[test]
+    fn registry_entirely_stale_against_live_is_empty_with_warn() {
+        let registry = vaults(&["self_agent-retired"]);
+        let live = vaults(&["self_agent-bjork-01"]);
+        let (swept, warning) = resolve_vaults_to_sweep(&registry, Some(&live));
+        assert!(swept.is_empty());
+        assert!(
+            warning
+                .as_deref()
+                .is_some_and(|w| w.contains("registry looks stale"))
+        );
+    }
+
+    #[test]
+    fn muninn_unreachable_falls_back_to_registry_token_list() {
+        let registry = vaults(&["self_agent-bjork-01", "self_agent-coach"]);
+        let (swept, warning) = resolve_vaults_to_sweep(&registry, None);
+        assert_eq!(swept, vec!["self_agent-bjork-01", "self_agent-coach"]);
+        assert!(
+            warning.is_none(),
+            "non-empty registry fallback is not an empty-discovery condition"
         );
     }
 
@@ -1032,6 +1332,7 @@ mod tests {
                 contradictions: vec![contradiction("self_agent-1", "a", "b")],
                 ..Default::default()
             }],
+            ..Default::default()
         }
     }
 
@@ -1044,6 +1345,7 @@ mod tests {
                 vault: "self_agent-1".to_string(),
                 ..Default::default()
             }],
+            ..Default::default()
         };
         let id = file_if_warranted(&graph, &clean, &HygieneThresholds::default(), T0, NO_ENV);
         assert!(id.is_none());
@@ -1160,6 +1462,7 @@ mod tests {
                 vault: "self_agent-1".to_string(),
                 ..Default::default()
             }],
+            ..Default::default()
         };
         // Deliberately does NOT cross the filing threshold — clean sweeps
         // must not write an autonomy_audit record...
@@ -1175,6 +1478,38 @@ mod tests {
         assert_eq!(marker.contradictions, 0);
         assert!(!marker.filed);
         assert!(marker.audit_id.is_none());
+        assert!(
+            marker.discovery_warning.is_none(),
+            "a genuinely clean sweep (vaults found, no findings) must not carry a discovery warning"
+        );
+    }
+
+    #[test]
+    fn empty_discovery_warning_propagates_to_the_last_run_marker() {
+        // Regression for "never silently empty": a report whose vault
+        // *discovery* found nothing must persist that reason on the marker,
+        // not just log it — a dashboard/digest reading the marker later has
+        // no access to the log line.
+        let graph = open_domain();
+        let empty = HygieneReport {
+            hotel_name: "test-hotel".to_string(),
+            vaults: Vec::new(),
+            discovery_warning: Some("vault_registry has no muninn_vault_token entries".to_string()),
+        };
+        assert!(
+            file_if_warranted(&graph, &empty, &HygieneThresholds::default(), T0, NO_ENV).is_none()
+        );
+        record_sweep_run(&graph, &empty, T0, None).expect("record");
+        let marker = get_last_sweep_run(&graph, "test-hotel")
+            .expect("lookup")
+            .expect("marker exists");
+        assert_eq!(marker.vaults_scanned, 0);
+        assert!(!marker.filed);
+        assert_eq!(
+            marker.discovery_warning.as_deref(),
+            Some("vault_registry has no muninn_vault_token entries"),
+            "empty-discovery reason must survive onto the persisted marker"
+        );
     }
 
     #[test]

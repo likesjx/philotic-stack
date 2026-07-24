@@ -36,6 +36,7 @@ use tracing::{debug, error, info, warn};
 
 mod architect_charter;
 mod auth;
+mod autonomy_sweep;
 mod dream;
 mod graph;
 mod memory;
@@ -7703,6 +7704,19 @@ async fn main() -> Result<()> {
         warn!(error = %e, "dream-sweep: failed to ensure nightly consolidation cron job");
     }
 
+    // Autopoiesis Slice A9 outcome-stamping follow-up: idempotent, always-on
+    // registration of the daily timeout-to-Neutral sweep. Unlike
+    // memory.hygiene/dream-sweep there is no operator opt-in env var — the
+    // trust ledger's promotion arithmetic needs this running on every hotel,
+    // not just ones an operator remembered to flip on.
+    if let Err(e) = autonomy_sweep::ensure_scheduled(
+        &graph_domain_arc,
+        &hotel_name,
+        service::cron_ticker::now_ms(),
+    ) {
+        warn!(error = %e, "autonomy_sweep: failed to ensure daily timeout-to-neutral sweep cron job");
+    }
+
     if smoke_mode {
         warn!(
             "PHILOTIC_SMOKE_MODE enabled: starting local-only IPC runtime without mesh or guest materialization."
@@ -8109,7 +8123,10 @@ async fn main() -> Result<()> {
     .with_egress(egress_gw.clone())
     .with_resource_registry(resource_registry_arc.clone())
     .with_hotel_state_dirty_tx(ipc_dirty_tx);
-    let ipc_server = if let Some(hq) = heal_queue_arc {
+    // Cloned (not moved): the CronTicker wiring below also needs the heal
+    // queue, to push the A9 Piece 3 pending-outcome notice from the
+    // in-process memory.hygiene sweep.
+    let ipc_server = if let Some(hq) = heal_queue_arc.clone() {
         ipc_server.with_heal_queue(hq)
     } else {
         ipc_server
@@ -8190,12 +8207,20 @@ async fn main() -> Result<()> {
             // registration): CronJobSync replicates the job definition to
             // every mesh peer regardless of that peer's own opt-in.
             memory_hygiene::sweep_enabled(|k| std::env::var(k).ok()),
+            // A9 Piece 3: lets a fresh hygiene filing push an unresolved
+            // pending-outcome breadcrumb into the same heal queue A3 already
+            // uses for operator visibility.
+            heal_queue_arc.clone(),
         )
         .with_dream_sweep(
             muninn_config_arc.clone(),
             hotel_name.clone(),
             dream::sweep_enabled(|k| std::env::var(k).ok()),
         )
+        // Autopoiesis Slice A9 outcome-stamping follow-up: always-on (no
+        // opt-in flag — see `autonomy_sweep` module docs on why the
+        // mesh-trap gate is a job-id match, not a local-enabled re-check).
+        .with_autonomy_sweep(hotel_name.clone())
         .with_architect_charter(
             hotel_name.clone(),
             // Local-hotel opt-in, re-checked at fire time by job id (not

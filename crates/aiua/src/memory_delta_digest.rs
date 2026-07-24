@@ -796,6 +796,7 @@ mod tests {
             stale: 3,
             filed: true,
             audit_id: Some("memory_hygiene:mac-jane:1750000000".to_string()),
+            discovery_warning: None,
         });
         let rendered = digest.render();
         assert!(rendered.contains("memory.hygiene last sweep"));
