@@ -6,7 +6,7 @@ domain: memory-context
 status: accepted-current-slice
 disposition: accepted for current slice
 last_updated: 2026-07-24
-verification_level: test-green
+verification_level: smoke-green
 tags:
 - muninn
 - memory
@@ -152,8 +152,11 @@ after the second manual resync in two days (see
 [`proposal:muninn-vps-reharden`](MUNINN_VPS_REHARDEN_PROPOSAL.md), the admin
 credential source — **implemented and applied live 2026-07-21** (PR #346).
 
-**Accepted for the current slice**: S1–S3 implemented (S4 tracked below).
-This doc is the single
+**Accepted for the current slice**: S1–S4 implemented. S1–S3 are merged
+(PR #342) and live on mac-jane — running binary sha verified against the
+build, probe green. S4's drill is implemented with its rails and unit tests,
+but its destructive path has never executed; see the slice status below for
+the two concrete blockers. This doc is the single
 home for the spec; the short spec-stage stub that briefly lived at
 `docs/specifications/MEMORY_TOKEN_SELF_HEAL_PROPOSAL.md` (added by
 `af5fe885` for scanner visibility while this branch was open) was folded in
@@ -177,11 +180,52 @@ here to keep one canonical proposal per `proposal_id`.
   config — after the first guest's heal rotated the secret, every other
   guest of a shared vault heals off the same rotation instead of being
   stranded with a bare `HEAL_BUDGET_EXHAUSTED` for the rest of the window.
-  On vps the mint path still needs the `muninn-vps-reharden` admin
-  credential; until then it escalates loudly.
+  The mint path resolves an admin credential fleet-wide now that
+  `muninn-vps-reharden` (PR #346) renders `context_graph.muninn` from the
+  vaulted admin password — that lands as the `muninn` config key the
+  `resolve_admin_credential` fallback reads. **Not yet exercised against a
+  real vps token-401**; until a live heal (or the S4 drill) confirms it,
+  treat end-to-end vps re-mint as unverified. The no-credential escalation
+  path is retained deliberately for hosts that lack one.
 - S3 `config-propagation-without-restart` — implemented (this PR):
   `FetchMemoryConfig` loads live from the Context Graph; heal response
   carries refreshed config; philote replaces cached `muninn_config` and
   retries once at auto-recall, `memory.recall`, and `memory.remember`.
-- S4 `key-wipe-drill` — not started (depends on a deployed S1–S3; slots into
-  substrate chaos smokes)
+- S4 `key-wipe-drill` — **implemented, destructive path not yet exercised**.
+  New `memory-token-wipe` scenario in `scripts/chaos-smoke.sh` plus the
+  `memory_token_drill_driver` example that drives it over IPC. Two phases:
+  a **read-only probe** (memory config served live from the Context Graph +
+  `HealMemoryToken` refusing an unregistered vault) that is safe on a live
+  hotel, and a **destructive corrupt→heal assertion** gated behind a
+  deliberately-provisioned sacrificial vault.
+
+  Deliberate deviation from the slice as specified: the drill corrupts **the
+  hotel's** half of the binding (`RotateSecret`) rather than wiping
+  **MuninnDB's** key store. Both produce an identical token-401 at the same
+  `with_auth` call site, so the circuit under test is unchanged, but this
+  variant never touches Pebble, needs no admin credential to break anything,
+  and so cannot strand a real vault. Rails: sacrificial-vault-only
+  (`vault_name_denied`, duplicated in the driver so neither layer stands
+  alone), never auto-selected by the round-robin, never auto-creates a vault,
+  original token captured and restored on every failure path.
+
+  Verification reached: **test-green + smoke-green (probe)**. The read-only
+  probe ran green against live mac-jane; the non-dry scenario ran end-to-end
+  and correctly REFUSED the destructive phase (no sacrificial vault
+  registered). `watched-live` is **not** reached — the corrupt→heal assertion
+  has never executed, and the "deliberately-missing admin credential produces
+  escalation" case is proven only by unit test, not by a live drill.
+
+  Two blockers for a first watched-live cycle, both filed as next seams
+  rather than silently absorbed:
+  1. **No sacrificial vault exists on any hotel.** Provisioning one is an
+     operator action (`AddVaultEntry` + a muninn-side vault); the drill
+     refuses rather than creating it.
+  2. **The chaos preflight blocks every scenario on mac-jane.**
+     `preflight_check` refuses unless `phil doctor` reports `ok == true`, but
+     mac-jane's `ok` is `false` on **warnings only**
+     (`ports.hotel-record-drift`, `logs.rotation-missing` — the latter a known
+     false positive, since log rotation is handled by a copytruncate
+     LaunchAgent). Pre-existing in SUBSTRATE_HARDENING S4, not introduced
+     here; until the gate distinguishes warning from unhealthy, no chaos
+     scenario can run on that hotel.
