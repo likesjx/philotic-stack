@@ -3,7 +3,7 @@ title: Philotic Architecture Domain Map
 doc_type: workflow
 domain: workflow-docs
 status: active
-last_updated: 2026-03-31
+last_updated: 2026-07-24
 tags:
 - docs
 - domains
@@ -134,6 +134,8 @@ Active proposals:
 - [COMPUTER_USE_TASK_RUNNER_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/COMPUTER_USE_TASK_RUNNER_PROPOSAL.md)
 - [MODEL_CONTROLLER_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/MODEL_CONTROLLER_PROPOSAL.md)
 - [AGENT_PLUGIN_HOOKS_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/AGENT_PLUGIN_HOOKS_PROPOSAL.md)
+- [DATA_DRIVEN_TOOL_GRANTS_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/DATA_DRIVEN_TOOL_GRANTS_PROPOSAL.md)
+- [OUTBOUND_INTEGRATION_FABRIC_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/OUTBOUND_INTEGRATION_FABRIC_PROPOSAL.md)
 
 ## Operator And Control Plane
 

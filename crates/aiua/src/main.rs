@@ -3166,10 +3166,10 @@ fn seed_abstract_tool_catalog(graph: &GraphDomain) -> anyhow::Result<()> {
         AbstractToolRecord {
             tool_name: "hotel.egress.check".into(),
             description: "Check whether an outbound HTTP request is permitted by the hotel's \
-                          egress policy and retrieve any vault-backed credentials to inject. \
-                          Returns `allowed`, `inject_headers` (e.g. Authorization), and \
-                          `deny_reason` if blocked. Call this before making privileged outbound \
-                          requests when operating at Mesh or Internet exposure tier."
+                          egress policy. Returns `allowed`, `credential_binding_configured`, and \
+                          `deny_reason` if blocked. Credential values are never returned; they \
+                          remain inside the hotel-owned executor that performs the request. Call \
+                          this before privileged outbound requests at Mesh or Internet exposure."
                 .into(),
             input_schema: serde_json::json!({
                 "type": "object",

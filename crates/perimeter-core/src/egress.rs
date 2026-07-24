@@ -5,6 +5,107 @@ use serde::{Deserialize, Serialize};
 
 use ansible_mesh_core::ExposureTier;
 
+/// Canonical outbound traffic classes used by policy and placement.
+///
+/// Classification is explicit input. Callers must not rely on the executor
+/// guessing policy from a URL after the route has already been selected.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum EgressTrafficClass {
+    Communication,
+    #[default]
+    GeneralApi,
+    Mcp,
+    ModelProvider,
+    MeshPeer,
+    LocalResource,
+    Artifact,
+}
+
+/// Behavior when a preferred exit hotel is not reachable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum EgressFallback {
+    #[default]
+    Deny,
+    LocalWithAudit,
+}
+
+/// Placement policy for the component that performs outbound network I/O.
+///
+/// `hotel_id` names a policy identity, not a hard-coded implementation host.
+/// Deployment may bind that identity to `vps-jane`, but the architecture does
+/// not make one physical machine a universal transit hop.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(tag = "mode", rename_all = "snake_case")]
+pub enum EgressPlacementPolicy {
+    #[default]
+    Local,
+    PreferHotel {
+        hotel_id: String,
+        #[serde(default)]
+        fallback: EgressFallback,
+    },
+    RequireHotel {
+        hotel_id: String,
+    },
+    Deny,
+}
+
+/// Resolved execution target for one outbound request.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "decision", rename_all = "snake_case")]
+pub enum EgressPlacementDecision {
+    ExecuteLocal { audit_fallback: bool },
+    ExecuteAtHotel { hotel_id: String },
+    Deny { reason: String },
+}
+
+/// Resolve an egress placement policy against current exit reachability.
+///
+/// This is intentionally a pure decision. Routing and materialization remain
+/// hotel responsibilities and the eventual HTTP runner owns the network call.
+pub fn decide_egress_placement(
+    policy: &EgressPlacementPolicy,
+    exit_hotel_reachable: bool,
+) -> EgressPlacementDecision {
+    match policy {
+        EgressPlacementPolicy::Local => EgressPlacementDecision::ExecuteLocal {
+            audit_fallback: false,
+        },
+        EgressPlacementPolicy::PreferHotel { hotel_id, fallback } => {
+            if exit_hotel_reachable {
+                EgressPlacementDecision::ExecuteAtHotel {
+                    hotel_id: hotel_id.clone(),
+                }
+            } else {
+                match fallback {
+                    EgressFallback::Deny => EgressPlacementDecision::Deny {
+                        reason: format!("preferred exit hotel '{hotel_id}' is unreachable"),
+                    },
+                    EgressFallback::LocalWithAudit => EgressPlacementDecision::ExecuteLocal {
+                        audit_fallback: true,
+                    },
+                }
+            }
+        }
+        EgressPlacementPolicy::RequireHotel { hotel_id } => {
+            if exit_hotel_reachable {
+                EgressPlacementDecision::ExecuteAtHotel {
+                    hotel_id: hotel_id.clone(),
+                }
+            } else {
+                EgressPlacementDecision::Deny {
+                    reason: format!("required exit hotel '{hotel_id}' is unreachable"),
+                }
+            }
+        }
+        EgressPlacementPolicy::Deny => EgressPlacementDecision::Deny {
+            reason: "external egress is disabled by placement policy".into(),
+        },
+    }
+}
+
 /// Per-tier egress policy — stored in mesh-config.json under `egress.tiers`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EgressPolicy {
@@ -64,6 +165,7 @@ pub struct EgressRequest {
     pub target_url: String,
     pub method: String,
     pub headers: HashMap<String, String>,
+    pub traffic_class: EgressTrafficClass,
     /// The tier of the hotel listener the agent is operating on.
     pub tier: ExposureTier,
 }
@@ -74,6 +176,14 @@ pub struct EgressRequest {
 pub trait EgressGateway: Send + Sync {
     /// Check whether the outbound request is permitted under the current policy.
     fn check(&self, request: &EgressRequest) -> EgressDecision;
+
+    /// Report whether policy names a credential binding for this target.
+    ///
+    /// This never resolves or returns the credential. Resolution belongs inside
+    /// the bounded executor that performs the request.
+    fn credential_binding_configured(&self, _request: &EgressRequest) -> bool {
+        false
+    }
 
     /// Inject vault-backed credentials into the request headers if a credential spec
     /// exists for the target host. Mutates `request.headers` in place.
@@ -151,8 +261,85 @@ mod tests {
             target_url: url.into(),
             method: "POST".into(),
             headers: HashMap::new(),
+            traffic_class: EgressTrafficClass::GeneralApi,
             tier: ExposureTier::Internet,
         }
+    }
+
+    #[test]
+    fn preferred_exit_uses_named_hotel_when_reachable() {
+        let decision = decide_egress_placement(
+            &EgressPlacementPolicy::PreferHotel {
+                hotel_id: "vps-jane".into(),
+                fallback: EgressFallback::LocalWithAudit,
+            },
+            true,
+        );
+        assert_eq!(
+            decision,
+            EgressPlacementDecision::ExecuteAtHotel {
+                hotel_id: "vps-jane".into()
+            }
+        );
+    }
+
+    #[test]
+    fn preferred_exit_can_fall_back_locally_with_audit() {
+        let decision = decide_egress_placement(
+            &EgressPlacementPolicy::PreferHotel {
+                hotel_id: "vps-jane".into(),
+                fallback: EgressFallback::LocalWithAudit,
+            },
+            false,
+        );
+        assert_eq!(
+            decision,
+            EgressPlacementDecision::ExecuteLocal {
+                audit_fallback: true
+            }
+        );
+    }
+
+    #[test]
+    fn required_exit_fails_closed_when_unreachable() {
+        let decision = decide_egress_placement(
+            &EgressPlacementPolicy::RequireHotel {
+                hotel_id: "vps-jane".into(),
+            },
+            false,
+        );
+        assert_eq!(
+            decision,
+            EgressPlacementDecision::Deny {
+                reason: "required exit hotel 'vps-jane' is unreachable".into()
+            }
+        );
+    }
+
+    #[test]
+    fn deny_mode_never_selects_an_executor() {
+        assert_eq!(
+            decide_egress_placement(&EgressPlacementPolicy::Deny, true),
+            EgressPlacementDecision::Deny {
+                reason: "external egress is disabled by placement policy".into()
+            }
+        );
+    }
+
+    #[test]
+    fn placement_policy_has_stable_data_shape() {
+        let policy = EgressPlacementPolicy::PreferHotel {
+            hotel_id: "vps-jane".into(),
+            fallback: EgressFallback::LocalWithAudit,
+        };
+        let json = serde_json::to_value(&policy).expect("serialize placement policy");
+        assert_eq!(json["mode"], "prefer_hotel");
+        assert_eq!(json["hotel_id"], "vps-jane");
+        assert_eq!(json["fallback"], "local_with_audit");
+
+        let decoded: EgressPlacementPolicy =
+            serde_json::from_value(json).expect("deserialize placement policy");
+        assert_eq!(decoded, policy);
     }
 
     #[test]

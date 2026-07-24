@@ -2,9 +2,9 @@
 title: Perimeter Egress Control Proposal
 doc_type: proposal
 domain: operator-control-plane
-status: proposed
+status: in-progress
 disposition: accepted-current-slice
-last_updated: 2026-03-31
+last_updated: 2026-07-24
 tags:
 - egress
 - perimeter
@@ -17,6 +17,7 @@ related_docs:
 - MEMBRANE_COMPONENT_PROPOSAL.md
 - MEMBRANE_EXTERNAL_AGENT_AND_EVENT_TRANSPORT_PROPOSAL.md
 - CONTROL_PLANE_ADMIN_SURFACE_PROPOSAL.md
+- OUTBOUND_INTEGRATION_FABRIC_PROPOSAL.md
 task_refs:
 - docs/task.md
 proposal_id: perimeter-egress-control
@@ -81,16 +82,22 @@ If we blur these together too early, we risk either:
 
 ## Current Reality
 
-Today the repo has no unified outbound egress control plane.
+Today the repo has the beginning of a hotel-owned egress control plane, but not
+an HTTP execution boundary.
 
-Current likely shape:
+Current proven shape:
 
-- membranes make transport-native outbound calls
-- tool/model/provider code can make direct HTTP calls where needed
-- there is no first-class egress policy object
-- there is no canonical place to audit "what external requests may leave this hotel"
+- `perimeter-core` defines `EgressPolicy`, destination allow/deny evaluation,
+  credential bindings, traffic classes, and exit-placement policy
+- `aiua` owns `HotelEgressGateway` and the `CheckEgress` IPC path
+- `hotel.egress.check` is authorization-only; it does not return resolved
+  credential material
+- membranes, MCP, model/provider, memory, graph, and other clients still perform
+  direct HTTP in their own runtimes
+- there is no shared request executor or canonical egress audit stream yet
 
-That is acceptable for current implementation velocity, but not a stable long-term security posture.
+The policy oracle is a useful boundary, but it is not an HTTP proxy. The
+execution and audit gap is the active seam.
 
 ## Recommended Egress Taxonomy
 
@@ -203,20 +210,26 @@ But the cognitive layer should interpret deterministic facts, not replace them a
 
 ## First Slice Recommendation
 
-The first coherent implementation slice should:
+The first coherent implementation slices are:
 
-1. Define the canonical egress policy object and finding schema.
+1. **Implemented, test-green:** define traffic classes and exit-placement
+   decisions; make checks authorization-only and keep credentials out of model
+   tool results.
 2. Inventory current direct outbound HTTP call sites by component class.
-3. Classify which current egress paths are:
+3. Classify current egress paths as:
    - perimeter-controlled already
    - temporary direct exceptions
    - violations of the intended future model
-4. Pick one non-model outbound HTTP path and route it through the perimeter boundary.
-5. Keep model/provider egress as an explicit documented exception until a later decision.
+4. Add the bounded hotel-owned HTTP executor defined by
+   [OUTBOUND_INTEGRATION_FABRIC_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/OUTBOUND_INTEGRATION_FABRIC_PROPOSAL.md).
+5. Route one non-model outbound HTTP path through that executor.
+6. Keep model/provider egress as an explicit documented exception until a
+   later decision.
 
 ## Open Questions
 
-- Should the first implementation live in `membrane`, a dedicated egress service, or hotel-owned request mediation?
+- The first implementation is a dedicated `egress-http-runner` selected and
+  mediated by the hotel; membranes retain transport semantics.
 - What is the minimum useful audit payload for outbound requests?
 - Which outbound classes should support approval-gated release versus strict deterministic allow/deny?
 - When should model/provider egress stop being an exception?

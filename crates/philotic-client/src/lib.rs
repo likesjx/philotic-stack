@@ -1886,8 +1886,10 @@ pub enum IpcRequest {
     GetPerimeterStatus,
     /// Force the hotel's PerimeterService to re-derive the snapshot from live interfaces.
     RefreshPerimeter,
-    /// Ask the hotel's EgressGateway whether an outbound request is permitted and
-    /// inject vault-backed credentials for the target host if applicable.
+    /// Ask the hotel's EgressGateway whether an outbound request is permitted.
+    ///
+    /// This is authorization-only. Credential values stay inside the hotel
+    /// executor that performs the eventual request.
     /// Responds with [`IpcResponse::EgressGrant`].
     CheckEgress {
         /// Calling agent's ID (used for vault access decisions).
@@ -2721,10 +2723,11 @@ pub enum IpcResponse {
         /// If `allowed` is false, the reason for denial.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         deny_reason: Option<String>,
-        /// Headers to inject into the outbound request (e.g. `Authorization: Bearer <token>`).
-        /// Only populated when `allowed` is true and a vault credential was resolved.
+        /// Whether policy has a credential binding for the target.
+        ///
+        /// The credential is not resolved or returned by this response.
         #[serde(default)]
-        inject_headers: std::collections::HashMap<String, String>,
+        credential_binding_configured: bool,
     },
     RouterStats {
         stats: Vec<ansible_mesh_core::router_trace::ProviderStats>,
@@ -4863,5 +4866,58 @@ mod tests {
             }
             other => panic!("expected Standard, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn egress_grant_never_serializes_credential_headers() {
+        let response = IpcResponse::EgressGrant {
+            allowed: true,
+            audit: true,
+            deny_reason: None,
+            credential_binding_configured: true,
+        };
+
+        let wire = serde_json::to_value(&response).expect("serialize egress grant");
+        assert_eq!(wire["allowed"], true);
+        assert_eq!(wire["credential_binding_configured"], true);
+        assert!(
+            wire.get("inject_headers").is_none(),
+            "egress check responses must not carry resolved credential headers"
+        );
+
+        let decoded: IpcResponse =
+            serde_json::from_value(wire).expect("deserialize egress grant");
+        assert!(matches!(
+            decoded,
+            IpcResponse::EgressGrant {
+                allowed: true,
+                audit: true,
+                credential_binding_configured: true,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn legacy_egress_grant_headers_are_ignored_by_new_clients() {
+        let legacy = serde_json::json!({
+            "allowed": true,
+            "audit": false,
+            "deny_reason": null,
+            "inject_headers": {
+                "Authorization": "Bearer legacy-secret"
+            }
+        });
+
+        let decoded: IpcResponse =
+            serde_json::from_value(legacy).expect("deserialize legacy egress grant");
+        assert!(matches!(
+            decoded,
+            IpcResponse::EgressGrant {
+                allowed: true,
+                credential_binding_configured: false,
+                ..
+            }
+        ));
     }
 }

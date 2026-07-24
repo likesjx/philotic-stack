@@ -1421,13 +1421,13 @@ impl AgentRuntime {
                         allowed,
                         audit,
                         deny_reason,
-                        inject_headers,
+                        credential_binding_configured,
                     }) => {
                         let text = serde_json::to_string_pretty(&serde_json::json!({
                             "allowed": allowed,
                             "audit": audit,
                             "deny_reason": deny_reason,
-                            "inject_headers": inject_headers,
+                            "credential_binding_configured": credential_binding_configured,
                         }))
                         .unwrap_or_else(|_| format!("allowed={allowed}"));
                         (text, None)

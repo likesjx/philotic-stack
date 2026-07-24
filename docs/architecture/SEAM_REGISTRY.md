@@ -3,7 +3,7 @@ title: Philotic Seam Registry
 doc_type: workflow
 domain: workflow-docs
 status: active
-last_updated: 2026-06-04
+last_updated: 2026-07-24
 tags:
 - seams
 - ids
@@ -83,6 +83,14 @@ This registry makes the seam layer explicit without forcing every task bullet to
 | `runner-release-distribution` | `deployment-distribution` | [RUNNER_ARTIFACT_BUILD_DISTRIBUTION_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/RUNNER_ARTIFACT_BUILD_DISTRIBUTION_PROPOSAL.md) | `docs/task.md` → `Runner artifact plane` |
 | `egress-policy-object` | `operator-control-plane` | [PERIMETER_EGRESS_CONTROL_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/PERIMETER_EGRESS_CONTROL_PROPOSAL.md) | `docs/task.md` → `Perimeter egress control` |
 | `outbound-classification` | `operator-control-plane` | [PERIMETER_EGRESS_CONTROL_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/PERIMETER_EGRESS_CONTROL_PROPOSAL.md) | `docs/task.md` → `Perimeter egress inventory` |
+| `mcp-upstream-registry` | `membrane-transport` | [MCP_CLIENT_FABRIC_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/MCP_CLIENT_FABRIC_PROPOSAL.md) | smoke-green | `docs/task.md` → `Outbound integration fabric` |
+| `mcp-client-guest` | `membrane-transport` | [MCP_CLIENT_FABRIC_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/MCP_CLIENT_FABRIC_PROPOSAL.md) | smoke-green | `docs/task.md` → `Outbound integration fabric` |
+| `mcp-catalog-projection` | `membrane-transport` | [MCP_CLIENT_FABRIC_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/MCP_CLIENT_FABRIC_PROPOSAL.md) | smoke-green | `docs/task.md` → `Outbound integration fabric` |
+| `mcp-upstream-credentials` | `membrane-transport` | [MCP_CLIENT_FABRIC_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/MCP_CLIENT_FABRIC_PROPOSAL.md) | smoke-green | `docs/task.md` → `Outbound integration fabric` |
+| `mcp-egress-policy` | `membrane-transport` | [MCP_CLIENT_FABRIC_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/MCP_CLIENT_FABRIC_PROPOSAL.md) | smoke-green (MCP-local) | `docs/task.md` → `Outbound integration fabric` |
+| `integration-binding-contract` | `tooling-execution` | [OUTBOUND_INTEGRATION_FABRIC_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/OUTBOUND_INTEGRATION_FABRIC_PROPOSAL.md) | proposed | `docs/task.md` → `Outbound integration fabric` |
+| `http-egress-execution-boundary` | `tooling-execution` | [OUTBOUND_INTEGRATION_FABRIC_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/OUTBOUND_INTEGRATION_FABRIC_PROPOSAL.md) | proposed | `docs/task.md` → `Outbound integration fabric` |
+| `exit-hotel-placement-policy` | `mesh-placement` | [OUTBOUND_INTEGRATION_FABRIC_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/OUTBOUND_INTEGRATION_FABRIC_PROPOSAL.md) | test-green | `docs/task.md` → `Outbound integration fabric` |
 | `hotel-membership-records` | `operator-control-plane` | [HOTEL_PERIMETER_TRUST_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/HOTEL_PERIMETER_TRUST_PROPOSAL.md) | `docs/task.md` → `New Project: Hotel Perimeter Trust` |
 | `perimeter-authz-policy` | `operator-control-plane` | [HOTEL_PERIMETER_TRUST_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/HOTEL_PERIMETER_TRUST_PROPOSAL.md) | `docs/task.md` → `New Project: Hotel Perimeter Trust` |
 | `shell-runner-split` | `tooling-execution` | [TASK_RUNNER_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/TASK_RUNNER_PROPOSAL.md) | `docs/task.md` → `Next Project: Tool Assembly and Routed Execution` |

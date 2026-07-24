@@ -3120,37 +3120,37 @@ impl IpcServer {
                             .as_deref()
                             .map(|s| s.ceiling())
                             .unwrap_or_default();
-                        let mut req = EgressRequest {
+                        let req = EgressRequest {
                             agent_id: agent_id.clone(),
                             target_url: target_url.clone(),
                             method: method.clone(),
                             headers: std::collections::HashMap::new(),
+                            traffic_class: perimeter_core::egress::EgressTrafficClass::GeneralApi,
                             tier,
                         };
                         let resp = match egress_gw.as_deref() {
                             Some(gw) => {
                                 let decision = gw.check(&req);
-                                if decision.is_allowed() {
-                                    let _ = gw.inject_credentials(&mut req).await;
-                                }
+                                let credential_binding_configured =
+                                    decision.is_allowed() && gw.credential_binding_configured(&req);
                                 match decision {
                                     EgressDecision::Allow => IpcResponse::EgressGrant {
                                         allowed: true,
                                         audit: false,
                                         deny_reason: None,
-                                        inject_headers: req.headers,
+                                        credential_binding_configured,
                                     },
                                     EgressDecision::AllowWithAudit => IpcResponse::EgressGrant {
                                         allowed: true,
                                         audit: true,
                                         deny_reason: None,
-                                        inject_headers: req.headers,
+                                        credential_binding_configured,
                                     },
                                     EgressDecision::Deny { reason } => IpcResponse::EgressGrant {
                                         allowed: false,
                                         audit: false,
                                         deny_reason: Some(reason),
-                                        inject_headers: std::collections::HashMap::new(),
+                                        credential_binding_configured: false,
                                     },
                                 }
                             }
@@ -3158,7 +3158,7 @@ impl IpcServer {
                                 allowed: true,
                                 audit: false,
                                 deny_reason: None,
-                                inject_headers: std::collections::HashMap::new(),
+                                credential_binding_configured: false,
                             },
                         };
                         let _ = outbound_tx.send(resp);
