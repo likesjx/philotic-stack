@@ -3,7 +3,7 @@ title: Muninn Memory Protocol Proposal
 doc_type: proposal
 domain: memory-context
 status: accepted-current-slice
-last_updated: 2026-03-31
+last_updated: 2026-07-24
 tags:
 - muninn
 - memory
@@ -14,6 +14,10 @@ related_docs:
 - ARCHITECTURE_STATUS.md
 - MUNINN_CLIENT_MEMORY_PROTOCOL.md
 - AGENT_WORKFLOW_PROPOSAL.md
+- KNOWLEDGE_ARCHITECTURE_PROPOSAL.md
+- MEMPALACE_EPISODIC_MEMORY_PROPOSAL.md
+- OBSIDIAN_KNOWLEDGE_GARDEN_PROPOSAL.md
+- CREATIVE_LEARNING_FLYWHEEL_PROPOSAL.md
 task_refs:
 - docs/task.md
 proposal_id: muninn-memory-protocol
@@ -83,21 +87,34 @@ This proposal now has three concrete artifacts behind it:
 - a shareable skill package in [SKILL.md](/Users/jaredlikes/code/philotic-stack/skills/muninn-memory-protocol/SKILL.md)
 - a bootstrap path that should attempt local Muninn recovery before requiring operator approval to continue without memory
 
+## Current Slice
+
+Keep the proven triad, helper, and compact write-back discipline while correcting the ownership boundary with MemPalace:
+
+- Muninn continues to receive deliberate atomic decisions, preferences, reality gaps, validation outcomes, and next seams.
+- MemPalace lifecycle hooks own automatic episodic capture and raw working-turn detail.
+- shared recall may combine both through authority-labeled `ContextPacket` references.
+- neither continuity nor episodic recall may override current observed truth or promote itself directly into LifeGraph.
+
+This slice updates the contract and task dependencies only; it does not claim MemPalace client hooks are active.
+
 ## Core Recommendation
 
-Treat Muninn/Mempalace as a shared memory protocol orchestrated entirely by the **`intel-graph` Coding Management Plane**.
+Treat Muninn as the compact continuity layer and MemPalace as the automatic episodic layer. They participate in one retrieval experience but do not own the same state.
 
-The core shift is from **Ceremonial Habits** to **100% Reflexive Operations**:
+The client protocol has two complementary paths:
 
-1. **Coding Agents (Operator/CLI Agents)**: They no longer use an active `muninn-memory-habit` script. Instead, they use IDE-native `Save`/`PreCompact` hooks that reflexively push conversation turns directly to the `intel-graph` REST API. The graph automatically isolates these records into the agent's dedicated Mempalace `Wing`.
-2. **Philotic Engine (Internal Agents)**: Internal `philote` processes remain bounded by strict runtime context management. They do not leak their state into the coding agent's semantic history.
-3. **Unified Intelligence**: The `intel-graph` serves as the sole broker. When an admin or architect philote needs systemic insight, the graph provides a unified response spanning the deterministic SQLite codebase and the semantic Mempalace histories.
+1. **Deliberate Muninn continuity:** at meaningful session start, recall `where_left_off` and the identity/operator/topic triad. At durable decision or closeout boundaries, write a short atomic decision, reality gap, validation result, next seam, or operator preference.
+2. **Reflexive MemPalace capture:** at reliable `Stop`, `Save`, or `PreCompact` boundaries, capture a provenance-rich episode automatically and idempotently. MemPalace may preserve conversation detail; Muninn must not become a transcript archive.
 
-That means:
+Intel Graph may coordinate project-session metadata and cross-system references, but it does not become the sole broker or canonical owner of personal continuity, episodic history, LifeGraph truth, or Obsidian note content.
 
-- the memory habit is completely automatic (100% reflex) for the coding layer.
-- the transport plumbing avoids fragmenting storage logic.
-- the `intel-graph` API abstracts the Mempalace implementation entirely.
+This means:
+
+- recall should feel unified even though authority remains split
+- current-turn and observed repo/runtime evidence outrank recalled memory
+- raw episodes are never promoted directly into LifeGraph truth
+- client automation supplements the explicit Muninn habit; it does not silently deprecate it
 
 ## Memory Triad
 
@@ -123,11 +140,9 @@ This triad is simple enough to share across clients without forcing all of them 
 
 ### The Reflexive Write
 
-Manual write-backs via `muninn_remember` and `muninn_decide` are deprecated for coding agents.
+Reflexive capture belongs to MemPalace. Lifecycle hooks should write an idempotent episodic envelope containing the source client, session, event, timestamp, privacy and retention classes, and content hash.
 
-Instead, the `intel-graph` hooks into the execution lifecycle via IDE `Save` and `PreCompact` hooks. At the end of every conversation turn, the raw `WorkingTurn` delta is automatically posted to the `intel-graph` API, which pipes it natively into the agent's partitioned Mempalace instance.
-
-This effectively means the memory overhead costs 0 execution tokens locally and requires no explicit tool invocation.
+Muninn write-back remains deliberate and compact. Use `muninn_remember` or `muninn_decide` when meaningful work produces a durable delta. This small act is intentional: extraction and judgment are part of the memory contract, not overhead to hide by dumping the whole turn elsewhere.
 
 Good write-back candidates:
 
@@ -142,6 +157,8 @@ Bad write-back candidates:
 - low-signal pleasantries
 - raw transcript dumps
 - implementation noise with no durable value
+
+Raw working turns may be eligible for governed MemPalace capture, subject to redaction and retention policy. They remain bad Muninn writes.
 
 ### Size Discipline
 

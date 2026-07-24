@@ -237,6 +237,46 @@ Seam IDs: `muninn-native-client-access`, `lifegraph-muninn-promotion`, `cross-ag
   - [x] Run `just mcp-client-uat remote-native` against `vps-jane`, confirming loopback-only native binding and SSH-tunneled MCP health.
   - [ ] Revisit Tailscale-only/private HTTPS only after credential lifecycle and client config are explicit.
 
+## MemPalace Episodic Memory
+
+Proposal: [MEMPALACE_EPISODIC_MEMORY_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/MEMPALACE_EPISODIC_MEMORY_PROPOSAL.md)
+
+Seam ID: `mempalace-episodic-lane`
+
+- [ ] Define the versioned episode envelope with stable episode/session IDs, client provenance, privacy class, retention class, and content hash.
+- [ ] Enable idempotent `Stop`, `Save`, or `PreCompact` capture for one trusted local client.
+- [ ] Add redact-before-store, no-capture, and delete-by-session behavior with sensitive fixtures.
+- [ ] Prove recall by session, client, and topic with bounded excerpts and explicit `episodic_evidence` authority.
+- [ ] Project MemPalace results into the shared `ContextPacket` without promoting raw episodes into Muninn or LifeGraph.
+- [ ] Measure capture success, duplicate rate, local recall latency, and re-entry usefulness before adding another client.
+
+## Obsidian Knowledge Garden
+
+Proposal: [OBSIDIAN_KNOWLEDGE_GARDEN_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/OBSIDIAN_KNOWLEDGE_GARDEN_PROPOSAL.md)
+
+Seam ID: `obsidian-knowledge-projection`
+
+- [ ] Select one high-value folder in the `Brain` vault for the first governed projection.
+- [ ] Define stable document identity, content hash, provenance, rename lineage, and tombstone contracts.
+- [ ] Implement incremental create, edit, rename, and delete indexing while skipping unchanged notes.
+- [ ] Add read-only `knowledge.search`, `knowledge.read`, and `knowledge.sync.status` tools.
+- [ ] Add an approval-gated review queue for proposed LifeGraph entity and relationship links.
+- [ ] Measure source traceability, indexing latency, duplicate rate, and accepted cross-note connections before expanding vault scope.
+
+## Creative Learning Flywheel
+
+Proposal: [CREATIVE_LEARNING_FLYWHEEL_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/CREATIVE_LEARNING_FLYWHEEL_PROPOSAL.md)
+
+Seam ID: `creative-learning-flywheel`
+
+- [ ] Choose one four-week creative or learning pilot domain.
+- [ ] Validate the proposed `Question`, `Idea`, `Experiment`, `Artifact`, `Learning`, and `Source` vocabulary behind LifeGraph proposed-write gates.
+- [ ] Add a sub-ten-second quick-capture path with an inbox state and deferred classification.
+- [ ] Generate a bounded daily brief containing one thread to resume, one small making action, and one momentum blocker.
+- [ ] Advance at least four ideas, complete at least two experiments, and create or share at least one artifact.
+- [ ] Close experiments with reusable learning and recall-usefulness feedback.
+- [ ] Review artifact rate, idea-to-artifact conversion, learning reuse, re-entry time, and maintenance cost before expanding scope.
+
 ### WI 1: Session Management
 
 Seam IDs: `session-leases`

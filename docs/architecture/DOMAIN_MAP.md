@@ -3,7 +3,7 @@ title: Philotic Architecture Domain Map
 doc_type: workflow
 domain: workflow-docs
 status: active
-last_updated: 2026-03-31
+last_updated: 2026-07-24
 tags:
 - docs
 - domains
@@ -106,6 +106,9 @@ Current truth:
 Active proposals:
 
 - [KNOWLEDGE_ARCHITECTURE_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/KNOWLEDGE_ARCHITECTURE_PROPOSAL.md)
+- [MEMPALACE_EPISODIC_MEMORY_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/MEMPALACE_EPISODIC_MEMORY_PROPOSAL.md)
+- [OBSIDIAN_KNOWLEDGE_GARDEN_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/OBSIDIAN_KNOWLEDGE_GARDEN_PROPOSAL.md)
+- [CREATIVE_LEARNING_FLYWHEEL_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/CREATIVE_LEARNING_FLYWHEEL_PROPOSAL.md)
 - [MUNINN_MEMORY_PROTOCOL_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/MUNINN_MEMORY_PROTOCOL_PROPOSAL.md)
 - [MUNINN_V07_CAPABILITY_ADOPTION_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/MUNINN_V07_CAPABILITY_ADOPTION_PROPOSAL.md)
 - [MEMORY_CULTIVATION_TRUE_UP_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/MEMORY_CULTIVATION_TRUE_UP_PROPOSAL.md)

@@ -3,7 +3,7 @@ title: Philotic Seam Registry
 doc_type: workflow
 domain: workflow-docs
 status: active
-last_updated: 2026-06-04
+last_updated: 2026-07-24
 tags:
 - seams
 - ids
@@ -111,6 +111,12 @@ This registry makes the seam layer explicit without forcing every task bullet to
 | `embeddinggemma-swap-validation` | `memory-context` | [EMBEDDINGGEMMA_SWAP_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/EMBEDDINGGEMMA_SWAP_PROPOSAL.md) | `docs/task.md` → `New Project: EmbeddingGemma Swap` |
 | `wider-client-adoption` | `memory-context` | [MUNINN_MEMORY_PROTOCOL_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/MUNINN_MEMORY_PROTOCOL_PROPOSAL.md) | `docs/task.md` → `Next Work Item: Muninn Heuristic Memory Experiment` |
 | `philotic-native-memory-integration` | `memory-context` | [MUNINN_MEMORY_PROTOCOL_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/MUNINN_MEMORY_PROTOCOL_PROPOSAL.md) | `docs/task.md` → `Context And Memory Engines` and Muninn follow-ons |
+| `muninn-native-client-access` | `memory-context` | [KNOWLEDGE_ARCHITECTURE_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/KNOWLEDGE_ARCHITECTURE_PROPOSAL.md) | uat-green | `docs/task.md` → `Cross-Agent Knowledge Architecture` |
+| `lifegraph-muninn-promotion` | `memory-context` | [KNOWLEDGE_ARCHITECTURE_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/KNOWLEDGE_ARCHITECTURE_PROPOSAL.md) | contract-defined | `docs/task.md` → `Cross-Agent Knowledge Architecture` |
+| `cross-agent-context-packet` | `memory-context` | [KNOWLEDGE_ARCHITECTURE_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/KNOWLEDGE_ARCHITECTURE_PROPOSAL.md) | watched-live-green | `docs/task.md` → `Cross-Agent Knowledge Architecture` |
+| `mempalace-episodic-lane` | `memory-context` | [MEMPALACE_EPISODIC_MEMORY_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/MEMPALACE_EPISODIC_MEMORY_PROPOSAL.md) | proposed | `docs/task.md` → `MemPalace Episodic Memory` |
+| `obsidian-knowledge-projection` | `memory-context` | [OBSIDIAN_KNOWLEDGE_GARDEN_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/OBSIDIAN_KNOWLEDGE_GARDEN_PROPOSAL.md) | proposed | `docs/task.md` → `Obsidian Knowledge Garden` |
+| `creative-learning-flywheel` | `memory-context` | [CREATIVE_LEARNING_FLYWHEEL_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/CREATIVE_LEARNING_FLYWHEEL_PROPOSAL.md) | proposed | `docs/task.md` → `Creative Learning Flywheel` |
 | `memory-spacetime-frame` | `memory-context` | [MEMORY_CULTIVATION_TRUE_UP_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/MEMORY_CULTIVATION_TRUE_UP_PROPOSAL.md) | implemented-runtime | `docs/task.md` → `New Project: Memory Cultivation and True-Up` |
 | `memory-shaping-context` | `memory-context` | [MEMORY_CULTIVATION_TRUE_UP_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/MEMORY_CULTIVATION_TRUE_UP_PROPOSAL.md) | implemented-runtime | `docs/task.md` → `New Project: Memory Cultivation and True-Up` |
 | `memory-cultivation-loop` | `memory-context` | [MEMORY_CULTIVATION_TRUE_UP_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/MEMORY_CULTIVATION_TRUE_UP_PROPOSAL.md) | implemented-runtime | `docs/task.md` → `New Project: Memory Cultivation and True-Up` |
