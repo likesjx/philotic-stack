@@ -157,14 +157,121 @@ data-driven first slice and will become the broker's projection target.
 | `table-identity-grants` | Per-agent `{db, verbs}` grants from `task.identity` | code-complete, test-green (catalog slice; broker integration follow-up) |
 | `ariel-table-cutover` | Live mbp-jane config: imessage entry, grant, bash.exec removal, identity fix | pending (operator ceremony) |
 
+## Cutover runbook — `ariel-table-cutover` (mbp-jane)
+
+Verified against the live hotel 2026-07-24: profile dir is `~/.philotic/jane/`
+(so the catalog belongs at `~/.philotic/jane/db_catalog.json`), Ariel's
+`default_toolset` is exactly `["bash.exec"]`, her `allowed_classes` already
+contains `table`, and her `identity_text` really does begin "You are Hermes".
+
+**Step 0 — Full Disk Access (BLOCKING, GUI-only, operator must do this).**
+`chat.db` is TCC-protected. Confirmed 2026-07-24: on mbp-jane even an SSH
+session gets `authorization denied` reading it, so this cannot be scripted
+remotely. In System Settings → Privacy & Security → Full Disk Access, add the
+binary that runs the hotel (`aiua`, and its launchd wrapper if separate), then
+restart the hotel. Verify before continuing:
+
+```bash
+ssh mbp-jane 'sqlite3 "file:$HOME/Library/Messages/chat.db?mode=ro" \
+  "SELECT COUNT(*) FROM message"'   # must print a number, not "authorization denied"
+```
+
+**Step 1 — deploy binaries** carrying this crate (`table-datasource`, `aiua`,
+`philote`) to mbp-jane. Do this only after PR #351 merges to `develop`.
+
+**Step 2 — register the database.** Write `~/.philotic/jane/db_catalog.json`:
+
+```json
+{
+  "databases": [
+    {
+      "name": "imessage",
+      "path": "~/Library/Messages/chat.db",
+      "mode": "ro",
+      "description": "macOS iMessage store (read-only, snapshot-on-read)",
+      "snapshot_on_read": true,
+      "snapshot_ttl_secs": 300,
+      "agents": { "agent-ariel": ["read"] }
+    }
+  ]
+}
+```
+
+No restart needed — the catalog hot-reloads on mtime change.
+
+**Step 3 — cut Ariel over** (replaces `bash.exec`, fixes the Hermes identity):
+
+```sql
+UPDATE graph_nodes
+SET data_json = json_set(
+      json_set(data_json,
+        '$.bundle_json.default_toolset',
+        json('["table.catalog","table.schema","table.build","table.query"]')),
+      '$.bundle_json.identity_text',
+      'You are Ariel, Communications Specialist. You manage inbound and outbound communications — message triage, correspondence, notification summaries. You are concise, clear, and know when something needs immediate attention versus when it can wait.')
+WHERE node_key = 'agent_identity:agent-ariel';
+```
+
+Applied against `~/.philotic/jane/context.db`. Restart the hotel so the agent
+identity is re-read.
+
+**Step 4 — verify Ariel, and only Ariel, can read.** Ask her (via Telegram) to
+run `table.catalog` — she should see `imessage` with `verbs: ["read"]` — then
+a `table.build` for recent messages. Then confirm a different agent
+(e.g. `agent-jane`) gets `no Read grant` and cannot see the entry at all.
+
+**Rollback:** delete `db_catalog.json` (removes all access instantly, no
+restart) and/or re-run the Step 3 UPDATE with the original
+`["bash.exec"]` / Hermes text.
+
+**Caution:** the reconciling seeder re-applies seeded profile values on restart
+and at scheduled reconciles. Re-check Ariel's `default_toolset` after the first
+restart; if it reverts, the seeded profile in `crates/aiua/src/main.rs` is the
+authority and must change too.
+
 ## Verification
 
-`cargo test -p table-datasource` — 22 tests: the 9 pre-existing behavior tests
+`cargo test -p table-datasource` — 24 tests: the 9 pre-existing behavior tests
 (kept green) plus builder unit tests and per-seam integration tests:
 traversal rejection, unknown-catalog-database rejection, ro write-kind
 rejection, smuggled-write rejection through the read lane, agent-SQL ATTACH
 denial, builder end-to-end, cross-db join attach, per-agent grant
 enforcement, catalog visibility filtering, snapshot-on-read stability.
+
+Two of those deserve calling out, because the first review pass got the
+threat model subtly wrong:
+
+- `read_lane_refuses_writes_on_a_writable_database` — the readonly guard's
+  load-bearing case. On a `ro` database the connection flags already refuse
+  writes, so a test there proves little; on a **writable** database
+  `stmt.readonly()` is the only thing between `table.query` and
+  `DELETE`/`UPDATE`/`INSERT`/`DROP`. All four are refused and the seeded row
+  survives.
+- `builder_cannot_express_a_write` — injection attempts land in the identifier
+  validator rather than in generated SQL.
+
+**Live verification** (`tests/imessage_live.rs`, `#[ignore]`d — needs a real
+`chat.db` + Full Disk Access):
+
+```
+cargo test -p table-datasource --test imessage_live -- --ignored --nocapture
+```
+
+Run green on mac-air 2026-07-24 against the operator's real 33k-message store:
+schema discovery found 25 tables with no prior knowledge; `table.build`
+compiled `SELECT m.ROWID, m.date, m.is_from_me FROM message AS m WHERE
+m.is_from_me = ?1 ORDER BY m.date DESC LIMIT 5` and returned rows; the
+`table.query` power lane executed the Apple-epoch + `handle` join. Writes
+(`DELETE`/`UPDATE`/`DROP`) were all refused with the `handle` table unchanged,
+an ungranted agent got `no Read grant` and could not see the entry, and the
+live `chat.db` was byte-identical afterwards. The tests assert on shape and
+counts only — they never print message bodies or handles.
+
+Note for future readers: `DELETE FROM message` on `chat.db` is rejected at
+*prepare* time because Apple's own triggers call SQLite functions absent from
+our bundled build — not by our guard. That is why the write-refusal assertions
+check "refused by any layer, data unchanged" rather than matching our error
+string, and why the guard is proven separately against a writable database.
 
 ## Follow-ups
 

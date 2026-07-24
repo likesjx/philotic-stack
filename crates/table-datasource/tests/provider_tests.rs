@@ -770,3 +770,88 @@ async fn snapshot_on_read_serves_stable_copy() {
         "snapshot must not see live writes inside the TTL"
     );
 }
+
+/// The load-bearing case for the readonly guard: on a READ-WRITE database the
+/// connection flags protect nothing, so `stmt.readonly()` is the only thing
+/// standing between the read lane and a destructive statement.
+#[tokio::test]
+async fn read_lane_refuses_writes_on_a_writable_database() {
+    let (p, _d) = open_tmp();
+    p.invoke(&make_task(
+        "table.exec",
+        None,
+        None,
+        Some("CREATE TABLE t (id TEXT PRIMARY KEY)"),
+        json!({}),
+    ))
+    .await
+    .unwrap();
+    p.invoke(&make_task(
+        "table.insert",
+        None,
+        Some("t"),
+        None,
+        json!({"id": "keep-me"}),
+    ))
+    .await
+    .unwrap();
+
+    for sql in [
+        "DELETE FROM t",
+        "UPDATE t SET id = 'clobbered'",
+        "INSERT INTO t (id) VALUES ('injected')",
+        "DROP TABLE t",
+    ] {
+        let err = p
+            .invoke(&make_task("table.query", None, None, Some(sql), json!({})))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("read-only"), "{sql} -> {err}");
+    }
+
+    // The row is untouched and the table still exists.
+    let out = p
+        .invoke(&make_task(
+            "table.query",
+            None,
+            None,
+            Some("SELECT id FROM t"),
+            json!({}),
+        ))
+        .await
+        .unwrap();
+    let ProviderOutput::ResultSet(Value::Array(rows)) = out else {
+        panic!()
+    };
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["id"], "keep-me");
+}
+
+/// Same guard on the builder lane: a spec cannot smuggle a write.
+#[tokio::test]
+async fn builder_cannot_express_a_write() {
+    let (p, _d) = open_tmp();
+    p.invoke(&make_task(
+        "table.exec",
+        None,
+        None,
+        Some("CREATE TABLE t (id TEXT)"),
+        json!({}),
+    ))
+    .await
+    .unwrap();
+    // Injection attempts land in the identifier validator, not in SQL.
+    for spec in [
+        json!({"table": "t; DELETE FROM t"}),
+        json!({"table": "t", "columns": ["id) ; DELETE FROM t --"]}),
+        json!({"table": "t", "where": [{"column": "id", "op": "=; DELETE FROM t", "value": 1}]}),
+    ] {
+        assert!(
+            p.invoke(&make_task("table.build", None, None, None, spec.clone()))
+                .await
+                .is_err(),
+            "spec should be rejected: {spec}"
+        );
+    }
+}
