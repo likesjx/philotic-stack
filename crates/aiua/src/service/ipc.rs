@@ -1356,6 +1356,10 @@ pub struct IpcServer {
     /// Tracks whether MuninnDB was reachable on the most recent probe. Shared with the
     /// probe loop and per-connection handlers for inline `RefreshMemoryConfig` probes.
     muninn_reachable: Arc<std::sync::atomic::AtomicBool>,
+    /// Per-vault timestamp of the last `HealMemoryToken` mint attempt — the
+    /// token self-heal mint budget. A misconfigured MuninnDB must produce one
+    /// throttled escalation, not an unbounded mint loop.
+    muninn_heal_attempts: Arc<Mutex<HashMap<String, std::time::Instant>>>,
     /// In-process channel for operator surface query tasks.
     /// When set, tasks addressed to `OPERATOR_SURFACE_QUERY_ROLE` are sent here
     /// instead of through the UDS inbox registry, eliminating the self-connection.
@@ -2664,6 +2668,7 @@ impl IpcServer {
             webrtc_signal_tx: None,
             network_broadcast,
             muninn_reachable: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            muninn_heal_attempts: Arc::new(Mutex::new(HashMap::new())),
             operator_surface_tx: None,
             perimeter_svc: None,
             egress_gw: None,
@@ -2831,6 +2836,7 @@ impl IpcServer {
                     let peer_sockets = self.peer_sockets.clone();
                     let muninn_config = self.muninn_config.clone();
                     let muninn_reachable = self.muninn_reachable.clone();
+                    let muninn_heal_attempts = self.muninn_heal_attempts.clone();
                     let training_storage = self.training_storage.clone();
                     let heal_queue = self.heal_queue.clone();
                     let webrtc_signal_tx = self.webrtc_signal_tx.clone();
@@ -2863,6 +2869,7 @@ impl IpcServer {
                             peer_sockets,
                             muninn_config,
                             muninn_reachable,
+                            muninn_heal_attempts,
                             training_storage,
                             heal_queue,
                             webrtc_signal_tx,
@@ -2913,6 +2920,7 @@ impl IpcServer {
         peer_sockets: Arc<RwLock<HashMap<String, String>>>,
         muninn_config: Option<Arc<memory_core::MuninnConfig>>,
         muninn_reachable: Arc<std::sync::atomic::AtomicBool>,
+        muninn_heal_attempts: Arc<Mutex<HashMap<String, std::time::Instant>>>,
         training_storage: Option<
             Arc<dyn ansible_mesh_core::whisper_training::WhisperTrainingStorage>,
         >,
@@ -3008,9 +3016,20 @@ impl IpcServer {
                 }
                 Ok(Some(frame)) => match serde_json::from_slice::<IpcRequest>(&frame) {
                     Ok(IpcRequest::FetchMemoryConfig) => {
-                        let config_json = muninn_config
-                            .as_deref()
-                            .and_then(|cfg| serde_json::to_string(cfg).ok());
+                        // DBs are truth: serve the config live from the Context
+                        // Graph so a token rotated after boot (manual resync or
+                        // HealMemoryToken) reaches re-fetching guests without a
+                        // hotel restart. The boot-time snapshot is only the
+                        // fallback when the live load errors.
+                        let config_json = match crate::memory::load_muninn_config(&graph) {
+                            Ok(cfg) => cfg.and_then(|c| serde_json::to_string(&c).ok()),
+                            Err(err) => {
+                                warn!(error = %err, "FetchMemoryConfig: live config load failed — serving boot snapshot");
+                                muninn_config
+                                    .as_deref()
+                                    .and_then(|cfg| serde_json::to_string(cfg).ok())
+                            }
+                        };
                         info!(
                             has_config = config_json.is_some(),
                             "FetchMemoryConfig handled"
@@ -3018,6 +3037,16 @@ impl IpcServer {
                         let _ = outbound_tx.send(IpcResponse::MemoryConfig(MemoryConfigPayload {
                             config_json,
                         }));
+                    }
+                    Ok(IpcRequest::HealMemoryToken { vault }) => {
+                        let response = Self::handle_heal_memory_token(
+                            &graph,
+                            heal_queue.as_deref(),
+                            &muninn_heal_attempts,
+                            &vault,
+                        )
+                        .await;
+                        let _ = outbound_tx.send(response);
                     }
                     Ok(IpcRequest::RefreshMemoryConfig) => {
                         let endpoint = muninn_config
@@ -3677,6 +3706,139 @@ impl IpcServer {
             let mut guard = inboxes.lock().await;
             if let Some(entries) = guard.get_mut(target_role) {
                 entries.retain(|subscriber| !stale.contains(&subscriber.conn_id));
+            }
+        }
+    }
+
+    // ── MuninnDB token self-heal ──────────────────────────────────────────────
+
+    /// Minimum interval between token mint attempts per vault. A genuinely
+    /// misconfigured MuninnDB must produce one throttled escalation per
+    /// window, not a mint storm.
+    const MUNINN_HEAL_MIN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(600);
+
+    /// Hotel-side handler for `IpcRequest::HealMemoryToken`: a guest hit a
+    /// token-401 (MuninnDB reachable but rejecting the stored bearer). The
+    /// hotel — which owns the vault master key, the Context Graph, and the
+    /// MuninnDB admin credential — re-mints the token and rotates the stored
+    /// secret in place, then returns the refreshed memory config so the guest
+    /// can retry once. Guardrails: per-vault mint budget (inside the window
+    /// no second mint happens, but the live config — which already carries
+    /// any just-rotated token — is served so other guests of a shared vault
+    /// are not stranded); vault must already be registered; no admin
+    /// credential → throttled operator escalation via the heal queue instead
+    /// of a mint. Raw tokens never appear in logs or heal entries.
+    async fn handle_heal_memory_token(
+        graph: &GraphDomain,
+        heal_queue: Option<&dyn ansible_mesh_core::heal_queue::HealQueueStorage>,
+        attempts: &Mutex<HashMap<String, std::time::Instant>>,
+        vault: &str,
+    ) -> IpcResponse {
+        {
+            let mut map = attempts.lock().await;
+            if let Some(last) = map.get(vault) {
+                if last.elapsed() < Self::MUNINN_HEAL_MIN_INTERVAL {
+                    // No second mint inside the window — but the FIRST heal
+                    // (the one that consumed the budget) rotated the secret in
+                    // the Context Graph, so serving the LIVE config still
+                    // heals this caller. Vaults are shared across guests
+                    // (`user_*`, fleet vaults): after a key-store wipe every
+                    // guest of the vault 401s and requests a heal near-
+                    // simultaneously; only the first may mint, the rest must
+                    // not be stranded with a bare error until the window
+                    // expires.
+                    info!(
+                        vault = %vault,
+                        "HealMemoryToken: mint budget consumed {:?} ago — serving live config without minting",
+                        last.elapsed()
+                    );
+                    let config_json = crate::memory::load_muninn_config(graph)
+                        .ok()
+                        .flatten()
+                        .and_then(|cfg| serde_json::to_string(&cfg).ok());
+                    if config_json.is_some() {
+                        return IpcResponse::MemoryConfig(MemoryConfigPayload { config_json });
+                    }
+                    return IpcResponse::error(
+                        "memory",
+                        "HEAL_BUDGET_EXHAUSTED",
+                        format!(
+                            "token heal for vault [{vault}] attempted {:?} ago — next attempt allowed after {:?}",
+                            last.elapsed(),
+                            Self::MUNINN_HEAL_MIN_INTERVAL
+                        ),
+                    );
+                }
+            }
+            map.insert(vault.to_string(), std::time::Instant::now());
+        }
+
+        let endpoint = graph
+            .get_muninn_endpoint()
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| "http://127.0.0.1:8475".to_string());
+
+        let cred = match crate::muninn_provision::resolve_admin_credential(graph) {
+            Ok(Some(cred)) => cred,
+            Ok(None) => {
+                warn!(
+                    vault = %vault,
+                    "HealMemoryToken: MuninnDB rejects the stored token but no admin credential is available — manual resync required"
+                );
+                if let Some(hq) = heal_queue {
+                    let _ = hq.push_error(
+                        "hotel",
+                        &format!(
+                            "muninn token rejected for vault [{vault}] but no admin credential available to re-mint — manual token resync required (see MEMORY_TOKEN_SELF_HEAL_PROPOSAL)"
+                        ),
+                    );
+                }
+                return IpcResponse::error(
+                    "memory",
+                    "NO_ADMIN_CREDENTIAL",
+                    format!("cannot heal token for vault [{vault}]: no MuninnDB admin credential"),
+                );
+            }
+            Err(err) => {
+                return IpcResponse::error(
+                    "memory",
+                    "HEAL_FAILED",
+                    format!("admin credential resolution failed: {err}"),
+                );
+            }
+        };
+
+        match crate::muninn_provision::remint_vault_token(
+            graph,
+            &endpoint,
+            &cred.username,
+            &cred.password,
+            vault,
+        )
+        .await
+        {
+            Ok(()) => {
+                info!(vault = %vault, "HealMemoryToken: token re-minted and rotated — returning refreshed config");
+                let config_json = crate::memory::load_muninn_config(graph)
+                    .ok()
+                    .flatten()
+                    .and_then(|cfg| serde_json::to_string(&cfg).ok());
+                IpcResponse::MemoryConfig(MemoryConfigPayload { config_json })
+            }
+            Err(err) => {
+                warn!(vault = %vault, error = %err, "HealMemoryToken: re-mint failed");
+                if let Some(hq) = heal_queue {
+                    let _ = hq.push_error(
+                        "hotel",
+                        &format!("muninn token heal failed for vault [{vault}]: {err}"),
+                    );
+                }
+                IpcResponse::error(
+                    "memory",
+                    "HEAL_FAILED",
+                    format!("token heal for vault [{vault}] failed: {err}"),
+                )
             }
         }
     }
@@ -6812,10 +6974,12 @@ impl IpcServer {
                 )
             }
             // Handled before process_request is called (in handle_client).
-            IpcRequest::FetchMemoryConfig | IpcRequest::RefreshMemoryConfig => IpcResponse::error(
+            IpcRequest::FetchMemoryConfig
+            | IpcRequest::RefreshMemoryConfig
+            | IpcRequest::HealMemoryToken { .. } => IpcResponse::error(
                 "memory",
                 "UNREACHABLE",
-                "FetchMemoryConfig/RefreshMemoryConfig dispatched early",
+                "FetchMemoryConfig/RefreshMemoryConfig/HealMemoryToken dispatched early",
             ),
             IpcRequest::ListTrainingSamples { .. }
             | IpcRequest::CorrectTrainingSample { .. }
@@ -14520,6 +14684,86 @@ pub(crate) mod tests {
     fn register_skill_test_graph() -> GraphDomain {
         let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
         GraphDomain::new(Arc::new(graph_store.adapter()))
+    }
+
+    // ── HealMemoryToken handler (memory-token-self-heal S2) ───────────────────
+
+    mod heal_memory_token {
+        use super::*;
+        use ansible_mesh_core::storage::VaultRegistryEntry;
+
+        fn graph_with_registered_vault(vault: &str, token: &str) -> (GraphDomain, String) {
+            let graph = register_skill_test_graph();
+            let secret_ref = store_secret(
+                &graph,
+                SecretInput {
+                    plaintext: token.to_string(),
+                    secret_kind: "muninn_vault_token".to_string(),
+                    scope: "hotel".to_string(),
+                    allowed_roles: vec!["hotel".to_string()],
+                    allowed_guests: vec!["hotel".to_string()],
+                },
+            )
+            .expect("store secret");
+            graph
+                .upsert_vault_registry_entry(&VaultRegistryEntry {
+                    vault_name: vault.to_string(),
+                    secret_ref: secret_ref.clone(),
+                })
+                .expect("register vault");
+            graph
+                .set_muninn_endpoint("http://127.0.0.1:9")
+                .expect("set endpoint");
+            (graph, secret_ref)
+        }
+
+        #[tokio::test]
+        async fn budget_throttled_heal_serves_live_config_without_minting() {
+            // Shared-vault scenario: guest A's heal just re-minted and
+            // consumed the vault's budget; guest B's heal inside the window
+            // must receive the LIVE (already-rotated) config, not a bare
+            // HEAL_BUDGET_EXHAUSTED error that strands it for 10 minutes.
+            let (graph, _ref) = graph_with_registered_vault("user_shared", "mk_rotated-token");
+            let attempts = Mutex::new(HashMap::from([(
+                "user_shared".to_string(),
+                std::time::Instant::now(),
+            )]));
+            let resp =
+                IpcServer::handle_heal_memory_token(&graph, None, &attempts, "user_shared").await;
+            match resp {
+                IpcResponse::MemoryConfig(payload) => {
+                    let json = payload.config_json.expect("throttled path serves config");
+                    let cfg: memory_core::MuninnConfig =
+                        serde_json::from_str(&json).expect("parse config");
+                    assert_eq!(
+                        cfg.vault_tokens.get("user_shared").map(String::as_str),
+                        Some("mk_rotated-token")
+                    );
+                }
+                other => panic!("expected MemoryConfig on throttled path, got {other:?}"),
+            }
+        }
+
+        #[tokio::test]
+        async fn heal_without_admin_credential_refuses_with_typed_error() {
+            let (graph, _ref) = graph_with_registered_vault("self_x", "mk_stale");
+            let attempts = Mutex::new(HashMap::new());
+            let resp = IpcServer::handle_heal_memory_token(&graph, None, &attempts, "self_x").await;
+            match resp {
+                IpcResponse::Standard { ok, code, .. } => {
+                    assert!(!ok);
+                    assert_eq!(code, "NO_ADMIN_CREDENTIAL");
+                }
+                other => panic!("expected NO_ADMIN_CREDENTIAL error, got {other:?}"),
+            }
+            // The failed attempt consumed the budget; a follow-up inside the
+            // window still gets the live config rather than another refusal.
+            let resp = IpcServer::handle_heal_memory_token(&graph, None, &attempts, "self_x").await;
+            assert!(
+                matches!(resp, IpcResponse::MemoryConfig(ref p) if p.config_json.is_some()),
+                "throttled follow-up must serve live config, got {resp:?}"
+            );
+        }
     }
 
     // ── FileHealWorkItem handler (Autopoiesis Slice A3) ───────────────────────

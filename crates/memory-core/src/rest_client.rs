@@ -73,6 +73,38 @@ impl MuninnConfig {
     }
 }
 
+// ──── Token rejection (self-heal signal) ─────────────────────────────────────
+
+/// MuninnDB actively rejected our bearer token (HTTP 401): the server is
+/// reachable but the stored token is stale — the token↔key binding spans two
+/// independent stores (MuninnDB's key store and the hotel Context Graph
+/// secret record), and MuninnDB has lost or rotated its half. Distinct from
+/// network-unreachable so callers can trigger a token re-mint
+/// (`IpcRequest::HealMemoryToken`) instead of backing off.
+#[derive(Debug, Clone)]
+pub struct TokenRejected {
+    pub vault: String,
+}
+
+impl std::fmt::Display for TokenRejected {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "muninn rejected bearer token for vault [{}] (HTTP 401) — stored token is stale",
+            self.vault
+        )
+    }
+}
+
+impl std::error::Error for TokenRejected {}
+
+/// If `err` is (or wraps) a [`TokenRejected`], return the rejected vault name.
+pub fn token_rejected_vault(err: &anyhow::Error) -> Option<&str> {
+    err.chain()
+        .find_map(|cause| cause.downcast_ref::<TokenRejected>())
+        .map(|t| t.vault.as_str())
+}
+
 // ──── Vault Address Resolution ────────────────────────────────────────────────
 
 /// Resolves a `MemoryScope` + agent context into a concrete MuninnDB vault name.
@@ -511,6 +543,19 @@ impl MuninnRestEngine {
         self.config.vault_tokens.contains_key(vault) || self.config.default_token.is_some()
     }
 
+    /// Convert an HTTP 401 into the typed [`TokenRejected`] error so callers
+    /// can distinguish a stale token from network-unreachable and trigger
+    /// token self-heal. Any other status passes through for the caller's
+    /// normal `error_for_status` handling.
+    fn auth_checked(resp: reqwest::Response, vault: &str) -> anyhow::Result<reqwest::Response> {
+        if resp.status() == reqwest::StatusCode::UNAUTHORIZED {
+            return Err(anyhow::Error::new(TokenRejected {
+                vault: vault.to_string(),
+            }));
+        }
+        Ok(resp)
+    }
+
     /// Merge lens auto-tags into the caller-provided tags.
     async fn apply_lens_tags(&self, mut tags: Vec<String>) -> Vec<String> {
         if let Some(lens) = self.lens.read().await.as_ref() {
@@ -575,6 +620,7 @@ impl MuninnRestEngine {
             return Ok(Some((self.config.default_vault.clone(), resp)));
         }
         let mut all_404 = true;
+        let mut first_rejected_vault: Option<String> = None;
         for (vault, token) in &pairs {
             let resp = build(vault, token).send().await?;
             if resp.status().is_success() {
@@ -584,6 +630,9 @@ impl MuninnRestEngine {
                 reqwest::StatusCode::UNAUTHORIZED => {
                     all_404 = false;
                     // wrong vault/token — try next
+                    if first_rejected_vault.is_none() {
+                        first_rejected_vault = Some(vault.to_string());
+                    }
                 }
                 reqwest::StatusCode::NOT_FOUND => {
                     // engram not in this vault — try next
@@ -596,6 +645,9 @@ impl MuninnRestEngine {
         }
         if all_404 {
             Ok(None) // genuinely absent from all known vaults
+        } else if let Some(vault) = first_rejected_vault {
+            Err(anyhow::Error::new(TokenRejected { vault })
+                .context("unauthorized on all vault token pairs"))
         } else {
             anyhow::bail!("unauthorized on all vault token pairs")
         }
@@ -633,11 +685,12 @@ impl MuninnRestEngine {
             metadata,
             idempotent_id: Some(format!("{}:{}", vault, concept)),
         };
-        let resp: WriteResponse = self
+        let resp = self
             .with_auth(self.client.post(self.url("/api/engrams")), vault)
             .json(&body)
             .send()
-            .await?
+            .await?;
+        let resp: WriteResponse = Self::auth_checked(resp, vault)?
             .error_for_status()?
             .json()
             .await?;
@@ -689,11 +742,12 @@ impl MemoryEngine for MuninnRestEngine {
             idempotent_id: Some(format!("{}:{}", vault, concept)),
         };
 
-        let resp: WriteResponse = self
+        let resp = self
             .with_auth(self.client.post(self.url("/api/engrams")), &vault)
             .json(&body)
             .send()
-            .await?
+            .await?;
+        let resp: WriteResponse = Self::auth_checked(resp, &vault)?
             .error_for_status()?
             .json()
             .await?;
@@ -740,11 +794,12 @@ impl MemoryEngine for MuninnRestEngine {
             vault: vault.clone(),
             engrams: items,
         };
-        let resp: BatchWriteResponse = self
+        let resp = self
             .with_auth(self.client.post(self.url("/api/engrams/batch")), &vault)
             .json(&body)
             .send()
-            .await?
+            .await?;
+        let resp: BatchWriteResponse = Self::auth_checked(resp, &vault)?
             .error_for_status()?
             .json()
             .await?;
@@ -814,7 +869,7 @@ impl MemoryEngine for MuninnRestEngine {
             if resp.status() == reqwest::StatusCode::NOT_FOUND {
                 return Ok(()); // already gone — idempotent
             }
-            resp.error_for_status()?;
+            Self::auth_checked(resp, &vault)?.error_for_status()?;
             self.recall_cache.clear();
             return Ok(());
         }
@@ -922,6 +977,12 @@ impl MemoryEngine for MuninnRestEngine {
         let mut all_engrams = Vec::new();
         let mut total = 0usize;
         let mut had_vault_error = false;
+        // First TokenRejected seen across the fan-out. Cross-scope recall
+        // degrades to partial results on per-vault errors, but when EVERY
+        // vault fails and at least one was an active 401, the degraded-empty
+        // result must surface as TokenRejected so the self-heal path fires —
+        // this was exactly the 2026-07-20/21 stale-token failure mode.
+        let mut first_token_rejected: Option<anyhow::Error> = None;
 
         // Cross-scope recall runs in the turn path before context composition:
         // the per-vault activations are independent, so fire them concurrently
@@ -946,11 +1007,12 @@ impl MemoryEngine for MuninnRestEngine {
                 };
                 async move {
                     let resp: anyhow::Result<ActivateResponse> = async {
-                        Ok(self
+                        let resp = self
                             .with_auth(self.client.post(self.url("/api/activate")), vault)
                             .json(&body)
                             .send()
-                            .await?
+                            .await?;
+                        Ok(Self::auth_checked(resp, vault)?
                             .error_for_status()?
                             .json()
                             .await?)
@@ -972,6 +1034,9 @@ impl MemoryEngine for MuninnRestEngine {
                         "Cross-scope activation failed for vault; continuing with others"
                     );
                     had_vault_error = true;
+                    if first_token_rejected.is_none() && token_rejected_vault(&err).is_some() {
+                        first_token_rejected = Some(err);
+                    }
                     continue;
                 }
                 Err(err) => return Err(err),
@@ -1020,6 +1085,11 @@ impl MemoryEngine for MuninnRestEngine {
         // known answer and is worth caching.
         let is_empty_degraded_result =
             is_cross_scope && had_vault_error && result.engrams.is_empty() && result.total == 0;
+        if is_empty_degraded_result {
+            if let Some(err) = first_token_rejected {
+                return Err(err);
+            }
+        }
         if !is_empty_degraded_result {
             self.recall_cache.insert(cache_key, result.clone());
         }
@@ -1038,7 +1108,7 @@ impl MemoryEngine for MuninnRestEngine {
             if resp.status() == reqwest::StatusCode::NOT_FOUND {
                 return Ok(None);
             }
-            let mut engram: Engram = resp
+            let mut engram: Engram = Self::auth_checked(resp, &vault)?
                 .error_for_status()?
                 .json::<ReadResponse>()
                 .await
@@ -1109,11 +1179,12 @@ impl MemoryEngine for MuninnRestEngine {
             relation,
             weight: None,
         };
-        self.with_auth(client.post(&url), &vault)
+        let resp = self
+            .with_auth(client.post(&url), &vault)
             .json(&body)
             .send()
-            .await?
-            .error_for_status()?;
+            .await?;
+        Self::auth_checked(resp, &vault)?.error_for_status()?;
         self.recall_cache.clear();
         Ok(())
     }
@@ -1159,9 +1230,10 @@ impl MemoryEngine for MuninnRestEngine {
                 }
             }
         };
-        let _ = vault; // vault populated cache; resp is what we need
-
-        let resp: LinksResponse = raw.error_for_status()?.json().await?;
+        let resp: LinksResponse = Self::auth_checked(raw, &vault)?
+            .error_for_status()?
+            .json()
+            .await?;
 
         let mut engrams = Vec::new();
         for link in resp.links {
@@ -1193,6 +1265,126 @@ impl MemoryEngine for MuninnRestEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ──── TokenRejected (401 → typed self-heal signal) ──────────────────
+
+    /// Minimal canned-response HTTP server on a std thread (memory-core's
+    /// tokio has no `net` feature). Serves every connection the same status
+    /// + body and closes.
+    fn spawn_canned_server(status: u16, body: &'static str) -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                // Drain the request: headers, then content-length body bytes.
+                use std::io::{Read, Write};
+                let mut buf = Vec::new();
+                let mut chunk = [0u8; 1024];
+                let (mut header_end, mut content_len) = (None, 0usize);
+                loop {
+                    match stream.read(&mut chunk) {
+                        Ok(0) => break,
+                        Ok(n) => {
+                            buf.extend_from_slice(&chunk[..n]);
+                            if header_end.is_none() {
+                                if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                                    header_end = Some(pos + 4);
+                                    let headers = String::from_utf8_lossy(&buf[..pos]);
+                                    content_len = headers
+                                        .lines()
+                                        .find_map(|l| {
+                                            let (k, v) = l.split_once(':')?;
+                                            k.eq_ignore_ascii_case("content-length")
+                                                .then(|| v.trim().parse().ok())?
+                                        })
+                                        .unwrap_or(0);
+                                }
+                            }
+                            if let Some(end) = header_end {
+                                if buf.len() >= end + content_len {
+                                    break;
+                                }
+                            }
+                        }
+                        Err(_) => break,
+                    }
+                }
+                let reason = if status == 401 {
+                    "Unauthorized"
+                } else {
+                    "Error"
+                };
+                let resp = format!(
+                    "HTTP/1.1 {status} {reason}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(resp.as_bytes());
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    fn engine_against(base_url: String) -> MuninnRestEngine {
+        let mut config = MuninnConfig::local("default")
+            .with_vault_token("self_agent-x", "stale-token")
+            .with_vault_token("user_jared", "stale-token-2");
+        config.base_url = base_url;
+        MuninnRestEngine::new(
+            config,
+            VaultResolver {
+                agent_id: "agent-x".into(),
+                user_id: "jared".into(),
+            },
+        )
+    }
+
+    #[tokio::test]
+    async fn remember_on_401_surfaces_token_rejected_with_vault() {
+        let engine = engine_against(spawn_canned_server(401, "{\"error\":\"unauthorized\"}"));
+        let err = engine
+            .remember(MemoryScope::SelfOnly, "c", "content", vec![])
+            .await
+            .expect_err("401 must error");
+        assert_eq!(token_rejected_vault(&err), Some("self_agent-x"));
+    }
+
+    #[tokio::test]
+    async fn remember_on_500_is_not_token_rejected() {
+        let engine = engine_against(spawn_canned_server(500, "boom"));
+        let err = engine
+            .remember(MemoryScope::SelfOnly, "c", "content", vec![])
+            .await
+            .expect_err("500 must error");
+        assert_eq!(token_rejected_vault(&err), None);
+    }
+
+    #[tokio::test]
+    async fn cross_scope_activate_with_all_vaults_401_surfaces_token_rejected() {
+        // The 2026-07-20/21 failure mode: every stored token stale. The
+        // degraded-empty cross-scope result must be a TokenRejected error,
+        // not a silent empty recall.
+        let engine = engine_against(spawn_canned_server(401, "{}"));
+        let scope = MemoryScope::CrossScope(vec![MemoryScope::SelfOnly, MemoryScope::SharedUser]);
+        let err = engine
+            .activate("ctx", scope, Some(3))
+            .await
+            .expect_err("all-401 cross-scope must error");
+        assert!(token_rejected_vault(&err).is_some());
+    }
+
+    #[tokio::test]
+    async fn vault_discovery_all_401_surfaces_token_rejected() {
+        // read() on an uncached id walks all (vault, token) pairs; when every
+        // pair 401s, the old opaque "unauthorized on all vault token pairs"
+        // string must now carry the typed marker.
+        let engine = engine_against(spawn_canned_server(401, "{}"));
+        let err = engine
+            .read(&"01UNKNOWN".to_string())
+            .await
+            .expect_err("all-401 discovery must error");
+        assert!(token_rejected_vault(&err).is_some());
+    }
 
     #[test]
     fn cross_scope_resolves_unprovisioned_session_vault_without_auth() {
