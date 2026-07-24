@@ -3,108 +3,11 @@ use std::collections::HashMap;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
+pub use ansible_mesh_core::integration::{
+    decide_egress_placement, EgressFallback, EgressPlacementDecision, EgressPlacementPolicy,
+    EgressTrafficClass,
+};
 use ansible_mesh_core::ExposureTier;
-
-/// Canonical outbound traffic classes used by policy and placement.
-///
-/// Classification is explicit input. Callers must not rely on the executor
-/// guessing policy from a URL after the route has already been selected.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(rename_all = "snake_case")]
-pub enum EgressTrafficClass {
-    Communication,
-    #[default]
-    GeneralApi,
-    Mcp,
-    ModelProvider,
-    MeshPeer,
-    LocalResource,
-    Artifact,
-}
-
-/// Behavior when a preferred exit hotel is not reachable.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(rename_all = "snake_case")]
-pub enum EgressFallback {
-    #[default]
-    Deny,
-    LocalWithAudit,
-}
-
-/// Placement policy for the component that performs outbound network I/O.
-///
-/// `hotel_id` names a policy identity, not a hard-coded implementation host.
-/// Deployment may bind that identity to `vps-jane`, but the architecture does
-/// not make one physical machine a universal transit hop.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(tag = "mode", rename_all = "snake_case")]
-pub enum EgressPlacementPolicy {
-    #[default]
-    Local,
-    PreferHotel {
-        hotel_id: String,
-        #[serde(default)]
-        fallback: EgressFallback,
-    },
-    RequireHotel {
-        hotel_id: String,
-    },
-    Deny,
-}
-
-/// Resolved execution target for one outbound request.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "decision", rename_all = "snake_case")]
-pub enum EgressPlacementDecision {
-    ExecuteLocal { audit_fallback: bool },
-    ExecuteAtHotel { hotel_id: String },
-    Deny { reason: String },
-}
-
-/// Resolve an egress placement policy against current exit reachability.
-///
-/// This is intentionally a pure decision. Routing and materialization remain
-/// hotel responsibilities and the eventual HTTP runner owns the network call.
-pub fn decide_egress_placement(
-    policy: &EgressPlacementPolicy,
-    exit_hotel_reachable: bool,
-) -> EgressPlacementDecision {
-    match policy {
-        EgressPlacementPolicy::Local => EgressPlacementDecision::ExecuteLocal {
-            audit_fallback: false,
-        },
-        EgressPlacementPolicy::PreferHotel { hotel_id, fallback } => {
-            if exit_hotel_reachable {
-                EgressPlacementDecision::ExecuteAtHotel {
-                    hotel_id: hotel_id.clone(),
-                }
-            } else {
-                match fallback {
-                    EgressFallback::Deny => EgressPlacementDecision::Deny {
-                        reason: format!("preferred exit hotel '{hotel_id}' is unreachable"),
-                    },
-                    EgressFallback::LocalWithAudit => EgressPlacementDecision::ExecuteLocal {
-                        audit_fallback: true,
-                    },
-                }
-            }
-        }
-        EgressPlacementPolicy::RequireHotel { hotel_id } => {
-            if exit_hotel_reachable {
-                EgressPlacementDecision::ExecuteAtHotel {
-                    hotel_id: hotel_id.clone(),
-                }
-            } else {
-                EgressPlacementDecision::Deny {
-                    reason: format!("required exit hotel '{hotel_id}' is unreachable"),
-                }
-            }
-        }
-        EgressPlacementPolicy::Deny => EgressPlacementDecision::Deny {
-            reason: "external egress is disabled by placement policy".into(),
-        },
-    }
-}
 
 /// Per-tier egress policy — stored in mesh-config.json under `egress.tiers`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
