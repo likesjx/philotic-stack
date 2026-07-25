@@ -27,6 +27,38 @@ use tokio::sync::RwLock;
 use uuid::Uuid;
 
 impl IpcServer {
+    fn classify_operator_surface_reply(
+        response: IpcResponse,
+        label: &str,
+    ) -> anyhow::Result<Option<String>> {
+        match response {
+            IpcResponse::InboundTask { task_json, .. } => Ok(Some(task_json)),
+            IpcResponse::MuninnStatus { .. }
+            | IpcResponse::NetworkState { .. }
+            | IpcResponse::ApartmentUpdate { .. }
+            | IpcResponse::GracefulShutdown { .. } => Ok(None),
+            other => anyhow::bail!("unexpected {label} reply envelope: {other:?}"),
+        }
+    }
+
+    async fn recv_operator_surface_reply(
+        client: &mut PhiloticClient,
+        timeout_secs: u64,
+        label: &str,
+    ) -> anyhow::Result<String> {
+        tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), async {
+            loop {
+                if let Some(task_json) =
+                    Self::classify_operator_surface_reply(client.recv_task().await?, label)?
+                {
+                    return Ok(task_json);
+                }
+            }
+        })
+        .await
+        .map_err(|_| anyhow::anyhow!("timed out waiting for {label} reply"))?
+    }
+
     /// Dispatch a single operator-target IPC request. Called from
     /// `IpcServer::process_request` for every `IpcRequest` variant belonging
     /// to the operator-target surface.
@@ -837,15 +869,12 @@ impl IpcServer {
             IpcResponse::Standard { ok: true, .. } => {}
             other => anyhow::bail!("unexpected remote agent query emit response: {other:?}"),
         }
-        let reply = tokio::time::timeout(
-            std::time::Duration::from_secs(OPERATOR_SURFACE_QUERY_TIMEOUT_SECS),
-            client.recv_task(),
+        let task_json = Self::recv_operator_surface_reply(
+            &mut client,
+            OPERATOR_SURFACE_QUERY_TIMEOUT_SECS,
+            "remote target agent",
         )
-        .await
-        .map_err(|_| anyhow::anyhow!("timed out waiting for remote target agent reply"))??;
-        let IpcResponse::InboundTask { task_json, .. } = reply else {
-            anyhow::bail!("unexpected remote target agent reply envelope: {reply:?}");
-        };
+        .await?;
         let view: OperatorTargetAgentInventoryView = serde_json::from_str(&task_json)?;
         if view.target_node_id != target_node_id {
             anyhow::bail!(
@@ -930,15 +959,12 @@ impl IpcServer {
             IpcResponse::Standard { ok: true, .. } => {}
             other => anyhow::bail!("unexpected remote config query emit response: {other:?}"),
         }
-        let reply = tokio::time::timeout(
-            std::time::Duration::from_secs(OPERATOR_SURFACE_QUERY_TIMEOUT_SECS),
-            client.recv_task(),
+        let task_json = Self::recv_operator_surface_reply(
+            &mut client,
+            OPERATOR_SURFACE_QUERY_TIMEOUT_SECS,
+            "remote target config",
         )
-        .await
-        .map_err(|_| anyhow::anyhow!("timed out waiting for remote target config reply"))??;
-        let IpcResponse::InboundTask { task_json, .. } = reply else {
-            anyhow::bail!("unexpected remote target config reply envelope: {reply:?}");
-        };
+        .await?;
         let view: OperatorTargetConfigView = serde_json::from_str(&task_json)?;
         if view.target_node_id != target_node_id {
             anyhow::bail!(
@@ -1023,15 +1049,12 @@ impl IpcServer {
             IpcResponse::Standard { ok: true, .. } => {}
             other => anyhow::bail!("unexpected remote secret query emit response: {other:?}"),
         }
-        let reply = tokio::time::timeout(
-            std::time::Duration::from_secs(OPERATOR_SURFACE_QUERY_TIMEOUT_SECS),
-            client.recv_task(),
+        let task_json = Self::recv_operator_surface_reply(
+            &mut client,
+            OPERATOR_SURFACE_QUERY_TIMEOUT_SECS,
+            "remote target secret",
         )
-        .await
-        .map_err(|_| anyhow::anyhow!("timed out waiting for remote target secret reply"))??;
-        let IpcResponse::InboundTask { task_json, .. } = reply else {
-            anyhow::bail!("unexpected remote target secret reply envelope: {reply:?}");
-        };
+        .await?;
         let view: OperatorTargetSecretInventoryView = serde_json::from_str(&task_json)?;
         if view.target_node_id != target_node_id {
             anyhow::bail!(
@@ -1126,15 +1149,12 @@ impl IpcServer {
             IpcResponse::Standard { ok: true, .. } => {}
             other => anyhow::bail!("unexpected remote placement query emit response: {other:?}"),
         }
-        let reply = tokio::time::timeout(
-            std::time::Duration::from_secs(OPERATOR_SURFACE_QUERY_TIMEOUT_SECS),
-            client.recv_task(),
+        let task_json = Self::recv_operator_surface_reply(
+            &mut client,
+            OPERATOR_SURFACE_QUERY_TIMEOUT_SECS,
+            "remote target placement",
         )
-        .await
-        .map_err(|_| anyhow::anyhow!("timed out waiting for remote target placement reply"))??;
-        let IpcResponse::InboundTask { task_json, .. } = reply else {
-            anyhow::bail!("unexpected remote target placement reply envelope: {reply:?}");
-        };
+        .await?;
         let view: OperatorTargetPlacementView = serde_json::from_str(&task_json)?;
         if view.target_node_id != target_node_id {
             anyhow::bail!(
@@ -1219,15 +1239,12 @@ impl IpcServer {
             IpcResponse::Standard { ok: true, .. } => {}
             other => anyhow::bail!("unexpected remote component query emit response: {other:?}"),
         }
-        let reply = tokio::time::timeout(
-            std::time::Duration::from_secs(OPERATOR_SURFACE_QUERY_TIMEOUT_SECS),
-            client.recv_task(),
+        let task_json = Self::recv_operator_surface_reply(
+            &mut client,
+            OPERATOR_SURFACE_QUERY_TIMEOUT_SECS,
+            "remote target component",
         )
-        .await
-        .map_err(|_| anyhow::anyhow!("timed out waiting for remote target component reply"))??;
-        let IpcResponse::InboundTask { task_json, .. } = reply else {
-            anyhow::bail!("unexpected remote target component reply envelope: {reply:?}");
-        };
+        .await?;
         let view: OperatorTargetComponentInventoryView = serde_json::from_str(&task_json)?;
         if view.target_node_id != target_node_id {
             anyhow::bail!(
@@ -1497,14 +1514,12 @@ impl IpcServer {
             IpcResponse::Standard { ok: true, .. } => {}
             other => anyhow::bail!("unexpected remote component mutation emit response: {other:?}"),
         }
-        let reply = tokio::time::timeout(std::time::Duration::from_secs(2), client.recv_task())
-            .await
-            .map_err(|_| {
-                anyhow::anyhow!("timed out waiting for target component mutation reply")
-            })??;
-        let IpcResponse::InboundTask { task_json, .. } = reply else {
-            anyhow::bail!("unexpected target component mutation reply envelope: {reply:?}");
-        };
+        let task_json = Self::recv_operator_surface_reply(
+            &mut client,
+            OPERATOR_SURFACE_QUERY_TIMEOUT_SECS,
+            "target component mutation",
+        )
+        .await?;
 
         if operation == "register" {
             let view: ComponentInventoryEntryView = serde_json::from_str(&task_json)?;
@@ -1625,12 +1640,12 @@ impl IpcServer {
             IpcResponse::Standard { ok: true, .. } => {}
             other => anyhow::bail!("unexpected remote config mutation emit response: {other:?}"),
         }
-        let reply = tokio::time::timeout(std::time::Duration::from_secs(2), client.recv_task())
-            .await
-            .map_err(|_| anyhow::anyhow!("timed out waiting for target config mutation reply"))??;
-        let IpcResponse::InboundTask { task_json, .. } = reply else {
-            anyhow::bail!("unexpected target config mutation reply envelope: {reply:?}");
-        };
+        let task_json = Self::recv_operator_surface_reply(
+            &mut client,
+            OPERATOR_SURFACE_QUERY_TIMEOUT_SECS,
+            "target config mutation",
+        )
+        .await?;
         let ack: OperatorTargetConfigMutationAckView = serde_json::from_str(&task_json)?;
         Ok(IpcResponse::OperatorTargetConfigMutationAckView {
             operator_target_config_mutation: ack,
@@ -1781,14 +1796,12 @@ impl IpcServer {
                     anyhow::bail!("unexpected remote secret mutation emit response: {other:?}")
                 }
             }
-            let reply = tokio::time::timeout(std::time::Duration::from_secs(2), client.recv_task())
-                .await
-                .map_err(|_| {
-                    anyhow::anyhow!("timed out waiting for target secret mutation reply")
-                })??;
-            let IpcResponse::InboundTask { task_json, .. } = reply else {
-                anyhow::bail!("unexpected target secret mutation reply envelope: {reply:?}");
-            };
+            let task_json = Self::recv_operator_surface_reply(
+                &mut client,
+                OPERATOR_SURFACE_QUERY_TIMEOUT_SECS,
+                "target secret mutation",
+            )
+            .await?;
             let ack: OperatorTargetSecretMutationAckView = serde_json::from_str(&task_json)?;
             Ok(IpcResponse::OperatorTargetSecretMutationAckView {
                 operator_target_secret_mutation: ack,
@@ -1921,18 +1934,47 @@ impl IpcServer {
                     anyhow::bail!("unexpected remote role home mutation emit response: {other:?}")
                 }
             }
-            let reply = tokio::time::timeout(std::time::Duration::from_secs(2), client.recv_task())
-                .await
-                .map_err(|_| {
-                    anyhow::anyhow!("timed out waiting for target role-home mutation reply")
-                })??;
-            let IpcResponse::InboundTask { task_json, .. } = reply else {
-                anyhow::bail!("unexpected target role-home mutation reply envelope: {reply:?}");
-            };
+            let task_json = Self::recv_operator_surface_reply(
+                &mut client,
+                OPERATOR_SURFACE_QUERY_TIMEOUT_SECS,
+                "target role-home mutation",
+            )
+            .await?;
             let ack: OperatorTargetRoleHomeAckView = serde_json::from_str(&task_json)?;
             Ok(IpcResponse::OperatorTargetRoleHomeAckView {
                 operator_target_role_home: ack,
             })
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn operator_surface_reply_ignores_oob_before_inbound_task() {
+        assert!(
+            IpcServer::classify_operator_surface_reply(
+                IpcResponse::MuninnStatus {
+                    available: false,
+                    endpoint: "http://127.0.0.1:8475".into(),
+                },
+                "target secret mutation",
+            )
+            .expect("classify OOB status")
+            .is_none()
+        );
+
+        let payload = IpcServer::classify_operator_surface_reply(
+            IpcResponse::InboundTask {
+                source_node: "vps-jane-aiua-01".into(),
+                task_id: Uuid::new_v4(),
+                task_json: r#"{"ok":true}"#.into(),
+            },
+            "target secret mutation",
+        )
+        .expect("classify inbound reply");
+        assert_eq!(payload.as_deref(), Some(r#"{"ok":true}"#));
     }
 }

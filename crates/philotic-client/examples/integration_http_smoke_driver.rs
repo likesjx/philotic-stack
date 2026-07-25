@@ -25,33 +25,40 @@ async fn main() -> Result<()> {
         .context("PHILOTIC_HOTEL_SOCKET must be set for integration smoke")?;
     let target_node = std::env::var("PHILOTIC_TARGET_NODE")
         .context("PHILOTIC_TARGET_NODE must be set for integration smoke")?;
+    let reply_node = std::env::var("PHILOTIC_REPLY_NODE").unwrap_or_else(|_| target_node.clone());
+    let exit_hotel = std::env::var("PHILOTIC_EXIT_HOTEL").ok();
 
-    let listener = TcpListener::bind("127.0.0.1:0").await?;
-    let listen_addr = listener.local_addr()?;
-    let server = tokio::spawn(async move {
-        let (mut stream, _) = listener.accept().await?;
-        let mut request = vec![0u8; 8192];
-        let count = timeout(Duration::from_secs(5), stream.read(&mut request))
-            .await
-            .context("timed out reading smoke HTTP request")??;
-        let request = String::from_utf8_lossy(&request[..count]).to_ascii_lowercase();
-        if !request.starts_with("get /v1/echo?probe=bounded http/1.1") {
-            bail!("unexpected smoke request line: {request}");
-        }
-        if !request.contains("\r\nauthorization: bearer smoke-token\r\n") {
-            bail!("runner did not inject the vault credential");
-        }
-        let body = r#"{"ok":true,"source":"bounded-egress"}"#;
-        let response = format!(
-            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
-             X-Discard-Me: secret-ish\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-            body.len(),
-            body
-        );
-        stream.write_all(response.as_bytes()).await?;
-        stream.shutdown().await?;
-        Ok::<(), anyhow::Error>(())
-    });
+    let (base_url, server) = if let Ok(base_url) = std::env::var("PHILOTIC_SMOKE_BASE_URL") {
+        (base_url, None)
+    } else {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let listen_addr = listener.local_addr()?;
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await?;
+            let mut request = vec![0u8; 8192];
+            let count = timeout(Duration::from_secs(5), stream.read(&mut request))
+                .await
+                .context("timed out reading smoke HTTP request")??;
+            let request = String::from_utf8_lossy(&request[..count]).to_ascii_lowercase();
+            if !request.starts_with("get /v1/echo?probe=bounded http/1.1") {
+                bail!("unexpected smoke request line: {request}");
+            }
+            if !request.contains("\r\nauthorization: bearer smoke-token\r\n") {
+                bail!("runner did not inject the vault credential");
+            }
+            let body = r#"{"ok":true,"source":"bounded-egress"}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                 X-Discard-Me: secret-ish\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream.write_all(response.as_bytes()).await?;
+            stream.shutdown().await?;
+            Ok::<(), anyhow::Error>(())
+        });
+        (format!("http://{listen_addr}/v1"), Some(server))
+    };
 
     let mut client = PhiloticClient::connect(GuestIdentity {
         guest_id: DRIVER_GUEST_ID.into(),
@@ -71,7 +78,7 @@ async fn main() -> Result<()> {
         owner_agent_id: OWNER.into(),
         display_name: Some("Integration smoke".into()),
         target: IntegrationTarget::Http(HttpIntegrationTarget {
-            base_url: format!("http://{listen_addr}/v1"),
+            base_url,
             allowed_methods: vec!["GET".into()],
             allowed_path_prefixes: vec!["/v1/echo".into()],
             allowed_request_headers: vec![],
@@ -92,7 +99,9 @@ async fn main() -> Result<()> {
         grant_agents: vec![],
         grant_skills: vec!["integration.smoke".into()],
         traffic_class: EgressTrafficClass::GeneralApi,
-        placement: EgressPlacementPolicy::Local,
+        placement: exit_hotel
+            .map(|hotel_id| EgressPlacementPolicy::RequireHotel { hotel_id })
+            .unwrap_or(EgressPlacementPolicy::Local),
         requires_approval: true,
         enabled: true,
         updated_at: SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs(),
@@ -162,7 +171,7 @@ async fn main() -> Result<()> {
                     "chat_id": "smoke-chat",
                     "agent_id": OWNER,
                     "caller_role": "integration-smoke",
-                    "reply_to": target_node,
+                    "reply_to": reply_node,
                     "reply_role": DRIVER_ROLE,
                     "reply_guest_id": DRIVER_GUEST_ID,
                 })
@@ -204,7 +213,9 @@ async fn main() -> Result<()> {
         );
     }
 
-    server.await.context("smoke HTTP server task panicked")??;
+    if let Some(server) = server {
+        server.await.context("smoke HTTP server task panicked")??;
+    }
 
     match client
         .send_request(IpcRequest::GetIntegrationAudit {
@@ -232,7 +243,7 @@ async fn main() -> Result<()> {
     }
 
     println!(
-        "integration HTTP smoke ok: binding -> vault credential -> bounded runner -> sanitized response -> durable audit"
+        "integration HTTP smoke ok: binding -> vault credential -> bounded runner at {target_node} -> sanitized response -> durable audit"
     );
     Ok(())
 }
