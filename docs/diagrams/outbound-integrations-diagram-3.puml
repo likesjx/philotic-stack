@@ -1,0 +1,19 @@
+@startuml
+participant Philote
+participant McpManager
+participant SourceHotel
+participant ExitHotel
+participant EgressRunner
+participant ExternalMCP
+Philote -> McpManager: Namespaced MCP tool call
+McpManager -> SourceHotel: Get MCP binding and placement
+SourceHotel --> McpManager: Binding and selected execution node
+McpManager -> ExitHotel: Route raw MCP HTTP envelope
+ExitHotel -> EgressRunner: Deliver bounded HTTP task
+EgressRunner -> ExternalMCP: MCP JSON RPC over governed HTTP
+ExternalMCP --> EgressRunner: MCP JSON RPC response
+EgressRunner -> ExitHotel: Append secret free HTTP audit
+ExitHotel --> McpManager: Sanitized HTTP response
+McpManager -> McpManager: Enforce protocol schema grant and allotment
+McpManager --> Philote: Normal datasource tool result
+@enduml

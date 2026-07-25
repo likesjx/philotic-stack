@@ -3,7 +3,7 @@ title: Philotic Stack Architecture Reference
 doc_type: reference
 domain: runtime-sessions
 status: active
-last_updated: 2026-07-24
+last_updated: 2026-07-25
 tags:
 - runtime
 - reference
@@ -11,12 +11,17 @@ tags:
 - ipc
 - mesh
 - memory
+- integrations
+- egress
 related_docs:
 - README.md
 - ARCHITECTURE_STATUS.md
 - PORT_BLUEPRINT.md
 - KNOWLEDGE_ARCHITECTURE_PROPOSAL.md
 - MEMORY_TRANSPARENCY_PROPOSAL.md
+- OUTBOUND_INTEGRATIONS.md
+- OUTBOUND_INTEGRATION_FABRIC_PROPOSAL.md
+- MCP_CLIENT_FABRIC_PROPOSAL.md
 task_refs:
 - docs/task.md
 tracks_domains:
@@ -30,7 +35,7 @@ tracks_domains:
 
 # Philotic Stack — Architecture Reference
 
-> **Status:** Living Document | **Last Updated:** 2026-07-24
+> **Status:** Living Document | **Last Updated:** 2026-07-25
 
 This document describes the full runtime architecture of the Philotic Stack —
 a distributed AI agent operating system built in Rust. It is built around a powerful and intuitive **Hotel & Guest** metaphor. It covers The Hotel daemon (the orchestrator), all crates, all materialized Guest processes (the agents and gateways), the IPC and mesh transports,
@@ -56,6 +61,7 @@ Generated UML/PlantUML diagrams for the graph-visible hierarchy live under
 6. [Client SDK — `crates/philotic-client`](#6-client-sdk--cratesphilotic-client)
 7. [Intra-Hotel IPC (Unix Domain Sockets)](#7-intra-hotel-ipc-unix-domain-sockets)
 8. [Inter-Hotel Mesh (Control Plane) and Execution Transport (Data Plane)](#8-inter-hotel-mesh-control-plane-and-execution-transport-data-plane)
+   - [Governed Outbound Integration Fabric](#88-governed-outbound-integration-fabric)
 9. [Storage Layer — Traits and Implementations](#9-storage-layer--traits-and-implementations)
 10. [Session Authority And Derived State Sync](#10-session-authority-and-derived-state-sync)
 11. [Guest Lifecycle — Materialization & Supervision](#11-guest-lifecycle--materialization--supervision)
@@ -449,6 +455,27 @@ The **Whisper Protocol** provides local paracrine dispatch for cooperative, conc
 - **Lookaside Reflex**: Solves immediate query routing by checking local capability indexes before falling back to external mesh dispatch.
 - **Membrane Attribution**: Ensures incoming events carry proper trace metadata detailing which gateway membrane or peer ingress received the request.
 - **ReturnRoute**: Keeps track of final response routing paths (`final_reply_guest_id`) so results can flow cleanly back through the exact same UDS connection and model router instance.
+
+### 8.8 Governed Outbound Integration Fabric
+
+Philotes receive binding-scoped tools, not ambient network access. The source
+hotel owns grants, projection, and placement. The selected execution hotel owns
+the final network hop, credential lookup, and content-free audit.
+
+Two materialized guests divide protocol from I/O:
+
+- `mcp-client-runner` owns MCP discovery, schemas, grants, allotments, and
+  local stdio lifecycle;
+- `egress-http-runner` owns HTTP validation, DNS/IP policy, resource limits,
+  credential injection, response sanitization, and external execution.
+
+The router is the control and placement plane, not a universal byte proxy.
+`vps-jane` is selected only when a binding prefers or requires it; specialized
+model, membrane, and local-service traffic retains its existing owner.
+
+For the authority map, canonical records, placement and failure semantics,
+runtime paths, and rendered sequence diagrams, see
+[OUTBOUND_INTEGRATIONS.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/OUTBOUND_INTEGRATIONS.md).
 
 ---
 
