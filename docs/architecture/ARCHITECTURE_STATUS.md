@@ -3,7 +3,7 @@ title: Philotic Architecture Status
 doc_type: status
 domain: runtime-sessions
 status: active
-last_updated: 2026-07-24
+last_updated: 2026-07-25
 tags:
 - source-of-truth
 - current-state
@@ -46,7 +46,7 @@ tracks_domains:
 
 # Philotic Architecture Status
 
-> **Status:** Transitional Snapshot | **Last Updated:** 2026-07-08
+> **Status:** Transitional Snapshot | **Last Updated:** 2026-07-25
 
 This document is a legacy human-readable projection of current architecture state.
 The SQLite graph is the canonical source of truth; this file exists for review,
@@ -193,10 +193,11 @@ These are real current choices, but they are explicitly not the final story:
 
 - Tailscale/MagicDNS remains the named transitional scaffold for deployed inter-hotel reachability
 - model/provider egress is still an explicit exception rather than routed through a perimeter egress plane
-- outbound MCP management now retains protocol authority while delegating HTTP
-  wire exchange to the shared hotel-owned `egress-http-runner`; the source path
-  is smoke-green, while installed fleet proof is still pending
-- `vps-jane` is an intended preferred/required exit for selected integration
+- outbound MCP management retains protocol authority while delegating HTTP
+  wire exchange to the shared hotel-owned `egress-http-runner`; both outbound
+  binaries are installed on the MBP/VPS fleet, and required `vps-jane` HTTP
+  execution is watched-live-green
+- `vps-jane` is a proven preferred/required exit for selected integration
   classes, not a universal transit hop; placement fallback remains explicit
 - build-on-host VPS deployment is still transitional until artifact distribution hardens
 - role incarnation design direction is adopted, and the first graph/routing substrate now exists; current design direction now favors context-shift role activation with shared self/memory by default, while concurrent role materialization remains conditional
@@ -231,7 +232,7 @@ These are the most clearly active seams as of 2026-07-08:
 | Tool execution envelope | catalog-backed tools and approval policy exist | extend structured error behavior across more routed components instead of falling back to ad hoc strings |
 | Autopoiesis / earned autonomy | the `AutonomyGrant` per-lane posture/budget/audit substrate is real (Slice A1, PR #156), with four lanes wired on top: `graph.bridge_edges` (A2, PR #163), `fleet.heal_slices` (A3, PR #161), `steward.active_checkins` (A5, PR #165), and `memory.hygiene` (Memory Transparency M4, `codex/memory-m4-hygiene-lane`, test-green only) | A4 `aria-architect-charter` and A6 `scheduled-slice-executor` are unstarted; A7/A8 exist only as proposal-doc slices (PR #181) with no lane implementation yet; `memory.hygiene` needs a deployed/watched-live nightly cycle before it counts as proven |
 | LifeGraph retrieval and self-heal loops | read+write loop is live end to end: auto-recall into turn prefetch (PR #152), auto-capture of turn outcomes (PR #168), Muninn provenance edges (PR #149), cross-domain/role-ranked/read-expanded retrieval (PRs #153/#154/#157/#159) with a calibrated recall threshold (PR #160); turn-level failures now feed the self-heal queue (PR #173) and repeated provider 4xx escalates fallback tiers (PR #176); routing now has a health-aware oracle beneath the static ladders (PR #167) and a native Anthropic model controller (PR #166, key not yet provisioned) | prove live feedback smoke beyond test-green, and provision the Anthropic provider key on at least one deployed hotel |
-| Outbound integration and egress | canonical bindings, SkillDAG dependency projection, owner/grant policy, local/preferred/required/deny placement, vault-only credentials, the bounded HTTP runner, success/failure audit, operator management, and MCP-over-HTTP delegation are implemented; isolated-hotel HTTP and MCP-over-HTTP binary round trips are smoke-green | install on the fleet, watched-live prove preferred/required `vps-jane` placement, then inventory and migrate remaining direct general-API clients by class |
+| Outbound integration and egress | canonical bindings, SkillDAG dependency projection, owner/grant policy, local/preferred/required/deny placement, vault-only credentials, the bounded HTTP runner, success/failure audit, operator management, and MCP-over-HTTP delegation are implemented; both outbound binaries are installed on `mbp-jane` and `vps-jane`; isolated HTTP/MCP binary smokes are green; a watched two-hotel run proved required `vps-jane` execution, target-local credential resolution and durable audit, and response return to `mbp-jane` | inventory and migrate remaining direct general-API clients by class while keeping model/provider and communication exceptions explicit |
 | Deployment hardening | VPS boundary and peer rendering contract are defined | remove plaintext secret assumptions and prove real VPS smokes |
 
 ## Domain Status Matrix

@@ -168,6 +168,7 @@ async fn main() -> Result<()> {
                     "integration_placement": resolved_binding.1,
                     "session_id": "smoke:integration-http",
                     "turn_id": "smoke-turn-integration-http",
+                    "correlation_id": "smoke-correlation-integration-http",
                     "chat_id": "smoke-chat",
                     "agent_id": OWNER,
                     "caller_role": "integration-smoke",
@@ -217,18 +218,21 @@ async fn main() -> Result<()> {
         server.await.context("smoke HTTP server task panicked")??;
     }
 
-    match client
-        .send_request(IpcRequest::GetIntegrationAudit {
-            binding_id: Some(BINDING_ID.into()),
-            limit: Some(10),
-        })
-        .await?
-    {
-        IpcResponse::IntegrationAuditState { integration_audits }
-            if integration_audits
-                .iter()
-                .any(|audit| audit.binding_id == BINDING_ID && audit.outcome == "http_200") => {}
-        other => bail!("durable integration audit was not observable: {other:?}"),
+    if target_node == reply_node {
+        match client
+            .send_request(IpcRequest::GetIntegrationAudit {
+                binding_id: Some(BINDING_ID.into()),
+                limit: Some(10),
+            })
+            .await?
+        {
+            IpcResponse::IntegrationAuditState { integration_audits }
+                if integration_audits
+                    .iter()
+                    .any(|audit| audit.binding_id == BINDING_ID && audit.outcome == "http_200") => {
+            }
+            other => bail!("durable integration audit was not observable: {other:?}"),
+        }
     }
 
     match client
@@ -243,7 +247,7 @@ async fn main() -> Result<()> {
     }
 
     println!(
-        "integration HTTP smoke ok: binding -> vault credential -> bounded runner at {target_node} -> sanitized response -> durable audit"
+        "integration HTTP smoke ok: binding -> vault credential -> bounded runner at {target_node} -> sanitized response"
     );
     Ok(())
 }

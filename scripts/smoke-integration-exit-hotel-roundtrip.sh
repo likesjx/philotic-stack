@@ -20,6 +20,11 @@ cleanup() {
   if [[ -n "${STUB_PID}" ]]; then
     ssh "${EXIT_REMOTE}" "kill '${STUB_PID}' >/dev/null 2>&1 || true"
   fi
+  ssh "${SOURCE_REMOTE}" \
+    "env PHILOTIC_HOTEL_SOCKET='${SOURCE_SOCKET}' \
+      /opt/homebrew/bin/phil integration remove \
+      --owner agent-integration-smoke integration-smoke >/dev/null 2>&1 || true" \
+    >/dev/null 2>&1 || true
   ssh "${SOURCE_REMOTE}" "rm -f '${DRIVER_REMOTE}'" >/dev/null 2>&1 || true
   ssh "${EXIT_REMOTE}" "rm -f '${STUB_REMOTE}' '${STUB_LOG}'" >/dev/null 2>&1 || true
 }
@@ -57,5 +62,15 @@ ssh "${SOURCE_REMOTE}" \
        PHILOTIC_EXIT_HOTEL='${EXIT_HOTEL}' \
        PHILOTIC_SMOKE_BASE_URL='http://127.0.0.1:${EXIT_PORT}/v1' \
        '${DRIVER_REMOTE}'"
+
+echo "▶ Verifying the durable audit at its execution authority on ${EXIT_HOTEL}..."
+AUDIT_JSON="$(ssh "${EXIT_REMOTE}" \
+  "sudo -u philotic env PHILOTIC_HOTEL_SOCKET='/run/philotic/${EXIT_HOTEL}.sock' \
+    /opt/philotic/bin/philotic-web integration audit \
+    --binding-id integration-smoke --limit 10 --json")"
+grep -Fq '"binding_id": "integration-smoke"' <<<"${AUDIT_JSON}"
+grep -Fq '"outcome": "http_200"' <<<"${AUDIT_JSON}"
+grep -Fq "\"executor_node_id\": \"${EXIT_NODE}\"" <<<"${AUDIT_JSON}"
+grep -Fq '"credential_injected": true' <<<"${AUDIT_JSON}"
 
 echo "WATCHED-LIVE-GREEN: governed HTTP exited through ${EXIT_HOTEL} and returned to ${SOURCE_NODE}"
