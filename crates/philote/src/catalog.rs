@@ -340,6 +340,8 @@ pub fn tools_for_skill(skill_name: &str) -> &'static [&'static str] {
         "observability.pipeline" => &[
             "table.configure",
             "table.query",
+            "table.build",
+            "table.catalog",
             "table.insert",
             "table.rolloff",
             "table.stats",
@@ -1033,13 +1035,19 @@ fn build_catalog() -> HashMap<String, ToolDefinition> {
         "table.query".into(),
         ToolDefinition {
             tool_name: "table.query".into(),
-            description: "Run a SELECT query against a table in the local table store. \
-                          Returns rows as JSON objects. Use graph_id to specify the table name \
-                          and query for the SQL. Pass limit in parameters to cap results."
+            description: "Run a SELECT query against a database in the table store. Read-only: \
+                          any statement that would write is rejected. Set db to target a named \
+                          catalog or profile database (default: 'default'). Returns rows as JSON \
+                          objects. Pass limit in parameters to cap results; pass attach as an \
+                          array of catalog database names to make them queryable as db.table."
                 .into(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
+                    "db": {
+                        "type": "string",
+                        "description": "Named database from table.catalog (default: 'default')."
+                    },
                     "graph_id": {
                         "type": "string",
                         "description": "Table name (also set as the target table for the query context)."
@@ -1050,11 +1058,60 @@ fn build_catalog() -> HashMap<String, ToolDefinition> {
                     },
                     "parameters": {
                         "type": "object",
-                        "description": "Optional query parameters. Include 'limit' to cap result count.",
+                        "description": "Optional query parameters. Include 'limit' to cap result count; 'attach' (array of catalog db names) to enable cross-database queries.",
                         "default": {}
                     }
                 },
                 "required": ["query"]
+            }),
+            class: Some("table".into()),
+        },
+    );
+
+    m.insert(
+        "table.build".into(),
+        ToolDefinition {
+            tool_name: "table.build".into(),
+            description: "Build and run a read-only query against a known database without \
+                          writing SQL. Pass a structured spec in parameters: table (string or \
+                          {table, as}), optional columns, where clauses ({column, op, value} \
+                          with ops =, !=, <, <=, >, >=, like, in, is_null, not_null), joins \
+                          ({db, table, as, type, on: {left, right}} — db references another \
+                          catalog database, attached read-only automatically), order_by \
+                          ({column, dir}), limit, offset. Returns the compiled SQL alongside \
+                          the rows. Set db to pick the primary database."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "db": {
+                        "type": "string",
+                        "description": "Primary database from table.catalog (default: 'default')."
+                    },
+                    "parameters": {
+                        "type": "object",
+                        "description": "Structured query spec: {table, columns?, where?, joins?, order_by?, limit?, offset?}."
+                    }
+                },
+                "required": ["parameters"]
+            }),
+            class: Some("table".into()),
+        },
+    );
+
+    m.insert(
+        "table.catalog".into(),
+        ToolDefinition {
+            tool_name: "table.catalog".into(),
+            description: "List the databases you can query: catalog databases registered by the \
+                          operator (with mode ro/rw, description, and your granted verbs) plus \
+                          profile databases in the local table store. Call this before \
+                          table.build or table.query against an unfamiliar database, then \
+                          table.schema (omit graph_id) to discover its tables."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {}
             }),
             class: Some("table".into()),
         },
@@ -1145,16 +1202,22 @@ fn build_catalog() -> HashMap<String, ToolDefinition> {
         "table.schema".into(),
         ToolDefinition {
             tool_name: "table.schema".into(),
-            description: "Return the CREATE TABLE DDL for a table in the local table store.".into(),
+            description: "Return CREATE TABLE DDL. With graph_id: that table's DDL. Without: \
+                          every table in the database — use this to discover the schema of a \
+                          catalog database before querying it. Set db to target a named database."
+                .into(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
+                    "db": {
+                        "type": "string",
+                        "description": "Named database from table.catalog (default: 'default')."
+                    },
                     "graph_id": {
                         "type": "string",
-                        "description": "Table name."
+                        "description": "Table name. Omit to list every table's DDL."
                     }
-                },
-                "required": ["graph_id"]
+                }
             }),
             class: Some("table".into()),
         },

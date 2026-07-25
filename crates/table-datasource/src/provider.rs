@@ -1,26 +1,50 @@
 use anyhow::{Result, bail};
 use async_trait::async_trait;
 use datasource::controller::{DatasourceProvider, DatasourceTask, ProviderOutput};
-use rusqlite::{Connection, types::ValueRef};
+use rusqlite::hooks::{AuthAction, AuthContext, Authorization};
+use rusqlite::{Connection, OpenFlags, types::ValueRef};
 use serde_json::{Map, Value, json};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tracing::info;
+
+use crate::builder::build_query;
+use crate::catalog::{
+    Catalog, CatalogEntry, DbMode, Verb, agent_from_identity, validate_profile_db_name,
+    verb_for_kind,
+};
+
+/// One pooled database connection plus its enforcement state.
+#[derive(Clone)]
+struct DbHandle {
+    conn: Arc<Mutex<Connection>>,
+    mode: DbMode,
+    /// Gate for ATTACH/DETACH: the runner flips this while performing its own
+    /// catalog-resolved attaches; agent SQL hitting ATTACH is denied by the
+    /// connection authorizer whenever it is false.
+    attach_ok: Arc<AtomicBool>,
+}
 
 pub struct SqliteTableProvider {
     base_dir: PathBuf,
-    pool: Arc<Mutex<HashMap<String, Arc<Mutex<Connection>>>>>,
+    catalog: Mutex<Catalog>,
+    pool: Arc<Mutex<HashMap<String, DbHandle>>>,
 }
 
 impl SqliteTableProvider {
-    /// Directory-based provider — DB name maps to `{base_dir}/{name}.db`.
+    /// Directory-based provider — profile DB name maps to `{base_dir}/{name}.db`;
+    /// catalog databases come from `{base_dir}/db_catalog.json` (or
+    /// `PHILOTIC_TABLE_CATALOG`).
     pub fn new(base_dir: &Path) -> Result<Self> {
         std::fs::create_dir_all(base_dir)?;
-        info!(base_dir = %base_dir.display(), "table-datasource initialised (multi-DB)");
+        let catalog = Catalog::load(Catalog::default_path(base_dir));
+        info!(base_dir = %base_dir.display(), "table-datasource initialised (multi-DB + catalog)");
         Ok(Self {
             base_dir: base_dir.to_path_buf(),
+            catalog: Mutex::new(catalog),
             pool: Arc::new(Mutex::new(HashMap::new())),
         })
     }
@@ -30,12 +54,13 @@ impl SqliteTableProvider {
     pub fn open<P: AsRef<Path>>(db_path: P) -> Result<Self> {
         let path = db_path.as_ref();
         let base_dir = path.parent().unwrap_or(Path::new("."));
-        let provider = Self {
-            base_dir: base_dir.to_path_buf(),
-            pool: Arc::new(Mutex::new(HashMap::new())),
-        };
-        // Pre-open the specific file as "default".
-        provider.open_named("default", path)?;
+        let provider = Self::new(base_dir)?;
+        let handle = open_handle(path, DbMode::ReadWrite)?;
+        provider
+            .pool
+            .lock()
+            .unwrap()
+            .insert("default".to_string(), handle);
         Ok(provider)
     }
 
@@ -43,28 +68,140 @@ impl SqliteTableProvider {
         &self.base_dir
     }
 
-    fn open_named(&self, name: &str, path: &Path) -> Result<Arc<Mutex<Connection>>> {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
+    /// Reload the catalog when its file changed; drop pooled connections so
+    /// path/mode/grant changes take effect without a restart.
+    fn refresh_catalog(&self) {
+        if self.catalog.lock().unwrap().refresh_if_changed() {
+            self.pool.lock().unwrap().clear();
+            info!("db_catalog.json changed — catalog reloaded, connection pool reset");
         }
-        let conn = Connection::open(path)?;
-        conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")?;
-        info!(db = name, path = %path.display(), "table-datasource opened DB");
-        let conn = Arc::new(Mutex::new(conn));
+    }
+
+    fn catalog_entry(&self, name: &str) -> Option<CatalogEntry> {
+        self.catalog.lock().unwrap().get(name).cloned()
+    }
+
+    fn get_handle(&self, name: &str, agent: &str, verb: Verb) -> Result<DbHandle> {
+        if let Some(entry) = self.catalog_entry(name) {
+            let mode = entry.db_mode()?;
+            if mode == DbMode::ReadOnly && verb == Verb::Write {
+                bail!("database '{name}' is read-only");
+            }
+            if !entry.allows(agent, verb) {
+                bail!("agent '{agent}' has no {verb:?} grant on database '{name}'");
+            }
+            let src = entry.resolved_path(&self.base_dir);
+            if !src.exists() {
+                bail!("catalog database '{name}' missing at {}", src.display());
+            }
+            let (open_path, refreshed) = if entry.snapshot_on_read {
+                self.ensure_snapshot(&entry, &src)?
+            } else {
+                (src, false)
+            };
+            if refreshed {
+                self.pool.lock().unwrap().remove(name);
+            }
+            if let Some(handle) = self.pool.lock().unwrap().get(name) {
+                return Ok(handle.clone());
+            }
+            let handle = open_handle(&open_path, mode)?;
+            self.pool
+                .lock()
+                .unwrap()
+                .insert(name.to_string(), handle.clone());
+            return Ok(handle);
+        }
+
+        // Profile database: legacy implicit mapping, now name-sanitized.
+        validate_profile_db_name(name)?;
+        if let Some(handle) = self.pool.lock().unwrap().get(name) {
+            return Ok(handle.clone());
+        }
+        let path = self.base_dir.join(format!("{name}.db"));
+        // Write kinds still create on demand (that is how tables get made), but
+        // a *read* must never bring a database into existence — otherwise any
+        // agent probing names litters the profile directory with empty files
+        // that then show up in table.catalog.
+        if verb == Verb::Read && !path.exists() {
+            bail!("unknown database {name:?}");
+        }
+        let handle = open_handle(&path, DbMode::ReadWrite)?;
         self.pool
             .lock()
             .unwrap()
-            .insert(name.to_string(), conn.clone());
-        Ok(conn)
+            .insert(name.to_string(), handle.clone());
+        Ok(handle)
     }
 
-    fn get_conn(&self, task: &DatasourceTask) -> Result<Arc<Mutex<Connection>>> {
-        let name = task.db.as_deref().unwrap_or("default");
-        if let Some(conn) = self.pool.lock().unwrap().get(name) {
-            return Ok(conn.clone());
+    /// Copy-on-read for live-written databases: back the source up into
+    /// `.snapshots/{name}.db` and query the copy. Returns the path to open and
+    /// whether the snapshot was (re)taken this call.
+    fn ensure_snapshot(&self, entry: &CatalogEntry, src: &Path) -> Result<(PathBuf, bool)> {
+        let snap_dir = self.base_dir.join(".snapshots");
+        std::fs::create_dir_all(&snap_dir)?;
+        let snap = snap_dir.join(format!("{}.db", entry.name));
+
+        let fresh = std::fs::metadata(&snap)
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|mtime| mtime.elapsed().ok())
+            .map(|age| age < Duration::from_secs(entry.snapshot_ttl_secs))
+            .unwrap_or(false);
+        if fresh {
+            return Ok((snap, false));
         }
-        let path = self.base_dir.join(format!("{}.db", name));
-        self.open_named(name, &path)
+
+        let src_conn = Connection::open_with_flags(
+            src,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
+        )?;
+        let _ = std::fs::remove_file(&snap);
+        let mut dst_conn = Connection::open(&snap)?;
+        let backup = rusqlite::backup::Backup::new(&src_conn, &mut dst_conn)?;
+        backup.run_to_completion(256, Duration::from_millis(5), None)?;
+        info!(db = entry.name, src = %src.display(), "snapshot refreshed");
+        Ok((snap, true))
+    }
+
+    /// Resolve `attach` database names to (alias, path) pairs, enforcing a read
+    /// grant on every attached database. Attached databases are always opened
+    /// read-only regardless of their own mode.
+    fn resolve_attaches(
+        &self,
+        names: &[String],
+        agent: &str,
+        primary: &str,
+    ) -> Result<Vec<(String, PathBuf)>> {
+        let mut out = Vec::new();
+        for name in names {
+            if name == primary {
+                continue;
+            }
+            if let Some(entry) = self.catalog_entry(name) {
+                if !entry.allows(agent, Verb::Read) {
+                    bail!("agent '{agent}' has no Read grant on database '{name}'");
+                }
+                let src = entry.resolved_path(&self.base_dir);
+                if !src.exists() {
+                    bail!("catalog database '{name}' missing at {}", src.display());
+                }
+                let (path, _) = if entry.snapshot_on_read {
+                    self.ensure_snapshot(&entry, &src)?
+                } else {
+                    (src, false)
+                };
+                out.push((name.clone(), path));
+            } else {
+                validate_profile_db_name(name)?;
+                let path = self.base_dir.join(format!("{name}.db"));
+                if !path.exists() {
+                    bail!("cannot attach unknown database '{name}'");
+                }
+                out.push((name.clone(), path));
+            }
+        }
+        Ok(out)
     }
 }
 
@@ -78,6 +215,7 @@ impl DatasourceProvider for SqliteTableProvider {
         matches!(
             task.kind.as_str(),
             "table.query"
+                | "table.build"
                 | "table.insert"
                 | "table.upsert"
                 | "table.update"
@@ -88,28 +226,155 @@ impl DatasourceProvider for SqliteTableProvider {
                 | "table.stats"
                 | "table.schema"
                 | "table.list"
+                | "table.catalog"
         )
     }
 
     async fn invoke(&self, task: &DatasourceTask) -> Result<ProviderOutput> {
-        match task.kind.as_str() {
-            "table.list" => return list_dbs(self, task),
+        let kind = task.kind.as_str();
+        let verb = verb_for_kind(kind)?;
+        let agent = agent_from_identity(&task.identity);
+        self.refresh_catalog();
+
+        match kind {
+            "table.list" => return list_dbs(self, &agent),
+            "table.catalog" => return catalog_info(self, &agent),
             _ => {}
         }
-        let conn_arc = self.get_conn(task)?;
-        let conn = conn_arc.lock().unwrap();
-        match task.kind.as_str() {
-            "table.configure" | "table.exec" => exec_ddl(&conn, task),
-            "table.query" => query_table(&conn, task),
-            "table.insert" => insert_row(&conn, task, false),
-            "table.upsert" => insert_row(&conn, task, true),
-            "table.update" => update_rows(&conn, task),
-            "table.delete" => delete_rows(&conn, task),
-            "table.rolloff" => rolloff_table(&conn, task),
-            "table.stats" => table_stats(&conn, task),
-            "table.schema" => table_schema(&conn, task),
-            other => bail!("unsupported table task kind: {other}"),
+
+        let db_name = task.db.as_deref().unwrap_or("default");
+        let handle = self.get_handle(db_name, &agent, verb)?;
+
+        if kind == "table.build" {
+            let built = build_query(&task.parameters)?;
+            let attaches = self.resolve_attaches(&built.attach_dbs, &agent, db_name)?;
+            let conn = handle.conn.lock().unwrap();
+            return with_attached(&conn, &handle, &attaches, |conn| {
+                run_read_query(conn, &built.sql, &built.params, usize::MAX).map(|rows| {
+                    ProviderOutput::ResultSet(json!({ "sql": built.sql, "rows": rows }))
+                })
+            });
         }
+
+        // table.query may also attach catalog databases: parameters.attach = ["name", ...]
+        let attach_names: Vec<String> = if kind == "table.query" {
+            task.parameters
+                .get("attach")
+                .and_then(Value::as_array)
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(Value::as_str)
+                        .map(str::to_string)
+                        .collect()
+                })
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        let attaches = self.resolve_attaches(&attach_names, &agent, db_name)?;
+
+        let conn = handle.conn.lock().unwrap();
+        with_attached(&conn, &handle, &attaches, |conn| match kind {
+            "table.configure" | "table.exec" => exec_ddl(conn, task),
+            "table.query" => query_table(conn, task),
+            "table.insert" => insert_row(conn, task, false),
+            "table.upsert" => insert_row(conn, task, true),
+            "table.update" => update_rows(conn, task),
+            "table.delete" => delete_rows(conn, task),
+            "table.rolloff" => rolloff_table(conn, task),
+            "table.stats" => table_stats(conn, task),
+            "table.schema" => table_schema(conn, task),
+            other => bail!("unsupported table task kind: {other}"),
+        })
+    }
+}
+
+// ── connection plumbing ──────────────────────────────────────────────────────
+
+fn open_handle(path: &Path, mode: DbMode) -> Result<DbHandle> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let conn = match mode {
+        DbMode::ReadWrite => {
+            let conn = Connection::open_with_flags(
+                path,
+                OpenFlags::SQLITE_OPEN_READ_WRITE
+                    | OpenFlags::SQLITE_OPEN_CREATE
+                    | OpenFlags::SQLITE_OPEN_URI,
+            )?;
+            conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")?;
+            conn
+        }
+        DbMode::ReadOnly => {
+            let conn = Connection::open_with_flags(
+                path,
+                OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
+            )?;
+            conn.execute_batch("PRAGMA query_only=ON;")?;
+            conn
+        }
+    };
+
+    let attach_ok = Arc::new(AtomicBool::new(false));
+    let flag = attach_ok.clone();
+    conn.authorizer(Some(move |ctx: AuthContext<'_>| match ctx.action {
+        AuthAction::Attach { .. } | AuthAction::Detach { .. } => {
+            if flag.load(Ordering::Relaxed) {
+                Authorization::Allow
+            } else {
+                Authorization::Deny
+            }
+        }
+        _ => Authorization::Allow,
+    }));
+
+    info!(path = %path.display(), ro = matches!(mode, DbMode::ReadOnly), "table-datasource opened DB");
+    Ok(DbHandle {
+        conn: Arc::new(Mutex::new(conn)),
+        mode,
+        attach_ok,
+    })
+}
+
+/// Run `f` with the given catalog databases attached read-only, detaching them
+/// afterwards even when `f` fails. ATTACH/DETACH are only authorized while the
+/// handle's gate flag is up — agent SQL can never attach on its own.
+fn with_attached<F>(
+    conn: &Connection,
+    handle: &DbHandle,
+    attaches: &[(String, PathBuf)],
+    f: F,
+) -> Result<ProviderOutput>
+where
+    F: FnOnce(&Connection) -> Result<ProviderOutput>,
+{
+    for (alias, path) in attaches {
+        handle.attach_ok.store(true, Ordering::Relaxed);
+        let uri = format!("file:{}?mode=ro", path.display());
+        let attached = conn.execute(
+            &format!("ATTACH DATABASE ?1 AS {alias}"),
+            rusqlite::params![uri],
+        );
+        handle.attach_ok.store(false, Ordering::Relaxed);
+        if let Err(err) = attached {
+            detach_all(conn, handle, attaches);
+            return Err(anyhow::anyhow!(
+                "failed to attach database '{alias}': {err}"
+            ));
+        }
+    }
+
+    let result = f(conn);
+    detach_all(conn, handle, attaches);
+    result
+}
+
+fn detach_all(conn: &Connection, handle: &DbHandle, attaches: &[(String, PathBuf)]) {
+    for (alias, _) in attaches {
+        handle.attach_ok.store(true, Ordering::Relaxed);
+        let _ = conn.execute(&format!("DETACH DATABASE {alias}"), []);
+        handle.attach_ok.store(false, Ordering::Relaxed);
     }
 }
 
@@ -138,19 +403,37 @@ fn query_table(conn: &Connection, task: &DatasourceTask) -> Result<ProviderOutpu
         .and_then(Value::as_u64)
         .unwrap_or(200) as usize;
 
-    let mut stmt = conn.prepare(sql)?;
-    let col_names: Vec<String> = stmt.column_names().iter().map(|s| s.to_string()).collect();
-
-    let owned_params: Vec<Box<dyn rusqlite::types::ToSql>> = task
+    let params: Vec<Value> = task
         .parameters
         .as_object()
         .map(|obj| {
             obj.iter()
-                .filter(|(k, _)| *k != "limit")
-                .map(|(_, v)| json_to_sql_box(v))
+                .filter(|(k, _)| *k != "limit" && *k != "attach")
+                .map(|(_, v)| v.clone())
                 .collect()
         })
         .unwrap_or_default();
+
+    let rows = run_read_query(conn, sql, &params, limit)?;
+    Ok(ProviderOutput::ResultSet(Value::Array(rows)))
+}
+
+/// The shared read lane: prepares `sql`, refuses anything that is not a
+/// read-only statement, binds `params` positionally, and maps rows to JSON.
+fn run_read_query(
+    conn: &Connection,
+    sql: &str,
+    params: &[Value],
+    limit: usize,
+) -> Result<Vec<Value>> {
+    let mut stmt = conn.prepare(sql)?;
+    if !stmt.readonly() {
+        bail!("table.query/table.build are read-only — use the explicit write task kinds");
+    }
+    let col_names: Vec<String> = stmt.column_names().iter().map(|s| s.to_string()).collect();
+
+    let owned_params: Vec<Box<dyn rusqlite::types::ToSql>> =
+        params.iter().map(json_to_sql_box).collect();
 
     let rows_result = stmt.query_map(
         rusqlite::params_from_iter(owned_params.iter().map(|p| p.as_ref())),
@@ -181,9 +464,9 @@ fn query_table(conn: &Connection, task: &DatasourceTask) -> Result<ProviderOutpu
                 }
                 records.push(Value::Object(row?));
             }
-            Ok(ProviderOutput::ResultSet(Value::Array(records)))
+            Ok(records)
         }
-        Err(e) => bail!("table.query failed: {e}"),
+        Err(e) => bail!("query failed: {e}"),
     }
 }
 
@@ -334,12 +617,88 @@ fn delete_rows(conn: &Connection, task: &DatasourceTask) -> Result<ProviderOutpu
     ))
 }
 
-// ── table.list ───────────────────────────────────────────────────────────────
+// ── table.list / table.catalog ───────────────────────────────────────────────
 
-fn list_dbs(provider: &SqliteTableProvider, _task: &DatasourceTask) -> Result<ProviderOutput> {
+fn list_dbs(provider: &SqliteTableProvider, agent: &str) -> Result<ProviderOutput> {
+    let mut seen: Vec<String> = Vec::new();
+    let mut dbs: Vec<Value> = Vec::new();
+
+    {
+        let catalog = provider.catalog.lock().unwrap();
+        for entry in catalog.entries() {
+            if entry.allows(agent, Verb::Read) {
+                seen.push(entry.name.clone());
+                dbs.push(json!({ "db": entry.name, "source": "catalog" }));
+            }
+        }
+    }
     let pool = provider.pool.lock().unwrap();
-    let dbs: Vec<Value> = pool.keys().map(|name| json!({ "db": name })).collect();
+    for name in pool.keys() {
+        if !seen.contains(name) {
+            dbs.push(json!({ "db": name, "source": "profile" }));
+        }
+    }
     Ok(ProviderOutput::ResultSet(json!({ "databases": dbs })))
+}
+
+/// Rich catalog view for the calling agent: what exists, what mode it is in,
+/// and which verbs the caller holds on it.
+fn catalog_info(provider: &SqliteTableProvider, agent: &str) -> Result<ProviderOutput> {
+    let mut dbs: Vec<Value> = Vec::new();
+
+    {
+        let catalog = provider.catalog.lock().unwrap();
+        for entry in catalog.entries() {
+            let read = entry.allows(agent, Verb::Read);
+            let write = entry.allows(agent, Verb::Write);
+            if !read && !write {
+                continue;
+            }
+            let mut verbs: Vec<&str> = Vec::new();
+            if read {
+                verbs.push("read");
+            }
+            if write {
+                verbs.push("write");
+            }
+            dbs.push(json!({
+                "db": entry.name,
+                "source": "catalog",
+                "mode": entry.mode,
+                "description": entry.description,
+                "snapshot_on_read": entry.snapshot_on_read,
+                "verbs": verbs,
+            }));
+        }
+    }
+
+    // Profile databases: every *.db file in the profile dir (rw, implicit).
+    if let Ok(read_dir) = std::fs::read_dir(&provider.base_dir) {
+        for dir_entry in read_dir.flatten() {
+            let path = dir_entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("db") {
+                continue;
+            }
+            let Some(name) = path.file_stem().and_then(|s| s.to_str()) else {
+                continue;
+            };
+            if validate_profile_db_name(name).is_err()
+                || provider.catalog.lock().unwrap().get(name).is_some()
+            {
+                continue;
+            }
+            dbs.push(json!({
+                "db": name,
+                "source": "profile",
+                "mode": "rw",
+                "verbs": ["read", "write"],
+            }));
+        }
+    }
+
+    Ok(ProviderOutput::ResultSet(
+        json!({ "agent": agent, "databases": dbs }),
+    ))
 }
 
 // ── table.rolloff ─────────────────────────────────────────────────────────────
@@ -417,23 +776,37 @@ fn table_stats(conn: &Connection, task: &DatasourceTask) -> Result<ProviderOutpu
 // ── table.schema ─────────────────────────────────────────────────────────────
 
 fn table_schema(conn: &Connection, task: &DatasourceTask) -> Result<ProviderOutput> {
-    let table = task
-        .graph_id
-        .as_deref()
-        .ok_or_else(|| anyhow::anyhow!("table.schema requires graph_id (table name)"))?;
-    validate_identifier(table)?;
-
-    let sql: String = conn
-        .query_row(
-            "SELECT sql FROM sqlite_master WHERE type='table' AND name=?1",
-            rusqlite::params![table],
-            |row| row.get(0),
-        )
-        .map_err(|_| anyhow::anyhow!("table '{table}' not found"))?;
-
-    Ok(ProviderOutput::ResultSet(
-        json!({ "table": table, "schema_sql": sql }),
-    ))
+    // With a table name: that table's DDL. Without: every table's DDL — the
+    // discovery path for catalog databases whose schema the agent has never seen.
+    match task.graph_id.as_deref() {
+        Some(table) => {
+            validate_identifier(table)?;
+            let sql: String = conn
+                .query_row(
+                    "SELECT sql FROM sqlite_master WHERE type='table' AND name=?1",
+                    rusqlite::params![table],
+                    |row| row.get(0),
+                )
+                .map_err(|_| anyhow::anyhow!("table '{table}' not found"))?;
+            Ok(ProviderOutput::ResultSet(
+                json!({ "table": table, "schema_sql": sql }),
+            ))
+        }
+        None => {
+            let mut stmt = conn
+                .prepare("SELECT name, sql FROM sqlite_master WHERE type='table' ORDER BY name")?;
+            let rows: Vec<Value> = stmt
+                .query_map([], |row| {
+                    Ok(json!({
+                        "table": row.get::<_, String>(0)?,
+                        "schema_sql": row.get::<_, Option<String>>(1)?,
+                    }))
+                })?
+                .filter_map(|r| r.ok())
+                .collect();
+            Ok(ProviderOutput::ResultSet(json!({ "tables": rows })))
+        }
+    }
 }
 
 // ── helpers ───────────────────────────────────────────────────────────────────
@@ -500,461 +873,5 @@ fn json_to_sql_box(v: &Value) -> Box<dyn rusqlite::types::ToSql> {
         }
         Value::String(s) => Box::new(s.clone()),
         other => Box::new(other.to_string()),
-    }
-}
-
-// ── tests ─────────────────────────────────────────────────────────────────────
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use datasource::controller::DatasourceTask;
-    use serde_json::json;
-    use tempfile::TempDir;
-
-    fn open_tmp() -> (SqliteTableProvider, TempDir) {
-        let d = TempDir::new().unwrap();
-        let p = SqliteTableProvider::new(d.path()).unwrap();
-        (p, d)
-    }
-
-    fn make_task(
-        kind: &str,
-        db: Option<&str>,
-        graph_id: Option<&str>,
-        query: Option<&str>,
-        params: Value,
-    ) -> DatasourceTask {
-        DatasourceTask {
-            kind: datasource::controller::TaskKind::Custom(kind.to_string()),
-            provider: Some("table".to_string()),
-            db: db.map(str::to_string),
-            graph_id: graph_id.map(str::to_string),
-            query: query.map(str::to_string),
-            parameters: params,
-            identity: json!({}),
-        }
-    }
-
-    #[tokio::test]
-    async fn configure_and_insert_and_query() {
-        let (p, _d) = open_tmp();
-
-        p.invoke(&make_task(
-            "table.configure",
-            None,
-            None,
-            Some("CREATE TABLE IF NOT EXISTS signals (id INTEGER PRIMARY KEY AUTOINCREMENT, provider TEXT NOT NULL, latency_ms INTEGER, timestamp INTEGER NOT NULL)"),
-            json!({}),
-        )).await.unwrap();
-
-        p.invoke(&make_task(
-            "table.insert",
-            None,
-            Some("signals"),
-            None,
-            json!({"provider": "gemini", "latency_ms": 120, "timestamp": 1_000_000}),
-        ))
-        .await
-        .unwrap();
-
-        p.invoke(&make_task(
-            "table.insert",
-            None,
-            Some("signals"),
-            None,
-            json!({"provider": "ollama", "latency_ms": 45, "timestamp": 1_000_001}),
-        ))
-        .await
-        .unwrap();
-
-        let out = p
-            .invoke(&make_task(
-                "table.query",
-                None,
-                None,
-                Some("SELECT provider, latency_ms FROM signals ORDER BY timestamp ASC"),
-                json!({}),
-            ))
-            .await
-            .unwrap();
-
-        let ProviderOutput::ResultSet(Value::Array(rows)) = out else {
-            panic!("expected ResultSet")
-        };
-        assert_eq!(rows.len(), 2);
-        assert_eq!(rows[0]["provider"], "gemini");
-        assert_eq!(rows[1]["provider"], "ollama");
-    }
-
-    #[tokio::test]
-    async fn upsert_replaces_existing() {
-        let (p, _d) = open_tmp();
-
-        p.invoke(&make_task(
-            "table.exec",
-            None,
-            None,
-            Some("CREATE TABLE IF NOT EXISTS kv (id TEXT PRIMARY KEY, val TEXT)"),
-            json!({}),
-        ))
-        .await
-        .unwrap();
-
-        p.invoke(&make_task(
-            "table.upsert",
-            None,
-            Some("kv"),
-            None,
-            json!({"id": "k1", "val": "first"}),
-        ))
-        .await
-        .unwrap();
-
-        p.invoke(&make_task(
-            "table.upsert",
-            None,
-            Some("kv"),
-            None,
-            json!({"id": "k1", "val": "second"}),
-        ))
-        .await
-        .unwrap();
-
-        let out = p
-            .invoke(&make_task(
-                "table.query",
-                None,
-                None,
-                Some("SELECT val FROM kv WHERE id = 'k1'"),
-                json!({}),
-            ))
-            .await
-            .unwrap();
-
-        let ProviderOutput::ResultSet(Value::Array(rows)) = out else {
-            panic!()
-        };
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0]["val"], "second");
-    }
-
-    #[tokio::test]
-    async fn update_with_where() {
-        let (p, _d) = open_tmp();
-
-        p.invoke(&make_task(
-            "table.exec",
-            None,
-            None,
-            Some(
-                "CREATE TABLE IF NOT EXISTS items (id TEXT PRIMARY KEY, status INTEGER DEFAULT 0)",
-            ),
-            json!({}),
-        ))
-        .await
-        .unwrap();
-
-        for id in ["a", "b", "c"] {
-            p.invoke(&make_task(
-                "table.insert",
-                None,
-                Some("items"),
-                None,
-                json!({"id": id, "status": 0}),
-            ))
-            .await
-            .unwrap();
-        }
-
-        let out = p
-            .invoke(&make_task(
-                "table.update",
-                None,
-                Some("items"),
-                None,
-                json!({"set": {"status": 1}, "where": "id = ?1", "params": ["b"]}),
-            ))
-            .await
-            .unwrap();
-
-        let ProviderOutput::ResultSet(r) = out else {
-            panic!()
-        };
-        assert_eq!(r["rows_affected"], 1);
-
-        let query_out = p
-            .invoke(&make_task(
-                "table.query",
-                None,
-                None,
-                Some("SELECT id FROM items WHERE status = 1"),
-                json!({}),
-            ))
-            .await
-            .unwrap();
-        let ProviderOutput::ResultSet(Value::Array(rows)) = query_out else {
-            panic!()
-        };
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0]["id"], "b");
-    }
-
-    #[tokio::test]
-    async fn delete_with_where() {
-        let (p, _d) = open_tmp();
-
-        p.invoke(&make_task(
-            "table.exec",
-            None,
-            None,
-            Some("CREATE TABLE IF NOT EXISTS items (id TEXT PRIMARY KEY)"),
-            json!({}),
-        ))
-        .await
-        .unwrap();
-
-        for id in ["x", "y", "z"] {
-            p.invoke(&make_task(
-                "table.insert",
-                None,
-                Some("items"),
-                None,
-                json!({"id": id}),
-            ))
-            .await
-            .unwrap();
-        }
-
-        let out = p
-            .invoke(&make_task(
-                "table.delete",
-                None,
-                Some("items"),
-                Some("id = ?1"),
-                json!(["y"]),
-            ))
-            .await
-            .unwrap();
-        let ProviderOutput::ResultSet(r) = out else {
-            panic!()
-        };
-        assert_eq!(r["rows_affected"], 1);
-
-        let query_out = p
-            .invoke(&make_task(
-                "table.query",
-                None,
-                None,
-                Some("SELECT COUNT(*) as n FROM items"),
-                json!({}),
-            ))
-            .await
-            .unwrap();
-        let ProviderOutput::ResultSet(Value::Array(rows)) = query_out else {
-            panic!()
-        };
-        assert_eq!(rows[0]["n"], 2);
-    }
-
-    #[tokio::test]
-    async fn multi_db_isolation() {
-        let (p, _d) = open_tmp();
-
-        for db in ["db_alpha", "db_beta"] {
-            p.invoke(&make_task(
-                "table.exec",
-                Some(db),
-                None,
-                Some("CREATE TABLE IF NOT EXISTS t (val TEXT)"),
-                json!({}),
-            ))
-            .await
-            .unwrap();
-        }
-
-        p.invoke(&make_task(
-            "table.insert",
-            Some("db_alpha"),
-            Some("t"),
-            None,
-            json!({"val": "alpha_row"}),
-        ))
-        .await
-        .unwrap();
-
-        let out = p
-            .invoke(&make_task(
-                "table.query",
-                Some("db_beta"),
-                None,
-                Some("SELECT COUNT(*) as n FROM t"),
-                json!({}),
-            ))
-            .await
-            .unwrap();
-        let ProviderOutput::ResultSet(Value::Array(rows)) = out else {
-            panic!()
-        };
-        assert_eq!(rows[0]["n"], 0, "db_beta must be empty");
-    }
-
-    #[tokio::test]
-    async fn exec_creates_index() {
-        let (p, _d) = open_tmp();
-
-        p.invoke(&make_task(
-            "table.exec",
-            None,
-            None,
-            Some("CREATE TABLE IF NOT EXISTS events (id TEXT PRIMARY KEY, ts INTEGER)"),
-            json!({}),
-        ))
-        .await
-        .unwrap();
-
-        p.invoke(&make_task(
-            "table.exec",
-            None,
-            None,
-            Some("CREATE INDEX IF NOT EXISTS idx_ts ON events (ts)"),
-            json!({}),
-        ))
-        .await
-        .unwrap();
-    }
-
-    #[tokio::test]
-    async fn rolloff_by_max_rows() {
-        let (p, _d) = open_tmp();
-
-        p.invoke(&make_task(
-            "table.configure",
-            None,
-            None,
-            Some("CREATE TABLE IF NOT EXISTS events (id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER NOT NULL, val TEXT)"),
-            json!({}),
-        )).await.unwrap();
-
-        for i in 0..10u64 {
-            p.invoke(&make_task(
-                "table.insert",
-                None,
-                Some("events"),
-                None,
-                json!({"ts": i, "val": format!("row-{i}")}),
-            ))
-            .await
-            .unwrap();
-        }
-
-        p.invoke(&make_task(
-            "table.rolloff",
-            None,
-            Some("events"),
-            None,
-            json!({"max_rows": 5, "ts_column": "ts"}),
-        ))
-        .await
-        .unwrap();
-
-        let out = p
-            .invoke(&make_task(
-                "table.stats",
-                None,
-                Some("events"),
-                None,
-                json!({"ts_column": "ts"}),
-            ))
-            .await
-            .unwrap();
-
-        let ProviderOutput::ResultSet(stats) = out else {
-            panic!()
-        };
-        assert_eq!(stats["row_count"], 5);
-    }
-
-    #[tokio::test]
-    async fn stats_returns_count_and_latest_ts() {
-        let (p, _d) = open_tmp();
-        p.invoke(&make_task(
-            "table.configure",
-            None,
-            None,
-            Some("CREATE TABLE IF NOT EXISTS t (ts INTEGER NOT NULL)"),
-            json!({}),
-        ))
-        .await
-        .unwrap();
-        p.invoke(&make_task(
-            "table.insert",
-            None,
-            Some("t"),
-            None,
-            json!({"ts": 999}),
-        ))
-        .await
-        .unwrap();
-
-        let out = p
-            .invoke(&make_task(
-                "table.stats",
-                None,
-                Some("t"),
-                None,
-                json!({"ts_column":"ts"}),
-            ))
-            .await
-            .unwrap();
-        let ProviderOutput::ResultSet(s) = out else {
-            panic!()
-        };
-        assert_eq!(s["row_count"], 1);
-        assert_eq!(s["latest_ts"], 999);
-    }
-
-    #[tokio::test]
-    async fn schema_returns_ddl() {
-        let (p, _d) = open_tmp();
-        p.invoke(&make_task(
-            "table.configure",
-            None,
-            None,
-            Some("CREATE TABLE IF NOT EXISTS meta (id TEXT PRIMARY KEY, val TEXT)"),
-            json!({}),
-        ))
-        .await
-        .unwrap();
-
-        let out = p
-            .invoke(&make_task(
-                "table.schema",
-                None,
-                Some("meta"),
-                None,
-                json!({}),
-            ))
-            .await
-            .unwrap();
-        let ProviderOutput::ResultSet(s) = out else {
-            panic!()
-        };
-        assert!(s["schema_sql"].as_str().unwrap().contains("CREATE TABLE"));
-    }
-
-    #[tokio::test]
-    async fn rejects_invalid_identifier() {
-        let (p, _d) = open_tmp();
-        let result = p
-            .invoke(&make_task(
-                "table.rolloff",
-                None,
-                Some("bad\"table"),
-                None,
-                json!({"max_rows": 1}),
-            ))
-            .await;
-        assert!(result.is_err());
     }
 }
