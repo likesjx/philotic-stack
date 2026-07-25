@@ -60,7 +60,7 @@ use tokio::sync::{Mutex, RwLock, mpsc};
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
-pub(super) const OPERATOR_SURFACE_QUERY_TIMEOUT_SECS: u64 = 5;
+pub(super) const OPERATOR_SURFACE_QUERY_TIMEOUT_SECS: u64 = 30;
 
 pub(crate) type InboxRegistry = Arc<Mutex<HashMap<String, Vec<RoleSubscriber>>>>;
 
@@ -1633,15 +1633,12 @@ impl IpcServer {
             IpcResponse::Standard { ok: true, .. } => {}
             other => anyhow::bail!("unexpected remote guest query emit response: {other:?}"),
         }
-        let reply = tokio::time::timeout(
-            std::time::Duration::from_secs(OPERATOR_SURFACE_QUERY_TIMEOUT_SECS),
-            client.recv_task(),
+        let task_json = Self::recv_operator_surface_reply(
+            &mut client,
+            OPERATOR_SURFACE_QUERY_TIMEOUT_SECS,
+            "remote guest inventory",
         )
-        .await
-        .map_err(|_| anyhow::anyhow!("timed out waiting for remote guest inventory reply"))??;
-        let IpcResponse::InboundTask { task_json, .. } = reply else {
-            anyhow::bail!("unexpected remote guest inventory reply envelope: {reply:?}");
-        };
+        .await?;
         let view: OperatorTargetGuestInventoryView = serde_json::from_str(&task_json)?;
         if view.target_node_id != target_node_id {
             anyhow::bail!(
@@ -1726,15 +1723,12 @@ impl IpcServer {
             IpcResponse::Standard { ok: true, .. } => {}
             other => anyhow::bail!("unexpected remote status query emit response: {other:?}"),
         }
-        let reply = tokio::time::timeout(
-            std::time::Duration::from_secs(OPERATOR_SURFACE_QUERY_TIMEOUT_SECS),
-            client.recv_task(),
+        let task_json = Self::recv_operator_surface_reply(
+            &mut client,
+            OPERATOR_SURFACE_QUERY_TIMEOUT_SECS,
+            "remote target status",
         )
-        .await
-        .map_err(|_| anyhow::anyhow!("timed out waiting for remote target status reply"))??;
-        let IpcResponse::InboundTask { task_json, .. } = reply else {
-            anyhow::bail!("unexpected remote target status reply envelope: {reply:?}");
-        };
+        .await?;
         let view: OperatorTargetStatusView = serde_json::from_str(&task_json)?;
         if view.target_node_id != target_node_id {
             anyhow::bail!(
@@ -11945,22 +11939,12 @@ impl IpcServer {
             other => anyhow::bail!("EmitTask for deploy_bundle failed: {other:?}"),
         }
 
-        let reply = tokio::time::timeout(std::time::Duration::from_secs(30), client.recv_task())
-            .await
-            .map_err(|_| {
-                anyhow::anyhow!(
-                    "timed out waiting for deploy_bundle reply from '{}'",
-                    dest_hotel
-                )
-            })??;
-
-        let IpcResponse::InboundTask {
-            task_json: reply_json,
-            ..
-        } = reply
-        else {
-            anyhow::bail!("unexpected deploy_bundle reply: {reply:?}");
-        };
+        let reply_json = Self::recv_operator_surface_reply(
+            &mut client,
+            OPERATOR_SURFACE_QUERY_TIMEOUT_SECS,
+            &format!("deploy_bundle from '{dest_hotel}'"),
+        )
+        .await?;
         let result: serde_json::Value = serde_json::from_str(&reply_json)?;
         if result.get("ok").and_then(|v| v.as_bool()) != Some(true) {
             let msg = result

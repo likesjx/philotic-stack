@@ -27,7 +27,7 @@ use tokio::sync::RwLock;
 use uuid::Uuid;
 
 impl IpcServer {
-    fn classify_operator_surface_reply(
+    pub(super) fn classify_operator_surface_reply(
         response: IpcResponse,
         label: &str,
     ) -> anyhow::Result<Option<String>> {
@@ -41,7 +41,7 @@ impl IpcServer {
         }
     }
 
-    async fn recv_operator_surface_reply(
+    pub(super) async fn recv_operator_surface_reply(
         client: &mut PhiloticClient,
         timeout_secs: u64,
         label: &str,
