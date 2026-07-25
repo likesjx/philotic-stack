@@ -186,6 +186,14 @@ fn space_labels(space: &SemanticSpace) -> &'static [&'static str] {
             "AttentionPatch",
             "SystemPatch",
         ],
+        SemanticSpace::CreativeLearningSemantic => &[
+            "Question",
+            "Idea",
+            "Experiment",
+            "Artifact",
+            "Learning",
+            "Source",
+        ],
         SemanticSpace::RolePersonSemantic => &["Role", "Person", "Value", "Preference", "Concern"],
         SemanticSpace::MemoryBridgeSemantic => &["Commitment", "Decision"],
     }

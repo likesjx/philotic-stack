@@ -367,10 +367,13 @@ impl ToolsetProfileRecord {
 pub fn tools_for_tool_class(class: &str) -> &'static [&'static str] {
     match class {
         "life_graph" => &[
+            "life.capture",
             "life.observe",
             "life.observe.batch",
             "life.recall",
             "life.recall.feedback",
+            "life.flywheel.brief",
+            "life.flywheel.review",
             "life.commit",
             "life.resolve",
             "life.conflict",

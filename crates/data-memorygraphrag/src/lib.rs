@@ -364,6 +364,7 @@ pub enum SemanticSpace {
     LifeEventSemantic,
     GoalSystemSemantic,
     SkillToolSemantic,
+    CreativeLearningSemantic,
     RolePersonSemantic,
     MemoryBridgeSemantic,
 }
@@ -1236,10 +1237,13 @@ impl ContextPacket {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LifeGraphToolName {
+    LifeCapture,
     LifeObserve,
     LifeObserveBatch,
     LifeRecall,
     LifeRecallFeedback,
+    LifeFlywheelBrief,
+    LifeFlywheelReview,
     LifeCommit,
     LifeResolve,
     LifeConflict,
@@ -1249,10 +1253,13 @@ pub enum LifeGraphToolName {
 impl LifeGraphToolName {
     pub fn as_str(&self) -> &'static str {
         match self {
+            Self::LifeCapture => "life.capture",
             Self::LifeObserve => "life.observe",
             Self::LifeObserveBatch => "life.observe.batch",
             Self::LifeRecall => "life.recall",
             Self::LifeRecallFeedback => "life.recall.feedback",
+            Self::LifeFlywheelBrief => "life.flywheel.brief",
+            Self::LifeFlywheelReview => "life.flywheel.review",
             Self::LifeCommit => "life.commit",
             Self::LifeResolve => "life.resolve",
             Self::LifeConflict => "life.conflict",
@@ -1263,7 +1270,8 @@ impl LifeGraphToolName {
     pub fn mutates_graph(&self) -> bool {
         matches!(
             self,
-            Self::LifeObserve
+            Self::LifeCapture
+                | Self::LifeObserve
                 | Self::LifeObserveBatch
                 | Self::LifeRecallFeedback
                 | Self::LifeCommit
@@ -1303,6 +1311,11 @@ impl LifeGraphToolSpec {
 pub fn life_graph_tool_catalog() -> Vec<LifeGraphToolSpec> {
     vec![
         LifeGraphToolSpec::new(
+            LifeGraphToolName::LifeCapture,
+            "Capture a question, idea, source, experiment, artifact, learning, or unclassified inbox item as proposed Life Graph evidence.",
+            false,
+        ),
+        LifeGraphToolSpec::new(
             LifeGraphToolName::LifeObserve,
             "Capture a grounded observation as proposed Life Graph evidence.",
             false,
@@ -1320,6 +1333,16 @@ pub fn life_graph_tool_catalog() -> Vec<LifeGraphToolSpec> {
         LifeGraphToolSpec::new(
             LifeGraphToolName::LifeRecallFeedback,
             "Record retrieval quality feedback and emit governed graph-improvement signals.",
+            false,
+        ),
+        LifeGraphToolSpec::new(
+            LifeGraphToolName::LifeFlywheelBrief,
+            "Read a bounded resume, make, and unblock brief from active creative-learning threads.",
+            false,
+        ),
+        LifeGraphToolSpec::new(
+            LifeGraphToolName::LifeFlywheelReview,
+            "Read bounded weekly creative-learning flow metrics and stale-inbox signals.",
             false,
         ),
         LifeGraphToolSpec::new(
@@ -1740,6 +1763,236 @@ impl GrowthLoopPolicy {
     }
 }
 
+/// Minimal classification accepted by the universal `life.capture` path.
+///
+/// `Inbox` deliberately maps to a proposed `Signal` with
+/// `inbox_state=unclassified`: capture first, classify later. The explicit
+/// creative kinds map to the governed creative-learning labels.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LifeCaptureKind {
+    #[default]
+    Inbox,
+    Question,
+    Idea,
+    Source,
+    Experiment,
+    Artifact,
+    Learning,
+}
+
+impl LifeCaptureKind {
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Inbox => "Signal",
+            Self::Question => "Question",
+            Self::Idea => "Idea",
+            Self::Source => "Source",
+            Self::Experiment => "Experiment",
+            Self::Artifact => "Artifact",
+            Self::Learning => "Learning",
+        }
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Inbox => "inbox",
+            Self::Question => "question",
+            Self::Idea => "idea",
+            Self::Source => "source",
+            Self::Experiment => "experiment",
+            Self::Artifact => "artifact",
+            Self::Learning => "learning",
+        }
+    }
+}
+
+fn default_capture_confidence() -> f32 {
+    0.8
+}
+
+/// Low-friction input for `life.capture`.
+///
+/// Only `content` is required. Everything else is optional context that
+/// improves provenance or lets the caller connect the capture to an existing
+/// LifeGraph node without turning capture into a taxonomy form.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LifeCaptureInput {
+    pub content: String,
+    #[serde(default)]
+    pub kind: LifeCaptureKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pilot_domain: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_by: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_role: Option<String>,
+    #[serde(default = "default_capture_confidence")]
+    pub confidence: f32,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub edges: Vec<ObserveEdge>,
+    #[serde(default)]
+    pub metadata: serde_json::Value,
+}
+
+impl LifeCaptureInput {
+    pub fn validate(&self) -> Result<(), ContractError> {
+        let mut violations = Vec::new();
+        require_non_empty(&mut violations, "content", &self.content);
+        if self.content.chars().count() > 2_000 {
+            violations.push("content must be at most 2000 characters".into());
+        }
+        require_unit_interval(&mut violations, "confidence", self.confidence);
+        if self
+            .pilot_domain
+            .as_deref()
+            .is_some_and(|domain| domain.chars().count() > 120)
+        {
+            violations.push("pilot_domain must be at most 120 characters".into());
+        }
+        for (idx, edge) in self.edges.iter().enumerate() {
+            if !cypher::is_living_cycle_rel_type(&edge.rel_type) {
+                violations.push(format!(
+                    "edges[{idx}].rel_type '{}' is not a living-cycle relation (expected one of {})",
+                    edge.rel_type,
+                    cypher::LIVING_CYCLE_REL_TYPES.join(", ")
+                ));
+            }
+            require_non_empty(
+                &mut violations,
+                &format!("edges[{idx}].target_id"),
+                &edge.target_id,
+            );
+        }
+        finish_validation(violations)
+    }
+
+    pub fn into_observe_input(self) -> Result<LifeObserveInput, ContractError> {
+        self.validate()?;
+
+        let suffix = ulid::Ulid::new().to_string().to_lowercase();
+        let kind = self.kind.as_str();
+        let label = self.kind.label();
+        let source_id = self
+            .source_id
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| "agent:quick-capture".into());
+        let source_kind = if source_id.starts_with("membrane:") {
+            SourceKind::MembraneEvent
+        } else {
+            SourceKind::RuntimeObservation
+        };
+        let inbox_state = matches!(self.kind, LifeCaptureKind::Inbox).then_some("unclassified");
+        let creative_status = if inbox_state.is_some() {
+            "inbox"
+        } else {
+            "captured"
+        };
+
+        Ok(LifeObserveInput {
+            observation_id: format!("obs:creative:{suffix}"),
+            evidence: EvidencePacket {
+                packet_id: format!("evidence:creative:{suffix}"),
+                claim_ref: GraphRecordRef {
+                    id: format!("life:{kind}:{suffix}"),
+                    label: label.into(),
+                    datasource: Some("life-graph".into()),
+                },
+                claim_summary: self.content.trim().to_string(),
+                source_refs: vec![SourceRef {
+                    source_id,
+                    source_kind,
+                    reliability: SourceReliability {
+                        score: 0.95,
+                        basis: ReliabilityBasis::DirectObservation,
+                    },
+                    uri: None,
+                    captured_at: None,
+                }],
+                passage_refs: Vec::new(),
+                confidence: self.confidence,
+                validation_state: ValidationState::Proposed,
+                observed_at: None,
+                valid_time_range: None,
+                source_reliability: 0.95,
+                conflict_ids: Vec::new(),
+                adjudication_status: AdjudicationStatus::NotNeeded,
+                metadata: serde_json::json!({
+                    "captured_via": "life.capture",
+                    "capture_kind": kind,
+                    "creative_status": creative_status,
+                    "inbox_state": inbox_state,
+                    "pilot_domain": self.pilot_domain,
+                    "caller_metadata": self.metadata,
+                }),
+            },
+            proposed_graph_refs: Vec::new(),
+            observed_by: self.observed_by,
+            observed_role: self.observed_role,
+            edges: self.edges,
+            provenance: None,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LifeFlywheelBriefInput {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pilot_domain: Option<String>,
+}
+
+impl LifeFlywheelBriefInput {
+    pub fn validate(&self) -> Result<(), ContractError> {
+        let mut violations = Vec::new();
+        if self
+            .pilot_domain
+            .as_deref()
+            .is_some_and(|domain| domain.chars().count() > 120)
+        {
+            violations.push("pilot_domain must be at most 120 characters".into());
+        }
+        finish_validation(violations)
+    }
+}
+
+fn default_review_lookback_days() -> u16 {
+    7
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LifeFlywheelReviewInput {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pilot_domain: Option<String>,
+    #[serde(default = "default_review_lookback_days")]
+    pub lookback_days: u16,
+}
+
+impl Default for LifeFlywheelReviewInput {
+    fn default() -> Self {
+        Self {
+            pilot_domain: None,
+            lookback_days: default_review_lookback_days(),
+        }
+    }
+}
+
+impl LifeFlywheelReviewInput {
+    pub fn validate(&self) -> Result<(), ContractError> {
+        LifeFlywheelBriefInput {
+            pilot_domain: self.pilot_domain.clone(),
+        }
+        .validate()?;
+        if !(1..=90).contains(&self.lookback_days) {
+            return Err(ContractError {
+                violations: vec!["lookback_days must be between 1 and 90".into()],
+            });
+        }
+        Ok(())
+    }
+}
+
 /// A typed living-cycle edge proposed alongside a `life.observe` node write.
 ///
 /// `rel_type` must be one of [`cypher::LIVING_CYCLE_REL_TYPES`]
@@ -2063,9 +2316,12 @@ impl LifeViewNeighborhoodInput {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "tool", content = "input", rename_all = "snake_case")]
 pub enum LifeGraphToolRequest {
+    LifeCapture(LifeCaptureInput),
     LifeObserve(LifeObserveInput),
     LifeRecall(RetrievalQuery),
     LifeRecallFeedback(RetrievalFeedbackInput),
+    LifeFlywheelBrief(LifeFlywheelBriefInput),
+    LifeFlywheelReview(LifeFlywheelReviewInput),
     LifeCommit(LifeCommitInput),
     LifeResolve(LifeResolveInput),
     LifePatchPropose(LifePatchProposalInput),
@@ -2074,9 +2330,12 @@ pub enum LifeGraphToolRequest {
 impl LifeGraphToolRequest {
     pub fn tool_name(&self) -> LifeGraphToolName {
         match self {
+            Self::LifeCapture(_) => LifeGraphToolName::LifeCapture,
             Self::LifeObserve(_) => LifeGraphToolName::LifeObserve,
             Self::LifeRecall(_) => LifeGraphToolName::LifeRecall,
             Self::LifeRecallFeedback(_) => LifeGraphToolName::LifeRecallFeedback,
+            Self::LifeFlywheelBrief(_) => LifeGraphToolName::LifeFlywheelBrief,
+            Self::LifeFlywheelReview(_) => LifeGraphToolName::LifeFlywheelReview,
             Self::LifeCommit(_) => LifeGraphToolName::LifeCommit,
             Self::LifeResolve(_) => LifeGraphToolName::LifeResolve,
             Self::LifePatchPropose(_) => LifeGraphToolName::LifePatchPropose,
@@ -2156,15 +2415,32 @@ impl MemoryGraphRagRunner {
 
     pub fn plan(&self, request: LifeGraphToolRequest) -> Result<RunnerPlan, ContractError> {
         match request {
+            LifeGraphToolRequest::LifeCapture(input) => self.plan_capture(input),
             LifeGraphToolRequest::LifeObserve(input) => self.plan_observe(input),
             LifeGraphToolRequest::LifeRecall(query) => self.plan_recall(query),
             LifeGraphToolRequest::LifeRecallFeedback(feedback) => {
                 self.plan_recall_feedback(feedback)
             }
+            LifeGraphToolRequest::LifeFlywheelBrief(input) => self.plan_flywheel_brief(input),
+            LifeGraphToolRequest::LifeFlywheelReview(input) => self.plan_flywheel_review(input),
             LifeGraphToolRequest::LifeCommit(input) => self.plan_commit(input),
             LifeGraphToolRequest::LifeResolve(input) => self.plan_resolve(input),
             LifeGraphToolRequest::LifePatchPropose(input) => self.plan_patch_propose(input),
         }
+    }
+
+    fn plan_capture(&self, input: LifeCaptureInput) -> Result<RunnerPlan, ContractError> {
+        input.validate()?;
+        Ok(RunnerPlan {
+            tool_name: LifeGraphToolName::LifeCapture,
+            steps: vec![RunnerPlanStep {
+                target: RunnerPlanTarget::GraphDatasource,
+                action: "life.capture".into(),
+                payload: serde_json::to_value(input).unwrap_or_default(),
+            }],
+            requires_operator: false,
+            blocked_reasons: Vec::new(),
+        })
     }
 
     fn plan_observe(&self, input: LifeObserveInput) -> Result<RunnerPlan, ContractError> {
@@ -2232,6 +2508,40 @@ impl MemoryGraphRagRunner {
                     }),
                 },
             ],
+            requires_operator: false,
+            blocked_reasons: Vec::new(),
+        })
+    }
+
+    fn plan_flywheel_brief(
+        &self,
+        input: LifeFlywheelBriefInput,
+    ) -> Result<RunnerPlan, ContractError> {
+        input.validate()?;
+        Ok(RunnerPlan {
+            tool_name: LifeGraphToolName::LifeFlywheelBrief,
+            steps: vec![RunnerPlanStep {
+                target: RunnerPlanTarget::GraphDatasource,
+                action: "life.flywheel.brief".into(),
+                payload: serde_json::to_value(input).unwrap_or_default(),
+            }],
+            requires_operator: false,
+            blocked_reasons: Vec::new(),
+        })
+    }
+
+    fn plan_flywheel_review(
+        &self,
+        input: LifeFlywheelReviewInput,
+    ) -> Result<RunnerPlan, ContractError> {
+        input.validate()?;
+        Ok(RunnerPlan {
+            tool_name: LifeGraphToolName::LifeFlywheelReview,
+            steps: vec![RunnerPlanStep {
+                target: RunnerPlanTarget::GraphDatasource,
+                action: "life.flywheel.review".into(),
+                payload: serde_json::to_value(input).unwrap_or_default(),
+            }],
             requires_operator: false,
             blocked_reasons: Vec::new(),
         })
@@ -3154,16 +3464,19 @@ mod tests {
 
         // Must stay in lockstep with the grant surface: the `life_graph` tool
         // class (ansible_mesh_core::graph::tools_for_tool_class) and the
-        // `life.steward` skill both expose all 8 life.* tools. A declared
+        // `life.steward` skill both expose the complete life.* surface. A declared
         // catalog narrower than the grant surface is the PR #271 failure
         // pattern (granted tool with no declared route).
         assert_eq!(
             tool_names,
             vec![
+                "life.capture",
                 "life.observe",
                 "life.observe.batch",
                 "life.recall",
                 "life.recall.feedback",
+                "life.flywheel.brief",
+                "life.flywheel.review",
                 "life.commit",
                 "life.resolve",
                 "life.conflict",
@@ -3183,6 +3496,80 @@ mod tests {
                 .find(|tool| tool.tool_name == "life.recall.feedback")
                 .expect("recall feedback spec")
                 .mutates_graph
+        );
+    }
+
+    #[test]
+    fn quick_capture_defaults_to_unclassified_proposed_signal() {
+        let observe = LifeCaptureInput {
+            content: "Explore how musical motifs can teach graph traversal.".into(),
+            kind: LifeCaptureKind::Inbox,
+            pilot_domain: Some("creative-coding".into()),
+            source_id: Some("membrane:telegram".into()),
+            observed_by: Some("agent-astrid-01".into()),
+            observed_role: Some("librarian".into()),
+            confidence: 0.8,
+            edges: vec![],
+            metadata: serde_json::json!({"client": "telegram"}),
+        }
+        .into_observe_input()
+        .expect("quick capture should expand into governed observation");
+
+        assert_eq!(observe.evidence.claim_ref.label, "Signal");
+        assert_eq!(observe.evidence.validation_state, ValidationState::Proposed);
+        assert_eq!(observe.evidence.metadata["capture_kind"], "inbox");
+        assert_eq!(observe.evidence.metadata["inbox_state"], "unclassified");
+        assert_eq!(observe.evidence.metadata["pilot_domain"], "creative-coding");
+        assert_eq!(observe.observed_by.as_deref(), Some("agent-astrid-01"));
+    }
+
+    #[test]
+    fn explicit_idea_capture_uses_creative_label_and_remains_proposed() {
+        let observe = LifeCaptureInput {
+            content: "Make a playable LifeGraph explorer.".into(),
+            kind: LifeCaptureKind::Idea,
+            pilot_domain: None,
+            source_id: None,
+            observed_by: None,
+            observed_role: None,
+            confidence: 0.8,
+            edges: vec![],
+            metadata: serde_json::Value::Null,
+        }
+        .into_observe_input()
+        .expect("idea capture should expand");
+
+        assert_eq!(observe.evidence.claim_ref.label, "Idea");
+        assert!(observe.evidence.claim_ref.id.starts_with("life:idea:"));
+        assert_eq!(observe.evidence.metadata["creative_status"], "captured");
+        assert!(observe.evidence.metadata["inbox_state"].is_null());
+    }
+
+    #[test]
+    fn flywheel_read_tools_are_non_mutating_and_validate_bounds() {
+        let runner = MemoryGraphRagRunner::default();
+        let brief = runner
+            .plan(LifeGraphToolRequest::LifeFlywheelBrief(
+                LifeFlywheelBriefInput::default(),
+            ))
+            .expect("brief should plan");
+        let review = runner
+            .plan(LifeGraphToolRequest::LifeFlywheelReview(
+                LifeFlywheelReviewInput::default(),
+            ))
+            .expect("review should plan");
+
+        assert!(!brief.tool_name.mutates_graph());
+        assert!(!review.tool_name.mutates_graph());
+        assert_eq!(brief.steps[0].action, "life.flywheel.brief");
+        assert_eq!(review.steps[0].action, "life.flywheel.review");
+        assert!(
+            LifeFlywheelReviewInput {
+                pilot_domain: None,
+                lookback_days: 0,
+            }
+            .validate()
+            .is_err()
         );
     }
 

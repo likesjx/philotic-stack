@@ -1,6 +1,7 @@
 use anyhow::{Context, Result, bail};
 use philotic_client::{GuestIdentity, IpcRequest, IpcResponse};
 use serde_json::{Value, json};
+use std::time::Instant;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
 use tokio::time::{Duration, timeout};
@@ -58,6 +59,74 @@ async fn main() -> Result<()> {
         bail!("life.observe expected embed_status=ok, got {observe_payload}");
     }
     println!("life.observe IPC ok  node_id={node_id}");
+
+    // Creative-learning slice: optional until every deployed runner has V006
+    // and the three-tool flywheel surface. This proves quick capture and both
+    // bounded read paths through the real hotel route.
+    if std::env::var("LIFE_GRAPH_SMOKE_FLYWHEEL").as_deref() == Ok("1") {
+        let capture_started = Instant::now();
+        let capture_payload = execute_life_tool(
+            &mut client,
+            &target_node,
+            &reply_node,
+            "life.capture",
+            capture_input(),
+        )
+        .await?;
+        assert_success_capability(&capture_payload, "life.capture")?;
+        let capture_data = &capture_payload["result"]["data"];
+        if capture_data["status"].as_str() != Some("proposed")
+            || capture_data["captured_via"].as_str() != Some("life.capture")
+        {
+            bail!("life.capture returned malformed proposed capture: {capture_payload}");
+        }
+        let capture_elapsed_ms = capture_started.elapsed().as_millis();
+        if capture_elapsed_ms >= 10_000 {
+            bail!("life.capture exceeded the sub-ten-second contract: {capture_elapsed_ms} ms");
+        }
+        println!(
+            "life.capture IPC ok  node_id={} kind={} elapsed_ms={capture_elapsed_ms}",
+            capture_data["node_id"], capture_data["capture_kind"],
+        );
+
+        let brief_payload = execute_life_tool(
+            &mut client,
+            &target_node,
+            &reply_node,
+            "life.flywheel.brief",
+            flywheel_brief_input(),
+        )
+        .await?;
+        assert_success_capability(&brief_payload, "life.flywheel.brief")?;
+        let brief_data = &brief_payload["result"]["data"];
+        if brief_data["status"].as_str() != Some("ok")
+            || brief_data["bounded"].as_bool() != Some(true)
+        {
+            bail!("life.flywheel.brief returned malformed brief: {brief_payload}");
+        }
+        println!(
+            "life.flywheel.brief IPC ok  resume={} make={} unblock={}",
+            brief_data["resume"], brief_data["make"], brief_data["unblock"]
+        );
+
+        let review_payload = execute_life_tool(
+            &mut client,
+            &target_node,
+            &reply_node,
+            "life.flywheel.review",
+            flywheel_review_input(),
+        )
+        .await?;
+        assert_success_capability(&review_payload, "life.flywheel.review")?;
+        let review_data = &review_payload["result"]["data"];
+        if review_data["status"].as_str() != Some("ok") || !review_data["metrics"].is_object() {
+            bail!("life.flywheel.review returned malformed review: {review_payload}");
+        }
+        println!(
+            "life.flywheel.review IPC ok  metrics={}",
+            review_data["metrics"]
+        );
+    }
 
     let recall_payload = execute_life_tool(
         &mut client,
@@ -360,6 +429,36 @@ fn recall_input() -> Value {
         "operator_intent": "open_loops_by_context",
         "max_context_packets": 5,
         "embedding": embedding
+    })
+}
+
+fn capture_input() -> Value {
+    json!({
+        "content": format!(
+            "Creative flywheel IPC smoke idea {}",
+            Uuid::new_v4().simple()
+        ),
+        "kind": "idea",
+        "pilot_domain": "LifeGraph creative systems",
+        "source_id": DRIVER_GUEST_ID,
+        "confidence": 0.9,
+        "metadata": {
+            "smoke": true,
+            "route": "hotel_ipc"
+        }
+    })
+}
+
+fn flywheel_brief_input() -> Value {
+    json!({
+        "pilot_domain": "LifeGraph creative systems"
+    })
+}
+
+fn flywheel_review_input() -> Value {
+    json!({
+        "pilot_domain": "LifeGraph creative systems",
+        "lookback_days": 7
     })
 }
 

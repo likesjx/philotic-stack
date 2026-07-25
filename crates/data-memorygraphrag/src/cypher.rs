@@ -27,6 +27,12 @@ const KNOWN_LABELS: &[&str] = &[
     "Signal",
     "GrowthHypothesis",
     "GrowthExperiment",
+    "Question",
+    "Idea",
+    "Experiment",
+    "Artifact",
+    "Learning",
+    "Source",
     "DriftFinding",
     "CapabilityPatch",
     "SkillPatch",
@@ -51,6 +57,13 @@ pub const LIVING_CYCLE_REL_TYPES: &[&str] = &[
     "SETS",
     "SPAWNS",
     "RELATES_TO",
+    "INSPIRES",
+    "INFORMS",
+    "TESTED_BY",
+    "PRODUCES",
+    "EXPRESSES",
+    "REFINES",
+    "SHARED_WITH",
     "SCOPED_TO",
 ];
 
@@ -107,6 +120,12 @@ pub struct ObserveCypher {
     pub claim_summary: String,
     pub observation_id: String,
     pub packet_id: String,
+    /// Quick-capture lifecycle fields projected from EvidencePacket.metadata.
+    /// Empty strings become null/preserve for ordinary life.observe callers.
+    pub capture_kind: String,
+    pub creative_status: String,
+    pub inbox_state: String,
+    pub pilot_domain: String,
     /// Muninn origin: engram ID of the first `MuninnEngram` source ref, if any.
     /// Preserved on the node so promotion (lifegraph-muninn-promotion seam)
     /// can trace a Life Graph fact back to its Muninn continuity source.
@@ -256,6 +275,20 @@ pub fn compile_observe(input: &LifeObserveInput, now_iso: &str) -> Result<Observ
         .provenance
         .as_ref()
         .map(|envelope| serde_json::to_string(envelope).unwrap_or_default());
+    let metadata_string = |key: &str| {
+        input
+            .evidence
+            .metadata
+            .get(key)
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .trim()
+            .to_string()
+    };
+    let capture_kind = metadata_string("capture_kind");
+    let creative_status = metadata_string("creative_status");
+    let inbox_state = metadata_string("inbox_state");
+    let pilot_domain = metadata_string("pilot_domain");
 
     // Label is whitelisted above — safe to interpolate. All string values are
     // escaped via escape_cypher_str before embedding in the query.
@@ -273,6 +306,10 @@ pub fn compile_observe(input: &LifeObserveInput, now_iso: &str) -> Result<Observ
             "n.claim_summary = $claim_summary, ",
             "n.observation_id = $observation_id, ",
             "n.packet_id = $packet_id, ",
+            "n.capture_kind = CASE $capture_kind WHEN '' THEN null ELSE $capture_kind END, ",
+            "n.creative_status = CASE $creative_status WHEN '' THEN null ELSE $creative_status END, ",
+            "n.inbox_state = CASE $inbox_state WHEN '' THEN null ELSE $inbox_state END, ",
+            "n.pilot_domain = CASE $pilot_domain WHEN '' THEN null ELSE $pilot_domain END, ",
             "n.observed_by = $observed_by, ",
             "n.observed_role = CASE $observed_role WHEN '' THEN null ELSE $observed_role END, ",
             "n.origin_engram_id = CASE $origin_engram_id WHEN '' THEN null ELSE $origin_engram_id END, ",
@@ -282,6 +319,10 @@ pub fn compile_observe(input: &LifeObserveInput, now_iso: &str) -> Result<Observ
             "n.confidence = $confidence, ",
             "n.observation_id = $observation_id, ",
             "n.packet_id = $packet_id, ",
+            "n.capture_kind = CASE $capture_kind WHEN '' THEN n.capture_kind ELSE $capture_kind END, ",
+            "n.creative_status = CASE $creative_status WHEN '' THEN n.creative_status ELSE $creative_status END, ",
+            "n.inbox_state = CASE $inbox_state WHEN '' THEN n.inbox_state ELSE $inbox_state END, ",
+            "n.pilot_domain = CASE $pilot_domain WHEN '' THEN n.pilot_domain ELSE $pilot_domain END, ",
             "n.observed_by = $observed_by, ",
             "n.observed_role = CASE $observed_role WHEN '' THEN null ELSE $observed_role END, ",
             "n.provenance_envelope = CASE $provenance_envelope WHEN '' THEN n.provenance_envelope ELSE $provenance_envelope END ",
@@ -305,6 +346,10 @@ pub fn compile_observe(input: &LifeObserveInput, now_iso: &str) -> Result<Observ
         claim_summary: input.evidence.claim_summary.clone(),
         observation_id: input.observation_id.clone(),
         packet_id: input.evidence.packet_id.clone(),
+        capture_kind,
+        creative_status,
+        inbox_state,
+        pilot_domain,
         origin_engram_id,
         origin_trust,
         provenance_envelope_json,
@@ -1268,6 +1313,13 @@ mod tests {
                 "SETS",
                 "SPAWNS",
                 "RELATES_TO",
+                "INSPIRES",
+                "INFORMS",
+                "TESTED_BY",
+                "PRODUCES",
+                "EXPRESSES",
+                "REFINES",
+                "SHARED_WITH",
                 "SCOPED_TO"
             ]
         );

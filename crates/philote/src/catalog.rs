@@ -296,10 +296,13 @@ pub fn skill_implied_tools(skill_name: &str) -> &'static [&'static str] {
             "graph.grant_access",
         ],
         "life.steward" => &[
+            "life.capture",
             "life.observe",
             "life.observe.batch",
             "life.recall",
             "life.recall.feedback",
+            "life.flywheel.brief",
+            "life.flywheel.review",
             "life.commit",
             "life.resolve",
             "life.conflict",
@@ -320,10 +323,13 @@ pub fn skill_implied_tools(skill_name: &str) -> &'static [&'static str] {
 pub fn tools_for_skill(skill_name: &str) -> &'static [&'static str] {
     match skill_name {
         "life.steward" => &[
+            "life.capture",
             "life.observe",
             "life.observe.batch",
             "life.recall",
             "life.recall.feedback",
+            "life.flywheel.brief",
+            "life.flywheel.review",
             "life.commit",
             "life.resolve",
             "life.conflict",
@@ -418,8 +424,18 @@ pub fn skill_is_relevant_for_turn(skill_name: &str, turn_text: &str) -> bool {
                 || t.contains("habits")
                 || t.contains("signal node")
                 || t.contains("life.observe")
+                || t.contains("life.capture")
                 || t.contains("life.recall")
                 || t.contains("life.recall.feedback")
+                || t.contains("life.flywheel")
+                || t.contains("idea:")
+                || t.contains("question:")
+                || t.contains("source:")
+                || t.contains("experiment:")
+                || t.contains("artifact:")
+                || t.contains("learning:")
+                || t.contains("resume")
+                || t.contains("weekly review")
                 || t.contains("life.commit")
                 || t.contains("record this")
                 || t.contains("observe this")
@@ -3205,6 +3221,70 @@ fn build_catalog() -> HashMap<String, ToolDefinition> {
     // ── Life Graph OS tools ────────────────────────────────────────────────────
 
     m.insert(
+        "life.capture".into(),
+        ToolDefinition {
+            tool_name: "life.capture".into(),
+            description: "Fast, governed creative capture. Record a short question, idea, source, \
+                          experiment, artifact, learning, or unclassified inbox item in LifeGraph. \
+                          Only content is required; use kind=inbox when classification would \
+                          interrupt flow. Every capture remains proposed evidence until confirmed."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "required": ["content"],
+                "properties": {
+                    "content": {
+                        "type": "string",
+                        "maxLength": 2000,
+                        "description": "The operator's captured thought, preserving their wording."
+                    },
+                    "kind": {
+                        "type": "string",
+                        "enum": ["inbox", "question", "idea", "source", "experiment", "artifact", "learning"],
+                        "default": "inbox"
+                    },
+                    "pilot_domain": {
+                        "type": "string",
+                        "description": "Optional single creative or learning pilot domain."
+                    },
+                    "source_id": {
+                        "type": "string",
+                        "description": "Optional membrane, client, or agent source identifier."
+                    },
+                    "confidence": {
+                        "type": "number",
+                        "minimum": 0,
+                        "maximum": 1,
+                        "default": 0.8
+                    },
+                    "edges": {
+                        "type": "array",
+                        "description": "Optional governed connections to existing LifeGraph node IDs.",
+                        "items": {
+                            "type": "object",
+                            "required": ["rel_type", "target_id"],
+                            "properties": {
+                                "rel_type": {
+                                    "type": "string",
+                                    "enum": [
+                                        "OWNS", "SHAPES", "SETS", "SPAWNS", "RELATES_TO",
+                                        "INSPIRES", "INFORMS", "TESTED_BY", "PRODUCES",
+                                        "EXPRESSES", "REFINES", "SHARED_WITH"
+                                    ]
+                                },
+                                "target_id": {"type": "string"}
+                            }
+                        },
+                        "default": []
+                    },
+                    "metadata": {"type": "object", "default": {}}
+                }
+            }),
+            class: Some("life_graph".into()),
+        },
+    );
+
+    m.insert(
         "life.observe".into(),
         ToolDefinition {
             tool_name: "life.observe".into(),
@@ -3244,6 +3324,7 @@ fn build_catalog() -> HashMap<String, ToolDefinition> {
                                             Person, Role, Goal, System, Habit, Project, Commitment, \
                                             OpenLoop, NextAction, Routine, Decision, Preference, Value, \
                                             Concern, Event, Signal, GrowthHypothesis, GrowthExperiment, \
+                                            Question, Idea, Experiment, Artifact, Learning, Source, \
                                             DriftFinding, CapabilityPatch, SkillPatch, ToolPatch, \
                                             SchemaPatch, AttentionPatch, SystemPatch, StewardshipInstruction."
                                     },
@@ -3427,7 +3508,7 @@ fn build_catalog() -> HashMap<String, ToolDefinition> {
                                 "space": {
                                     "type": "string",
                                     "enum": ["life_event_semantic", "goal_system_semantic",
-                                             "skill_tool_semantic", "role_person_semantic",
+                                             "skill_tool_semantic", "creative_learning_semantic", "role_person_semantic",
                                              "memory_bridge_semantic"]
                                 },
                                 "embedding_model": {"type": "string", "default": "Xenova/all-mpnet-base-v2"},
@@ -3535,6 +3616,56 @@ fn build_catalog() -> HashMap<String, ToolDefinition> {
                         "type": "array",
                         "items": {"type": "object"},
                         "default": []
+                    }
+                }
+            }),
+            class: Some("life_graph".into()),
+        },
+    );
+
+    m.insert(
+        "life.flywheel.brief".into(),
+        ToolDefinition {
+            tool_name: "life.flywheel.brief".into(),
+            description: "Read a bounded daily creative brief from LifeGraph. Returns at most \
+                          one active question or idea to resume, one experiment or idea to make, \
+                          and one open loop or concern to unblock. This tool never writes or \
+                          invents work."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "pilot_domain": {
+                        "type": "string",
+                        "description": "Optional pilot-domain filter."
+                    }
+                }
+            }),
+            class: Some("life_graph".into()),
+        },
+    );
+
+    m.insert(
+        "life.flywheel.review".into(),
+        ToolDefinition {
+            tool_name: "life.flywheel.review".into(),
+            description: "Read bounded creative-learning flow metrics from LifeGraph: questions, \
+                          ideas, experiments, artifacts, learnings, learning reuse, \
+                          idea-to-artifact conversion, and the oldest unclassified inbox item. \
+                          Use for weekly review; do not optimize raw node count."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "pilot_domain": {
+                        "type": "string",
+                        "description": "Optional pilot-domain filter."
+                    },
+                    "lookback_days": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 90,
+                        "default": 7
                     }
                 }
             }),

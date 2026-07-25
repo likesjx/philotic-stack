@@ -27,6 +27,7 @@ pub fn index_name(space: &SemanticSpace, label: &str) -> String {
         SemanticSpace::LifeEventSemantic => "life_event_semantic",
         SemanticSpace::GoalSystemSemantic => "goal_system_semantic",
         SemanticSpace::SkillToolSemantic => "skill_tool_semantic",
+        SemanticSpace::CreativeLearningSemantic => "creative_learning_semantic",
         SemanticSpace::RolePersonSemantic => "role_person_semantic",
         SemanticSpace::MemoryBridgeSemantic => "memory_bridge_semantic",
     };
@@ -59,6 +60,14 @@ pub fn labels_for_space(space: &SemanticSpace) -> &'static [&'static str] {
             "AttentionPatch",
             "SystemPatch",
         ],
+        SemanticSpace::CreativeLearningSemantic => &[
+            "Question",
+            "Idea",
+            "Experiment",
+            "Artifact",
+            "Learning",
+            "Source",
+        ],
         SemanticSpace::RolePersonSemantic => &[
             "Role",
             "Aspiration",
@@ -84,6 +93,9 @@ pub fn embedding_space_for_label(label: &str) -> Option<&'static str> {
         "GrowthHypothesis" | "GrowthExperiment" | "DriftFinding" | "CapabilityPatch"
         | "SkillPatch" | "ToolPatch" | "SchemaPatch" | "AttentionPatch" | "SystemPatch" => {
             Some("skill_tool_semantic")
+        }
+        "Question" | "Idea" | "Experiment" | "Artifact" | "Learning" | "Source" => {
+            Some("creative_learning_semantic")
         }
         "Role" | "Aspiration" | "Person" | "Value" | "Preference" | "Concern" => {
             Some("role_person_semantic")
@@ -775,6 +787,14 @@ mod tests {
             index_name(&SemanticSpace::MemoryBridgeSemantic, "Commitment"),
             "memory_bridge_semantic__Commitment"
         );
+        assert_eq!(
+            index_name(&SemanticSpace::CreativeLearningSemantic, "Artifact"),
+            "creative_learning_semantic__Artifact"
+        );
+        assert_eq!(
+            embedding_space_for_label("Learning"),
+            Some("creative_learning_semantic")
+        );
     }
 
     #[test]
@@ -1201,7 +1221,9 @@ mod tests {
         // SCOPED_TO (LifeGraph auto-anchor Slice 1) so recall expansion
         // traverses the server-injected node->Role anchor edges too.
         assert!(
-            cypher.contains("MATCH (n)-[r:OWNS|SHAPES|SETS|SPAWNS|RELATES_TO|SCOPED_TO]-(related)")
+            cypher.contains(
+                "MATCH (n)-[r:OWNS|SHAPES|SETS|SPAWNS|RELATES_TO|INSPIRES|INFORMS|TESTED_BY|PRODUCES|EXPRESSES|REFINES|SHARED_WITH|SCOPED_TO]-(related)"
+            )
         );
         assert!(cypher.contains("n.id IN ['l:ol:a', 'l:ol:b\\'quote']"));
         assert!(cypher.contains("coalesce(related.validation_state, 'inferred') <> 'retired'"));
@@ -1219,6 +1241,13 @@ mod tests {
                 "SETS",
                 "SPAWNS",
                 "RELATES_TO",
+                "INSPIRES",
+                "INFORMS",
+                "TESTED_BY",
+                "PRODUCES",
+                "EXPRESSES",
+                "REFINES",
+                "SHARED_WITH",
                 "SCOPED_TO"
             ]
         );

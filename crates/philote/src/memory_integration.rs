@@ -747,6 +747,8 @@ pub(super) struct DirectLifeObserveCommand {
     pub(super) claim_summary: String,
     pub(super) source_id: String,
     pub(super) confidence: f64,
+    /// Present only for the universal creative quick-capture prefixes.
+    pub(super) capture_kind: Option<String>,
 }
 
 /// The imperative anchor must begin within this many characters of the start
@@ -790,6 +792,18 @@ pub(super) fn parse_direct_life_observe_command(content: &str) -> Option<DirectL
     }
 
     let lower = trimmed.to_lowercase();
+    let quick_capture = [
+        ("capture:", "Signal", "inbox"),
+        ("inbox:", "Signal", "inbox"),
+        ("question:", "Question", "question"),
+        ("idea:", "Idea", "idea"),
+        ("source:", "Source", "source"),
+        ("experiment:", "Experiment", "experiment"),
+        ("artifact:", "Artifact", "artifact"),
+        ("learning:", "Learning", "learning"),
+    ]
+    .into_iter()
+    .find(|(prefix, _, _)| lower.starts_with(prefix));
     // Bare "life.observe" mid-text is NOT a trigger — the message must either
     // START with "life.observe" or carry an imperative record anchor near the
     // front. This keeps prompts that merely mention the tool name (charters,
@@ -801,11 +815,13 @@ pub(super) fn parse_direct_life_observe_command(content: &str) -> Option<DirectL
             .is_some_and(|idx| idx <= DIRECT_LIFE_OBSERVE_ANCHOR_WINDOW)
     };
     let explicit_record_imperative = anchored("record this") || anchored("record an open loop");
-    if !starts_with_life_observe && !explicit_record_imperative {
+    if !starts_with_life_observe && !explicit_record_imperative && quick_capture.is_none() {
         return None;
     }
 
-    let label = extract_direct_life_observe_field(trimmed, "label")
+    let label = quick_capture
+        .map(|(_, label, _)| label.to_string())
+        .or_else(|| extract_direct_life_observe_field(trimmed, "label"))
         .unwrap_or_else(|| {
             if lower.contains("open loop") {
                 "OpenLoop".into()
@@ -838,6 +854,12 @@ pub(super) fn parse_direct_life_observe_command(content: &str) -> Option<DirectL
             .trim()
             .to_string();
     }
+    if let Some((prefix, _, _)) = quick_capture {
+        claim_summary = claim_summary[prefix.len()..]
+            .trim_start_matches([':', '=', ',', '-'])
+            .trim()
+            .to_string();
+    }
 
     if claim_summary.is_empty() {
         return None;
@@ -848,6 +870,7 @@ pub(super) fn parse_direct_life_observe_command(content: &str) -> Option<DirectL
         claim_summary,
         source_id,
         confidence,
+        capture_kind: quick_capture.map(|(_, _, kind)| kind.to_string()),
     })
 }
 
@@ -1000,6 +1023,10 @@ pub(super) fn direct_life_observe_input(
             "adjudication_status": "not_needed",
             "metadata": {
                 "route": "philote_direct_life_observe",
+                "captured_via": command.capture_kind.as_ref().map(|_| "quick_prefix"),
+                "capture_kind": command.capture_kind.clone(),
+                "creative_status": command.capture_kind.as_ref().map(|kind| if kind == "inbox" { "inbox" } else { "captured" }),
+                "inbox_state": command.capture_kind.as_deref().filter(|kind| *kind == "inbox").map(|_| "unclassified"),
                 "session_id": session_id,
                 "turn_id": turn_id,
                 "chat_id": chat_id,
@@ -1141,6 +1168,10 @@ pub(super) fn direct_life_observe_command_from_arguments(
         claim_summary,
         source_id,
         confidence,
+        capture_kind: evidence
+            .pointer("/metadata/capture_kind")
+            .and_then(Value::as_str)
+            .map(str::to_string),
     })
 }
 
@@ -2988,6 +3019,66 @@ mod tests {
     }
 
     #[test]
+    fn creative_quick_capture_prefixes_bypass_model_with_governed_labels() {
+        let cases = [
+            (
+                "capture: revisit generative counterpoint",
+                "Signal",
+                "inbox",
+            ),
+            (
+                "question: what makes re-entry feel effortless?",
+                "Question",
+                "question",
+            ),
+            ("idea: make a playable memory graph", "Idea", "idea"),
+            ("source: Hofstadter on strange loops", "Source", "source"),
+            (
+                "experiment: prototype the loop in one evening",
+                "Experiment",
+                "experiment",
+            ),
+            (
+                "artifact: interactive LifeGraph explorer",
+                "Artifact",
+                "artifact",
+            ),
+            (
+                "learning: constraints increased creative output",
+                "Learning",
+                "learning",
+            ),
+        ];
+
+        for (text, label, kind) in cases {
+            let parsed =
+                super::parse_direct_life_observe_command(text).expect("prefix should parse");
+            assert_eq!(parsed.label, label);
+            assert_eq!(parsed.capture_kind.as_deref(), Some(kind));
+            assert!(!parsed.claim_summary.contains(':'));
+        }
+    }
+
+    #[test]
+    fn creative_quick_capture_stamps_inbox_metadata_for_briefs() {
+        let parsed = super::parse_direct_life_observe_command("idea: build a tiny synth")
+            .expect("idea should parse");
+        let value = super::direct_life_observe_input(
+            &parsed,
+            "session-1",
+            "turn-1",
+            "chat-1",
+            "agent-astrid-01",
+            Some("librarian"),
+        );
+
+        assert_eq!(value["evidence"]["claim_ref"]["label"], "Idea");
+        assert_eq!(value["evidence"]["metadata"]["capture_kind"], "idea");
+        assert_eq!(value["evidence"]["metadata"]["creative_status"], "captured");
+        assert!(value["evidence"]["metadata"]["inbox_state"].is_null());
+    }
+
+    #[test]
     fn direct_life_observe_parser_accepts_record_this_imperative() {
         let parsed = super::parse_direct_life_observe_command(
             "Record this: mbp-jane aiua.log still lacks newsyslog rotation",
@@ -3088,6 +3179,7 @@ mod tests {
             claim_summary: "Schedule rowing habit on weekly Saturdays".into(),
             source_id: "membrane:telegram".into(),
             confidence: 0.8,
+            capture_kind: None,
         };
 
         let value = super::direct_life_observe_input(
@@ -3122,6 +3214,7 @@ mod tests {
             claim_summary: "Schedule rowing habit on weekly Saturdays".into(),
             source_id: "membrane:telegram".into(),
             confidence: 0.8,
+            capture_kind: None,
         };
 
         let value = super::direct_life_observe_input(
@@ -3164,6 +3257,7 @@ mod tests {
             claim_summary: "Schedule rowing habit on weekly Saturdays".into(),
             source_id: "membrane:telegram".into(),
             confidence: 0.8,
+            capture_kind: None,
         };
 
         let mut value = super::direct_life_observe_input(
@@ -3193,6 +3287,7 @@ mod tests {
             claim_summary: "A plain observation".into(),
             source_id: "membrane:telegram".into(),
             confidence: 0.7,
+            capture_kind: None,
         };
 
         let value = super::direct_life_observe_input(
@@ -3216,6 +3311,7 @@ mod tests {
             claim_summary: "A plain observation".into(),
             source_id: "membrane:telegram".into(),
             confidence: 0.7,
+            capture_kind: None,
         };
 
         let value = super::direct_life_observe_input(

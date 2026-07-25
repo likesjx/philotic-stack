@@ -2,7 +2,7 @@
 title: Creative Learning Flywheel Proposal
 doc_type: proposal
 domain: memory-context
-status: proposed
+status: accepted-current-slice
 last_updated: 2026-07-24
 tags:
   - creativity
@@ -55,9 +55,17 @@ Organization serves motion through this loop. If the system creates more categor
 
 ## Disposition
 
-Proposed as the outcome layer above LifeGraph, Muninn, MemPalace, and Obsidian.
+`accepted for current slice`
 
 This proposal does not create another memory store. It defines the behavior, graph vocabulary, prompts, reviews, and measures that turn the existing stores into a personal growth system.
+
+The first implementation slice uses `life.capture`,
+`life.flywheel.brief`, and `life.flywheel.review` over the canonical
+LifeGraph. All captures enter as proposed evidence; the brief and review are
+read-only. V006 is installed on the live Memgraph, the `mac-jane` catalogs and
+parser are installed, and the updated runner is smoke-green through isolated
+hotel IPC against the live Memgraph and ONNX sidecar. The supervised
+`vps-jane` runner has not been replaced yet.
 
 ## Ownership By Stage
 
@@ -95,7 +103,10 @@ Learning --REFINES--> Idea | Goal | Method
 Artifact --SHARED_WITH--> Person | Audience
 ```
 
-These are proposed schema additions. They become canonical only after the LifeGraph schema and validation path accept them.
+These labels and relationships are accepted for the current slice through
+`V006__creative_learning_flywheel.cypher` and the server-side LifeGraph
+allowlists. They remain governed by the normal proposed-write and confirmation
+path.
 
 ## Agent Behaviors
 
@@ -171,15 +182,19 @@ Node count, note count, and captured-token count are diagnostics, not success me
 
 ## Current Slice
 
-Run one four-week pilot in a single creative or learning domain:
+Run one four-week pilot in the `LifeGraph creative systems` domain:
 
-1. Accept the minimal growth vocabulary behind proposed-write gates.
-2. Add sub-ten-second quick capture.
-3. Generate a daily bounded “resume, make, unblock” brief.
+1. Use the accepted minimal growth vocabulary behind proposed-write gates.
+2. Capture with `life.capture` or the model-bypass prefixes `capture:`,
+   `question:`, `idea:`, `source:`, `experiment:`, `artifact:`, and
+   `learning:`.
+3. Generate a daily bounded “resume, make, unblock” brief with
+   `life.flywheel.brief`.
 4. Select one idea each week and define its smallest experiment.
-5. produce at least one artifact
-6. close each experiment with a learning and retrieval-usefulness signal
-7. review the measures and remove friction before expanding scope
+5. Produce at least one artifact.
+6. Close each experiment with a learning and retrieval-usefulness signal.
+7. Review the measures with `life.flywheel.review` and remove friction before
+   expanding scope.
 
 ## Success Measures For The Pilot
 
@@ -199,4 +214,9 @@ Run one four-week pilot in a single creative or learning domain:
 
 ## Next Seam
 
-Implement `creative-learning-flywheel` only after the episodic and Obsidian projection lanes can supply provenance-backed context. Begin with one domain and optimize for completed creative loops, not graph density.
+With explicit authorization to transfer the source or built artifact, install
+the updated runner into the supervised `vps-jane` service and prove the
+production routed capture, brief, and review path. Then activate the daily
+brief and weekly review cadence and run the four-week `LifeGraph creative
+systems` pilot. Expand only after the review shows artifacts, learning reuse,
+and lower re-entry cost without excess maintenance.

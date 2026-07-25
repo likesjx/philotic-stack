@@ -357,10 +357,13 @@ impl AgentRuntime {
         bypass_approval: bool,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + '_>> {
         Box::pin(async move {
-            // Per-agent provenance: life.observe writes must record WHO observed
+            // Per-agent provenance: life.capture/life.observe writes must record WHO observed
             // (canonical agent id), not just the membrane transport. Stamp the
             // runtime's identity (and active role, if any) unless already set.
-            if tool_call.tool_name == "life.observe" {
+            if matches!(
+                tool_call.tool_name.as_str(),
+                "life.capture" | "life.observe"
+            ) {
                 if let Some(args) = tool_call.arguments.as_object_mut() {
                     let has_observed_by = args
                         .get("observed_by")

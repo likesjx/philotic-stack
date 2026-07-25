@@ -4895,9 +4895,12 @@ fn is_graph_datasource_tool(tool_name: &str) -> bool {
 fn is_life_graph_tool(tool_name: &str) -> bool {
     matches!(
         tool_name,
-        "life.observe"
+        "life.capture"
+            | "life.observe"
             | "life.recall"
             | "life.recall.feedback"
+            | "life.flywheel.brief"
+            | "life.flywheel.review"
             | "life.commit"
             | "life.resolve"
             | "life.conflict"

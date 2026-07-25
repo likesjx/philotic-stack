@@ -270,13 +270,15 @@ Proposal: [CREATIVE_LEARNING_FLYWHEEL_PROPOSAL.md](/Users/jaredlikes/code/philot
 
 Seam ID: `creative-learning-flywheel`
 
-- [ ] Choose one four-week creative or learning pilot domain.
-- [ ] Validate the proposed `Question`, `Idea`, `Experiment`, `Artifact`, `Learning`, and `Source` vocabulary behind LifeGraph proposed-write gates.
-- [ ] Add a sub-ten-second quick-capture path with an inbox state and deferred classification.
-- [ ] Generate a bounded daily brief containing one thread to resume, one small making action, and one momentum blocker.
+- [x] Choose `LifeGraph creative systems` as the first four-week pilot domain.
+- [x] Validate the `Question`, `Idea`, `Experiment`, `Artifact`, `Learning`, and `Source` vocabulary behind LifeGraph proposed-write gates.
+- [x] Add a sub-ten-second quick-capture path with an inbox state and deferred classification (`life.capture` plus direct capture prefixes).
+- [x] Generate a bounded daily brief containing one thread to resume, one small making action, and one momentum blocker (`life.flywheel.brief`).
+- [x] Apply and verify V006 on the live Memgraph, install the updated `mac-jane` catalogs/parser, and smoke the updated runner through isolated hotel IPC against the live Memgraph and ONNX sidecar (548 ms measured quick capture).
+- [ ] With explicit source/artifact-transfer authorization, install the updated runner into the supervised `vps-jane` service and prove the production routed capture/brief/review path.
 - [ ] Advance at least four ideas, complete at least two experiments, and create or share at least one artifact.
 - [ ] Close experiments with reusable learning and recall-usefulness feedback.
-- [ ] Review artifact rate, idea-to-artifact conversion, learning reuse, re-entry time, and maintenance cost before expanding scope.
+- [ ] Run the weekly `life.flywheel.review` over the pilot and review artifact rate, idea-to-artifact conversion, learning reuse, re-entry time, and maintenance cost before expanding scope.
 
 ### WI 1: Session Management
 

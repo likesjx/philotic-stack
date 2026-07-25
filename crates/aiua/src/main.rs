@@ -3603,6 +3603,31 @@ fn seed_abstract_tool_catalog(graph: &GraphDomain) -> anyhow::Result<()> {
             tool_markers: Vec::new(),
         },
         AbstractToolRecord {
+            tool_name: "life.capture".into(),
+            description: "Fast governed creative capture. Only content is required; unclassified \
+                          captures stay in a proposed inbox until deliberately connected or promoted."
+                .into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "content": { "type": "string", "maxLength": 2000 },
+                    "kind": {
+                        "type": "string",
+                        "enum": ["inbox", "question", "idea", "source", "experiment", "artifact", "learning"],
+                        "default": "inbox"
+                    },
+                    "pilot_domain": { "type": "string" },
+                    "source_id": { "type": "string" },
+                    "confidence": { "type": "number", "minimum": 0.0, "maximum": 1.0, "default": 0.8 },
+                    "edges": { "type": "array", "items": { "type": "object" }, "default": [] },
+                    "metadata": { "type": "object", "default": {} }
+                },
+                "required": ["content"]
+            }),
+            class: "life_graph".into(),
+            tool_markers: vec!["low_friction".into(), "proposed_write".into()],
+        },
+        AbstractToolRecord {
             tool_name: "life.observe".into(),
             description: "Write an observation to the life graph. Use to record open loops, \
                           goals, commitments, signals, or events that matter to the agent or user. \
@@ -3629,7 +3654,10 @@ fn seed_abstract_tool_catalog(graph: &GraphDomain) -> anyhow::Result<()> {
                                     "label": {
                                         "type": "string",
                                         "description": "Graph node label.",
-                                        "enum": ["Signal", "OpenLoop", "Commitment", "Event", "Goal", "Insight"]
+                                        "enum": [
+                                            "Signal", "OpenLoop", "Commitment", "Event", "Goal",
+                                            "Question", "Idea", "Experiment", "Artifact", "Learning", "Source"
+                                        ]
                                     }
                                 },
                                 "required": ["id", "label"]
@@ -3761,6 +3789,35 @@ fn seed_abstract_tool_catalog(graph: &GraphDomain) -> anyhow::Result<()> {
             }),
             class: "life_graph".into(),
             tool_markers: vec!["feedback".into(), "self_improving".into()],
+        },
+        AbstractToolRecord {
+            tool_name: "life.flywheel.brief".into(),
+            description: "Read at most one creative thread to resume, one experiment or idea to \
+                          make, and one blocker to clear. Read-only and bounded."
+                .into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "pilot_domain": { "type": "string" }
+                }
+            }),
+            class: "life_graph".into(),
+            tool_markers: vec!["read_only".into(), "bounded".into()],
+        },
+        AbstractToolRecord {
+            tool_name: "life.flywheel.review".into(),
+            description: "Read weekly creative-learning flow metrics and the oldest unclassified \
+                          inbox item. Read-only; raw node count is a diagnostic, not the goal."
+                .into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "pilot_domain": { "type": "string" },
+                    "lookback_days": { "type": "integer", "minimum": 1, "maximum": 90, "default": 7 }
+                }
+            }),
+            class: "life_graph".into(),
+            tool_markers: vec!["read_only".into(), "review".into()],
         },
         AbstractToolRecord {
             tool_name: "life.commit".into(),
@@ -4244,10 +4301,13 @@ fn seed_abstract_skill_catalog(graph: &GraphDomain) -> anyhow::Result<()> {
                           per-merge pings."
                 .into(),
             implied_tools: vec![
+                "life.capture".into(),
                 "life.observe".into(),
                 "life.observe.batch".into(),
                 "life.recall".into(),
                 "life.recall.feedback".into(),
+                "life.flywheel.brief".into(),
+                "life.flywheel.review".into(),
                 "life.commit".into(),
                 "life.resolve".into(),
                 "life.conflict".into(),
@@ -4878,10 +4938,13 @@ fn seed_toolset_profiles(graph: &GraphDomain) -> anyhow::Result<()> {
                 "target_node": remote_node,
                 "target_role": "life-graph-runner",
                 "supported_tools": [
+                    "life.capture",
                     "life.observe",
                     "life.observe.batch",
                     "life.recall",
                     "life.recall.feedback",
+                    "life.flywheel.brief",
+                    "life.flywheel.review",
                     "life.commit",
                     "life.resolve",
                     "life.conflict",
