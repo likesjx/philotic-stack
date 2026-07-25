@@ -98,6 +98,8 @@ jobs:
             -p membrane-telegram \
             -p membrane-discord \
             -p membrane-mcp \
+            -p membrane-mcp-client \
+            -p egress-http-runner \
             -p model-router \
             -p tool-runner \
             -p graph-datasource \
@@ -138,6 +140,7 @@ jobs:
           # in philotic_binaries but are not build outputs (the ansible remote
           # path stats-and-skips them), so they are intentionally NOT required here.
           for bin in aiua philote philote-worker membrane-telegram membrane-discord membrane-mcp \
+                     membrane-mcp-client egress-http-runner \
                      model-router model-controller-elevenlabs \
                      model-controller-gemini model-controller-openai \
                      model-controller-anthropic \
