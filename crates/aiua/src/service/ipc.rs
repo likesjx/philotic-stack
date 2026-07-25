@@ -13905,7 +13905,7 @@ fn default_visible_toolset(bindings: &serde_json::Value) -> Vec<String> {
         .and_then(serde_json::Value::as_array)
     {
         // Class grants resolved hotel-side and carried on the bindings by
-        // `compose_session_bindings`, so this stays a pure function of the
+        // `compose_session_snapshot`, so this stays a pure function of the
         // bindings and the class expansion cannot drift between the two.
         let class_grants = bindings.get("resolved_class_grants");
         for class in classes.iter().filter_map(serde_json::Value::as_str) {

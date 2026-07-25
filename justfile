@@ -425,6 +425,12 @@ smoke-agent-graph:
 smoke-desktop-membrane:
     bash scripts/smoke-desktop-membrane.sh
 
+# Run the data-driven tool-grants roundtrip smoke: disable a tool at runtime with
+# no rebuild, prove it leaves the composed session snapshot, and prove the boot
+# seeder does not revert it across a hotel restart (ephemeral throwaway hotel).
+smoke-tool-grants:
+    bash scripts/smoke-tool-grants-roundtrip.sh
+
 # Run the `phil config get/set` IPC roundtrip smoke (ephemeral throwaway hotel)
 smoke-config:
     bash scripts/smoke-config-roundtrip.sh
