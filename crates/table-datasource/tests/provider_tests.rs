@@ -958,3 +958,58 @@ async fn ungranted_agent_cannot_reach_a_snapshot() {
         "ungranted agent must not see the snapshot: {names:?}"
     );
 }
+
+/// Snapshots are plaintext copies of external databases. They must be
+/// owner-only on disk, and removed when the provider shuts down cleanly.
+#[cfg(unix)]
+#[tokio::test]
+async fn snapshots_are_owner_only_and_purged_on_drop() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let ext = TempDir::new().unwrap();
+    let ext_provider = SqliteTableProvider::new(ext.path()).unwrap();
+    seed_signals(&ext_provider, Some("private")).await;
+
+    let dir = TempDir::new().unwrap();
+    let snap_dir = dir.path().join(".snapshots");
+    let snap = snap_dir.join("private.db");
+
+    {
+        let p = write_catalog(
+            &dir,
+            json!([{
+                "name": "private",
+                "path": ext.path().join("private.db").to_str().unwrap(),
+                "mode": "ro",
+                "snapshot_on_read": true,
+                "snapshot_ttl_secs": 3600
+            }]),
+        );
+        p.invoke(&make_task(
+            "table.query",
+            Some("private"),
+            None,
+            Some("SELECT COUNT(*) AS n FROM signals"),
+            json!({}),
+        ))
+        .await
+        .unwrap();
+
+        assert!(snap.exists(), "snapshot should have been taken");
+        let file_mode = std::fs::metadata(&snap).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            file_mode, 0o600,
+            "snapshot must be owner-only, got {file_mode:o}"
+        );
+        let dir_mode = std::fs::metadata(&snap_dir).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            dir_mode, 0o700,
+            "snapshot dir must be owner-only, got {dir_mode:o}"
+        );
+    } // provider dropped here
+
+    assert!(
+        !snap_dir.exists(),
+        "snapshots must not outlive a clean provider shutdown"
+    );
+}

@@ -133,15 +133,27 @@ That directory did not previously hold private data, and it is in scope for
 backup scripts, `phil reset`, and worktree-gc — the copy can silently end up in
 a backup tarball.
 
-Mitigations in place: the snapshot is not reachable by any database name an
-agent can spell (proven by `ungranted_agent_cannot_reach_a_snapshot` — the
-`.snapshots` directory is not enumerated as a profile database, and `.`/`/` are
-rejected by the name validator), and reads never create a profile database, so
-name-probing cannot litter or shadow.
+Mitigations in place:
 
-Not yet addressed — worth a follow-up before this is used for anything more
-sensitive: `chmod 0600` on snapshot files, unlink on clean shutdown, and an
-explicit backup-exclusion for `.snapshots/`.
+- **Unreachable by name** — no database name an agent can spell resolves to a
+  snapshot (`ungranted_agent_cannot_reach_a_snapshot`: the `.snapshots`
+  directory is not enumerated as a profile database, and `.`/`/` are rejected
+  by the name validator). Reads also never create a profile database, so
+  name-probing can neither litter nor shadow.
+- **Owner-only on disk** — snapshot files are `0600` and the directory `0700`,
+  applied *before* the copy runs so the file is never briefly world-readable
+  while filling with private rows, and re-asserted after the connection closes
+  (`snapshots_are_owner_only_and_purged_on_drop`).
+- **Purged on clean shutdown** — `Drop` removes `.snapshots/` entirely, so a
+  normal hotel restart leaves no plaintext copy behind. Best-effort by
+  construction: a `SIGKILL` (`phil flush`) skips destructors, which is exactly
+  why the files are owner-only as well. Cost: a restart re-copies rather than
+  reusing a within-TTL snapshot — cheap, and it keeps the data fresher.
+
+Still open: `.snapshots/` is not yet excluded from backup tooling. Until it is,
+a backup taken while the hotel is running can capture the copy. Worth closing
+before this is pointed at anything more sensitive than the operator's own
+messages on their own machine.
 
 ### 4. Per-agent grants
 
@@ -259,7 +271,7 @@ authority and must change too.
 
 ## Verification
 
-`cargo test -p table-datasource` — 25 tests: the 9 pre-existing behavior tests
+`cargo test -p table-datasource` — 26 tests: the 9 pre-existing behavior tests
 (kept green) plus builder unit tests and per-seam integration tests:
 traversal rejection, unknown-catalog-database rejection, ro write-kind
 rejection, smuggled-write rejection through the read lane, agent-SQL ATTACH

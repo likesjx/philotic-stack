@@ -140,6 +140,11 @@ impl SqliteTableProvider {
     fn ensure_snapshot(&self, entry: &CatalogEntry, src: &Path) -> Result<(PathBuf, bool)> {
         let snap_dir = self.base_dir.join(".snapshots");
         std::fs::create_dir_all(&snap_dir)?;
+        // A snapshot is a full plaintext copy of the source — for the iMessage
+        // entry that is the operator's whole message corpus. Keep it owner-only
+        // so it is not readable by other local accounts, and lock the directory
+        // down too (SQLite may drop transient -journal/-wal siblings in here).
+        restrict_to_owner(&snap_dir, 0o700);
         let snap = snap_dir.join(format!("{}.db", entry.name));
 
         let fresh = std::fs::metadata(&snap)
@@ -158,12 +163,53 @@ impl SqliteTableProvider {
         )?;
         let _ = std::fs::remove_file(&snap);
         let mut dst_conn = Connection::open(&snap)?;
-        let backup = rusqlite::backup::Backup::new(&src_conn, &mut dst_conn)?;
-        backup.run_to_completion(256, Duration::from_millis(5), None)?;
+        // Tighten before the copy runs, so the file is never briefly world-readable
+        // while it fills with private rows.
+        restrict_to_owner(&snap, 0o600);
+        {
+            let backup = rusqlite::backup::Backup::new(&src_conn, &mut dst_conn)?;
+            backup.run_to_completion(256, Duration::from_millis(5), None)?;
+        }
+        drop(dst_conn);
+        // Re-assert after the connection closes, in case SQLite recreated the file.
+        restrict_to_owner(&snap, 0o600);
         info!(db = entry.name, src = %src.display(), "snapshot refreshed");
         Ok((snap, true))
     }
 
+    /// Best-effort removal of every snapshot this provider materialized. Called
+    /// on drop so a clean shutdown does not leave plaintext copies of external
+    /// databases lying in the profile directory. Not a guarantee — a SIGKILL
+    /// (`phil flush`) skips it — which is why the files are owner-only in the
+    /// first place.
+    fn purge_snapshots(&self) {
+        let snap_dir = self.base_dir.join(".snapshots");
+        if snap_dir.exists() && std::fs::remove_dir_all(&snap_dir).is_ok() {
+            info!(dir = %snap_dir.display(), "purged database snapshots on shutdown");
+        }
+    }
+}
+
+impl Drop for SqliteTableProvider {
+    fn drop(&mut self) {
+        self.purge_snapshots();
+    }
+}
+
+/// Restrict a path to owner-only access. No-op on non-Unix.
+fn restrict_to_owner(path: &Path, mode: u32) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode));
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (path, mode);
+    }
+}
+
+impl SqliteTableProvider {
     /// Resolve `attach` database names to (alias, path) pairs, enforcing a read
     /// grant on every attached database. Attached databases are always opened
     /// read-only regardless of their own mode.
