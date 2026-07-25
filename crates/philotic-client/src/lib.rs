@@ -1790,6 +1790,37 @@ pub enum IpcRequest {
         owner_agent_id: String,
         credential: String,
     },
+    /// Register or update a governed outbound integration binding.
+    RegisterIntegrationBinding {
+        binding: ansible_mesh_core::integration::IntegrationBinding,
+    },
+    /// Revoke a binding owned by the calling agent.
+    RevokeIntegrationBinding {
+        binding_id: String,
+        owner_agent_id: String,
+    },
+    /// Return bindings with placement resolved against current mesh state.
+    GetIntegrationBindings {},
+    /// Store or rotate a binding credential at its selected execution hotel.
+    ///
+    /// Plaintext is accepted only on this operator/owner IPC mutation surface;
+    /// responses and durable binding records contain only the vault reference.
+    ProvisionIntegrationCredential {
+        binding_id: String,
+        owner_agent_id: String,
+        credential: String,
+    },
+    /// Append secret-free, content-free egress execution evidence.
+    RecordIntegrationAudit {
+        audit: ansible_mesh_core::integration::HttpIntegrationAudit,
+    },
+    /// Read recent integration audit records, newest first.
+    GetIntegrationAudit {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        binding_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        limit: Option<u32>,
+    },
     // ── Training data admin IPC ───────────────────────────────────────────────
     /// List voice training samples. Responds with [`IpcResponse::Standard`] (data.samples).
     ListTrainingSamples {
@@ -1886,8 +1917,10 @@ pub enum IpcRequest {
     GetPerimeterStatus,
     /// Force the hotel's PerimeterService to re-derive the snapshot from live interfaces.
     RefreshPerimeter,
-    /// Ask the hotel's EgressGateway whether an outbound request is permitted and
-    /// inject vault-backed credentials for the target host if applicable.
+    /// Ask the hotel's EgressGateway whether an outbound request is permitted.
+    ///
+    /// This is authorization-only. Credential values stay inside the hotel
+    /// executor that performs the eventual request.
     /// Responds with [`IpcResponse::EgressGrant`].
     CheckEgress {
         /// Calling agent's ID (used for vault access decisions).
@@ -2624,6 +2657,18 @@ pub enum IpcResponse {
     McpUpstreamsState {
         mcp_upstreams: Vec<McpUpstreamEntry>,
     },
+    /// Response to integration binding mutations.
+    IntegrationBindingRegistered {
+        binding_id: String,
+        materialized_node_id: Option<String>,
+    },
+    /// Response to [`IpcRequest::GetIntegrationBindings`].
+    IntegrationBindingsState {
+        integration_bindings: Vec<IntegrationBindingEntry>,
+    },
+    IntegrationAuditState {
+        integration_audits: Vec<ansible_mesh_core::integration::HttpIntegrationAudit>,
+    },
     DiscordGatewayLease {
         granted: bool,
         lease: Option<LeaseEnvelope>,
@@ -2721,10 +2766,11 @@ pub enum IpcResponse {
         /// If `allowed` is false, the reason for denial.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         deny_reason: Option<String>,
-        /// Headers to inject into the outbound request (e.g. `Authorization: Bearer <token>`).
-        /// Only populated when `allowed` is true and a vault credential was resolved.
+        /// Whether policy has a credential binding for the target.
+        ///
+        /// The credential is not resolved or returned by this response.
         #[serde(default)]
-        inject_headers: std::collections::HashMap<String, String>,
+        credential_binding_configured: bool,
     },
     RouterStats {
         stats: Vec<ansible_mesh_core::router_trace::ProviderStats>,
@@ -2779,6 +2825,16 @@ pub struct McpUpstreamEntry {
     /// Last catalog report from the mcp-client guest, if any yet.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub catalog: Option<ansible_mesh_core::mcp_upstream::McpUpstreamCatalog>,
+}
+
+/// One integration binding plus its current placement resolution.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct IntegrationBindingEntry {
+    pub binding: ansible_mesh_core::integration::IntegrationBinding,
+    pub placement: ansible_mesh_core::integration::EgressPlacementDecision,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_node_id: Option<String>,
+    pub exit_hotel_reachable: bool,
 }
 
 impl IpcResponse {
@@ -4863,5 +4919,57 @@ mod tests {
             }
             other => panic!("expected Standard, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn egress_grant_never_serializes_credential_headers() {
+        let response = IpcResponse::EgressGrant {
+            allowed: true,
+            audit: true,
+            deny_reason: None,
+            credential_binding_configured: true,
+        };
+
+        let wire = serde_json::to_value(&response).expect("serialize egress grant");
+        assert_eq!(wire["allowed"], true);
+        assert_eq!(wire["credential_binding_configured"], true);
+        assert!(
+            wire.get("inject_headers").is_none(),
+            "egress check responses must not carry resolved credential headers"
+        );
+
+        let decoded: IpcResponse = serde_json::from_value(wire).expect("deserialize egress grant");
+        assert!(matches!(
+            decoded,
+            IpcResponse::EgressGrant {
+                allowed: true,
+                audit: true,
+                credential_binding_configured: true,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn legacy_egress_grant_headers_are_ignored_by_new_clients() {
+        let legacy = serde_json::json!({
+            "allowed": true,
+            "audit": false,
+            "deny_reason": null,
+            "inject_headers": {
+                "Authorization": "Bearer legacy-secret"
+            }
+        });
+
+        let decoded: IpcResponse =
+            serde_json::from_value(legacy).expect("deserialize legacy egress grant");
+        assert!(matches!(
+            decoded,
+            IpcResponse::EgressGrant {
+                allowed: true,
+                credential_binding_configured: false,
+                ..
+            }
+        ));
     }
 }

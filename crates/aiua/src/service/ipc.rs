@@ -3120,37 +3120,37 @@ impl IpcServer {
                             .as_deref()
                             .map(|s| s.ceiling())
                             .unwrap_or_default();
-                        let mut req = EgressRequest {
+                        let req = EgressRequest {
                             agent_id: agent_id.clone(),
                             target_url: target_url.clone(),
                             method: method.clone(),
                             headers: std::collections::HashMap::new(),
+                            traffic_class: perimeter_core::egress::EgressTrafficClass::GeneralApi,
                             tier,
                         };
                         let resp = match egress_gw.as_deref() {
                             Some(gw) => {
                                 let decision = gw.check(&req);
-                                if decision.is_allowed() {
-                                    let _ = gw.inject_credentials(&mut req).await;
-                                }
+                                let credential_binding_configured =
+                                    decision.is_allowed() && gw.credential_binding_configured(&req);
                                 match decision {
                                     EgressDecision::Allow => IpcResponse::EgressGrant {
                                         allowed: true,
                                         audit: false,
                                         deny_reason: None,
-                                        inject_headers: req.headers,
+                                        credential_binding_configured,
                                     },
                                     EgressDecision::AllowWithAudit => IpcResponse::EgressGrant {
                                         allowed: true,
                                         audit: true,
                                         deny_reason: None,
-                                        inject_headers: req.headers,
+                                        credential_binding_configured,
                                     },
                                     EgressDecision::Deny { reason } => IpcResponse::EgressGrant {
                                         allowed: false,
                                         audit: false,
                                         deny_reason: Some(reason),
-                                        inject_headers: std::collections::HashMap::new(),
+                                        credential_binding_configured: false,
                                     },
                                 }
                             }
@@ -3158,7 +3158,7 @@ impl IpcServer {
                                 allowed: true,
                                 audit: false,
                                 deny_reason: None,
-                                inject_headers: std::collections::HashMap::new(),
+                                credential_binding_configured: false,
                             },
                         };
                         let _ = outbound_tx.send(resp);
@@ -4229,6 +4229,115 @@ impl IpcServer {
                 .guest_id
                 .strip_prefix(owner_agent_id)
                 .is_some_and(|rest| rest.starts_with(':'))
+    }
+
+    /// Resolve a binding's exit policy against the live mesh registry and map
+    /// the policy hotel identity to its concrete node id.
+    async fn integration_binding_entry(
+        binding: ansible_mesh_core::integration::IntegrationBinding,
+        registry: &Arc<RwLock<NodeRegistry>>,
+        graph: &GraphDomain,
+        local_node_id: &str,
+    ) -> philotic_client::IntegrationBindingEntry {
+        use ansible_mesh_core::integration::{
+            EgressPlacementDecision, EgressPlacementPolicy, decide_egress_placement,
+        };
+
+        let requested_hotel = match &binding.placement {
+            EgressPlacementPolicy::PreferHotel { hotel_id, .. }
+            | EgressPlacementPolicy::RequireHotel { hotel_id } => Some(hotel_id.as_str()),
+            EgressPlacementPolicy::Local | EgressPlacementPolicy::Deny => None,
+        };
+        let local_hotel = Self::local_hotel_name(graph, local_node_id);
+        let mut exit_node_id = None;
+        let mut exit_hotel_reachable = requested_hotel.is_none();
+
+        if let Some(hotel_id) = requested_hotel {
+            if hotel_id == local_node_id || local_hotel.as_deref() == Some(hotel_id) {
+                exit_node_id = Some(local_node_id.to_string());
+                exit_hotel_reachable = true;
+            } else {
+                let guard = registry.read().await;
+                if let Some(status) = guard.active_nodes().find(|status| {
+                    status.capabilities.node_id == hotel_id
+                        || Self::target_hotel_name(
+                            graph,
+                            status,
+                            local_hotel.as_deref().unwrap_or_default(),
+                        ) == hotel_id
+                }) {
+                    let node_id = status.capabilities.node_id.clone();
+                    exit_hotel_reachable =
+                        status.execution_reachability.is_some() && guard.is_node_healthy(&node_id);
+                    exit_node_id = Some(node_id);
+                }
+            }
+        }
+
+        let placement = decide_egress_placement(&binding.placement, exit_hotel_reachable);
+        let execution_node_id = match &placement {
+            EgressPlacementDecision::ExecuteLocal { .. } => Some(local_node_id.to_string()),
+            EgressPlacementDecision::ExecuteAtHotel { .. } => exit_node_id,
+            EgressPlacementDecision::Deny { .. } => None,
+        };
+        philotic_client::IntegrationBindingEntry {
+            binding,
+            placement,
+            execution_node_id,
+            exit_hotel_reachable,
+        }
+    }
+
+    async fn materialize_integration_runner(
+        entry: &philotic_client::IntegrationBindingEntry,
+        registry: &Arc<RwLock<NodeRegistry>>,
+        graph: &GraphDomain,
+        materialization_requester: Option<&dyn GuestMaterializationRequester>,
+        local_node_id: &str,
+    ) -> Option<String> {
+        let target_node_id = entry.execution_node_id.as_deref()?;
+        let target_hotel = if target_node_id == local_node_id {
+            Self::local_hotel_name(graph, local_node_id)?
+        } else {
+            let guard = registry.read().await;
+            let status = guard.get_node(target_node_id)?;
+            Self::target_hotel_name(
+                graph,
+                status,
+                Self::local_hotel_name(graph, local_node_id)
+                    .as_deref()
+                    .unwrap_or_default(),
+            )
+        };
+        let guest_id = format!("{target_hotel}:egress-http");
+
+        let response = Self::handle_operator_target_request(
+            IpcRequest::SetOperatorTargetComponentActive {
+                target_node_id: target_node_id.to_string(),
+                guest_id,
+                active: true,
+            },
+            registry,
+            graph,
+            materialization_requester,
+            local_node_id,
+        )
+        .await;
+        match response {
+            IpcResponse::OperatorTargetComponentMutationAckView {
+                operator_target_component_mutation,
+            } if operator_target_component_mutation.ok => Some(target_node_id.to_string()),
+            IpcResponse::Standard { ok: true, .. } => Some(target_node_id.to_string()),
+            other => {
+                warn!(
+                    binding_id = entry.binding.binding_id,
+                    target_node_id,
+                    ?other,
+                    "integration binding persisted but runner materialization did not complete"
+                );
+                None
+            }
+        }
     }
 
     async fn process_request(
@@ -9167,6 +9276,497 @@ impl IpcServer {
                 )
             }
 
+            // ── Governed outbound integration registry ───────────────────────
+            IpcRequest::RegisterIntegrationBinding { binding } => {
+                use ansible_mesh_core::integration::{IntegrationBinding, IntegrationTarget};
+
+                let binding_id = binding.binding_id.clone();
+                if !Self::mcp_owner_identity_ok(current_identity, &binding.owner_agent_id) {
+                    return IpcResponse::error(
+                        "integration_binding",
+                        "FORBIDDEN",
+                        format!(
+                            "owner_agent_id '{}' does not match the registered guest identity",
+                            binding.owner_agent_id
+                        ),
+                    );
+                }
+                if let Err(message) = binding.validate() {
+                    return IpcResponse::error("integration_binding", "INVALID_BINDING", message);
+                }
+                if let IntegrationTarget::Mcp { upstream_id } = &binding.target {
+                    let upstreams: std::collections::HashMap<
+                        String,
+                        ansible_mesh_core::mcp_upstream::McpUpstreamConfig,
+                    > = graph
+                        .get_config_value("__mcp_upstreams__")
+                        .ok()
+                        .flatten()
+                        .and_then(|value| serde_json::from_str(&value).ok())
+                        .unwrap_or_default();
+                    if !upstreams.contains_key(upstream_id) {
+                        return IpcResponse::error(
+                            "integration_binding",
+                            "MCP_UPSTREAM_NOT_FOUND",
+                            format!("no MCP upstream is registered as '{upstream_id}'"),
+                        );
+                    }
+                }
+
+                let mut bindings: std::collections::HashMap<String, IntegrationBinding> = graph
+                    .get_config_value("__integration_bindings__")
+                    .ok()
+                    .flatten()
+                    .and_then(|value| serde_json::from_str(&value).ok())
+                    .unwrap_or_default();
+                if let Some(existing) = bindings.get(&binding_id) {
+                    if existing.owner_agent_id != binding.owner_agent_id {
+                        return IpcResponse::error(
+                            "integration_binding",
+                            "FORBIDDEN",
+                            format!(
+                                "binding '{binding_id}' is owned by '{}'",
+                                existing.owner_agent_id
+                            ),
+                        );
+                    }
+                    if binding.updated_at < existing.updated_at {
+                        return IpcResponse::error(
+                            "integration_binding",
+                            "STALE_UPDATE",
+                            format!(
+                                "binding update timestamp {} predates current {}",
+                                binding.updated_at, existing.updated_at
+                            ),
+                        );
+                    }
+                }
+                bindings.insert(binding_id.clone(), binding.clone());
+                let serialized = match serde_json::to_string(&bindings) {
+                    Ok(value) => value,
+                    Err(error) => {
+                        return IpcResponse::error(
+                            "integration_binding",
+                            "SERIALIZE_ERROR",
+                            error.to_string(),
+                        );
+                    }
+                };
+                if let Err(error) = graph.set_config_value("__integration_bindings__", &serialized)
+                {
+                    return IpcResponse::error(
+                        "integration_binding",
+                        "CONFIG_STORE_ERROR",
+                        error.to_string(),
+                    );
+                }
+
+                let entry =
+                    Self::integration_binding_entry(binding, registry, graph, local_node_id).await;
+                let materialized_node_id =
+                    if matches!(entry.binding.target, IntegrationTarget::Http(_))
+                        && !matches!(
+                            entry.placement,
+                            ansible_mesh_core::integration::EgressPlacementDecision::Deny { .. }
+                        )
+                    {
+                        Self::materialize_integration_runner(
+                            &entry,
+                            registry,
+                            graph,
+                            materialization_requester,
+                            local_node_id,
+                        )
+                        .await
+                    } else {
+                        None
+                    };
+                info!(
+                    binding_id,
+                    execution_node_id = ?entry.execution_node_id,
+                    materialized_node_id = ?materialized_node_id,
+                    "outbound integration binding registered"
+                );
+                IpcResponse::IntegrationBindingRegistered {
+                    binding_id,
+                    materialized_node_id,
+                }
+            }
+
+            IpcRequest::RevokeIntegrationBinding {
+                binding_id,
+                owner_agent_id,
+            } => {
+                use ansible_mesh_core::integration::IntegrationBinding;
+                if !Self::mcp_owner_identity_ok(current_identity, &owner_agent_id) {
+                    return IpcResponse::error(
+                        "integration_binding",
+                        "FORBIDDEN",
+                        format!(
+                            "owner_agent_id '{owner_agent_id}' does not match the registered guest identity"
+                        ),
+                    );
+                }
+                let mut bindings: std::collections::HashMap<String, IntegrationBinding> = graph
+                    .get_config_value("__integration_bindings__")
+                    .ok()
+                    .flatten()
+                    .and_then(|value| serde_json::from_str(&value).ok())
+                    .unwrap_or_default();
+                match bindings.get(&binding_id) {
+                    Some(binding) if binding.owner_agent_id == owner_agent_id => {}
+                    Some(binding) => {
+                        return IpcResponse::error(
+                            "integration_binding",
+                            "FORBIDDEN",
+                            format!(
+                                "binding '{binding_id}' is owned by '{}'",
+                                binding.owner_agent_id
+                            ),
+                        );
+                    }
+                    None => {
+                        return IpcResponse::error(
+                            "integration_binding",
+                            "NOT_FOUND",
+                            format!("no integration binding is registered as '{binding_id}'"),
+                        );
+                    }
+                }
+                bindings.remove(&binding_id);
+                if let Err(error) = graph.set_config_value(
+                    "__integration_bindings__",
+                    &serde_json::to_string(&bindings).unwrap_or_else(|_| "{}".into()),
+                ) {
+                    return IpcResponse::error(
+                        "integration_binding",
+                        "CONFIG_STORE_ERROR",
+                        error.to_string(),
+                    );
+                }
+                info!(binding_id, "outbound integration binding revoked");
+                IpcResponse::IntegrationBindingRegistered {
+                    binding_id,
+                    materialized_node_id: None,
+                }
+            }
+
+            IpcRequest::GetIntegrationBindings {} => {
+                use ansible_mesh_core::integration::IntegrationBinding;
+                let bindings: std::collections::HashMap<String, IntegrationBinding> = graph
+                    .get_config_value("__integration_bindings__")
+                    .ok()
+                    .flatten()
+                    .and_then(|value| serde_json::from_str(&value).ok())
+                    .unwrap_or_default();
+                let mut entries = Vec::with_capacity(bindings.len());
+                for binding in bindings.into_values() {
+                    entries.push(
+                        Self::integration_binding_entry(binding, registry, graph, local_node_id)
+                            .await,
+                    );
+                }
+                entries
+                    .sort_by(|left, right| left.binding.binding_id.cmp(&right.binding.binding_id));
+                IpcResponse::IntegrationBindingsState {
+                    integration_bindings: entries,
+                }
+            }
+
+            IpcRequest::RecordIntegrationAudit { audit } => {
+                let authorized = current_identity
+                    .as_ref()
+                    .is_some_and(|identity| identity.role == "egress-http-runner");
+                if !authorized {
+                    return IpcResponse::error(
+                        "integration_audit",
+                        "FORBIDDEN",
+                        "only the egress-http-runner role may append integration audits",
+                    );
+                }
+                if audit.finished_at_ms < audit.started_at_ms
+                    || audit.binding_id.is_empty()
+                    || audit.tool_name.is_empty()
+                    || audit.agent_id.is_empty()
+                    || audit.caller_role.is_empty()
+                    || audit.session_id.is_empty()
+                    || audit.turn_id.is_empty()
+                    || audit.correlation_id.is_empty()
+                    || audit.executor_node_id.is_empty()
+                    || (audit.outcome == "failed" && audit.failure_code.is_none())
+                {
+                    return IpcResponse::error(
+                        "integration_audit",
+                        "INVALID_AUDIT",
+                        "audit identity and time range are invalid",
+                    );
+                }
+                let mut audits: Vec<ansible_mesh_core::integration::HttpIntegrationAudit> = graph
+                    .get_config_value("__integration_audits__")
+                    .ok()
+                    .flatten()
+                    .and_then(|value| serde_json::from_str(&value).ok())
+                    .unwrap_or_default();
+                audits.push(audit);
+                if audits.len() > 2_000 {
+                    let remove = audits.len() - 2_000;
+                    audits.drain(..remove);
+                }
+                match serde_json::to_string(&audits)
+                    .map_err(anyhow::Error::from)
+                    .and_then(|value| graph.set_config_value("__integration_audits__", &value))
+                {
+                    Ok(()) => IpcResponse::success("integration_audit", None),
+                    Err(error) => IpcResponse::error(
+                        "integration_audit",
+                        "CONFIG_STORE_ERROR",
+                        error.to_string(),
+                    ),
+                }
+            }
+
+            IpcRequest::GetIntegrationAudit { binding_id, limit } => {
+                let authorized = current_identity.as_ref().is_none_or(|identity| {
+                    matches!(
+                        identity.role.as_str(),
+                        "operator" | "admin" | "management" | "desktop-membrane"
+                    )
+                });
+                if !authorized {
+                    return IpcResponse::error(
+                        "integration_audit",
+                        "FORBIDDEN",
+                        "integration audit reads require an operator identity",
+                    );
+                }
+                let audits: Vec<ansible_mesh_core::integration::HttpIntegrationAudit> = graph
+                    .get_config_value("__integration_audits__")
+                    .ok()
+                    .flatten()
+                    .and_then(|value| serde_json::from_str(&value).ok())
+                    .unwrap_or_default();
+                let mut selected: Vec<_> = audits
+                    .into_iter()
+                    .rev()
+                    .filter(|audit| {
+                        binding_id
+                            .as_ref()
+                            .is_none_or(|binding_id| audit.binding_id == *binding_id)
+                    })
+                    .take(limit.unwrap_or(100).clamp(1, 500) as usize)
+                    .collect();
+                selected.sort_by(|left, right| right.finished_at_ms.cmp(&left.finished_at_ms));
+                IpcResponse::IntegrationAuditState {
+                    integration_audits: selected,
+                }
+            }
+
+            IpcRequest::ProvisionIntegrationCredential {
+                binding_id,
+                owner_agent_id,
+                credential,
+            } => {
+                use ansible_mesh_core::integration::{IntegrationBinding, IntegrationTarget};
+                if !Self::mcp_owner_identity_ok(current_identity, &owner_agent_id) {
+                    return IpcResponse::error(
+                        "integration_credential",
+                        "FORBIDDEN",
+                        format!(
+                            "owner_agent_id '{owner_agent_id}' does not match the registered guest identity"
+                        ),
+                    );
+                }
+                if credential.trim().is_empty() {
+                    return IpcResponse::error(
+                        "integration_credential",
+                        "EMPTY_CREDENTIAL",
+                        "credential must be non-empty",
+                    );
+                }
+                let mut bindings: std::collections::HashMap<String, IntegrationBinding> = graph
+                    .get_config_value("__integration_bindings__")
+                    .ok()
+                    .flatten()
+                    .and_then(|value| serde_json::from_str(&value).ok())
+                    .unwrap_or_default();
+                let Some(snapshot) = bindings.get(&binding_id).cloned() else {
+                    return IpcResponse::error(
+                        "integration_credential",
+                        "NOT_FOUND",
+                        format!("no integration binding is registered as '{binding_id}'"),
+                    );
+                };
+                if snapshot.owner_agent_id != owner_agent_id {
+                    return IpcResponse::error(
+                        "integration_credential",
+                        "FORBIDDEN",
+                        format!("binding '{binding_id}' is not owned by '{owner_agent_id}'"),
+                    );
+                }
+                let entry = Self::integration_binding_entry(
+                    snapshot.clone(),
+                    registry,
+                    graph,
+                    local_node_id,
+                )
+                .await;
+                let Some(execution_node_id) = entry.execution_node_id.clone() else {
+                    return IpcResponse::error(
+                        "integration_credential",
+                        "PLACEMENT_DENIED",
+                        match entry.placement {
+                            ansible_mesh_core::integration::EgressPlacementDecision::Deny {
+                                reason,
+                            } => reason,
+                            _ => "binding has no executable placement".into(),
+                        },
+                    );
+                };
+                let existing_ref = match &snapshot.target {
+                    IntegrationTarget::Http(target) => target
+                        .credential
+                        .as_ref()
+                        .map(|binding| binding.secret_ref.clone()),
+                    IntegrationTarget::Mcp { .. } => {
+                        return IpcResponse::error(
+                            "integration_credential",
+                            "USE_MCP_CREDENTIAL_SURFACE",
+                            "MCP bindings use ProvisionMcpUpstreamCredential",
+                        );
+                    }
+                };
+
+                let (vault_ref, rotated) = if execution_node_id == local_node_id {
+                    match existing_ref {
+                        Some(secret_ref)
+                            if graph.get_secret(&secret_ref).ok().flatten().is_some() =>
+                        {
+                            if let Err(error) =
+                                crate::vault::rotate_secret(graph, &secret_ref, &credential)
+                            {
+                                return IpcResponse::error(
+                                    "integration_credential",
+                                    "VAULT_ERROR",
+                                    error.to_string(),
+                                );
+                            }
+                            (secret_ref, true)
+                        }
+                        _ => match store_secret(
+                            graph,
+                            SecretInput {
+                                secret_kind: "integration_http_credential".into(),
+                                scope: "hotel".into(),
+                                allowed_roles: vec!["egress-http-runner".into()],
+                                allowed_guests: Vec::new(),
+                                plaintext: credential,
+                            },
+                        ) {
+                            Ok(secret_ref) => (secret_ref, false),
+                            Err(error) => {
+                                return IpcResponse::error(
+                                    "integration_credential",
+                                    "VAULT_ERROR",
+                                    error.to_string(),
+                                );
+                            }
+                        },
+                    }
+                } else {
+                    let request = match existing_ref {
+                        Some(secret_ref) if !secret_ref.starts_with("pending:") => {
+                            IpcRequest::RotateOperatorTargetSecret {
+                                target_node_id: execution_node_id.clone(),
+                                secret_ref,
+                                plaintext: credential,
+                            }
+                        }
+                        _ => IpcRequest::AddOperatorTargetVaultEntry {
+                            target_node_id: execution_node_id.clone(),
+                            vault_name: format!("integration/{binding_id}"),
+                            plaintext: credential,
+                            allowed_roles: vec!["egress-http-runner".into()],
+                        },
+                    };
+                    let response = Self::handle_operator_target_request(
+                        request,
+                        registry,
+                        graph,
+                        materialization_requester,
+                        local_node_id,
+                    )
+                    .await;
+                    match response {
+                        IpcResponse::OperatorTargetSecretMutationAckView {
+                            operator_target_secret_mutation,
+                        } if operator_target_secret_mutation.ok => {
+                            let Some(secret_ref) = operator_target_secret_mutation.secret_ref
+                            else {
+                                return IpcResponse::error(
+                                    "integration_credential",
+                                    "REMOTE_VAULT_ERROR",
+                                    "remote vault mutation returned no secret_ref",
+                                );
+                            };
+                            (
+                                secret_ref,
+                                operator_target_secret_mutation.operation == "rotate",
+                            )
+                        }
+                        other => {
+                            return IpcResponse::error(
+                                "integration_credential",
+                                "REMOTE_VAULT_ERROR",
+                                format!("remote vault mutation failed: {other:?}"),
+                            );
+                        }
+                    }
+                };
+
+                let binding = bindings
+                    .get_mut(&binding_id)
+                    .expect("binding snapshot came from this registry");
+                let IntegrationTarget::Http(target) = &mut binding.target else {
+                    unreachable!("MCP target returned above")
+                };
+                match &mut target.credential {
+                    Some(credential_binding) => credential_binding.secret_ref = vault_ref.clone(),
+                    None => {
+                        return IpcResponse::error(
+                            "integration_credential",
+                            "MISSING_CREDENTIAL_INJECTION",
+                            "binding must declare credential header and format before provisioning",
+                        );
+                    }
+                }
+                binding.updated_at = unix_ts();
+                if let Err(error) = graph.set_config_value(
+                    "__integration_bindings__",
+                    &serde_json::to_string(&bindings).unwrap_or_else(|_| "{}".into()),
+                ) {
+                    return IpcResponse::error(
+                        "integration_credential",
+                        "CONFIG_STORE_ERROR",
+                        error.to_string(),
+                    );
+                }
+                info!(
+                    binding_id,
+                    execution_node_id,
+                    rotated,
+                    "integration credential provisioned at execution hotel"
+                );
+                IpcResponse::success(
+                    "integration_credential",
+                    Some(serde_json::json!({
+                        "binding_id": binding_id,
+                        "vault_ref": vault_ref,
+                        "execution_node_id": execution_node_id,
+                        "rotated": rotated,
+                    })),
+                )
+            }
+
             // ── MCP upstream (client fabric) registry ─────────────────────────
             IpcRequest::RegisterMcpUpstream { config } => {
                 use ansible_mesh_core::mcp_upstream::{
@@ -9250,13 +9850,14 @@ impl IpcServer {
 
                 // Ownership: an existing registration may only be updated by
                 // its owner.
-                let mut registry: std::collections::HashMap<String, McpUpstreamConfig> = graph
-                    .get_config_value("__mcp_upstreams__")
-                    .ok()
-                    .flatten()
-                    .and_then(|s| serde_json::from_str(&s).ok())
-                    .unwrap_or_default();
-                if let Some(existing) = registry.get(&upstream_id) {
+                let mut upstream_registry: std::collections::HashMap<String, McpUpstreamConfig> =
+                    graph
+                        .get_config_value("__mcp_upstreams__")
+                        .ok()
+                        .flatten()
+                        .and_then(|s| serde_json::from_str(&s).ok())
+                        .unwrap_or_default();
+                if let Some(existing) = upstream_registry.get(&upstream_id) {
                     if existing.owner_agent_id != config.owner_agent_id {
                         return IpcResponse::error(
                             "mcp_upstream",
@@ -9268,8 +9869,8 @@ impl IpcServer {
                         );
                     }
                 }
-                registry.insert(upstream_id.clone(), config.clone());
-                match serde_json::to_string(&registry) {
+                upstream_registry.insert(upstream_id.clone(), config.clone());
+                match serde_json::to_string(&upstream_registry) {
                     Ok(json) => {
                         if let Err(e) = graph.set_config_value("__mcp_upstreams__", &json) {
                             return IpcResponse::error(
@@ -9286,6 +9887,60 @@ impl IpcServer {
                             e.to_string(),
                         );
                     }
+                }
+
+                // Mirror MCP HTTP transport into the canonical integration
+                // registry. The mcp-client keeps protocol/session ownership;
+                // this binding only selects and materializes the hotel that
+                // performs its network I/O through egress-http-runner.
+                if matches!(config.transport, McpUpstreamTransport::Http { .. }) {
+                    use ansible_mesh_core::integration::{
+                        EgressTrafficClass, IntegrationBinding, IntegrationTarget,
+                    };
+                    let binding = IntegrationBinding {
+                        binding_id: format!("mcp:{upstream_id}"),
+                        owner_agent_id: config.owner_agent_id.clone(),
+                        display_name: Some(format!("MCP upstream {upstream_id}")),
+                        target: IntegrationTarget::Mcp {
+                            upstream_id: upstream_id.clone(),
+                        },
+                        grant_agents: config.grant_agents.clone(),
+                        grant_skills: vec![],
+                        traffic_class: EgressTrafficClass::Mcp,
+                        placement: config.placement.clone(),
+                        requires_approval: true,
+                        enabled: true,
+                        updated_at: config.updated_at,
+                    };
+                    let mut bindings: std::collections::HashMap<String, IntegrationBinding> = graph
+                        .get_config_value("__integration_bindings__")
+                        .ok()
+                        .flatten()
+                        .and_then(|value| serde_json::from_str(&value).ok())
+                        .unwrap_or_default();
+                    bindings.insert(binding.binding_id.clone(), binding.clone());
+                    if let Ok(serialized) = serde_json::to_string(&bindings) {
+                        if let Err(error) =
+                            graph.set_config_value("__integration_bindings__", &serialized)
+                        {
+                            warn!(
+                                upstream_id,
+                                %error,
+                                "failed to persist MCP transport integration binding"
+                            );
+                        }
+                    }
+                    let entry =
+                        Self::integration_binding_entry(binding, registry, graph, local_node_id)
+                            .await;
+                    let _ = Self::materialize_integration_runner(
+                        &entry,
+                        registry,
+                        graph,
+                        materialization_requester,
+                        local_node_id,
+                    )
+                    .await;
                 }
 
                 // Fan out the config to the mcp-client guest inbox.
@@ -9384,13 +10039,13 @@ impl IpcServer {
                         ),
                     );
                 }
-                let mut registry: std::collections::HashMap<String, McpUpstreamConfig> = graph
+                let mut upstreams: std::collections::HashMap<String, McpUpstreamConfig> = graph
                     .get_config_value("__mcp_upstreams__")
                     .ok()
                     .flatten()
                     .and_then(|s| serde_json::from_str(&s).ok())
                     .unwrap_or_default();
-                match registry.get(&upstream_id) {
+                match upstreams.get(&upstream_id) {
                     Some(existing) if existing.owner_agent_id != owner_agent_id => {
                         return IpcResponse::error(
                             "mcp_upstream",
@@ -9407,9 +10062,22 @@ impl IpcServer {
                     }
                     Some(_) => {}
                 }
-                registry.remove(&upstream_id);
-                if let Ok(json) = serde_json::to_string(&registry) {
+                upstreams.remove(&upstream_id);
+                if let Ok(json) = serde_json::to_string(&upstreams) {
                     let _ = graph.set_config_value("__mcp_upstreams__", &json);
+                }
+                let mut integration_bindings: std::collections::HashMap<
+                    String,
+                    ansible_mesh_core::integration::IntegrationBinding,
+                > = graph
+                    .get_config_value("__integration_bindings__")
+                    .ok()
+                    .flatten()
+                    .and_then(|value| serde_json::from_str(&value).ok())
+                    .unwrap_or_default();
+                integration_bindings.remove(&format!("mcp:{upstream_id}"));
+                if let Ok(json) = serde_json::to_string(&integration_bindings) {
+                    let _ = graph.set_config_value("__integration_bindings__", &json);
                 }
                 // Drop the stored catalog too.
                 let mut catalogs: std::collections::HashMap<String, serde_json::Value> = graph
@@ -9539,20 +10207,20 @@ impl IpcServer {
                     );
                 }
 
-                let mut registry: std::collections::HashMap<String, McpUpstreamConfig> = graph
+                let mut upstreams: std::collections::HashMap<String, McpUpstreamConfig> = graph
                     .get_config_value("__mcp_upstreams__")
                     .ok()
                     .flatten()
                     .and_then(|s| serde_json::from_str(&s).ok())
                     .unwrap_or_default();
-                let Some(config) = registry.get_mut(&upstream_id) else {
+                let Some(config_snapshot) = upstreams.get(&upstream_id).cloned() else {
                     return IpcResponse::error(
                         "mcp_upstream_credential",
                         "NOT_FOUND",
                         format!("no upstream registered as {upstream_id}"),
                     );
                 };
-                if config.owner_agent_id != owner_agent_id {
+                if config_snapshot.owner_agent_id != owner_agent_id {
                     return IpcResponse::error(
                         "mcp_upstream_credential",
                         "FORBIDDEN",
@@ -9560,52 +10228,163 @@ impl IpcServer {
                     );
                 }
 
-                // Rotate in place when a credential ref already exists;
-                // otherwise mint a new vault secret. The plaintext is stored
-                // (the guest must present it outbound) — readable only by the
-                // mcp-client-runner role, and kind-scoped so registry sweeps
-                // (e.g. Muninn config loading) can filter it out.
-                let (vault_ref, rotated) = match config.credential_ref.clone() {
-                    Some(existing_ref) => {
-                        if let Err(e) =
-                            crate::vault::rotate_secret(graph, &existing_ref, &credential)
+                let binding_id = format!("mcp:{upstream_id}");
+                let integration_bindings: std::collections::HashMap<
+                    String,
+                    ansible_mesh_core::integration::IntegrationBinding,
+                > = graph
+                    .get_config_value("__integration_bindings__")
+                    .ok()
+                    .flatten()
+                    .and_then(|value| serde_json::from_str(&value).ok())
+                    .unwrap_or_default();
+                let (execution_node_id, placement) = if let Some(binding) =
+                    integration_bindings.get(&binding_id).cloned()
+                {
+                    let entry =
+                        Self::integration_binding_entry(binding, registry, graph, local_node_id)
+                            .await;
+                    (entry.execution_node_id, entry.placement)
+                } else {
+                    (
+                        Some(local_node_id.to_string()),
+                        ansible_mesh_core::integration::EgressPlacementDecision::ExecuteLocal {
+                            audit_fallback: false,
+                        },
+                    )
+                };
+                let Some(execution_node_id) = execution_node_id else {
+                    return IpcResponse::error(
+                        "mcp_upstream_credential",
+                        "PLACEMENT_DENIED",
+                        match placement {
+                            ansible_mesh_core::integration::EgressPlacementDecision::Deny {
+                                reason,
+                            } => reason,
+                            _ => "MCP transport has no execution node".into(),
+                        },
+                    );
+                };
+
+                let (vault_ref, rotated) = if execution_node_id == local_node_id {
+                    match config_snapshot.credential_ref.clone() {
+                        Some(existing_ref)
+                            if graph.get_secret(&existing_ref).ok().flatten().is_some() =>
                         {
-                            return IpcResponse::error(
-                                "mcp_upstream_credential",
-                                "VAULT_ERROR",
-                                e.to_string(),
-                            );
+                            if let Err(error) =
+                                crate::vault::rotate_secret(graph, &existing_ref, &credential)
+                            {
+                                return IpcResponse::error(
+                                    "mcp_upstream_credential",
+                                    "VAULT_ERROR",
+                                    error.to_string(),
+                                );
+                            }
+                            (existing_ref, true)
                         }
-                        (existing_ref, true)
-                    }
-                    None => {
-                        let secret_ref = match store_secret(
+                        _ => match store_secret(
                             graph,
                             SecretInput {
                                 secret_kind: "mcp_upstream_credential".into(),
                                 scope: "hotel".into(),
-                                allowed_roles: vec!["mcp-client-runner".into()],
+                                allowed_roles: vec![
+                                    "egress-http-runner".into(),
+                                    "mcp-client-runner".into(),
+                                ],
                                 allowed_guests: Vec::new(),
                                 plaintext: credential,
                             },
                         ) {
-                            Ok(r) => r,
-                            Err(e) => {
+                            Ok(secret_ref) => (secret_ref, false),
+                            Err(error) => {
                                 return IpcResponse::error(
                                     "mcp_upstream_credential",
                                     "VAULT_ERROR",
-                                    e.to_string(),
+                                    error.to_string(),
                                 );
                             }
-                        };
-                        config.credential_ref = Some(secret_ref.clone());
-                        (secret_ref, false)
+                        },
+                    }
+                } else {
+                    let remote_request = match config_snapshot.credential_ref.clone() {
+                        Some(secret_ref) => IpcRequest::RotateOperatorTargetSecret {
+                            target_node_id: execution_node_id.clone(),
+                            secret_ref,
+                            plaintext: credential.clone(),
+                        },
+                        None => IpcRequest::AddOperatorTargetVaultEntry {
+                            target_node_id: execution_node_id.clone(),
+                            vault_name: format!("mcp/{upstream_id}"),
+                            plaintext: credential.clone(),
+                            allowed_roles: vec!["egress-http-runner".into()],
+                        },
+                    };
+                    let mut response = Self::handle_operator_target_request(
+                        remote_request,
+                        registry,
+                        graph,
+                        materialization_requester,
+                        local_node_id,
+                    )
+                    .await;
+                    // A placement move leaves the old hotel's ref behind. If
+                    // rotating that ref on the new exit fails, create a new
+                    // execution-hotel secret instead of copying old material.
+                    if !matches!(
+                        response,
+                        IpcResponse::OperatorTargetSecretMutationAckView {
+                            ref operator_target_secret_mutation
+                        } if operator_target_secret_mutation.ok
+                    ) && config_snapshot.credential_ref.is_some()
+                    {
+                        response = Self::handle_operator_target_request(
+                            IpcRequest::AddOperatorTargetVaultEntry {
+                                target_node_id: execution_node_id.clone(),
+                                vault_name: format!("mcp/{upstream_id}"),
+                                plaintext: credential,
+                                allowed_roles: vec!["egress-http-runner".into()],
+                            },
+                            registry,
+                            graph,
+                            materialization_requester,
+                            local_node_id,
+                        )
+                        .await;
+                    }
+                    match response {
+                        IpcResponse::OperatorTargetSecretMutationAckView {
+                            operator_target_secret_mutation,
+                        } if operator_target_secret_mutation.ok => {
+                            let Some(secret_ref) = operator_target_secret_mutation.secret_ref
+                            else {
+                                return IpcResponse::error(
+                                    "mcp_upstream_credential",
+                                    "REMOTE_VAULT_ERROR",
+                                    "remote vault mutation returned no secret_ref",
+                                );
+                            };
+                            (
+                                secret_ref,
+                                operator_target_secret_mutation.operation == "rotate",
+                            )
+                        }
+                        other => {
+                            return IpcResponse::error(
+                                "mcp_upstream_credential",
+                                "REMOTE_VAULT_ERROR",
+                                format!("remote vault mutation failed: {other:?}"),
+                            );
+                        }
                     }
                 };
+                let config = upstreams
+                    .get_mut(&upstream_id)
+                    .expect("config snapshot came from this registry");
+                config.credential_ref = Some(vault_ref.clone());
                 config.updated_at = unix_ts();
                 let config_snapshot = config.clone();
 
-                match serde_json::to_string(&registry) {
+                match serde_json::to_string(&upstreams) {
                     Ok(json) => {
                         if let Err(e) = graph.set_config_value("__mcp_upstreams__", &json) {
                             return IpcResponse::error(
@@ -9624,8 +10403,8 @@ impl IpcServer {
                     }
                 }
 
-                // Fan out so the guest re-resolves the credential and
-                // reconnects authenticated.
+                // Fan out so the MCP manager reconnects; the actual secret is
+                // resolved later by egress-http-runner at the execution hotel.
                 let task_json = serde_json::json!({
                     "action": "update_mcp_upstream",
                     "config": config_snapshot,
@@ -9641,13 +10420,19 @@ impl IpcServer {
                 )
                 .await;
 
-                info!(upstream_id, rotated, "MCP upstream credential provisioned.");
+                info!(
+                    upstream_id,
+                    execution_node_id,
+                    rotated,
+                    "MCP upstream credential provisioned at transport execution hotel"
+                );
                 IpcResponse::success(
                     "mcp_upstream_credential",
                     Some(serde_json::json!({
                         "upstream_id": upstream_id,
                         "vault_ref": vault_ref,
                         "rotated": rotated,
+                        "execution_node_id": execution_node_id,
                     })),
                 )
             }

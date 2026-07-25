@@ -1662,9 +1662,39 @@ Seam IDs: `wider-client-adoption`, `philotic-native-memory-integration`
 - [ ] `openclaw.json` ingestion: define a migration/import path that can consume legacy agent manifests and materialize Philotic agents.
 - [ ] Context graph deployment model: decide local-first vs cloud-backed vs hybrid graph ownership, sync, and operational model.
 - [ ] Context graph decentralization: decide how much of the graph can be replicated/federated across hotels versus kept locally authoritative.
-- [ ] Perimeter egress control (`egress-policy-object`): define the canonical outbound egress policy object and finding schema.
+- [x] Outbound integration fabric Slice 0 (`egress-policy-object`,
+  `exit-hotel-placement-policy`): define canonical traffic classes and
+  local/preferred/required/deny exit decisions; make `hotel.egress.check`
+  authorization-only so resolved credential headers never return to philotes.
+- [x] Outbound integration fabric Slice 1
+  (`http-egress-execution-boundary`): add a bounded `egress-http-runner`,
+  typed request/response envelopes, redirect rechecks, limits, sanitization,
+  and audit; migrate one non-model HTTP path.
+- [ ] Outbound integration fabric Slice 2 (`exit-hotel-placement-policy`):
+  route preferred/required Internet integration execution to `vps-jane` and
+  prove local, fallback, and fail-closed behavior in a watched two-hotel run.
+  - [x] Implement reachability-aware local/preferred/required/deny placement,
+    remote runner materialization, routed execution, audited fallback, and
+    fail-closed decisions.
+  - [ ] Install and watched-live prove preferred/required execution on
+    `vps-jane`.
+- [x] Outbound integration fabric Slice 3 (`mcp-egress-policy`): move MCP HTTP
+  exchange behind the shared egress executor while retaining the existing MCP
+  manager's registry, catalog, grants, and stdio policy; isolated binary smoke
+  proves the credentialed MCP lifecycle and durable egress audit.
+- [x] Outbound integration fabric Slice 4 (`integration-binding-contract`):
+  compile reviewed SkillDAG requirements into local integration bindings,
+  grants, and `ToolExecutionRoute` records.
+- [ ] Outbound integration fabric Slice 5 (`outbound-fleet-enforcement`):
+  deployment inventories now install `membrane-mcp-client` and
+  `egress-http-runner`; roll out the branch, inventory remaining direct clients,
+  and migrate general API traffic class by class while keeping model/provider
+  and communication exceptions explicit.
+- [x] Perimeter egress control (`egress-policy-object`): define the first
+  canonical policy and placement types; finding schema remains part of the
+  HTTP executor/audit slice.
 - [ ] Perimeter egress inventory (`outbound-classification`): classify current direct outbound HTTP paths into perimeter-controlled, temporary exceptions, and future violations.
-- [ ] Perimeter egress first implementation: route one non-model outbound HTTP path through a perimeter-controlled boundary while keeping model/provider egress as an explicit exception for now.
+- [x] Perimeter egress first implementation: route one non-model outbound HTTP path through a perimeter-controlled boundary while keeping model/provider egress as an explicit exception for now.
 - [ ] Review [MEMBRANE_EXTERNAL_AGENT_AND_EVENT_TRANSPORT_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/MEMBRANE_EXTERNAL_AGENT_AND_EVENT_TRANSPORT_PROPOSAL.md).
 - [ ] External membrane transport contract (`a2a-membrane-contract`, `nostr-membrane-contract`): define the first normalized inbound/outbound envelope and session-binding inputs for `A2A` / `Nostr` membranes.
 - [ ] External principal trust records (`transport-edge-trust-gates`): define the first shared trust record for external agent peers, pubkeys, and relays, including trust classes, allowed capability classes, quarantine state, and policy refs.

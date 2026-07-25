@@ -19,6 +19,7 @@ pub mod graph;
 pub mod graph_tools;
 pub mod heal_queue;
 pub mod heartbeat;
+pub mod integration;
 pub mod ledger;
 pub mod materializer;
 pub mod mcp_endpoint;

@@ -4,7 +4,7 @@ doc_type: proposal
 domain: membrane-transport
 status: in-progress
 disposition: phase-3-implemented
-last_updated: 2026-07-18
+last_updated: 2026-07-24
 tags:
   - mcp
   - mcp-client
@@ -27,6 +27,7 @@ related_docs:
   - MCP_MEMBRANE_HARDENING_PROPOSAL.md
   - MCP_COORDINATION_ENDPOINT_PROPOSAL.md
   - GUEST_PRIMITIVE_PATTERN.md
+  - OUTBOUND_INTEGRATION_FABRIC_PROPOSAL.md
 source_of_truth_targets:
   - docs/architecture/MCP_CLIENT_FABRIC_PROPOSAL.md
 ---
@@ -110,6 +111,13 @@ source_of_truth_targets:
 > The fabric is now feature-complete across all three phases. Still outstanding:
 > the philote approval-UX drill through a real cognitive turn, and a fleet
 > deploy (no production hotel runs the fabric binaries yet).
+>
+> **Shared egress follow-on (2026-07-24).** The client manager is the MCP
+> protocol authority, but its HTTP transport still performs network I/O
+> directly after checking its own MCP host policy. The accepted
+> `OUTBOUND_INTEGRATION_FABRIC_PROPOSAL` keeps this manager and moves its HTTP
+> exchange behind the shared hotel-owned execution and exit-placement contract.
+> Stdio remains local and command-allowlisted.
 
 ## Problem
 

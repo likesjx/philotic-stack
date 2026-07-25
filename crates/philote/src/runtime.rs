@@ -1604,6 +1604,9 @@ pub struct AgentRuntime {
     /// or is granted, cached from `GetMcpUpstreams`. Copied into each session's
     /// bindings so the tool assembly projects them (proposal mcp-client-fabric).
     mcp_upstream_tools: Vec<crate::session::McpUpstreamToolBinding>,
+    /// Governed HTTP integrations resolved by the hotel against live mesh
+    /// placement and copied into each session's projected tool assembly.
+    http_integration_tools: Vec<crate::session::HttpIntegrationToolBinding>,
     /// Tasks dequeued from a session's pending_user_tasks after a turn completed.
     /// Dispatched at the top of the main event loop to avoid async recursion.
     pending_drains: std::collections::VecDeque<(Uuid, InboundTaskPayload)>,
@@ -1980,6 +1983,7 @@ impl AgentRuntime {
             openrouter_tools_catalog: None,
             default_agent_profile: AgentProfile::default(),
             mcp_upstream_tools: Vec::new(),
+            http_integration_tools: Vec::new(),
             pending_drains: std::collections::VecDeque::new(),
             stuck_turn_first_seen: HashMap::new(),
             stuck_turn_signature: HashMap::new(),
@@ -6693,6 +6697,89 @@ impl AgentRuntime {
         }
     }
 
+    pub(crate) async fn refresh_http_integration_projection(&mut self) {
+        let entries = match self
+            .ipc_client
+            .send_request_with_timeout(
+                IpcRequest::GetIntegrationBindings {},
+                Duration::from_secs(5),
+            )
+            .await
+        {
+            Ok(IpcResponse::IntegrationBindingsState {
+                integration_bindings,
+            }) => integration_bindings,
+            Ok(_) => return,
+            Err(error) => {
+                warn!("refresh_http_integration_projection: request failed: {error}");
+                return;
+            }
+        };
+        let mut projected = Vec::new();
+        for entry in entries {
+            if !entry.binding.is_granted_to(&self.agent_id) {
+                continue;
+            }
+            if !matches!(
+                entry.binding.target,
+                ansible_mesh_core::integration::IntegrationTarget::Http(_)
+            ) {
+                continue;
+            }
+            let Some(execution_node_id) = entry.execution_node_id else {
+                continue;
+            };
+            if matches!(
+                entry.placement,
+                ansible_mesh_core::integration::EgressPlacementDecision::Deny { .. }
+            ) {
+                continue;
+            }
+            projected.push(crate::session::HttpIntegrationToolBinding {
+                binding: entry.binding,
+                placement: entry.placement,
+                execution_node_id,
+            });
+        }
+        self.http_integration_tools = projected;
+        let cache = self.http_integration_tools.clone();
+        let agent_id = self.agent_id.clone();
+        for state in self.sessions.values_mut() {
+            let available: Vec<_> = cache
+                .iter()
+                .filter(|entry| {
+                    entry
+                        .binding
+                        .is_available_to(&agent_id, &state.bindings.effective_skillset)
+                })
+                .cloned()
+                .collect();
+            if state.bindings.http_integration_tools != available {
+                state.bindings.http_integration_tools = available;
+                state.rebuild_default_tool_assembly();
+            }
+        }
+    }
+
+    fn apply_http_integration_projection(&mut self, session_id: &str) {
+        let cache = self.http_integration_tools.clone();
+        let agent_id = self.agent_id.clone();
+        if let Some(state) = self.sessions.get_mut(session_id) {
+            let available: Vec<_> = cache
+                .into_iter()
+                .filter(|entry| {
+                    entry
+                        .binding
+                        .is_available_to(&agent_id, &state.bindings.effective_skillset)
+                })
+                .collect();
+            if state.bindings.http_integration_tools != available {
+                state.bindings.http_integration_tools = available;
+                state.rebuild_default_tool_assembly();
+            }
+        }
+    }
+
     /// Copy the cached upstream projection into one session's bindings if it
     /// drifted (e.g. a session restored from a pre-projection checkpoint).
     fn apply_mcp_upstream_projection(&mut self, session_id: &str) {
@@ -6724,11 +6811,14 @@ impl AgentRuntime {
             _ => None,
         };
 
-        let Some(state) = self.sessions.get_mut(session_id) else {
-            return;
-        };
         let Some(snapshot) = snapshot else { return };
-        Self::merge_snapshot_bindings(state, &snapshot);
+        {
+            let Some(state) = self.sessions.get_mut(session_id) else {
+                return;
+            };
+            Self::merge_snapshot_bindings(state, &snapshot);
+        }
+        self.apply_http_integration_projection(session_id);
     }
 
     fn merge_snapshot_bindings(state: &mut SessionState, snapshot: &serde_json::Value) {
@@ -6786,6 +6876,7 @@ impl AgentRuntime {
     ) -> Result<()> {
         if self.sessions.contains_key(session_id) {
             self.apply_mcp_upstream_projection(session_id);
+            self.apply_http_integration_projection(session_id);
             return Ok(());
         }
 
@@ -6924,6 +7015,7 @@ impl AgentRuntime {
 
                         self.sessions.insert(session_id.to_string(), state);
                         self.apply_mcp_upstream_projection(session_id);
+                        self.apply_http_integration_projection(session_id);
                         return Ok(());
                     }
                 }
@@ -6987,6 +7079,7 @@ impl AgentRuntime {
 
         self.sessions.insert(session_id.to_string(), state);
         self.apply_mcp_upstream_projection(session_id);
+        self.apply_http_integration_projection(session_id);
         Ok(())
     }
 

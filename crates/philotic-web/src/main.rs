@@ -12,6 +12,7 @@ mod footprint;
 mod harness;
 mod heal;
 mod init;
+mod integration;
 mod keys;
 mod load;
 mod mcp;
@@ -214,6 +215,12 @@ enum Command {
     Mcp {
         #[command(subcommand)]
         action: mcp::McpAction,
+    },
+
+    /// Manage governed outbound HTTP/API integration bindings
+    Integration {
+        #[command(subcommand)]
+        action: integration::IntegrationAction,
     },
 
     /// Manage provider keys and model configuration in the hotel vault/config plane
@@ -583,6 +590,7 @@ async fn main() -> Result<()> {
             } => mesh::accept(invite, hotel, host).await,
         },
         Command::Mcp { action } => mcp::run(action).await,
+        Command::Integration { action } => integration::run(action).await,
         Command::Keys { action } => keys::run(action).await,
         Command::Heal { action } => heal::run(action).await,
         Command::Config { action } => config::run(action).await,

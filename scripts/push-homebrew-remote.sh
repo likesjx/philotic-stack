@@ -155,6 +155,8 @@ cargo build --release --bins \
   -p philote \
   -p membrane-telegram \
   -p membrane-discord \
+  -p membrane-mcp-client \
+  -p egress-http-runner \
   -p model-router \
   -p tool-runner \
   -p graph-datasource \

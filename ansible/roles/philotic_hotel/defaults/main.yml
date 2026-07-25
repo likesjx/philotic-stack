@@ -29,6 +29,8 @@ philotic_binaries:
   - membrane-telegram
   - membrane-discord
   - membrane-mcp
+  - membrane-mcp-client
+  - egress-http-runner
   - graph-datasource
   - table-datasource
   - router-listener
