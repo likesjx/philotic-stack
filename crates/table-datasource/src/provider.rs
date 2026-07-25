@@ -119,6 +119,13 @@ impl SqliteTableProvider {
             return Ok(handle.clone());
         }
         let path = self.base_dir.join(format!("{name}.db"));
+        // Write kinds still create on demand (that is how tables get made), but
+        // a *read* must never bring a database into existence — otherwise any
+        // agent probing names litters the profile directory with empty files
+        // that then show up in table.catalog.
+        if verb == Verb::Read && !path.exists() {
+            bail!("unknown database {name:?}");
+        }
         let handle = open_handle(&path, DbMode::ReadWrite)?;
         self.pool
             .lock()

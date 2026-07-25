@@ -855,3 +855,106 @@ async fn builder_cannot_express_a_write() {
         );
     }
 }
+
+/// Snapshot-on-read materializes a full copy of the source under
+/// `{base_dir}/.snapshots/`. That copy must not become a back door: an
+/// ungranted agent must not reach it by any database name it can spell.
+#[tokio::test]
+async fn ungranted_agent_cannot_reach_a_snapshot() {
+    let ext = TempDir::new().unwrap();
+    let ext_provider = SqliteTableProvider::new(ext.path()).unwrap();
+    seed_signals(&ext_provider, Some("private")).await;
+
+    let dir = TempDir::new().unwrap();
+    let p = write_catalog(
+        &dir,
+        json!([{
+            "name": "private",
+            "path": ext.path().join("private.db").to_str().unwrap(),
+            "mode": "ro",
+            "snapshot_on_read": true,
+            "snapshot_ttl_secs": 3600,
+            "agents": {"agent-ariel": ["read"]}
+        }]),
+    );
+
+    // Granted read materializes .snapshots/private.db.
+    p.invoke(&make_task_as(
+        "table.query",
+        Some("private"),
+        None,
+        Some("SELECT COUNT(*) AS n FROM signals"),
+        json!({}),
+        "agent-ariel",
+    ))
+    .await
+    .unwrap();
+    assert!(
+        dir.path().join(".snapshots/private.db").exists(),
+        "snapshot should exist for the rest of this test to mean anything"
+    );
+
+    // No name an ungranted agent can spell reaches it — as the primary db...
+    for name in ["private", "snapshots", ".snapshots", ".snapshots/private"] {
+        let result = p
+            .invoke(&make_task_as(
+                "table.query",
+                Some(name),
+                None,
+                Some("SELECT COUNT(*) AS n FROM signals"),
+                json!({}),
+                "agent-jane",
+            ))
+            .await;
+        assert!(
+            result.is_err(),
+            "db {name:?} must be denied to an ungranted agent"
+        );
+    }
+
+    // ...and via the attach lane.
+    for name in ["private", ".snapshots/private"] {
+        let result = p
+            .invoke(&make_task_as(
+                "table.query",
+                None,
+                None,
+                Some("SELECT 1"),
+                json!({"attach": [name]}),
+                "agent-jane",
+            ))
+            .await;
+        assert!(
+            result.is_err(),
+            "attach {name:?} must be denied to an ungranted agent"
+        );
+    }
+
+    // The snapshot is also not enumerable as a profile database.
+    let ProviderOutput::ResultSet(cat) = p
+        .invoke(&make_task_as(
+            "table.catalog",
+            None,
+            None,
+            None,
+            json!({}),
+            "agent-jane",
+        ))
+        .await
+        .unwrap()
+    else {
+        panic!()
+    };
+    let names: Vec<&str> = cat["databases"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|d| d["db"].as_str())
+        .collect();
+    assert!(
+        !names
+            .iter()
+            .any(|n| n.contains("private") || n.contains("snapshot")),
+        "ungranted agent must not see the snapshot: {names:?}"
+    );
+}

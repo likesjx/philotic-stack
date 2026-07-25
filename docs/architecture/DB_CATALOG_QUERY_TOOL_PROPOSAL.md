@@ -3,7 +3,7 @@ title: Database Catalog and Governed SQLite Query Tool
 doc_type: proposal
 domain: tooling-execution
 status: in-progress
-last_updated: 2026-07-21
+last_updated: 2026-07-24
 tags:
 - table-datasource
 - catalog
@@ -85,8 +85,10 @@ known databases:
 - Catalog names resolve to their registered path with their registered mode.
 - Non-catalog names fall back to the legacy profile mapping
   `{base_dir}/{name}.db`, now restricted to `[A-Za-z0-9_-]+` (closes the
-  traversal hole; auto-create behavior for profile DBs is preserved for
-  backward compatibility).
+  traversal hole). Write kinds still auto-create profile DBs for backward
+  compatibility, but **reads never do** — a read against a non-existent
+  profile database errors instead of creating an empty one, so name-probing
+  cannot litter the profile directory or pollute `table.catalog`.
 - The file is re-read whenever its mtime changes and the connection pool is
   reset — **grants and databases are editable at runtime with no deploy**
   (per the data-driven-tool-grants principle).
@@ -120,6 +122,26 @@ tools on *any* database.
   because real schemas (iMessage's Apple-epoch timestamps, `handle` joins)
   want expressions a builder cannot cover. `parameters.attach` lists catalog
   databases to attach read-only.
+
+### 3a. Residual risk: snapshots are plaintext copies
+
+`snapshot_on_read` writes a **full unencrypted copy** of the source to
+`{base_dir}/.snapshots/{name}.db` — for the Ariel slice that is the operator's
+entire message corpus (~70 MB) living in `~/.philotic/jane/.snapshots/`, with
+default permissions, refreshed on TTL expiry, **not cleaned up on shutdown**.
+That directory did not previously hold private data, and it is in scope for
+backup scripts, `phil reset`, and worktree-gc — the copy can silently end up in
+a backup tarball.
+
+Mitigations in place: the snapshot is not reachable by any database name an
+agent can spell (proven by `ungranted_agent_cannot_reach_a_snapshot` — the
+`.snapshots` directory is not enumerated as a profile database, and `.`/`/` are
+rejected by the name validator), and reads never create a profile database, so
+name-probing cannot litter or shadow.
+
+Not yet addressed — worth a follow-up before this is used for anything more
+sensitive: `chmod 0600` on snapshot files, unlink on clean shutdown, and an
+explicit backup-exclusion for `.snapshots/`.
 
 ### 4. Per-agent grants
 
@@ -221,8 +243,14 @@ a `table.build` for recent messages. Then confirm a different agent
 (e.g. `agent-jane`) gets `no Read grant` and cannot see the entry at all.
 
 **Rollback:** delete `db_catalog.json` (removes all access instantly, no
-restart) and/or re-run the Step 3 UPDATE with the original
-`["bash.exec"]` / Hermes text.
+restart), **and delete the snapshot copy** — it outlives the catalog entry:
+
+```bash
+ssh mbp-jane 'rm -f ~/.philotic/jane/db_catalog.json && rm -rf ~/.philotic/jane/.snapshots/'
+```
+
+Then, if reverting Ariel too, re-run the Step 3 UPDATE with the original
+`["bash.exec"]` toolset / Hermes text.
 
 **Caution:** the reconciling seeder re-applies seeded profile values on restart
 and at scheduled reconciles. Re-check Ariel's `default_toolset` after the first
@@ -231,7 +259,7 @@ authority and must change too.
 
 ## Verification
 
-`cargo test -p table-datasource` — 24 tests: the 9 pre-existing behavior tests
+`cargo test -p table-datasource` — 25 tests: the 9 pre-existing behavior tests
 (kept green) plus builder unit tests and per-seam integration tests:
 traversal rejection, unknown-catalog-database rejection, ro write-kind
 rejection, smuggled-write rejection through the read lane, agent-SQL ATTACH
@@ -249,6 +277,11 @@ threat model subtly wrong:
   survives.
 - `builder_cannot_express_a_write` — injection attempts land in the identifier
   validator rather than in generated SQL.
+- `ungranted_agent_cannot_reach_a_snapshot` — writing this test found a real
+  flaw: probing `db` names as a read used to **create** empty profile
+  databases, which then appeared in `table.catalog`. Reads now refuse a
+  profile database that does not exist (write kinds still create, so
+  `table.configure` is unchanged). The snapshot itself was never reachable.
 
 **Live verification** (`tests/imessage_live.rs`, `#[ignore]`d — needs a real
 `chat.db` + Full Disk Access):
