@@ -46,6 +46,7 @@ active_seams:
 related_docs:
 - ARCHITECTURE_STATUS.md
 - ARCHITECTURE.md
+- OUTBOUND_INTEGRATIONS.md
 - DATA_DRIVEN_TOOL_GRANTS_PROPOSAL.md
 - MCP_CLIENT_FABRIC_PROPOSAL.md
 - PERIMETER_EGRESS_CONTROL_PROPOSAL.md
@@ -56,11 +57,16 @@ related_docs:
 task_refs:
 - docs/task.md
 source_of_truth_targets:
-- docs/architecture/OUTBOUND_INTEGRATION_FABRIC_PROPOSAL.md
-- docs/architecture/ARCHITECTURE_STATUS.md
+- docs/architecture/OUTBOUND_INTEGRATIONS.md
+- docs/architecture/ARCHITECTURE.md
 ---
 
 # Outbound Integration Fabric
+
+> Current runtime ownership, records, failure semantics, and diagrams live in
+> [OUTBOUND_INTEGRATIONS.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/OUTBOUND_INTEGRATIONS.md).
+> This proposal preserves the recommendation, implementation history, and
+> remaining seams.
 
 ## Goal
 

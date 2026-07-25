@@ -33,13 +33,19 @@ related_docs:
   - MCP_COORDINATION_ENDPOINT_PROPOSAL.md
   - GUEST_PRIMITIVE_PATTERN.md
   - OUTBOUND_INTEGRATION_FABRIC_PROPOSAL.md
+  - OUTBOUND_INTEGRATIONS.md
 source_of_truth_targets:
-  - docs/architecture/MCP_CLIENT_FABRIC_PROPOSAL.md
+  - docs/architecture/OUTBOUND_INTEGRATIONS.md
+  - docs/architecture/ARCHITECTURE.md
 task_refs:
   - docs/task.md
 ---
 
 # MCP Client Fabric — Philote-Governed Consumption of External MCP Servers
+
+> Current runtime ownership, records, placement, and sequence diagrams live in
+> [OUTBOUND_INTEGRATIONS.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/OUTBOUND_INTEGRATIONS.md).
+> This proposal preserves the design history and implementation evidence.
 
 > **Phase 1 implemented (2026-07-18, `codex/mcp-client-fabric`).** Registry +
 > HTTP client + projection are live with these design deviations from the text
@@ -128,11 +134,11 @@ task_refs:
 > two-hotel HTTP proof separately establishes the cross-hotel execution
 > boundary.
 
-## Problem
+## Original Problem
 
-The 2026-07-15 MCP audit established an airtight negative: **the stack has no
-MCP client anywhere.** Every MCP code path is server-side (`membrane-mcp`,
-`graph-intelligence`'s embedded server). There is:
+The 2026-07-15 MCP audit established that the stack had no MCP client. Every
+MCP code path was server-side (`membrane-mcp`, `graph-intelligence`'s embedded
+server). At that point there was:
 
 - no philote tool to register or use an upstream MCP server,
 - no IPC variant, no storage model, no outbound transport (`rmcp`/SDK absent
@@ -144,8 +150,8 @@ MCP client anywhere.** Every MCP code path is server-side (`membrane-mcp`,
 
 Meanwhile the ecosystem philotes should tap — MuninnDB, graph-intelligence,
 Perplexity-class research servers, operator tooling — increasingly leads with
-MCP. Today, every such integration is either hand-rolled REST (Muninn) or
-simply unavailable to philotes.
+MCP. Before this proposal landed, each such integration was either hand-rolled
+REST (Muninn) or unavailable to philotes.
 
 ## Vision
 
@@ -176,6 +182,10 @@ pub struct McpUpstreamConfig {
     pub owner_agent_id: String,
     /// How to reach the server.
     pub transport: McpUpstreamTransport,
+    /// Which hotel performs HTTP transport I/O.
+    pub placement: EgressPlacementPolicy,
+    /// Optional resolved-address scope override for HTTP transport.
+    pub http_network_scope: Option<HttpNetworkScope>,
     /// Vault ref for the outbound credential (bearer header today).
     /// None = unauthenticated upstream (loopback-only by policy).
     pub credential_ref: Option<String>,
@@ -191,10 +201,9 @@ pub struct McpUpstreamConfig {
 }
 
 pub enum McpUpstreamTransport {
-    /// Streamable HTTP / plain HTTP JSON-RPC. The only Phase-1 transport.
+    /// Streamable HTTP / plain HTTP JSON-RPC through egress-http-runner.
     Http { url: String },
-    /// Stdio subprocess (command + args). Phase 3 — process supervision,
-    /// sandboxing, and PATH policy must land first.
+    /// Local stdio subprocess under the exact command allowlist.
     Stdio { command: String, args: Vec<String> },
 }
 
@@ -208,16 +217,15 @@ pub struct McpUpstreamToolGrant {
 }
 ```
 
-Persistence: hotel context graph under `__mcp_upstream__:<upstream_id>`
-(same LWW pattern as `__mcp_endpoint__:*`). The reserved-prefix `SetConfig`
-ACL from the hardening proposal (`mcp-membrane-hardening` S4) covers this
-prefix from day one.
+Persistence uses registry maps in the hotel context graph:
+`__mcp_upstreams__` for configuration and `__mcp_upstream_catalogs__` for
+guest reports. HTTP upstreams are mirrored into `__integration_bindings__` so
+placement and HTTP egress share one policy contract.
 
-## Runtime: the `mcp-client` guest
+## Runtime: the `mcp-client-runner` guest
 
-One new crate, `membrane-mcp-client`, reusing `membrane::MembraneRuntime`
-(lease lifecycle, IPC reconnect, push handling — the same chassis every
-membrane guest rides):
+The `membrane-mcp-client` crate is a plain inbox-subscriber guest under the
+reserved `mcp-client-runner` role:
 
 - Materialized on demand by the hotel when the first upstream is registered;
   one guest supervises **all** upstreams for the hotel (connections are
@@ -225,11 +233,10 @@ membrane guest rides):
 - On `update_mcp_upstream` push (or startup replay via `GetMcpUpstreams`):
   `initialize` → `tools/list` → validate against `tool_allowlist` → report
   the projected tool set to the hotel (`ReportMcpUpstreamCatalog` IPC).
-- Executes remote `tools/call` on behalf of the mesh with per-call timeout
-  (default 30s), response-size cap, and allotment enforcement.
-- Hand-rolled JSON-RPC client mirroring the server's `protocol.rs` (we
-  already speak the wire format; an SDK dependency is optional, not
-  required — decide at implementation with a size/maintenance bake-off).
+- Executes remote `tools/call` with per-call timeout, response-size cap, and
+  allotment enforcement.
+- Uses the implemented hand-rolled JSON-RPC client. HTTP envelopes delegate
+  to `egress-http-runner`; local stdio owns its allowlisted subprocess.
 
 ## Catalog projection
 
@@ -247,11 +254,10 @@ membrane guest rides):
   `stale-grant` and drops it from projection until the owner re-approves
   (`mcp.connect` re-run) — descriptions cannot silently mutate under an
   existing approval.
-- Invocation path: `turn_loop` → `tool_exec` (namespace match) →
-  `IpcRequest::CallMcpUpstreamTool { upstream_id, tool, args }` → hotel
-  routes to the `mcp-client` guest → remote call → result (with `isError`
-  mapped to the standard tool-error shape) back through the normal
-  enriched-tool-result path.
+- Invocation path: `turn_loop` → `tool_exec` (namespace match) → assembled
+  `ToolExecutionRoute` → standard `EmitTask` dispatch to `mcp-client-runner`
+  → remote call → standard `datasource_response` → normal enriched-tool-result
+  path.
 
 ## IPC surface
 
@@ -262,7 +268,7 @@ membrane guest rides):
 | `GetMcpUpstreams {}` / `GetMcpUpstreamStatus { upstream_id }` | Replay/status | Read-only |
 | `ProvisionMcpUpstreamCredential { upstream_id, secret }` | Store outbound credential in vault | Narrow write, approval-backed (shared shape with `ProvisionMcpTokenGrant` from hardening S3) |
 | `ReportMcpUpstreamCatalog { upstream_id, tools }` | Guest → hotel projection report | Guest identity = the mcp-client guest |
-| `CallMcpUpstreamTool { upstream_id, tool, args }` | Execute remote tool | Caller must be in `grant_agents`; allotment charged |
+| Standard `EmitTask` with `ToolExecutionRoute` | Execute remote tool through `mcp-client-runner` | Caller must be in `grant_agents`; allotment charged |
 
 ## Philote tools
 
@@ -290,17 +296,17 @@ membrane guest rides):
   above. Projected tools can never grant classes (`config`, `shell`) —
   they are leaf calls only.
 - **Blast radius**: `grant_agents` scopes who may call; allotments and
-  response-size caps bound each grant; the audit trail is the standard tool
-  ledger (every `CallMcpUpstreamTool` is a recorded tool execution with
-  upstream provenance).
+  response-size caps bound each grant; the standard tool ledger records the
+  MCP execution and the execution-hotel `__integration_audits__` registry
+  records the shared HTTP boundary without bodies or credentials.
 - **Availability**: upstream failures degrade to tool errors, never to turn
   evictions — timeouts are per-call and the client guest is supervised like
   any membrane guest.
 
-## Phases
+## Implementation History
 
 1. **Phase 1 — Registry + HTTP client + owner-only projection.**
-   Types, `__mcp_upstream__` persistence, `RegisterMcpUpstream`/revoke/get,
+   Types, registry-map persistence, `RegisterMcpUpstream`/revoke/get,
    `membrane-mcp-client` crate (HTTP transport, initialize/tools-list/call),
    `mcp.connect`/`mcp.disconnect`/`mcp.upstreams`, projection into the
    owner's catalog. **Proof: a philote connects to the local graph-
@@ -326,10 +332,14 @@ membrane guest rides):
 - Independent of the coordination-endpoint proposal (inbound), but Phase 1's
   fixture unlocks its testing too.
 
-## Open Questions
+## Resolved Decisions And Follow-On
 
-- SDK vs hand-rolled client: `rmcp` maturity vs our existing wire knowledge —
-  decide with a spike in Phase 1.
+- The client is hand-rolled JSON-RPC, preserving a small and auditable protocol
+  surface.
+- Projected calls use the standard `ToolExecutionRoute` and `EmitTask` path;
+  there is no MCP-specific call IPC.
+- HTTP transport uses the shared egress runner and placement policy; stdio
+  remains local and exact-command allowlisted.
 - Should projected tools be visible in `tools/list` of our *own* gateway
   endpoints (re-export)? Default **no** (no transitive exposure); revisit
   with a concrete need.

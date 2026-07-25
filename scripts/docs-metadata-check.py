@@ -73,6 +73,17 @@ REQUIRED_DOCS = {
         "task_refs",
         "tracks_domains",
     },
+    "docs/architecture/OUTBOUND_INTEGRATIONS.md": {
+        "title",
+        "doc_type",
+        "domain",
+        "status",
+        "last_updated",
+        "tags",
+        "related_docs",
+        "task_refs",
+        "tracks_domains",
+    },
     "docs/architecture/AGENT_LOOP_RESEARCH.md": {
         "title",
         "doc_type",

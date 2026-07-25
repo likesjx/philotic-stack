@@ -1693,6 +1693,8 @@ Seam IDs: `wider-client-adoption`, `philotic-native-memory-integration`
   - [x] Install the exact merged outbound binaries on `mbp-jane` and
     `vps-jane`, restart both supervised hotels, and prove required VPS
     execution in a watched two-hotel run.
+  - [x] Publish the durable outbound authority/runtime reference with rendered
+    binding, direct HTTP, and MCP-over-HTTP sequence diagrams.
   - [ ] Inventory remaining direct clients and migrate eligible general API
     traffic behind governed bindings.
 - [x] Perimeter egress control (`egress-policy-object`): define the first
