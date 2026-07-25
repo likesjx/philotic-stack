@@ -1670,13 +1670,13 @@ Seam IDs: `wider-client-adoption`, `philotic-native-memory-integration`
   (`http-egress-execution-boundary`): add a bounded `egress-http-runner`,
   typed request/response envelopes, redirect rechecks, limits, sanitization,
   and audit; migrate one non-model HTTP path.
-- [ ] Outbound integration fabric Slice 2 (`exit-hotel-placement-policy`):
+- [x] Outbound integration fabric Slice 2 (`exit-hotel-placement-policy`):
   route preferred/required Internet integration execution to `vps-jane` and
   prove local, fallback, and fail-closed behavior in a watched two-hotel run.
   - [x] Implement reachability-aware local/preferred/required/deny placement,
     remote runner materialization, routed execution, audited fallback, and
     fail-closed decisions.
-  - [ ] Install and watched-live prove preferred/required execution on
+  - [x] Install and watched-live prove preferred/required execution on
     `vps-jane`.
 - [x] Outbound integration fabric Slice 3 (`mcp-egress-policy`): move MCP HTTP
   exchange behind the shared egress executor while retaining the existing MCP
@@ -1687,9 +1687,14 @@ Seam IDs: `wider-client-adoption`, `philotic-native-memory-integration`
   grants, and `ToolExecutionRoute` records.
 - [ ] Outbound integration fabric Slice 5 (`outbound-fleet-enforcement`):
   deployment inventories now install `membrane-mcp-client` and
-  `egress-http-runner`; roll out the branch, inventory remaining direct clients,
-  and migrate general API traffic class by class while keeping model/provider
-  and communication exceptions explicit.
+  `egress-http-runner`; inventory remaining direct clients and migrate general
+  API traffic class by class while keeping model/provider and communication
+  exceptions explicit.
+  - [x] Install the exact merged outbound binaries on `mbp-jane` and
+    `vps-jane`, restart both supervised hotels, and prove required VPS
+    execution in a watched two-hotel run.
+  - [ ] Inventory remaining direct clients and migrate eligible general API
+    traffic behind governed bindings.
 - [x] Perimeter egress control (`egress-policy-object`): define the first
   canonical policy and placement types; finding schema remains part of the
   HTTP executor/audit slice.

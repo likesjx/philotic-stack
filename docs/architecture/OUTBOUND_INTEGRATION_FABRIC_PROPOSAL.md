@@ -2,9 +2,9 @@
 title: Outbound Integration Fabric — SkillDAG Bindings, HTTP Egress, and Exit Placement
 doc_type: proposal
 domain: tooling-execution
-status: accepted-current-slice
-disposition: accepted-current-slice
-last_updated: 2026-07-24
+status: implemented
+disposition: implemented
+last_updated: 2026-07-25
 tags:
 - skilldag
 - integrations
@@ -21,6 +21,7 @@ implemented_by:
 - crates/egress-http-runner/src/main.rs
 - crates/aiua/src/main.rs
 - crates/aiua/src/service/ipc.rs
+- crates/aiua/src/service/operator_surface.rs
 - crates/philotic-client/src/lib.rs
 - crates/philote/src/catalog.rs
 - crates/philote/src/runtime.rs
@@ -29,13 +30,19 @@ implemented_by:
 - crates/membrane-mcp-client/src/main.rs
 - crates/membrane-mcp-client/src/upstream.rs
 - crates/philotic-web/src/integration.rs
+- .github/workflows/build-linux.yml
+- ansible/roles/philotic_hotel/tasks/main.yml
+- scripts/push-homebrew-remote.sh
 - scripts/smoke-integration-http-roundtrip.sh
+- scripts/smoke-integration-exit-hotel-roundtrip.sh
+- scripts/integration-exit-smoke-stub.py
 - scripts/smoke-mcp-http-egress-roundtrip.sh
 active_seams:
 - integration-binding-contract
 - http-egress-execution-boundary
 - exit-hotel-placement-policy
 - mcp-egress-policy
+- outbound-fleet-enforcement
 related_docs:
 - ARCHITECTURE_STATUS.md
 - ARCHITECTURE.md
@@ -88,7 +95,8 @@ network exit merely because it already has "router" in its name.
 
 ## Disposition
 
-Implemented in source through the local binary-smoke boundary.
+Implemented, installed on the declared MBP and VPS hotels, and watched-live
+green for required `vps-jane` execution.
 
 The completed implementation:
 
@@ -109,9 +117,15 @@ The completed implementation:
 - installs both outbound runtime binaries through the declared build and
   deployment inventories
 
-The isolated hotel HTTP and MCP-over-HTTP smokes are green. Installed two-hotel
-rollout and a watched `vps-jane` exit proof remain a deployment gate, not an
-unimplemented source boundary.
+The isolated hotel HTTP and MCP-over-HTTP smokes are green. The installed
+two-hotel proof routed a required-placement request from `mbp-jane` to the
+VPS-only loopback target, resolved the credential inside `vps-jane`, enforced
+the bounded HTTP contract, returned a sanitized response to `mbp-jane`, and
+persisted the content-free audit at the exit hotel's authority.
+
+The remaining work is migration, not fabric construction: inventory direct
+outbound callers and move eligible general-API traffic behind bindings while
+keeping model/provider and communication exceptions explicit.
 
 ## Current Truth
 
@@ -142,6 +156,12 @@ unimplemented source boundary.
 - `perimeter-core` defines an `EgressPolicy`, policy evaluation, and
   vault-backed credential binding.
 - `aiua` exposes `CheckEgress` and a hotel-owned `HotelEgressGateway`.
+- The exact merged Linux artifact installed `aiua`, `egress-http-runner`, and
+  `membrane-mcp-client` on `vps-jane`; the matching merged `aiua` was installed
+  and restarted on `mbp-jane`.
+- A watched two-hotel run proved required `vps-jane` placement, target-hotel
+  credential resolution, response return to `mbp-jane`, and durable audit
+  persistence at the execution hotel.
 
 ### Proven Gap
 
@@ -151,12 +171,9 @@ unimplemented source boundary.
 - Before this slice, `CheckEgress` resolved credentials and returned raw
   injection headers through IPC; `hotel.egress.check` rendered those headers
   into a model-facing tool result.
-- The updated MCP client and HTTP runner are present in deployment inventories,
-  but this branch has not yet been proven as the installed runtime on every
-  hotel.
-- Preferred/required exit selection is implemented, including explicit audited
-  local fallback and fail-closed required placement, but a watched two-hotel
-  `vps-jane` run is still required for installed-runtime proof.
+- The installed cross-hotel proof covers the HTTP execution boundary. The MCP
+  manager's protocol lifecycle and shared-HTTP delegation remain proven by the
+  isolated binary smoke rather than a public live upstream call.
 
 ### Intended
 
@@ -424,9 +441,10 @@ revocation. Runner tests prove redirect-host denial and response limits.
 - route execution to `vps-jane` when policy selects it
 - prove fail-closed and audited fallback behavior
 
-Status: source-implemented and test-green. Local execution is smoke-green;
-installed preferred/required `vps-jane` execution remains unproven until a
-watched two-hotel rollout.
+Status: implemented and watched-live-green. The installed proof used a required
+`vps-jane` policy, a target reachable only on VPS loopback, a credential
+resolved at the VPS vault boundary, and a return route to `mbp-jane`; it also
+verified the durable audit through the target hotel's operator surface.
 
 ### Slice 3 — MCP HTTP Adoption
 
@@ -434,11 +452,11 @@ watched two-hotel rollout.
 - execute MCP HTTP transport through the shared boundary
 - retain MCP registry/catalog/grant semantics
 
-Status: source-implemented and local smoke-green. The smoke proves
+Status: implemented and local smoke-green. The smoke proves
 initialization, notification, tool catalog, credentialed tool call, sanitized
 result, durable egress audit, and revoke with the MCP manager retaining
-protocol ownership. A live authenticated `vps-jane` MCP call remains part of
-the installed rollout gate.
+protocol ownership. A public live upstream call through `vps-jane` would be a
+higher-level runtime proof, not a remaining source or fleet-installation gate.
 
 ### Slice 4 — SkillDAG Binding Compiler
 
@@ -462,8 +480,9 @@ client.
 Model/provider and communication paths move only under their own explicit
 slices.
 
-Status: deployment inventory implemented; fleet installation, direct-client
-inventory, and class-by-class migration remain operational follow-through.
+Status: fleet installation is watched-live-green on `mbp-jane` and `vps-jane`.
+Direct-client inventory and class-by-class migration remain the active
+operational follow-through.
 
 ## Verification Ladder
 
@@ -487,12 +506,21 @@ exit.
 - migrating every existing `reqwest` caller in one change
 - treating a generic HTTP proxy as a browser or unrestricted fetch tool
 
-## Open Questions
+## Resolved Decisions And Follow-On Questions
 
-- Which hotel capability marker should declare eligibility as an Internet exit?
-- Should the first HTTP runner accept arbitrary approved URLs, or only binding
-  IDs plus relative paths?
-- Which response headers are safe enough to return by default?
-- Should communication egress eventually share the executor while membranes
-  retain transport semantics?
-- At what point should model/provider egress lose its transitional exception?
+Resolved:
+
+- the HTTP runner accepts binding authority plus a relative request path, not an
+  arbitrary model-supplied URL
+- response headers are denied by default and returned only through each
+  binding's explicit allowlist
+- the hotel router selects placement while the execution runner owns bytes and
+  the MCP manager retains protocol lifecycle
+
+Still open:
+
+- which durable hotel capability marker should declare Internet-exit
+  eligibility beyond current reachability and explicit hotel identity
+- whether communication egress should eventually share the executor while
+  membranes retain transport semantics
+- when model/provider egress should lose its transitional exception

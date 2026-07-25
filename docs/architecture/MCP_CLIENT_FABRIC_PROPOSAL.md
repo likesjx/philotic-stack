@@ -2,9 +2,9 @@
 title: MCP Client Fabric — Philote-Governed Consumption of External MCP Servers
 doc_type: proposal
 domain: membrane-transport
-status: in-progress
-disposition: phase-3-implemented
-last_updated: 2026-07-24
+status: implemented
+disposition: implemented
+last_updated: 2026-07-25
 tags:
   - mcp
   - mcp-client
@@ -15,7 +15,12 @@ tags:
   - security
 proposal_id: mcp-client-fabric
 implements: []
-implemented_by: []
+implemented_by:
+  - crates/membrane-mcp-client/src/main.rs
+  - crates/membrane-mcp-client/src/upstream.rs
+  - crates/aiua/src/service/ipc.rs
+  - crates/philotic-client/examples/mcp_upstream_smoke_driver.rs
+  - scripts/smoke-mcp-http-egress-roundtrip.sh
 active_seams:
   - mcp-upstream-registry
   - mcp-client-guest
@@ -30,6 +35,8 @@ related_docs:
   - OUTBOUND_INTEGRATION_FABRIC_PROPOSAL.md
 source_of_truth_targets:
   - docs/architecture/MCP_CLIENT_FABRIC_PROPOSAL.md
+task_refs:
+  - docs/task.md
 ---
 
 # MCP Client Fabric — Philote-Governed Consumption of External MCP Servers
@@ -108,16 +115,18 @@ source_of_truth_targets:
 >   through the fabric. Fixture: `scripts/mcp_stdio_stub.py`; driver adds
 >   `MCP_SMOKE_STDIO_CMD` / `MCP_SMOKE_STDIO_ARGS`.
 >
-> The fabric is now feature-complete across all three phases. Still outstanding:
-> the philote approval-UX drill through a real cognitive turn, and a fleet
-> deploy (no production hotel runs the fabric binaries yet).
+> The fabric is feature-complete across all three phases. The
+> `membrane-mcp-client` binary is now installed on `mbp-jane` and `vps-jane`.
+> The remaining higher-level proof is the philote approval-UX drill through a
+> real cognitive turn, not a fleet installation gap.
 >
-> **Shared egress follow-on (2026-07-24).** The client manager is the MCP
-> protocol authority, but its HTTP transport still performs network I/O
-> directly after checking its own MCP host policy. The accepted
-> `OUTBOUND_INTEGRATION_FABRIC_PROPOSAL` keeps this manager and moves its HTTP
-> exchange behind the shared hotel-owned execution and exit-placement contract.
-> Stdio remains local and command-allowlisted.
+> **Shared egress follow-on implemented (2026-07-25).** The client manager
+> remains the MCP protocol authority while HTTP exchange now runs through the
+> shared hotel-owned `egress-http-runner` and exit-placement contract. Stdio
+> remains local and command-allowlisted. The isolated binary smoke proves the
+> credentialed MCP lifecycle and durable shared-egress audit; the installed
+> two-hotel HTTP proof separately establishes the cross-hotel execution
+> boundary.
 
 ## Problem
 
