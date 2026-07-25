@@ -2,8 +2,8 @@
 title: Creative Learning Flywheel Proposal
 doc_type: proposal
 domain: memory-context
-status: accepted-current-slice
-last_updated: 2026-07-24
+status: implemented
+last_updated: 2026-07-25
 tags:
   - creativity
   - learning
@@ -55,7 +55,7 @@ Organization serves motion through this loop. If the system creates more categor
 
 ## Disposition
 
-`accepted for current slice`
+`implemented`; four-week pilot active
 
 This proposal does not create another memory store. It defines the behavior, graph vocabulary, prompts, reviews, and measures that turn the existing stores into a personal growth system.
 
@@ -63,9 +63,21 @@ The first implementation slice uses `life.capture`,
 `life.flywheel.brief`, and `life.flywheel.review` over the canonical
 LifeGraph. All captures enter as proposed evidence; the brief and review are
 read-only. V006 is installed on the live Memgraph, the `mac-jane` catalogs and
-parser are installed, and the updated runner is smoke-green through isolated
-hotel IPC against the live Memgraph and ONNX sidecar. The supervised
-`vps-jane` runner has not been replaced yet.
+parser are installed, and the updated runner is installed under the supervised
+`vps-jane` hotel. The production route is watched-live-green from `mac-jane`
+through the remote runner and live Memgraph/ONNX services and back to
+`mac-jane`.
+
+The idempotent cadence installer registers:
+
+- `lifegraph-flywheel-daily:mac-jane` at `12:00 UTC` daily
+- `lifegraph-flywheel-weekly:mac-jane` at `22:00 UTC` on Sunday
+
+Both jobs target Björk's orchestrator role, preapprove only their read-only
+flywheel tools, run in isolated cron sessions, and deliver one bounded result
+to the operator's Telegram. Both completed a forced first fire on 2026-07-25.
+The scheduler currently stores UTC expressions, so the displayed local time
+shifts by one hour when America/New_York enters or leaves daylight saving time.
 
 ## Ownership By Stage
 
@@ -214,9 +226,8 @@ Run one four-week pilot in the `LifeGraph creative systems` domain:
 
 ## Next Seam
 
-With explicit authorization to transfer the source or built artifact, install
-the updated runner into the supervised `vps-jane` service and prove the
-production routed capture, brief, and review path. Then activate the daily
-brief and weekly review cadence and run the four-week `LifeGraph creative
-systems` pilot. Expand only after the review shows artifacts, learning reuse,
-and lower re-entry cost without excess maintenance.
+Run the four-week `LifeGraph creative systems` pilot using the active daily
+brief and weekly review. Expand only after the review shows artifacts,
+learning reuse, and lower re-entry cost without excess maintenance. Treat
+timezone-aware cron scheduling as a follow-on only if the UTC-backed cadence's
+one-hour seasonal shift creates real friction.
