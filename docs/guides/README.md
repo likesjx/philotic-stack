@@ -20,6 +20,7 @@ How-to documentation, policy authoring guides, and operational runbooks.
 | [DESKTOP_COMPONENT_AUTHORING_WATCHED_UAT.md](DESKTOP_COMPONENT_AUTHORING_WATCHED_UAT.md) | Operator runbook for watched-live desktop component create/edit validation |
 | [DISCORD_WATCHED_UAT.md](DISCORD_WATCHED_UAT.md) | Operator runbook for watched-live Discord provider validation on `develop` |
 | [SANDBOX_POLICIES.md](SANDBOX_POLICIES.md) | How to write custom sandbox policies for `philotic-sandbox` |
+| [USING_THE_TABLE_QUERY_TOOLS.md](USING_THE_TABLE_QUERY_TOOLS.md) | How an agent reads granted databases via `table.catalog`/`schema`/`build`/`query` — no shell |
 
 ## Templates
 
