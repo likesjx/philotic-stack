@@ -364,6 +364,7 @@ pub enum SemanticSpace {
     LifeEventSemantic,
     GoalSystemSemantic,
     SkillToolSemantic,
+    CreativeLearningSemantic,
     RolePersonSemantic,
     MemoryBridgeSemantic,
 }
@@ -626,6 +627,8 @@ impl RetrievalContextPacket {
 #[serde(rename_all = "snake_case")]
 pub enum ContextAuthority {
     MuninnContinuity,
+    EpisodicEvidence,
+    AuthoredKnowledge,
     LifeGraphTruth,
     LifeGraphEvidence,
     IntelGraphProjectTruth,
@@ -637,6 +640,8 @@ pub enum ContextAuthority {
 #[serde(rename_all = "snake_case")]
 pub enum ContextRefKind {
     MuninnEngram,
+    MemPalaceEpisode,
+    ObsidianDocument,
     LifeGraphNode,
     LifeGraphEvidencePacket,
     LifeGraphRetrievalPacket,
@@ -667,6 +672,8 @@ impl ContextRef {
 
         match (&self.kind, &self.authority) {
             (ContextRefKind::MuninnEngram, ContextAuthority::MuninnContinuity)
+            | (ContextRefKind::MemPalaceEpisode, ContextAuthority::EpisodicEvidence)
+            | (ContextRefKind::ObsidianDocument, ContextAuthority::AuthoredKnowledge)
             | (ContextRefKind::LifeGraphNode, ContextAuthority::LifeGraphTruth)
             | (ContextRefKind::LifeGraphNode, ContextAuthority::LifeGraphEvidence)
             | (ContextRefKind::LifeGraphEvidencePacket, ContextAuthority::LifeGraphEvidence)
@@ -732,8 +739,143 @@ pub struct MuninnRecallMemory {
     pub metadata: serde_json::Value,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EpisodicPrivacyClass {
+    Normal,
+    Sensitive,
+    Private,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EpisodicRetentionClass {
+    Session,
+    Days30,
+    Days90,
+    Durable,
+    UserManaged,
+}
+
+/// Stable envelope for an automatically captured MemPalace episode.
+///
+/// Episodes are evidence about what happened. They are not canonical life
+/// truth and must be promoted through the LifeGraph governance tools before a
+/// life claim can acquire that authority.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct EpisodicEpisode {
+    pub episode_id: String,
+    pub session_id: String,
+    pub client: String,
+    pub agent_or_role: String,
+    pub captured_at: String,
+    pub source_event: String,
+    pub content_or_summary: String,
+    pub content_hash: String,
+    #[serde(default)]
+    pub provenance: serde_json::Value,
+    pub privacy_class: EpisodicPrivacyClass,
+    pub retention_class: EpisodicRetentionClass,
+    #[serde(default)]
+    pub related_context_refs: Vec<String>,
+    #[serde(default)]
+    pub metadata: serde_json::Value,
+}
+
+impl EpisodicEpisode {
+    pub fn validate(&self) -> Result<(), ContractError> {
+        let mut violations = Vec::new();
+        require_non_empty(&mut violations, "episode_id", &self.episode_id);
+        require_non_empty(&mut violations, "session_id", &self.session_id);
+        require_non_empty(&mut violations, "client", &self.client);
+        require_non_empty(&mut violations, "agent_or_role", &self.agent_or_role);
+        require_non_empty(&mut violations, "captured_at", &self.captured_at);
+        require_non_empty(&mut violations, "source_event", &self.source_event);
+        require_non_empty(
+            &mut violations,
+            "content_or_summary",
+            &self.content_or_summary,
+        );
+        require_non_empty(&mut violations, "content_hash", &self.content_hash);
+
+        if chrono::DateTime::parse_from_rfc3339(&self.captured_at).is_err() {
+            violations.push("captured_at must be RFC3339".into());
+        }
+
+        let hash = self
+            .content_hash
+            .strip_prefix("sha256:")
+            .unwrap_or_default();
+        if hash.len() != 64
+            || !hash
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            violations.push("content_hash must be sha256:<64 lowercase hex chars>".into());
+        }
+
+        for (idx, context_ref) in self.related_context_refs.iter().enumerate() {
+            require_non_empty(
+                &mut violations,
+                &format!("related_context_refs[{idx}]"),
+                context_ref,
+            );
+        }
+
+        finish_validation(violations)
+    }
+}
+
+/// Bounded episodic evidence returned by MemPalace semantic recall.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MemPalaceRecallEpisode {
+    pub episode_id: String,
+    pub session_id: String,
+    pub client: String,
+    pub agent_or_role: String,
+    pub captured_at: String,
+    pub source_event: String,
+    pub excerpt: String,
+    pub content_hash: String,
+    pub score: f32,
+    pub retrieval_rationale: String,
+    pub privacy_class: EpisodicPrivacyClass,
+    pub retention_class: EpisodicRetentionClass,
+    #[serde(default)]
+    pub related_context_refs: Vec<String>,
+    #[serde(default)]
+    pub provenance: serde_json::Value,
+    #[serde(default)]
+    pub metadata: serde_json::Value,
+}
+
+/// Bounded reference to an authored Obsidian note. The note body remains
+/// canonical in the vault and is intentionally not copied into LifeGraph.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct KnowledgeRecallDocument {
+    pub document_id: String,
+    pub vault_id: String,
+    pub relative_path: String,
+    pub content_hash: String,
+    pub title: String,
+    pub excerpt: String,
+    pub score: f32,
+    pub modified_at: String,
+    #[serde(default)]
+    pub headings: Vec<String>,
+    #[serde(default)]
+    pub tags: Vec<String>,
+    #[serde(default)]
+    pub outbound_links: Vec<String>,
+    #[serde(default)]
+    pub provenance: serde_json::Value,
+    #[serde(default)]
+    pub metadata: serde_json::Value,
+}
+
 /// Cross-agent context envelope that can carry Muninn, LifeGraph, Intel Graph,
-/// repo, and runtime references without erasing their authority boundaries.
+/// MemPalace, repo, and runtime references without erasing their authority
+/// boundaries.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ContextPacket {
     pub packet_id: String,
@@ -965,15 +1107,143 @@ impl ContextPacket {
             }),
         }
     }
+
+    pub fn from_mempalace_recall(
+        packet_id: impl Into<String>,
+        generated_at: impl Into<String>,
+        query_id: Option<String>,
+        summary: impl Into<String>,
+        episodes: &[MemPalaceRecallEpisode],
+    ) -> Self {
+        let refs: Vec<_> = episodes
+            .iter()
+            .map(|episode| ContextRef {
+                ref_id: episode.episode_id.clone(),
+                kind: ContextRefKind::MemPalaceEpisode,
+                authority: ContextAuthority::EpisodicEvidence,
+                summary: Some(episode.excerpt.clone()),
+                validation_state: None,
+                uri: None,
+                metadata: serde_json::json!({
+                    "session_id": episode.session_id,
+                    "client": episode.client,
+                    "agent_or_role": episode.agent_or_role,
+                    "captured_at": episode.captured_at,
+                    "source_event": episode.source_event,
+                    "content_hash": episode.content_hash,
+                    "score": episode.score,
+                    "retrieval_rationale": episode.retrieval_rationale,
+                    "privacy_class": episode.privacy_class,
+                    "retention_class": episode.retention_class,
+                    "related_context_refs": episode.related_context_refs,
+                    "provenance": episode.provenance,
+                    "extra": episode.metadata,
+                }),
+            })
+            .collect();
+        let ref_ids = refs
+            .iter()
+            .map(|context_ref| context_ref.ref_id.clone())
+            .collect();
+
+        Self {
+            packet_id: packet_id.into(),
+            generated_at: generated_at.into(),
+            query_id,
+            audience_role: None,
+            summary: summary.into(),
+            refs,
+            sections: vec![ContextPacketSection {
+                title: "MemPalace episodic recall".into(),
+                authority: ContextAuthority::EpisodicEvidence,
+                ref_ids,
+                text: None,
+            }],
+            policy_notes: vec![
+                "MemPalace refs are episodic evidence about what happened, not canonical LifeGraph truth.".into(),
+                "Current-turn observations and governed LifeGraph truth outrank stale episodic recall.".into(),
+                "Promote extracted candidates through life.observe; never promote raw transcripts automatically.".into(),
+            ],
+            metadata: serde_json::json!({
+                "source": "mempalace_recall",
+            }),
+        }
+    }
+
+    pub fn from_knowledge_recall(
+        packet_id: impl Into<String>,
+        generated_at: impl Into<String>,
+        query_id: Option<String>,
+        summary: impl Into<String>,
+        documents: &[KnowledgeRecallDocument],
+    ) -> Self {
+        let refs: Vec<_> = documents
+            .iter()
+            .map(|document| ContextRef {
+                ref_id: document.document_id.clone(),
+                kind: ContextRefKind::ObsidianDocument,
+                authority: ContextAuthority::AuthoredKnowledge,
+                summary: Some(document.excerpt.clone()),
+                validation_state: None,
+                uri: Some(format!(
+                    "obsidian://open?vault={}&file={}",
+                    document.vault_id, document.relative_path
+                )),
+                metadata: serde_json::json!({
+                    "vault_id": document.vault_id,
+                    "relative_path": document.relative_path,
+                    "content_hash": document.content_hash,
+                    "title": document.title,
+                    "score": document.score,
+                    "modified_at": document.modified_at,
+                    "headings": document.headings,
+                    "tags": document.tags,
+                    "outbound_links": document.outbound_links,
+                    "provenance": document.provenance,
+                    "extra": document.metadata,
+                }),
+            })
+            .collect();
+        let ref_ids = refs
+            .iter()
+            .map(|context_ref| context_ref.ref_id.clone())
+            .collect();
+
+        Self {
+            packet_id: packet_id.into(),
+            generated_at: generated_at.into(),
+            query_id,
+            audience_role: None,
+            summary: summary.into(),
+            refs,
+            sections: vec![ContextPacketSection {
+                title: "Obsidian authored knowledge".into(),
+                authority: ContextAuthority::AuthoredKnowledge,
+                ref_ids,
+                text: None,
+            }],
+            policy_notes: vec![
+                "Obsidian Markdown remains canonical for note bodies and authored structure.".into(),
+                "Backlinks and extracted entity links are candidates, not confirmed LifeGraph truth.".into(),
+                "Create, patch, and LifeGraph-link operations require a reviewable proposal before application.".into(),
+            ],
+            metadata: serde_json::json!({
+                "source": "knowledge_search",
+            }),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LifeGraphToolName {
+    LifeCapture,
     LifeObserve,
     LifeObserveBatch,
     LifeRecall,
     LifeRecallFeedback,
+    LifeFlywheelBrief,
+    LifeFlywheelReview,
     LifeCommit,
     LifeResolve,
     LifeConflict,
@@ -983,10 +1253,13 @@ pub enum LifeGraphToolName {
 impl LifeGraphToolName {
     pub fn as_str(&self) -> &'static str {
         match self {
+            Self::LifeCapture => "life.capture",
             Self::LifeObserve => "life.observe",
             Self::LifeObserveBatch => "life.observe.batch",
             Self::LifeRecall => "life.recall",
             Self::LifeRecallFeedback => "life.recall.feedback",
+            Self::LifeFlywheelBrief => "life.flywheel.brief",
+            Self::LifeFlywheelReview => "life.flywheel.review",
             Self::LifeCommit => "life.commit",
             Self::LifeResolve => "life.resolve",
             Self::LifeConflict => "life.conflict",
@@ -997,7 +1270,8 @@ impl LifeGraphToolName {
     pub fn mutates_graph(&self) -> bool {
         matches!(
             self,
-            Self::LifeObserve
+            Self::LifeCapture
+                | Self::LifeObserve
                 | Self::LifeObserveBatch
                 | Self::LifeRecallFeedback
                 | Self::LifeCommit
@@ -1037,6 +1311,11 @@ impl LifeGraphToolSpec {
 pub fn life_graph_tool_catalog() -> Vec<LifeGraphToolSpec> {
     vec![
         LifeGraphToolSpec::new(
+            LifeGraphToolName::LifeCapture,
+            "Capture a question, idea, source, experiment, artifact, learning, or unclassified inbox item as proposed Life Graph evidence.",
+            false,
+        ),
+        LifeGraphToolSpec::new(
             LifeGraphToolName::LifeObserve,
             "Capture a grounded observation as proposed Life Graph evidence.",
             false,
@@ -1054,6 +1333,16 @@ pub fn life_graph_tool_catalog() -> Vec<LifeGraphToolSpec> {
         LifeGraphToolSpec::new(
             LifeGraphToolName::LifeRecallFeedback,
             "Record retrieval quality feedback and emit governed graph-improvement signals.",
+            false,
+        ),
+        LifeGraphToolSpec::new(
+            LifeGraphToolName::LifeFlywheelBrief,
+            "Read a bounded resume, make, and unblock brief from active creative-learning threads.",
+            false,
+        ),
+        LifeGraphToolSpec::new(
+            LifeGraphToolName::LifeFlywheelReview,
+            "Read bounded weekly creative-learning flow metrics and stale-inbox signals.",
             false,
         ),
         LifeGraphToolSpec::new(
@@ -1474,6 +1763,236 @@ impl GrowthLoopPolicy {
     }
 }
 
+/// Minimal classification accepted by the universal `life.capture` path.
+///
+/// `Inbox` deliberately maps to a proposed `Signal` with
+/// `inbox_state=unclassified`: capture first, classify later. The explicit
+/// creative kinds map to the governed creative-learning labels.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LifeCaptureKind {
+    #[default]
+    Inbox,
+    Question,
+    Idea,
+    Source,
+    Experiment,
+    Artifact,
+    Learning,
+}
+
+impl LifeCaptureKind {
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Inbox => "Signal",
+            Self::Question => "Question",
+            Self::Idea => "Idea",
+            Self::Source => "Source",
+            Self::Experiment => "Experiment",
+            Self::Artifact => "Artifact",
+            Self::Learning => "Learning",
+        }
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Inbox => "inbox",
+            Self::Question => "question",
+            Self::Idea => "idea",
+            Self::Source => "source",
+            Self::Experiment => "experiment",
+            Self::Artifact => "artifact",
+            Self::Learning => "learning",
+        }
+    }
+}
+
+fn default_capture_confidence() -> f32 {
+    0.8
+}
+
+/// Low-friction input for `life.capture`.
+///
+/// Only `content` is required. Everything else is optional context that
+/// improves provenance or lets the caller connect the capture to an existing
+/// LifeGraph node without turning capture into a taxonomy form.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LifeCaptureInput {
+    pub content: String,
+    #[serde(default)]
+    pub kind: LifeCaptureKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pilot_domain: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_by: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_role: Option<String>,
+    #[serde(default = "default_capture_confidence")]
+    pub confidence: f32,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub edges: Vec<ObserveEdge>,
+    #[serde(default)]
+    pub metadata: serde_json::Value,
+}
+
+impl LifeCaptureInput {
+    pub fn validate(&self) -> Result<(), ContractError> {
+        let mut violations = Vec::new();
+        require_non_empty(&mut violations, "content", &self.content);
+        if self.content.chars().count() > 2_000 {
+            violations.push("content must be at most 2000 characters".into());
+        }
+        require_unit_interval(&mut violations, "confidence", self.confidence);
+        if self
+            .pilot_domain
+            .as_deref()
+            .is_some_and(|domain| domain.chars().count() > 120)
+        {
+            violations.push("pilot_domain must be at most 120 characters".into());
+        }
+        for (idx, edge) in self.edges.iter().enumerate() {
+            if !cypher::is_living_cycle_rel_type(&edge.rel_type) {
+                violations.push(format!(
+                    "edges[{idx}].rel_type '{}' is not a living-cycle relation (expected one of {})",
+                    edge.rel_type,
+                    cypher::LIVING_CYCLE_REL_TYPES.join(", ")
+                ));
+            }
+            require_non_empty(
+                &mut violations,
+                &format!("edges[{idx}].target_id"),
+                &edge.target_id,
+            );
+        }
+        finish_validation(violations)
+    }
+
+    pub fn into_observe_input(self) -> Result<LifeObserveInput, ContractError> {
+        self.validate()?;
+
+        let suffix = ulid::Ulid::new().to_string().to_lowercase();
+        let kind = self.kind.as_str();
+        let label = self.kind.label();
+        let source_id = self
+            .source_id
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| "agent:quick-capture".into());
+        let source_kind = if source_id.starts_with("membrane:") {
+            SourceKind::MembraneEvent
+        } else {
+            SourceKind::RuntimeObservation
+        };
+        let inbox_state = matches!(self.kind, LifeCaptureKind::Inbox).then_some("unclassified");
+        let creative_status = if inbox_state.is_some() {
+            "inbox"
+        } else {
+            "captured"
+        };
+
+        Ok(LifeObserveInput {
+            observation_id: format!("obs:creative:{suffix}"),
+            evidence: EvidencePacket {
+                packet_id: format!("evidence:creative:{suffix}"),
+                claim_ref: GraphRecordRef {
+                    id: format!("life:{kind}:{suffix}"),
+                    label: label.into(),
+                    datasource: Some("life-graph".into()),
+                },
+                claim_summary: self.content.trim().to_string(),
+                source_refs: vec![SourceRef {
+                    source_id,
+                    source_kind,
+                    reliability: SourceReliability {
+                        score: 0.95,
+                        basis: ReliabilityBasis::DirectObservation,
+                    },
+                    uri: None,
+                    captured_at: None,
+                }],
+                passage_refs: Vec::new(),
+                confidence: self.confidence,
+                validation_state: ValidationState::Proposed,
+                observed_at: None,
+                valid_time_range: None,
+                source_reliability: 0.95,
+                conflict_ids: Vec::new(),
+                adjudication_status: AdjudicationStatus::NotNeeded,
+                metadata: serde_json::json!({
+                    "captured_via": "life.capture",
+                    "capture_kind": kind,
+                    "creative_status": creative_status,
+                    "inbox_state": inbox_state,
+                    "pilot_domain": self.pilot_domain,
+                    "caller_metadata": self.metadata,
+                }),
+            },
+            proposed_graph_refs: Vec::new(),
+            observed_by: self.observed_by,
+            observed_role: self.observed_role,
+            edges: self.edges,
+            provenance: None,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LifeFlywheelBriefInput {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pilot_domain: Option<String>,
+}
+
+impl LifeFlywheelBriefInput {
+    pub fn validate(&self) -> Result<(), ContractError> {
+        let mut violations = Vec::new();
+        if self
+            .pilot_domain
+            .as_deref()
+            .is_some_and(|domain| domain.chars().count() > 120)
+        {
+            violations.push("pilot_domain must be at most 120 characters".into());
+        }
+        finish_validation(violations)
+    }
+}
+
+fn default_review_lookback_days() -> u16 {
+    7
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LifeFlywheelReviewInput {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pilot_domain: Option<String>,
+    #[serde(default = "default_review_lookback_days")]
+    pub lookback_days: u16,
+}
+
+impl Default for LifeFlywheelReviewInput {
+    fn default() -> Self {
+        Self {
+            pilot_domain: None,
+            lookback_days: default_review_lookback_days(),
+        }
+    }
+}
+
+impl LifeFlywheelReviewInput {
+    pub fn validate(&self) -> Result<(), ContractError> {
+        LifeFlywheelBriefInput {
+            pilot_domain: self.pilot_domain.clone(),
+        }
+        .validate()?;
+        if !(1..=90).contains(&self.lookback_days) {
+            return Err(ContractError {
+                violations: vec!["lookback_days must be between 1 and 90".into()],
+            });
+        }
+        Ok(())
+    }
+}
+
 /// A typed living-cycle edge proposed alongside a `life.observe` node write.
 ///
 /// `rel_type` must be one of [`cypher::LIVING_CYCLE_REL_TYPES`]
@@ -1797,9 +2316,12 @@ impl LifeViewNeighborhoodInput {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "tool", content = "input", rename_all = "snake_case")]
 pub enum LifeGraphToolRequest {
+    LifeCapture(LifeCaptureInput),
     LifeObserve(LifeObserveInput),
     LifeRecall(RetrievalQuery),
     LifeRecallFeedback(RetrievalFeedbackInput),
+    LifeFlywheelBrief(LifeFlywheelBriefInput),
+    LifeFlywheelReview(LifeFlywheelReviewInput),
     LifeCommit(LifeCommitInput),
     LifeResolve(LifeResolveInput),
     LifePatchPropose(LifePatchProposalInput),
@@ -1808,9 +2330,12 @@ pub enum LifeGraphToolRequest {
 impl LifeGraphToolRequest {
     pub fn tool_name(&self) -> LifeGraphToolName {
         match self {
+            Self::LifeCapture(_) => LifeGraphToolName::LifeCapture,
             Self::LifeObserve(_) => LifeGraphToolName::LifeObserve,
             Self::LifeRecall(_) => LifeGraphToolName::LifeRecall,
             Self::LifeRecallFeedback(_) => LifeGraphToolName::LifeRecallFeedback,
+            Self::LifeFlywheelBrief(_) => LifeGraphToolName::LifeFlywheelBrief,
+            Self::LifeFlywheelReview(_) => LifeGraphToolName::LifeFlywheelReview,
             Self::LifeCommit(_) => LifeGraphToolName::LifeCommit,
             Self::LifeResolve(_) => LifeGraphToolName::LifeResolve,
             Self::LifePatchPropose(_) => LifeGraphToolName::LifePatchPropose,
@@ -1890,15 +2415,32 @@ impl MemoryGraphRagRunner {
 
     pub fn plan(&self, request: LifeGraphToolRequest) -> Result<RunnerPlan, ContractError> {
         match request {
+            LifeGraphToolRequest::LifeCapture(input) => self.plan_capture(input),
             LifeGraphToolRequest::LifeObserve(input) => self.plan_observe(input),
             LifeGraphToolRequest::LifeRecall(query) => self.plan_recall(query),
             LifeGraphToolRequest::LifeRecallFeedback(feedback) => {
                 self.plan_recall_feedback(feedback)
             }
+            LifeGraphToolRequest::LifeFlywheelBrief(input) => self.plan_flywheel_brief(input),
+            LifeGraphToolRequest::LifeFlywheelReview(input) => self.plan_flywheel_review(input),
             LifeGraphToolRequest::LifeCommit(input) => self.plan_commit(input),
             LifeGraphToolRequest::LifeResolve(input) => self.plan_resolve(input),
             LifeGraphToolRequest::LifePatchPropose(input) => self.plan_patch_propose(input),
         }
+    }
+
+    fn plan_capture(&self, input: LifeCaptureInput) -> Result<RunnerPlan, ContractError> {
+        input.validate()?;
+        Ok(RunnerPlan {
+            tool_name: LifeGraphToolName::LifeCapture,
+            steps: vec![RunnerPlanStep {
+                target: RunnerPlanTarget::GraphDatasource,
+                action: "life.capture".into(),
+                payload: serde_json::to_value(input).unwrap_or_default(),
+            }],
+            requires_operator: false,
+            blocked_reasons: Vec::new(),
+        })
     }
 
     fn plan_observe(&self, input: LifeObserveInput) -> Result<RunnerPlan, ContractError> {
@@ -1966,6 +2508,40 @@ impl MemoryGraphRagRunner {
                     }),
                 },
             ],
+            requires_operator: false,
+            blocked_reasons: Vec::new(),
+        })
+    }
+
+    fn plan_flywheel_brief(
+        &self,
+        input: LifeFlywheelBriefInput,
+    ) -> Result<RunnerPlan, ContractError> {
+        input.validate()?;
+        Ok(RunnerPlan {
+            tool_name: LifeGraphToolName::LifeFlywheelBrief,
+            steps: vec![RunnerPlanStep {
+                target: RunnerPlanTarget::GraphDatasource,
+                action: "life.flywheel.brief".into(),
+                payload: serde_json::to_value(input).unwrap_or_default(),
+            }],
+            requires_operator: false,
+            blocked_reasons: Vec::new(),
+        })
+    }
+
+    fn plan_flywheel_review(
+        &self,
+        input: LifeFlywheelReviewInput,
+    ) -> Result<RunnerPlan, ContractError> {
+        input.validate()?;
+        Ok(RunnerPlan {
+            tool_name: LifeGraphToolName::LifeFlywheelReview,
+            steps: vec![RunnerPlanStep {
+                target: RunnerPlanTarget::GraphDatasource,
+                action: "life.flywheel.review".into(),
+                payload: serde_json::to_value(input).unwrap_or_default(),
+            }],
             requires_operator: false,
             blocked_reasons: Vec::new(),
         })
@@ -2708,6 +3284,179 @@ mod tests {
     }
 
     #[test]
+    fn episodic_episode_envelope_validates_governed_capture_fields() {
+        let episode = EpisodicEpisode {
+            episode_id: "episode_codex_session-stop_abc123".into(),
+            session_id: "session-123".into(),
+            client: "codex".into(),
+            agent_or_role: "codex".into(),
+            captured_at: "2026-07-24T15:30:00Z".into(),
+            source_event: "stop".into(),
+            content_or_summary: "Implemented the episodic evidence boundary.".into(),
+            content_hash: format!("sha256:{}", "a".repeat(64)),
+            provenance: serde_json::json!({"hook": "mempalace_reflex_hook"}),
+            privacy_class: EpisodicPrivacyClass::Normal,
+            retention_class: EpisodicRetentionClass::Days90,
+            related_context_refs: vec!["seam:mempalace-episodic-lane".into()],
+            metadata: serde_json::json!({}),
+        };
+
+        episode
+            .validate()
+            .expect("complete episodic envelope should validate");
+    }
+
+    #[test]
+    fn episodic_episode_rejects_invalid_hash_and_timestamp() {
+        let episode = EpisodicEpisode {
+            episode_id: "episode:test".into(),
+            session_id: "session:test".into(),
+            client: "codex".into(),
+            agent_or_role: "codex".into(),
+            captured_at: "sometime yesterday".into(),
+            source_event: "stop".into(),
+            content_or_summary: "A remembered event.".into(),
+            content_hash: "not-a-hash".into(),
+            provenance: serde_json::json!({}),
+            privacy_class: EpisodicPrivacyClass::Normal,
+            retention_class: EpisodicRetentionClass::Days30,
+            related_context_refs: vec![],
+            metadata: serde_json::json!({}),
+        };
+
+        let err = episode
+            .validate()
+            .expect_err("invalid episode envelope must be rejected");
+        assert!(err.violations.iter().any(|v| v.contains("RFC3339")));
+        assert!(err.violations.iter().any(|v| v.contains("content_hash")));
+    }
+
+    #[test]
+    fn mempalace_recall_context_packet_uses_episodic_evidence_authority() {
+        let episodes = vec![MemPalaceRecallEpisode {
+            episode_id: "episode:codex:abc123".into(),
+            session_id: "session-123".into(),
+            client: "codex".into(),
+            agent_or_role: "codex".into(),
+            captured_at: "2026-07-24T15:30:00Z".into(),
+            source_event: "stop".into(),
+            excerpt: "The capture bridge must preserve provenance.".into(),
+            content_hash: format!("sha256:{}", "b".repeat(64)),
+            score: 0.93,
+            retrieval_rationale: "semantic similarity".into(),
+            privacy_class: EpisodicPrivacyClass::Normal,
+            retention_class: EpisodicRetentionClass::Days90,
+            related_context_refs: vec!["seam:mempalace-episodic-lane".into()],
+            provenance: serde_json::json!({"client": "codex"}),
+            metadata: serde_json::json!({}),
+        }];
+
+        let packet = ContextPacket::from_mempalace_recall(
+            "context:mempalace:test",
+            "2026-07-24T15:31:00Z",
+            Some("mempalace:recall:test".into()),
+            "Episodic recall for the MemPalace seam",
+            &episodes,
+        );
+
+        packet
+            .validate()
+            .expect("MemPalace context packet should validate");
+        assert_eq!(packet.refs[0].kind, ContextRefKind::MemPalaceEpisode);
+        assert_eq!(packet.refs[0].authority, ContextAuthority::EpisodicEvidence);
+        assert_eq!(
+            packet.sections[0].authority,
+            ContextAuthority::EpisodicEvidence
+        );
+        assert!(packet.policy_notes[0].contains("not canonical LifeGraph truth"));
+
+        let json = serde_json::to_value(packet).expect("serialize context packet");
+        assert_eq!(json["refs"][0]["kind"], "mem_palace_episode");
+        assert_eq!(json["refs"][0]["authority"], "episodic_evidence");
+    }
+
+    #[test]
+    fn mempalace_ref_cannot_claim_lifegraph_truth() {
+        let context_ref = ContextRef {
+            ref_id: "episode:codex:abc123".into(),
+            kind: ContextRefKind::MemPalaceEpisode,
+            authority: ContextAuthority::LifeGraphTruth,
+            summary: Some("An episode is evidence, not truth.".into()),
+            validation_state: Some(ValidationState::Confirmed),
+            uri: None,
+            metadata: serde_json::json!({}),
+        };
+
+        let err = context_ref
+            .validate()
+            .expect_err("MemPalace episodes must not claim LifeGraph truth authority");
+        assert!(err.violations.iter().any(|v| v.contains("cannot claim")));
+    }
+
+    #[test]
+    fn knowledge_recall_context_packet_preserves_authored_knowledge_authority() {
+        let documents = vec![KnowledgeRecallDocument {
+            document_id: "document:obsidian:brain:abc123".into(),
+            vault_id: "Brain".into(),
+            relative_path: "Efforts/Ongoing/Playing the Piano.md".into(),
+            content_hash: format!("sha256:{}", "c".repeat(64)),
+            title: "Playing the Piano".into(),
+            excerpt: "Practice small musical ideas and turn them into artifacts.".into(),
+            score: 0.89,
+            modified_at: "2026-07-24T15:30:00Z".into(),
+            headings: vec!["Practice loop".into()],
+            tags: vec!["music".into(), "creative".into()],
+            outbound_links: vec!["Creative Learning".into()],
+            provenance: serde_json::json!({"indexer": "obsidian_knowledge"}),
+            metadata: serde_json::json!({}),
+        }];
+
+        let packet = ContextPacket::from_knowledge_recall(
+            "context:knowledge:test",
+            "2026-07-24T15:31:00Z",
+            Some("knowledge:search:test".into()),
+            "Authored knowledge about piano practice",
+            &documents,
+        );
+
+        packet
+            .validate()
+            .expect("Obsidian context packet should validate");
+        assert_eq!(packet.refs[0].kind, ContextRefKind::ObsidianDocument);
+        assert_eq!(
+            packet.refs[0].authority,
+            ContextAuthority::AuthoredKnowledge
+        );
+        assert_eq!(
+            packet.sections[0].authority,
+            ContextAuthority::AuthoredKnowledge
+        );
+        assert_eq!(
+            packet.refs[0].uri.as_deref(),
+            Some("obsidian://open?vault=Brain&file=Efforts/Ongoing/Playing the Piano.md")
+        );
+        assert!(packet.policy_notes[1].contains("not confirmed LifeGraph truth"));
+    }
+
+    #[test]
+    fn obsidian_document_cannot_claim_lifegraph_truth() {
+        let context_ref = ContextRef {
+            ref_id: "document:obsidian:brain:abc123".into(),
+            kind: ContextRefKind::ObsidianDocument,
+            authority: ContextAuthority::LifeGraphTruth,
+            summary: Some("Authored notes do not become canonical life claims.".into()),
+            validation_state: Some(ValidationState::Confirmed),
+            uri: None,
+            metadata: serde_json::json!({}),
+        };
+
+        let err = context_ref
+            .validate()
+            .expect_err("Obsidian documents must not claim LifeGraph truth authority");
+        assert!(err.violations.iter().any(|v| v.contains("cannot claim")));
+    }
+
+    #[test]
     fn runner_catalog_exposes_first_life_graph_tool_surface() {
         let runner = MemoryGraphRagRunner::default();
         let catalog = runner.tool_catalog();
@@ -2715,16 +3464,19 @@ mod tests {
 
         // Must stay in lockstep with the grant surface: the `life_graph` tool
         // class (ansible_mesh_core::graph::tools_for_tool_class) and the
-        // `life.steward` skill both expose all 8 life.* tools. A declared
+        // `life.steward` skill both expose the complete life.* surface. A declared
         // catalog narrower than the grant surface is the PR #271 failure
         // pattern (granted tool with no declared route).
         assert_eq!(
             tool_names,
             vec![
+                "life.capture",
                 "life.observe",
                 "life.observe.batch",
                 "life.recall",
                 "life.recall.feedback",
+                "life.flywheel.brief",
+                "life.flywheel.review",
                 "life.commit",
                 "life.resolve",
                 "life.conflict",
@@ -2744,6 +3496,80 @@ mod tests {
                 .find(|tool| tool.tool_name == "life.recall.feedback")
                 .expect("recall feedback spec")
                 .mutates_graph
+        );
+    }
+
+    #[test]
+    fn quick_capture_defaults_to_unclassified_proposed_signal() {
+        let observe = LifeCaptureInput {
+            content: "Explore how musical motifs can teach graph traversal.".into(),
+            kind: LifeCaptureKind::Inbox,
+            pilot_domain: Some("creative-coding".into()),
+            source_id: Some("membrane:telegram".into()),
+            observed_by: Some("agent-astrid-01".into()),
+            observed_role: Some("librarian".into()),
+            confidence: 0.8,
+            edges: vec![],
+            metadata: serde_json::json!({"client": "telegram"}),
+        }
+        .into_observe_input()
+        .expect("quick capture should expand into governed observation");
+
+        assert_eq!(observe.evidence.claim_ref.label, "Signal");
+        assert_eq!(observe.evidence.validation_state, ValidationState::Proposed);
+        assert_eq!(observe.evidence.metadata["capture_kind"], "inbox");
+        assert_eq!(observe.evidence.metadata["inbox_state"], "unclassified");
+        assert_eq!(observe.evidence.metadata["pilot_domain"], "creative-coding");
+        assert_eq!(observe.observed_by.as_deref(), Some("agent-astrid-01"));
+    }
+
+    #[test]
+    fn explicit_idea_capture_uses_creative_label_and_remains_proposed() {
+        let observe = LifeCaptureInput {
+            content: "Make a playable LifeGraph explorer.".into(),
+            kind: LifeCaptureKind::Idea,
+            pilot_domain: None,
+            source_id: None,
+            observed_by: None,
+            observed_role: None,
+            confidence: 0.8,
+            edges: vec![],
+            metadata: serde_json::Value::Null,
+        }
+        .into_observe_input()
+        .expect("idea capture should expand");
+
+        assert_eq!(observe.evidence.claim_ref.label, "Idea");
+        assert!(observe.evidence.claim_ref.id.starts_with("life:idea:"));
+        assert_eq!(observe.evidence.metadata["creative_status"], "captured");
+        assert!(observe.evidence.metadata["inbox_state"].is_null());
+    }
+
+    #[test]
+    fn flywheel_read_tools_are_non_mutating_and_validate_bounds() {
+        let runner = MemoryGraphRagRunner::default();
+        let brief = runner
+            .plan(LifeGraphToolRequest::LifeFlywheelBrief(
+                LifeFlywheelBriefInput::default(),
+            ))
+            .expect("brief should plan");
+        let review = runner
+            .plan(LifeGraphToolRequest::LifeFlywheelReview(
+                LifeFlywheelReviewInput::default(),
+            ))
+            .expect("review should plan");
+
+        assert!(!brief.tool_name.mutates_graph());
+        assert!(!review.tool_name.mutates_graph());
+        assert_eq!(brief.steps[0].action, "life.flywheel.brief");
+        assert_eq!(review.steps[0].action, "life.flywheel.review");
+        assert!(
+            LifeFlywheelReviewInput {
+                pilot_domain: None,
+                lookback_days: 0,
+            }
+            .validate()
+            .is_err()
         );
     }
 

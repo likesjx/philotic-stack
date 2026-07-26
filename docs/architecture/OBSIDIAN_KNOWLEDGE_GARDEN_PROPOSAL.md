@@ -2,7 +2,7 @@
 title: Obsidian Knowledge Garden Proposal
 doc_type: proposal
 domain: memory-context
-status: proposed
+status: accepted-current-slice
 last_updated: 2026-07-24
 tags:
   - obsidian
@@ -48,15 +48,21 @@ The integration is a governed projection, not a second copy of the vault:
 
 ## Disposition
 
-Proposed as an incremental indexing and governed-write slice.
+Accepted for the first incremental indexing and governed-write slice.
 
 Current local observation on 2026-07-24:
 
 - the Obsidian CLI resolves the default vault as `Brain`
 - the vault contains approximately 1,421 Markdown notes
-- no governed incremental Obsidian-to-LifeGraph synchronization path has been proven
+- `Efforts/Ongoing` is the selected first projection scope (six Markdown notes)
+- the governed index and narrow MCP server are test-green
+- a real isolated sync against that scope is smoke-green
+- the installed `mac-jane` upstream is connected with seven projected tools
+- routed `knowledge.sync.status` and `knowledge.search` calls are watched-live-green
 
-The vault is real and substantial. The useful graph projection is still intended architecture.
+The vault is real and substantial. The first metadata projection now exists,
+while cross-note entity acceptance and installed-runtime use remain intentionally
+bounded.
 
 ## Document Projection
 
@@ -136,14 +142,25 @@ The steward proposes; it does not rewrite the vault autonomously.
 
 ## Current Slice
 
-The first implementation slice should:
+The first implementation slice:
 
-1. Index one explicitly selected folder in the `Brain` vault.
-2. Create stable `Document` projections with hashes and provenance.
-3. Prove incremental create, edit, rename, and delete behavior.
-4. Add read-only search and read tools.
-5. Add a review queue for proposed LifeGraph relationships.
-6. Measure recall quality before indexing the entire vault.
+1. indexes `Brain/Efforts/Ongoing`
+2. stores stable document identity, hashes, provenance, rename lineage, and
+   tombstones in a derived SQLite index without copying note bodies
+3. proves incremental create, edit, rename, delete, and unchanged-note behavior
+4. exposes read-only search/read/status plus review-only create/patch/link
+   proposals over a narrow stdio MCP server
+5. projects results as `authored_knowledge` `ContextPacket` references
+6. provisions the server through the generic MCP client fabric with an explicit
+   seven-tool allowlist
+7. directs Astrid to the governed tools and forbids vault edits through bash
+
+Targeted Python/Rust tests, direct MCP negotiation, an isolated real-vault sync,
+and installed routed calls through `mac-jane` are green. Search reads the
+derived metadata index so cloud hydration cannot block quick recall; the
+background refresh and explicit `knowledge.read` own current-body access.
+The provisioner fails loudly when the hotel is absent or its stdio allowlist
+has not been configured.
 
 ## Success Measures
 

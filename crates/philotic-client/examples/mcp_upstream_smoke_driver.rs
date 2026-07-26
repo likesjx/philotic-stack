@@ -23,16 +23,19 @@
 //! MCP_SMOKE_REFRESH_SECS (periodic re-list interval),
 //! MCP_SMOKE_MODE=inspect (only print the stored catalog incl. stale grants,
 //! no register/call — for stale-grant drills where re-registering would reset
-//! the approval baseline), MCP_SMOKE_STDIO_CMD + MCP_SMOKE_STDIO_ARGS (register
-//! a stdio transport instead of HTTP — space-separated args; Phase-3 proof).
+//! the approval baseline), MCP_SMOKE_MODE=existing plus MCP_SMOKE_UPSTREAM_ID
+//! and MCP_SMOKE_OWNER (call an already-provisioned upstream without replacing
+//! its approval baseline), MCP_SMOKE_ARGUMENTS_JSON (tool arguments),
+//! MCP_SMOKE_STDIO_CMD + MCP_SMOKE_STDIO_ARGS (register a stdio transport
+//! instead of HTTP — space-separated args; Phase-3 proof).
 
 use anyhow::{Context, Result, bail};
 use philotic_client::{GuestIdentity, IpcRequest, IpcResponse, PhiloticClient};
 use serde_json::{Value, json};
 use std::time::Duration;
 
-const OWNER: &str = "smoke-agent";
-const UPSTREAM_ID: &str = "intel-graph-smoke";
+const DEFAULT_OWNER: &str = "smoke-agent";
+const DEFAULT_UPSTREAM_ID: &str = "intel-graph-smoke";
 
 fn now() -> u64 {
     std::time::SystemTime::now()
@@ -46,6 +49,9 @@ async fn main() -> Result<()> {
     let url =
         std::env::var("MCP_SMOKE_URL").unwrap_or_else(|_| "http://127.0.0.1:8901/mcp".to_string());
     let tool = std::env::var("MCP_SMOKE_TOOL").unwrap_or_else(|_| "graph_status".to_string());
+    let owner = std::env::var("MCP_SMOKE_OWNER").unwrap_or_else(|_| DEFAULT_OWNER.to_string());
+    let upstream_id =
+        std::env::var("MCP_SMOKE_UPSTREAM_ID").unwrap_or_else(|_| DEFAULT_UPSTREAM_ID.to_string());
     let node_id = std::env::var("MCP_SMOKE_NODE").unwrap_or_else(|_| "local-aiua-01".to_string());
     let credential = std::env::var("MCP_SMOKE_CREDENTIAL")
         .ok()
@@ -54,14 +60,23 @@ async fn main() -> Result<()> {
         .ok()
         .and_then(|s| s.parse::<u64>().ok());
     let inspect_only = std::env::var("MCP_SMOKE_MODE").as_deref() == Ok("inspect");
-    let stdio_cmd = std::env::var("MCP_SMOKE_STDIO_CMD").ok().filter(|s| !s.is_empty());
+    let existing_only = std::env::var("MCP_SMOKE_MODE").as_deref() == Ok("existing");
+    let tool_arguments: Value = std::env::var("MCP_SMOKE_ARGUMENTS_JSON")
+        .ok()
+        .map(|raw| serde_json::from_str(&raw))
+        .transpose()
+        .context("MCP_SMOKE_ARGUMENTS_JSON must be valid JSON")?
+        .unwrap_or_else(|| json!({}));
+    let stdio_cmd = std::env::var("MCP_SMOKE_STDIO_CMD")
+        .ok()
+        .filter(|s| !s.is_empty());
     let stdio_args: Vec<String> = std::env::var("MCP_SMOKE_STDIO_ARGS")
         .ok()
         .map(|s| s.split_whitespace().map(str::to_string).collect())
         .unwrap_or_default();
 
     let identity = GuestIdentity {
-        guest_id: OWNER.into(),
+        guest_id: owner.clone(),
         role: "agent".into(),
         supported_tools: vec![],
     };
@@ -104,18 +119,19 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
-    // 1. Register the upstream.
+    // 1. Register the upstream, unless this is a verification call against an
+    // already-provisioned catalog.
     let config = ansible_mesh_core::mcp_upstream::McpUpstreamConfig {
-        upstream_id: UPSTREAM_ID.into(),
-        owner_agent_id: OWNER.into(),
+        upstream_id: upstream_id.clone(),
+        owner_agent_id: owner.clone(),
         transport: match &stdio_cmd {
             Some(cmd) => ansible_mesh_core::mcp_upstream::McpUpstreamTransport::Stdio {
                 command: cmd.clone(),
                 args: stdio_args.clone(),
             },
-            None => ansible_mesh_core::mcp_upstream::McpUpstreamTransport::Http {
-                url: url.clone(),
-            },
+            None => {
+                ansible_mesh_core::mcp_upstream::McpUpstreamTransport::Http { url: url.clone() }
+            }
         },
         credential_ref: None,
         tool_allowlist: vec![ansible_mesh_core::mcp_upstream::McpUpstreamToolGrant {
@@ -127,25 +143,29 @@ async fn main() -> Result<()> {
         refresh_interval_secs: refresh_secs,
         updated_at: now(),
     };
-    match client
-        .send_request(IpcRequest::RegisterMcpUpstream { config })
-        .await?
-    {
-        IpcResponse::McpUpstreamRegistered {
-            mcp_upstream_id,
-            mcp_upstream_materialized,
-        } => println!(
-            "[2/4] upstream '{mcp_upstream_id}' registered (guest spawned: {mcp_upstream_materialized})"
-        ),
-        other => bail!("RegisterMcpUpstream unexpected response: {other:?}"),
+    if existing_only {
+        println!("[2/4] using existing upstream '{upstream_id}'");
+    } else {
+        match client
+            .send_request(IpcRequest::RegisterMcpUpstream { config })
+            .await?
+        {
+            IpcResponse::McpUpstreamRegistered {
+                mcp_upstream_id,
+                mcp_upstream_materialized,
+            } => println!(
+                "[2/4] upstream '{mcp_upstream_id}' registered (guest spawned: {mcp_upstream_materialized})"
+            ),
+            other => bail!("RegisterMcpUpstream unexpected response: {other:?}"),
+        }
     }
 
     // 1b. Provision the outbound credential (Phase-2 authenticated path).
-    if let Some(cred) = credential {
+    if let Some(cred) = credential.filter(|_| !existing_only) {
         match client
             .send_request(IpcRequest::ProvisionMcpUpstreamCredential {
-                upstream_id: UPSTREAM_ID.into(),
-                owner_agent_id: OWNER.into(),
+                upstream_id: upstream_id.clone(),
+                owner_agent_id: owner.clone(),
                 credential: cred,
             })
             .await?
@@ -160,7 +180,7 @@ async fn main() -> Result<()> {
     }
 
     // 2. Poll until the guest reports the catalog.
-    let projected_name = ansible_mesh_core::mcp_upstream::projected_tool_name(UPSTREAM_ID, &tool);
+    let projected_name = ansible_mesh_core::mcp_upstream::projected_tool_name(&upstream_id, &tool);
     let mut connected = false;
     for attempt in 0..30 {
         tokio::time::sleep(Duration::from_secs(1)).await;
@@ -169,7 +189,7 @@ async fn main() -> Result<()> {
         {
             if let Some(entry) = mcp_upstreams
                 .iter()
-                .find(|e| e.config.upstream_id == UPSTREAM_ID)
+                .find(|e| e.config.upstream_id == upstream_id)
             {
                 if let Some(catalog) = &entry.catalog {
                     let has_tool = catalog.tools.iter().any(|t| t.remote_name == tool);
@@ -203,19 +223,19 @@ async fn main() -> Result<()> {
         "turn_id": turn_id,
         "chat_id": "smoke",
         "tool_name": projected_name,
-        "arguments": {},
+        "arguments": tool_arguments,
         "execution_mode": "mcp_upstream",
-        "agent_id": OWNER,
+        "agent_id": owner,
         "return_route": {
             "node": node_id,
             "role": "agent",
-            "guest_id": OWNER,
+            "guest_id": owner,
             "session_id": session_id,
             "turn_id": turn_id,
         },
         "reply_to": node_id,
         "reply_role": "agent",
-        "reply_guest_id": OWNER,
+        "reply_guest_id": owner,
     });
     client
         .send_request(IpcRequest::EmitTask {

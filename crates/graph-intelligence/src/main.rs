@@ -36,6 +36,14 @@ struct Args {
     /// Allow a non-loopback bind without an auth token (env: PHILOTIC_GRAPH_INSECURE)
     #[arg(long, env = "PHILOTIC_GRAPH_INSECURE")]
     insecure_bind: bool,
+
+    /// MemPalace episodic adapter path (env: PHILOTIC_EPISODIC_ADAPTER)
+    #[arg(
+        long,
+        env = "PHILOTIC_EPISODIC_ADAPTER",
+        default_value = "scripts/mempalace_episode.py"
+    )]
+    episodic_adapter: String,
 }
 
 #[tokio::main]
@@ -56,6 +64,7 @@ async fn main() -> anyhow::Result<()> {
         repo_root: args.worktree.to_string_lossy().to_string(),
         auth_token: args.token.filter(|t| !t.is_empty()),
         allow_insecure_bind: args.insecure_bind,
+        episodic_adapter: args.episodic_adapter,
     };
 
     serve(config).await

@@ -2,8 +2,8 @@
 title: Creative Learning Flywheel Proposal
 doc_type: proposal
 domain: memory-context
-status: proposed
-last_updated: 2026-07-24
+status: implemented
+last_updated: 2026-07-26
 tags:
   - creativity
   - learning
@@ -14,6 +14,7 @@ related_docs:
   - LIFE_GRAPH_OS_PROPOSAL.md
   - MEMPALACE_EPISODIC_MEMORY_PROPOSAL.md
   - OBSIDIAN_KNOWLEDGE_GARDEN_PROPOSAL.md
+  - ../process/CREATIVE_LEARNING_PILOT_PLAYBOOK.md
 task_refs:
   - docs/task.md#creative-learning-flywheel
 proposal_id: creative-learning-flywheel
@@ -55,9 +56,29 @@ Organization serves motion through this loop. If the system creates more categor
 
 ## Disposition
 
-Proposed as the outcome layer above LifeGraph, Muninn, MemPalace, and Obsidian.
+`implemented`; four-week pilot active
 
 This proposal does not create another memory store. It defines the behavior, graph vocabulary, prompts, reviews, and measures that turn the existing stores into a personal growth system.
+
+The first implementation slice uses `life.capture`,
+`life.flywheel.brief`, and `life.flywheel.review` over the canonical
+LifeGraph. All captures enter as proposed evidence; the brief and review are
+read-only. V006 is installed on the live Memgraph, the `mac-jane` catalogs and
+parser are installed, and the updated runner is installed under the supervised
+`vps-jane` hotel. The production route is watched-live-green from `mac-jane`
+through the remote runner and live Memgraph/ONNX services and back to
+`mac-jane`.
+
+The idempotent cadence installer registers:
+
+- `lifegraph-flywheel-daily:mac-jane` at `12:00 UTC` daily
+- `lifegraph-flywheel-weekly:mac-jane` at `22:00 UTC` on Sunday
+
+Both jobs target Björk's orchestrator role, preapprove only their read-only
+flywheel tools, run in isolated cron sessions, and deliver one bounded result
+to the operator's Telegram. Both completed a forced first fire on 2026-07-25.
+The scheduler currently stores UTC expressions, so the displayed local time
+shifts by one hour when America/New_York enters or leaves daylight saving time.
 
 ## Ownership By Stage
 
@@ -95,7 +116,10 @@ Learning --REFINES--> Idea | Goal | Method
 Artifact --SHARED_WITH--> Person | Audience
 ```
 
-These are proposed schema additions. They become canonical only after the LifeGraph schema and validation path accept them.
+These labels and relationships are accepted for the current slice through
+`V006__creative_learning_flywheel.cypher` and the server-side LifeGraph
+allowlists. They remain governed by the normal proposed-write and confirmation
+path.
 
 ## Agent Behaviors
 
@@ -171,15 +195,23 @@ Node count, note count, and captured-token count are diagnostics, not success me
 
 ## Current Slice
 
-Run one four-week pilot in a single creative or learning domain:
+Run one four-week pilot in the `LifeGraph creative systems` domain:
 
-1. Accept the minimal growth vocabulary behind proposed-write gates.
-2. Add sub-ten-second quick capture.
-3. Generate a daily bounded “resume, make, unblock” brief.
+Operational procedure, dates, scorecard definitions, recovery rules, and the
+cross-agent contract live in the
+[Creative Learning Four-Week Pilot Playbook](../process/CREATIVE_LEARNING_PILOT_PLAYBOOK.md).
+
+1. Use the accepted minimal growth vocabulary behind proposed-write gates.
+2. Capture with `life.capture` or the model-bypass prefixes `capture:`,
+   `question:`, `idea:`, `source:`, `experiment:`, `artifact:`, and
+   `learning:`.
+3. Generate a daily bounded “resume, make, unblock” brief with
+   `life.flywheel.brief`.
 4. Select one idea each week and define its smallest experiment.
-5. produce at least one artifact
-6. close each experiment with a learning and retrieval-usefulness signal
-7. review the measures and remove friction before expanding scope
+5. Produce at least one artifact.
+6. Close each experiment with a learning and retrieval-usefulness signal.
+7. Review the measures with `life.flywheel.review` and remove friction before
+   expanding scope.
 
 ## Success Measures For The Pilot
 
@@ -199,4 +231,9 @@ Run one four-week pilot in a single creative or learning domain:
 
 ## Next Seam
 
-Implement `creative-learning-flywheel` only after the episodic and Obsidian projection lanes can supply provenance-backed context. Begin with one domain and optimize for completed creative loops, not graph density.
+Run the four-week `LifeGraph creative systems` pilot using the active daily
+brief, weekly review, and
+[pilot playbook](../process/CREATIVE_LEARNING_PILOT_PLAYBOOK.md). Expand only
+after the review shows artifacts, learning reuse, and lower re-entry cost
+without excess maintenance. Treat timezone-aware cron scheduling as a follow-on
+only if the UTC-backed cadence's one-hour seasonal shift creates real friction.

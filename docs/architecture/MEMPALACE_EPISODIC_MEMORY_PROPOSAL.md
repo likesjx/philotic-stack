@@ -2,7 +2,7 @@
 title: MemPalace Episodic Memory Proposal
 doc_type: proposal
 domain: memory-context
-status: proposed
+status: accepted-current-slice
 last_updated: 2026-07-24
 tags:
   - mempalace
@@ -24,6 +24,8 @@ active_seams:
   - mempalace-episodic-lane
 source_of_truth_targets:
   - ARCHITECTURE_STATUS.md
+implemented_by:
+  - mempalace-episodic-lane-slice-1
 ---
 
 # MemPalace Episodic Memory Proposal
@@ -52,7 +54,7 @@ It must not answer by authority:
 
 ## Disposition
 
-Proposed as a bounded integration slice.
+Accepted for the current slice.
 
 Current local observation on 2026-07-24:
 
@@ -62,6 +64,16 @@ Current local observation on 2026-07-24:
 - No local `.mempalace_convos` capture files were found.
 
 This proves storage exists. It does not prove automatic cross-agent capture, useful recall, retention governance, or successful re-entry.
+
+Slice 1 implemented and verified on 2026-07-24:
+
+- a validated `EpisodicEpisode` envelope with stable IDs, RFC3339 capture time, SHA-256 content identity, provenance, privacy, retention, and related context refs
+- a MemPalace-owned local adapter for idempotent capture, filtered semantic recall, status, and scoped deletion
+- redact-before-store, no-capture markers, private-result suppression, duplicate suppression, and ID-conflict detection
+- a bounded `ContextPacket` projection whose refs carry `mem_palace_episode` kind and `episodic_evidence` authority
+- a hardened generic lifecycle hook plus versioned REST endpoints; the legacy `/api/mempalace/turn` path now delegates to the governed adapter instead of appending files and running an invalid background `mempalace mine --yes`
+
+Targeted Rust/Python tests and an isolated real-MemPalace smoke are green. This is not yet an installed-runtime claim for Codex, Claude, or Perplexity lifecycle configuration.
 
 ## Capture Contract
 
@@ -128,14 +140,16 @@ Before broad enablement:
 
 ## Current Slice
 
-The first implementation slice should:
+The first implementation slice now:
 
-1. Define and validate the episode envelope.
-2. Enable one local client hook with idempotent capture.
-3. Prove recall by `session_id`, topic, and client.
-4. Project bounded results into `ContextPacket`.
-5. Prove no transcript content is promoted to LifeGraph or Muninn automatically.
-6. Add capture, recall, redaction, and deletion smoke tests.
+1. Defines and validates the episode envelope.
+2. Provides an idempotent local lifecycle hook whose default client is Codex.
+3. Proves recall by `session_id`, topic, and client.
+4. Projects bounded results into `ContextPacket`.
+5. Keeps transcript content out of LifeGraph and Muninn unless a later explicit promotion action occurs.
+6. Covers capture, recall, redaction, privacy filtering, duplicate conflict, and deletion behavior with tests plus an isolated live MemPalace smoke.
+
+The next activation slice must install the hook into one verified client lifecycle surface and measure capture success over real eligible sessions. The generic hook being present in the repo is not evidence that any client currently invokes it.
 
 ## Success Measures
 
@@ -155,4 +169,4 @@ The first implementation slice should:
 
 ## Next Seam
 
-Implement `mempalace-episodic-lane` for one trusted local client, then measure whether it materially improves re-entry before expanding the capture surface.
+Install `mempalace-episodic-lane` on one verified local client lifecycle surface, measure capture/recall/re-entry quality, then expand to another client only if the first lane is useful.

@@ -8,10 +8,14 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
+use data_memorygraphrag::{
+    ContextPacket, EpisodicEpisode, EpisodicPrivacyClass, EpisodicRetentionClass,
+    MemPalaceRecallEpisode,
+};
 use rust_embed::RustEmbed;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use tower_http::cors::{AllowOrigin, Any, CorsLayer};
-use tracing;
 
 use crate::engine::ManageProposalRequest;
 use crate::scanner::{full_scan, ScanConfig};
@@ -134,6 +138,35 @@ pub struct MempalaceTurnBody {
     pub turn_transcript: String,
 }
 
+#[derive(Deserialize, Serialize)]
+pub struct EpisodicRecallBody {
+    pub query: String,
+    #[serde(default)]
+    pub client: Option<String>,
+    #[serde(default)]
+    pub session_id: Option<String>,
+    #[serde(default)]
+    pub results: Option<usize>,
+    #[serde(default)]
+    pub excerpt_chars: Option<usize>,
+    #[serde(default)]
+    pub include_private: bool,
+}
+
+#[derive(Deserialize, Serialize)]
+pub struct EpisodicDeleteBody {
+    #[serde(default)]
+    pub episode_id: Option<String>,
+    #[serde(default)]
+    pub client: Option<String>,
+    #[serde(default)]
+    pub session_id: Option<String>,
+    #[serde(default)]
+    pub source_event: Option<String>,
+    #[serde(default)]
+    pub before: Option<String>,
+}
+
 #[derive(Deserialize)]
 pub struct ManageProposalBody {
     pub agent: String,
@@ -242,6 +275,10 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/test-run", post(post_test_run))
         .route("/api/scan", post(trigger_scan))
         .route("/api/edges", post(post_upsert_edge))
+        .route("/api/mempalace/episodes", post(post_mempalace_episode))
+        .route("/api/mempalace/recall", post(post_mempalace_recall))
+        .route("/api/mempalace/delete", post(post_mempalace_delete))
+        .route("/api/mempalace/status", get(get_mempalace_status))
         .route("/api/mempalace/turn", post(post_mempalace_turn))
         // Local-origin CORS only: permissive CORS let any web page POST JSON to
         // the unauthenticated write endpoints (drive-by graph mutation).
@@ -282,92 +319,189 @@ async fn post_mempalace_turn(
     State(state): State<Arc<AppState>>,
     Json(body): Json<MempalaceTurnBody>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
-    tracing::info!(
-        "Broker received reflexive turn for mempalace Wing [{}]: {} chars in session {}",
-        body.agent_id,
-        body.turn_transcript.len(),
-        body.session_id
+    let source_hash = format!(
+        "sha256:{:x}",
+        Sha256::digest(body.turn_transcript.as_bytes())
     );
-
-    // Write transcript to a persistent file for mempalace to mine
-    let convos_dir = Path::new(&state.repo_root)
-        .join(".mempalace_convos")
-        .join(&body.agent_id);
-    if let Err(e) = tokio::fs::create_dir_all(&convos_dir).await {
-        tracing::error!("Failed to create convos directory: {}", e);
-        return Err(internal_error(anyhow::anyhow!("Create dir failed: {}", e)));
-    }
-
-    let file_path = convos_dir.join(format!("{}.md", body.session_id));
-    use tokio::io::AsyncWriteExt;
-
-    // Append the turn to the session file
-    let mut file = match tokio::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&file_path)
-        .await
-    {
-        Ok(f) => f,
-        Err(e) => {
-            tracing::error!("Failed to open session file: {}", e);
-            return Err(internal_error(anyhow::anyhow!("File open failed: {}", e)));
-        }
+    let identity = format!(
+        "{}\0{}\0stop\0{}",
+        body.agent_id, body.session_id, source_hash
+    );
+    let episode_id = format!(
+        "episode:legacy:{}",
+        &format!("{:x}", Sha256::digest(identity.as_bytes()))[..32]
+    );
+    let episode = EpisodicEpisode {
+        episode_id,
+        session_id: body.session_id,
+        client: "legacy_graph_hook".into(),
+        agent_or_role: body.agent_id,
+        captured_at: chrono::Utc::now().to_rfc3339(),
+        source_event: "stop".into(),
+        content_or_summary: body.turn_transcript,
+        content_hash: source_hash,
+        provenance: serde_json::json!({
+            "compatibility_route": "/api/mempalace/turn",
+        }),
+        privacy_class: EpisodicPrivacyClass::Normal,
+        retention_class: EpisodicRetentionClass::Days90,
+        related_context_refs: vec![],
+        metadata: serde_json::json!({
+            "legacy_request": true,
+        }),
     };
+    capture_mempalace_episode(&state, episode).await
+}
 
-    let payload = format!(
-        "\n\n### Turn At: {}\n{}\n",
-        chrono::Utc::now().to_rfc3339(),
-        body.turn_transcript
-    );
+async fn post_mempalace_episode(
+    State(state): State<Arc<AppState>>,
+    Json(episode): Json<EpisodicEpisode>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    capture_mempalace_episode(&state, episode).await
+}
 
-    if let Err(e) = file.write_all(payload.as_bytes()).await {
-        tracing::error!("Failed to write to session file: {}", e);
-        return Err(internal_error(anyhow::anyhow!("Write file failed: {}", e)));
+async fn capture_mempalace_episode(
+    state: &Arc<AppState>,
+    episode: EpisodicEpisode,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    if let Err(error) = episode.validate() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: error.to_string(),
+            }),
+        ));
     }
 
-    // Trigger mempalace mine in the background so we don't block the agent
-    let convos_path = convos_dir.clone();
-    let agent_id_for_log = body.agent_id.clone();
-    tokio::spawn(async move {
-        tracing::info!("Executing mempalace mine on {:?}", convos_path);
-        match tokio::process::Command::new("mempalace")
-            .arg("mine")
-            .arg(&convos_path)
-            .arg("--mode")
-            .arg("convos")
-            .arg("--yes")
-            .output()
-            .await
-        {
-            Ok(output) => {
-                if !output.status.success() {
-                    let stderr = String::from_utf8_lossy(&output.stderr);
-                    tracing::error!("Mempalace mine failed: {}", stderr);
-                } else {
-                    tracing::info!("Mempalace mine complete for Wing [{}]", agent_id_for_log);
-                }
-            }
-            Err(e) => tracing::error!("Failed to spawn mempalace: {}", e),
-        }
-    });
-
+    let request = serde_json::to_value(&episode).map_err(|error| internal_error(error.into()))?;
+    let result = run_episode_adapter(state, "capture", request).await?;
     let _ = state.change_tx.send(ChangeEvent {
-        event_type: "mempalace_turn_received".to_string(),
+        event_type: "mempalace_episode_capture".to_string(),
         payload: serde_json::json!({
-            "agent_id": body.agent_id,
-            "session_id": body.session_id,
-            "size": body.turn_transcript.len(),
-            "file": file_path.to_string_lossy(),
+            "episode_id": episode.episode_id,
+            "session_id": episode.session_id,
+            "client": episode.client,
+            "adapter_status": result.get("status"),
         }),
     });
+    Ok(Json(result))
+}
 
-    Ok(Json(serde_json::json!({
-        "status": "brokered",
-        "wing": format!("wing_{}", body.agent_id),
-        "transcript_length": body.turn_transcript.len(),
-        "file": file_path.to_string_lossy(),
-    })))
+async fn post_mempalace_recall(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<EpisodicRecallBody>,
+) -> Result<Json<ContextPacket>, (StatusCode, Json<ErrorResponse>)> {
+    if body.query.trim().is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: "query is required".into(),
+            }),
+        ));
+    }
+    let request = serde_json::to_value(&body).map_err(|error| internal_error(error.into()))?;
+    let result = run_episode_adapter(&state, "recall", request).await?;
+    let episodes: Vec<MemPalaceRecallEpisode> =
+        serde_json::from_value(result.get("episodes").cloned().unwrap_or_default())
+            .map_err(|error| internal_error(error.into()))?;
+    let generated_at = chrono::Utc::now().to_rfc3339();
+    let query_hash = format!("{:x}", Sha256::digest(body.query.as_bytes()));
+    let packet = ContextPacket::from_mempalace_recall(
+        format!("context:mempalace:{}", uuid::Uuid::new_v4()),
+        generated_at,
+        Some(format!("mempalace:recall:{}", &query_hash[..16])),
+        format!("MemPalace episodic recall for {:?}", body.query.trim()),
+        &episodes,
+    );
+    packet.validate().map_err(|error| {
+        internal_error(anyhow::anyhow!(
+            "MemPalace emitted an invalid ContextPacket: {error}"
+        ))
+    })?;
+    Ok(Json(packet))
+}
+
+async fn post_mempalace_delete(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<EpisodicDeleteBody>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    let request = serde_json::to_value(body).map_err(|error| internal_error(error.into()))?;
+    run_episode_adapter(&state, "delete", request)
+        .await
+        .map(Json)
+}
+
+async fn get_mempalace_status(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    run_episode_adapter(&state, "status", serde_json::json!({}))
+        .await
+        .map(Json)
+}
+
+async fn run_episode_adapter(
+    state: &Arc<AppState>,
+    command: &str,
+    payload: serde_json::Value,
+) -> Result<serde_json::Value, (StatusCode, Json<ErrorResponse>)> {
+    use tokio::io::AsyncWriteExt;
+    use tokio::process::Command;
+
+    let mut child = Command::new("python3")
+        .arg(&state.episodic_adapter)
+        .arg(command)
+        .current_dir(&state.repo_root)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|error| {
+            adapter_error(format!(
+                "failed to start episodic adapter {}: {error}",
+                state.episodic_adapter.display()
+            ))
+        })?;
+
+    if let Some(mut stdin) = child.stdin.take() {
+        stdin
+            .write_all(payload.to_string().as_bytes())
+            .await
+            .map_err(|error| adapter_error(format!("failed to write adapter request: {error}")))?;
+    }
+    let output = child
+        .wait_with_output()
+        .await
+        .map_err(|error| adapter_error(format!("failed to wait for episodic adapter: {error}")))?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let parsed = stdout
+        .lines()
+        .rev()
+        .find(|line| !line.trim().is_empty())
+        .ok_or_else(|| adapter_error("episodic adapter returned no JSON".into()))
+        .and_then(|line| {
+            serde_json::from_str::<serde_json::Value>(line).map_err(|error| {
+                adapter_error(format!("episodic adapter returned invalid JSON: {error}"))
+            })
+        })?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(adapter_error(format!(
+            "episodic adapter failed: {}; {}",
+            parsed
+                .get("error")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("unknown adapter error"),
+            stderr.trim()
+        )));
+    }
+    Ok(parsed)
+}
+
+fn adapter_error(message: String) -> (StatusCode, Json<ErrorResponse>) {
+    (
+        StatusCode::BAD_GATEWAY,
+        Json(ErrorResponse { error: message }),
+    )
 }
 
 async fn get_status(

@@ -1,3 +1,4 @@
+use std::io::Write;
 use std::net::TcpListener;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -28,6 +29,10 @@ fn available_port() -> u16 {
 
 /// Create a test AppState with a scanned in-memory engine.
 fn test_state() -> Arc<AppState> {
+    test_state_with_adapter(workspace_root().join("scripts/mempalace_episode.py"))
+}
+
+fn test_state_with_adapter(episodic_adapter: PathBuf) -> Arc<AppState> {
     let root = workspace_root();
     let mut engine = GraphEngine::open(":memory:").expect("Failed to create engine");
 
@@ -53,7 +58,54 @@ fn test_state() -> Arc<AppState> {
         repo_root: root.to_string_lossy().to_string(),
         change_tx,
         server_info: serde_json::json!({"version": "test"}),
+        episodic_adapter,
     })
+}
+
+fn fake_episodic_adapter() -> tempfile::NamedTempFile {
+    let mut file = tempfile::NamedTempFile::new().expect("temporary episodic adapter");
+    file.write_all(
+        br#"#!/usr/bin/env python3
+import json
+import sys
+
+command = sys.argv[1]
+payload = json.load(sys.stdin)
+if command == "capture":
+    print(json.dumps({
+        "status": "captured",
+        "episode_id": payload["episode_id"],
+        "content_hash": payload["content_hash"],
+    }))
+elif command == "recall":
+    print(json.dumps({
+        "status": "ok",
+        "episodes": [{
+            "episode_id": "episode:codex:test",
+            "session_id": "session-123",
+            "client": "codex",
+            "agent_or_role": "codex",
+            "captured_at": "2026-07-24T15:30:00Z",
+            "source_event": "stop",
+            "excerpt": "The episode boundary preserved provenance.",
+            "content_hash": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "score": 0.93,
+            "retrieval_rationale": "semantic similarity",
+            "privacy_class": "normal",
+            "retention_class": "days90",
+            "related_context_refs": ["seam:mempalace-episodic-lane"],
+            "provenance": {"client": "codex"},
+            "metadata": {}
+        }]
+    }))
+elif command == "delete":
+    print(json.dumps({"status": "deleted", "deleted_count": 1}))
+elif command == "status":
+    print(json.dumps({"status": "ok", "episode_count": 1, "clients": {"codex": 1}}))
+"#,
+    )
+    .expect("write fake episodic adapter");
+    file
 }
 
 #[tokio::test]
@@ -100,6 +152,79 @@ async fn test_api_status_endpoint() {
     // Verify some nodes were found
     let total = body["node_counts"]["total"].as_u64().unwrap_or(0);
     assert!(total > 0, "Expected total node count > 0, got {}", total);
+}
+
+#[tokio::test]
+async fn test_mempalace_episode_api_preserves_episodic_authority() {
+    let adapter = fake_episodic_adapter();
+    let state = test_state_with_adapter(adapter.path().to_path_buf());
+    let port = available_port();
+
+    let app = api::router(state);
+    let listener = tokio::net::TcpListener::bind(format!("127.0.0.1:{}", port))
+        .await
+        .expect("Failed to bind");
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    let client = reqwest::Client::new();
+    let capture = client
+        .post(format!(
+            "http://127.0.0.1:{}/api/mempalace/episodes",
+            port
+        ))
+        .json(&serde_json::json!({
+            "episode_id": "episode:codex:test",
+            "session_id": "session-123",
+            "client": "codex",
+            "agent_or_role": "codex",
+            "captured_at": "2026-07-24T15:30:00Z",
+            "source_event": "stop",
+            "content_or_summary": "The episode boundary preserved provenance.",
+            "content_hash": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "provenance": {"hook": "test"},
+            "privacy_class": "normal",
+            "retention_class": "days90",
+            "related_context_refs": ["seam:mempalace-episodic-lane"],
+            "metadata": {}
+        }))
+        .send()
+        .await
+        .expect("capture episode");
+    assert_eq!(capture.status(), 200);
+    let capture_body: serde_json::Value = capture.json().await.expect("capture response");
+    assert_eq!(capture_body["status"], "captured");
+
+    let recall = client
+        .post(format!("http://127.0.0.1:{}/api/mempalace/recall", port))
+        .json(&serde_json::json!({
+            "query": "episode boundary",
+            "client": "codex",
+            "results": 5
+        }))
+        .send()
+        .await
+        .expect("recall episode");
+    assert_eq!(recall.status(), 200);
+    let packet: serde_json::Value = recall.json().await.expect("recall ContextPacket");
+    assert_eq!(packet["refs"][0]["kind"], "mem_palace_episode");
+    assert_eq!(packet["refs"][0]["authority"], "episodic_evidence");
+    assert_eq!(packet["sections"][0]["authority"], "episodic_evidence");
+    assert!(packet["policy_notes"][0]
+        .as_str()
+        .unwrap_or_default()
+        .contains("not canonical LifeGraph truth"));
+
+    let status = client
+        .get(format!("http://127.0.0.1:{}/api/mempalace/status", port))
+        .send()
+        .await
+        .expect("episode status");
+    assert_eq!(status.status(), 200);
+    let status_body: serde_json::Value = status.json().await.expect("status response");
+    assert_eq!(status_body["episode_count"], 1);
 }
 
 #[tokio::test]

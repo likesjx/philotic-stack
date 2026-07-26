@@ -82,6 +82,8 @@ impl PhiloticGraphConfig {
             allow_insecure_bind: std::env::var("PHILOTIC_GRAPH_INSECURE")
                 .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
                 .unwrap_or(false),
+            episodic_adapter: std::env::var("PHILOTIC_EPISODIC_ADAPTER")
+                .unwrap_or_else(|_| "scripts/mempalace_episode.py".to_string()),
         }
     }
 }

@@ -243,11 +243,12 @@ Proposal: [MEMPALACE_EPISODIC_MEMORY_PROPOSAL.md](/Users/jaredlikes/code/philoti
 
 Seam ID: `mempalace-episodic-lane`
 
-- [ ] Define the versioned episode envelope with stable episode/session IDs, client provenance, privacy class, retention class, and content hash.
-- [ ] Enable idempotent `Stop`, `Save`, or `PreCompact` capture for one trusted local client.
-- [ ] Add redact-before-store, no-capture, and delete-by-session behavior with sensitive fixtures.
-- [ ] Prove recall by session, client, and topic with bounded excerpts and explicit `episodic_evidence` authority.
-- [ ] Project MemPalace results into the shared `ContextPacket` without promoting raw episodes into Muninn or LifeGraph.
+- [x] Define the versioned episode envelope with stable episode/session IDs, client provenance, privacy class, retention class, and content hash.
+- [x] Implement and isolated-smoke an idempotent lifecycle capture hook whose default local client is Codex.
+- [ ] Install the hook on one verified Codex lifecycle surface and measure eligible-session capture success.
+- [x] Add redact-before-store, no-capture, private-result filtering, ID-conflict detection, and delete-by-session behavior with sensitive fixtures.
+- [x] Prove recall by session, client, and topic with bounded excerpts and explicit `episodic_evidence` authority.
+- [x] Project MemPalace results into the shared `ContextPacket` without promoting raw episodes into Muninn or LifeGraph.
 - [ ] Measure capture success, duplicate rate, local recall latency, and re-entry usefulness before adding another client.
 
 ## Obsidian Knowledge Garden
@@ -256,26 +257,32 @@ Proposal: [OBSIDIAN_KNOWLEDGE_GARDEN_PROPOSAL.md](/Users/jaredlikes/code/philoti
 
 Seam ID: `obsidian-knowledge-projection`
 
-- [ ] Select one high-value folder in the `Brain` vault for the first governed projection.
-- [ ] Define stable document identity, content hash, provenance, rename lineage, and tombstone contracts.
-- [ ] Implement incremental create, edit, rename, and delete indexing while skipping unchanged notes.
-- [ ] Add read-only `knowledge.search`, `knowledge.read`, and `knowledge.sync.status` tools.
-- [ ] Add an approval-gated review queue for proposed LifeGraph entity and relationship links.
+- [x] Select `Brain/Efforts/Ongoing` as the high-value folder for the first governed projection.
+- [x] Define stable document identity, content hash, provenance, rename lineage, and tombstone contracts.
+- [x] Implement incremental create, edit, rename, and delete indexing while skipping unchanged notes.
+- [x] Add read-only `knowledge.search`, `knowledge.read`, and `knowledge.sync.status` tools.
+- [x] Add a review-only queue for proposed LifeGraph entity and relationship links; no apply path is projected.
 - [ ] Measure source traceability, indexing latency, duplicate rate, and accepted cross-note connections before expanding vault scope.
 
 ## Creative Learning Flywheel
 
 Proposal: [CREATIVE_LEARNING_FLYWHEEL_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/CREATIVE_LEARNING_FLYWHEEL_PROPOSAL.md)
 
+Playbook: [CREATIVE_LEARNING_PILOT_PLAYBOOK.md](/Users/jaredlikes/code/philotic-stack/docs/process/CREATIVE_LEARNING_PILOT_PLAYBOOK.md)
+
 Seam ID: `creative-learning-flywheel`
 
-- [ ] Choose one four-week creative or learning pilot domain.
-- [ ] Validate the proposed `Question`, `Idea`, `Experiment`, `Artifact`, `Learning`, and `Source` vocabulary behind LifeGraph proposed-write gates.
-- [ ] Add a sub-ten-second quick-capture path with an inbox state and deferred classification.
-- [ ] Generate a bounded daily brief containing one thread to resume, one small making action, and one momentum blocker.
+- [x] Choose `LifeGraph creative systems` as the first four-week pilot domain.
+- [x] Validate the `Question`, `Idea`, `Experiment`, `Artifact`, `Learning`, and `Source` vocabulary behind LifeGraph proposed-write gates.
+- [x] Add a sub-ten-second quick-capture path with an inbox state and deferred classification (`life.capture` plus direct capture prefixes).
+- [x] Generate a bounded daily brief containing one thread to resume, one small making action, and one momentum blocker (`life.flywheel.brief`).
+- [x] Apply and verify V006 on the live Memgraph, install the updated `mac-jane` catalogs/parser, and smoke the updated runner through isolated hotel IPC against the live Memgraph and ONNX sidecar (548 ms measured quick capture).
+- [x] Install the updated runner into the supervised `vps-jane` service and prove installed hash, restarted PID, executable path, and the production-routed capture/brief/review path (982 ms measured capture).
+- [x] Register deterministic daily and weekly cadence jobs through hotel IPC and first-fire-verify both isolated sessions through the remote LifeGraph runner and Telegram delivery.
+- [x] Publish the dated four-week pilot playbook with daily and weekly loops, manual advancement criteria, scorecard, recovery rules, and cross-agent contract.
 - [ ] Advance at least four ideas, complete at least two experiments, and create or share at least one artifact.
 - [ ] Close experiments with reusable learning and recall-usefulness feedback.
-- [ ] Review artifact rate, idea-to-artifact conversion, learning reuse, re-entry time, and maintenance cost before expanding scope.
+- [ ] Run the weekly `life.flywheel.review` over the pilot and review artifact rate, idea-to-artifact conversion, learning reuse, re-entry time, and maintenance cost before expanding scope.
 
 ### WI 1: Session Management
 

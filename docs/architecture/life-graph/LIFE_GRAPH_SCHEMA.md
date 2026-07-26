@@ -1,9 +1,9 @@
 ---
 title: Life Graph Schema
-doc_type: specification
+doc_type: reference
 domain: memory-context
-status: proposed
-last_updated: 2026-07-07
+status: active
+last_updated: 2026-07-24
 tags:
 - life-graph
 - schema
@@ -28,7 +28,8 @@ Canonical node/edge vocabulary for the Life Graph OS. All Cypher migrations, too
 - **Database**: Memgraph 3.10.1+ via `graph-datasource` (memgraph-cypher provider)
 - **Bolt endpoint**: `100.64.212.8:7687` (vps-jane Tailscale)
 - **Database name**: default (single-database deployment; logical partition via node labels)
-- **Migration**: `migrations/V001__life_graph_schema.cypher`
+- **Migrations**: `migrations/V001__life_graph_schema.cypher` through
+  `migrations/V006__creative_learning_flywheel.cypher`
 
 The `graph-datasource` crate remains generic. It does not know that a graph contains life data. Life Graph OS semantics live in `data-memorygraphrag` and in this schema vocabulary.
 
@@ -48,10 +49,27 @@ Every node and every agent-written or inferred edge **must** carry these propert
 | `validation_state` | `string` | `inferred` \| `proposed` \| `confirmed` \| `retired` \| `conflicted` |
 | `observed_at` | `string` | ISO 8601 timestamp when first observed |
 | `last_confirmed_at` | `string \| null` | ISO 8601 timestamp of last operator or strong-evidence confirmation |
+| `capture_kind` | `string \| null` | Quick-capture kind: `inbox`, `question`, `idea`, `source`, `experiment`, `artifact`, or `learning` |
+| `creative_status` | `string \| null` | Lightweight creative lifecycle state, initially `inbox` or `captured` |
+| `inbox_state` | `string \| null` | `unclassified` for deferred-classification captures |
+| `pilot_domain` | `string \| null` | Optional single-domain pilot scope used by bounded briefs and reviews |
 
 Operator-created nodes may omit provenance fields; they are required on agent-written records.
 
-`life.observe` also accepts an optional `edges[]` field (`{rel_type, target_id}`) MERGE'd idempotently with the node write. `rel_type` must be one of the living-cycle set `OWNS | SHAPES | SETS | SPAWNS | RELATES_TO` (unknown rel_types are rejected before the node write); a `target_id` matching no existing node creates nothing and is reported as `target_missing` in the response envelope. Domain zoning Role nodes (`domain_slug`, `steward_agent`) are seeded by `migrations/V005__domain_role_zoning_seed.cypher`.
+`life.capture` expands a minimal `{content, kind?, pilot_domain?, source_id?,
+edges?}` payload into the same governed `life.observe` path. Captures are
+always `proposed`; an omitted kind becomes a `Signal` with
+`capture_kind=inbox` and `inbox_state=unclassified`.
+
+`life.observe` also accepts an optional `edges[]` field (`{rel_type,
+target_id}`) MERGE'd idempotently with the node write. `rel_type` must be one
+of the living-cycle set `OWNS | SHAPES | SETS | SPAWNS | RELATES_TO |
+INSPIRES | INFORMS | TESTED_BY | PRODUCES | EXPRESSES | REFINES |
+SHARED_WITH | SCOPED_TO` (unknown rel_types are rejected before the node
+write); a `target_id` matching no existing node creates nothing and is
+reported as `target_missing` in the response envelope. Domain zoning Role
+nodes (`domain_slug`, `steward_agent`) are seeded by
+`migrations/V005__domain_role_zoning_seed.cypher`.
 
 ### Muninn Promotion Contract (seam: `lifegraph-muninn-promotion`)
 
@@ -358,11 +376,13 @@ A belief about what will help the operator improve or change.
 
 Embedding space: `skill_tool_semantic`
 
-#### Idea-node convention (`idea:<slug>`)
+#### Legacy repo-implementation idea convention (`idea:<slug>`)
 
 Operator ideas captured by the idea-intake charter
 ([ARIA_IDEA_PIPELINE_PROPOSAL](../ARIA_IDEA_PIPELINE_PROPOSAL.md)) reuse
-`GrowthHypothesis` — a convention, not a schema patch:
+`GrowthHypothesis` when they are specifically proposals for changing Philotic
+itself. This remains a project-triage compatibility convention; it is not the
+owner of the personal creative-learning lifecycle.
 
 | Convention | Value |
 |---|---|
@@ -373,10 +393,30 @@ Operator ideas captured by the idea-intake charter
 | `idea_status` | absent = `captured` → `promoted` (with `graph_ref: doc:<proposal-id>`) → `shipped` \| `declined` (with `idea_status_reason`). Written by the triage pipeline (`just idea-sweep`), not at intake — `life.observe` has no custom-property write path |
 
 Provenance envelope as always (`source_membrane`, `observed_by`,
-`validation_state: proposed`). The LifeGraph node is the provenance anchor
-for the idea's whole life; the intel-graph node referenced by `graph_ref`
-owns execution state. Revisit a dedicated `Idea` label (a governed
-SchemaPatch) only if lens ergonomics demand it.
+`validation_state: proposed`). The LifeGraph node is the provenance anchor;
+the Intel Graph node referenced by `graph_ref` owns repository execution
+state. Personal questions and creative ideas use the V006 labels below.
+
+---
+
+### Question / Idea / Experiment / Artifact / Learning / Source
+
+The minimal creative-learning vocabulary added by V006. These labels describe
+movement through a creative thread, not a new store:
+
+| Label | Meaning | Initial `creative_status` |
+|---|---|---|
+| `Question` | Something worth understanding | `captured` |
+| `Idea` | A possible connection, approach, or creation | `captured` |
+| `Experiment` | A bounded way to test or explore | `captured` |
+| `Artifact` | Something made, published, performed, or shipped | `captured` |
+| `Learning` | A reusable conclusion grounded in evidence | `captured` |
+| `Source` | Material that informed the work | `captured` |
+
+All six use `creative_learning_semantic`. Quick capture creates proposed nodes;
+`life.commit` remains the only confirmation path. Advancement is represented
+with typed relationships rather than by copying the same content between
+stores.
 
 ---
 
@@ -448,6 +488,14 @@ Embedding space: `skill_tool_semantic`
 | `REDUCES_FRICTION_FOR` | `System`, `Habit`, `Routine` | `Role`, `Goal`, `Habit` | Explicitly reduces barrier |
 | `SUGGESTS_PATCH` | `DriftFinding`, `GrowthExperiment` | `*Patch` | Leads to a patch proposal |
 | `APPLIES_TO_ROLE` | `Preference`, `Value`, `Concern`, `*Patch` | `Role` | Scoped to a specific role |
+| `INSPIRES` | `Question` | `Idea` | Curiosity generated a possible direction |
+| `INFORMS` | `Source` | `Question`, `Idea` | Source materially shaped the thread |
+| `TESTED_BY` | `Idea` | `Experiment` | Idea has a bounded test |
+| `PRODUCES` | `Experiment` | `Artifact`, `Learning` | Test yielded something made or learned |
+| `EXPRESSES` | `Artifact` | `Idea` | Artifact embodies the idea |
+| `REFINES` | `Learning` | `Idea`, `Goal`, `System` | Learning changed a future direction or method |
+| `SHARED_WITH` | `Artifact` | `Person`, `Role` | Artifact reached an audience or collaborator |
+| `SCOPED_TO` | any observed node | `Role` | Server-injected structural/domain anchor |
 
 Edge provenance: the full provenance envelope applies to agent-inferred edges. Operator-asserted edges may carry only `source_membrane` and `observed_at`.
 
@@ -462,6 +510,7 @@ All spaces use dimension `768` and metric `cos` (cosine similarity). Never mix m
 | `life_event_semantic` | `Event`, `Signal`, `OpenLoop` | Temporal and observational recall |
 | `goal_system_semantic` | `Goal`, `System`, `Habit`, `Project`, `Routine`, `NextAction` | Purpose, structure, and next-step retrieval |
 | `skill_tool_semantic` | `GrowthHypothesis`, `GrowthExperiment`, `DriftFinding`, `CapabilityPatch`, `SkillPatch`, `ToolPatch`, `SchemaPatch`, `AttentionPatch`, `SystemPatch` | Capability improvement retrieval |
+| `creative_learning_semantic` | `Question`, `Idea`, `Experiment`, `Artifact`, `Learning`, `Source` | Creative-thread re-entry, making, reflection, and reuse |
 | `role_person_semantic` | `Role`, `Person`, `Value`, `Preference`, `Concern` | Identity and relational context |
 | `memory_bridge_semantic` | `Commitment`, `Decision` | Cross-domain bridges: commitments and decisions span roles, goals, and people |
 
@@ -479,5 +528,11 @@ Retrieval pipeline:
 - Migration target: Memgraph 3.10.1 on `vps-jane` (Tailscale `100.64.212.8:7687`)
 - SQLite provider (`SqliteCypherProvider`) does **not** support DDL. No SQLite migration exists or is needed — Life Graph OS is Memgraph-only.
 - Apply `V001__life_graph_schema.cypher` statement-by-statement (Bolt does not support multi-statement batches).
+- `V006__creative_learning_flywheel.cypher` was applied to the live
+  `vps-jane` Memgraph on 2026-07-24 after parser validation. It adds the
+  creative constraints, property indexes, and 768-dimensional semantic
+  indexes.
 - Migration is designed to be applied once. Re-running will fail on existing constraints; that is expected.
-- Verification: after applying, run `SHOW INDEX INFO;` and `SHOW VECTOR INDEX INFO;` to confirm all constraints, indexes, and vector indexes are present.
+- Verification on 2026-07-24 used `SHOW CONSTRAINT INFO;`, `SHOW INDEX INFO;`,
+  and `SHOW VECTOR INDEX INFO;` to confirm the six label constraints, property
+  indexes, and six cosine vector indexes at 768 dimensions.

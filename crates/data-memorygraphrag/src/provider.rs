@@ -7,7 +7,8 @@ use data_memorygraphrag::projection;
 use data_memorygraphrag::zoning;
 use data_memorygraphrag::{
     AdjudicationStatus, ConflictHandoff, ContextPacket, EvidencePacket, FeedbackEdgeSpec,
-    GraphRecordRef, LifeCommitInput, LifeGraphToolRequest, LifeObserveBatchInput, LifeObserveInput,
+    GraphRecordRef, LifeCaptureInput, LifeCommitInput, LifeFlywheelBriefInput,
+    LifeFlywheelReviewInput, LifeGraphToolRequest, LifeObserveBatchInput, LifeObserveInput,
     LifePatchApplyInput, LifePatchListInput, LifePatchProposalInput, LifeRecallStatsInput,
     LifeResolveInput, LifeViewNeighborhoodInput, LifeViewNodeInput, MAX_OBSERVE_BATCH,
     MemoryGraphRagRunner, PatchApplyDecision, PatchGate, PatchKind, PatchRisk, PolicyFilter,
@@ -473,10 +474,13 @@ impl DatasourceProvider for LifeGraphProvider {
 
     async fn invoke(&self, task: &DatasourceTask) -> Result<ProviderOutput> {
         let mut output = match task.kind.as_str() {
+            "life.capture" => self.handle_capture(task).await,
             "life.observe" => self.handle_observe(task).await,
             "life.observe.batch" => self.handle_observe_batch(task).await,
             "life.recall" => self.handle_recall(task).await,
             "life.recall.feedback" => self.handle_recall_feedback(task).await,
+            "life.flywheel.brief" => self.handle_flywheel_brief(task).await,
+            "life.flywheel.review" => self.handle_flywheel_review(task).await,
             "life.commit" => self.handle_commit(task).await,
             "life.resolve" | "life.conflict.resolve" => self.handle_resolve(task).await,
             "life.conflict" | "life.conflict.handle" => self.handle_conflict(task).await,
@@ -528,7 +532,7 @@ fn change_notification_for(kind: &str, data: &Value) -> Option<Value> {
         }));
     }
     let change_kind = match kind {
-        "life.observe" => "observed",
+        "life.capture" | "life.observe" => "observed",
         "life.commit" => "committed",
         "life.resolve" | "life.conflict.resolve" => "resolved",
         "life.conflict" | "life.conflict.handle" => "conflict_opened",
@@ -568,6 +572,50 @@ fn change_notification_for(kind: &str, data: &Value) -> Option<Value> {
 }
 
 impl LifeGraphProvider {
+    /// `life.capture` is the low-friction front door. It expands the minimal
+    /// capture contract into the ordinary governed `life.observe` pipeline,
+    /// so proposal state, provenance, embedding, anchors, and notifications
+    /// retain one implementation and one authority boundary.
+    async fn handle_capture(&self, task: &DatasourceTask) -> Result<ProviderOutput> {
+        let mut input: LifeCaptureInput = serde_json::from_value(task.parameters.clone())
+            .context(format!(
+                "{CONTRACT_ERROR_MARKER} failed to parse life.capture parameters as LifeCaptureInput"
+            ))?;
+        if input.observed_by.is_none() {
+            input.observed_by = task
+                .identity
+                .get("agent_id")
+                .or_else(|| task.identity.get("subject"))
+                .and_then(Value::as_str)
+                .filter(|value| !value.trim().is_empty())
+                .map(str::to_string);
+        }
+        self.runner
+            .plan(LifeGraphToolRequest::LifeCapture(input.clone()))
+            .map_err(|e| {
+                anyhow::anyhow!("{CONTRACT_ERROR_MARKER} life.capture plan validation failed: {e}")
+            })?;
+        let capture_kind = input.kind.as_str().to_string();
+        let observe_input = input.into_observe_input().map_err(|e| {
+            anyhow::anyhow!("{CONTRACT_ERROR_MARKER} life.capture conversion failed: {e}")
+        })?;
+        let observe_task = DatasourceTask {
+            kind: TaskKind::Custom("life.observe".into()),
+            provider: task.provider.clone(),
+            db: task.db.clone(),
+            graph_id: task.graph_id.clone(),
+            query: task.query.clone(),
+            parameters: serde_json::to_value(observe_input)?,
+            identity: task.identity.clone(),
+        };
+        let mut output = self.handle_observe(&observe_task).await?;
+        if let ProviderOutput::ResultSet(data) = &mut output {
+            data["capture_kind"] = json!(capture_kind);
+            data["captured_via"] = json!("life.capture");
+        }
+        Ok(output)
+    }
+
     /// `life.observe`, single-item path: embeds its own claim_summary via one
     /// sidecar round trip. Thin wrapper over
     /// [`Self::handle_observe_with_embedding`] with no precomputed vector.
@@ -641,6 +689,10 @@ impl LifeGraphProvider {
             .param("claim_summary", compiled.claim_summary.as_str())
             .param("observation_id", compiled.observation_id.as_str())
             .param("packet_id", compiled.packet_id.as_str())
+            .param("capture_kind", compiled.capture_kind.as_str())
+            .param("creative_status", compiled.creative_status.as_str())
+            .param("inbox_state", compiled.inbox_state.as_str())
+            .param("pilot_domain", compiled.pilot_domain.as_str())
             .param("observed_by", compiled.observed_by.as_str())
             .param(
                 "observed_role",
@@ -1119,6 +1171,15 @@ impl LifeGraphProvider {
             NamedRecallStrategy::ReEntryContext => {
                 self.extend_vector_hits(
                     &mut all_hits,
+                    SemanticSpace::CreativeLearningSemantic,
+                    &["Question", "Idea", "Experiment", "Artifact", "Learning"],
+                    8,
+                    min_similarity,
+                    &embedding,
+                )
+                .await?;
+                self.extend_vector_hits(
+                    &mut all_hits,
                     SemanticSpace::LifeEventSemantic,
                     &["Event"],
                     6,
@@ -1180,6 +1241,22 @@ impl LifeGraphProvider {
                     &mut all_hits,
                     SemanticSpace::RolePersonSemantic,
                     &["Aspiration"],
+                    top_k,
+                    min_similarity,
+                    &embedding,
+                )
+                .await?;
+                self.extend_vector_hits(
+                    &mut all_hits,
+                    SemanticSpace::CreativeLearningSemantic,
+                    &[
+                        "Question",
+                        "Idea",
+                        "Experiment",
+                        "Artifact",
+                        "Learning",
+                        "Source",
+                    ],
                     top_k,
                     min_similarity,
                     &embedding,
@@ -1962,6 +2039,99 @@ impl LifeGraphProvider {
         })))
     }
 
+    /// Read a deliberately tiny daily creative brief: one thread to resume,
+    /// one thing to make, and one blocker to clear. Each lane is independently
+    /// bounded to one row so an empty lane never inflates the others.
+    async fn handle_flywheel_brief(&self, task: &DatasourceTask) -> Result<ProviderOutput> {
+        let input: LifeFlywheelBriefInput = serde_json::from_value(task.parameters.clone())
+            .context(format!(
+                "{CONTRACT_ERROR_MARKER} failed to parse life.flywheel.brief parameters"
+            ))?;
+        self.runner
+            .plan(LifeGraphToolRequest::LifeFlywheelBrief(input.clone()))
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "{CONTRACT_ERROR_MARKER} life.flywheel.brief plan validation failed: {e}"
+                )
+            })?;
+
+        let resume = self
+            .execute_cypher(&flywheel_brief_lane_cypher(
+                FlywheelBriefLane::Resume,
+                input.pilot_domain.as_deref(),
+            ))
+            .await?;
+        let make = self
+            .execute_cypher(&flywheel_brief_lane_cypher(
+                FlywheelBriefLane::Make,
+                input.pilot_domain.as_deref(),
+            ))
+            .await?;
+        let unblock = self
+            .execute_cypher(&flywheel_brief_lane_cypher(
+                FlywheelBriefLane::Unblock,
+                input.pilot_domain.as_deref(),
+            ))
+            .await?;
+
+        Ok(ProviderOutput::ResultSet(json!({
+            "status": "ok",
+            "brief_kind": "resume_make_unblock",
+            "pilot_domain": input.pilot_domain,
+            "bounded": true,
+            "resume": first_result_row(&resume),
+            "make": first_result_row(&make),
+            "unblock": first_result_row(&unblock),
+        })))
+    }
+
+    /// Read weekly creative flow rather than graph volume. The review reports
+    /// lifecycle counts, idea-to-artifact conversion, explicit learning reuse,
+    /// and the oldest unclassified inbox item.
+    async fn handle_flywheel_review(&self, task: &DatasourceTask) -> Result<ProviderOutput> {
+        let input: LifeFlywheelReviewInput = serde_json::from_value(task.parameters.clone())
+            .context(format!(
+                "{CONTRACT_ERROR_MARKER} failed to parse life.flywheel.review parameters"
+            ))?;
+        self.runner
+            .plan(LifeGraphToolRequest::LifeFlywheelReview(input.clone()))
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "{CONTRACT_ERROR_MARKER} life.flywheel.review plan validation failed: {e}"
+                )
+            })?;
+
+        let since = (chrono::Utc::now() - chrono::Duration::days(i64::from(input.lookback_days)))
+            .to_rfc3339();
+        let counts = self
+            .execute_cypher(&flywheel_review_counts_cypher(
+                &since,
+                input.pilot_domain.as_deref(),
+            ))
+            .await?;
+        let reuse = self
+            .execute_cypher(&flywheel_learning_reuse_cypher(
+                &since,
+                input.pilot_domain.as_deref(),
+            ))
+            .await?;
+        let stale_inbox = self
+            .execute_cypher(&flywheel_stale_inbox_cypher(input.pilot_domain.as_deref()))
+            .await?;
+        let metrics = summarize_flywheel_review(&counts, &reuse);
+
+        Ok(ProviderOutput::ResultSet(json!({
+            "status": "ok",
+            "review_kind": "creative_learning_flow",
+            "pilot_domain": input.pilot_domain,
+            "lookback_days": input.lookback_days,
+            "since": since,
+            "metrics": metrics,
+            "oldest_unclassified_inbox": first_result_row(&stale_inbox),
+            "guardrail": "Optimize completed creative loops and learning reuse, not node count.",
+        })))
+    }
+
     /// Handle `life.recall.stats` — the READ-ONLY retrieval-quality review
     /// surface (life-graph-semantic-retrieval seam).
     ///
@@ -2703,6 +2873,161 @@ fn score_hits(
 
 fn escape_cypher_single_quoted(value: &str) -> String {
     value.replace('\\', "\\\\").replace('\'', "\\'")
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FlywheelBriefLane {
+    Resume,
+    Make,
+    Unblock,
+}
+
+fn flywheel_domain_predicate(alias: &str, pilot_domain: Option<&str>) -> String {
+    pilot_domain
+        .filter(|domain| !domain.trim().is_empty())
+        .map(|domain| {
+            format!(
+                " AND {alias}.pilot_domain = '{}'",
+                escape_cypher_single_quoted(domain.trim())
+            )
+        })
+        .unwrap_or_default()
+}
+
+fn flywheel_brief_lane_cypher(lane: FlywheelBriefLane, pilot_domain: Option<&str>) -> String {
+    let label_predicate = match lane {
+        FlywheelBriefLane::Resume => "(n:Question OR n:Idea)",
+        FlywheelBriefLane::Make => "(n:Experiment OR n:Idea)",
+        FlywheelBriefLane::Unblock => "(n:OpenLoop OR n:Concern)",
+    };
+    let domain = flywheel_domain_predicate("n", pilot_domain);
+    format!(
+        "MATCH (n) \
+         WHERE {label_predicate} \
+           AND coalesce(n.validation_state, 'proposed') <> 'retired' \
+           {domain} \
+         RETURN n.id AS id, head(labels(n)) AS label, \
+                n.claim_summary AS summary, n.creative_status AS creative_status, \
+                n.inbox_state AS inbox_state, n.pilot_domain AS pilot_domain, \
+                coalesce(n.last_confirmed_at, n.observed_at, n.created_at) AS activity_at \
+         ORDER BY activity_at DESC \
+         LIMIT 1"
+    )
+}
+
+fn flywheel_review_counts_cypher(since: &str, pilot_domain: Option<&str>) -> String {
+    let domain = flywheel_domain_predicate("n", pilot_domain);
+    format!(
+        "MATCH (n) \
+         WHERE coalesce(n.observed_at, n.created_at, '') >= '{}' \
+           AND coalesce(n.validation_state, 'proposed') <> 'retired' \
+           {domain} \
+         UNWIND labels(n) AS label \
+         WITH n, label \
+         WHERE label IN ['Question', 'Idea', 'Experiment', 'Artifact', 'Learning', 'Source'] \
+            OR (label = 'Signal' AND n.capture_kind = 'inbox') \
+         RETURN label, count(*) AS count \
+         ORDER BY label",
+        escape_cypher_single_quoted(since)
+    )
+}
+
+fn flywheel_learning_reuse_cypher(since: &str, pilot_domain: Option<&str>) -> String {
+    let domain = flywheel_domain_predicate("l", pilot_domain);
+    format!(
+        "MATCH (l:Learning)-[r:REFINES]->() \
+         WHERE coalesce(r.created_at, l.observed_at, l.created_at, '') >= '{}' \
+           AND coalesce(l.validation_state, 'proposed') <> 'retired' \
+           {domain} \
+         RETURN count(r) AS count",
+        escape_cypher_single_quoted(since)
+    )
+}
+
+fn flywheel_stale_inbox_cypher(pilot_domain: Option<&str>) -> String {
+    let domain = flywheel_domain_predicate("n", pilot_domain);
+    format!(
+        "MATCH (n:Signal) \
+         WHERE n.capture_kind = 'inbox' \
+           AND n.inbox_state = 'unclassified' \
+           AND coalesce(n.validation_state, 'proposed') <> 'retired' \
+           {domain} \
+         RETURN n.id AS id, n.claim_summary AS summary, \
+                n.pilot_domain AS pilot_domain, \
+                coalesce(n.observed_at, n.created_at) AS captured_at \
+         ORDER BY captured_at ASC \
+         LIMIT 1"
+    )
+}
+
+fn first_result_row(result: &Value) -> Value {
+    result
+        .get("rows")
+        .and_then(Value::as_array)
+        .and_then(|rows| rows.first())
+        .cloned()
+        .unwrap_or(Value::Null)
+}
+
+fn summarize_flywheel_review(count_result: &Value, reuse_result: &Value) -> Value {
+    let labels = [
+        "Question",
+        "Idea",
+        "Experiment",
+        "Artifact",
+        "Learning",
+        "Source",
+        "Signal",
+    ];
+    let mut counts = serde_json::Map::new();
+    for label in labels {
+        counts.insert(label.to_string(), json!(0));
+    }
+    for row in count_result
+        .get("rows")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let Some(label) = row.get("label").and_then(Value::as_str) else {
+            continue;
+        };
+        if counts.contains_key(label) {
+            counts.insert(
+                label.to_string(),
+                json!(row.get("count").and_then(Value::as_u64).unwrap_or(0)),
+            );
+        }
+    }
+
+    let ideas = counts.get("Idea").and_then(Value::as_u64).unwrap_or(0);
+    let artifacts = counts.get("Artifact").and_then(Value::as_u64).unwrap_or(0);
+    let idea_to_artifact_conversion = if ideas == 0 {
+        0.0
+    } else {
+        artifacts as f64 / ideas as f64
+    };
+    let learning_reuse_edges = first_result_row(reuse_result)
+        .get("count")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let experiments = counts
+        .get("Experiment")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let learnings = counts.get("Learning").and_then(Value::as_u64).unwrap_or(0);
+    let inbox = counts.get("Signal").and_then(Value::as_u64).unwrap_or(0);
+
+    json!({
+        "counts": counts,
+        "ideas_advanced_proxy": ideas,
+        "experiments_recorded": experiments,
+        "artifacts_created": artifacts,
+        "learnings_recorded": learnings,
+        "learning_reuse_edges": learning_reuse_edges,
+        "unclassified_inbox_captured": inbox,
+        "idea_to_artifact_conversion": idea_to_artifact_conversion,
+    })
 }
 
 /// Cypher for the living-cycle domain membership check: which of `node_ids`
@@ -3798,10 +4123,48 @@ mod tests {
         // node->Role anchor rel type (LifeGraph auto-anchor Slice 1); domain
         // membership now also recognizes the auto-anchor as membership.
         assert!(cypher.contains(
-            "type(r) IN ['OWNS', 'SHAPES', 'SETS', 'SPAWNS', 'RELATES_TO', 'SCOPED_TO']"
+            "type(r) IN ['OWNS', 'SHAPES', 'SETS', 'SPAWNS', 'RELATES_TO', 'INSPIRES', 'INFORMS', 'TESTED_BY', 'PRODUCES', 'EXPRESSES', 'REFINES', 'SHARED_WITH', 'SCOPED_TO']"
         ));
         assert!(cypher.contains("n.id IN ['l:ol:a', 'l:ol:b\\'quote']"));
         assert!(cypher.contains("RETURN DISTINCT n.id AS node_id"));
+    }
+
+    #[test]
+    fn flywheel_brief_queries_are_bounded_and_domain_scoped() {
+        let resume = flywheel_brief_lane_cypher(FlywheelBriefLane::Resume, Some("music's future"));
+        let make = flywheel_brief_lane_cypher(FlywheelBriefLane::Make, None);
+        let unblock = flywheel_brief_lane_cypher(FlywheelBriefLane::Unblock, None);
+
+        assert!(resume.contains("(n:Question OR n:Idea)"));
+        assert!(resume.contains("n.pilot_domain = 'music\\'s future'"));
+        assert!(make.contains("(n:Experiment OR n:Idea)"));
+        assert!(unblock.contains("(n:OpenLoop OR n:Concern)"));
+        for cypher in [&resume, &make, &unblock] {
+            assert!(cypher.contains("LIMIT 1"));
+            assert!(cypher.contains("validation_state"));
+        }
+    }
+
+    #[test]
+    fn flywheel_review_summary_tracks_flow_and_reuse() {
+        let counts = json!({
+            "rows": [
+                {"label": "Idea", "count": 4},
+                {"label": "Experiment", "count": 2},
+                {"label": "Artifact", "count": 1},
+                {"label": "Learning", "count": 2},
+                {"label": "Signal", "count": 3}
+            ]
+        });
+        let reuse = json!({"rows": [{"count": 1}]});
+        let summary = summarize_flywheel_review(&counts, &reuse);
+
+        assert_eq!(summary["ideas_advanced_proxy"], 4);
+        assert_eq!(summary["experiments_recorded"], 2);
+        assert_eq!(summary["artifacts_created"], 1);
+        assert_eq!(summary["learning_reuse_edges"], 1);
+        assert_eq!(summary["unclassified_inbox_captured"], 3);
+        assert_eq!(summary["idea_to_artifact_conversion"], 0.25);
     }
 
     #[test]

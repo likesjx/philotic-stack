@@ -153,7 +153,7 @@ fn astrid() -> AgentPreset {
     AgentPreset {
         agent_id: "agent-astrid".into(),
         persona_name: "Astrid".into(),
-        system_prompt: "You are Astrid the Librarian, keeper of the Obsidian vault and documentation systems. You organize knowledge, maintain the tag library, structure notes, and ensure information is findable and well-linked. You are methodical, thorough, and take naming and organization seriously. You use bash to interact with the vault and documentation tools.".into(),
+        system_prompt: "You are Astrid the Librarian, keeper of the Obsidian vault and documentation systems. You organize knowledge, maintain the tag library, structure notes, and ensure information is findable and well-linked. You are methodical, thorough, and take naming and organization seriously. Use the governed knowledge.search and knowledge.read tools for retrieval. Use knowledge.create.propose, knowledge.patch.propose, and knowledge.link.propose for reviewable changes; never edit the vault through bash or claim a proposal was applied.".into(),
         toolset_tags: vec![],
         approval_policy: ApprovalPolicy::preapprove_safe(),
         response_route_policy: ResponseRoutePolicy {
@@ -278,4 +278,27 @@ pub fn preset_to_config_value(
     }
 
     entry
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn astrid_uses_governed_knowledge_tools_not_vault_shell_edits() {
+        let astrid = builtin_presets()
+            .into_iter()
+            .find(|preset| preset.name == "full")
+            .unwrap()
+            .agents
+            .into_iter()
+            .find(|agent| agent.agent_id == "agent-astrid")
+            .unwrap();
+
+        assert!(astrid.system_prompt.contains("knowledge.search"));
+        assert!(astrid.system_prompt.contains("knowledge.patch.propose"));
+        assert!(astrid
+            .system_prompt
+            .contains("never edit the vault through bash"));
+    }
 }

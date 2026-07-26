@@ -735,10 +735,10 @@ mod tests {
         // node->Role anchor rel type (LifeGraph auto-anchor Slice 1); bridge
         // discovery shares that same vocabulary constant.
         assert!(cypher.contains(
-            "type(ra) IN ['OWNS', 'SHAPES', 'SETS', 'SPAWNS', 'RELATES_TO', 'SCOPED_TO']"
+            "type(ra) IN ['OWNS', 'SHAPES', 'SETS', 'SPAWNS', 'RELATES_TO', 'INSPIRES', 'INFORMS', 'TESTED_BY', 'PRODUCES', 'EXPRESSES', 'REFINES', 'SHARED_WITH', 'SCOPED_TO']"
         ));
         assert!(cypher.contains(
-            "type(rb) IN ['OWNS', 'SHAPES', 'SETS', 'SPAWNS', 'RELATES_TO', 'SCOPED_TO']"
+            "type(rb) IN ['OWNS', 'SHAPES', 'SETS', 'SPAWNS', 'RELATES_TO', 'INSPIRES', 'INFORMS', 'TESTED_BY', 'PRODUCES', 'EXPRESSES', 'REFINES', 'SHARED_WITH', 'SCOPED_TO']"
         ));
         assert!(cypher.contains("NOT bridge.id IN ['l:a:1', 'l:a\\'2']"));
         assert!(cypher.contains("NOT bridge.id IN ['l:b:1']"));

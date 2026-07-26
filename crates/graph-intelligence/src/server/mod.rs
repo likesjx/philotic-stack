@@ -37,6 +37,8 @@ pub struct ServerConfig {
     pub auth_token: Option<String>,
     /// Allow a non-loopback bind without an auth token (explicit opt-in)
     pub allow_insecure_bind: bool,
+    /// MemPalace-owned episodic adapter. Relative paths resolve from repo_root.
+    pub episodic_adapter: String,
 }
 
 impl Default for ServerConfig {
@@ -55,6 +57,7 @@ impl Default for ServerConfig {
             repo_root: ".".to_string(),
             auth_token: None,
             allow_insecure_bind: false,
+            episodic_adapter: "scripts/mempalace_episode.py".to_string(),
         }
     }
 }
@@ -131,6 +134,8 @@ pub struct AppState {
     /// Surfaced in /api/status so stale-binary drift is observable (the server
     /// once ran 12 days from a deleted binary with no way to tell).
     pub server_info: serde_json::Value,
+    /// Compatibility invocation path only; MemPalace remains the data owner.
+    pub episodic_adapter: std::path::PathBuf,
 }
 
 fn server_identity() -> serde_json::Value {
@@ -178,12 +183,22 @@ pub async fn serve(config: ServerConfig) -> Result<()> {
     // Create broadcast channel for WebSocket events
     let (change_tx, _) = broadcast::channel::<ws::ChangeEvent>(256);
 
+    let episodic_adapter = {
+        let configured = std::path::PathBuf::from(&config.episodic_adapter);
+        if configured.is_absolute() {
+            configured
+        } else {
+            Path::new(&config.repo_root).join(configured)
+        }
+    };
+
     let state = Arc::new(AppState {
         engine: Mutex::new(engine),
         scan_config: config.scan_config,
         repo_root: config.repo_root,
         change_tx,
         server_info: server_identity(),
+        episodic_adapter,
     });
 
     // Build the HTTP + WebSocket router
