@@ -3,7 +3,18 @@
 > **Operator intent (2026-07-23, paraphrased):** "The lifegraph has become the focus.
 > I need it to be able to manage my life — let's make it more active."
 
-Status: **proposal — slices S1/S2 implementation started on this branch**
+Status: **S1 verified live (defect not reproduced) · S2 merged + verified live
+(2026-07-26, run 7df89e5a: agenda-edge fixture `proposed` + `target_missing`, 10/10 PASS)
+· S3 implemented — runtime cron registration (see below) · S4 pending SIL evidence**
+
+> **S3 mechanism note:** the architect-charter env-gated boot seeder was never
+> enabled on any host (no ansible plumbing sets its vars), so the brief registers
+> at runtime through `IpcRequest::RegisterCronJob` instead — the same validated
+> path as the `cron.register` tool, mirroring Beacon's live evening check-in job.
+> Registrar: `crates/philotic-client/examples/life_graph_brief_cron_register.rs`;
+> contract doc: `skills/lifegraph-daily-brief/SKILL.md`. The job row persists in
+> the hotel context graph across restarts; a boot seeder remains available as a
+> follow-up if re-registration-on-wipe is ever needed.
 
 ## Goal
 
