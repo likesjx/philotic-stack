@@ -3,7 +3,7 @@ title: Creative Learning Flywheel Proposal
 doc_type: proposal
 domain: memory-context
 status: implemented
-last_updated: 2026-07-25
+last_updated: 2026-07-26
 tags:
   - creativity
   - learning
@@ -14,6 +14,7 @@ related_docs:
   - LIFE_GRAPH_OS_PROPOSAL.md
   - MEMPALACE_EPISODIC_MEMORY_PROPOSAL.md
   - OBSIDIAN_KNOWLEDGE_GARDEN_PROPOSAL.md
+  - ../process/CREATIVE_LEARNING_PILOT_PLAYBOOK.md
 task_refs:
   - docs/task.md#creative-learning-flywheel
 proposal_id: creative-learning-flywheel
@@ -196,6 +197,10 @@ Node count, note count, and captured-token count are diagnostics, not success me
 
 Run one four-week pilot in the `LifeGraph creative systems` domain:
 
+Operational procedure, dates, scorecard definitions, recovery rules, and the
+cross-agent contract live in the
+[Creative Learning Four-Week Pilot Playbook](../process/CREATIVE_LEARNING_PILOT_PLAYBOOK.md).
+
 1. Use the accepted minimal growth vocabulary behind proposed-write gates.
 2. Capture with `life.capture` or the model-bypass prefixes `capture:`,
    `question:`, `idea:`, `source:`, `experiment:`, `artifact:`, and
@@ -227,7 +232,8 @@ Run one four-week pilot in the `LifeGraph creative systems` domain:
 ## Next Seam
 
 Run the four-week `LifeGraph creative systems` pilot using the active daily
-brief and weekly review. Expand only after the review shows artifacts,
-learning reuse, and lower re-entry cost without excess maintenance. Treat
-timezone-aware cron scheduling as a follow-on only if the UTC-backed cadence's
-one-hour seasonal shift creates real friction.
+brief, weekly review, and
+[pilot playbook](../process/CREATIVE_LEARNING_PILOT_PLAYBOOK.md). Expand only
+after the review shows artifacts, learning reuse, and lower re-entry cost
+without excess maintenance. Treat timezone-aware cron scheduling as a follow-on
+only if the UTC-backed cadence's one-hour seasonal shift creates real friction.

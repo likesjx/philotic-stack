@@ -268,6 +268,8 @@ Seam ID: `obsidian-knowledge-projection`
 
 Proposal: [CREATIVE_LEARNING_FLYWHEEL_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/CREATIVE_LEARNING_FLYWHEEL_PROPOSAL.md)
 
+Playbook: [CREATIVE_LEARNING_PILOT_PLAYBOOK.md](/Users/jaredlikes/code/philotic-stack/docs/process/CREATIVE_LEARNING_PILOT_PLAYBOOK.md)
+
 Seam ID: `creative-learning-flywheel`
 
 - [x] Choose `LifeGraph creative systems` as the first four-week pilot domain.
@@ -277,6 +279,7 @@ Seam ID: `creative-learning-flywheel`
 - [x] Apply and verify V006 on the live Memgraph, install the updated `mac-jane` catalogs/parser, and smoke the updated runner through isolated hotel IPC against the live Memgraph and ONNX sidecar (548 ms measured quick capture).
 - [x] Install the updated runner into the supervised `vps-jane` service and prove installed hash, restarted PID, executable path, and the production-routed capture/brief/review path (982 ms measured capture).
 - [x] Register deterministic daily and weekly cadence jobs through hotel IPC and first-fire-verify both isolated sessions through the remote LifeGraph runner and Telegram delivery.
+- [x] Publish the dated four-week pilot playbook with daily and weekly loops, manual advancement criteria, scorecard, recovery rules, and cross-agent contract.
 - [ ] Advance at least four ideas, complete at least two experiments, and create or share at least one artifact.
 - [ ] Close experiments with reusable learning and recall-usefulness feedback.
 - [ ] Run the weekly `life.flywheel.review` over the pilot and review artifact rate, idea-to-artifact conversion, learning reuse, re-entry time, and maintenance cost before expanding scope.
