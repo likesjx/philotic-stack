@@ -90,7 +90,12 @@ mapping for philotic-stack:
 ## Slice A — Entity Index Plane (do this first)
 
 **Seam: `apple-entity-index-plane`.** Highest value, lowest risk, no new server
-work — it rides the existing `lifegraph-read-plane`.
+work — it rides `lifegraph-read-plane`, which has **shipped** (verified
+2026-07-26): `life.view.node` / `life.view.neighborhood` handlers in
+`crates/data-memorygraphrag/src/provider.rs:487`, edge-bearer REST routes
+registered in `crates/philotic-web/src/serve.rs:696-704`, and a built Swift
+`LifeGraphClient` with `fetchLens` / `fetchNode`. The read plane is real, so
+entity donation has something to donate on day one.
 
 Conform LifeGraph nodes and Muninn memories to `AppEntity` + `IndexedEntity`,
 and donate them via `indexAppEntities` on cache fill / `LifeGraphChange` apply,
@@ -162,8 +167,13 @@ call site* served by Apple's on-device model when offline/cheap and by the
 philotic mesh (with full agent context, LifeGraph access, and mesh tools) when
 connected. Provider selection becomes a policy decision, not a rewrite.
 
-Also note: Foundation Models on **Private Cloud Compute** is free for Small
-Business Program apps (<2M downloads) — which we would qualify for.
+**Do not count on free PCC.** Foundation Models on Private Cloud Compute is
+free for Apple **Small Business Program** apps (<2M downloads), but that
+program is an App Store commission program requiring paid enrollment *and*
+App Store distribution. An operator-personal app installed on our own devices
+is almost certainly **not** eligible. Treat PCC as unavailable-by-default; if
+we ever ship to the App Store, revisit. This does not affect D1 (on-device is
+unconditionally free) or D2 (our own mesh is the backend).
 
 ## Slice E — Free Wins
 
@@ -221,6 +231,14 @@ An iPhone 13 Pro (A15) **cannot run Apple Intelligence at all** — no on-device
 iPhone verification of any slice here is possible on it. Development and
 Simulator work on an Apple silicon Mac is unaffected; only device verification
 is gated. See session notes for the September 2026 hardware decision.
+
+**Signing constraint on the dev loop**: a free Apple Account (Xcode "Personal
+Team") issues provisioning profiles that **expire 7 days** after creation — the
+installed app simply stops launching and must be rebuilt from Xcode. Paid
+Apple Developer Program profiles last a year. Any slice whose verification
+target is *watched-live on a real device over days* (which is most of Plane 5,
+since Spotlight indexing and Siri reasoning need lived-in data) effectively
+requires the $99 membership to avoid weekly re-signing.
 
 ## Explicitly Out of Scope
 
