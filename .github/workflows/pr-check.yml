@@ -1,0 +1,110 @@
+name: PR Check
+
+# The gate that was missing. Before this workflow the only CI was
+# build-linux.yml (push to develop — i.e. AFTER merge, and no tests) and
+# release.yml (tags only). Nothing verified a pull request, while the standing
+# policy is to auto-merge agent PRs into develop "at honest green" — a green
+# that was entirely self-reported by the agent that wrote the code.
+#
+# Scope, deliberately:
+#   test  — HARD gate. `cargo check` + `cargo test --workspace` on macOS arm64,
+#           which is what mac-jane and mbp-jane actually run. Verified green at
+#           introduction: 2078 passed / 0 failed / 89 test binaries.
+#   fmt   — HARD gate. `cargo fmt --all --check`. The 13 files that had drifted
+#           are formatted in the same PR that adds this, so it is green on
+#           arrival.
+#   clippy — ADVISORY (continue-on-error). The workspace currently emits
+#           hundreds of warnings (aiua alone: 313). Making it blocking today
+#           would mean a multi-day cleanup, and a gate that is red on arrival
+#           just teaches everyone to ignore it. Ratchet crate-by-crate via
+#           [workspace.lints], then flip this to blocking.
+#
+# Not covered yet (follow-up): a Linux compile check on PRs. build-linux.yml
+# still only runs post-merge on develop, so a PR can break the vps-jane build
+# and not find out until it lands. Adding it means reproducing that workflow's
+# selective package set — `cargo test --workspace` will not work on Linux
+# because of the Apple-only crates.
+
+on:
+  pull_request:
+    branches: [develop, main]
+  workflow_dispatch: {}
+
+concurrency:
+  group: pr-check-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # Keep build.rs on the placeholder-UI path. Setting PHILOTIC_DESKTOP_DIR
+  # makes crates/philotic-web/build.rs shell out to npm and panic. Same
+  # reasoning as build-linux.yml.
+  RUST_BACKTRACE: 1
+
+jobs:
+  test:
+    name: check + test (macos arm64)
+    runs-on: macos-14
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install pinned Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.94.0"
+          components: rustfmt, clippy
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: macos-arm64-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: macos-arm64-cargo-
+
+      - name: Show toolchain in use
+        run: |
+          rustc --version
+          cargo --version
+
+      - name: cargo check --workspace
+        run: cargo check --workspace --all-targets
+
+      - name: cargo test --workspace
+        run: cargo test --workspace --no-fail-fast
+
+      # Advisory only — see header. Surfaces the warning count in the job
+      # summary so the number is visible and can be ratcheted down, without
+      # blocking the PR.
+      - name: cargo clippy (advisory)
+        id: clippy
+        continue-on-error: true
+        run: |
+          set -o pipefail
+          cargo clippy --workspace --all-targets --message-format=short \
+            2>&1 | tee /tmp/clippy.log || true
+          count=$(grep -c "warning:" /tmp/clippy.log || true)
+          echo "### Clippy: ${count} warnings (advisory, non-blocking)" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "Blocking clippy is tracked as a ratchet: add \`[workspace.lints]\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "per crate as each is cleaned, then make this step blocking." >> "$GITHUB_STEP_SUMMARY"
+
+  fmt:
+    name: rustfmt
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install pinned Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.94.0"
+          components: rustfmt
+
+      # Cheap: rustfmt parses the workspace members, it does not build.
+      - name: cargo fmt --all --check
+        run: cargo fmt --all --check

@@ -39,8 +39,12 @@ jobs:
         run: python3 scripts/check-outbound-egress-inventory.py
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        # Pinned to match rust-toolchain.toml. Must be bumped in lockstep with
+        # it: the toolchain file decides which rustc cargo uses, so the target
+        # below has to be installed against that exact toolchain.
+        uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: "1.94.0"
           targets: x86_64-unknown-linux-gnu
 
       - name: Cache cargo
