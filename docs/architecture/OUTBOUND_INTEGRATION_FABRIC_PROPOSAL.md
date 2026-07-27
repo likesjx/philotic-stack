@@ -4,7 +4,7 @@ doc_type: proposal
 domain: tooling-execution
 status: implemented
 disposition: implemented
-last_updated: 2026-07-25
+last_updated: 2026-07-26
 tags:
 - skilldag
 - integrations
@@ -21,6 +21,8 @@ implemented_by:
 - crates/egress-http-runner/src/main.rs
 - crates/aiua/src/main.rs
 - crates/aiua/src/service/ipc.rs
+- crates/aiua/src/service/governed_http.rs
+- crates/aiua/src/service/model_catalog_sync.rs
 - crates/aiua/src/service/operator_surface.rs
 - crates/philotic-client/src/lib.rs
 - crates/philote/src/catalog.rs
@@ -37,6 +39,8 @@ implemented_by:
 - scripts/smoke-integration-exit-hotel-roundtrip.sh
 - scripts/integration-exit-smoke-stub.py
 - scripts/smoke-mcp-http-egress-roundtrip.sh
+- scripts/smoke-model-catalog-egress-roundtrip.sh
+- scripts/check-outbound-egress-inventory.py
 active_seams:
 - integration-binding-contract
 - http-egress-execution-boundary
@@ -47,6 +51,7 @@ related_docs:
 - ARCHITECTURE_STATUS.md
 - ARCHITECTURE.md
 - OUTBOUND_INTEGRATIONS.md
+- OUTBOUND_EGRESS_INVENTORY.md
 - DATA_DRIVEN_TOOL_GRANTS_PROPOSAL.md
 - MCP_CLIENT_FABRIC_PROPOSAL.md
 - PERIMETER_EGRESS_CONTROL_PROPOSAL.md
@@ -129,9 +134,11 @@ VPS-only loopback target, resolved the credential inside `vps-jane`, enforced
 the bounded HTTP contract, returned a sanitized response to `mbp-jane`, and
 persisted the content-free audit at the exit hotel's authority.
 
-The remaining work is migration, not fabric construction: inventory direct
-outbound callers and move eligible general-API traffic behind bindings while
-keeping model/provider and communication exceptions explicit.
+The remaining work is migration, not fabric construction. The first inventory
+and migration slice is complete: 33 direct-client files have machine-checked
+dispositions, and the hotel-owned OpenRouter catalog sync now uses a narrow
+system binding and the shared executor. The remaining future violation and
+temporary auth exceptions are explicit.
 
 ## Current Truth
 
@@ -168,12 +175,23 @@ keeping model/provider and communication exceptions explicit.
 - A watched two-hotel run proved required `vps-jane` placement, target-hotel
   credential resolution, response return to `mbp-jane`, and durable audit
   persistence at the execution hotel.
+- The direct-client inventory is machine-checked and fails on unclassified,
+  stale, or regressed migrated callers.
+- The OpenRouter model-catalog sync no longer constructs a network client. It
+  registers a credential-free `general-api` system binding, prefers `vps-jane`
+  with explicit fallback, and uses the hotel route plus `egress-http-runner`.
+- An isolated binary smoke proves system binding registration, runner
+  execution, compact catalog persistence, and the durable content-free audit.
 
 ### Proven Gap
 
-- Direct HTTP clients remain distributed across membranes, MCP, models, memory,
-  graph, web, and other runners. Model/provider and communication paths remain
-  named transitional exceptions.
+- Direct HTTP clients remain distributed across membranes, models, memory,
+  graph, web, and other runners. Every detected production constructor now has
+  a recorded owner and disposition; model/provider and communication paths
+  remain named transitional exceptions.
+- The Philote OpenRouter catalog fallback is the remaining general-API future
+  violation. Operator OAuth/token exchange is a temporary exception pending a
+  credential-safe auth binding.
 - Before this slice, `CheckEgress` resolved credentials and returned raw
   injection headers through IPC; `hotel.egress.check` rendered those headers
   into a model-facing tool result.
@@ -487,8 +505,10 @@ Model/provider and communication paths move only under their own explicit
 slices.
 
 Status: fleet installation is watched-live-green on `mbp-jane` and `vps-jane`.
-Direct-client inventory and class-by-class migration remain the active
-operational follow-through.
+The direct-client inventory and the first class-by-class migration are
+smoke-green. Remaining follow-through is removal of the Philote catalog
+fallback, auth egress design, and eventual host-level enforcement once named
+exceptions have executable allow rules.
 
 ## Verification Ladder
 

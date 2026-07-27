@@ -249,6 +249,38 @@ pub enum HttpNetworkScope {
     Private,
 }
 
+/// Infer the narrowest declared address scope from a literal/host name.
+///
+/// DNS names remain public by default; executors still resolve and validate
+/// every address immediately before I/O. This helper only prevents each
+/// protocol/service adapter from inventing a different loopback/tailnet rule.
+pub fn infer_http_network_scope(host: &str) -> HttpNetworkScope {
+    if host.eq_ignore_ascii_case("localhost") {
+        return HttpNetworkScope::Loopback;
+    }
+    let Ok(ip) = host.trim_matches(['[', ']']).parse::<IpAddr>() else {
+        return HttpNetworkScope::Public;
+    };
+    if ip.is_loopback() {
+        return HttpNetworkScope::Loopback;
+    }
+    if let IpAddr::V4(v4) = ip {
+        let octets = v4.octets();
+        if octets[0] == 100 && (64..128).contains(&octets[1]) {
+            return HttpNetworkScope::Tailnet;
+        }
+        if v4.is_private() || v4.is_link_local() {
+            return HttpNetworkScope::Private;
+        }
+    }
+    if let IpAddr::V6(v6) = ip {
+        if v6.is_unique_local() || v6.is_unicast_link_local() {
+            return HttpNetworkScope::Private;
+        }
+    }
+    HttpNetworkScope::Public
+}
+
 /// Vault credential injection. Only `secret_ref` crosses process boundaries.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HttpCredentialBinding {
@@ -760,6 +792,30 @@ mod tests {
             "192.168.1.2".parse().unwrap(),
             HttpNetworkScope::Private
         ));
+    }
+
+    #[test]
+    fn network_scope_inference_is_shared_and_conservative() {
+        assert_eq!(
+            infer_http_network_scope("localhost"),
+            HttpNetworkScope::Loopback
+        );
+        assert_eq!(
+            infer_http_network_scope("127.0.0.1"),
+            HttpNetworkScope::Loopback
+        );
+        assert_eq!(
+            infer_http_network_scope("100.79.239.64"),
+            HttpNetworkScope::Tailnet
+        );
+        assert_eq!(
+            infer_http_network_scope("192.168.1.20"),
+            HttpNetworkScope::Private
+        );
+        assert_eq!(
+            infer_http_network_scope("openrouter.ai"),
+            HttpNetworkScope::Public
+        );
     }
 
     #[test]

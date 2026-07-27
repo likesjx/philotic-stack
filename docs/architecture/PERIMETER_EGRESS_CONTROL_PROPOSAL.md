@@ -4,7 +4,7 @@ doc_type: proposal
 domain: operator-control-plane
 status: in-progress
 disposition: accepted-current-slice
-last_updated: 2026-07-24
+last_updated: 2026-07-26
 tags:
 - egress
 - perimeter
@@ -18,11 +18,18 @@ related_docs:
 - MEMBRANE_EXTERNAL_AGENT_AND_EVENT_TRANSPORT_PROPOSAL.md
 - CONTROL_PLANE_ADMIN_SURFACE_PROPOSAL.md
 - OUTBOUND_INTEGRATION_FABRIC_PROPOSAL.md
+- OUTBOUND_EGRESS_INVENTORY.md
 task_refs:
 - docs/task.md
 proposal_id: perimeter-egress-control
 implements: []
-implemented_by: []
+implemented_by:
+- crates/ansible-mesh-core/src/integration.rs
+- crates/egress-http-runner/src/lib.rs
+- crates/aiua/src/service/governed_http.rs
+- crates/aiua/src/service/model_catalog_sync.rs
+- docs/architecture/outbound-egress-inventory.json
+- scripts/check-outbound-egress-inventory.py
 active_seams:
 - egress-policy-object
 - outbound-classification
@@ -63,7 +70,10 @@ This means Philotic should not silently allow every guest to make arbitrary outb
 
 ## Disposition
 
-Proposed.
+Accepted for the current slice. The bounded general-API execution boundary,
+content-free audit, direct-client inventory, and first governed migration are
+implemented. Specialized exceptions and remaining migration work keep the
+broader perimeter enforcement program open.
 
 Track follow-on work in [docs/task.md](/Users/jaredlikes/code/philotic-stack/docs/task.md).
 
@@ -82,8 +92,8 @@ If we blur these together too early, we risk either:
 
 ## Current Reality
 
-Today the repo has the beginning of a hotel-owned egress control plane, but not
-an HTTP execution boundary.
+Today the repo has a hotel-owned policy and HTTP execution boundary plus an
+explicit inventory of direct exceptions.
 
 Current proven shape:
 
@@ -92,12 +102,16 @@ Current proven shape:
 - `aiua` owns `HotelEgressGateway` and the `CheckEgress` IPC path
 - `hotel.egress.check` is authorization-only; it does not return resolved
   credential material
-- membranes, MCP, model/provider, memory, graph, and other clients still perform
-  direct HTTP in their own runtimes
-- there is no shared request executor or canonical egress audit stream yet
-
-The policy oracle is a useful boundary, but it is not an HTTP proxy. The
-execution and audit gap is the active seam.
+- `egress-http-runner` executes bounded HTTP requests and emits durable
+  content-free audit records
+- MCP-over-HTTP delegates its wire exchange to that runner while the MCP
+  manager retains protocol authority
+- the OpenRouter model-catalog poll is the first hotel-owned general-API caller
+  migrated to a system binding
+- 33 remaining production direct-client files have machine-checked
+  dispositions in `outbound-egress-inventory.json`
+- model providers, communications, local resources, mesh, and artifacts remain
+  named specialized exceptions; operator auth is a temporary exception
 
 ## Recommended Egress Taxonomy
 
@@ -215,14 +229,17 @@ The first coherent implementation slices are:
 1. **Implemented, test-green:** define traffic classes and exit-placement
    decisions; make checks authorization-only and keep credentials out of model
    tool results.
-2. Inventory current direct outbound HTTP call sites by component class.
-3. Classify current egress paths as:
+2. **Implemented, smoke-green:** inventory current direct outbound HTTP call
+   sites by component class.
+3. **Implemented:** classify current egress paths as:
    - perimeter-controlled already
    - temporary direct exceptions
    - violations of the intended future model
-4. Add the bounded hotel-owned HTTP executor defined by
+4. **Implemented and watched-live-green for selected `vps-jane` placement:** add
+   the bounded hotel-owned HTTP executor defined by
    [OUTBOUND_INTEGRATION_FABRIC_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/OUTBOUND_INTEGRATION_FABRIC_PROPOSAL.md).
-5. Route one non-model outbound HTTP path through that executor.
+5. **Implemented, smoke-green:** route the hotel-owned OpenRouter catalog sync
+   through that executor.
 6. Keep model/provider egress as an explicit documented exception until a
    later decision.
 

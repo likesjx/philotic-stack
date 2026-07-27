@@ -15,9 +15,9 @@ mod stdio;
 mod upstream;
 
 use ansible_mesh_core::integration::{
-    projected_http_tool_name, EgressPlacementDecision, EgressTrafficClass, HttpCredentialBinding,
-    HttpIntegrationRequest, HttpIntegrationResponse, HttpIntegrationTarget, HttpNetworkScope,
-    IntegrationBinding, IntegrationTarget,
+    infer_http_network_scope, projected_http_tool_name, EgressPlacementDecision,
+    EgressTrafficClass, HttpCredentialBinding, HttpIntegrationRequest, HttpIntegrationResponse,
+    HttpIntegrationTarget, IntegrationBinding, IntegrationTarget,
 };
 use ansible_mesh_core::mcp_upstream::{
     parse_projected_tool_name, McpUpstreamCatalog, McpUpstreamConfig, McpUpstreamTransport,
@@ -30,7 +30,6 @@ use philotic_client::{
 };
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, HashMap};
-use std::net::IpAddr;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tracing::{info, warn};
 use upstream::{HttpTransportExecutor, UpstreamClient};
@@ -329,7 +328,7 @@ impl HttpTransportExecutor for RunnerHttpExecutor<'_> {
         let path = parsed.path().to_string();
         let network_scope = config
             .http_network_scope
-            .unwrap_or_else(|| infer_network_scope(host));
+            .unwrap_or_else(|| infer_http_network_scope(host));
         let integration_id = format!("mcp:{}", config.upstream_id);
 
         let entries = match self
@@ -503,33 +502,6 @@ impl HttpTransportExecutor for RunnerHttpExecutor<'_> {
             return serde_json::from_str(&result.body).context("upstream response is not JSON");
         }
     }
-}
-
-fn infer_network_scope(host: &str) -> HttpNetworkScope {
-    if host.eq_ignore_ascii_case("localhost") {
-        return HttpNetworkScope::Loopback;
-    }
-    let Ok(ip) = host.trim_matches(['[', ']']).parse::<IpAddr>() else {
-        return HttpNetworkScope::Public;
-    };
-    if ip.is_loopback() {
-        return HttpNetworkScope::Loopback;
-    }
-    if let IpAddr::V4(v4) = ip {
-        let octets = v4.octets();
-        if octets[0] == 100 && (64..128).contains(&octets[1]) {
-            return HttpNetworkScope::Tailnet;
-        }
-        if v4.is_private() || v4.is_link_local() {
-            return HttpNetworkScope::Private;
-        }
-    }
-    if let IpAddr::V6(v6) = ip {
-        if v6.is_unique_local() || v6.is_unicast_link_local() {
-            return HttpNetworkScope::Private;
-        }
-    }
-    HttpNetworkScope::Public
 }
 
 #[tokio::main]

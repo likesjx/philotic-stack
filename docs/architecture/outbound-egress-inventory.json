@@ -1,0 +1,246 @@
+{
+  "schema_version": 1,
+  "scanner": "scripts/check-outbound-egress-inventory.py",
+  "direct_callers": [
+    {
+      "path": "crates/egress-http-runner/src/lib.rs",
+      "traffic_classes": ["general-api"],
+      "disposition": "controlled-boundary",
+      "authority": "IntegrationBinding plus ToolExecutionRoute",
+      "note": "The bounded HTTP executor; direct socket ownership is its purpose."
+    },
+    {
+      "path": "crates/memory-core/src/rest_client.rs",
+      "traffic_classes": ["local-resource"],
+      "disposition": "named-exception",
+      "authority": "memory datasource configuration",
+      "note": "Dedicated Muninn and memory-plane protocol client."
+    },
+    {
+      "path": "crates/philote/src/runtime.rs",
+      "traffic_classes": ["general-api"],
+      "disposition": "future-violation",
+      "authority": "none",
+      "note": "Legacy OpenRouter catalog fallback; remove after governed hotel catalog availability is proven."
+    },
+    {
+      "path": "crates/philote/src/memory_explain_tool.rs",
+      "traffic_classes": ["local-resource"],
+      "disposition": "named-exception",
+      "authority": "memory explanation tool contract",
+      "note": "Reads the local intel-graph explanation plane."
+    },
+    {
+      "path": "crates/mlx-runner/src/client.rs",
+      "traffic_classes": ["local-resource", "model-provider"],
+      "disposition": "named-exception",
+      "authority": "MLX runner protocol",
+      "note": "Dedicated client for the local MLX sidecar."
+    },
+    {
+      "path": "crates/mlx-runner/src/server.rs",
+      "traffic_classes": ["local-resource", "model-provider"],
+      "disposition": "named-exception",
+      "authority": "MLX runner protocol",
+      "note": "Local model-server health and control path."
+    },
+    {
+      "path": "crates/philotic-web/src/serve.rs",
+      "traffic_classes": ["general-api"],
+      "disposition": "temporary-exception",
+      "authority": "operator OIDC flow",
+      "note": "OIDC token and userinfo exchange needs a dedicated auth egress contract before migration."
+    },
+    {
+      "path": "crates/philotic-web/src/memory_explain.rs",
+      "traffic_classes": ["local-resource"],
+      "disposition": "named-exception",
+      "authority": "memory explanation endpoint",
+      "note": "Reads local Muninn and intel-graph explanation planes."
+    },
+    {
+      "path": "crates/philotic-web/src/serve/edge.rs",
+      "traffic_classes": ["artifact", "mesh-peer"],
+      "disposition": "named-exception",
+      "authority": "edge artifact upload contract",
+      "note": "Hotel-to-hotel artifact transfer has a dedicated signed edge protocol."
+    },
+    {
+      "path": "crates/graph-intelligence/src/embeddings.rs",
+      "traffic_classes": ["local-resource"],
+      "disposition": "named-exception",
+      "authority": "embedding sidecar configuration",
+      "note": "Local embedding sidecar protocol."
+    },
+    {
+      "path": "crates/data-memorygraphrag/src/provider.rs",
+      "traffic_classes": ["local-resource"],
+      "disposition": "named-exception",
+      "authority": "memory embedding sidecar configuration",
+      "note": "Local ONNX embedding sidecar protocol."
+    },
+    {
+      "path": "crates/router-listener/src/main.rs",
+      "traffic_classes": ["artifact"],
+      "disposition": "named-exception",
+      "authority": "routed blob transfer contract",
+      "note": "Downloads routed artifacts from the hotel blob service."
+    },
+    {
+      "path": "crates/aiua/src/dream.rs",
+      "traffic_classes": ["local-resource"],
+      "disposition": "named-exception",
+      "authority": "dream consolidation configuration",
+      "note": "Local Muninn, embedding, and Ollama consolidation protocols."
+    },
+    {
+      "path": "crates/aiua/src/memory_hygiene.rs",
+      "traffic_classes": ["local-resource"],
+      "disposition": "named-exception",
+      "authority": "memory hygiene configuration",
+      "note": "Local Muninn and embedding maintenance protocols."
+    },
+    {
+      "path": "crates/aiua/src/auth.rs",
+      "traffic_classes": ["general-api", "model-provider"],
+      "disposition": "temporary-exception",
+      "authority": "operator authentication ceremony",
+      "note": "Provider validation and OAuth exchange need a credential-safe auth egress contract."
+    },
+    {
+      "path": "crates/aiua/src/main.rs",
+      "traffic_classes": ["artifact"],
+      "disposition": "named-exception",
+      "authority": "guest bundle materialization contract",
+      "note": "Downloads a content-addressed guest bundle during materialization."
+    },
+    {
+      "path": "crates/aiua/src/muninn_provision.rs",
+      "traffic_classes": ["local-resource"],
+      "disposition": "named-exception",
+      "authority": "Muninn provisioning ceremony",
+      "note": "Dedicated administrative protocol for the configured Muninn service."
+    },
+    {
+      "path": "crates/aiua/src/service/ipc.rs",
+      "traffic_classes": ["artifact", "local-resource"],
+      "disposition": "named-exception",
+      "authority": "hotel IPC and artifact contracts",
+      "note": "Muninn probes plus hotel blob upload and local control-plane calls."
+    },
+    {
+      "path": "crates/membrane-discord/src/gateway.rs",
+      "traffic_classes": ["communication"],
+      "disposition": "named-exception",
+      "authority": "Discord membrane lease and protocol",
+      "note": "Dedicated Discord gateway WebSocket."
+    },
+    {
+      "path": "crates/membrane-discord/src/voice_gateway.rs",
+      "traffic_classes": ["communication"],
+      "disposition": "named-exception",
+      "authority": "Discord membrane lease and protocol",
+      "note": "Dedicated Discord voice gateway WebSocket."
+    },
+    {
+      "path": "crates/membrane-discord/src/main.rs",
+      "traffic_classes": ["communication"],
+      "disposition": "named-exception",
+      "authority": "Discord membrane lease and protocol",
+      "note": "Dedicated Discord REST delivery client."
+    },
+    {
+      "path": "crates/heal-dispatcher/src/main.rs",
+      "traffic_classes": ["local-resource"],
+      "disposition": "named-exception",
+      "authority": "heal dispatcher configuration",
+      "note": "Local Ollama, intel-graph, and health-probe protocols."
+    },
+    {
+      "path": "crates/model-router/src/runtime.rs",
+      "traffic_classes": ["model-provider"],
+      "disposition": "named-exception",
+      "authority": "model routing and provider controller contract",
+      "note": "Shared model-provider client construction."
+    },
+    {
+      "path": "crates/model-router/src/transcribe_stream.rs",
+      "traffic_classes": ["model-provider"],
+      "disposition": "named-exception",
+      "authority": "transcription controller contract",
+      "note": "Provider-native streaming transcription WebSocket."
+    },
+    {
+      "path": "crates/model-router/src/bin/model-controller-ollama.rs",
+      "traffic_classes": ["local-resource", "model-provider"],
+      "disposition": "named-exception",
+      "authority": "Ollama model controller contract",
+      "note": "Local model-provider health and inference protocol."
+    },
+    {
+      "path": "crates/model-router/src/bin/model-controller-vision.rs",
+      "traffic_classes": ["model-provider"],
+      "disposition": "named-exception",
+      "authority": "vision model controller contract",
+      "note": "Provider-specialized vision inference protocol."
+    },
+    {
+      "path": "crates/model-router/src/providers/gemini.rs",
+      "traffic_classes": ["model-provider"],
+      "disposition": "named-exception",
+      "authority": "Gemini provider contract",
+      "note": "Provider-native REST and live WebSocket inference."
+    },
+    {
+      "path": "crates/model-router/src/providers/onnx.rs",
+      "traffic_classes": ["local-resource", "model-provider"],
+      "disposition": "named-exception",
+      "authority": "ONNX provider contract",
+      "note": "Local provider sidecar protocol."
+    },
+    {
+      "path": "crates/model-router/src/providers/ollama.rs",
+      "traffic_classes": ["local-resource", "model-provider"],
+      "disposition": "named-exception",
+      "authority": "Ollama provider contract",
+      "note": "Local provider sidecar protocol."
+    },
+    {
+      "path": "crates/model-router/src/providers/elevenlabs.rs",
+      "traffic_classes": ["model-provider"],
+      "disposition": "named-exception",
+      "authority": "ElevenLabs provider contract",
+      "note": "Provider-native speech synthesis protocol."
+    },
+    {
+      "path": "crates/model-router/src/providers/anthropic.rs",
+      "traffic_classes": ["model-provider"],
+      "disposition": "named-exception",
+      "authority": "Anthropic provider contract",
+      "note": "Provider-native inference protocol."
+    },
+    {
+      "path": "crates/model-router/src/providers/openai.rs",
+      "traffic_classes": ["model-provider"],
+      "disposition": "named-exception",
+      "authority": "OpenAI provider contract",
+      "note": "Provider-native REST and realtime WebSocket inference."
+    },
+    {
+      "path": "crates/membrane-telegram/src/lib.rs",
+      "traffic_classes": ["communication"],
+      "disposition": "named-exception",
+      "authority": "Telegram membrane poll lease and protocol",
+      "note": "Dedicated Telegram polling, delivery, and media client."
+    }
+  ],
+  "migrated_callers": [
+    {
+      "path": "crates/aiua/src/service/model_catalog_sync.rs",
+      "traffic_classes": ["general-api"],
+      "disposition": "migrated",
+      "authority": "IntegrationBinding model-catalog-openrouter",
+      "note": "Uses GovernedHttpService and egress-http-runner; no direct network client remains."
+    }
+  ]
+}

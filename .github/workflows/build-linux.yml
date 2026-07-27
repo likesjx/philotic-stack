@@ -35,6 +35,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Verify outbound egress inventory
+        run: python3 scripts/check-outbound-egress-inventory.py
+
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
