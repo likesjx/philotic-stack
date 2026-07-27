@@ -607,8 +607,46 @@ impl SessionState {
         self.parked_plan_turn.is_some()
     }
 
+    /// Replace the turn's plan with the model's latest emission, carrying
+    /// grounded verification flags across by step id.
+    ///
+    /// The model re-emits `active_plan` on most iterations and may renumber,
+    /// reorder, add or drop steps. Verification flags are index-aligned, so a
+    /// naive replace silently mis-attributes or erases them — and an erased
+    /// flag means a step that was already proven done gets re-marked
+    /// unverified (or, worse, a fresh unverified step inherits a stale
+    /// `true`). Re-key by step id so a step keeps its own evidence and a
+    /// genuinely new step starts unverified.
     pub fn set_active_plan(&mut self, plan: ActivePlan) {
         if let Some(turn) = self.active_turn.as_mut() {
+            let carried: Vec<(u32, bool)> = turn
+                .active_plan
+                .as_ref()
+                .map(|prev| {
+                    prev.steps
+                        .iter()
+                        .enumerate()
+                        .map(|(i, s)| {
+                            (
+                                s.id,
+                                turn.plan_steps_verified.get(i).copied().unwrap_or(false),
+                            )
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+
+            turn.plan_steps_verified = plan
+                .steps
+                .iter()
+                .map(|s| {
+                    carried
+                        .iter()
+                        .find(|(id, _)| *id == s.id)
+                        .map(|(_, verified)| *verified)
+                        .unwrap_or(false)
+                })
+                .collect();
             turn.active_plan = Some(plan);
         }
     }
@@ -1664,10 +1702,24 @@ impl SessionState {
         self.tool_assembly = default_tool_assembly_for_bindings(&self.bindings);
     }
 
-    /// Record a completed tool call/result pair on the active turn's history.
+    /// Record a completed tool call/result pair on the active turn's history,
+    /// then re-run grounded step verification and latch the result.
+    ///
+    /// Latching matters because evidence is consumed one call per step: as the
+    /// history grows (or is trimmed under context pressure) a step's proof can
+    /// stop being re-derivable, and a step that was genuinely done must not
+    /// silently revert to unverified mid-turn.
     pub fn push_tool_history(&mut self, call: ToolCall, result: ToolResult) {
         if let Some(turn) = self.active_turn.as_mut() {
             turn.working_tool_history.push((call, result));
+            if let Some(plan) = turn.active_plan.as_ref() {
+                turn.plan_steps_verified = crate::plan_eval::verify_plan_steps(
+                    plan,
+                    &turn.working_tool_history,
+                    &turn.plan_steps_verified,
+                )
+                .verified_flags();
+            }
         }
     }
 
@@ -1705,34 +1757,7 @@ impl SessionState {
                     name = call.tool_name,
                 ));
             }
-            let reentry_hint = if let Some(plan) = turn.active_plan.as_ref() {
-                let done = plan.steps.iter().filter(|s| s.status == "done").count();
-                let failed = plan.steps.iter().filter(|s| s.status == "failed").count();
-                let total = plan.steps.len();
-                if plan.status == "done" || (done + failed == total && total > 0) {
-                    "All plan steps are complete. Provide your final response to the user now. \
-                     Do not call any more tools."
-                        .to_string()
-                } else {
-                    let pending: Vec<String> = plan
-                        .steps
-                        .iter()
-                        .filter(|s| s.status == "pending" || s.status == "in_progress")
-                        .map(|s| format!("step {}: {}", s.id, s.description))
-                        .collect();
-                    format!(
-                        "{done}/{total} plan steps done. Remaining: {}. \
-                         Continue with the next pending step, or respond to the user if \
-                         all necessary work is complete.",
-                        pending.join("; ")
-                    )
-                }
-            } else {
-                "Review the above tool results. If your task is complete, respond to the user \
-                 now. Only call another tool if a specific next step is still required."
-                    .to_string()
-            };
-            prompt.push_str(&reentry_hint);
+            prompt.push_str(&crate::plan_eval::reentry_hint(turn));
         }
 
         Some(prompt)
@@ -3531,6 +3556,11 @@ impl SessionState {
                         .into(),
                 );
             }
+        } else if crate::plan_eval::should_plan(&turn.user_content) {
+            // Plan by default: a plan-worthy turn that has not declared one yet
+            // gets the contract up front, so its steps are atomic, tool-bound,
+            // and therefore individually verifiable.
+            lines.push(crate::plan_eval::plan_directive().into());
         }
 
         if !turn.working_tool_history.is_empty() {
@@ -3563,37 +3593,9 @@ impl SessionState {
                 ));
             }
 
-            // Build a structured re-entry footer based on plan state so the model
-            // knows exactly whether to continue calling tools or deliver a final reply.
-            let reentry_hint = if let Some(plan) = turn.active_plan.as_ref() {
-                let done = plan.steps.iter().filter(|s| s.status == "done").count();
-                let failed = plan.steps.iter().filter(|s| s.status == "failed").count();
-                let total = plan.steps.len();
-                if plan.status == "done" || (done + failed == total && total > 0) {
-                    "All plan steps are complete. Provide your final response to the user now. \
-                     Do not call any more tools."
-                        .to_string()
-                } else {
-                    let pending: Vec<String> = plan
-                        .steps
-                        .iter()
-                        .filter(|s| s.status == "pending" || s.status == "in_progress")
-                        .map(|s| format!("step {}: {}", s.id, s.description))
-                        .collect();
-                    format!(
-                        "{done}/{total} plan steps done. Remaining: {}. \
-                         Continue with the next pending step, or respond to the user if \
-                         all necessary work is complete.",
-                        pending.join("; ")
-                    )
-                }
-            } else {
-                // No active plan — use a conservative hint that doesn't bias toward more tools.
-                "Review the above tool results. If your task is complete, respond to the user \
-                 now. Only call another tool if a specific next step is still required."
-                    .to_string()
-            };
-            lines.push(reentry_hint);
+            // Structured re-entry footer: grounded in verification against the
+            // tool results above, not the model's own step statuses.
+            lines.push(crate::plan_eval::reentry_hint(turn));
         }
         if !self.paracrine_threads.is_empty() {
             lines.push("\n[Paracrine side loops]".into());
@@ -3807,6 +3809,8 @@ impl SessionState {
                 }).collect::<Vec<_>>(),
                 "recalled_memories": turn.recalled_memories,
                 "active_plan": turn.active_plan,
+                "started_at_unix": turn.started_at_unix,
+                "plan_steps_verified": turn.plan_steps_verified,
                 "consecutive_step_failures": turn.consecutive_step_failures,
                 "provider_repair_note": turn.provider_repair_note,
                 "provider_repair_attempts": turn.provider_repair_attempts,
@@ -4200,6 +4204,16 @@ impl SessionState {
                 paracrine_chain_started_at: turn
                     .get("paracrine_chain_started_at")
                     .and_then(serde_json::Value::as_u64),
+                // Restored across a hotel restart: the zombie watchdog still
+                // clocks this turn from its ORIGINAL started_at, so the budget
+                // must not reset here.
+                started_at_unix: turn
+                    .get("started_at_unix")
+                    .and_then(serde_json::Value::as_u64),
+                plan_steps_verified: turn
+                    .get("plan_steps_verified")
+                    .and_then(|v| serde_json::from_value(v.clone()).ok())
+                    .unwrap_or_default(),
                 selection_source: turn
                     .get("selection_source")
                     .and_then(|v| serde_json::from_value(v.clone()).ok())
@@ -5525,6 +5539,8 @@ mod tests {
             streamed_content: String::new(),
             paracrine_hop_count: 0,
             paracrine_chain_started_at: None,
+            started_at_unix: None,
+            plan_steps_verified: Vec::new(),
             selection_source: SelectionSource::default(),
         }
     }
@@ -5745,6 +5761,8 @@ mod tests {
             streamed_content: String::new(),
             paracrine_hop_count: 0,
             paracrine_chain_started_at: None,
+            started_at_unix: None,
+            plan_steps_verified: Vec::new(),
             selection_source: SelectionSource::default(),
         });
 
@@ -5938,6 +5956,74 @@ mod tests {
         );
     }
 
+    fn step(id: u32, description: &str) -> PlanStep {
+        PlanStep {
+            id,
+            description: description.into(),
+            tool_name: Some("life.observe".into()),
+            status: "pending".into(),
+        }
+    }
+
+    fn plan_of(steps: Vec<PlanStep>) -> ActivePlan {
+        ActivePlan {
+            goal: "map the family".into(),
+            steps,
+            status: "executing".into(),
+            context_1_advisory: None,
+        }
+    }
+
+    /// The model re-emits `active_plan` on most iterations. Verification flags
+    /// are index-aligned and live outside the plan, so a naive replace would
+    /// wipe evidence for work that really happened.
+    #[test]
+    fn set_active_plan_carries_verification_across_a_reemission() {
+        let mut state =
+            SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
+        state.start_turn(test_working_turn(Some(plan_of(vec![
+            step(1, "Propose Zerin"),
+            step(2, "Propose Daxton"),
+        ]))));
+        state.active_turn.as_mut().unwrap().plan_steps_verified = vec![true, false];
+
+        // Model re-sends the same plan, marking step 1 back to pending.
+        state.set_active_plan(plan_of(vec![
+            step(1, "Propose Zerin"),
+            step(2, "Propose Daxton"),
+        ]));
+
+        let flags = &state.active_turn.as_ref().unwrap().plan_steps_verified;
+        assert_eq!(flags, &vec![true, false], "step 1's evidence must survive");
+    }
+
+    /// Re-keying is by step id, so reordering must move the flag with the step
+    /// rather than leaving it on the slot.
+    #[test]
+    fn set_active_plan_rekeys_flags_by_step_id_not_position() {
+        let mut state =
+            SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
+        state.start_turn(test_working_turn(Some(plan_of(vec![
+            step(1, "Propose Zerin"),
+            step(2, "Propose Daxton"),
+        ]))));
+        state.active_turn.as_mut().unwrap().plan_steps_verified = vec![true, false];
+
+        // Steps swap positions; a brand-new step 3 appears.
+        state.set_active_plan(plan_of(vec![
+            step(2, "Propose Daxton"),
+            step(1, "Propose Zerin"),
+            step(3, "Propose Mali"),
+        ]));
+
+        let flags = &state.active_turn.as_ref().unwrap().plan_steps_verified;
+        assert_eq!(
+            flags,
+            &vec![false, true, false],
+            "the verified flag must follow step id 1, and a new step starts unverified"
+        );
+    }
+
     #[test]
     fn checkpoint_round_trip_preserves_context1_advisory_on_active_plan() {
         let mut state =
@@ -6077,6 +6163,8 @@ mod tests {
             streamed_content: String::new(),
             paracrine_hop_count: 0,
             paracrine_chain_started_at: None,
+            started_at_unix: None,
+            plan_steps_verified: Vec::new(),
             selection_source: SelectionSource::default(),
         });
 
@@ -6132,6 +6220,8 @@ mod tests {
             streamed_content: String::new(),
             paracrine_hop_count: 0,
             paracrine_chain_started_at: None,
+            started_at_unix: None,
+            plan_steps_verified: Vec::new(),
             selection_source: SelectionSource::default(),
         });
 
@@ -7007,6 +7097,8 @@ mod tests {
             streamed_content: String::new(),
             paracrine_hop_count: 0,
             paracrine_chain_started_at: None,
+            started_at_unix: None,
+            plan_steps_verified: Vec::new(),
             selection_source: SelectionSource::default(),
         });
 
@@ -7105,6 +7197,8 @@ mod tests {
             streamed_content: String::new(),
             paracrine_hop_count: 0,
             paracrine_chain_started_at: None,
+            started_at_unix: None,
+            plan_steps_verified: Vec::new(),
             selection_source: SelectionSource::default(),
         });
 
@@ -7310,6 +7404,8 @@ mod tests {
             streamed_content: String::new(),
             paracrine_hop_count: 0,
             paracrine_chain_started_at: None,
+            started_at_unix: None,
+            plan_steps_verified: Vec::new(),
             selection_source: SelectionSource::default(),
         });
 
@@ -7399,6 +7495,8 @@ mod tests {
             streamed_content: String::new(),
             paracrine_hop_count: 0,
             paracrine_chain_started_at: None,
+            started_at_unix: None,
+            plan_steps_verified: Vec::new(),
             selection_source: SelectionSource::default(),
         });
 
@@ -8525,6 +8623,8 @@ mod tests {
             streamed_content: String::new(),
             paracrine_hop_count: 0,
             paracrine_chain_started_at: None,
+            started_at_unix: None,
+            plan_steps_verified: Vec::new(),
             selection_source: SelectionSource::default(),
         });
         let index = merge_session_index(None, &first);
@@ -8587,6 +8687,8 @@ mod tests {
             streamed_content: String::new(),
             paracrine_hop_count: 0,
             paracrine_chain_started_at: None,
+            started_at_unix: None,
+            plan_steps_verified: Vec::new(),
             selection_source: SelectionSource::default(),
         });
 
@@ -8664,6 +8766,8 @@ mod tests {
             streamed_content: String::new(),
             paracrine_hop_count: 0,
             paracrine_chain_started_at: None,
+            started_at_unix: None,
+            plan_steps_verified: Vec::new(),
             selection_source: SelectionSource::default(),
         });
 
@@ -8742,6 +8846,8 @@ mod tests {
             streamed_content: String::new(),
             paracrine_hop_count: 0,
             paracrine_chain_started_at: None,
+            started_at_unix: None,
+            plan_steps_verified: Vec::new(),
             selection_source: SelectionSource::default(),
         });
 
@@ -9112,6 +9218,8 @@ mod tests {
             streamed_content: String::new(),
             paracrine_hop_count: 0,
             paracrine_chain_started_at: None,
+            started_at_unix: None,
+            plan_steps_verified: Vec::new(),
             selection_source: SelectionSource::default(),
         });
 
@@ -9454,6 +9562,8 @@ mod tests {
             streamed_content: String::new(),
             paracrine_hop_count: 0,
             paracrine_chain_started_at: None,
+            started_at_unix: None,
+            plan_steps_verified: Vec::new(),
             selection_source: SelectionSource::default(),
         }
     }
@@ -9859,12 +9969,12 @@ mod tests {
 
         let prompt = state.build_reentry_prompt().unwrap();
         assert!(
-            prompt.contains("All plan steps are complete"),
-            "should show all-done message, got: {prompt}"
+            prompt.contains("complete and verified against this turn's tool results"),
+            "should release the turn once verified, got: {prompt}"
         );
         assert!(
-            !prompt.contains("Call another tool if needed"),
-            "should not use old generic footer"
+            prompt.contains("Do not call any more tools"),
+            "should stop the loop, got: {prompt}"
         );
     }
 
@@ -9905,12 +10015,18 @@ mod tests {
 
         let prompt = state.build_reentry_prompt().unwrap();
         assert!(
-            prompt.contains("1/2 plan steps done"),
-            "should show partial progress, got: {prompt}"
+            prompt.contains("1/2 plan steps verified"),
+            "should show verified progress, got: {prompt}"
         );
         assert!(
             prompt.contains("coordinator role"),
-            "should name pending step"
+            "should name the outstanding step"
+        );
+        // The escape hatch that turned a multi-step plan into one step per
+        // user message must not come back.
+        assert!(
+            !prompt.contains("or respond to the user if"),
+            "must not license bailing out mid-plan, got: {prompt}"
         );
     }
 
@@ -9956,6 +10072,8 @@ mod tests {
             streamed_content: String::new(),
             paracrine_hop_count: 0,
             paracrine_chain_started_at: None,
+            started_at_unix: None,
+            plan_steps_verified: Vec::new(),
             selection_source: SelectionSource::default(),
         };
         state.start_turn(turn);

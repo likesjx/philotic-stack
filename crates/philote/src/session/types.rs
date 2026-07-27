@@ -804,6 +804,73 @@ pub struct WorkingTurn {
     /// checkpoints deserialize to `None`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub paracrine_chain_started_at: Option<u64>,
+    /// Unix-seconds when this turn began. The hotel's zombie watchdog fails a
+    /// turn 300s after its `started_at` with no heartbeat to reset the clock,
+    /// so in-turn plan execution measures its wall-clock budget from here and
+    /// stops early enough to still deliver a reply. See
+    /// [`crate::plan_eval::PLAN_EXECUTION_BUDGET_SECS`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_at_unix: Option<u64>,
+    /// Model-immutable per-step verification flags, index-aligned with
+    /// `active_plan.steps`.
+    ///
+    /// These deliberately do NOT live inside `active_plan`: the model re-emits
+    /// `active_plan` on most iterations and `set_active_plan` replaces it
+    /// wholesale, so flags stored there would be erased whenever the model
+    /// re-sent a step as `pending`. Grounded verification has to survive the
+    /// model's own bookkeeping — that is the entire point of it.
+    #[serde(default)]
+    pub plan_steps_verified: Vec<bool>,
+}
+
+#[cfg(test)]
+impl WorkingTurn {
+    /// Bare turn for unit tests that only exercise plan logic. Every field
+    /// that plan evaluation reads is left for the caller to set.
+    pub(crate) fn for_plan_tests() -> Self {
+        Self {
+            task_id: Uuid::nil(),
+            turn_id: "turn-test".into(),
+            chat_id: String::new(),
+            primary_user_id: None,
+            user_content: String::new(),
+            final_reply_to: String::new(),
+            final_reply_role: String::new(),
+            final_reply_guest_id: None,
+            phase: crate::r#loop::TurnPhase::Thinking,
+            iteration: 0,
+            pending_tool_call: None,
+            pending_approval: None,
+            working_tool_history: Vec::new(),
+            recalled_memories: Vec::new(),
+            active_plan: None,
+            consecutive_step_failures: 0,
+            streak_extension: 0,
+            provider_repair_note: None,
+            provider_repair_attempts: 0,
+            pending_text_reply: None,
+            had_voice_input: false,
+            awaiting_transcription_reentry: false,
+            scripted_loop_context: None,
+            associated_paracrine_ids: Vec::new(),
+            paracrine_origin: None,
+            paracrine_reply_session_id: None,
+            paracrine_reply_chat_id: None,
+            paracrine_response_routing: None,
+            paracrine_merge_completed: false,
+            plan_confirmed: false,
+            plan_confirm_note: None,
+            fallback_tier: 0,
+            ladder_tier0_dispatched: false,
+            selection_source: SelectionSource::default(),
+            streaming_retry_attempts: 0,
+            streamed_content: String::new(),
+            paracrine_hop_count: 0,
+            paracrine_chain_started_at: None,
+            started_at_unix: None,
+            plan_steps_verified: Vec::new(),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1916,6 +1983,8 @@ mod paracrine_budget_tests {
             paracrine_hop_count: 0,
             paracrine_chain_started_at: None,
             selection_source: SelectionSource::default(),
+            started_at_unix: None,
+            plan_steps_verified: Vec::new(),
         }
     }
 

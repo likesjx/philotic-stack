@@ -3126,6 +3126,8 @@ impl AgentRuntime {
                 streamed_content: String::new(),
                 paracrine_hop_count: 0,
                 paracrine_chain_started_at: None,
+                started_at_unix: Some(crate::plan_eval::unix_now()),
+                plan_steps_verified: Vec::new(),
                 selection_source,
             });
             state.set_active_turn_phase(TurnPhase::LoadingContext);
@@ -7386,6 +7388,8 @@ mod tests {
             streamed_content: String::new(),
             paracrine_hop_count: 0,
             paracrine_chain_started_at: None,
+            started_at_unix: None,
+            plan_steps_verified: Vec::new(),
             selection_source: SelectionSource::default(),
         }
     }
@@ -8395,6 +8399,8 @@ mod tests {
             streamed_content: String::new(),
             paracrine_hop_count: 0,
             paracrine_chain_started_at: None,
+            started_at_unix: None,
+            plan_steps_verified: Vec::new(),
             selection_source: SelectionSource::default(),
         });
 
@@ -12068,21 +12074,34 @@ mod tests {
         let _ = std::fs::remove_file(&socket_path);
 
         let emitted = emitted.lock().unwrap();
-        let notices: Vec<_> = emitted
+
+        // The stop notice is recorded, not spoken. It used to be delivered to
+        // the user verbatim ("*(Plan paused: … /plan drop to discard.)*"),
+        // which is the plan machinery narrating itself into the conversation.
+        let chat_notices: Vec<_> = emitted
             .iter()
             .filter(|e| {
                 e["task"]["action"] == "send_reply"
                     && e["task"]["content"]
                         .as_str()
                         .unwrap_or_default()
-                        .contains("budget")
+                        .contains("/plan drop")
             })
             .collect();
-        assert_eq!(notices.len(), 1, "one stop notice: {:#?}", *emitted);
-        let notice = notices[0]["task"]["content"].as_str().unwrap();
+        assert!(
+            chat_notices.is_empty(),
+            "plan scaffolding must not be sent to the user: {:#?}",
+            *emitted
+        );
+
+        let stopped: Vec<_> = emitted
+            .iter()
+            .filter(|e| e["task"]["action"] == "turn_event" && e["task"]["event"] == "plan_stopped")
+            .collect();
+        assert_eq!(stopped.len(), 1, "one plan_stopped event: {:#?}", *emitted);
+        let notice = stopped[0]["task"]["partial_content"].as_str().unwrap();
         assert!(notice.contains("2/3 steps done"), "{notice}");
         assert!(notice.contains("work item 3"), "{notice}");
-        assert!(notice.contains("/plan drop"), "{notice}");
     }
 
     #[tokio::test]

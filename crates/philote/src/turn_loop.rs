@@ -3338,25 +3338,26 @@ impl AgentRuntime {
                         )
                         .await;
                 }
-                // One tight operator message: done / undone / why stopped.
-                let reply_payload = FinalReplyPayload {
-                    action: "send_reply",
-                    session_id: session_id.to_string(),
-                    turn_id,
-                    chat_id,
-                    content: notice,
-                    audio_artifact: None,
-                    send_text_caption: false,
-                    reply_markup: None,
-                };
-                self.ipc_client
-                    .send_request(IpcRequest::EmitTask {
-                        target_node: reply_to,
-                        target_role: reply_role,
-                        target_guest_id: reply_guest_id,
-                        task_json: serde_json::to_string(&reply_payload)?,
-                    })
-                    .await?;
+                // Recorded, not sent. This used to go to the user verbatim —
+                // "*(Plan paused: a step failed or no forward progress was
+                // made. … /plan drop to discard.)*" — which is the machinery
+                // narrating itself into the conversation, and the operator
+                // told us it read as transactional and robotic. Steps now run
+                // and get verified inside the turn, so the model's own reply
+                // is what the user should see; this stays as an operator- and
+                // debug-facing turn event.
+                let _ = self
+                    .emit_plan_turn_event(
+                        session_id,
+                        "plan_stopped",
+                        Some(notice),
+                        &turn_id,
+                        &chat_id,
+                        &reply_to,
+                        &reply_role,
+                        reply_guest_id,
+                    )
+                    .await;
                 Ok(())
             }
             PlanFollowup::Continue { eval_json } => {
