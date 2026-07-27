@@ -1,7 +1,7 @@
 ---
 doc_type: defect-tracker
 status: active
-last_updated: 2026-07-20
+last_updated: 2026-07-27
 ---
 
 # Defects and Technical Debt
@@ -82,6 +82,7 @@ Tracked defects and known technical debt. Each entry carries status, severity, p
 | DEF-065 | `AddVaultEntry` (used by `phil keys configure` and agent-migration vault import) hardcoded `secret_kind: "vault-token"`, discarding the caller's `vault_name` — provider keys stored as generic tokens, indistinguishable from MCP token grants in secret_refs when debugging ACL failures; live evidence 2026-07-20 vps-jane provider-key incident (`secret://hotel/default/vault-token/…` refs for gemini/elevenlabs) | low | fixed | 1 | 2026-07-20 | codex/fix-add-vault-entry-kind — kind = `vault_name` at both store sites + regression test |
 | DEF-066 | Every `full_scan` silently wiped ALL node embeddings: scans delete+reinsert nodes, and the upsert COALESCE only preserves embeddings when the old row still exists — with 6h scheduled scans, semantic search could never stay populated (live DB had 0 embeddings across 11k nodes) | medium | fixed | 1 | 2026-07-20 | codex/intel-graph-top3 — snapshot_embeddings before clear, restore_embeddings (into surviving ids with NULL embedding) after scan |
 | DEF-067 | `memory.hygiene` sweep vault discovery matched zero vaults on every real hotel — `collect_agent_vault_names` (`dream.rs`) filters materialized guest configs for a top-level `agent_id` field, but no guest config in this codebase carries that field at the top level (it lives under `env.PHILOTIC_AGENT_ID`, e.g. `agent_guests_for_profile`); nightly sweeps logged `vaults=0 contradictions=0 stale=0` since first deploy and read as "clean" instead of broken. Live evidence 2026-07-20 mac-jane: `materialized_guests` has zero rows with a top-level `agent_id`, while `config:vault_registry` holds valid `muninn_vault_token` entries for `self_agent-bjork-01`, `self_agent-coach`, `user_likesjx` | high | fixed | 2 | 2026-07-20 | codex/hygiene-vault-discovery — discovery now sources sweepable vaults from `config.vault_tokens` (the resolved `vault_registry`), cross-checked against MuninnDB's own `GET /api/vaults` ground truth; zero-vault discovery now logs WARN with the reason and is recorded distinctly on the last-run marker so an empty sweep is never mistaken for a clean one |
+| DEF-068 | `EmitTask` logged and healed an unknown remote target but still returned success and appended an undeliverable event, leaving the caller to time out after a false acceptance | high | fixed | 1 | 2026-07-27 | codex/lifegraph-delivery-assurance — reject with `TARGET_NODE_UNREACHABLE` before ledger append while retaining classified heal evidence |
 
 ---
 
@@ -148,6 +149,12 @@ The router-listener guest crashes on startup when the `router_listener.config` k
 Watched-live intake test for the Aria idea pipeline: operator texted Aria an idea; Aria's turn projected life.* correctly and emitted 3 tasks to `vps-jane-aiua-01/life-graph-runner` (02:24:39Z). vps-jane was mid-shutdown (`stop-sigterm` from ~02:23:38, SIGKILL 02:25:08 — parallel deploy). The autorecall (read) completed at 02:24:48; the observe (write) tasks were claimed but never executed and did NOT replay after the hotel restarted — Memgraph shows no node, no error surfaced to Aria, and she confirmed capture to the operator. Beacon (vps) was simultaneously killed mid-reply on its own turn.
 
 Class: mesh EmitTask delivery to datasource runners is at-most-once once claimed; a mid-processing SIGKILL loses the task silently. Same failure class as the Coach `stuck_turn_evicted:WaitingTool` incident (2026-07-14). Fix directions: (a) at-least-once redelivery for datasource tasks (claim → ack-on-complete with redelivery timeout), (b) philote-side write-confirmation in the idea charter (life.recall the node id after observe; retry once, tell the operator honestly on failure), (c) drain window in the vps systemd unit (stop-sigterm grace already 90s — the runner needs to stop claiming on SIGTERM).
+
+### DEF-068: unknown remote EmitTask returned false success
+
+**Found**: 2026-07-27 · **Seam**: cross-host-distributed-validation
+
+A watched-live negative LifeGraph smoke from `mbp-jane` targeted a nonexistent node. The hotel correctly classified `emit_task_unknown_target_node` and created a heal record, but still returned `ok`, appended `TASK_INVOKE`, and left the caller waiting until its 30-second datasource-response timeout. The acceptance boundary now returns `TARGET_NODE_UNREACHABLE` before appending the event. A regression asserts the structured error, classified heal evidence, and absence of a ledger command. This closes false acceptance for a destination that is unknown at dispatch time; it does not close DEF-059's separate post-claim crash/replay gap.
 
 ## Fixed defects — detail
 

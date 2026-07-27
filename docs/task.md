@@ -40,6 +40,7 @@ Stable seam refs live in [SEAM_REGISTRY.md](/Users/jaredlikes/code/philotic-stac
   - [ ] keep WebRTC as optional peer session transport after signaling, not the graph or membership sync plane
   - [ ] classify the canonical mesh-shared graph projection in code instead of relying on operator intuition
 - [ ] Recover a single known-good live mesh runtime path across `bjork`, `mbp-jane`, and `jane-vps`.
+- [x] Reject `EmitTask` synchronously with `TARGET_NODE_UNREACHABLE` when a remote node has no registry entry or peer socket; retain a classified heal record and do not append a phantom ledger event.
 - [x] Make response return routing core according to [RESPONSE_RETURN_ROUTE_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/RESPONSE_RETURN_ROUTE_PROPOSAL.md):
   - [x] patch `philote` to emit `reply_guest_id` for model-driven and direct LifeGraph tool calls
   - [x] patch `datasource` to target `reply_guest_id` for success and failure responses
