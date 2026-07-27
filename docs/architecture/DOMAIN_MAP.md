@@ -3,7 +3,7 @@ title: Philotic Architecture Domain Map
 doc_type: workflow
 domain: workflow-docs
 status: active
-last_updated: 2026-07-25
+last_updated: 2026-07-26
 tags:
 - docs
 - domains
@@ -14,6 +14,7 @@ related_docs:
 - ARCHITECTURE_STATUS.md
 - ARCHITECTURE.md
 - OUTBOUND_INTEGRATIONS.md
+- OUTBOUND_EGRESS_INVENTORY.md
 task_refs:
 - docs/task.md
 ---
@@ -127,6 +128,7 @@ Current truth:
 
 - [ARCHITECTURE_STATUS.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/ARCHITECTURE_STATUS.md)
 - [OUTBOUND_INTEGRATIONS.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/OUTBOUND_INTEGRATIONS.md)
+- [OUTBOUND_EGRESS_INVENTORY.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/OUTBOUND_EGRESS_INVENTORY.md)
 
 Active proposals:
 

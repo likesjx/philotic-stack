@@ -7972,6 +7972,22 @@ async fn main() -> Result<()> {
             }
         });
 
+        // Opt-in smoke seam for proving that the hotel-owned model-catalog
+        // service traverses the same binding/placement/runner/audit path as a
+        // guest integration. Normal smoke mode remains network-silent.
+        if std::env::var("PHILOTIC_SMOKE_MODEL_CATALOG")
+            .ok()
+            .as_deref()
+            == Some("1")
+        {
+            crate::service::model_catalog_sync::spawn_loop(
+                graph_domain_arc.clone(),
+                db_path.to_string_lossy().to_string(),
+                hotel.ipc_socket_path.clone(),
+                caps.node_id.clone(),
+            );
+        }
+
         tokio::signal::ctrl_c().await?;
         let _ = graph_domain_arc.set_hotel_pid(&hotel_name, None);
         info!("Ansible smoke-mode shutdown complete.");
@@ -8475,6 +8491,8 @@ async fn main() -> Result<()> {
     crate::service::model_catalog_sync::spawn_loop(
         graph_domain_arc.clone(),
         db_path.to_string_lossy().to_string(),
+        socket_path.clone(),
+        caps.node_id.clone(),
     );
 
     // Host-health scan: samples host vitals (load/CPU/mem/disk) plus

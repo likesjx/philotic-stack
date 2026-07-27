@@ -1695,12 +1695,21 @@ Seam IDs: `wider-client-adoption`, `philotic-native-memory-integration`
     execution in a watched two-hotel run.
   - [x] Publish the durable outbound authority/runtime reference with rendered
     binding, direct HTTP, and MCP-over-HTTP sequence diagrams.
-  - [ ] Inventory remaining direct clients and migrate eligible general API
-    traffic behind governed bindings.
+  - [x] Inventory 33 production direct-client files with machine-checked
+    traffic classes and dispositions.
+  - [x] Migrate the hotel-owned OpenRouter model-catalog sync behind a narrow
+    system `IntegrationBinding` and prove catalog persistence plus durable audit
+    in an isolated binary smoke.
+  - [ ] Remove the Philote direct OpenRouter catalog fallback after installed
+    hotel rollout proof.
+  - [ ] Define a credential-safe auth egress contract before migrating OAuth
+    token and userinfo exchange.
 - [x] Perimeter egress control (`egress-policy-object`): define the first
   canonical policy and placement types; finding schema remains part of the
   HTTP executor/audit slice.
-- [ ] Perimeter egress inventory (`outbound-classification`): classify current direct outbound HTTP paths into perimeter-controlled, temporary exceptions, and future violations.
+- [x] Perimeter egress inventory (`outbound-classification`): classify current
+  direct outbound HTTP paths into controlled boundaries, named/temporary
+  exceptions, and future violations; enforce inventory completeness in CI.
 - [x] Perimeter egress first implementation: route one non-model outbound HTTP path through a perimeter-controlled boundary while keeping model/provider egress as an explicit exception for now.
 - [ ] Review [MEMBRANE_EXTERNAL_AGENT_AND_EVENT_TRANSPORT_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/MEMBRANE_EXTERNAL_AGENT_AND_EVENT_TRANSPORT_PROPOSAL.md).
 - [ ] External membrane transport contract (`a2a-membrane-contract`, `nostr-membrane-contract`): define the first normalized inbound/outbound envelope and session-binding inputs for `A2A` / `Nostr` membranes.

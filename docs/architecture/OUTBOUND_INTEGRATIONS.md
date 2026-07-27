@@ -3,7 +3,7 @@ title: Governed Outbound Integrations
 doc_type: reference
 domain: tooling-execution
 status: active
-last_updated: 2026-07-25
+last_updated: 2026-07-26
 tags:
 - integrations
 - egress
@@ -15,6 +15,7 @@ related_docs:
 - ARCHITECTURE.md
 - ARCHITECTURE_STATUS.md
 - OUTBOUND_INTEGRATION_FABRIC_PROPOSAL.md
+- OUTBOUND_EGRESS_INVENTORY.md
 - MCP_CLIENT_FABRIC_PROPOSAL.md
 - PERIMETER_EGRESS_CONTROL_PROPOSAL.md
 - DATA_DRIVEN_TOOL_GRANTS_PROPOSAL.md
@@ -48,6 +49,7 @@ the final network hop, credential lookup, and content-free audit.
 ```mermaid
 flowchart LR
     O[Operator or SkillDAG] -->|reviewed intent| B[IntegrationBinding]
+    H[Hotel-owned system service] -->|system-owned binding| B
     B --> G[Source hotel graph]
     G --> P[Philote tool projection]
     P --> R{Protocol}
@@ -203,6 +205,34 @@ McpManager --> Philote: Normal datasource tool result
 The philote sees a normal namespaced tool. It does not receive a raw MCP client,
 arbitrary endpoint authority, or access to upstream credentials.
 
+## Hotel-Owned System Callers
+
+Hotel-owned services use the same boundary through `GovernedHttpService`.
+They connect to the local front desk as named system guests, ensure a
+system-owned binding, use the hotel's placement decision, and await the routed
+sanitized response. They do not receive a privileged direct-client escape
+hatch merely because they run inside `aiua`.
+
+```plantuml
+@startuml
+participant HotelService
+participant SourceHotel
+participant ExitRunner
+participant ExternalAPI
+HotelService -> SourceHotel: Ensure system IntegrationBinding
+SourceHotel --> HotelService: Binding placement and execution node
+HotelService -> SourceHotel: Emit bounded HTTP task
+SourceHotel -> ExitRunner: Route task and return route
+ExitRunner -> ExternalAPI: Validated request
+ExternalAPI --> ExitRunner: HTTP response
+ExitRunner -> SourceHotel: Append content free audit
+ExitRunner --> HotelService: Sanitized response
+@enduml
+```
+<!-- plantuml-node-skill:rendered:outbound-integrations-diagram-4:start -->
+![outbound-integrations-diagram-4](../diagrams/outbound-integrations-diagram-4.svg)
+<!-- plantuml-node-skill:rendered:outbound-integrations-diagram-4:end -->
+
 ## Failure Semantics
 
 Failures are explicit and do not open a direct-network escape hatch:
@@ -240,7 +270,7 @@ requires more than source tests: the installed binary path, running process,
 supervisor restart, selected hotel, vault lookup, external response, return
 route, and execution-hotel audit must all be observed from the updated runtime.
 
-## Explicit Exceptions And Next Seam
+## Explicit Exceptions And Classification
 
 Not every socket should be hairpinned through this fabric. Specialized planes
 retain their own owners when their contracts are already narrow:
@@ -249,8 +279,19 @@ retain their own owners when their contracts are already narrow:
 - Telegram and Discord transport remain membrane-owned;
 - local MLX, Ollama, Muninn, and sidecar traffic remains local-service traffic.
 
-Everything else must be classified rather than silently grandfathered. The next
-seam is `outbound-classification`: inventory direct HTTP callers, assign each a
-traffic class and authority owner, record an explicit exception or migration
-decision, then migrate one low-risk general API caller through an
-`IntegrationBinding`.
+Everything else must be classified rather than silently grandfathered. The
+completed classification seam is recorded in
+[OUTBOUND_EGRESS_INVENTORY.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/OUTBOUND_EGRESS_INVENTORY.md).
+The machine-checked inventory currently classifies 33 direct-client files and
+guards the first migrated caller from regression.
+
+The first general-API migration is the hotel-owned OpenRouter model-catalog
+sync. Its `model-catalog-openrouter` system binding permits only credential-free
+`GET /api/v1/models`, prefers `vps-jane` with explicit audited local fallback,
+and executes through `egress-http-runner`. An isolated binary smoke proves the
+binding, runner hop, compact catalog persistence, and durable audit.
+
+The next migrations are removal of the Philote direct catalog fallback and a
+dedicated credential-safe auth egress contract. Named model-provider,
+communication, local-resource, mesh, and artifact exceptions remain explicit
+rather than pretending every socket has identical semantics.

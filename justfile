@@ -12,6 +12,14 @@ build:
 check:
     cargo check --workspace
 
+# Keep every production direct network constructor explicitly classified.
+outbound-egress-check:
+    python3 scripts/check-outbound-egress-inventory.py
+
+# Prove the hotel-owned OpenRouter catalog leaves through the governed runner.
+model-catalog-egress-smoke:
+    ./scripts/smoke-model-catalog-egress-roundtrip.sh
+
 # Verify the repo bootstrap engine: Muninn, helper scripts, and workspace baseline.
 engine-check:
     ./scripts/engine-check.sh
