@@ -289,7 +289,11 @@ The first general-API migration is the hotel-owned OpenRouter model-catalog
 sync. Its `model-catalog-openrouter` system binding permits only credential-free
 `GET /api/v1/models`, prefers `vps-jane` with explicit audited local fallback,
 and executes through `egress-http-runner`. An isolated binary smoke proves the
-binding, runner hop, compact catalog persistence, and durable audit.
+binding, runner hop, compact catalog persistence, and durable audit. The
+installed two-hotel run additionally proves the `mbp-jane` system caller
+resolves and executes at `vps-jane-aiua-01`, receives HTTP 200, and persists
+the compact catalog while the content-free audit remains authoritative at the
+VPS exit.
 
 The next migrations are removal of the Philote direct catalog fallback and a
 dedicated credential-safe auth egress contract. Named model-provider,

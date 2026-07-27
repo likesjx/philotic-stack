@@ -182,6 +182,10 @@ temporary auth exceptions are explicit.
   with explicit fallback, and uses the hotel route plus `egress-http-runner`.
 - An isolated binary smoke proves system binding registration, runner
   execution, compact catalog persistence, and the durable content-free audit.
+- An installed watched-live run proves the launchd-managed `mbp-jane` caller
+  resolves that binding to `vps-jane-aiua-01`; the execution-hotel audit
+  records HTTP 200, 533,046 response bytes, no credentials, and no redirects,
+  while the source hotel persists 342 compact catalog entries.
 
 ### Proven Gap
 

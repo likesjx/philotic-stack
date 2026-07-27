@@ -24,7 +24,7 @@ proposal_refs:
 source_of_truth_targets:
 - docs/architecture/outbound-egress-inventory.json
 - scripts/check-outbound-egress-inventory.py
-verification_level: smoke-green
+verification_level: watched-live-green
 ---
 
 # Outbound Egress Inventory and Classification
@@ -89,6 +89,15 @@ The `aiua` OpenRouter catalog poll is deliberately the first migration:
 - `prefer_hotel(vps-jane)` with explicit local audited fallback;
 - system-owned binding, not a model-facing ambient grant.
 
+The merged runtime is watched-live-green on the installed fleet. The
+launchd-managed `mbp-jane` hotel resolved the binding to
+`vps-jane-aiua-01`; the VPS runner returned HTTP 200 for the exact path,
+recorded a 533,046-byte response with no credential injection or redirects,
+and the source hotel persisted a 342-model compact catalog. The installed VPS
+`aiua` hash matched the verified CI artifact, while the MBP staging hash
+matched the local release artifact before the required remote ad-hoc
+re-signing.
+
 ```plantuml
 @startuml
 participant CatalogService
@@ -126,8 +135,8 @@ responsibility of runner materialization and host deployment policy.
 
 ## Remaining Seams
 
-1. Remove the Philote direct OpenRouter fallback after the governed catalog is
-   proven on the installed hotels.
+1. Remove the Philote direct OpenRouter fallback now that the governed catalog
+   is proven on the installed hotels.
 2. Define a credential-safe auth egress contract for OAuth token and userinfo
    exchange before migrating operator auth.
 3. Decide whether communication membranes should delegate only their HTTP hop
