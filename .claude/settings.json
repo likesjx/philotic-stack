@@ -1,0 +1,163 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-settings.json",
+
+  "//": [
+    "Shared, version-controlled Claude Code settings for philotic-stack.",
+    "",
+    "Before this file existed, every setting lived in .claude/settings.local.json,",
+    "which is globally gitignored (~/.config/git/ignore). That meant 872 permission",
+    "grants and the only configured hook could not be shared, reviewed, or",
+    "propagated to the 14 sibling worktrees or the other machines in the fleet.",
+    "",
+    "settings.local.json still works and still wins for personal overrides. What",
+    "belongs HERE is anything that is a project rule rather than a personal",
+    "preference: the deny rails, the hooks, and an allowlist of commands that are",
+    "safe for any agent in any worktree.",
+    "",
+    "Deliberately NOT allowlisted, even though the local file grants them today:",
+    "ansible-playbook with --vault-password-file, ssh deploy@jane-vps with sudo,",
+    "and cp/ln into /opt/homebrew/Cellar. Those deploy to the live fleet and",
+    "should cost one confirmation."
+  ],
+
+  "permissions": {
+    "deny": [
+      "Bash(git push --force:*)",
+      "Bash(git push -f:*)",
+      "Bash(git push --force-with-lease:*)",
+      "Bash(git push origin main:*)",
+      "Bash(git push origin master:*)",
+      "Bash(git push origin HEAD:main:*)",
+      "Bash(git push upstream main:*)",
+      "Read(./mesh-config.secrets.json)",
+      "Read(./ansible/vault/**)",
+      "Read(./**/*.key)",
+      "Read(./**/*.pem)"
+    ],
+
+    "allow": [
+      "Bash(just check)",
+      "Bash(just test)",
+      "Bash(just build)",
+      "Bash(just format)",
+      "Bash(just test-suite)",
+      "Bash(just status)",
+      "Bash(just --list)",
+      "Bash(just --show:*)",
+      "Bash(just workstream-status:*)",
+      "Bash(just workstream-overlap:*)",
+      "Bash(just intel-graph-status)",
+      "Bash(just intel-graph-health)",
+      "Bash(just mac-jane-status:*)",
+      "Bash(just jane-status)",
+
+      "Bash(cargo check:*)",
+      "Bash(cargo test:*)",
+      "Bash(cargo build:*)",
+      "Bash(cargo fmt:*)",
+      "Bash(cargo clippy:*)",
+      "Bash(cargo tree:*)",
+      "Bash(cargo metadata:*)",
+
+      "Bash(git status:*)",
+      "Bash(git diff:*)",
+      "Bash(git log:*)",
+      "Bash(git show:*)",
+      "Bash(git branch:*)",
+      "Bash(git worktree list)",
+      "Bash(git rev-parse:*)",
+      "Bash(git merge-base:*)",
+      "Bash(git blame:*)",
+      "Bash(git stash list)",
+      "Bash(git fetch:*)",
+      "Bash(git add:*)",
+      "Bash(git commit:*)",
+
+      "Bash(gh pr view:*)",
+      "Bash(gh pr list:*)",
+      "Bash(gh pr diff:*)",
+      "Bash(gh pr checks:*)",
+      "Bash(gh run list:*)",
+      "Bash(gh run view:*)",
+      "Bash(gh repo view:*)",
+
+      "Bash(phil graph status:*)",
+      "Bash(phil graph proposals:*)",
+      "Bash(phil graph seams:*)",
+      "Bash(phil graph green:*)",
+      "Bash(phil graph search:*)",
+      "Bash(phil graph skeleton:*)",
+      "Bash(phil graph harness list)",
+      "Bash(phil graph harness verify:*)",
+
+      "Bash(rg:*)",
+      "Bash(fd:*)",
+      "Bash(ls:*)",
+      "Bash(wc:*)",
+      "Bash(jq:*)",
+      "Bash(head:*)",
+      "Bash(tail:*)",
+
+      "mcp__intel-graph__graph_status",
+      "mcp__intel-graph__graph_digest",
+      "mcp__intel-graph__graph_proposals",
+      "mcp__intel-graph__graph_node",
+      "mcp__intel-graph__graph_query",
+      "mcp__intel-graph__graph_search",
+      "mcp__intel-graph__graph_semantic_search",
+      "mcp__intel-graph__graph_snippet",
+      "mcp__intel-graph__graph_context_for",
+      "mcp__intel-graph__graph_next_task",
+      "mcp__intel-graph__graph_impact",
+      "mcp__intel-graph__graph_decide",
+      "mcp__intel-graph__session_start",
+      "mcp__intel-graph__session_close",
+
+      "mcp__muninn-local__muninn_where_left_off",
+      "mcp__muninn-local__muninn_recall",
+      "mcp__muninn-local__muninn_read",
+      "mcp__muninn-local__muninn_status",
+      "mcp__muninn-local__muninn_guide",
+      "mcp__muninn-local__muninn_remember",
+      "mcp__muninn-local__muninn_remember_batch",
+      "mcp__muninn-local__muninn_decide",
+      "mcp__muninn-local__muninn_evolve"
+    ]
+  },
+
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "startup",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "phil graph harness verify claude-local 2>/dev/null | grep -E 'clean|drifted|pending_verify' || true"
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "$CLAUDE_PROJECT_DIR/.claude/hooks/guard-destructive-git.sh"
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "$CLAUDE_PROJECT_DIR/.claude/hooks/fmt-rust.sh"
+          }
+        ]
+      }
+    ]
+  }
+}

@@ -1,5 +1,7 @@
+---
 name: session-hygiene
 description: Monitor and maintain session health. Detect stale sessions, orphaned workstreams, and agent coordination conflicts. Run during session start, check-engine, or on-demand.
+---
 
 # Session Hygiene
 

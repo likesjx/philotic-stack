@@ -1,5 +1,7 @@
+---
 name: routing-reflex
 description: Inspect and self-correct the agent's media routing and voice response policy at runtime. Use when entering a voice-capable context (Discord, TTS, audio input) or when routing is behaving unexpectedly.
+---
 
 # Routing Reflex Skill
 
