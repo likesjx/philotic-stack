@@ -1125,12 +1125,24 @@ fn split_at_paragraph_boundary(text: &str, limit: usize) -> Vec<String> {
     let mut chunks = Vec::new();
     let mut remaining = text;
     while remaining.len() > limit {
-        let split_at = if let Some(pos) = remaining[..limit].rfind("\n\n") {
+        let mut boundary = limit;
+        while boundary > 0 && !remaining.is_char_boundary(boundary) {
+            boundary -= 1;
+        }
+        if boundary == 0 {
+            boundary = remaining
+                .chars()
+                .next()
+                .map(char::len_utf8)
+                .unwrap_or(remaining.len());
+        }
+        let candidate = &remaining[..boundary];
+        let split_at = if let Some(pos) = candidate.rfind("\n\n") {
             pos + 2
-        } else if let Some(pos) = remaining[..limit].rfind('\n') {
+        } else if let Some(pos) = candidate.rfind('\n') {
             pos + 1
         } else {
-            limit
+            boundary
         };
         chunks.push(remaining[..split_at].to_string());
         remaining = &remaining[split_at..];
@@ -1206,6 +1218,45 @@ async fn upsert_formatted_text(
     }
 
     first_message_id
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum StreamingDraftUpdate {
+    Rendered { message_id: i64, text: String },
+    Retained(i64),
+}
+
+/// Update an in-flight draft without replacing it when Telegram rejects an
+/// edit. A later cumulative partial or the final reply can retry safely.
+async fn upsert_streaming_draft(
+    http_client: &reqwest::Client,
+    tg_base: &str,
+    chat_id: &str,
+    thread_id: Option<&str>,
+    existing_message_id: Option<i64>,
+    text: &str,
+) -> Option<StreamingDraftUpdate> {
+    let first_chunk = split_at_paragraph_boundary(text, 4096).into_iter().next()?;
+
+    if let Some(message_id) = existing_message_id {
+        if edit_telegram_text(http_client, tg_base, chat_id, message_id, &first_chunk).await {
+            Some(StreamingDraftUpdate::Rendered {
+                message_id,
+                text: first_chunk,
+            })
+        } else {
+            // Streaming is best-effort. Preserve the last visible draft on a
+            // rate limit or transient failure; final delivery owns recovery.
+            Some(StreamingDraftUpdate::Retained(message_id))
+        }
+    } else {
+        send_telegram_text(http_client, tg_base, chat_id, thread_id, &first_chunk, None)
+            .await
+            .map(|message_id| StreamingDraftUpdate::Rendered {
+                message_id,
+                text: first_chunk,
+            })
+    }
 }
 
 /// Commands handled entirely within membrane, before the envelope reaches agent-core.
@@ -3263,27 +3314,39 @@ impl TelegramSeatGuest {
                 content.len()
             );
             if !chat_id.is_empty() && !content.is_empty() {
-                let (draft_message_id, thread_id) = {
-                    let turns = self.active_turns.lock().unwrap();
-                    turns
-                        .get(&session_id)
-                        .map(|active| (active.draft_message_id, active.thread_id.clone()))
-                        .unwrap_or((None, None))
+                let now = tokio::time::Instant::now();
+                let due_snapshot = {
+                    let mut turns = self.active_turns.lock().unwrap();
+                    turns.get_mut(&session_id).and_then(|active| {
+                        streaming_edit_due(active.streaming_last_edit, now)
+                            .then(|| (active.draft_message_id, active.thread_id.clone()))
+                    })
                 };
-                if let Some(message_id) = upsert_formatted_text(
-                    &self.http_client,
-                    &tg_base,
-                    &chat_id,
-                    thread_id.as_deref(),
-                    draft_message_id,
-                    &content,
-                    None, // no button on partial/draft messages
-                )
-                .await
-                {
-                    if let Some(active) = self.active_turns.lock().unwrap().get_mut(&session_id) {
-                        active.draft_message_id = Some(message_id);
-                        active.draft_text = content;
+
+                if let Some((draft_message_id, thread_id)) = due_snapshot {
+                    if let Some(update) = upsert_streaming_draft(
+                        &self.http_client,
+                        &tg_base,
+                        &chat_id,
+                        thread_id.as_deref(),
+                        draft_message_id,
+                        &content,
+                    )
+                    .await
+                    {
+                        if let Some(active) = self.active_turns.lock().unwrap().get_mut(&session_id)
+                        {
+                            active.streaming_last_edit = Some(now);
+                            match update {
+                                StreamingDraftUpdate::Rendered { message_id, text } => {
+                                    active.draft_message_id = Some(message_id);
+                                    active.draft_text = text;
+                                }
+                                StreamingDraftUpdate::Retained(message_id) => {
+                                    active.draft_message_id = Some(message_id);
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -3322,22 +3385,28 @@ impl TelegramSeatGuest {
                     }
                 };
                 if let Some((draft_snapshot, thread_id, draft_message_id)) = due_snapshot {
-                    if let Some(message_id) = upsert_formatted_text(
+                    if let Some(update) = upsert_streaming_draft(
                         &self.http_client,
                         &tg_base,
                         &chat_id,
                         thread_id.as_deref(),
                         draft_message_id,
                         &draft_snapshot,
-                        None, // no button on streaming drafts
                     )
                     .await
                     {
                         if let Some(active) = self.active_turns.lock().unwrap().get_mut(&session_id)
                         {
-                            active.draft_message_id = Some(message_id);
                             active.streaming_last_edit = Some(now);
-                            active.draft_text = draft_snapshot;
+                            match update {
+                                StreamingDraftUpdate::Rendered { message_id, text } => {
+                                    active.draft_message_id = Some(message_id);
+                                    active.draft_text = text;
+                                }
+                                StreamingDraftUpdate::Retained(message_id) => {
+                                    active.draft_message_id = Some(message_id);
+                                }
+                            }
                         }
                     }
                 }
@@ -4123,6 +4192,14 @@ mod tests {
     }
 
     #[test]
+    fn split_at_paragraph_boundary_preserves_utf8_boundaries() {
+        let text = format!("{}🙂tail", "x".repeat(4095));
+        let chunks = super::split_at_paragraph_boundary(&text, 4096);
+        assert_eq!(chunks.concat(), text);
+        assert!(chunks.iter().all(|chunk| chunk.is_char_boundary(chunk.len())));
+    }
+
+    #[test]
     fn help_text_includes_new_command() {
         let help = super::telegram_help_text(&[]);
         assert!(help.contains("/new"), "help text should mention /new");
@@ -4344,7 +4421,9 @@ mod tests {
 
     // --- Draft finalisation: exactly one message must survive each turn. ---
 
-    use super::{draft_already_final, upsert_formatted_text};
+    use super::{
+        draft_already_final, upsert_formatted_text, upsert_streaming_draft, StreamingDraftUpdate,
+    };
     use std::sync::{Arc, Mutex};
 
     /// How the mock Telegram API should answer `editMessageText`.
@@ -4473,6 +4552,103 @@ mod tests {
                 "sendMessage".to_string(),
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn streaming_edit_failure_retains_draft_without_replacement() {
+        let (tg_base, calls) = spawn_mock_telegram(MockEdit::Fail).await;
+        let client = reqwest::Client::new();
+
+        let result =
+            upsert_streaming_draft(&client, &tg_base, "123", None, Some(42), "partial text").await;
+
+        assert_eq!(result, Some(StreamingDraftUpdate::Retained(42)));
+        let calls = calls.lock().unwrap();
+        assert_eq!(*calls, vec!["editMessageText".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn streaming_without_draft_sends_once_and_tracks_message() {
+        let (tg_base, calls) = spawn_mock_telegram(MockEdit::Ok).await;
+        let client = reqwest::Client::new();
+
+        let result =
+            upsert_streaming_draft(&client, &tg_base, "123", None, None, "partial text").await;
+
+        assert_eq!(
+            result,
+            Some(StreamingDraftUpdate::Rendered {
+                message_id: 777,
+                text: "partial text".to_string(),
+            })
+        );
+        let calls = calls.lock().unwrap();
+        assert_eq!(*calls, vec!["sendMessage".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn streaming_tracks_only_visible_chunk_for_long_reply() {
+        let (tg_base, calls) = spawn_mock_telegram(MockEdit::Ok).await;
+        let client = reqwest::Client::new();
+        let long_text = "x".repeat(5000);
+
+        let result =
+            upsert_streaming_draft(&client, &tg_base, "123", None, None, &long_text).await;
+
+        assert_eq!(
+            result,
+            Some(StreamingDraftUpdate::Rendered {
+                message_id: 777,
+                text: "x".repeat(4096),
+            })
+        );
+        let calls = calls.lock().unwrap();
+        assert_eq!(*calls, vec!["sendMessage".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn cumulative_partials_require_active_turn_and_respect_throttle() {
+        let (tg_base, calls) = spawn_mock_telegram(MockEdit::Ok).await;
+        let mut guest = new_test_seat_guest();
+        guest.tg_base = Some(tg_base);
+        let session_id = "telegram:123:agent-jane";
+
+        let partial = |content: &str| {
+            json!({
+                "action": "partial_reply",
+                "session_id": session_id,
+                "chat_id": "123",
+                "content": content,
+            })
+            .to_string()
+        };
+
+        guest.handle_inbound_task(&partial("first")).await;
+        assert!(
+            calls.lock().unwrap().is_empty(),
+            "a seat must not create streaming messages for a turn it does not own"
+        );
+
+        let (cancel_tx, _cancel_rx) = oneshot::channel();
+        guest
+            .active_turns
+            .lock()
+            .unwrap()
+            .insert(session_id.to_string(), ActiveTurn::new(cancel_tx, None));
+
+        guest.handle_inbound_task(&partial("first")).await;
+        guest.handle_inbound_task(&partial("second")).await;
+
+        let calls = calls.lock().unwrap().clone();
+        assert_eq!(
+            calls,
+            vec!["sendMessage".to_string()],
+            "back-to-back cumulative partials must share the streaming throttle"
+        );
+        let turns = guest.active_turns.lock().unwrap();
+        let active = turns.get(session_id).unwrap();
+        assert_eq!(active.draft_message_id, Some(777));
+        assert_eq!(active.draft_text, "first");
     }
 
     #[tokio::test]
