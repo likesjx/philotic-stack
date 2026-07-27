@@ -9502,6 +9502,113 @@ mod tests {
         assert_eq!(reply["target_guest_id"], "membrane-seat-1");
     }
 
+    // ── Stale tool result must not poison the turn that replaced it ──────────
+    //
+    // `handle_model_response` has always dropped a response whose turn_id is not
+    // the active turn. `handle_tool_result` had no such guard, so a result that
+    // outlived its turn was applied to whatever turn was active by the time it
+    // landed. Reachable whenever a tool outruns the 90s WaitingTool watchdog —
+    // e.g. a slow `life.observe.batch`: the turn is evicted, the operator sends
+    // another message, and the runner's late reply (still carrying the ORIGINAL
+    // turn_id, and cancelled by nothing) clears the NEW turn's pending tool call
+    // and injects a foreign result, so the new turn hangs on a call that can
+    // never complete. One slow tool call poisons the following turn.
+    #[tokio::test]
+    async fn stale_tool_result_does_not_clobber_the_new_active_turn() {
+        let socket_path = format!("/tmp/philote-stale-{}.sock", Uuid::new_v4().simple());
+        let listener = tokio::net::UnixListener::bind(&socket_path).expect("bind");
+        let emitted = std::sync::Arc::new(std::sync::Mutex::new(Vec::<serde_json::Value>::new()));
+        let server = tokio::spawn(run_recording_hotel(listener, emitted.clone()));
+
+        let identity = philotic_client::GuestIdentity {
+            guest_id: "agent-stale".into(),
+            role: "agent".into(),
+            supported_tools: Vec::new(),
+        };
+        let client = philotic_client::PhiloticClient::connect_at(&socket_path, identity)
+            .await
+            .expect("connect to stub hotel");
+        let mut runtime = AgentRuntime::new(client, "agent-stale");
+
+        let session_id = "sess-stale";
+        runtime
+            .ensure_session_loaded(session_id, "telegram")
+            .await
+            .expect("session load");
+
+        // Turn A was evicted by the watchdog while its batch was still running;
+        // turn B is now active and waiting on its own, unrelated tool.
+        runtime
+            .sessions
+            .get_mut(session_id)
+            .expect("session exists")
+            .start_turn(def004_working_turn("turn-b", "session.status"));
+
+        // Turn A's `life.observe.batch` finally returns — long after eviction.
+        runtime
+            .handle_tool_result(InboundTaskPayload {
+                action: Some("tool_result".into()),
+                session_id: Some(session_id.into()),
+                turn_id: Some("turn-a-evicted".into()),
+                tool_name: Some("life.observe.batch".into()),
+                content: Some(r#"{"status":"ok","succeeded":25}"#.into()),
+                ..Default::default()
+            })
+            .await
+            .expect("stale result is dropped, not an error");
+
+        {
+            let state = runtime.sessions.get(session_id).expect("session");
+            let turn = state.active_turn.as_ref().expect("turn B still active");
+            assert_eq!(turn.turn_id, "turn-b", "turn B must remain the active turn");
+            assert_eq!(
+                turn.pending_tool_call
+                    .as_ref()
+                    .map(|c| c.tool_name.as_str()),
+                Some("session.status"),
+                "turn B's pending tool call must survive a stale result for another turn"
+            );
+            assert!(
+                turn.working_tool_history.is_empty(),
+                "a foreign turn's result must never enter turn B's history: {:?}",
+                turn.working_tool_history
+            );
+            assert_eq!(
+                turn.iteration, 0,
+                "a dropped result must not advance turn B"
+            );
+        }
+
+        // Control: the SAME payload addressed to turn B is still accepted, so the
+        // guard rejects only genuinely stale results rather than tool results at
+        // large.
+        runtime
+            .handle_tool_result(InboundTaskPayload {
+                action: Some("tool_result".into()),
+                session_id: Some(session_id.into()),
+                turn_id: Some("turn-b".into()),
+                tool_name: Some("session.status".into()),
+                content: Some("session green".into()),
+                ..Default::default()
+            })
+            .await
+            .expect("matching tool result");
+
+        {
+            let state = runtime.sessions.get(session_id).expect("session");
+            let turn = state.active_turn.as_ref().expect("turn B active");
+            assert_eq!(
+                turn.working_tool_history.len(),
+                1,
+                "a result for the active turn must still be accepted"
+            );
+        }
+
+        drop(runtime);
+        let _ = server.await;
+        let _ = std::fs::remove_file(&socket_path);
+    }
+
     // ── life.observe contract-error retry (2026-07-10 LifeGraph forensic) ────
     //
     // A model-invoked `life.observe` call whose payload fails datasource's

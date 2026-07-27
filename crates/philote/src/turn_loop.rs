@@ -1419,6 +1419,42 @@ impl AgentRuntime {
             let pending_tool_name = active_turn
                 .and_then(|turn| turn.pending_tool_call.as_ref())
                 .map(|tool| tool.tool_name.clone());
+
+            // Staleness guard — `handle_model_response` has always dropped a
+            // response whose turn_id is not the active turn; tool results had no
+            // such check, so a LATE result was applied to whatever turn happened
+            // to be active. That is reachable whenever a tool outlives its turn:
+            // a long `life.observe.batch` blows the 90s WaitingTool watchdog, the
+            // turn is evicted (`active_turn = None`), the operator sends another
+            // message, and the runner's reply — which still carries the ORIGINAL
+            // turn_id, and which nothing cancels — lands on the new turn, pushing
+            // a foreign tool result into its history and clearing its pending
+            // tool call, so the new turn then hangs on a call that can never
+            // complete. One slow tool call thus poisons the following turn.
+            //
+            // Deliberately narrower than the model-response guard: it fires ONLY
+            // on an explicit, non-empty, mismatched turn_id. The ~100 in-process
+            // callers in `tool_exec.rs` either pass the current turn's id (match,
+            // unaffected) or pass none (the fallback below, unaffected), and some
+            // legitimately run with no active turn at all — so "no active turn"
+            // is NOT treated as stale here.
+            if let (Some(incoming), Some(active)) = (
+                task.turn_id.as_deref().filter(|s| !s.is_empty()),
+                active_turn.map(|turn| turn.turn_id.as_str()),
+            ) {
+                if incoming != active {
+                    warn!(
+                        session_id = %session_id,
+                        stale_turn_id = %incoming,
+                        active_turn_id = %active,
+                        tool = task.tool_name.as_deref().unwrap_or("unknown"),
+                        "handle_tool_result: dropping stale tool result — its turn is no \
+                         longer active (likely evicted by the watchdog while the tool ran)"
+                    );
+                    return Ok(());
+                }
+            }
+
             let turn_id = task
                 .turn_id
                 .as_deref()
