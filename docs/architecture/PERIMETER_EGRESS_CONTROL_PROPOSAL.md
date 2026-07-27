@@ -107,7 +107,8 @@ Current proven shape:
 - MCP-over-HTTP delegates its wire exchange to that runner while the MCP
   manager retains protocol authority
 - the OpenRouter model-catalog poll is the first hotel-owned general-API caller
-  migrated to a system binding
+  migrated to a system binding, with installed watched-live proof from
+  `mbp-jane` through the selected `vps-jane-aiua-01` executor
 - 33 remaining production direct-client files have machine-checked
   dispositions in `outbound-egress-inventory.json`
 - model providers, communications, local resources, mesh, and artifacts remain
