@@ -5831,11 +5831,10 @@ impl IpcServer {
                 } else {
                     task_json
                 };
-                // Visibility guard: a task addressed to a remote node this
-                // hotel has never seen (no registry entry, no peer socket)
-                // will sit in the ledger with no consumer. Don't block it —
-                // the node may legitimately appear later (boot races) — but
-                // make the misroute loudly observable instead of silent.
+                // Acceptance is a delivery contract: never acknowledge a task
+                // whose destination is absent from both the live registry and
+                // the explicit peer bridge. A later node appearance cannot
+                // rescue a caller that already received a false-success reply.
                 if target_node != local_node_id {
                     let node_known = {
                         let reg = registry.read().await;
@@ -5863,6 +5862,7 @@ impl IpcServer {
                                 );
                             }
                         }
+                        return IpcResponse::error("emit_task", "TARGET_NODE_UNREACHABLE", message);
                     }
                 }
                 info!(
@@ -17630,7 +17630,10 @@ pub(crate) mod tests {
             .await
             .expect("emit task");
 
-        assert!(matches!(response, IpcResponse::Standard { ok: true, .. }));
+        assert!(
+            matches!(response, IpcResponse::Standard { ok: true, .. }),
+            "local task should be accepted, got {response:?}"
+        );
 
         let delivered =
             tokio::time::timeout(tokio::time::Duration::from_secs(1), agent.recv_task())
@@ -18989,6 +18992,90 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn emit_task_rejects_unknown_remote_node_before_ledger_append() {
+        let _env_guard = ipc_env_guard();
+        let socket_path = test_socket_path();
+        let (dispatcher_tx, mut dispatcher_rx) = test_dispatcher_channel();
+        let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
+        let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
+        let heal_queue = Arc::new(RecordingHealQueue::default());
+        let server = IpcServer::new(socket_path.clone(), "local-aiua-01", dispatcher_tx, graph)
+            .with_heal_queue(heal_queue.clone());
+
+        let server_task = tokio::spawn(async move {
+            server.run().await.expect("ipc server should run");
+        });
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        unsafe {
+            std::env::set_var("PHILOTIC_HOTEL_SOCKET", &socket_path);
+        }
+
+        let mut runner = PhiloticClient::connect(GuestIdentity {
+            guest_id: "life-graph-route-smoke".into(),
+            role: "life-graph.ipc.smoke.reply".into(),
+            supported_tools: Vec::new(),
+        })
+        .await
+        .expect("smoke client connect");
+
+        let response = runner
+            .send_request(IpcRequest::EmitTask {
+                target_node: "missing-aiua-01".into(),
+                target_role: "life-graph-runner".into(),
+                target_guest_id: None,
+                task_json: serde_json::json!({
+                    "action": "execute_tool",
+                    "tool_name": "life.observe",
+                    "session_id": "smoke:unknown-node",
+                    "turn_id": "smoke-turn-unknown-node"
+                })
+                .to_string(),
+            })
+            .await
+            .expect("emit task response");
+
+        match response {
+            IpcResponse::Standard {
+                ok: false,
+                code,
+                message,
+                ..
+            } => {
+                assert_eq!(code, "TARGET_NODE_UNREACHABLE");
+                assert!(message.contains("missing-aiua-01"));
+            }
+            other => panic!("expected unreachable-node error, got {other:?}"),
+        }
+
+        let pushed = heal_queue.pushed.lock().unwrap();
+        assert_eq!(pushed.len(), 1);
+        assert_eq!(pushed[0].0, "aiua.emit_task_route");
+        assert_eq!(pushed[0].2, "medium");
+        assert_eq!(pushed[0].3, "emit_task_unknown_target_node");
+        drop(pushed);
+
+        assert!(
+            tokio::time::timeout(
+                tokio::time::Duration::from_millis(100),
+                dispatcher_rx.recv()
+            )
+            .await
+            .is_err(),
+            "unreachable task must not be appended to the ledger"
+        );
+
+        unsafe {
+            std::env::remove_var("PHILOTIC_HOTEL_SOCKET");
+        }
+        server_task.abort();
+        let _ = server_task.await;
+        if Path::new(&socket_path).exists() {
+            let _ = std::fs::remove_file(&socket_path);
+        }
+    }
+
+    #[tokio::test]
     async fn emit_task_routes_base_agent_target_to_active_incarnation() {
         let _env_guard = ipc_env_guard();
         let socket_path = test_socket_path();
@@ -20319,7 +20406,21 @@ pub(crate) mod tests {
         let socket_path = test_socket_path();
         let (dispatcher_tx, mut dispatcher_rx) = test_dispatcher_channel();
         let graph = Arc::new(GraphDomain::new(Arc::new(TestGraphAdapter)));
-        let server = IpcServer::new(socket_path.clone(), "local-aiua-01", dispatcher_tx, graph);
+        let registry = Arc::new(RwLock::new(NodeRegistry::new()));
+        registry.write().await.update_node(
+            NodeCapabilities {
+                node_id: "remote-ansible-02".into(),
+                roles: vec![ansible_mesh_core::NodeRole::AnsibleNode],
+                models: vec![],
+                tools: vec![],
+                constraints: Default::default(),
+            },
+            vec![],
+            None,
+            None,
+        );
+        let server = IpcServer::new(socket_path.clone(), "local-aiua-01", dispatcher_tx, graph)
+            .with_registry(registry);
 
         let server_task = tokio::spawn(async move {
             server.run().await.expect("ipc server should run");
@@ -20345,7 +20446,7 @@ pub(crate) mod tests {
         .await
         .expect("receiver connect");
 
-        sender
+        let response = sender
             .send_request(IpcRequest::EmitTask {
                 target_node: "remote-ansible-02".into(),
                 target_role: "agent".into(),
@@ -20354,6 +20455,10 @@ pub(crate) mod tests {
             })
             .await
             .expect("emit remote task");
+        assert!(
+            matches!(response, IpcResponse::Standard { ok: true, .. }),
+            "known remote node should be accepted, got {response:?}"
+        );
 
         let recv = tokio::time::timeout(
             tokio::time::Duration::from_millis(200),
@@ -27024,6 +27129,23 @@ pub(crate) mod tests {
                 mesh_host: None,
             })
             .expect("seed remote hotel");
+        let remote_registry = Arc::new(RwLock::new(NodeRegistry::new()));
+        remote_registry.write().await.update_node(
+            NodeCapabilities {
+                node_id: "local-aiua-01".into(),
+                roles: vec![ansible_mesh_core::NodeRole::AnsibleNode],
+                models: vec![],
+                tools: vec![],
+                constraints: Default::default(),
+            },
+            vec![],
+            Some(ExecutionReachability {
+                protocol: "tcp-framed-v1".into(),
+                host: "local.mesh".into(),
+                port: 9002,
+            }),
+            None,
+        );
 
         let local_server = IpcServer::new(
             local_socket_path.clone(),
@@ -27037,7 +27159,8 @@ pub(crate) mod tests {
             "remote-aiua-01",
             remote_dispatcher_tx,
             remote_graph,
-        );
+        )
+        .with_registry(remote_registry);
 
         let local_server_task = tokio::spawn(async move {
             local_server
