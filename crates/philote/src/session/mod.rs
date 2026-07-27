@@ -5569,14 +5569,13 @@ mod tests {
         ComponentRouteAssembly, ComponentRouteBinding, Context1Advisory, ContextAuthority,
         ContextLayerId, ContextMutability, FallbackOverride, HookRequest, HookResult,
         HttpIntegrationToolBinding, LIFE_RECALL_TRUNCATION_MARKER, LifeRecallCacheEntry,
-        McpUpstreamToolBinding,
-        MemoryAuthority, MemorySpacetimeFrame, MemorySpatialScope, MemoryTemporalKind,
-        MemoryValidationLevel, ParacrineThreadStatus, PlanStep, PromotionAction,
-        RecalledMemoryRecord, RefreshRequest, ResponseRouteMode, RoleActivation, SelectionSource,
-        SessionBindings, SessionState, TaskRunnerBaseConfig, ToolRunnerIncarnationBinding,
-        TransportReplyTargetBinding, TtsMode, TurnRecord, VoiceDeliveryMode, VoiceResponsePolicy,
-        WorkingTurn, apply_life_recall_char_budget, default_tool_assembly_for_bindings,
-        merge_session_index, session_checkpoint_memory_type,
+        McpUpstreamToolBinding, MemoryAuthority, MemorySpacetimeFrame, MemorySpatialScope,
+        MemoryTemporalKind, MemoryValidationLevel, ParacrineThreadStatus, PlanStep,
+        PromotionAction, RecalledMemoryRecord, RefreshRequest, ResponseRouteMode, RoleActivation,
+        SelectionSource, SessionBindings, SessionState, TaskRunnerBaseConfig,
+        ToolRunnerIncarnationBinding, TransportReplyTargetBinding, TtsMode, TurnRecord,
+        VoiceDeliveryMode, VoiceResponsePolicy, WorkingTurn, apply_life_recall_char_budget,
+        default_tool_assembly_for_bindings, merge_session_index, session_checkpoint_memory_type,
     };
     use crate::r#loop::{ApprovalRequest, ToolCall, ToolResult, TurnPhase};
     use crate::reflex::ReflexEvent;
