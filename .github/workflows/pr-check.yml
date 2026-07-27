@@ -40,6 +40,12 @@ env:
   # makes crates/philotic-web/build.rs shell out to npm and panic. Same
   # reasoning as build-linux.yml.
   RUST_BACKTRACE: 1
+  # Belt-and-braces for audiopus_sys: if pkg-config somehow still misses Opus
+  # and the crate falls back to building it from source, opus's bundled
+  # CMakeLists declares `cmake_minimum_required(VERSION <3.5)`, which CMake 4
+  # (on the runner and on the dev Macs) refuses outright. This lets that
+  # configure step proceed instead of panicking the build script.
+  CMAKE_POLICY_VERSION_MINIMUM: "3.5"
 
 jobs:
   test:
@@ -48,6 +54,15 @@ jobs:
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
+
+      # Undeclared system dependency, surfaced by the first run of this
+      # workflow. crates/membrane-discord depends on `opus`, whose -sys crate
+      # first asks pkg-config for a system Opus and only builds from source if
+      # that fails. The dev Macs have opus 1.6.1 from Homebrew, so the source
+      # path never runs locally and the dependency was invisible. A bare runner
+      # has neither, so it took the source path and died on CMake 4.
+      - name: Install system dependencies (Opus)
+        run: brew install opus pkg-config
 
       - name: Install pinned Rust toolchain
         uses: dtolnay/rust-toolchain@master
