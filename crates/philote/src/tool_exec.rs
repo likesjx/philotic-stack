@@ -747,6 +747,35 @@ impl AgentRuntime {
                 final_reply_guest_id,
             };
 
+            // HTTP integrations carry their complete non-secret authority with
+            // the task. This makes cross-hotel execution independent of a
+            // replicated registry while keeping vault material local to the
+            // selected executor hotel.
+            let integration_authority = if route.execution_mode == "http_integration" {
+                ansible_mesh_core::integration::parse_projected_http_tool_name(&tool_req.tool_name)
+                    .and_then(|binding_id| {
+                        self.sessions.get(&session_id).and_then(|state| {
+                            state
+                                .bindings
+                                .http_integration_tools
+                                .iter()
+                                .find(|entry| entry.binding.binding_id == binding_id)
+                                .cloned()
+                        })
+                    })
+            } else {
+                None
+            };
+            if route.execution_mode == "http_integration" && integration_authority.is_none() {
+                return self
+                    .fail_active_turn(
+                        session_id,
+                        turn_id,
+                        "HTTP integration route lost its binding authority before dispatch".into(),
+                    )
+                    .await;
+            }
+
             if route.execution_mode == "local_agent" {
                 return self.execute_local_agent_tool(tool_req).await;
             }
@@ -794,13 +823,25 @@ impl AgentRuntime {
                     .await;
             }
 
+            let mut task_value = serde_json::to_value(&tool_req)?;
+            if let Some(authority) = integration_authority {
+                task_value["integration_binding"] = serde_json::to_value(authority.binding)?;
+                task_value["integration_placement"] = serde_json::to_value(authority.placement)?;
+                task_value["caller_role"] = serde_json::Value::String(
+                    std::env::var("PHILOTIC_ROLE_NAME")
+                        .ok()
+                        .filter(|role| !role.is_empty())
+                        .unwrap_or_else(|| "orchestrator".into()),
+                );
+            }
+
             self.ipc_client
                 .send_request_with_timeout(
                     IpcRequest::EmitTask {
                         target_node: route.target_node,
                         target_role: route.target_role,
                         target_guest_id: route.incarnation_id.clone(),
-                        task_json: serde_json::to_string(&tool_req)?,
+                        task_json: task_value.to_string(),
                     },
                     Duration::from_secs(30),
                 )
@@ -1421,13 +1462,13 @@ impl AgentRuntime {
                         allowed,
                         audit,
                         deny_reason,
-                        inject_headers,
+                        credential_binding_configured,
                     }) => {
                         let text = serde_json::to_string_pretty(&serde_json::json!({
                             "allowed": allowed,
                             "audit": audit,
                             "deny_reason": deny_reason,
-                            "inject_headers": inject_headers,
+                            "credential_binding_configured": credential_binding_configured,
                         }))
                         .unwrap_or_else(|_| format!("allowed={allowed}"));
                         (text, None)
@@ -5636,6 +5677,402 @@ impl AgentRuntime {
                 .await
             }
 
+            // ── integration.bind_http ────────────────────────────────────────
+            "integration.bind_http" => {
+                use ansible_mesh_core::integration::{
+                    DEFAULT_HTTP_MAX_REDIRECTS, DEFAULT_HTTP_MAX_REQUEST_BYTES,
+                    DEFAULT_HTTP_MAX_RESPONSE_BYTES, DEFAULT_HTTP_TIMEOUT_SECS,
+                    EgressPlacementPolicy, EgressTrafficClass, HttpCredentialBinding,
+                    HttpIntegrationTarget, HttpNetworkScope, IntegrationBinding, IntegrationTarget,
+                };
+                use std::collections::BTreeMap;
+
+                let session_id = payload.session_id.clone();
+                let turn_id = payload.turn_id.clone();
+                let args = &payload.arguments;
+                let required_string = |key: &str| {
+                    args.get(key)
+                        .and_then(serde_json::Value::as_str)
+                        .filter(|value| !value.trim().is_empty())
+                        .map(str::to_string)
+                        .ok_or_else(|| {
+                            format!("integration.bind_http: missing required argument '{key}'")
+                        })
+                };
+                let binding_id = match required_string("binding_id") {
+                    Ok(value) => value,
+                    Err(message) => {
+                        return self.fail_active_turn(session_id, turn_id, message).await;
+                    }
+                };
+                let base_url = match required_string("base_url") {
+                    Ok(value) => value,
+                    Err(message) => {
+                        return self.fail_active_turn(session_id, turn_id, message).await;
+                    }
+                };
+                let string_vec = |key: &str| -> Vec<String> {
+                    args.get(key)
+                        .and_then(|value| serde_json::from_value(value.clone()).ok())
+                        .unwrap_or_default()
+                };
+                let allowed_methods = string_vec("allowed_methods");
+                let allowed_path_prefixes = string_vec("allowed_path_prefixes");
+                if allowed_methods.is_empty() || allowed_path_prefixes.is_empty() {
+                    return self
+                        .fail_active_turn(
+                            session_id,
+                            turn_id,
+                            "integration.bind_http: allowed_methods and allowed_path_prefixes \
+                             must both be non-empty"
+                                .into(),
+                        )
+                        .await;
+                }
+                let network_scope: HttpNetworkScope = match serde_json::from_value(
+                    args.get("network_scope")
+                        .cloned()
+                        .unwrap_or_else(|| serde_json::json!("public")),
+                ) {
+                    Ok(value) => value,
+                    Err(error) => {
+                        return self
+                            .fail_active_turn(
+                                session_id,
+                                turn_id,
+                                format!("integration.bind_http: invalid network_scope: {error}"),
+                            )
+                            .await;
+                    }
+                };
+                let traffic_class: EgressTrafficClass = match serde_json::from_value(
+                    args.get("traffic_class")
+                        .cloned()
+                        .unwrap_or_else(|| serde_json::json!("general_api")),
+                ) {
+                    Ok(value) => value,
+                    Err(error) => {
+                        return self
+                            .fail_active_turn(
+                                session_id,
+                                turn_id,
+                                format!("integration.bind_http: invalid traffic_class: {error}"),
+                            )
+                            .await;
+                    }
+                };
+                let placement: EgressPlacementPolicy = match serde_json::from_value(
+                    args.get("placement")
+                        .cloned()
+                        .unwrap_or_else(|| serde_json::json!({"mode": "local"})),
+                ) {
+                    Ok(value) => value,
+                    Err(error) => {
+                        return self
+                            .fail_active_turn(
+                                session_id,
+                                turn_id,
+                                format!("integration.bind_http: invalid placement: {error}"),
+                            )
+                            .await;
+                    }
+                };
+                let credential = match (
+                    args.get("credential_header")
+                        .and_then(serde_json::Value::as_str),
+                    args.get("credential_format")
+                        .and_then(serde_json::Value::as_str),
+                ) {
+                    (None, None) => None,
+                    (Some(header), Some(format)) => Some(HttpCredentialBinding {
+                        // Replaced atomically by the operator-only
+                        // `phil integration set-credential` surface.
+                        secret_ref: format!("pending:integration/{binding_id}"),
+                        header: header.to_string(),
+                        format: format.to_string(),
+                    }),
+                    _ => {
+                        return self
+                            .fail_active_turn(
+                                session_id,
+                                turn_id,
+                                "integration.bind_http: credential_header and credential_format \
+                                 must be supplied together"
+                                    .into(),
+                            )
+                            .await;
+                    }
+                };
+                let default_headers: BTreeMap<String, String> = args
+                    .get("default_headers")
+                    .and_then(|value| serde_json::from_value(value.clone()).ok())
+                    .unwrap_or_default();
+                let binding = IntegrationBinding {
+                    binding_id: binding_id.clone(),
+                    owner_agent_id: self.agent_id.clone(),
+                    display_name: args
+                        .get("display_name")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_string),
+                    target: IntegrationTarget::Http(HttpIntegrationTarget {
+                        base_url,
+                        allowed_methods,
+                        allowed_path_prefixes,
+                        allowed_request_headers: string_vec("allowed_request_headers"),
+                        default_headers,
+                        response_header_allowlist: string_vec("response_header_allowlist"),
+                        allowed_redirect_hosts: string_vec("allowed_redirect_hosts"),
+                        network_scope,
+                        credential,
+                        timeout_secs: args
+                            .get("timeout_secs")
+                            .and_then(serde_json::Value::as_u64)
+                            .unwrap_or(DEFAULT_HTTP_TIMEOUT_SECS),
+                        max_request_bytes: args
+                            .get("max_request_bytes")
+                            .and_then(serde_json::Value::as_u64)
+                            .unwrap_or(DEFAULT_HTTP_MAX_REQUEST_BYTES),
+                        max_response_bytes: args
+                            .get("max_response_bytes")
+                            .and_then(serde_json::Value::as_u64)
+                            .unwrap_or(DEFAULT_HTTP_MAX_RESPONSE_BYTES),
+                        max_redirects: args
+                            .get("max_redirects")
+                            .and_then(serde_json::Value::as_u64)
+                            .and_then(|value| u8::try_from(value).ok())
+                            .unwrap_or(DEFAULT_HTTP_MAX_REDIRECTS),
+                    }),
+                    grant_agents: string_vec("grant_agents"),
+                    grant_skills: string_vec("grant_skills"),
+                    traffic_class,
+                    placement,
+                    requires_approval: args
+                        .get("requires_approval")
+                        .and_then(serde_json::Value::as_bool)
+                        .unwrap_or(true),
+                    enabled: true,
+                    updated_at: std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|duration| duration.as_secs())
+                        .unwrap_or(1),
+                };
+                let response = self
+                    .ipc_client
+                    .send_request(IpcRequest::RegisterIntegrationBinding { binding })
+                    .await;
+                let (content, tool_err) = match response {
+                    Ok(IpcResponse::IntegrationBindingRegistered {
+                        materialized_node_id,
+                        ..
+                    }) => (
+                        format!(
+                            "HTTP integration '{binding_id}' registered. Projected tool: \
+                             http:{binding_id}.request. Execution runner: {}.{}",
+                            materialized_node_id.as_deref().unwrap_or(
+                                "not materialized because placement is currently denied/unreachable"
+                            ),
+                            if args.get("credential_header").is_some() {
+                                " An operator must provision its credential with \
+                                 `phil integration set-credential` outside the model path."
+                            } else {
+                                ""
+                            }
+                        ),
+                        None,
+                    ),
+                    Ok(IpcResponse::Standard {
+                        ok: false,
+                        code,
+                        message,
+                        ..
+                    }) => {
+                        let error = TaskErrorPayload::ipc_failure("aiua", &*code, message);
+                        (error.display_message(), Some(error))
+                    }
+                    Ok(other) => {
+                        let error = TaskErrorPayload::ipc_failure(
+                            "aiua",
+                            "UNEXPECTED_RESPONSE",
+                            format!("integration.bind_http: unexpected response: {other:?}"),
+                        );
+                        (error.display_message(), Some(error))
+                    }
+                    Err(error) => {
+                        let error = TaskErrorPayload::transport_error(
+                            "philote",
+                            format!("integration.bind_http: IPC transport error — {error}"),
+                        );
+                        (error.display_message(), Some(error))
+                    }
+                };
+                self.refresh_http_integration_projection().await;
+                self.handle_tool_result(InboundTaskPayload {
+                    action: Some("tool_result".into()),
+                    source: Some("agent".into()),
+                    session_id: Some(session_id),
+                    turn_id: Some(turn_id),
+                    chat_id: Some(payload.chat_id),
+                    content: Some(content),
+                    error: tool_err,
+                    tool_name: Some("integration.bind_http".into()),
+                    final_reply_to: Some(payload.final_reply_to),
+                    final_reply_role: Some(payload.final_reply_role),
+                    final_reply_guest_id: payload.final_reply_guest_id,
+                    ..Default::default()
+                })
+                .await
+            }
+
+            "integration.unbind" => {
+                let session_id = payload.session_id.clone();
+                let turn_id = payload.turn_id.clone();
+                let binding_id = match payload
+                    .arguments
+                    .get("binding_id")
+                    .and_then(serde_json::Value::as_str)
+                    .filter(|value| !value.trim().is_empty())
+                {
+                    Some(value) => value.to_string(),
+                    None => {
+                        return self
+                            .fail_active_turn(
+                                session_id,
+                                turn_id,
+                                "integration.unbind: missing required argument 'binding_id'".into(),
+                            )
+                            .await;
+                    }
+                };
+                let response = self
+                    .ipc_client
+                    .send_request(IpcRequest::RevokeIntegrationBinding {
+                        binding_id: binding_id.clone(),
+                        owner_agent_id: self.agent_id.clone(),
+                    })
+                    .await;
+                let (content, tool_err) = match response {
+                    Ok(IpcResponse::IntegrationBindingRegistered { .. }) => (
+                        format!(
+                            "Integration '{binding_id}' revoked; its projected tool is no longer available."
+                        ),
+                        None,
+                    ),
+                    Ok(IpcResponse::Standard {
+                        ok: false,
+                        code,
+                        message,
+                        ..
+                    }) => {
+                        let error = TaskErrorPayload::ipc_failure("aiua", &*code, message);
+                        (error.display_message(), Some(error))
+                    }
+                    Ok(other) => {
+                        let error = TaskErrorPayload::ipc_failure(
+                            "aiua",
+                            "UNEXPECTED_RESPONSE",
+                            format!("integration.unbind: unexpected response: {other:?}"),
+                        );
+                        (error.display_message(), Some(error))
+                    }
+                    Err(error) => {
+                        let error = TaskErrorPayload::transport_error(
+                            "philote",
+                            format!("integration.unbind: IPC transport error — {error}"),
+                        );
+                        (error.display_message(), Some(error))
+                    }
+                };
+                self.refresh_http_integration_projection().await;
+                self.handle_tool_result(InboundTaskPayload {
+                    action: Some("tool_result".into()),
+                    source: Some("agent".into()),
+                    session_id: Some(session_id),
+                    turn_id: Some(turn_id),
+                    chat_id: Some(payload.chat_id),
+                    content: Some(content),
+                    error: tool_err,
+                    tool_name: Some("integration.unbind".into()),
+                    final_reply_to: Some(payload.final_reply_to),
+                    final_reply_role: Some(payload.final_reply_role),
+                    final_reply_guest_id: payload.final_reply_guest_id,
+                    ..Default::default()
+                })
+                .await
+            }
+
+            "integration.list" => {
+                let session_id = payload.session_id.clone();
+                let turn_id = payload.turn_id.clone();
+                self.refresh_http_integration_projection().await;
+                let (content, tool_err) = match self
+                    .ipc_client
+                    .send_request(IpcRequest::GetIntegrationBindings {})
+                    .await
+                {
+                    Ok(IpcResponse::IntegrationBindingsState {
+                        integration_bindings,
+                    }) => {
+                        let visible: Vec<_> = integration_bindings
+                            .into_iter()
+                            .filter(|entry| entry.binding.is_granted_to(&self.agent_id))
+                            .collect();
+                        if visible.is_empty() {
+                            (
+                                "No outbound integration bindings are granted to this agent."
+                                    .into(),
+                                None,
+                            )
+                        } else {
+                            (
+                                serde_json::to_string_pretty(&visible).unwrap_or_else(|_| {
+                                    "Integration bindings are unavailable.".into()
+                                }),
+                                None,
+                            )
+                        }
+                    }
+                    Ok(IpcResponse::Standard {
+                        ok: false,
+                        code,
+                        message,
+                        ..
+                    }) => {
+                        let error = TaskErrorPayload::ipc_failure("aiua", &*code, message);
+                        (error.display_message(), Some(error))
+                    }
+                    Ok(other) => {
+                        let error = TaskErrorPayload::ipc_failure(
+                            "aiua",
+                            "UNEXPECTED_RESPONSE",
+                            format!("integration.list: unexpected response: {other:?}"),
+                        );
+                        (error.display_message(), Some(error))
+                    }
+                    Err(error) => {
+                        let error = TaskErrorPayload::transport_error(
+                            "philote",
+                            format!("integration.list: IPC transport error — {error}"),
+                        );
+                        (error.display_message(), Some(error))
+                    }
+                };
+                self.handle_tool_result(InboundTaskPayload {
+                    action: Some("tool_result".into()),
+                    source: Some("agent".into()),
+                    session_id: Some(session_id),
+                    turn_id: Some(turn_id),
+                    chat_id: Some(payload.chat_id),
+                    content: Some(content),
+                    error: tool_err,
+                    tool_name: Some("integration.list".into()),
+                    final_reply_to: Some(payload.final_reply_to),
+                    final_reply_role: Some(payload.final_reply_role),
+                    final_reply_guest_id: payload.final_reply_guest_id,
+                    ..Default::default()
+                })
+                .await
+            }
+
             // ── mcp.connect ──────────────────────────────────────────────────
             "mcp.connect" => {
                 let session_id = payload.session_id.clone();
@@ -5725,6 +6162,15 @@ impl AgentRuntime {
                     transport: ansible_mesh_core::mcp_upstream::McpUpstreamTransport::Http {
                         url: url.clone(),
                     },
+                    placement: args
+                        .get("placement")
+                        .cloned()
+                        .and_then(|value| serde_json::from_value(value).ok())
+                        .unwrap_or_default(),
+                    http_network_scope: args
+                        .get("network_scope")
+                        .cloned()
+                        .and_then(|value| serde_json::from_value(value).ok()),
                     credential_ref,
                     tool_allowlist: tools.clone(),
                     grant_agents,

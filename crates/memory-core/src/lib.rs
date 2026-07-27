@@ -16,7 +16,10 @@ pub use null::NullMemoryEngine;
 pub use recall::{
     RecallContext, RecallDecision, RecallMode, RecallTrigger, TurnRecallResult, evaluate_recall,
 };
-pub use rest_client::{MuninnConfig, MuninnRestEngine, VaultResolver, is_fleet_shared_vault};
+pub use rest_client::{
+    MuninnConfig, MuninnRestEngine, TokenRejected, VaultResolver, is_fleet_shared_vault,
+    token_rejected_vault,
+};
 pub use types::{
     ActivationResult, AgentId, AttentionalLens, CognitiveOutcome, Engram, EngramId, EngramRef,
     LinkKind, MemoryScope, SessionId, UserId, VaultId,

@@ -155,6 +155,8 @@ cargo build --release --bins \
   -p philote \
   -p membrane-telegram \
   -p membrane-discord \
+  -p membrane-mcp-client \
+  -p egress-http-runner \
   -p model-router \
   -p tool-runner \
   -p graph-datasource \
@@ -256,9 +258,6 @@ if [[ -n "${PHIL_CELLAR}" && -f "${ROOT_DIR}/target/release/philotic-web" ]]; th
   echo "  ✓ phil / philotic-web"
 fi
 
-echo "▶ Applying mesh-config on ${REMOTE}..."
-ssh "${SSH_OPTS[@]}" "${REMOTE}" "env PHILOTIC_PROFILE='${REMOTE_PROFILE}' PHILOTIC_GRAPH_DATABASE_DIR='${REMOTE_GRAPH_DIR}' PHILOTIC_LIFE_GRAPH_RUNNER_HOME_NODE='${LIFE_GRAPH_RUNNER_HOME_NODE}' PHILOTIC_REMOTE_LIFE_GRAPH_RUNNER_NODE='${REMOTE_LIFE_GRAPH_RUNNER_NODE}' /opt/homebrew/bin/aiua load --file ~/mesh-config.json --hotel ${HOTEL_NAME}"
-
 if [[ -n "${LAUNCHD_LABEL}" ]]; then
   echo "▶ Restarting hotel '${HOTEL_NAME}' via launchd (${LAUNCHD_LABEL})..."
   # Clear the stale active_pid row first: aiua refuses to boot when the row
@@ -280,6 +279,23 @@ else
   echo "▶ No launchd service — hand-starting hotel '${HOTEL_NAME}' on ${REMOTE} with Rust cutover flags..."
   ssh "${SSH_OPTS[@]}" "${REMOTE}" "ulimit -n 65536; nohup env PATH=/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin PHILOTIC_PROFILE='${REMOTE_PROFILE}' PHILOTIC_GRAPH_DATABASE_DIR='${REMOTE_GRAPH_DIR}' PHILOTIC_LIFE_GRAPH_RUNNER_HOME_NODE='${LIFE_GRAPH_RUNNER_HOME_NODE}' PHILOTIC_REMOTE_LIFE_GRAPH_RUNNER_NODE='${REMOTE_LIFE_GRAPH_RUNNER_NODE}' PHILOTIC_ENABLE_RUST_AUTH=1 PHILOTIC_ENABLE_RUST_DISPATCHER=1 PHILOTIC_ENABLE_RUST_TASK_LIFECYCLE=1 /opt/homebrew/bin/aiua --hotel ${HOTEL_NAME} >> ~/.philotic/${REMOTE_PROFILE}/aiua.log 2>&1 & echo \$! > ~/.philotic/${REMOTE_PROFILE}/aiua.pid && echo 'aiua started pid '\$(cat ~/.philotic/${REMOTE_PROFILE}/aiua.pid)"
 fi
+
+# Loading mesh config may consult hotel-materialized services such as Muninn.
+# Do it only after supervision is restored, and retry during guest startup. A
+# failed config load can now fail the deploy without leaving the hotel booted
+# out — the old ordering stranded mbp-jane after every dependency outage.
+echo "▶ Applying mesh-config on ${REMOTE}..."
+for attempt in {1..12}; do
+  if ssh "${SSH_OPTS[@]}" "${REMOTE}" "env PHILOTIC_PROFILE='${REMOTE_PROFILE}' PHILOTIC_GRAPH_DATABASE_DIR='${REMOTE_GRAPH_DIR}' PHILOTIC_LIFE_GRAPH_RUNNER_HOME_NODE='${LIFE_GRAPH_RUNNER_HOME_NODE}' PHILOTIC_REMOTE_LIFE_GRAPH_RUNNER_NODE='${REMOTE_LIFE_GRAPH_RUNNER_NODE}' /opt/homebrew/bin/aiua load --file ~/mesh-config.json --hotel ${HOTEL_NAME}"; then
+    break
+  fi
+  if [[ ${attempt} -eq 12 ]]; then
+    echo "❌ Mesh-config load still failing after ${attempt} attempts; hotel remains supervised and running."
+    exit 1
+  fi
+  echo "  waiting for hotel dependencies (${attempt}/12)..."
+  sleep 5
+done
 
 echo "▶ Ensuring log rotation on ${REMOTE}..."
 # Streams the installer over ssh — no repo checkout needed on the remote.

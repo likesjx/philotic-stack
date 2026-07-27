@@ -245,7 +245,7 @@
       - --
       - sh
       - -lc
-      - "cd {{ philotic_data_dir | quote }} && {{ philotic_bin_dir | quote }}/aiua load --file {{ philotic_etc_dir | quote }}/mesh-config.json --hotel {{ philotic_hotel_runtime_name | quote }}"
+      - "set -a && . {{ (philotic_etc_dir ~ '/secrets.env') | quote }} && set +a && cd {{ philotic_data_dir | quote }} && {{ philotic_bin_dir | quote }}/aiua load --file {{ philotic_etc_dir | quote }}/mesh-config.json --hotel {{ philotic_hotel_runtime_name | quote }}"
   environment:
     PHILOTIC_BIN_DIR: "{{ philotic_bin_dir }}"
     PHILOTIC_HOTEL_SOCKET: "{{ philotic_hotel_socket }}"

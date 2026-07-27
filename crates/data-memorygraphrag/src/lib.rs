@@ -1474,11 +1474,13 @@ impl GrowthLoopPolicy {
     }
 }
 
-/// A typed living-cycle edge proposed alongside a `life.observe` node write.
+/// A typed edge proposed alongside a `life.observe` node write.
 ///
 /// `rel_type` must be one of [`cypher::LIVING_CYCLE_REL_TYPES`]
-/// (OWNS / SHAPES / SETS / SPAWNS / RELATES_TO / SCOPED_TO). Unknown
-/// rel_types are rejected before the node write. By default (`upsert_target:
+/// (OWNS / SHAPES / SETS / SPAWNS / RELATES_TO / SCOPED_TO) or an agenda
+/// relation from [`cypher::AGENDA_EDGE_RULES`] (ADVANCES / BLOCKED_BY /
+/// NEEDS_FOLLOWUP / PROMISED_TO / CONTAINS / SUPPORTS — endpoint-validated).
+/// Unknown rel_types are rejected before the node write. By default (`upsert_target:
 /// false`) a `target_id` that matches no existing node creates nothing — the
 /// miss is reported in the response envelope without failing the node write.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1908,12 +1910,24 @@ impl MemoryGraphRagRunner {
             violations.extend(err.violations);
         }
         for (idx, edge) in input.edges.iter().enumerate() {
-            if !cypher::is_living_cycle_rel_type(&edge.rel_type) {
+            if !cypher::is_living_cycle_rel_type(&edge.rel_type)
+                && !cypher::is_agenda_rel_type(&edge.rel_type)
+            {
                 violations.push(format!(
-                    "edges[{idx}].rel_type '{}' is not a living-cycle relation (expected one of {})",
+                    "edges[{idx}].rel_type '{}' is not an allowed relation (expected one of {})",
                     edge.rel_type,
-                    cypher::LIVING_CYCLE_REL_TYPES.join(", ")
+                    cypher::observe_rel_type_vocabulary()
                 ));
+            }
+            if let Some(rule) = cypher::agenda_edge_rule(&edge.rel_type) {
+                let source_label = &input.evidence.claim_ref.label;
+                if !rule.source_labels.contains(&source_label.as_str()) {
+                    violations.push(format!(
+                        "edges[{idx}].rel_type {} not allowed from {source_label} (allowed sources: {})",
+                        rule.rel_type,
+                        rule.source_labels.join(", ")
+                    ));
+                }
             }
             require_non_empty(
                 &mut violations,

@@ -12,6 +12,14 @@ build:
 check:
     cargo check --workspace
 
+# Keep every production direct network constructor explicitly classified.
+outbound-egress-check:
+    python3 scripts/check-outbound-egress-inventory.py
+
+# Prove the hotel-owned OpenRouter catalog leaves through the governed runner.
+model-catalog-egress-smoke:
+    ./scripts/smoke-model-catalog-egress-roundtrip.sh
+
 # Verify the repo bootstrap engine: Muninn, helper scripts, and workspace baseline.
 engine-check:
     ./scripts/engine-check.sh
@@ -150,7 +158,7 @@ start-aiua hotel:
 
 # Rebuild the local runtime binaries that the hotel materializes during watched UAT.
 build-runtime:
-    cargo build -p aiua -p philote -p membrane-telegram -p model-router -p tool-runner -p graph-datasource -p philotic-web
+    cargo build -p aiua -p philote -p membrane-telegram -p membrane-mcp-client -p egress-http-runner -p model-router -p tool-runner -p graph-datasource -p philotic-web
 
 # Kill local Philotic hotel/guest binaries from this checkout and clear stale sockets.
 kill-local-stack:
@@ -164,6 +172,8 @@ kill-local-stack:
     @pkill -KILL -f "target/debug/model-controller-openai" 2>/dev/null || true
     @pkill -KILL -f "target/debug/model-controller-ollama" 2>/dev/null || true
     @pkill -KILL -f "target/debug/tool-runner" 2>/dev/null || true
+    @pkill -KILL -f "target/debug/egress-http-runner" 2>/dev/null || true
+    @pkill -KILL -f "target/debug/membrane-mcp-client" 2>/dev/null || true
     @pkill -KILL -f "target/debug/graph-runner" 2>/dev/null || true
     @pkill -KILL -f "target/debug/graph-datasource" 2>/dev/null || true
     @pkill -KILL -f "target/debug/model-controller-mlx" 2>/dev/null || true
@@ -392,6 +402,14 @@ smoke-session-control:
 smoke-mcp:
     ./scripts/mcp-client-uat.sh safe
 
+# Run the governed HTTP integration binary smoke test
+smoke-integration-http:
+    ./scripts/smoke-integration-http-roundtrip.sh
+
+# Run MCP protocol management with its HTTP wire exchange through governed egress
+smoke-mcp-http-egress:
+    ./scripts/smoke-mcp-http-egress-roundtrip.sh
+
 # Run the session bindings binary smoke test
 smoke-session-bindings:
     ./scripts/smoke-session-bindings-roundtrip.sh
@@ -502,6 +520,8 @@ smoke-suite:
     ./scripts/smoke-preapprove-roundtrip.sh
     ./scripts/smoke-session-control-roundtrip.sh
     ./scripts/smoke-session-bindings-roundtrip.sh
+    ./scripts/smoke-integration-http-roundtrip.sh
+    ./scripts/smoke-mcp-http-egress-roundtrip.sh
     ./scripts/smoke-subagent-roundtrip.sh
     bash scripts/smoke-cognitive-roundtrip.sh
     bash scripts/smoke-cognitive-reentry-roundtrip.sh
@@ -552,9 +572,9 @@ local-push:
     set -euo pipefail
     AIUA_CELLAR=/opt/homebrew/Cellar/aiua/0.1.0-alpha/bin
     PHIL_CELLAR=/opt/homebrew/Cellar/philotic-web/0.1.0-alpha/bin
-    AIUA_BINS="aiua philote membrane-telegram membrane-discord membrane-mcp model-router model-controller-gemini model-controller-elevenlabs model-controller-openrouter model-controller-anthropic model-controller-openai model-controller-mlx model-controller-ollama model-controller-onnx model-controller-parakeet model-controller-vision philote-worker tool-runner graph-datasource table-datasource router-listener agent-datasource heal-dispatcher life-graph-runner"
+    AIUA_BINS="aiua philote membrane-telegram membrane-discord membrane-mcp membrane-mcp-client egress-http-runner model-router model-controller-gemini model-controller-elevenlabs model-controller-openrouter model-controller-anthropic model-controller-openai model-controller-mlx model-controller-ollama model-controller-onnx model-controller-parakeet model-controller-vision philote-worker tool-runner graph-datasource table-datasource router-listener agent-datasource heal-dispatcher life-graph-runner"
     echo "▶ Building release binaries..."
-    cargo build --release -p aiua -p philote -p membrane-telegram -p membrane-discord -p membrane-mcp -p model-router -p tool-runner -p graph-datasource -p philotic-web -p table-datasource -p router-listener -p agent-datasource -p heal-dispatcher -p data-memorygraphrag
+    cargo build --release -p aiua -p philote -p membrane-telegram -p membrane-discord -p membrane-mcp -p membrane-mcp-client -p egress-http-runner -p model-router -p tool-runner -p graph-datasource -p philotic-web -p table-datasource -p router-listener -p agent-datasource -p heal-dispatcher -p data-memorygraphrag
     echo "▶ Installing aiua stack to ${AIUA_CELLAR}..."
     # Make bin dir writable so we can delete+recreate files (new inode avoids macOS codesign cache poisoning)
     chmod u+w "${AIUA_CELLAR}"
@@ -784,6 +804,8 @@ vps-push:
       -p membrane-telegram \
       -p membrane-discord \
       -p membrane-mcp \
+      -p membrane-mcp-client \
+      -p egress-http-runner \
       -p model-router \
       -p tool-runner \
       -p graph-datasource \

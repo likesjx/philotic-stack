@@ -35,6 +35,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Verify outbound egress inventory
+        run: python3 scripts/check-outbound-egress-inventory.py
+
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -98,6 +101,8 @@ jobs:
             -p membrane-telegram \
             -p membrane-discord \
             -p membrane-mcp \
+            -p membrane-mcp-client \
+            -p egress-http-runner \
             -p model-router \
             -p tool-runner \
             -p graph-datasource \
@@ -138,6 +143,7 @@ jobs:
           # in philotic_binaries but are not build outputs (the ansible remote
           # path stats-and-skips them), so they are intentionally NOT required here.
           for bin in aiua philote philote-worker membrane-telegram membrane-discord membrane-mcp \
+                     membrane-mcp-client egress-http-runner \
                      model-router model-controller-elevenlabs \
                      model-controller-gemini model-controller-openai \
                      model-controller-anthropic \

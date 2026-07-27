@@ -1,0 +1,12 @@
+@startuml
+participant Operator
+participant SourceHotel
+participant HotelGraph
+participant Philote
+Operator -> SourceHotel: Apply reviewed IntegrationBinding
+SourceHotel -> HotelGraph: Persist target grants placement and revision
+SourceHotel -> SourceHotel: Validate dependencies and resolve placement
+SourceHotel -> SourceHotel: Materialize the selected runner
+SourceHotel -> Philote: Project binding scoped tool and ToolExecutionRoute
+Philote --> Operator: Ready or unresolved dependency
+@enduml

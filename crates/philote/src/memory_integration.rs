@@ -1243,6 +1243,67 @@ impl AgentRuntime {
         warn!("FetchMemoryConfig failed after 3 attempts — running without memory");
     }
 
+    /// A memory op hit a token-401 (`memory_core::TokenRejected`): MuninnDB is
+    /// reachable but rejects our stored bearer. Ask the hotel to re-mint the
+    /// token from the durable Context-Graph truth (`HealMemoryToken`) and, on
+    /// success, replace the cached memory config so the caller can rebuild an
+    /// engine and retry ONCE. Returns `true` when a refreshed config was
+    /// applied. The hotel enforces the per-vault mint budget; a refusal
+    /// (budget, no admin credential) comes back as an error response and
+    /// simply returns `false` here.
+    pub(super) async fn heal_memory_token(&mut self, vault: &str) -> bool {
+        warn!(vault = %vault, "Muninn rejected stored token — requesting hotel token heal");
+        let result = self
+            .ipc_client
+            .send_request_with_timeout(
+                IpcRequest::HealMemoryToken {
+                    vault: vault.to_string(),
+                },
+                // Minting is an admin login + key mint + secret rotation on
+                // the hotel side — allow more headroom than a plain fetch.
+                std::time::Duration::from_secs(20),
+            )
+            .await;
+        match result {
+            Ok(IpcResponse::MemoryConfig(config)) if config.config_json.is_some() => {
+                let json = config.config_json.expect("checked is_some");
+                match serde_json::from_str::<MuninnConfig>(&json) {
+                    Ok(cfg) => {
+                        info!(
+                            vault = %vault,
+                            vaults = cfg.vault_tokens.len(),
+                            "Token heal succeeded — memory config refreshed"
+                        );
+                        self.muninn_config = Some(cfg);
+                        true
+                    }
+                    Err(e) => {
+                        warn!(vault = %vault, error = %e, "Token heal returned unparseable config");
+                        false
+                    }
+                }
+            }
+            Ok(IpcResponse::MemoryConfig(_)) => {
+                // Heal ran (or was budget-served) but the hotel could not load
+                // a config — distinct from a refusal; nothing to retry with.
+                warn!(vault = %vault, "Token heal returned no config — hotel could not load memory config");
+                false
+            }
+            Ok(IpcResponse::Standard { code, message, .. }) => {
+                warn!(vault = %vault, code = %code, message = %message, "Token heal refused by hotel");
+                false
+            }
+            Ok(_) => {
+                warn!(vault = %vault, "Unexpected response to HealMemoryToken");
+                false
+            }
+            Err(e) => {
+                warn!(vault = %vault, error = %e, "HealMemoryToken request failed");
+                false
+            }
+        }
+    }
+
     /// Build a `MuninnRestEngine` scoped to the given agent and user.
     /// Returns `None` if MuninnDB is not configured or the hotel has reported it unreachable.
     pub(super) fn memory_engine_for(
@@ -1715,8 +1776,34 @@ impl AgentRuntime {
         let result = match engine.recall_for_turn(&recall_context).await {
             Ok(r) => r,
             Err(err) => {
-                warn!(session_id = %session_id, error = %err, "Auto recall failed: memory engine error.");
-                return Ok(());
+                // A token-401 is self-healable: ask the hotel to re-mint from
+                // the durable Context-Graph truth, then retry exactly once
+                // with an engine built from the refreshed config.
+                let healed_retry = match memory_core::token_rejected_vault(&err) {
+                    Some(vault) => {
+                        let vault = vault.to_string();
+                        if self.heal_memory_token(&vault).await {
+                            match self.memory_engine_for(&self.agent_id, &memory_user_id) {
+                                Some(engine) => Some(engine.recall_for_turn(&recall_context).await),
+                                None => None,
+                            }
+                        } else {
+                            None
+                        }
+                    }
+                    None => None,
+                };
+                match healed_retry {
+                    Some(Ok(r)) => r,
+                    Some(Err(retry_err)) => {
+                        warn!(session_id = %session_id, error = %retry_err, "Auto recall failed after token heal — giving up for this turn.");
+                        return Ok(());
+                    }
+                    None => {
+                        warn!(session_id = %session_id, error = %err, "Auto recall failed: memory engine error.");
+                        return Ok(());
+                    }
+                }
             }
         };
         let recall_reason = result.decision.reason.clone();
@@ -2008,30 +2095,46 @@ impl AgentRuntime {
 
         let content = match self.memory_engine_for(&self.agent_id, &memory_user_id) {
             None => "Memory unavailable: MuninnDB not configured.".to_string(),
-            Some(engine) => match engine.activate(&query, scope, Some(limit)).await {
-                Err(e) => format!("memory.recall error: {e}"),
-                Ok(result) if result.engrams.is_empty() => {
-                    "No relevant memories found.".to_string()
-                }
-                Ok(result) => {
-                    let mut out = format!("{} engram(s) recalled:\n", result.engrams.len());
-                    for (i, eng) in result.engrams.iter().enumerate() {
-                        out.push_str(&format!(
-                            "{}. [{}] {} — {}{}\n",
-                            i + 1,
-                            eng.concept,
-                            eng.content,
-                            eng.tags.join(", "),
-                            if eng.vault_id.is_empty() {
-                                String::new()
-                            } else {
-                                format!(" (vault: {})", eng.vault_id)
+            Some(engine) => {
+                let mut recall_result = engine.activate(&query, scope.clone(), Some(limit)).await;
+                // Token-401 → hotel re-mint → retry once with a fresh engine.
+                if let Err(err) = &recall_result {
+                    if let Some(vault) = memory_core::token_rejected_vault(err) {
+                        let vault = vault.to_string();
+                        if self.heal_memory_token(&vault).await {
+                            if let Some(engine) =
+                                self.memory_engine_for(&self.agent_id, &memory_user_id)
+                            {
+                                recall_result = engine.activate(&query, scope, Some(limit)).await;
                             }
-                        ));
+                        }
                     }
-                    out
                 }
-            },
+                match recall_result {
+                    Err(e) => format!("memory.recall error: {e}"),
+                    Ok(result) if result.engrams.is_empty() => {
+                        "No relevant memories found.".to_string()
+                    }
+                    Ok(result) => {
+                        let mut out = format!("{} engram(s) recalled:\n", result.engrams.len());
+                        for (i, eng) in result.engrams.iter().enumerate() {
+                            out.push_str(&format!(
+                                "{}. [{}] {} — {}{}\n",
+                                i + 1,
+                                eng.concept,
+                                eng.content,
+                                eng.tags.join(", "),
+                                if eng.vault_id.is_empty() {
+                                    String::new()
+                                } else {
+                                    format!(" (vault: {})", eng.vault_id)
+                                }
+                            ));
+                        }
+                        out
+                    }
+                }
+            }
         };
 
         self.handle_tool_result(InboundTaskPayload {
@@ -2251,10 +2354,39 @@ impl AgentRuntime {
             match self.memory_engine_for(&self.agent_id, &memory_user_id) {
                 None => "Memory unavailable: MuninnDB not configured.".to_string(),
                 Some(engine) => {
-                    match engine
-                        .remember_with_metadata(scope, &concept, &content_str, tags, metadata)
-                        .await
-                    {
+                    let mut engine = engine;
+                    let mut write = engine
+                        .remember_with_metadata(
+                            scope.clone(),
+                            &concept,
+                            &content_str,
+                            tags.clone(),
+                            metadata.clone(),
+                        )
+                        .await;
+                    // Token-401 → hotel re-mint → retry once with a fresh engine.
+                    if let Err(err) = &write {
+                        if let Some(vault) = memory_core::token_rejected_vault(err) {
+                            let vault = vault.to_string();
+                            if self.heal_memory_token(&vault).await {
+                                if let Some(fresh) =
+                                    self.memory_engine_for(&self.agent_id, &memory_user_id)
+                                {
+                                    engine = fresh;
+                                    write = engine
+                                        .remember_with_metadata(
+                                            scope,
+                                            &concept,
+                                            &content_str,
+                                            tags,
+                                            metadata,
+                                        )
+                                        .await;
+                                }
+                            }
+                        }
+                    }
+                    match write {
                         Ok(engram_ref) => {
                             let _ = engine.retry_enrich(&engram_ref.id).await;
                             format!(

@@ -183,4 +183,4 @@ This proposal exists as a repo document on purpose. Proposal nodes created only 
 the graph MCP (`graph_create_node` with a bare `proposal:` id) **do not survive a
 rescan** — two nodes and their recorded decisions filed on 2026-07-26 were gone by
 the next freshness run. Every durable proposal in the graph is `doc:`-prefixed and
-derived from a committed file. See DEF-071.
+derived from a committed file. See DEF-072.

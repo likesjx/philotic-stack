@@ -6,7 +6,8 @@ use ansible_mesh_core::membership::{
 use ansible_mesh_core::provider_keys::{ProviderKeySpec, provider_key_specs};
 use ansible_mesh_core::registry::{CapabilityAdvertisement, ExecutionReachability, NodeRegistry};
 use ansible_mesh_core::storage::{
-    AgentIdentityRecord, CursorStorage, EventStorage, GuestRecord, HotelRecord, VaultRegistryEntry,
+    AgentIdentityRecord, ComponentManifest, CursorStorage, EventStorage, GuestRecord, HotelRecord,
+    VaultRegistryEntry,
 };
 use ansible_mesh_core::{NodeCapabilities, NodeHealthSnapshot, NodeRole};
 use anyhow::{Context, Result};
@@ -245,6 +246,202 @@ pub enum LedgerCommand {
     },
 }
 
+fn operator_surface_payload_string(
+    payload: &OperatorSurfaceQueryHandoff,
+    key: &str,
+) -> Result<String> {
+    payload
+        .payload
+        .get(key)
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "operator surface [{}] missing string payload field [{}]",
+                payload.surface,
+                key
+            )
+        })
+}
+
+fn operator_surface_payload_optional_string(
+    payload: &OperatorSurfaceQueryHandoff,
+    key: &str,
+) -> Option<String> {
+    payload
+        .payload
+        .get(key)
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string)
+}
+
+async fn handle_forwarded_operator_target_surface(
+    client: &mut PhiloticClient,
+    payload: &OperatorSurfaceQueryHandoff,
+    local_node_id: &str,
+) -> Result<String> {
+    let target_node_id = local_node_id.to_string();
+    let request = match payload.surface.as_str() {
+        "operator.targets.components" => IpcRequest::QueryOperatorTargetComponents {
+            target_node_id: target_node_id.clone(),
+        },
+        "operator.targets.config" => IpcRequest::QueryOperatorTargetConfig {
+            target_node_id: target_node_id.clone(),
+        },
+        "operator.targets.secrets" => IpcRequest::QueryOperatorTargetSecrets {
+            target_node_id: target_node_id.clone(),
+        },
+        "operator.targets.placement" => IpcRequest::QueryOperatorTargetPlacement {
+            target_node_id: target_node_id.clone(),
+            agent_id: operator_surface_payload_optional_string(payload, "agent_id"),
+            role_name: operator_surface_payload_optional_string(payload, "role_name"),
+            tool_name: operator_surface_payload_optional_string(payload, "tool_name"),
+            required_markers: serde_json::from_value(
+                payload
+                    .payload
+                    .get("required_markers")
+                    .cloned()
+                    .unwrap_or_else(|| serde_json::json!([])),
+            )
+            .context("operator surface placement required_markers must be strings")?,
+            prefer_locality: payload
+                .payload
+                .get("prefer_locality")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false),
+        },
+        "operator.targets.components.register" => {
+            let manifest: ComponentManifest = serde_json::from_value(
+                payload
+                    .payload
+                    .get("manifest")
+                    .cloned()
+                    .ok_or_else(|| anyhow::anyhow!("component manifest missing"))?,
+            )
+            .context("invalid forwarded component manifest")?;
+            IpcRequest::RegisterOperatorTargetComponent {
+                target_node_id: target_node_id.clone(),
+                manifest,
+            }
+        }
+        "operator.targets.components.set_active" => IpcRequest::SetOperatorTargetComponentActive {
+            target_node_id: target_node_id.clone(),
+            guest_id: operator_surface_payload_string(payload, "guest_id")?,
+            active: payload
+                .payload
+                .get("active")
+                .and_then(serde_json::Value::as_bool)
+                .ok_or_else(|| anyhow::anyhow!("component active flag missing"))?,
+        },
+        "operator.targets.components.restart" => IpcRequest::RestartOperatorTargetComponent {
+            target_node_id: target_node_id.clone(),
+            guest_id: operator_surface_payload_string(payload, "guest_id")?,
+        },
+        "operator.targets.components.remove" => IpcRequest::RemoveOperatorTargetComponent {
+            target_node_id: target_node_id.clone(),
+            guest_id: operator_surface_payload_string(payload, "guest_id")?,
+        },
+        "operator.targets.config.set" => IpcRequest::SetOperatorTargetConfig {
+            target_node_id: target_node_id.clone(),
+            key: operator_surface_payload_string(payload, "key")?,
+            value_json: operator_surface_payload_string(payload, "value_json")?,
+        },
+        "operator.targets.secrets.rotate" => IpcRequest::RotateOperatorTargetSecret {
+            target_node_id: target_node_id.clone(),
+            secret_ref: operator_surface_payload_string(payload, "secret_ref")?,
+            plaintext: operator_surface_payload_string(payload, "plaintext")?,
+        },
+        "operator.targets.secrets.add" => IpcRequest::AddOperatorTargetVaultEntry {
+            target_node_id: target_node_id.clone(),
+            vault_name: operator_surface_payload_string(payload, "vault_name")?,
+            plaintext: operator_surface_payload_string(payload, "plaintext")?,
+            allowed_roles: serde_json::from_value(
+                payload
+                    .payload
+                    .get("allowed_roles")
+                    .cloned()
+                    .unwrap_or_else(|| serde_json::json!([])),
+            )
+            .context("operator surface allowed_roles must be strings")?,
+        },
+        "operator.targets.roles.set_home" => IpcRequest::SetOperatorTargetRoleHome {
+            target_node_id: target_node_id.clone(),
+            agent_id: operator_surface_payload_string(payload, "agent_id")?,
+            role_name: operator_surface_payload_string(payload, "role_name")?,
+            calling_role: operator_surface_payload_string(payload, "calling_role")?,
+            target_hotel: operator_surface_payload_optional_string(payload, "target_hotel"),
+        },
+        other => anyhow::bail!("unsupported forwarded operator surface [{other}]"),
+    };
+
+    let response = client.send_request(request).await?;
+    match (payload.surface.as_str(), response) {
+        (
+            "operator.targets.components",
+            IpcResponse::OperatorTargetComponentsView {
+                operator_target_components,
+            },
+        ) => Ok(serde_json::to_string(&operator_target_components)?),
+        (
+            "operator.targets.config",
+            IpcResponse::OperatorTargetConfigView {
+                operator_target_config,
+            },
+        ) => Ok(serde_json::to_string(&operator_target_config)?),
+        (
+            "operator.targets.secrets",
+            IpcResponse::OperatorTargetSecretsView {
+                operator_target_secrets,
+            },
+        ) => Ok(serde_json::to_string(&operator_target_secrets)?),
+        (
+            "operator.targets.placement",
+            IpcResponse::OperatorTargetPlacementView {
+                operator_target_placement,
+            },
+        ) => Ok(serde_json::to_string(&operator_target_placement)?),
+        (
+            "operator.targets.components.register",
+            IpcResponse::ComponentInventory { components },
+        ) => {
+            let component = components
+                .into_iter()
+                .next()
+                .ok_or_else(|| anyhow::anyhow!("registered component reply was empty"))?;
+            Ok(serde_json::to_string(&component)?)
+        }
+        (
+            "operator.targets.components.set_active"
+            | "operator.targets.components.restart"
+            | "operator.targets.components.remove",
+            IpcResponse::OperatorTargetComponentMutationAckView {
+                operator_target_component_mutation,
+            },
+        ) => Ok(serde_json::to_string(&operator_target_component_mutation)?),
+        (
+            "operator.targets.config.set",
+            IpcResponse::OperatorTargetConfigMutationAckView {
+                operator_target_config_mutation,
+            },
+        ) => Ok(serde_json::to_string(&operator_target_config_mutation)?),
+        (
+            "operator.targets.secrets.rotate" | "operator.targets.secrets.add",
+            IpcResponse::OperatorTargetSecretMutationAckView {
+                operator_target_secret_mutation,
+            },
+        ) => Ok(serde_json::to_string(&operator_target_secret_mutation)?),
+        (
+            "operator.targets.roles.set_home",
+            IpcResponse::OperatorTargetRoleHomeAckView {
+                operator_target_role_home,
+            },
+        ) => Ok(serde_json::to_string(&operator_target_role_home)?),
+        (surface, other) => anyhow::bail!(
+            "unexpected local reply for forwarded operator surface [{surface}]: {other:?}"
+        ),
+    }
+}
+
 /// Operator surface query worker — receives tasks via in-process channel (no UDS
 /// self-connection) and uses a single persistent `PhiloticClient` for outgoing
 /// queries and reply emission. This eliminates the socket-leak crash loop.
@@ -411,7 +608,21 @@ async fn handle_operator_surface_query_task(
                 other => anyhow::bail!("unexpected ApplyAgentBundle response: {other:?}"),
             }
         }
-        _ => return Ok(()),
+        "operator.targets.components"
+        | "operator.targets.config"
+        | "operator.targets.secrets"
+        | "operator.targets.placement"
+        | "operator.targets.components.register"
+        | "operator.targets.components.set_active"
+        | "operator.targets.components.restart"
+        | "operator.targets.components.remove"
+        | "operator.targets.config.set"
+        | "operator.targets.secrets.rotate"
+        | "operator.targets.secrets.add"
+        | "operator.targets.roles.set_home" => {
+            handle_forwarded_operator_target_surface(client, &payload, local_node_id).await?
+        }
+        other => anyhow::bail!("unsupported operator surface handoff [{other}]"),
     };
 
     match client
@@ -2437,6 +2648,28 @@ fn hotel_shared_guests(
             active_pid: None,
             last_active_at: None,
         },
+        // Governed outbound HTTP executor. Seeded on every hotel so placement
+        // can activate it locally or at an exit hotel without copying runtime
+        // configuration across the mesh. It stays dormant until a binding
+        // selects this hotel.
+        GuestRecord {
+            hotel_name: hotel_name.to_string(),
+            guest_id: format!("{hotel_name}:egress-http"),
+            role: "egress-http-runner".into(),
+            config_json: serde_json::json!({
+                "command": "egress-http-runner",
+                "args": [],
+                "env": {
+                    "PHILOTIC_HOTEL_SOCKET": socket_path.clone(),
+                    "PHILOTIC_NODE_ID": node_id.clone(),
+                    "PHILOTIC_GUEST_ID": format!("{hotel_name}:egress-http")
+                }
+            })
+            .to_string(),
+            is_active: false,
+            active_pid: None,
+            last_active_at: None,
+        },
         GuestRecord {
             hotel_name: hotel_name.to_string(),
             guest_id: format!("{hotel_name}:heal-dispatcher"),
@@ -3166,10 +3399,10 @@ fn seed_abstract_tool_catalog(graph: &GraphDomain) -> anyhow::Result<()> {
         AbstractToolRecord {
             tool_name: "hotel.egress.check".into(),
             description: "Check whether an outbound HTTP request is permitted by the hotel's \
-                          egress policy and retrieve any vault-backed credentials to inject. \
-                          Returns `allowed`, `inject_headers` (e.g. Authorization), and \
-                          `deny_reason` if blocked. Call this before making privileged outbound \
-                          requests when operating at Mesh or Internet exposure tier."
+                          egress policy. Returns `allowed`, `credential_binding_configured`, and \
+                          `deny_reason` if blocked. Credential values are never returned; they \
+                          remain inside the hotel-owned executor that performs the request. Call \
+                          this before privileged outbound requests at Mesh or Internet exposure."
                 .into(),
             input_schema: serde_json::json!({
                 "type": "object",
@@ -7739,6 +7972,22 @@ async fn main() -> Result<()> {
             }
         });
 
+        // Opt-in smoke seam for proving that the hotel-owned model-catalog
+        // service traverses the same binding/placement/runner/audit path as a
+        // guest integration. Normal smoke mode remains network-silent.
+        if std::env::var("PHILOTIC_SMOKE_MODEL_CATALOG")
+            .ok()
+            .as_deref()
+            == Some("1")
+        {
+            crate::service::model_catalog_sync::spawn_loop(
+                graph_domain_arc.clone(),
+                db_path.to_string_lossy().to_string(),
+                hotel.ipc_socket_path.clone(),
+                caps.node_id.clone(),
+            );
+        }
+
         tokio::signal::ctrl_c().await?;
         let _ = graph_domain_arc.set_hotel_pid(&hotel_name, None);
         info!("Ansible smoke-mode shutdown complete.");
@@ -8242,6 +8491,8 @@ async fn main() -> Result<()> {
     crate::service::model_catalog_sync::spawn_loop(
         graph_domain_arc.clone(),
         db_path.to_string_lossy().to_string(),
+        socket_path.clone(),
+        caps.node_id.clone(),
     );
 
     // Host-health scan: samples host vitals (load/CPU/mem/disk) plus
@@ -8702,7 +8953,7 @@ mod tests {
     #[test]
     fn default_guest_seed_injects_hotel_socket_env() {
         let guests = default_guest_seed("beta-hotel");
-        assert_eq!(guests.len(), 14); // shared guests omit graph-datasource off the configured home hotel and the retired graph-runner; profile: agent, agent-datasource; +3 full-suite controllers (anthropic/openai/ollama)
+        assert_eq!(guests.len(), 15); // shared guests omit graph-datasource off the configured home hotel and the retired graph-runner; profile: agent, agent-datasource; +3 full-suite controllers (anthropic/openai/ollama); dormant egress HTTP runner
         // Membrane is the first guest from hotel_shared_guests
         let membrane = guests
             .iter()
@@ -8718,6 +8969,11 @@ mod tests {
         assert!(guests.iter().any(|guest| guest.role == "model.elevenlabs"));
         assert!(guests.iter().any(|guest| guest.role == "model.openrouter"));
         assert!(guests.iter().any(|guest| guest.role == "tool"));
+        assert!(
+            guests
+                .iter()
+                .any(|guest| guest.role == "egress-http-runner" && !guest.is_active)
+        );
         assert!(!guests.iter().any(|guest| guest.role == "graph-datasource"));
         // Single membrane uses PHILOTIC_AGENT_ROSTER (not per-agent token key)
         let roster_json = config["env"]["PHILOTIC_AGENT_ROSTER"]

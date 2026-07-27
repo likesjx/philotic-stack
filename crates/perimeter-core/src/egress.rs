@@ -3,6 +3,10 @@ use std::collections::HashMap;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
+pub use ansible_mesh_core::integration::{
+    decide_egress_placement, EgressFallback, EgressPlacementDecision, EgressPlacementPolicy,
+    EgressTrafficClass,
+};
 use ansible_mesh_core::ExposureTier;
 
 /// Per-tier egress policy — stored in mesh-config.json under `egress.tiers`.
@@ -64,6 +68,7 @@ pub struct EgressRequest {
     pub target_url: String,
     pub method: String,
     pub headers: HashMap<String, String>,
+    pub traffic_class: EgressTrafficClass,
     /// The tier of the hotel listener the agent is operating on.
     pub tier: ExposureTier,
 }
@@ -74,6 +79,14 @@ pub struct EgressRequest {
 pub trait EgressGateway: Send + Sync {
     /// Check whether the outbound request is permitted under the current policy.
     fn check(&self, request: &EgressRequest) -> EgressDecision;
+
+    /// Report whether policy names a credential binding for this target.
+    ///
+    /// This never resolves or returns the credential. Resolution belongs inside
+    /// the bounded executor that performs the request.
+    fn credential_binding_configured(&self, _request: &EgressRequest) -> bool {
+        false
+    }
 
     /// Inject vault-backed credentials into the request headers if a credential spec
     /// exists for the target host. Mutates `request.headers` in place.
@@ -151,8 +164,85 @@ mod tests {
             target_url: url.into(),
             method: "POST".into(),
             headers: HashMap::new(),
+            traffic_class: EgressTrafficClass::GeneralApi,
             tier: ExposureTier::Internet,
         }
+    }
+
+    #[test]
+    fn preferred_exit_uses_named_hotel_when_reachable() {
+        let decision = decide_egress_placement(
+            &EgressPlacementPolicy::PreferHotel {
+                hotel_id: "vps-jane".into(),
+                fallback: EgressFallback::LocalWithAudit,
+            },
+            true,
+        );
+        assert_eq!(
+            decision,
+            EgressPlacementDecision::ExecuteAtHotel {
+                hotel_id: "vps-jane".into()
+            }
+        );
+    }
+
+    #[test]
+    fn preferred_exit_can_fall_back_locally_with_audit() {
+        let decision = decide_egress_placement(
+            &EgressPlacementPolicy::PreferHotel {
+                hotel_id: "vps-jane".into(),
+                fallback: EgressFallback::LocalWithAudit,
+            },
+            false,
+        );
+        assert_eq!(
+            decision,
+            EgressPlacementDecision::ExecuteLocal {
+                audit_fallback: true
+            }
+        );
+    }
+
+    #[test]
+    fn required_exit_fails_closed_when_unreachable() {
+        let decision = decide_egress_placement(
+            &EgressPlacementPolicy::RequireHotel {
+                hotel_id: "vps-jane".into(),
+            },
+            false,
+        );
+        assert_eq!(
+            decision,
+            EgressPlacementDecision::Deny {
+                reason: "required exit hotel 'vps-jane' is unreachable".into()
+            }
+        );
+    }
+
+    #[test]
+    fn deny_mode_never_selects_an_executor() {
+        assert_eq!(
+            decide_egress_placement(&EgressPlacementPolicy::Deny, true),
+            EgressPlacementDecision::Deny {
+                reason: "external egress is disabled by placement policy".into()
+            }
+        );
+    }
+
+    #[test]
+    fn placement_policy_has_stable_data_shape() {
+        let policy = EgressPlacementPolicy::PreferHotel {
+            hotel_id: "vps-jane".into(),
+            fallback: EgressFallback::LocalWithAudit,
+        };
+        let json = serde_json::to_value(&policy).expect("serialize placement policy");
+        assert_eq!(json["mode"], "prefer_hotel");
+        assert_eq!(json["hotel_id"], "vps-jane");
+        assert_eq!(json["fallback"], "local_with_audit");
+
+        let decoded: EgressPlacementPolicy =
+            serde_json::from_value(json).expect("deserialize placement policy");
+        assert_eq!(decoded, policy);
     }
 
     #[test]

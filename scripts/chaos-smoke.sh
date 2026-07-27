@@ -16,6 +16,17 @@
 #                   key (chaos_smoke.canary_value — nothing in the codebase
 #                   reads this key). Asserts the hotel stays healthy
 #                   (`phil doctor` + heal-queue depth), then restores the key.
+#   memory-token-wipe
+#                   proposal:memory-token-self-heal S4. Asserts the muninn
+#                   token self-heal circuit. Always runs a READ-ONLY probe
+#                   first (memory config served live from the Context Graph +
+#                   HealMemoryToken refusing an unregistered vault); then, ONLY
+#                   if a deliberately-provisioned sacrificial vault
+#                   (PHILOTIC_CHAOS_DRILL_VAULT, must start with
+#                   "chaos_smoke") is registered, corrupts its stored token
+#                   and asserts the hotel re-mints it with no restart. Never
+#                   auto-selected — explicit name only. Never creates a vault:
+#                   an absent sacrificial vault is a REFUSAL, not a failure.
 #   mesh-peer-drop  STUB. Not implemented — see the function body below for
 #                   why (safely dropping/restoring a live mesh UDP peer link
 #                   from an external script is not tractable without a
@@ -34,6 +45,12 @@
 #      hard denylist (philote agent guests, membrane, heal-dispatcher).
 #   4. config-corrupt only ever touches PHILOTIC_CHAOS_CONFIG_KEY, which
 #      cannot be pointed outside the "chaos_smoke." namespace.
+#   6. memory-token-wipe only ever touches PHILOTIC_CHAOS_DRILL_VAULT, checked
+#      against vault_name_denied() — real memory vaults (default, self_*,
+#      user_*, session_*) are rejected outright, and the same guard is
+#      duplicated inside the drill driver so neither layer is the only thing
+#      protecting a real vault. The original token is captured before the
+#      corruption and restored on every failure path.
 #   5. --dry-run prints the full plan (including the live pre-flight health
 #      read) and exits 0 without killing anything, writing any config, or
 #      POSTing anything to the intel graph.
@@ -105,13 +122,15 @@ OBSERVE_SECS="${PHILOTIC_CHAOS_OBSERVE_SECS:-15}"
 HEAL_QUEUE_MAX="${PHILOTIC_CHAOS_HEAL_QUEUE_MAX:-3}"
 GRAPH_HOST="${GRAPH_HOST:-http://127.0.0.1:8900}"
 PHIL_BIN="${PHIL_BIN:-phil}"
+DRILL_VAULT="${PHILOTIC_CHAOS_DRILL_VAULT:-chaos_smoke_token_drill}"
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 DRY_RUN=0
 SCENARIO=""
 for arg in "$@"; do
     case "$arg" in
         --dry-run) DRY_RUN=1 ;;
-        guest-kill|config-corrupt|mesh-peer-drop) SCENARIO="$arg" ;;
+        guest-kill|config-corrupt|mesh-peer-drop|memory-token-wipe) SCENARIO="$arg" ;;
         -h|--help)
             sed -n '2,80p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
             exit 0
@@ -124,7 +143,8 @@ for arg in "$@"; do
 done
 
 # Round-robin between the two REAL scenarios when none is named. mesh-peer-drop
-# is a stub — never auto-selected, only runnable by explicit name.
+# is a stub, and memory-token-wipe touches a muninn vault token — neither is
+# ever auto-selected; both run only when named explicitly.
 if [[ -z "$SCENARIO" ]]; then
     WEEK="$(date +%V)"
     if (( WEEK % 2 == 0 )); then
@@ -179,6 +199,24 @@ guest_id_denied() {
 config_key_denied() {
     case "$1" in
         chaos_smoke.*) return 1 ;;
+        *) return 0 ;;
+    esac
+}
+
+# ── Rail 6: memory-token-wipe sacrificial-vault guard ───────────────────────
+# The drill corrupts a muninn vault token. That is exactly the action behind
+# the 2026-07-20/21 incidents, so the vault must be explicitly sacrificial:
+# name starts with "chaos_smoke", and never a real memory vault. Mirrored in
+# crates/philotic-client/examples/memory_token_drill_driver.rs
+# (vault_name_denied) so neither layer can be the only thing standing between
+# a drill and a real vault.
+vault_name_denied() {
+    case "$1" in
+        default|default_*) return 0 ;;
+        self_*) return 0 ;;
+        user_*) return 0 ;;
+        session_*) return 0 ;;
+        chaos_smoke*) return 1 ;;
         *) return 0 ;;
     esac
 }
@@ -461,6 +499,86 @@ scenario_config_corrupt() {
     return 0
 }
 
+# ── Scenario: memory-token-wipe ─────────────────────────────────────────
+# proposal:memory-token-self-heal S4 (key-wipe-drill). Asserts the full
+# self-heal circuit for the muninn token<->key binding: corrupt the stored
+# token, then confirm the hotel re-mints and serves a refreshed config with
+# no restart and no manual step.
+#
+# What it corrupts, and why that differs from the incident: the 2026-07-20/21
+# incidents wiped MUNINN's half of the binding (the Pebble key store). This
+# drill corrupts THE HOTEL's half via RotateSecret instead. Both produce an
+# identical token-401 at the identical with_auth call site, so the circuit
+# under test is the same — but this never touches Pebble, needs no admin
+# credential to break anything, and therefore cannot strand a real vault.
+#
+# Requires a deliberately-provisioned sacrificial vault. It never creates
+# one: an absent sacrificial vault is a REFUSAL, not a failure, exactly like
+# config-corrupt's dedicated key.
+scenario_memory_token_wipe() {
+    if vault_name_denied "$DRILL_VAULT"; then
+        log "REFUSING: PHILOTIC_CHAOS_DRILL_VAULT='$DRILL_VAULT' is not a sacrificial vault (must start with chaos_smoke, never default/self_*/user_*/session_*)."
+        return 2
+    fi
+
+    local socket="${PHILOTIC_HOTEL_SOCKET:-}"
+    if [[ -z "$socket" || ! -S "$socket" ]]; then
+        log "REFUSING: PHILOTIC_HOTEL_SOCKET is unset or not a socket ('${socket:-<unset>}') — the drill drives the hotel over IPC."
+        return 2
+    fi
+
+    local driver="$ROOT_DIR/target/release/examples/memory_token_drill_driver"
+    [[ -x "$driver" ]] || driver="$ROOT_DIR/target/debug/examples/memory_token_drill_driver"
+    if [[ ! -x "$driver" ]]; then
+        log "REFUSING: drill driver not built. Run: cargo build -p philotic-client --example memory_token_drill_driver"
+        return 2
+    fi
+
+    if [[ $DRY_RUN -eq 1 ]]; then
+        log "[dry-run] would run the READ-ONLY probe (FetchMemoryConfig served live + HealMemoryToken refuses an unregistered vault), then, only if '$DRILL_VAULT' is registered in vault_registry, corrupt its stored token via RotateSecret and assert HealMemoryToken re-mints it. Original token is captured first and restored on any failure. Nothing is touched in dry-run."
+        log "[dry-run] driver: $driver"
+        return 0
+    fi
+
+    # The read-only probe runs first and unconditionally: it proves the IPC
+    # verbs are wired in the RUNNING binary and that the registered-vaults-only
+    # rail holds, before anything destructive is attempted.
+    log "running read-only probe (no vault is touched)..."
+    local probe_out probe_rc
+    probe_out="$(PHILOTIC_HOTEL_SOCKET="$socket" "$driver" probe 2>&1)"
+    probe_rc=$?
+    echo "$probe_out" | sed 's/^/  /' >&2
+    if [[ $probe_rc -ne 0 ]]; then
+        file_failure "memory-token-wipe" \
+            "read-only probe failed: the hotel did not serve memory config live, or the registered-vaults-only heal rail did not hold" \
+            "hotel:$HOTEL" "vault:$DRILL_VAULT" "probe_output:$probe_out"
+        return 1
+    fi
+
+    # Destructive phase — gated on the sacrificial vault actually existing.
+    if ! echo "$probe_out" | grep -q "vault=${DRILL_VAULT}\b"; then
+        log "REFUSING the destructive phase: sacrificial vault '$DRILL_VAULT' is not registered in vault_registry on this hotel."
+        log "  The probe passed, so S1-S3 are wired; the corrupt/heal assertion needs a deliberately-provisioned sacrificial vault."
+        log "  This drill never auto-creates one — provisioning a muninn vault is an operator action."
+        return 2
+    fi
+
+    log "running destructive corrupt->heal drill against sacrificial vault '$DRILL_VAULT'..."
+    local drill_out drill_rc
+    drill_out="$(PHILOTIC_HOTEL_SOCKET="$socket" "$driver" drill "$DRILL_VAULT" 2>&1)"
+    drill_rc=$?
+    echo "$drill_out" | sed 's/^/  /' >&2
+    if [[ $drill_rc -ne 0 ]]; then
+        file_failure "memory-token-wipe" \
+            "self-heal circuit did not close: a corrupted vault token was not re-minted into a refreshed config" \
+            "hotel:$HOTEL" "vault:$DRILL_VAULT" "drill_output:$drill_out"
+        return 1
+    fi
+
+    log "PASS: memory-token-wipe — corrupted token was re-minted and the refreshed config served without a restart."
+    return 0
+}
+
 # ── Scenario: mesh-peer-drop (STUB) ─────────────────────────────────────
 scenario_mesh_peer_drop() {
     cat <<'EOF'
@@ -514,8 +632,9 @@ main() {
 
     local status=0
     case "$SCENARIO" in
-        guest-kill)     scenario_guest_kill "$db_path"; status=$? ;;
-        config-corrupt) scenario_config_corrupt "$db_path"; status=$? ;;
+        guest-kill)        scenario_guest_kill "$db_path"; status=$? ;;
+        config-corrupt)    scenario_config_corrupt "$db_path"; status=$? ;;
+        memory-token-wipe) scenario_memory_token_wipe; status=$? ;;
         *)
             log "unknown scenario: $SCENARIO" >&2
             exit 2

@@ -386,6 +386,11 @@ pub fn tools_for_skill(skill_name: &str) -> &'static [&'static str] {
             "mcp.upstreams",
             "mcp.set_credential",
         ],
+        "integration.manage" => &[
+            "integration.bind_http",
+            "integration.unbind",
+            "integration.list",
+        ],
         _ => &[],
     }
 }
@@ -585,6 +590,14 @@ pub fn skill_is_relevant_for_turn(skill_name: &str, turn_text: &str) -> bool {
                 || t.contains("mcp route")
                 || t.contains("upstream")
                 || t.contains("connect mcp")
+        }
+        "integration.manage" => {
+            t.contains("integration")
+                || t.contains("http api")
+                || t.contains("api binding")
+                || t.contains("outbound api")
+                || t.contains("egress")
+                || t.contains("exit hotel")
         }
         _ => false,
     }
@@ -3099,6 +3112,15 @@ fn build_catalog() -> HashMap<String, ToolDefinition> {
                                         tools. Absent = owner only.",
                         "items": { "type": "string" }
                     },
+                    "placement": {
+                        "type": "object",
+                        "description": "Optional HTTP exit placement using the same tagged policy as integration.bind_http. MCP protocol ownership stays local; only HTTP transport runs at the selected hotel."
+                    },
+                    "network_scope": {
+                        "type": "string",
+                        "enum": ["public", "loopback", "tailnet", "private"],
+                        "description": "Optional resolved-address scope. Literal loopback/tailnet/private IPs are inferred; DNS names default to public."
+                    },
                     "credential_ref": {
                         "type": "string",
                         "description": "Optional vault secret ref holding the bearer token \
@@ -3108,6 +3130,104 @@ fn build_catalog() -> HashMap<String, ToolDefinition> {
                 "required": ["upstream_id", "url", "tools"]
             }),
             class: Some("config".into()),
+        },
+    );
+
+    m.insert(
+        "integration.bind_http".into(),
+        ToolDefinition {
+            tool_name: "integration.bind_http".into(),
+            description: "Create or update a governed outbound HTTP integration. The binding \
+                          grants a named API capability, never arbitrary network access: base URL, \
+                          methods, path prefixes, headers, address scope, byte/time limits, agent \
+                          grants, and hotel exit placement are all explicit. Prefer \
+                          {mode:'prefer_hotel',hotel_id:'vps-jane',fallback:'deny'} for public APIs \
+                          that should normally exit through vps-jane; use local for device-bound \
+                          resources. This is a high-agency configuration action."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["binding_id", "base_url", "allowed_methods", "allowed_path_prefixes"],
+                "properties": {
+                    "binding_id": {"type": "string"},
+                    "display_name": {"type": "string"},
+                    "base_url": {"type": "string"},
+                    "allowed_methods": {
+                        "type": "array",
+                        "items": {"type": "string", "enum": ["GET","HEAD","POST","PUT","PATCH","DELETE","OPTIONS"]}
+                    },
+                    "allowed_path_prefixes": {"type": "array", "items": {"type": "string"}},
+                    "allowed_request_headers": {"type": "array", "items": {"type": "string"}},
+                    "default_headers": {"type": "object", "additionalProperties": {"type": "string"}},
+                    "response_header_allowlist": {"type": "array", "items": {"type": "string"}},
+                    "allowed_redirect_hosts": {"type": "array", "items": {"type": "string"}},
+                    "network_scope": {
+                        "type": "string",
+                        "enum": ["public", "loopback", "tailnet", "private"],
+                        "default": "public"
+                    },
+                    "traffic_class": {
+                        "type": "string",
+                        "enum": ["communication","general_api","mcp","model_provider","mesh_peer","local_resource","artifact"],
+                        "default": "general_api"
+                    },
+                    "placement": {
+                        "type": "object",
+                        "description": "Tagged placement policy: {mode:'local'}, {mode:'prefer_hotel',hotel_id:'vps-jane',fallback:'deny'|'local_with_audit'}, {mode:'require_hotel',hotel_id:'vps-jane'}, or {mode:'deny'}."
+                    },
+                    "grant_agents": {"type": "array", "items": {"type": "string"}},
+                    "grant_skills": {
+                        "type": "array",
+                        "description": "Optional SkillDAG dependencies. When non-empty, the projected tool appears only in sessions whose effective skill set contains at least one named skill.",
+                        "items": {"type": "string"}
+                    },
+                    "requires_approval": {"type": "boolean", "default": true},
+                    "credential_header": {
+                        "type": "string",
+                        "description": "Optional runner-owned injection header, e.g. Authorization. Pair with credential_format; an operator must provision the value outside the model path with phil integration set-credential."
+                    },
+                    "credential_format": {
+                        "type": "string",
+                        "description": "Format containing exactly one {}, e.g. 'Bearer {}'."
+                    },
+                    "timeout_secs": {"type": "integer", "minimum": 1, "maximum": 300},
+                    "max_request_bytes": {"type": "integer", "minimum": 1},
+                    "max_response_bytes": {"type": "integer", "minimum": 1},
+                    "max_redirects": {"type": "integer", "minimum": 0, "maximum": 10}
+                }
+            }),
+            class: Some("config".into()),
+        },
+    );
+
+    m.insert(
+        "integration.unbind".into(),
+        ToolDefinition {
+            tool_name: "integration.unbind".into(),
+            description: "Revoke a governed outbound integration owned by this agent. The \
+                          projected http:<binding>.request tool disappears immediately."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["binding_id"],
+                "properties": {"binding_id": {"type": "string"}}
+            }),
+            class: Some("config".into()),
+        },
+    );
+
+    m.insert(
+        "integration.list".into(),
+        ToolDefinition {
+            tool_name: "integration.list".into(),
+            description: "List governed outbound integration bindings with their current \
+                          placement decision, execution node, reachability, grants, and projected \
+                          tool name. Secret values are never included."
+                .into(),
+            input_schema: json!({"type": "object", "properties": {}}),
+            class: Some("session".into()),
         },
     );
 
@@ -3345,6 +3465,40 @@ fn build_catalog() -> HashMap<String, ToolDefinition> {
                         "type": "array",
                         "items": {"type": "object"},
                         "default": []
+                    },
+                    "edges": {
+                        "type": "array",
+                        "default": [],
+                        "description": "Typed edges from this node to existing nodes. Living-cycle: \
+                            OWNS, SHAPES, SETS, SPAWNS, RELATES_TO. Agenda (endpoint-validated): \
+                            ADVANCES (NextAction/Habit/Project→Goal), \
+                            BLOCKED_BY (Goal/NextAction/Project→Concern/OpenLoop/Commitment), \
+                            NEEDS_FOLLOWUP (Event/Commitment/OpenLoop→NextAction/Commitment), \
+                            PROMISED_TO (Commitment→Person), \
+                            CONTAINS (Project/System/Routine→NextAction/Habit/OpenLoop), \
+                            SUPPORTS (System/Habit/Routine→Goal/Habit). \
+                            ALWAYS wire new Goals, NextActions, Commitments and OpenLoops into the \
+                            agenda: a NextAction should ADVANCES its Goal; a Commitment should be \
+                            PROMISED_TO its Person. A target_id that matches no node (or the wrong \
+                            node type) writes nothing and is reported as target_missing.",
+                        "items": {
+                            "type": "object",
+                            "required": ["rel_type", "target_id"],
+                            "properties": {
+                                "rel_type": {
+                                    "type": "string",
+                                    "enum": [
+                                        "OWNS", "SHAPES", "SETS", "SPAWNS", "RELATES_TO",
+                                        "ADVANCES", "BLOCKED_BY", "NEEDS_FOLLOWUP",
+                                        "PROMISED_TO", "CONTAINS", "SUPPORTS"
+                                    ]
+                                },
+                                "target_id": {
+                                    "type": "string",
+                                    "description": "Existing Life Graph node ID the edge points to."
+                                }
+                            }
+                        }
                     }
                 }
             }),

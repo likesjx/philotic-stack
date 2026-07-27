@@ -15,14 +15,19 @@
 //! + provenance and raises alerts. It does not touch live availability,
 //! reachability, or per-turn routing.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use tracing::{info, warn};
 
 use ansible_mesh_core::domain::GraphDomain;
 use ansible_mesh_core::heal_queue::{HealQueueStorage, SqliteHealQueueStorage};
+use ansible_mesh_core::integration::{
+    EgressFallback, EgressPlacementPolicy, EgressTrafficClass, HttpIntegrationRequest,
+    HttpIntegrationTarget, IntegrationBinding, IntegrationTarget, infer_http_network_scope,
+};
 use ansible_mesh_core::model_catalog_discovery::{
     CatalogDiffEvent, CatalogDiffKind, DiscoveredModel, diff_catalog, parse_openrouter_models,
 };
@@ -31,7 +36,13 @@ use ansible_mesh_core::model_routing::{
 };
 use ansible_mesh_core::provider_keys::provider_key_specs;
 
+use super::governed_http::GovernedHttpService;
+
 const OPENROUTER_URL: &str = "https://openrouter.ai/api/v1/models";
+const BINDING_ID: &str = "model-catalog-openrouter";
+const SYSTEM_GUEST_ID: &str = "system:model-catalog-sync";
+const SYSTEM_ROLE: &str = "model-catalog-sync";
+const DEFAULT_EXIT_HOTEL: &str = "vps-jane";
 /// Config-node key holding the last OpenRouter discovery snapshot, so diffs
 /// survive hotel restarts (the deprecation that bit us happened *during*
 /// downtime — an in-memory `prev` would have missed it).
@@ -50,12 +61,13 @@ const INITIAL_DELAY_SECS: u64 = 45;
 
 /// Spawn the periodic discovery loop. Bare interval loop (ends on process exit),
 /// matching the network-poll loop style in `main.rs`.
-pub fn spawn_loop(graph: Arc<GraphDomain>, db_path: String) {
+pub fn spawn_loop(
+    graph: Arc<GraphDomain>,
+    db_path: String,
+    socket_path: String,
+    local_node_id: String,
+) {
     tokio::spawn(async move {
-        let http = reqwest::Client::builder()
-            .timeout(Duration::from_secs(30))
-            .build()
-            .unwrap_or_else(|_| reqwest::Client::new());
         let heal: Option<Arc<dyn HealQueueStorage>> = match SqliteHealQueueStorage::open(&db_path) {
             Ok(h) => Some(Arc::new(h)),
             Err(e) => {
@@ -64,11 +76,16 @@ pub fn spawn_loop(graph: Arc<GraphDomain>, db_path: String) {
             }
         };
 
-        tokio::time::sleep(Duration::from_secs(INITIAL_DELAY_SECS)).await;
-        let mut interval = tokio::time::interval(Duration::from_secs(SYNC_INTERVAL_SECS));
+        tokio::time::sleep(Duration::from_secs(initial_delay_secs())).await;
+        let mut interval = tokio::time::interval(Duration::from_secs(sync_interval_secs()));
         loop {
             interval.tick().await;
-            if let Err(e) = run_once(&graph, heal.as_ref(), &http).await {
+            let result = async {
+                let body = fetch_openrouter_catalog(&socket_path, &local_node_id).await?;
+                run_once(&graph, heal.as_ref(), &body).await
+            }
+            .await;
+            if let Err(e) = result {
                 warn!("model-catalog-sync: run failed: {e:#}");
             }
         }
@@ -79,25 +96,14 @@ pub fn spawn_loop(graph: Arc<GraphDomain>, db_path: String) {
 pub async fn run_once(
     graph: &GraphDomain,
     heal: Option<&Arc<dyn HealQueueStorage>>,
-    http: &reqwest::Client,
+    body: &str,
 ) -> Result<()> {
     let now_secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .ok();
 
-    let body = http
-        .get(OPENROUTER_URL)
-        .send()
-        .await
-        .context("fetch OpenRouter model list")?
-        .error_for_status()
-        .context("OpenRouter model list returned an error status")?
-        .text()
-        .await
-        .context("read OpenRouter model list body")?;
-
-    let discovered = parse_openrouter_models(&body, now_secs)?;
+    let discovered = parse_openrouter_models(body, now_secs)?;
 
     let prev: Vec<DiscoveredModel> = match graph.get_config_value(SNAPSHOT_KEY)? {
         Some(json) => serde_json::from_str(&json).unwrap_or_default(),
@@ -159,6 +165,125 @@ pub async fn run_once(
         "model-catalog-sync: catalog synced"
     );
     Ok(())
+}
+
+async fn fetch_openrouter_catalog(socket_path: &str, local_node_id: &str) -> Result<String> {
+    let source_url =
+        std::env::var("PHILOTIC_MODEL_CATALOG_URL").unwrap_or_else(|_| OPENROUTER_URL.into());
+    let (binding, request) = openrouter_binding(&source_url)?;
+    let response = GovernedHttpService {
+        socket_path: socket_path.to_string(),
+        local_node_id: local_node_id.to_string(),
+        guest_id: SYSTEM_GUEST_ID.into(),
+        role: SYSTEM_ROLE.into(),
+    }
+    .execute(binding, request, "openrouter model catalog")
+    .await
+    .context("fetch OpenRouter model list through governed egress")?;
+    if !(200..300).contains(&response.status) {
+        bail!(
+            "OpenRouter model list returned HTTP {} through governed egress",
+            response.status
+        );
+    }
+    Ok(response.body)
+}
+
+fn openrouter_binding(source_url: &str) -> Result<(IntegrationBinding, HttpIntegrationRequest)> {
+    let exit_hotel = std::env::var("PHILOTIC_MODEL_CATALOG_EXIT_HOTEL")
+        .unwrap_or_else(|_| DEFAULT_EXIT_HOTEL.into());
+    openrouter_binding_for_exit(source_url, &exit_hotel)
+}
+
+fn openrouter_binding_for_exit(
+    source_url: &str,
+    exit_hotel: &str,
+) -> Result<(IntegrationBinding, HttpIntegrationRequest)> {
+    let parsed = reqwest::Url::parse(source_url).context("invalid model catalog source URL")?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        bail!("model catalog source URL must use HTTP(S)");
+    }
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        bail!("model catalog source URL must not contain userinfo");
+    }
+    if parsed.query().is_some() || parsed.fragment().is_some() {
+        bail!("model catalog source URL must not contain query or fragment");
+    }
+    let host = parsed
+        .host_str()
+        .context("model catalog source URL has no host")?;
+    let origin = parsed.origin().ascii_serialization();
+    let path = parsed.path().to_string();
+    let placement = if exit_hotel.trim().is_empty() || exit_hotel.eq_ignore_ascii_case("local") {
+        EgressPlacementPolicy::Local
+    } else {
+        EgressPlacementPolicy::PreferHotel {
+            hotel_id: exit_hotel.to_string(),
+            fallback: EgressFallback::LocalWithAudit,
+        }
+    };
+    let updated_at = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(1)
+        .max(1);
+    let binding = IntegrationBinding {
+        binding_id: BINDING_ID.into(),
+        owner_agent_id: SYSTEM_GUEST_ID.into(),
+        display_name: Some("OpenRouter model catalog".into()),
+        target: IntegrationTarget::Http(HttpIntegrationTarget {
+            base_url: origin,
+            allowed_methods: vec!["GET".into()],
+            allowed_path_prefixes: vec![path.clone()],
+            allowed_request_headers: Vec::new(),
+            default_headers: BTreeMap::from([("accept".into(), "application/json".into())]),
+            response_header_allowlist: vec!["content-type".into()],
+            allowed_redirect_hosts: Vec::new(),
+            network_scope: infer_http_network_scope(host),
+            credential: None,
+            timeout_secs: 30,
+            max_request_bytes: 1024,
+            max_response_bytes: 4 * 1024 * 1024,
+            max_redirects: 0,
+        }),
+        grant_agents: Vec::new(),
+        grant_skills: Vec::new(),
+        traffic_class: EgressTrafficClass::GeneralApi,
+        placement,
+        requires_approval: false,
+        enabled: true,
+        updated_at,
+    };
+    binding
+        .validate()
+        .map_err(anyhow::Error::msg)
+        .context("invalid model catalog integration binding")?;
+    Ok((
+        binding,
+        HttpIntegrationRequest {
+            binding_id: BINDING_ID.into(),
+            method: "GET".into(),
+            path,
+            query: BTreeMap::new(),
+            headers: BTreeMap::new(),
+            body: None,
+        },
+    ))
+}
+
+fn initial_delay_secs() -> u64 {
+    std::env::var("PHILOTIC_MODEL_CATALOG_INITIAL_DELAY_SECS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(INITIAL_DELAY_SECS)
+}
+
+fn sync_interval_secs() -> u64 {
+    std::env::var("PHILOTIC_MODEL_CATALOG_INTERVAL_SECS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(SYNC_INTERVAL_SECS)
 }
 
 /// Project the full discovery snapshot into the compact guest-facing catalog
@@ -391,5 +516,54 @@ mod tests {
             compact[0].get("think").is_none(),
             "unreported fields are omitted"
         );
+    }
+
+    #[test]
+    fn catalog_binding_is_narrow_public_and_credential_free() {
+        let (binding, request) =
+            openrouter_binding_for_exit("https://openrouter.ai/api/v1/models", "vps-jane")
+                .expect("binding");
+
+        assert_eq!(binding.binding_id, BINDING_ID);
+        assert_eq!(binding.owner_agent_id, SYSTEM_GUEST_ID);
+        assert_eq!(binding.traffic_class, EgressTrafficClass::GeneralApi);
+        assert!(!binding.requires_approval);
+        assert_eq!(
+            binding.placement,
+            EgressPlacementPolicy::PreferHotel {
+                hotel_id: "vps-jane".into(),
+                fallback: EgressFallback::LocalWithAudit,
+            }
+        );
+        let IntegrationTarget::Http(target) = binding.target else {
+            panic!("expected HTTP target");
+        };
+        assert_eq!(target.base_url, "https://openrouter.ai");
+        assert_eq!(target.allowed_methods, ["GET"]);
+        assert_eq!(target.allowed_path_prefixes, ["/api/v1/models"]);
+        assert_eq!(
+            target.network_scope,
+            ansible_mesh_core::integration::HttpNetworkScope::Public
+        );
+        assert!(target.credential.is_none());
+        assert_eq!(target.max_redirects, 0);
+        assert_eq!(request.path, "/api/v1/models");
+        assert!(request.query.is_empty());
+    }
+
+    #[test]
+    fn catalog_binding_can_be_pinned_local_for_smoke_without_broadening_scope() {
+        let (binding, _) =
+            openrouter_binding_for_exit("http://127.0.0.1:8123/api/v1/models", "local")
+                .expect("binding");
+        assert_eq!(binding.placement, EgressPlacementPolicy::Local);
+        let IntegrationTarget::Http(target) = binding.target else {
+            panic!("expected HTTP target");
+        };
+        assert_eq!(
+            target.network_scope,
+            ansible_mesh_core::integration::HttpNetworkScope::Loopback
+        );
+        assert_eq!(target.allowed_path_prefixes, ["/api/v1/models"]);
     }
 }

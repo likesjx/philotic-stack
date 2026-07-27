@@ -58,6 +58,73 @@ pub fn is_living_cycle_rel_type(rel_type: &str) -> bool {
     LIVING_CYCLE_REL_TYPES.contains(&rel_type)
 }
 
+/// Endpoint rule for an agenda relationship: which source labels may write it
+/// and which target labels it may land on. Mirrors the Relationship Types
+/// table in `docs/architecture/life-graph/LIFE_GRAPH_SCHEMA.md`.
+#[derive(Debug)]
+pub struct AgendaEdgeRule {
+    pub rel_type: &'static str,
+    pub source_labels: &'static [&'static str],
+    pub target_labels: &'static [&'static str],
+}
+
+/// Agenda relationship types allowed on `life.observe` edge writes
+/// (LIFE_GRAPH_ACTIVE proposal, slice S2). Unlike the living-cycle six,
+/// these are endpoint-validated: the source label is checked at compile
+/// time and the target label is enforced in the query itself, so agents
+/// cannot wire junk topology. The vocabulary stays closed — anything not
+/// living-cycle or agenda is rejected before the node write.
+pub const AGENDA_EDGE_RULES: &[AgendaEdgeRule] = &[
+    AgendaEdgeRule {
+        rel_type: "ADVANCES",
+        source_labels: &["NextAction", "Habit", "Project"],
+        target_labels: &["Goal"],
+    },
+    AgendaEdgeRule {
+        rel_type: "BLOCKED_BY",
+        source_labels: &["Goal", "NextAction", "Project"],
+        target_labels: &["Concern", "OpenLoop", "Commitment"],
+    },
+    AgendaEdgeRule {
+        rel_type: "NEEDS_FOLLOWUP",
+        source_labels: &["Event", "Commitment", "OpenLoop"],
+        target_labels: &["NextAction", "Commitment"],
+    },
+    AgendaEdgeRule {
+        rel_type: "PROMISED_TO",
+        source_labels: &["Commitment"],
+        target_labels: &["Person"],
+    },
+    AgendaEdgeRule {
+        rel_type: "CONTAINS",
+        source_labels: &["Project", "System", "Routine"],
+        target_labels: &["NextAction", "Habit", "OpenLoop"],
+    },
+    AgendaEdgeRule {
+        rel_type: "SUPPORTS",
+        source_labels: &["System", "Habit", "Routine"],
+        target_labels: &["Goal", "Habit"],
+    },
+];
+
+pub fn agenda_edge_rule(rel_type: &str) -> Option<&'static AgendaEdgeRule> {
+    AGENDA_EDGE_RULES.iter().find(|r| r.rel_type == rel_type)
+}
+
+pub fn is_agenda_rel_type(rel_type: &str) -> bool {
+    agenda_edge_rule(rel_type).is_some()
+}
+
+/// Every rel_type accepted on a `life.observe` edge write, for error text.
+pub fn observe_rel_type_vocabulary() -> String {
+    let agenda = AGENDA_EDGE_RULES
+        .iter()
+        .map(|r| r.rel_type)
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("{}, {}", LIVING_CYCLE_REL_TYPES.join(", "), agenda)
+}
+
 /// Build the server-side structural anchor edge for a `life.observe` write:
 /// `node -SCOPED_TO-> Role`. Resolves the target through
 /// [`crate::zoning::canonical_role_node_id_for_agent`] — the SAME
@@ -327,15 +394,29 @@ pub fn compile_observe_edges(input: &LifeObserveInput) -> Result<Vec<ObserveEdge
 
     let mut compiled = Vec::with_capacity(input.edges.len());
     for edge in &input.edges {
-        if !is_living_cycle_rel_type(&edge.rel_type) {
+        let agenda_rule = agenda_edge_rule(&edge.rel_type);
+        if !is_living_cycle_rel_type(&edge.rel_type) && agenda_rule.is_none() {
             return Err(format!(
-                "unknown living-cycle rel_type: {} (expected one of {})",
+                "unknown rel_type: {} (expected one of {})",
                 edge.rel_type,
-                LIVING_CYCLE_REL_TYPES.join(", ")
+                observe_rel_type_vocabulary()
             ));
         }
         if edge.target_id.trim().is_empty() {
             return Err("edge target_id must not be empty".to_string());
+        }
+        // Agenda edges are endpoint-validated (living-cycle edges are not):
+        // wrong source label is a compile-time rejection; the target label
+        // constraint is baked into the MATCH below, so a wrong-label target
+        // writes nothing and surfaces as target_missing.
+        if let Some(rule) = agenda_rule {
+            if !rule.source_labels.contains(&label.as_str()) {
+                return Err(format!(
+                    "rel_type {} not allowed from {label} (allowed sources: {})",
+                    rule.rel_type,
+                    rule.source_labels.join(", ")
+                ));
+            }
         }
 
         // Label and rel_type are both whitelisted above — safe to interpolate.
@@ -365,9 +446,20 @@ pub fn compile_observe_edges(input: &LifeObserveInput) -> Result<Vec<ObserveEdge
         // comment for any future consumer.
         let will_upsert = edge.upsert_target && edge.rel_type == "SCOPED_TO";
         let target_clause = if will_upsert {
-            "MERGE (t:Role {id: $target_id}) ON CREATE SET t.name = $target_id, t.created_at = $created_at "
+            "MERGE (t:Role {id: $target_id}) ON CREATE SET t.name = $target_id, t.created_at = $created_at ".to_string()
+        } else if let Some(rule) = agenda_rule {
+            // Target labels come from the static AGENDA_EDGE_RULES table —
+            // safe to interpolate. A target that exists under a different
+            // label matches nothing, preserving target_missing semantics.
+            let predicate = rule
+                .target_labels
+                .iter()
+                .map(|l| format!("t:{l}"))
+                .collect::<Vec<_>>()
+                .join(" OR ");
+            format!("MATCH (t {{id: $target_id}}) WHERE {predicate} ")
         } else {
-            "MATCH (t {id: $target_id}) "
+            "MATCH (t {id: $target_id}) ".to_string()
         };
         let query = format!(
             concat!(
@@ -1222,6 +1314,91 @@ mod tests {
 
         let err = compile_observe_edges(&input).unwrap_err();
         assert!(err.contains("target_id"));
+    }
+
+    #[test]
+    fn compile_observe_edges_agenda_edge_constrains_target_label() {
+        let mut input = minimal_observe_input("NextAction");
+        input.evidence.claim_ref.id = "life:next_action:book-erg-slot".to_string();
+        input.edges = vec![crate::ObserveEdge {
+            rel_type: "ADVANCES".into(),
+            target_id: "life:goal:row-weekly".into(),
+            upsert_target: false,
+        }];
+
+        let compiled = compile_observe_edges(&input).unwrap();
+        assert_eq!(compiled.len(), 1);
+        assert!(!compiled[0].upsert_target);
+        assert!(compiled[0].query.contains("MATCH (n:NextAction {id: $id})"));
+        assert!(compiled[0]
+            .query
+            .contains("MATCH (t {id: $target_id}) WHERE t:Goal"));
+        assert!(compiled[0].query.contains("MERGE (n)-[r:ADVANCES]->(t)"));
+    }
+
+    #[test]
+    fn compile_observe_edges_agenda_edge_multi_target_labels_are_ored() {
+        let mut input = minimal_observe_input("Goal");
+        input.edges = vec![crate::ObserveEdge {
+            rel_type: "BLOCKED_BY".into(),
+            target_id: "life:open_loop:garage".into(),
+            upsert_target: false,
+        }];
+
+        let compiled = compile_observe_edges(&input).unwrap();
+        assert!(compiled[0]
+            .query
+            .contains("WHERE t:Concern OR t:OpenLoop OR t:Commitment"));
+    }
+
+    #[test]
+    fn compile_observe_edges_agenda_edge_rejects_wrong_source_label() {
+        // PROMISED_TO may only be written from a Commitment.
+        let mut input = minimal_observe_input("Goal");
+        input.edges = vec![crate::ObserveEdge {
+            rel_type: "PROMISED_TO".into(),
+            target_id: "life:person:sam".into(),
+            upsert_target: false,
+        }];
+
+        let err = compile_observe_edges(&input).unwrap_err();
+        assert!(err.contains("PROMISED_TO"));
+        assert!(err.contains("Goal"));
+        assert!(err.contains("Commitment"));
+    }
+
+    #[test]
+    fn compile_observe_edges_agenda_edge_never_upserts_target() {
+        // A mis-set upsert_target on an agenda edge must not manufacture
+        // a target node — same downgrade-to-MATCH rule as non-SCOPED_TO
+        // living-cycle edges.
+        let mut input = minimal_observe_input("Commitment");
+        input.edges = vec![crate::ObserveEdge {
+            rel_type: "PROMISED_TO".into(),
+            target_id: "life:person:sam".into(),
+            upsert_target: true,
+        }];
+
+        let compiled = compile_observe_edges(&input).unwrap();
+        assert!(!compiled[0].upsert_target);
+        assert!(!compiled[0].query.contains("MERGE (t"));
+        assert!(compiled[0]
+            .query
+            .contains("MATCH (t {id: $target_id}) WHERE t:Person"));
+    }
+
+    #[test]
+    fn compile_observe_edges_unknown_rel_error_lists_agenda_vocabulary() {
+        let mut input = minimal_observe_input("Goal");
+        input.edges = vec![crate::ObserveEdge {
+            rel_type: "DESTROYS".into(),
+            target_id: "life:goal:x".into(),
+            upsert_target: false,
+        }];
+
+        let err = compile_observe_edges(&input).unwrap_err();
+        assert!(err.contains("ADVANCES"));
+        assert!(err.contains("SUPPORTS"));
     }
 
     #[test]

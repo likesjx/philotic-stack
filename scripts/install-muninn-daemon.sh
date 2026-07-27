@@ -7,7 +7,7 @@
 # daemon was hand-started, so on 2026-07-23 it died on mbp-jane and stayed down
 # for three days. Every agent on that host ran memory-blind the whole time
 # ("Auto recall skipped: no Muninn memory backend configured") while the heal
-# circuit filed 919 critical entries and repaired nothing. See DEF-070.
+# circuit filed 919 critical entries and repaired nothing. See DEF-071.
 #
 # mac-jane only LOOKED healthy: `muninn mcp` proxies spawned by Claude desktop/
 # CLI clients resurrect the daemon on demand (verified — SIGKILL with no launchd

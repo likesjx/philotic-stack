@@ -1561,6 +1561,12 @@ pub struct SessionBindings {
     /// `GetMcpUpstreams`; descriptions/schemas are third-party content.
     #[serde(default)]
     pub mcp_upstream_tools: Vec<McpUpstreamToolBinding>,
+    /// Governed HTTP integrations projected as `http:<binding>.request`.
+    /// Each entry carries its non-secret binding and the hotel's live placement
+    /// decision so dispatch can route to the selected runner without giving
+    /// the model ambient URL authority.
+    #[serde(default)]
+    pub http_integration_tools: Vec<HttpIntegrationToolBinding>,
 }
 
 /// One projected upstream MCP tool bound into a session (see
@@ -1575,6 +1581,13 @@ pub struct McpUpstreamToolBinding {
     /// Remote input schema verbatim (a JSON object).
     #[serde(default)]
     pub input_schema: serde_json::Value,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HttpIntegrationToolBinding {
+    pub binding: ansible_mesh_core::integration::IntegrationBinding,
+    pub placement: ansible_mesh_core::integration::EgressPlacementDecision,
+    pub execution_node_id: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
