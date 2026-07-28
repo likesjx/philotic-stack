@@ -1,0 +1,25 @@
+@startuml
+participant OperatorBrowser
+participant PhiloticWeb
+participant SourceHotel
+participant EgressRunner
+participant ExitVault
+participant TokenEndpoint
+participant UserInfoEndpoint
+OperatorBrowser -> PhiloticWeb: OIDC callback with code and state
+PhiloticWeb -> PhiloticWeb: Validate state and recover PKCE verifier
+PhiloticWeb -> SourceHotel: Typed provider code verifier and exact redirect URI
+SourceHotel -> SourceHotel: Authorize exact web identity and compile local binding
+SourceHotel -> EgressRunner: Execute local-only OIDC exchange
+EgressRunner -> ExitVault: Resolve client-secret reference
+ExitVault --> EgressRunner: Client-secret value
+EgressRunner -> TokenEndpoint: POST bounded token form
+TokenEndpoint --> EgressRunner: Access and optional refresh tokens
+EgressRunner -> UserInfoEndpoint: GET with runner-local bearer token
+UserInfoEndpoint --> EgressRunner: Provider identity claims
+EgressRunner -> EgressRunner: Allowlist claims and discard token material
+EgressRunner -> SourceHotel: Claims plus two content-free audits
+SourceHotel --> PhiloticWeb: Provider ID and allowlisted claims only
+PhiloticWeb -> SourceHotel: Link identity and issue operator session
+PhiloticWeb --> OperatorBrowser: Same-origin operator session
+@enduml

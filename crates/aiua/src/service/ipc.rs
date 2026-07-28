@@ -4334,6 +4334,148 @@ impl IpcServer {
         }
     }
 
+    async fn exchange_operator_oidc(
+        socket_path: &str,
+        local_node_id: &str,
+        graph: &GraphDomain,
+        provider: &str,
+        authorization_code: String,
+        code_verifier: String,
+        redirect_uri: String,
+    ) -> anyhow::Result<ansible_mesh_core::integration::OidcExchangeResponse> {
+        use ansible_mesh_core::integration::{
+            EgressPlacementPolicy, EgressTrafficClass, HttpNetworkScope, IntegrationBinding,
+            IntegrationTarget, OidcExchangeRequest, OidcIntegrationTarget,
+        };
+
+        let provider = provider.trim().to_ascii_lowercase();
+        let (client_id_key, client_secret_ref_key, default_token_url, default_userinfo_url) =
+            match provider.as_str() {
+                "google" => (
+                    "oidc_google_client_id",
+                    "oidc_google_client_secret_ref",
+                    "https://oauth2.googleapis.com/token",
+                    "https://openidconnect.googleapis.com/v1/userinfo",
+                ),
+                "github" => (
+                    "oidc_github_client_id",
+                    "oidc_github_client_secret_ref",
+                    "https://github.com/login/oauth/access_token",
+                    "https://api.github.com/user",
+                ),
+                _ => anyhow::bail!("unsupported operator OIDC provider '{provider}'"),
+            };
+        let read_config_string = |key: &str| -> anyhow::Result<Option<String>> {
+            Ok(graph
+                .get_config_value(key)?
+                .and_then(|value| serde_json::from_str::<String>(&value).ok())
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty()))
+        };
+        let client_id = read_config_string(client_id_key)?
+            .ok_or_else(|| anyhow::anyhow!("{client_id_key} is not configured"))?;
+        let client_secret_ref = read_config_string(client_secret_ref_key)?
+            .ok_or_else(|| anyhow::anyhow!("{client_secret_ref_key} is not configured"))?;
+        let smoke_mode = std::env::var("PHILOTIC_SMOKE_MODE").as_deref() == Ok("1");
+        let token_url = if smoke_mode {
+            read_config_string(&format!("smoke_oidc_{provider}_token_url"))?
+                .unwrap_or_else(|| default_token_url.into())
+        } else {
+            default_token_url.into()
+        };
+        let userinfo_url = if smoke_mode {
+            read_config_string(&format!("smoke_oidc_{provider}_userinfo_url"))?
+                .unwrap_or_else(|| default_userinfo_url.into())
+        } else {
+            default_userinfo_url.into()
+        };
+        let endpoint_is_loopback = |raw: &str| -> anyhow::Result<bool> {
+            let url = reqwest::Url::parse(raw).context("operator OIDC endpoint URL is invalid")?;
+            let host = url
+                .host_str()
+                .ok_or_else(|| anyhow::anyhow!("operator OIDC endpoint URL has no host"))?;
+            Ok(host == "localhost"
+                || host
+                    .parse::<std::net::IpAddr>()
+                    .is_ok_and(|address| address.is_loopback()))
+        };
+        let token_is_loopback = endpoint_is_loopback(&token_url)?;
+        let userinfo_is_loopback = endpoint_is_loopback(&userinfo_url)?;
+        if token_is_loopback != userinfo_is_loopback {
+            anyhow::bail!(
+                "operator OIDC token and userinfo endpoints must share one network scope"
+            );
+        }
+        let network_scope = if token_is_loopback {
+            HttpNetworkScope::Loopback
+        } else {
+            HttpNetworkScope::Public
+        };
+
+        let redirect = reqwest::Url::parse(&redirect_uri)
+            .context("operator OIDC redirect_uri is invalid")?;
+        if !redirect.username().is_empty() || redirect.password().is_some() {
+            anyhow::bail!("operator OIDC redirect_uri must not contain userinfo");
+        }
+        let expected_path = format!("/auth/oidc/{provider}/callback");
+        if redirect.path() != expected_path {
+            anyhow::bail!(
+                "operator OIDC redirect_uri path '{}' does not match '{}'",
+                redirect.path(),
+                expected_path
+            );
+        }
+        if redirect.scheme() != "https"
+            && !(redirect.scheme() == "http"
+                && redirect
+                    .host_str()
+                    .is_some_and(|host| matches!(host, "127.0.0.1" | "localhost" | "::1")))
+        {
+            anyhow::bail!("operator OIDC redirect_uri must use HTTPS or HTTP loopback");
+        }
+
+        let binding_id = format!("operator-oidc-{provider}");
+        let binding = IntegrationBinding {
+            binding_id: binding_id.clone(),
+            owner_agent_id: "operator-auth-egress".into(),
+            display_name: Some(format!("{provider} operator OIDC exchange")),
+            target: IntegrationTarget::Oidc(OidcIntegrationTarget {
+                provider_id: provider,
+                client_id,
+                client_secret_ref: Some(client_secret_ref),
+                token_url,
+                userinfo_url,
+                redirect_uri: redirect.to_string(),
+                network_scope,
+                timeout_secs: 15,
+                max_response_bytes: 64 * 1024,
+            }),
+            grant_agents: Vec::new(),
+            grant_skills: Vec::new(),
+            traffic_class: EgressTrafficClass::GeneralApi,
+            placement: EgressPlacementPolicy::Local,
+            requires_approval: false,
+            enabled: true,
+            updated_at: unix_ts(),
+        };
+        crate::service::governed_http::GovernedHttpService {
+            socket_path: socket_path.to_string(),
+            local_node_id: local_node_id.to_string(),
+            guest_id: "operator-auth-egress".into(),
+            role: "operator-auth-egress".into(),
+        }
+        .execute_oidc(
+            binding,
+            OidcExchangeRequest {
+                binding_id,
+                authorization_code,
+                code_verifier,
+            },
+            "operator OIDC exchange",
+        )
+        .await
+    }
+
     async fn process_request(
         req: IpcRequest,
         local_node_id: &str,
@@ -9358,7 +9500,10 @@ impl IpcServer {
                 let entry =
                     Self::integration_binding_entry(binding, registry, graph, local_node_id).await;
                 let materialized_node_id =
-                    if matches!(entry.binding.target, IntegrationTarget::Http(_))
+                    if matches!(
+                        entry.binding.target,
+                        IntegrationTarget::Http(_) | IntegrationTarget::Oidc(_)
+                    )
                         && !matches!(
                             entry.placement,
                             ansible_mesh_core::integration::EgressPlacementDecision::Deny { .. }
@@ -9464,6 +9609,51 @@ impl IpcServer {
                     .sort_by(|left, right| left.binding.binding_id.cmp(&right.binding.binding_id));
                 IpcResponse::IntegrationBindingsState {
                     integration_bindings: entries,
+                }
+            }
+
+            IpcRequest::ExchangeOperatorOidc {
+                provider,
+                authorization_code,
+                code_verifier,
+                redirect_uri,
+            } => {
+                let authorized = current_identity.as_ref().is_some_and(|identity| {
+                    identity.role == "management" && identity.guest_id == "philotic-web-oidc"
+                });
+                if !authorized {
+                    return IpcResponse::error(
+                        "operator_oidc",
+                        "FORBIDDEN",
+                        "operator OIDC exchange requires the philotic-web-oidc management identity",
+                    );
+                }
+                match Self::exchange_operator_oidc(
+                    socket_path,
+                    local_node_id,
+                    graph,
+                    &provider,
+                    authorization_code,
+                    code_verifier,
+                    redirect_uri,
+                )
+                .await
+                {
+                    Ok(response) => IpcResponse::success(
+                        "operator_oidc",
+                        Some(
+                            serde_json::to_value(response)
+                                .unwrap_or_else(|_| serde_json::json!({})),
+                        ),
+                    ),
+                    Err(error) => {
+                        error!(provider, %error, "governed operator OIDC exchange failed");
+                        IpcResponse::error(
+                            "operator_oidc",
+                            "OIDC_EXCHANGE_FAILED",
+                            error.to_string(),
+                        )
+                    }
                 }
             }
 
@@ -9621,6 +9811,7 @@ impl IpcServer {
                         .credential
                         .as_ref()
                         .map(|binding| binding.secret_ref.clone()),
+                    IntegrationTarget::Oidc(target) => target.client_secret_ref.clone(),
                     IntegrationTarget::Mcp { .. } => {
                         return IpcResponse::error(
                             "integration_credential",
@@ -9720,18 +9911,23 @@ impl IpcServer {
                 let binding = bindings
                     .get_mut(&binding_id)
                     .expect("binding snapshot came from this registry");
-                let IntegrationTarget::Http(target) = &mut binding.target else {
-                    unreachable!("MCP target returned above")
-                };
-                match &mut target.credential {
-                    Some(credential_binding) => credential_binding.secret_ref = vault_ref.clone(),
-                    None => {
-                        return IpcResponse::error(
-                            "integration_credential",
-                            "MISSING_CREDENTIAL_INJECTION",
-                            "binding must declare credential header and format before provisioning",
-                        );
+                match &mut binding.target {
+                    IntegrationTarget::Http(target) => match &mut target.credential {
+                        Some(credential_binding) => {
+                            credential_binding.secret_ref = vault_ref.clone()
+                        }
+                        None => {
+                            return IpcResponse::error(
+                                "integration_credential",
+                                "MISSING_CREDENTIAL_INJECTION",
+                                "binding must declare credential header and format before provisioning",
+                            );
+                        }
+                    },
+                    IntegrationTarget::Oidc(target) => {
+                        target.client_secret_ref = Some(vault_ref.clone());
                     }
+                    IntegrationTarget::Mcp { .. } => unreachable!("MCP target returned above"),
                 }
                 binding.updated_at = unix_ts();
                 if let Err(error) = graph.set_config_value(
