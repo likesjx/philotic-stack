@@ -4412,8 +4412,8 @@ impl IpcServer {
             HttpNetworkScope::Public
         };
 
-        let redirect = reqwest::Url::parse(&redirect_uri)
-            .context("operator OIDC redirect_uri is invalid")?;
+        let redirect =
+            reqwest::Url::parse(&redirect_uri).context("operator OIDC redirect_uri is invalid")?;
         if !redirect.username().is_empty() || redirect.password().is_some() {
             anyhow::bail!("operator OIDC redirect_uri must not contain userinfo");
         }
@@ -9499,27 +9499,24 @@ impl IpcServer {
 
                 let entry =
                     Self::integration_binding_entry(binding, registry, graph, local_node_id).await;
-                let materialized_node_id =
-                    if matches!(
-                        entry.binding.target,
-                        IntegrationTarget::Http(_) | IntegrationTarget::Oidc(_)
+                let materialized_node_id = if matches!(
+                    entry.binding.target,
+                    IntegrationTarget::Http(_) | IntegrationTarget::Oidc(_)
+                ) && !matches!(
+                    entry.placement,
+                    ansible_mesh_core::integration::EgressPlacementDecision::Deny { .. }
+                ) {
+                    Self::materialize_integration_runner(
+                        &entry,
+                        registry,
+                        graph,
+                        materialization_requester,
+                        local_node_id,
                     )
-                        && !matches!(
-                            entry.placement,
-                            ansible_mesh_core::integration::EgressPlacementDecision::Deny { .. }
-                        )
-                    {
-                        Self::materialize_integration_runner(
-                            &entry,
-                            registry,
-                            graph,
-                            materialization_requester,
-                            local_node_id,
-                        )
-                        .await
-                    } else {
-                        None
-                    };
+                    .await
+                } else {
+                    None
+                };
                 info!(
                     binding_id,
                     execution_node_id = ?entry.execution_node_id,

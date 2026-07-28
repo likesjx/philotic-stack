@@ -9,17 +9,17 @@
 use std::time::Duration;
 
 use ansible_mesh_core::integration::{
-    projected_http_tool_name, EgressPlacementDecision, HttpIntegrationRequest,
-    HttpIntegrationResponse, IntegrationBinding, OidcExchangeRequest, OidcExchangeResponse,
+    EgressPlacementDecision, HttpIntegrationRequest, HttpIntegrationResponse, IntegrationBinding,
+    OidcExchangeRequest, OidcExchangeResponse, projected_http_tool_name,
 };
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 use philotic_client::{
     GuestIdentity, IntegrationBindingEntry, IpcRequest, IpcResponse, PhiloticClient,
 };
-use serde::de::DeserializeOwned;
 use serde::Serialize;
-use serde_json::{json, Value};
-use tokio::time::{timeout, Instant};
+use serde::de::DeserializeOwned;
+use serde_json::{Value, json};
+use tokio::time::{Instant, timeout};
 use uuid::Uuid;
 
 const RUNNER_ROLE: &str = "egress-http-runner";
