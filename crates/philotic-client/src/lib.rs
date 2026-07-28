@@ -1810,6 +1810,18 @@ pub enum IpcRequest {
         owner_agent_id: String,
         credential: String,
     },
+    /// Perform the local-only OIDC token + userinfo back-channel exchange.
+    ///
+    /// The hotel compiles exact provider endpoints and the configured
+    /// client-secret reference into a system binding. The egress runner
+    /// resolves that secret, consumes the access token internally, and returns
+    /// only sanitized userinfo plus content-free audit metadata.
+    ExchangeOperatorOidc {
+        provider: String,
+        authorization_code: String,
+        code_verifier: String,
+        redirect_uri: String,
+    },
     /// Append secret-free, content-free egress execution evidence.
     RecordIntegrationAudit {
         audit: ansible_mesh_core::integration::HttpIntegrationAudit,
@@ -3588,6 +3600,39 @@ mod tests {
             IpcResponse::Standard { ok: true, code, .. } => assert_eq!(code, "OK"),
             other => panic!("standard response decoded as wrong variant: {other:?}"),
         }
+    }
+
+    #[test]
+    fn operator_oidc_exchange_request_roundtrips_without_secret_material() {
+        let request = IpcRequest::ExchangeOperatorOidc {
+            provider: "google".into(),
+            authorization_code: "one-time-code".into(),
+            code_verifier: "v".repeat(64),
+            redirect_uri: "https://hotel.example/auth/oidc/google/callback".into(),
+        };
+        let bytes = serde_json::to_vec(&request).expect("serialize OIDC exchange request");
+        let decoded =
+            serde_json::from_slice::<IpcRequest>(&bytes).expect("deserialize OIDC exchange request");
+        match decoded {
+            IpcRequest::ExchangeOperatorOidc {
+                provider,
+                authorization_code,
+                code_verifier,
+                redirect_uri,
+            } => {
+                assert_eq!(provider, "google");
+                assert_eq!(authorization_code, "one-time-code");
+                assert_eq!(code_verifier.len(), 64);
+                assert_eq!(
+                    redirect_uri,
+                    "https://hotel.example/auth/oidc/google/callback"
+                );
+            }
+            other => panic!("OIDC exchange request decoded as wrong variant: {other:?}"),
+        }
+        let wire = String::from_utf8(bytes).expect("OIDC request JSON is UTF-8");
+        assert!(!wire.contains("client_secret"));
+        assert!(!wire.contains("access_token"));
     }
 
     #[test]

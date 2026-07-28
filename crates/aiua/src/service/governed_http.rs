@@ -9,15 +9,17 @@
 use std::time::Duration;
 
 use ansible_mesh_core::integration::{
-    EgressPlacementDecision, HttpIntegrationRequest, HttpIntegrationResponse, IntegrationBinding,
-    projected_http_tool_name,
+    projected_http_tool_name, EgressPlacementDecision, HttpIntegrationRequest,
+    HttpIntegrationResponse, IntegrationBinding, OidcExchangeRequest, OidcExchangeResponse,
 };
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{anyhow, bail, Context, Result};
 use philotic_client::{
     GuestIdentity, IntegrationBindingEntry, IpcRequest, IpcResponse, PhiloticClient,
 };
-use serde_json::{Value, json};
-use tokio::time::{Instant, timeout};
+use serde::de::DeserializeOwned;
+use serde::Serialize;
+use serde_json::{json, Value};
+use tokio::time::{timeout, Instant};
 use uuid::Uuid;
 
 const RUNNER_ROLE: &str = "egress-http-runner";
@@ -44,7 +46,48 @@ impl GovernedHttpService {
                 desired_binding.binding_id
             );
         }
+        self.execute_typed(
+            desired_binding,
+            request,
+            |binding_id| projected_http_tool_name(binding_id),
+            operation,
+        )
+        .await
+    }
 
+    pub async fn execute_oidc(
+        &self,
+        desired_binding: IntegrationBinding,
+        request: OidcExchangeRequest,
+        operation: &str,
+    ) -> Result<OidcExchangeResponse> {
+        if request.binding_id != desired_binding.binding_id {
+            bail!(
+                "request binding '{}' does not match desired authority '{}'",
+                request.binding_id,
+                desired_binding.binding_id
+            );
+        }
+        self.execute_typed(
+            desired_binding,
+            request,
+            |binding_id| format!("integration.auth.{binding_id}.exchange"),
+            operation,
+        )
+        .await
+    }
+
+    async fn execute_typed<Request, Response>(
+        &self,
+        desired_binding: IntegrationBinding,
+        request: Request,
+        tool_name: impl FnOnce(&str) -> String,
+        operation: &str,
+    ) -> Result<Response>
+    where
+        Request: Serialize,
+        Response: DeserializeOwned,
+    {
         let mut client = PhiloticClient::connect_at(
             &self.socket_path,
             GuestIdentity {
@@ -84,9 +127,10 @@ impl GovernedHttpService {
 
         let correlation_id = Uuid::new_v4().to_string();
         let session_id = format!("system:{}", self.role);
+        let tool_name = tool_name(&entry.binding.binding_id);
         let task = json!({
             "action": "execute_tool",
-            "tool_name": projected_http_tool_name(&entry.binding.binding_id),
+            "tool_name": tool_name,
             "arguments": request,
             "integration_binding": entry.binding,
             "integration_placement": entry.placement,
@@ -161,7 +205,7 @@ impl GovernedHttpService {
                     .cloned()
                     .ok_or_else(|| anyhow!("governed HTTP reply omitted result"))?,
             )
-            .context("decoding governed HTTP response");
+            .with_context(|| format!("decoding governed operation '{operation}' response"));
         }
     }
 }

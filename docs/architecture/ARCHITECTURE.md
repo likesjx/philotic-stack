@@ -473,6 +473,13 @@ The router is the control and placement plane, not a universal byte proxy.
 `vps-jane` is selected only when a binding prefers or requires it; specialized
 model, membrane, and local-service traffic retains its existing owner.
 
+Operator OIDC back-channel traffic uses a distinct local-only binding:
+`philotic-web` retains browser state, PKCE, identity linking, and session
+issuance, while the hotel and `egress-http-runner` own provider endpoints,
+client-secret resolution, token exchange, userinfo retrieval, claims
+allowlisting, and content-free per-leg audits. Access and refresh tokens never
+return to the web process or cross the mesh.
+
 For the authority map, canonical records, placement and failure semantics,
 runtime paths, and rendered sequence diagrams, see
 [OUTBOUND_INTEGRATIONS.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/OUTBOUND_INTEGRATIONS.md).

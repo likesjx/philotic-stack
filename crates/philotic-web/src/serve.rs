@@ -460,7 +460,6 @@ struct OidcProviderStatusView {
 #[derive(Debug, Clone)]
 struct OidcProviderSettings {
     client_id: Option<String>,
-    client_secret: Option<String>,
     client_secret_ref: Option<String>,
 }
 
@@ -1998,22 +1997,23 @@ async fn handle_auth_oidc_callback(
         }
     };
 
-    let token = match exchange_oidc_code(&provider, code, code_verifier).await {
-        Ok(token) => token,
-        Err(err) => {
-            return oidc_callback_error_response(
-                StatusCode::BAD_GATEWAY,
-                format!("OIDC token exchange failed: {err}"),
-            );
-        }
-    };
-
-    let identity = match fetch_oidc_identity(&provider, &token.access_token).await {
+    let userinfo =
+        match exchange_oidc_identity_via_hotel(&state.socket, &provider, code, code_verifier).await
+        {
+            Ok(userinfo) => userinfo,
+            Err(err) => {
+                return oidc_callback_error_response(
+                    StatusCode::BAD_GATEWAY,
+                    format!("governed OIDC exchange failed: {err}"),
+                );
+            }
+        };
+    let identity = match oidc_identity_from_userinfo(&provider, &userinfo) {
         Ok(identity) => identity,
         Err(err) => {
             return oidc_callback_error_response(
                 StatusCode::BAD_GATEWAY,
-                format!("OIDC identity fetch failed: {err}"),
+                format!("OIDC identity response was invalid: {err}"),
             );
         }
     };
@@ -4063,9 +4063,9 @@ async fn handle_config_oidc(headers: HeaderMap, State(state): State<AppState>) -
                 secret_ref: resolved.google.client_secret_ref.clone(),
                 secret_ref_source: oidc_value_source(
                     resolved.google.client_secret_ref.is_some(),
-                    env_trimmed("PHILOTIC_OIDC_GOOGLE_CLIENT_SECRET").is_some(),
+                    false,
                 ),
-                secret_configured: resolved.google.client_secret.is_some(),
+                secret_configured: resolved.google.client_secret_ref.is_some(),
                 callback_url: format!("{}/auth/oidc/google/callback", resolved.public_base_url),
             },
             OidcProviderConfigView {
@@ -4083,9 +4083,9 @@ async fn handle_config_oidc(headers: HeaderMap, State(state): State<AppState>) -
                 secret_ref: resolved.github.client_secret_ref.clone(),
                 secret_ref_source: oidc_value_source(
                     resolved.github.client_secret_ref.is_some(),
-                    env_trimmed("PHILOTIC_OIDC_GITHUB_CLIENT_SECRET").is_some(),
+                    false,
                 ),
-                secret_configured: resolved.github.client_secret.is_some(),
+                secret_configured: resolved.github.client_secret_ref.is_some(),
                 callback_url: format!("{}/auth/oidc/github/callback", resolved.public_base_url),
             },
         ],
@@ -6288,32 +6288,6 @@ async fn ipc_set_config(socket: &str, key: &str, value_json: &str) -> Result<()>
     }
 }
 
-async fn ipc_get_secret(socket: &str, secret_ref: &str) -> Result<Option<Value>> {
-    let mut client = connect_management_client(socket, "philotic-web-secret-read").await?;
-    match client
-        .send_request(IpcRequest::GetSecret {
-            secret_ref: secret_ref.to_string(),
-        })
-        .await?
-    {
-        IpcResponse::SecretData {
-            value_json: Some(raw),
-            ..
-        } => {
-            let parsed: Value = serde_json::from_str(&raw).unwrap_or_else(|_| Value::String(raw));
-            Ok(Some(parsed))
-        }
-        IpcResponse::SecretData {
-            value_json: None, ..
-        } => Ok(None),
-        IpcResponse::Standard {
-            ok: false, message, ..
-        } => Err(anyhow!(message)),
-        IpcResponse::Error(message) => Err(anyhow!(message)),
-        other => Err(anyhow!("unexpected get_secret response: {other:?}")),
-    }
-}
-
 async fn ipc_rotate_secret(socket: &str, secret_ref: &str, plaintext: &str) -> Result<()> {
     let mut client = connect_management_client(socket, "philotic-web-vault-write").await?;
     match client
@@ -8365,18 +8339,10 @@ struct OidcProviderConfig {
     label: String,
     configured: bool,
     client_id: Option<String>,
-    client_secret: Option<String>,
     auth_url: String,
-    token_url: String,
-    userinfo_url: String,
     scopes: Vec<String>,
     extra_auth_params: Vec<(String, String)>,
     redirect_uri: String,
-}
-
-#[derive(Debug, serde::Deserialize)]
-struct OidcTokenResponse {
-    access_token: String,
 }
 
 #[derive(Debug)]
@@ -8424,12 +8390,9 @@ fn oidc_provider_config_from_resolved(
             id: "google".into(),
             label: "Google".into(),
             configured: resolved.google.client_id.is_some()
-                && resolved.google.client_secret.is_some(),
+                && resolved.google.client_secret_ref.is_some(),
             client_id: resolved.google.client_id,
-            client_secret: resolved.google.client_secret,
             auth_url: "https://accounts.google.com/o/oauth2/v2/auth".into(),
-            token_url: "https://oauth2.googleapis.com/token".into(),
-            userinfo_url: "https://openidconnect.googleapis.com/v1/userinfo".into(),
             scopes: vec!["openid".into(), "profile".into(), "email".into()],
             extra_auth_params: vec![
                 ("access_type".into(), "offline".into()),
@@ -8441,12 +8404,9 @@ fn oidc_provider_config_from_resolved(
             id: "github".into(),
             label: "GitHub".into(),
             configured: resolved.github.client_id.is_some()
-                && resolved.github.client_secret.is_some(),
+                && resolved.github.client_secret_ref.is_some(),
             client_id: resolved.github.client_id,
-            client_secret: resolved.github.client_secret,
             auth_url: "https://github.com/login/oauth/authorize".into(),
-            token_url: "https://github.com/login/oauth/access_token".into(),
-            userinfo_url: "https://api.github.com/user".into(),
             scopes: vec!["read:user".into(), "user:email".into()],
             extra_auth_params: Vec::new(),
             redirect_uri: format!("{}/auth/oidc/github/callback", resolved.public_base_url),
@@ -8467,30 +8427,20 @@ async fn load_oidc_resolved_config(
     let github_client_id = oidc_config_string(socket, "oidc_github_client_id")
         .await?
         .or_else(|| env_trimmed("PHILOTIC_OIDC_GITHUB_CLIENT_ID"));
-    let (google_client_secret_ref, google_client_secret) = oidc_secret_from_ref_or_env(
-        socket,
-        "oidc_google_client_secret_ref",
-        "PHILOTIC_OIDC_GOOGLE_CLIENT_SECRET",
-    )
-    .await?;
-    let (github_client_secret_ref, github_client_secret) = oidc_secret_from_ref_or_env(
-        socket,
-        "oidc_github_client_secret_ref",
-        "PHILOTIC_OIDC_GITHUB_CLIENT_SECRET",
-    )
-    .await?;
+    let google_client_secret_ref =
+        oidc_config_string(socket, "oidc_google_client_secret_ref").await?;
+    let github_client_secret_ref =
+        oidc_config_string(socket, "oidc_github_client_secret_ref").await?;
 
     Ok(OidcResolvedConfig {
         public_base_url,
         public_base_source,
         google: OidcProviderSettings {
             client_id: google_client_id,
-            client_secret: google_client_secret,
             client_secret_ref: google_client_secret_ref,
         },
         github: OidcProviderSettings {
             client_id: github_client_id,
-            client_secret: github_client_secret,
             client_secret_ref: github_client_secret_ref,
         },
     })
@@ -8554,20 +8504,6 @@ async fn oidc_config_string(socket: &str, key: &str) -> Result<Option<String>> {
         .await?
         .and_then(|value| value.as_str().map(|value| value.trim().to_string()))
         .filter(|value| !value.is_empty()))
-}
-
-async fn oidc_secret_from_ref_or_env(
-    socket: &str,
-    ref_key: &str,
-    env_key: &str,
-) -> Result<(Option<String>, Option<String>)> {
-    if let Some(secret_ref) = oidc_config_string(socket, ref_key).await? {
-        let secret = ipc_get_secret(socket, &secret_ref)
-            .await?
-            .and_then(|value| value.as_str().map(|value| value.to_string()));
-        return Ok((Some(secret_ref), secret));
-    }
-    Ok((None, env_trimmed(env_key)))
 }
 
 fn oidc_value_source(hotel_config_present: bool, env_fallback_present: bool) -> String {
@@ -8643,79 +8579,57 @@ fn pkce_code_challenge(code_verifier: &str) -> String {
     URL_SAFE_NO_PAD.encode(digest)
 }
 
-async fn exchange_oidc_code(
+async fn exchange_oidc_identity_via_hotel(
+    socket: &str,
     provider: &OidcProviderConfig,
     code: &str,
     code_verifier: &str,
-) -> Result<OidcTokenResponse> {
-    let client_id = provider
-        .client_id
-        .as_deref()
-        .context("OIDC client id is not configured")?;
-    let mut form = vec![
-        ("client_id", client_id.to_string()),
-        ("code", code.to_string()),
-        ("code_verifier", code_verifier.to_string()),
-        ("grant_type", "authorization_code".into()),
-        ("redirect_uri", provider.redirect_uri.clone()),
-    ];
-    if let Some(client_secret) = provider.client_secret.as_deref() {
-        form.push(("client_secret", client_secret.to_string()));
+) -> Result<Value> {
+    let mut client = connect_client_with_identity(
+        socket,
+        GuestIdentity {
+            guest_id: "philotic-web-oidc".into(),
+            role: "management".into(),
+            supported_tools: vec![],
+        },
+    )
+    .await?;
+    let response = client
+        .send_request_with_timeout(
+            IpcRequest::ExchangeOperatorOidc {
+                provider: provider.id.clone(),
+                authorization_code: code.to_string(),
+                code_verifier: code_verifier.to_string(),
+                redirect_uri: provider.redirect_uri.clone(),
+            },
+            Duration::from_secs(45),
+        )
+        .await
+        .context("hotel OIDC exchange request failed")?;
+
+    match response {
+        IpcResponse::Standard {
+            ok: true,
+            data: Some(data),
+            ..
+        } => {
+            let exchanged: ansible_mesh_core::integration::OidcExchangeResponse =
+                serde_json::from_value(data)
+                    .context("hotel returned invalid OIDC exchange data")?;
+            if exchanged.provider_id != provider.id {
+                bail!(
+                    "hotel returned OIDC provider [{}] for requested provider [{}]",
+                    exchanged.provider_id,
+                    provider.id
+                );
+            }
+            Ok(exchanged.userinfo)
+        }
+        IpcResponse::Standard { message, .. } => {
+            bail!("hotel rejected OIDC exchange: {message}")
+        }
+        other => bail!("unexpected hotel OIDC exchange response: {other:?}"),
     }
-
-    let response = reqwest::Client::new()
-        .post(&provider.token_url)
-        .header("accept", "application/json")
-        .header("user-agent", "philotic-web/0.1")
-        .form(&form)
-        .send()
-        .await
-        .context("failed to exchange OIDC authorization code")?;
-
-    if !response.status().is_success() {
-        let status = response.status();
-        let body = response.text().await.unwrap_or_default();
-        bail!(
-            "token exchange failed ({}): {}",
-            status.as_u16(),
-            body.trim()
-        );
-    }
-
-    response
-        .json::<OidcTokenResponse>()
-        .await
-        .context("failed to decode OIDC token response")
-}
-
-async fn fetch_oidc_identity(
-    provider: &OidcProviderConfig,
-    access_token: &str,
-) -> Result<OidcIdentity> {
-    let response = reqwest::Client::new()
-        .get(&provider.userinfo_url)
-        .header("accept", "application/json")
-        .header("user-agent", "philotic-web/0.1")
-        .bearer_auth(access_token)
-        .send()
-        .await
-        .context("failed to fetch OIDC userinfo")?;
-
-    if !response.status().is_success() {
-        let status = response.status();
-        let body = response.text().await.unwrap_or_default();
-        bail!(
-            "userinfo fetch failed ({}): {}",
-            status.as_u16(),
-            body.trim()
-        );
-    }
-
-    let body: Value = response
-        .json()
-        .await
-        .context("failed to decode OIDC userinfo response")?;
-    oidc_identity_from_userinfo(provider, &body)
 }
 
 fn oidc_identity_from_userinfo(
@@ -9248,12 +9162,10 @@ mod tests {
                 public_base_source: "hotel-config".into(),
                 google: OidcProviderSettings {
                     client_id: Some("google-client".into()),
-                    client_secret: Some("google-secret".into()),
                     client_secret_ref: Some("vault:google".into()),
                 },
                 github: OidcProviderSettings {
                     client_id: None,
-                    client_secret: None,
                     client_secret_ref: None,
                 },
             },
@@ -9276,12 +9188,10 @@ mod tests {
                 public_base_source: "hotel-config".into(),
                 google: OidcProviderSettings {
                     client_id: Some("google-client".into()),
-                    client_secret: Some("google-secret".into()),
                     client_secret_ref: Some("vault:google".into()),
                 },
                 github: OidcProviderSettings {
                     client_id: None,
-                    client_secret: None,
                     client_secret_ref: None,
                 },
             },
@@ -9306,12 +9216,10 @@ mod tests {
             public_base_source: "request-headers".into(),
             google: OidcProviderSettings {
                 client_id: Some("google-client".into()),
-                client_secret: Some("google-secret".into()),
                 client_secret_ref: Some("vault:google".into()),
             },
             github: OidcProviderSettings {
                 client_id: Some("github-client".into()),
-                client_secret: Some("github-secret".into()),
                 client_secret_ref: Some("vault:github".into()),
             },
         }));
@@ -9320,12 +9228,10 @@ mod tests {
             public_base_source: "hotel-config".into(),
             google: OidcProviderSettings {
                 client_id: Some("google-client".into()),
-                client_secret: Some("google-secret".into()),
                 client_secret_ref: Some("vault:google".into()),
             },
             github: OidcProviderSettings {
                 client_id: Some("github-client".into()),
-                client_secret: Some("github-secret".into()),
                 client_secret_ref: Some("vault:github".into()),
             },
         }));
@@ -9340,12 +9246,10 @@ mod tests {
                 public_base_source: "hotel-config".into(),
                 google: OidcProviderSettings {
                     client_id: Some("google-client".into()),
-                    client_secret: Some("google-secret".into()),
                     client_secret_ref: Some("vault:google".into()),
                 },
                 github: OidcProviderSettings {
                     client_id: None,
-                    client_secret: None,
                     client_secret_ref: None,
                 },
             },
@@ -9379,12 +9283,10 @@ mod tests {
                 public_base_source: "hotel-config".into(),
                 google: OidcProviderSettings {
                     client_id: None,
-                    client_secret: None,
                     client_secret_ref: None,
                 },
                 github: OidcProviderSettings {
                     client_id: Some("github-client".into()),
-                    client_secret: Some("github-secret".into()),
                     client_secret_ref: Some("vault:github".into()),
                 },
             },

@@ -67,7 +67,8 @@ exception merely because it lives in the same crate.
 | `egress-http-runner` | general API | controlled boundary | `IntegrationBinding` + `ToolExecutionRoute` |
 | OpenRouter model-catalog sync | general API | migrated | system binding `model-catalog-openrouter` |
 | Philote model-catalog consumption | general API | migrated; no direct network | hotel config `model_catalog.openrouter` |
-| Operator OAuth/token/userinfo exchanges | general API, model provider | temporary exception | operator auth ceremony; dedicated auth binding still needed |
+| Operator OIDC token/userinfo exchange | general API | migrated | local-only `operator-oidc-{provider}` binding |
+| Gemini CLI OAuth and provider validation | model provider | temporary exception | model-provider auth ceremony in `aiua::auth` |
 | Model-router providers and transcription | model provider | named exception | provider/controller contracts |
 | Telegram and Discord clients | communication | named exception | membrane leases and transport contracts |
 | Muninn, memory, intel-graph, embedding, Ollama, MLX, and ONNX sidecars | local resource | named exception | dedicated datasource/sidecar contracts |
@@ -103,6 +104,25 @@ capability badges and `/models` browsing. If the projection is not yet
 available, the UI reports that discovery has not published a snapshot and
 retains any previously cached snapshot; cognition no longer creates a second
 OpenRouter client or destination policy.
+
+## Credential-Safe Operator OIDC Migration
+
+The operator OIDC back channel is now the second governed general-API
+migration. `philotic-web` still owns browser state, PKCE challenge state,
+provider identity linking, and hotel session issuance. It no longer resolves a
+client secret or constructs the token and userinfo HTTP clients.
+
+The exact `philotic-web-oidc` management identity sends the one-time
+authorization code, PKCE verifier, provider ID, and exact callback URI to its
+source hotel. The hotel compiles a non-model-projected, local-only
+`operator-oidc-{provider}` binding. The local runner resolves the client-secret
+reference from the execution-hotel vault, performs both back-channel requests,
+keeps access and refresh tokens inside the runner, allowlists returned identity
+claims, and appends separate token and userinfo audits.
+
+`scripts/smoke-operator-oidc-egress-roundtrip.sh` proves the real hotel IPC,
+runner, vault, token endpoint, userinfo endpoint, claims-only response, and
+durable audits against isolated loopback provider fixtures.
 
 ```plantuml
 @startuml
@@ -141,8 +161,9 @@ responsibility of runner materialization and host deployment policy.
 
 ## Remaining Seams
 
-1. Define a credential-safe auth egress contract for OAuth token and userinfo
-   exchange before migrating operator auth.
+1. Migrate the remaining Gemini CLI OAuth/provider-validation calls only after
+   deciding whether they belong to the model-provider plane or the general auth
+   plane; do not widen the operator OIDC binding to absorb them.
 2. Decide whether communication membranes should delegate only their HTTP hop
    to the shared runner without surrendering protocol and lease authority.
 3. Add host-level enforcement only after each named exception has an executable
