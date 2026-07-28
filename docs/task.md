@@ -1706,8 +1706,13 @@ Seam IDs: `wider-client-adoption`, `philotic-native-memory-integration`
     source-hotel compact catalog persistence.
   - [x] Remove the Philote direct OpenRouter catalog fallback now that installed
     hotel rollout proof is green.
-  - [ ] Define a credential-safe auth egress contract before migrating OAuth
-    token and userinfo exchange.
+  - [x] Define and implement a credential-safe operator OIDC egress contract:
+    `philotic-web` retains state, PKCE, identity linking, and session issuance;
+    the hotel compiles an exact local-only binding; `egress-http-runner`
+    resolves the client secret, consumes access/refresh tokens internally,
+    returns allowlisted userinfo claims only, and persists one content-free
+    audit per back-channel leg. An isolated binary smoke proves the complete
+    IPC, vault, token, userinfo, response, and audit round-trip.
 - [x] Perimeter egress control (`egress-policy-object`): define the first
   canonical policy and placement types; finding schema remains part of the
   HTTP executor/audit slice.

@@ -2,10 +2,10 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use ansible_mesh_core::integration::{
     parse_projected_http_tool_name, EgressPlacementDecision, HttpIntegrationAudit,
-    HttpIntegrationRequest, IntegrationBinding, IntegrationTarget,
+    HttpIntegrationRequest, IntegrationBinding, IntegrationTarget, OidcExchangeRequest,
 };
 use anyhow::Result;
-use egress_http_runner::{execute, ExecutionContext};
+use egress_http_runner::{execute, execute_oidc, ExecutionContext};
 use philotic_client::{
     is_ipc_disconnect, GuestIdentity, IpcRequest, IpcResponse, PhiloticClient, ReturnRoute,
     TaskErrorPayload,
@@ -23,16 +23,21 @@ async fn resolve_credential(
     ipc_client: &mut PhiloticClient,
     binding: &IntegrationBinding,
 ) -> Result<Option<String>, String> {
-    let IntegrationTarget::Http(target) = &binding.target else {
-        return Ok(None);
+    let secret_ref = match &binding.target {
+        IntegrationTarget::Http(target) => target
+            .credential
+            .as_ref()
+            .map(|credential| credential.secret_ref.as_str()),
+        IntegrationTarget::Oidc(target) => target.client_secret_ref.as_deref(),
+        IntegrationTarget::Mcp { .. } => None,
     };
-    let Some(credential) = &target.credential else {
+    let Some(secret_ref) = secret_ref else {
         return Ok(None);
     };
     let response = ipc_client
         .send_request_with_timeout(
             IpcRequest::GetSecret {
-                secret_ref: credential.secret_ref.clone(),
+                secret_ref: secret_ref.to_string(),
             },
             Duration::from_secs(5),
         )
@@ -49,7 +54,7 @@ async fn resolve_credential(
         }
         _ => Err(format!(
             "credential ref '{}' is unavailable to role '{}'",
-            credential.secret_ref, ROLE
+            secret_ref, ROLE
         )),
     }
 }
@@ -108,17 +113,56 @@ fn failure_code(message: &str) -> &'static str {
 fn failed_audit(
     task: &Value,
     binding: &IntegrationBinding,
-    request: &HttpIntegrationRequest,
     placement: EgressPlacementDecision,
     started_at_ms: u64,
     message: &str,
 ) -> HttpIntegrationAudit {
-    let target = match &binding.target {
-        IntegrationTarget::Http(target) => Some(target),
-        IntegrationTarget::Mcp { .. } => None,
+    let request: Option<HttpIntegrationRequest> = task
+        .get("arguments")
+        .cloned()
+        .and_then(|value| serde_json::from_value(value).ok());
+    let (target_url, method, path, credential_ref, request_bytes) = match &binding.target {
+        IntegrationTarget::Http(target) => (
+            target.base_url.clone(),
+            request
+                .as_ref()
+                .map(|request| request.method.clone())
+                .unwrap_or_else(|| "UNKNOWN".into()),
+            request
+                .as_ref()
+                .map(|request| request.path.clone())
+                .unwrap_or_default(),
+            target
+                .credential
+                .as_ref()
+                .map(|credential| credential.secret_ref.clone()),
+            request
+                .as_ref()
+                .and_then(|request| request.body.as_ref())
+                .and_then(|body| serde_json::to_vec(body).ok())
+                .map(|body| body.len() as u64)
+                .unwrap_or(0),
+        ),
+        IntegrationTarget::Oidc(target) => (
+            target.token_url.clone(),
+            "POST".into(),
+            reqwest::Url::parse(&target.token_url)
+                .ok()
+                .map(|url| url.path().to_string())
+                .unwrap_or_default(),
+            target.client_secret_ref.clone(),
+            0,
+        ),
+        IntegrationTarget::Mcp { .. } => (
+            "invalid://binding".into(),
+            "UNKNOWN".into(),
+            String::new(),
+            None,
+            0,
+        ),
     };
-    let target_origin = target
-        .and_then(|target| reqwest::Url::parse(&target.base_url).ok())
+    let target_origin = reqwest::Url::parse(&target_url)
+        .ok()
         .and_then(|url| {
             Some(format!(
                 "{}://{}:{}",
@@ -165,21 +209,14 @@ fn failed_audit(
         executor_node_id: local_node_id(),
         placement,
         target_origin,
-        method: request.method.clone(),
-        path: request.path.clone(),
+        method,
+        path,
         policy_revision: binding.updated_at,
         approval_required: binding.requires_approval,
-        credential_ref: target
-            .and_then(|target| target.credential.as_ref())
-            .map(|credential| credential.secret_ref.clone()),
+        credential_ref,
         credential_injected: false,
         redirect_count: 0,
-        request_bytes: request
-            .body
-            .as_ref()
-            .and_then(|body| serde_json::to_vec(body).ok())
-            .map(|body| body.len() as u64)
-            .unwrap_or(0),
+        request_bytes,
         response_status: None,
         response_bytes: 0,
         started_at_ms,
@@ -235,17 +272,8 @@ async fn handle_call(ipc_client: &mut PhiloticClient, task: &Value) -> Result<()
     .unwrap_or_else(|_| EgressPlacementDecision::Deny {
         reason: "task omitted a valid placement decision".into(),
     });
-    let request: Result<HttpIntegrationRequest, _> =
-        serde_json::from_value(task.get("arguments").cloned().unwrap_or(json!({})));
-
-    let outcome = match (&binding, &request) {
-        (Ok(binding), Ok(request)) => {
-            let mut request = request.clone();
-            if request.binding_id.is_empty() {
-                if let Some(parsed) = parse_projected_http_tool_name(&tool_name) {
-                    request.binding_id = parsed.to_string();
-                }
-            }
+    let outcome: Result<(Value, Vec<HttpIntegrationAudit>), String> = match &binding {
+        Ok(binding) => {
             if !binding.is_granted_to(agent_id) {
                 Err(format!(
                     "agent '{}' is not granted integration '{}'",
@@ -255,10 +283,8 @@ async fn handle_call(ipc_client: &mut PhiloticClient, task: &Value) -> Result<()
                 Err("hotel supplied a denied integration placement".into())
             } else {
                 match resolve_credential(ipc_client, &binding).await {
-                    Ok(credential) => execute(
-                        &binding,
-                        &request,
-                        ExecutionContext {
+                    Ok(credential) => {
+                        let context = ExecutionContext {
                             executor_node_id: &local_node_id(),
                             placement: placement.clone(),
                             credential: credential.as_deref(),
@@ -268,21 +294,82 @@ async fn handle_call(ipc_client: &mut PhiloticClient, task: &Value) -> Result<()
                             session_id,
                             turn_id,
                             correlation_id,
-                        },
-                    )
-                    .await
-                    .map_err(|error| format!("{error:#}")),
+                        };
+                        match &binding.target {
+                            IntegrationTarget::Http(_) => {
+                                match serde_json::from_value::<HttpIntegrationRequest>(
+                                    task.get("arguments").cloned().unwrap_or(json!({})),
+                                ) {
+                                    Ok(mut request) => {
+                                        if request.binding_id.is_empty() {
+                                            if let Some(parsed) =
+                                                parse_projected_http_tool_name(&tool_name)
+                                            {
+                                                request.binding_id = parsed.to_string();
+                                            }
+                                        }
+                                        execute(binding, &request, context)
+                                            .await
+                                            .map(|result| {
+                                                let audit = result.audit.clone();
+                                                (
+                                                    serde_json::to_value(result)
+                                                        .unwrap_or(Value::Null),
+                                                    vec![audit],
+                                                )
+                                            })
+                                            .map_err(|error| format!("{error:#}"))
+                                    }
+                                    Err(error) => {
+                                        Err(format!("invalid HTTP integration arguments: {error}"))
+                                    }
+                                }
+                            }
+                            IntegrationTarget::Oidc(_) => {
+                                match serde_json::from_value::<OidcExchangeRequest>(
+                                    task.get("arguments").cloned().unwrap_or(json!({})),
+                                ) {
+                                    Ok(mut request) => {
+                                        if request.binding_id.is_empty() {
+                                            request.binding_id = binding.binding_id.clone();
+                                        }
+                                        execute_oidc(binding, &request, context)
+                                            .await
+                                            .map(|result| {
+                                                let audits = result.audits.clone();
+                                                (
+                                                    serde_json::to_value(result)
+                                                        .unwrap_or(Value::Null),
+                                                    audits,
+                                                )
+                                            })
+                                            .map_err(|error| format!("{error:#}"))
+                                    }
+                                    Err(error) => {
+                                        Err(format!("invalid OIDC exchange arguments: {error}"))
+                                    }
+                                }
+                            }
+                            IntegrationTarget::Mcp { .. } => {
+                                Err("MCP integrations must execute through mcp-client-runner"
+                                    .into())
+                            }
+                        }
+                    }
                     Err(message) => Err(message),
                 }
             }
         }
-        (Err(error), _) => Err(format!("task omitted a valid integration binding: {error}")),
-        (_, Err(error)) => Err(format!("invalid HTTP integration arguments: {error}")),
+        Err(error) => Err(format!("task omitted a valid integration binding: {error}")),
     };
 
     let mut reply = json!({
         "action": "datasource_response",
-        "capability": "integration.http.request",
+        "capability": if matches!(&binding, Ok(IntegrationBinding { target: IntegrationTarget::Oidc(_), .. })) {
+            "integration.auth.oidc_exchange"
+        } else {
+            "integration.http.request"
+        },
         "tool_name": tool_name,
         "provider": ROLE,
         "return_route": {
@@ -298,15 +385,17 @@ async fn handle_call(ipc_client: &mut PhiloticClient, task: &Value) -> Result<()
         "chat_id": chat_id,
     });
     match outcome {
-        Ok(result) => {
-            record_audit(ipc_client, result.audit.clone()).await;
-            reply["result"] = serde_json::to_value(result).unwrap_or(Value::Null);
+        Ok((result, audits)) => {
+            for audit in audits {
+                record_audit(ipc_client, audit).await;
+            }
+            reply["result"] = result;
         }
         Err(message) => {
-            if let (Ok(binding), Ok(request)) = (&binding, &request) {
+            if let Ok(binding) = &binding {
                 record_audit(
                     ipc_client,
-                    failed_audit(task, binding, request, placement, started_at_ms, &message),
+                    failed_audit(task, binding, placement, started_at_ms, &message),
                 )
                 .await;
             }

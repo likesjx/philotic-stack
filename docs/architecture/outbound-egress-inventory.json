@@ -38,13 +38,6 @@
       "note": "Local model-server health and control path."
     },
     {
-      "path": "crates/philotic-web/src/serve.rs",
-      "traffic_classes": ["general-api"],
-      "disposition": "temporary-exception",
-      "authority": "operator OIDC flow",
-      "note": "OIDC token and userinfo exchange needs a dedicated auth egress contract before migration."
-    },
-    {
       "path": "crates/philotic-web/src/memory_explain.rs",
       "traffic_classes": ["local-resource"],
       "disposition": "named-exception",
@@ -241,6 +234,13 @@
       "disposition": "migrated",
       "authority": "IntegrationBinding model-catalog-openrouter",
       "note": "Uses GovernedHttpService and egress-http-runner; no direct network client remains."
+    },
+    {
+      "path": "crates/philotic-web/src/serve.rs",
+      "traffic_classes": ["general-api"],
+      "disposition": "migrated",
+      "authority": "local-only IntegrationBinding operator-oidc-{provider}",
+      "note": "Owns browser state, PKCE, identity linking, and session issuance; token and userinfo back-channel traffic executes through the hotel and egress runner."
     }
   ]
 }

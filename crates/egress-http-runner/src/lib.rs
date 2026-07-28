@@ -13,7 +13,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use ansible_mesh_core::integration::{
     forbidden_caller_header, ip_matches_scope, EgressPlacementDecision, HttpIntegrationAudit,
     HttpIntegrationRequest, HttpIntegrationResponse, HttpIntegrationTarget, IntegrationBinding,
-    IntegrationTarget,
+    IntegrationTarget, OidcExchangeRequest, OidcExchangeResponse, OidcIntegrationTarget,
 };
 use anyhow::{anyhow, bail, Context, Result};
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue, LOCATION};
@@ -91,7 +91,7 @@ pub async fn execute(
         let port = url
             .port_or_known_default()
             .ok_or_else(|| anyhow!("URL has no known port"))?;
-        let resolved = resolve_allowed(&host, port, target).await?;
+        let resolved = resolve_allowed(&host, port, target.network_scope).await?;
         let client = pinned_client(&host, resolved, target.timeout_secs)?;
         let mut headers = build_headers(target, request, host == base_host)?;
         let credential_injected = if host == base_host {
@@ -189,6 +189,246 @@ pub async fn execute(
     }
 }
 
+pub async fn execute_oidc(
+    binding: &IntegrationBinding,
+    request: &OidcExchangeRequest,
+    context: ExecutionContext<'_>,
+) -> Result<OidcExchangeResponse> {
+    let started_at_ms = unix_ms();
+    binding.validate().map_err(|message| anyhow!(message))?;
+    if !binding.enabled {
+        bail!("integration binding '{}' is disabled", binding.binding_id);
+    }
+    if request.binding_id != binding.binding_id {
+        bail!(
+            "request binding '{}' does not match authority '{}'",
+            request.binding_id,
+            binding.binding_id
+        );
+    }
+    let IntegrationTarget::Oidc(target) = &binding.target else {
+        bail!(
+            "binding '{}' is not an OIDC integration",
+            binding.binding_id
+        );
+    };
+    if !matches!(
+        &context.placement,
+        EgressPlacementDecision::ExecuteLocal { .. }
+    ) {
+        bail!("OIDC exchange must execute locally");
+    }
+    if request.authorization_code.trim().is_empty() {
+        bail!("OIDC authorization code must be non-empty");
+    }
+    if request.code_verifier.len() < 43 || request.code_verifier.len() > 128 {
+        bail!("OIDC PKCE verifier must contain 43..=128 characters");
+    }
+
+    let token_url = Url::parse(&target.token_url).context("invalid OIDC token_url")?;
+    let token_client = oidc_client(&token_url, target).await?;
+    let mut token_form = vec![
+        ("client_id", target.client_id.clone()),
+        ("code", request.authorization_code.clone()),
+        ("code_verifier", request.code_verifier.clone()),
+        ("grant_type", "authorization_code".into()),
+        ("redirect_uri", target.redirect_uri.clone()),
+    ];
+    let client_secret_injected = match (target.client_secret_ref.as_deref(), context.credential) {
+        (Some(_), Some(secret)) => {
+            token_form.push(("client_secret", secret.to_string()));
+            true
+        }
+        (Some(secret_ref), None) => {
+            bail!(
+                "OIDC binding requires client-secret ref '{}' but the executor did not resolve it",
+                secret_ref
+            )
+        }
+        (None, _) => false,
+    };
+    let token_request = token_client
+        .post(token_url.clone())
+        .header("accept", "application/json")
+        .header("user-agent", "philotic-egress/oidc")
+        .form(&token_form)
+        .build()
+        .context("building OIDC token request")?;
+    let token_request_bytes = token_request
+        .body()
+        .and_then(reqwest::Body::as_bytes)
+        .map(|body| body.len() as u64)
+        .unwrap_or_default();
+    let token_response = token_client
+        .execute(token_request)
+        .await
+        .context("OIDC token exchange request failed")?;
+    let token_status = token_response.status().as_u16();
+    let token_bytes = read_bounded(token_response, target.max_response_bytes).await?;
+    if !(200..300).contains(&token_status) {
+        bail!("OIDC token exchange returned HTTP {token_status}");
+    }
+    let token_body: serde_json::Value =
+        serde_json::from_slice(&token_bytes).context("invalid OIDC token response JSON")?;
+    let access_token = token_body
+        .get("access_token")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .context("OIDC token response omitted access_token")?
+        .to_string();
+    let token_finished_at_ms = unix_ms();
+    let token_audit = oidc_audit(
+        binding,
+        &context,
+        &token_url,
+        "POST",
+        target.client_secret_ref.clone(),
+        client_secret_injected,
+        token_request_bytes,
+        token_status,
+        token_bytes.len() as u64,
+        started_at_ms,
+        token_finished_at_ms,
+        "token",
+    )?;
+
+    let userinfo_started_at_ms = unix_ms();
+    let userinfo_url = Url::parse(&target.userinfo_url).context("invalid OIDC userinfo_url")?;
+    let userinfo_client = oidc_client(&userinfo_url, target).await?;
+    let userinfo_response = userinfo_client
+        .get(userinfo_url.clone())
+        .header("accept", "application/json")
+        .header("user-agent", "philotic-egress/oidc")
+        .bearer_auth(&access_token)
+        .send()
+        .await
+        .context("OIDC userinfo request failed")?;
+    let userinfo_status = userinfo_response.status().as_u16();
+    let userinfo_bytes = read_bounded(userinfo_response, target.max_response_bytes).await?;
+    if !(200..300).contains(&userinfo_status) {
+        bail!("OIDC userinfo returned HTTP {userinfo_status}");
+    }
+    let userinfo: serde_json::Value =
+        serde_json::from_slice(&userinfo_bytes).context("invalid OIDC userinfo JSON")?;
+    let userinfo = sanitize_oidc_userinfo(userinfo)?;
+    let userinfo_finished_at_ms = unix_ms();
+    let userinfo_audit = oidc_audit(
+        binding,
+        &context,
+        &userinfo_url,
+        "GET",
+        Some("ephemeral:oidc_access_token".into()),
+        true,
+        0,
+        userinfo_status,
+        userinfo_bytes.len() as u64,
+        userinfo_started_at_ms,
+        userinfo_finished_at_ms,
+        "userinfo",
+    )?;
+
+    Ok(OidcExchangeResponse {
+        provider_id: target.provider_id.clone(),
+        userinfo,
+        audits: vec![token_audit, userinfo_audit],
+    })
+}
+
+fn sanitize_oidc_userinfo(userinfo: serde_json::Value) -> Result<serde_json::Value> {
+    const ALLOWED_CLAIMS: &[&str] = &[
+        "sub",
+        "id",
+        "name",
+        "login",
+        "email",
+        "email_verified",
+        "picture",
+        "avatar_url",
+        "html_url",
+        "locale",
+        "given_name",
+        "family_name",
+    ];
+    let object = userinfo
+        .as_object()
+        .context("OIDC userinfo response must be a JSON object")?;
+    let sanitized = object
+        .iter()
+        .filter(|(key, _)| ALLOWED_CLAIMS.contains(&key.as_str()))
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect();
+    Ok(serde_json::Value::Object(sanitized))
+}
+
+async fn oidc_client(url: &Url, target: &OidcIntegrationTarget) -> Result<reqwest::Client> {
+    if !matches!(url.scheme(), "http" | "https") {
+        bail!("OIDC endpoint must use HTTP(S)");
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        bail!("OIDC endpoint userinfo is forbidden");
+    }
+    if url.scheme() == "http"
+        && !matches!(
+            target.network_scope,
+            ansible_mesh_core::integration::HttpNetworkScope::Loopback
+        )
+    {
+        bail!("OIDC endpoints must use HTTPS outside loopback scope");
+    }
+    let host = normalized_host(url)?;
+    let port = url
+        .port_or_known_default()
+        .ok_or_else(|| anyhow!("OIDC endpoint has no known port"))?;
+    let resolved = resolve_allowed(&host, port, target.network_scope).await?;
+    pinned_client(&host, resolved, target.timeout_secs)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn oidc_audit(
+    binding: &IntegrationBinding,
+    context: &ExecutionContext<'_>,
+    url: &Url,
+    method: &str,
+    credential_ref: Option<String>,
+    credential_injected: bool,
+    request_bytes: u64,
+    response_status: u16,
+    response_bytes: u64,
+    started_at_ms: u64,
+    finished_at_ms: u64,
+    leg: &str,
+) -> Result<HttpIntegrationAudit> {
+    Ok(HttpIntegrationAudit {
+        binding_id: binding.binding_id.clone(),
+        tool_name: format!("{}.{}", context.tool_name, leg),
+        agent_id: context.agent_id.to_string(),
+        caller_role: context.caller_role.to_string(),
+        session_id: context.session_id.to_string(),
+        turn_id: context.turn_id.to_string(),
+        correlation_id: format!("{}:{leg}", context.correlation_id),
+        traffic_class: binding.traffic_class,
+        executor_node_id: context.executor_node_id.to_string(),
+        placement: context.placement.clone(),
+        target_origin: origin(url)?,
+        method: method.to_string(),
+        path: url.path().to_string(),
+        policy_revision: binding.updated_at,
+        approval_required: binding.requires_approval,
+        credential_ref,
+        credential_injected,
+        redirect_count: 0,
+        request_bytes,
+        response_status: Some(response_status),
+        response_bytes,
+        started_at_ms,
+        finished_at_ms,
+        duration_ms: finished_at_ms.saturating_sub(started_at_ms),
+        outcome: format!("oidc_{leg}_http_{response_status}"),
+        failure_code: None,
+    })
+}
+
 fn parse_method(value: &str) -> Result<Method> {
     if value != value.to_ascii_uppercase() {
         bail!("HTTP method must be uppercase");
@@ -268,7 +508,7 @@ fn validate_url_authority(
 async fn resolve_allowed(
     host: &str,
     port: u16,
-    target: &HttpIntegrationTarget,
+    network_scope: ansible_mesh_core::integration::HttpNetworkScope,
 ) -> Result<SocketAddr> {
     let addresses: Vec<SocketAddr> = lookup_host((host, port))
         .await
@@ -279,12 +519,12 @@ async fn resolve_allowed(
     }
     addresses
         .into_iter()
-        .find(|address| ip_matches_scope(address.ip(), target.network_scope))
+        .find(|address| ip_matches_scope(address.ip(), network_scope))
         .ok_or_else(|| {
             anyhow!(
                 "all resolved addresses for '{}' are outside {:?} scope",
                 host,
-                target.network_scope
+                network_scope
             )
         })
 }
@@ -427,6 +667,7 @@ mod tests {
     use super::*;
     use ansible_mesh_core::integration::{
         EgressPlacementPolicy, EgressTrafficClass, HttpCredentialBinding, HttpNetworkScope,
+        OidcExchangeRequest, OidcIntegrationTarget,
     };
     use serde_json::json;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -493,6 +734,32 @@ mod tests {
         }
     }
 
+    fn oidc_binding(token_address: SocketAddr, userinfo_address: SocketAddr) -> IntegrationBinding {
+        IntegrationBinding {
+            binding_id: "operator-oidc-test".into(),
+            owner_agent_id: "operator-auth-egress".into(),
+            display_name: None,
+            target: IntegrationTarget::Oidc(OidcIntegrationTarget {
+                provider_id: "test".into(),
+                client_id: "client-id".into(),
+                client_secret_ref: Some("secret://hotel/default/oidc/test-client-secret".into()),
+                token_url: format!("http://{token_address}/token"),
+                userinfo_url: format!("http://{userinfo_address}/userinfo"),
+                redirect_uri: "http://127.0.0.1/auth/oidc/test/callback".into(),
+                network_scope: HttpNetworkScope::Loopback,
+                timeout_secs: 5,
+                max_response_bytes: 4096,
+            }),
+            grant_agents: vec![],
+            grant_skills: vec![],
+            traffic_class: EgressTrafficClass::GeneralApi,
+            placement: EgressPlacementPolicy::Local,
+            requires_approval: false,
+            enabled: true,
+            updated_at: 1,
+        }
+    }
+
     #[tokio::test]
     async fn bounded_call_injects_secret_and_sanitizes_response() {
         let (address, server) = one_shot_server(r#"{"temperature":72}"#).await;
@@ -537,6 +804,61 @@ mod tests {
         assert!(wire_request.contains("x-request-tag: turn-1"));
         assert!(wire_request.contains("post /v1/forecast?zip=30309"));
         assert!(response.audit.credential_injected);
+    }
+
+    #[tokio::test]
+    async fn oidc_exchange_keeps_tokens_inside_runner_and_audits_both_legs() {
+        let (token_address, token_server) =
+            one_shot_server(r#"{"access_token":"ephemeral-token","token_type":"Bearer"}"#).await;
+        let (userinfo_address, userinfo_server) = one_shot_server(
+            r#"{"sub":"operator-1","email":"operator@example.com","access_token":"echoed-token","refresh_token":"echoed-refresh"}"#,
+        )
+        .await;
+        let binding = oidc_binding(token_address, userinfo_address);
+        let response = execute_oidc(
+            &binding,
+            &OidcExchangeRequest {
+                binding_id: binding.binding_id.clone(),
+                authorization_code: "one-time-code".into(),
+                code_verifier: "v".repeat(64),
+            },
+            ExecutionContext {
+                executor_node_id: "mbp-jane",
+                placement: EgressPlacementDecision::ExecuteLocal {
+                    audit_fallback: false,
+                },
+                credential: Some("client-secret"),
+                tool_name: "integration.auth.operator-oidc-test.exchange",
+                agent_id: "operator-auth-egress",
+                caller_role: "operator-auth",
+                session_id: "system:operator-auth",
+                turn_id: "turn-oidc",
+                correlation_id: "request-oidc",
+            },
+        )
+        .await
+        .unwrap();
+
+        let token_wire = token_server.await.unwrap();
+        let userinfo_wire = userinfo_server.await.unwrap().to_ascii_lowercase();
+        assert!(token_wire.contains("client_secret=client-secret"));
+        assert!(token_wire.contains("code=one-time-code"));
+        assert!(token_wire.contains(&format!("code_verifier={}", "v".repeat(64))));
+        assert!(userinfo_wire.contains("authorization: bearer ephemeral-token"));
+        assert_eq!(response.userinfo["sub"], "operator-1");
+        assert_eq!(response.audits.len(), 2);
+        assert_eq!(response.audits[0].path, "/token");
+        assert_eq!(response.audits[1].path, "/userinfo");
+        assert!(response
+            .audits
+            .iter()
+            .all(|audit| audit.credential_injected));
+        assert!(!serde_json::to_string(&response)
+            .unwrap()
+            .contains("ephemeral-token"));
+        assert!(!serde_json::to_string(&response)
+            .unwrap()
+            .contains("echoed-token"));
     }
 
     #[tokio::test]
