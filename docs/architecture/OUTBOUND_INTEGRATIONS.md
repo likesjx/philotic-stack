@@ -3,7 +3,7 @@ title: Governed Outbound Integrations
 doc_type: reference
 domain: tooling-execution
 status: active
-last_updated: 2026-07-26
+last_updated: 2026-07-28
 tags:
 - integrations
 - egress
@@ -282,8 +282,8 @@ retain their own owners when their contracts are already narrow:
 Everything else must be classified rather than silently grandfathered. The
 completed classification seam is recorded in
 [OUTBOUND_EGRESS_INVENTORY.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/OUTBOUND_EGRESS_INVENTORY.md).
-The machine-checked inventory currently classifies 33 direct-client files and
-guards the first migrated caller from regression.
+The machine-checked inventory currently classifies 32 remaining direct-client
+files and guards two migrated callers from regression.
 
 The first general-API migration is the hotel-owned OpenRouter model-catalog
 sync. Its `model-catalog-openrouter` system binding permits only credential-free
@@ -295,7 +295,8 @@ resolves and executes at `vps-jane-aiua-01`, receives HTTP 200, and persists
 the compact catalog while the content-free audit remains authoritative at the
 VPS exit.
 
-The next migrations are removal of the Philote direct catalog fallback and a
-dedicated credential-safe auth egress contract. Named model-provider,
-communication, local-resource, mesh, and artifact exceptions remain explicit
-rather than pretending every socket has identical semantics.
+Philote now consumes only the hotel-owned compact catalog projection; it no
+longer constructs a direct OpenRouter client when that projection is absent.
+The next migration is a dedicated credential-safe auth egress contract. Named
+model-provider, communication, local-resource, mesh, and artifact exceptions
+remain explicit rather than pretending every socket has identical semantics.

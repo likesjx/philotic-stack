@@ -1704,7 +1704,7 @@ Seam IDs: `wider-client-adoption`, `philotic-native-memory-integration`
   - [x] Install and watched-live prove the catalog path from the launchd-managed
     `mbp-jane` caller through `vps-jane-aiua-01`, including HTTP 200 audit and
     source-hotel compact catalog persistence.
-  - [ ] Remove the Philote direct OpenRouter catalog fallback now that installed
+  - [x] Remove the Philote direct OpenRouter catalog fallback now that installed
     hotel rollout proof is green.
   - [ ] Define a credential-safe auth egress contract before migrating OAuth
     token and userinfo exchange.

@@ -1590,12 +1590,13 @@ pub struct AgentRuntime {
     muninn_available: bool,
     /// Role configurations registered via `role.configure`, keyed by role_name.
     configured_roles: HashMap<String, CachedRoleConfig>,
-    /// Cached OpenRouter catalog snapshot for `/model` display: the set of
-    /// model ids whose endpoints accept tool calls, plus the set of all known
-    /// ids (absent-from-catalog models stay unannotated). Refreshed lazily
-    /// when older than [`OPENROUTER_CATALOG_TTL`]; `None` until first fetch or
-    /// when the last fetch failed (annotation is best-effort — dispatch-time
-    /// tools handling lives in model-router, not here).
+    /// Cached hotel-owned OpenRouter catalog snapshot for `/model` display:
+    /// the set of model ids whose endpoints accept tool calls, plus the set of
+    /// all known ids (absent-from-catalog models stay unannotated). Refreshed
+    /// lazily when older than [`OPENROUTER_CATALOG_TTL`]; `None` until the
+    /// hotel's governed discovery job publishes its first snapshot
+    /// (annotation is best-effort — dispatch-time tools handling lives in
+    /// model-router, not here).
     openrouter_tools_catalog: Option<OpenRouterToolsCatalog>,
     /// Agent profile (identity_text, soul_text, etc.) fetched from hotel at startup.
     /// Applied to every new session so the correct persona is used from the first turn.
@@ -1654,9 +1655,8 @@ pub struct AgentRuntime {
 }
 
 /// One model row from the hotel's compact catalog (config node
-/// `model_catalog.openrouter`, written by aiua's model-catalog-sync job) or
-/// from the direct-OpenRouter fallback fetch. Backs both the `/models`
-/// drill-down and the `/model` tool badges.
+/// `model_catalog.openrouter`, written by aiua's governed model-catalog-sync
+/// job). Backs both the `/models` drill-down and the `/model` tool badges.
 #[derive(Debug, Clone)]
 struct CatalogModelEntry {
     id: String,
@@ -1680,6 +1680,26 @@ impl OpenRouterToolsCatalog {
             .iter()
             .find(|e| e.id == model_id)
             .and_then(|e| e.tools)
+    }
+}
+
+fn parse_compact_model_catalog(raw: &str) -> Option<Vec<CatalogModelEntry>> {
+    let rows: Vec<serde_json::Value> = serde_json::from_str(raw).ok()?;
+    let entries: Vec<CatalogModelEntry> = rows
+        .iter()
+        .filter_map(|row| {
+            Some(CatalogModelEntry {
+                id: row.get("id")?.as_str()?.to_string(),
+                name: row.get("name").and_then(|n| n.as_str()).map(str::to_string),
+                tools: row.get("tools").and_then(|t| t.as_bool()),
+                ctx: row.get("ctx").and_then(|c| c.as_u64()).map(|c| c as u32),
+            })
+        })
+        .collect();
+    if entries.is_empty() {
+        None
+    } else {
+        Some(entries)
     }
 }
 
@@ -1725,11 +1745,12 @@ impl AgentRuntime {
             .and_then(|c| c.supports_tools(model_id))
     }
 
-    /// Refresh the cached catalog if stale. HOTEL-FIRST: reads the compact
-    /// catalog aiua's model-catalog-sync job persists to the config node
-    /// `model_catalog.openrouter` (one fetch per hotel, mesh-consistent);
-    /// falls back to a direct OpenRouter fetch when the hotel hasn't run
-    /// discovery yet. A failed refresh keeps the previous snapshot.
+    /// Refresh the cached catalog if stale. Reads only the compact catalog
+    /// aiua's governed model-catalog-sync job persists to the config node
+    /// `model_catalog.openrouter` (one external fetch per hotel rather than one
+    /// ambient fetch per philote). A failed refresh keeps the previous
+    /// snapshot; absence remains visible instead of creating a second network
+    /// authority inside cognition.
     async fn ensure_openrouter_catalog(&mut self) {
         let stale = self
             .openrouter_tools_catalog
@@ -1739,11 +1760,7 @@ impl AgentRuntime {
         if !stale {
             return;
         }
-        let fresh = match self.fetch_hotel_catalog().await {
-            Some(entries) => Some(entries),
-            None => self.fetch_openrouter_catalog_direct().await,
-        };
-        if let Some(entries) = fresh {
+        if let Some(entries) = self.fetch_hotel_catalog().await {
             self.openrouter_tools_catalog = Some(OpenRouterToolsCatalog {
                 fetched_at: std::time::Instant::now(),
                 entries,
@@ -1771,91 +1788,7 @@ impl AgentRuntime {
             }) => v,
             _ => return None,
         };
-        let rows: Vec<serde_json::Value> = serde_json::from_str(&raw).ok()?;
-        let entries: Vec<CatalogModelEntry> = rows
-            .iter()
-            .filter_map(|row| {
-                Some(CatalogModelEntry {
-                    id: row.get("id")?.as_str()?.to_string(),
-                    name: row.get("name").and_then(|n| n.as_str()).map(str::to_string),
-                    tools: row.get("tools").and_then(|t| t.as_bool()),
-                    ctx: row.get("ctx").and_then(|c| c.as_u64()).map(|c| c as u32),
-                })
-            })
-            .collect();
-        if entries.is_empty() {
-            None
-        } else {
-            Some(entries)
-        }
-    }
-
-    /// Direct OpenRouter fallback for hotels that haven't run catalog
-    /// discovery yet (public endpoint, no key).
-    async fn fetch_openrouter_catalog_direct(&mut self) -> Option<Vec<CatalogModelEntry>> {
-        let base = match self
-            .ipc_client
-            .send_request_with_timeout(
-                IpcRequest::GetConfig {
-                    key: "openrouter_base_url".into(),
-                },
-                Duration::from_secs(3),
-            )
-            .await
-        {
-            Ok(IpcResponse::ConfigData {
-                value_json: Some(v),
-                ..
-            }) => v,
-            _ => "https://openrouter.ai/api".to_string(),
-        };
-        let base = base
-            .trim()
-            .trim_matches('"')
-            .trim_end_matches('/')
-            .trim_end_matches("/v1")
-            .trim_end_matches('/')
-            .to_string();
-        let url = format!("{base}/v1/models");
-        let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(4))
-            .build()
-            .ok()?;
-        let body: serde_json::Value = client.get(&url).send().await.ok()?.json().await.ok()?;
-        let entries: Vec<CatalogModelEntry> = body
-            .get("data")
-            .and_then(|d| d.as_array())?
-            .iter()
-            .filter_map(|model| {
-                let id = model.get("id").and_then(|i| i.as_str())?.to_string();
-                let tools = model
-                    .get("supported_parameters")
-                    .and_then(|p| p.as_array())
-                    .map(|params| {
-                        params
-                            .iter()
-                            .filter_map(|p| p.as_str())
-                            .any(|p| p == "tools")
-                    });
-                Some(CatalogModelEntry {
-                    id,
-                    name: model
-                        .get("name")
-                        .and_then(|n| n.as_str())
-                        .map(str::to_string),
-                    tools,
-                    ctx: model
-                        .get("context_length")
-                        .and_then(|c| c.as_u64())
-                        .map(|c| c as u32),
-                })
-            })
-            .collect();
-        if entries.is_empty() {
-            None
-        } else {
-            Some(entries)
-        }
+        parse_compact_model_catalog(&raw)
     }
 
     /// Build the `/models` drill-down reply: bare → vendor buttons; with a
@@ -1867,8 +1800,9 @@ impl AgentRuntime {
         self.ensure_openrouter_catalog().await;
         let Some(catalog) = self.openrouter_tools_catalog.as_ref() else {
             return (
-                "Model catalog unavailable — the hotel's discovery job hasn't run yet and \
-                 OpenRouter is unreachable. You can still bind directly: /model <vendor/model>."
+                "Model catalog unavailable — the hotel's governed discovery job hasn't \
+                 published a snapshot yet. You can still bind directly: \
+                 /model <vendor/model>."
                     .to_string(),
                 None,
             );
@@ -7280,9 +7214,10 @@ mod tests {
         extract_model_error, extract_model_error_payload, format_role_command_reply,
         format_roles_report, loop_stop_fallback_reply, loop_stop_reason,
         media_analysis_attachments, next_ladder_tier, normalized_user_content,
-        parse_memory_candidate, pick_oracle_role, primary_dispatch_used_ladder, provider_for_role,
-        resolve_media_routing, resolve_model_execution_target, role_model_binding,
-        shadow_eligible_capability, should_attempt_provider_repair, tool_step_earns_streak,
+        parse_compact_model_catalog, pick_oracle_role, primary_dispatch_used_ladder,
+        provider_for_role, resolve_media_routing, resolve_model_execution_target,
+        role_model_binding, shadow_eligible_capability, should_attempt_provider_repair,
+        tool_step_earns_streak,
     };
     use crate::commands::SlashCommand;
     use crate::r#loop::{ApprovalRequest, PlanProposalAction, ToolCall, ToolResult, TurnPhase};
@@ -7297,6 +7232,33 @@ mod tests {
     };
     use philotic_client::{TaskErrorPayload, UserProfileDataPayload};
     use uuid::Uuid;
+
+    #[test]
+    fn compact_model_catalog_parser_keeps_hotel_projection_fields() {
+        let entries = parse_compact_model_catalog(
+            r#"[
+                {"id":"openai/gpt-5.6","name":"GPT 5.6","tools":true,"ctx":1050000},
+                {"name":"missing id"},
+                {"id":"anthropic/claude","tools":false}
+            ]"#,
+        )
+        .expect("valid compact catalog");
+
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].id, "openai/gpt-5.6");
+        assert_eq!(entries[0].name.as_deref(), Some("GPT 5.6"));
+        assert_eq!(entries[0].tools, Some(true));
+        assert_eq!(entries[0].ctx, Some(1_050_000));
+        assert_eq!(entries[1].id, "anthropic/claude");
+        assert_eq!(entries[1].tools, Some(false));
+    }
+
+    #[test]
+    fn compact_model_catalog_parser_rejects_absent_or_invalid_snapshots() {
+        assert!(parse_compact_model_catalog("not-json").is_none());
+        assert!(parse_compact_model_catalog("[]").is_none());
+        assert!(parse_compact_model_catalog(r#"[{"name":"missing id"}]"#).is_none());
+    }
 
     // ── Routing-oracle helpers ────────────────────────────────────────────
 
