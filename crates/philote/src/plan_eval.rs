@@ -633,9 +633,20 @@ pub struct PlanCompletion {
 /// Evaluate the plan as a whole. A step counts as settled when it is either
 /// verified by tool evidence, or not checkable *and* claimed done by the
 /// model. Anything else is outstanding and must not be reported as finished.
+///
+/// A non-atomic step is never settled, whatever its evidence says. This is the
+/// load-bearing case: "propose Zerin, Mali and Daxton" is *verified* by the one
+/// `life.observe` that ran for Zerin, so evidence alone reports it complete and
+/// the other two artifacts vanish silently — which is the original incident. A
+/// step that bundles outcomes cannot be checked one-to-one, so it stays
+/// outstanding until it is split.
 pub fn evaluate_whole_plan(plan: &ActivePlan, verification: &PlanVerification) -> PlanCompletion {
     let mut outstanding = Vec::new();
     for (i, step) in plan.steps.iter().enumerate() {
+        if verification.non_atomic_step_ids.contains(&step.id) {
+            outstanding.push(i);
+            continue;
+        }
         let settled = match verification.evidence.get(i) {
             Some(StepEvidence::Verified) => true,
             Some(StepEvidence::NotCheckable) => step.status == "done",
@@ -675,12 +686,17 @@ pub fn plan_integrity_note(
         let Some(step) = plan.steps.get(*i) else {
             continue;
         };
-        let why = match verification.evidence.get(*i) {
-            Some(StepEvidence::Missing) if step.status == "done" => {
-                "you marked this done, but no successful tool call in this turn did it"
+        let why = if verification.non_atomic_step_ids.contains(&step.id) {
+            "this step bundles several outcomes, so one tool call cannot have completed all of \
+             them. Split it into one step per outcome and do the parts that are still missing"
+        } else {
+            match verification.evidence.get(*i) {
+                Some(StepEvidence::Missing) if step.status == "done" => {
+                    "you marked this done, but no successful tool call in this turn did it"
+                }
+                Some(StepEvidence::Missing) => "no successful tool call in this turn did it",
+                _ => "not completed",
             }
-            Some(StepEvidence::Missing) => "no successful tool call in this turn did it",
-            _ => "not completed",
         };
         note.push_str(&format!(
             "- step {}: {} — {why}\n",
@@ -726,6 +742,11 @@ pub fn should_plan(user_content: &str) -> bool {
 
     // Anything that asks for something, or asks a question, gets a plan —
     // even a one-step one, so its completion is checkable.
+    //
+    // Matched on word boundaries, not as raw substrings: "over budget" ends in
+    // "get", "forget it" contains "get", and "planning to relax" contains
+    // "plan". A false positive only costs a one-step plan, but it costs it on
+    // exactly the chit-chat the skip branch exists to protect.
     const REQUEST_MARKERS: &[&str] = &[
         "can you",
         "could you",
@@ -733,16 +754,16 @@ pub fn should_plan(user_content: &str) -> bool {
         "please",
         "i need",
         "i want",
-        "let's",
-        "lets ",
-        "add ",
+        "lets",
+        "let s",
+        "add",
         "create",
-        "set ",
+        "set",
         "update",
         "change",
-        "get ",
+        "get",
         "find",
-        "make ",
+        "make",
         "show",
         "list",
         "record",
@@ -760,10 +781,24 @@ pub fn should_plan(user_content: &str) -> bool {
         "look up",
         "figure out",
         "help me",
-        "map ",
+        "map",
         "propose",
     ];
-    if trimmed.contains('?') || REQUEST_MARKERS.iter().any(|m| lower.contains(m)) {
+    let words_padded = format!(
+        " {} ",
+        lower
+            .chars()
+            .map(|c| if c.is_alphanumeric() { c } else { ' ' })
+            .collect::<String>()
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+    );
+    if trimmed.contains('?')
+        || REQUEST_MARKERS
+            .iter()
+            .any(|m| words_padded.contains(&format!(" {m} ")))
+    {
         return true;
     }
 
@@ -1343,17 +1378,23 @@ mod tests {
         );
         assert_eq!(atomicity_violations(&p), vec![1]);
 
+        // Only Zerin's call ran. Evidence alone would mark the bundled step
+        // Verified and let the turn report all three as done — that is the
+        // original incident. Bundling must override the evidence.
         let h = history_args(&[("life.observe", observe("Zerin Maluy"), "ok")]);
         let v = verify_plan_steps(&p, &h, &[]);
+        assert_eq!(v.evidence[0], StepEvidence::Verified, "one call did match");
+
         let c = evaluate_whole_plan(&p, &v);
-        // One call clears the bundled step, which is exactly why bundling is
-        // unsafe — so the integrity note must still call the bundling out.
-        let note = plan_integrity_note(&p, &v, &c);
         assert!(
-            c.complete && note.is_none(),
-            "bundled step verifies off one call — atomicity flag is the guard"
+            !c.complete,
+            "a bundled step must never settle the plan, however it verified"
         );
-        assert!(!v.non_atomic_step_ids.is_empty());
+        assert_eq!(c.outstanding, vec![0]);
+
+        let note = plan_integrity_note(&p, &v, &c).expect("integrity note must fire");
+        assert!(note.contains("bundles several outcomes"));
+        assert!(note.contains("Split it into one step per outcome"));
     }
 
     #[test]
@@ -1382,6 +1423,12 @@ mod tests {
             "Kelley and I are watching The Bear - fourth season 😉",
             "ok",
             "Chef! 🫡",
+            // Substring collisions: these contain "get"/"plan"/"set" inside
+            // longer words and must not trip the request markers.
+            "forget it",
+            "we came in over budget",
+            "planning to relax tonight",
+            "the sunset was unreal",
         ] {
             assert!(!should_plan(msg), "should not plan: {msg}");
         }

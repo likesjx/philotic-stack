@@ -6024,6 +6024,34 @@ mod tests {
         );
     }
 
+    /// Verification flags are latched turn state. A silent serde drop here
+    /// would revert proven steps to unverified after any hotel restart, and
+    /// the turn would redo work it had already done.
+    #[test]
+    fn checkpoint_round_trip_preserves_verification_flags_and_start_time() {
+        let mut state =
+            SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
+        let mut turn = test_working_turn(Some(plan_of(vec![
+            step(1, "Propose Zerin"),
+            step(2, "Propose Daxton"),
+        ])));
+        turn.plan_steps_verified = vec![true, false];
+        turn.started_at_unix = Some(1_785_183_905);
+        turn.phase = TurnPhase::WaitingTool;
+        state.start_turn(turn);
+
+        let restored =
+            SessionState::from_checkpoint(&state.checkpoint_json()).expect("checkpoint restores");
+        let restored_turn = restored.active_turn.as_ref().expect("turn survives");
+
+        assert_eq!(restored_turn.plan_steps_verified, vec![true, false]);
+        assert_eq!(
+            restored_turn.started_at_unix,
+            Some(1_785_183_905),
+            "the zombie watchdog still clocks from the original start, so the budget must not reset"
+        );
+    }
+
     #[test]
     fn checkpoint_round_trip_preserves_context1_advisory_on_active_plan() {
         let mut state =
