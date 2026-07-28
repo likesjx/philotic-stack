@@ -119,6 +119,11 @@ pub fn decide_egress_placement(
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum IntegrationTarget {
     Http(HttpIntegrationTarget),
+    /// A local-only, two-leg OIDC exchange. The runner resolves the client
+    /// secret at the execution hotel, exchanges the authorization code, uses
+    /// the ephemeral access token for userinfo, and returns only allowlisted
+    /// identity claims. This target is system-only and is never model-projected.
+    Oidc(OidcIntegrationTarget),
     /// Connects the shared placement/audit contract to the existing MCP
     /// manager without moving MCP protocol authority into the HTTP runner.
     Mcp {
@@ -197,6 +202,15 @@ impl IntegrationBinding {
         }
         match &self.target {
             IntegrationTarget::Http(target) => target.validate(),
+            IntegrationTarget::Oidc(target) => {
+                if !matches!(self.placement, EgressPlacementPolicy::Local) {
+                    return Err(
+                        "OIDC integrations must execute locally so authorization codes and access tokens never traverse the mesh"
+                            .into(),
+                    );
+                }
+                target.validate()
+            }
             IntegrationTarget::Mcp { upstream_id } => {
                 validate_identifier("MCP upstream_id", upstream_id)
             }
@@ -289,6 +303,57 @@ pub struct HttpCredentialBinding {
     pub header: String,
     /// Exactly one `{}` placeholder is replaced with the resolved secret.
     pub format: String,
+}
+
+/// Exact, non-secret authority for one OIDC token + userinfo exchange.
+///
+/// The authorization endpoint remains owned by the operator-auth ceremony.
+/// This target covers only the back-channel network legs after a callback has
+/// already passed state and PKCE challenge validation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OidcIntegrationTarget {
+    pub provider_id: String,
+    pub client_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_secret_ref: Option<String>,
+    pub token_url: String,
+    pub userinfo_url: String,
+    /// Exact redirect URI included in the token exchange. It is compiled by
+    /// the hotel from the current operator-auth callback configuration rather
+    /// than accepted as a runner-controlled destination.
+    pub redirect_uri: String,
+    #[serde(default)]
+    pub network_scope: HttpNetworkScope,
+    #[serde(default = "default_http_timeout_secs")]
+    pub timeout_secs: u64,
+    #[serde(default = "default_oidc_max_response_bytes")]
+    pub max_response_bytes: u64,
+}
+
+impl OidcIntegrationTarget {
+    pub fn validate(&self) -> Result<(), String> {
+        validate_identifier("OIDC provider_id", &self.provider_id)?;
+        if self.client_id.trim().is_empty() || self.client_id.len() > 512 {
+            return Err("OIDC client_id must contain 1..=512 characters".into());
+        }
+        if let Some(secret_ref) = &self.client_secret_ref {
+            validate_identifier("OIDC client_secret_ref", secret_ref)?;
+        }
+        validate_oidc_endpoint("token_url", &self.token_url, self.network_scope)?;
+        validate_oidc_endpoint("userinfo_url", &self.userinfo_url, self.network_scope)?;
+        validate_oidc_redirect_uri(&self.redirect_uri)?;
+        if self.timeout_secs == 0 || self.timeout_secs > 120 {
+            return Err("OIDC timeout_secs must be between 1 and 120".into());
+        }
+        if self.max_response_bytes == 0 || self.max_response_bytes > 1024 * 1024 {
+            return Err("OIDC max_response_bytes must be between 1 and 1048576".into());
+        }
+        Ok(())
+    }
+}
+
+fn default_oidc_max_response_bytes() -> u64 {
+    64 * 1024
 }
 
 /// Bounded HTTP authority for an integration.
@@ -460,6 +525,25 @@ pub struct HttpIntegrationResponse {
     pub content_type: Option<String>,
     pub response_bytes: u64,
     pub audit: HttpIntegrationAudit,
+}
+
+/// Ephemeral values supplied after the operator-auth ceremony validates state
+/// and PKCE challenge ownership. The request is local-only by contract.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OidcExchangeRequest {
+    #[serde(default)]
+    pub binding_id: String,
+    pub authorization_code: String,
+    pub code_verifier: String,
+}
+
+/// Sanitized OIDC exchange result. Access and refresh tokens never appear in
+/// this envelope; only allowlisted userinfo claims and content-free audit do.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct OidcExchangeResponse {
+    pub provider_id: String,
+    pub userinfo: serde_json::Value,
+    pub audits: Vec<HttpIntegrationAudit>,
 }
 
 /// Secret-free, content-free execution evidence.
@@ -647,6 +731,30 @@ fn validate_host(host: &str) -> Result<(), String> {
     Ok(())
 }
 
+fn validate_oidc_endpoint(
+    label: &str,
+    value: &str,
+    network_scope: HttpNetworkScope,
+) -> Result<(), String> {
+    let parsed = ParsedHttpUrl::parse(value).map_err(|message| format!("{label}: {message}"))?;
+    if parsed.username_or_password {
+        return Err(format!("{label} must not contain userinfo"));
+    }
+    if value.starts_with("http://") && !matches!(network_scope, HttpNetworkScope::Loopback) {
+        return Err(format!("{label} must use https outside loopback scope"));
+    }
+    Ok(())
+}
+
+fn validate_oidc_redirect_uri(value: &str) -> Result<(), String> {
+    let parsed =
+        ParsedHttpUrl::parse(value).map_err(|message| format!("redirect_uri: {message}"))?;
+    if parsed.username_or_password {
+        return Err("redirect_uri must not contain userinfo".into());
+    }
+    Ok(())
+}
+
 /// Minimal URL shape validation kept dependency-free for the shared contract.
 struct ParsedHttpUrl {
     path: String,
@@ -753,6 +861,57 @@ mod tests {
             target.allowed_methods = vec!["get".into()];
         }
         assert!(binding.validate().unwrap_err().contains("non-uppercase"));
+    }
+
+    #[test]
+    fn oidc_binding_is_local_only_and_never_model_projected() {
+        let mut binding = IntegrationBinding {
+            binding_id: "operator-oidc-google".into(),
+            owner_agent_id: "operator-auth-egress".into(),
+            display_name: Some("Google operator sign-in".into()),
+            target: IntegrationTarget::Oidc(OidcIntegrationTarget {
+                provider_id: "google".into(),
+                client_id: "client-id".into(),
+                client_secret_ref: Some("secret://hotel/default/oidc/google-client-secret".into()),
+                token_url: "https://oauth2.googleapis.com/token".into(),
+                userinfo_url: "https://openidconnect.googleapis.com/v1/userinfo".into(),
+                redirect_uri: "https://hotel.example/auth/oidc/google/callback".into(),
+                network_scope: HttpNetworkScope::Public,
+                timeout_secs: 10,
+                max_response_bytes: 65_536,
+            }),
+            grant_agents: vec![],
+            grant_skills: vec![],
+            traffic_class: EgressTrafficClass::GeneralApi,
+            placement: EgressPlacementPolicy::Local,
+            requires_approval: false,
+            enabled: true,
+            updated_at: 1,
+        };
+
+        binding.validate().unwrap();
+        assert_eq!(binding.projected_tool_name(), None);
+
+        binding.placement = EgressPlacementPolicy::RequireHotel {
+            hotel_id: "vps-jane".into(),
+        };
+        assert!(binding.validate().unwrap_err().contains("locally"));
+    }
+
+    #[test]
+    fn oidc_public_endpoints_require_https() {
+        let target = OidcIntegrationTarget {
+            provider_id: "test".into(),
+            client_id: "client-id".into(),
+            client_secret_ref: None,
+            token_url: "http://provider.example/token".into(),
+            userinfo_url: "https://provider.example/userinfo".into(),
+            redirect_uri: "http://127.0.0.1/callback".into(),
+            network_scope: HttpNetworkScope::Public,
+            timeout_secs: 10,
+            max_response_bytes: 1024,
+        };
+        assert!(target.validate().unwrap_err().contains("https"));
     }
 
     #[test]

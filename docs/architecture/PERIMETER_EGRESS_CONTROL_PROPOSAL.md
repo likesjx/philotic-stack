@@ -2,9 +2,9 @@
 title: Perimeter Egress Control Proposal
 doc_type: proposal
 domain: operator-control-plane
-status: in-progress
+status: accepted-current-slice
 disposition: accepted-current-slice
-last_updated: 2026-07-26
+last_updated: 2026-07-28
 tags:
 - egress
 - perimeter
@@ -28,11 +28,12 @@ implemented_by:
 - crates/egress-http-runner/src/lib.rs
 - crates/aiua/src/service/governed_http.rs
 - crates/aiua/src/service/model_catalog_sync.rs
+- crates/aiua/src/service/ipc.rs
+- crates/philotic-web/src/serve.rs
 - docs/architecture/outbound-egress-inventory.json
 - scripts/check-outbound-egress-inventory.py
 active_seams:
-- egress-policy-object
-- outbound-classification
+- outbound-fleet-enforcement
 source_of_truth_targets:
 - ARCHITECTURE_STATUS.md
 ---
@@ -49,6 +50,15 @@ Define a deterministic outbound egress boundary for Philotic so the system can a
 - how egress policy, audit, and security review stay machine-checkable instead of becoming ambient lore
 
 This proposal exists because "inside the perimeter" is only half the story. If we do not define how traffic leaves the system, security posture becomes a collection of vibes plus whichever crate imported `reqwest` first.
+
+## Disposition
+
+`accepted-current-slice`. The canonical policy, bounded HTTP executor,
+MCP-over-HTTP delegation, first hotel-owned general-API migration, and
+credential-safe operator OIDC migration are implemented. Fleet enforcement
+remains active because named model-provider, communication, local-resource,
+mesh, and artifact exceptions have not all moved behind executable host-level
+rules.
 
 ## Core Recommendation
 
@@ -109,8 +119,11 @@ Current proven shape:
 - the OpenRouter model-catalog poll is the first hotel-owned general-API caller
   migrated to a system binding, with installed watched-live proof from
   `mbp-jane` through the selected `vps-jane-aiua-01` executor
-- 33 remaining production direct-client files have machine-checked
-  dispositions in `outbound-egress-inventory.json`
+- Philote consumes only the hotel-owned compact catalog and no longer owns a
+  direct OpenRouter fallback client
+- 32 remaining production direct-client files have machine-checked
+  dispositions, while two migrated callers are regression-guarded in
+  `outbound-egress-inventory.json`
 - model providers, communications, local resources, mesh, and artifacts remain
   named specialized exceptions; operator auth is a temporary exception
 
@@ -223,9 +236,9 @@ Then a later cognitive/security cycle may:
 
 But the cognitive layer should interpret deterministic facts, not replace them as the source of truth.
 
-## First Slice Recommendation
+## Current Slice
 
-The first coherent implementation slices are:
+The coherent implementation slices now are:
 
 1. **Implemented, test-green:** define traffic classes and exit-placement
    decisions; make checks authorization-only and keep credentials out of model
@@ -241,14 +254,20 @@ The first coherent implementation slices are:
    [OUTBOUND_INTEGRATION_FABRIC_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/OUTBOUND_INTEGRATION_FABRIC_PROPOSAL.md).
 5. **Implemented, smoke-green:** route the hotel-owned OpenRouter catalog sync
    through that executor.
-6. Keep model/provider egress as an explicit documented exception until a
+6. **Implemented, smoke-green:** route operator OIDC token and userinfo
+   back-channel exchange through a typed local-only binding; keep client
+   secrets and access/refresh tokens inside the execution hotel, return only
+   allowlisted identity claims, and audit both legs separately.
+7. Keep model/provider egress as an explicit documented exception until a
    later decision.
 
 ## Open Questions
 
 - The first implementation is a dedicated `egress-http-runner` selected and
   mediated by the hotel; membranes retain transport semantics.
-- What is the minimum useful audit payload for outbound requests?
+- The implemented audit payload records target, status, size, duration,
+  placement, credential reference, and disposition without request or response
+  content. Revisit only when an operator use case proves that insufficient.
 - Which outbound classes should support approval-gated release versus strict deterministic allow/deny?
 - When should model/provider egress stop being an exception?
 - How does this intersect with future perimeter health / membrane supervision checks?

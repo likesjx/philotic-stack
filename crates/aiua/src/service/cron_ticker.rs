@@ -1206,6 +1206,10 @@ mod tests {
                 *self.last_guest_id.lock().await = Some(guest_id.to_string());
                 Ok(true)
             }
+
+            async fn restart_guest(&self, guest_id: &str) -> anyhow::Result<bool> {
+                self.ensure_guest_active(guest_id).await
+            }
         }
 
         let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");

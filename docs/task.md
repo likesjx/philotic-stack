@@ -34,12 +34,14 @@ Stable seam refs live in [SEAM_REGISTRY.md](/Users/jaredlikes/code/philotic-stac
 
 ## Current Mesh / Transport Pressure
 
+- [x] Fix DEF-073's guest-supervisor stale-snapshot race so heal restarts cannot leave duplicate Telegram gateways or duplicate final delivery.
 - [ ] Enforce the explicit mesh transport boundary from [MESH_SYNC_AND_TRANSPORT_BOUNDARIES_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/MESH_SYNC_AND_TRANSPORT_BOUNDARIES_PROPOSAL.md):
   - [ ] keep UDP limited to compact state-sync/control traffic
   - [ ] remove any remaining routed execution or payload traffic that still leans on the beacon family
   - [ ] keep WebRTC as optional peer session transport after signaling, not the graph or membership sync plane
   - [ ] classify the canonical mesh-shared graph projection in code instead of relying on operator intuition
 - [ ] Recover a single known-good live mesh runtime path across `bjork`, `mbp-jane`, and `jane-vps`.
+- [x] Reject `EmitTask` synchronously with `TARGET_NODE_UNREACHABLE` when a remote node has no registry entry or peer socket; retain a classified heal record and do not append a phantom ledger event.
 - [x] Make response return routing core according to [RESPONSE_RETURN_ROUTE_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/RESPONSE_RETURN_ROUTE_PROPOSAL.md):
   - [x] patch `philote` to emit `reply_guest_id` for model-driven and direct LifeGraph tool calls
   - [x] patch `datasource` to target `reply_guest_id` for success and failure responses
@@ -1703,10 +1705,15 @@ Seam IDs: `wider-client-adoption`, `philotic-native-memory-integration`
   - [x] Install and watched-live prove the catalog path from the launchd-managed
     `mbp-jane` caller through `vps-jane-aiua-01`, including HTTP 200 audit and
     source-hotel compact catalog persistence.
-  - [ ] Remove the Philote direct OpenRouter catalog fallback now that installed
+  - [x] Remove the Philote direct OpenRouter catalog fallback now that installed
     hotel rollout proof is green.
-  - [ ] Define a credential-safe auth egress contract before migrating OAuth
-    token and userinfo exchange.
+  - [x] Define and implement a credential-safe operator OIDC egress contract:
+    `philotic-web` retains state, PKCE, identity linking, and session issuance;
+    the hotel compiles an exact local-only binding; `egress-http-runner`
+    resolves the client secret, consumes access/refresh tokens internally,
+    returns allowlisted userinfo claims only, and persists one content-free
+    audit per back-channel leg. An isolated binary smoke proves the complete
+    IPC, vault, token, userinfo, response, and audit round-trip.
 - [x] Perimeter egress control (`egress-policy-object`): define the first
   canonical policy and placement types; finding schema remains part of the
   HTTP executor/audit slice.

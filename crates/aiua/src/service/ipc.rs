@@ -4334,6 +4334,148 @@ impl IpcServer {
         }
     }
 
+    async fn exchange_operator_oidc(
+        socket_path: &str,
+        local_node_id: &str,
+        graph: &GraphDomain,
+        provider: &str,
+        authorization_code: String,
+        code_verifier: String,
+        redirect_uri: String,
+    ) -> anyhow::Result<ansible_mesh_core::integration::OidcExchangeResponse> {
+        use ansible_mesh_core::integration::{
+            EgressPlacementPolicy, EgressTrafficClass, HttpNetworkScope, IntegrationBinding,
+            IntegrationTarget, OidcExchangeRequest, OidcIntegrationTarget,
+        };
+
+        let provider = provider.trim().to_ascii_lowercase();
+        let (client_id_key, client_secret_ref_key, default_token_url, default_userinfo_url) =
+            match provider.as_str() {
+                "google" => (
+                    "oidc_google_client_id",
+                    "oidc_google_client_secret_ref",
+                    "https://oauth2.googleapis.com/token",
+                    "https://openidconnect.googleapis.com/v1/userinfo",
+                ),
+                "github" => (
+                    "oidc_github_client_id",
+                    "oidc_github_client_secret_ref",
+                    "https://github.com/login/oauth/access_token",
+                    "https://api.github.com/user",
+                ),
+                _ => anyhow::bail!("unsupported operator OIDC provider '{provider}'"),
+            };
+        let read_config_string = |key: &str| -> anyhow::Result<Option<String>> {
+            Ok(graph
+                .get_config_value(key)?
+                .and_then(|value| serde_json::from_str::<String>(&value).ok())
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty()))
+        };
+        let client_id = read_config_string(client_id_key)?
+            .ok_or_else(|| anyhow::anyhow!("{client_id_key} is not configured"))?;
+        let client_secret_ref = read_config_string(client_secret_ref_key)?
+            .ok_or_else(|| anyhow::anyhow!("{client_secret_ref_key} is not configured"))?;
+        let smoke_mode = std::env::var("PHILOTIC_SMOKE_MODE").as_deref() == Ok("1");
+        let token_url = if smoke_mode {
+            read_config_string(&format!("smoke_oidc_{provider}_token_url"))?
+                .unwrap_or_else(|| default_token_url.into())
+        } else {
+            default_token_url.into()
+        };
+        let userinfo_url = if smoke_mode {
+            read_config_string(&format!("smoke_oidc_{provider}_userinfo_url"))?
+                .unwrap_or_else(|| default_userinfo_url.into())
+        } else {
+            default_userinfo_url.into()
+        };
+        let endpoint_is_loopback = |raw: &str| -> anyhow::Result<bool> {
+            let url = reqwest::Url::parse(raw).context("operator OIDC endpoint URL is invalid")?;
+            let host = url
+                .host_str()
+                .ok_or_else(|| anyhow::anyhow!("operator OIDC endpoint URL has no host"))?;
+            Ok(host == "localhost"
+                || host
+                    .parse::<std::net::IpAddr>()
+                    .is_ok_and(|address| address.is_loopback()))
+        };
+        let token_is_loopback = endpoint_is_loopback(&token_url)?;
+        let userinfo_is_loopback = endpoint_is_loopback(&userinfo_url)?;
+        if token_is_loopback != userinfo_is_loopback {
+            anyhow::bail!(
+                "operator OIDC token and userinfo endpoints must share one network scope"
+            );
+        }
+        let network_scope = if token_is_loopback {
+            HttpNetworkScope::Loopback
+        } else {
+            HttpNetworkScope::Public
+        };
+
+        let redirect = reqwest::Url::parse(&redirect_uri)
+            .context("operator OIDC redirect_uri is invalid")?;
+        if !redirect.username().is_empty() || redirect.password().is_some() {
+            anyhow::bail!("operator OIDC redirect_uri must not contain userinfo");
+        }
+        let expected_path = format!("/auth/oidc/{provider}/callback");
+        if redirect.path() != expected_path {
+            anyhow::bail!(
+                "operator OIDC redirect_uri path '{}' does not match '{}'",
+                redirect.path(),
+                expected_path
+            );
+        }
+        if redirect.scheme() != "https"
+            && !(redirect.scheme() == "http"
+                && redirect
+                    .host_str()
+                    .is_some_and(|host| matches!(host, "127.0.0.1" | "localhost" | "::1")))
+        {
+            anyhow::bail!("operator OIDC redirect_uri must use HTTPS or HTTP loopback");
+        }
+
+        let binding_id = format!("operator-oidc-{provider}");
+        let binding = IntegrationBinding {
+            binding_id: binding_id.clone(),
+            owner_agent_id: "operator-auth-egress".into(),
+            display_name: Some(format!("{provider} operator OIDC exchange")),
+            target: IntegrationTarget::Oidc(OidcIntegrationTarget {
+                provider_id: provider,
+                client_id,
+                client_secret_ref: Some(client_secret_ref),
+                token_url,
+                userinfo_url,
+                redirect_uri: redirect.to_string(),
+                network_scope,
+                timeout_secs: 15,
+                max_response_bytes: 64 * 1024,
+            }),
+            grant_agents: Vec::new(),
+            grant_skills: Vec::new(),
+            traffic_class: EgressTrafficClass::GeneralApi,
+            placement: EgressPlacementPolicy::Local,
+            requires_approval: false,
+            enabled: true,
+            updated_at: unix_ts(),
+        };
+        crate::service::governed_http::GovernedHttpService {
+            socket_path: socket_path.to_string(),
+            local_node_id: local_node_id.to_string(),
+            guest_id: "operator-auth-egress".into(),
+            role: "operator-auth-egress".into(),
+        }
+        .execute_oidc(
+            binding,
+            OidcExchangeRequest {
+                binding_id,
+                authorization_code,
+                code_verifier,
+            },
+            "operator OIDC exchange",
+        )
+        .await
+    }
+
     async fn process_request(
         req: IpcRequest,
         local_node_id: &str,
@@ -5831,11 +5973,10 @@ impl IpcServer {
                 } else {
                     task_json
                 };
-                // Visibility guard: a task addressed to a remote node this
-                // hotel has never seen (no registry entry, no peer socket)
-                // will sit in the ledger with no consumer. Don't block it —
-                // the node may legitimately appear later (boot races) — but
-                // make the misroute loudly observable instead of silent.
+                // Acceptance is a delivery contract: never acknowledge a task
+                // whose destination is absent from both the live registry and
+                // the explicit peer bridge. A later node appearance cannot
+                // rescue a caller that already received a false-success reply.
                 if target_node != local_node_id {
                     let node_known = {
                         let reg = registry.read().await;
@@ -5863,6 +6004,7 @@ impl IpcServer {
                                 );
                             }
                         }
+                        return IpcResponse::error("emit_task", "TARGET_NODE_UNREACHABLE", message);
                     }
                 }
                 info!(
@@ -9358,7 +9500,10 @@ impl IpcServer {
                 let entry =
                     Self::integration_binding_entry(binding, registry, graph, local_node_id).await;
                 let materialized_node_id =
-                    if matches!(entry.binding.target, IntegrationTarget::Http(_))
+                    if matches!(
+                        entry.binding.target,
+                        IntegrationTarget::Http(_) | IntegrationTarget::Oidc(_)
+                    )
                         && !matches!(
                             entry.placement,
                             ansible_mesh_core::integration::EgressPlacementDecision::Deny { .. }
@@ -9464,6 +9609,51 @@ impl IpcServer {
                     .sort_by(|left, right| left.binding.binding_id.cmp(&right.binding.binding_id));
                 IpcResponse::IntegrationBindingsState {
                     integration_bindings: entries,
+                }
+            }
+
+            IpcRequest::ExchangeOperatorOidc {
+                provider,
+                authorization_code,
+                code_verifier,
+                redirect_uri,
+            } => {
+                let authorized = current_identity.as_ref().is_some_and(|identity| {
+                    identity.role == "management" && identity.guest_id == "philotic-web-oidc"
+                });
+                if !authorized {
+                    return IpcResponse::error(
+                        "operator_oidc",
+                        "FORBIDDEN",
+                        "operator OIDC exchange requires the philotic-web-oidc management identity",
+                    );
+                }
+                match Self::exchange_operator_oidc(
+                    socket_path,
+                    local_node_id,
+                    graph,
+                    &provider,
+                    authorization_code,
+                    code_verifier,
+                    redirect_uri,
+                )
+                .await
+                {
+                    Ok(response) => IpcResponse::success(
+                        "operator_oidc",
+                        Some(
+                            serde_json::to_value(response)
+                                .unwrap_or_else(|_| serde_json::json!({})),
+                        ),
+                    ),
+                    Err(error) => {
+                        error!(provider, %error, "governed operator OIDC exchange failed");
+                        IpcResponse::error(
+                            "operator_oidc",
+                            "OIDC_EXCHANGE_FAILED",
+                            error.to_string(),
+                        )
+                    }
                 }
             }
 
@@ -9621,6 +9811,7 @@ impl IpcServer {
                         .credential
                         .as_ref()
                         .map(|binding| binding.secret_ref.clone()),
+                    IntegrationTarget::Oidc(target) => target.client_secret_ref.clone(),
                     IntegrationTarget::Mcp { .. } => {
                         return IpcResponse::error(
                             "integration_credential",
@@ -9720,18 +9911,23 @@ impl IpcServer {
                 let binding = bindings
                     .get_mut(&binding_id)
                     .expect("binding snapshot came from this registry");
-                let IntegrationTarget::Http(target) = &mut binding.target else {
-                    unreachable!("MCP target returned above")
-                };
-                match &mut target.credential {
-                    Some(credential_binding) => credential_binding.secret_ref = vault_ref.clone(),
-                    None => {
-                        return IpcResponse::error(
-                            "integration_credential",
-                            "MISSING_CREDENTIAL_INJECTION",
-                            "binding must declare credential header and format before provisioning",
-                        );
+                match &mut binding.target {
+                    IntegrationTarget::Http(target) => match &mut target.credential {
+                        Some(credential_binding) => {
+                            credential_binding.secret_ref = vault_ref.clone()
+                        }
+                        None => {
+                            return IpcResponse::error(
+                                "integration_credential",
+                                "MISSING_CREDENTIAL_INJECTION",
+                                "binding must declare credential header and format before provisioning",
+                            );
+                        }
+                    },
+                    IntegrationTarget::Oidc(target) => {
+                        target.client_secret_ref = Some(vault_ref.clone());
                     }
+                    IntegrationTarget::Mcp { .. } => unreachable!("MCP target returned above"),
                 }
                 binding.updated_at = unix_ts();
                 if let Err(error) = graph.set_config_value(
@@ -12852,22 +13048,19 @@ impl IpcServer {
             }
         }
 
-        // Terminate running process.
-        if let Some(ref pid_str) = guest.active_pid {
-            if let Ok(pid) = pid_str.parse::<u32>() {
-                let _ = ProcessCommand::new("kill")
-                    .args(["-15", &pid.to_string()])
-                    .status();
-            }
-        }
-        if let Err(e) = graph.set_guest_pid(&hotel_name, guest_id, None) {
-            warn!("RestartComponent: failed to clear PID for {guest_id}: {e}");
-        }
-
-        // Respawn.
         if let Some(req) = materialization_requester {
-            if let Err(e) = req.ensure_guest_active(guest_id).await {
-                return IpcResponse::error("restart_component", "SPAWN_FAILED", e.to_string());
+            match req.restart_guest(guest_id).await {
+                Ok(true) => {}
+                Ok(false) => {
+                    return IpcResponse::error(
+                        "restart_component",
+                        "SPAWN_FAILED",
+                        format!("guest {guest_id} was not re-materialized"),
+                    );
+                }
+                Err(e) => {
+                    return IpcResponse::error("restart_component", "SPAWN_FAILED", e.to_string());
+                }
             }
         } else {
             return IpcResponse::error(
@@ -17122,6 +17315,10 @@ pub(crate) mod tests {
             Ok(true)
         }
 
+        async fn restart_guest(&self, guest_id: &str) -> anyhow::Result<bool> {
+            self.ensure_guest_active(guest_id).await
+        }
+
         async fn check_heal_restart_budget(&self, _guest_id: &str) -> HealRestartVerdict {
             self.budget_checks.fetch_add(1, Ordering::SeqCst);
             if self.deny_budget {
@@ -17630,7 +17827,10 @@ pub(crate) mod tests {
             .await
             .expect("emit task");
 
-        assert!(matches!(response, IpcResponse::Standard { ok: true, .. }));
+        assert!(
+            matches!(response, IpcResponse::Standard { ok: true, .. }),
+            "local task should be accepted, got {response:?}"
+        );
 
         let delivered =
             tokio::time::timeout(tokio::time::Duration::from_secs(1), agent.recv_task())
@@ -18989,6 +19189,90 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn emit_task_rejects_unknown_remote_node_before_ledger_append() {
+        let _env_guard = ipc_env_guard();
+        let socket_path = test_socket_path();
+        let (dispatcher_tx, mut dispatcher_rx) = test_dispatcher_channel();
+        let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
+        let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
+        let heal_queue = Arc::new(RecordingHealQueue::default());
+        let server = IpcServer::new(socket_path.clone(), "local-aiua-01", dispatcher_tx, graph)
+            .with_heal_queue(heal_queue.clone());
+
+        let server_task = tokio::spawn(async move {
+            server.run().await.expect("ipc server should run");
+        });
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        unsafe {
+            std::env::set_var("PHILOTIC_HOTEL_SOCKET", &socket_path);
+        }
+
+        let mut runner = PhiloticClient::connect(GuestIdentity {
+            guest_id: "life-graph-route-smoke".into(),
+            role: "life-graph.ipc.smoke.reply".into(),
+            supported_tools: Vec::new(),
+        })
+        .await
+        .expect("smoke client connect");
+
+        let response = runner
+            .send_request(IpcRequest::EmitTask {
+                target_node: "missing-aiua-01".into(),
+                target_role: "life-graph-runner".into(),
+                target_guest_id: None,
+                task_json: serde_json::json!({
+                    "action": "execute_tool",
+                    "tool_name": "life.observe",
+                    "session_id": "smoke:unknown-node",
+                    "turn_id": "smoke-turn-unknown-node"
+                })
+                .to_string(),
+            })
+            .await
+            .expect("emit task response");
+
+        match response {
+            IpcResponse::Standard {
+                ok: false,
+                code,
+                message,
+                ..
+            } => {
+                assert_eq!(code, "TARGET_NODE_UNREACHABLE");
+                assert!(message.contains("missing-aiua-01"));
+            }
+            other => panic!("expected unreachable-node error, got {other:?}"),
+        }
+
+        let pushed = heal_queue.pushed.lock().unwrap();
+        assert_eq!(pushed.len(), 1);
+        assert_eq!(pushed[0].0, "aiua.emit_task_route");
+        assert_eq!(pushed[0].2, "medium");
+        assert_eq!(pushed[0].3, "emit_task_unknown_target_node");
+        drop(pushed);
+
+        assert!(
+            tokio::time::timeout(
+                tokio::time::Duration::from_millis(100),
+                dispatcher_rx.recv()
+            )
+            .await
+            .is_err(),
+            "unreachable task must not be appended to the ledger"
+        );
+
+        unsafe {
+            std::env::remove_var("PHILOTIC_HOTEL_SOCKET");
+        }
+        server_task.abort();
+        let _ = server_task.await;
+        if Path::new(&socket_path).exists() {
+            let _ = std::fs::remove_file(&socket_path);
+        }
+    }
+
+    #[tokio::test]
     async fn emit_task_routes_base_agent_target_to_active_incarnation() {
         let _env_guard = ipc_env_guard();
         let socket_path = test_socket_path();
@@ -20319,7 +20603,21 @@ pub(crate) mod tests {
         let socket_path = test_socket_path();
         let (dispatcher_tx, mut dispatcher_rx) = test_dispatcher_channel();
         let graph = Arc::new(GraphDomain::new(Arc::new(TestGraphAdapter)));
-        let server = IpcServer::new(socket_path.clone(), "local-aiua-01", dispatcher_tx, graph);
+        let registry = Arc::new(RwLock::new(NodeRegistry::new()));
+        registry.write().await.update_node(
+            NodeCapabilities {
+                node_id: "remote-ansible-02".into(),
+                roles: vec![ansible_mesh_core::NodeRole::AnsibleNode],
+                models: vec![],
+                tools: vec![],
+                constraints: Default::default(),
+            },
+            vec![],
+            None,
+            None,
+        );
+        let server = IpcServer::new(socket_path.clone(), "local-aiua-01", dispatcher_tx, graph)
+            .with_registry(registry);
 
         let server_task = tokio::spawn(async move {
             server.run().await.expect("ipc server should run");
@@ -20345,7 +20643,7 @@ pub(crate) mod tests {
         .await
         .expect("receiver connect");
 
-        sender
+        let response = sender
             .send_request(IpcRequest::EmitTask {
                 target_node: "remote-ansible-02".into(),
                 target_role: "agent".into(),
@@ -20354,6 +20652,10 @@ pub(crate) mod tests {
             })
             .await
             .expect("emit remote task");
+        assert!(
+            matches!(response, IpcResponse::Standard { ok: true, .. }),
+            "known remote node should be accepted, got {response:?}"
+        );
 
         let recv = tokio::time::timeout(
             tokio::time::Duration::from_millis(200),
@@ -27024,6 +27326,23 @@ pub(crate) mod tests {
                 mesh_host: None,
             })
             .expect("seed remote hotel");
+        let remote_registry = Arc::new(RwLock::new(NodeRegistry::new()));
+        remote_registry.write().await.update_node(
+            NodeCapabilities {
+                node_id: "local-aiua-01".into(),
+                roles: vec![ansible_mesh_core::NodeRole::AnsibleNode],
+                models: vec![],
+                tools: vec![],
+                constraints: Default::default(),
+            },
+            vec![],
+            Some(ExecutionReachability {
+                protocol: "tcp-framed-v1".into(),
+                host: "local.mesh".into(),
+                port: 9002,
+            }),
+            None,
+        );
 
         let local_server = IpcServer::new(
             local_socket_path.clone(),
@@ -27037,7 +27356,8 @@ pub(crate) mod tests {
             "remote-aiua-01",
             remote_dispatcher_tx,
             remote_graph,
-        );
+        )
+        .with_registry(remote_registry);
 
         let local_server_task = tokio::spawn(async move {
             local_server

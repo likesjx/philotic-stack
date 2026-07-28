@@ -3,7 +3,7 @@ title: Governed Outbound Integrations
 doc_type: reference
 domain: tooling-execution
 status: active
-last_updated: 2026-07-26
+last_updated: 2026-07-28
 tags:
 - integrations
 - egress
@@ -111,7 +111,7 @@ unresolved bindings are withheld from the model-facing surface.
 
 | Record | Storage key | Purpose |
 |---|---|---|
-| `IntegrationBinding` registry | `__integration_bindings__` | HTTP targets, grants, placement, credential references, limits, and revision |
+| `IntegrationBinding` registry | `__integration_bindings__` | HTTP and local-only OIDC targets, grants, placement, credential references, limits, and revision |
 | `McpUpstreamConfig` registry | `__mcp_upstreams__` | MCP server definitions, transport, placement, network scope, grants, and limits |
 | MCP catalog registry | `__mcp_upstream_catalogs__` | Discovered tool schemas and catalog freshness |
 | Integration audit registry | `__integration_audits__` | Content-free execution records on the execution hotel |
@@ -233,6 +233,61 @@ ExitRunner --> HotelService: Sanitized response
 ![outbound-integrations-diagram-4](../diagrams/outbound-integrations-diagram-4.svg)
 <!-- plantuml-node-skill:rendered:outbound-integrations-diagram-4:end -->
 
+## Credential-Safe Operator OIDC Back Channel
+
+Operator OIDC uses the same governed executor without turning authentication
+into a generic form-post escape hatch. The ceremony and the credential-bearing
+network exchange retain different owners:
+
+- `philotic-web` owns browser state, PKCE, callback validation, identity
+  linking, and hotel session issuance;
+- the source hotel accepts the typed exchange only from the exact
+  `philotic-web-oidc` management identity and compiles provider endpoints,
+  client ID, client-secret reference, and exact callback URI;
+- `operator-oidc-{provider}` is always local-only and never model-projected;
+- `egress-http-runner` resolves the client secret from its local vault,
+  performs token and userinfo requests, and consumes access/refresh tokens
+  internally;
+- only allowlisted identity claims and content-free audit records cross back
+  into `philotic-web`.
+
+```plantuml
+@startuml
+participant OperatorBrowser
+participant PhiloticWeb
+participant SourceHotel
+participant EgressRunner
+participant ExitVault
+participant TokenEndpoint
+participant UserInfoEndpoint
+OperatorBrowser -> PhiloticWeb: OIDC callback with code and state
+PhiloticWeb -> PhiloticWeb: Validate state and recover PKCE verifier
+PhiloticWeb -> SourceHotel: Typed provider code verifier and exact redirect URI
+SourceHotel -> SourceHotel: Authorize exact web identity and compile local binding
+SourceHotel -> EgressRunner: Execute local-only OIDC exchange
+EgressRunner -> ExitVault: Resolve client-secret reference
+ExitVault --> EgressRunner: Client-secret value
+EgressRunner -> TokenEndpoint: POST bounded token form
+TokenEndpoint --> EgressRunner: Access and optional refresh tokens
+EgressRunner -> UserInfoEndpoint: GET with runner-local bearer token
+UserInfoEndpoint --> EgressRunner: Provider identity claims
+EgressRunner -> EgressRunner: Allowlist claims and discard token material
+EgressRunner -> SourceHotel: Claims plus two content-free audits
+SourceHotel --> PhiloticWeb: Provider ID and allowlisted claims only
+PhiloticWeb -> SourceHotel: Link identity and issue operator session
+PhiloticWeb --> OperatorBrowser: Same-origin operator session
+@enduml
+```
+<!-- plantuml-node-skill:rendered:outbound-integrations-diagram-5:start -->
+![outbound-integrations-diagram-5](../diagrams/outbound-integrations-diagram-5.svg)
+<!-- plantuml-node-skill:rendered:outbound-integrations-diagram-5:end -->
+The runner emits separate `token` and `userinfo` audit records so the final
+network hops remain observable without serializing request bodies, response
+bodies, authorization codes, client secrets, access tokens, or refresh tokens.
+The production provider endpoints are hotel-compiled constants. Loopback
+endpoint overrides exist only under `PHILOTIC_SMOKE_MODE=1` for the binary
+round-trip fixture.
+
 ## Failure Semantics
 
 Failures are explicit and do not open a direct-network escape hatch:
@@ -282,8 +337,8 @@ retain their own owners when their contracts are already narrow:
 Everything else must be classified rather than silently grandfathered. The
 completed classification seam is recorded in
 [OUTBOUND_EGRESS_INVENTORY.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/OUTBOUND_EGRESS_INVENTORY.md).
-The machine-checked inventory currently classifies 33 direct-client files and
-guards the first migrated caller from regression.
+The machine-checked inventory currently classifies 31 remaining direct-client
+files and guards three migrated callers from regression.
 
 The first general-API migration is the hotel-owned OpenRouter model-catalog
 sync. Its `model-catalog-openrouter` system binding permits only credential-free
@@ -295,7 +350,11 @@ resolves and executes at `vps-jane-aiua-01`, receives HTTP 200, and persists
 the compact catalog while the content-free audit remains authoritative at the
 VPS exit.
 
-The next migrations are removal of the Philote direct catalog fallback and a
-dedicated credential-safe auth egress contract. Named model-provider,
-communication, local-resource, mesh, and artifact exceptions remain explicit
-rather than pretending every socket has identical semantics.
+Philote now consumes only the hotel-owned compact catalog projection; it no
+longer constructs a direct OpenRouter client when that projection is absent.
+Operator OIDC token and userinfo exchange is also migrated through a dedicated
+local-only credential-safe binding. The remaining `aiua::auth` Gemini CLI
+OAuth/provider-validation path stays a named temporary model-provider
+exception pending a separate authority decision. Communication,
+local-resource, mesh, and artifact exceptions remain explicit rather than
+pretending every socket has identical semantics.
