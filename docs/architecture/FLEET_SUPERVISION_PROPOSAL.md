@@ -135,9 +135,27 @@ registration row. Covers evidence 4.
 bounded restart action for known host services — backoff, budget, and only then
 escalate. Covers evidence 3.
 
-**S4 — Escalation truth.** `escalated` is not `resolved`. One open, aging work item
-per distinct fault; re-detections bump a counter rather than filing duplicates;
-age drives severity. Covers evidence 1.
+**S4 — Escalation truth.** ✅ **Implemented.** `escalated` is no longer written as
+`resolved`. Covers evidence 1.
+
+- `HEAL_STATUS_ESCALATED` + `terminal_status_for_outcome()` in
+  `ansible-mesh-core::heal_queue`: only outcomes that actually repaired
+  something may claim `resolved`. Both `escalate` and `escalated` (the
+  dispatcher has emitted each into that column over time) map to the new
+  status.
+- Terminal for dispatch — `pending_errors` selects `status = 'pending'`, so an
+  escalated row is never re-picked and the 5-minute cadence cannot return under
+  a new name. The retention vacuum reaps `escalated` alongside `resolved` and
+  `abandoned` so a recurring fault cannot grow the table without bound.
+- New `phil doctor` check **`heal.escalated-unrepaired`** surfaces the worst
+  `(pattern_tag, guest_id)` pair still escalating: Warning past 1h, Critical
+  past 6h (≥3 escalations). The muninn outage would have gone Critical on day
+  one instead of hiding behind 918 rows marked `resolved`.
+
+Deliberately **not** collapsed at push time: the A3 recurrence tracker counts
+rows, so one row per detection must keep landing or it never reaches its
+work-item filing threshold. Aggregation happens in the doctor check instead. A
+regression test pins this coupling.
 
 **S5 — Out-of-band operator path.** Escalation must never depend solely on an agent
 that may be the failing component. Folds in the previously-filed

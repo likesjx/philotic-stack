@@ -123,6 +123,34 @@ pub const DEFAULT_ABANDON_CEILING_SECS: u64 = 3 * 24 * 3600;
 /// policy (distinct from operator/dispatcher `resolved`).
 pub const HEAL_STATUS_ABANDONED: &str = "abandoned";
 
+/// Terminal status for a row whose only action was to escalate to a human or
+/// an agent role — i.e. the fault was reported, **not repaired**.
+///
+/// DEF-070: this used to be written as `resolved`. On mbp-jane a dead muninn
+/// filed 919 `service_probe_failed:muninn` rows over three days and 918 of them
+/// were stamped `resolved` — the ledger claimed success for a fault that was
+/// still burning, and nothing surfaced the difference. Fleet-wide the ledger
+/// read 1426 `escalated` against exactly 4 `restarted`.
+///
+/// `escalated` is terminal for dispatch purposes (the dispatcher must never
+/// re-pick the row, or the 5-minute cadence simply returns under a new name)
+/// but is deliberately NOT `resolved`, so "reported" and "fixed" can be told
+/// apart by `phil doctor`, dashboards, and anyone reading the table.
+pub const HEAL_STATUS_ESCALATED: &str = "escalated";
+
+/// Map a dispatcher outcome string to the terminal status it earns.
+///
+/// Only outcomes that actually *repaired* something may claim `resolved`.
+/// Escalation is a hand-off, so it gets [`HEAL_STATUS_ESCALATED`]. The
+/// dispatcher has historically emitted both `escalate` (the action name) and
+/// `escalated` (the past-tense outcome) into this column, so both are matched.
+pub fn terminal_status_for_outcome(outcome: &str) -> &'static str {
+    match outcome.trim() {
+        "escalate" | "escalated" => HEAL_STATUS_ESCALATED,
+        _ => "resolved",
+    }
+}
+
 /// Cheap, allocation-light dedup key for a raw guest-stderr line: the first
 /// line only, lowercased, with every run of ASCII digits collapsed to a single
 /// `#`. This makes a crash-looping guest's near-identical repeats (which differ
@@ -454,9 +482,16 @@ pub trait HealQueueStorage: Send + Sync {
         pattern_tag: &str,
         heal_action: &str,
     ) -> Result<()>;
+    /// Stamp a terminal status + outcome on a row.
+    ///
+    /// The status is derived from `outcome` via
+    /// [`terminal_status_for_outcome`]: escalate-only outcomes become
+    /// [`HEAL_STATUS_ESCALATED`] rather than `resolved`, so a fault that was
+    /// merely reported is never recorded as fixed (DEF-070).
     fn resolve(&self, id: &str, outcome: &str) -> Result<()>;
-    /// Delete terminal rows (`resolved` **and** `abandoned`) older than
-    /// `older_than_secs`. Pending/assigned rows are never touched here.
+    /// Delete terminal rows (`resolved`, `abandoned` **and** `escalated`)
+    /// older than `older_than_secs`. Pending/assigned rows are never touched
+    /// here.
     fn vacuum_old(&self, older_than_secs: u64) -> Result<usize>;
     /// Secondary vacuum policy (F10): force-resolve `pending`/`assigned` rows
     /// older than `pending_ceiling_secs` to [`HEAL_STATUS_ABANDONED`] with an
@@ -710,10 +745,17 @@ impl HealQueueStorage for SqliteHealQueueStorage {
     }
 
     fn resolve(&self, id: &str, outcome: &str) -> Result<()> {
+        // DEF-070: an escalate-only outcome is a hand-off, not a repair. Stamp
+        // it `escalated` so the ledger stops claiming success for faults that
+        // are still burning. Both statuses are terminal for dispatch —
+        // `pending_errors` selects `status = 'pending'` only, so an escalated
+        // row is never re-picked and the old 5-minute re-file cadence cannot
+        // return under a new name.
+        let status = terminal_status_for_outcome(outcome);
         let conn = self.conn.lock().unwrap();
         conn.execute(
-            "UPDATE heal_queue SET outcome = ?1, status = 'resolved' WHERE id = ?2",
-            params![outcome, id],
+            "UPDATE heal_queue SET outcome = ?1, status = ?2 WHERE id = ?3",
+            params![outcome, status, id],
         )?;
         Ok(())
     }
@@ -725,11 +767,14 @@ impl HealQueueStorage for SqliteHealQueueStorage {
             .unwrap_or(0)
             .saturating_sub(older_than_secs) as i64;
         let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
-        // Reap both operator/dispatcher `resolved` rows and abandon-vacuum
-        // `abandoned` rows (F10) — both are terminal.
+        // Reap operator/dispatcher `resolved` rows, abandon-vacuum
+        // `abandoned` rows (F10), and `escalated` rows (DEF-070) — all three
+        // are terminal for dispatch. `escalated` is included deliberately:
+        // leaving it out would let a recurring escalate-only fault grow the
+        // table without bound (919 rows in three days on mbp-jane).
         let n = conn.execute(
             "DELETE FROM heal_queue
-             WHERE status IN ('resolved', 'abandoned') AND timestamp < ?1",
+             WHERE status IN ('resolved', 'abandoned', 'escalated') AND timestamp < ?1",
             params![cutoff],
         )?;
         Ok(n)
@@ -1399,5 +1444,147 @@ mod tests {
         });
         let back: HealWorkItemRecord = serde_json::from_value(legacy).expect("legacy");
         assert_eq!(back.audit_id, None);
+    }
+
+    // ── DEF-070: escalation is a hand-off, not a repair ──────────────────
+
+    #[test]
+    fn escalate_outcomes_map_to_escalated_status_others_to_resolved() {
+        // The dispatcher has emitted both the action name and the past-tense
+        // outcome into this column over time; both must count as escalation.
+        assert_eq!(
+            terminal_status_for_outcome("escalate"),
+            HEAL_STATUS_ESCALATED
+        );
+        assert_eq!(
+            terminal_status_for_outcome("escalated"),
+            HEAL_STATUS_ESCALATED
+        );
+        assert_eq!(
+            terminal_status_for_outcome(" escalated "),
+            HEAL_STATUS_ESCALATED
+        );
+
+        // Everything that actually did something keeps `resolved`.
+        for repaired in [
+            "restarted",
+            "noop",
+            "work_item_filed",
+            "restart_failed",
+            "restart_skipped_budget_exhausted",
+            "restart_skipped_not_a_guest",
+        ] {
+            assert_eq!(
+                terminal_status_for_outcome(repaired),
+                "resolved",
+                "outcome {repaired} must not be recorded as an escalation"
+            );
+        }
+    }
+
+    /// The regression this whole slice exists for: a service probe that fails
+    /// every 5 minutes for days must never leave a ledger that reads "all
+    /// resolved". On mbp-jane that produced 918 `resolved` rows for a dead
+    /// muninn.
+    #[test]
+    fn recurring_escalate_only_fault_never_reports_resolved() {
+        let store = SqliteHealQueueStorage::open(":memory:").expect("open");
+
+        const CADENCE_SECS: i64 = 300; // host-health scan interval
+        const CYCLES: i64 = 12;
+        let base = 1_700_000_000;
+
+        let mut ids = Vec::new();
+        for cycle in 0..CYCLES {
+            // Push far enough apart that the 60s flood window never collapses
+            // them — this is what made the real ledger grow one row per scan.
+            let id = store
+                .push_error_at(
+                    "host-health-scan",
+                    "host-health: service_probe_failed:muninn — no TCP connect to 127.0.0.1:8475",
+                    base + cycle * CADENCE_SECS,
+                )
+                .expect("push");
+            store
+                .update_triage(&id, "critical", "service_probe_failed:muninn", "escalate")
+                .expect("triage");
+            store.resolve(&id, "escalated").expect("resolve");
+            ids.push(id);
+        }
+
+        let rows = store.all_rows_for_test().expect("all rows");
+        let escalated = rows
+            .iter()
+            .filter(|r| r.status == HEAL_STATUS_ESCALATED)
+            .count();
+        let resolved = rows.iter().filter(|r| r.status == "resolved").count();
+
+        assert_eq!(
+            escalated, CYCLES as usize,
+            "every escalate-only cycle must be recorded as escalated"
+        );
+        assert_eq!(
+            resolved, 0,
+            "a fault that was only reported must never be recorded as resolved"
+        );
+
+        // Terminal for dispatch: an escalated row is never re-picked, or the
+        // 5-minute cadence simply returns under a new status name.
+        let pending = store.pending_errors(100).expect("pending");
+        assert!(
+            pending.is_empty(),
+            "escalated rows must not be re-dispatched, got {pending:?}"
+        );
+    }
+
+    /// Guards the coupling that shaped this design: the A3 recurrence tracker
+    /// counts *rows*, so escalated rows must keep landing individually. If a
+    /// future change collapses them at push time, the tracker stops seeing
+    /// recurrence and never files a work item.
+    #[test]
+    fn escalated_rows_remain_individually_visible_for_recurrence_counting() {
+        let store = SqliteHealQueueStorage::open(":memory:").expect("open");
+        let base = 1_700_000_000;
+
+        for cycle in 0..5 {
+            let id = store
+                .push_error_at("host-health-scan", "probe failed", base + cycle * 300)
+                .expect("push");
+            store
+                .update_triage(&id, "critical", "service_probe_failed:muninn", "escalate")
+                .expect("triage");
+            store.resolve(&id, "escalated").expect("resolve");
+        }
+
+        let rows = store.all_rows_for_test().expect("all rows");
+        let same_fault = rows
+            .iter()
+            .filter(|r| r.pattern_tag.as_deref() == Some("service_probe_failed:muninn"))
+            .count();
+        assert_eq!(
+            same_fault, 5,
+            "recurrence counting needs one row per detection, not a collapsed row"
+        );
+    }
+
+    #[test]
+    fn vacuum_reaps_escalated_rows_so_they_cannot_grow_without_bound() {
+        let store = SqliteHealQueueStorage::open(":memory:").expect("open");
+        let old = store
+            .push_error_at("g", "ancient escalate", 1_000)
+            .expect("push");
+        store.resolve(&old, "escalated").expect("resolve");
+
+        let rows = store.all_rows_for_test().expect("all");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].status, HEAL_STATUS_ESCALATED);
+
+        // Any sane retention window is far newer than epoch+1000.
+        let reaped = store.vacuum_old(60).expect("vacuum");
+        assert_eq!(
+            reaped, 1,
+            "escalated rows must be reapable like other terminal rows"
+        );
+        assert!(store.all_rows_for_test().expect("all").is_empty());
     }
 }
