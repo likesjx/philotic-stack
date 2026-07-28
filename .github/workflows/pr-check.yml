@@ -7,17 +7,28 @@ name: PR Check
 # that was entirely self-reported by the agent that wrote the code.
 #
 # Scope, deliberately:
-#   test  — HARD gate. `cargo check` + `cargo test --workspace` on macOS arm64,
-#           which is what mac-jane and mbp-jane actually run. Verified green at
-#           introduction: 2078 passed / 0 failed / 89 test binaries.
-#   fmt   — HARD gate. `cargo fmt --all --check`. The 13 files that had drifted
+#   test  — HARD gate. `cargo test --workspace` on macOS arm64, which is what
+#           mac-jane and mbp-jane actually run. Linux is not an option here:
+#           the workspace contains Apple-only crates, which is why
+#           build-linux.yml builds a selective package set rather than
+#           --workspace.
+#   fmt   — HARD gate. `cargo fmt --all --check`. The files that had drifted
 #           are formatted in the same PR that adds this, so it is green on
 #           arrival.
-#   clippy — ADVISORY (continue-on-error). The workspace currently emits
-#           hundreds of warnings (aiua alone: 313). Making it blocking today
-#           would mean a multi-day cleanup, and a gate that is red on arrival
-#           just teaches everyone to ignore it. Ratchet crate-by-crate via
-#           [workspace.lints], then flip this to blocking.
+#
+# Clippy is deliberately NOT here. The workspace emits hundreds of warnings
+# (aiua alone: 313), so a blocking clippy would be red on arrival and would
+# only teach everyone to ignore the gate — and a non-blocking one would cost a
+# second cold macOS compile for information nobody is required to act on.
+# Reintroducing it is tracked by proposal:clippy-ratchet-workspace-lints:
+# clean crates one at a time behind [workspace.lints], then add it blocking.
+#
+# On timeouts and cache: the first run of this workflow was cancelled at a
+# 90-minute limit while still compiling test binaries, and because the job was
+# cancelled the cargo cache was never saved — so the following run would have
+# started cold too. The limit is now 180 minutes so a cold run can finish and
+# populate the cache; warm runs are far quicker. There is no separate
+# `cargo check` step because `cargo test` compiles everything it would have.
 #
 # Not covered yet (follow-up): a Linux compile check on PRs. build-linux.yml
 # still only runs post-merge on develop, so a PR can break the vps-jane build
@@ -49,9 +60,9 @@ env:
 
 jobs:
   test:
-    name: check + test (macos arm64)
+    name: test (macos arm64)
     runs-on: macos-14
-    timeout-minutes: 90
+    timeout-minutes: 180
     steps:
       - uses: actions/checkout@v4
 
@@ -70,8 +81,13 @@ jobs:
           toolchain: "1.94.0"
           components: rustfmt, clippy
 
-      - name: Cache cargo
-        uses: actions/cache@v4
+      # Restore/save are split rather than using actions/cache, so that a run
+      # which fails or is cancelled still saves what it compiled. With the
+      # combined action the post-step is skipped on anything but success, which
+      # is how the first attempt here left the next run just as cold as itself.
+      - name: Restore cargo cache
+        id: cargo_cache
+        uses: actions/cache/restore@v4
         with:
           path: |
             ~/.cargo/registry
@@ -85,27 +101,23 @@ jobs:
           rustc --version
           cargo --version
 
-      - name: cargo check --workspace
-        run: cargo check --workspace --all-targets
-
+      # No separate `cargo check` step: `cargo test` compiles everything it
+      # would have, and on a cold runner the duplicate pass was a large part of
+      # what pushed the first run past its limit.
       - name: cargo test --workspace
         run: cargo test --workspace --no-fail-fast
 
-      # Advisory only — see header. Surfaces the warning count in the job
-      # summary so the number is visible and can be ratcheted down, without
-      # blocking the PR.
-      - name: cargo clippy (advisory)
-        id: clippy
-        continue-on-error: true
-        run: |
-          set -o pipefail
-          cargo clippy --workspace --all-targets --message-format=short \
-            2>&1 | tee /tmp/clippy.log || true
-          count=$(grep -c "warning:" /tmp/clippy.log || true)
-          echo "### Clippy: ${count} warnings (advisory, non-blocking)" >> "$GITHUB_STEP_SUMMARY"
-          echo "" >> "$GITHUB_STEP_SUMMARY"
-          echo "Blocking clippy is tracked as a ratchet: add \`[workspace.lints]\`" >> "$GITHUB_STEP_SUMMARY"
-          echo "per crate as each is cleaned, then make this step blocking." >> "$GITHUB_STEP_SUMMARY"
+      # always(): a red or timed-out run has still done most of the compiling,
+      # and the next attempt should benefit from it.
+      - name: Save cargo cache
+        if: always() && steps.cargo_cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: macos-arm64-cargo-${{ hashFiles('**/Cargo.lock') }}
 
   fmt:
     name: rustfmt
