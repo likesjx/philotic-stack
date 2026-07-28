@@ -365,6 +365,7 @@ pub fn catalog() -> Vec<Box<dyn Check>> {
         Box::new(LogsRotationMissing),
         Box::new(SecretsStorePermissions),
         Box::new(HealQueueDepth),
+        Box::new(HealEscalatedUnrepaired),
         Box::new(HealOldestPendingAge),
         Box::new(HealDispatcherStaleness),
         Box::new(SystemDiskSpace),
@@ -1985,6 +1986,106 @@ impl Check for HealQueueDepth {
             |row| row.get(0),
         )?;
         Ok(evaluate_heal_queue_depth(self.id(), pending, assigned))
+    }
+}
+
+// ── heal.escalated-unrepaired ────────────────────────────────────────────
+
+/// A single fault escalating for longer than this without repair is a warning.
+const ESCALATED_UNREPAIRED_WARN_SECS: i64 = 3600;
+/// …and longer than this is critical: nobody is acting on it.
+const ESCALATED_UNREPAIRED_CRITICAL_SECS: i64 = 6 * 3600;
+/// Below this many escalations a recurring-fault verdict isn't meaningful yet.
+const ESCALATED_UNREPAIRED_MIN_COUNT: i64 = 3;
+
+/// Threshold logic for [`HealEscalatedUnrepaired`], split out so it is testable
+/// without a database.
+///
+/// DEF-070: escalation is a hand-off, not a repair. A `(pattern_tag, guest_id)`
+/// pair that keeps escalating and never repairs is exactly the shape of the
+/// muninn outage — 919 rows over three days, every one of them "handled".
+/// Nothing surfaced it because escalated rows were stamped `resolved` and the
+/// only queue check counts `pending`.
+fn evaluate_heal_escalated_unrepaired(
+    check_id: &'static str,
+    worst: Option<(String, String, i64, i64)>,
+) -> Vec<Finding> {
+    let Some((pattern_tag, guest_id, count, span_secs)) = worst else {
+        return Vec::new();
+    };
+    if count < ESCALATED_UNREPAIRED_MIN_COUNT {
+        return Vec::new();
+    }
+    let severity = if span_secs > ESCALATED_UNREPAIRED_CRITICAL_SECS {
+        Severity::Critical
+    } else if span_secs > ESCALATED_UNREPAIRED_WARN_SECS {
+        Severity::Warning
+    } else {
+        return Vec::new();
+    };
+
+    let hours = span_secs as f64 / 3600.0;
+    vec![Finding {
+        check_id: check_id.to_string(),
+        severity,
+        message: format!(
+            "fault [{pattern_tag}] on [{guest_id}] has escalated {count} time(s) over {hours:.1}h \
+             and was never repaired — escalation is a hand-off, not a fix; either the escalation \
+             target is not acting (or is itself the failing component), or this pattern needs a \
+             repair action instead of an escalate action"
+        ),
+        evidence: json!({
+            "pattern_tag": pattern_tag,
+            "guest_id": guest_id,
+            "escalations": count,
+            "span_secs": span_secs,
+            "warn_above_secs": ESCALATED_UNREPAIRED_WARN_SECS,
+            "critical_above_secs": ESCALATED_UNREPAIRED_CRITICAL_SECS,
+        }),
+        fix_hint: "inspect with `phil heal list`; repair the underlying service, then give this \
+                   pattern a bounded repair action so it stops relying on a human noticing"
+            .to_string(),
+        auto_repairable: false,
+    }]
+}
+
+struct HealEscalatedUnrepaired;
+
+impl Check for HealEscalatedUnrepaired {
+    fn id(&self) -> &'static str {
+        "heal.escalated-unrepaired"
+    }
+
+    fn severity(&self) -> Severity {
+        Severity::Warning
+    }
+
+    fn detect(&self, ctx: &DoctorCtx) -> Result<Vec<Finding>> {
+        if let Some(findings) = missing_table_finding(ctx, self.id(), "heal_queue")? {
+            return Ok(findings);
+        }
+        // Worst offender only: one finding beats N near-identical ones, and the
+        // worst pair is the one an operator should look at first.
+        let worst = ctx
+            .conn
+            .query_row(
+                "SELECT COALESCE(pattern_tag, '(unclassified)'), guest_id, COUNT(*), \
+                        MAX(timestamp) - MIN(timestamp) \
+                 FROM heal_queue WHERE status = 'escalated' \
+                 GROUP BY pattern_tag, guest_id \
+                 ORDER BY COUNT(*) DESC LIMIT 1",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, i64>(3)?,
+                    ))
+                },
+            )
+            .optional()?;
+        Ok(evaluate_heal_escalated_unrepaired(self.id(), worst))
     }
 }
 
@@ -4234,6 +4335,42 @@ mod tests {
         ));
     }
 
+    // heal.escalated-unrepaired threshold logic (DEF-070).
+    #[test]
+    fn heal_escalated_unrepaired_thresholds_fire_by_span() {
+        let id = "heal.escalated-unrepaired";
+        let f = |count: i64, span: i64| {
+            evaluate_heal_escalated_unrepaired(
+                id,
+                Some((
+                    "service_probe_failed:muninn".into(),
+                    "host-health-scan".into(),
+                    count,
+                    span,
+                )),
+            )
+        };
+
+        // Nothing escalated at all → clean.
+        assert!(evaluate_heal_escalated_unrepaired(id, None).is_empty());
+        // A couple of escalations is not yet a recurring-fault verdict.
+        assert!(f(2, 10 * 3600).is_empty());
+        // Recurring but young (inside the warn window) → clean.
+        assert!(f(5, ESCALATED_UNREPAIRED_WARN_SECS).is_empty());
+        // Over warn → Warning; exactly at critical is still Warning.
+        assert!(only(
+            &[Severity::Warning],
+            &f(5, ESCALATED_UNREPAIRED_WARN_SECS + 1)
+        ));
+        assert!(only(
+            &[Severity::Warning],
+            &f(5, ESCALATED_UNREPAIRED_CRITICAL_SECS)
+        ));
+        // Over critical → Critical. This is the muninn shape: 919 escalations
+        // across three days, every one of them previously "resolved".
+        assert!(only(&[Severity::Critical], &f(919, 3 * 24 * 3600)));
+    }
+
     // heal.oldest-pending-age threshold logic.
     #[test]
     fn heal_oldest_pending_thresholds_fire_by_age() {
@@ -4345,6 +4482,7 @@ mod tests {
         let ctx = DoctorCtx::open_at("jane", path).expect("open ctx");
         for check in [
             Box::new(HealQueueDepth) as Box<dyn Check>,
+            Box::new(HealEscalatedUnrepaired) as Box<dyn Check>,
             Box::new(HealOldestPendingAge) as Box<dyn Check>,
         ] {
             let findings = check.detect(&ctx).expect("detect must not error");
