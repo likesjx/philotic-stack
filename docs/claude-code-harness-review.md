@@ -4,7 +4,7 @@ Review of how Claude Code is used in this repo, 2026-07-27. Implementation
 landed in PR #371; the follow-ups below are the part that was deliberately not
 implemented.
 
-> **Why this is a doc and not only graph nodes.** The seven follow-ups were
+> **Why this is a doc and not only graph nodes.** The follow-ups below were
 > filed with `graph_create_node`, per the standing rule that proposals live in
 > the intel-graph rather than in markdown. But DEF-072 records that
 > `graph_create_node` proposals are wiped by the 6h rescan — only `doc:`-backed
@@ -51,8 +51,18 @@ Two results that contradicted prior notes and are worth keeping:
 1. **`pr-check.yml`** — the missing gate. `build-linux.yml` runs on push to
    develop (after merge, no tests); `release.yml` runs on tags. Nothing verified
    a PR, while the standing policy is to auto-merge agent PRs "at honest green"
-   — a green self-reported by the agent that wrote the code. Now `cargo test
-   --workspace` on macOS arm64 and `cargo fmt --all --check` are hard gates.
+   — a green self-reported by the agent that wrote the code.
+
+   **What actually landed:** `cargo fmt --all --check` is a hard gate on PRs and
+   runs in ~16s. `cargo test --workspace` runs but is **advisory
+   (`continue-on-error`), not blocking.** On a cold macos-14 runner it took
+   2h59m and was still going when the job timed out — at 90 minutes, then again
+   at 180. `cargo check --workspace` passes there, so this is build cost, not
+   broken code: 31 crates, 89 test binaries, heavy dependencies. Both cancelled
+   runs also failed to save the cargo cache, so every attempt restarted cold.
+   Making it blocking is `proposal:pr-test-gate-viability`. A blocking 3-hour
+   job would stall every PR, and a gate people route around is worse than an
+   honest advisory one.
 2. **`rust-toolchain.toml`** pinned to 1.94.0, with `build-linux.yml` and
    `release.yml` passing the version explicitly alongside their `targets:`
    input. Caveat: rustup is not installed on the dev Macs, so the pin governs
@@ -91,15 +101,23 @@ Two results that contradicted prior notes and are worth keeping:
    Homebrew so the source path never ran locally and the dependency was
    invisible. A bare runner took it and died on CMake 4. Audit the other
    `-sys`/`build.rs` crates and document the required system packages.
-5. `proposal:clippy-ratchet-workspace-lints` — clippy is not in the PR gate
+5. `proposal:pr-test-gate-viability` — **make the test gate blocking.** Cold
+   `cargo test --workspace` on macos-14 measured 2h59m and did not finish;
+   cancelled runs never saved the cargo cache, so nothing ever got warm. Work
+   needed: warm the cache from a develop push (now wired), confirm `target/`
+   fits under GitHub's 10 GB cache limit, shard the workspace across a matrix,
+   evaluate `cargo-nextest`, and keep `CARGO_PROFILE_TEST_DEBUG=0`. Flip
+   `continue-on-error` off only after a cached run finishes well inside the
+   timeout.
+6. `proposal:clippy-ratchet-workspace-lints` — clippy is not in the PR gate
    because hundreds of existing warnings would make it red on arrival. Clean
    crates one at a time behind `[workspace.lints]`, then add it blocking.
-6. `proposal:claude-charter-in-repo` — `.claude/CLAUDE.md` is checked in and
+7. `proposal:claude-charter-in-repo` — `.claude/CLAUDE.md` is checked in and
    contains only `@/Users/jaredlikes/.claude/philotic/harnesses/claude-local/CLAUDE.md`.
    On any other machine or in CI that resolves to nothing and the charter
    silently vanishes. The charter should live in-repo with the harness tool
    syncing into it.
-7. `proposal:pr-linux-compile-check` — the PR gate is macOS-only, so a PR can
+8. `proposal:pr-linux-compile-check` — the PR gate is macOS-only, so a PR can
    break the vps-jane build and not find out until it lands on develop. Add a
    `cargo check` job on ubuntu over the package set `build-linux.yml` builds.
 

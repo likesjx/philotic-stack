@@ -6,39 +6,47 @@ name: PR Check
 # policy is to auto-merge agent PRs into develop "at honest green" — a green
 # that was entirely self-reported by the agent that wrote the code.
 #
-# Scope, deliberately:
-#   test  — HARD gate. `cargo test --workspace` on macOS arm64, which is what
-#           mac-jane and mbp-jane actually run. Linux is not an option here:
-#           the workspace contains Apple-only crates, which is why
-#           build-linux.yml builds a selective package set rather than
-#           --workspace.
-#   fmt   — HARD gate. `cargo fmt --all --check`. The files that had drifted
-#           are formatted in the same PR that adds this, so it is green on
-#           arrival.
+# CURRENT STATE, stated plainly:
 #
-# Clippy is deliberately NOT here. The workspace emits hundreds of warnings
-# (aiua alone: 313), so a blocking clippy would be red on arrival and would
-# only teach everyone to ignore the gate — and a non-blocking one would cost a
-# second cold macOS compile for information nobody is required to act on.
-# Reintroducing it is tracked by proposal:clippy-ratchet-workspace-lints:
-# clean crates one at a time behind [workspace.lints], then add it blocking.
+#   fmt  — HARD gate on PRs. Runs in ~16s. This is real enforcement today.
+#   test — NOT blocking yet (continue-on-error). It runs, and its failures are
+#          visible, but it cannot fail a PR.
 #
-# On timeouts and cache: the first run of this workflow was cancelled at a
-# 90-minute limit while still compiling test binaries, and because the job was
-# cancelled the cargo cache was never saved — so the following run would have
-# started cold too. The limit is now 180 minutes so a cold run can finish and
-# populate the cache; warm runs are far quicker. There is no separate
-# `cargo check` step because `cargo test` compiles everything it would have.
+# Why test is not blocking yet. On a cold macos-14 runner `cargo test
+# --workspace` took 2h59m and was still going when the job timed out — twice,
+# at 90 and at 180 minutes. `cargo check --workspace` passes there, so this is
+# build cost, not broken code: 31 crates and 89 test binaries, with heavy
+# dependencies (ort/onnxruntime and friends). Worse, both cancelled runs failed
+# to save the cargo cache, so every attempt restarted from cold and the cache
+# never got a chance to make later runs cheap.
 #
-# Not covered yet (follow-up): a Linux compile check on PRs. build-linux.yml
-# still only runs post-merge on develop, so a PR can break the vps-jane build
-# and not find out until it lands. Adding it means reproducing that workflow's
-# selective package set — `cargo test --workspace` will not work on Linux
-# because of the Apple-only crates.
+# Making it blocking is its own piece of work, tracked as
+# proposal:pr-test-gate-viability: warm the cache from a develop push, shard the
+# workspace across a matrix, evaluate cargo-nextest, and confirm target/ fits
+# under the 10 GB cache limit. Until that lands, a blocking 3-hour job would
+# stall every PR, and a gate people route around is worse than an honest
+# advisory one.
+#
+# Linux is not an option for the test job: the workspace contains Apple-only
+# crates, which is why build-linux.yml builds a selective package set rather
+# than --workspace. A Linux compile check over that subset is
+# proposal:pr-linux-compile-check.
+#
+# Clippy is deliberately absent. The workspace emits hundreds of warnings (aiua
+# alone: 313), so blocking clippy would be red on arrival and would only teach
+# everyone to ignore the gate. See proposal:clippy-ratchet-workspace-lints.
 
 on:
   pull_request:
     branches: [develop, main]
+  # Also on develop pushes: post-merge signal, and — more importantly right now
+  # — a chance to populate the macOS cargo cache outside a PR's critical path,
+  # so PR runs can restore instead of building from cold.
+  push:
+    branches: [develop]
+    paths-ignore:
+      - "docs/**"
+      - "**/*.md"
   workflow_dispatch: {}
 
 concurrency:
@@ -47,78 +55,20 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
-  # Keep build.rs on the placeholder-UI path. Setting PHILOTIC_DESKTOP_DIR
-  # makes crates/philotic-web/build.rs shell out to npm and panic. Same
-  # reasoning as build-linux.yml.
   RUST_BACKTRACE: 1
+  # Compile-cost reduction. Debug info for 89 test binaries is a large part of
+  # both the link time and the cache size, and incremental artifacts are pure
+  # waste on a runner that starts fresh every time.
+  CARGO_INCREMENTAL: "0"
+  CARGO_PROFILE_DEV_DEBUG: "0"
+  CARGO_PROFILE_TEST_DEBUG: "0"
   # Belt-and-braces for audiopus_sys: if pkg-config somehow still misses Opus
   # and the crate falls back to building it from source, opus's bundled
   # CMakeLists declares `cmake_minimum_required(VERSION <3.5)`, which CMake 4
-  # (on the runner and on the dev Macs) refuses outright. This lets that
-  # configure step proceed instead of panicking the build script.
+  # (on the runner and on the dev Macs) refuses outright.
   CMAKE_POLICY_VERSION_MINIMUM: "3.5"
 
 jobs:
-  test:
-    name: test (macos arm64)
-    runs-on: macos-14
-    timeout-minutes: 180
-    steps:
-      - uses: actions/checkout@v4
-
-      # Undeclared system dependency, surfaced by the first run of this
-      # workflow. crates/membrane-discord depends on `opus`, whose -sys crate
-      # first asks pkg-config for a system Opus and only builds from source if
-      # that fails. The dev Macs have opus 1.6.1 from Homebrew, so the source
-      # path never runs locally and the dependency was invisible. A bare runner
-      # has neither, so it took the source path and died on CMake 4.
-      - name: Install system dependencies (Opus)
-        run: brew install opus pkg-config
-
-      - name: Install pinned Rust toolchain
-        uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: "1.94.0"
-          components: rustfmt, clippy
-
-      # Restore/save are split rather than using actions/cache, so that a run
-      # which fails or is cancelled still saves what it compiled. With the
-      # combined action the post-step is skipped on anything but success, which
-      # is how the first attempt here left the next run just as cold as itself.
-      - name: Restore cargo cache
-        id: cargo_cache
-        uses: actions/cache/restore@v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: macos-arm64-cargo-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: macos-arm64-cargo-
-
-      - name: Show toolchain in use
-        run: |
-          rustc --version
-          cargo --version
-
-      # No separate `cargo check` step: `cargo test` compiles everything it
-      # would have, and on a cold runner the duplicate pass was a large part of
-      # what pushed the first run past its limit.
-      - name: cargo test --workspace
-        run: cargo test --workspace --no-fail-fast
-
-      # always(): a red or timed-out run has still done most of the compiling,
-      # and the next attempt should benefit from it.
-      - name: Save cargo cache
-        if: always() && steps.cargo_cache.outputs.cache-hit != 'true'
-        uses: actions/cache/save@v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: macos-arm64-cargo-${{ hashFiles('**/Cargo.lock') }}
-
   fmt:
     name: rustfmt
     runs-on: ubuntu-24.04
@@ -135,3 +85,68 @@ jobs:
       # Cheap: rustfmt parses the workspace members, it does not build.
       - name: cargo fmt --all --check
         run: cargo fmt --all --check
+
+  test:
+    name: test (macos arm64, advisory)
+    runs-on: macos-14
+    # Advisory until proposal:pr-test-gate-viability lands. Do NOT remove this
+    # without first confirming a cached run finishes well inside the timeout.
+    continue-on-error: true
+    timeout-minutes: 350
+    steps:
+      - uses: actions/checkout@v4
+
+      # Undeclared system dependency, surfaced by the first run of this
+      # workflow. crates/membrane-discord depends on `opus`, whose -sys crate
+      # first asks pkg-config for a system Opus and only builds from source if
+      # that fails. The dev Macs have opus 1.6.1 from Homebrew, so the source
+      # path never runs locally and the dependency was invisible. A bare runner
+      # has neither, so it took the source path and died on CMake 4.
+      - name: Install system dependencies (Opus)
+        run: brew install opus pkg-config
+
+      - name: Install pinned Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.94.0"
+
+      # Restore/save are split rather than using actions/cache, so that a run
+      # which fails or is cancelled still saves what it compiled. The combined
+      # action only saves on success, which is how the earlier attempts threw
+      # away three hours of compilation and left the next run just as cold.
+      - name: Restore cargo cache
+        id: cargo_cache
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: macos-arm64-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: macos-arm64-cargo-
+
+      - name: Show toolchain in use
+        run: |
+          rustc --version
+          cargo --version
+
+      # Build and run separately so the job summary distinguishes "still
+      # compiling" from "tests actually failed" — the earlier timeouts were
+      # ambiguous until the step timings were inspected by hand.
+      - name: Build test binaries
+        run: cargo test --workspace --no-run
+
+      # Save as soon as the expensive part is done, before running tests, so a
+      # genuine test failure cannot cost us the cache.
+      - name: Save cargo cache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: macos-arm64-cargo-${{ hashFiles('**/Cargo.lock') }}-${{ github.run_id }}
+
+      - name: cargo test --workspace
+        run: cargo test --workspace --no-fail-fast
