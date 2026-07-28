@@ -3,7 +3,7 @@ title: Outbound Egress Inventory and Classification
 doc_type: seam
 domain: tooling-execution
 status: implemented
-last_updated: 2026-07-26
+last_updated: 2026-07-28
 tags:
 - egress
 - inventory
@@ -66,7 +66,7 @@ exception merely because it lives in the same crate.
 |---|---|---|---|
 | `egress-http-runner` | general API | controlled boundary | `IntegrationBinding` + `ToolExecutionRoute` |
 | OpenRouter model-catalog sync | general API | migrated | system binding `model-catalog-openrouter` |
-| Philote OpenRouter catalog fallback | general API | future violation | none; remove after governed catalog rollout proof |
+| Philote model-catalog consumption | general API | migrated; no direct network | hotel config `model_catalog.openrouter` |
 | Operator OAuth/token/userinfo exchanges | general API, model provider | temporary exception | operator auth ceremony; dedicated auth binding still needed |
 | Model-router providers and transcription | model provider | named exception | provider/controller contracts |
 | Telegram and Discord clients | communication | named exception | membrane leases and transport contracts |
@@ -97,6 +97,12 @@ and the source hotel persisted a 342-model compact catalog. The installed VPS
 `aiua` hash matched the verified CI artifact, while the MBP staging hash
 matched the local release artifact before the required remote ad-hoc
 re-signing.
+
+Philote now consumes only that compact hotel-owned projection for `/model`
+capability badges and `/models` browsing. If the projection is not yet
+available, the UI reports that discovery has not published a snapshot and
+retains any previously cached snapshot; cognition no longer creates a second
+OpenRouter client or destination policy.
 
 ```plantuml
 @startuml
@@ -135,12 +141,10 @@ responsibility of runner materialization and host deployment policy.
 
 ## Remaining Seams
 
-1. Remove the Philote direct OpenRouter fallback now that the governed catalog
-   is proven on the installed hotels.
-2. Define a credential-safe auth egress contract for OAuth token and userinfo
+1. Define a credential-safe auth egress contract for OAuth token and userinfo
    exchange before migrating operator auth.
-3. Decide whether communication membranes should delegate only their HTTP hop
+2. Decide whether communication membranes should delegate only their HTTP hop
    to the shared runner without surrendering protocol and lease authority.
-4. Add host-level enforcement only after each named exception has an executable
+3. Add host-level enforcement only after each named exception has an executable
    allow rule; otherwise a firewall would merely turn explicit debt into
    exciting production outages.

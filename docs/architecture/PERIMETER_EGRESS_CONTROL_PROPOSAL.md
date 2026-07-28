@@ -2,9 +2,9 @@
 title: Perimeter Egress Control Proposal
 doc_type: proposal
 domain: operator-control-plane
-status: in-progress
+status: accepted-current-slice
 disposition: accepted-current-slice
-last_updated: 2026-07-26
+last_updated: 2026-07-28
 tags:
 - egress
 - perimeter
@@ -109,8 +109,11 @@ Current proven shape:
 - the OpenRouter model-catalog poll is the first hotel-owned general-API caller
   migrated to a system binding, with installed watched-live proof from
   `mbp-jane` through the selected `vps-jane-aiua-01` executor
-- 33 remaining production direct-client files have machine-checked
-  dispositions in `outbound-egress-inventory.json`
+- Philote consumes only the hotel-owned compact catalog and no longer owns a
+  direct OpenRouter fallback client
+- 32 remaining production direct-client files have machine-checked
+  dispositions, while two migrated callers are regression-guarded in
+  `outbound-egress-inventory.json`
 - model providers, communications, local resources, mesh, and artifacts remain
   named specialized exceptions; operator auth is a temporary exception
 

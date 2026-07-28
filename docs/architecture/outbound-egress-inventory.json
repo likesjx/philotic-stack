@@ -17,13 +17,6 @@
       "note": "Dedicated Muninn and memory-plane protocol client."
     },
     {
-      "path": "crates/philote/src/runtime.rs",
-      "traffic_classes": ["general-api"],
-      "disposition": "future-violation",
-      "authority": "none",
-      "note": "Legacy OpenRouter catalog fallback; remove after governed hotel catalog availability is proven."
-    },
-    {
       "path": "crates/philote/src/memory_explain_tool.rs",
       "traffic_classes": ["local-resource"],
       "disposition": "named-exception",
@@ -235,6 +228,13 @@
     }
   ],
   "migrated_callers": [
+    {
+      "path": "crates/philote/src/runtime.rs",
+      "traffic_classes": ["general-api"],
+      "disposition": "migrated",
+      "authority": "hotel config model_catalog.openrouter",
+      "note": "Consumes only the compact hotel-owned catalog; no direct OpenRouter client remains."
+    },
     {
       "path": "crates/aiua/src/service/model_catalog_sync.rs",
       "traffic_classes": ["general-api"],

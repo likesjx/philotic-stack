@@ -4,7 +4,7 @@ doc_type: proposal
 domain: tooling-execution
 status: implemented
 disposition: implemented
-last_updated: 2026-07-26
+last_updated: 2026-07-28
 tags:
 - skilldag
 - integrations
@@ -134,11 +134,13 @@ VPS-only loopback target, resolved the credential inside `vps-jane`, enforced
 the bounded HTTP contract, returned a sanitized response to `mbp-jane`, and
 persisted the content-free audit at the exit hotel's authority.
 
-The remaining work is migration, not fabric construction. The first inventory
-and migration slice is complete: 33 direct-client files have machine-checked
-dispositions, and the hotel-owned OpenRouter catalog sync now uses a narrow
-system binding and the shared executor. The remaining future violation and
-temporary auth exceptions are explicit.
+The remaining work is migration, not fabric construction. The initial
+inventory classified 33 direct-client files; after removing Philote's catalog
+fallback, 32 direct-client files remain classified and two migrated callers
+are guarded against regression. The hotel-owned OpenRouter catalog sync uses a
+narrow system binding and the shared executor, and Philote consumes only its
+compact hotel projection. The remaining temporary auth exceptions are
+explicit.
 
 ## Current Truth
 
@@ -193,9 +195,8 @@ temporary auth exceptions are explicit.
   graph, web, and other runners. Every detected production constructor now has
   a recorded owner and disposition; model/provider and communication paths
   remain named transitional exceptions.
-- The Philote OpenRouter catalog fallback is the remaining general-API future
-  violation. Operator OAuth/token exchange is a temporary exception pending a
-  credential-safe auth binding.
+- Operator OAuth/token exchange is the remaining general-API temporary
+  exception pending a credential-safe auth binding.
 - Before this slice, `CheckEgress` resolved credentials and returned raw
   injection headers through IPC; `hotel.egress.check` rendered those headers
   into a model-facing tool result.
@@ -509,10 +510,10 @@ Model/provider and communication paths move only under their own explicit
 slices.
 
 Status: fleet installation is watched-live-green on `mbp-jane` and `vps-jane`.
-The direct-client inventory and the first class-by-class migration are
-smoke-green. Remaining follow-through is removal of the Philote catalog
-fallback, auth egress design, and eventual host-level enforcement once named
-exceptions have executable allow rules.
+The direct-client inventory, hotel-owned catalog migration, and Philote
+consumer cutover are implemented. Remaining follow-through is auth egress
+design and eventual host-level enforcement once named exceptions have
+executable allow rules.
 
 ## Verification Ladder
 
