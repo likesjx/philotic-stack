@@ -13048,22 +13048,19 @@ impl IpcServer {
             }
         }
 
-        // Terminate running process.
-        if let Some(ref pid_str) = guest.active_pid {
-            if let Ok(pid) = pid_str.parse::<u32>() {
-                let _ = ProcessCommand::new("kill")
-                    .args(["-15", &pid.to_string()])
-                    .status();
-            }
-        }
-        if let Err(e) = graph.set_guest_pid(&hotel_name, guest_id, None) {
-            warn!("RestartComponent: failed to clear PID for {guest_id}: {e}");
-        }
-
-        // Respawn.
         if let Some(req) = materialization_requester {
-            if let Err(e) = req.ensure_guest_active(guest_id).await {
-                return IpcResponse::error("restart_component", "SPAWN_FAILED", e.to_string());
+            match req.restart_guest(guest_id).await {
+                Ok(true) => {}
+                Ok(false) => {
+                    return IpcResponse::error(
+                        "restart_component",
+                        "SPAWN_FAILED",
+                        format!("guest {guest_id} was not re-materialized"),
+                    );
+                }
+                Err(e) => {
+                    return IpcResponse::error("restart_component", "SPAWN_FAILED", e.to_string());
+                }
             }
         } else {
             return IpcResponse::error(
@@ -17316,6 +17313,10 @@ pub(crate) mod tests {
                 .unwrap_or_else(|poison| poison.into_inner());
             *guard = Some(guest_id.to_string());
             Ok(true)
+        }
+
+        async fn restart_guest(&self, guest_id: &str) -> anyhow::Result<bool> {
+            self.ensure_guest_active(guest_id).await
         }
 
         async fn check_heal_restart_budget(&self, _guest_id: &str) -> HealRestartVerdict {

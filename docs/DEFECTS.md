@@ -1,7 +1,7 @@
 ---
 doc_type: defect-tracker
 status: active
-last_updated: 2026-07-27
+last_updated: 2026-07-28
 ---
 
 # Defects and Technical Debt
@@ -87,6 +87,7 @@ Tracked defects and known technical debt. Each entry carries status, severity, p
 | DEF-070 | Self-heal circuit records `escalated` as `resolved`, so a burning fault reports success forever. `service_probe_failed:muninn` filed **919** entries on mbp-jane at a 4.99-min cadence over 3 days; **918** were written `status=resolved` / `outcome=escalated`. All-time `heal_queue` is 1426/1680 (85%) escalated versus **4** ever `restarted`. The dedup work item (`97ffa94d`) neither suppresses re-filing nor keeps one aging open record. Compounding: every escalation targeted `role:agent-jane:orchestrator`, which was itself the deaf agent of DEF-069 — the alert path ran through the broken component with no out-of-band fallback | high | fixed | 3 | 2026-07-26 | FLEET_SUPERVISION_PROPOSAL.md S4 — `HEAL_STATUS_ESCALATED` + `terminal_status_for_outcome()` so only real repairs claim `resolved`; escalated rows stay terminal for dispatch (never re-picked) and are reaped by the retention vacuum; new `phil doctor` check `heal.escalated-unrepaired` flags the worst still-escalating `(pattern_tag, guest_id)` pair (Warning >1h, Critical >6h). Rows are deliberately NOT collapsed at push — the A3 recurrence tracker counts rows, and a regression test pins that coupling. **Test-green, not deployed.** The out-of-band escalation target (S5) is still open |
 | DEF-071 | Muninn daemon unsupervised on both Macs — no launchd job existed for the daemon (only `com.muninn.mcp`, the stdio proxy). It died on mbp-jane 2026-07-23 and stayed down 3 days, leaving every agent on that host memory-blind (`Auto recall skipped: no Muninn memory backend configured`). mac-jane only appeared healthy because `muninn mcp` proxies spawned by Claude clients resurrect the daemon on demand (verified: SIGKILL with no launchd job → fresh `ppid=1` instance in ~6s) | high | fixed | 1 | 2026-07-23 | `com.muninn.daemon` launchd plist (KeepAlive, ThrottleInterval 5) installed on both Macs 2026-07-27, mirroring vps-jane systemd `Restart=always`/`RestartSec=5`; SIGKILL-verified respawn on both (mac-jane 72573→74346, mbp-jane 69942→70039). Covers process exit only; wedged-but-listening still needs FLEET_SUPERVISION_PROPOSAL.md S2+S3 |
 | DEF-072 | Proposal nodes created only through the graph MCP do not survive a rescan. Two `proposal:*` nodes plus their `graph_decide` records, filed 2026-07-26 via `graph_create_node`, were gone by the next `intel-graph-freshness` run (2026-07-27 17:57Z) — `graph_create_node` returned success and `graph_decide` accepted writes against them right up until they vanished. All ~110 durable proposals in the graph are `doc:`-prefixed and derived from committed files. This silently undermines the standing rule that proposals belong in the intel-graph rather than in `.md` files | medium | open | 2 | 2026-07-27 | workaround: back every proposal with a committed doc carrying `doc_type: proposal` frontmatter. Real fix = either persist MCP-authored nodes across rescan, or have `graph_create_node` refuse/warn for a bare `proposal:` id |
+| DEF-073 | Guest supervisor stale-snapshot race spawned duplicate Telegram gateways. A heal restart cleared `active_pid`; the supervisor captured that state, waited on the materializer lock, then ignored the refreshed replacement PID and spawned again. `LocalProcessMaterializer::children.insert` overwrote the first child handle, leaving an untracked gateway with the same guest IDs. Jane consequently produced one model response but both gateways sent it to Telegram | high | fixed | 2 | 2026-07-28 | codex/jane-double-response — atomic reclaim/respawn under the materializer lock, refreshed-PID recheck before supervisor spawn, and fail-closed duplicate-child guard |
 
 ---
 
@@ -159,6 +160,14 @@ Class: mesh EmitTask delivery to datasource runners is at-most-once once claimed
 **Found**: 2026-07-27 · **Seam**: cross-host-distributed-validation
 
 A watched-live negative LifeGraph smoke from `mbp-jane` targeted a nonexistent node. The hotel correctly classified `emit_task_unknown_target_node` and created a heal record, but still returned `ok`, appended `TASK_INVOKE`, and left the caller waiting until its 30-second datasource-response timeout. The acceptance boundary now returns `TARGET_NODE_UNREACHABLE` before appending the event. A regression asserts the structured error, classified heal evidence, and absence of a ledger command. This closes false acceptance for a destination that is unknown at dispatch time; it does not close DEF-059's separate post-claim crash/replay gap.
+
+### DEF-073: supervisor race materialized duplicate Telegram gateways
+
+**Found and fixed**: 2026-07-28 · **Seam**: telegram-poll-lease
+
+Jane had two live `membrane-telegram` processes with the same logical guest IDs. A single inbound message generated one Philote `model_response`, but both gateways received the same reply task and each sent a final Telegram response. A heal-triggered gateway restart overlapped the five-second supervisor reconciliation loop: reconciliation retained a stale `active_pid=None` decision while waiting for the materializer lock, refreshed the guest after the replacement was live, but did not re-evaluate the refreshed PID before spawning. Inserting the second child under the same map key discarded the first process handle without terminating it; the poll lease could not distinguish the two because both registered under the same guest ID.
+
+The fix makes restart reclaim-and-respawn atomic under the shared materializer lock, makes reconciliation recheck refreshed PID liveness before spawning, and makes the local process materializer reject a duplicate live child instead of overwriting its handle. Regression tests cover both the stale-snapshot interleaving and the duplicate-child fence.
 
 ## Fixed defects — detail
 
