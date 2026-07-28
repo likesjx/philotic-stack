@@ -155,6 +155,19 @@ impl Materializer for LocalProcessMaterializer {
         guest_id: &str,
         config_json: &serde_json::Value,
     ) -> Result<String> {
+        let tracked_child_is_live = if let Some(child) = self.children.get_mut(guest_id) {
+            child.try_wait()?.is_none()
+        } else {
+            false
+        };
+        if tracked_child_is_live {
+            anyhow::bail!(
+                "Refusing to spawn duplicate OS child for guest '{}': a tracked child is still live",
+                guest_id
+            );
+        }
+        self.children.remove(guest_id);
+
         if let Some(cmd) = config_json.get("command").and_then(|c| c.as_str()) {
             // Resolve binary path: if PHILOTIC_BIN_DIR is set and the command is not
             // already absolute, prepend the bin dir. Falls back to PATH in dev mode.
@@ -525,6 +538,7 @@ pub struct GuestManager {
 #[async_trait]
 pub trait GuestMaterializationRequester: Send + Sync {
     async fn ensure_guest_active(&self, guest_id: &str) -> Result<bool>;
+    async fn restart_guest(&self, guest_id: &str) -> Result<bool>;
 
     /// Consult the shared respawn budget before a heal-dispatcher-triggered
     /// restart. Records the attempt against the same budget the supervisor uses,
@@ -854,6 +868,51 @@ impl GuestManager {
         }
     }
 
+    /// Reclaim and respawn one guest while holding the materializer lock for the
+    /// whole transition. This prevents the supervisor or another restart request
+    /// from observing the cleared PID and spawning a second incarnation.
+    pub async fn restart_guest(&self, guest_id: &str) -> Result<bool> {
+        let mut mat = self.materializer.lock().await;
+        let Some(current_rec) =
+            Self::refresh_guest_record(self.graph.as_ref(), &self.hotel_name, guest_id)?
+        else {
+            return Ok(false);
+        };
+        if !current_rec.is_active {
+            return Ok(false);
+        }
+
+        if let Err(err) = mat.reclaim_guest(&current_rec.guest_id).await {
+            warn!(
+                "Restart materialization: reclaim failed for [{}]: {}",
+                current_rec.guest_id, err
+            );
+        }
+        if let Some(active_pid) = current_rec.active_pid.as_deref() {
+            if let Ok(pid) = active_pid.parse::<u32>() {
+                if LocalProcessMaterializer::pid_exists(pid) {
+                    warn!(
+                        "Restart materialization: Guest [{}] PID {} survived reclaim; killing directly.",
+                        current_rec.guest_id, pid
+                    );
+                    LocalProcessMaterializer::terminate_pid(pid);
+                }
+            }
+        }
+        Self::clear_guest_pid(self.graph.as_ref(), &self.hotel_name, &current_rec.guest_id);
+
+        let config: serde_json::Value =
+            serde_json::from_str(&current_rec.config_json).unwrap_or_default();
+        let new_pid = mat.spawn_guest(&current_rec.guest_id, &config).await?;
+        self.graph
+            .set_guest_pid(&self.hotel_name, &current_rec.guest_id, Some(&new_pid))?;
+        info!(
+            "Restart materialization: spawned Guest [{}] (PID {}).",
+            current_rec.guest_id, new_pid
+        );
+        Ok(true)
+    }
+
     /// An infinite loop that reconciles the SQLite desired state with the active `Materializer` state.
     pub async fn supervise_guests(self: Arc<Self>, mut shutdown_rx: broadcast::Receiver<()>) {
         info!("Started Guest Supervisor Reconciliation Loop");
@@ -980,6 +1039,29 @@ impl GuestManager {
                             rec.guest_id
                         );
                         continue;
+                    }
+                    if let Some(refreshed_pid) = current_rec.active_pid.as_deref() {
+                        if mat
+                            .check_status(&current_rec.guest_id, refreshed_pid)
+                            .await?
+                        {
+                            info!(
+                                "Supervisor: Guest [{}] gained live PID [{}] while waiting to reconcile. Skipping duplicate spawn.",
+                                current_rec.guest_id, refreshed_pid
+                            );
+                            continue;
+                        }
+                        if let Err(e) = mat.reclaim_guest(&current_rec.guest_id).await {
+                            warn!(
+                                "Supervisor: reclaim of refreshed stale Guest [{}] failed: {}",
+                                current_rec.guest_id, e
+                            );
+                        }
+                        Self::clear_guest_pid(
+                            self.graph.as_ref(),
+                            &self.hotel_name,
+                            &current_rec.guest_id,
+                        );
                     }
                     // Flap protection: a crash-looping guest gets at most
                     // RESPAWN_BUDGET_MAX respawns per RESPAWN_BUDGET_WINDOW_SECS
@@ -1200,6 +1282,10 @@ impl GuestMaterializationRequester for GuestManager {
         Self::ensure_guest_active(self, guest_id).await
     }
 
+    async fn restart_guest(&self, guest_id: &str) -> Result<bool> {
+        Self::restart_guest(self, guest_id).await
+    }
+
     async fn check_heal_restart_budget(&self, guest_id: &str) -> HealRestartVerdict {
         self.check_heal_restart_budget_at(guest_id, epoch_now())
     }
@@ -1224,6 +1310,7 @@ mod tests {
         nodes: StdMutex<HashMap<String, GraphNode>>,
         list_guest_calls: AtomicUsize,
         clear_guests_on_second_list: bool,
+        replacement_guest_on_second_list: Option<GraphNode>,
     }
 
     impl TestGraphAdapter {
@@ -1245,12 +1332,28 @@ mod tests {
                 nodes: StdMutex::new(nodes),
                 list_guest_calls: AtomicUsize::new(0),
                 clear_guests_on_second_list: false,
+                replacement_guest_on_second_list: None,
             }
         }
 
         fn with_guests_cleared_on_second_list(guests: Vec<GuestRecord>) -> Self {
             let mut adapter = Self::with_guests(guests);
             adapter.clear_guests_on_second_list = true;
+            adapter
+        }
+
+        fn with_guest_replaced_on_second_list(
+            initial: GuestRecord,
+            replacement: GuestRecord,
+        ) -> Self {
+            let mut adapter = Self::with_guests(vec![initial]);
+            let key = format!("guest:{}:{}", replacement.hotel_name, replacement.guest_id);
+            adapter.replacement_guest_on_second_list = Some(GraphNode {
+                node_key: key,
+                kind: "guest".to_string(),
+                label: Some(replacement.guest_id.clone()),
+                data: serde_json::to_value(replacement).unwrap(),
+            });
             adapter
         }
     }
@@ -1278,6 +1381,14 @@ mod tests {
                 let call_index = self.list_guest_calls.fetch_add(1, Ordering::SeqCst);
                 if self.clear_guests_on_second_list && call_index >= 1 {
                     self.nodes.lock().unwrap().retain(|_, n| n.kind != "guest");
+                }
+                if call_index >= 1 {
+                    if let Some(replacement) = &self.replacement_guest_on_second_list {
+                        self.nodes
+                            .lock()
+                            .unwrap()
+                            .insert(replacement.node_key.clone(), replacement.clone());
+                    }
                 }
             }
             Ok(self
@@ -1383,6 +1494,37 @@ mod tests {
                 .await
                 .expect("status after reclaim should succeed")
         );
+    }
+
+    #[tokio::test]
+    async fn local_process_materializer_refuses_duplicate_live_child() {
+        let mut materializer = LocalProcessMaterializer::new("aiua_context.db");
+        let guest_id = "single-incarnation-guest";
+        let config = json!({
+            "command": "/bin/sleep",
+            "args": ["30"]
+        });
+        let original_pid = materializer
+            .spawn_guest(guest_id, &config)
+            .await
+            .expect("spawn original child");
+
+        let duplicate = materializer.spawn_guest(guest_id, &config).await;
+        assert!(
+            duplicate.is_err(),
+            "a live tracked child must fence a duplicate spawn"
+        );
+        assert!(
+            materializer
+                .check_status(guest_id, &original_pid)
+                .await
+                .expect("original child status")
+        );
+
+        materializer
+            .reclaim_guest(guest_id)
+            .await
+            .expect("reclaim original child");
     }
 
     #[test]
@@ -1786,6 +1928,42 @@ mod tests {
         assert_eq!(reclaim_count.load(Ordering::SeqCst), 1);
         let guests = graph.list_guests("test-hotel", false).expect("list guests");
         assert!(guests.is_empty());
+    }
+
+    #[tokio::test]
+    async fn reconcile_all_skips_spawn_when_guest_gains_live_pid_after_snapshot() {
+        let initial = GuestRecord {
+            hotel_name: "test-hotel".into(),
+            guest_id: "membrane-gateway".into(),
+            role: "membrane".into(),
+            config_json: json!({ "command": "target/debug/membrane-telegram" }).to_string(),
+            is_active: true,
+            active_pid: None,
+            last_active_at: None,
+        };
+        let mut replacement = initial.clone();
+        replacement.active_pid = Some("replacement-pid".into());
+        let graph = make_domain(TestGraphAdapter::with_guest_replaced_on_second_list(
+            initial,
+            replacement,
+        ));
+
+        let mock = MockMaterializer::new(HashMap::from([("replacement-pid".to_string(), true)]));
+        let spawn_count = mock.spawn_count.clone();
+        let reclaim_count = mock.reclaim_count.clone();
+        let manager = GuestManager::new("test-hotel", graph, Box::new(mock));
+
+        manager
+            .reconcile_all()
+            .await
+            .expect("reconcile should succeed");
+
+        assert_eq!(
+            spawn_count.load(Ordering::SeqCst),
+            0,
+            "a replacement that became live while the supervisor waited must not be duplicated"
+        );
+        assert_eq!(reclaim_count.load(Ordering::SeqCst), 0);
     }
 
     // ── Heal-the-healer: dispatcher heartbeat watchdog (S2) ────────────────

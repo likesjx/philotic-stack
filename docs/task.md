@@ -34,6 +34,7 @@ Stable seam refs live in [SEAM_REGISTRY.md](/Users/jaredlikes/code/philotic-stac
 
 ## Current Mesh / Transport Pressure
 
+- [x] Fix DEF-073's guest-supervisor stale-snapshot race so heal restarts cannot leave duplicate Telegram gateways or duplicate final delivery.
 - [ ] Enforce the explicit mesh transport boundary from [MESH_SYNC_AND_TRANSPORT_BOUNDARIES_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/MESH_SYNC_AND_TRANSPORT_BOUNDARIES_PROPOSAL.md):
   - [ ] keep UDP limited to compact state-sync/control traffic
   - [ ] remove any remaining routed execution or payload traffic that still leans on the beacon family
