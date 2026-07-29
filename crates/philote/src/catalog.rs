@@ -306,6 +306,14 @@ pub fn skill_implied_tools(skill_name: &str) -> &'static [&'static str] {
             "life.patch.propose",
         ],
         "lifegraph.truth_summarizer" => &["life.recall", "graph.query"],
+        "mesh.steward" => &[
+            "heal.list",
+            "heal.resolve",
+            "heal.close_work_item",
+            "host.vitals",
+            "session.repair_stale",
+            "component.restart",
+        ],
         "imessage-monitor" => &["bash.exec"],
         _ => &[],
     }
@@ -330,6 +338,14 @@ pub fn tools_for_skill(skill_name: &str) -> &'static [&'static str] {
             "life.patch.propose",
         ],
         "lifegraph.truth_summarizer" => &["life.recall", "graph.query"],
+        "mesh.steward" => &[
+            "heal.list",
+            "heal.resolve",
+            "heal.close_work_item",
+            "host.vitals",
+            "session.repair_stale",
+            "component.restart",
+        ],
         "cron.manage" => &[
             "cron.register",
             "cron.list",
@@ -598,6 +614,35 @@ pub fn skill_is_relevant_for_turn(skill_name: &str, turn_text: &str) -> bool {
                 || t.contains("outbound api")
                 || t.contains("egress")
                 || t.contains("exit hotel")
+        }
+        "mesh.steward" => {
+            // Fleet maintenance language: the heal queue, host pressure,
+            // wedged guests, and zombie sessions. Without these keywords the
+            // mesh.steward charter would be dead text on maintenance turns —
+            // the heal.* tools would never project (same failure mode the
+            // life.steward idea-intake keywords fixed).
+            t.contains("heal")
+                || t.contains("maintenance")
+                || t.contains("maintain")
+                || t.contains("housekeep")
+                || t.contains("housekeeping")
+                || t.contains("restart")
+                || t.contains("vitals")
+                || t.contains("disk")
+                || t.contains("memory pressure")
+                || t.contains("mem pressure")
+                || t.contains("queue")
+                || t.contains("cleanup")
+                || t.contains("clean up")
+                || t.contains("stale")
+                || t.contains("stuck")
+                || t.contains("work item")
+                || t.contains("triage")
+                || t.contains("hygiene")
+                || t.contains("component")
+                // matches diagnose / diagnostic / diagnosis
+                || t.contains("diagnos")
+                || t.contains("health")
         }
         _ => false,
     }
@@ -3829,6 +3874,160 @@ fn build_catalog() -> HashMap<String, ToolDefinition> {
         },
     );
 
+    m.insert(
+        "heal.list".into(),
+        ToolDefinition {
+            tool_name: "heal.list".into(),
+            description: "Diagnostic only. Returns the hotel's self-heal state: pending \
+                          (unresolved) heal_queue entries and open heal work items filed by the \
+                          heal circuit. Use this to review outstanding maintenance before \
+                          resolving entries or closing work items. Never use bash.exec with \
+                          `phil heal list` when this tool is available."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "scope": {
+                        "type": "string",
+                        "enum": ["queue", "work_items", "both"],
+                        "description": "Which surface to list: the pending heal queue, filed work items, or both (default both)."
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Maximum pending heal_queue entries to return (default 20)."
+                    }
+                }
+            }),
+            class: Some("heal".into()),
+        },
+    );
+
+    m.insert(
+        "heal.resolve".into(),
+        ToolDefinition {
+            tool_name: "heal.resolve".into(),
+            description: "Mark a heal_queue entry resolved with an observed outcome. Mutating — \
+                          use only after the underlying fault has actually been attended to, and \
+                          always record what happened in `outcome`. Requires operational admin \
+                          authority; non-admin agents are refused server-side."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "entry_id": {
+                        "type": "string",
+                        "description": "The heal_queue entry id to resolve (from heal.list)."
+                    },
+                    "outcome": {
+                        "type": "string",
+                        "description": "Short note describing the observed outcome (e.g. 'guest restarted, healthy'). Defaults to 'resolved_by_agent'."
+                    }
+                },
+                "required": ["entry_id"]
+            }),
+            class: Some("heal".into()),
+        },
+    );
+
+    m.insert(
+        "heal.close_work_item".into(),
+        ToolDefinition {
+            tool_name: "heal.close_work_item".into(),
+            description: "Close a filed heal work item once its underlying recurring fault is \
+                          repaired. Mutating and idempotent — closing an already-closed item \
+                          succeeds; a missing id reports closed=false. Record why in `reason`. \
+                          Requires operational admin authority; non-admin agents are refused \
+                          server-side."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "work_item_id": {
+                        "type": "string",
+                        "description": "The heal work item id to close (from heal.list work_items)."
+                    },
+                    "reason": {
+                        "type": "string",
+                        "description": "Short note explaining why the item is being closed."
+                    }
+                },
+                "required": ["work_item_id"]
+            }),
+            class: Some("heal".into()),
+        },
+    );
+
+    m.insert(
+        "host.vitals".into(),
+        ToolDefinition {
+            tool_name: "host.vitals".into(),
+            description: "Diagnostic only. Returns the latest host health scan snapshot: disk \
+                          headroom, memory pressure, and load. Statuses are pre-graded against \
+                          the hotel's thresholds — trust the reported status over raw \
+                          percentages. Returns {\"status\":\"no_scan_yet\"} if no scan has run \
+                          on this hotel."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {}
+            }),
+            class: Some("heal".into()),
+        },
+    );
+
+    m.insert(
+        "session.repair_stale".into(),
+        ToolDefinition {
+            tool_name: "session.repair_stale".into(),
+            description: "Repair session turns stuck in 'running' longer than min_age_secs \
+                          (default 300) — the zombie-turn sweep the heal dispatcher runs \
+                          periodically, on demand. Mutating but bounded: it only fails-out \
+                          already-dead turns; it never touches healthy sessions. Requires \
+                          operational admin authority; non-admin agents are refused server-side."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "min_age_secs": {
+                        "type": "integer",
+                        "description": "Only repair turns older than this many seconds (default 300)."
+                    }
+                }
+            }),
+            class: Some("heal".into()),
+        },
+    );
+
+    m.insert(
+        "component.restart".into(),
+        ToolDefinition {
+            tool_name: "component.restart".into(),
+            description: "Restart a wedged materialized guest: the hotel terminates the process \
+                          and immediately re-spawns it. HIGH AGENCY and respawn-budget-gated \
+                          server-side — if the budget is exhausted the restart is refused; \
+                          escalate to the operator instead of retrying. Use hotel.status first \
+                          to confirm the guest_id and that a restart is actually warranted. \
+                          Requires operational admin authority; non-admin agents are refused \
+                          server-side."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "guest_id": {
+                        "type": "string",
+                        "description": "The materialized guest id to restart (from hotel.status)."
+                    },
+                    "reason_note": {
+                        "type": "string",
+                        "description": "Short note explaining why the restart is needed (echoed in the result for the audit trail)."
+                    }
+                },
+                "required": ["guest_id"]
+            }),
+            class: Some("heal".into()),
+        },
+    );
+
     m
 }
 
@@ -4040,6 +4239,68 @@ mod tests {
                 "expected life.steward to be relevant for {turn:?}"
             );
         }
+    }
+
+    #[test]
+    fn mesh_steward_tools_are_cataloged_with_heal_class() {
+        let catalog = tool_catalog();
+        for tool in [
+            "heal.list",
+            "heal.resolve",
+            "heal.close_work_item",
+            "host.vitals",
+            "session.repair_stale",
+            "component.restart",
+        ] {
+            let def = catalog
+                .get(tool)
+                .unwrap_or_else(|| panic!("{tool} should have a real catalog schema"));
+            assert_eq!(
+                def.class.as_deref(),
+                Some("heal"),
+                "{tool} should carry the heal class"
+            );
+        }
+    }
+
+    #[test]
+    fn mesh_steward_implied_tools_have_catalog_entries() {
+        let catalog = tool_catalog();
+        let implied = skill_implied_tools("mesh.steward");
+        assert_eq!(implied.len(), 6, "mesh.steward should imply all six tools");
+        for tool in implied {
+            assert!(
+                catalog.contains_key(*tool),
+                "mesh.steward implied tool {tool} should have a real catalog schema"
+            );
+        }
+    }
+
+    #[test]
+    fn mesh_steward_relevant_for_maintenance_language() {
+        // aria-mesh-steward slice 1: maintenance-language turns must project
+        // the heal.* tools or the steward charter is dead text (same failure
+        // mode the life.steward idea-intake keywords fixed). Turn text
+        // reaches this function already lowercased.
+        for turn in [
+            "check the heal queue",
+            "restart the stuck membrane guest",
+            "how are the host vitals",
+            "run maintenance",
+            "clean up stale sessions",
+            "any open work items to triage?",
+            "how is disk looking on this hotel",
+            "diagnose the wedged component",
+        ] {
+            assert!(
+                skill_is_relevant_for_turn("mesh.steward", turn),
+                "expected mesh.steward to be relevant for {turn:?}"
+            );
+        }
+        assert!(
+            !skill_is_relevant_for_turn("mesh.steward", "what is the weather tomorrow"),
+            "mesh.steward should not project on unrelated turns"
+        );
     }
 
     #[test]

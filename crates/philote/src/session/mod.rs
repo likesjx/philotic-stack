@@ -4935,67 +4935,10 @@ fn default_visible_toolset(bindings: &SessionBindings) -> Vec<String> {
 }
 
 fn is_local_agent_tool(tool_name: &str) -> bool {
-    matches!(
-        tool_name,
-        "session.status"
-            | "hotel.status"
-            | "hotel.logs"
-            | "hotel.perimeter.status"
-            | "hotel.perimeter.refresh"
-            | "hotel.egress.check"
-            | "agent.configure"
-            | "memory.recall"
-            | "memory.remember"
-            | "memory.cultivate"
-            | "memory.true_up"
-            | "memory.promote_candidate"
-            | "memory.fix"
-            | "memory.status"
-            | "rule.propose"
-            | "routing.policy.propose"
-            | "routing.reflex.set"
-            | "routing.reflex.get"
-            | "routing.pipeline.set"
-            | "routing.pipeline.remove"
-            | "routing.pipeline.get"
-            | "mcp.provision"
-            | "mcp.revoke"
-            | "mcp.status"
-            | "mcp.connect"
-            | "mcp.disconnect"
-            | "mcp.upstreams"
-            | "mcp.set_credential"
-            | "integration.bind_http"
-            | "integration.unbind"
-            | "integration.list"
-            | "desktop.observe"
-            | "skill.register"
-            | "skill.list"
-            | "skill.assign"
-            | "skill.revoke"
-            | "subagent.spawn"
-            | "role.configure"
-            | "role.create_or_update"
-            | "role.list"
-            | "role.set_home"
-            | "transport.set_home"
-            | "handoff.to_role"
-            | "handoff.back"
-            | "delegate.whisper"
-            | "delegate.to_peer"
-            | "delegate.to_external_cognitive_peer"
-            | "delegate.merge"
-            | "approval.request_standing"
-            | "table.add_listener"
-            | "router.stats"
-            | "vision.setup"
-            | "vision.status"
-            | "cron.register"
-            | "cron.list"
-            | "cron.enable"
-            | "cron.disable"
-            | "cron.remove"
-    )
+    // Delegates to the shared allowlist so the agent-side route assembly and
+    // the hotel-side compose_tool_assembly can never diverge again (they had
+    // drifted into two different lists before the aria-mesh-steward slice).
+    ansible_mesh_core::local_agent_tools::is_local_agent_tool(tool_name)
 }
 
 fn is_agent_graph_tool(tool_name: &str) -> bool {

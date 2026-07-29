@@ -4097,6 +4097,132 @@ fn seed_abstract_tool_catalog(graph: &GraphDomain) -> anyhow::Result<()> {
             class: "cron".into(),
             tool_markers: vec!["high_agency".into()],
         },
+        // ── Mesh steward (heal class, aria-mesh-steward slice 1) ────────────
+        AbstractToolRecord {
+            tool_name: "heal.list".into(),
+            description: "Diagnostic only. Returns the hotel's self-heal state: pending \
+                          (unresolved) heal_queue entries and open heal work items filed by the \
+                          heal circuit. Use this to review outstanding maintenance before \
+                          resolving entries or closing work items."
+                .into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "scope": {
+                        "type": "string",
+                        "enum": ["queue", "work_items", "both"],
+                        "description": "Which surface to list: the pending heal queue, filed work items, or both (default both)."
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Maximum pending heal_queue entries to return (default 20)."
+                    }
+                }
+            }),
+            class: "heal".into(),
+            tool_markers: Vec::new(),
+        },
+        AbstractToolRecord {
+            tool_name: "heal.resolve".into(),
+            description: "Mark a heal_queue entry resolved with an observed outcome. Mutating — \
+                          always record what happened in `outcome`. Requires operational admin \
+                          authority; non-admin agents are refused server-side."
+                .into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "entry_id": {
+                        "type": "string",
+                        "description": "The heal_queue entry id to resolve (from heal.list)."
+                    },
+                    "outcome": {
+                        "type": "string",
+                        "description": "Short note describing the observed outcome. Defaults to 'resolved_by_agent'."
+                    }
+                },
+                "required": ["entry_id"]
+            }),
+            class: "heal".into(),
+            tool_markers: Vec::new(),
+        },
+        AbstractToolRecord {
+            tool_name: "heal.close_work_item".into(),
+            description: "Close a filed heal work item once its underlying recurring fault is \
+                          repaired. Mutating and idempotent. Requires operational admin \
+                          authority; non-admin agents are refused server-side."
+                .into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "work_item_id": {
+                        "type": "string",
+                        "description": "The heal work item id to close (from heal.list work_items)."
+                    },
+                    "reason": {
+                        "type": "string",
+                        "description": "Short note explaining why the item is being closed."
+                    }
+                },
+                "required": ["work_item_id"]
+            }),
+            class: "heal".into(),
+            tool_markers: Vec::new(),
+        },
+        AbstractToolRecord {
+            tool_name: "host.vitals".into(),
+            description: "Diagnostic only. Returns the latest host health scan snapshot: disk \
+                          headroom, memory pressure, and load. Statuses are pre-graded against \
+                          the hotel's thresholds — trust the reported status over raw \
+                          percentages."
+                .into(),
+            input_schema: serde_json::json!({ "type": "object", "properties": {} }),
+            class: "heal".into(),
+            tool_markers: Vec::new(),
+        },
+        AbstractToolRecord {
+            tool_name: "session.repair_stale".into(),
+            description: "Repair session turns stuck in 'running' longer than min_age_secs \
+                          (default 300) — the zombie-turn sweep, on demand. Mutating but \
+                          bounded: it only fails-out already-dead turns. Requires operational \
+                          admin authority; non-admin agents are refused server-side."
+                .into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "min_age_secs": {
+                        "type": "integer",
+                        "description": "Only repair turns older than this many seconds (default 300)."
+                    }
+                }
+            }),
+            class: "heal".into(),
+            tool_markers: Vec::new(),
+        },
+        AbstractToolRecord {
+            tool_name: "component.restart".into(),
+            description: "Restart a wedged materialized guest: the hotel terminates the process \
+                          and immediately re-spawns it. HIGH AGENCY and respawn-budget-gated \
+                          server-side — if the budget is exhausted the restart is refused; \
+                          escalate to the operator instead of retrying. Requires operational \
+                          admin authority; non-admin agents are refused server-side."
+                .into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "guest_id": {
+                        "type": "string",
+                        "description": "The materialized guest id to restart (from hotel.status)."
+                    },
+                    "reason_note": {
+                        "type": "string",
+                        "description": "Short note explaining why the restart is needed."
+                    }
+                },
+                "required": ["guest_id"]
+            }),
+            class: "heal".into(),
+            tool_markers: vec!["high_agency".into()],
+        },
     ];
 
     for tool in &catalog {
@@ -4495,6 +4621,35 @@ fn seed_abstract_skill_catalog(graph: &GraphDomain) -> anyhow::Result<()> {
             ..Default::default()
         },
         AbstractSkillRecord {
+            skill_name: "mesh.steward".into(),
+            description: "Mesh steward duties: keep the fleet high-functioning. Use heal.list \
+                          to review the self-heal queue and open work items, \
+                          heal.resolve/heal.close_work_item to close out attended items (always \
+                          record an outcome note), host.vitals for host pressure truth (disk \
+                          floor + memory pressure are pre-graded — trust status over raw \
+                          percentages), session.repair_stale to clear zombie turns, and \
+                          component.restart for a wedged guest (respawn-budget-gated; never \
+                          restart-loop — if the budget is exhausted, escalate to the operator \
+                          instead). Prefer these typed tools over bash shell-outs. Mutating \
+                          steward actions require operational admin authority — non-admin \
+                          agents will be refused server-side."
+                .into(),
+            implied_tools: vec![
+                "heal.list".into(),
+                "heal.resolve".into(),
+                "heal.close_work_item".into(),
+                "host.vitals".into(),
+                "session.repair_stale".into(),
+                "component.restart".into(),
+            ],
+            validation_state: ansible_mesh_core::graph::SkillValidationState::Validated,
+            skill_markers: vec!["governed".into(), "heal".into()],
+            field_sources: serde_json::json!({
+                "workflow": "heal.list/host.vitals -> attend the fault -> heal.resolve/heal.close_work_item/session.repair_stale/component.restart"
+            }),
+            ..Default::default()
+        },
+        AbstractSkillRecord {
             skill_name: "lifegraph.truth_summarizer".into(),
             description: "Summarize LifeGraph state with provenance discipline. Separate confirmed \
                           graph facts from seeded placeholders, inferred intent, and recommended \
@@ -4742,6 +4897,10 @@ fn seed_toolset_profiles(graph: &GraphDomain) -> anyhow::Result<()> {
                 "agent.initiate".into(),
                 "profile.manage".into(),
                 "mcp.manage".into(),
+                // Projects only on maintenance-language turns; the server-side
+                // operational-admin gate protects the mutating heal ops from
+                // non-admin agents.
+                "mesh.steward".into(),
             ],
             remote_tool_runners: vec![],
             seed_baseline: None,
@@ -4934,6 +5093,7 @@ fn seed_toolset_profiles(graph: &GraphDomain) -> anyhow::Result<()> {
                 "mcp".into(),
                 "desktop".into(),
                 "life_graph".into(),
+                "heal".into(),
             ],
             allowed_skills: vec![
                 "skill.crafting".into(),
@@ -4954,6 +5114,7 @@ fn seed_toolset_profiles(graph: &GraphDomain) -> anyhow::Result<()> {
                 "profile.manage".into(),
                 "life.steward".into(),
                 "lifegraph.truth_summarizer".into(),
+                "mesh.steward".into(),
             ],
             on_demand_skills: vec![],
             remote_tool_runners: vec![],
