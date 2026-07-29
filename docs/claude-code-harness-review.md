@@ -27,7 +27,7 @@ The through-line: **nothing mechanically stopped a bad change from reaching
 
 | Check | Result |
 |---|---|
-| `cargo test --workspace --no-fail-fast` | 2078 passed, 0 failed, 89 binaries, no hang (on `fe8bf77b`) |
+| `cargo test --workspace --no-fail-fast` | 2078 passed, 0 failed, 89 binaries (on `fe8bf77b`, **on a Mac with an unlocked Keychain** — see below) |
 | `cargo clippy --workspace --all-targets` | exit 0, hundreds of warnings (aiua alone: 313) |
 | `cargo fmt --all --check` | dirty |
 | `just test` honesty | **honest** — runs `cargo test` unconditionally, propagates exit code |
@@ -41,10 +41,13 @@ Two results that contradicted prior notes and are worth keeping:
    `scripts/test-and-record.sh` only skips *graph recording* when :8900 is down.
    `cargo test --workspace` runs unconditionally and `exit "$TEST_EXIT_CODE"`
    propagates real failures. The "honest green" policy rests on a sound signal.
-2. **The `aiua` test hang is stale.** `MEMORY.md` said `cargo test -p aiua`
-   stalls at `desktop_membrane` lease tests. The full workspace suite completed
-   clean with no skips. That note was the main thing arguing against a CI test
-   gate and should be retired.
+2. **The `aiua` test hang is environment-dependent, not stale.** `MEMORY.md`
+   said `cargo test -p aiua` stalls at `desktop_membrane` lease tests. It runs
+   clean on a developer Mac — 2078 passed, no skips — so it initially looked
+   retired. CI then reproduced a hang, and the cause turned out to be the macOS
+   Keychain shell-out (below), which blocks wherever the login keychain is not
+   unlocked. Correct the memory rather than deleting it: the suite is green on
+   an interactive Mac and hangs everywhere else.
 
 ## What PR #371 changed
 
@@ -55,14 +58,36 @@ Two results that contradicted prior notes and are worth keeping:
 
    **What actually landed:** `cargo fmt --all --check` is a hard gate on PRs and
    runs in ~16s. `cargo test --workspace` runs but is **advisory
-   (`continue-on-error`), not blocking.** On a cold macos-14 runner it took
-   2h59m and was still going when the job timed out — at 90 minutes, then again
-   at 180. `cargo check --workspace` passes there, so this is build cost, not
-   broken code: 31 crates, 89 test binaries, heavy dependencies. Both cancelled
-   runs also failed to save the cargo cache, so every attempt restarted cold.
-   Making it blocking is `proposal:pr-test-gate-viability`. A blocking 3-hour
-   job would stall every PR, and a gate people route around is worse than an
-   honest advisory one.
+   (`continue-on-error`), not blocking** — because it does not terminate.
+
+   **Why, and this is the most valuable thing the gate found.** The first two
+   runs timed out during compilation (90 min, then 180), which suggested build
+   cost. That diagnosis was wrong. On the third run, with a longer limit, the
+   **build step succeeded** and the cargo cache saved at **2.03 GiB** — well
+   under GitHub's 10 GB limit, so caching is viable. It was `cargo test`
+   *execution* that ran 5h50m to the limit.
+
+   The orphan processes GitHub terminated at teardown name the culprit:
+   `aiua-2f3393f6dd` and three **`security`** processes — the macOS Keychain
+   CLI. `crates/aiua/src/vault.rs` shells out to `security
+   find-generic-password` and `add-generic-password` for the vault root key.
+   On a host with no unlocked login keychain those calls **block indefinitely**.
+   `load_keychain_root_key` tolerates the non-interactive *error* case (exit 36
+   / "User interaction is not allowed" → `Ok(None)`), but
+   `store_keychain_root_key` has no equivalent, and neither survives the call
+   simply hanging. `crates/philotic-web` (`serve.rs`, `doctor.rs`) does the same.
+
+   So the workspace test suite cannot complete on **any** machine without an
+   unlocked login Keychain — a fresh Mac, a CI runner, a headless box. This is
+   almost certainly the real explanation for the long-standing "cargo test -p
+   aiua hangs at desktop_membrane" reports, which were assumed to be a tokio
+   deadlock. Fix (`proposal:aiua-tests-hang-on-keychain`): an escape hatch that
+   skips the Keychain backend for the existing file backend, plus a timeout
+   around every `security` invocation. That unblocks
+   `proposal:pr-test-gate-viability`.
+
+   Not fixed in this PR: it is a change to the vault security path and deserves
+   its own review, not a fold-in to a harness PR.
 2. **`rust-toolchain.toml`** pinned to 1.94.0, with `build-linux.yml` and
    `release.yml` passing the version explicitly alongside their `targets:`
    input. Caveat: rustup is not installed on the dev Macs, so the pin governs
