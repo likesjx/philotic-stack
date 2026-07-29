@@ -1,13 +1,13 @@
 use aes_gcm::aead::{Aead, KeyInit};
 use aes_gcm::{Aes256Gcm, Key, Nonce};
 use ansible_mesh_core::domain::GraphDomain;
+use ansible_mesh_core::keychain;
 use ansible_mesh_core::storage::SecretRecord;
 use anyhow::{Context, Result, bail};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use std::fs;
 use std::path::PathBuf;
-use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
@@ -170,7 +170,7 @@ fn load_or_create_root_key() -> Result<Vec<u8>> {
         return Ok(from_file);
     }
 
-    if cfg!(target_os = "macos") {
+    if keychain::enabled() {
         if let Some(existing) = load_keychain_root_key()? {
             return Ok(existing);
         }
@@ -181,8 +181,11 @@ fn load_or_create_root_key() -> Result<Vec<u8>> {
     }
 
     bail!(
-        "{} must be set to a base64-encoded 32-byte key, or ~/.philotic/vault-master-key.env must exist, before using the hotel vault on this platform",
-        VAULT_ENV_KEY
+        "{} must be set to a base64-encoded 32-byte key, or ~/.philotic/vault-master-key.env must exist, before using the hotel vault here.\n\
+         The macOS Keychain backend is not in use on this host (non-macOS, {}=0, or a detected CI environment). \
+         The Keychain is deliberately skipped where there is no unlocked login keychain, because the `security` CLI blocks indefinitely rather than failing.",
+        VAULT_ENV_KEY,
+        keychain::KEYCHAIN_ENABLED_ENV
     )
 }
 
@@ -217,17 +220,17 @@ fn vault_master_key_env_path() -> Result<PathBuf> {
 }
 
 fn load_keychain_root_key() -> Result<Option<Vec<u8>>> {
-    let output = Command::new("security")
-        .args([
+    let output = keychain::run_security(
+        &[
             "find-generic-password",
             "-s",
             VAULT_KEYCHAIN_SERVICE,
             "-a",
             &vault_key_account(),
             "-w",
-        ])
-        .output()
-        .context("failed to run macOS security CLI while reading the Philotic vault root key")?;
+        ],
+        "reading the Philotic vault root key",
+    )?;
 
     if output.status.success() {
         let raw = String::from_utf8(output.stdout)
@@ -254,8 +257,8 @@ fn load_keychain_root_key() -> Result<Option<Vec<u8>>> {
 
 fn store_keychain_root_key(key_bytes: &[u8]) -> Result<()> {
     let encoded = BASE64_STANDARD.encode(key_bytes);
-    let output = Command::new("security")
-        .args([
+    let output = keychain::run_security(
+        &[
             "add-generic-password",
             "-U",
             "-s",
@@ -266,9 +269,23 @@ fn store_keychain_root_key(key_bytes: &[u8]) -> Result<()> {
             &encoded,
             "-T",
             "",
-        ])
-        .output()
-        .context("failed to run macOS security CLI while storing the Philotic vault root key")?;
+        ],
+        "storing the Philotic vault root key",
+    )?;
+
+    // The read path already tolerates a locked/non-interactive keychain by
+    // returning Ok(None); the write path used to hard-fail on it, which turned a
+    // recoverable "no keychain here" into an error after the caller had already
+    // generated a key.
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if !output.status.success() && stderr.contains("User interaction is not allowed") {
+        bail!(
+            "the login Keychain is locked or unavailable, so the generated vault root key could \
+             not be stored. Set {}=0 and provide {} or ~/.philotic/vault-master-key.env instead.",
+            keychain::KEYCHAIN_ENABLED_ENV,
+            VAULT_ENV_KEY
+        );
+    }
 
     if !output.status.success() {
         bail!(
