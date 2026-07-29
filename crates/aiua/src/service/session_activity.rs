@@ -674,6 +674,20 @@ impl IpcServer {
                     ),
                 );
             }
+
+            // DEF-069: a session pinned to a role incarnation that is not
+            // actually serving goes SILENTLY deaf — turns are created, never
+            // dispatched, and reaped here 300s later with no operator-visible
+            // error. agent-jane lost 31h to exactly this, was recovered by a
+            // manual DB patch, then lost another 17h to the same pin two days
+            // later. The reap is not a repair; it only tidies up after the loss.
+            //
+            // Demote the session back to its base agent — always materialized,
+            // and the incarnation that served every completed turn in both
+            // incidents — so a permanent silent outage degrades into at most a
+            // couple of lost turns.
+            Self::demote_stuck_role_incarnation(graph, heal_queue, &sid);
+
             repaired += 1;
         }
         if repaired > 0 {
@@ -684,6 +698,127 @@ impl IpcServer {
         }
         IpcResponse::success("repair", Some(serde_json::json!({"repaired": repaired})))
     }
+
+    /// Re-point a session away from a role incarnation that has stopped
+    /// serving, back to its base agent. See the call site for why (DEF-069).
+    fn demote_stuck_role_incarnation(
+        graph: &GraphDomain,
+        heal_queue: Option<&dyn ansible_mesh_core::heal_queue::HealQueueStorage>,
+        session_id: &str,
+    ) {
+        let Ok(Some(mut session)) = graph.get_session(session_id) else {
+            return;
+        };
+        let turns = graph
+            .list_session_turns(session_id, ZOMBIE_DEMOTE_TURN_SCAN)
+            .unwrap_or_default();
+        let Some(base_agent_id) = decide_role_incarnation_demotion(
+            session.active_incarnation_id.as_deref(),
+            session.primary_agent_id.as_deref(),
+            &turns,
+        ) else {
+            return;
+        };
+
+        let stuck = session
+            .active_incarnation_id
+            .clone()
+            .unwrap_or_else(|| "<none>".into());
+        session.active_incarnation_id = Some(base_agent_id.clone());
+        if let Err(e) = graph.upsert_session(&session) {
+            warn!(
+                session_id,
+                stuck_incarnation = %stuck,
+                error = %e,
+                "zombie-demotion: failed to re-point session to base agent"
+            );
+            return;
+        }
+
+        warn!(
+            session_id,
+            stuck_incarnation = %stuck,
+            base_agent_id = %base_agent_id,
+            "zombie-demotion: role incarnation stopped serving — session re-pointed to its base \
+             agent so it stops losing turns silently"
+        );
+        if let Some(hq) = heal_queue {
+            let message = format!(
+                "[role_incarnation_not_serving] session [{session_id}] was pinned to [{stuck}], \
+                 which let {ZOMBIE_DEMOTE_THRESHOLD} consecutive turns die as zombies without \
+                 ever dispatching; re-pointed to base agent [{base_agent_id}]. That incarnation \
+                 is registered but not serving — re-issue the role command only after confirming \
+                 its guest actually consumes tasks."
+            );
+            let _ =
+                hq.push_classified(session_id, &message, "high", "role_incarnation_not_serving");
+        }
+    }
+}
+
+/// Consecutive zombie-reaped turns (no completed turn in between) that a role
+/// incarnation is allowed before its session is demoted to the base agent.
+///
+/// Two, not one: a single zombie is routinely a transient provider or network
+/// failure — mbp-jane lost a turn exactly that way during a Telegram/openrouter
+/// outage on 2026-07-28 — and that must not knock a session out of a role the
+/// operator deliberately chose.
+const ZOMBIE_DEMOTE_THRESHOLD: usize = 2;
+
+/// How many recent turns to scan when measuring the consecutive zombie streak.
+const ZOMBIE_DEMOTE_TURN_SCAN: usize = 20;
+
+/// Pure decision rule for [`IpcServer::demote_stuck_role_incarnation`], split
+/// out so the policy is testable without a graph.
+///
+/// Returns `Some(base_agent_id)` when the session should be re-pointed.
+/// `turns` may arrive in any order; it is sorted newest-first internally.
+fn decide_role_incarnation_demotion(
+    active_incarnation_id: Option<&str>,
+    primary_agent_id: Option<&str>,
+    turns: &[SessionTurnRecord],
+) -> Option<String> {
+    // Only role incarnations ("{agent_id}:{role}") can be demoted; a session
+    // already on its base agent has nowhere safer to go.
+    let active = active_incarnation_id?;
+    let (base_agent_id, _role) = active.split_once(':')?;
+
+    // Never re-point at an agent this session does not belong to. Without this
+    // guard a malformed incarnation id could silently hand the session to a
+    // different agent — a worse failure than the one being repaired.
+    if primary_agent_id != Some(base_agent_id) {
+        return None;
+    }
+
+    let mut ordered: Vec<&SessionTurnRecord> = turns.iter().collect();
+    ordered.sort_by_key(|t| std::cmp::Reverse(t.started_at));
+
+    let mut streak = 0usize;
+    for turn in ordered {
+        if is_zombie_repaired_turn(turn) {
+            streak += 1;
+            if streak >= ZOMBIE_DEMOTE_THRESHOLD {
+                return Some(base_agent_id.to_string());
+            }
+        } else if turn.status == "completed" {
+            // A success more recent than the streak means the incarnation is
+            // alive; this is not the stuck-pin failure.
+            break;
+        }
+        // Any other status (running, unknown) is inconclusive — keep scanning
+        // rather than counting it or breaking on it.
+    }
+    None
+}
+
+fn is_zombie_repaired_turn(turn: &SessionTurnRecord) -> bool {
+    turn.status == "failed"
+        && turn
+            .error_json
+            .as_ref()
+            .and_then(|e| e.get("error"))
+            .and_then(serde_json::Value::as_str)
+            == Some("ZOMBIE_TURN_REPAIR")
 }
 
 fn merge_turn_status(current: &str, incoming: Option<&str>) -> Option<String> {
@@ -692,6 +827,147 @@ fn merge_turn_status(current: &str, incoming: Option<&str>) -> Option<String> {
         return Some(current.to_string());
     }
     Some(incoming.to_string())
+}
+
+#[cfg(test)]
+mod demotion_policy_tests {
+    use super::*;
+
+    fn turn(turn_id: &str, status: &str, started_at: u64, zombie: bool) -> SessionTurnRecord {
+        SessionTurnRecord {
+            turn_id: turn_id.into(),
+            session_id: "telegram:1:agent-jane".into(),
+            request_event_id: None,
+            user_message_json: serde_json::json!({}),
+            status: status.into(),
+            response_json: None,
+            error_json: zombie.then(|| {
+                serde_json::json!({
+                    "error": "ZOMBIE_TURN_REPAIR",
+                    "reason": "hotel watchdog: stale running turn"
+                })
+            }),
+            started_at: Some(started_at),
+            completed_at: Some(started_at + 300),
+        }
+    }
+
+    const JANE: Option<&str> = Some("agent-jane");
+
+    /// The exact shape of both agent-jane outages: session pinned to
+    /// `agent-jane:orchestrator`, consecutive turns reaped as zombies.
+    #[test]
+    fn demotes_after_consecutive_zombies_on_a_role_incarnation() {
+        let turns = [
+            turn("t1", "completed", 100, false),
+            turn("t2", "failed", 200, true),
+            turn("t3", "failed", 300, true),
+        ];
+        assert_eq!(
+            decide_role_incarnation_demotion(Some("agent-jane:orchestrator"), JANE, &turns),
+            Some("agent-jane".to_string())
+        );
+    }
+
+    /// A single zombie is routinely a transient provider/network failure — the
+    /// 2026-07-28 Telegram+openrouter outage produced exactly one. It must not
+    /// knock a session out of a role the operator chose.
+    #[test]
+    fn one_zombie_is_a_blip_not_a_stuck_pin() {
+        let turns = [
+            turn("t1", "completed", 100, false),
+            turn("t2", "failed", 200, true),
+        ];
+        assert_eq!(
+            decide_role_incarnation_demotion(Some("agent-jane:vixen"), JANE, &turns),
+            None
+        );
+    }
+
+    /// A success newer than the zombies means the incarnation is alive.
+    #[test]
+    fn a_completed_turn_breaks_the_streak() {
+        let turns = [
+            turn("t1", "failed", 100, true),
+            turn("t2", "failed", 200, true),
+            turn("t3", "completed", 300, false),
+        ];
+        assert_eq!(
+            decide_role_incarnation_demotion(Some("agent-jane:vixen"), JANE, &turns),
+            None
+        );
+    }
+
+    /// A session already on its base agent has nowhere safer to go — demoting
+    /// it would be a no-op at best and a misroute at worst.
+    #[test]
+    fn base_agent_sessions_are_never_demoted() {
+        let turns = [
+            turn("t1", "failed", 100, true),
+            turn("t2", "failed", 200, true),
+        ];
+        assert_eq!(
+            decide_role_incarnation_demotion(Some("agent-jane"), JANE, &turns),
+            None
+        );
+        assert_eq!(decide_role_incarnation_demotion(None, JANE, &turns), None);
+    }
+
+    /// Never hand a session to an agent it does not belong to.
+    #[test]
+    fn refuses_to_demote_across_agents() {
+        let turns = [
+            turn("t1", "failed", 100, true),
+            turn("t2", "failed", 200, true),
+        ];
+        assert_eq!(
+            decide_role_incarnation_demotion(Some("agent-astrid:orchestrator"), JANE, &turns),
+            None
+        );
+        assert_eq!(
+            decide_role_incarnation_demotion(Some("agent-jane:orchestrator"), None, &turns),
+            None
+        );
+    }
+
+    /// Ordering is derived from `started_at`, not from list order — the graph
+    /// listing is not time-sorted.
+    #[test]
+    fn unordered_input_is_evaluated_newest_first() {
+        let scrambled = [
+            turn("t3", "failed", 300, true),
+            turn("t1", "completed", 100, false),
+            turn("t2", "failed", 200, true),
+        ];
+        assert_eq!(
+            decide_role_incarnation_demotion(Some("agent-jane:orchestrator"), JANE, &scrambled),
+            Some("agent-jane".to_string())
+        );
+
+        // Same records, but the newest is a success → alive, no demotion.
+        let alive = [
+            turn("t2", "failed", 200, true),
+            turn("t3", "completed", 300, false),
+            turn("t1", "failed", 100, true),
+        ];
+        assert_eq!(
+            decide_role_incarnation_demotion(Some("agent-jane:orchestrator"), JANE, &alive),
+            None
+        );
+    }
+
+    /// Ordinary failures are not zombies; only watchdog-reaped turns count.
+    #[test]
+    fn non_zombie_failures_do_not_trigger_demotion() {
+        let turns = [
+            turn("t1", "failed", 100, false),
+            turn("t2", "failed", 200, false),
+        ];
+        assert_eq!(
+            decide_role_incarnation_demotion(Some("agent-jane:orchestrator"), JANE, &turns),
+            None
+        );
+    }
 }
 
 #[cfg(test)]
