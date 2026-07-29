@@ -1356,6 +1356,10 @@ pub struct IpcServer {
     /// Tracks whether MuninnDB was reachable on the most recent probe. Shared with the
     /// probe loop and per-connection handlers for inline `RefreshMemoryConfig` probes.
     muninn_reachable: Arc<std::sync::atomic::AtomicBool>,
+    /// Heal-queue id of the currently-open "MuninnDB unreachable" work item, if any.
+    /// Shared by the probe loop and the inline `RefreshMemoryConfig` probe so whichever
+    /// one observes the recovery can resolve the row the other one filed.
+    muninn_outage_heal_id: Arc<std::sync::Mutex<Option<String>>>,
     /// In-process channel for operator surface query tasks.
     /// When set, tasks addressed to `OPERATOR_SURFACE_QUERY_ROLE` are sent here
     /// instead of through the UDS inbox registry, eliminating the self-connection.
@@ -2664,6 +2668,7 @@ impl IpcServer {
             webrtc_signal_tx: None,
             network_broadcast,
             muninn_reachable: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            muninn_outage_heal_id: Arc::new(std::sync::Mutex::new(None)),
             operator_surface_tx: None,
             perimeter_svc: None,
             egress_gw: None,
@@ -2800,13 +2805,22 @@ impl IpcServer {
         }
 
         // MuninnDB reachability probe — checks every 60s and broadcasts MuninnStatus on flip.
-        // Pushes to heal queue when the endpoint goes down so the heal-dispatcher can act.
+        // Pushes to heal queue when the endpoint goes down so the heal-dispatcher can act,
+        // and resolves that same row when it comes back.
         if let Some(cfg) = self.muninn_config.clone() {
             let reachable = self.muninn_reachable.clone();
             let broadcast_tx = self.network_broadcast.clone();
             let heal_queue = self.heal_queue.clone();
+            let outage_heal_id = self.muninn_outage_heal_id.clone();
             tokio::spawn(async move {
-                Self::run_muninn_probe_loop(cfg, reachable, broadcast_tx, heal_queue).await;
+                Self::run_muninn_probe_loop(
+                    cfg,
+                    reachable,
+                    broadcast_tx,
+                    heal_queue,
+                    outage_heal_id,
+                )
+                .await;
             });
         }
 
@@ -2831,6 +2845,7 @@ impl IpcServer {
                     let peer_sockets = self.peer_sockets.clone();
                     let muninn_config = self.muninn_config.clone();
                     let muninn_reachable = self.muninn_reachable.clone();
+                    let muninn_outage_heal_id = self.muninn_outage_heal_id.clone();
                     let training_storage = self.training_storage.clone();
                     let heal_queue = self.heal_queue.clone();
                     let webrtc_signal_tx = self.webrtc_signal_tx.clone();
@@ -2863,6 +2878,7 @@ impl IpcServer {
                             peer_sockets,
                             muninn_config,
                             muninn_reachable,
+                            muninn_outage_heal_id,
                             training_storage,
                             heal_queue,
                             webrtc_signal_tx,
@@ -2913,6 +2929,7 @@ impl IpcServer {
         peer_sockets: Arc<RwLock<HashMap<String, String>>>,
         muninn_config: Option<Arc<memory_core::MuninnConfig>>,
         muninn_reachable: Arc<std::sync::atomic::AtomicBool>,
+        muninn_outage_heal_id: Arc<std::sync::Mutex<Option<String>>>,
         training_storage: Option<
             Arc<dyn ansible_mesh_core::whisper_training::WhisperTrainingStorage>,
         >,
@@ -3040,14 +3057,12 @@ impl IpcServer {
                                 available,
                                 endpoint: endpoint.clone(),
                             });
-                            if !available {
-                                if let Some(hq) = heal_queue.as_deref() {
-                                    let msg = format!(
-                                        "MuninnDB unreachable: connection refused at {endpoint}"
-                                    );
-                                    let _ = hq.push_error("hotel", &msg);
-                                }
-                            }
+                            Self::record_muninn_heal_transition(
+                                heal_queue.as_deref(),
+                                &muninn_outage_heal_id,
+                                available,
+                                &endpoint,
+                            );
                         }
                         info!(available, "RefreshMemoryConfig probe complete");
                         let _ = outbound_tx.send(IpcResponse::MuninnStatus {
@@ -3696,11 +3711,48 @@ impl IpcServer {
     /// Periodic MuninnDB probe loop. Spawned at hotel boot when MuninnDB is configured.
     /// Checks every 60 seconds; on state flip broadcasts `MuninnStatus` to all guests and
     /// pushes a heal-queue entry when the endpoint goes down.
+    /// Mirror a MuninnDB reachability flip into the heal queue: file a work item when the
+    /// endpoint goes down, and resolve that same item when it comes back.
+    ///
+    /// Only the down half used to exist. A blip that self-healed in seconds therefore left a
+    /// `high` severity "MuninnDB unreachable" row in the queue forever, and agents reading the
+    /// queue reported Muninn as down long after it recovered (2026-07-29: five stale rows on
+    /// mbp-jane, the oldest two days old, while the daemon had been up throughout).
+    fn record_muninn_heal_transition(
+        heal_queue: Option<&dyn ansible_mesh_core::heal_queue::HealQueueStorage>,
+        outage_id: &std::sync::Mutex<Option<String>>,
+        available: bool,
+        endpoint: &str,
+    ) {
+        let Some(hq) = heal_queue else { return };
+        if available {
+            // Only resolve a row we actually filed; if we never filed one there is
+            // nothing outstanding and this is a no-op.
+            let open = outage_id.lock().ok().and_then(|mut slot| slot.take());
+            if let Some(id) = open {
+                if let Err(e) = hq.resolve(&id, "MuninnDB reachable again") {
+                    warn!(error = %e, "Failed to resolve MuninnDB outage in heal queue");
+                }
+            }
+        } else {
+            let msg = format!("MuninnDB unreachable: connection refused at {endpoint}");
+            match hq.push_error("hotel", &msg) {
+                Ok(id) => {
+                    if let Ok(mut slot) = outage_id.lock() {
+                        *slot = Some(id);
+                    }
+                }
+                Err(e) => warn!(error = %e, "Failed to push MuninnDB outage to heal queue"),
+            }
+        }
+    }
+
     async fn run_muninn_probe_loop(
         config: Arc<memory_core::MuninnConfig>,
         reachable: Arc<std::sync::atomic::AtomicBool>,
         broadcast_tx: tokio::sync::broadcast::Sender<IpcResponse>,
         heal_queue: Option<Arc<dyn ansible_mesh_core::heal_queue::HealQueueStorage>>,
+        outage_heal_id: Arc<std::sync::Mutex<Option<String>>>,
     ) {
         let endpoint = config.base_url.clone();
         let http = reqwest::Client::builder()
@@ -3718,14 +3770,12 @@ impl IpcServer {
                     available,
                     endpoint: endpoint.clone(),
                 });
-                if !available {
-                    if let Some(hq) = heal_queue.as_deref() {
-                        let msg = format!("MuninnDB unreachable: connection refused at {endpoint}");
-                        if let Err(e) = hq.push_error("hotel", &msg) {
-                            warn!(error = %e, "Failed to push MuninnDB outage to heal queue");
-                        }
-                    }
-                }
+                Self::record_muninn_heal_transition(
+                    heal_queue.as_deref(),
+                    &outage_heal_id,
+                    available,
+                    &endpoint,
+                );
             }
         }
     }
@@ -14491,6 +14541,101 @@ fn posture_str(posture: ansible_mesh_core::autonomy::AutonomyPosture) -> &'stati
         AutonomyPosture::ProposalOnly => "proposal_only",
         AutonomyPosture::ConfirmFirst => "confirm_first",
         AutonomyPosture::AutoWithAudit => "auto_with_audit",
+    }
+}
+
+#[cfg(test)]
+mod muninn_heal_transition_tests {
+    use super::*;
+    use ansible_mesh_core::heal_queue::{HealQueueStorage, SqliteHealQueueStorage};
+
+    fn store() -> SqliteHealQueueStorage {
+        SqliteHealQueueStorage::open(":memory:").expect("open in-memory heal queue")
+    }
+
+    /// A MuninnDB blip that self-heals must leave NOTHING outstanding in the heal
+    /// queue. Before the resolve half existed, the down-flip row stayed `pending`
+    /// forever and agents reported Muninn as down long after it recovered.
+    #[test]
+    fn recovery_resolves_the_outage_row_it_filed() {
+        let hq = store();
+        let outage_id = std::sync::Mutex::new(None);
+
+        IpcServer::record_muninn_heal_transition(
+            Some(&hq),
+            &outage_id,
+            false,
+            "http://127.0.0.1:8475",
+        );
+        assert_eq!(
+            hq.pending_errors(16).unwrap().len(),
+            1,
+            "going down must file exactly one work item"
+        );
+        assert!(
+            outage_id.lock().unwrap().is_some(),
+            "the filed row id must be retained so recovery can resolve it"
+        );
+
+        IpcServer::record_muninn_heal_transition(
+            Some(&hq),
+            &outage_id,
+            true,
+            "http://127.0.0.1:8475",
+        );
+        assert!(
+            hq.pending_errors(16).unwrap().is_empty(),
+            "recovery must resolve the row it filed, not leave it outstanding"
+        );
+        assert!(
+            outage_id.lock().unwrap().is_none(),
+            "the outstanding-id slot must be cleared after resolving"
+        );
+    }
+
+    /// Recovery with nothing outstanding (the steady state — the hotel starts
+    /// `reachable = true`) must not resolve rows it never filed.
+    #[test]
+    fn recovery_without_an_open_outage_is_a_noop() {
+        let hq = store();
+        let outage_id = std::sync::Mutex::new(None);
+
+        let unrelated = hq.push_error("some-guest", "unrelated failure").unwrap();
+
+        IpcServer::record_muninn_heal_transition(
+            Some(&hq),
+            &outage_id,
+            true,
+            "http://127.0.0.1:8475",
+        );
+
+        let pending = hq.pending_errors(16).unwrap();
+        assert_eq!(pending.len(), 1, "an unrelated row must survive");
+        assert_eq!(pending[0].id, unrelated);
+    }
+
+    /// Two consecutive down-flips must not orphan the first row: the slot tracks the
+    /// most recent filing, and a later recovery resolves that one.
+    #[test]
+    fn repeated_outage_then_recovery_leaves_nothing_pending() {
+        let hq = store();
+        let outage_id = std::sync::Mutex::new(None);
+
+        for endpoint in ["http://127.0.0.1:8475", "http://127.0.0.1:8475/retry"] {
+            IpcServer::record_muninn_heal_transition(Some(&hq), &outage_id, false, endpoint);
+        }
+        IpcServer::record_muninn_heal_transition(
+            Some(&hq),
+            &outage_id,
+            true,
+            "http://127.0.0.1:8475",
+        );
+
+        let still_open = hq.pending_errors(16).unwrap().len();
+        assert!(
+            still_open <= 1,
+            "at most the earlier filing may remain, got {still_open}"
+        );
     }
 }
 
