@@ -844,6 +844,13 @@ pub struct WorkingTurn {
     /// [`crate::plan_eval::PLAN_EXECUTION_BUDGET_SECS`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub started_at_unix: Option<u64>,
+    /// Unix-seconds of the last interim message this turn sent to the user
+    /// without ending the turn. Gates the next one, so a long turn stays
+    /// audible without narrating every step. See
+    /// [`crate::plan_eval::interim_reply_admissible`]. `#[serde(default)]` so
+    /// old checkpoints deserialize to `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_interim_at_unix: Option<u64>,
     /// Model-immutable per-step verification flags, index-aligned with
     /// `active_plan.steps`.
     ///
@@ -901,6 +908,7 @@ impl WorkingTurn {
             paracrine_hop_count: 0,
             paracrine_chain_started_at: None,
             started_at_unix: None,
+            last_interim_at_unix: None,
             plan_steps_verified: Vec::new(),
         }
     }
@@ -2030,6 +2038,7 @@ mod paracrine_budget_tests {
             paracrine_chain_started_at: None,
             selection_source: SelectionSource::default(),
             started_at_unix: None,
+            last_interim_at_unix: None,
             plan_steps_verified: Vec::new(),
         }
     }

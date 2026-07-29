@@ -3085,6 +3085,7 @@ impl AgentRuntime {
                 paracrine_hop_count: 0,
                 paracrine_chain_started_at: None,
                 started_at_unix: Some(crate::plan_eval::unix_now()),
+                last_interim_at_unix: None,
                 plan_steps_verified: Vec::new(),
                 selection_source,
             });
@@ -3840,6 +3841,17 @@ impl AgentRuntime {
     }
 
     async fn emit_partial_reply(&mut self, session_id: &str, content: String) -> Result<()> {
+        // Stamp the turn before sending, so every interim path — plan progress,
+        // a handoff announcement, a paracrine signal — draws on the same quiet
+        // period. Rate-limiting only the progress notes would let two of these
+        // land back to back and reproduce the chatter the gate exists to stop.
+        if let Some(turn) = self
+            .sessions
+            .get_mut(session_id)
+            .and_then(|s| s.active_turn.as_mut())
+        {
+            turn.last_interim_at_unix = Some(crate::plan_eval::unix_now());
+        }
         let (turn_id, chat_id, final_reply_to, final_reply_role, final_reply_guest_id) = {
             let Some(state) = self.sessions.get(session_id) else {
                 return Ok(());
@@ -4007,11 +4019,19 @@ impl AgentRuntime {
             state.clear_handoff_summary();
         }
 
+        // `partial_replies` is offered on the re-entry path only. This is the
+        // one dispatch that can be followed by another tool call, so it is the
+        // only place a turn can speak and still keep working; the initial
+        // dispatch is iteration 0, which the interim gate declines anyway.
+        // Deliberately not added to `voice_response_contract` — an interim on a
+        // voice turn would route through the draft-edit path that voice replies
+        // delete, which is untested.
         let response_contract = Some(cognitive_response_contract(&[
             "spoken_text",
             "memory_candidate",
             "active_plan",
             "memory_concept",
+            "partial_replies",
         ]));
         let response_route = Some(model_response_route(
             self.sessions.get(&session_id),
@@ -7464,6 +7484,7 @@ mod tests {
             paracrine_hop_count: 0,
             paracrine_chain_started_at: None,
             started_at_unix: None,
+            last_interim_at_unix: None,
             plan_steps_verified: Vec::new(),
             selection_source: SelectionSource::default(),
         }
@@ -8555,6 +8576,7 @@ mod tests {
             paracrine_hop_count: 0,
             paracrine_chain_started_at: None,
             started_at_unix: None,
+            last_interim_at_unix: None,
             plan_steps_verified: Vec::new(),
             selection_source: SelectionSource::default(),
         });

@@ -465,6 +465,49 @@ pub fn unix_now() -> u64 {
         .unwrap_or(0)
 }
 
+/// Quiet period between interim messages inside one turn.
+///
+/// Sized against the turn's own budget: with [`PLAN_EXECUTION_BUDGET_SECS`] at
+/// 210, a 45s floor allows at most a handful of interim notes on the longest
+/// possible turn, and none at all on a short one.
+pub const INTERIM_REPLY_MIN_GAP_SECS: u64 = 45;
+
+/// Iterations a turn runs before it may speak without finishing.
+///
+/// The first steps of a plan are usually fast, and narrating them is the
+/// per-step receipt behaviour the operator objected to. Silence is correct
+/// until a turn is demonstrably long-running.
+pub const INTERIM_REPLY_MIN_ITERATION: u32 = 2;
+
+/// Whether the loop will carry an interim message from the model right now.
+///
+/// The model decides *what* to say — it holds the context. The loop decides
+/// *whether it may be said*, because only the loop holds the clock and the
+/// mandate not to chatter. An interim message does not end the turn: it edits
+/// the same draft the final reply will overwrite, so an admitted note costs
+/// nothing in the transcript and a declined one costs nothing at all.
+pub fn interim_reply_admissible(
+    turn_started_at_unix: Option<u64>,
+    last_interim_at_unix: Option<u64>,
+    iteration: u32,
+    now_unix: u64,
+) -> bool {
+    if iteration < INTERIM_REPLY_MIN_ITERATION {
+        return false;
+    }
+    // Unknown start time — stay quiet rather than risk narrating a fast turn.
+    let Some(started) = turn_started_at_unix else {
+        return false;
+    };
+    if now_unix.saturating_sub(started) < INTERIM_REPLY_MIN_GAP_SECS {
+        return false;
+    }
+    match last_interim_at_unix {
+        Some(last) => now_unix.saturating_sub(last) >= INTERIM_REPLY_MIN_GAP_SECS,
+        None => true,
+    }
+}
+
 /// True when in-turn plan execution must stop and hand off to the final reply.
 pub fn plan_execution_budget_exhausted(started_at_unix: Option<u64>, now_unix: u64) -> bool {
     let Some(started) = started_at_unix else {
@@ -1023,13 +1066,19 @@ pub fn reentry_hint(turn: &WorkingTurn) -> String {
 
     format!(
         "{}/{} plan steps verified against actual tool results.\nStill outstanding:\n{outstanding}\n\
-         Keep working in THIS turn — do not hand the plan back to the user between steps, and do \
-         not send a progress receipt after each tool call. Take exactly one of these three exits:\n\
+         Keep working in THIS turn — do not hand the plan back to the user between steps. \
+         Take exactly one of these three exits:\n\
          1. Execute the next outstanding step now with a tool call. This is the default.\n\
          2. If every step is finished, deliver ONE final reply covering the whole plan.\n\
          3. If a step genuinely cannot proceed without the user — a decision only they can make, \
-         a missing credential, an ambiguity you cannot resolve — reply now, say specifically what \
-         you need, and name the step it blocks.\n\
+         a missing credential, an ambiguity you cannot resolve — and no other step can move \
+         while you wait, reply now, say specifically what you need, and name the step it blocks. \
+         If the other steps CAN still move, do not stop: put what you need in `partial_replies` \
+         and carry on with them.\n\
+         You may also add one short line to `partial_replies` alongside a tool call to say what \
+         you are doing on a long stretch of work. It reaches the user without ending the turn, \
+         and the loop drops it if you are speaking too often — so use it when the silence would \
+         be long, not after every step.\n\
          Never report a step as done unless a successful tool call in this turn did it.",
         completion.verified, completion.total,
     )
@@ -1342,6 +1391,104 @@ mod tests {
         );
         assert_eq!(out.stalled_continuations, 0);
         assert_eq!(out.verdict, PlanEvalVerdict::Continue);
+    }
+
+    // ── Interim replies: speaking without ending the turn ────────────────
+
+    #[test]
+    fn interim_reply_is_declined_on_the_first_iterations() {
+        // Long-running turn, but only one step in: narrating here is the
+        // per-step receipt behaviour, not a progress note.
+        assert!(!interim_reply_admissible(Some(1_000), None, 0, 1_500));
+        assert!(!interim_reply_admissible(Some(1_000), None, 1, 1_500));
+        assert!(interim_reply_admissible(Some(1_000), None, 2, 1_500));
+    }
+
+    #[test]
+    fn interim_reply_is_declined_until_the_turn_is_actually_long() {
+        let started = 1_000;
+        // Deep into the tool loop but only a few seconds in — still silent.
+        assert!(!interim_reply_admissible(
+            Some(started),
+            None,
+            9,
+            started + INTERIM_REPLY_MIN_GAP_SECS - 1
+        ));
+        assert!(interim_reply_admissible(
+            Some(started),
+            None,
+            9,
+            started + INTERIM_REPLY_MIN_GAP_SECS
+        ));
+    }
+
+    #[test]
+    fn interim_reply_enforces_a_quiet_period_between_messages() {
+        let started = 1_000;
+        let first = started + 60;
+        assert!(!interim_reply_admissible(
+            Some(started),
+            Some(first),
+            9,
+            first + INTERIM_REPLY_MIN_GAP_SECS - 1
+        ));
+        assert!(interim_reply_admissible(
+            Some(started),
+            Some(first),
+            9,
+            first + INTERIM_REPLY_MIN_GAP_SECS
+        ));
+    }
+
+    /// Unknown start time means the clock cannot be trusted; stay quiet rather
+    /// than risk narrating a fast turn.
+    #[test]
+    fn interim_reply_is_declined_without_a_known_start_time() {
+        assert!(!interim_reply_admissible(None, None, 9, 99_999));
+    }
+
+    /// The gate must leave room for several notes across the longest turn the
+    /// in-turn budget allows, or a long plan still runs effectively silent.
+    #[test]
+    fn interim_gap_admits_several_notes_within_the_turn_budget() {
+        assert!(PLAN_EXECUTION_BUDGET_SECS / INTERIM_REPLY_MIN_GAP_SECS >= 3);
+    }
+
+    /// The re-entry hint has to invite the channel it just enabled, or the
+    /// model never populates `partial_replies` and the flush is dead code.
+    #[test]
+    fn reentry_hint_invites_interim_notes_without_licensing_receipts() {
+        let p = plan(
+            "executing",
+            &[
+                ("read config", Some("hotel.status"), "pending"),
+                ("apply fix", Some("life.observe"), "pending"),
+            ],
+        );
+        let hint = reentry_hint(&turn_with(Some(p), vec![]));
+        assert!(hint.contains("partial_replies"));
+        assert!(
+            hint.contains("without ending the turn"),
+            "the model must know speaking does not stop the plan, got: {hint}"
+        );
+        // The blanket ban is gone, but the anti-chatter framing must remain.
+        assert!(!hint.contains("do not send a progress receipt after each tool call"));
+        assert!(hint.contains("not after every step"));
+    }
+
+    /// Exit 3 used to end the plan whenever the model needed anything. It
+    /// should only do so when nothing else can move.
+    #[test]
+    fn reentry_hint_blocks_only_when_no_other_step_can_move() {
+        let p = plan(
+            "executing",
+            &[
+                ("read config", Some("hotel.status"), "pending"),
+                ("apply fix", Some("life.observe"), "pending"),
+            ],
+        );
+        let hint = reentry_hint(&turn_with(Some(p), vec![]));
+        assert!(hint.contains("If the other steps CAN still move, do not stop"));
     }
 
     #[test]
