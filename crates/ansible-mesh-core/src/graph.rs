@@ -398,6 +398,14 @@ pub fn tools_for_tool_class(class: &str) -> &'static [&'static str] {
             "training.status",
         ],
         "asr" => &["asr.setup", "asr.status"],
+        "heal" => &[
+            "heal.list",
+            "heal.resolve",
+            "heal.close_work_item",
+            "host.vitals",
+            "session.repair_stale",
+            "component.restart",
+        ],
         _ => &[],
     }
 }
@@ -1097,5 +1105,20 @@ mod content_policy_tests {
         assert!(tools_for_tool_class("training").contains(&"training.export"));
         assert!(tools_for_tool_class("asr").contains(&"asr.setup"));
         assert!(tools_for_tool_class("nonexistent").is_empty());
+    }
+
+    #[test]
+    fn heal_class_expands_to_exactly_the_mesh_steward_tools() {
+        assert_eq!(
+            tools_for_tool_class("heal"),
+            &[
+                "heal.list",
+                "heal.resolve",
+                "heal.close_work_item",
+                "host.vitals",
+                "session.repair_stale",
+                "component.restart",
+            ]
+        );
     }
 }
