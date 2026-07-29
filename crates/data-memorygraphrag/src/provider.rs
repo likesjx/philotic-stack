@@ -372,6 +372,46 @@ fn plan_bridge_action(decision: &AutonomyDecision) -> BridgeAction {
 /// queued and the batch stalled until the 93s WaitingTool watchdog evicted it.
 static LIFE_GRAPH_POOL: tokio::sync::OnceCell<Graph> = tokio::sync::OnceCell::const_new();
 
+/// Per-query bound on a single Memgraph round trip.
+///
+/// neo4rs 0.9 exposes NO timeout on `ConfigBuilder` (only `fetch_size` and
+/// `max_connections`), so a query that never comes back is an unbounded await
+/// by default — the same failure class already fixed for the embed sidecar.
+/// Memgraph's own `query_execution_timeout_sec=600` is no help here: it is
+/// 6.7x the caller's 90s watchdog, so the caller always gives up first and the
+/// server-side limit never protects anyone.
+///
+/// Sized so `OBSERVE_BATCH_BUDGET_SECS` can absorb several slow queries and
+/// still return a useful partial result rather than surrendering the whole
+/// budget to one of them. See `datasource::runtime::PROVIDER_INVOKE_TIMEOUT_SECS`
+/// for the full deadline chain.
+const MEMGRAPH_QUERY_TIMEOUT_SECS: u64 = 15;
+
+/// Bound one Memgraph round trip, naming the site so a timeout says WHICH
+/// query hung rather than just that something did.
+///
+/// Note this bounds the round trip that dispatches the query; streaming further
+/// rows is bounded in turn by the batch budget and the provider-invoke deadline
+/// above it.
+async fn bounded_query<F, T>(what: &str, fut: F) -> Result<T>
+where
+    F: std::future::Future<Output = std::result::Result<T, neo4rs::Error>>,
+{
+    match tokio::time::timeout(
+        std::time::Duration::from_secs(MEMGRAPH_QUERY_TIMEOUT_SECS),
+        fut,
+    )
+    .await
+    {
+        Ok(Ok(value)) => Ok(value),
+        Ok(Err(err)) => Err(err.into()),
+        Err(_) => Err(anyhow::anyhow!(
+            "Memgraph query '{what}' exceeded the {MEMGRAPH_QUERY_TIMEOUT_SECS}s client deadline \
+             (server-side query_execution_timeout_sec is far larger and would not have fired)"
+        )),
+    }
+}
+
 /// Wall-clock budget for one `life.observe.batch`, deliberately smaller than
 /// philote's 90s `WAITING_TOOL_SECS` watchdog (`crates/philote/src/turn_loop.rs`).
 ///
@@ -445,7 +485,7 @@ impl LifeGraphProvider {
 
     async fn execute_cypher(&self, cypher: &str) -> Result<Value> {
         let graph = self.connect().await?;
-        let mut rows = graph.execute(query(cypher)).await?;
+        let mut rows = bounded_query("execute_cypher", graph.execute(query(cypher))).await?;
         let mut output = Vec::new();
         while let Some(row) = rows.next().await? {
             output.push(row_to_json(&row)?);
@@ -456,7 +496,11 @@ impl LifeGraphProvider {
     /// Execute a vector-search query with the embedding bound as `$vec`.
     async fn execute_cypher_with_vec(&self, cypher: &str, vec_param: Vec<f64>) -> Result<Value> {
         let graph = self.connect().await?;
-        let mut rows = graph.execute(query(cypher).param("vec", vec_param)).await?;
+        let mut rows = bounded_query(
+            "vector_query",
+            graph.execute(query(cypher).param("vec", vec_param)),
+        )
+        .await?;
         let mut output = Vec::new();
         while let Some(row) = rows.next().await? {
             output.push(row_to_json(&row)?);
@@ -674,7 +718,7 @@ impl LifeGraphProvider {
                 compiled.provenance_envelope_json.as_deref().unwrap_or(""),
             );
 
-        let mut rows = graph.execute(q).await?;
+        let mut rows = bounded_query("observe_node_write", graph.execute(q)).await?;
         let first_row = rows.next().await?;
 
         let node_id = first_row
@@ -702,7 +746,8 @@ impl LifeGraphProvider {
                 .param("created_at", now.as_str())
                 .param("observation_id", compiled.observation_id.as_str())
                 .param("observed_by", compiled.observed_by.as_str());
-            let status = match graph.execute(edge_query).await {
+            let status = match bounded_query("observe_edge_merge", graph.execute(edge_query)).await
+            {
                 Ok(mut rows) => match rows.next().await {
                     Ok(Some(_)) => "written",
                     Ok(None) => {
@@ -1667,7 +1712,7 @@ impl LifeGraphProvider {
         } else {
             q = q.param("connectivity_ratio", 0.0_f64);
         }
-        let mut rows = graph.execute(q).await?;
+        let mut rows = bounded_query("recall_feedback_write", graph.execute(q)).await?;
         let _ = rows.next().await?;
 
         // ── Feedback-informed ranking (recall_utility EWMA) ───────────────
@@ -2053,7 +2098,7 @@ impl LifeGraphProvider {
         let cypher = cypher::patch_list_query(&statuses, limit);
 
         let graph = self.connect().await?;
-        let mut rows = graph.execute(query(&cypher)).await?;
+        let mut rows = bounded_query("patch_list_read", graph.execute(query(&cypher))).await?;
         let mut patches = Vec::new();
         while let Some(row) = rows.next().await? {
             let risk: String = row.get("risk").unwrap_or_default();
@@ -2348,7 +2393,7 @@ impl LifeGraphProvider {
         if let Some(summary) = &compiled.resolution_summary {
             q = q.param("resolution_summary", summary.as_str());
         }
-        let mut rows = graph.execute(q).await?;
+        let mut rows = bounded_query("conflict_cypher", graph.execute(q)).await?;
         let _ = rows.next().await?;
         Ok(())
     }

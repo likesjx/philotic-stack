@@ -11,6 +11,31 @@ use std::sync::Arc;
 use std::time::Duration;
 use tracing::{error, info, warn};
 
+/// Backstop deadline for a single `DatasourceProvider::invoke`.
+///
+/// THREE DEADLINES GOVERN ONE LIFEGRAPH CALL, AND THEY MUST STAY ORDERED:
+///
+/// ```text
+///   Memgraph per-query   15s  (data-memorygraphrag: MEMGRAPH_QUERY_TIMEOUT_SECS)
+///     <  batch budget    60s  (data-memorygraphrag: OBSERVE_BATCH_BUDGET_SECS)
+///       <  this          75s
+///         <  caller      90s  (philote/turn_loop.rs: WAITING_TOOL_SECS)
+/// ```
+///
+/// Each must be strictly larger than the one it contains, or the containing
+/// deadline fires first and the inner bound never gets to do its job. In
+/// particular, dropping BELOW the batch budget would abandon healthy batches
+/// mid-write: a cancelled future does not un-write what Memgraph already
+/// committed, so every such kill manufactures an orphaned-write divergence
+/// (which philote then has to reconcile via `orphaned_tool_write`). Staying
+/// under the caller's watchdog is what lets the runner report a real failure
+/// instead of the caller inferring one from silence.
+///
+/// The four constants live in three crates. Changing any one of them without
+/// checking the others breaks the chain silently — there is no compile-time
+/// link between them.
+const PROVIDER_INVOKE_TIMEOUT_SECS: u64 = 75;
+
 pub type ProviderFactory = dyn Fn() -> Vec<Arc<dyn DatasourceProvider>> + Send + Sync;
 
 pub struct DatasourceGuestConfig {
@@ -127,7 +152,27 @@ pub async fn run_datasource_controller(config: DatasourceGuestConfig) -> Result<
                     "dispatching datasource task"
                 );
 
-                match provider.invoke(&controller_task).await {
+                // Backstop deadline. This loop awaits `invoke` INLINE and is the
+                // only consumer of the inbox, so an unbounded provider call does
+                // not just strand its own caller — it head-of-line blocks every
+                // other agent's datasource traffic on this runner for as long as
+                // it hangs. Bounding it means a wedged provider costs one task,
+                // not the queue.
+                //
+                // Deadline ordering matters and all three live in different
+                // crates — see PROVIDER_INVOKE_TIMEOUT_SECS.
+                match tokio::time::timeout(
+                    Duration::from_secs(PROVIDER_INVOKE_TIMEOUT_SECS),
+                    provider.invoke(&controller_task),
+                )
+                .await
+                .unwrap_or_else(|_| {
+                    Err(anyhow::anyhow!(
+                        "provider exceeded the {PROVIDER_INVOKE_TIMEOUT_SECS}s runtime deadline \
+                         and was abandoned; any writes it completed before this point are \
+                         durable and were NOT rolled back"
+                    ))
+                }) {
                     Ok(output) => {
                         let change = match &output {
                             ProviderOutput::ResultSet(data) => {

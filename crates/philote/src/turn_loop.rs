@@ -1406,11 +1406,120 @@ impl AgentRuntime {
         }
     }
 
+    /// Describe what a dropped tool result says it wrote, or `None` when the
+    /// payload shows nothing durable landed.
+    ///
+    /// Only used on the stale-drop path, where the tool ran to completion but
+    /// its turn is gone. Read-only tools (`life.recall`, `*.status`) and clean
+    /// rejections change nothing and must NOT raise a heal event — otherwise
+    /// every evicted read would file diagnostic noise.
+    ///
+    /// Conservative by construction: it reports only what the payload proves,
+    /// so an unparseable or unrecognised body yields `None` rather than a
+    /// guess. A missed orphan is a quiet gap; a fabricated one would send
+    /// someone hunting writes that never happened.
+    pub(super) fn orphaned_write_summary(tool: &str, content: Option<&str>) -> Option<String> {
+        let value: serde_json::Value = serde_json::from_str(content?).ok()?;
+
+        // Batch shape: any successful item is a durable write.
+        if let Some(succeeded) = value.get("succeeded").and_then(serde_json::Value::as_u64) {
+            if succeeded == 0 {
+                return None;
+            }
+            let requested = value
+                .get("requested")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(succeeded);
+            return Some(format!(
+                "{succeeded} of {requested} observation(s) were written before the result was \
+                 dropped"
+            ));
+        }
+
+        // Single-write shape: the terminal states that mean the graph changed.
+        let status = value.get("status").and_then(serde_json::Value::as_str)?;
+        if !matches!(
+            status,
+            "proposed" | "committed" | "resolved" | "applied" | "patch_applied"
+        ) {
+            return None;
+        }
+        let node = value
+            .get("node_id")
+            .or_else(|| value.get("patch_id"))
+            .or_else(|| value.get("conflict_id"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("(id not reported)");
+        Some(format!("{tool} wrote {node} (status={status})"))
+    }
+
     pub(super) async fn handle_tool_result(&mut self, task: InboundTaskPayload) -> Result<()> {
         let session_id = match task.session_id.as_deref().filter(|s| !s.is_empty()) {
             Some(session_id) => session_id.to_string(),
             None => return Ok(()),
         };
+        // Staleness guard — `handle_model_response` has always dropped a
+        // response whose turn_id is not the active turn; tool results had no
+        // such check, so a LATE result was applied to whatever turn happened to
+        // be active. That is reachable whenever a tool outlives its turn: a long
+        // `life.observe.batch` blows the 90s WaitingTool watchdog, the turn is
+        // evicted (`active_turn = None`), the operator sends another message,
+        // and the runner's reply — which still carries the ORIGINAL turn_id, and
+        // which nothing cancels — lands on the new turn, pushing a foreign tool
+        // result into its history and clearing its pending tool call, so the new
+        // turn then hangs on a call that can never complete. One slow tool call
+        // thus poisons the following turn.
+        //
+        // Deliberately narrower than the model-response guard: it fires ONLY on
+        // an explicit, non-empty, mismatched turn_id. The ~100 in-process
+        // callers in `tool_exec.rs` either pass the current turn's id (match,
+        // unaffected) or pass none (the fallback below, unaffected), and some
+        // legitimately run with no active turn at all — so "no active turn" is
+        // NOT treated as stale here.
+        let stale_drop = {
+            let active_turn = self
+                .sessions
+                .get(&session_id)
+                .and_then(|state| state.active_turn.as_ref());
+            match (
+                task.turn_id.as_deref().filter(|s| !s.is_empty()),
+                active_turn.map(|turn| turn.turn_id.as_str()),
+            ) {
+                (Some(incoming), Some(active)) if incoming != active => {
+                    Some((incoming.to_string(), active.to_string()))
+                }
+                _ => None,
+            }
+        };
+        if let Some((stale_turn_id, active_turn_id)) = stale_drop {
+            let tool = task.tool_name.as_deref().unwrap_or("unknown").to_string();
+            warn!(
+                session_id = %session_id,
+                stale_turn_id = %stale_turn_id,
+                active_turn_id = %active_turn_id,
+                tool = %tool,
+                "handle_tool_result: dropping stale tool result — its turn is no longer \
+                 active (likely evicted by the watchdog while the tool ran)"
+            );
+            // Reconciliation: dropping the result keeps the NEW turn clean, but
+            // the tool already ran. A write tool that reached the graph has
+            // changed durable state for a turn the operator was told had died —
+            // silently discarding that report would leave the graph and the
+            // conversation disagreeing, and the agent would happily write the
+            // same observations again. Surface it into the self-heal queue so
+            // the divergence is recoverable rather than invisible.
+            if let Some(landed) = Self::orphaned_write_summary(&tool, task.content.as_deref()) {
+                let detail = format!(
+                    "session={session_id} stale_turn={stale_turn_id} active_turn={active_turn_id} \
+                     tool={tool} — the turn was evicted while this write tool was still running; \
+                     {landed}. The writes are DURABLE and already in the graph: reconcile before \
+                     re-observing the same facts."
+                );
+                self.push_heal_event("orphaned_tool_write", &detail).await;
+            }
+            return Ok(());
+        }
+
         let (turn_id, pending_tool_name) = {
             let active_turn = self
                 .sessions
@@ -1419,41 +1528,6 @@ impl AgentRuntime {
             let pending_tool_name = active_turn
                 .and_then(|turn| turn.pending_tool_call.as_ref())
                 .map(|tool| tool.tool_name.clone());
-
-            // Staleness guard — `handle_model_response` has always dropped a
-            // response whose turn_id is not the active turn; tool results had no
-            // such check, so a LATE result was applied to whatever turn happened
-            // to be active. That is reachable whenever a tool outlives its turn:
-            // a long `life.observe.batch` blows the 90s WaitingTool watchdog, the
-            // turn is evicted (`active_turn = None`), the operator sends another
-            // message, and the runner's reply — which still carries the ORIGINAL
-            // turn_id, and which nothing cancels — lands on the new turn, pushing
-            // a foreign tool result into its history and clearing its pending
-            // tool call, so the new turn then hangs on a call that can never
-            // complete. One slow tool call thus poisons the following turn.
-            //
-            // Deliberately narrower than the model-response guard: it fires ONLY
-            // on an explicit, non-empty, mismatched turn_id. The ~100 in-process
-            // callers in `tool_exec.rs` either pass the current turn's id (match,
-            // unaffected) or pass none (the fallback below, unaffected), and some
-            // legitimately run with no active turn at all — so "no active turn"
-            // is NOT treated as stale here.
-            if let (Some(incoming), Some(active)) = (
-                task.turn_id.as_deref().filter(|s| !s.is_empty()),
-                active_turn.map(|turn| turn.turn_id.as_str()),
-            ) {
-                if incoming != active {
-                    warn!(
-                        session_id = %session_id,
-                        stale_turn_id = %incoming,
-                        active_turn_id = %active,
-                        tool = task.tool_name.as_deref().unwrap_or("unknown"),
-                        "handle_tool_result: dropping stale tool result — its turn is no \
-                         longer active (likely evicted by the watchdog while the tool ran)"
-                    );
-                    return Ok(());
-                }
-            }
 
             let turn_id = task
                 .turn_id

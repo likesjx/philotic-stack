@@ -9502,6 +9502,73 @@ mod tests {
         assert_eq!(reply["target_guest_id"], "membrane-seat-1");
     }
 
+    /// Dropping a stale result protects the new turn, but the tool already ran.
+    /// A WRITE that reached the graph has changed durable state for a turn the
+    /// operator was told had died — so the drop must not also be silent, or the
+    /// graph and the conversation diverge with nothing recording it. Read-only
+    /// tools and clean rejections changed nothing and must stay quiet, otherwise
+    /// every evicted read files diagnostic noise.
+    #[test]
+    fn orphaned_write_summary_reports_writes_and_ignores_everything_else() {
+        use super::AgentRuntime;
+
+        // Batch with durable writes → reported, naming the count.
+        let summary = AgentRuntime::orphaned_write_summary(
+            "life.observe.batch",
+            Some(r#"{"status":"partial","requested":25,"succeeded":18,"failed":7}"#),
+        )
+        .expect("a batch that wrote must be reported");
+        assert!(
+            summary.contains("18") && summary.contains("25"),
+            "summary must quantify what landed: {summary}"
+        );
+
+        // Batch that wrote nothing → nothing to reconcile.
+        assert!(
+            AgentRuntime::orphaned_write_summary(
+                "life.observe.batch",
+                Some(r#"{"status":"failed","requested":3,"succeeded":0,"failed":3}"#),
+            )
+            .is_none(),
+            "a batch that wrote nothing must not raise a heal event"
+        );
+
+        // Single durable write → reported with its node id.
+        let summary = AgentRuntime::orphaned_write_summary(
+            "life.observe",
+            Some(r#"{"status":"proposed","node_id":"goal-42"}"#),
+        )
+        .expect("a completed single write must be reported");
+        assert!(
+            summary.contains("goal-42"),
+            "summary names the node: {summary}"
+        );
+
+        // Read-only result → silent.
+        assert!(
+            AgentRuntime::orphaned_write_summary(
+                "life.recall",
+                Some(r#"{"status":"ok","context_packet":{"ranked_packets":[]}}"#),
+            )
+            .is_none(),
+            "an evicted read must not file a heal event"
+        );
+
+        // Blocked / rejected write → nothing landed, stay silent.
+        assert!(
+            AgentRuntime::orphaned_write_summary(
+                "life.observe",
+                Some(r#"{"status":"blocked","reasons":["policy"]}"#),
+            )
+            .is_none(),
+            "a blocked write changed nothing"
+        );
+
+        // Unparseable or absent body → conservative silence, never a guess.
+        assert!(AgentRuntime::orphaned_write_summary("life.observe", Some("not json")).is_none());
+        assert!(AgentRuntime::orphaned_write_summary("life.observe", None).is_none());
+    }
+
     // ── Stale tool result must not poison the turn that replaced it ──────────
     //
     // `handle_model_response` has always dropped a response whose turn_id is not
