@@ -4412,8 +4412,8 @@ impl IpcServer {
             HttpNetworkScope::Public
         };
 
-        let redirect = reqwest::Url::parse(&redirect_uri)
-            .context("operator OIDC redirect_uri is invalid")?;
+        let redirect =
+            reqwest::Url::parse(&redirect_uri).context("operator OIDC redirect_uri is invalid")?;
         if !redirect.username().is_empty() || redirect.password().is_some() {
             anyhow::bail!("operator OIDC redirect_uri must not contain userinfo");
         }
@@ -5099,6 +5099,16 @@ impl IpcServer {
                 IpcResponse::success("fail", None)
             }
             IpcRequest::RepairStaleSessionTurns { min_age_secs } => {
+                // Agent-originated calls (session.repair_stale steward tool)
+                // require operational admin authority; the heal-dispatcher
+                // and CLI paths pass through unchanged.
+                if let Err(refusal) = steward_agent_admin_gate(
+                    graph,
+                    current_identity.as_ref(),
+                    "repair_stale_session_turns",
+                ) {
+                    return refusal;
+                }
                 Self::handle_repair_stale_session_turns(graph, heal_queue, min_age_secs)
             }
             // TODO(role-loop): schedule alongside the RepairStaleSessionTurns cron so
@@ -7969,6 +7979,22 @@ impl IpcServer {
                 .await
             }
             IpcRequest::RestartComponent { guest_id, reason } => {
+                // Agent-originated restarts (component.restart steward tool)
+                // require operational admin authority, and are ALWAYS treated
+                // as automatic remediation: an agent never gets the operator
+                // (budget-exempt) reason regardless of what the wire says, so
+                // a wedged guest cannot be restart-looped past the shared
+                // respawn budget. Heal-dispatcher, CLI, and desktop paths
+                // pass through unchanged.
+                let reason = match steward_agent_admin_gate(
+                    graph,
+                    current_identity.as_ref(),
+                    "restart_component",
+                ) {
+                    Err(refusal) => return refusal,
+                    Ok(true) => RestartReason::Heal,
+                    Ok(false) => reason,
+                };
                 Self::handle_restart_component(
                     graph,
                     materialization_requester,
@@ -9499,27 +9525,24 @@ impl IpcServer {
 
                 let entry =
                     Self::integration_binding_entry(binding, registry, graph, local_node_id).await;
-                let materialized_node_id =
-                    if matches!(
-                        entry.binding.target,
-                        IntegrationTarget::Http(_) | IntegrationTarget::Oidc(_)
+                let materialized_node_id = if matches!(
+                    entry.binding.target,
+                    IntegrationTarget::Http(_) | IntegrationTarget::Oidc(_)
+                ) && !matches!(
+                    entry.placement,
+                    ansible_mesh_core::integration::EgressPlacementDecision::Deny { .. }
+                ) {
+                    Self::materialize_integration_runner(
+                        &entry,
+                        registry,
+                        graph,
+                        materialization_requester,
+                        local_node_id,
                     )
-                        && !matches!(
-                            entry.placement,
-                            ansible_mesh_core::integration::EgressPlacementDecision::Deny { .. }
-                        )
-                    {
-                        Self::materialize_integration_runner(
-                            &entry,
-                            registry,
-                            graph,
-                            materialization_requester,
-                            local_node_id,
-                        )
-                        .await
-                    } else {
-                        None
-                    };
+                    .await
+                } else {
+                    None
+                };
                 info!(
                     binding_id,
                     execution_node_id = ?entry.execution_node_id,
@@ -10824,19 +10847,31 @@ impl IpcServer {
                 ),
             },
 
-            IpcRequest::ResolveHealEntry { id, outcome } => match heal_queue.as_deref() {
-                Some(hq) => match hq.resolve(&id, &outcome) {
-                    Ok(()) => IpcResponse::success("resolve_heal_entry", None),
-                    Err(e) => {
-                        IpcResponse::error("resolve_heal_entry", "STORAGE_ERROR", format!("{e}"))
-                    }
-                },
-                None => IpcResponse::error(
-                    "resolve_heal_entry",
-                    "UNAVAILABLE",
-                    "heal_queue not configured".to_string(),
-                ),
-            },
+            IpcRequest::ResolveHealEntry { id, outcome } => {
+                // Agent-originated calls (heal.resolve steward tool) require
+                // operational admin authority; the heal-dispatcher and CLI
+                // paths pass through unchanged.
+                if let Err(refusal) =
+                    steward_agent_admin_gate(graph, current_identity.as_ref(), "resolve_heal_entry")
+                {
+                    return refusal;
+                }
+                match heal_queue.as_deref() {
+                    Some(hq) => match hq.resolve(&id, &outcome) {
+                        Ok(()) => IpcResponse::success("resolve_heal_entry", None),
+                        Err(e) => IpcResponse::error(
+                            "resolve_heal_entry",
+                            "STORAGE_ERROR",
+                            format!("{e}"),
+                        ),
+                    },
+                    None => IpcResponse::error(
+                        "resolve_heal_entry",
+                        "UNAVAILABLE",
+                        "heal_queue not configured".to_string(),
+                    ),
+                }
+            }
 
             IpcRequest::FileHealWorkItem {
                 pattern_tag,
@@ -10863,6 +10898,16 @@ impl IpcServer {
             }
 
             IpcRequest::CloseHealWorkItem { work_item_id } => {
+                // Agent-originated calls (heal.close_work_item steward tool)
+                // require operational admin authority; the autonomy-lane loop
+                // and `phil heal close` CLI paths pass through unchanged.
+                if let Err(refusal) = steward_agent_admin_gate(
+                    graph,
+                    current_identity.as_ref(),
+                    "close_heal_work_item",
+                ) {
+                    return refusal;
+                }
                 // Closure path for a filed heal work item (finding F8). Wired
                 // straight to the unit-tested domain method; closing a missing
                 // id returns closed=false, and closing an already-closed item
@@ -14777,7 +14822,14 @@ pub(super) fn compose_tool_assembly(
     let execution_routes = toolset
         .iter()
         .map(|tool_name| {
-            if is_local_agent_tool(tool_name) {
+            // Pinned takes precedence over the shared local-agent allowlist:
+            // desktop.observe is in BOTH sets (philote's own assembly routes
+            // it local_agent as a metadata stub, while the hotel-side
+            // assembly pins it to a real desktop runner). The pre-union
+            // hotel routing is preserved deliberately — the allowlist
+            // unification (aria-mesh-steward slice 1) merged the lists, it
+            // did not adjudicate this routing disagreement.
+            if is_local_agent_tool(tool_name) && !is_pinned_tool(tool_name) {
                 return Some((
                     tool_name.to_string(),
                     serde_json::json!({
@@ -15049,44 +15101,72 @@ fn remote_available_capacity(advertisement: &CapabilityAdvertisement) -> i64 {
 }
 
 fn is_local_agent_tool(tool_name: &str) -> bool {
-    matches!(
-        tool_name,
-        "session.status"
-            | "hotel.status"
-            | "hotel.logs"
-            | "hotel.perimeter.status"
-            | "hotel.perimeter.refresh"
-            | "hotel.egress.check"
-            | "agent.configure"
-            | "skill.register"
-            | "subagent.spawn"
-            | "role.configure"
-            | "role.list"
-            | "role.set_home"
-            | "transport.set_home"
-            | "bash.exec"
-            | "training.list"
-            | "training.correct"
-            | "training.export"
-            | "training.status"
-            | "asr.setup"
-            | "asr.status"
-            | "vision.setup"
-            | "vision.status"
-            | "cron.register"
-            | "cron.list"
-            | "cron.enable"
-            | "cron.disable"
-            | "cron.remove"
-            | "delegate.to_peer"
-            | "delegate.to_external_cognitive_peer"
-            | "delegate.merge"
-            | "delegate.whisper"
-            | "handoff.to_role"
-            | "handoff.back"
-            | "rule.propose"
-            | "routing.policy.propose"
-    )
+    // Delegates to the shared allowlist so the hotel-side compose_tool_assembly
+    // and the agent-side route assembly can never diverge again (they had
+    // drifted into two different lists before the aria-mesh-steward slice).
+    ansible_mesh_core::local_agent_tools::is_local_agent_tool(tool_name)
+}
+
+/// Operational-admin gate for agent-originated heal/steward mutations
+/// (aria-mesh-steward slice 1: heal.resolve, heal.close_work_item,
+/// session.repair_stale, component.restart).
+///
+/// Classifies the calling connection's registered identity:
+/// - `Ok(false)` — NOT an agent (heal-dispatcher, `phil` CLI, web, operator
+///   surface): proceed exactly as before this gate existed.
+/// - `Ok(true)` — an agent caller WITH operational admin authority
+///   (DEF-058 tier: `is_admin` OR the orchestrator persona).
+/// - `Err(refusal)` — an agent caller WITHOUT operational admin authority.
+///
+/// Agent detection mirrors `is_agent_handoff_caller`: the base philote
+/// registers `role == "agent"` with `guest_id == agent_id`; role-incarnation
+/// workers register `guest_id == "{agent_id}:{role_name}"` and are matched by
+/// their role-incarnation records. Authority resolution: a role worker is
+/// judged by its own incarnation record; the single-process base guest hosts
+/// every role in-process and is judged by its agent's orchestrator
+/// incarnation (its management posture) — the per-session active role is not
+/// visible at the IPC layer, so this is deliberately the coarse tier, with
+/// philote-side toolset projection as the finer-grained layer.
+fn steward_agent_admin_gate(
+    graph: &GraphDomain,
+    current_identity: Option<&GuestIdentity>,
+    op: &str,
+) -> Result<bool, IpcResponse> {
+    let Some(identity) = current_identity else {
+        return Ok(false);
+    };
+    let incarnations = graph
+        .list_role_incarnations_by_guest_id(&identity.guest_id)
+        .unwrap_or_default();
+    let is_agent_caller = identity.role == "agent" || !incarnations.is_empty();
+    if !is_agent_caller {
+        return Ok(false);
+    }
+    let authorized = if incarnations.is_empty() {
+        graph
+            .get_role_incarnation(&identity.guest_id, "orchestrator")
+            .ok()
+            .flatten()
+            .map(|r| r.has_operational_admin_authority())
+            .unwrap_or(false)
+    } else {
+        incarnations
+            .iter()
+            .any(|r| r.has_operational_admin_authority())
+    };
+    if authorized {
+        Ok(true)
+    } else {
+        Err(IpcResponse::error(
+            op,
+            "ADMIN_REQUIRED",
+            format!(
+                "guest '{}' (role '{}') lacks operational admin authority for mutating \
+                 heal/steward operations",
+                identity.guest_id, identity.role
+            ),
+        ))
+    }
 }
 
 fn is_pinned_tool(tool_name: &str) -> bool {
@@ -15646,6 +15726,106 @@ pub(crate) mod tests {
     fn register_skill_test_graph() -> GraphDomain {
         let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
         GraphDomain::new(Arc::new(graph_store.adapter()))
+    }
+
+    // ── steward_agent_admin_gate (aria-mesh-steward slice 1) ──────────────────
+
+    mod steward_admin_gate {
+        use super::*;
+
+        fn identity(guest_id: &str, role: &str) -> GuestIdentity {
+            GuestIdentity {
+                guest_id: guest_id.into(),
+                role: role.into(),
+                supported_tools: Vec::new(),
+            }
+        }
+
+        fn graph_with_role(agent_id: &str, role_name: &str, is_admin: bool) -> GraphDomain {
+            let graph = register_skill_test_graph();
+            graph
+                .upsert_role_incarnation(&RoleIncarnationRecord {
+                    agent_id: agent_id.into(),
+                    role_name: role_name.into(),
+                    guest_id: format!("{agent_id}:{role_name}"),
+                    is_admin,
+                    ..Default::default()
+                })
+                .expect("upsert role incarnation");
+            graph
+        }
+
+        fn assert_admin_required(result: Result<bool, IpcResponse>) {
+            match result {
+                Err(IpcResponse::Standard { ok, code, .. }) => {
+                    assert!(!ok);
+                    assert_eq!(code, "ADMIN_REQUIRED");
+                }
+                other => panic!("expected ADMIN_REQUIRED refusal, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn non_agent_identities_pass_through_unchanged() {
+            let graph = register_skill_test_graph();
+            // Unregistered connection (pre-Register requests).
+            assert!(matches!(
+                steward_agent_admin_gate(&graph, None, "op"),
+                Ok(false)
+            ));
+            // heal-dispatcher and the `phil` CLI register non-agent roles.
+            let dispatcher = identity("heal-dispatcher-01", "heal-dispatcher");
+            assert!(matches!(
+                steward_agent_admin_gate(&graph, Some(&dispatcher), "op"),
+                Ok(false)
+            ));
+            let cli = identity("phil-heal", "management");
+            assert!(matches!(
+                steward_agent_admin_gate(&graph, Some(&cli), "op"),
+                Ok(false)
+            ));
+        }
+
+        #[test]
+        fn agent_without_admin_authority_gets_admin_required() {
+            // A specialist role worker (vixen) has neither is_admin nor the
+            // orchestrator persona → refused.
+            let graph = graph_with_role("aria", "vixen", false);
+            let worker = identity("aria:vixen", "vixen");
+            assert_admin_required(steward_agent_admin_gate(&graph, Some(&worker), "op"));
+
+            // A base philote whose agent has no orchestrator incarnation at
+            // all is refused too (nothing to derive authority from).
+            let bare = identity("aria-unknown", "agent");
+            assert_admin_required(steward_agent_admin_gate(&graph, Some(&bare), "op"));
+        }
+
+        #[test]
+        fn operational_admin_agents_are_authorized() {
+            // Orchestrator role worker: operational tier by role name.
+            let graph = graph_with_role("aria", "orchestrator", false);
+            let orch = identity("aria:orchestrator", "orchestrator");
+            assert!(matches!(
+                steward_agent_admin_gate(&graph, Some(&orch), "op"),
+                Ok(true)
+            ));
+
+            // Base philote (guest_id == agent_id, role "agent"): judged by
+            // its agent's orchestrator incarnation.
+            let base = identity("aria", "agent");
+            assert!(matches!(
+                steward_agent_admin_gate(&graph, Some(&base), "op"),
+                Ok(true)
+            ));
+
+            // is_admin role worker: full-admin tier also passes.
+            let graph = graph_with_role("aria", "steward", true);
+            let admin = identity("aria:steward", "steward");
+            assert!(matches!(
+                steward_agent_admin_gate(&graph, Some(&admin), "op"),
+                Ok(true)
+            ));
+        }
     }
 
     // ── HealMemoryToken handler (memory-token-self-heal S2) ───────────────────
