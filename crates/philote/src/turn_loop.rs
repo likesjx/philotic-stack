@@ -10,8 +10,8 @@ use super::*;
 
 use crate::plan_eval::{
     DEFAULT_PLAN_CONTINUATION_BUDGET, PlanEvalVerdict, PriorPlanState, evaluate_plan,
-    plan_continuation_brief, plan_continuation_disabled, plan_stop_notice,
-    scaled_continuation_budget,
+    interim_reply_admissible, plan_continuation_brief, plan_continuation_disabled,
+    plan_stop_notice, scaled_continuation_budget, unix_now,
 };
 use crate::session::CarryoverPlan;
 
@@ -1365,6 +1365,43 @@ impl AgentRuntime {
                 .await
             }
             AgentAction::ToolCall(tool_call) => {
+                // Speaking and continuing used to be mutually exclusive: the
+                // model could populate `partial_replies`, but the loop only
+                // flushed them on the Respond arm — the moment the turn ends.
+                // So the only way to be heard was to stop, which is why a long
+                // plan ran silent to its wall-clock budget and why "say what
+                // you need" had to be a terminal exit. Flushing here lets a
+                // turn report and keep working; the gate keeps it from
+                // becoming the per-step receipt stream operators objected to.
+                if !partial_replies.is_empty() {
+                    let admissible = self
+                        .sessions
+                        .get(&session_id)
+                        .and_then(|s| s.active_turn.as_ref())
+                        .map(|t| {
+                            interim_reply_admissible(
+                                t.started_at_unix,
+                                t.last_interim_at_unix,
+                                t.iteration,
+                                unix_now(),
+                            )
+                        })
+                        .unwrap_or(false);
+                    if admissible {
+                        // One note per opportunity: the model sometimes emits
+                        // several, and sending them all is the chatter the gate
+                        // is meant to prevent.
+                        if let Some(partial) = partial_replies.into_iter().next() {
+                            self.emit_partial_reply(&session_id, partial).await?;
+                        }
+                    } else {
+                        debug!(
+                            session_id = %session_id,
+                            "Declining mid-turn interim reply (too soon since the last one)."
+                        );
+                    }
+                }
+
                 let forced_stop_reply = self.sessions.get(&session_id).and_then(|state| {
                     let turn = state.active_turn.as_ref()?;
                     let iteration_cap =

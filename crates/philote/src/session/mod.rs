@@ -3830,6 +3830,7 @@ impl SessionState {
                 "recalled_memories": turn.recalled_memories,
                 "active_plan": turn.active_plan,
                 "started_at_unix": turn.started_at_unix,
+                "last_interim_at_unix": turn.last_interim_at_unix,
                 "plan_steps_verified": turn.plan_steps_verified,
                 "consecutive_step_failures": turn.consecutive_step_failures,
                 "provider_repair_note": turn.provider_repair_note,
@@ -4229,6 +4230,9 @@ impl SessionState {
                 // must not reset here.
                 started_at_unix: turn
                     .get("started_at_unix")
+                    .and_then(serde_json::Value::as_u64),
+                last_interim_at_unix: turn
+                    .get("last_interim_at_unix")
                     .and_then(serde_json::Value::as_u64),
                 plan_steps_verified: turn
                     .get("plan_steps_verified")
@@ -5655,6 +5659,7 @@ mod tests {
             paracrine_hop_count: 0,
             paracrine_chain_started_at: None,
             started_at_unix: None,
+            last_interim_at_unix: None,
             plan_steps_verified: Vec::new(),
             selection_source: SelectionSource::default(),
         }
@@ -5905,6 +5910,7 @@ mod tests {
             paracrine_hop_count: 0,
             paracrine_chain_started_at: None,
             started_at_unix: None,
+            last_interim_at_unix: None,
             plan_steps_verified: Vec::new(),
             selection_source: SelectionSource::default(),
         });
@@ -6180,6 +6186,7 @@ mod tests {
         ])));
         turn.plan_steps_verified = vec![true, false];
         turn.started_at_unix = Some(1_785_183_905);
+        turn.last_interim_at_unix = Some(1_785_183_950);
         turn.phase = TurnPhase::WaitingTool;
         state.start_turn(turn);
 
@@ -6192,6 +6199,11 @@ mod tests {
             restored_turn.started_at_unix,
             Some(1_785_183_905),
             "the zombie watchdog still clocks from the original start, so the budget must not reset"
+        );
+        assert_eq!(
+            restored_turn.last_interim_at_unix,
+            Some(1_785_183_950),
+            "losing this across a checkpoint resets the quiet period and lets the turn chatter"
         );
     }
 
@@ -6335,6 +6347,7 @@ mod tests {
             paracrine_hop_count: 0,
             paracrine_chain_started_at: None,
             started_at_unix: None,
+            last_interim_at_unix: None,
             plan_steps_verified: Vec::new(),
             selection_source: SelectionSource::default(),
         });
@@ -6392,6 +6405,7 @@ mod tests {
             paracrine_hop_count: 0,
             paracrine_chain_started_at: None,
             started_at_unix: None,
+            last_interim_at_unix: None,
             plan_steps_verified: Vec::new(),
             selection_source: SelectionSource::default(),
         });
@@ -7271,6 +7285,7 @@ mod tests {
             paracrine_hop_count: 0,
             paracrine_chain_started_at: None,
             started_at_unix: None,
+            last_interim_at_unix: None,
             plan_steps_verified: Vec::new(),
             selection_source: SelectionSource::default(),
         });
@@ -7371,6 +7386,7 @@ mod tests {
             paracrine_hop_count: 0,
             paracrine_chain_started_at: None,
             started_at_unix: None,
+            last_interim_at_unix: None,
             plan_steps_verified: Vec::new(),
             selection_source: SelectionSource::default(),
         });
@@ -7578,6 +7594,7 @@ mod tests {
             paracrine_hop_count: 0,
             paracrine_chain_started_at: None,
             started_at_unix: None,
+            last_interim_at_unix: None,
             plan_steps_verified: Vec::new(),
             selection_source: SelectionSource::default(),
         });
@@ -7669,6 +7686,7 @@ mod tests {
             paracrine_hop_count: 0,
             paracrine_chain_started_at: None,
             started_at_unix: None,
+            last_interim_at_unix: None,
             plan_steps_verified: Vec::new(),
             selection_source: SelectionSource::default(),
         });
@@ -8797,6 +8815,7 @@ mod tests {
             paracrine_hop_count: 0,
             paracrine_chain_started_at: None,
             started_at_unix: None,
+            last_interim_at_unix: None,
             plan_steps_verified: Vec::new(),
             selection_source: SelectionSource::default(),
         });
@@ -8861,6 +8880,7 @@ mod tests {
             paracrine_hop_count: 0,
             paracrine_chain_started_at: None,
             started_at_unix: None,
+            last_interim_at_unix: None,
             plan_steps_verified: Vec::new(),
             selection_source: SelectionSource::default(),
         });
@@ -8940,6 +8960,7 @@ mod tests {
             paracrine_hop_count: 0,
             paracrine_chain_started_at: None,
             started_at_unix: None,
+            last_interim_at_unix: None,
             plan_steps_verified: Vec::new(),
             selection_source: SelectionSource::default(),
         });
@@ -9020,6 +9041,7 @@ mod tests {
             paracrine_hop_count: 0,
             paracrine_chain_started_at: None,
             started_at_unix: None,
+            last_interim_at_unix: None,
             plan_steps_verified: Vec::new(),
             selection_source: SelectionSource::default(),
         });
@@ -9392,6 +9414,7 @@ mod tests {
             paracrine_hop_count: 0,
             paracrine_chain_started_at: None,
             started_at_unix: None,
+            last_interim_at_unix: None,
             plan_steps_verified: Vec::new(),
             selection_source: SelectionSource::default(),
         });
@@ -9736,6 +9759,7 @@ mod tests {
             paracrine_hop_count: 0,
             paracrine_chain_started_at: None,
             started_at_unix: None,
+            last_interim_at_unix: None,
             plan_steps_verified: Vec::new(),
             selection_source: SelectionSource::default(),
         }
@@ -10278,6 +10302,7 @@ mod tests {
             paracrine_hop_count: 0,
             paracrine_chain_started_at: None,
             started_at_unix: None,
+            last_interim_at_unix: None,
             plan_steps_verified: Vec::new(),
             selection_source: SelectionSource::default(),
         };
