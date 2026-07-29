@@ -79,6 +79,16 @@ Two results that contradicted prior notes and are worth keeping:
    push to main / never force-push / never merge to main" mechanical;
    `fmt-rust.sh` (PostToolUse) keeps Rust formatted.
 
+   **Trap avoided, worth recording:** project `settings.json` is validated
+   strictly — *"a file that fails validation is rejected as a whole and
+   reported"*; only *managed* settings parse tolerantly. A `"//"` comment key
+   does not get ignored, it can discard the entire file and silently disable
+   every deny rule and both hooks. Rationale therefore lives in
+   `.claude/README.md`, not inline. Confirm the file actually loaded with
+   `/status` → **Setting sources**.
+
+
+
 ## Follow-ups (graph proposals, mirrored here for durability)
 
 1. `proposal:secret-push-guard-activation` — **highest value, one command.**
@@ -109,15 +119,23 @@ Two results that contradicted prior notes and are worth keeping:
    evaluate `cargo-nextest`, and keep `CARGO_PROFILE_TEST_DEBUG=0`. Flip
    `continue-on-error` off only after a cached run finishes well inside the
    timeout.
-6. `proposal:clippy-ratchet-workspace-lints` — clippy is not in the PR gate
+6. `proposal:tool-agnostic-fmt-hook` — the PostToolUse rustfmt hook covers Claude
+   Code only, but eight harnesses are registered (codex, windsurf, four
+   gemini/antigravity roles) and any of them can drift develop. This is not
+   theoretical: PR #371 went red on its own merge commit within a day, because
+   develop picked up unformatted code from another harness after the branch was
+   cut. Move the enforcement to a git `pre-commit` hook, which applies whoever
+   commits — and which rides along with the `just install-git-hooks` step
+   already needed for (1).
+7. `proposal:clippy-ratchet-workspace-lints` — clippy is not in the PR gate
    because hundreds of existing warnings would make it red on arrival. Clean
    crates one at a time behind `[workspace.lints]`, then add it blocking.
-7. `proposal:claude-charter-in-repo` — `.claude/CLAUDE.md` is checked in and
+8. `proposal:claude-charter-in-repo` — `.claude/CLAUDE.md` is checked in and
    contains only `@/Users/jaredlikes/.claude/philotic/harnesses/claude-local/CLAUDE.md`.
    On any other machine or in CI that resolves to nothing and the charter
    silently vanishes. The charter should live in-repo with the harness tool
    syncing into it.
-8. `proposal:pr-linux-compile-check` — the PR gate is macOS-only, so a PR can
+9. `proposal:pr-linux-compile-check` — the PR gate is macOS-only, so a PR can
    break the vps-jane build and not find out until it lands on develop. Add a
    `cargo check` job on ubuntu over the package set `build-linux.yml` builds.
 
