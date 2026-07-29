@@ -9,8 +9,9 @@
 use super::*;
 
 use crate::plan_eval::{
-    DEFAULT_PLAN_CONTINUATION_BUDGET, PlanEvalVerdict, evaluate_plan, plan_continuation_brief,
-    plan_continuation_disabled, plan_stop_notice,
+    DEFAULT_PLAN_CONTINUATION_BUDGET, PlanEvalVerdict, PriorPlanState, evaluate_plan,
+    plan_continuation_brief, plan_continuation_disabled, plan_stop_notice,
+    scaled_continuation_budget,
 };
 use crate::session::CarryoverPlan;
 
@@ -3398,17 +3399,28 @@ impl AgentRuntime {
                     return Ok(());
                 }
 
-                // Charge the budget and synthesize the continuation brief.
-                let brief = {
+                // Charge the budget and synthesize the continuation brief. The
+                // budget shown to the model ("continuation 2/6") has to be the
+                // scaled one the eval actually enforces, or the brief tells the
+                // plan it has less room than it does.
+                let (brief, budget) = {
                     let Some(state) = self.sessions.get_mut(session_id) else {
                         return Ok(());
                     };
                     let Some(carry) = state.carryover_plan.as_mut() else {
                         return Ok(());
                     };
+                    let budget = scaled_continuation_budget(
+                        budget,
+                        carry
+                            .plan
+                            .steps
+                            .len()
+                            .saturating_sub(carry.steps_done_count()),
+                    );
                     let brief = plan_continuation_brief(carry, budget);
                     carry.continuations_used += 1;
-                    brief
+                    (brief, budget)
                 };
                 // Re-persist so the charged budget survives a restart.
                 let _ = self.persist_session_checkpoint(session_id).await;
@@ -3498,27 +3510,64 @@ pub(super) fn plan_followup_after_turn(
             state.carryover_plan = None;
             return None;
         }
-        // The same plan (by goal) continues an existing carryover's budget and
-        // step flags; a different plan replaces it (user redirected the work).
-        let (prior_done, used, origin) = match state.carryover_plan.as_ref() {
+        // The same plan (by goal) continues an existing carryover's budget,
+        // evidence and stall count; a different plan replaces it (user
+        // redirected the work).
+        let (prior_carry, used, origin) = match state.carryover_plan.as_ref() {
             Some(c) if c.plan.goal == plan.goal => (
-                Some(c.steps_done.clone()),
+                Some(c.clone()),
                 c.continuations_used,
                 c.created_turn_id.clone(),
             ),
             _ => (None, 0, completed_turn.turn_id.clone()),
         };
 
-        let outcome = evaluate_plan(
-            plan,
-            prior_done.as_deref(),
-            &completed_turn.working_tool_history,
-        );
+        // Evidence from this turn merges with evidence carried from earlier
+        // ones. `plan_steps_verified` is latched by `push_tool_history` against
+        // real results, so it is safe to promote to carryover evidence;
+        // `steps_done` is not, and is deliberately never fed back in.
+        let mut carried_verified: Vec<u32> = prior_carry
+            .as_ref()
+            .map(|c| c.verified_step_ids.clone())
+            .unwrap_or_default();
+        for (i, step) in plan.steps.iter().enumerate() {
+            if completed_turn
+                .plan_steps_verified
+                .get(i)
+                .copied()
+                .unwrap_or(false)
+                && !carried_verified.contains(&step.id)
+            {
+                carried_verified.push(step.id);
+            }
+        }
+
+        let prior_state = prior_carry.as_ref().map(|c| PriorPlanState {
+            verified_step_ids: carried_verified.as_slice(),
+            settled_count: c.steps_done_count(),
+            stalls: c.stalled_continuations,
+        });
+
+        let outcome = evaluate_plan(plan, prior_state, &completed_turn.working_tool_history);
+        // Evidence is sticky across the whole plan lifetime: a step proven in
+        // turn 1 must stay proven in turn 3, long after its tool result has
+        // scrolled out of the working history.
+        let mut verified_step_ids = carried_verified;
+        for id in &outcome.verified_step_ids {
+            if !verified_step_ids.contains(id) {
+                verified_step_ids.push(*id);
+            }
+        }
+        // The budget has to fit the work that is actually left, or a large plan
+        // is truncated at the same arbitrary place as a small one.
+        let budget = scaled_continuation_budget(budget, outcome.outstanding_step_ids.len());
         let eval_json = outcome.event_json();
         info!(
             session_id = %state.session_id,
             steps_done = outcome.steps_done,
+            steps_verified = outcome.steps_verified,
             steps_total = outcome.steps_total,
+            stalls = outcome.stalled_continuations,
             verdict = outcome.verdict.as_str(),
             basis = outcome.basis.as_str(),
             "Plan eval"
@@ -3533,6 +3582,8 @@ pub(super) fn plan_followup_after_turn(
                 let carry = CarryoverPlan {
                     plan: plan.clone(),
                     steps_done: outcome.steps_done_flags.clone(),
+                    verified_step_ids,
+                    stalled_continuations: outcome.stalled_continuations,
                     continuations_used: used,
                     created_turn_id: origin,
                 };
@@ -3552,6 +3603,8 @@ pub(super) fn plan_followup_after_turn(
                 let carry = CarryoverPlan {
                     plan: plan.clone(),
                     steps_done: outcome.steps_done_flags.clone(),
+                    verified_step_ids,
+                    stalled_continuations: outcome.stalled_continuations,
                     continuations_used: used,
                     created_turn_id: origin,
                 };
@@ -3585,6 +3638,15 @@ pub(super) fn plan_followup_after_turn(
             .as_ref()
             .map(|c| c.continuations_used)
             .unwrap_or(0);
+        // Scale on the same basis as the evaluated path, or a plan deferred by
+        // an interleaved user turn would be held to a narrower budget than the
+        // one it was running under.
+        let outstanding = state
+            .carryover_plan
+            .as_ref()
+            .map(|c| c.plan.steps.len().saturating_sub(c.steps_done_count()))
+            .unwrap_or(0);
+        let budget = scaled_continuation_budget(budget, outstanding);
         if used >= budget {
             let carry = state.carryover_plan.take().expect("checked above");
             let notice = plan_stop_notice(

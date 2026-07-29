@@ -3535,6 +3535,26 @@ impl SessionState {
                 plan.status,
                 plan.steps.len()
             ));
+            // A continuation turn opens with its plan already seeded and an
+            // empty tool history, so the re-entry footer below (which is gated
+            // on that history) has not fired yet. Without a guard here the
+            // model can reply "all done" on the strength of the statuses it
+            // carried over, which is the self-certification this loop exists to
+            // refuse — and on a continuation the claim is exactly the one that
+            // failed to verify last turn.
+            if turn.working_tool_history.is_empty() {
+                let verification = crate::plan_eval::verify_plan_steps(
+                    plan,
+                    &turn.working_tool_history,
+                    &turn.plan_steps_verified,
+                );
+                let completion = crate::plan_eval::evaluate_whole_plan(plan, &verification);
+                if let Some(note) =
+                    crate::plan_eval::plan_integrity_note(plan, &verification, &completion)
+                {
+                    lines.push(note);
+                }
+            }
             if let Some(advisory) = plan.context_1_advisory.as_ref() {
                 lines.push(format!(
                     "Context-1 advisory: approval_risk_hint={}, recommended_preapproved_classes=[{}]{}.",
@@ -5605,6 +5625,8 @@ mod tests {
                 context_1_advisory: None,
             },
             steps_done: vec![true, false],
+            verified_step_ids: vec![1],
+            stalled_continuations: 1,
             continuations_used: 2,
             created_turn_id: "turn-origin".into(),
         }
@@ -5624,6 +5646,32 @@ mod tests {
         assert_eq!(carry.continuations_used, 2);
         assert_eq!(carry.steps_done, vec![true, false]);
         assert_eq!(carry.created_turn_id, "turn-origin");
+        // Evidence and stall count must survive a checkpoint, or a restart
+        // mid-plan silently re-opens verified steps and resets the spin guard.
+        assert_eq!(carry.verified_step_ids, vec![1]);
+        assert_eq!(carry.stalled_continuations, 1);
+    }
+
+    /// A checkpoint written before evidence tracking existed must rehydrate,
+    /// with no evidence rather than a parse failure.
+    #[test]
+    fn carryover_plan_rehydrates_from_a_pre_evidence_checkpoint() {
+        let mut state =
+            SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
+        state.carryover_plan = Some(test_carryover_plan());
+        let mut checkpoint = state.checkpoint_json();
+        let carry = checkpoint
+            .get_mut("carryover_plan")
+            .and_then(|c| c.as_object_mut())
+            .expect("carryover object");
+        carry.remove("verified_step_ids");
+        carry.remove("stalled_continuations");
+
+        let restored = SessionState::from_checkpoint(&checkpoint).expect("rehydrate state");
+        let carry = restored.carryover_plan.expect("carryover restored");
+        assert!(carry.verified_step_ids.is_empty());
+        assert_eq!(carry.stalled_continuations, 0);
+        assert_eq!(carry.continuations_used, 2);
     }
 
     #[test]
@@ -10095,6 +10143,38 @@ mod tests {
         assert!(
             !prompt.contains("or respond to the user if"),
             "must not license bailing out mid-plan, got: {prompt}"
+        );
+    }
+
+    /// A continuation turn opens with its plan seeded and no tool history yet,
+    /// so the re-entry footer has not fired. The plan carries the same `done`
+    /// statuses that failed to verify last turn, and without a guard the model
+    /// can open the turn by declaring success on them.
+    #[test]
+    fn seeded_continuation_plan_cannot_self_certify_before_any_tool_runs() {
+        let mut state =
+            SessionState::new("sess-9".into(), "agent-bjork-01".into(), "telegram".into());
+        let plan = ActivePlan {
+            goal: "add the children".into(),
+            status: "done".into(),
+            steps: vec![PlanStep {
+                id: 1,
+                description: "propose Daxton as a Person node".into(),
+                tool_name: Some("life.observe".into()),
+                status: "done".into(),
+            }],
+            context_1_advisory: None,
+        };
+        state.start_turn(make_turn_with_plan(plan));
+
+        let projection = state.project_working_state();
+        assert!(
+            projection.contains("Do NOT tell the user the plan is finished"),
+            "seeded continuation must be barred from claiming success, got: {projection}"
+        );
+        assert!(
+            projection.contains("Daxton"),
+            "the outstanding step must be named, got: {projection}"
         );
     }
 
