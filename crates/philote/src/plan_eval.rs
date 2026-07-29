@@ -381,6 +381,19 @@ pub fn plan_continuation_brief(carryover: &CarryoverPlan, budget: u32) -> String
         );
     }
 
+    // The loop stops after this turn, and it stops as a turn event the operator
+    // never sees. If the model does not name the shortfall in its own reply,
+    // nobody learns the work was abandoned — which is the same silence as a
+    // false success claim, just from the other direction.
+    if carryover.continuations_used + 1 >= budget {
+        brief.push_str(
+            "This is the LAST continuation for this plan — no further automatic turns follow. \
+             If you cannot finish everything here, your reply must tell the user plainly which \
+             items are done, which are not, and what you need in order to finish. Do not imply \
+             that work will continue on its own.\n",
+        );
+    }
+
     brief.push_str(
         "Pick up at the first remaining step. Do not re-plan from scratch and do not repeat \
          completed work. Update step statuses in active_plan as you execute. A step counts as \
@@ -1519,6 +1532,28 @@ mod tests {
         );
         let brief = plan_continuation_brief(&carry, 3);
         assert!(brief.contains("Split them into one step per outcome"));
+    }
+
+    /// The loop's terminal state is a turn event the operator never sees, so
+    /// the last continuation has to put the shortfall in the model's own reply.
+    #[test]
+    fn last_continuation_requires_the_reply_to_name_the_shortfall() {
+        let p = plan(
+            "executing",
+            &[
+                ("add Zerin", Some("life.observe"), "pending"),
+                ("add Daxton", Some("life.observe"), "pending"),
+            ],
+        );
+        // continuations_used = 2 of a budget of 3: this is the last one.
+        let last = carryover(p.clone(), vec![false, false], 2);
+        let brief = plan_continuation_brief(&last, 3);
+        assert!(brief.contains("LAST continuation"));
+        assert!(brief.contains("Do not imply that work will continue on its own."));
+
+        // An earlier continuation must not say so.
+        let earlier = carryover(p, vec![false, false], 0);
+        assert!(!plan_continuation_brief(&earlier, 3).contains("LAST continuation"));
     }
 
     #[test]
