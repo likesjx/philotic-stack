@@ -80,6 +80,10 @@ philotic_oidc_public_base_url: ""
 philotic_memgraph_enabled: false
 philotic_memgraph_image: "memgraph/memgraph:latest"
 philotic_memgraph_container_name: "philotic-memgraph"
+# uid/gid of the `memgraph` user inside memgraph/memgraph:*. The data dir is a
+# host bind mount, so these must match or the database cannot write to it.
+philotic_memgraph_uid: 101
+philotic_memgraph_gid: 103
 philotic_memgraph_data_dir: "{{ philotic_data_dir }}/memgraph"
 # Host interface address for Bolt. Use a Tailscale IP for central graph services
 # so other hotels can reach Memgraph without exposing it on public interfaces.
