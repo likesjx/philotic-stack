@@ -36,6 +36,14 @@ use tracing::{error, info, warn};
 /// link between them.
 const PROVIDER_INVOKE_TIMEOUT_SECS: u64 = 75;
 
+/// How often a still-running provider tells its caller it is alive.
+///
+/// Must divide the caller's phase watchdog several times over, so a single
+/// dropped or delayed ping cannot starve the caller into evicting a healthy
+/// turn. At 20s against philote's 90s `WAITING_TOOL_SECS` a turn survives two
+/// consecutive lost pings.
+const TOOL_PROGRESS_PING_SECS: u64 = 20;
+
 pub type ProviderFactory = dyn Fn() -> Vec<Arc<dyn DatasourceProvider>> + Send + Sync;
 
 pub struct DatasourceGuestConfig {
@@ -152,27 +160,58 @@ pub async fn run_datasource_controller(config: DatasourceGuestConfig) -> Result<
                     "dispatching datasource task"
                 );
 
-                // Backstop deadline. This loop awaits `invoke` INLINE and is the
-                // only consumer of the inbox, so an unbounded provider call does
-                // not just strand its own caller — it head-of-line blocks every
+                // Run the provider under a backstop deadline WHILE emitting
+                // periodic progress pings.
+                //
+                // The deadline: this loop awaits `invoke` INLINE and is the only
+                // consumer of the inbox, so an unbounded provider call does not
+                // just strand its own caller — it head-of-line blocks every
                 // other agent's datasource traffic on this runner for as long as
                 // it hangs. Bounding it means a wedged provider costs one task,
-                // not the queue.
+                // not the queue. Ordering matters and the constants live in
+                // three crates — see PROVIDER_INVOKE_TIMEOUT_SECS.
                 //
-                // Deadline ordering matters and all three live in different
-                // crates — see PROVIDER_INVOKE_TIMEOUT_SECS.
-                match tokio::time::timeout(
-                    Duration::from_secs(PROVIDER_INVOKE_TIMEOUT_SECS),
-                    provider.invoke(&controller_task),
-                )
-                .await
-                .unwrap_or_else(|_| {
-                    Err(anyhow::anyhow!(
-                        "provider exceeded the {PROVIDER_INVOKE_TIMEOUT_SECS}s runtime deadline \
-                         and was abandoned; any writes it completed before this point are \
-                         durable and were NOT rolled back"
-                    ))
-                }) {
+                // The pings: a caller's phase watchdog otherwise cannot tell a
+                // slow-but-healthy tool from a dead one, so the only previous
+                // way to survive being slow was a bespoke per-tool constant
+                // (delegate.whisper's 660s). A ping says "still working" and
+                // refreshes the caller's PHASE timer only — philote keeps the
+                // total-active ceiling in a separate clock that pings cannot
+                // touch, so a genuinely wedged tool is still evicted on time.
+                //
+                // Deliberately NOT spawned: select! keeps the one-task-at-a-time
+                // ordering of this loop intact, and needs no change to the
+                // DatasourceProvider trait.
+                let invoke_result = {
+                    let invoke_fut = provider.invoke(&controller_task);
+                    tokio::pin!(invoke_fut);
+                    let deadline =
+                        tokio::time::sleep(Duration::from_secs(PROVIDER_INVOKE_TIMEOUT_SECS));
+                    tokio::pin!(deadline);
+                    let mut ticker =
+                        tokio::time::interval(Duration::from_secs(TOOL_PROGRESS_PING_SECS));
+                    ticker.tick().await; // interval fires immediately; drop that one
+                    loop {
+                        tokio::select! {
+                            output = &mut invoke_fut => break output,
+                            _ = &mut deadline => break Err(anyhow::anyhow!(
+                                "provider exceeded the {PROVIDER_INVOKE_TIMEOUT_SECS}s runtime \
+                                 deadline and was abandoned; any writes it completed before this \
+                                 point are durable and were NOT rolled back"
+                            )),
+                            _ = ticker.tick() => {
+                                emit_tool_progress(
+                                    &mut ipc_client,
+                                    &reply,
+                                    &controller_task,
+                                    provider.id(),
+                                )
+                                .await;
+                            }
+                        }
+                    }
+                };
+                match invoke_result {
                     Ok(output) => {
                         let change = match &output {
                             ProviderOutput::ResultSet(data) => {
@@ -326,6 +365,47 @@ async fn emit_success_response(
         .await?;
 
     Ok(())
+}
+
+/// Tell the caller a still-running provider is alive, so its phase watchdog
+/// does not evict a healthy turn mid-tool.
+///
+/// Travels the SAME reply route as `datasource_response` — no new IpcRequest
+/// variant and no hotel change, which also keeps it clear of the documented
+/// `IpcResponse` untagged-ordering hazard.
+///
+/// Best-effort by design: a ping that cannot be sent is dropped, never
+/// propagated. Failing the task because a keepalive failed would let a
+/// diagnostic signal break the very work it is reporting on.
+async fn emit_tool_progress(
+    ipc_client: &mut PhiloticClient,
+    reply: &ReplyRoute,
+    task: &DatasourceTask,
+    provider_id: &str,
+) {
+    let request = IpcRequest::EmitTask {
+        target_node: reply.return_route.node.clone(),
+        target_role: reply.return_route.role.clone(),
+        target_guest_id: reply.return_route.guest_id.clone(),
+        task_json: json!({
+            "action": "tool_progress",
+            "capability": task.kind.as_str(),
+            "tool_name": task.kind.as_str(),
+            "provider": provider_id,
+            "return_route": reply.return_route.as_json(),
+            "reply_guest_id": reply.return_route.guest_id,
+            "session_id": reply.return_route.session_id,
+            "turn_id": reply.return_route.turn_id,
+            "chat_id": reply.chat_id,
+        })
+        .to_string(),
+    };
+    if let Err(err) = ipc_client.send_request(request).await {
+        warn!(
+            capability = task.kind.as_str(),
+            "tool progress ping failed (best-effort): {err}"
+        );
+    }
 }
 
 async fn emit_failure(

@@ -9502,6 +9502,99 @@ mod tests {
         assert_eq!(reply["target_guest_id"], "membrane-seat-1");
     }
 
+    /// Keepalive must buy a slow tool more PHASE time without ever buying it
+    /// unlimited TOTAL time. If a ping could push back the total-turn ceiling,
+    /// a wedged tool that keeps pinging would hang the session forever — worse
+    /// than the eviction it is avoiding. The two clocks are separate maps and
+    /// must stay that way; this test is what enforces it.
+    #[tokio::test]
+    async fn tool_progress_refreshes_phase_clock_but_never_the_total_turn_ceiling() {
+        let socket_path = format!("/tmp/philote-ping-{}.sock", Uuid::new_v4().simple());
+        let listener = tokio::net::UnixListener::bind(&socket_path).expect("bind");
+        let emitted = std::sync::Arc::new(std::sync::Mutex::new(Vec::<serde_json::Value>::new()));
+        let server = tokio::spawn(run_recording_hotel(listener, emitted.clone()));
+
+        let client = philotic_client::PhiloticClient::connect_at(
+            &socket_path,
+            philotic_client::GuestIdentity {
+                guest_id: "agent-ping".into(),
+                role: "agent".into(),
+                supported_tools: Vec::new(),
+            },
+        )
+        .await
+        .expect("connect to stub hotel");
+        let mut runtime = AgentRuntime::new(client, "agent-ping");
+
+        let session_id = "sess-ping";
+        let turn_id = "turn-ping";
+        runtime
+            .ensure_session_loaded(session_id, "telegram")
+            .await
+            .expect("session load");
+        runtime
+            .sessions
+            .get_mut(session_id)
+            .expect("session exists")
+            .start_turn(def004_working_turn(turn_id, "life.observe.batch"));
+
+        // Seed both clocks well in the past, as they would be for a turn that
+        // has already been waiting a long time.
+        let long_ago = std::time::Instant::now() - std::time::Duration::from_secs(300);
+        runtime
+            .stuck_turn_first_seen
+            .insert(session_id.to_string(), long_ago);
+        runtime
+            .total_active_since
+            .insert(session_id.to_string(), long_ago);
+
+        runtime.handle_tool_progress(&InboundTaskPayload {
+            action: Some("tool_progress".into()),
+            session_id: Some(session_id.into()),
+            turn_id: Some(turn_id.into()),
+            tool_name: Some("life.observe.batch".into()),
+            ..Default::default()
+        });
+
+        let phase_clock = *runtime
+            .stuck_turn_first_seen
+            .get(session_id)
+            .expect("phase clock present");
+        let total_clock = *runtime
+            .total_active_since
+            .get(session_id)
+            .expect("total clock present");
+        assert!(
+            phase_clock > long_ago,
+            "a ping must refresh the phase watchdog"
+        );
+        assert_eq!(
+            total_clock, long_ago,
+            "a ping must NOT push back the total-turn ceiling — that would let a \
+             wedged tool ping forever and hang the session"
+        );
+
+        // A ping naming a DIFFERENT turn is ignored, so a late ping from an
+        // already-evicted tool cannot hold a new turn's watchdog open.
+        let before = *runtime.stuck_turn_first_seen.get(session_id).unwrap();
+        runtime.handle_tool_progress(&InboundTaskPayload {
+            action: Some("tool_progress".into()),
+            session_id: Some(session_id.into()),
+            turn_id: Some("turn-already-evicted".into()),
+            tool_name: Some("life.observe.batch".into()),
+            ..Default::default()
+        });
+        assert_eq!(
+            *runtime.stuck_turn_first_seen.get(session_id).unwrap(),
+            before,
+            "a ping for a non-active turn must be ignored"
+        );
+
+        drop(runtime);
+        let _ = server.await;
+        let _ = std::fs::remove_file(&socket_path);
+    }
+
     /// Dropping a stale result protects the new turn, but the tool already ran.
     /// A WRITE that reached the graph has changed durable state for a turn the
     /// operator was told had died — so the drop must not also be silent, or the

@@ -787,6 +787,9 @@ impl AgentRuntime {
                                 warn!("Failed to forward model_dispatch_status: {}", err);
                             }
                         }
+                        Ok(task) if task.action.as_deref() == Some("tool_progress") => {
+                            self.handle_tool_progress(&task);
+                        }
                         Ok(task) if task.action.as_deref() == Some("datasource_response") => {
                             let task_ref = task.clone();
                             if let Err(err) = self.handle_datasource_response(task).await {
@@ -1403,6 +1406,56 @@ impl AgentRuntime {
             AgentAction::Fail { message } => {
                 self.fail_active_turn(session_id, turn_id, message).await
             }
+        }
+    }
+
+    /// A still-running tool reports it is alive: refresh this session's PHASE
+    /// watchdog so a slow-but-healthy tool is not evicted mid-flight.
+    ///
+    /// Before this existed, the phase watchdog could not distinguish a slow tool
+    /// from a dead one, so the only way to survive being slow was a bespoke
+    /// per-tool constant (`delegate.whisper`'s 660s) — which does not
+    /// generalise, and left every other long tool one eviction away from having
+    /// its turn poisoned by its own late result.
+    ///
+    /// SAFETY PROPERTY — this must never let a wedged tool run forever. It
+    /// clears only `stuck_turn_first_seen`, the PHASE clock. The total-turn
+    /// ceiling (`MAX_TOTAL_ACTIVE_SECS`) is measured from `total_active_since`,
+    /// a SEPARATE map this function does not touch, so the 600s catch-all still
+    /// fires on schedule no matter how many pings arrive. Keep it that way: if
+    /// these two clocks are ever merged, pings become an unbounded stay of
+    /// execution and a hung tool hangs the session forever — strictly worse
+    /// than eviction.
+    ///
+    /// Ignores a ping for anything but the current active turn, so a late ping
+    /// from an already-evicted tool cannot hold a NEW turn's watchdog open.
+    pub(super) fn handle_tool_progress(&mut self, task: &InboundTaskPayload) {
+        let Some(session_id) = task.session_id.as_deref().filter(|s| !s.is_empty()) else {
+            return;
+        };
+        let matches_active_turn = self
+            .sessions
+            .get(session_id)
+            .and_then(|state| state.active_turn.as_ref())
+            .is_some_and(|turn| {
+                task.turn_id
+                    .as_deref()
+                    .filter(|id| !id.is_empty())
+                    .is_none_or(|incoming| incoming == turn.turn_id)
+            });
+        if !matches_active_turn {
+            return;
+        }
+        if self
+            .stuck_turn_first_seen
+            .insert(session_id.to_string(), std::time::Instant::now())
+            .is_some()
+        {
+            debug!(
+                session_id = %session_id,
+                tool = task.tool_name.as_deref().unwrap_or("unknown"),
+                "tool progress ping — phase watchdog refreshed (total-turn ceiling unaffected)"
+            );
         }
     }
 
