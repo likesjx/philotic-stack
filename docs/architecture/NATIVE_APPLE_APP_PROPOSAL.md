@@ -15,6 +15,7 @@ tags:
 - eventkit
 - attention-steward
 related_docs:
+- APPLE_INTELLIGENCE_PLANE_PROPOSAL.md
 - LIFE_GRAPH_OS_PROPOSAL.md
 - MCP_COORDINATION_ENDPOINT_PROPOSAL.md
 - DISTRIBUTED_CRON_PROPOSAL.md
@@ -342,7 +343,10 @@ Slice 6 is the largest and should be its own workstream.
   knows the graph shape) or is client-side layout sufficient at lens scale?
 - Per-device capability policy: does the operator gate tool advertisement
   per device (Mac may create calendar events, phone may not)?
-- Widget/App Intents surface (Siri "what's on my plate?" → `re_entry_context`
-  lens) — after slice 4, likely cheap and high-leverage.
+- ~~Widget/App Intents surface (Siri "what's on my plate?" → `re_entry_context`
+  lens)~~ — answered and expanded in
+  [APPLE_INTELLIGENCE_PLANE_PROPOSAL.md](APPLE_INTELLIGENCE_PLANE_PROPOSAL.md)
+  (Plane 5). Confirmed cheap and high-leverage; the `IndexedEntity`/Spotlight
+  slice rides `lifegraph-read-plane` and should follow slice 4.
 - Does the steward's nudge tone policy live in SIL only, or does the app
   keep a local quiet-hours override the graph never sees?
