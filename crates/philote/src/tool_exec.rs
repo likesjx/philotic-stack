@@ -1556,6 +1556,451 @@ impl AgentRuntime {
                 })
                 .await
             }
+            // ── Mesh steward (heal class, aria-mesh-steward slice 1) ────────
+            "heal.list" => {
+                let scope = payload
+                    .arguments
+                    .get("scope")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("both")
+                    .to_string();
+                let limit = payload
+                    .arguments
+                    .get("limit")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(20) as usize;
+                let mut tool_err: Option<TaskErrorPayload> = None;
+                let mut pending = serde_json::Value::Array(Vec::new());
+                let mut work_items = serde_json::Value::Array(Vec::new());
+                if matches!(scope.as_str(), "queue" | "both") {
+                    match self
+                        .ipc_client
+                        .send_request(IpcRequest::GetHealQueuePending { limit })
+                        .await
+                    {
+                        Ok(IpcResponse::HealQueuePending { rows }) => {
+                            pending = serde_json::to_value(&rows)
+                                .unwrap_or_else(|_| serde_json::Value::Array(Vec::new()));
+                        }
+                        Ok(_) => {}
+                        Err(e) => {
+                            tool_err = Some(TaskErrorPayload::transport_error(
+                                "philote",
+                                format!("heal.list: IPC transport error — {e}"),
+                            ));
+                        }
+                    }
+                }
+                if tool_err.is_none() && matches!(scope.as_str(), "work_items" | "both") {
+                    match self
+                        .ipc_client
+                        .send_request(IpcRequest::GetConfig {
+                            key: "__heal_work_items__".into(),
+                        })
+                        .await
+                    {
+                        Ok(IpcResponse::ConfigData { value_json, .. }) => {
+                            work_items = value_json
+                                .as_deref()
+                                .and_then(|s| serde_json::from_str(s).ok())
+                                .unwrap_or_else(|| serde_json::Value::Array(Vec::new()));
+                        }
+                        Ok(_) => {}
+                        Err(e) => {
+                            tool_err = Some(TaskErrorPayload::transport_error(
+                                "philote",
+                                format!("heal.list: IPC transport error — {e}"),
+                            ));
+                        }
+                    }
+                }
+                let content = match &tool_err {
+                    Some(err) => err.display_message(),
+                    None => serde_json::to_string_pretty(&serde_json::json!({
+                        "pending": pending,
+                        "work_items": work_items,
+                    }))
+                    .unwrap_or_else(|_| "{}".into()),
+                };
+                self.handle_tool_result(InboundTaskPayload {
+                    action: Some("tool_result".into()),
+                    source: Some("agent".into()),
+                    session_id: Some(payload.session_id),
+                    turn_id: Some(payload.turn_id),
+                    chat_id: Some(payload.chat_id),
+                    content: Some(content),
+                    error: tool_err,
+                    tool_name: Some(payload.tool_name),
+                    final_reply_to: Some(payload.final_reply_to),
+                    final_reply_role: Some(payload.final_reply_role),
+                    final_reply_guest_id: payload.final_reply_guest_id,
+                    ..Default::default()
+                })
+                .await
+            }
+            "heal.resolve" => {
+                let entry_id = payload
+                    .arguments
+                    .get("entry_id")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string);
+                let outcome = payload
+                    .arguments
+                    .get("outcome")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("resolved_by_agent")
+                    .to_string();
+                let Some(entry_id) = entry_id else {
+                    let err = TaskErrorPayload::ipc_failure(
+                        "philote",
+                        "MISSING_ARGS",
+                        "heal.resolve requires 'entry_id'",
+                    );
+                    return self
+                        .handle_tool_result(InboundTaskPayload {
+                            action: Some("tool_result".into()),
+                            source: Some("agent".into()),
+                            session_id: Some(payload.session_id),
+                            turn_id: Some(payload.turn_id),
+                            chat_id: Some(payload.chat_id),
+                            content: Some(err.display_message()),
+                            error: Some(err),
+                            tool_name: Some(payload.tool_name),
+                            final_reply_to: Some(payload.final_reply_to),
+                            final_reply_role: Some(payload.final_reply_role),
+                            final_reply_guest_id: payload.final_reply_guest_id,
+                            ..Default::default()
+                        })
+                        .await;
+                };
+                let (content, tool_err) = match self
+                    .ipc_client
+                    .send_request(IpcRequest::ResolveHealEntry {
+                        id: entry_id.clone(),
+                        outcome: outcome.clone(),
+                    })
+                    .await
+                {
+                    Ok(IpcResponse::Standard { ok: true, .. }) => (
+                        format!("Heal entry '{entry_id}' resolved with outcome: {outcome}"),
+                        None,
+                    ),
+                    Ok(IpcResponse::Standard {
+                        ok: false,
+                        code,
+                        message,
+                        ..
+                    }) => {
+                        let e = TaskErrorPayload::ipc_failure("aiua", &*code, message);
+                        (e.display_message(), Some(e))
+                    }
+                    Ok(_) => ("heal.resolve: unexpected response".into(), None),
+                    Err(e) => {
+                        let err = TaskErrorPayload::transport_error(
+                            "philote",
+                            format!("heal.resolve: IPC transport error — {e}"),
+                        );
+                        (err.display_message(), Some(err))
+                    }
+                };
+                self.handle_tool_result(InboundTaskPayload {
+                    action: Some("tool_result".into()),
+                    source: Some("agent".into()),
+                    session_id: Some(payload.session_id),
+                    turn_id: Some(payload.turn_id),
+                    chat_id: Some(payload.chat_id),
+                    content: Some(content),
+                    error: tool_err,
+                    tool_name: Some(payload.tool_name),
+                    final_reply_to: Some(payload.final_reply_to),
+                    final_reply_role: Some(payload.final_reply_role),
+                    final_reply_guest_id: payload.final_reply_guest_id,
+                    ..Default::default()
+                })
+                .await
+            }
+            "heal.close_work_item" => {
+                let work_item_id = payload
+                    .arguments
+                    .get("work_item_id")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string);
+                let reason = payload
+                    .arguments
+                    .get("reason")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string);
+                let Some(work_item_id) = work_item_id else {
+                    let err = TaskErrorPayload::ipc_failure(
+                        "philote",
+                        "MISSING_ARGS",
+                        "heal.close_work_item requires 'work_item_id'",
+                    );
+                    return self
+                        .handle_tool_result(InboundTaskPayload {
+                            action: Some("tool_result".into()),
+                            source: Some("agent".into()),
+                            session_id: Some(payload.session_id),
+                            turn_id: Some(payload.turn_id),
+                            chat_id: Some(payload.chat_id),
+                            content: Some(err.display_message()),
+                            error: Some(err),
+                            tool_name: Some(payload.tool_name),
+                            final_reply_to: Some(payload.final_reply_to),
+                            final_reply_role: Some(payload.final_reply_role),
+                            final_reply_guest_id: payload.final_reply_guest_id,
+                            ..Default::default()
+                        })
+                        .await;
+                };
+                let (content, tool_err) = match self
+                    .ipc_client
+                    .send_request(IpcRequest::CloseHealWorkItem {
+                        work_item_id: work_item_id.clone(),
+                    })
+                    .await
+                {
+                    Ok(IpcResponse::Standard { ok: true, data, .. }) => {
+                        let closed = data
+                            .as_ref()
+                            .and_then(|d| d.get("closed"))
+                            .and_then(|v| v.as_bool())
+                            .unwrap_or(false);
+                        // The IPC has no reason field — echo the note into the
+                        // result so it lands in the session transcript.
+                        let text = serde_json::to_string_pretty(&serde_json::json!({
+                            "closed": closed,
+                            "work_item_id": work_item_id,
+                            "reason": reason,
+                        }))
+                        .unwrap_or_else(|_| format!("closed={closed}"));
+                        (text, None)
+                    }
+                    Ok(IpcResponse::Standard {
+                        ok: false,
+                        code,
+                        message,
+                        ..
+                    }) => {
+                        let e = TaskErrorPayload::ipc_failure("aiua", &*code, message);
+                        (e.display_message(), Some(e))
+                    }
+                    Ok(_) => ("heal.close_work_item: unexpected response".into(), None),
+                    Err(e) => {
+                        let err = TaskErrorPayload::transport_error(
+                            "philote",
+                            format!("heal.close_work_item: IPC transport error — {e}"),
+                        );
+                        (err.display_message(), Some(err))
+                    }
+                };
+                self.handle_tool_result(InboundTaskPayload {
+                    action: Some("tool_result".into()),
+                    source: Some("agent".into()),
+                    session_id: Some(payload.session_id),
+                    turn_id: Some(payload.turn_id),
+                    chat_id: Some(payload.chat_id),
+                    content: Some(content),
+                    error: tool_err,
+                    tool_name: Some(payload.tool_name),
+                    final_reply_to: Some(payload.final_reply_to),
+                    final_reply_role: Some(payload.final_reply_role),
+                    final_reply_guest_id: payload.final_reply_guest_id,
+                    ..Default::default()
+                })
+                .await
+            }
+            "host.vitals" => {
+                let (content, tool_err) = match self
+                    .ipc_client
+                    .send_request(IpcRequest::GetConfig {
+                        key: "host_health.status".into(),
+                    })
+                    .await
+                {
+                    Ok(IpcResponse::ConfigData { value_json, .. }) => {
+                        let text = value_json
+                            .as_deref()
+                            .and_then(|s| {
+                                serde_json::from_str::<serde_json::Value>(s)
+                                    .ok()
+                                    .and_then(|v| serde_json::to_string_pretty(&v).ok())
+                            })
+                            .unwrap_or_else(|| "{\"status\":\"no_scan_yet\"}".into());
+                        (text, None)
+                    }
+                    Ok(_) => ("{\"status\":\"no_scan_yet\"}".into(), None),
+                    Err(e) => {
+                        let err = TaskErrorPayload::transport_error(
+                            "philote",
+                            format!("host.vitals: IPC transport error — {e}"),
+                        );
+                        (err.display_message(), Some(err))
+                    }
+                };
+                self.handle_tool_result(InboundTaskPayload {
+                    action: Some("tool_result".into()),
+                    source: Some("agent".into()),
+                    session_id: Some(payload.session_id),
+                    turn_id: Some(payload.turn_id),
+                    chat_id: Some(payload.chat_id),
+                    content: Some(content),
+                    error: tool_err,
+                    tool_name: Some(payload.tool_name),
+                    final_reply_to: Some(payload.final_reply_to),
+                    final_reply_role: Some(payload.final_reply_role),
+                    final_reply_guest_id: payload.final_reply_guest_id,
+                    ..Default::default()
+                })
+                .await
+            }
+            "session.repair_stale" => {
+                let min_age_secs = payload
+                    .arguments
+                    .get("min_age_secs")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(300);
+                let (content, tool_err) = match self
+                    .ipc_client
+                    .send_request(IpcRequest::RepairStaleSessionTurns { min_age_secs })
+                    .await
+                {
+                    Ok(IpcResponse::Standard { ok: true, data, .. }) => {
+                        let repaired = data
+                            .as_ref()
+                            .and_then(|d| d.get("repaired"))
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(0);
+                        (
+                            format!(
+                                "Repaired {repaired} stale session turn(s) older than {min_age_secs}s."
+                            ),
+                            None,
+                        )
+                    }
+                    Ok(IpcResponse::Standard {
+                        ok: false,
+                        code,
+                        message,
+                        ..
+                    }) => {
+                        let e = TaskErrorPayload::ipc_failure("aiua", &*code, message);
+                        (e.display_message(), Some(e))
+                    }
+                    Ok(_) => ("session.repair_stale: unexpected response".into(), None),
+                    Err(e) => {
+                        let err = TaskErrorPayload::transport_error(
+                            "philote",
+                            format!("session.repair_stale: IPC transport error — {e}"),
+                        );
+                        (err.display_message(), Some(err))
+                    }
+                };
+                self.handle_tool_result(InboundTaskPayload {
+                    action: Some("tool_result".into()),
+                    source: Some("agent".into()),
+                    session_id: Some(payload.session_id),
+                    turn_id: Some(payload.turn_id),
+                    chat_id: Some(payload.chat_id),
+                    content: Some(content),
+                    error: tool_err,
+                    tool_name: Some(payload.tool_name),
+                    final_reply_to: Some(payload.final_reply_to),
+                    final_reply_role: Some(payload.final_reply_role),
+                    final_reply_guest_id: payload.final_reply_guest_id,
+                    ..Default::default()
+                })
+                .await
+            }
+            "component.restart" => {
+                let guest_id = payload
+                    .arguments
+                    .get("guest_id")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string);
+                let reason_note = payload
+                    .arguments
+                    .get("reason_note")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string);
+                let Some(guest_id) = guest_id else {
+                    let err = TaskErrorPayload::ipc_failure(
+                        "philote",
+                        "MISSING_ARGS",
+                        "component.restart requires 'guest_id'",
+                    );
+                    return self
+                        .handle_tool_result(InboundTaskPayload {
+                            action: Some("tool_result".into()),
+                            source: Some("agent".into()),
+                            session_id: Some(payload.session_id),
+                            turn_id: Some(payload.turn_id),
+                            chat_id: Some(payload.chat_id),
+                            content: Some(err.display_message()),
+                            error: Some(err),
+                            tool_name: Some(payload.tool_name),
+                            final_reply_to: Some(payload.final_reply_to),
+                            final_reply_role: Some(payload.final_reply_role),
+                            final_reply_guest_id: payload.final_reply_guest_id,
+                            ..Default::default()
+                        })
+                        .await;
+                };
+                let (content, tool_err) = match self
+                    .ipc_client
+                    .send_request(IpcRequest::RestartComponent {
+                        guest_id: guest_id.clone(),
+                        // Agent-initiated restarts are automatic remediation, NEVER
+                        // deliberate operator action — always the Heal reason so the
+                        // hotel's shared respawn budget applies (a wedged guest cannot
+                        // be restart-looped by an agent).
+                        reason: philotic_client::RestartReason::Heal,
+                    })
+                    .await
+                {
+                    Ok(IpcResponse::Standard { ok: true, .. }) => (
+                        match &reason_note {
+                            Some(note) => {
+                                format!("Guest '{guest_id}' restart requested. Reason: {note}")
+                            }
+                            None => format!("Guest '{guest_id}' restart requested."),
+                        },
+                        None,
+                    ),
+                    Ok(IpcResponse::Standard {
+                        ok: false,
+                        code,
+                        message,
+                        ..
+                    }) => {
+                        let e = TaskErrorPayload::ipc_failure("aiua", &*code, message);
+                        (e.display_message(), Some(e))
+                    }
+                    Ok(_) => ("component.restart: unexpected response".into(), None),
+                    Err(e) => {
+                        let err = TaskErrorPayload::transport_error(
+                            "philote",
+                            format!("component.restart: IPC transport error — {e}"),
+                        );
+                        (err.display_message(), Some(err))
+                    }
+                };
+                self.handle_tool_result(InboundTaskPayload {
+                    action: Some("tool_result".into()),
+                    source: Some("agent".into()),
+                    session_id: Some(payload.session_id),
+                    turn_id: Some(payload.turn_id),
+                    chat_id: Some(payload.chat_id),
+                    content: Some(content),
+                    error: tool_err,
+                    tool_name: Some(payload.tool_name),
+                    final_reply_to: Some(payload.final_reply_to),
+                    final_reply_role: Some(payload.final_reply_role),
+                    final_reply_guest_id: payload.final_reply_guest_id,
+                    ..Default::default()
+                })
+                .await
+            }
             "hotel.best_place_to_run" => {
                 let args = &payload.arguments;
                 let agent_id = args

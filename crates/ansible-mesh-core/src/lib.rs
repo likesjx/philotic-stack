@@ -21,6 +21,7 @@ pub mod heal_queue;
 pub mod heartbeat;
 pub mod integration;
 pub mod ledger;
+pub mod local_agent_tools;
 pub mod materializer;
 pub mod mcp_endpoint;
 pub mod mcp_route;
