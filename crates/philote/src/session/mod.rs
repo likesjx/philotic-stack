@@ -5583,14 +5583,13 @@ mod tests {
         ComponentRouteAssembly, ComponentRouteBinding, Context1Advisory, ContextAuthority,
         ContextLayerId, ContextMutability, FallbackOverride, HookRequest, HookResult,
         HttpIntegrationToolBinding, LIFE_RECALL_TRUNCATION_MARKER, LifeRecallCacheEntry,
-        McpUpstreamToolBinding,
-        MemoryAuthority, MemorySpacetimeFrame, MemorySpatialScope, MemoryTemporalKind,
-        MemoryValidationLevel, ParacrineThreadStatus, PlanStep, PromotionAction,
-        RecalledMemoryRecord, RefreshRequest, ResponseRouteMode, RoleActivation, SelectionSource,
-        SessionBindings, SessionState, TaskRunnerBaseConfig, ToolRunnerIncarnationBinding,
-        TransportReplyTargetBinding, TtsMode, TurnRecord, VoiceDeliveryMode, VoiceResponsePolicy,
-        WorkingTurn, apply_life_recall_char_budget, default_tool_assembly_for_bindings,
-        merge_session_index, session_checkpoint_memory_type,
+        McpUpstreamToolBinding, MemoryAuthority, MemorySpacetimeFrame, MemorySpatialScope,
+        MemoryTemporalKind, MemoryValidationLevel, ParacrineThreadStatus, PlanStep,
+        PromotionAction, RecalledMemoryRecord, RefreshRequest, ResponseRouteMode, RoleActivation,
+        SelectionSource, SessionBindings, SessionState, TaskRunnerBaseConfig,
+        ToolRunnerIncarnationBinding, TransportReplyTargetBinding, TtsMode, TurnRecord,
+        VoiceDeliveryMode, VoiceResponsePolicy, WorkingTurn, apply_life_recall_char_budget,
+        default_tool_assembly_for_bindings, merge_session_index, session_checkpoint_memory_type,
     };
     use crate::r#loop::{ApprovalRequest, ToolCall, ToolResult, TurnPhase};
     use crate::reflex::ReflexEvent;
@@ -5663,6 +5662,8 @@ mod tests {
                 context_1_advisory: None,
             },
             steps_done: vec![true, false],
+            verified_step_ids: vec![1],
+            stalled_continuations: 1,
             continuations_used: 2,
             created_turn_id: "turn-origin".into(),
         }
@@ -5682,6 +5683,32 @@ mod tests {
         assert_eq!(carry.continuations_used, 2);
         assert_eq!(carry.steps_done, vec![true, false]);
         assert_eq!(carry.created_turn_id, "turn-origin");
+        // Evidence and stall count must survive a checkpoint, or a restart
+        // mid-plan silently re-opens verified steps and resets the spin guard.
+        assert_eq!(carry.verified_step_ids, vec![1]);
+        assert_eq!(carry.stalled_continuations, 1);
+    }
+
+    /// A checkpoint written before evidence tracking existed must rehydrate,
+    /// with no evidence rather than a parse failure.
+    #[test]
+    fn carryover_plan_rehydrates_from_a_pre_evidence_checkpoint() {
+        let mut state =
+            SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
+        state.carryover_plan = Some(test_carryover_plan());
+        let mut checkpoint = state.checkpoint_json();
+        let carry = checkpoint
+            .get_mut("carryover_plan")
+            .and_then(|c| c.as_object_mut())
+            .expect("carryover object");
+        carry.remove("verified_step_ids");
+        carry.remove("stalled_continuations");
+
+        let restored = SessionState::from_checkpoint(&checkpoint).expect("rehydrate state");
+        let carry = restored.carryover_plan.expect("carryover restored");
+        assert!(carry.verified_step_ids.is_empty());
+        assert_eq!(carry.stalled_continuations, 0);
+        assert_eq!(carry.continuations_used, 2);
     }
 
     #[test]

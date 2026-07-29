@@ -497,12 +497,32 @@ fn duplicate_tool_skip(result: &ToolResult) -> bool {
     result.content.starts_with("[Duplicate call skipped]")
 }
 
+/// True when a call to a normally low-signal tool is in fact this turn's
+/// declared work.
+///
+/// The tools in [`low_progress_tool_name`] are diagnostics — an agent that
+/// strings four of them together is usually circling rather than progressing.
+/// But "check the hotel status and tell me what's wrong" is a plan whose steps
+/// legitimately *are* those calls, and counting them as low progress truncated
+/// exactly the read-only plans the loop was asked to carry to completion. A
+/// call bound to a plan step is the plan being executed, whatever the tool.
+fn call_serves_a_plan_step(turn: &WorkingTurn, call: &ToolCall) -> bool {
+    turn.active_plan.as_ref().is_some_and(|plan| {
+        plan.steps
+            .iter()
+            .any(|s| s.tool_name.as_deref() == Some(call.tool_name.as_str()))
+    })
+}
+
 fn recent_low_progress_tool_run(turn: &WorkingTurn) -> usize {
     turn.working_tool_history
         .iter()
         .rev()
         .take_while(|(call, result)| {
-            low_progress_tool_name(&call.tool_name) || duplicate_tool_skip(result)
+            // A duplicate is still a duplicate even when a step declares that
+            // tool: repeating an identical call is not executing the next step.
+            duplicate_tool_skip(result)
+                || (low_progress_tool_name(&call.tool_name) && !call_serves_a_plan_step(turn, call))
         })
         .count()
 }
@@ -7560,6 +7580,86 @@ mod tests {
         assert!(loop_stop_reason(&turn, 10).is_none());
     }
 
+    /// A plan whose steps genuinely are diagnostic reads must be allowed to
+    /// finish. Treating its own declared steps as "circling" truncated exactly
+    /// the read-only plans the loop is supposed to carry to completion.
+    #[test]
+    fn loop_stop_reason_allows_a_plan_built_from_diagnostic_tools() {
+        let mut turn = test_working_turn(TurnPhase::WaitingModel);
+        let diagnostics = ["hotel.status", "role.list", "skill.list", "session.status"];
+        turn.active_plan = Some(ActivePlan {
+            goal: "report on hotel health".into(),
+            steps: diagnostics
+                .iter()
+                .enumerate()
+                .map(|(i, tool)| PlanStep {
+                    id: i as u32 + 1,
+                    description: format!("read {tool}"),
+                    tool_name: Some((*tool).to_string()),
+                    status: "pending".into(),
+                })
+                .collect(),
+            status: "executing".into(),
+            context_1_advisory: None,
+        });
+        for tool_name in diagnostics {
+            push_test_tool(&mut turn, tool_name, "ok");
+        }
+
+        assert!(loop_stop_reason(&turn, 10).is_none());
+    }
+
+    /// The exemption is for *declared* steps only — an unplanned diagnostic run
+    /// still stops the turn even when a plan is present.
+    #[test]
+    fn loop_stop_reason_still_stops_undeclared_diagnostic_run_under_a_plan() {
+        let mut turn = test_working_turn(TurnPhase::WaitingModel);
+        turn.active_plan = Some(ActivePlan {
+            goal: "add a memory".into(),
+            steps: vec![PlanStep {
+                id: 1,
+                description: "record the fact".into(),
+                tool_name: Some("memory.remember".into()),
+                status: "pending".into(),
+            }],
+            status: "executing".into(),
+            context_1_advisory: None,
+        });
+        for tool_name in ["hotel.status", "role.list", "skill.list", "session.status"] {
+            push_test_tool(&mut turn, tool_name, "ok");
+        }
+
+        let reason = loop_stop_reason(&turn, 10).expect("diagnostic run should still stop");
+        assert!(reason.contains("status"));
+    }
+
+    /// Repeating an identical call is not executing the next step, even when a
+    /// plan step declares that tool.
+    #[test]
+    fn loop_stop_reason_still_stops_duplicate_calls_on_a_planned_tool() {
+        let mut turn = test_working_turn(TurnPhase::WaitingModel);
+        turn.active_plan = Some(ActivePlan {
+            goal: "report on hotel health".into(),
+            steps: vec![PlanStep {
+                id: 1,
+                description: "read hotel.status".into(),
+                tool_name: Some("hotel.status".into()),
+                status: "pending".into(),
+            }],
+            status: "executing".into(),
+            context_1_advisory: None,
+        });
+        for _ in 0..4 {
+            push_test_tool(
+                &mut turn,
+                "hotel.status",
+                "[Duplicate call skipped] hotel.status",
+            );
+        }
+
+        assert!(loop_stop_reason(&turn, 10).is_some());
+    }
+
     #[test]
     fn loop_stop_fallback_names_recent_tool_path() {
         let mut turn = test_working_turn(TurnPhase::WaitingModel);
@@ -12099,6 +12199,8 @@ mod tests {
             state.carryover_plan = Some(CarryoverPlan {
                 plan: plan_with_statuses("ship it", &["done", "pending", "pending"]),
                 steps_done: vec![true, false, false],
+                verified_step_ids: vec![1],
+                stalled_continuations: 0,
                 continuations_used: 3,
                 created_turn_id: "turn-origin".into(),
             });
@@ -12233,6 +12335,8 @@ mod tests {
             state.carryover_plan = Some(CarryoverPlan {
                 plan: plan_with_statuses("old goal", &["done", "pending"]),
                 steps_done: vec![true, false],
+                verified_step_ids: vec![1],
+                stalled_continuations: 0,
                 continuations_used: 1,
                 created_turn_id: "turn-old".into(),
             });
@@ -12368,6 +12472,8 @@ mod tests {
             .carryover_plan = Some(CarryoverPlan {
             plan: plan_with_statuses("ship it", &["done", "pending"]),
             steps_done: vec![true, false],
+            verified_step_ids: vec![1],
+            stalled_continuations: 0,
             continuations_used: 1,
             created_turn_id: "turn-origin".into(),
         });

@@ -295,7 +295,32 @@ pub struct CarryoverPlan {
     /// The plan as last seen on the completed turn.
     pub plan: ActivePlan,
     /// Index-aligned per-step completion mirror from the last plan eval.
+    ///
+    /// "Settled", not "verified": a step with no bound tool settles on the
+    /// model's own claim, because there is no artifact to check it against.
+    /// Recomputed from scratch on every eval, so it is safe against a plan
+    /// whose steps were re-emitted in a different order.
     pub steps_done: Vec<bool>,
+    /// Ids of steps backed by a real tool result, carried across continuation
+    /// turns.
+    ///
+    /// Keyed by step **id**, not index, because a continuation turn may split a
+    /// bundled step and renumber the tail — index-aligned evidence would then
+    /// be attributed to the wrong step. Distinct from `steps_done` on purpose:
+    /// a flag here can only ever have been set by [`crate::plan_eval::
+    /// verify_plan_steps`] against an actual tool result, never by the model's
+    /// `status` field. Feeding `steps_done` back as evidence would launder
+    /// self-certification through the carryover and make grounded verification
+    /// decorative.
+    #[serde(default)]
+    pub verified_step_ids: Vec<u32>,
+    /// Consecutive continuation turns that settled no new step.
+    ///
+    /// One stall is normal — a turn can legitimately spend its iterations on a
+    /// failed call or a read that sets up the next step. Repeated stalls mean
+    /// the loop is spinning. See `MAX_CONSECUTIVE_PLAN_STALLS`.
+    #[serde(default)]
+    pub stalled_continuations: u32,
     /// Number of continuation turns already synthesized for this plan.
     #[serde(default)]
     pub continuations_used: u32,
@@ -306,6 +331,14 @@ pub struct CarryoverPlan {
 impl CarryoverPlan {
     pub fn steps_done_count(&self) -> usize {
         self.steps_done.iter().filter(|d| **d).count()
+    }
+
+    /// Evidence flags re-keyed onto `plan`'s current steps by id.
+    pub fn verified_flags_for(&self, plan: &ActivePlan) -> Vec<bool> {
+        plan.steps
+            .iter()
+            .map(|s| self.verified_step_ids.contains(&s.id))
+            .collect()
     }
 }
 

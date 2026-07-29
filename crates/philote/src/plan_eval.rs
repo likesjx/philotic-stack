@@ -2,16 +2,23 @@
 //!
 //! There are two layers here, and the difference between them matters.
 //!
-//! **Cross-turn carryover (original).** After a turn's final Respond,
-//! [`evaluate_plan`] derives a completion verdict for the turn's `ActivePlan`
-//! without a second model round-trip: it trusts the model's own per-step status
-//! claims when the response contract carried them (`basis = model_reported`),
-//! and otherwise falls back to a cheap heuristic against the turn's tool
-//! history (`basis = heuristic`). The runtime persists a
+//! **Cross-turn carryover (the repeat stage).** After a turn's final Respond,
+//! [`evaluate_plan`] derives a verdict for the turn's `ActivePlan` without a
+//! second model round-trip. The runtime persists a
 //! [`crate::session::CarryoverPlan`], emits `plan_eval` / `plan_continuation`
 //! turn events, and synthesizes budgeted continuation turns through
-//! `pending_drains`. This remains the overflow path for work that genuinely
-//! exceeds one turn.
+//! `pending_drains`. This is the overflow path for work that genuinely exceeds
+//! one turn, and it repeats until the plan is verifiably done, the loop stalls
+//! out, or the budget is spent.
+//!
+//! This layer used to trust `step.status == "done"` — the same self-certification
+//! the in-turn layer below was built to eliminate. That left the two halves of
+//! the cycle disagreeing: the turn refused to *claim* completion it could not
+//! prove, while the eval that decided whether to *repeat* took the model's word
+//! for it, so a plan that marked itself done escaped the loop with the work
+//! undone. Both layers now share [`verify_plan_steps`] / [`evaluate_whole_plan`],
+//! and the carryover carries evidence (`verified_step_ids`) separately from
+//! settlement (`steps_done`) so a model claim can never be fed back as proof.
 //!
 //! **In-turn execution and grounded verification (this layer).** Trusting
 //! `step.status == "done"` is self-certification, not evaluation. A model that
@@ -45,6 +52,32 @@ use std::collections::BTreeMap;
 /// Default number of auto-continuation turns per carried-over plan.
 /// Role-overridable via `TurnLoopConfig.plan_continuation_budget`.
 pub const DEFAULT_PLAN_CONTINUATION_BUDGET: u32 = 3;
+
+/// Ceiling on the outstanding-scaled continuation budget. Bounds the repeat
+/// stage so a plan can never loop indefinitely, however many steps it declares.
+pub const PLAN_CONTINUATION_BUDGET_CEILING: u32 = 8;
+
+/// Consecutive stalled continuations tolerated before the plan is `Blocked`.
+///
+/// One stall is not failure. Under grounded evaluation a turn only counts as
+/// progress when a step actually settles, and a turn legitimately spent on a
+/// failed call, a rate limit, or a read that sets up the next step settles
+/// nothing — the previous rule (`Blocked` on the first stall) killed those
+/// plans one turn before they would have recovered. Two in a row is a spin.
+pub const MAX_CONSECUTIVE_PLAN_STALLS: u32 = 2;
+
+/// Continuation budget for a plan, widened to fit the work actually left.
+///
+/// A flat budget of 3 is generous for a two-step plan and arbitrary for a
+/// twelve-step one; the same ceiling then truncates every large plan at the
+/// same place regardless of size. Scale with outstanding steps, bounded by
+/// [`PLAN_CONTINUATION_BUDGET_CEILING`], and never shrink a configured budget.
+pub fn scaled_continuation_budget(configured: u32, outstanding: usize) -> u32 {
+    let scaled = u32::try_from(outstanding)
+        .unwrap_or(PLAN_CONTINUATION_BUDGET_CEILING)
+        .min(PLAN_CONTINUATION_BUDGET_CEILING);
+    configured.max(scaled)
+}
 
 /// Operator kill switch: when set, the plan-eval-repeat loop never persists a
 /// carryover and never synthesizes continuation turns.
@@ -80,19 +113,21 @@ impl PlanEvalVerdict {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PlanEvalBasis {
-    /// The model's response contract carried per-step (or whole-plan) status
-    /// claims — the eval trusts them.
+    /// At least one step is bound to a tool, so completion was checked against
+    /// real tool results.
+    Grounded,
+    /// No step in the plan declares a tool, so there is no artifact to check
+    /// and the model's own claims are the only signal available. Surfaced in
+    /// the `plan_eval` event because it is also the cheapest way to evade
+    /// verification: a plan that binds no tools cannot be contradicted.
     ModelReported,
-    /// The contract was silent on completion; steps were matched against the
-    /// turn's tool-history successes.
-    Heuristic,
 }
 
 impl PlanEvalBasis {
     pub fn as_str(&self) -> &'static str {
         match self {
+            Self::Grounded => "grounded",
             Self::ModelReported => "model_reported",
-            Self::Heuristic => "heuristic",
         }
     }
 }
@@ -101,11 +136,25 @@ impl PlanEvalBasis {
 #[derive(Debug, Clone)]
 pub struct PlanEvalOutcome {
     pub steps_total: usize,
+    /// Steps that are settled: verified by evidence, or unverifiable and
+    /// claimed done by the model.
     pub steps_done: usize,
-    /// Index-aligned per-step completion flags (merged with any prior flags).
+    /// Steps backed by an actual tool result. Never exceeds `steps_done`.
+    pub steps_verified: usize,
+    /// Index-aligned settled flags.
     pub steps_done_flags: Vec<bool>,
-    /// Step ids marked done by the heuristic rather than a model claim.
+    /// Ids of evidence-backed steps, to carry into the next continuation.
+    pub verified_step_ids: Vec<u32>,
+    /// Steps counted as settled on the model's word alone (no bound tool).
     pub uncertain_step_ids: Vec<u32>,
+    /// Steps the model marked done that the tool history contradicts.
+    pub contradicted_step_ids: Vec<u32>,
+    /// Steps bundling several outcomes; never settled until split.
+    pub non_atomic_step_ids: Vec<u32>,
+    /// Ids of steps still to do.
+    pub outstanding_step_ids: Vec<u32>,
+    /// Consecutive continuations (including this one) that settled nothing new.
+    pub stalled_continuations: u32,
     pub verdict: PlanEvalVerdict,
     pub basis: PlanEvalBasis,
 }
@@ -116,93 +165,136 @@ impl PlanEvalOutcome {
         json!({
             "steps_total": self.steps_total,
             "steps_done": self.steps_done,
+            "steps_verified": self.steps_verified,
             "verdict": self.verdict.as_str(),
             "basis": self.basis.as_str(),
             "uncertain_steps": self.uncertain_step_ids,
+            "contradicted_steps": self.contradicted_step_ids,
+            "non_atomic_steps": self.non_atomic_step_ids,
+            "outstanding_steps": self.outstanding_step_ids,
+            "stalls": self.stalled_continuations,
         })
     }
 }
 
-/// Evaluate plan completion after a turn's final Respond.
+/// What an earlier turn of the *same* plan established, threaded into this eval.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct PriorPlanState<'a> {
+    /// Evidence-backed step ids from previous turns. Only ever set by
+    /// [`verify_plan_steps`] against a real tool result.
+    pub verified_step_ids: &'a [u32],
+    /// How many steps were settled as of the previous eval, for stall detection.
+    pub settled_count: usize,
+    /// Consecutive stalls already recorded for this plan.
+    pub stalls: u32,
+}
+
+/// True when any step declares a tool, i.e. the plan has something checkable.
+fn plan_has_checkable_step(plan: &ActivePlan) -> bool {
+    plan.steps.iter().any(step_is_tool_bound)
+}
+
+/// Evaluate the plan after a turn's final Respond, and decide whether the
+/// cycle repeats.
 ///
-/// `prior_done` carries the per-step flags from an existing carryover (i.e.
-/// this turn was a continuation); a step once done stays done. When
-/// `prior_done` is present and the eval finds no *new* completed step, the
-/// verdict is `Blocked` — a continuation that made no forward progress must
-/// not spin the loop again.
+/// Completion is grounded: a step settles when [`verify_plan_steps`] attributes
+/// a successful tool call to it, or — only when it declares no tool, so there
+/// is nothing to check — when the model claims it. `plan.status == "done"` is
+/// no longer sufficient on its own; a plan that marks itself finished with
+/// unverified steps yields `Continue`, and the loop goes back for the rest.
+///
+/// `prior` carries the same plan's earlier state. Evidence comes in as step
+/// **ids** (never as settled flags — see [`CarryoverPlan::verified_step_ids`]),
+/// because a continuation that splits a bundled step renumbers the tail.
 pub fn evaluate_plan(
     plan: &ActivePlan,
-    prior_done: Option<&[bool]>,
+    prior: Option<PriorPlanState<'_>>,
     tool_history: &[(ToolCall, ToolResult)],
 ) -> PlanEvalOutcome {
     let total = plan.steps.len();
-    let plan_declared_done = plan.status == "done";
     let plan_declared_failed = plan.status == "failed";
+    let checkable = plan_has_checkable_step(plan);
 
-    // The model "engaged" with status tracking if the plan or any step carries
-    // a terminal status. When silent, completion falls to the heuristic.
-    let model_engaged = plan_declared_done
-        || plan_declared_failed
-        || plan
-            .steps
-            .iter()
-            .any(|s| matches!(s.status.as_str(), "done" | "failed"));
+    // Evidence carried from earlier turns of this plan, re-keyed by step id.
+    // Each continuation turn starts with a fresh `working_tool_history`, so
+    // without this the proof of an already-finished step disappears and the
+    // loop redoes it.
+    let prior_verified: Vec<bool> = plan
+        .steps
+        .iter()
+        .map(|s| {
+            prior
+                .map(|p| p.verified_step_ids.contains(&s.id))
+                .unwrap_or(false)
+        })
+        .collect();
+
+    let verification = verify_plan_steps(plan, tool_history, &prior_verified);
+    let completion = evaluate_whole_plan(plan, &verification);
 
     let mut flags = vec![false; total];
     let mut uncertain: Vec<u32> = Vec::new();
-    let mut any_step_failed = false;
-
     for (i, step) in plan.steps.iter().enumerate() {
-        match step.status.as_str() {
-            "done" => flags[i] = true,
-            "failed" => any_step_failed = true,
-            _ => {
-                if plan_declared_done {
-                    // Whole-plan claim covers steps the model forgot to mark.
-                    flags[i] = true;
-                } else if heuristic_step_done(step, tool_history) {
-                    flags[i] = true;
-                    uncertain.push(step.id);
-                }
-            }
-        }
-        if let Some(prior) = prior_done {
-            if prior.get(i).copied().unwrap_or(false) {
-                flags[i] = true;
-            }
+        flags[i] = !completion.outstanding.contains(&i);
+        // Settled without evidence: nothing to check it against, so this rests
+        // on the model's word. Reported so the gap stays visible.
+        if flags[i] && verification.evidence.get(i) != Some(&StepEvidence::Verified) {
+            uncertain.push(step.id);
         }
     }
 
+    // A plan that binds no tools anywhere has nothing to verify, so a
+    // whole-plan `done` still covers steps the model left unmarked. Without
+    // this a purely conversational plan could never settle and would spin the
+    // continuation budget on work that has no artifact to produce.
+    let mut complete = completion.complete;
+    if !checkable && plan.status == "done" && total > 0 {
+        flags.iter_mut().for_each(|f| *f = true);
+        uncertain = plan.steps.iter().map(|s| s.id).collect();
+        complete = true;
+    }
+
     let done = flags.iter().filter(|f| **f).count();
-    let basis = if model_engaged {
-        PlanEvalBasis::ModelReported
-    } else {
-        PlanEvalBasis::Heuristic
+    let verified_step_ids: Vec<u32> = plan
+        .steps
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| verification.evidence.get(*i) == Some(&StepEvidence::Verified))
+        .map(|(_, s)| s.id)
+        .collect();
+    let outstanding_step_ids: Vec<u32> = plan
+        .steps
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| !flags[*i])
+        .map(|(_, s)| s.id)
+        .collect();
+
+    // A continuation that settled nothing new is a stall. One is tolerated —
+    // see MAX_CONSECUTIVE_PLAN_STALLS — because under grounded evaluation a
+    // turn spent on a failed call makes no progress but is not yet a spin.
+    let stalls = match prior {
+        Some(p) if done <= p.settled_count => p.stalls.saturating_add(1),
+        Some(_) => 0,
+        None => 0,
     };
+
+    let every_step_settled_or_failed = plan
+        .steps
+        .iter()
+        .enumerate()
+        .all(|(i, s)| flags[i] || s.status == "failed");
 
     let verdict = if plan_declared_failed {
         PlanEvalVerdict::Blocked
-    } else if total > 0 && done == total {
+    } else if complete {
         PlanEvalVerdict::Complete
-    } else if plan_declared_done {
-        PlanEvalVerdict::Complete
-    } else if any_step_failed
-        && plan
-            .steps
-            .iter()
-            .enumerate()
-            .all(|(i, s)| flags[i] || s.status == "failed")
-    {
-        // Everything is either done or failed — nothing left to continue with.
+    } else if every_step_settled_or_failed {
+        // Everything is either settled or explicitly failed — nothing left to
+        // continue with.
         PlanEvalVerdict::Blocked
-    } else if let Some(prior) = prior_done {
-        let prior_count = prior.iter().filter(|f| **f).count();
-        if done <= prior_count {
-            // Continuation turn made no forward progress.
-            PlanEvalVerdict::Blocked
-        } else {
-            PlanEvalVerdict::Continue
-        }
+    } else if stalls >= MAX_CONSECUTIVE_PLAN_STALLS {
+        PlanEvalVerdict::Blocked
     } else {
         PlanEvalVerdict::Continue
     };
@@ -210,48 +302,21 @@ pub fn evaluate_plan(
     PlanEvalOutcome {
         steps_total: total,
         steps_done: done,
+        steps_verified: verification.verified_count(),
         steps_done_flags: flags,
+        verified_step_ids,
         uncertain_step_ids: uncertain,
+        contradicted_step_ids: verification.contradicted_step_ids.clone(),
+        non_atomic_step_ids: verification.non_atomic_step_ids.clone(),
+        outstanding_step_ids,
+        stalled_continuations: stalls,
         verdict,
-        basis,
+        basis: if checkable {
+            PlanEvalBasis::Grounded
+        } else {
+            PlanEvalBasis::ModelReported
+        },
     }
-}
-
-/// Cheap heuristic: does the tool history contain a successful call that
-/// plausibly executed this step? Conservative on purpose — under-marking only
-/// costs one continuation turn, over-marking silently skips work.
-fn heuristic_step_done(step: &PlanStep, history: &[(ToolCall, ToolResult)]) -> bool {
-    // Strongest signal: the step is bound to a tool and that tool ran successfully.
-    if let Some(tool) = step.tool_name.as_deref() {
-        if !tool.is_empty() {
-            return history
-                .iter()
-                .any(|(call, result)| call.tool_name == tool && tool_result_looks_ok(result));
-        }
-    }
-
-    // Fallback: significant token overlap between the step description and a
-    // successful call's tool name + arguments.
-    let step_tokens = significant_tokens(&step.description);
-    if step_tokens.is_empty() {
-        return false;
-    }
-    history.iter().any(|(call, result)| {
-        if !tool_result_looks_ok(result) {
-            return false;
-        }
-        let haystack = format!(
-            "{} {}",
-            call.tool_name.replace(['.', '_', '-'], " "),
-            call.arguments
-        )
-        .to_lowercase();
-        let matched = step_tokens
-            .iter()
-            .filter(|t| haystack.contains(t.as_str()))
-            .count();
-        matched >= 2 || (step_tokens.len() == 1 && matched == 1)
-    })
 }
 
 fn tool_result_looks_ok(result: &ToolResult) -> bool {
@@ -276,9 +341,27 @@ fn significant_tokens(text: &str) -> Vec<String> {
 /// Structured "continue the plan" brief for the synthesized continuation turn.
 /// Cites exactly what is done and what remains so the next turn's model sees
 /// the remaining work without re-planning.
+///
+/// The remaining list is not a bare restatement of the plan. It says *why* each
+/// step is still outstanding, because the two ways a step survives a turn need
+/// opposite responses: a step the model marked done but no tool call performed
+/// must be redone (restating it plainly invites the model to mark it done
+/// again), and a step bundling several outcomes must be split before it can
+/// ever settle — under grounded evaluation it is unconditionally outstanding,
+/// so a continuation that does not split it burns the whole budget and still
+/// finishes with the plan unfinished.
 pub fn plan_continuation_brief(carryover: &CarryoverPlan, budget: u32) -> String {
     let done_list = step_list(&carryover.plan, &carryover.steps_done, true);
-    let remaining_list = step_list(&carryover.plan, &carryover.steps_done, false);
+    // No tool history: with the carryover's evidence as the only input, this
+    // reports each step's standing as of the last eval.
+    let verification = verify_plan_steps(
+        &carryover.plan,
+        &[],
+        &carryover.verified_flags_for(&carryover.plan),
+    );
+    let completion = evaluate_whole_plan(&carryover.plan, &verification);
+    let remaining_list = outstanding_lines(&carryover.plan, &verification, &completion);
+
     let mut brief = format!(
         "[Plan continuation {}/{}] Continue executing your existing plan. Goal: {}\n",
         carryover.continuations_used + 1,
@@ -288,12 +371,23 @@ pub fn plan_continuation_brief(carryover: &CarryoverPlan, budget: u32) -> String
     if !done_list.is_empty() {
         brief.push_str(&format!("Completed steps:\n{done_list}\n"));
     }
-    brief.push_str(&format!(
-        "Remaining steps:\n{remaining_list}\n\
-         Pick up at the first remaining step. Do not re-plan or repeat completed work. \
-         Update step statuses in active_plan as you execute; when every step is done, \
-         deliver a final summary of the whole plan to the user."
-    ));
+    brief.push_str(&format!("Remaining steps:\n{remaining_list}\n"));
+
+    if carryover.stalled_continuations > 0 {
+        brief.push_str(
+            "The previous continuation finished without completing a single outstanding step. \
+             Do not repeat the approach that just failed — take a different route to the same \
+             outcome, or say specifically what is blocking you.\n",
+        );
+    }
+
+    brief.push_str(
+        "Pick up at the first remaining step. Do not re-plan from scratch and do not repeat \
+         completed work. Update step statuses in active_plan as you execute. A step counts as \
+         done only when a successful tool call in this turn actually did it — marking it done \
+         without one leaves it outstanding. When every step is genuinely done, deliver a final \
+         summary of the whole plan to the user.",
+    );
     brief
 }
 
@@ -970,8 +1064,22 @@ mod tests {
             .collect()
     }
 
+    fn carryover(p: ActivePlan, steps_done: Vec<bool>, used: u32) -> CarryoverPlan {
+        CarryoverPlan {
+            plan: p,
+            steps_done,
+            verified_step_ids: Vec::new(),
+            stalled_continuations: 0,
+            continuations_used: used,
+            created_turn_id: "turn-0".into(),
+        }
+    }
+
     #[test]
-    fn model_reported_all_done_is_complete() {
+    fn unbound_steps_all_claimed_done_is_complete() {
+        // Nothing declares a tool, so there is no artifact to check against and
+        // the model's claim is the only signal. Complete, but reported as
+        // uncertain and `model_reported` so the gap is visible.
         let p = plan(
             "executing",
             &[("read config", None, "done"), ("apply fix", None, "done")],
@@ -980,11 +1088,12 @@ mod tests {
         assert_eq!(out.verdict, PlanEvalVerdict::Complete);
         assert_eq!(out.basis, PlanEvalBasis::ModelReported);
         assert_eq!(out.steps_done, 2);
-        assert!(out.uncertain_step_ids.is_empty());
+        assert_eq!(out.steps_verified, 0);
+        assert_eq!(out.uncertain_step_ids, vec![1, 2]);
     }
 
     #[test]
-    fn plan_status_done_trusts_whole_plan_claim() {
+    fn whole_plan_done_claim_covers_unmarked_steps_only_when_nothing_is_checkable() {
         let p = plan(
             "done",
             &[
@@ -998,20 +1107,35 @@ mod tests {
         assert_eq!(out.steps_done, 2);
     }
 
+    /// The defect this change exists to close, at the carryover layer.
+    ///
+    /// The model declares the whole plan done and marks every step done. One
+    /// step is bound to a tool that never ran successfully. The old eval
+    /// returned `Complete` on the strength of those claims and dropped the
+    /// carryover, so the loop exited with the work undone — the same
+    /// self-certification the in-turn layer already refused to accept.
     #[test]
-    fn model_reported_partial_continues() {
+    fn plan_declaring_itself_done_still_continues_when_a_step_is_unverified() {
         let p = plan(
-            "executing",
+            "done",
             &[
-                ("read config", None, "done"),
-                ("apply fix", None, "pending"),
-                ("verify deploy", None, "pending"),
+                ("add Zerin as a Person node", Some("life.observe"), "done"),
+                ("add Daxton as a Person node", Some("life.observe"), "done"),
             ],
         );
-        let out = evaluate_plan(&p, None, &[]);
+        // Only Zerin's call landed.
+        let h = history_args(&[(
+            "life.observe",
+            serde_json::json!({"text": "Zerin is a child"}),
+            "created life:person:zerin",
+        )]);
+        let out = evaluate_plan(&p, None, &h);
         assert_eq!(out.verdict, PlanEvalVerdict::Continue);
-        assert_eq!(out.basis, PlanEvalBasis::ModelReported);
-        assert_eq!(out.steps_done, 1);
+        assert_eq!(out.basis, PlanEvalBasis::Grounded);
+        assert_eq!(out.steps_verified, 1);
+        assert_eq!(out.outstanding_step_ids, vec![2]);
+        // The false claim is surfaced, not silently accepted.
+        assert_eq!(out.contradicted_step_ids, vec![2]);
     }
 
     #[test]
@@ -1019,7 +1143,6 @@ mod tests {
         let p = plan("failed", &[("read config", None, "pending")]);
         let out = evaluate_plan(&p, None, &[]);
         assert_eq!(out.verdict, PlanEvalVerdict::Blocked);
-        assert_eq!(out.basis, PlanEvalBasis::ModelReported);
     }
 
     #[test]
@@ -1033,8 +1156,7 @@ mod tests {
     }
 
     #[test]
-    fn heuristic_bound_tool_success_marks_step_uncertain() {
-        // Contract silent: every step "pending", but the bound tool ran fine.
+    fn bound_tool_success_verifies_step() {
         let p = plan(
             "executing",
             &[
@@ -1044,14 +1166,18 @@ mod tests {
         );
         let h = history(&[("hotel.status", "hotel green")]);
         let out = evaluate_plan(&p, None, &h);
-        assert_eq!(out.basis, PlanEvalBasis::Heuristic);
+        assert_eq!(out.basis, PlanEvalBasis::Grounded);
         assert_eq!(out.verdict, PlanEvalVerdict::Continue);
-        assert_eq!(out.steps_done, 1);
-        assert_eq!(out.uncertain_step_ids, vec![1]);
+        assert_eq!(out.steps_verified, 1);
+        assert_eq!(out.verified_step_ids, vec![1]);
+        // Step 1 has evidence, so it is not uncertain; step 2 is unbound and
+        // unclaimed, so it is outstanding rather than settled.
+        assert!(out.uncertain_step_ids.is_empty());
+        assert_eq!(out.outstanding_step_ids, vec![2]);
     }
 
     #[test]
-    fn heuristic_bound_tool_error_does_not_mark_step() {
+    fn bound_tool_error_does_not_verify_step() {
         let p = plan(
             "executing",
             &[("check hotel status", Some("hotel.status"), "pending")],
@@ -1062,96 +1188,367 @@ mod tests {
         assert_eq!(out.verdict, PlanEvalVerdict::Continue);
     }
 
+    /// Token attribution still settles an unbound step — but one call now
+    /// clears exactly one step.
+    ///
+    /// The old heuristic asked "does *any* successful call look like this
+    /// step?" for every step independently, so a single `life.observe` answered
+    /// yes for all five children and the plan read as complete. Attribution is
+    /// consuming: N sibling steps need N successful calls.
     #[test]
-    fn heuristic_description_token_match() {
+    fn one_call_settles_one_step_not_every_similar_sibling() {
         let p = plan(
             "executing",
-            &[("recall session memory context", None, "pending")],
+            &[
+                ("recall Zerin from memory", None, "pending"),
+                ("recall Daxton from memory", None, "pending"),
+            ],
         );
-        let h = history(&[("memory.recall", "3 memories found for session context")]);
+        let h = history_args(&[(
+            "memory.recall",
+            serde_json::json!({"query": "Zerin"}),
+            "1 memory found",
+        )]);
         let out = evaluate_plan(&p, None, &h);
-        assert_eq!(out.basis, PlanEvalBasis::Heuristic);
-        assert_eq!(out.steps_done, 1);
-        assert_eq!(out.uncertain_step_ids, vec![1]);
+        assert_eq!(out.steps_verified, 1, "one call must clear only one step");
+        assert_eq!(out.verified_step_ids, vec![1]);
+        assert_eq!(out.outstanding_step_ids, vec![2]);
+        assert_eq!(out.verdict, PlanEvalVerdict::Continue);
     }
 
     #[test]
-    fn heuristic_silent_history_continues_with_zero_done() {
+    fn silent_history_continues_with_zero_done() {
         let p = plan(
             "executing",
             &[("write deployment runbook", None, "pending")],
         );
         let out = evaluate_plan(&p, None, &[]);
-        assert_eq!(out.basis, PlanEvalBasis::Heuristic);
         assert_eq!(out.verdict, PlanEvalVerdict::Continue);
         assert_eq!(out.steps_done, 0);
     }
 
+    /// Evidence, not settlement, is what carries across turns: a step proven in
+    /// turn 1 stays proven in turn 2 even though the continuation starts with
+    /// an empty tool history.
     #[test]
-    fn prior_done_flags_merge_and_stay_done() {
+    fn prior_evidence_keeps_a_step_verified_across_turns() {
         let p = plan(
             "executing",
             &[
-                ("read config", None, "pending"),
-                ("apply fix", None, "done"),
-                ("verify deploy", None, "pending"),
+                ("add Zerin", Some("life.observe"), "done"),
+                ("add Daxton", Some("life.observe"), "pending"),
             ],
         );
-        let out = evaluate_plan(&p, Some(&[true, false, false]), &[]);
-        // step 1 stays done from prior, step 2 newly model-reported done.
-        assert_eq!(out.steps_done, 2);
-        assert!(out.steps_done_flags[0] && out.steps_done_flags[1]);
+        let prior = PriorPlanState {
+            verified_step_ids: &[1],
+            settled_count: 1,
+            stalls: 0,
+        };
+        let out = evaluate_plan(&p, Some(prior), &[]);
+        assert!(out.steps_done_flags[0], "turn-1 evidence must survive");
+        assert_eq!(out.verified_step_ids, vec![1]);
+        assert_eq!(out.outstanding_step_ids, vec![2]);
+        assert_eq!(out.verdict, PlanEvalVerdict::Continue);
+    }
+
+    /// A carryover must never be able to promote a model claim into evidence.
+    /// Only `verified_step_ids` seeds verification, and it is populated solely
+    /// from `verify_plan_steps` output.
+    #[test]
+    fn settled_flags_are_not_accepted_as_evidence() {
+        let p = plan("executing", &[("add Daxton", Some("life.observe"), "done")]);
+        // Nothing ran, and no prior *evidence* exists — only a claim.
+        let prior = PriorPlanState {
+            verified_step_ids: &[],
+            settled_count: 1,
+            stalls: 0,
+        };
+        let out = evaluate_plan(&p, Some(prior), &[]);
+        assert_eq!(out.steps_verified, 0);
+        assert_eq!(out.outstanding_step_ids, vec![1]);
+        assert_ne!(out.verdict, PlanEvalVerdict::Complete);
+    }
+
+    /// One stalled continuation is tolerated; two in a row is a spin.
+    ///
+    /// Under grounded evaluation a turn spent on a failing tool settles
+    /// nothing, and blocking on the first such turn kills plans one turn before
+    /// they recover.
+    #[test]
+    fn first_stall_continues_and_second_blocks() {
+        let p = plan(
+            "executing",
+            &[
+                ("read config", Some("hotel.status"), "pending"),
+                ("apply fix", Some("life.observe"), "pending"),
+            ],
+        );
+        let first = evaluate_plan(
+            &p,
+            Some(PriorPlanState {
+                verified_step_ids: &[],
+                settled_count: 0,
+                stalls: 0,
+            }),
+            &[],
+        );
+        assert_eq!(first.verdict, PlanEvalVerdict::Continue);
+        assert_eq!(first.stalled_continuations, 1);
+
+        let second = evaluate_plan(
+            &p,
+            Some(PriorPlanState {
+                verified_step_ids: &[],
+                settled_count: 0,
+                stalls: first.stalled_continuations,
+            }),
+            &[],
+        );
+        assert_eq!(second.verdict, PlanEvalVerdict::Blocked);
+        assert_eq!(second.stalled_continuations, 2);
+    }
+
+    #[test]
+    fn forward_progress_resets_the_stall_counter() {
+        let p = plan(
+            "executing",
+            &[
+                ("check hotel status", Some("hotel.status"), "pending"),
+                ("apply fix", Some("life.observe"), "pending"),
+            ],
+        );
+        let h = history(&[("hotel.status", "hotel green")]);
+        let out = evaluate_plan(
+            &p,
+            Some(PriorPlanState {
+                verified_step_ids: &[],
+                settled_count: 0,
+                stalls: 1,
+            }),
+            &h,
+        );
+        assert_eq!(out.stalled_continuations, 0);
         assert_eq!(out.verdict, PlanEvalVerdict::Continue);
     }
 
     #[test]
-    fn continuation_without_progress_is_blocked() {
-        let p = plan(
-            "executing",
-            &[
-                ("read config", None, "done"),
-                ("apply fix", None, "pending"),
-            ],
+    fn continuation_budget_scales_with_outstanding_work_and_is_bounded() {
+        // Never shrinks a configured budget.
+        assert_eq!(scaled_continuation_budget(3, 1), 3);
+        assert_eq!(scaled_continuation_budget(3, 0), 3);
+        // Widens to fit the work that is actually left.
+        assert_eq!(scaled_continuation_budget(3, 6), 6);
+        // Bounded, so a large plan cannot loop indefinitely.
+        assert_eq!(
+            scaled_continuation_budget(3, 40),
+            PLAN_CONTINUATION_BUDGET_CEILING
         );
-        // Prior already had step 1 done — this continuation added nothing.
-        let out = evaluate_plan(&p, Some(&[true, false]), &[]);
-        assert_eq!(out.verdict, PlanEvalVerdict::Blocked);
+        assert_eq!(scaled_continuation_budget(12, 40), 12);
     }
 
     #[test]
     fn continuation_brief_cites_remaining_steps_only() {
-        let carry = CarryoverPlan {
-            plan: plan(
+        let carry = carryover(
+            plan(
                 "executing",
                 &[
                     ("read config", None, "done"),
                     ("apply fix", None, "pending"),
                 ],
             ),
-            steps_done: vec![true, false],
-            continuations_used: 1,
-            created_turn_id: "turn-0".into(),
-        };
+            vec![true, false],
+            1,
+        );
         let brief = plan_continuation_brief(&carry, 3);
         assert!(brief.contains("[Plan continuation 2/3]"));
         assert!(brief.contains("Completed steps:\n- step 1: read config"));
         assert!(brief.contains("Remaining steps:\n- step 2: apply fix"));
     }
 
+    /// A step the model marked done that no tool call performed must be told to
+    /// redo it. Restating it as an ordinary pending step invites the model to
+    /// mark it done a second time.
+    #[test]
+    fn continuation_brief_tells_the_model_to_redo_an_unbacked_claim() {
+        let carry = carryover(
+            plan("executing", &[("add Daxton", Some("life.observe"), "done")]),
+            vec![false],
+            1,
+        );
+        let brief = plan_continuation_brief(&carry, 3);
+        assert!(brief.contains("Redo it."), "brief was: {brief}");
+    }
+
+    /// A bundled step is unconditionally outstanding, so a plan containing one
+    /// can never reach `Complete` until the model splits it. That is deliberate
+    /// — but it must not mean the plan grinds through the entire continuation
+    /// budget. A model that ignores the split instruction settles nothing new
+    /// each turn, so the stall guard stops it after two, not eight.
+    #[test]
+    fn a_bundled_step_the_model_never_splits_stops_on_stalls_not_budget() {
+        let p = plan(
+            "done",
+            &[(
+                "propose Zerin, Mali and Daxton as Person nodes",
+                Some("life.observe"),
+                "done",
+            )],
+        );
+        let h = history_args(&[(
+            "life.observe",
+            serde_json::json!({"text": "Zerin"}),
+            "created life:person:zerin",
+        )]);
+
+        // Turn 1: evidence exists, but a bundled step is never settled.
+        let first = evaluate_plan(&p, None, &h);
+        assert_eq!(first.verdict, PlanEvalVerdict::Continue);
+        assert_eq!(first.non_atomic_step_ids, vec![1]);
+        assert_eq!(first.steps_done, 0);
+
+        // Continuations that re-emit the same bundled step settle nothing.
+        let second = evaluate_plan(
+            &p,
+            Some(PriorPlanState {
+                verified_step_ids: &first.verified_step_ids,
+                settled_count: first.steps_done,
+                stalls: 0,
+            }),
+            &h,
+        );
+        assert_eq!(second.verdict, PlanEvalVerdict::Continue);
+        let third = evaluate_plan(
+            &p,
+            Some(PriorPlanState {
+                verified_step_ids: &second.verified_step_ids,
+                settled_count: second.steps_done,
+                stalls: second.stalled_continuations,
+            }),
+            &h,
+        );
+        assert_eq!(
+            third.verdict,
+            PlanEvalVerdict::Blocked,
+            "an unsplit bundle must stop on the stall guard"
+        );
+    }
+
+    /// And when the model *does* split it, the plan settles — the split steps
+    /// are individually attributable, and the goal is unchanged so the
+    /// carryover keeps its continuity.
+    #[test]
+    fn splitting_a_bundled_step_lets_the_plan_complete() {
+        let bundled = plan(
+            "executing",
+            &[(
+                "propose Zerin, Mali and Daxton as Person nodes",
+                Some("life.observe"),
+                "done",
+            )],
+        );
+        let first = evaluate_plan(&bundled, None, &[]);
+        assert_eq!(first.verdict, PlanEvalVerdict::Continue);
+
+        // The continuation re-emits the plan as one step per artifact.
+        let split = plan(
+            "executing",
+            &[
+                (
+                    "propose Zerin as a Person node",
+                    Some("life.observe"),
+                    "done",
+                ),
+                (
+                    "propose Mali as a Person node",
+                    Some("life.observe"),
+                    "done",
+                ),
+                (
+                    "propose Daxton as a Person node",
+                    Some("life.observe"),
+                    "done",
+                ),
+            ],
+        );
+        let h = history_args(&[
+            (
+                "life.observe",
+                serde_json::json!({"text": "Zerin"}),
+                "created life:person:zerin",
+            ),
+            (
+                "life.observe",
+                serde_json::json!({"text": "Mali"}),
+                "created life:person:mali",
+            ),
+            (
+                "life.observe",
+                serde_json::json!({"text": "Daxton"}),
+                "created life:person:daxton",
+            ),
+        ]);
+        let out = evaluate_plan(
+            &split,
+            Some(PriorPlanState {
+                verified_step_ids: &first.verified_step_ids,
+                settled_count: first.steps_done,
+                stalls: first.stalled_continuations,
+            }),
+            &h,
+        );
+        assert_eq!(out.verdict, PlanEvalVerdict::Complete);
+        assert_eq!(out.steps_verified, 3);
+    }
+
+    /// A bundled step is unconditionally outstanding, so a continuation that
+    /// does not split it can never settle the plan — it would burn the whole
+    /// budget and still finish unfinished.
+    #[test]
+    fn continuation_brief_demands_a_bundled_step_be_split() {
+        let carry = carryover(
+            plan(
+                "executing",
+                &[(
+                    "propose Zerin, Mali and Daxton as Person nodes",
+                    Some("life.observe"),
+                    "done",
+                )],
+            ),
+            vec![false],
+            1,
+        );
+        let brief = plan_continuation_brief(&carry, 3);
+        assert!(brief.contains("Split them into one step per outcome"));
+    }
+
+    #[test]
+    fn continuation_brief_after_a_stall_demands_a_different_approach() {
+        let mut carry = carryover(
+            plan(
+                "executing",
+                &[("apply fix", Some("life.observe"), "pending")],
+            ),
+            vec![false],
+            1,
+        );
+        carry.stalled_continuations = 1;
+        let brief = plan_continuation_brief(&carry, 3);
+        assert!(brief.contains("Do not repeat the approach that just failed"));
+    }
+
     #[test]
     fn stop_notice_reports_done_undone_and_reason() {
-        let carry = CarryoverPlan {
-            plan: plan(
+        let carry = carryover(
+            plan(
                 "executing",
                 &[
                     ("read config", None, "done"),
                     ("apply fix", None, "pending"),
                 ],
             ),
-            steps_done: vec![true, false],
-            continuations_used: 3,
-            created_turn_id: "turn-0".into(),
-        };
+            vec![true, false],
+            3,
+        );
         let notice = plan_stop_notice(&carry, "continuation budget exhausted");
         assert!(notice.contains("1/2 steps done"));
         assert!(notice.contains("continuation budget exhausted"));
@@ -1251,11 +1648,15 @@ mod tests {
         assert!(note.contains("Daxton"));
         assert!(note.contains("you marked this done"));
 
-        // Contrast: the legacy evaluator accepts the model's own claim.
-        assert_eq!(
-            evaluate_plan(&p, None, &h).verdict,
-            PlanEvalVerdict::Complete
-        );
+        // The carryover evaluator agrees. It used to accept the model's own
+        // claim here and return `Complete`, which dropped the carryover and
+        // ended the loop with Daxton still missing — the in-turn layer refused
+        // to *claim* the plan was done while the layer deciding whether to
+        // *repeat* took the claim at face value. Both are grounded now.
+        let out = evaluate_plan(&p, None, &h);
+        assert_eq!(out.verdict, PlanEvalVerdict::Continue);
+        assert_eq!(out.outstanding_step_ids, vec![5]);
+        assert_eq!(out.contradicted_step_ids, vec![5]);
     }
 
     /// One successful call must not clear several same-tool steps.
