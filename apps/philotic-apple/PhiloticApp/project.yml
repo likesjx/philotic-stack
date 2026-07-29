@@ -74,13 +74,21 @@ targets:
         INFOPLIST_KEY_NSSpeechRecognitionUsageDescription: "Speech is transcribed on-device to send voice messages."
         INFOPLIST_KEY_NSHealthShareUsageDescription: "PhiloticApp reads your health metrics to build your life graph."
         TARGETED_DEVICE_FAMILY: "1,2"
-        # Pinned to the Simulator SDK/platform (not iphoneos device) because this
-        # dev environment's installed simulator runtime (iOS 26.2) trails the
-        # Xcode-bundled device/SDK component (iOS 26.5), which the toolchain
-        # reports as "not installed" for device builds. Device archiving is out
-        # of scope for the v0 MVP; revisit if/when device builds are needed.
-        SDKROOT: iphonesimulator
-        SUPPORTED_PLATFORMS: iphonesimulator
+        # Device-install ready. Automatic signing: open the project in Xcode,
+        # select the PhiloticApp-iOS target -> Signing & Capabilities, and
+        # pick your Team (a free Apple ID works; DEVELOPMENT_TEAM is left
+        # blank on purpose so Xcode prompts rather than pinning a stale id).
+        # A signed build is what makes the HealthKit permission prompt fire.
+        # NOTE: SDKROOT is intentionally unset so Xcode chooses iphoneos vs
+        # iphonesimulator from the selected run destination. On THIS dev Mac a
+        # CLI `xcodebuild -scheme PhiloticApp-iOS` may still fail on the local
+        # simulator-runtime version skew — build/run the iOS target from
+        # Xcode against your device, not the CLI gate (which uses macOS).
+        CODE_SIGNING_ALLOWED: "YES"
+        CODE_SIGNING_REQUIRED: "YES"
+        CODE_SIGN_STYLE: Automatic
+        CODE_SIGN_IDENTITY: "Apple Development"
+        DEVELOPMENT_TEAM: ""
 
 schemes:
   PhiloticApp-macOS:
