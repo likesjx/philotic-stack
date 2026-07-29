@@ -3375,6 +3375,75 @@ mod tests {
         );
     }
 
+    /// The datasource runtime runs "read-only" capabilities concurrently and
+    /// off the critical path, which is only safe if they genuinely do not
+    /// write — concurrent writes would break the read-after-write ordering the
+    /// sequential path exists to guarantee.
+    ///
+    /// `change_notification_for` is this crate's own authority on what counts as
+    /// a write (it fires a device ping for exactly the mutating outcomes), so it
+    /// makes a good independent cross-check on the allowlist in another crate.
+    ///
+    /// This test earns its keep: it catches the mistake actually made while
+    /// writing that allowlist — `life.conflict` looks like a query but OPENS a
+    /// conflict, and `change_notification_for` classifies it `conflict_opened`.
+    #[test]
+    fn no_capability_treated_as_read_only_can_emit_a_write_notification() {
+        // Permissive payload carrying every id and status the write branches
+        // look for, so any capability classified as a write WILL produce a
+        // notification and fail the assertion below.
+        let statuses = [
+            "proposed",
+            "committed",
+            "resolved",
+            "applied",
+            "awaiting_operator",
+            "open",
+            "ok",
+            "partial",
+        ];
+        let read_only = [
+            "life.recall",
+            "life.recall.stats",
+            "life.view.node",
+            "life.view.neighborhood",
+            "life.patch.list",
+        ];
+
+        for capability in read_only {
+            assert!(
+                datasource::runtime::is_read_only_capability(capability),
+                "{capability} is listed here but the runtime no longer treats it as read-only — \
+                 keep the two lists in step"
+            );
+            for status in statuses {
+                let data = json!({
+                    "status": status,
+                    "node_id": "n-1",
+                    "patch_id": "p-1",
+                    "conflict_id": "c-1",
+                    "first_node_id": "n-1",
+                    "succeeded": 1,
+                });
+                assert!(
+                    change_notification_for(capability, &data).is_none(),
+                    "{capability} produced a write notification for status={status}, so it \
+                     MUTATES and must not run concurrently off the critical path"
+                );
+            }
+        }
+
+        // And the converse for the one that caught us out.
+        assert!(
+            !datasource::runtime::is_read_only_capability("life.conflict"),
+            "life.conflict opens a conflict — it is a write and must stay sequential"
+        );
+        assert!(
+            !datasource::runtime::is_read_only_capability("life.observe.batch"),
+            "the observe batch is the write this whole change exists to keep sequential"
+        );
+    }
+
     #[test]
     fn change_notification_for_batch_pings_once_on_any_success() {
         let change = change_notification_for(

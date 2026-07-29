@@ -36,6 +36,33 @@ use tracing::{error, info, warn};
 /// link between them.
 const PROVIDER_INVOKE_TIMEOUT_SECS: u64 = 75;
 
+/// How many read-only datasource tasks may run concurrently.
+///
+/// Sized to Memgraph's `bolt_num_workers=2` on the vps. Raising it past the
+/// server's worker count does not buy throughput — it re-creates the Bolt
+/// saturation that PRs #275/#277 fixed, where connection churn stalled batches
+/// until the caller's watchdog evicted them. If that setting changes, this
+/// should change with it.
+const CONCURRENT_READ_SLOTS: usize = 2;
+
+/// Capabilities that only read, and may therefore run off the critical path.
+///
+/// Conservative allowlist rather than a "not a write" denylist: a capability
+/// nobody has classified stays on the sequential path, so the failure mode of
+/// forgetting to update this is lost concurrency, never a lost write ordering
+/// guarantee. Keeping writes sequential is what preserves read-after-write
+/// consistency without per-session locking.
+pub fn is_read_only_capability(kind: &str) -> bool {
+    matches!(
+        kind,
+        "life.recall"
+            | "life.recall.stats"
+            | "life.view.node"
+            | "life.view.neighborhood"
+            | "life.patch.list"
+    )
+}
+
 /// How often a still-running provider tells its caller it is alive.
 ///
 /// Must divide the caller's phase watchdog several times over, so a single
@@ -98,6 +125,43 @@ pub async fn run_datasource_controller(config: DatasourceGuestConfig) -> Result<
         })
         .await?;
 
+    // Separate connection for OUTBOUND frames.
+    //
+    // `PhiloticClient` wraps ONE UnixStream and the reply protocol has no
+    // per-message correlation id — replies are matched by FIFO order (see the
+    // DEF-045 note on `PhiloticClient`). Emitting concurrently over the receive
+    // connection would therefore interleave frames and mis-attribute replies,
+    // which is why a read task cannot simply borrow the main client.
+    //
+    // A second connection under its own mutex gives every emitter a serialized,
+    // correctly-ordered pipe while leaving the receive loop free to keep
+    // accepting work. It registers under a DISTINCT guest id on purpose: the
+    // hotel drains a guest's parked-inbound queue on Register, so re-registering
+    // the runner's own id here would steal tasks from the receive connection.
+    // It never subscribes to an inbox and so is never delivered work.
+    let emitter: Arc<tokio::sync::Mutex<PhiloticClient>> = Arc::new(tokio::sync::Mutex::new(
+        PhiloticClient::connect(GuestIdentity {
+            guest_id: format!("{}:emitter", config.guest_id),
+            role: config.role.into(),
+            supported_tools: Vec::new(),
+        })
+        .await?,
+    ));
+
+    // Read-only `life.*` work runs off the critical path so a long write (a
+    // 25-item observe batch can legitimately take tens of seconds) no longer
+    // head-of-line blocks every other agent's sub-second recall on this runner.
+    //
+    // Bounded, not free: Memgraph on the vps runs `bolt_num_workers=2`, and
+    // unbounded concurrency here would recreate by a different route the very
+    // saturation that PRs #275/#277 fixed — the connection-pool churn that
+    // stalled batches until the watchdog evicted them.
+    //
+    // WRITES DELIBERATELY STAY INLINE AND SEQUENTIAL. That preserves
+    // read-after-write ordering by construction, with no per-session locking and
+    // no dependence on every caller supplying a session_id.
+    let read_slots = Arc::new(tokio::sync::Semaphore::new(CONCURRENT_READ_SLOTS));
+
     info!(role = config.role, "listening for datasource tasks");
 
     loop {
@@ -159,6 +223,71 @@ pub async fn run_datasource_controller(config: DatasourceGuestConfig) -> Result<
                     provider = provider.id(),
                     "dispatching datasource task"
                 );
+
+                // Read-only work leaves the critical path; writes stay inline.
+                if is_read_only_capability(controller_task.kind.as_str()) {
+                    let emitter = Arc::clone(&emitter);
+                    let slots = Arc::clone(&read_slots);
+                    let provider = Arc::clone(&provider);
+                    tokio::spawn(async move {
+                        // Acquiring the permit inside the task means the receive
+                        // loop never blocks on a full slot set — excess reads
+                        // queue here instead of stalling the inbox.
+                        let _permit = match slots.acquire_owned().await {
+                            Ok(permit) => permit,
+                            Err(_) => return, // semaphore closed: shutting down
+                        };
+                        let outcome = tokio::time::timeout(
+                            Duration::from_secs(PROVIDER_INVOKE_TIMEOUT_SECS),
+                            provider.invoke(&controller_task),
+                        )
+                        .await
+                        .unwrap_or_else(|_| {
+                            Err(anyhow::anyhow!(
+                                "read provider exceeded the {PROVIDER_INVOKE_TIMEOUT_SECS}s \
+                                 runtime deadline and was abandoned"
+                            ))
+                        });
+                        let mut client = emitter.lock().await;
+                        match outcome {
+                            Ok(output) => {
+                                if let Err(err) = emit_success_response(
+                                    &mut client,
+                                    &reply,
+                                    &controller_task,
+                                    provider.id(),
+                                    output,
+                                )
+                                .await
+                                {
+                                    warn!("failed to emit read response: {err}");
+                                }
+                            }
+                            Err(err) => {
+                                let chained = format!("{err:#}");
+                                error!("datasource read invocation failed: {chained}");
+                                let sub_kind = if chained.contains(CONTRACT_ERROR_MARKER) {
+                                    Some("invalid_request")
+                                } else {
+                                    None
+                                };
+                                if let Err(err) = emit_failure_with_sub_kind(
+                                    &mut client,
+                                    &reply,
+                                    Some(controller_task.kind.as_str()),
+                                    Some(provider.id()),
+                                    format!("provider failed: {chained}"),
+                                    sub_kind,
+                                )
+                                .await
+                                {
+                                    warn!("failed to emit read failure: {err}");
+                                }
+                            }
+                        }
+                    });
+                    continue;
+                }
 
                 // Run the provider under a backstop deadline WHILE emitting
                 // periodic progress pings.
