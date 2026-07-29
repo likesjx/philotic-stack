@@ -1993,6 +1993,8 @@ impl AgentRuntime {
                 streamed_content: String::new(),
                 paracrine_hop_count: 0,
                 paracrine_chain_started_at: None,
+                started_at_unix: None,
+                plan_steps_verified: Vec::new(),
                 selection_source: SelectionSource::default(),
             });
             Some((
