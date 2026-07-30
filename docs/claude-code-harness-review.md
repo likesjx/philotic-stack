@@ -164,6 +164,27 @@ Two results that contradicted prior notes and are worth keeping:
    break the vps-jane build and not find out until it lands on develop. Add a
    `cargo check` job on ubuntu over the package set `build-linux.yml` builds.
 
+## Follow-up outcomes
+
+All nine were implemented on `codex/claude-harness-hardening` (PR #371).
+Notes on the two whose effect is not visible in the diff:
+
+- **`proposal:agent-grant-blast-radius`** — `.claude/settings.local.json` is
+  globally gitignored, so the prune leaves no commit. Recorded here instead:
+  **923 → 728 entries.** Removed 10 shell fragments produced by the permission
+  prompt splitting multi-line commands (`Bash(done)`, `Bash(do echo ...)`), and
+  demoted **185** grants back to prompting — 89 that mutate installed binaries
+  under `/opt/homebrew/Cellar`, 31 `ssh … sudo` (remote root on jane-vps), 20
+  `ansible-playbook` fleet deploys, 18 other remote shells, 11 launchctl/
+  systemctl, plus rm -rf, pkill, brew mutations, git push and rsync. Read-only
+  `Read(/opt/homebrew/...)` grants were kept. A backup of the original is at
+  `$CLAUDE_JOB_DIR/tmp/settings.local.json.backup`.
+- **`proposal:claude-charter-in-repo`** — also fixed the phantom skills at their
+  source. **Four** skills (`planning`, `verification`, `implementation`,
+  `review`) were declared across **nine** canonical profiles and exist nowhere
+  on disk; all nine were re-registered against real skills. `implementation` on
+  the claude-local charter was a symptom, not the disease.
+
 ## Not filed, but noted
 
 - **MCP surface.** `muninn` and `muninn-local` are both connected and expose
