@@ -196,7 +196,7 @@ impl VisionBackend {
             let (shape, data) = enc_out[0]
                 .try_extract_tensor::<f32>()
                 .map_err(|e| anyhow::anyhow!("extract encoder output: {e}"))?;
-            let dims: &[i64] = &shape;
+            let dims: &[i64] = shape;
             anyhow::ensure!(
                 dims.len() == 3,
                 "expected 3D encoder output, got {}D",
@@ -253,7 +253,7 @@ impl VisionBackend {
                 let (shape, data) = dec_out[0]
                     .try_extract_tensor::<f32>()
                     .map_err(|e| anyhow::anyhow!("extract logits: {e}"))?;
-                let dims: &[i64] = &shape;
+                let dims: &[i64] = shape;
                 let vocab = dims[2] as usize;
                 let offset = (seq_len - 1) * vocab;
                 data[offset..offset + vocab]

@@ -163,11 +163,10 @@ impl MembraneRuntime {
                                 match guest.handle_push(&msg).await {
                                     Ok(true) => {} // handled by variant
                                     Ok(false) => {
-                                        if let Some(reply) = extract_outbound_reply(&msg) {
-                                            if let Err(e) = guest.deliver(reply).await {
+                                        if let Some(reply) = extract_outbound_reply(&msg)
+                                            && let Err(e) = guest.deliver(reply).await {
                                                 error!(err = %e, "deliver error");
                                             }
-                                        }
                                     }
                                     Err(e) => error!(err = %e, "handle_push error"),
                                 }
@@ -300,11 +299,11 @@ fn build_inbound_request(envelope: &InboundEnvelope) -> philotic_client::IpcRequ
 
     // Transport-specific extras override same-named standard fields
     // (e.g. Telegram sets "transport": "telegram" and adds chat_id).
-    if !envelope.extra.is_empty() {
-        if let Some(obj) = payload.as_object_mut() {
-            for (key, value) in &envelope.extra {
-                obj.insert(key.clone(), value.clone());
-            }
+    if !envelope.extra.is_empty()
+        && let Some(obj) = payload.as_object_mut()
+    {
+        for (key, value) in &envelope.extra {
+            obj.insert(key.clone(), value.clone());
         }
     }
 

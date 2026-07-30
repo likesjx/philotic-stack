@@ -154,10 +154,10 @@ pub fn canonical_role_node_id_for_agent(
     agent_id: &str,
     observed_role: Option<&str>,
 ) -> Option<&'static str> {
-    if let Some(domain_slug) = domain_slug_for_agent(agent_id) {
-        if let Some(role_node_id) = role_node_id_for_domain(domain_slug) {
-            return Some(role_node_id);
-        }
+    if let Some(domain_slug) = domain_slug_for_agent(agent_id)
+        && let Some(role_node_id) = role_node_id_for_domain(domain_slug)
+    {
+        return Some(role_node_id);
     }
     observed_role.and_then(|role| role_node_id_for_domain(role.trim()))
 }

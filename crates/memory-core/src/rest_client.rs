@@ -1085,10 +1085,8 @@ impl MemoryEngine for MuninnRestEngine {
         // known answer and is worth caching.
         let is_empty_degraded_result =
             is_cross_scope && had_vault_error && result.engrams.is_empty() && result.total == 0;
-        if is_empty_degraded_result {
-            if let Some(err) = first_token_rejected {
-                return Err(err);
-            }
+        if is_empty_degraded_result && let Some(err) = first_token_rejected {
+            return Err(err);
         }
         if !is_empty_degraded_result {
             self.recall_cache.insert(cache_key, result.clone());
@@ -1287,24 +1285,24 @@ mod tests {
                         Ok(0) => break,
                         Ok(n) => {
                             buf.extend_from_slice(&chunk[..n]);
-                            if header_end.is_none() {
-                                if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
-                                    header_end = Some(pos + 4);
-                                    let headers = String::from_utf8_lossy(&buf[..pos]);
-                                    content_len = headers
-                                        .lines()
-                                        .find_map(|l| {
-                                            let (k, v) = l.split_once(':')?;
-                                            k.eq_ignore_ascii_case("content-length")
-                                                .then(|| v.trim().parse().ok())?
-                                        })
-                                        .unwrap_or(0);
-                                }
+                            if header_end.is_none()
+                                && let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n")
+                            {
+                                header_end = Some(pos + 4);
+                                let headers = String::from_utf8_lossy(&buf[..pos]);
+                                content_len = headers
+                                    .lines()
+                                    .find_map(|l| {
+                                        let (k, v) = l.split_once(':')?;
+                                        k.eq_ignore_ascii_case("content-length")
+                                            .then(|| v.trim().parse().ok())?
+                                    })
+                                    .unwrap_or(0);
                             }
-                            if let Some(end) = header_end {
-                                if buf.len() >= end + content_len {
-                                    break;
-                                }
+                            if let Some(end) = header_end
+                                && buf.len() >= end + content_len
+                            {
+                                break;
                             }
                         }
                         Err(_) => break,

@@ -92,9 +92,8 @@ impl DatasourceProvider for SqliteTableProvider {
     }
 
     async fn invoke(&self, task: &DatasourceTask) -> Result<ProviderOutput> {
-        match task.kind.as_str() {
-            "table.list" => return list_dbs(self, task),
-            _ => {}
+        if task.kind.as_str() == "table.list" {
+            return list_dbs(self, task);
         }
         let conn_arc = self.get_conn(task)?;
         let conn = conn_arc.lock().unwrap();

@@ -409,14 +409,14 @@ pub fn compile_observe_edges(input: &LifeObserveInput) -> Result<Vec<ObserveEdge
         // wrong source label is a compile-time rejection; the target label
         // constraint is baked into the MATCH below, so a wrong-label target
         // writes nothing and surfaces as target_missing.
-        if let Some(rule) = agenda_rule {
-            if !rule.source_labels.contains(&label.as_str()) {
-                return Err(format!(
-                    "rel_type {} not allowed from {label} (allowed sources: {})",
-                    rule.rel_type,
-                    rule.source_labels.join(", ")
-                ));
-            }
+        if let Some(rule) = agenda_rule
+            && !rule.source_labels.contains(&label.as_str())
+        {
+            return Err(format!(
+                "rel_type {} not allowed from {label} (allowed sources: {})",
+                rule.rel_type,
+                rule.source_labels.join(", ")
+            ));
         }
 
         // Label and rel_type are both whitelisted above — safe to interpolate.
@@ -759,10 +759,10 @@ pub fn patch_list_query(statuses: &[String], limit: usize) -> String {
     ];
     let mut tokens: Vec<&str> = Vec::new();
     for status in statuses {
-        if let Some(known) = known.iter().copied().find(|k| *k == status.as_str()) {
-            if !tokens.contains(&known) {
-                tokens.push(known);
-            }
+        if let Some(known) = known.iter().copied().find(|k| *k == status.as_str())
+            && !tokens.contains(&known)
+        {
+            tokens.push(known);
         }
     }
     if tokens.is_empty() {

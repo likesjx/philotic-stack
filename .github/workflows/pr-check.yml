@@ -155,6 +155,55 @@ jobs:
             target
           key: linux-pr-cargo-${{ hashFiles('**/Cargo.lock') }}-${{ github.run_id }}
 
+  # proposal:clippy-ratchet-workspace-lints — a HARD gate, but only for crates
+  # that have opted in via `[lints] workspace = true`. 17 of 32 are gated today;
+  # the rest still only warn, so this is green on arrival rather than red.
+  # Clean a crate, add the opt-in, and it can never regress. Progress is
+  # visible as the count of Cargo.toml files carrying [lints].
+  #
+  # Runs on macOS to match the dev fleet: onnx-runner pulls ort with the
+  # `coreml` feature, and other gated crates are Apple-leaning, so a Linux
+  # clippy run is not a like-for-like check. It shares the cache key the test
+  # job warms on develop pushes, so it restores rather than building cold.
+  clippy:
+    name: clippy (ratchet)
+    runs-on: macos-14
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system dependencies (Opus)
+        run: brew install opus pkg-config
+
+      - name: Install pinned Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.94.0"
+          components: clippy
+
+      - name: Restore cargo cache
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: macos-arm64-clippy-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            macos-arm64-clippy-
+            macos-arm64-cargo-
+
+      - name: Report ratchet coverage
+        run: |
+          gated=$(grep -l '^\[lints\]' crates/*/Cargo.toml | wc -l | tr -d ' ')
+          total=$(ls -d crates/*/ | wc -l | tr -d ' ')
+          echo "### Clippy ratchet: ${gated}/${total} crates gated at deny" >> "$GITHUB_STEP_SUMMARY"
+
+      # Opted-in crates deny warnings; everything else still only warns, so a
+      # non-zero exit here means a gated crate regressed.
+      - name: cargo clippy --workspace
+        run: cargo clippy --workspace --all-targets
+
   test:
     name: test (macos arm64, advisory)
     runs-on: macos-14

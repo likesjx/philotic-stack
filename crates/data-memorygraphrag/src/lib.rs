@@ -212,11 +212,11 @@ impl EvidencePacket {
             violations.push("conflicted evidence packets require at least one conflict_id".into());
         }
 
-        if let Some(range) = &self.valid_time_range {
-            if range.starts_at.is_none() && range.ends_at.is_none() {
-                violations
-                    .push("valid_time_range requires starts_at, ends_at, or both".to_string());
-            }
+        if let Some(range) = &self.valid_time_range
+            && range.starts_at.is_none()
+            && range.ends_at.is_none()
+        {
+            violations.push("valid_time_range requires starts_at, ends_at, or both".to_string());
         }
 
         finish_validation(violations)
@@ -868,21 +868,21 @@ impl ContextPacket {
             }
 
             for passage in &evidence.passage_refs {
-                if let Some(muninn_id) = &passage.muninn_engram_id {
-                    if seen_muninn.insert(muninn_id.clone()) {
-                        refs.push(ContextRef {
-                            ref_id: muninn_id.clone(),
-                            kind: ContextRefKind::MuninnEngram,
-                            authority: ContextAuthority::MuninnContinuity,
-                            summary: Some("Muninn passage source for LifeGraph evidence".into()),
-                            validation_state: None,
-                            uri: None,
-                            metadata: serde_json::json!({
-                                "passage_id": passage.passage_id,
-                                "excerpt_hash": passage.excerpt_hash,
-                            }),
-                        });
-                    }
+                if let Some(muninn_id) = &passage.muninn_engram_id
+                    && seen_muninn.insert(muninn_id.clone())
+                {
+                    refs.push(ContextRef {
+                        ref_id: muninn_id.clone(),
+                        kind: ContextRefKind::MuninnEngram,
+                        authority: ContextAuthority::MuninnContinuity,
+                        summary: Some("Muninn passage source for LifeGraph evidence".into()),
+                        validation_state: None,
+                        uri: None,
+                        metadata: serde_json::json!({
+                            "passage_id": passage.passage_id,
+                            "excerpt_hash": passage.excerpt_hash,
+                        }),
+                    });
                 }
             }
         }
@@ -1868,17 +1868,9 @@ impl Default for RunnerConfig {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct MemoryGraphRagRunner {
     pub config: RunnerConfig,
-}
-
-impl Default for MemoryGraphRagRunner {
-    fn default() -> Self {
-        Self {
-            config: RunnerConfig::default(),
-        }
-    }
 }
 
 impl MemoryGraphRagRunner {

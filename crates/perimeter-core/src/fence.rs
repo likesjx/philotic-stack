@@ -29,14 +29,15 @@ impl IngressDecision {
 /// second gate, applied to every route on whatever interface is bound.
 ///
 /// Policy (tier = the hotel's current perimeter ceiling):
-/// - Local:    Allow. The listener is loopback-bound at this tier, so only
-///             local processes can connect at all.
-/// - Lan:      Allow any source that reached the listener. Auth is enforced
-///             at route level (`auth != None` is required for non-loopback
-///             publication as of the MCP membrane hardening).
-/// - Mesh:     Bearer token required unless request is from loopback
-///             (loopback callers are local hotel tooling, not remote mesh clients).
-/// - Internet: Bearer token required. No loopback bypass — callers must authenticate.
+/// - Local: Allow. The listener is loopback-bound at this tier, so only
+///   local processes can connect at all.
+/// - Lan: Allow any source that reached the listener. Auth is enforced
+///   at route level (`auth != None` is required for non-loopback
+///   publication as of the MCP membrane hardening).
+/// - Mesh: Bearer token required unless request is from loopback
+///   (loopback callers are local hotel tooling, not remote mesh clients).
+/// - Internet: Bearer token required. No loopback bypass — callers must
+///   authenticate.
 pub fn check_ingress(
     tier: ExposureTier,
     auth_header: Option<&str>,

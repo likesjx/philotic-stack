@@ -15,3 +15,7 @@ rusqlite = { version = "0.37", features = ["bundled"] }
 sha2 = "0.10"
 tokio = { version = "1", features = ["rt"] }
 tracing = "0.1"
+
+# Clippy ratchet: this crate is warning-free and must stay that way.
+[lints]
+workspace = true

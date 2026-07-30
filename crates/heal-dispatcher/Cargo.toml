@@ -17,3 +17,7 @@ serde_json = "1.0"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
 tracing = "0.1"
 tracing-subscriber = "0.3"
+
+# Clippy ratchet: this crate is warning-free and must stay that way.
+[lints]
+workspace = true
