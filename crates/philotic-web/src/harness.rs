@@ -1695,6 +1695,98 @@ fn export_harness(
     apply_harness(engine, adapter, harness_id, Some(config.profile), None)
 }
 
+/// Resolve every skill a harness declares against the filesystem.
+///
+/// proposal:harness-verify-resolves-skills.
+///
+/// `verify` used to report `clean` for harness:claude-local while all seven
+/// skills its charter declared Active were unreachable by the runtime, and one
+/// of them (`implementation`) did not exist anywhere on disk. It compared the
+/// managed config block's hash and nothing else. A verifier that attests a
+/// broken harness is healthy is worse than no verifier at all, because the
+/// green is trusted — that is exactly how the Claude harness sat broken.
+///
+/// Three things have to hold for a declared skill to be real:
+///   1. `skills/<name>/SKILL.md` exists,
+///   2. its frontmatter parses and carries `name:` + `description:`
+///      (11 of 32 once opened with a bare `name:` and no `---`, so they would
+///      not have registered even if correctly placed), and
+///   3. for claude-code, it is reachable from a discovery path Claude Code
+///      actually reads — `.claude/skills/<name>` — never a top-level `skills/`.
+fn check_declared_skills(runtime_kind: &str, skills: &[String], root: &Path) -> Vec<String> {
+    let mut failures = Vec::new();
+
+    for skill in skills {
+        let skill_md = root.join("skills").join(skill).join("SKILL.md");
+        if !skill_md.is_file() {
+            failures.push(format!(
+                "skill '{skill}' is declared but skills/{skill}/SKILL.md does not exist"
+            ));
+            continue;
+        }
+
+        match fs::read_to_string(&skill_md) {
+            Ok(body) => {
+                if let Some(problem) = frontmatter_problem(&body) {
+                    failures.push(format!("skill '{skill}': {problem}"));
+                }
+            }
+            Err(err) => {
+                failures.push(format!("skill '{skill}': cannot read SKILL.md ({err})"));
+                continue;
+            }
+        }
+
+        // Placement only matters for runtimes with a fixed discovery path.
+        if runtime_kind == "claude-code" {
+            let discoverable = root.join(".claude").join("skills").join(skill);
+            // is_file() follows symlinks, which is the supported layout here:
+            // a `<skill-name>` entry may be a symlink and Claude Code follows it.
+            if !discoverable.join("SKILL.md").is_file() {
+                failures.push(format!(
+                    "skill '{skill}' is not reachable from Claude Code's discovery path \
+                     (.claude/skills/{skill}/SKILL.md); a top-level skills/ directory is never scanned"
+                ));
+            }
+        }
+    }
+
+    failures
+}
+
+/// Returns a description of what is wrong with a SKILL.md frontmatter block,
+/// or `None` when it is well-formed.
+fn frontmatter_problem(body: &str) -> Option<String> {
+    let mut lines = body.lines();
+    if lines.next().map(str::trim) != Some("---") {
+        return Some(
+            "frontmatter does not open with '---', so the skill will not register".to_string(),
+        );
+    }
+
+    let mut has_name = false;
+    let mut has_description = false;
+    for line in lines {
+        if line.trim() == "---" {
+            return if has_name && has_description {
+                None
+            } else if !has_name {
+                Some("frontmatter is missing 'name:'".to_string())
+            } else {
+                Some("frontmatter is missing 'description:'".to_string())
+            };
+        }
+        if line.starts_with("name:") {
+            has_name = true;
+        }
+        if line.starts_with("description:") {
+            has_description = true;
+        }
+    }
+
+    Some("frontmatter block is never closed with '---'".to_string())
+}
+
 fn verify_harness(
     engine: &GraphEngine,
     adapter: &dyn HarnessAdapter,
@@ -1757,6 +1849,17 @@ fn verify_harness(
             if severity != Some("error") {
                 severity = Some("warn");
             }
+        }
+
+        // proposal:harness-verify-resolves-skills — a declared skill the
+        // runtime cannot load is an error, not a warning: the charter is
+        // promising the agent a capability that does not exist.
+        let repo_root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let skill_failures =
+            check_declared_skills(adapter.runtime_kind(), &config.skills, &repo_root);
+        if !skill_failures.is_empty() {
+            drift_status = "drifted";
+            severity = Some("error");
         }
 
         let mut updated = harness.clone();
@@ -1824,7 +1927,12 @@ fn verify_harness(
                     "last_seen_at": now.to_rfc3339(),
                     "resolved_at": serde_json::Value::Null,
                     "resolved_by_observation": serde_json::Value::Null,
-                    "summary": if aux_failures.is_empty() {
+                    "summary": if !skill_failures.is_empty() {
+                        format!(
+                            "Harness drift: {} declared skill(s) do not resolve",
+                            skill_failures.len()
+                        )
+                    } else if aux_failures.is_empty() {
                         "Rendered config does not match observed local state".to_string()
                     } else {
                         format!(
@@ -1835,7 +1943,8 @@ fn verify_harness(
                     "details": {
                         "rendered_hash": rendered_hash,
                         "observed_hash": observation.properties["profile_hash"].clone(),
-                        "aux_failures": aux_failures
+                        "aux_failures": aux_failures,
+                        "skill_failures": skill_failures
                     }
                 }),
                 file_path: Some(config.target_path.to_string_lossy().to_string()),
@@ -1892,6 +2001,14 @@ fn verify_harness(
             harness_id,
             drift_status
         );
+        // Print the specifics: "drifted" alone sends people to diff the config
+        // file, which is not where an unresolvable skill shows up.
+        for failure in &skill_failures {
+            eprintln!("  skill: {failure}");
+        }
+        for failure in &aux_failures {
+            eprintln!("  aux:   {failure}");
+        }
         return Ok(());
     }
 
@@ -3529,5 +3646,94 @@ mod tests {
         assert!(missing.evaluate().is_some());
 
         fs::remove_dir_all(&dir).ok();
+    }
+
+    // ---- proposal:harness-verify-resolves-skills ------------------------
+    //
+    // Regression cover for a verifier that reported `clean` while every skill
+    // the charter declared was unreachable, and one did not exist at all.
+
+    fn write_skill(root: &Path, name: &str, body: &str) {
+        let dir = root.join("skills").join(name);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("SKILL.md"), body).unwrap();
+    }
+
+    fn make_discoverable(root: &Path, name: &str) {
+        let dir = root.join(".claude").join("skills").join(name);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("SKILL.md"),
+            fs::read_to_string(root.join("skills").join(name).join("SKILL.md")).unwrap(),
+        )
+        .unwrap();
+    }
+
+    const GOOD: &str = "---\nname: good\ndescription: A well-formed skill.\n---\n\n# Good\n";
+
+    #[test]
+    fn declared_skill_that_does_not_exist_is_reported() {
+        let tmp = tempfile::tempdir().unwrap();
+        // `implementation` was declared by the claude-local charter and existed
+        // nowhere on disk — verify still said clean.
+        let failures =
+            check_declared_skills("claude-code", &["implementation".to_string()], tmp.path());
+        assert_eq!(failures.len(), 1, "{failures:?}");
+        assert!(failures[0].contains("does not exist"), "{failures:?}");
+    }
+
+    #[test]
+    fn skill_present_but_not_in_claude_discovery_path_is_reported() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_skill(tmp.path(), "good", GOOD);
+        // Present under skills/ but with no .claude/skills entry: this was the
+        // state of all 32 skills, none of which Claude Code could load.
+        let failures = check_declared_skills("claude-code", &["good".to_string()], tmp.path());
+        assert_eq!(failures.len(), 1, "{failures:?}");
+        assert!(failures[0].contains("discovery path"), "{failures:?}");
+
+        // Other runtimes read skills/ directly, so placement is not their problem.
+        assert!(check_declared_skills("codex", &["good".to_string()], tmp.path()).is_empty());
+    }
+
+    #[test]
+    fn fully_wired_skill_passes() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_skill(tmp.path(), "good", GOOD);
+        make_discoverable(tmp.path(), "good");
+        assert!(check_declared_skills("claude-code", &["good".to_string()], tmp.path()).is_empty());
+    }
+
+    #[test]
+    fn malformed_frontmatter_is_reported() {
+        // The exact shape 11 of 32 SKILL.md files had: a bare `name:` line with
+        // no opening `---`, which never registers.
+        assert!(frontmatter_problem("name: x\ndescription: y\n\n# Body\n")
+            .unwrap()
+            .contains("does not open with '---'"));
+        assert!(frontmatter_problem("---\ndescription: y\n---\n")
+            .unwrap()
+            .contains("missing 'name:'"));
+        assert!(frontmatter_problem("---\nname: x\n---\n")
+            .unwrap()
+            .contains("missing 'description:'"));
+        assert!(frontmatter_problem("---\nname: x\ndescription: y\n")
+            .unwrap()
+            .contains("never closed"));
+        assert!(frontmatter_problem(GOOD).is_none());
+    }
+
+    #[test]
+    fn malformed_frontmatter_fails_the_declared_skill_check() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_skill(
+            tmp.path(),
+            "bare",
+            "name: bare\ndescription: no delimiters\n",
+        );
+        make_discoverable(tmp.path(), "bare");
+        let failures = check_declared_skills("claude-code", &["bare".to_string()], tmp.path());
+        assert_eq!(failures.len(), 1, "{failures:?}");
+        assert!(failures[0].contains("---"), "{failures:?}");
     }
 }
