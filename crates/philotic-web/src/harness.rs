@@ -2716,13 +2716,46 @@ fn windsurf_target_path(harness_id: &str) -> Result<PathBuf> {
         .join(format!("philotic-{}.md", short_harness_id(harness_id))))
 }
 
+/// Default skills per canonical profile.
+///
+/// These must be REAL skill directory names under `skills/`. They used to be
+/// generic placeholders — `planning`, `verification`, `implementation` — none
+/// of which exist on disk, which is how `implementation` ended up declared
+/// Active on the claude-local charter while existing nowhere. `verify` now
+/// treats an unresolvable declared skill as an error, so fiction here would
+/// mark every harness drifted.
+///
+/// `default_skills_are_real_skills` guards this: it resolves every name below
+/// against `skills/`, so a placeholder can never be reintroduced silently.
 fn default_skills_for_profile(profile: &str) -> Vec<String> {
     match profile {
-        "verifier" => vec!["verification".into(), "muninn-memory-habit".into()],
-        "implementer" => vec!["implementation".into(), "muninn-memory-habit".into()],
+        "verifier" => vec![
+            "verification-ladder".into(),
+            "verification-orchestrator".into(),
+            "muninn-memory-habit".into(),
+        ],
+        "implementer" => vec![
+            "philotic-slice-closeout".into(),
+            "verification-ladder".into(),
+            "muninn-memory-habit".into(),
+        ],
+        "reviewer" => vec![
+            "verification-ladder".into(),
+            "proposal-maintainer".into(),
+            "muninn-memory-habit".into(),
+        ],
+        "architect" => vec![
+            "graph-intelligence".into(),
+            "proposal-pipeline".into(),
+            "architecture-docs-maintainer".into(),
+            "muninn-memory-habit".into(),
+        ],
+        // orchestrator and anything else
         _ => vec![
-            "planning".into(),
-            "verification".into(),
+            "graph-intelligence".into(),
+            "proposal-pipeline".into(),
+            "verification-ladder".into(),
+            "session-hygiene".into(),
             "muninn-memory-habit".into(),
         ],
     }
@@ -3721,6 +3754,53 @@ mod tests {
             .unwrap()
             .contains("never closed"));
         assert!(frontmatter_problem(GOOD).is_none());
+    }
+
+    /// Every default skill must be a real directory under `skills/`.
+    ///
+    /// The defaults were once `planning`, `verification` and `implementation`,
+    /// none of which exist — which is how `implementation` came to be declared
+    /// Active on a charter while existing nowhere on disk. Since `verify` now
+    /// errors on an unresolvable declared skill, a placeholder here would mark
+    /// every harness drifted. This makes that impossible to reintroduce.
+    #[test]
+    fn default_skills_are_real_skills() {
+        // tests run with CWD = crate root; skills/ lives at the repo root.
+        let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(Path::parent)
+            .expect("repo root")
+            .to_path_buf();
+        let skills_dir = repo_root.join("skills");
+        assert!(
+            skills_dir.is_dir(),
+            "expected {} to exist",
+            skills_dir.display()
+        );
+
+        for profile in [
+            "orchestrator",
+            "implementer",
+            "verifier",
+            "reviewer",
+            "architect",
+            "something-unknown",
+        ] {
+            for skill in default_skills_for_profile(profile) {
+                let path = skills_dir.join(&skill).join("SKILL.md");
+                assert!(
+                    path.is_file(),
+                    "profile '{profile}' declares skill '{skill}', but {} does not exist",
+                    path.display()
+                );
+                let body = fs::read_to_string(&path).unwrap();
+                assert!(
+                    frontmatter_problem(&body).is_none(),
+                    "profile '{profile}' declares skill '{skill}', whose frontmatter is invalid: {:?}",
+                    frontmatter_problem(&body)
+                );
+            }
+        }
     }
 
     #[test]
