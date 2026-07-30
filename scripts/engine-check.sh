@@ -90,6 +90,14 @@ else
   fail "docs metadata anchor set passes frontmatter checks"
 fi
 
+# proposal:declare-system-dependencies — undeclared system packages made the
+# workspace only appear to build from a clean checkout.
+if "${ROOT_DIR}/scripts/preflight-system-deps.sh" >/dev/null 2>&1; then
+  pass "system dependency preflight passes"
+else
+  fail "system dependency preflight fails — run: just preflight"
+fi
+
 # proposal:secret-push-guard-activation — assert the guard is actually wired.
 #
 # .githooks/pre-push has existed (and invoked scripts/secret-push-check.py)

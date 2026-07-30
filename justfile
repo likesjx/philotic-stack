@@ -24,9 +24,17 @@ model-catalog-egress-smoke:
 engine-check:
     ./scripts/engine-check.sh
 
-# Install repo-local git hooks such as the deterministic pre-push secret check.
+# Install repo-local git hooks: the deterministic pre-push secret check and the
+# pre-commit rustfmt gate. core.hooksPath lives in .git/config, which is shared
+# across linked worktrees, so this covers every worktree at once.
 install-git-hooks:
     git config core.hooksPath .githooks
+
+# Check the system packages the workspace needs but does not declare.
+# Run this first on a new machine — it fails loudly at setup instead of letting
+# the build die confusingly three minutes in.
+preflight:
+    ./scripts/preflight-system-deps.sh
 
 # Mandatory Muninn bootstrap gate for meaningful sessions.
 session-start:
