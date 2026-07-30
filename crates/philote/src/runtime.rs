@@ -6807,6 +6807,13 @@ impl AgentRuntime {
         let new_skillset: Option<Vec<String>> = bindings
             .get("effective_skillset")
             .and_then(|v| serde_json::from_value(v.clone()).ok());
+        // Hotel-composed "name — description" doctrine lines for the skills in
+        // play. Without carrying these, only a checkpoint-restored session ever
+        // has them — a fresh session's [Skill guidance] prompt section (see
+        // SessionState::project_agent_self) would stay empty forever.
+        let new_skill_guidance: Option<Vec<String>> = bindings
+            .get("effective_skill_guidance")
+            .and_then(|v| serde_json::from_value(v.clone()).ok());
         let new_allowed_classes: Option<Vec<String>> = bindings
             .get("allowed_classes")
             .and_then(|v| serde_json::from_value(v.clone()).ok());
@@ -6826,6 +6833,13 @@ impl AgentRuntime {
             if skillset != state.bindings.effective_skillset {
                 state.bindings.effective_skillset = skillset;
                 changed = true;
+            }
+        }
+        if let Some(skill_guidance) = new_skill_guidance {
+            // Prompt-facing only — guidance never affects tool routing, so it
+            // deliberately does not set `changed` (no tool-assembly rebuild).
+            if skill_guidance != state.bindings.effective_skill_guidance {
+                state.bindings.effective_skill_guidance = skill_guidance;
             }
         }
         if let Some(allowed_classes) = new_allowed_classes {
