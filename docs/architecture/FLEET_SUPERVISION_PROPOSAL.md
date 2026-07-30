@@ -4,7 +4,7 @@ doc_type: proposal
 domain: operator-control-plane
 status: proposed
 disposition: proposed
-last_updated: 2026-07-27
+last_updated: 2026-07-30
 verification_level: field-evidence
 tags:
 - supervision
@@ -130,6 +130,39 @@ divergence table above impossible to reproduce silently.
 **S2 — Serving, not running.** Liveness must assert the service *answers* (TCP +
 protocol probe), and dispatch must assert delivery is *ACKed*. Never trust a
 registration row. Covers evidence 4.
+
+*Recovery half shipped (PR #382); detection half still open.* When the zombie
+watchdog reaps a turn, a session pinned to a role incarnation that let two or
+more consecutive turns die is now re-pointed to its base agent and files
+`role_incarnation_not_serving`. That bounds the damage; it does not prevent the
+wedge.
+
+The 2026-07-28 recurrence — agent-jane deaf a second time, ~17h, same pin, that
+philote again inert at 0.54s CPU over 17h — surfaced the two mechanisms the
+detection half has to close:
+
+1. **The re-pin needs no operator command.** `deliver_live_guest_task`
+   (`ipc.rs:4161`) calls `update_session_active_incarnation` for *any* delivery
+   carrying `activate_session_id`. A single whisper, parked-task flush, or role
+   dispatch to a role incarnation therefore re-points the whole conversational
+   session at it — no `/role`, no `/sfw`, nothing in the log that reads like a
+   decision. Its liveness test is "has an inbox subscription under this role",
+   which the inert philote satisfies: it subscribed and then never consumed.
+   *Having a subscription is not the same as draining it* — the same conflation
+   as evidence 4, one layer down.
+2. **No detector could fire.** `SUBSCRIBER_BACKLOG_WEDGE_THRESHOLD` is 32
+   undrained frames. A turn that dies undispatched contributes roughly one
+   frame, so the ~11 turns lost in the recurrence never came close. The
+   threshold is calibrated for a chatty streaming guest and is effectively
+   unreachable for a conversational agent — it would take 32 lost turns to trip.
+   `subscriber_wedged` exists in the deployed binary and has fired **zero**
+   times fleet-wide.
+
+So the wedge is entered silently by a routine delivery, and every existing
+detector is either downstream of the bad assumption or calibrated out of range.
+A correct S2 must (a) refuse to re-pin a session onto an incarnation that has
+not demonstrably consumed a task, and (b) make the backlog gauge sensitive to
+*undelivered turns*, not just frame count.
 
 **S3 — Repair actions for service probes.** `service_probe_failed:<svc>` gains a
 bounded restart action for known host services — backoff, budget, and only then
