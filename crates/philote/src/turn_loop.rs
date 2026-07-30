@@ -43,7 +43,20 @@ impl AgentRuntime {
     pub(super) async fn evict_timed_out_turns(&mut self) {
         const WAITING_MODEL_SECS: u64 = 300;
         const THINKING_SECS: u64 = 90; // post-model, dispatching actions or building reply
-        const WAITING_TOOL_SECS: u64 = 90;
+        // Sized from observed healthy runs, not intuition. On mac-jane, successful
+        // turns sit at p95 = 79s but a healthy `life.flywheel.brief` (Memgraph over
+        // Tailscale) took 154s — while 14 turns were evicted at exactly 90/92/94s in
+        // WaitingTool. The old 90s budget was below the real tool population and was
+        // killing healthy-but-slow work, which is why scheduled briefs never landed.
+        // 300s matches WAITING_MODEL_SECS.
+        //
+        // This is a PER-CALL budget. MAX_TOTAL_ACTIVE_SECS is the aggregate one, and
+        // now that it actually enforces it is the binding constraint on a multi-call
+        // turn: four calls each inside 300s are still evicted once the turn passes
+        // 600s total. Raising this alone buys nothing past the ceiling. 600s remains
+        // ample for the observed population — the slowest healthy multi-call turn
+        // (life.recall x3 + life.flywheel.brief) totalled 154s.
+        const WAITING_TOOL_SECS: u64 = 300;
         const WAITING_VOICE_SECS: u64 = 60;
         const WAITING_APPROVAL_SECS: u64 = 300; // 5 min — operator may be slow
         // A blocking `delegate.whisper` waits for a specialist turn that itself may
@@ -63,17 +76,35 @@ impl AgentRuntime {
 
         // Step 0: maintain total_active_since — track ALL sessions with an active
         // turn, regardless of phase, so InProgress turns are also bounded.
+        //
+        // The stamp is read from `SessionState::active_turn_since` (set at turn start)
+        // rather than stamped here with the tick's `now`. That distinction is the whole
+        // point: `entry().or_insert(now)` only holds the ceiling if this function runs
+        // regularly, and when ticks were missed the budget silently restarted from the
+        // resume. Turns escaped the 600s ceiling for 823–3177s that way while reporting
+        // 90s. Anchoring to a stamp taken outside the tick makes the deadline survive
+        // any gap: the next tick to run sees the true elapsed time and evicts.
         let all_session_ids: Vec<String> = self.sessions.keys().cloned().collect();
         for sid in &all_session_ids {
-            if self
+            let turn_started = self
                 .sessions
                 .get(sid)
-                .map(|s| s.active_turn.is_some())
-                .unwrap_or(false)
-            {
-                self.total_active_since.entry(sid.clone()).or_insert(now);
-            } else {
-                self.total_active_since.remove(sid);
+                .filter(|s| s.active_turn.is_some())
+                .map(|s| s.active_turn_since);
+            match turn_started {
+                // Active turn with an authoritative start stamp.
+                Some(Some(started)) => {
+                    self.total_active_since.insert(sid.clone(), started);
+                }
+                // Active turn that reached `active_turn` without going through
+                // `start_turn` (e.g. a parked turn restored inline for failure).
+                // Fall back to the old tick-local behaviour so it stays covered.
+                Some(None) => {
+                    self.total_active_since.entry(sid.clone()).or_insert(now);
+                }
+                None => {
+                    self.total_active_since.remove(sid);
+                }
             }
         }
         self.total_active_since
@@ -82,9 +113,17 @@ impl AgentRuntime {
         // Step 1: reconcile stuck_turn_first_seen against current session state.
         // Add sessions newly in a waiting phase; reset when the exact wait signature changes.
         // Parked approval turns count as waiting (they live in parked_approval_turn, not active_turn).
+        //
+        // Each waiting state also yields the instant it actually began — `turn_waiting_since`
+        // for an active turn (stamped in `set_active_turn_phase`), `parked_*_since` for a
+        // parked one. Those stamps are taken at the transition, so they are immune to
+        // missed watchdog ticks; the tick's `now` is only a fallback for the rare state
+        // that carries no stamp. Signature-change semantics are unchanged: a turn making
+        // real progress through several tool calls still re-stamps, and therefore still
+        // earns a fresh phase budget per call.
         let session_ids: Vec<String> = self.sessions.keys().cloned().collect();
         for session_id in &session_ids {
-            let wait_signature = self.sessions.get(session_id).and_then(|s| {
+            let wait_state = self.sessions.get(session_id).and_then(|s| {
                 if let Some(turn) = s.active_turn.as_ref() {
                     if matches!(
                         turn.phase,
@@ -98,35 +137,55 @@ impl AgentRuntime {
                             .as_ref()
                             .map(|tool| tool.tool_name.as_str())
                             .unwrap_or("-");
-                        return Some(format!(
-                            "active:{}:{:?}:{}:{}",
-                            turn.turn_id, turn.phase, turn.iteration, pending_tool
+                        return Some((
+                            format!(
+                                "active:{}:{:?}:{}:{}",
+                                turn.turn_id, turn.phase, turn.iteration, pending_tool
+                            ),
+                            s.turn_waiting_since,
                         ));
                     }
                 }
                 if let Some(turn) = s.parked_approval_turn.as_ref() {
-                    return Some(format!("parked_approval:{}", turn.turn_id));
+                    return Some((
+                        format!("parked_approval:{}", turn.turn_id),
+                        s.parked_approval_since,
+                    ));
                 }
                 if let Some(turn) = s.parked_plan_turn.as_ref() {
-                    return Some(format!("parked_plan:{}", turn.turn_id));
+                    return Some((format!("parked_plan:{}", turn.turn_id), s.parked_plan_since));
                 }
                 None
             });
 
-            if let Some(signature) = wait_signature {
+            if let Some((signature, waiting_since)) = wait_state {
                 let signature_changed = self
                     .stuck_turn_signature
                     .get(session_id)
                     .map(|current| current != &signature)
                     .unwrap_or(true);
                 if signature_changed {
-                    self.stuck_turn_first_seen.insert(session_id.clone(), now);
                     self.stuck_turn_signature
                         .insert(session_id.clone(), signature);
-                } else {
-                    self.stuck_turn_first_seen
-                        .entry(session_id.clone())
-                        .or_insert(now);
+                }
+                match waiting_since {
+                    // Authoritative: re-anchor every tick. The stamp only moves when the
+                    // phase actually changes, so this is stable across ticks — and a gap
+                    // in ticks can no longer rewind the deadline.
+                    Some(started) => {
+                        self.stuck_turn_first_seen
+                            .insert(session_id.clone(), started);
+                    }
+                    // No stamp for this state — preserve the original tick-local
+                    // behaviour rather than leaving the session uncovered.
+                    None if signature_changed => {
+                        self.stuck_turn_first_seen.insert(session_id.clone(), now);
+                    }
+                    None => {
+                        self.stuck_turn_first_seen
+                            .entry(session_id.clone())
+                            .or_insert(now);
+                    }
                 }
             } else {
                 self.stuck_turn_first_seen.remove(session_id);
@@ -294,12 +353,18 @@ impl AgentRuntime {
             elapsed_secs,
         ) in timed_out
         {
-            let has_pending_tool = self
+            // Name the tool, not just its presence. `has_pending_tool=true` alone cannot
+            // tell you which tool overran, so diagnosing an eviction meant reconstructing
+            // the call from `session_event` rows in the hotel graph. One field removes
+            // that whole step.
+            let pending_tool = self
                 .sessions
                 .get(&session_id)
                 .and_then(|s| s.active_turn.as_ref())
-                .map(|t| t.pending_tool_call.is_some())
-                .unwrap_or(false);
+                .and_then(|t| t.pending_tool_call.as_ref())
+                .map(|tool| tool.tool_name.clone());
+            let has_pending_tool = pending_tool.is_some();
+            let pending_tool = pending_tool.unwrap_or_else(|| "-".to_string());
 
             // WaitingModel: escalate to the next fallback tier instead of evicting.
             // The model-router's IPC connection may have dropped silently (no error
@@ -312,6 +377,7 @@ impl AgentRuntime {
                     phase = %phase,
                     elapsed_secs = %elapsed_secs,
                     has_pending_tool = %has_pending_tool,
+                    pending_tool = %pending_tool,
                     "Turn watchdog: WaitingModel timeout — escalating to next fallback tier"
                 );
                 self.stuck_turn_first_seen.remove(&session_id);
@@ -334,6 +400,7 @@ impl AgentRuntime {
                 phase = %phase,
                 elapsed_secs = %elapsed_secs,
                 has_pending_tool = %has_pending_tool,
+                pending_tool = %pending_tool,
                 "Turn watchdog: evicting stuck turn"
             );
 
@@ -348,6 +415,7 @@ impl AgentRuntime {
                 state.parked_approval_turn = None;
                 state.parked_approval_since = None;
                 state.turn_waiting_since = None;
+                state.active_turn_since = None;
 
                 // Persist clean checkpoint so a restart also starts unblocked.
                 let mem_type = state.checkpoint_memory_type();
@@ -3220,6 +3288,7 @@ impl AgentRuntime {
             // re-queues it — creating an infinite queue/drain loop.
             state.active_turn = None;
             state.turn_waiting_since = None;
+            state.active_turn_since = None;
             (
                 task_id,
                 checkpoint_memory_type,
@@ -3698,5 +3767,266 @@ pub(super) fn plan_followup_after_turn(
         Some(PlanFollowup::Continue { eval_json: None })
     } else {
         None
+    }
+}
+
+#[cfg(test)]
+mod watchdog_clock_tests {
+    use super::super::tests::{run_recording_hotel, test_working_turn};
+    use super::*;
+    use crate::session::SessionState;
+    use std::time::{Duration, Instant};
+
+    /// Build a runtime wired to a stub hotel over a throwaway UDS.
+    async fn runtime_with_stub_hotel(
+        tag: &str,
+    ) -> (
+        AgentRuntime,
+        String,
+        tokio::task::JoinHandle<()>,
+        std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
+    ) {
+        let socket_path = format!(
+            "/tmp/philote-watchdog-{}-{}.sock",
+            tag,
+            Uuid::new_v4().simple()
+        );
+        let listener = tokio::net::UnixListener::bind(&socket_path).expect("bind");
+        let emitted = std::sync::Arc::new(std::sync::Mutex::new(Vec::<serde_json::Value>::new()));
+        let server = tokio::spawn(run_recording_hotel(listener, emitted.clone()));
+        let identity = philotic_client::GuestIdentity {
+            guest_id: "agent-watchdog".into(),
+            role: "agent".into(),
+            supported_tools: Vec::new(),
+        };
+        let client = philotic_client::PhiloticClient::connect_at(&socket_path, identity)
+            .await
+            .expect("connect to stub hotel");
+        let runtime = AgentRuntime::new(client, "agent-watchdog");
+        (runtime, socket_path, server, emitted)
+    }
+
+    fn run_big_stack<F, Fut>(f: F)
+    where
+        F: FnOnce() -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = ()>,
+    {
+        std::thread::Builder::new()
+            .stack_size(64 * 1024 * 1024)
+            .spawn(move || {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("build current-thread runtime")
+                    .block_on(f());
+            })
+            .expect("spawn big-stack test thread")
+            .join()
+            .expect("big-stack test thread panicked");
+    }
+
+    /// THE regression. A turn sat in `WaitingTool` far past its budget while the
+    /// watchdog missed every intervening tick. Under the old tick-local clock the
+    /// first tick after the gap stamped `first_seen = now`, so `elapsed` restarted
+    /// at zero and the turn survived — that is how a live 881s turn was reported and
+    /// evicted as "90s", and how turns ran 823–3177s past a 600s ceiling.
+    ///
+    /// The clock is now stamped at the phase transition, so the very first tick
+    /// after a gap sees the true elapsed time and evicts.
+    #[test]
+    fn evicts_on_first_tick_after_a_missed_tick_gap() {
+        run_big_stack(|| async {
+            let (mut runtime, socket_path, server, _emitted) = runtime_with_stub_hotel("gap").await;
+
+            let session_id = "cron:flywheel:mac-jane".to_string();
+            let mut state =
+                SessionState::new(session_id.clone(), "agent-watchdog".into(), "cron".into());
+            state.start_turn(test_working_turn(TurnPhase::WaitingTool));
+            // The turn entered WaitingTool 400s ago (> the 300s tool budget) and the
+            // watchdog has not run once since — exactly the starved-tick scenario.
+            let long_ago = Instant::now() - Duration::from_secs(400);
+            state.turn_waiting_since = Some(long_ago);
+            state.active_turn_since = Some(long_ago);
+            runtime.sessions.insert(session_id.clone(), state);
+
+            // One single tick — the first since the gap.
+            runtime.evict_timed_out_turns().await;
+
+            let turn_still_active = runtime
+                .sessions
+                .get(&session_id)
+                .and_then(|s| s.active_turn.as_ref())
+                .is_some();
+            assert!(
+                !turn_still_active,
+                "a turn 400s past its WaitingTool budget must be evicted on the first \
+                 tick after a missed-tick gap, not granted a fresh budget"
+            );
+
+            drop(runtime);
+            let _ = server.await;
+            let _ = std::fs::remove_file(&socket_path);
+        });
+    }
+
+    /// The total-active ceiling must also survive a tick gap. `LoadingContext` carries
+    /// no phase deadline, so `MAX_TOTAL_ACTIVE_SECS` is the only thing bounding it — and
+    /// it was anchored to a tick-local stamp, which is why it never held in practice.
+    #[test]
+    fn total_active_ceiling_holds_across_a_missed_tick_gap() {
+        run_big_stack(|| async {
+            let (mut runtime, socket_path, server, _emitted) =
+                runtime_with_stub_hotel("ceiling").await;
+
+            let session_id = "telegram:7898847424:agent-bjork-01".to_string();
+            let mut state = SessionState::new(
+                session_id.clone(),
+                "agent-watchdog".into(),
+                "telegram".into(),
+            );
+            state.start_turn(test_working_turn(TurnPhase::LoadingContext));
+            // Alive 700s — past the 600s hard ceiling — with no tick in between.
+            state.active_turn_since = Some(Instant::now() - Duration::from_secs(700));
+            runtime.sessions.insert(session_id.clone(), state);
+
+            runtime.evict_timed_out_turns().await;
+
+            let turn_still_active = runtime
+                .sessions
+                .get(&session_id)
+                .and_then(|s| s.active_turn.as_ref())
+                .is_some();
+            assert!(
+                !turn_still_active,
+                "a turn past MAX_TOTAL_ACTIVE_SECS must be evicted on the first tick \
+                 after a gap, whatever phase it is in"
+            );
+
+            drop(runtime);
+            let _ = server.await;
+            let _ = std::fs::remove_file(&socket_path);
+        });
+    }
+
+    /// Guard the other direction: the budget raise must actually buy headroom. A
+    /// healthy-but-slow tool call at 154s (the measured duration of a real
+    /// `life.flywheel.brief` against Memgraph over Tailscale) used to be killed by the
+    /// old 90s budget. It must now survive.
+    #[test]
+    fn healthy_slow_tool_call_survives_the_raised_budget() {
+        run_big_stack(|| async {
+            let (mut runtime, socket_path, server, _emitted) =
+                runtime_with_stub_hotel("slow").await;
+
+            let session_id = "cron:flywheel-slow:mac-jane".to_string();
+            let mut state =
+                SessionState::new(session_id.clone(), "agent-watchdog".into(), "cron".into());
+            state.start_turn(test_working_turn(TurnPhase::WaitingTool));
+            let since = Instant::now() - Duration::from_secs(154);
+            state.turn_waiting_since = Some(since);
+            state.active_turn_since = Some(since);
+            runtime.sessions.insert(session_id.clone(), state);
+
+            runtime.evict_timed_out_turns().await;
+
+            let turn_still_active = runtime
+                .sessions
+                .get(&session_id)
+                .and_then(|s| s.active_turn.as_ref())
+                .is_some();
+            assert!(
+                turn_still_active,
+                "a 154s tool call is healthy for this tool population and must not be \
+                 evicted — the old 90s budget is what stopped scheduled briefs landing"
+            );
+
+            drop(runtime);
+            let _ = server.await;
+            let _ = std::fs::remove_file(&socket_path);
+        });
+    }
+
+    /// The binding constraint on a multi-call turn is the total ceiling, not the phase
+    /// budget. A turn on its fourth tool call — fresh 300s phase budget, only 100s into
+    /// it — is still evicted once the turn as a whole passes MAX_TOTAL_ACTIVE_SECS.
+    /// That is intended (the ceiling is the backstop and it finally enforces), but it
+    /// means the effective per-turn tool allowance is 600s in aggregate, however
+    /// generous any single phase budget is. Documented here so the next person sizing
+    /// WAITING_TOOL_SECS knows raising it alone buys nothing past the ceiling.
+    #[test]
+    fn total_ceiling_binds_a_multi_call_turn_before_the_phase_budget_does() {
+        run_big_stack(|| async {
+            let (mut runtime, socket_path, server, _emitted) =
+                runtime_with_stub_hotel("multicall").await;
+
+            let session_id = "cron:multi-call:mac-jane".to_string();
+            let mut state =
+                SessionState::new(session_id.clone(), "agent-watchdog".into(), "cron".into());
+            state.start_turn(test_working_turn(TurnPhase::WaitingTool));
+            // Turn alive 700s across several tool calls; the current call started 100s
+            // ago, well inside its own 300s budget.
+            state.active_turn_since = Some(Instant::now() - Duration::from_secs(700));
+            state.turn_waiting_since = Some(Instant::now() - Duration::from_secs(100));
+            runtime.sessions.insert(session_id.clone(), state);
+
+            runtime.evict_timed_out_turns().await;
+
+            let turn_still_active = runtime
+                .sessions
+                .get(&session_id)
+                .and_then(|s| s.active_turn.as_ref())
+                .is_some();
+            assert!(
+                !turn_still_active,
+                "the total ceiling must bind a long multi-call turn even when the \
+                 current phase is comfortably inside its own budget"
+            );
+
+            drop(runtime);
+            let _ = server.await;
+            let _ = std::fs::remove_file(&socket_path);
+        });
+    }
+
+    /// Multi-step turns must still get a fresh phase budget per tool call. The clock
+    /// swap changes only where the timestamp comes from, never this behaviour.
+    #[test]
+    fn progressing_turn_earns_a_fresh_budget_per_tool_call() {
+        run_big_stack(|| async {
+            let (mut runtime, socket_path, server, _emitted) =
+                runtime_with_stub_hotel("progress").await;
+
+            let session_id = "cron:multi-step:mac-jane".to_string();
+            let mut state =
+                SessionState::new(session_id.clone(), "agent-watchdog".into(), "cron".into());
+            state.start_turn(test_working_turn(TurnPhase::WaitingTool));
+            // 200s into the first tool call: under the 300s budget, and the total
+            // ceiling has plenty of room.
+            state.turn_waiting_since = Some(Instant::now() - Duration::from_secs(200));
+            state.active_turn_since = Some(Instant::now() - Duration::from_secs(200));
+            runtime.sessions.insert(session_id.clone(), state);
+            runtime.evict_timed_out_turns().await;
+
+            // The tool returns and the turn dispatches the next one — the phase
+            // transition re-stamps the clock, so the new call starts from zero.
+            if let Some(state) = runtime.sessions.get_mut(&session_id) {
+                state.set_active_turn_phase(TurnPhase::WaitingTool);
+            }
+            runtime.evict_timed_out_turns().await;
+
+            let turn_still_active = runtime
+                .sessions
+                .get(&session_id)
+                .and_then(|s| s.active_turn.as_ref())
+                .is_some();
+            assert!(
+                turn_still_active,
+                "a turn making real progress must get a fresh phase budget per tool call"
+            );
+
+            drop(runtime);
+            let _ = server.await;
+            let _ = std::fs::remove_file(&socket_path);
+        });
     }
 }

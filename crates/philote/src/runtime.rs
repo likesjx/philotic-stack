@@ -10099,11 +10099,21 @@ mod tests {
             .expect("session exists")
             .start_turn(turn);
 
-        // Backdate the watchdog bookkeeping past the WaitingTool deadline,
-        // with the matching wait signature so reconcile keeps the timestamp.
+        // Backdate past the WaitingTool deadline (now 300s), with the matching wait
+        // signature so reconcile keeps the timestamp. `turn_waiting_since` is the
+        // authoritative clock the watchdog reads — set it the way production does, via
+        // the phase stamp, rather than relying only on the watchdog's own bookkeeping.
         let past = std::time::Instant::now()
-            .checked_sub(std::time::Duration::from_secs(120))
+            .checked_sub(std::time::Duration::from_secs(400))
             .expect("backdate instant");
+        {
+            let state = runtime
+                .sessions
+                .get_mut(session_id)
+                .expect("session exists");
+            state.turn_waiting_since = Some(past);
+            state.active_turn_since = Some(past);
+        }
         runtime
             .stuck_turn_first_seen
             .insert(session_id.to_string(), past);
