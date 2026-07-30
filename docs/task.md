@@ -23,10 +23,12 @@ Operator principle: **"we should not have any tool hard coded."** Grants were th
 - [x] Resolve grants hotel-side onto the bindings; philote demotes its compiled-in tables to fallback.
 - [x] Enforce the policy at projection *and* at dispatch — a disabled tool must be unexecutable, not merely unlisted.
 - [x] `phil tools show|disable|enable|set-class|set-skill` operator surface.
-- [ ] Watched live run: disable `life.observe.batch` on a running hotel with no deploy (slice-1 criterion; `test-green` only until then).
-- [ ] Slice 2 — runner routing as data (runner `supported_tools` is still compiled in).
-- [ ] Slice 3 — governance/audit; owns the agent-facing grant surface, deliberately deferred.
+- [x] Live run: `just smoke-tool-grants` disables `life.observe.batch` on a running hotel with no rebuild and no restart, and proves the disable survives a restart (slice-1 criterion, smoke-green).
+- [x] Slice 2 — runner routing as data: `ToolRunnerGrant` binds a runner to the class grant that defines what it serves, so routes and grants cannot drift.
+- [x] Slice 3 — governance/audit: append-only `ToolGrantAuditRecord`, written before the mutation (fail closed), store-assigned ordering, `phil tools audit`.
+- [ ] Slice 4 — SkillDAG reflection in the LifeGraph. Still deferred: needs the remote LifeGraph healthy and an operator approval UX to compile proposals down into the registry.
 - [ ] Retire the remaining transitional grant sources: philote `tools_for_skill`, `tool_catalog()` class tags.
+- [ ] Fleet rollout: this is proven on ephemeral hotels only — no installed binary was replaced on mac-jane/mbp-jane/vps-jane.
 
 ## New Project: Primitives Crate Split
 

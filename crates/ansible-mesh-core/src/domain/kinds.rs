@@ -28,6 +28,8 @@ pub const NODE_KIND_SKILL_REGISTRATION_AUDIT: &str = "skill_registration_audit";
 pub const NODE_KIND_TOOLSET_PROFILE: &str = "toolset_profile";
 /// Per-hotel tool grant registry and tool policy (`proposal:data-driven-tool-grants-skilldag`).
 pub const NODE_KIND_TOOL_GRANT_REGISTRY: &str = "tool_grant_registry";
+/// Append-only audit trail for accepted tool grant/policy changes (who / what / when).
+pub const NODE_KIND_TOOL_GRANT_AUDIT: &str = "tool_grant_audit";
 pub const NODE_KIND_NODE_CAPABILITIES: &str = "node_capabilities";
 pub const NODE_KIND_CONFIG: &str = "config";
 pub const NODE_KIND_APARTMENT: &str = "apartment";

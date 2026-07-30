@@ -177,4 +177,37 @@ echo "5. Re-enabling ${TOOL}..."
 "${PHIL_BIN}" tools enable "${TOOL}" --db "${DB_PATH}" | sed 's/^/     /'
 expect_state "PRESENT:ALLOWED" "re-enabled live"
 
+# ── Slice 2: runner routes follow the class grant ────────────────────────────
+echo "6. Runner routes are bound to a class grant (slice 2)..."
+"${PHIL_BIN}" tools show --db "${DB_PATH}" | grep -A2 "Remote runner routes" | sed 's/^/     /'
+# Matched in two pieces on purpose: the rendered line separates them with an
+# em-dash, and `.` does not reliably span a multi-byte character here.
+RUNNER_LINE="$("${PHIL_BIN}" tools show --db "${DB_PATH}" | grep 'life-graph-runner' || true)"
+if [[ -z "${RUNNER_LINE}" ]] || ! grep -q "class 'life_graph'" <<<"${RUNNER_LINE}"; then
+  echo "FAIL: life-graph-runner was not seeded bound to the life_graph class"
+  echo "  got: ${RUNNER_LINE:-<no runner line>}"
+  exit 1
+fi
+if ! grep -q "life.observe.batch" <<<"${RUNNER_LINE}"; then
+  echo "FAIL: the runner's served tools did not come from the class grant"
+  exit 1
+fi
+echo "  ok: runner bound to its class grant"
+
+# ── Slice 3: every grant change is audited ───────────────────────────────────
+echo "7. Grant changes are audited (slice 3)..."
+AUDIT="$("${PHIL_BIN}" tools audit --db "${DB_PATH}")"
+echo "${AUDIT}" | sed 's/^/     /'
+for expected in "disable ${TOOL}" "enable ${TOOL}"; do
+  if ! echo "${AUDIT}" | grep -q "${expected}"; then
+    echo "FAIL: audit trail is missing an entry for '${expected}'"
+    exit 1
+  fi
+done
+if ! echo "${AUDIT}" | grep -q "by phil tools"; then
+  echo "FAIL: audit entries do not record who made the change"
+  exit 1
+fi
+echo "  ok: disable and enable both recorded with an actor"
+
 echo "Tool-grants roundtrip smoke succeeded."

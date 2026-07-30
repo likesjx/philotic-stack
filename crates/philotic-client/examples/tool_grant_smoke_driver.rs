@@ -69,8 +69,8 @@ async fn main() -> Result<()> {
     let session_id = std::env::var("PHILOTIC_SMOKE_SESSION_ID")
         .unwrap_or_else(|_| "smoke:tool-grants:agent-jane-01".to_string());
     let chat_id = "tool-grant-smoke-chat";
-    let tool = std::env::var("PHILOTIC_SMOKE_TOOL")
-        .unwrap_or_else(|_| "life.observe.batch".to_string());
+    let tool =
+        std::env::var("PHILOTIC_SMOKE_TOOL").unwrap_or_else(|_| "life.observe.batch".to_string());
 
     let mut client = PhiloticClient::connect(GuestIdentity {
         guest_id: "tool-grant-smoke-membrane".into(),

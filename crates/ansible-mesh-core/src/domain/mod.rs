@@ -22,7 +22,7 @@ use crate::graph::{
     AbstractModelRecord, AbstractRightRecord, AbstractSkillRecord, AbstractToolRecord, GraphNode,
     MembraneTransportHomeRecord, ModelProfileRecord, RoleIncarnationRecord, RoleReadinessState,
     RoutingPolicyEvaluationRecord, RoutingPolicyRecord, RuleRecord, SkillRegistrationAuditRecord,
-    ToolGrantRegistryRecord, ToolsetProfileRecord, WorkflowSkillRecord,
+    ToolGrantAuditRecord, ToolGrantRegistryRecord, ToolsetProfileRecord, WorkflowSkillRecord,
 };
 use crate::heal_queue::{
     HealWorkItemRecord, HEAL_WORK_ITEM_STATUS_CLOSED, HEAL_WORK_ITEM_STATUS_OPEN,
@@ -1064,6 +1064,57 @@ impl GraphDomain {
         }
     }
 
+    /// Records one accepted tool-grant change. Call this BEFORE mutating the
+    /// registry so a change cannot land unaudited.
+    ///
+    /// Assigns `sequence` here rather than trusting the caller, so ordering is a
+    /// property of the store: second-resolution timestamps tie routinely and the
+    /// trail still has to say which change came first.
+    pub fn record_tool_grant_audit(&self, record: &ToolGrantAuditRecord) -> Result<()> {
+        let next_sequence = self
+            .list_tool_grant_audits()?
+            .iter()
+            .map(|existing| existing.sequence)
+            .max()
+            .map(|max| max + 1)
+            .unwrap_or(1);
+        let record = ToolGrantAuditRecord {
+            sequence: next_sequence,
+            ..record.clone()
+        };
+        let data = serde_json::to_value(&record)
+            .context("GraphDomain::record_tool_grant_audit: serialize ToolGrantAuditRecord")?;
+        self.adapter.upsert_node(&GraphNode {
+            node_key: format!("{}:{}", NODE_KIND_TOOL_GRANT_AUDIT, record.audit_id),
+            kind: NODE_KIND_TOOL_GRANT_AUDIT.to_string(),
+            label: Some(record.target.clone()),
+            data,
+        })
+    }
+
+    /// Lists the tool-grant audit trail, oldest first. Malformed records are
+    /// skipped with a warning rather than failing the whole listing.
+    pub fn list_tool_grant_audits(&self) -> Result<Vec<ToolGrantAuditRecord>> {
+        let mut audits = Vec::new();
+        for node in self
+            .adapter
+            .list_nodes_by_kind(NODE_KIND_TOOL_GRANT_AUDIT)?
+        {
+            match serde_json::from_value::<ToolGrantAuditRecord>(node.data.clone()) {
+                Ok(rec) => audits.push(rec),
+                Err(err) => {
+                    warn!(
+                        node_key = %node.node_key,
+                        "Skipping incompatible tool_grant_audit record during list: {}",
+                        err
+                    );
+                }
+            }
+        }
+        audits.sort_by_key(|rec| (rec.changed_at, rec.sequence));
+        Ok(audits)
+    }
+
     // ── Skill registration audit methods ──────────────────────────────────────
 
     fn skill_registration_audit_key(audit_id: &str) -> String {
@@ -1967,7 +2018,7 @@ mod tests {
     use super::*;
     use crate::graph::{
         AbstractModelRecord, AbstractRightRecord, AbstractSkillRecord, RoleIncarnationRecord,
-        SkillRegistrationAuditRecord, ToolsetProfileRecord,
+        SkillRegistrationAuditRecord, ToolGrantAuditRecord, ToolsetProfileRecord,
     };
     use crate::sqlite_storage::SqliteGraphStorage;
     use crate::storage::{
@@ -2202,6 +2253,49 @@ mod tests {
             .expect("get")
             .expect("exists");
         assert_eq!(grant.earned.confirmed_good_outcomes, 0);
+    }
+
+    /// Slice 3: the grant audit trail must order correctly even when several
+    /// changes land inside the same second, which a scripted operator run does
+    /// routinely. Ordering is assigned by the store, not trusted from callers.
+    #[test]
+    fn tool_grant_audits_order_by_sequence_within_one_second() {
+        let domain = make_domain();
+        assert!(domain.list_tool_grant_audits().expect("list").is_empty());
+
+        for (id, action, target) in [
+            ("a1", "disable", "life.observe.batch"),
+            ("a2", "set_class", "life_graph"),
+            ("a3", "enable", "life.observe.batch"),
+        ] {
+            domain
+                .record_tool_grant_audit(&ToolGrantAuditRecord {
+                    audit_id: id.into(),
+                    action: action.into(),
+                    target: target.into(),
+                    before: "before".into(),
+                    after: "after".into(),
+                    changed_by: "phil tools (test)".into(),
+                    // Identical timestamps on purpose — this is the tie case.
+                    changed_at: 1000,
+                    // Deliberately unset: the store must assign ordering.
+                    sequence: 0,
+                })
+                .expect("record audit");
+        }
+
+        let audits = domain.list_tool_grant_audits().expect("list");
+        assert_eq!(audits.len(), 3, "audits are append-only");
+        assert_eq!(
+            audits.iter().map(|a| a.action.as_str()).collect::<Vec<_>>(),
+            vec!["disable", "set_class", "enable"],
+            "trail must replay in the order the changes actually happened"
+        );
+        assert_eq!(
+            audits.iter().map(|a| a.sequence).collect::<Vec<_>>(),
+            vec![1, 2, 3],
+            "the store assigns a monotonic sequence"
+        );
     }
 
     #[test]

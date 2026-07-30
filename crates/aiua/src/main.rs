@@ -1,5 +1,6 @@
 use ansible_mesh_core::graph::{
-    AbstractSkillRecord, AbstractToolRecord, GrantSource, ToolClassGrant, ToolsetProfileRecord,
+    AbstractSkillRecord, AbstractToolRecord, GrantSource, ToolClassGrant, ToolRunnerGrant,
+    ToolsetProfileRecord,
 };
 use ansible_mesh_core::membership::{
     MeshMembershipAcceptPayload, derive_transport_session_key, fingerprint_from_base64url,
@@ -4458,6 +4459,13 @@ fn reconcile_seeded_skill(graph: &GraphDomain, seed: &AbstractSkillRecord) -> an
     graph.upsert_abstract_skill(&record)
 }
 
+/// Remote runner roles and the tool class that defines what each one serves.
+///
+/// The first-boot seed for [`ToolGrantRegistryRecord::runner_grants`]; operators
+/// can re-point a runner at a different class at runtime.
+pub(crate) const BUILTIN_RUNNER_CLASS_BINDINGS: &[(&str, &str)] =
+    &[("life-graph-runner", "life_graph")];
+
 /// Seeds the per-hotel tool grant registry, preserving every runtime edit.
 ///
 /// Seeds a class only when it is absent from the registry. A class present with
@@ -4479,6 +4487,20 @@ fn seed_tool_grant_registry(graph: &GraphDomain) -> anyhow::Result<()> {
                 .iter()
                 .map(|tool| (*tool).to_string())
                 .collect(),
+            grant_source: GrantSource::Seed,
+        });
+        changed = true;
+    }
+
+    // Slice 2: bind each remote runner to the class grant that defines what it
+    // serves, so the runner's route list and the model's grant list cannot drift.
+    for (runner_role, tool_class) in BUILTIN_RUNNER_CLASS_BINDINGS {
+        if registry.runner_class(runner_role).is_some() {
+            continue;
+        }
+        registry.runner_grants.push(ToolRunnerGrant {
+            runner_role: (*runner_role).to_string(),
+            tool_class: (*tool_class).to_string(),
             grant_source: GrantSource::Seed,
         });
         changed = true;
@@ -4944,29 +4966,35 @@ fn seed_toolset_profiles(graph: &GraphDomain) -> anyhow::Result<()> {
                 .unwrap_or(&remote_node)
                 .to_string();
             let runner_incarnation_id = format!("{hotel_id}:life-graph-runner");
+            // Slice 2: the runner's supported tools come from the registry class
+            // grant it is bound to, not a second hardcoded copy of the same list.
+            // Those two copies drifting is what previously let a tool be granted
+            // to the model with no route to the runner — the turn then hung until
+            // the watchdog evicted it.
+            let registry = graph.get_tool_grant_registry()?;
+            let runner_class = registry
+                .as_ref()
+                .and_then(|reg| reg.runner_class("life-graph-runner"))
+                .unwrap_or("life_graph")
+                .to_string();
+            let runner_tools = ansible_mesh_core::graph::resolve_tool_class_grants(
+                registry.as_ref(),
+                &runner_class,
+            );
             let runner = serde_json::json!({
                 "incarnation_id": runner_incarnation_id,
                 "runner_id": runner_incarnation_id,
                 "hotel_id": hotel_id,
                 "target_node": remote_node,
                 "target_role": "life-graph-runner",
-                "supported_tools": [
-                    "life.observe",
-                    "life.observe.batch",
-                    "life.recall",
-                    "life.recall.feedback",
-                    "life.commit",
-                    "life.resolve",
-                    "life.conflict",
-                    "life.patch.propose"
-                ],
+                "supported_tools": runner_tools,
                 "execution_mode": "capability"
             });
             for mut profile in graph.list_toolset_profiles()? {
                 if !profile
                     .allowed_classes
                     .iter()
-                    .any(|class| class == "life_graph")
+                    .any(|class| *class == runner_class)
                 {
                     continue;
                 }
@@ -8782,6 +8810,72 @@ mod tests {
             "a runtime disable must survive a restart, got {:?}",
             after.disabled_tools
         );
+    }
+
+    /// Slice 2: a runner's route list follows the class grant it is bound to.
+    ///
+    /// These were two independently maintained copies of one tool set, and
+    /// drifting them apart is not cosmetic — a tool granted to the model with no
+    /// matching runner route produces a turn that hangs until the watchdog
+    /// evicts it. Narrowing the class grant must narrow the runner with it.
+    #[test]
+    fn runner_supported_tools_follow_the_class_grant() {
+        let storage = SqliteGraphStorage::open(":memory:").expect("open sqlite");
+        let graph = GraphDomain::new(Arc::new(storage.adapter()));
+        unsafe {
+            std::env::set_var("PHILOTIC_REMOTE_LIFE_GRAPH_RUNNER_NODE", "vps-jane-aiua-01");
+        }
+        seed_tool_grant_registry(&graph).expect("seed registry");
+
+        // Operator narrows the life_graph class to a single tool at runtime.
+        let mut registry = graph
+            .get_tool_grant_registry()
+            .expect("read registry")
+            .expect("registry seeded");
+        assert_eq!(
+            registry.runner_class("life-graph-runner"),
+            Some("life_graph"),
+            "the runner should be seeded bound to its class"
+        );
+        for grant in &mut registry.class_grants {
+            if grant.class_name == "life_graph" {
+                grant.tools = vec!["life.recall".into()];
+                grant.grant_source = GrantSource::Runtime;
+            }
+        }
+        graph
+            .upsert_tool_grant_registry(&registry)
+            .expect("narrow class");
+
+        seed_toolset_profiles(&graph).expect("seed toolset profiles");
+
+        let profile = graph
+            .list_toolset_profiles()
+            .expect("list profiles")
+            .into_iter()
+            .find(|p| {
+                p.allowed_classes.iter().any(|c| c == "life_graph")
+                    && !p.remote_tool_runners.is_empty()
+            })
+            .expect("a life_graph profile with a seeded remote runner");
+        let runner = &profile.remote_tool_runners[0];
+        let supported = runner
+            .get("supported_tools")
+            .and_then(|v| v.as_array())
+            .expect("supported_tools array")
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            supported,
+            vec!["life.recall"],
+            "the runner must serve exactly what the class grant says, got {supported:?}"
+        );
+
+        unsafe {
+            std::env::remove_var("PHILOTIC_REMOTE_LIFE_GRAPH_RUNNER_NODE");
+        }
     }
 
     /// The registry seeds every built-in class, and never invents a disable.

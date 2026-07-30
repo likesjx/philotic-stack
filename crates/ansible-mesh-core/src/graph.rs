@@ -165,6 +165,60 @@ pub struct ToolClassGrant {
     pub grant_source: GrantSource,
 }
 
+/// Append-only audit entry for one accepted change to the tool grant registry.
+///
+/// Node kind: `tool_grant_audit`. Node key: `tool_grant_audit:{audit_id}`.
+///
+/// Slice 3 of `proposal:data-driven-tool-grants-skilldag`. Making grants editable
+/// at runtime removed the deploy from the loop — and with it the git history that
+/// used to answer "who changed what, and when". This record puts that answer back
+/// without putting the deploy back. Written BEFORE the registry mutation, so a
+/// change cannot land unaudited (fail closed), mirroring
+/// [`SkillRegistrationAuditRecord`].
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct ToolGrantAuditRecord {
+    pub audit_id: String,
+    /// What changed: `disable`, `enable`, `set_class`, `set_runner`, `set_skill`.
+    pub action: String,
+    /// The class, skill, runner role, or tool name the action targeted.
+    pub target: String,
+    /// Value before the change, rendered for human review.
+    #[serde(default)]
+    pub before: String,
+    /// Value after the change, rendered for human review.
+    #[serde(default)]
+    pub after: String,
+    /// Who made the change (operator CLI identity or guest id).
+    pub changed_by: String,
+    /// Unix timestamp (seconds) when the change was accepted.
+    pub changed_at: u64,
+    /// Monotonic per-hotel ordinal, assigned by `record_tool_grant_audit`.
+    ///
+    /// Second-resolution timestamps tie constantly — a script that disables two
+    /// tools in a row produces identical `changed_at` values, and an audit trail
+    /// that cannot say which change came first is not much of an audit trail.
+    #[serde(default)]
+    pub sequence: u64,
+}
+
+/// Which tools a remote tool runner is registered to serve.
+///
+/// Slice 2 of `proposal:data-driven-tool-grants-skilldag`. A runner's route list
+/// and the model's grant list used to be two independently maintained copies of
+/// the same tool set, and drifting them apart is not a cosmetic problem: a tool
+/// granted to the model with no matching runner route produces a turn that hangs
+/// until the watchdog evicts it. Binding the runner to a `tool_class` makes the
+/// class grant the single authority for both.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct ToolRunnerGrant {
+    /// Guest role of the runner, e.g. `life-graph-runner`.
+    pub runner_role: String,
+    /// Tool class whose grant defines what this runner serves.
+    pub tool_class: String,
+    #[serde(default)]
+    pub grant_source: GrantSource,
+}
+
 /// Per-hotel registry of tool grants and tool policy.
 ///
 /// Node kind: `tool_grant_registry`. Node key: `tool_grant_registry:default`.
@@ -182,6 +236,9 @@ pub struct ToolClassGrant {
 pub struct ToolGrantRegistryRecord {
     #[serde(default)]
     pub class_grants: Vec<ToolClassGrant>,
+    /// Remote tool runners bound to the class grant that defines what they serve.
+    #[serde(default)]
+    pub runner_grants: Vec<ToolRunnerGrant>,
     /// Tools suppressed hotel-wide regardless of which source granted them.
     #[serde(default)]
     pub disabled_tools: Vec<String>,
@@ -206,6 +263,14 @@ impl ToolGrantRegistryRecord {
     /// Returns `true` when `tool_name` is disabled hotel-wide.
     pub fn is_disabled(&self, tool_name: &str) -> bool {
         self.disabled_tools.iter().any(|name| name == tool_name)
+    }
+
+    /// Returns the tool class that defines what `runner_role` serves.
+    pub fn runner_class(&self, runner_role: &str) -> Option<&str> {
+        self.runner_grants
+            .iter()
+            .find(|grant| grant.runner_role == runner_role)
+            .map(|grant| grant.tool_class.as_str())
     }
 }
 
