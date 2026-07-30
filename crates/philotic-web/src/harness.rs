@@ -2687,14 +2687,24 @@ fn codex_target_path(harness_id: &str) -> Result<PathBuf> {
         .join("AGENTS.md"))
 }
 
+/// proposal:claude-charter-in-repo.
+///
+/// The charter used to be projected to
+/// `~/.claude/philotic/harnesses/<id>/CLAUDE.md`, and the checked-in
+/// `.claude/CLAUDE.md` @-imported that ABSOLUTE path. On any other machine, in
+/// CI, in a cloud session, or for a collaborator, the import resolved to
+/// nothing and the charter silently vanished — with no error, because a missing
+/// @import is not a failure. The dependency direction was backwards: a
+/// version-controlled file pointing out at machine-local state.
+///
+/// Now it projects into the repo, like the windsurf adapter already did, so the
+/// charter is diffable, reviewable, and travels with the checkout.
 fn claude_code_target_path(harness_id: &str) -> Result<PathBuf> {
-    let home = dirs::home_dir().context("failed to locate home directory")?;
-    Ok(home
+    let root = std::env::current_dir().context("failed to locate current workspace")?;
+    Ok(root
         .join(".claude")
-        .join("philotic")
-        .join("harnesses")
-        .join(short_harness_id(harness_id))
-        .join("CLAUDE.md"))
+        .join("harness")
+        .join(format!("{}.md", short_harness_id(harness_id))))
 }
 
 fn antigravity_target_path(harness_id: &str) -> Result<PathBuf> {
@@ -2951,6 +2961,62 @@ fn render_windsurf_workflow_markdown(
     )
 }
 
+/// Remove a previously-written philotic harness verify hook from a settings
+/// file, leaving everything else untouched.
+///
+/// The hook moved from settings.local.json to settings.json; both files load and
+/// their hooks merge, so a leftover entry means the verify command runs twice
+/// per session. Missing or unparseable files are left alone — settings.local.json
+/// is co-owned by Claude Code itself, and mangling it would be worse than a
+/// duplicate hook.
+fn strip_stale_verify_hook(path: &PathBuf) -> Result<()> {
+    if !path.exists() {
+        return Ok(());
+    }
+    let Ok(raw) = fs::read_to_string(path) else {
+        return Ok(());
+    };
+    let Ok(mut settings) = serde_json::from_str::<serde_json::Value>(&raw) else {
+        return Ok(());
+    };
+
+    let Some(entries) = settings
+        .get_mut("hooks")
+        .and_then(|h| h.get_mut("SessionStart"))
+        .and_then(|s| s.as_array_mut())
+    else {
+        return Ok(());
+    };
+
+    let before = entries.len();
+    entries.retain(|entry| {
+        entry
+            .get("hooks")
+            .and_then(|h| h.as_array())
+            .map(|cmds| {
+                !cmds.iter().any(|c| {
+                    c.get("command")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.contains("phil graph harness verify"))
+                        .unwrap_or(false)
+                })
+            })
+            .unwrap_or(true)
+    });
+
+    if entries.len() == before {
+        return Ok(());
+    }
+
+    let updated = serde_json::to_string_pretty(&settings)?;
+    write_harness_file(path, updated.as_bytes())?;
+    println!(
+        "  → removed a stale duplicate verify hook from {}",
+        path.display()
+    );
+    Ok(())
+}
+
 fn write_claude_code_workspace_files(
     harness_id: &str,
     projection_path: &PathBuf,
@@ -2959,9 +3025,20 @@ fn write_claude_code_workspace_files(
     let root = std::env::current_dir().context("failed to locate current workspace")?;
     let dot_claude = root.join(".claude");
 
-    // 1. Write .claude/CLAUDE.md with @import pointing at the projection.
+    // 1. Write .claude/CLAUDE.md with an @import pointing at the projection.
     //    This causes Claude Code to load the harness role/skills on every session start.
-    let import_path = projection_path.to_string_lossy();
+    //
+    //    The import is RELATIVE. It used to be the projection's absolute path
+    //    under $HOME, in a file that is checked into git — so on any other
+    //    machine, in CI, or for a collaborator it resolved to nothing and the
+    //    charter silently vanished. A relative import travels with the repo.
+    //    Relative to the IMPORTING FILE's directory (.claude/), not the repo
+    //    root — `@./.claude/harness/x.md` inside `.claude/CLAUDE.md` would
+    //    resolve to `.claude/.claude/harness/x.md`.
+    let import_path = projection_path
+        .strip_prefix(&dot_claude)
+        .map(|rel| format!("./{}", rel.display()))
+        .unwrap_or_else(|_| projection_path.to_string_lossy().to_string());
     let import_md = format!(
         "<!-- Managed by `phil graph harness apply`. Do not edit manually. -->\n\
          <!-- Re-run `phil graph harness apply {harness_id}` to refresh after profile changes. -->\n\
@@ -2970,9 +3047,18 @@ fn write_claude_code_workspace_files(
     let claude_md_path = dot_claude.join("CLAUDE.md");
     write_harness_file(&claude_md_path, import_md.as_bytes())?;
 
-    // 2. Merge a SessionStart hook into .claude/settings.local.json.
+    // 2. Merge a SessionStart hook into .claude/settings.json.
     //    The hook verifies the harness on startup so drift is visible before any work.
-    let settings_path = dot_claude.join("settings.local.json");
+    //
+    //    This used to target settings.local.json, which is globally gitignored
+    //    (~/.config/git/ignore), so the hook could not be shared or reviewed and
+    //    did not propagate to sibling worktrees or other machines. settings.json
+    //    is the version-controlled home for project rules.
+    //
+    //    NOTE: project settings are validated STRICTLY — a file that fails
+    //    validation is rejected as a whole — so only schema-valid keys may be
+    //    written here. hooks.SessionStart is schema-valid.
+    let settings_path = dot_claude.join("settings.json");
     let mut settings: serde_json::Value = if settings_path.exists() {
         let raw = fs::read_to_string(&settings_path)
             .with_context(|| format!("failed to read {}", settings_path.display()))?;
@@ -3021,11 +3107,13 @@ fn write_claude_code_workspace_files(
     let updated = serde_json::to_string_pretty(&settings)?;
     write_harness_file(&settings_path, updated.as_bytes())?;
 
-    println!(
-        "  → wrote .claude/CLAUDE.md (imports {})",
-        projection_path.display()
-    );
-    println!("  → merged SessionStart verify hook into .claude/settings.local.json");
+    // Earlier versions wrote this hook into settings.local.json. Both files load
+    // and their hooks merge, so a leftover entry there would run the verify
+    // command twice every session. Strip it.
+    strip_stale_verify_hook(&dot_claude.join("settings.local.json"))?;
+
+    println!("  → wrote .claude/CLAUDE.md (imports {})", import_path);
+    println!("  → merged SessionStart verify hook into .claude/settings.json");
     Ok(vec![
         AuxCheck::Hash {
             path: claude_md_path.to_string_lossy().to_string(),
