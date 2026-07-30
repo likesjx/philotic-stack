@@ -140,6 +140,12 @@ without putting the deploy back.
 - Ordering is assigned by the store, not the caller. Second-resolution
   timestamps tie constantly — a scripted operator run produces several changes
   in one second — so a monotonic `sequence` decides replay order.
+- Reads and writes differ in strictness on purpose. *Listing* the trail skips a
+  malformed row so one bad record cannot hide the rest from an operator;
+  *extending* it refuses, because a skipped row drops out of the max-sequence
+  scan, the next write reuses a sequence already on disk, and ordering goes
+  ambiguous again — while the recorder still returns `Ok` and the caller mutates
+  grants believing the change was audited.
 - `phil tools audit` reads the trail.
 
 **The agent-facing grant surface stays out.** Letting a model widen its own

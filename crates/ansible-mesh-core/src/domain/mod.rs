@@ -1071,13 +1071,7 @@ impl GraphDomain {
     /// property of the store: second-resolution timestamps tie routinely and the
     /// trail still has to say which change came first.
     pub fn record_tool_grant_audit(&self, record: &ToolGrantAuditRecord) -> Result<()> {
-        let next_sequence = self
-            .list_tool_grant_audits()?
-            .iter()
-            .map(|existing| existing.sequence)
-            .max()
-            .map(|max| max + 1)
-            .unwrap_or(1);
+        let next_sequence = self.max_tool_grant_audit_sequence()? + 1;
         let record = ToolGrantAuditRecord {
             sequence: next_sequence,
             ..record.clone()
@@ -1092,8 +1086,37 @@ impl GraphDomain {
         })
     }
 
+    /// Highest `sequence` currently on disk, or 0 when the trail is empty.
+    ///
+    /// Strict on purpose, unlike [`Self::list_tool_grant_audits`]: a malformed
+    /// row is a hard error rather than a skipped one. Reading leniently here
+    /// would drop that row from the maximum, so the next write could reuse a
+    /// sequence already on disk — reintroducing the ambiguous ordering that
+    /// `sequence` exists to remove, and letting `record_tool_grant_audit` return
+    /// `Ok` while the trail is not actually intact. Skipping is right when
+    /// *displaying* a trail and wrong when *extending* one.
+    fn max_tool_grant_audit_sequence(&self) -> Result<u64> {
+        let mut max = 0u64;
+        for node in self
+            .adapter
+            .list_nodes_by_kind(NODE_KIND_TOOL_GRANT_AUDIT)?
+        {
+            let record: ToolGrantAuditRecord = serde_json::from_value(node.data.clone())
+                .with_context(|| {
+                    format!(
+                        "GraphDomain::max_tool_grant_audit_sequence: audit record [{}] is \
+                         unreadable, refusing to extend the trail from an unknown position",
+                        node.node_key
+                    )
+                })?;
+            max = max.max(record.sequence);
+        }
+        Ok(max)
+    }
+
     /// Lists the tool-grant audit trail, oldest first. Malformed records are
-    /// skipped with a warning rather than failing the whole listing.
+    /// skipped with a warning rather than failing the whole listing — a single
+    /// bad row must not hide the rest of the trail from an operator reading it.
     pub fn list_tool_grant_audits(&self) -> Result<Vec<ToolGrantAuditRecord>> {
         let mut audits = Vec::new();
         for node in self
@@ -2295,6 +2318,63 @@ mod tests {
             audits.iter().map(|a| a.sequence).collect::<Vec<_>>(),
             vec![1, 2, 3],
             "the store assigns a monotonic sequence"
+        );
+    }
+
+    /// A corrupt audit row must block extending the trail rather than being
+    /// skipped: skipping drops it from the max-sequence scan, so the next write
+    /// reuses a sequence already on disk and ordering goes ambiguous again —
+    /// while `record_tool_grant_audit` still returns `Ok` and the caller happily
+    /// mutates grants believing the change was audited.
+    #[test]
+    fn unreadable_audit_row_refuses_to_extend_the_trail() {
+        let domain = make_domain();
+        domain
+            .record_tool_grant_audit(&ToolGrantAuditRecord {
+                audit_id: "a1".into(),
+                action: "disable".into(),
+                target: "life.observe.batch".into(),
+                before: "allowed".into(),
+                after: "disabled".into(),
+                changed_by: "phil tools (test)".into(),
+                changed_at: 1000,
+                sequence: 0,
+            })
+            .expect("record first audit");
+
+        // Corrupt a row the way a partial write or a schema skew would.
+        domain
+            .adapter
+            .upsert_node(&GraphNode {
+                node_key: "tool_grant_audit:corrupt".into(),
+                kind: NODE_KIND_TOOL_GRANT_AUDIT.to_string(),
+                label: Some("corrupt".into()),
+                data: serde_json::json!({ "not": "an audit record" }),
+            })
+            .expect("write corrupt row");
+
+        let err = domain
+            .record_tool_grant_audit(&ToolGrantAuditRecord {
+                audit_id: "a2".into(),
+                action: "enable".into(),
+                target: "life.observe.batch".into(),
+                before: "disabled".into(),
+                after: "allowed".into(),
+                changed_by: "phil tools (test)".into(),
+                changed_at: 1000,
+                sequence: 0,
+            })
+            .expect_err("extending the trail past an unreadable row must fail");
+        assert!(
+            format!("{err:#}").contains("unreadable"),
+            "error should name the unreadable row, got: {err:#}"
+        );
+
+        // Reading the trail stays lenient — an operator can still see history.
+        assert_eq!(
+            domain.list_tool_grant_audits().expect("list").len(),
+            1,
+            "the readable entry is still listed"
         );
     }
 
