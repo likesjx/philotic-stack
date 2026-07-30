@@ -67,6 +67,14 @@ env:
   # CMakeLists declares `cmake_minimum_required(VERSION <3.5)`, which CMake 4
   # (on the runner and on the dev Macs) refuses outright.
   CMAKE_POLICY_VERSION_MINIMUM: "3.5"
+  # The tests, and any hotel binary they spawn, need a vault root key.
+  # Previously the macOS Keychain was consulted for it and BLOCKED forever on a
+  # runner (that is what ran the test job to a 5h50m timeout). The Keychain is
+  # now skipped in CI, which would make key resolution fail cleanly instead —
+  # better, but still a failure. Providing an ephemeral key means neither
+  # happens. This is NOT a secret: it encrypts nothing but throwaway CI state,
+  # and it is the same all-0x07 key the unit tests already use.
+  PHILOTIC_VAULT_MASTER_KEY: "BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc="
 
 jobs:
   fmt:
