@@ -13,7 +13,8 @@ ExecStartPre=-/usr/bin/docker rm -f {{ philotic_memgraph_container_name }}
 ExecStart=/usr/bin/docker run --rm \
   --name {{ philotic_memgraph_container_name }} \
   --publish {{ philotic_memgraph_host }}:{{ philotic_memgraph_port }}:7687 \
-  --volume {{ philotic_memgraph_data_dir }}:/var/opt/memgraph \
+  --user {{ philotic_memgraph_uid }}:{{ philotic_memgraph_gid }} \
+  --volume {{ philotic_memgraph_data_dir }}:/var/lib/memgraph \
   {{ philotic_memgraph_image }}
 ExecStop=/usr/bin/docker stop {{ philotic_memgraph_container_name }}
 
