@@ -1,0 +1,68 @@
+#!/bin/sh
+# proposal:tool-agnostic-fmt-hook
+#
+# Keep rustfmt drift out of develop, for every harness.
+#
+# Claude Code has a PostToolUse rustfmt hook (.claude/hooks/fmt-rust.sh), but
+# eight harnesses are registered against this repo — codex, windsurf, four
+# gemini/antigravity roles — and any of them can introduce drift. This is not
+# theoretical: PR #371 went red on its own pull_request merge commit within a
+# day of the fmt gate landing, because develop had picked up unformatted code
+# from another harness after the branch was cut. A git hook applies whoever (or
+# whatever) makes the commit.
+#
+# Deliberately checks ONLY STAGED FILES, not the whole workspace. A repo-wide
+# `cargo fmt --all --check` here would fail on drift the committer did not
+# cause, and a hook that blocks you for someone else's mess is a hook that gets
+# bypassed with --no-verify. This stops you adding NEW drift.
+#
+# Bypass for a genuine emergency: git commit --no-verify
+set -eu
+
+# Only Rust files that are actually staged (Added/Copied/Modified/Renamed).
+STAGED_RS="$(git diff --cached --name-only --diff-filter=ACMR -- '*.rs' || true)"
+
+[ -z "${STAGED_RS}" ] && exit 0
+
+command -v rustfmt >/dev/null 2>&1 || {
+    echo "pre-commit: rustfmt not found on PATH — skipping format check." >&2
+    exit 0
+}
+
+# The workspace mixes edition 2021 and 2024 crates, so the edition has to come
+# from each file's nearest Cargo.toml rather than being assumed.
+file_edition() {
+    dir="$(dirname "$1")"
+    while [ "${dir}" != "." ] && [ "${dir}" != "/" ] && [ ! -f "${dir}/Cargo.toml" ]; do
+        dir="$(dirname "${dir}")"
+    done
+    if [ -f "${dir}/Cargo.toml" ]; then
+        edition="$(grep -m1 '^edition' "${dir}/Cargo.toml" 2>/dev/null | sed 's/[^"]*"\([^"]*\)".*/\1/')"
+        [ -n "${edition}" ] && { echo "${edition}"; return; }
+    fi
+    echo "2021"
+}
+
+UNFORMATTED=""
+for file in ${STAGED_RS}; do
+    # Skip files staged for deletion or otherwise absent from the worktree.
+    [ -f "${file}" ] || continue
+    if ! rustfmt --check --edition "$(file_edition "${file}")" "${file}" >/dev/null 2>&1; then
+        UNFORMATTED="${UNFORMATTED} ${file}"
+    fi
+done
+
+[ -z "${UNFORMATTED}" ] && exit 0
+
+echo "" >&2
+echo "pre-commit: these staged files are not rustfmt-clean:" >&2
+for file in ${UNFORMATTED}; do
+    echo "    ${file}" >&2
+done
+echo "" >&2
+echo "  Fix:  cargo fmt --all && git add${UNFORMATTED}" >&2
+echo "" >&2
+echo "  \`cargo fmt --all --check\` is a hard CI gate (.github/workflows/pr-check.yml)," >&2
+echo "  so committing this would only move the failure to the pull request." >&2
+echo "" >&2
+exit 1
