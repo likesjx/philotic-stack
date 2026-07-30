@@ -1929,8 +1929,11 @@ impl SessionState {
     pub fn context_breakdown_text(&self) -> String {
         let mut lines = Vec::new();
 
-        // Identity section
-        let identity = self.project_agent_self();
+        // Identity section. No turn content here, so the per-turn skill
+        // projection is empty — the estimate excludes the (capped)
+        // [Skill guidance] section, which only exists on turns that
+        // project skills.
+        let identity = self.project_agent_self(&[]);
         lines.push(format!(
             "identity       {} chars — persona + soul + role posture",
             identity.len()
@@ -2308,10 +2311,15 @@ impl SessionState {
 
         let mut budget_ledger = BudgetLedger::default();
         let injection_budget = &self.settings.injection_budget;
+        // Computed once per turn and shared by the Identity layer (so
+        // [Skill guidance] tracks the per-turn skill projection) and the
+        // projection's role_activation metadata below.
+        let projected_skill_names =
+            self.projected_skill_names_for_turn(user_content, projected_tools);
         let identity = apply_injection_budget(
             &mut budget_ledger,
             "identity",
-            self.project_agent_self(),
+            self.project_agent_self(&projected_skill_names),
             injection_budget.persona_chars,
         );
         let relationship = self.project_user(user_content);
@@ -2488,7 +2496,7 @@ impl SessionState {
                 started_at: None,
             },
             active_step,
-            role_activation: self.projected_role_activation_for_turn(user_content, projected_tools),
+            role_activation: self.projected_role_activation_for_turn(&projected_skill_names),
             current_user_message: user_content.to_string(),
             budget: ContextBudget {
                 included_sections: layers.len(),
@@ -2822,14 +2830,57 @@ impl SessionState {
 
     fn projected_role_activation_for_turn(
         &self,
-        user_content: &str,
-        projected_tools: &[ToolDefinition],
+        projected_skill_names: &[String],
     ) -> Option<RoleActivation> {
         let mut activation = self.role_activation.clone()?;
-        activation.effective_skillset =
-            self.projected_skill_names_for_turn(user_content, projected_tools);
-        activation.effective_skill_guidance.clear();
+        activation.effective_skillset = projected_skill_names.to_vec();
+        // Guidance follows the same per-turn projection: only ACTIVE projected
+        // skills carry their doctrine text. This used to be `.clear()` — the
+        // discard point that kept every skill's hotel-composed guidance out of
+        // the turn (the model saw bare skill ids, never the doctrine).
+        activation.effective_skill_guidance = self.skill_guidance_for_turn(projected_skill_names);
         Some(activation)
+    }
+
+    /// Returns the hotel-composed skill-guidance lines ("name — description")
+    /// for the given per-turn projected skills, defensively capped so a
+    /// pathological skill catalog can never blow up the prompt. Guidance for
+    /// non-projected skills is never returned — context cost tracks relevance.
+    fn skill_guidance_for_turn(&self, projected_skill_names: &[String]) -> Vec<String> {
+        const MAX_SKILL_GUIDANCE_ENTRIES: usize = 6;
+        const MAX_SKILL_GUIDANCE_CHARS: usize = 1500;
+
+        if projected_skill_names.is_empty() || self.bindings.effective_skill_guidance.is_empty() {
+            return Vec::new();
+        }
+        let mut out: Vec<String> = Vec::new();
+        let mut total_chars = 0usize;
+        let mut truncated = 0usize;
+        for entry in &self.bindings.effective_skill_guidance {
+            // Hotel format: "{skill_name} — {description}" (ipc.rs
+            // compose_session_snapshot). Entries that don't parse or don't
+            // match a projected skill are skipped, not rendered.
+            let Some(name) = entry.split(" — ").next().map(str::trim) else {
+                continue;
+            };
+            if !projected_skill_names.iter().any(|skill| skill == name) {
+                continue;
+            }
+            if out.len() >= MAX_SKILL_GUIDANCE_ENTRIES
+                || total_chars + entry.len() > MAX_SKILL_GUIDANCE_CHARS
+            {
+                truncated += 1;
+                continue;
+            }
+            total_chars += entry.len();
+            out.push(entry.clone());
+        }
+        if truncated > 0 {
+            out.push(format!(
+                "… {truncated} more skill-guidance entries truncated (budget cap)"
+            ));
+        }
+        out
     }
 
     fn push_layer(
@@ -2893,7 +2944,11 @@ impl SessionState {
         }
     }
 
-    pub fn project_agent_self(&self) -> String {
+    /// Renders the Identity layer. `projected_skills` is the per-turn skill
+    /// projection (see `projected_skill_names_for_turn`) — pass `&[]` for
+    /// turn-agnostic contexts (size estimates, policy checks); guidance for
+    /// non-projected skills is never rendered.
+    pub fn project_agent_self(&self, projected_skills: &[String]) -> String {
         let mut lines = Vec::new();
 
         if let Some(identity) = self
@@ -2943,6 +2998,22 @@ impl SessionState {
                     lines.push(format!("Role addendum: {role_addendum}"));
                 }
             }
+        }
+
+        // Doctrine text for the skills projected THIS turn — the hotel
+        // composes "name — description" guidance from the skill catalog
+        // (effective_skill_guidance), and before this section existed nothing
+        // on the philote side ever rendered it: the model saw bare skill ids
+        // with the charter text (outcome-note discipline, respawn-budget
+        // escalation, …) silently dropped. Capped in skill_guidance_for_turn.
+        let skill_guidance = self.skill_guidance_for_turn(projected_skills);
+        if !skill_guidance.is_empty() {
+            let mut section = String::from("\n[Skill guidance]");
+            for entry in &skill_guidance {
+                section.push_str("\n- ");
+                section.push_str(entry);
+            }
+            lines.push(section);
         }
 
         // Providers with no API-level safety toggle (Anthropic/OpenAI/Ollama/
@@ -7366,6 +7437,75 @@ mod tests {
         assert!(prompt.contains("Role working-memory policy: role_local."));
     }
 
+    /// aria-mesh-steward follow-up: the hotel composes per-skill doctrine text
+    /// ("name — description") into bindings.effective_skill_guidance, and the
+    /// Identity layer must render it as a [Skill guidance] section — but ONLY
+    /// for skills projected on this turn. Before this existed the strings were
+    /// discarded (`.clear()` + vec![] resets) and no skill doctrine ever
+    /// reached the model.
+    #[test]
+    fn skill_guidance_renders_for_projected_skills_only() {
+        let mut state =
+            SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
+        state.clear_tool_bindings();
+        state.add_tool_binding("echo");
+        state.bindings.effective_skillset = vec!["mesh.steward".into()];
+        state.bindings.on_demand_skills = vec!["mesh.steward".into()];
+        state.bindings.effective_skill_guidance = vec![
+            "mesh.steward — Mesh steward duties: keep the fleet high-functioning.".into(),
+            "cron.manage — Register and manage recurring cron jobs.".into(),
+        ];
+
+        // Maintenance-language turn → mesh.steward projects → its guidance
+        // renders; cron.manage is not projected, so its guidance must not.
+        let prompt = state.build_prompt("check the heal queue");
+        assert!(
+            prompt.contains("[Skill guidance]"),
+            "projected skill with guidance should render the section:\n{prompt}"
+        );
+        assert!(prompt.contains("mesh.steward — Mesh steward duties"));
+        assert!(
+            !prompt.contains("cron.manage — Register and manage"),
+            "non-projected skills' guidance must stay out of the prompt"
+        );
+
+        // Unrelated turn → mesh.steward not relevant → no section at all.
+        let prompt = state.build_prompt("write me a haiku about rivers");
+        assert!(
+            !prompt.contains("[Skill guidance]"),
+            "no projected skills → no guidance section:\n{prompt}"
+        );
+    }
+
+    /// The guidance section is defensively capped (max 6 entries / 1500 chars)
+    /// so a pathological skill catalog cannot blow up the prompt.
+    #[test]
+    fn skill_guidance_for_turn_is_capped_defensively() {
+        let mut state =
+            SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
+
+        // Entry-count cap: 10 matching skills → 6 entries + truncation marker.
+        let names: Vec<String> = (0..10).map(|i| format!("skill{i}")).collect();
+        state.bindings.effective_skill_guidance = names
+            .iter()
+            .map(|n| format!("{n} — doctrine text for {n}"))
+            .collect();
+        let out = state.skill_guidance_for_turn(&names);
+        assert_eq!(out.len(), 7, "6 capped entries + 1 truncation marker");
+        assert!(out.last().expect("marker").contains("truncated"));
+
+        // Char cap: an oversized entry is dropped (marked truncated) while a
+        // small one still renders.
+        state.bindings.effective_skill_guidance = vec![
+            format!("big — {}", "x".repeat(2000)),
+            "small — fits fine".into(),
+        ];
+        let out = state.skill_guidance_for_turn(&["big".into(), "small".into()]);
+        assert!(out.iter().any(|e| e.starts_with("small — ")));
+        assert!(!out.iter().any(|e| e.starts_with("big — ")));
+        assert!(out.last().expect("marker").contains("truncated"));
+    }
+
     #[test]
     fn model_affordances_project_visible_tools_without_raw_inventory_prompt_dump() {
         let mut state =
@@ -9055,7 +9195,7 @@ mod tests {
     fn effective_content_policy_defaults_to_standard() {
         let state = SessionState::new("sess-cp1".into(), "agent-jane-01".into(), "telegram".into());
         assert_eq!(state.effective_content_policy(), "standard");
-        assert!(!state.project_agent_self().contains("[Content Policy]"));
+        assert!(!state.project_agent_self(&[]).contains("[Content Policy]"));
     }
 
     /// role.configure's projection into the model request: an explicit
@@ -9071,7 +9211,7 @@ mod tests {
         assert_eq!(state.effective_content_policy(), "unrestricted");
         // The provider-agnostic half of fix 1: an unrestricted agent gets the
         // permissive system line, with no restrictive language added.
-        let projected = state.project_agent_self();
+        let projected = state.project_agent_self(&[]);
         assert!(projected.contains("[Content Policy]"));
         assert!(projected.contains("unrestricted"));
     }
@@ -10464,7 +10604,8 @@ mod tests {
         // byte-for-byte with no added header overhead.
         assert!(!layer.rendered_content.contains("[IDENTITY"));
         assert!(!layer.rendered_content.contains("truncated"));
-        assert_eq!(layer.rendered_content, state.project_agent_self());
+        // Fixture has no skills/guidance, so the turn-agnostic render matches.
+        assert_eq!(layer.rendered_content, state.project_agent_self(&[]));
     }
 
     #[test]

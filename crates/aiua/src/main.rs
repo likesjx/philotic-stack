@@ -5147,7 +5147,14 @@ fn seed_toolset_profiles(graph: &GraphDomain) -> anyhow::Result<()> {
                 "graph.create".into(),
                 "graph.list".into(),
             ],
-            allowed_classes: vec!["session".into(), "utility".into(), "workspace".into(), "memory".into(), "graph".into(), "agent_graph".into(), "life_graph".into()],
+            // "heal": the architect-charter daily brief (DEFAULT_CHARTER_MANIFEST
+            // in architect_charter.rs) instructs the typed heal.list /
+            // host.vitals steward tools and forbids the `phil heal list`
+            // shell-out — without this class grant those tools never project
+            // for the charter's own profile and the sweep goes blind. The
+            // mutating heal ops stay refused server-side (operational-admin
+            // gate); this grant only makes the read surface visible.
+            allowed_classes: vec!["session".into(), "utility".into(), "workspace".into(), "memory".into(), "graph".into(), "agent_graph".into(), "life_graph".into(), "heal".into()],
             allowed_skills: vec![
                 "handoff.back".into(),
                 "capability.request".into(),
@@ -5155,6 +5162,10 @@ fn seed_toolset_profiles(graph: &GraphDomain) -> anyhow::Result<()> {
                 "context.synthesize".into(),
                 "session.recover".into(),
                 "lifegraph.truth_summarizer".into(),
+                // Carries the mesh.steward doctrine (outcome notes,
+                // respawn-budget escalation) alongside the heal class the
+                // charter's heal.list instruction depends on.
+                "mesh.steward".into(),
             ],
             on_demand_skills: vec![],
             remote_tool_runners: vec![],
@@ -9291,6 +9302,60 @@ mod tests {
                 .allowed_skills
                 .iter()
                 .any(|skill| skill == "lifegraph.truth_summarizer")
+        );
+    }
+
+    /// The architect-charter daily brief (Autopoiesis Slice A4) runs on the
+    /// "architect" toolset profile and its manifest is prescriptive about
+    /// which tools to call — including the typed heal.list / host.vitals
+    /// steward tools while FORBIDDING the `phil heal list` shell-out. Every
+    /// tool the charter names must actually be granted by the profile
+    /// (directly in allowed_tools or via an allowed_classes expansion),
+    /// otherwise the next daily-brief fire has invisible tools AND a
+    /// forbidden fallback (the post-#386 defect this test pins).
+    #[test]
+    fn architect_profile_grants_every_tool_the_charter_manifest_names() {
+        use crate::architect_charter::DEFAULT_CHARTER_MANIFEST;
+
+        let storage = SqliteGraphStorage::open(":memory:").expect("open sqlite");
+        let graph = GraphDomain::new(Arc::new(storage.adapter()));
+        seed_toolset_profiles(&graph).expect("seed toolset profiles");
+
+        let architect = graph
+            .get_toolset_profile("architect")
+            .expect("read architect profile")
+            .expect("architect profile should exist");
+
+        let granted = |tool: &str| -> bool {
+            architect.allowed_tools.iter().any(|t| t == tool)
+                || architect.allowed_classes.iter().any(|class| {
+                    ansible_mesh_core::graph::tools_for_tool_class(class).contains(&tool)
+                })
+        };
+
+        for tool in [
+            "memory.delta_digest",
+            "heal.list",
+            "host.vitals",
+            "bash.exec",
+        ] {
+            assert!(
+                DEFAULT_CHARTER_MANIFEST.contains(tool),
+                "charter manifest should still name `{tool}` — if it stopped, update this test's list"
+            );
+            assert!(
+                granted(tool),
+                "architect profile must grant `{tool}` — the charter manifest instructs the model to call it"
+            );
+        }
+
+        // The steward doctrine travels with the skill grant.
+        assert!(
+            architect
+                .allowed_skills
+                .iter()
+                .any(|skill| skill == "mesh.steward"),
+            "architect profile must carry mesh.steward so the heal-sweep doctrine reaches the charter role"
         );
     }
 

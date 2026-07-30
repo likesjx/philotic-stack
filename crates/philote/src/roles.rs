@@ -213,6 +213,10 @@ impl AgentRuntime {
                     toolset_profile_ref: Some(toolset_profile),
                     skillset_profile_ref: None,
                     effective_skillset: vec![],
+                    // Empty on construction, NOT a discard: skill guidance is
+                    // hotel-composed into bindings.effective_skill_guidance
+                    // (merge_snapshot_bindings) and filled onto the activation
+                    // per turn by projected_role_activation_for_turn.
                     effective_skill_guidance: vec![],
                     working_memory_policy: None,
                     memory_projection_policy: None,
@@ -479,6 +483,10 @@ impl AgentRuntime {
                     }),
                 skillset_profile_ref: None,
                 effective_skillset: vec![],
+                // Empty on construction, NOT a discard: skill guidance is
+                // hotel-composed into bindings.effective_skill_guidance
+                // (merge_snapshot_bindings) and filled onto the activation
+                // per turn by projected_role_activation_for_turn.
                 effective_skill_guidance: vec![],
                 working_memory_policy: None,
                 memory_projection_policy: None,
