@@ -32,13 +32,33 @@ Method: a Python driver speaking the hotel UDS protocol directly (4-byte BE leng
 
 Per-item ≈ 0.22s local, ≈ 0.44s cross-mesh. A max-size batch lands **~16× under** the 90s `WAITING_TOOL_SECS` watchdog. Run 3 also proves the documented per-item isolation guarantee: one contract-invalid item returns `status=error` in its own row while every other item still writes.
 
-**Why it looked open for 12 days:** `life.observe.batch` had been dispatched to the runner **zero times** in the whole journald window (since 2026-07-20), while 52 single `life.observe` writes landed in the same window. It is granted (present in the live `abstract_skill:life.steward` `implied_tools` — the suggested mitigation was never applied) and routed (in `tools_for_allowed_class`, and `batch=true` in `remote_tool_runners` on all 9 mac-jane profiles and on mbp-jane). The model simply had not chosen it. So the Jul-14 hang was real, PRs #271/#277/#278 fixed it, and nothing re-exercised it.
+**Why it looked open for 12 days:** the Jul-14 hang was real, PRs #271/#277/#278 fixed it, and little re-exercised it. `life.observe.batch` is granted (present in the live `abstract_skill:life.steward` `implied_tools` — the suggested mitigation was never applied) and routed (in `tools_for_allowed_class`, and `batch=true` in `remote_tool_runners` on all 9 mac-jane profiles and on mbp-jane).
+
+> **⚠️ Correction (2026-07-27).** An earlier revision of this line claimed the tool had been dispatched **zero times** and that "the model simply had not chosen it". **Both were wrong**, and the mistake is worth more than the claim was.
+>
+> It was a **grep artifact**, not a fact. Two things compounded: journald on vps-jane retains only ~6 days, so "no hits" could never have meant "never"; and the hotel's structured log lines carry **ANSI colour codes**, which sit between the field name and the `=` and silently break the obvious `grep 'capability="life.observe.batch"'`. ANSI-stripped, the same window holds **8 dispatches in 7 days**.
+>
+> The hotel's durable `session_event` record — full history, no retention limit — shows **28 calls between 2026-07-13 and 2026-07-28**, 6 responses ok and 2 errored. Use `scripts/tool-usage.sh <tool>` (PR #388) for this question. Never journald.
+>
+> **Reading those 2 errors is what found the real bug** (PR #372): the model sometimes emits `observations` as an array of **JSON strings** rather than objects, and plain serde derive rejected the **entire batch** — `invalid type: string ..., expected struct LifeObserveInput` — discarding every observation despite valid content. It fails one layer **above** all the batch machinery this document investigates, which is why none of the work below could have found it. It is the strongest candidate yet for the "flight observations never land" symptom.
 
 **Hypothesis raised and killed before writing code:** that per-item embed latency × 25 blew the watchdog. Measured first — ONNX sidecar on vps returns in **0.17–0.23s**, Memgraph MERGE+SET in **~0.09s**. Neither is a cost center. Recording it because the arithmetic was plausible and wrong, which is exactly the trap this handoff warns about.
 
-**"Flight observations never land" — far smaller than feared.** In the 6-day window there were only **6** real provider invocation failures total, against 52 successful observes: 3× `life.commit: packet_id must not be empty`, 1× `life.patch.propose` same, 1× `life.observe` edge `rel_type 'ADVANCES'` not a living-cycle relation, 2× Memgraph type errors. There is no systemic observe-side rejection. The dominant live contract problem is a *different* tool — `life.commit` with an empty `packet_id`, with visible model retries.
+**"Flight observations never land" — far smaller than feared.** In the 6-day window there were only **6** real provider invocation failures total, against 52 successful observes: 3× `life.commit: packet_id must not be empty`, 1× `life.patch.propose` same, 1× `life.observe` edge `rel_type 'ADVANCES'` not a living-cycle relation, 2× Memgraph type errors. There is no systemic observe-side rejection **of the kind this section looked for**. The dominant live contract problem visible here is a *different* tool — `life.commit` with an empty `packet_id`, with visible model retries.
 
-Note the living-cycle vocabulary has since been widened; the runner now accepts `OWNS, SHAPES, SETS, SPAWNS, RELATES_TO, INSPIRES, INFORMS, TESTED_BY, PRODUCES, EXPRESSES, REFINES, SHARED_WITH, SCOPED_TO`. `ADVANCES` is still not among them, and a non-living-cycle `rel_type` fails `plan_observe` **pre-write**, discarding that whole node (`crates/data-memorygraphrag/src/lib.rs:1836`).
+> **⚠️ Superseded in part (2026-07-27).** This paragraph reasoned from the same ~6-day journald window and so under-counted. The durable record later showed a systemic loss the logs could not reveal: whole `life.observe.batch` calls rejected at **deserialization**, before any per-item accounting exists to be logged. See the correction above and PR #372.
+
+> **⚠️ Correction (2026-07-27) — this paragraph described a binary, not the source.** An earlier revision stated the runner "now accepts `OWNS, SHAPES, SETS, SPAWNS, RELATES_TO, INSPIRES, INFORMS, TESTED_BY, PRODUCES, EXPRESSES, REFINES, SHARED_WITH, SCOPED_TO`" and that "`ADVANCES` is still not among them".
+>
+> That vocabulary appears **nowhere in `develop`**. It was read off the `life-graph-runner` **deployed on vps-jane**, which was built from an unmerged branch whose artifacts were still on the box — the divergent-build trap this document otherwise warns about, walked straight into.
+>
+> On `develop` the two closed sets are:
+> - **living-cycle** (`LIVING_CYCLE_REL_TYPES`): `OWNS, SHAPES, SETS, SPAWNS, RELATES_TO, SCOPED_TO`
+> - **agenda** (`AGENDA_EDGE_RULES`, endpoint-validated): `ADVANCES, BLOCKED_BY, NEEDS_FOLLOWUP, PROMISED_TO, CONTAINS, SUPPORTS`
+>
+> So `ADVANCES` **is** accepted on `develop` — as an agenda relation. The deployed binary rejected it. An unknown `rel_type` still fails `plan_observe` **pre-write**, discarding that whole node.
+>
+> Both sets are now pinned by `write_enabled_edge_vocabulary_matches_the_schema_doc` (PR #388), which also asserts they stay disjoint, and every guest logs its `build_sha` at startup so a deployed binary can state which commit it is.
 
 ### ⚠️ Latent, unfixed — why a recurrence would look identical
 
