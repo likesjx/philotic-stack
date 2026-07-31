@@ -114,29 +114,50 @@ Two results that contradicted prior notes and are worth keeping:
 
 
 
-## Follow-ups (graph proposals, mirrored here for durability)
+## Follow-ups — ALL NINE IMPLEMENTED
 
-1. `proposal:secret-push-guard-activation` — **highest value, one command.**
+Every follow-up below was implemented on `codex/claude-harness-hardening`
+(PR #371), plus `proposal:aiua-tests-hang-on-keychain`, which the test gate
+depended on. Status per item is inline.
+
+
+
+1. ✅ `proposal:secret-push-guard-activation` — **DONE.** `just install-git-hooks`
+   run; `core.hooksPath` now `.githooks`, verified to apply to the main checkout
+   too (shared `.git/config`), so all 18 worktrees are covered. The guard fired
+   on a real push for the first time ever: *"secret-push-check: scanned 6
+   commit(s); no forbidden secrets found"*. `engine-check.sh` now asserts it
+   stays wired.
+
+   Original finding: **highest value, one command.**
    `.githooks/pre-push` invokes `scripts/secret-push-check.py`, but
    `core.hooksPath` points at an empty `.git/hooks`. The guard has never fired,
    despite `backup-pre-secret-rewrite-20260313` in history. `just
    install-git-hooks` fixes all worktrees at once (`.git/config` is shared).
-2. `proposal:harness-verify-resolves-skills` — `phil graph harness verify`
+2. ✅ `proposal:harness-verify-resolves-skills` — **DONE.** verify now resolves each declared skill (exists / frontmatter valid / reachable from the runtime's discovery path) and reports `drifted` with the specific failure. Proven: it caught `implementation`, then `planning` and `verification`, where the old one said `clean`.
+
+   Original finding: — `phil graph harness verify`
    reported `claude-local: clean` while all 7 declared skills were unreachable
    and one (`implementation`) does not exist anywhere on disk. It checks the
    managed CLAUDE.md block and never resolves the skill list against the
    filesystem. It attests that a broken harness is healthy.
-3. `proposal:agent-grant-blast-radius` — of the 872 grants, ~a third are parser
+3. ✅ `proposal:agent-grant-blast-radius` — **DONE.** 923 → 728 entries; 185 dangerous grants demoted to prompt. Details above.
+
+   Original finding: — of the 872 grants, ~a third are parser
    garbage, but the list also contains blanket grants for `ansible-playbook
    --vault-password-file`, `ssh deploy@jane-vps "sudo …"`, and `cp`/`ln` into
    `/opt/homebrew/Cellar`. Any agent can run those unattended.
-4. `proposal:declare-system-dependencies` — found by the new gate on its first
+4. ✅ `proposal:declare-system-dependencies` — **DONE.** `just preflight` + README table + `engine-check.sh` assertion. Verified it fails correctly when Opus is absent.
+
+   Original finding: — found by the new gate on its first
    run. `membrane-discord` depends on `opus`; its `-sys` crate asks pkg-config
    first and only builds from source on failure. The dev Macs have opus from
    Homebrew so the source path never ran locally and the dependency was
    invisible. A bare runner took it and died on CMake 4. Audit the other
    `-sys`/`build.rs` crates and document the required system packages.
-5. `proposal:pr-test-gate-viability` — **make the test gate blocking.** Cold
+5. ✅ `proposal:pr-test-gate-viability` — **DONE.** The test job is now a hard gate. Three things had to be fixed first: the Keychain hang, a test-isolation bug where two tests `remove_var`'d the vault key out from under three others, and a TOCTOU port race in graph-intelligence's server tests. Verified under CI conditions: 2340 passed / 0 failed.
+
+   Original finding: — **make the test gate blocking.** Cold
    `cargo test --workspace` on macos-14 measured 2h59m and did not finish;
    cancelled runs never saved the cargo cache, so nothing ever got warm. Work
    needed: warm the cache from a develop push (now wired), confirm `target/`
@@ -144,7 +165,9 @@ Two results that contradicted prior notes and are worth keeping:
    evaluate `cargo-nextest`, and keep `CARGO_PROFILE_TEST_DEBUG=0`. Flip
    `continue-on-error` off only after a cached run finishes well inside the
    timeout.
-6. `proposal:tool-agnostic-fmt-hook` — the PostToolUse rustfmt hook covers Claude
+6. ✅ `proposal:tool-agnostic-fmt-hook` — **DONE.** `.githooks/pre-commit` checks staged Rust files only. Verified both ways: unformatted → exit 1, formatted → exit 0.
+
+   Original finding: — the PostToolUse rustfmt hook covers Claude
    Code only, but eight harnesses are registered (codex, windsurf, four
    gemini/antigravity roles) and any of them can drift develop. This is not
    theoretical: PR #371 went red on its own merge commit within a day, because
@@ -152,15 +175,21 @@ Two results that contradicted prior notes and are worth keeping:
    cut. Move the enforcement to a git `pre-commit` hook, which applies whoever
    commits — and which rides along with the `just install-git-hooks` step
    already needed for (1).
-7. `proposal:clippy-ratchet-workspace-lints` — clippy is not in the PR gate
+7. ✅ `proposal:clippy-ratchet-workspace-lints` — **DONE.** `[workspace.lints.clippy]` + per-crate opt-in; **17 of 32 crates gated at deny**, and a hard clippy job in CI (passes in ~3m). Five crates were deliberately backed out and named as the next steps.
+
+   Original finding: — clippy is not in the PR gate
    because hundreds of existing warnings would make it red on arrival. Clean
    crates one at a time behind `[workspace.lints]`, then add it blocking.
-8. `proposal:claude-charter-in-repo` — `.claude/CLAUDE.md` is checked in and
+8. ✅ `proposal:claude-charter-in-repo` — **DONE.** Charter projects to `.claude/harness/claude-local.md` with a relative import; hook moved to the version-controlled `settings.json`. Also fixed the phantom skills at source across nine canonical profiles.
+
+   Original finding: — `.claude/CLAUDE.md` is checked in and
    contains only `@/Users/jaredlikes/.claude/philotic/harnesses/claude-local/CLAUDE.md`.
    On any other machine or in CI that resolves to nothing and the charter
    silently vanishes. The charter should live in-repo with the harness tool
    syncing into it.
-9. `proposal:pr-linux-compile-check` — the PR gate is macOS-only, so a PR can
+9. ✅ `proposal:pr-linux-compile-check` — **DONE.** `cargo check` job over exactly build-linux.yml's package set (parity asserted), passing in ~2m.
+
+   Original finding: — the PR gate is macOS-only, so a PR can
    break the vps-jane build and not find out until it lands on develop. Add a
    `cargo check` job on ubuntu over the package set `build-linux.yml` builds.
 
