@@ -1742,8 +1742,47 @@ pub const MAX_OBSERVE_BATCH: usize = 25;
 /// writes.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct LifeObserveBatchInput {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_observations_leniently")]
     pub observations: Vec<LifeObserveInput>,
+}
+
+/// Accept each observation either as a JSON object or as a STRING containing
+/// one.
+///
+/// Models routinely emit nested tool arguments as pre-serialized strings —
+/// `"observations": ["{\"observation_id\":...}", ...]` instead of an array of
+/// objects. Plain derive rejects the entire batch with
+/// `invalid type: string ..., expected struct LifeObserveInput`, so every
+/// observation in the call is lost even though the content was perfectly valid.
+///
+/// This is not hypothetical: the hotel's durable record shows batches failing
+/// exactly this way on the operator's live graph, and it is a strong candidate
+/// for the long-standing "observations never land" symptom, which no amount of
+/// batch-machinery debugging would have explained.
+///
+/// Deliberately narrow. It only unwraps one layer of string encoding; the inner
+/// value must still satisfy `LifeObserveInput` in full, so no validation,
+/// provenance requirement or plan gate is relaxed. A malformed inner payload
+/// still fails, and now says so per item rather than as an opaque type error
+/// about the whole array.
+fn deserialize_observations_leniently<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Vec<LifeObserveInput>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::Error as _;
+
+    let raw = Vec::<serde_json::Value>::deserialize(deserializer)?;
+    raw.into_iter()
+        .enumerate()
+        .map(|(index, value)| match value {
+            serde_json::Value::String(encoded) => serde_json::from_str(&encoded)
+                .map_err(|err| D::Error::custom(format!("observations[{index}]: {err}"))),
+            other => serde_json::from_value(other)
+                .map_err(|err| D::Error::custom(format!("observations[{index}]: {err}"))),
+        })
+        .collect()
 }
 
 /// Input for `life.view.node` — the READ-ONLY single-node detail surface
@@ -2200,6 +2239,91 @@ fn finish_validation(violations: Vec<String>) -> Result<(), ContractError> {
 
 #[cfg(test)]
 mod tests {
+    /// The EXACT payload shape recorded failing on the operator's live graph
+    /// (hotel session_event, 2026-07-28). Guards against "fixed it in principle
+    /// but not for the case that actually happened".
+    #[test]
+    fn observe_batch_parses_the_payload_that_failed_live() {
+        let live_item = r#"{"observation_id":"obs:role-human-2026-07-28","evidence":{"claim_ref":{"id":"life:role:human","label":"Role"},"claim_summary":"Establish the primary Human role representing the operator's personal life, wellness, and self-stewardship.","confidence":0.9,"validation_state":"proposed","source_refs":[{"source_id":"membrane:telegram","source_kind":"operator_confirmation","reliability":{"score":0.9,"basis":"operator_confirmed"}}]}}"#;
+        let parsed: super::LifeObserveBatchInput = serde_json::from_value(serde_json::json!({
+            "observations": [live_item]
+        }))
+        .expect("the payload observed failing live must now parse");
+        assert_eq!(parsed.observations.len(), 1);
+        assert_eq!(
+            parsed.observations[0].observation_id,
+            "obs:role-human-2026-07-28"
+        );
+    }
+
+    /// Models routinely emit nested tool arguments as pre-serialized strings.
+    /// Plain derive rejects the WHOLE batch with `invalid type: string ...,
+    /// expected struct LifeObserveInput`, losing every observation in the call
+    /// even though the content is valid — observed on the operator's live graph
+    /// in the hotel's durable event record.
+    #[test]
+    fn observe_batch_accepts_string_encoded_observations() {
+        let object_form = serde_json::json!({
+            "observations": [{
+                "observation_id": "obs-1",
+                "evidence": {
+                    "packet_id": "pkt-1",
+                    "claim_ref": {"id": "n-1", "label": "Signal"},
+                    "claim_summary": "a claim",
+                    "source_refs": [],
+                    "confidence": 0.9,
+                    "validation_state": "proposed",
+                }
+            }]
+        });
+        let parsed_object: super::LifeObserveBatchInput =
+            serde_json::from_value(object_form.clone()).expect("object form must parse");
+
+        // The same observation, pre-serialized into a string by the model.
+        let inner = object_form["observations"][0].to_string();
+        let string_form = serde_json::json!({ "observations": [inner] });
+        let parsed_string: super::LifeObserveBatchInput =
+            serde_json::from_value(string_form).expect("string-encoded form must parse");
+
+        assert_eq!(
+            parsed_object, parsed_string,
+            "a string-encoded observation must deserialize identically to the object form"
+        );
+        assert_eq!(parsed_string.observations.len(), 1);
+        assert_eq!(parsed_string.observations[0].observation_id, "obs-1");
+    }
+
+    /// Leniency must not become permissiveness: only ONE layer of string
+    /// encoding is unwrapped, and the inner value still has to satisfy
+    /// `LifeObserveInput` in full. A malformed item must still fail, and the
+    /// error must name which index was bad rather than being an opaque type
+    /// error about the whole array.
+    #[test]
+    fn observe_batch_still_rejects_malformed_items_and_names_the_index() {
+        let err = serde_json::from_value::<super::LifeObserveBatchInput>(serde_json::json!({
+            "observations": [
+                {
+                    "observation_id": "obs-ok",
+                    "evidence": {
+                        "packet_id": "pkt-1",
+                        "claim_ref": {"id": "n-1", "label": "Signal"},
+                        "claim_summary": "a claim",
+                        "source_refs": [],
+                        "confidence": 0.9,
+                        "validation_state": "proposed",
+                    }
+                },
+                "{\"observation_id\":\"obs-bad\"}"
+            ]
+        }))
+        .expect_err("an item missing required fields must still fail");
+        let message = err.to_string();
+        assert!(
+            message.contains("observations[1]"),
+            "error must name the offending index: {message}"
+        );
+    }
+
     use super::*;
 
     #[test]

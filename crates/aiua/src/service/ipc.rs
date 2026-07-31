@@ -13484,8 +13484,18 @@ impl IpcServer {
                         .collect()
                 })
                 .unwrap_or_default();
+            let on_demand_skills: Vec<String> = bindings
+                .get("on_demand_skills")
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_str())
+                        .map(str::to_string)
+                        .collect()
+                })
+                .unwrap_or_default();
 
-            if !skillset.is_empty() {
+            if !skillset.is_empty() || !on_demand_skills.is_empty() {
                 let mut toolset: Vec<String> = bindings
                     .get("effective_toolset")
                     .and_then(|v| v.as_array())
@@ -13506,6 +13516,13 @@ impl IpcServer {
                             .collect()
                     })
                     .unwrap_or_default();
+                let mut push_guidance = |skill_record: &AbstractSkillRecord| {
+                    let guidance =
+                        format!("{} — {}", skill_record.skill_name, skill_record.description);
+                    if !skill_guidance.contains(&guidance) {
+                        skill_guidance.push(guidance);
+                    }
+                };
 
                 for skill_name in &skillset {
                     if let Ok(Some(skill_record)) = graph.get_abstract_skill(skill_name) {
@@ -13514,11 +13531,21 @@ impl IpcServer {
                                 toolset.push(implied.clone());
                             }
                         }
-                        let guidance =
-                            format!("{} — {}", skill_record.skill_name, skill_record.description);
-                        if !skill_guidance.contains(&guidance) {
-                            skill_guidance.push(guidance);
-                        }
+                        push_guidance(&skill_record);
+                    }
+                }
+                // On-demand skills project per-turn in philote, but their
+                // doctrine text must still travel in effective_skill_guidance —
+                // a skill projected without its guidance is a bare id (the
+                // model never sees the outcome-note / escalation discipline the
+                // catalog describes). Tools are deliberately NOT expanded here;
+                // per-turn on-demand tool visibility stays philote's decision.
+                for skill_name in &on_demand_skills {
+                    if skillset.contains(skill_name) {
+                        continue;
+                    }
+                    if let Ok(Some(skill_record)) = graph.get_abstract_skill(skill_name) {
+                        push_guidance(&skill_record);
                     }
                 }
 

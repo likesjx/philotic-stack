@@ -71,12 +71,15 @@
 # ── Central graph database (optional Memgraph provider) ───────────────────────
 
 - name: Create Memgraph data directory
+  # Owned by the in-container memgraph user (uid 101 / gid 103), not root:
+  # this directory IS the database. Memgraph writes its snapshots and WAL
+  # here, and cannot start if it may not write.
   file:
     path: "{{ philotic_memgraph_data_dir }}"
     state: directory
-    owner: "root"
-    group: "root"
-    mode: "0755"
+    owner: "{{ philotic_memgraph_uid }}"
+    group: "{{ philotic_memgraph_gid }}"
+    mode: "0750"
   when: philotic_memgraph_enabled | bool
 
 - name: Deploy Memgraph systemd unit
