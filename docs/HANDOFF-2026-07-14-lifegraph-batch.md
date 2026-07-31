@@ -1,6 +1,6 @@
 # Session Handoff — 2026-07-14 (vps-jane / Beacon)
 
-> Read this first. It captures a very long session. The headline: **the three things the operator originally needed are DONE and verified.** One rabbit hole (`life.observe.batch`) remains open and needs a **methodical isolation repro**, not more guess-deploys.
+> Read this first. It captures a very long session. The headline: **the three things the operator originally needed are DONE and verified.** The one rabbit hole (`life.observe.batch`) is **CLOSED as of 2026-07-26** — the isolation repro finally ran on both legs and the batch is healthy. See [the closure section](#-2026-07-26-closed--isolation-repro-ran-on-both-legs-batch-is-healthy).
 
 ---
 
@@ -10,7 +10,7 @@
 |---|---|
 | **Memory 401** — Beacon couldn't save operator facts (kids' names) | ✅ **FIXED + live-verified** (write+recall to `user_likesjx`, 0 401s) |
 | **Transcribe timeout** — long voice memos failed | ✅ **Deployed** (unverified — needs a long voice memo) |
-| **`life.observe.batch`** — flight itineraries wedge Beacon | ⏳ **3 layers fixed, handler now runs, but observations still don't land.** STOP guessing → do the isolation repro. |
+| **`life.observe.batch`** — flight itineraries wedge Beacon | ✅ **CLOSED 2026-07-26.** Isolation repro ran on both legs: 25/25 items in **5.5s** local, 6 items in **2.6s** cross-mesh. Not hanging; it had simply never been re-exercised after the 3 fixes. |
 
 All deployed to **vps-jane** (Beacon) via `just vps-deploy-ci`. Branch `codex/beacon-memory-userid-transcribe-scaling` merged to `develop` across PRs #268, #271, #275, #277, #278. **Not yet fanned out to mbp-jane / mac-jane** (same bugs affect them; they're on develop now).
 
@@ -18,7 +18,62 @@ The operator's flight data is **safe in Muninn** regardless (vault `user_likesjx
 
 ---
 
-## ⏳ OPEN: `life.observe.batch` — flight observations never land
+## ✅ 2026-07-26 CLOSED — isolation repro ran on both legs, batch is healthy
+
+The decisive test below finally ran. **`life.observe.batch` is not hanging and observations do land.**
+
+Method: a Python driver speaking the hotel UDS protocol directly (4-byte BE length prefix + JSON; `IpcRequest` is `{"operation":…,"payload":…}`), replicating `life_graph_ipc_smoke_driver.rs` without an 11-minute CI build. Kept as `scripts/lifegraph_batch_probe.py`.
+
+| run | leg | items | wall time | outcome |
+|---|---|---|---|---|
+| 1 | vps local (`/run/philotic/vps-jane.sock`) | 3 | **0.68s** | 3/3 `proposed`, `embed_status=ok` |
+| 2 | vps local | **25** (`MAX_OBSERVE_BATCH`) | **5.50s** | **25/25 `proposed`** |
+| 3 | **mac-jane → mesh → vps** | 6 (1 deliberately invalid) | **2.63s** | `partial`: 5 `proposed`, 1 isolated `error` |
+
+Per-item ≈ 0.22s local, ≈ 0.44s cross-mesh. A max-size batch lands **~16× under** the 90s `WAITING_TOOL_SECS` watchdog. Run 3 also proves the documented per-item isolation guarantee: one contract-invalid item returns `status=error` in its own row while every other item still writes.
+
+**Why it looked open for 12 days:** the Jul-14 hang was real, PRs #271/#277/#278 fixed it, and little re-exercised it. `life.observe.batch` is granted (present in the live `abstract_skill:life.steward` `implied_tools` — the suggested mitigation was never applied) and routed (in `tools_for_allowed_class`, and `batch=true` in `remote_tool_runners` on all 9 mac-jane profiles and on mbp-jane).
+
+> **⚠️ Correction (2026-07-27).** An earlier revision of this line claimed the tool had been dispatched **zero times** and that "the model simply had not chosen it". **Both were wrong**, and the mistake is worth more than the claim was.
+>
+> It was a **grep artifact**, not a fact. Two things compounded: journald on vps-jane retains only ~6 days, so "no hits" could never have meant "never"; and the hotel's structured log lines carry **ANSI colour codes**, which sit between the field name and the `=` and silently break the obvious `grep 'capability="life.observe.batch"'`. ANSI-stripped, the same window holds **8 dispatches in 7 days**.
+>
+> The hotel's durable `session_event` record — full history, no retention limit — shows **28 calls between 2026-07-13 and 2026-07-28**, 6 responses ok and 2 errored. Use `scripts/tool-usage.sh <tool>` (PR #388) for this question. Never journald.
+>
+> **Reading those 2 errors is what found the real bug** (PR #372): the model sometimes emits `observations` as an array of **JSON strings** rather than objects, and plain serde derive rejected the **entire batch** — `invalid type: string ..., expected struct LifeObserveInput` — discarding every observation despite valid content. It fails one layer **above** all the batch machinery this document investigates, which is why none of the work below could have found it. It is the strongest candidate yet for the "flight observations never land" symptom.
+
+**Hypothesis raised and killed before writing code:** that per-item embed latency × 25 blew the watchdog. Measured first — ONNX sidecar on vps returns in **0.17–0.23s**, Memgraph MERGE+SET in **~0.09s**. Neither is a cost center. Recording it because the arithmetic was plausible and wrong, which is exactly the trap this handoff warns about.
+
+**"Flight observations never land" — far smaller than feared.** In the 6-day window there were only **6** real provider invocation failures total, against 52 successful observes: 3× `life.commit: packet_id must not be empty`, 1× `life.patch.propose` same, 1× `life.observe` edge `rel_type 'ADVANCES'` not a living-cycle relation, 2× Memgraph type errors. There is no systemic observe-side rejection **of the kind this section looked for**. The dominant live contract problem visible here is a *different* tool — `life.commit` with an empty `packet_id`, with visible model retries.
+
+> **⚠️ Superseded in part (2026-07-27).** This paragraph reasoned from the same ~6-day journald window and so under-counted. The durable record later showed a systemic loss the logs could not reveal: whole `life.observe.batch` calls rejected at **deserialization**, before any per-item accounting exists to be logged. See the correction above and PR #372.
+
+> **⚠️ Correction (2026-07-27) — this paragraph described a binary, not the source.** An earlier revision stated the runner "now accepts `OWNS, SHAPES, SETS, SPAWNS, RELATES_TO, INSPIRES, INFORMS, TESTED_BY, PRODUCES, EXPRESSES, REFINES, SHARED_WITH, SCOPED_TO`" and that "`ADVANCES` is still not among them".
+>
+> That vocabulary appears **nowhere in `develop`**. It was read off the `life-graph-runner` **deployed on vps-jane**, which was built from an unmerged branch whose artifacts were still on the box — the divergent-build trap this document otherwise warns about, walked straight into.
+>
+> On `develop` the two closed sets are:
+> - **living-cycle** (`LIVING_CYCLE_REL_TYPES`): `OWNS, SHAPES, SETS, SPAWNS, RELATES_TO, SCOPED_TO`
+> - **agenda** (`AGENDA_EDGE_RULES`, endpoint-validated): `ADVANCES, BLOCKED_BY, NEEDS_FOLLOWUP, PROMISED_TO, CONTAINS, SUPPORTS`
+>
+> So `ADVANCES` **is** accepted on `develop` — as an agenda relation. The deployed binary rejected it. An unknown `rel_type` still fails `plan_observe` **pre-write**, discarding that whole node.
+>
+> Both sets are now pinned by `write_enabled_edge_vocabulary_matches_the_schema_doc` (PR #388), which also asserts they stay disjoint, and every guest logs its `build_sha` at startup so a deployed binary can state which commit it is.
+
+### ⚠️ Latent, unfixed — why a recurrence would look identical
+
+None of these caused the current state; all are code-visible, and together they mean nothing *bounds* a slow LifeGraph task.
+
+1. **No timeout on `provider.invoke()`** — `crates/datasource/src/runtime.rs` awaits it inline in the receive loop, unbounded.
+2. **The runner loop is strictly sequential** — zero `spawn`/`JoinSet` in `runtime.rs`. One `life.*` task at a time, process-wide, so a slow task head-of-line blocks *every* agent's LifeGraph traffic on every hotel routed to it. This explains "wedges Beacon" better than per-turn eviction does.
+3. **No client-side timeout on any Memgraph query in the provider** — neo4rs sets none by default, and Memgraph's `query_execution_timeout_sec=600` is 6.7× the 90s caller watchdog. Same unbounded-wait class as the `embed_text` hang already fixed with an 8s bound.
+4. **No wall-clock budget on the batch** — worst case 25 × (8s embed timeout + unbounded Memgraph). The handler already returns `partial` with per-item rows, so it is structurally ready to bound and return early.
+
+Fix shape is **bounding, not re-architecting**: a batch deadline returning partial results, a Memgraph client timeout, and a timeout around `provider.invoke()`. Concurrency work on the sequential loop is a bigger change than warranted — the ordering may be load-bearing.
+
+---
+
+## ⏳ ORIGINAL (2026-07-14) OPEN ITEM — kept for the record, resolved above
 
 ### Do this FIRST (the decisive test I kept skipping)
 
