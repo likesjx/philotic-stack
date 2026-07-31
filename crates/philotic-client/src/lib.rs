@@ -3638,8 +3638,8 @@ mod tests {
             redirect_uri: "https://hotel.example/auth/oidc/google/callback".into(),
         };
         let bytes = serde_json::to_vec(&request).expect("serialize OIDC exchange request");
-        let decoded =
-            serde_json::from_slice::<IpcRequest>(&bytes).expect("deserialize OIDC exchange request");
+        let decoded = serde_json::from_slice::<IpcRequest>(&bytes)
+            .expect("deserialize OIDC exchange request");
         match decoded {
             IpcRequest::ExchangeOperatorOidc {
                 provider,
