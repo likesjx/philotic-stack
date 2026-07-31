@@ -6,35 +6,35 @@ name: PR Check
 # policy is to auto-merge agent PRs into develop "at honest green" — a green
 # that was entirely self-reported by the agent that wrote the code.
 #
-# CURRENT STATE, stated plainly:
+# All four jobs are HARD gates.
 #
-#   fmt  — HARD gate on PRs. Runs in ~16s. This is real enforcement today.
-#   test — NOT blocking yet (continue-on-error). It runs, and its failures are
-#          visible, but it cannot fail a PR.
+# The test job was advisory for a while because it did not terminate: cold runs
+# hit 90-, 180- and finally 350-minute limits. That was never build cost — the
+# build step succeeded and the cache saved at 2.03 GiB. `cargo test` EXECUTION
+# hung, on the macOS Keychain (`security find/add-generic-password` blocks
+# forever where no login keychain is unlocked). Fixed in
+# ansible_mesh_core::keychain, and the job now finishes in ~10 minutes.
 #
-# Why test is not blocking yet. On a cold macos-14 runner `cargo test
-# --workspace` took 2h59m and was still going when the job timed out — twice,
-# at 90 and at 180 minutes. `cargo check --workspace` passes there, so this is
-# build cost, not broken code: 31 crates and 89 test binaries, with heavy
-# dependencies (ort/onnxruntime and friends). Worse, both cancelled runs failed
-# to save the cargo cache, so every attempt restarted from cold and the cache
-# never got a chance to make later runs cheap.
+# Two further fixes were needed before it could be trusted as blocking:
+#   - Three tests relied on an ambient PHILOTIC_VAULT_MASTER_KEY that another
+#     test deleted mid-run (Rust runs tests as threads of one process, and that
+#     test called remove_var instead of restoring). See VaultKeyEnv in ipc.rs.
+#   - graph-intelligence's server tests raced on port allocation: they asked for
+#     a free port, dropped the listener, then re-bound it. Now they bind :0 and
+#     read back the assigned port.
 #
-# Making it blocking is its own piece of work, tracked as
-# proposal:pr-test-gate-viability: warm the cache from a develop push, shard the
-# workspace across a matrix, evaluate cargo-nextest, and confirm target/ fits
-# under the 10 GB cache limit. Until that lands, a blocking 3-hour job would
-# stall every PR, and a gate people route around is worse than an honest
-# advisory one.
+# Verified under exact CI conditions (CI=true plus the ambient key):
+# 2340 passed / 0 failed, exit 0.
 #
 # Linux is not an option for the test job: the workspace contains Apple-only
 # crates, which is why build-linux.yml builds a selective package set rather
 # than --workspace. A Linux compile check over that subset is
 # proposal:pr-linux-compile-check.
 #
-# Clippy is deliberately absent. The workspace emits hundreds of warnings (aiua
-# alone: 313), so blocking clippy would be red on arrival and would only teach
-# everyone to ignore the gate. See proposal:clippy-ratchet-workspace-lints.
+# Clippy is gated by ratchet, not wholesale: only crates that opted in via
+# `[lints] workspace = true` deny warnings (17 of 32 today). The workspace still
+# carries ~700 warnings overall, so a blanket -D warnings would be red on
+# arrival. See proposal:clippy-ratchet-workspace-lints.
 
 on:
   pull_request:
@@ -213,11 +213,11 @@ jobs:
         run: cargo clippy --workspace --all-targets
 
   test:
-    name: test (macos arm64, advisory)
+    name: test (macos arm64)
     runs-on: macos-14
-    # Advisory until proposal:pr-test-gate-viability lands. Do NOT remove this
-    # without first confirming a cached run finishes well inside the timeout.
-    continue-on-error: true
+    # Blocking as of proposal:pr-test-gate-viability. The timeout stays generous
+    # because a cold runner still has to build 89 test binaries; a warm one
+    # finishes in ~10 minutes.
     timeout-minutes: 350
     steps:
       - uses: actions/checkout@v4

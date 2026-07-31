@@ -1,4 +1,3 @@
-use std::net::TcpListener;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -15,15 +14,6 @@ fn workspace_root() -> PathBuf {
         .and_then(|p| p.parent())
         .map(|p| p.to_path_buf())
         .expect("Could not find workspace root")
-}
-
-/// Find an available port by binding to port 0.
-fn available_port() -> u16 {
-    TcpListener::bind("127.0.0.1:0")
-        .expect("Failed to bind")
-        .local_addr()
-        .expect("Failed to get addr")
-        .port()
 }
 
 /// Create a test AppState with a scanned in-memory engine.
@@ -59,12 +49,16 @@ fn test_state() -> Arc<AppState> {
 #[tokio::test]
 async fn test_api_status_endpoint() {
     let state = test_state();
-    let port = available_port();
-
     let app = api::router(state);
-    let listener = tokio::net::TcpListener::bind(format!("127.0.0.1:{}", port))
+    // Bind to port 0 and read back what the OS assigned. Asking for a free
+    // port and then re-binding it is a TOCTOU race: the old helper dropped
+    // its listener before returning, so a concurrently-starting test could
+    // claim the port in between. That made these tests intermittently fail
+    // under `cargo test --workspace` while passing in isolation.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("Failed to bind");
+    let port = listener.local_addr().expect("Failed to get addr").port();
 
     tokio::spawn(async move {
         axum::serve(listener, app).await.unwrap();
@@ -105,12 +99,16 @@ async fn test_api_status_endpoint() {
 #[tokio::test]
 async fn test_api_proposals_endpoint() {
     let state = test_state();
-    let port = available_port();
-
     let app = api::router(state);
-    let listener = tokio::net::TcpListener::bind(format!("127.0.0.1:{}", port))
+    // Bind to port 0 and read back what the OS assigned. Asking for a free
+    // port and then re-binding it is a TOCTOU race: the old helper dropped
+    // its listener before returning, so a concurrently-starting test could
+    // claim the port in between. That made these tests intermittently fail
+    // under `cargo test --workspace` while passing in isolation.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("Failed to bind");
+    let port = listener.local_addr().expect("Failed to get addr").port();
 
     tokio::spawn(async move {
         axum::serve(listener, app).await.unwrap();
@@ -146,12 +144,16 @@ async fn test_api_proposals_endpoint() {
 #[tokio::test]
 async fn test_api_proposal_content_prefers_graph_authored_content() {
     let state = test_state();
-    let port = available_port();
-
     let app = api::router(state);
-    let listener = tokio::net::TcpListener::bind(format!("127.0.0.1:{}", port))
+    // Bind to port 0 and read back what the OS assigned. Asking for a free
+    // port and then re-binding it is a TOCTOU race: the old helper dropped
+    // its listener before returning, so a concurrently-starting test could
+    // claim the port in between. That made these tests intermittently fail
+    // under `cargo test --workspace` while passing in isolation.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("Failed to bind");
+    let port = listener.local_addr().expect("Failed to get addr").port();
 
     tokio::spawn(async move {
         axum::serve(listener, app).await.unwrap();
@@ -213,12 +215,16 @@ async fn test_api_proposal_content_prefers_graph_authored_content() {
 #[tokio::test]
 async fn test_api_manage_proposal_updates_agent_work_focus() {
     let state = test_state();
-    let port = available_port();
-
     let app = api::router(state);
-    let listener = tokio::net::TcpListener::bind(format!("127.0.0.1:{}", port))
+    // Bind to port 0 and read back what the OS assigned. Asking for a free
+    // port and then re-binding it is a TOCTOU race: the old helper dropped
+    // its listener before returning, so a concurrently-starting test could
+    // claim the port in between. That made these tests intermittently fail
+    // under `cargo test --workspace` while passing in isolation.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("Failed to bind");
+    let port = listener.local_addr().expect("Failed to get addr").port();
 
     tokio::spawn(async move {
         axum::serve(listener, app).await.unwrap();
@@ -275,12 +281,16 @@ async fn test_api_manage_proposal_updates_agent_work_focus() {
 #[tokio::test]
 async fn test_api_nodes_endpoint() {
     let state = test_state();
-    let port = available_port();
-
     let app = api::router(state);
-    let listener = tokio::net::TcpListener::bind(format!("127.0.0.1:{}", port))
+    // Bind to port 0 and read back what the OS assigned. Asking for a free
+    // port and then re-binding it is a TOCTOU race: the old helper dropped
+    // its listener before returning, so a concurrently-starting test could
+    // claim the port in between. That made these tests intermittently fail
+    // under `cargo test --workspace` while passing in isolation.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("Failed to bind");
+    let port = listener.local_addr().expect("Failed to get addr").port();
 
     tokio::spawn(async move {
         axum::serve(listener, app).await.unwrap();
@@ -336,12 +346,16 @@ async fn test_api_nodes_endpoint() {
 #[tokio::test]
 async fn test_api_not_found() {
     let state = test_state();
-    let port = available_port();
-
     let app = api::router(state);
-    let listener = tokio::net::TcpListener::bind(format!("127.0.0.1:{}", port))
+    // Bind to port 0 and read back what the OS assigned. Asking for a free
+    // port and then re-binding it is a TOCTOU race: the old helper dropped
+    // its listener before returning, so a concurrently-starting test could
+    // claim the port in between. That made these tests intermittently fail
+    // under `cargo test --workspace` while passing in isolation.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("Failed to bind");
+    let port = listener.local_addr().expect("Failed to get addr").port();
 
     tokio::spawn(async move {
         axum::serve(listener, app).await.unwrap();
@@ -369,11 +383,13 @@ async fn test_api_not_found() {
 /// Helper: spin up a test server, return (port, client)
 async fn start_test_server() -> (u16, reqwest::Client) {
     let state = test_state();
-    let port = available_port();
     let app = api::router(state);
-    let listener = tokio::net::TcpListener::bind(format!("127.0.0.1:{}", port))
+    // Bind to port 0 and read back what the OS assigned — see the note on the
+    // other call sites; asking for a free port and re-binding it races.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("Failed to bind");
+    let port = listener.local_addr().expect("Failed to get addr").port();
     tokio::spawn(async move {
         axum::serve(listener, app).await.unwrap();
     });

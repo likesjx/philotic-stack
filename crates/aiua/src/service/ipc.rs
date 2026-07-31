@@ -17345,6 +17345,37 @@ pub(crate) mod tests {
             .unwrap_or_else(|poison| poison.into_inner())
     }
 
+    /// Sets `PHILOTIC_VAULT_MASTER_KEY` for a test and RESTORES the previous
+    /// value on drop.
+    ///
+    /// These tests used to `remove_var` unconditionally when finished. Rust
+    /// runs tests as threads of a SINGLE process, so that deleted the key out
+    /// from under any concurrently-running test, and it deleted the ambient
+    /// value CI provides. That is how three unrelated tests
+    /// (heal_memory_token::*, gemini_oauth_startup_*) failed on the runner
+    /// while passing locally: they never set the key themselves and relied on
+    /// the environment, which another test had wiped mid-run.
+    pub(crate) struct VaultKeyEnv(Option<std::ffi::OsString>);
+
+    impl VaultKeyEnv {
+        pub(crate) fn set(value: &str) -> Self {
+            let previous = std::env::var_os("PHILOTIC_VAULT_MASTER_KEY");
+            unsafe { std::env::set_var("PHILOTIC_VAULT_MASTER_KEY", value) };
+            Self(previous)
+        }
+    }
+
+    impl Drop for VaultKeyEnv {
+        fn drop(&mut self) {
+            unsafe {
+                match self.0.take() {
+                    Some(previous) => std::env::set_var("PHILOTIC_VAULT_MASTER_KEY", previous),
+                    None => std::env::remove_var("PHILOTIC_VAULT_MASTER_KEY"),
+                }
+            }
+        }
+    }
+
     fn response_task_json(session_id: &str) -> String {
         serde_json::json!({
             "session_id": session_id,
@@ -20788,9 +20819,9 @@ pub(crate) mod tests {
         );
 
         let vault_key = base64::engine::general_purpose::STANDARD.encode([5u8; 32]);
+        let _vault_key_env = VaultKeyEnv::set(&vault_key);
         unsafe {
             std::env::set_var("PHILOTIC_HOTEL_SOCKET", &socket_path);
-            std::env::set_var("PHILOTIC_VAULT_MASTER_KEY", vault_key);
         }
 
         let secret_ref = store_secret(
@@ -20838,7 +20869,6 @@ pub(crate) mod tests {
 
         unsafe {
             std::env::remove_var("PHILOTIC_HOTEL_SOCKET");
-            std::env::remove_var("PHILOTIC_VAULT_MASTER_KEY");
         }
         server_task.abort();
         let _ = server_task.await;
@@ -20851,9 +20881,7 @@ pub(crate) mod tests {
     fn add_vault_entry_stores_secret_under_the_vault_name_kind() {
         let _env_guard = ipc_env_guard();
         let vault_key = base64::engine::general_purpose::STANDARD.encode([7u8; 32]);
-        unsafe {
-            std::env::set_var("PHILOTIC_VAULT_MASTER_KEY", &vault_key);
-        }
+        let _vault_key_env = VaultKeyEnv::set(&vault_key);
 
         let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
         let graph = GraphDomain::new(Arc::new(graph_store.adapter()));
@@ -20876,10 +20904,6 @@ pub(crate) mod tests {
             .expect("secret stored");
         assert_eq!(record.secret_kind, "gemini_api_key");
         assert_eq!(record.allowed_roles, vec!["model", "model.gemini"]);
-
-        unsafe {
-            std::env::remove_var("PHILOTIC_VAULT_MASTER_KEY");
-        }
     }
 
     #[tokio::test]
