@@ -1,8 +1,11 @@
 # Claude Code harness review (`proposal:claude-code-harness-review`)
 
-Review of how Claude Code is used in this repo, 2026-07-27. Implementation
-landed in PR #371; the follow-ups below are the part that was deliberately not
-implemented.
+Review of how Claude Code is used in this repo, 2026-07-27. Implementation and
+all nine follow-ups landed in PR #371.
+
+**Final state: four hard PR gates, all green** — `rustfmt`, `clippy (ratchet)`,
+`cargo check (linux x86_64)`, and `test (macos arm64)`. Before this PR there was
+no CI on pull requests at all.
 
 > **Why this is a doc and not only graph nodes.** The follow-ups below were
 > filed with `graph_create_node`, per the standing rule that proposals live in
@@ -56,11 +59,14 @@ Two results that contradicted prior notes and are worth keeping:
    a PR, while the standing policy is to auto-merge agent PRs "at honest green"
    — a green self-reported by the agent that wrote the code.
 
-   **What actually landed:** `cargo fmt --all --check` is a hard gate on PRs and
-   runs in ~16s. `cargo test --workspace` runs but is **advisory
-   (`continue-on-error`), not blocking** — because it does not terminate.
+   **What landed:** four hard gates — `rustfmt` (~17s), `clippy (ratchet)`
+   (~3m), `cargo check` for the Linux/vps-jane package set (~2m), and
+   `cargo test --workspace` on macOS arm64 (~10m). All green.
 
-   **Why, and this is the most valuable thing the gate found.** The first two
+   The test job spent a while advisory, and getting it to blocking is the most
+   valuable thing this whole exercise produced.
+
+   **The first two
    runs timed out during compilation (90 min, then 180), which suggested build
    cost. That diagnosis was wrong. On the third run, with a longer limit, the
    **build step succeeded** and the cargo cache saved at **2.03 GiB** — well
@@ -86,8 +92,24 @@ Two results that contradicted prior notes and are worth keeping:
    around every `security` invocation. That unblocks
    `proposal:pr-test-gate-viability`.
 
-   Not fixed in this PR: it is a change to the vault security path and deserves
-   its own review, not a fold-in to a harness PR.
+   **Fixed** in `ansible_mesh_core::keychain`: the backend is skipped where
+   there is no unlocked login keychain (explicit `PHILOTIC_VAULT_KEYCHAIN`
+   override, otherwise off for non-macOS and detected CI), and every `security`
+   call runs under a deadline with stdin closed, so it can never hang or be
+   left orphaned. The job went from a 5h50m timeout to ~10 minutes.
+
+   Two further bugs surfaced before the gate could be trusted, both found by
+   the gate itself:
+   - **Test isolation.** Three tests relied on an ambient
+     `PHILOTIC_VAULT_MASTER_KEY` while two others called `remove_var` on it
+     when they finished. Rust runs tests as threads of one process, so that
+     deleted the key out from under whatever ran concurrently. A `VaultKeyEnv`
+     guard now restores the previous value instead.
+   - **A TOCTOU port race.** graph-intelligence's server tests asked a helper
+     for a free port; the helper dropped its listener before returning, so a
+     concurrently-starting test could take the port first. Passed in isolation,
+     failed under `--workspace`. All 8 sites now bind `:0` and read back the
+     assigned port.
 2. **`rust-toolchain.toml`** pinned to 1.94.0, with `build-linux.yml` and
    `release.yml` passing the version explicitly alongside their `targets:`
    input. Caveat: rustup is not installed on the dev Macs, so the pin governs
