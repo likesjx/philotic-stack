@@ -1330,9 +1330,11 @@ mod tests {
         assert_eq!(compiled.len(), 1);
         assert!(!compiled[0].upsert_target);
         assert!(compiled[0].query.contains("MATCH (n:NextAction {id: $id})"));
-        assert!(compiled[0]
-            .query
-            .contains("MATCH (t {id: $target_id}) WHERE t:Goal"));
+        assert!(
+            compiled[0]
+                .query
+                .contains("MATCH (t {id: $target_id}) WHERE t:Goal")
+        );
         assert!(compiled[0].query.contains("MERGE (n)-[r:ADVANCES]->(t)"));
     }
 
@@ -1346,9 +1348,11 @@ mod tests {
         }];
 
         let compiled = compile_observe_edges(&input).unwrap();
-        assert!(compiled[0]
-            .query
-            .contains("WHERE t:Concern OR t:OpenLoop OR t:Commitment"));
+        assert!(
+            compiled[0]
+                .query
+                .contains("WHERE t:Concern OR t:OpenLoop OR t:Commitment")
+        );
     }
 
     #[test]
@@ -1382,9 +1386,11 @@ mod tests {
         let compiled = compile_observe_edges(&input).unwrap();
         assert!(!compiled[0].upsert_target);
         assert!(!compiled[0].query.contains("MERGE (t"));
-        assert!(compiled[0]
-            .query
-            .contains("MATCH (t {id: $target_id}) WHERE t:Person"));
+        assert!(
+            compiled[0]
+                .query
+                .contains("MATCH (t {id: $target_id}) WHERE t:Person")
+        );
     }
 
     #[test]

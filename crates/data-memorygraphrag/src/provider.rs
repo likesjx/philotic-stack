@@ -372,6 +372,60 @@ fn plan_bridge_action(decision: &AutonomyDecision) -> BridgeAction {
 /// queued and the batch stalled until the 93s WaitingTool watchdog evicted it.
 static LIFE_GRAPH_POOL: tokio::sync::OnceCell<Graph> = tokio::sync::OnceCell::const_new();
 
+/// Per-query bound on a single Memgraph round trip.
+///
+/// neo4rs 0.9 exposes NO timeout on `ConfigBuilder` (only `fetch_size` and
+/// `max_connections`), so a query that never comes back is an unbounded await
+/// by default — the same failure class already fixed for the embed sidecar.
+/// Memgraph's own `query_execution_timeout_sec=600` is no help here: it is
+/// 6.7x the caller's 90s watchdog, so the caller always gives up first and the
+/// server-side limit never protects anyone.
+///
+/// Sized so `OBSERVE_BATCH_BUDGET_SECS` can absorb several slow queries and
+/// still return a useful partial result rather than surrendering the whole
+/// budget to one of them. See `datasource::runtime::PROVIDER_INVOKE_TIMEOUT_SECS`
+/// for the full deadline chain.
+const MEMGRAPH_QUERY_TIMEOUT_SECS: u64 = 15;
+
+/// Bound one Memgraph round trip, naming the site so a timeout says WHICH
+/// query hung rather than just that something did.
+///
+/// Note this bounds the round trip that dispatches the query; streaming further
+/// rows is bounded in turn by the batch budget and the provider-invoke deadline
+/// above it.
+async fn bounded_query<F, T>(what: &str, fut: F) -> Result<T>
+where
+    F: std::future::Future<Output = std::result::Result<T, neo4rs::Error>>,
+{
+    match tokio::time::timeout(
+        std::time::Duration::from_secs(MEMGRAPH_QUERY_TIMEOUT_SECS),
+        fut,
+    )
+    .await
+    {
+        Ok(Ok(value)) => Ok(value),
+        Ok(Err(err)) => Err(err.into()),
+        Err(_) => Err(anyhow::anyhow!(
+            "Memgraph query '{what}' exceeded the {MEMGRAPH_QUERY_TIMEOUT_SECS}s client deadline \
+             (server-side query_execution_timeout_sec is far larger and would not have fired)"
+        )),
+    }
+}
+
+/// Wall-clock budget for one `life.observe.batch`, deliberately smaller than
+/// philote's 90s `WAITING_TOOL_SECS` watchdog (`crates/philote/src/turn_loop.rs`).
+///
+/// The runner cannot see the caller's deadline and nothing cancels an in-flight
+/// batch when that deadline fires, so without a self-imposed budget a slow batch
+/// keeps writing durably long after the turn waiting on it was evicted — the
+/// caller is told the turn died while the graph quietly changes underneath it.
+/// The ~30s of headroom covers mesh transport plus philote-side processing on
+/// the cross-hotel path, so the response still lands inside the caller's window.
+///
+/// Keep this BELOW `WAITING_TOOL_SECS`; raising it past that reintroduces
+/// exactly the orphaned-write window it exists to close.
+const OBSERVE_BATCH_BUDGET_SECS: u64 = 60;
+
 /// Soft, non-error result for an advisory `life.recall.feedback` call that
 /// could not be recorded (bad params or contract-invalid rating). Returned as a
 /// normal `ProviderOutput` (not an `Err`) so the turn loop does NOT treat it as
@@ -431,7 +485,7 @@ impl LifeGraphProvider {
 
     async fn execute_cypher(&self, cypher: &str) -> Result<Value> {
         let graph = self.connect().await?;
-        let mut rows = graph.execute(query(cypher)).await?;
+        let mut rows = bounded_query("execute_cypher", graph.execute(query(cypher))).await?;
         let mut output = Vec::new();
         while let Some(row) = rows.next().await? {
             output.push(row_to_json(&row)?);
@@ -442,7 +496,11 @@ impl LifeGraphProvider {
     /// Execute a vector-search query with the embedding bound as `$vec`.
     async fn execute_cypher_with_vec(&self, cypher: &str, vec_param: Vec<f64>) -> Result<Value> {
         let graph = self.connect().await?;
-        let mut rows = graph.execute(query(cypher).param("vec", vec_param)).await?;
+        let mut rows = bounded_query(
+            "vector_query",
+            graph.execute(query(cypher).param("vec", vec_param)),
+        )
+        .await?;
         let mut output = Vec::new();
         while let Some(row) = rows.next().await? {
             output.push(row_to_json(&row)?);
@@ -660,7 +718,7 @@ impl LifeGraphProvider {
                 compiled.provenance_envelope_json.as_deref().unwrap_or(""),
             );
 
-        let mut rows = graph.execute(q).await?;
+        let mut rows = bounded_query("observe_node_write", graph.execute(q)).await?;
         let first_row = rows.next().await?;
 
         let node_id = first_row
@@ -688,7 +746,8 @@ impl LifeGraphProvider {
                 .param("created_at", now.as_str())
                 .param("observation_id", compiled.observation_id.as_str())
                 .param("observed_by", compiled.observed_by.as_str());
-            let status = match graph.execute(edge_query).await {
+            let status = match bounded_query("observe_edge_merge", graph.execute(edge_query)).await
+            {
                 Ok(mut rows) => match rows.next().await {
                     Ok(Some(_)) => "written",
                     Ok(None) => {
@@ -913,41 +972,101 @@ impl LifeGraphProvider {
 
         let requested = input.observations.len();
 
-        // One shared sidecar round trip for the whole batch
+        // ── Plan phase ───────────────────────────────────────────────────────
+        // Validate EVERY item before writing ANY of them. Each item's plan gate
+        // used to run lazily inside the write loop, so a batch whose last item
+        // was contract-invalid had already written the earlier ones by the time
+        // anyone noticed — the caller learned about a structural mistake only
+        // after it had half-landed. Planning first means the rejection set is
+        // known up front and reported whole, and the shared embed round trip
+        // below is not spent on items that were never going to be written.
+        //
+        // This deliberately does NOT become all-or-nothing: valid items still
+        // write. Per-item durability is the documented contract, and the
+        // `life.steward` skill prompt tells the model "partial failure never
+        // rolls anything back, so never report a rollback" — rejecting the whole
+        // batch here would contradict the instructions the model is acting on.
+        let mut rejected: Vec<Value> = Vec::new();
+        let mut planned_ok: Vec<(usize, LifeObserveInput)> = Vec::with_capacity(requested);
+        for (index, observation) in input.observations.into_iter().enumerate() {
+            match self
+                .runner
+                .plan(LifeGraphToolRequest::LifeObserve(observation.clone()))
+            {
+                Ok(plan) if !plan.allowed() => rejected.push(json!({
+                    "index": index,
+                    "observation_id": observation.observation_id,
+                    "reason": "blocked",
+                    "detail": plan.blocked_reasons,
+                })),
+                Ok(_) => planned_ok.push((index, observation)),
+                Err(err) => rejected.push(json!({
+                    "index": index,
+                    "observation_id": observation.observation_id,
+                    "reason": "contract_invalid",
+                    "detail": err.to_string(),
+                })),
+            }
+        }
+
+        // One shared sidecar round trip for the surviving items
         // (lifegraph-batch-observe-embeds seam). The embed source is exactly
         // what the single-item path embeds: evidence.claim_summary. Failure
         // modes degrade per-item: Ok(None) = old sidecar without the batch
         // route, Err = sidecar down — both fall back to the per-item
         // embed_text call inside handle_observe (which fails fast under the
         // shared circuit breaker when the sidecar is genuinely down).
-        let embed_sources: Vec<String> = input
-            .observations
+        // Indexed by POSITION IN `planned_ok`, not by original batch index.
+        let embed_sources: Vec<String> = planned_ok
             .iter()
-            .map(|observation| observation.evidence.claim_summary.clone())
+            .map(|(_, observation)| observation.evidence.claim_summary.clone())
             .collect();
-        let mut precomputed_embeddings: Vec<Option<(Vec<f32>, String)>> = match embed_texts_batch(
-            &embed_sources,
-        )
-        .await
+        let mut precomputed_embeddings: Vec<Option<(Vec<f32>, String)>> = if embed_sources
+            .is_empty()
         {
-            Ok(Some(vectors)) => vectors.into_iter().map(Some).collect(),
-            Ok(None) => {
-                info!(
-                    "life.observe.batch: sidecar has no batch endpoint — falling back to per-item embeds"
-                );
-                vec![None; requested]
-            }
-            Err(e) => {
-                warn!("life.observe.batch: batch embed failed ({e:#}) — per-item fallback");
-                vec![None; requested]
+            Vec::new()
+        } else {
+            match embed_texts_batch(&embed_sources).await {
+                Ok(Some(vectors)) => vectors.into_iter().map(Some).collect(),
+                Ok(None) => {
+                    info!(
+                        "life.observe.batch: sidecar has no batch endpoint — falling back to per-item embeds"
+                    );
+                    vec![None; planned_ok.len()]
+                }
+                Err(e) => {
+                    warn!("life.observe.batch: batch embed failed ({e:#}) — per-item fallback");
+                    vec![None; planned_ok.len()]
+                }
             }
         };
 
-        let mut results = Vec::with_capacity(requested);
+        // ── Write phase (wall-clock bounded) ─────────────────────────────────
+        // The caller's watchdog (philote's 90s `WAITING_TOOL_SECS`) cannot see
+        // inside this loop, and nothing cancels the runner when it fires, so an
+        // unbounded batch can outlive the very turn waiting on it — writing
+        // durably while the caller was already told the turn died. Self-limiting
+        // keeps the batch inside the caller's budget by construction: whatever
+        // is still unwritten when the budget runs out is reported as
+        // `not_attempted` for the caller to re-send, never silently dropped.
+        let deadline =
+            std::time::Instant::now() + std::time::Duration::from_secs(OBSERVE_BATCH_BUDGET_SECS);
+        let mut results = Vec::with_capacity(planned_ok.len());
         let mut succeeded = 0usize;
-        let mut failed = 0usize;
+        let mut write_failed = 0usize;
+        let mut not_attempted: Vec<Value> = Vec::new();
         let mut first_node_id: Option<String> = None;
-        for (index, observation) in input.observations.into_iter().enumerate() {
+        let mut budget_exhausted = false;
+
+        for (slot, (index, observation)) in planned_ok.into_iter().enumerate() {
+            if budget_exhausted || std::time::Instant::now() >= deadline {
+                budget_exhausted = true;
+                not_attempted.push(json!({
+                    "index": index,
+                    "observation_id": observation.observation_id,
+                }));
+                continue;
+            }
             let item_task = DatasourceTask {
                 kind: TaskKind::Custom("life.observe".into()),
                 provider: task.provider.clone(),
@@ -957,7 +1076,7 @@ impl LifeGraphProvider {
                 parameters: serde_json::to_value(&observation)?,
                 identity: task.identity.clone(),
             };
-            let precomputed = precomputed_embeddings.get_mut(index).and_then(Option::take);
+            let precomputed = precomputed_embeddings.get_mut(slot).and_then(Option::take);
             let item_result = match self
                 .handle_observe_with_embedding(&item_task, precomputed)
                 .await
@@ -979,21 +1098,63 @@ impl LifeGraphProvider {
                         .map(str::to_string);
                 }
             } else {
-                failed += 1;
+                write_failed += 1;
             }
             results.push(json!({ "index": index, "result": item_result }));
         }
 
-        let status = if failed == 0 {
+        // Plan-phase rejections count as batch failures alongside any item that
+        // passed planning but failed at write time. `failed` keeps its original
+        // meaning for existing callers: everything that did not land.
+        let failed = write_failed + rejected.len();
+
+        let status = if failed == 0 && not_attempted.is_empty() {
             "ok"
         } else if succeeded > 0 {
             "partial"
         } else {
             "failed"
         };
+
+        // ── Evaluation ───────────────────────────────────────────────────────
+        // An actionable summary, so the caller does not have to reduce N result
+        // rows to work out what to do next. The three outcomes need genuinely
+        // different responses: `rejected` items must be FIXED before re-sending,
+        // `not_attempted` items can be re-sent AS-IS, and anything that landed
+        // is durable and must NOT be re-sent.
+        let mut next_action = Vec::new();
+        if !rejected.is_empty() {
+            next_action.push(format!(
+                "{} item(s) failed validation and were never written — fix the payload \
+                 (see evaluation.rejected[].detail) and re-send only those",
+                rejected.len()
+            ));
+        }
+        if !not_attempted.is_empty() {
+            next_action.push(format!(
+                "{} item(s) were not attempted because the {OBSERVE_BATCH_BUDGET_SECS}s batch \
+                 budget ran out — re-send exactly those, unchanged, in a new call",
+                not_attempted.len()
+            ));
+        }
+        if write_failed > 0 {
+            next_action.push(format!(
+                "{write_failed} item(s) passed validation but failed at write time — inspect \
+                 results[].result.error before retrying"
+            ));
+        }
+        if next_action.is_empty() {
+            next_action.push("all observations landed durably — do not re-send them".into());
+        }
+
         info!(
             requested,
-            succeeded, failed, "life.observe.batch: bulk observation write completed"
+            succeeded,
+            failed,
+            rejected = rejected.len(),
+            not_attempted = not_attempted.len(),
+            budget_exhausted,
+            "life.observe.batch: bulk observation write completed"
         );
         Ok(ProviderOutput::ResultSet(json!({
             "status": status,
@@ -1002,6 +1163,15 @@ impl LifeGraphProvider {
             "failed": failed,
             "first_node_id": first_node_id,
             "results": results,
+            "evaluation": {
+                "written": succeeded,
+                "rejected": rejected,
+                "not_attempted": not_attempted,
+                "budget_exhausted": budget_exhausted,
+                "budget_secs": OBSERVE_BATCH_BUDGET_SECS,
+                "rollback": false,
+                "next_action": next_action,
+            },
         })))
     }
 
@@ -1542,7 +1712,7 @@ impl LifeGraphProvider {
         } else {
             q = q.param("connectivity_ratio", 0.0_f64);
         }
-        let mut rows = graph.execute(q).await?;
+        let mut rows = bounded_query("recall_feedback_write", graph.execute(q)).await?;
         let _ = rows.next().await?;
 
         // ── Feedback-informed ranking (recall_utility EWMA) ───────────────
@@ -1928,7 +2098,7 @@ impl LifeGraphProvider {
         let cypher = cypher::patch_list_query(&statuses, limit);
 
         let graph = self.connect().await?;
-        let mut rows = graph.execute(query(&cypher)).await?;
+        let mut rows = bounded_query("patch_list_read", graph.execute(query(&cypher))).await?;
         let mut patches = Vec::new();
         while let Some(row) = rows.next().await? {
             let risk: String = row.get("risk").unwrap_or_default();
@@ -2223,7 +2393,7 @@ impl LifeGraphProvider {
         if let Some(summary) = &compiled.resolution_summary {
             q = q.param("resolution_summary", summary.as_str());
         }
-        let mut rows = graph.execute(q).await?;
+        let mut rows = bounded_query("conflict_cypher", graph.execute(q)).await?;
         let _ = rows.next().await?;
         Ok(())
     }
@@ -3112,6 +3282,166 @@ mod tests {
             .await
             .expect_err("garbage batch parameters must be a contract error");
         assert!(format!("{err:#}").contains(CONTRACT_ERROR_MARKER));
+    }
+
+    /// The plan phase must validate the WHOLE batch before writing anything.
+    /// Previously each item's plan gate ran lazily inside the write loop, so a
+    /// batch whose last item was contract-invalid had already written the
+    /// earlier ones before anyone noticed.
+    ///
+    /// Every item here carries a `rel_type` outside BOTH closed vocabularies
+    /// (living-cycle and agenda), so planning rejects all of them — and because
+    /// that now happens up front, the batch returns without opening a Memgraph
+    /// connection at all, which is exactly what lets this run with no database.
+    ///
+    /// The fixture deliberately uses a relation that can never become valid
+    /// rather than a real-but-misused one: an earlier draft used `ADVANCES`,
+    /// which passed only because the fixture's `OpenLoop` source label failed
+    /// *endpoint* validation — so the test would have silently stopped
+    /// exercising vocabulary rejection as the agenda vocabulary grew.
+    #[tokio::test]
+    async fn observe_batch_plans_every_item_before_writing_any() {
+        let provider = LifeGraphProvider::from_env();
+        let observations: Vec<LifeObserveInput> = (0..3)
+            .map(|i| {
+                let mut observation = minimal_observe_input_for_provider_tests(&format!("obs-{i}"));
+                observation.edges = vec![ObserveEdge {
+                    rel_type: "NOT_A_REAL_RELATION".into(),
+                    target_id: "some-target".into(),
+                    upsert_target: false,
+                }];
+                observation
+            })
+            .collect();
+        let parameters = serde_json::to_value(LifeObserveBatchInput { observations })
+            .expect("serialize batch input");
+        let out = provider
+            .handle_observe_batch(&DatasourceTask {
+                kind: TaskKind::Custom("life.observe.batch".into()),
+                provider: None,
+                db: None,
+                graph_id: None,
+                query: None,
+                parameters,
+                identity: json!({}),
+            })
+            .await
+            .expect("an all-invalid batch is a reported outcome, not an Err");
+        let ProviderOutput::ResultSet(value) = out else {
+            panic!("expected ResultSet");
+        };
+
+        assert_eq!(value["status"], "failed");
+        assert_eq!(value["succeeded"], 0);
+        assert_eq!(value["failed"], 3, "plan rejections count as failures");
+
+        // Nothing was attempted: no per-item write rows at all.
+        assert!(
+            value["results"]
+                .as_array()
+                .expect("results array")
+                .is_empty(),
+            "no item may be written when every item fails planning: {}",
+            value["results"]
+        );
+
+        // All three rejections are reported together, each naming its cause.
+        let rejected = value["evaluation"]["rejected"]
+            .as_array()
+            .expect("rejected array");
+        assert_eq!(rejected.len(), 3, "every invalid item must be reported");
+        for entry in rejected {
+            assert_eq!(entry["reason"], "contract_invalid");
+            let detail = entry["detail"].as_str().unwrap_or_default();
+            assert!(
+                detail.contains("NOT_A_REAL_RELATION"),
+                "rejection must name the offending relation: {detail}"
+            );
+        }
+
+        // The evaluation must never imply a rollback — per-item durability is
+        // the documented contract the model prompt relies on.
+        assert_eq!(value["evaluation"]["rollback"], json!(false));
+        let next_action = value["evaluation"]["next_action"]
+            .as_array()
+            .expect("next_action array")
+            .iter()
+            .filter_map(Value::as_str)
+            .collect::<Vec<_>>()
+            .join(" | ");
+        assert!(
+            next_action.contains("fix"),
+            "caller must be told to fix rather than blindly retry: {next_action}"
+        );
+    }
+
+    /// The datasource runtime runs "read-only" capabilities concurrently and
+    /// off the critical path, which is only safe if they genuinely do not
+    /// write — concurrent writes would break the read-after-write ordering the
+    /// sequential path exists to guarantee.
+    ///
+    /// `change_notification_for` is this crate's own authority on what counts as
+    /// a write (it fires a device ping for exactly the mutating outcomes), so it
+    /// makes a good independent cross-check on the allowlist in another crate.
+    ///
+    /// This test earns its keep: it catches the mistake actually made while
+    /// writing that allowlist — `life.conflict` looks like a query but OPENS a
+    /// conflict, and `change_notification_for` classifies it `conflict_opened`.
+    #[test]
+    fn no_capability_treated_as_read_only_can_emit_a_write_notification() {
+        // Permissive payload carrying every id and status the write branches
+        // look for, so any capability classified as a write WILL produce a
+        // notification and fail the assertion below.
+        let statuses = [
+            "proposed",
+            "committed",
+            "resolved",
+            "applied",
+            "awaiting_operator",
+            "open",
+            "ok",
+            "partial",
+        ];
+        let read_only = [
+            "life.recall",
+            "life.recall.stats",
+            "life.view.node",
+            "life.view.neighborhood",
+            "life.patch.list",
+        ];
+
+        for capability in read_only {
+            assert!(
+                datasource::runtime::is_read_only_capability(capability),
+                "{capability} is listed here but the runtime no longer treats it as read-only — \
+                 keep the two lists in step"
+            );
+            for status in statuses {
+                let data = json!({
+                    "status": status,
+                    "node_id": "n-1",
+                    "patch_id": "p-1",
+                    "conflict_id": "c-1",
+                    "first_node_id": "n-1",
+                    "succeeded": 1,
+                });
+                assert!(
+                    change_notification_for(capability, &data).is_none(),
+                    "{capability} produced a write notification for status={status}, so it \
+                     MUTATES and must not run concurrently off the critical path"
+                );
+            }
+        }
+
+        // And the converse for the one that caught us out.
+        assert!(
+            !datasource::runtime::is_read_only_capability("life.conflict"),
+            "life.conflict opens a conflict — it is a write and must stay sequential"
+        );
+        assert!(
+            !datasource::runtime::is_read_only_capability("life.observe.batch"),
+            "the observe batch is the write this whole change exists to keep sequential"
+        );
     }
 
     #[test]
