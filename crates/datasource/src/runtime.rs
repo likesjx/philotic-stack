@@ -106,9 +106,12 @@ impl ReplyRoute {
 pub async fn run_datasource_controller(config: DatasourceGuestConfig) -> Result<()> {
     let _ = tracing_subscriber::fmt::try_init();
 
+    // State provenance up front. A deployed guest running code nobody merged is
+    // otherwise invisible — see `philotic_client::build_sha`.
     info!(
         guest_id = config.guest_id,
         role = config.role,
+        build_sha = philotic_client::build_sha(),
         "starting datasource guest controller"
     );
 

@@ -953,6 +953,91 @@ fn feedback_rating_str(rating: &RetrievalFeedbackRating) -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    /// The write-enabled edge vocabulary is duplicated in prose in
+    /// `docs/architecture/life-graph/LIFE_GRAPH_SCHEMA.md`, and the two HAVE
+    /// drifted: on 2026-07-27 the doc described the agenda edges as
+    /// write-enabled while the runner deployed on vps-jane rejected `ADVANCES`
+    /// outright, because it was built from a branch predating them.
+    ///
+    /// Pinning the vocabulary here means a change to either closed set has to
+    /// be deliberate, and gives the doc a single place to be checked against.
+    /// Asserted against an explicit expected list rather than by parsing the
+    /// markdown table — a doc-parsing test fails on reformatting, which teaches
+    /// people to ignore it.
+    ///
+    /// If this fails, update BOTH the constant and the Relationship Types table
+    /// in that schema doc.
+    #[test]
+    fn write_enabled_edge_vocabulary_matches_the_schema_doc() {
+        let living: Vec<&str> = super::LIVING_CYCLE_REL_TYPES.to_vec();
+        assert_eq!(
+            living,
+            vec![
+                "OWNS",
+                "SHAPES",
+                "SETS",
+                "SPAWNS",
+                "RELATES_TO",
+                "SCOPED_TO"
+            ],
+            "living-cycle vocabulary changed — update LIFE_GRAPH_SCHEMA.md too"
+        );
+
+        let agenda: Vec<(&str, Vec<&str>, Vec<&str>)> = super::AGENDA_EDGE_RULES
+            .iter()
+            .map(|rule| {
+                (
+                    rule.rel_type,
+                    rule.source_labels.to_vec(),
+                    rule.target_labels.to_vec(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            agenda,
+            vec![
+                (
+                    "ADVANCES",
+                    vec!["NextAction", "Habit", "Project"],
+                    vec!["Goal"]
+                ),
+                (
+                    "BLOCKED_BY",
+                    vec!["Goal", "NextAction", "Project"],
+                    vec!["Concern", "OpenLoop", "Commitment"]
+                ),
+                (
+                    "NEEDS_FOLLOWUP",
+                    vec!["Event", "Commitment", "OpenLoop"],
+                    vec!["NextAction", "Commitment"]
+                ),
+                ("PROMISED_TO", vec!["Commitment"], vec!["Person"]),
+                (
+                    "CONTAINS",
+                    vec!["Project", "System", "Routine"],
+                    vec!["NextAction", "Habit", "OpenLoop"]
+                ),
+                (
+                    "SUPPORTS",
+                    vec!["System", "Habit", "Routine"],
+                    vec!["Goal", "Habit"]
+                ),
+            ],
+            "agenda edge vocabulary changed — update LIFE_GRAPH_SCHEMA.md too"
+        );
+
+        // The two sets must stay disjoint: a relation in both would make
+        // `is_living_cycle_rel_type` and `is_agenda_rel_type` disagree about
+        // which validation path applies.
+        for rule in super::AGENDA_EDGE_RULES {
+            assert!(
+                !super::is_living_cycle_rel_type(rule.rel_type),
+                "{} is in BOTH closed vocabularies",
+                rule.rel_type
+            );
+        }
+    }
+
     use super::*;
     use crate::{
         AdjudicationStatus, EvidencePacket, GraphRecordRef, LifeObserveInput, ReliabilityBasis,

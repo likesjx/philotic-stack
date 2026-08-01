@@ -16,6 +16,33 @@ use tokio::net::UnixStream;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
+/// The commit this binary was built from, or `"unknown"` for a local build.
+///
+/// Read at COMPILE time via `option_env!`, so the value is baked into the
+/// binary and cannot drift from the code it describes. A runtime env var would
+/// describe the environment, not the executable — which is exactly the mistake
+/// this exists to prevent.
+///
+/// WHY THIS EXISTS: on 2026-07-27 the vps `life-graph-runner` was answering with
+/// a LifeGraph edge vocabulary (`INSPIRES`, `TESTED_BY`, `SHARED_WITH`, …) that
+/// appears nowhere in `develop`; it traced to an unmerged branch whose artifacts
+/// were still on the box. Nothing in the running system could report what code
+/// it was executing, so identifying it needed a `grep` for a marker string
+/// against the binary on disk. Several rounds of debugging had reasoned from
+/// repo source that did not match the deployed binary. Every guest now states
+/// its provenance at startup, so "what is this actually running?" is answerable
+/// from the logs.
+///
+/// Set `PHILOTIC_BUILD_SHA` in the build environment (CI does this); an unset
+/// value yields `"unknown"` rather than failing the build, so local development
+/// is unaffected.
+pub const fn build_sha() -> &'static str {
+    match option_env!("PHILOTIC_BUILD_SHA") {
+        Some(sha) if !sha.is_empty() => sha,
+        _ => "unknown",
+    }
+}
+
 /// Represents the identity of a Guest materializing in the Hotel.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GuestIdentity {
@@ -3611,8 +3638,8 @@ mod tests {
             redirect_uri: "https://hotel.example/auth/oidc/google/callback".into(),
         };
         let bytes = serde_json::to_vec(&request).expect("serialize OIDC exchange request");
-        let decoded =
-            serde_json::from_slice::<IpcRequest>(&bytes).expect("deserialize OIDC exchange request");
+        let decoded = serde_json::from_slice::<IpcRequest>(&bytes)
+            .expect("deserialize OIDC exchange request");
         match decoded {
             IpcRequest::ExchangeOperatorOidc {
                 provider,
@@ -5016,5 +5043,23 @@ mod tests {
                 ..
             }
         ));
+    }
+}
+
+#[cfg(test)]
+mod build_provenance_tests {
+    /// `build_sha` must always return something printable — an unset build env
+    /// yields "unknown" rather than an empty string, so a startup log never
+    /// silently omits the field and read as "no provenance surface at all".
+    #[test]
+    fn build_sha_is_never_empty() {
+        let sha = super::build_sha();
+        assert!(!sha.is_empty(), "build_sha must never be empty");
+        // Locally this is "unknown"; in CI it is the commit. Both are valid —
+        // the invariant is only that the field is always populated.
+        assert!(
+            sha == "unknown" || sha.chars().all(|c| c.is_ascii_alphanumeric()),
+            "unexpected build sha shape: {sha}"
+        );
     }
 }

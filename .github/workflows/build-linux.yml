@@ -94,6 +94,12 @@ jobs:
           fi
 
       - name: Build release binaries
+        env:
+          # Baked into every binary via philotic_client::build_sha() and logged
+          # by each guest at startup, so a deployed binary can always say which
+          # commit it came from. Added after a vps runner was found answering
+          # with code from an unmerged branch, undetectable from the outside.
+          PHILOTIC_BUILD_SHA: ${{ github.sha }}
         run: |
           cargo build --release --target "${TARGET}" --bins \
             -p aiua \
