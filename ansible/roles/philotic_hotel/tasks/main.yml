@@ -359,3 +359,48 @@
     - philotic_onnx_sidecar_enabled
     - ufw_check.rc == 0
   ignore_errors: yes
+
+# ── Muninn maintenance timer ────────────────────────────────────────────────
+# Muninn prunes its own backup dir and (since the replication-log retention
+# fix) its own log, but nothing retains the agent-driven nightly backups and
+# nothing watches the store size. Reachability probes stayed green through a
+# leak that grew the store from 311 MB to 20 GB.
+
+- name: Install muninn maintenance script
+  template:
+    src: muninn-maintenance.sh.j2
+    dest: /usr/local/bin/muninn-maintenance.sh
+    owner: root
+    group: root
+    mode: "0755"
+  when: muninn_enabled | default(true) | bool
+
+- name: Install muninn maintenance systemd unit
+  template:
+    src: muninn-maintenance.service.j2
+    dest: /etc/systemd/system/muninn-maintenance.service
+    owner: root
+    group: root
+    mode: "0644"
+  notify:
+    - Reload systemd
+  when: muninn_enabled | default(true) | bool
+
+- name: Install muninn maintenance timer
+  template:
+    src: muninn-maintenance.timer.j2
+    dest: /etc/systemd/system/muninn-maintenance.timer
+    owner: root
+    group: root
+    mode: "0644"
+  notify:
+    - Reload systemd
+  when: muninn_enabled | default(true) | bool
+
+- name: Enable and start muninn maintenance timer
+  systemd:
+    name: muninn-maintenance.timer
+    enabled: true
+    state: started
+    daemon_reload: true
+  when: muninn_enabled | default(true) | bool
