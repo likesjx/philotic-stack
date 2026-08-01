@@ -1450,6 +1450,22 @@ pub enum IpcRequest {
         plaintext: String,
         #[serde(default)]
         allowed_roles: Vec<String>,
+        /// Secret kind to store under. Defaults to `vault_name` (the DEF-065
+        /// behaviour: a provider key stored as a generic `vault-token` is
+        /// indistinguishable from an MCP grant when debugging ACL failures).
+        ///
+        /// Set this explicitly to register a vault that a *consumer* filters
+        /// by kind — notably `muninn_vault_token`, which
+        /// `aiua::memory::load_muninn_config` requires before it will put a
+        /// vault into `MuninnConfig::vault_tokens`. Without it there is no
+        /// way to register a Muninn vault outside the `--load-config`
+        /// provisioning path, whose names are derived solely from agent ids
+        /// and Telegram users (`derive_vault_names`).
+        ///
+        /// Wire-compatible: `IpcRequest` is internally tagged, and this field
+        /// defaults to `None`, so older guests keep working unchanged.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        secret_kind: Option<String>,
     },
     /// Request the hotel's loaded MuninnDB configuration (vault tokens included).
     FetchMemoryConfig,

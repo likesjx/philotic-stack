@@ -1694,6 +1694,9 @@ impl IpcServer {
                         vault_name.to_string(),
                         plaintext.to_string(),
                         allowed_roles.to_vec(),
+                        // Operator-targeted vault writes keep the DEF-065
+                        // default: kind == vault_name.
+                        None,
                     )?;
                     Ok(IpcResponse::OperatorTargetSecretMutationAckView {
                         operator_target_secret_mutation: OperatorTargetSecretMutationAckView {

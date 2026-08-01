@@ -6317,6 +6317,8 @@ async fn ipc_add_vault_entry(
             vault_name: vault_name.to_string(),
             plaintext: plaintext.to_string(),
             allowed_roles,
+            // Provider/API keys keep the DEF-065 default: kind == vault_name.
+            secret_kind: None,
         })
         .await?
     {

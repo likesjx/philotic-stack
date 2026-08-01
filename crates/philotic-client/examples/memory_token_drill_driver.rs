@@ -161,6 +161,76 @@ async fn run_probe(socket_path: &str) -> Result<()> {
     Ok(())
 }
 
+/// Register a sacrificial vault so the drill has something to corrupt.
+///
+/// Deliberately seeds a **placeholder token that MuninnDB will reject**: the
+/// registry entry is all the heal path needs (it looks the vault up, mints,
+/// and rotates in place), so the first heal mints the first real token. That
+/// keeps an admin credential out of this driver entirely — the hotel owns it.
+///
+/// This is a separate, explicitly-invoked operator command. The `drill` mode
+/// still refuses to create anything: provisioning a vault stays a deliberate
+/// act, never a side effect of a chaos run.
+async fn run_provision(socket_path: &str, vault: &str) -> Result<()> {
+    if vault_name_denied(vault) {
+        bail!(
+            "REFUSING: '{vault}' is not a sacrificial vault name. Only 'chaos_smoke*' \
+             vaults may be provisioned by this tool."
+        );
+    }
+
+    let mut client = connect(socket_path).await?;
+
+    let existing = vault_tokens(&fetch_config(&mut client).await?)?;
+    if existing.iter().any(|(name, _)| name == vault) {
+        eprintln!("vault '{vault}' is already registered — nothing to do.");
+        return Ok(());
+    }
+
+    let placeholder = format!("mk_chaos_smoke_placeholder_{}", Uuid::new_v4().simple());
+    let resp = client
+        .send_request(IpcRequest::AddVaultEntry {
+            vault_name: vault.to_string(),
+            plaintext: placeholder,
+            // Mirror what provision_muninn_vaults stores: the hotel resolves
+            // vault tokens as role "hotel", and load_muninn_config skips any
+            // registry entry whose kind is not muninn_vault_token.
+            allowed_roles: vec!["hotel".to_string()],
+            secret_kind: Some("muninn_vault_token".to_string()),
+        })
+        .await?;
+
+    let secret_ref = match resp {
+        IpcResponse::Standard {
+            ok: true,
+            ref data, ..
+        } => data
+            .as_ref()
+            .and_then(|d| d.get("secret_ref"))
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+            .context("AddVaultEntry succeeded but returned no secret_ref")?,
+        IpcResponse::Standard {
+            ok: false,
+            ref code,
+            ref message,
+            ..
+        } => bail!("AddVaultEntry refused: [{code}] {message}"),
+        IpcResponse::Error(msg) => bail!("AddVaultEntry failed: {msg}"),
+        other => bail!("unexpected response to AddVaultEntry: {other:?}"),
+    };
+
+    eprintln!("provisioned sacrificial vault '{vault}'");
+    eprintln!("  secret_ref: {secret_ref}");
+    eprintln!(
+        "  seeded with a placeholder token MuninnDB will reject — the first heal mints the real one."
+    );
+    eprintln!("\nRun the drill with:");
+    eprintln!("  export PHILOTIC_DRILL_SECRET_REF={secret_ref}");
+    eprintln!("  ... --example memory_token_drill_driver -- drill {vault}");
+    Ok(())
+}
+
 async fn run_drill(socket_path: &str, vault: &str) -> Result<()> {
     if vault_name_denied(vault) {
         bail!(
@@ -285,6 +355,13 @@ async fn main() -> Result<()> {
 
     match mode {
         "probe" => run_probe(&socket_path).await,
+        "provision" => {
+            let vault = args.get(1).context(
+                "provision mode requires a sacrificial vault name, e.g. \
+                 `-- provision chaos_smoke_token_drill`",
+            )?;
+            run_provision(&socket_path, vault).await
+        }
         "drill" => {
             let vault = args.get(1).context(
                 "drill mode requires a sacrificial vault name, e.g. \

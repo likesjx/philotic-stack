@@ -4808,9 +4808,16 @@ impl IpcServer {
                 vault_name,
                 plaintext,
                 allowed_roles,
+                secret_kind,
             } => {
                 info!("AddVaultEntry requested: {}", vault_name);
-                match Self::handle_add_vault_entry(graph, vault_name, plaintext, allowed_roles) {
+                match Self::handle_add_vault_entry(
+                    graph,
+                    vault_name,
+                    plaintext,
+                    allowed_roles,
+                    secret_kind,
+                ) {
                     Ok(secret_ref) => IpcResponse::success(
                         "vault",
                         Some(serde_json::json!({ "secret_ref": secret_ref })),
@@ -12509,16 +12516,23 @@ impl IpcServer {
         vault_name: String,
         plaintext: String,
         allowed_roles: Vec<String>,
+        secret_kind: Option<String>,
     ) -> anyhow::Result<String> {
-        // Store the encrypted secret. The kind must be the caller's vault_name
-        // (e.g. `gemini_api_key`), not a generic label: the kind is embedded in
-        // the secret_ref, and a `phil keys configure` entry stored as
-        // `vault-token` is indistinguishable from an MCP token grant when
+        // Store the encrypted secret. The kind defaults to the caller's
+        // vault_name (e.g. `gemini_api_key`), not a generic label: the kind is
+        // embedded in the secret_ref, and a `phil keys configure` entry stored
+        // as `vault-token` is indistinguishable from an MCP token grant when
         // debugging ACL failures (2026-07-20 vps-jane provider-key incident).
+        //
+        // An explicit kind is required for vaults whose consumer filters on it
+        // — `muninn_vault_token` is the only such kind today
+        // (`memory::load_muninn_config` skips every registry entry that does
+        // not carry it).
+        let secret_kind = secret_kind.unwrap_or_else(|| vault_name.clone());
         let secret_ref = store_secret(
             graph,
             SecretInput {
-                secret_kind: vault_name.clone(),
+                secret_kind,
                 scope: "hotel".to_string(),
                 allowed_roles,
                 allowed_guests: Vec::new(),
@@ -21073,6 +21087,7 @@ pub(crate) mod tests {
             "gemini_api_key".into(),
             "sk-live-key".into(),
             vec!["model".into(), "model.gemini".into()],
+            None,
         )
         .expect("add vault entry");
 
@@ -21086,6 +21101,60 @@ pub(crate) mod tests {
             .expect("secret stored");
         assert_eq!(record.secret_kind, "gemini_api_key");
         assert_eq!(record.allowed_roles, vec!["model", "model.gemini"]);
+
+        unsafe {
+            std::env::remove_var("PHILOTIC_VAULT_MASTER_KEY");
+        }
+    }
+
+    /// An explicit `secret_kind` is the only way to register a vault that a
+    /// consumer filters by kind. `memory::load_muninn_config` skips every
+    /// registry entry whose kind is not `muninn_vault_token`, and
+    /// `derive_vault_names` only ever yields `self_*`/`user_*` — so without
+    /// this there is no path to register a sacrificial Muninn vault (the
+    /// blocker that stopped the memory-token-self-heal S4 drill).
+    #[tokio::test]
+    async fn add_vault_entry_honours_an_explicit_secret_kind() {
+        let _env_guard = ipc_env_guard();
+        let vault_key = base64::engine::general_purpose::STANDARD.encode([9u8; 32]);
+        unsafe {
+            std::env::set_var("PHILOTIC_VAULT_MASTER_KEY", &vault_key);
+        }
+
+        let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
+        let graph = GraphDomain::new(Arc::new(graph_store.adapter()));
+
+        let secret_ref = IpcServer::handle_add_vault_entry(
+            &graph,
+            "chaos_smoke_token_drill".into(),
+            "mk_placeholder".into(),
+            vec!["hotel".into()],
+            Some("muninn_vault_token".into()),
+        )
+        .expect("add vault entry with explicit kind");
+
+        let record = graph
+            .get_secret(&secret_ref)
+            .expect("get secret")
+            .expect("secret stored");
+        assert_eq!(
+            record.secret_kind, "muninn_vault_token",
+            "explicit kind must win over the vault_name default"
+        );
+        assert!(
+            secret_ref.contains("/muninn_vault_token/"),
+            "secret_ref must embed the explicit kind, got {secret_ref}"
+        );
+
+        // The vault must now be visible to the Muninn config loader — the
+        // whole point of the explicit kind.
+        let config = crate::memory::load_muninn_config(&graph)
+            .expect("load muninn config")
+            .expect("config present once a muninn vault is registered");
+        assert!(
+            config.vault_tokens.contains_key("chaos_smoke_token_drill"),
+            "a muninn_vault_token entry must reach MuninnConfig::vault_tokens"
+        );
 
         unsafe {
             std::env::remove_var("PHILOTIC_VAULT_MASTER_KEY");
