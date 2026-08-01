@@ -1,0 +1,10 @@
+[Unit]
+Description=Run muninn maintenance daily
+
+[Timer]
+OnCalendar={{ muninn_maintenance_oncalendar }}
+Persistent=true
+RandomizedDelaySec=300
+
+[Install]
+WantedBy=timers.target

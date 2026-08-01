@@ -1,0 +1,76 @@
+#!/usr/bin/env bash
+# Muninn maintenance — managed by ansible (philotic_hotel role). Do not edit in place.
+#
+# Two jobs the product does not do for itself:
+#
+#   1. Retention on the AGENT-driven backup directory. Muninn prunes its own
+#      MUNINN_BACKUP_DIR to MUNINN_BACKUP_RETAIN, but the nightly agent backup
+#      writes somewhere else and never pruned. Eight snapshots reached 21 GB
+#      on vps-jane.
+#
+#   2. A size alarm. Nothing watched the Pebble store, so a replication-log
+#      leak grew it from 311 MB to 20 GB over eight days completely unnoticed.
+#      Reachability probes stayed green the whole time — the daemon was fine,
+#      the store was not.
+#
+# Reports to the journal; a breach logs to stderr and exits non-zero so
+# `systemctl status` and `journalctl -p err` both surface it.
+set -uo pipefail
+
+BACKUP_DIR="{{ muninn_agent_backup_dir }}"
+RETAIN={{ muninn_agent_backup_retain }}
+PEBBLE_DIR="{{ muninn_data_dir }}/pebble"
+MAX_STORE_MB={{ muninn_store_warn_mb }}
+MAX_SSTS={{ muninn_store_warn_ssts }}
+MAX_DISK_PCT={{ muninn_disk_warn_pct }}
+
+{% raw %}
+log()  { echo "muninn-maintenance: $*"; }
+warn() { echo "muninn-maintenance: WARNING: $*" >&2; }
+
+# ── 1. Backup retention ─────────────────────────────────────────────────────
+if [ -d "$BACKUP_DIR" ]; then
+  stale=$(ls -1dt "$BACKUP_DIR"/*/ 2>/dev/null | tail -n +$((RETAIN + 1)))
+  if [ -n "$stale" ]; then
+    n=$(echo "$stale" | wc -l | tr -d ' ')
+    before=$(du -sm "$BACKUP_DIR" 2>/dev/null | cut -f1)
+    echo "$stale" | while read -r d; do [ -n "$d" ] && rm -rf "$d"; done
+    after=$(du -sm "$BACKUP_DIR" 2>/dev/null | cut -f1)
+    log "pruned $n backup(s) from $BACKUP_DIR, ${before}MB -> ${after}MB (retain=$RETAIN)"
+  else
+    log "backup retention: nothing to prune (retain=$RETAIN)"
+  fi
+else
+  log "backup retention: $BACKUP_DIR absent — skipped"
+fi
+
+# ── 2. Store size alarm ─────────────────────────────────────────────────────
+if [ ! -d "$PEBBLE_DIR" ]; then
+  warn "pebble dir $PEBBLE_DIR not found"
+  exit 1
+fi
+
+store_mb=$(du -sm "$PEBBLE_DIR" 2>/dev/null | cut -f1)
+ssts=$(find "$PEBBLE_DIR" -maxdepth 1 -name '*.sst' 2>/dev/null | wc -l | tr -d ' ')
+disk_pct=$(df --output=pcent / 2>/dev/null | tail -1 | tr -dc '0-9')
+
+log "store=${store_mb}MB ssts=${ssts} disk=${disk_pct}%"
+
+breach=0
+if [ "${store_mb:-0}" -gt "$MAX_STORE_MB" ]; then
+  warn "pebble store ${store_mb}MB exceeds ${MAX_STORE_MB}MB"; breach=1
+fi
+if [ "${ssts:-0}" -gt "$MAX_SSTS" ]; then
+  warn "sstable count ${ssts} exceeds ${MAX_SSTS} — compaction is not keeping up"; breach=1
+fi
+if [ "${disk_pct:-0}" -gt "$MAX_DISK_PCT" ]; then
+  warn "root filesystem ${disk_pct}% full"; breach=1
+fi
+
+if [ "$breach" = 1 ]; then
+  warn "muninn store is unhealthy — check the replication log backlog (max_log_backlog in cluster.yaml) before it fills the disk"
+  exit 1
+fi
+
+log "ok"
+{% endraw %}

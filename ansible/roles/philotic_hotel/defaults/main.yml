@@ -110,3 +110,17 @@ philotic_onnx_sidecar_port: 11435
 philotic_onnx_embed_repo: "Xenova/all-mpnet-base-v2"
 philotic_onnx_embed_dim: 768
 philotic_onnx_prefer_quantized: true
+
+# ── Muninn maintenance ───────────────────────────────────────────────────────
+# The agent-driven nightly backup writes outside MUNINN_BACKUP_DIR and had no
+# retention of its own — eight snapshots reached 21 GB on vps-jane.
+muninn_agent_backup_dir: "/home/deploy/muninn-backups"
+muninn_agent_backup_retain: 3
+muninn_data_dir: "/home/deploy/.muninn/data"
+# Thresholds for the store-size alarm. Healthy steady state after the
+# replication-log retention fix is ~250-1000 MB and a few dozen sstables; the
+# leak that went unnoticed for eight days reached 20 GB and 4,482 sstables.
+muninn_store_warn_mb: 4096
+muninn_store_warn_ssts: 500
+muninn_disk_warn_pct: 85
+muninn_maintenance_oncalendar: "*-*-* 05:20:00 UTC"
