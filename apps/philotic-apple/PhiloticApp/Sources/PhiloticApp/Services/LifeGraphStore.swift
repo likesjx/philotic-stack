@@ -90,6 +90,15 @@ public final class LifeGraphStore {
             if response.data.status != "ok" {
                 lastError = "lens returned status \(response.data.status)"
             }
+            // Donate to the Spotlight semantic index (seam:
+            // apple-entity-index-plane). Only packets the server already
+            // released reach here, and LifeIndexMapper applies the
+            // validation-state filter before anything is indexed. Fire and
+            // forget: a Spotlight failure must never degrade the Life surface.
+            let donated = packets
+            Task.detached(priority: .utility) {
+                await LifeIndexDonor.applyLensPackets(donated)
+            }
         } catch {
             lastError = String(describing: error)
         }
@@ -110,6 +119,14 @@ public final class LifeGraphStore {
         )
         if recentChanges.count > 20 {
             recentChanges.removeLast(recentChanges.count - 20)
+        }
+        // A retirement must evict the node from the system index immediately,
+        // not wait for the next lens refresh — Spotlight would keep answering
+        // with a claim the graph has retracted. Non-removal kinds carry no
+        // provenance and are intentionally no-ops here.
+        Task.detached(priority: .utility) {
+            await LifeIndexDonor.applyChange(
+                changeKind: kind, nodeId: nodeId, label: label, summary: summary)
         }
     }
 
