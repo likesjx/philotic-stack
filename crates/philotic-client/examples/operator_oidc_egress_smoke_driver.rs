@@ -1,5 +1,5 @@
 use ansible_mesh_core::integration::OidcExchangeResponse;
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use philotic_client::{GuestIdentity, IpcRequest, IpcResponse, PhiloticClient};
 use serde_json::json;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -155,14 +155,12 @@ async fn main() -> Result<()> {
     {
         IpcResponse::IntegrationAuditState { integration_audits }
             if integration_audits.len() >= 2
-                && integration_audits
-                    .iter()
-                    .any(|audit| audit.path == "/token" && audit.outcome == "oidc_token_http_200")
-                && integration_audits
-                    .iter()
-                    .any(|audit| {
-                        audit.path == "/userinfo" && audit.outcome == "oidc_userinfo_http_200"
-                    }) => {}
+                && integration_audits.iter().any(|audit| {
+                    audit.path == "/token" && audit.outcome == "oidc_token_http_200"
+                })
+                && integration_audits.iter().any(|audit| {
+                    audit.path == "/userinfo" && audit.outcome == "oidc_userinfo_http_200"
+                }) => {}
         other => bail!("durable OIDC audits were not observable: {other:?}"),
     }
 

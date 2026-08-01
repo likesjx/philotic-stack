@@ -676,10 +676,8 @@ pub fn project_context_packet(
             datasource: Some("life-graph".into()),
         };
         let mut packet = project_hit_to_evidence_packet(&hit, generated_at);
-        if fallback_origin {
-            if let Some(meta) = packet.metadata.as_object_mut() {
-                meta.insert("fallback_origin".into(), true.into());
-            }
+        if fallback_origin && let Some(meta) = packet.metadata.as_object_mut() {
+            meta.insert("fallback_origin".into(), true.into());
         }
         let evidence_path = match &expansion_origin {
             Some(exp) => {
@@ -902,7 +900,7 @@ mod tests {
 
         assert!(score_fresh > score_stale, "fresh hit should rank higher");
         assert!(score_fresh > 0.5, "fresh confirmed hit should score well");
-        assert!(score_stale >= 0.0 && score_stale <= 1.0);
+        assert!((0.0..=1.0).contains(&score_stale));
     }
 
     #[test]

@@ -140,7 +140,7 @@ impl WhisperBackend {
                 .try_extract_tensor::<f32>()
                 .map_err(|e| anyhow::anyhow!("failed to extract encoder output: {}", e))?;
             // shape: [1, enc_seq, enc_hidden] e.g. [1, 1500, 384] for whisper-small
-            let dims: &[i64] = &shape;
+            let dims: &[i64] = shape;
             anyhow::ensure!(
                 dims.len() == 3,
                 "expected 3D encoder output [1, enc_seq, hidden], got {}D",
@@ -183,7 +183,7 @@ impl WhisperBackend {
                 let (shape, data) = dec_out[0]
                     .try_extract_tensor::<f32>()
                     .map_err(|e| anyhow::anyhow!("failed to extract logits: {}", e))?;
-                let dims: &[i64] = &shape;
+                let dims: &[i64] = shape;
                 let vocab = dims[2] as usize;
                 // Take logits at the last sequence position.
                 let offset = (seq_len - 1) * vocab;

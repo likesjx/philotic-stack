@@ -20,8 +20,7 @@ impl ProposalStatus {
         match s
             .trim()
             .to_lowercase()
-            .replace(' ', "-")
-            .replace('\u{2014}', "-")
+            .replace([' ', '\u{2014}'], "-")
             .as_str()
         {
             "draft" => Some(Self::Draft),

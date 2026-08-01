@@ -282,7 +282,7 @@ async fn handle_call(ipc_client: &mut PhiloticClient, task: &Value) -> Result<()
             } else if matches!(&placement, EgressPlacementDecision::Deny { .. }) {
                 Err("hotel supplied a denied integration placement".into())
             } else {
-                match resolve_credential(ipc_client, &binding).await {
+                match resolve_credential(ipc_client, binding).await {
                     Ok(credential) => {
                         let context = ExecutionContext {
                             executor_node_id: &local_node_id(),

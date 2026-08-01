@@ -8,3 +8,7 @@ description = "Compiled-in, non-configurable execution safety floor (L0 hardline
 regex = "1.12"
 
 [dev-dependencies]
+
+# Clippy ratchet: this crate is warning-free and must stay that way.
+[lints]
+workspace = true

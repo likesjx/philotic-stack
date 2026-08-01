@@ -197,13 +197,13 @@ impl DatasourceProvider for SqliteCypherProvider {
                     for entry in std::fs::read_dir(&self.base_dir)? {
                         let entry = entry?;
                         let path = entry.path();
-                        if path.extension().and_then(|s| s.to_str()) == Some("db") {
-                            if let Some(name) = path.file_stem().and_then(|s| s.to_str()) {
-                                graphs.push(json!({
-                                    "graph_id": name,
-                                    "role": "owner"
-                                }));
-                            }
+                        if path.extension().and_then(|s| s.to_str()) == Some("db")
+                            && let Some(name) = path.file_stem().and_then(|s| s.to_str())
+                        {
+                            graphs.push(json!({
+                                "graph_id": name,
+                                "role": "owner"
+                            }));
                         }
                     }
                 }

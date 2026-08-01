@@ -232,7 +232,10 @@ async fn main() -> Result<()> {
                     .unwrap_or_else(|| json!({ "status": "missing_from_results" }));
                 let status = item["status"].as_str().unwrap_or("unknown").to_string();
                 let detail = item_detail(&item);
-                println!("batch   {:<26} status={:<12} {}", fixture.name, status, detail);
+                println!(
+                    "batch   {:<26} status={:<12} {}",
+                    fixture.name, status, detail
+                );
                 reports.push(ItemReport {
                     name: fixture.name.to_string(),
                     phase: "batch",
@@ -401,7 +404,10 @@ async fn execute_life_tool(
             }
             if payload.get("error").is_some() && !payload["error"].is_null() {
                 if payload["turn_id"].as_str() == Some(&turn_id) {
-                    bail!("{tool_name}: datasource returned error: {}", payload["error"]);
+                    bail!(
+                        "{tool_name}: datasource returned error: {}",
+                        payload["error"]
+                    );
                 }
                 continue;
             }

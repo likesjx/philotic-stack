@@ -1,0 +1,278 @@
+name: PR Check
+
+# The gate that was missing. Before this workflow the only CI was
+# build-linux.yml (push to develop — i.e. AFTER merge, and no tests) and
+# release.yml (tags only). Nothing verified a pull request, while the standing
+# policy is to auto-merge agent PRs into develop "at honest green" — a green
+# that was entirely self-reported by the agent that wrote the code.
+#
+# All four jobs are HARD gates.
+#
+# The test job was advisory for a while because it did not terminate: cold runs
+# hit 90-, 180- and finally 350-minute limits. That was never build cost — the
+# build step succeeded and the cache saved at 2.03 GiB. `cargo test` EXECUTION
+# hung, on the macOS Keychain (`security find/add-generic-password` blocks
+# forever where no login keychain is unlocked). Fixed in
+# ansible_mesh_core::keychain, and the job now finishes in ~10 minutes.
+#
+# Two further fixes were needed before it could be trusted as blocking:
+#   - Three tests relied on an ambient PHILOTIC_VAULT_MASTER_KEY that another
+#     test deleted mid-run (Rust runs tests as threads of one process, and that
+#     test called remove_var instead of restoring). See VaultKeyEnv in ipc.rs.
+#   - graph-intelligence's server tests raced on port allocation: they asked for
+#     a free port, dropped the listener, then re-bound it. Now they bind :0 and
+#     read back the assigned port.
+#
+# Verified under exact CI conditions (CI=true plus the ambient key):
+# 2340 passed / 0 failed, exit 0.
+#
+# Linux is not an option for the test job: the workspace contains Apple-only
+# crates, which is why build-linux.yml builds a selective package set rather
+# than --workspace. A Linux compile check over that subset is
+# proposal:pr-linux-compile-check.
+#
+# Clippy is gated by ratchet, not wholesale: only crates that opted in via
+# `[lints] workspace = true` deny warnings (17 of 32 today). The workspace still
+# carries ~700 warnings overall, so a blanket -D warnings would be red on
+# arrival. See proposal:clippy-ratchet-workspace-lints.
+
+on:
+  pull_request:
+    branches: [develop, main]
+  # Also on develop pushes: post-merge signal, and — more importantly right now
+  # — a chance to populate the macOS cargo cache outside a PR's critical path,
+  # so PR runs can restore instead of building from cold.
+  push:
+    branches: [develop]
+    paths-ignore:
+      - "docs/**"
+      - "**/*.md"
+  workflow_dispatch: {}
+
+concurrency:
+  group: pr-check-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  # Compile-cost reduction. Debug info for 89 test binaries is a large part of
+  # both the link time and the cache size, and incremental artifacts are pure
+  # waste on a runner that starts fresh every time.
+  CARGO_INCREMENTAL: "0"
+  CARGO_PROFILE_DEV_DEBUG: "0"
+  CARGO_PROFILE_TEST_DEBUG: "0"
+  # Belt-and-braces for audiopus_sys: if pkg-config somehow still misses Opus
+  # and the crate falls back to building it from source, opus's bundled
+  # CMakeLists declares `cmake_minimum_required(VERSION <3.5)`, which CMake 4
+  # (on the runner and on the dev Macs) refuses outright.
+  CMAKE_POLICY_VERSION_MINIMUM: "3.5"
+  # The tests, and any hotel binary they spawn, need a vault root key.
+  # Previously the macOS Keychain was consulted for it and BLOCKED forever on a
+  # runner (that is what ran the test job to a 5h50m timeout). The Keychain is
+  # now skipped in CI, which would make key resolution fail cleanly instead —
+  # better, but still a failure. Providing an ephemeral key means neither
+  # happens. This is NOT a secret: it encrypts nothing but throwaway CI state,
+  # and it is the same all-0x07 key the unit tests already use.
+  PHILOTIC_VAULT_MASTER_KEY: "BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc="
+
+jobs:
+  fmt:
+    name: rustfmt
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install pinned Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.94.0"
+          components: rustfmt
+
+      # Cheap: rustfmt parses the workspace members, it does not build.
+      - name: cargo fmt --all --check
+        run: cargo fmt --all --check
+
+  # proposal:pr-linux-compile-check — vps-jane runs Linux, but the test job is
+  # macOS-only (the workspace has Apple-only crates, which is why
+  # build-linux.yml builds a selective package set rather than --workspace).
+  # Without this, a PR could break the VPS build and nobody would find out until
+  # it had already landed on develop. Checks exactly the package set
+  # build-linux.yml ships, so the two cannot drift apart silently.
+  linux:
+    name: cargo check (linux x86_64)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      # Same undeclared dependency the macOS job hit: membrane-discord -> opus
+      # -> audiopus_sys prefers a system Opus and only builds from source (via
+      # CMake, which fails on CMake 4) when pkg-config cannot find one.
+      - name: Install system dependencies (Opus)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libopus-dev pkg-config
+
+      - name: Install pinned Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.94.0"
+          targets: x86_64-unknown-linux-gnu
+
+      - name: Restore cargo cache
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: linux-pr-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            linux-pr-cargo-
+            linux-x86_64-cargo-
+
+      - name: cargo check (vps-jane package set)
+        run: |
+          cargo check --target x86_64-unknown-linux-gnu --bins \
+            -p aiua \
+            -p philote \
+            -p membrane-telegram \
+            -p membrane-discord \
+            -p membrane-mcp \
+            -p membrane-mcp-client \
+            -p egress-http-runner \
+            -p model-router \
+            -p tool-runner \
+            -p graph-datasource \
+            -p table-datasource \
+            -p router-listener \
+            -p agent-datasource \
+            -p heal-dispatcher \
+            -p data-memorygraphrag \
+            -p philotic-web
+
+      - name: Save cargo cache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: linux-pr-cargo-${{ hashFiles('**/Cargo.lock') }}-${{ github.run_id }}
+
+  # proposal:clippy-ratchet-workspace-lints — a HARD gate, but only for crates
+  # that have opted in via `[lints] workspace = true`. 17 of 32 are gated today;
+  # the rest still only warn, so this is green on arrival rather than red.
+  # Clean a crate, add the opt-in, and it can never regress. Progress is
+  # visible as the count of Cargo.toml files carrying [lints].
+  #
+  # Runs on macOS to match the dev fleet: onnx-runner pulls ort with the
+  # `coreml` feature, and other gated crates are Apple-leaning, so a Linux
+  # clippy run is not a like-for-like check. It shares the cache key the test
+  # job warms on develop pushes, so it restores rather than building cold.
+  clippy:
+    name: clippy (ratchet)
+    runs-on: macos-14
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system dependencies (Opus)
+        run: brew install opus pkg-config
+
+      - name: Install pinned Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.94.0"
+          components: clippy
+
+      - name: Restore cargo cache
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: macos-arm64-clippy-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            macos-arm64-clippy-
+            macos-arm64-cargo-
+
+      - name: Report ratchet coverage
+        run: |
+          gated=$(grep -l '^\[lints\]' crates/*/Cargo.toml | wc -l | tr -d ' ')
+          total=$(ls -d crates/*/ | wc -l | tr -d ' ')
+          echo "### Clippy ratchet: ${gated}/${total} crates gated at deny" >> "$GITHUB_STEP_SUMMARY"
+
+      # Opted-in crates deny warnings; everything else still only warns, so a
+      # non-zero exit here means a gated crate regressed.
+      - name: cargo clippy --workspace
+        run: cargo clippy --workspace --all-targets
+
+  test:
+    name: test (macos arm64)
+    runs-on: macos-14
+    # Blocking as of proposal:pr-test-gate-viability. The timeout stays generous
+    # because a cold runner still has to build 89 test binaries; a warm one
+    # finishes in ~10 minutes.
+    timeout-minutes: 350
+    steps:
+      - uses: actions/checkout@v4
+
+      # Undeclared system dependency, surfaced by the first run of this
+      # workflow. crates/membrane-discord depends on `opus`, whose -sys crate
+      # first asks pkg-config for a system Opus and only builds from source if
+      # that fails. The dev Macs have opus 1.6.1 from Homebrew, so the source
+      # path never runs locally and the dependency was invisible. A bare runner
+      # has neither, so it took the source path and died on CMake 4.
+      - name: Install system dependencies (Opus)
+        run: brew install opus pkg-config
+
+      - name: Install pinned Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.94.0"
+
+      # Restore/save are split rather than using actions/cache, so that a run
+      # which fails or is cancelled still saves what it compiled. The combined
+      # action only saves on success, which is how the earlier attempts threw
+      # away three hours of compilation and left the next run just as cold.
+      - name: Restore cargo cache
+        id: cargo_cache
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: macos-arm64-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: macos-arm64-cargo-
+
+      - name: Show toolchain in use
+        run: |
+          rustc --version
+          cargo --version
+
+      # Build and run separately so the job summary distinguishes "still
+      # compiling" from "tests actually failed" — the earlier timeouts were
+      # ambiguous until the step timings were inspected by hand.
+      - name: Build test binaries
+        run: cargo test --workspace --no-run
+
+      # Save as soon as the expensive part is done, before running tests, so a
+      # genuine test failure cannot cost us the cache.
+      - name: Save cargo cache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: macos-arm64-cargo-${{ hashFiles('**/Cargo.lock') }}-${{ github.run_id }}
+
+      - name: cargo test --workspace
+        run: cargo test --workspace --no-fail-fast

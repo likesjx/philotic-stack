@@ -123,7 +123,10 @@ async fn run_probe(socket_path: &str) -> Result<()> {
     for (vault, token) in &tokens {
         eprintln!("   vault={vault:<28} token={}", fingerprint(token));
     }
-    eprintln!("   {} registered vault token(s) served live\n", tokens.len());
+    eprintln!(
+        "   {} registered vault token(s) served live\n",
+        tokens.len()
+    );
 
     eprintln!("== S2 check: HealMemoryToken refuses an unregistered vault ==");
     eprintln!("   requesting heal for {UNREGISTERED_PROBE_VAULT} (must be refused)");

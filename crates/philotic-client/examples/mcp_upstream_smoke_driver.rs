@@ -272,16 +272,18 @@ async fn main() -> Result<()> {
                         })
                         .await?
                     {
-                        IpcResponse::IntegrationAuditState {
-                            integration_audits,
-                        } if integration_audits.iter().any(|audit| {
-                            audit.binding_id == format!("mcp:{UPSTREAM_ID}")
-                                && audit.outcome == "http_200"
-                                && audit.caller_role == "mcp-client-runner"
-                        }) => println!(
-                            "      governed egress audit observed ({} MCP HTTP exchanges)",
-                            integration_audits.len()
-                        ),
+                        IpcResponse::IntegrationAuditState { integration_audits }
+                            if integration_audits.iter().any(|audit| {
+                                audit.binding_id == format!("mcp:{UPSTREAM_ID}")
+                                    && audit.outcome == "http_200"
+                                    && audit.caller_role == "mcp-client-runner"
+                            }) =>
+                        {
+                            println!(
+                                "      governed egress audit observed ({} MCP HTTP exchanges)",
+                                integration_audits.len()
+                            )
+                        }
                         other => bail!("MCP governed egress audit was not observable: {other:?}"),
                     }
                 }

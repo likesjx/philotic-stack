@@ -258,10 +258,10 @@ async fn handle_event(
 
 /// Map event fields to table columns using schema_map (or pass through all fields).
 fn build_row(handler: &EventHandlerConfig, envelope: &Value) -> Value {
-    if let Some(ref script) = handler.adapter_script {
-        if let Some(adapted) = run_adapter(script, envelope) {
-            return adapted;
-        }
+    if let Some(ref script) = handler.adapter_script
+        && let Some(adapted) = run_adapter(script, envelope)
+    {
+        return adapted;
     }
 
     let Some(obj) = envelope.as_object() else {

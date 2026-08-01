@@ -34,3 +34,20 @@ members = [
     "crates/exec-guard",
 ]
 resolver = "2"
+
+# Clippy ratchet — proposal:clippy-ratchet-workspace-lints.
+#
+# The workspace carries ~700 clippy warnings (aiua alone: 346), so a blanket
+# `-D warnings` would be red on arrival and would only teach everyone to ignore
+# the gate. Instead crates opt in ONE AT A TIME by adding
+#
+#     [lints]
+#     workspace = true
+#
+# to their Cargo.toml. Opted-in crates then fail `cargo clippy` on any warning;
+# the rest still only warn. Clean a crate, opt it in, and it can never regress.
+#
+# These are clippy-only lints, so `cargo build`/`cargo test` are unaffected —
+# only `cargo clippy` enforces them.
+[workspace.lints.clippy]
+all = "deny"

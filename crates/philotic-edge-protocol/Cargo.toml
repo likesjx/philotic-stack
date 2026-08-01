@@ -7,3 +7,7 @@ description = "Wire types for the edge-mesh client-server protocol (edge clients
 [dependencies]
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+
+# Clippy ratchet: this crate is warning-free and must stay that way.
+[lints]
+workspace = true

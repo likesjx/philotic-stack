@@ -410,13 +410,13 @@ async fn dispatch_cycle(
         Ok(IpcResponse::Standard {
             data: Some(data), ..
         }) => {
-            if let Some(n) = data.get("repaired").and_then(|v| v.as_u64()) {
-                if n > 0 {
-                    info!(
-                        repaired = n,
-                        "heal-dispatcher: zombie turn scan repaired stale turns"
-                    );
-                }
+            if let Some(n) = data.get("repaired").and_then(|v| v.as_u64())
+                && n > 0
+            {
+                info!(
+                    repaired = n,
+                    "heal-dispatcher: zombie turn scan repaired stale turns"
+                );
             }
         }
         Ok(_) => {}
@@ -540,21 +540,21 @@ async fn process_row(
     // Recurrence tracking (Autopoiesis Slice A3): a (pattern_tag, guest_id)
     // pair breaching the sliding-window threshold files a heal work item on
     // the hotel through the fleet.heal_slices autonomy lane.
-    if !row.raw_text.starts_with(WORK_ITEM_FILED_PREFIX) {
-        if let Some(breach) = tracker.record(&pattern_tag, &row.guest_id, now, &row.raw_text) {
-            file_heal_work_item(
-                ipc,
-                http,
-                notifier,
-                intel_graph_url,
-                &pattern_tag,
-                &row.guest_id,
-                breach,
-                tracker.window_secs(),
-                now,
-            )
-            .await?;
-        }
+    if !row.raw_text.starts_with(WORK_ITEM_FILED_PREFIX)
+        && let Some(breach) = tracker.record(&pattern_tag, &row.guest_id, now, &row.raw_text)
+    {
+        file_heal_work_item(
+            ipc,
+            http,
+            notifier,
+            intel_graph_url,
+            &pattern_tag,
+            &row.guest_id,
+            breach,
+            tracker.window_secs(),
+            now,
+        )
+        .await?;
     }
 
     // Execute the action and record outcome.
@@ -590,10 +590,11 @@ async fn process_row(
     // notification failure (swallowed inside) can't disturb row resolution.
     // Skip our own work_item_filed echo rows — they never carry the escalate
     // action, but guard anyway.
-    if heal_action == "escalate" && !row.raw_text.starts_with(WORK_ITEM_FILED_PREFIX) {
-        if let Some(ping) = notifier.on_escalate(&pattern_tag, &row.guest_id, now) {
-            notifier.push(ipc, ping).await;
-        }
+    if heal_action == "escalate"
+        && !row.raw_text.starts_with(WORK_ITEM_FILED_PREFIX)
+        && let Some(ping) = notifier.on_escalate(&pattern_tag, &row.guest_id, now)
+    {
+        notifier.push(ipc, ping).await;
     }
 
     Ok(())

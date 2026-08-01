@@ -975,20 +975,23 @@ fn vault_key_account() -> String {
 /// Read-only Keychain lookup. Unlike aiua's `load_or_create_root_key`, this
 /// never generates or stores a key on a miss — doctor must not write.
 fn keychain_key_source() -> Option<Vec<u8>> {
-    if !cfg!(target_os = "macos") {
+    // Also skipped where there is no unlocked login keychain — `security`
+    // blocks forever there rather than failing, and doctor must never hang.
+    if !ansible_mesh_core::keychain::enabled() {
         return None;
     }
-    let output = std::process::Command::new("security")
-        .args([
+    let output = ansible_mesh_core::keychain::run_security(
+        &[
             "find-generic-password",
             "-s",
             VAULT_KEYCHAIN_SERVICE,
             "-a",
             &vault_key_account(),
             "-w",
-        ])
-        .output()
-        .ok()?;
+        ],
+        "reading the Philotic vault root key",
+    )
+    .ok()?;
     if !output.status.success() {
         return None;
     }

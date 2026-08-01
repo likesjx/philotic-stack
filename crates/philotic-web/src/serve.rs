@@ -8266,16 +8266,23 @@ fn load_root_key_from_file() -> Result<Vec<u8>> {
 }
 
 fn load_root_key_from_keychain(account: &str) -> Result<Option<Vec<u8>>> {
-    let output = std::process::Command::new("security")
-        .args([
+    // Skipped entirely where there is no unlocked login keychain — `security`
+    // blocks forever there rather than failing. See ansible_mesh_core::keychain.
+    if !ansible_mesh_core::keychain::enabled() {
+        return Ok(None);
+    }
+
+    let output = ansible_mesh_core::keychain::run_security(
+        &[
             "find-generic-password",
             "-s",
             "ai.philotic.hotel-vault",
             "-a",
             account,
             "-w",
-        ])
-        .output()?;
+        ],
+        "reading the Philotic vault root key",
+    )?;
 
     if output.status.success() {
         let raw = String::from_utf8(output.stdout)?;

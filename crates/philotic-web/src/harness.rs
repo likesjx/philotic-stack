@@ -1695,6 +1695,98 @@ fn export_harness(
     apply_harness(engine, adapter, harness_id, Some(config.profile), None)
 }
 
+/// Resolve every skill a harness declares against the filesystem.
+///
+/// proposal:harness-verify-resolves-skills.
+///
+/// `verify` used to report `clean` for harness:claude-local while all seven
+/// skills its charter declared Active were unreachable by the runtime, and one
+/// of them (`implementation`) did not exist anywhere on disk. It compared the
+/// managed config block's hash and nothing else. A verifier that attests a
+/// broken harness is healthy is worse than no verifier at all, because the
+/// green is trusted — that is exactly how the Claude harness sat broken.
+///
+/// Three things have to hold for a declared skill to be real:
+///   1. `skills/<name>/SKILL.md` exists,
+///   2. its frontmatter parses and carries `name:` + `description:`
+///      (11 of 32 once opened with a bare `name:` and no `---`, so they would
+///      not have registered even if correctly placed), and
+///   3. for claude-code, it is reachable from a discovery path Claude Code
+///      actually reads — `.claude/skills/<name>` — never a top-level `skills/`.
+fn check_declared_skills(runtime_kind: &str, skills: &[String], root: &Path) -> Vec<String> {
+    let mut failures = Vec::new();
+
+    for skill in skills {
+        let skill_md = root.join("skills").join(skill).join("SKILL.md");
+        if !skill_md.is_file() {
+            failures.push(format!(
+                "skill '{skill}' is declared but skills/{skill}/SKILL.md does not exist"
+            ));
+            continue;
+        }
+
+        match fs::read_to_string(&skill_md) {
+            Ok(body) => {
+                if let Some(problem) = frontmatter_problem(&body) {
+                    failures.push(format!("skill '{skill}': {problem}"));
+                }
+            }
+            Err(err) => {
+                failures.push(format!("skill '{skill}': cannot read SKILL.md ({err})"));
+                continue;
+            }
+        }
+
+        // Placement only matters for runtimes with a fixed discovery path.
+        if runtime_kind == "claude-code" {
+            let discoverable = root.join(".claude").join("skills").join(skill);
+            // is_file() follows symlinks, which is the supported layout here:
+            // a `<skill-name>` entry may be a symlink and Claude Code follows it.
+            if !discoverable.join("SKILL.md").is_file() {
+                failures.push(format!(
+                    "skill '{skill}' is not reachable from Claude Code's discovery path \
+                     (.claude/skills/{skill}/SKILL.md); a top-level skills/ directory is never scanned"
+                ));
+            }
+        }
+    }
+
+    failures
+}
+
+/// Returns a description of what is wrong with a SKILL.md frontmatter block,
+/// or `None` when it is well-formed.
+fn frontmatter_problem(body: &str) -> Option<String> {
+    let mut lines = body.lines();
+    if lines.next().map(str::trim) != Some("---") {
+        return Some(
+            "frontmatter does not open with '---', so the skill will not register".to_string(),
+        );
+    }
+
+    let mut has_name = false;
+    let mut has_description = false;
+    for line in lines {
+        if line.trim() == "---" {
+            return if has_name && has_description {
+                None
+            } else if !has_name {
+                Some("frontmatter is missing 'name:'".to_string())
+            } else {
+                Some("frontmatter is missing 'description:'".to_string())
+            };
+        }
+        if line.starts_with("name:") {
+            has_name = true;
+        }
+        if line.starts_with("description:") {
+            has_description = true;
+        }
+    }
+
+    Some("frontmatter block is never closed with '---'".to_string())
+}
+
 fn verify_harness(
     engine: &GraphEngine,
     adapter: &dyn HarnessAdapter,
@@ -1757,6 +1849,17 @@ fn verify_harness(
             if severity != Some("error") {
                 severity = Some("warn");
             }
+        }
+
+        // proposal:harness-verify-resolves-skills — a declared skill the
+        // runtime cannot load is an error, not a warning: the charter is
+        // promising the agent a capability that does not exist.
+        let repo_root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let skill_failures =
+            check_declared_skills(adapter.runtime_kind(), &config.skills, &repo_root);
+        if !skill_failures.is_empty() {
+            drift_status = "drifted";
+            severity = Some("error");
         }
 
         let mut updated = harness.clone();
@@ -1824,7 +1927,12 @@ fn verify_harness(
                     "last_seen_at": now.to_rfc3339(),
                     "resolved_at": serde_json::Value::Null,
                     "resolved_by_observation": serde_json::Value::Null,
-                    "summary": if aux_failures.is_empty() {
+                    "summary": if !skill_failures.is_empty() {
+                        format!(
+                            "Harness drift: {} declared skill(s) do not resolve",
+                            skill_failures.len()
+                        )
+                    } else if aux_failures.is_empty() {
                         "Rendered config does not match observed local state".to_string()
                     } else {
                         format!(
@@ -1835,7 +1943,8 @@ fn verify_harness(
                     "details": {
                         "rendered_hash": rendered_hash,
                         "observed_hash": observation.properties["profile_hash"].clone(),
-                        "aux_failures": aux_failures
+                        "aux_failures": aux_failures,
+                        "skill_failures": skill_failures
                     }
                 }),
                 file_path: Some(config.target_path.to_string_lossy().to_string()),
@@ -1892,6 +2001,14 @@ fn verify_harness(
             harness_id,
             drift_status
         );
+        // Print the specifics: "drifted" alone sends people to diff the config
+        // file, which is not where an unresolvable skill shows up.
+        for failure in &skill_failures {
+            eprintln!("  skill: {failure}");
+        }
+        for failure in &aux_failures {
+            eprintln!("  aux:   {failure}");
+        }
         return Ok(());
     }
 
@@ -2570,14 +2687,24 @@ fn codex_target_path(harness_id: &str) -> Result<PathBuf> {
         .join("AGENTS.md"))
 }
 
+/// proposal:claude-charter-in-repo.
+///
+/// The charter used to be projected to
+/// `~/.claude/philotic/harnesses/<id>/CLAUDE.md`, and the checked-in
+/// `.claude/CLAUDE.md` @-imported that ABSOLUTE path. On any other machine, in
+/// CI, in a cloud session, or for a collaborator, the import resolved to
+/// nothing and the charter silently vanished — with no error, because a missing
+/// @import is not a failure. The dependency direction was backwards: a
+/// version-controlled file pointing out at machine-local state.
+///
+/// Now it projects into the repo, like the windsurf adapter already did, so the
+/// charter is diffable, reviewable, and travels with the checkout.
 fn claude_code_target_path(harness_id: &str) -> Result<PathBuf> {
-    let home = dirs::home_dir().context("failed to locate home directory")?;
-    Ok(home
+    let root = std::env::current_dir().context("failed to locate current workspace")?;
+    Ok(root
         .join(".claude")
-        .join("philotic")
-        .join("harnesses")
-        .join(short_harness_id(harness_id))
-        .join("CLAUDE.md"))
+        .join("harness")
+        .join(format!("{}.md", short_harness_id(harness_id))))
 }
 
 fn antigravity_target_path(harness_id: &str) -> Result<PathBuf> {
@@ -2599,13 +2726,46 @@ fn windsurf_target_path(harness_id: &str) -> Result<PathBuf> {
         .join(format!("philotic-{}.md", short_harness_id(harness_id))))
 }
 
+/// Default skills per canonical profile.
+///
+/// These must be REAL skill directory names under `skills/`. They used to be
+/// generic placeholders — `planning`, `verification`, `implementation` — none
+/// of which exist on disk, which is how `implementation` ended up declared
+/// Active on the claude-local charter while existing nowhere. `verify` now
+/// treats an unresolvable declared skill as an error, so fiction here would
+/// mark every harness drifted.
+///
+/// `default_skills_are_real_skills` guards this: it resolves every name below
+/// against `skills/`, so a placeholder can never be reintroduced silently.
 fn default_skills_for_profile(profile: &str) -> Vec<String> {
     match profile {
-        "verifier" => vec!["verification".into(), "muninn-memory-habit".into()],
-        "implementer" => vec!["implementation".into(), "muninn-memory-habit".into()],
+        "verifier" => vec![
+            "verification-ladder".into(),
+            "verification-orchestrator".into(),
+            "muninn-memory-habit".into(),
+        ],
+        "implementer" => vec![
+            "philotic-slice-closeout".into(),
+            "verification-ladder".into(),
+            "muninn-memory-habit".into(),
+        ],
+        "reviewer" => vec![
+            "verification-ladder".into(),
+            "proposal-maintainer".into(),
+            "muninn-memory-habit".into(),
+        ],
+        "architect" => vec![
+            "graph-intelligence".into(),
+            "proposal-pipeline".into(),
+            "architecture-docs-maintainer".into(),
+            "muninn-memory-habit".into(),
+        ],
+        // orchestrator and anything else
         _ => vec![
-            "planning".into(),
-            "verification".into(),
+            "graph-intelligence".into(),
+            "proposal-pipeline".into(),
+            "verification-ladder".into(),
+            "session-hygiene".into(),
             "muninn-memory-habit".into(),
         ],
     }
@@ -2801,6 +2961,62 @@ fn render_windsurf_workflow_markdown(
     )
 }
 
+/// Remove a previously-written philotic harness verify hook from a settings
+/// file, leaving everything else untouched.
+///
+/// The hook moved from settings.local.json to settings.json; both files load and
+/// their hooks merge, so a leftover entry means the verify command runs twice
+/// per session. Missing or unparseable files are left alone — settings.local.json
+/// is co-owned by Claude Code itself, and mangling it would be worse than a
+/// duplicate hook.
+fn strip_stale_verify_hook(path: &PathBuf) -> Result<()> {
+    if !path.exists() {
+        return Ok(());
+    }
+    let Ok(raw) = fs::read_to_string(path) else {
+        return Ok(());
+    };
+    let Ok(mut settings) = serde_json::from_str::<serde_json::Value>(&raw) else {
+        return Ok(());
+    };
+
+    let Some(entries) = settings
+        .get_mut("hooks")
+        .and_then(|h| h.get_mut("SessionStart"))
+        .and_then(|s| s.as_array_mut())
+    else {
+        return Ok(());
+    };
+
+    let before = entries.len();
+    entries.retain(|entry| {
+        entry
+            .get("hooks")
+            .and_then(|h| h.as_array())
+            .map(|cmds| {
+                !cmds.iter().any(|c| {
+                    c.get("command")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.contains("phil graph harness verify"))
+                        .unwrap_or(false)
+                })
+            })
+            .unwrap_or(true)
+    });
+
+    if entries.len() == before {
+        return Ok(());
+    }
+
+    let updated = serde_json::to_string_pretty(&settings)?;
+    write_harness_file(path, updated.as_bytes())?;
+    println!(
+        "  → removed a stale duplicate verify hook from {}",
+        path.display()
+    );
+    Ok(())
+}
+
 fn write_claude_code_workspace_files(
     harness_id: &str,
     projection_path: &PathBuf,
@@ -2809,9 +3025,20 @@ fn write_claude_code_workspace_files(
     let root = std::env::current_dir().context("failed to locate current workspace")?;
     let dot_claude = root.join(".claude");
 
-    // 1. Write .claude/CLAUDE.md with @import pointing at the projection.
+    // 1. Write .claude/CLAUDE.md with an @import pointing at the projection.
     //    This causes Claude Code to load the harness role/skills on every session start.
-    let import_path = projection_path.to_string_lossy();
+    //
+    //    The import is RELATIVE. It used to be the projection's absolute path
+    //    under $HOME, in a file that is checked into git — so on any other
+    //    machine, in CI, or for a collaborator it resolved to nothing and the
+    //    charter silently vanished. A relative import travels with the repo.
+    //    Relative to the IMPORTING FILE's directory (.claude/), not the repo
+    //    root — `@./.claude/harness/x.md` inside `.claude/CLAUDE.md` would
+    //    resolve to `.claude/.claude/harness/x.md`.
+    let import_path = projection_path
+        .strip_prefix(&dot_claude)
+        .map(|rel| format!("./{}", rel.display()))
+        .unwrap_or_else(|_| projection_path.to_string_lossy().to_string());
     let import_md = format!(
         "<!-- Managed by `phil graph harness apply`. Do not edit manually. -->\n\
          <!-- Re-run `phil graph harness apply {harness_id}` to refresh after profile changes. -->\n\
@@ -2820,9 +3047,18 @@ fn write_claude_code_workspace_files(
     let claude_md_path = dot_claude.join("CLAUDE.md");
     write_harness_file(&claude_md_path, import_md.as_bytes())?;
 
-    // 2. Merge a SessionStart hook into .claude/settings.local.json.
+    // 2. Merge a SessionStart hook into .claude/settings.json.
     //    The hook verifies the harness on startup so drift is visible before any work.
-    let settings_path = dot_claude.join("settings.local.json");
+    //
+    //    This used to target settings.local.json, which is globally gitignored
+    //    (~/.config/git/ignore), so the hook could not be shared or reviewed and
+    //    did not propagate to sibling worktrees or other machines. settings.json
+    //    is the version-controlled home for project rules.
+    //
+    //    NOTE: project settings are validated STRICTLY — a file that fails
+    //    validation is rejected as a whole — so only schema-valid keys may be
+    //    written here. hooks.SessionStart is schema-valid.
+    let settings_path = dot_claude.join("settings.json");
     let mut settings: serde_json::Value = if settings_path.exists() {
         let raw = fs::read_to_string(&settings_path)
             .with_context(|| format!("failed to read {}", settings_path.display()))?;
@@ -2871,11 +3107,13 @@ fn write_claude_code_workspace_files(
     let updated = serde_json::to_string_pretty(&settings)?;
     write_harness_file(&settings_path, updated.as_bytes())?;
 
-    println!(
-        "  → wrote .claude/CLAUDE.md (imports {})",
-        projection_path.display()
-    );
-    println!("  → merged SessionStart verify hook into .claude/settings.local.json");
+    // Earlier versions wrote this hook into settings.local.json. Both files load
+    // and their hooks merge, so a leftover entry there would run the verify
+    // command twice every session. Strip it.
+    strip_stale_verify_hook(&dot_claude.join("settings.local.json"))?;
+
+    println!("  → wrote .claude/CLAUDE.md (imports {})", import_path);
+    println!("  → merged SessionStart verify hook into .claude/settings.json");
     Ok(vec![
         AuxCheck::Hash {
             path: claude_md_path.to_string_lossy().to_string(),
@@ -3529,5 +3767,141 @@ mod tests {
         assert!(missing.evaluate().is_some());
 
         fs::remove_dir_all(&dir).ok();
+    }
+
+    // ---- proposal:harness-verify-resolves-skills ------------------------
+    //
+    // Regression cover for a verifier that reported `clean` while every skill
+    // the charter declared was unreachable, and one did not exist at all.
+
+    fn write_skill(root: &Path, name: &str, body: &str) {
+        let dir = root.join("skills").join(name);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("SKILL.md"), body).unwrap();
+    }
+
+    fn make_discoverable(root: &Path, name: &str) {
+        let dir = root.join(".claude").join("skills").join(name);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("SKILL.md"),
+            fs::read_to_string(root.join("skills").join(name).join("SKILL.md")).unwrap(),
+        )
+        .unwrap();
+    }
+
+    const GOOD: &str = "---\nname: good\ndescription: A well-formed skill.\n---\n\n# Good\n";
+
+    #[test]
+    fn declared_skill_that_does_not_exist_is_reported() {
+        let tmp = tempfile::tempdir().unwrap();
+        // `implementation` was declared by the claude-local charter and existed
+        // nowhere on disk — verify still said clean.
+        let failures =
+            check_declared_skills("claude-code", &["implementation".to_string()], tmp.path());
+        assert_eq!(failures.len(), 1, "{failures:?}");
+        assert!(failures[0].contains("does not exist"), "{failures:?}");
+    }
+
+    #[test]
+    fn skill_present_but_not_in_claude_discovery_path_is_reported() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_skill(tmp.path(), "good", GOOD);
+        // Present under skills/ but with no .claude/skills entry: this was the
+        // state of all 32 skills, none of which Claude Code could load.
+        let failures = check_declared_skills("claude-code", &["good".to_string()], tmp.path());
+        assert_eq!(failures.len(), 1, "{failures:?}");
+        assert!(failures[0].contains("discovery path"), "{failures:?}");
+
+        // Other runtimes read skills/ directly, so placement is not their problem.
+        assert!(check_declared_skills("codex", &["good".to_string()], tmp.path()).is_empty());
+    }
+
+    #[test]
+    fn fully_wired_skill_passes() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_skill(tmp.path(), "good", GOOD);
+        make_discoverable(tmp.path(), "good");
+        assert!(check_declared_skills("claude-code", &["good".to_string()], tmp.path()).is_empty());
+    }
+
+    #[test]
+    fn malformed_frontmatter_is_reported() {
+        // The exact shape 11 of 32 SKILL.md files had: a bare `name:` line with
+        // no opening `---`, which never registers.
+        assert!(frontmatter_problem("name: x\ndescription: y\n\n# Body\n")
+            .unwrap()
+            .contains("does not open with '---'"));
+        assert!(frontmatter_problem("---\ndescription: y\n---\n")
+            .unwrap()
+            .contains("missing 'name:'"));
+        assert!(frontmatter_problem("---\nname: x\n---\n")
+            .unwrap()
+            .contains("missing 'description:'"));
+        assert!(frontmatter_problem("---\nname: x\ndescription: y\n")
+            .unwrap()
+            .contains("never closed"));
+        assert!(frontmatter_problem(GOOD).is_none());
+    }
+
+    /// Every default skill must be a real directory under `skills/`.
+    ///
+    /// The defaults were once `planning`, `verification` and `implementation`,
+    /// none of which exist — which is how `implementation` came to be declared
+    /// Active on a charter while existing nowhere on disk. Since `verify` now
+    /// errors on an unresolvable declared skill, a placeholder here would mark
+    /// every harness drifted. This makes that impossible to reintroduce.
+    #[test]
+    fn default_skills_are_real_skills() {
+        // tests run with CWD = crate root; skills/ lives at the repo root.
+        let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(Path::parent)
+            .expect("repo root")
+            .to_path_buf();
+        let skills_dir = repo_root.join("skills");
+        assert!(
+            skills_dir.is_dir(),
+            "expected {} to exist",
+            skills_dir.display()
+        );
+
+        for profile in [
+            "orchestrator",
+            "implementer",
+            "verifier",
+            "reviewer",
+            "architect",
+            "something-unknown",
+        ] {
+            for skill in default_skills_for_profile(profile) {
+                let path = skills_dir.join(&skill).join("SKILL.md");
+                assert!(
+                    path.is_file(),
+                    "profile '{profile}' declares skill '{skill}', but {} does not exist",
+                    path.display()
+                );
+                let body = fs::read_to_string(&path).unwrap();
+                assert!(
+                    frontmatter_problem(&body).is_none(),
+                    "profile '{profile}' declares skill '{skill}', whose frontmatter is invalid: {:?}",
+                    frontmatter_problem(&body)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn malformed_frontmatter_fails_the_declared_skill_check() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_skill(
+            tmp.path(),
+            "bare",
+            "name: bare\ndescription: no delimiters\n",
+        );
+        make_discoverable(tmp.path(), "bare");
+        let failures = check_declared_skills("claude-code", &["bare".to_string()], tmp.path());
+        assert_eq!(failures.len(), 1, "{failures:?}");
+        assert!(failures[0].contains("---"), "{failures:?}");
     }
 }

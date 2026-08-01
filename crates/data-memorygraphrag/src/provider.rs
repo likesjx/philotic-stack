@@ -474,10 +474,10 @@ impl LifeGraphProvider {
             .user(self.config.user.as_str())
             .password(self.config.password.as_str());
 
-        if let Ok(db) = std::env::var("PHILOTIC_MEMGRAPH_DB") {
-            if !db.is_empty() {
-                builder = builder.db(db.as_str());
-            }
+        if let Ok(db) = std::env::var("PHILOTIC_MEMGRAPH_DB")
+            && !db.is_empty()
+        {
+            builder = builder.db(db.as_str());
         }
 
         Ok(Graph::connect(builder.build()?)?)
@@ -556,10 +556,10 @@ impl DatasourceProvider for LifeGraphProvider {
         // change_notification that the datasource runtime fans out to the
         // configured observer role (which philotic-web turns into retained
         // LifeGraphChange frames for enrolled edge devices).
-        if let ProviderOutput::ResultSet(data) = &mut output {
-            if let Some(change) = change_notification_for(task.kind.as_str(), data) {
-                data["change_notification"] = change;
-            }
+        if let ProviderOutput::ResultSet(data) = &mut output
+            && let Some(change) = change_notification_for(task.kind.as_str(), data)
+        {
+            data["change_notification"] = change;
         }
         Ok(output)
     }
@@ -3189,6 +3189,300 @@ fn feedback_signal_evidence(input: &RetrievalFeedbackInput) -> EvidencePacket {
     }
 }
 
+/// Compute seconds elapsed since `observed_at` ISO 8601 string.
+/// Returns 0 on parse failure (treat unknown age as fresh).
+/// Call the ONNX sidecar's `/api/embeddings` endpoint and return `(vector, model_gen)`.
+///
+/// The sidecar address is read from `PHILOTIC_ONNX_SIDECAR_ADDR`
+/// (default `http://127.0.0.1:11435`).
+/// Returns an explicit error on dim mismatch — callers should surface this, not silently
+/// continue with a wrong-dim vector.
+/// Hard ceiling for a single embed-on-write sidecar call. Sized so a stalled
+/// ONNX embedding sidecar fails fast — surfacing as a graceful "sidecar
+/// unavailable" skip in `handle_observe` (the node is already written; the
+/// embedding is optional) — instead of hanging the observe indefinitely. That
+/// indefinite hang is what wedged `life.observe.batch`: with no timeout, each
+/// per-item embed blocked forever and the turn sat until the watchdog evicted
+/// it. Kept small so even a multi-item batch degrades within the turn watchdog.
+const EMBED_SIDECAR_TIMEOUT_SECS: u64 = 8;
+
+/// After an embed sidecar failure, treat it as down for this long and
+/// short-circuit further embed calls (fast Err, no HTTP). This turns a
+/// persistently-down sidecar from "N × timeout per bulk write" into a single
+/// timeout, so `life.observe.batch` and the steward distillation sweep don't
+/// wedge when embeddings are unavailable — the observations still land, just
+/// without vectors.
+const EMBED_SIDECAR_COOLDOWN_SECS: u64 = 60;
+
+/// Unix-seconds deadline before which the embed sidecar is treated as down.
+/// `0` = healthy. Process-global, best-effort (Relaxed) — a stale read only
+/// costs at most one extra timeout, never correctness.
+static EMBED_SIDECAR_DOWN_UNTIL: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+fn now_unix_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Circuit-breaking wrapper over [`embed_text_inner`]: skips the sidecar during
+/// the post-failure cooldown, and arms the cooldown on any failure. Callers get
+/// an `Err` (handled as a graceful "sidecar_unavailable" skip) either way.
+async fn embed_text(text: &str) -> anyhow::Result<(Vec<f32>, String)> {
+    use std::sync::atomic::Ordering;
+    let now = now_unix_secs();
+    if EMBED_SIDECAR_DOWN_UNTIL.load(Ordering::Relaxed) > now {
+        anyhow::bail!("embed_text: sidecar in cooldown after a recent failure");
+    }
+    match embed_text_inner(text).await {
+        Ok(result) => {
+            // Recovered (or never down): clear any lingering cooldown.
+            EMBED_SIDECAR_DOWN_UNTIL.store(0, Ordering::Relaxed);
+            Ok(result)
+        }
+        Err(e) => {
+            EMBED_SIDECAR_DOWN_UNTIL.store(
+                now.saturating_add(EMBED_SIDECAR_COOLDOWN_SECS),
+                Ordering::Relaxed,
+            );
+            Err(e)
+        }
+    }
+}
+
+/// One-round-trip batch embed via the sidecar's `/api/embeddings/batch`
+/// (lifegraph-batch-observe-embeds seam). Outcomes:
+/// - `Ok(Some(vectors))` — one vector per input text, shared model gen;
+/// - `Ok(None)` — the sidecar predates the batch endpoint (404): the caller
+///   falls back to per-item [`embed_text`] so mixed fleets keep working;
+/// - `Err` — transport/inference failure; arms the same circuit breaker as
+///   [`embed_text`], so subsequent per-item calls fail fast too.
+async fn embed_texts_batch(texts: &[String]) -> anyhow::Result<Option<Vec<(Vec<f32>, String)>>> {
+    use std::sync::atomic::Ordering;
+    let now = now_unix_secs();
+    if EMBED_SIDECAR_DOWN_UNTIL.load(Ordering::Relaxed) > now {
+        anyhow::bail!("embed_texts_batch: sidecar in cooldown after a recent failure");
+    }
+
+    let base = std::env::var("PHILOTIC_ONNX_SIDECAR_ADDR")
+        .unwrap_or_else(|_| "http://127.0.0.1:11435".to_string());
+    let url = format!("{base}/api/embeddings/batch");
+    let client = reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(3))
+        // Whole-batch budget: sequential inference server-side, so scale the
+        // single-item budget by batch size (bounded by the server's own cap).
+        .timeout(std::time::Duration::from_secs(
+            EMBED_SIDECAR_TIMEOUT_SECS.saturating_mul(texts.len().max(1) as u64),
+        ))
+        .build()
+        .context("embed_texts_batch: failed to build HTTP client")?;
+
+    let arm_cooldown = || {
+        EMBED_SIDECAR_DOWN_UNTIL.store(
+            now.saturating_add(EMBED_SIDECAR_COOLDOWN_SECS),
+            Ordering::Relaxed,
+        );
+    };
+
+    let response = match client
+        .post(&url)
+        .json(&serde_json::json!({ "prompts": texts }))
+        .send()
+        .await
+    {
+        Ok(response) => response,
+        Err(e) => {
+            arm_cooldown();
+            return Err(e).context("embed_texts_batch: HTTP request failed");
+        }
+    };
+    if response.status() == reqwest::StatusCode::NOT_FOUND {
+        // Older sidecar without the batch route — NOT a health failure.
+        return Ok(None);
+    }
+    let resp: serde_json::Value = match response.json().await {
+        Ok(value) => value,
+        Err(e) => {
+            arm_cooldown();
+            return Err(e).context("embed_texts_batch: failed to parse JSON response");
+        }
+    };
+    if let Some(err) = resp.get("error").and_then(serde_json::Value::as_str) {
+        arm_cooldown();
+        anyhow::bail!("embed_texts_batch: sidecar error: {err}");
+    }
+
+    let model_gen = resp
+        .get("model")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("unknown")
+        .to_string();
+    let embeddings: Vec<Vec<f32>> = resp
+        .get("embeddings")
+        .and_then(serde_json::Value::as_array)
+        .map(|rows| {
+            rows.iter()
+                .map(|row| {
+                    row.as_array()
+                        .map(|arr| {
+                            arr.iter()
+                                .filter_map(|v| v.as_f64().map(|f| f as f32))
+                                .collect()
+                        })
+                        .unwrap_or_default()
+                })
+                .collect()
+        })
+        .ok_or_else(|| {
+            arm_cooldown();
+            anyhow::anyhow!("embed_texts_batch: response missing 'embeddings' array")
+        })?;
+    if embeddings.len() != texts.len() {
+        arm_cooldown();
+        anyhow::bail!(
+            "embed_texts_batch: sidecar returned {} embeddings for {} prompts",
+            embeddings.len(),
+            texts.len()
+        );
+    }
+
+    EMBED_SIDECAR_DOWN_UNTIL.store(0, Ordering::Relaxed);
+    Ok(Some(
+        embeddings
+            .into_iter()
+            .map(|vector| (vector, model_gen.clone()))
+            .collect(),
+    ))
+}
+
+async fn embed_text_inner(text: &str) -> anyhow::Result<(Vec<f32>, String)> {
+    let base = std::env::var("PHILOTIC_ONNX_SIDECAR_ADDR")
+        .unwrap_or_else(|_| "http://127.0.0.1:11435".to_string());
+    let url = format!("{base}/api/embeddings");
+
+    // Bounded client: a sidecar that accepts the TCP connection but never
+    // responds must NOT hang embed-on-write forever (see EMBED_SIDECAR_TIMEOUT_SECS).
+    let client = reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(3))
+        .timeout(std::time::Duration::from_secs(EMBED_SIDECAR_TIMEOUT_SECS))
+        .build()
+        .context("embed_text: failed to build HTTP client")?;
+    let resp: serde_json::Value = client
+        .post(&url)
+        .json(&serde_json::json!({"prompt": text}))
+        .send()
+        .await
+        .context("embed_text: HTTP request failed")?
+        .json()
+        .await
+        .context("embed_text: failed to parse JSON response")?;
+
+    if let Some(err) = resp.get("error").and_then(serde_json::Value::as_str) {
+        anyhow::bail!("embed_text: sidecar error: {err}");
+    }
+
+    let vector: Vec<f32> = resp
+        .get("embedding")
+        .and_then(serde_json::Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_f64().map(|f| f as f32))
+                .collect()
+        })
+        .ok_or_else(|| anyhow::anyhow!("embed_text: response missing 'embedding' array"))?;
+
+    let model_gen = resp
+        .get("model")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("unknown")
+        .to_string();
+
+    Ok((vector, model_gen))
+}
+
+fn compute_age_secs(observed_at: Option<&str>, now: &chrono::DateTime<chrono::Utc>) -> u64 {
+    observed_at
+        .and_then(|ts| chrono::DateTime::parse_from_rfc3339(ts).ok())
+        .map(|dt| {
+            let elapsed = *now - dt.with_timezone(&chrono::Utc);
+            elapsed.num_seconds().max(0) as u64
+        })
+        .unwrap_or(0)
+}
+
+// ── Bolt → JSON conversion (mirrors graph-datasource/memgraph_provider.rs) ────
+
+fn row_to_json(row: &Row) -> Result<Value> {
+    let mut object = serde_json::Map::new();
+    for key in row.keys() {
+        let key = key.value.as_str();
+        let value: BoltType = row.get(key)?;
+        object.insert(key.to_string(), bolt_value_to_json(value));
+    }
+    Ok(Value::Object(object))
+}
+
+fn bolt_value_to_json(value: BoltType) -> Value {
+    match value {
+        BoltType::String(v) => json!(v.value),
+        BoltType::Boolean(v) => json!(v.value),
+        BoltType::Integer(v) => json!(v.value),
+        BoltType::Float(v) => json!(v.value),
+        BoltType::Null(_) => Value::Null,
+        BoltType::List(v) => bolt_list_to_json(v),
+        BoltType::Map(v) => bolt_map_to_json(v),
+        BoltType::Node(v) => bolt_node_to_json(v),
+        BoltType::Relation(v) => bolt_relation_to_json(v),
+        BoltType::UnboundedRelation(v) => bolt_unbounded_relation_to_json(v),
+        BoltType::Bytes(v) => json!(v.value),
+        other => json!({ "kind": "unsupported_bolt_value", "debug": format!("{other:?}") }),
+    }
+}
+
+fn bolt_list_to_json(v: BoltList) -> Value {
+    Value::Array(v.into_iter().map(bolt_value_to_json).collect())
+}
+
+fn bolt_map_to_json(v: BoltMap) -> Value {
+    Value::Object(
+        v.value
+            .into_iter()
+            .map(|(k, val)| (k.value, bolt_value_to_json(val)))
+            .collect(),
+    )
+}
+
+fn bolt_node_to_json(v: BoltNode) -> Value {
+    json!({
+        "kind": "node",
+        "id": v.id.value,
+        "labels": bolt_list_to_json(v.labels),
+        "properties": bolt_map_to_json(v.properties),
+    })
+}
+
+fn bolt_relation_to_json(v: BoltRelation) -> Value {
+    json!({
+        "kind": "relationship",
+        "id": v.id.value,
+        "source": v.start_node_id.value,
+        "target": v.end_node_id.value,
+        "label": v.typ.value,
+        "properties": bolt_map_to_json(v.properties),
+    })
+}
+
+fn bolt_unbounded_relation_to_json(v: BoltUnboundedRelation) -> Value {
+    json!({
+        "kind": "relationship",
+        "id": v.id.value,
+        "label": v.typ.value,
+        "properties": bolt_map_to_json(v.properties),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4452,298 +4746,4 @@ mod tests {
         assert_eq!(specs.len(), 1);
         assert_eq!(specs[0].to_id, "life:goal:graph");
     }
-}
-
-/// Compute seconds elapsed since `observed_at` ISO 8601 string.
-/// Returns 0 on parse failure (treat unknown age as fresh).
-/// Call the ONNX sidecar's `/api/embeddings` endpoint and return `(vector, model_gen)`.
-///
-/// The sidecar address is read from `PHILOTIC_ONNX_SIDECAR_ADDR`
-/// (default `http://127.0.0.1:11435`).
-/// Returns an explicit error on dim mismatch — callers should surface this, not silently
-/// continue with a wrong-dim vector.
-/// Hard ceiling for a single embed-on-write sidecar call. Sized so a stalled
-/// ONNX embedding sidecar fails fast — surfacing as a graceful "sidecar
-/// unavailable" skip in `handle_observe` (the node is already written; the
-/// embedding is optional) — instead of hanging the observe indefinitely. That
-/// indefinite hang is what wedged `life.observe.batch`: with no timeout, each
-/// per-item embed blocked forever and the turn sat until the watchdog evicted
-/// it. Kept small so even a multi-item batch degrades within the turn watchdog.
-const EMBED_SIDECAR_TIMEOUT_SECS: u64 = 8;
-
-/// After an embed sidecar failure, treat it as down for this long and
-/// short-circuit further embed calls (fast Err, no HTTP). This turns a
-/// persistently-down sidecar from "N × timeout per bulk write" into a single
-/// timeout, so `life.observe.batch` and the steward distillation sweep don't
-/// wedge when embeddings are unavailable — the observations still land, just
-/// without vectors.
-const EMBED_SIDECAR_COOLDOWN_SECS: u64 = 60;
-
-/// Unix-seconds deadline before which the embed sidecar is treated as down.
-/// `0` = healthy. Process-global, best-effort (Relaxed) — a stale read only
-/// costs at most one extra timeout, never correctness.
-static EMBED_SIDECAR_DOWN_UNTIL: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
-
-fn now_unix_secs() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
-}
-
-/// Circuit-breaking wrapper over [`embed_text_inner`]: skips the sidecar during
-/// the post-failure cooldown, and arms the cooldown on any failure. Callers get
-/// an `Err` (handled as a graceful "sidecar_unavailable" skip) either way.
-async fn embed_text(text: &str) -> anyhow::Result<(Vec<f32>, String)> {
-    use std::sync::atomic::Ordering;
-    let now = now_unix_secs();
-    if EMBED_SIDECAR_DOWN_UNTIL.load(Ordering::Relaxed) > now {
-        anyhow::bail!("embed_text: sidecar in cooldown after a recent failure");
-    }
-    match embed_text_inner(text).await {
-        Ok(result) => {
-            // Recovered (or never down): clear any lingering cooldown.
-            EMBED_SIDECAR_DOWN_UNTIL.store(0, Ordering::Relaxed);
-            Ok(result)
-        }
-        Err(e) => {
-            EMBED_SIDECAR_DOWN_UNTIL.store(
-                now.saturating_add(EMBED_SIDECAR_COOLDOWN_SECS),
-                Ordering::Relaxed,
-            );
-            Err(e)
-        }
-    }
-}
-
-/// One-round-trip batch embed via the sidecar's `/api/embeddings/batch`
-/// (lifegraph-batch-observe-embeds seam). Outcomes:
-/// - `Ok(Some(vectors))` — one vector per input text, shared model gen;
-/// - `Ok(None)` — the sidecar predates the batch endpoint (404): the caller
-///   falls back to per-item [`embed_text`] so mixed fleets keep working;
-/// - `Err` — transport/inference failure; arms the same circuit breaker as
-///   [`embed_text`], so subsequent per-item calls fail fast too.
-async fn embed_texts_batch(texts: &[String]) -> anyhow::Result<Option<Vec<(Vec<f32>, String)>>> {
-    use std::sync::atomic::Ordering;
-    let now = now_unix_secs();
-    if EMBED_SIDECAR_DOWN_UNTIL.load(Ordering::Relaxed) > now {
-        anyhow::bail!("embed_texts_batch: sidecar in cooldown after a recent failure");
-    }
-
-    let base = std::env::var("PHILOTIC_ONNX_SIDECAR_ADDR")
-        .unwrap_or_else(|_| "http://127.0.0.1:11435".to_string());
-    let url = format!("{base}/api/embeddings/batch");
-    let client = reqwest::Client::builder()
-        .connect_timeout(std::time::Duration::from_secs(3))
-        // Whole-batch budget: sequential inference server-side, so scale the
-        // single-item budget by batch size (bounded by the server's own cap).
-        .timeout(std::time::Duration::from_secs(
-            EMBED_SIDECAR_TIMEOUT_SECS.saturating_mul(texts.len().max(1) as u64),
-        ))
-        .build()
-        .context("embed_texts_batch: failed to build HTTP client")?;
-
-    let arm_cooldown = || {
-        EMBED_SIDECAR_DOWN_UNTIL.store(
-            now.saturating_add(EMBED_SIDECAR_COOLDOWN_SECS),
-            Ordering::Relaxed,
-        );
-    };
-
-    let response = match client
-        .post(&url)
-        .json(&serde_json::json!({ "prompts": texts }))
-        .send()
-        .await
-    {
-        Ok(response) => response,
-        Err(e) => {
-            arm_cooldown();
-            return Err(e).context("embed_texts_batch: HTTP request failed");
-        }
-    };
-    if response.status() == reqwest::StatusCode::NOT_FOUND {
-        // Older sidecar without the batch route — NOT a health failure.
-        return Ok(None);
-    }
-    let resp: serde_json::Value = match response.json().await {
-        Ok(value) => value,
-        Err(e) => {
-            arm_cooldown();
-            return Err(e).context("embed_texts_batch: failed to parse JSON response");
-        }
-    };
-    if let Some(err) = resp.get("error").and_then(serde_json::Value::as_str) {
-        arm_cooldown();
-        anyhow::bail!("embed_texts_batch: sidecar error: {err}");
-    }
-
-    let model_gen = resp
-        .get("model")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or("unknown")
-        .to_string();
-    let embeddings: Vec<Vec<f32>> = resp
-        .get("embeddings")
-        .and_then(serde_json::Value::as_array)
-        .map(|rows| {
-            rows.iter()
-                .map(|row| {
-                    row.as_array()
-                        .map(|arr| {
-                            arr.iter()
-                                .filter_map(|v| v.as_f64().map(|f| f as f32))
-                                .collect()
-                        })
-                        .unwrap_or_default()
-                })
-                .collect()
-        })
-        .ok_or_else(|| {
-            arm_cooldown();
-            anyhow::anyhow!("embed_texts_batch: response missing 'embeddings' array")
-        })?;
-    if embeddings.len() != texts.len() {
-        arm_cooldown();
-        anyhow::bail!(
-            "embed_texts_batch: sidecar returned {} embeddings for {} prompts",
-            embeddings.len(),
-            texts.len()
-        );
-    }
-
-    EMBED_SIDECAR_DOWN_UNTIL.store(0, Ordering::Relaxed);
-    Ok(Some(
-        embeddings
-            .into_iter()
-            .map(|vector| (vector, model_gen.clone()))
-            .collect(),
-    ))
-}
-
-async fn embed_text_inner(text: &str) -> anyhow::Result<(Vec<f32>, String)> {
-    let base = std::env::var("PHILOTIC_ONNX_SIDECAR_ADDR")
-        .unwrap_or_else(|_| "http://127.0.0.1:11435".to_string());
-    let url = format!("{base}/api/embeddings");
-
-    // Bounded client: a sidecar that accepts the TCP connection but never
-    // responds must NOT hang embed-on-write forever (see EMBED_SIDECAR_TIMEOUT_SECS).
-    let client = reqwest::Client::builder()
-        .connect_timeout(std::time::Duration::from_secs(3))
-        .timeout(std::time::Duration::from_secs(EMBED_SIDECAR_TIMEOUT_SECS))
-        .build()
-        .context("embed_text: failed to build HTTP client")?;
-    let resp: serde_json::Value = client
-        .post(&url)
-        .json(&serde_json::json!({"prompt": text}))
-        .send()
-        .await
-        .context("embed_text: HTTP request failed")?
-        .json()
-        .await
-        .context("embed_text: failed to parse JSON response")?;
-
-    if let Some(err) = resp.get("error").and_then(serde_json::Value::as_str) {
-        anyhow::bail!("embed_text: sidecar error: {err}");
-    }
-
-    let vector: Vec<f32> = resp
-        .get("embedding")
-        .and_then(serde_json::Value::as_array)
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|v| v.as_f64().map(|f| f as f32))
-                .collect()
-        })
-        .ok_or_else(|| anyhow::anyhow!("embed_text: response missing 'embedding' array"))?;
-
-    let model_gen = resp
-        .get("model")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or("unknown")
-        .to_string();
-
-    Ok((vector, model_gen))
-}
-
-fn compute_age_secs(observed_at: Option<&str>, now: &chrono::DateTime<chrono::Utc>) -> u64 {
-    observed_at
-        .and_then(|ts| chrono::DateTime::parse_from_rfc3339(ts).ok())
-        .map(|dt| {
-            let elapsed = *now - dt.with_timezone(&chrono::Utc);
-            elapsed.num_seconds().max(0) as u64
-        })
-        .unwrap_or(0)
-}
-
-// ── Bolt → JSON conversion (mirrors graph-datasource/memgraph_provider.rs) ────
-
-fn row_to_json(row: &Row) -> Result<Value> {
-    let mut object = serde_json::Map::new();
-    for key in row.keys() {
-        let key = key.value.as_str();
-        let value: BoltType = row.get(key)?;
-        object.insert(key.to_string(), bolt_value_to_json(value));
-    }
-    Ok(Value::Object(object))
-}
-
-fn bolt_value_to_json(value: BoltType) -> Value {
-    match value {
-        BoltType::String(v) => json!(v.value),
-        BoltType::Boolean(v) => json!(v.value),
-        BoltType::Integer(v) => json!(v.value),
-        BoltType::Float(v) => json!(v.value),
-        BoltType::Null(_) => Value::Null,
-        BoltType::List(v) => bolt_list_to_json(v),
-        BoltType::Map(v) => bolt_map_to_json(v),
-        BoltType::Node(v) => bolt_node_to_json(v),
-        BoltType::Relation(v) => bolt_relation_to_json(v),
-        BoltType::UnboundedRelation(v) => bolt_unbounded_relation_to_json(v),
-        BoltType::Bytes(v) => json!(v.value),
-        other => json!({ "kind": "unsupported_bolt_value", "debug": format!("{other:?}") }),
-    }
-}
-
-fn bolt_list_to_json(v: BoltList) -> Value {
-    Value::Array(v.into_iter().map(bolt_value_to_json).collect())
-}
-
-fn bolt_map_to_json(v: BoltMap) -> Value {
-    Value::Object(
-        v.value
-            .into_iter()
-            .map(|(k, val)| (k.value, bolt_value_to_json(val)))
-            .collect(),
-    )
-}
-
-fn bolt_node_to_json(v: BoltNode) -> Value {
-    json!({
-        "kind": "node",
-        "id": v.id.value,
-        "labels": bolt_list_to_json(v.labels),
-        "properties": bolt_map_to_json(v.properties),
-    })
-}
-
-fn bolt_relation_to_json(v: BoltRelation) -> Value {
-    json!({
-        "kind": "relationship",
-        "id": v.id.value,
-        "source": v.start_node_id.value,
-        "target": v.end_node_id.value,
-        "label": v.typ.value,
-        "properties": bolt_map_to_json(v.properties),
-    })
-}
-
-fn bolt_unbounded_relation_to_json(v: BoltUnboundedRelation) -> Value {
-    json!({
-        "kind": "relationship",
-        "id": v.id.value,
-        "label": v.typ.value,
-        "properties": bolt_map_to_json(v.properties),
-    })
 }
