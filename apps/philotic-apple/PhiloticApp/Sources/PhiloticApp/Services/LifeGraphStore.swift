@@ -68,6 +68,7 @@ public final class LifeGraphStore {
     public private(set) var recentChanges: [LifeGraphChangeEvent] = []
 
     private let client = LifeGraphClient()
+    private let memoryClient = MemoryClient()
 
     public init() {}
 
@@ -99,8 +100,40 @@ public final class LifeGraphStore {
             Task.detached(priority: .utility) {
                 await LifeIndexDonor.applyLensPackets(donated)
             }
+            // Muninn rides the same refresh so both memory planes reach the
+            // index together, but on its own failure path (see below).
+            let memoryContext = context
+            Task { [weak self] in
+                await self?.refreshMemoryIndex(
+                    baseURL: baseURL, bearerToken: bearerToken, context: memoryContext)
+            }
         } catch {
             lastError = String(describing: error)
+        }
+    }
+
+    /// Pull structured Muninn recall and mirror it into the Spotlight index
+    /// (seam: apple-entity-index-plane, Muninn extension).
+    ///
+    /// Kept separate from `refresh` because the two planes fail independently:
+    /// Muninn being unconfigured or unreachable must never blank the Life
+    /// surface, and a lens error must not stop memory indexing. Failures are
+    /// intentionally swallowed — this is a background index refresh, not an
+    /// operator-visible action.
+    public func refreshMemoryIndex(
+        baseURL: URL, bearerToken: String, context: String? = nil
+    ) async {
+        do {
+            let response = try await memoryClient.recall(
+                baseURL: baseURL,
+                bearerToken: bearerToken,
+                context: context,
+                maxResults: 25
+            )
+            guard response.status == "ok" else { return }
+            await LifeIndexDonor.applyMemories(response.memories)
+        } catch {
+            // Muninn is optional on a hotel; absence is not an error state.
         }
     }
 

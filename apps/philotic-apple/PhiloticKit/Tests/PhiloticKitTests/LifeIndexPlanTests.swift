@@ -83,19 +83,19 @@ final class LifeIndexPlanTests: XCTestCase {
         // by Siri forever. It must be actively removed.
         let plan = LifeIndexMapper.plan(from: [packet(id: "node-1", state: "retired")])
         XCTAssertTrue(plan.donate.isEmpty)
-        XCTAssertEqual(plan.purge, ["node-1"])
+        XCTAssertEqual(plan.purge, ["life:node-1"])
     }
 
     func testConflictedClaimIsPurged() {
         let plan = LifeIndexMapper.plan(from: [packet(id: "node-1", state: "conflicted")])
         XCTAssertTrue(plan.donate.isEmpty)
-        XCTAssertEqual(plan.purge, ["node-1"])
+        XCTAssertEqual(plan.purge, ["life:node-1"])
     }
 
     func testBlankSummaryIsNotDonated() {
         let plan = LifeIndexMapper.plan(from: [packet(id: "node-1", summary: "   ")])
         XCTAssertTrue(plan.donate.isEmpty, "an untitled Spotlight entry is unactionable noise")
-        XCTAssertEqual(plan.purge, ["node-1"])
+        XCTAssertEqual(plan.purge, ["life:node-1"])
     }
 
     func testEmptyNodeIdIsIgnoredEntirely() {
@@ -122,7 +122,7 @@ final class LifeIndexPlanTests: XCTestCase {
             packet(id: "node-1", state: "confirmed", score: 0.9),
         ])
         XCTAssertTrue(retiredFirst.donate.isEmpty)
-        XCTAssertEqual(retiredFirst.purge, ["node-1"])
+        XCTAssertEqual(retiredFirst.purge, ["life:node-1"])
 
         let retiredSecond = LifeIndexMapper.plan(from: [
             packet(id: "node-1", state: "confirmed", score: 0.9),
@@ -131,7 +131,7 @@ final class LifeIndexPlanTests: XCTestCase {
         XCTAssertTrue(
             retiredSecond.donate.isEmpty,
             "a later retirement must evict an already-accepted donation")
-        XCTAssertEqual(retiredSecond.purge, ["node-1"])
+        XCTAssertEqual(retiredSecond.purge, ["life:node-1"])
     }
 
     func testDonationOrderIsDeterministic() {
@@ -166,7 +166,7 @@ final class LifeIndexPlanTests: XCTestCase {
         for kind in ["retired", "deleted", "removed", "retracted", "RETIRED"] {
             let plan = LifeIndexMapper.plan(
                 forChangeKind: kind, nodeId: "node-1", label: "Goal", summary: "x")
-            XCTAssertEqual(plan.purge, ["node-1"], "change kind \(kind) should purge")
+            XCTAssertEqual(plan.purge, ["life:node-1"], "change kind \(kind) should purge")
         }
     }
 
@@ -184,5 +184,126 @@ final class LifeIndexPlanTests: XCTestCase {
         let plan = LifeIndexMapper.plan(
             forChangeKind: "retired", nodeId: "", label: nil, summary: nil)
         XCTAssertTrue(plan.isEmpty)
+    }
+
+    // MARK: - Muninn extension
+
+    private func memory(
+        id: String,
+        concept: String = "apple: providers are app-scoped",
+        content: String = "Custom Foundation Models providers serve only the adopting app.",
+        trust: String? = "observed",
+        deleted: Bool = false,
+        confidence: Double = 0.9,
+        updatedAt: UInt64? = 1_780_000_000
+    ) -> MuninnMemory {
+        let json = """
+            {
+              "id": "\(id)",
+              "vault_id": "default",
+              "concept": "\(concept)",
+              "content": "\(content)",
+              "tags": ["apple"],
+              "confidence": \(confidence),
+              "created_at": 1779000000,
+              "updated_at": \(updatedAt.map(String.init) ?? "null"),
+              \(trust.map { "\"trust\": \"\($0)\"," } ?? "")
+              "deleted": \(deleted)
+            }
+            """
+        return try! JSONDecoder().decode(MuninnMemory.self, from: Data(json.utf8))
+    }
+
+    func testTrustedMemoryIsDonated() {
+        let plan = LifeIndexMapper.plan(fromMemories: [memory(id: "eng-1")])
+        XCTAssertEqual(plan.donate.count, 1)
+        XCTAssertEqual(plan.donate.first?.source, .muninn)
+        XCTAssertEqual(plan.withheld, 0)
+    }
+
+    func testMemoryWithoutProvenanceIsWithheldNotDonated() {
+        // The whole point of the Muninn extension's stricter rule: a memory
+        // with no envelope must not become an untraceable Siri answer.
+        let plan = LifeIndexMapper.plan(fromMemories: [memory(id: "eng-1", trust: nil)])
+        XCTAssertTrue(plan.donate.isEmpty)
+        XCTAssertEqual(plan.withheld, 1, "the adoption gap must be counted, not silent")
+    }
+
+    func testUnrecognisedTrustTierIsWithheld() {
+        let plan = LifeIndexMapper.plan(fromMemories: [memory(id: "eng-1", trust: "vibes")])
+        XCTAssertTrue(plan.donate.isEmpty)
+        XCTAssertEqual(plan.withheld, 1)
+    }
+
+    func testAllRecognisedTrustTiersAreIndexable() {
+        for tier in ["observed", "inferred", "told"] {
+            let plan = LifeIndexMapper.plan(fromMemories: [memory(id: "eng-1", trust: tier)])
+            XCTAssertEqual(plan.donate.count, 1, "tier \(tier) should be indexable")
+        }
+    }
+
+    func testSoftDeletedMemoryIsPurged() {
+        let plan = LifeIndexMapper.plan(fromMemories: [memory(id: "eng-1", deleted: true)])
+        XCTAssertTrue(plan.donate.isEmpty)
+        XCTAssertEqual(plan.purge, ["muninn:eng-1"])
+    }
+
+    func testDeletedMemoryEvictsAnEarlierDonationOfTheSameId() {
+        let plan = LifeIndexMapper.plan(fromMemories: [
+            memory(id: "eng-1"),
+            memory(id: "eng-1", deleted: true),
+        ])
+        XCTAssertTrue(plan.donate.isEmpty)
+        XCTAssertEqual(plan.purge, ["muninn:eng-1"])
+    }
+
+    func testMuninnAndLifeGraphIdsCannotCollide() {
+        // Same raw id on both planes must yield two distinct index entries.
+        let life = LifeIndexMapper.plan(from: [packet(id: "shared-1")])
+        let muninn = LifeIndexMapper.plan(fromMemories: [memory(id: "shared-1")])
+        XCTAssertEqual(life.donate.first?.indexId, "life:shared-1")
+        XCTAssertEqual(muninn.donate.first?.indexId, "muninn:shared-1")
+        XCTAssertNotEqual(life.donate.first?.indexId, muninn.donate.first?.indexId)
+    }
+
+    func testMemoryProvenanceLineShowsTrustTier() {
+        let plan = LifeIndexMapper.plan(fromMemories: [
+            memory(id: "eng-1", trust: "told", confidence: 0.5)
+        ])
+        XCTAssertEqual(plan.donate.first?.provenanceLine, "Memory · Told · 50% confidence")
+    }
+
+    func testMemoryWithBlankConceptFallsBackToContent() {
+        let plan = LifeIndexMapper.plan(fromMemories: [
+            memory(id: "eng-1", concept: "  ", content: "the fallback body")
+        ])
+        XCTAssertEqual(plan.donate.first?.summary, "the fallback body")
+    }
+
+    func testEmptyMemoryIdIsIgnored() {
+        let plan = LifeIndexMapper.plan(fromMemories: [memory(id: "")])
+        XCTAssertTrue(plan.isEmpty)
+        XCTAssertEqual(plan.withheld, 0)
+    }
+
+    func testMemoryUpdatedAtBecomesISO8601() {
+        let plan = LifeIndexMapper.plan(fromMemories: [memory(id: "eng-1", updatedAt: 0)])
+        XCTAssertEqual(plan.donate.first?.observedAt, "1970-01-01T00:00:00Z")
+    }
+
+    // MARK: - Cache compatibility
+
+    func testSnapshotDecodesWithoutSourceOrTrust() throws {
+        // Caches written before the Muninn extension must keep loading.
+        let json = """
+            {
+              "id": "node-1", "label": "Goal", "summary": "s",
+              "validationState": "confirmed", "confidence": 0.9, "score": 1.0
+            }
+            """
+        let snapshot = try JSONDecoder().decode(LifeIndexSnapshot.self, from: Data(json.utf8))
+        XCTAssertEqual(snapshot.source, .lifeGraph)
+        XCTAssertNil(snapshot.trust)
+        XCTAssertEqual(snapshot.indexId, "life:node-1")
     }
 }

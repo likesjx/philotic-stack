@@ -85,6 +85,7 @@
 //!   GET  /api/edge/lifegraph/lens/:lens   (edge-bearer; life.recall named strategy)
 //!   GET  /api/edge/lifegraph/node/:node_id   (edge-bearer; life.view.node)
 //!   GET  /api/edge/lifegraph/neighborhood/:node_id   (edge-bearer; life.view.neighborhood)
+//!   GET  /api/edge/memory/recall   (edge-bearer; memory.recall.structured — provenance-bearing)
 //!   GET  /api/apartments/:agent_id   (disabled by default for the desktop membrane)
 //!   POST /api/guests/:guest_id/restart
 //!   POST /api/guests/:guest_id/stop
@@ -707,6 +708,10 @@ pub async fn run(
             "/api/edge/lifegraph/observe",
             post(edge::handle_edge_lifegraph_observe)
                 .layer(axum::extract::DefaultBodyLimit::max(2 * 1024 * 1024)),
+        )
+        .route(
+            "/api/edge/memory/recall",
+            get(edge::handle_edge_memory_recall),
         )
         .route(
             "/api/edge/blob",
@@ -5653,6 +5658,105 @@ async fn ipc_life_graph_datasource_call(
             .and_then(|r| r.get("data"))
             .cloned()
             .unwrap_or(serde_json::Value::Null));
+    }
+}
+
+/// Round-trip a tool-runner tool and return its `content` string.
+///
+/// Sibling of [`ipc_life_graph_datasource_call`], but the two cannot be
+/// merged: the life-graph runner replies with `action: "datasource_response"`
+/// carrying `result.data`, while tool-runner replies with
+/// `action: "tool_result"` carrying a flat `content` string, and they are
+/// addressed by different roles (`life-graph-runner` vs `tool.<tool_name>`).
+///
+/// Used by the edge memory read plane (seam: apple-entity-index-plane,
+/// Muninn extension) to reach `memory.recall.structured`.
+async fn ipc_tool_runner_call(
+    socket: &str,
+    tool_name: &str,
+    arguments: serde_json::Value,
+) -> Result<String> {
+    let targets = ipc_desktop_membrane_targets(socket).await?;
+    let local_node = targets
+        .iter()
+        .find(|t| t.is_local)
+        .map(|t| t.target_node_id.clone())
+        .ok_or_else(|| anyhow!("no local operator target for tool-runner routing"))?;
+
+    let reply_guest_id = new_operator_chat_id("edge-tool");
+    let reply_role = format!("management.tool.reply.{reply_guest_id}");
+    let turn_id = new_operator_chat_id("tool-turn");
+
+    let mut client = connect_client_with_identity(
+        socket,
+        GuestIdentity {
+            guest_id: reply_guest_id.clone(),
+            role: reply_role.clone(),
+            supported_tools: vec![],
+        },
+    )
+    .await?;
+    match client
+        .send_request(IpcRequest::SubscribeInbox {
+            role: reply_role.clone(),
+        })
+        .await?
+    {
+        IpcResponse::Standard { ok: true, .. } => {}
+        other => bail!("tool-runner reply subscription refused: {other:?}"),
+    }
+
+    let task_json = serde_json::json!({
+        "action": "execute_tool",
+        "tool_name": tool_name,
+        "arguments": arguments,
+        "session_id": format!("edge-tool:{reply_guest_id}"),
+        "turn_id": turn_id,
+        "chat_id": "",
+        "agent_id": reply_guest_id,
+        "reply_to": local_node,
+        "reply_role": reply_role,
+    })
+    .to_string();
+    match client
+        .send_request(IpcRequest::EmitTask {
+            target_node: local_node.clone(),
+            target_role: format!("tool.{tool_name}"),
+            target_guest_id: None,
+            task_json,
+        })
+        .await?
+    {
+        IpcResponse::Standard { ok: true, .. } => {}
+        other => bail!("tool-runner task emit refused: {other:?}"),
+    }
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            bail!("timed out awaiting {tool_name} tool reply");
+        }
+        let pushed = tokio::time::timeout(remaining, client.recv_task())
+            .await
+            .map_err(|_| anyhow!("timed out awaiting {tool_name} tool reply"))??;
+        let IpcResponse::InboundTask { task_json, .. } = pushed else {
+            continue;
+        };
+        let Ok(payload) = serde_json::from_str::<serde_json::Value>(&task_json) else {
+            continue;
+        };
+        if payload.get("action").and_then(serde_json::Value::as_str) != Some("tool_result") {
+            continue;
+        }
+        if payload.get("turn_id").and_then(serde_json::Value::as_str) != Some(turn_id.as_str()) {
+            continue;
+        }
+        return Ok(payload
+            .get("content")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_string());
     }
 }
 

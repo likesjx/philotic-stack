@@ -26,7 +26,8 @@ struct LifeNodeEntity: IndexedEntity {
         )
     }
 
-    /// The canonical LifeGraph node id.
+    /// Namespaced index identifier (`life:<node-id>` / `muninn:<engram-id>`),
+    /// so the two memory planes cannot collide in one index.
     var id: String
 
     @Property(title: "Summary")
@@ -42,9 +43,9 @@ struct LifeNodeEntity: IndexedEntity {
     var observedAt: String?
 
     init(snapshot: LifeIndexSnapshot) {
-        self.id = snapshot.id
+        self.id = snapshot.indexId
         self.summary = snapshot.summary
-        self.label = snapshot.label
+        self.label = snapshot.source == .muninn ? "Memory" : snapshot.label
         self.provenance = snapshot.provenanceLine
         self.observedAt = snapshot.observedAt
     }

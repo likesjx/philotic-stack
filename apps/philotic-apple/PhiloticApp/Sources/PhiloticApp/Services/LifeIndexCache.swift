@@ -84,7 +84,9 @@ actor LifeIndexCache {
     func apply(_ plan: LifeIndexPlan) {
         load()
         for snapshot in plan.donate {
-            snapshots[snapshot.id] = snapshot
+            // Keyed by namespaced indexId so LifeGraph and Muninn records
+            // cannot collide, and so purges (which carry indexIds) hit.
+            snapshots[snapshot.indexId] = snapshot
         }
         for id in plan.purge {
             snapshots.removeValue(forKey: id)
@@ -111,12 +113,12 @@ actor LifeIndexCache {
             // it. Losing it is strictly better than failing to launch.
             return
         }
-        snapshots = Dictionary(uniqueKeysWithValues: decoded.map { ($0.id, $0) })
+        snapshots = Dictionary(uniqueKeysWithValues: decoded.map { ($0.indexId, $0) })
     }
 
     private func persist() {
         guard let fileURL else { return }
-        let ordered = snapshots.values.sorted { $0.id < $1.id }
+        let ordered = snapshots.values.sorted { $0.indexId < $1.indexId }
         guard let data = try? JSONEncoder().encode(ordered) else { return }
         try? data.write(to: fileURL, options: .atomic)
     }

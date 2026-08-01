@@ -66,6 +66,72 @@ public enum LifeValidationState: String, Codable, Equatable, Sendable {
     }
 }
 
+/// Which memory plane a snapshot came from.
+///
+/// The index spans two planes with genuinely different provenance
+/// vocabularies — LifeGraph has `validation_state`, Muninn has a trust tier —
+/// so the source travels with each snapshot rather than being inferred from
+/// the id. It also namespaces ids: a LifeGraph node and a Muninn engram could
+/// otherwise collide in the index.
+public enum LifeIndexSource: String, Codable, Equatable, Sendable {
+    case lifeGraph = "life"
+    case muninn = "muninn"
+
+    /// Prefix applied to the index identifier so the two planes cannot
+    /// collide, and so a purge targets exactly one plane.
+    public var idPrefix: String { "\(rawValue):" }
+
+    public var displayName: String {
+        switch self {
+        case .lifeGraph: return "Life Graph"
+        case .muninn: return "Memory"
+        }
+    }
+}
+
+/// Muninn's trust tiers, mirroring `TrustTier` in ansible-mesh-core.
+///
+/// `unknown` is not a tier — it means the stored memory carries no provenance
+/// envelope. Per Standing Rule 2 it is never silently upgraded, and per the
+/// donation rule below it is never indexed.
+public enum LifeTrustTier: String, Codable, Equatable, Sendable {
+    case observed
+    case inferred
+    case told
+    case unknown
+
+    public init(rawValueOrUnknown raw: String?) {
+        guard let raw, let parsed = LifeTrustTier(rawValue: raw.lowercased()) else {
+            self = .unknown
+            return
+        }
+        self = parsed
+    }
+
+    /// May a memory at this tier be donated to the system index?
+    ///
+    /// Fail-closed on `unknown`: putting un-provenanced memory in front of
+    /// Siri means the operator cannot tell where an answer came from and has
+    /// no reversal path. Withholding is the conservative failure, and the
+    /// count of withheld memories is surfaced on the plan so the gap is
+    /// visible rather than silent (Memory Transparency, Standing Rule 1).
+    public var isIndexable: Bool {
+        switch self {
+        case .observed, .told, .inferred: return true
+        case .unknown: return false
+        }
+    }
+
+    public var chip: String {
+        switch self {
+        case .observed: return "Observed"
+        case .inferred: return "Inferred"
+        case .told: return "Told"
+        case .unknown: return "Unattributed"
+        }
+    }
+}
+
 /// One LifeGraph claim, flattened to exactly what the system index needs.
 ///
 /// Keyed by the **graph node id** (`claimRef.id`), not the packet id: the same
@@ -82,6 +148,10 @@ public struct LifeIndexSnapshot: Codable, Equatable, Sendable, Identifiable {
     /// Retrieval score of the best packet that carried this node. Used to
     /// break ties when the same node arrives from two lenses.
     public let score: Double
+    public let source: LifeIndexSource
+    /// Muninn trust tier. `nil` for LifeGraph snapshots, which express
+    /// provenance through `validationState` instead.
+    public let trust: LifeTrustTier?
 
     public init(
         id: String,
@@ -90,7 +160,9 @@ public struct LifeIndexSnapshot: Codable, Equatable, Sendable, Identifiable {
         validationState: LifeValidationState,
         confidence: Double,
         observedAt: String?,
-        score: Double
+        score: Double,
+        source: LifeIndexSource = .lifeGraph,
+        trust: LifeTrustTier? = nil
     ) {
         self.id = id
         self.label = label
@@ -99,12 +171,38 @@ public struct LifeIndexSnapshot: Codable, Equatable, Sendable, Identifiable {
         self.confidence = confidence
         self.observedAt = observedAt
         self.score = score
+        self.source = source
+        self.trust = trust
     }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        id = try c.decode(String.self, forKey: .id)
+        label = try c.decode(String.self, forKey: .label)
+        summary = try c.decode(String.self, forKey: .summary)
+        validationState = try c.decode(LifeValidationState.self, forKey: .validationState)
+        confidence = try c.decode(Double.self, forKey: .confidence)
+        observedAt = try c.decodeIfPresent(String.self, forKey: .observedAt)
+        score = try c.decode(Double.self, forKey: .score)
+        // Caches written before the Muninn extension carry neither field.
+        source = (try? c.decodeIfPresent(LifeIndexSource.self, forKey: .source)) ?? .lifeGraph
+        trust = try? c.decodeIfPresent(LifeTrustTier.self, forKey: .trust)
+    }
+
+    /// Identifier used in the system index — namespaced by plane so a
+    /// LifeGraph node and a Muninn engram can never collide.
+    public var indexId: String { source.idPrefix + id }
 
     /// Provenance line shown under the title in Spotlight results.
     public var provenanceLine: String {
         let pct = Int((confidence * 100).rounded())
-        return "\(label) · \(validationState.chip) · \(pct)% confidence"
+        switch source {
+        case .lifeGraph:
+            return "\(label) · \(validationState.chip) · \(pct)% confidence"
+        case .muninn:
+            let tier = (trust ?? .unknown).chip
+            return "Memory · \(tier) · \(pct)% confidence"
+        }
     }
 }
 
@@ -115,11 +213,19 @@ public struct LifeIndexSnapshot: Codable, Equatable, Sendable, Identifiable {
 /// or Spotlight keeps answering with content the graph has retracted.
 public struct LifeIndexPlan: Equatable, Sendable {
     public let donate: [LifeIndexSnapshot]
+    /// Namespaced index identifiers (`LifeIndexSnapshot.indexId`) to remove.
     public let purge: [String]
+    /// How many records were withheld for lack of usable provenance.
+    ///
+    /// Surfaced rather than swallowed: a silently-empty index looks identical
+    /// to a working one, and the whole point of the fail-closed rule is that
+    /// the operator can see the gap (Memory Transparency, Standing Rule 1).
+    public let withheld: Int
 
-    public init(donate: [LifeIndexSnapshot], purge: [String]) {
+    public init(donate: [LifeIndexSnapshot], purge: [String], withheld: Int = 0) {
         self.donate = donate
         self.purge = purge
+        self.withheld = withheld
     }
 
     public var isEmpty: Bool { donate.isEmpty && purge.isEmpty }
@@ -149,14 +255,14 @@ public enum LifeIndexMapper {
                 // Non-indexable (or unusable) wins over any indexable sibling:
                 // when the graph says retired/conflicted anywhere, the safe
                 // resolution is to remove the node from the index entirely.
-                purge.insert(id)
+                purge.insert(LifeIndexSource.lifeGraph.idPrefix + id)
                 best.removeValue(forKey: id)
                 continue
             }
 
             // A node already marked for purge is not resurrected by a
             // higher-scoring indexable packet in the same batch.
-            guard !purge.contains(id) else { continue }
+            guard !purge.contains(LifeIndexSource.lifeGraph.idPrefix + id) else { continue }
 
             let candidate = LifeIndexSnapshot(
                 id: id,
@@ -179,6 +285,79 @@ public enum LifeIndexMapper {
         return LifeIndexPlan(donate: donate, purge: purge.sorted())
     }
 
+    /// Map structured Muninn recall results into a donate/purge plan.
+    ///
+    /// Governance differs from the LifeGraph path because the provenance
+    /// vocabulary differs:
+    ///
+    /// - `deleted` (Muninn soft-delete) → purge, never donate.
+    /// - `trust == unknown` → withhold. A memory with no provenance envelope
+    ///   must not become a Siri answer the operator cannot trace or reverse.
+    ///   These are counted in `withheld` rather than dropped silently, so the
+    ///   adoption gap is observable instead of looking like an empty index.
+    /// - blank concept *and* content → unusable, withhold.
+    ///
+    /// Note this is intentionally stricter than the LifeGraph rule, where
+    /// `inferred` is indexable: LifeGraph's `inferred` is a positive assertion
+    /// by the graph, whereas Muninn's `unknown` is the *absence* of any
+    /// assertion. Those are not the same claim.
+    public static func plan(fromMemories memories: [MuninnMemory]) -> LifeIndexPlan {
+        var best: [String: LifeIndexSnapshot] = [:]
+        var purge: Set<String> = []
+        var withheld = 0
+
+        for memory in memories {
+            let id = memory.id.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !id.isEmpty else { continue }
+            let indexId = LifeIndexSource.muninn.idPrefix + id
+
+            if memory.deleted {
+                purge.insert(indexId)
+                best.removeValue(forKey: id)
+                continue
+            }
+
+            let tier = LifeTrustTier(rawValueOrUnknown: memory.trust)
+            let concept = memory.concept.trimmingCharacters(in: .whitespacesAndNewlines)
+            let content = memory.content.trimmingCharacters(in: .whitespacesAndNewlines)
+            let summary = concept.isEmpty ? content : concept
+
+            guard tier.isIndexable, !summary.isEmpty else {
+                withheld += 1
+                continue
+            }
+            guard !purge.contains(indexId) else { continue }
+
+            let snapshot = LifeIndexSnapshot(
+                id: id,
+                label: content.isEmpty ? "Memory" : content,
+                summary: summary,
+                // Muninn has no validation state; `confirmed` records that the
+                // memory is live (not soft-deleted). Trust carries the real
+                // provenance signal and is rendered in `provenanceLine`.
+                validationState: .confirmed,
+                confidence: memory.confidence,
+                observedAt: memory.updatedAt.map(Self.iso8601(fromEpochSeconds:)),
+                score: memory.confidence,
+                source: .muninn,
+                trust: tier
+            )
+            best[id] = snapshot
+        }
+
+        let donate = best.values.sorted {
+            $0.score == $1.score ? $0.id < $1.id : $0.score > $1.score
+        }
+        return LifeIndexPlan(donate: donate, purge: purge.sorted(), withheld: withheld)
+    }
+
+    /// Muninn stores epoch seconds; the index wants ISO-8601.
+    static func iso8601(fromEpochSeconds seconds: UInt64) -> String {
+        let formatter = ISO8601DateFormatter()
+        formatter.timeZone = TimeZone(secondsFromGMT: 0)
+        return formatter.string(from: Date(timeIntervalSince1970: TimeInterval(seconds)))
+    }
+
     /// Map a `LifeGraphChange` frame into an incremental plan.
     ///
     /// Live changes carry only `change_kind` / `node_id` / `label` / `summary`
@@ -195,7 +374,8 @@ public enum LifeIndexMapper {
 
         switch changeKind.lowercased() {
         case "retired", "deleted", "removed", "retracted":
-            return LifeIndexPlan(donate: [], purge: [nodeId])
+            return LifeIndexPlan(
+                donate: [], purge: [LifeIndexSource.lifeGraph.idPrefix + nodeId])
         default:
             // Not a removal. We lack provenance for a safe donation, so do
             // nothing and let the next authoritative refresh reconcile.

@@ -46,6 +46,23 @@ enum LifeIndexDonor {
         await apply(LifeIndexMapper.plan(from: packets))
     }
 
+    /// Build a plan from structured Muninn recall and apply it.
+    ///
+    /// Logs the withheld count: memories lacking a provenance envelope are
+    /// deliberately not indexed, and that must be visible rather than looking
+    /// like an empty result.
+    static func applyMemories(_ memories: [MuninnMemory]) async {
+        let plan = LifeIndexMapper.plan(fromMemories: memories)
+        if plan.withheld > 0 {
+            log.info(
+                """
+                Withheld \(plan.withheld) Muninn memories from the system index \
+                (no provenance envelope). Donated \(plan.donate.count).
+                """)
+        }
+        await apply(plan)
+    }
+
     /// Apply an incremental LifeGraphChange frame. Only removals act; see
     /// `LifeIndexMapper.plan(forChangeKind:...)` for why.
     static func applyChange(
