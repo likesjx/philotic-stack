@@ -95,6 +95,9 @@ async fn main() -> Result<()> {
             vault_name: "operator-oidc-smoke".into(),
             plaintext: CLIENT_SECRET.into(),
             allowed_roles: vec!["egress-http-runner".into()],
+            // No consumer filters this smoke vault by kind, so keep the
+            // pre-DEF-065 default: store it under the vault name.
+            secret_kind: None,
         })
         .await?
     {
