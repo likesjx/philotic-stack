@@ -4196,7 +4196,11 @@ mod tests {
         let text = format!("{}🙂tail", "x".repeat(4095));
         let chunks = super::split_at_paragraph_boundary(&text, 4096);
         assert_eq!(chunks.concat(), text);
-        assert!(chunks.iter().all(|chunk| chunk.is_char_boundary(chunk.len())));
+        assert!(
+            chunks
+                .iter()
+                .all(|chunk| chunk.is_char_boundary(chunk.len()))
+        );
     }
 
     #[test]
@@ -4422,7 +4426,7 @@ mod tests {
     // --- Draft finalisation: exactly one message must survive each turn. ---
 
     use super::{
-        draft_already_final, upsert_formatted_text, upsert_streaming_draft, StreamingDraftUpdate,
+        StreamingDraftUpdate, draft_already_final, upsert_formatted_text, upsert_streaming_draft,
     };
     use std::sync::{Arc, Mutex};
 
@@ -4592,8 +4596,7 @@ mod tests {
         let client = reqwest::Client::new();
         let long_text = "x".repeat(5000);
 
-        let result =
-            upsert_streaming_draft(&client, &tg_base, "123", None, None, &long_text).await;
+        let result = upsert_streaming_draft(&client, &tg_base, "123", None, None, &long_text).await;
 
         assert_eq!(
             result,
