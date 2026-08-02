@@ -205,8 +205,7 @@ async fn run_provision(socket_path: &str, vault: &str) -> Result<()> {
 
     let secret_ref = match resp {
         IpcResponse::Standard {
-            ok: true,
-            ref data, ..
+            ok: true, ref data, ..
         } => data
             .as_ref()
             .and_then(|d| d.get("secret_ref"))

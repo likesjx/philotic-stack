@@ -8724,6 +8724,37 @@ mod tests {
         std::env::temp_dir().join(format!("philotic-web-{name}-{}.db", uuid::Uuid::new_v4()))
     }
 
+    /// Sets an env var for a test and RESTORES the previous value on drop.
+    ///
+    /// Tests run as threads of a single process, so unconditionally calling
+    /// `remove_var` when a test finishes deletes the variable out from under
+    /// anything running concurrently — and deletes the ambient value CI
+    /// provides. That made three unrelated aiua tests fail on the runner while
+    /// passing locally. Mirrors `VaultKeyEnv` in aiua's ipc tests.
+    struct EnvVarGuard {
+        key: &'static str,
+        previous: Option<std::ffi::OsString>,
+    }
+
+    impl EnvVarGuard {
+        fn set(key: &'static str, value: &str) -> Self {
+            let previous = std::env::var_os(key);
+            unsafe { std::env::set_var(key, value) };
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            unsafe {
+                match self.previous.take() {
+                    Some(previous) => std::env::set_var(self.key, previous),
+                    None => std::env::remove_var(self.key),
+                }
+            }
+        }
+    }
+
     fn seed_projected_identity(context_path: &PathBuf, identity: &ProjectedUserIdentityRecord) {
         let storage = SqliteGraphStorage::open(context_path).unwrap();
         let graph = GraphDomain::new(Arc::new(storage.adapter()));
@@ -9330,10 +9361,12 @@ mod tests {
         let key_id = format!("test-key-{}", uuid::Uuid::new_v4());
         let root_key = base64::engine::general_purpose::STANDARD.encode([7u8; 32]);
 
-        unsafe {
-            std::env::set_var("PHILOTIC_VAULT_KEY_ID", &key_id);
-            std::env::set_var("PHILOTIC_VAULT_MASTER_KEY", &root_key);
-        }
+        // Restores the previous values on drop rather than deleting them.
+        // Rust runs tests as threads of a single process, so an unconditional
+        // remove_var here deleted the vault key out from under whatever ran
+        // concurrently — including the value CI provides.
+        let _key_id_env = EnvVarGuard::set("PHILOTIC_VAULT_KEY_ID", &key_id);
+        let _root_key_env = EnvVarGuard::set("PHILOTIC_VAULT_MASTER_KEY", &root_key);
 
         ensure_operator_auth_tables(&context_path, "mac-jane").unwrap();
         let refs = list_root_user_key_refs(&context_path, "mac-jane").unwrap();
@@ -9348,10 +9381,6 @@ mod tests {
         assert_eq!(root_ref.vault_ref.as_deref(), Some(expected_ref.as_str()));
         assert!(root_ref.public_fingerprint.is_some());
 
-        unsafe {
-            std::env::remove_var("PHILOTIC_VAULT_KEY_ID");
-            std::env::remove_var("PHILOTIC_VAULT_MASTER_KEY");
-        }
         let _ = fs::remove_file(&context_path);
     }
 

@@ -21141,9 +21141,7 @@ pub(crate) mod tests {
     async fn add_vault_entry_honours_an_explicit_secret_kind() {
         let _env_guard = ipc_env_guard();
         let vault_key = base64::engine::general_purpose::STANDARD.encode([9u8; 32]);
-        unsafe {
-            std::env::set_var("PHILOTIC_VAULT_MASTER_KEY", &vault_key);
-        }
+        let _vault_key_env = VaultKeyEnv::set(&vault_key);
 
         let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
         let graph = GraphDomain::new(Arc::new(graph_store.adapter()));
@@ -21179,10 +21177,6 @@ pub(crate) mod tests {
             config.vault_tokens.contains_key("chaos_smoke_token_drill"),
             "a muninn_vault_token entry must reach MuninnConfig::vault_tokens"
         );
-
-        unsafe {
-            std::env::remove_var("PHILOTIC_VAULT_MASTER_KEY");
-        }
     }
 
     #[tokio::test]
