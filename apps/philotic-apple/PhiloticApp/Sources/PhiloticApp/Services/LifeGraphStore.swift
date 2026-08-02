@@ -70,6 +70,11 @@ public final class LifeGraphStore {
     private let client = LifeGraphClient()
     private let memoryClient = MemoryClient()
 
+    /// Minimum spacing between Muninn index refreshes, independent of how
+    /// often the Life surface reloads.
+    static let memoryRefreshInterval: TimeInterval = 300
+    private var lastMemoryIndexRefresh: Date?
+
     public init() {}
 
     /// Fetch the selected lens. Errors surface in `lastError`; stale packets
@@ -121,8 +126,18 @@ public final class LifeGraphStore {
     /// intentionally swallowed — this is a background index refresh, not an
     /// operator-visible action.
     public func refreshMemoryIndex(
-        baseURL: URL, bearerToken: String, context: String? = nil
+        baseURL: URL, bearerToken: String, context: String? = nil, force: Bool = false
     ) async {
+        // `refresh` is called on appear, on every lens switch, on submit and
+        // on pull-to-refresh — four lenses would mean four identical Muninn
+        // round-trips. The memory plane does not vary by lens, so throttle it
+        // on its own cadence rather than the Life surface's.
+        if !force, let last = lastMemoryIndexRefresh,
+            Date().timeIntervalSince(last) < Self.memoryRefreshInterval
+        {
+            return
+        }
+        lastMemoryIndexRefresh = Date()
         do {
             let response = try await memoryClient.recall(
                 baseURL: baseURL,

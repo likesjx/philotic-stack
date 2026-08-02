@@ -78,6 +78,13 @@ actor LifeIndexCache {
         return snapshots.count
     }
 
+    /// Every namespaced index id this device has donated — the exact scope a
+    /// purge should target, so it never reaches another slice's entities.
+    func allIndexIds() async -> [String] {
+        load()
+        return snapshots.keys.sorted()
+    }
+
     // MARK: - Writes
 
     /// Apply a governed plan: donations upsert, purges remove.

@@ -76,11 +76,18 @@ enum LifeIndexDonor {
     /// Remove everything this device has donated. Called when the operator
     /// disconnects or re-enrolls — a device that loses authorisation must stop
     /// answering with philotic content.
+    /// Scoped to the ids this plane actually donated — deliberately NOT
+    /// `deleteAllSearchableItems()`, which would wipe the app's entire
+    /// Spotlight index. That is harmless only while this is the sole donor,
+    /// and Slice B adds `reminders`/`calendar` entities that must survive an
+    /// operator disconnect of the life/memory planes.
     static func purgeAll() async {
+        let ids = await LifeIndexCache.shared.allIndexIds()
         #if canImport(CoreSpotlight)
-            if #available(iOS 18.0, macOS 15.0, *) {
+            if #available(iOS 18.0, macOS 15.0, *), !ids.isEmpty {
                 do {
-                    try await CSSearchableIndex.default().deleteAllSearchableItems()
+                    try await CSSearchableIndex.default().deleteAppEntities(
+                        identifiedBy: ids, ofType: LifeNodeEntity.self)
                 } catch {
                     log.error("Spotlight purge-all failed: \(error.localizedDescription)")
                 }
