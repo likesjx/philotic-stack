@@ -52,6 +52,14 @@ BAD_EDGE_AT = os.environ.get("PROBE_BAD_EDGE_AT")
 GUEST = "life-graph-batch-probe"
 ROLE = "life-graph.batch.probe.reply"
 N = int(os.environ.get("PROBE_N", "12"))
+# PROBE_STRING_ENCODE=1 sends each observation as a JSON *string* instead of an
+# object — the shape models actually emit for nested tool arguments, and the one
+# that used to make plain serde derive reject the WHOLE batch with
+# `invalid type: string ..., expected struct LifeObserveInput`. Every
+# observation was discarded despite being valid. Use this to prove a deployed
+# runner carries the lenient deserializer: same items, same expected outcome as
+# a normal run.
+STRING_ENCODE = os.environ.get("PROBE_STRING_ENCODE") == "1"
 TOOL = os.environ.get("PROBE_TOOL", "life.observe.batch")
 WAIT = float(os.environ.get("PROBE_WAIT", "300"))
 
@@ -130,7 +138,10 @@ ipc.send("subscribe_inbox", {"role": ROLE})
 
 turn_id = f"probe-turn-{RUN}"
 if TOOL == "life.observe.batch":
-    arguments = {"observations": [observation(i) for i in range(N)]}
+    items = [observation(i) for i in range(N)]
+    if STRING_ENCODE:
+        items = [json.dumps(item) for item in items]
+    arguments = {"observations": items}
 else:
     arguments = observation(0)
 
