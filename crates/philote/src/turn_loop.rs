@@ -1552,9 +1552,23 @@ impl AgentRuntime {
         if !matches_active_turn {
             return;
         }
+        let now = std::time::Instant::now();
+        // Refresh the AUTHORITATIVE phase clock, not just the watchdog's derived map.
+        // `evict_timed_out_turns` re-anchors `stuck_turn_first_seen` from
+        // `turn_waiting_since` on every tick, so stamping only the map would have this
+        // ping silently overwritten within one tick (~5s) and the keepalive would do
+        // nothing. Both are stamped: the state field is what actually survives.
+        //
+        // `active_turn_since` is deliberately NOT touched — that is the total-turn
+        // ceiling, and a wedged tool that keeps pinging must never be able to push it
+        // back. The two clocks stay separate; see
+        // `tool_progress_refreshes_phase_clock_but_never_the_total_turn_ceiling`.
+        if let Some(state) = self.sessions.get_mut(session_id) {
+            state.turn_waiting_since = Some(now);
+        }
         if self
             .stuck_turn_first_seen
-            .insert(session_id.to_string(), std::time::Instant::now())
+            .insert(session_id.to_string(), now)
             .is_some()
         {
             debug!(
@@ -4143,6 +4157,84 @@ mod watchdog_clock_tests {
                 !turn_still_active,
                 "the total ceiling must bind a long multi-call turn even when the \
                  current phase is comfortably inside its own budget"
+            );
+
+            drop(runtime);
+            let _ = server.await;
+            let _ = std::fs::remove_file(&socket_path);
+        });
+    }
+
+    /// Cross-feature guard. The #372 tool keepalive refreshes the phase clock so a
+    /// slow-but-live tool is not evicted. Once the watchdog re-anchors
+    /// `stuck_turn_first_seen` from `turn_waiting_since` each tick, a keepalive that
+    /// stamped only the map would be silently overwritten within one tick and the
+    /// feature would quietly stop working. The ping must survive a tick — and must
+    /// still never push back the total ceiling.
+    #[test]
+    fn tool_progress_ping_survives_a_watchdog_tick_but_not_the_total_ceiling() {
+        run_big_stack(|| async {
+            let (mut runtime, socket_path, server, _emitted) =
+                runtime_with_stub_hotel("pingtick").await;
+
+            let session_id = "cron:slow-tool:mac-jane".to_string();
+            let mut state =
+                SessionState::new(session_id.clone(), "agent-watchdog".into(), "cron".into());
+            let mut turn = test_working_turn(TurnPhase::WaitingTool);
+            turn.turn_id = "turn-ping".into();
+            turn.pending_tool_call = Some(ToolCall {
+                tool_name: "life.observe.batch".into(),
+                arguments: serde_json::json!({}),
+            });
+            state.start_turn(turn);
+            // 400s into the phase — already PAST the 300s budget, so only a keepalive
+            // can save this turn — but 500s into the turn overall, still under the
+            // 600s ceiling. Without an effective ping the next tick must evict.
+            state.turn_waiting_since = Some(Instant::now() - Duration::from_secs(400));
+            state.active_turn_since = Some(Instant::now() - Duration::from_secs(500));
+            runtime.sessions.insert(session_id.clone(), state);
+
+            // The tool reports progress, then the watchdog ticks.
+            runtime.handle_tool_progress(&InboundTaskPayload {
+                action: Some("tool_progress".into()),
+                session_id: Some(session_id.clone()),
+                turn_id: Some("turn-ping".into()),
+                tool_name: Some("life.observe.batch".into()),
+                ..Default::default()
+            });
+            runtime.evict_timed_out_turns().await;
+
+            assert!(
+                runtime
+                    .sessions
+                    .get(&session_id)
+                    .and_then(|s| s.active_turn.as_ref())
+                    .is_some(),
+                "a keepalive ping must still be in effect after a watchdog tick — \
+                 otherwise the tick re-anchors the clock and the ping is a no-op"
+            );
+
+            // The ceiling is untouched by pings: push the turn past it and the very
+            // next tick must evict, however recently the tool pinged.
+            if let Some(state) = runtime.sessions.get_mut(&session_id) {
+                state.active_turn_since = Some(Instant::now() - Duration::from_secs(700));
+            }
+            runtime.handle_tool_progress(&InboundTaskPayload {
+                action: Some("tool_progress".into()),
+                session_id: Some(session_id.clone()),
+                turn_id: Some("turn-ping".into()),
+                tool_name: Some("life.observe.batch".into()),
+                ..Default::default()
+            });
+            runtime.evict_timed_out_turns().await;
+
+            assert!(
+                runtime
+                    .sessions
+                    .get(&session_id)
+                    .and_then(|s| s.active_turn.as_ref())
+                    .is_none(),
+                "no amount of pinging may push back the total-turn ceiling"
             );
 
             drop(runtime);
