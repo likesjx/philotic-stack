@@ -610,10 +610,27 @@ local-push:
     done
     chmod u-w "${AIUA_CELLAR}"
     echo "▶ Installing phil to ${PHIL_CELLAR}..."
-    chmod u+w "${PHIL_CELLAR}/philotic-web" "${PHIL_CELLAR}/phil" 2>/dev/null || true
+    # rm BEFORE cp so the new binary lands on a NEW INODE. Overwriting in
+    # place poisons macOS's code-signature cache: the kernel keeps the old
+    # CDHash for that inode, decides the replacement does not match, and
+    # SIGKILLs it. The symptom is brutal to diagnose — every invocation exits
+    # 137 with no output whatsoever, while `codesign -v` reports the binary as
+    # perfectly valid. The AIUA_CELLAR loop above already does this; this path
+    # did not, so `phil` was dead on arrival after every deploy while aiua and
+    # philote were fine.
+    #
+    # Note ${PHIL_CELLAR}/phil is a SYMLINK to philotic-web, so it needs no
+    # copy of its own — writing through it would just rewrite the same file.
+    chmod u+w "${PHIL_CELLAR}" "${PHIL_CELLAR}/philotic-web" 2>/dev/null || true
+    rm -f "${PHIL_CELLAR}/philotic-web"
     cp target/release/philotic-web "${PHIL_CELLAR}/philotic-web"
-    cp target/release/philotic-web "${PHIL_CELLAR}/phil"
-    chmod u-w "${PHIL_CELLAR}/philotic-web" "${PHIL_CELLAR}/phil"
+    chmod u-w "${PHIL_CELLAR}/philotic-web"
+    # Fail loudly here rather than shipping a binary the kernel will kill.
+    if ! "${PHIL_CELLAR}/philotic-web" --version >/dev/null 2>&1; then
+        echo "  ✗ phil was installed but will not execute (exit $?)." >&2
+        echo "    Usually macOS code-signature cache poisoning — check the inode changed." >&2
+        exit 1
+    fi
     echo "  ✓ phil"
     echo "✅ Local Homebrew install updated."
 
