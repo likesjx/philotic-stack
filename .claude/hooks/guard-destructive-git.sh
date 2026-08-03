@@ -12,6 +12,17 @@
 # Contract: exit 2 blocks the tool call and shows stderr to Claude. Exit 0
 # allows. Any parsing failure allows — a guard that breaks the session when it
 # cannot read its own input is worse than the risk it mitigates.
+#
+# IMPORTANT: matching is per-SEGMENT, not over the whole command string. The
+# first version scanned the entire command whenever `git push` appeared
+# anywhere in it, so
+#
+#     git push origin foo && gh pr create --body "...use \`rm -f\`..."
+#
+# was blocked as a "force-push" because the PR body contained ` -f `. A real
+# false positive, hit within a day of shipping. Splitting on shell separators
+# means a segment's flags are only ever attributed to that segment's own
+# command.
 set -uo pipefail
 
 input=$(cat)
@@ -36,37 +47,45 @@ block() {
     exit 2
 }
 
-# Collapse newlines/continuations so multi-line commands are matched too.
-n=$(printf '%s' "$cmd" | tr '\n\\' '  ' | tr -s ' ')
+current_branch=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "")
 
-# Only inspect commands that actually invoke git push / git merge, including
-# after a pipe, semicolon, && or ||.
-if printf '%s' "$n" | grep -qE '(^|[;&|]\s*)git\s+(-C\s+\S+\s+)?push\b'; then
+# Split into segments on ; && || | and newlines, then judge each on its own.
+segments=$(printf '%s' "$cmd" | python3 -c '
+import re, sys
+raw = sys.stdin.read()
+for part in re.split(r"(?:\|\||&&|[;&|\n])", raw):
+    part = part.strip()
+    if part:
+        print(part)
+' 2>/dev/null) || exit 0
 
-    if printf '%s' "$n" | grep -qE '\-\-force(\b|=)|\s-f(\s|$)|\-\-force\-with\-lease'; then
-        block "force-push"
+while IFS= read -r seg; do
+    [ -z "$seg" ] && continue
+
+    # Only a segment that IS a git push is judged as one.
+    if printf '%s' "$seg" | grep -qE '^(sudo +)?git( +-C +[^ ]+)? +push\b'; then
+        if printf '%s' "$seg" | grep -qE '(^| )--force(\b|=)|(^| )-f( |$)|(^| )--force-with-lease'; then
+            block "force-push"
+        fi
+        # Explicit refspec targeting main/master, e.g.
+        #   git push origin main | git push origin HEAD:main | git push -u origin master
+        # Whole-word so a branch like codex/main-thing is not caught.
+        if printf '%s' "$seg" | grep -qE '(^| |:)(main|master)( |$)'; then
+            block "push targeting main/master"
+        fi
+        # Bare `git push` while the checkout is on main/master.
+        if [ "$current_branch" = "main" ] || [ "$current_branch" = "master" ]; then
+            block "bare 'git push' while on branch '$current_branch'"
+        fi
     fi
 
-    # Explicit refspec targeting main/master, e.g.
-    #   git push origin main | git push origin HEAD:main | git push -u origin master
-    if printf '%s' "$n" | grep -qE 'push\b.*\b(main|master)\b'; then
-        block "push targeting main/master"
+    # Merging into main from a working checkout. Releases go through the
+    # sync/develop-into-main PR path, not a local merge.
+    if printf '%s' "$seg" | grep -qE '^(sudo +)?git( +-C +[^ ]+)? +merge\b'; then
+        if [ "$current_branch" = "main" ] || [ "$current_branch" = "master" ]; then
+            block "git merge while on '$current_branch'"
+        fi
     fi
-
-    # Bare `git push` while the checkout is on main/master.
-    branch=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "")
-    if [ "$branch" = "main" ] || [ "$branch" = "master" ]; then
-        block "bare 'git push' while on branch '$branch'"
-    fi
-fi
-
-# Merging anything into main from a working checkout. Releases go through the
-# sync/develop-into-main PR path, not a local merge.
-if printf '%s' "$n" | grep -qE '(^|[;&|]\s*)git\s+(-C\s+\S+\s+)?merge\b'; then
-    branch=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "")
-    if [ "$branch" = "main" ] || [ "$branch" = "master" ]; then
-        block "git merge while on '$branch'"
-    fi
-fi
+done <<< "$segments"
 
 exit 0
