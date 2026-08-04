@@ -234,6 +234,15 @@ pub struct SessionState {
     /// to evict turns that have been stuck in WaitingModel/WaitingTool/WaitingVoice
     /// past the configured deadline.
     pub turn_waiting_since: Option<std::time::Instant>,
+    /// Wall-clock instant when the current active turn began. Not persisted — the
+    /// startup sweep (`sweep_stale_session_turns`) drops any restored active turn, so
+    /// a reloaded checkpoint never reaches the watchdog without a fresh stamp.
+    ///
+    /// Anchors the watchdog's `MAX_TOTAL_ACTIVE_SECS` ceiling. It must be stamped
+    /// here, at turn start, rather than derived inside the watchdog tick: a tick-local
+    /// stamp silently restarts the budget whenever ticks are missed, which is exactly
+    /// how turns escaped the ceiling for hours (see `evict_timed_out_turns`).
+    pub active_turn_since: Option<std::time::Instant>,
     /// A turn that entered WaitingApproval and was parked so the session stays free
     /// for new work while the operator decides. Restored when the operator approves
     /// or denies via `/approve`, `/deny`, or a paracrine ApprovalResolution response.
@@ -325,6 +334,7 @@ impl SessionState {
             pending_user_tasks: std::collections::VecDeque::new(),
             queue_arbiter_role: None,
             turn_waiting_since: None,
+            active_turn_since: None,
             parked_approval_turn: None,
             parked_approval_since: None,
             parked_plan_turn: None,
@@ -373,6 +383,7 @@ impl SessionState {
 
     pub fn start_turn(&mut self, turn: WorkingTurn) {
         self.active_turn = Some(turn);
+        self.active_turn_since = Some(std::time::Instant::now());
     }
 
     /// Returns true if a turn is currently active (any phase except Completed/Failed).
@@ -417,12 +428,16 @@ impl SessionState {
         if let Some(turn) = self.active_turn.as_mut() {
             turn.phase = phase;
         }
-        // Stamp the waiting clock when entering a phase that blocks on an external
-        // response; clear it when the turn moves on or completes.
+        // Stamp the waiting clock when entering a phase the watchdog holds to a
+        // deadline; clear it when the turn moves on or completes. `Thinking` is
+        // included because `evict_timed_out_turns` enforces THINKING_SECS against it —
+        // every phase with a deadline needs a clock stamped at the transition, or the
+        // watchdog falls back to its own tick and the deadline stops being wall-honest.
         self.turn_waiting_since = match phase {
-            TurnPhase::WaitingModel | TurnPhase::WaitingTool | TurnPhase::WaitingVoice => {
-                Some(std::time::Instant::now())
-            }
+            TurnPhase::WaitingModel
+            | TurnPhase::Thinking
+            | TurnPhase::WaitingTool
+            | TurnPhase::WaitingVoice => Some(std::time::Instant::now()),
             _ => None,
         };
     }
@@ -568,6 +583,10 @@ impl SessionState {
         if let Some(turn) = self.parked_approval_turn.take() {
             self.parked_approval_since = None;
             self.active_turn = Some(turn);
+            // Fresh total budget on resume: the ceiling bounds agent work, and the
+            // operator's deliberation time (already bounded by WAITING_APPROVAL_SECS)
+            // must not be charged against it.
+            self.active_turn_since = Some(std::time::Instant::now());
             true
         } else {
             false
@@ -596,6 +615,8 @@ impl SessionState {
             turn.plan_confirmed = true;
             turn.plan_confirm_note = operator_note;
             self.active_turn = Some(turn);
+            // Fresh total budget on resume — see `restore_parked_approval_turn`.
+            self.active_turn_since = Some(std::time::Instant::now());
             true
         } else {
             false
@@ -4382,6 +4403,7 @@ impl SessionState {
                 .and_then(serde_json::Value::as_str)
                 .map(str::to_string),
             turn_waiting_since: None,
+            active_turn_since: None,
             parked_approval_turn,
             parked_approval_since: None,
             parked_plan_turn,
