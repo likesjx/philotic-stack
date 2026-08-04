@@ -209,7 +209,11 @@ public final class HealthKitCaptureService {
 
         let evidence = EvidencePacket(
             packetId: "pkt-\(UUID().uuidString)",
-            claimRef: GraphRecordRef(id: claimId, label: "HealthMetric", datasource: "memgraph"),
+            // LifeGraph label MUST be a known ontology label (cypher.rs
+            // KNOWN_LABELS) — "HealthMetric" is rejected at Cypher compile
+            // ("unknown Life Graph label"). Health readings are Signals; the
+            // specific metric kind rides in metadata.metric.
+            claimRef: GraphRecordRef(id: claimId, label: "Signal", datasource: "memgraph"),
             claimSummary: summary,
             sourceRefs: [
                 SourceRef(
