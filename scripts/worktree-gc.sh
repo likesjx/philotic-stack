@@ -147,12 +147,51 @@ newest_activity_epoch() {
     local wt="$1"
     local gitdir newest=0 marker m
     gitdir="$(git -C "${wt}" rev-parse --absolute-git-dir 2>/dev/null || true)"
-    for marker in "${wt}/.git" "${gitdir:+${gitdir}/HEAD}"; do
+    # .git and HEAD alone are a POOR activity signal: neither is touched by
+    # editing files, compiling, or running tests, so a worktree an agent has
+    # been working in for hours looks completely idle. index/logs/HEAD/ORIG_HEAD
+    # move whenever anyone runs git in the worktree (status refreshes the
+    # index), which is a far better proxy for "someone is here".
+    for marker in \
+        "${wt}/.git" \
+        "${gitdir:+${gitdir}/HEAD}" \
+        "${gitdir:+${gitdir}/index}" \
+        "${gitdir:+${gitdir}/logs/HEAD}" \
+        "${gitdir:+${gitdir}/ORIG_HEAD}"; do
         [[ -n "${marker}" && -e "${marker}" ]] || continue
         m="$(stat -f %m "${marker}" 2>/dev/null || true)"
         [[ -n "${m}" && "${m}" -gt "${newest}" ]] && newest="${m}"
     done
     printf '%s' "${newest}"
+}
+
+# worktree_in_use <worktree>: 0 if any LIVE process has its cwd inside it.
+#
+# This is the invariant that was missing, and it is the only one that is
+# actually true by construction: a worktree somebody is standing in must not be
+# deleted, regardless of how its branch looks. Without it, a worktree is
+# eligible the moment its work is committed and pushed — which is exactly when
+# an agent is most likely to still be working in it. It has removed an active
+# worktree out from under a running session three times; the session's shell
+# then silently falls back to the MAIN checkout, where the next git command
+# operates on the wrong repository.
+#
+# `-d cwd` restricts lsof to current-working-directory descriptors, which is
+# vastly cheaper than `+D` (that would walk the whole tree, target/ included).
+# If lsof is unavailable we fail SAFE — treat the worktree as in use — because
+# wrongly keeping a stale worktree costs disk, and wrongly deleting a live one
+# costs work.
+worktree_in_use() {
+    local wt="$1" resolved
+    resolved="$(cd "${wt}" 2>/dev/null && pwd -P)" || return 0
+    command -v lsof >/dev/null 2>&1 || return 0
+    lsof -a -d cwd -F n 2>/dev/null | awk -v p="${resolved}" '
+        /^n/ {
+            path = substr($0, 2)
+            if (path == p || index(path, p "/") == 1) { found = 1; exit }
+        }
+        END { exit(found ? 0 : 1) }
+    '
 }
 
 # --- preflight ----------------------------------------------------------------
@@ -225,7 +264,14 @@ process_worktree() {
         return
     fi
 
-    # Invariant 9: grace period. This worktree is otherwise removable
+    # Invariant 9: never reap a worktree a live process is sitting in.
+    if worktree_in_use "${wt}"; then
+        log "PRESERVE (in use: a live process has its cwd here): ${wt} (${branch})"
+        n_preserved=$((n_preserved + 1))
+        return
+    fi
+
+    # Invariant 10: grace period. This worktree is otherwise removable
     # (merged+clean+not-excluded), but a freshly-created one looks exactly like
     # this the instant it exists. Preserve it if its most-recent git activity is
     # within the grace window so a session that just created it isn't reaped
