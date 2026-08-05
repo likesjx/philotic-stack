@@ -10,3 +10,7 @@ uuid = { version = "1.10", features = ["v4", "serde"] }
 
 [dev-dependencies]
 serde_json = "1.0"
+
+# Clippy ratchet: this crate is warning-free and must stay that way.
+[lints]
+workspace = true

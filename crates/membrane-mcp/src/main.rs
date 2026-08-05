@@ -150,10 +150,10 @@ impl ListenerManager {
     /// declared exposure or perimeter ceiling changed it.
     async fn reconcile(&mut self) {
         let addr = self.effective_addr();
-        if let Some((bound, _)) = &self.current {
-            if *bound == addr {
-                return;
-            }
+        if let Some((bound, _)) = &self.current
+            && *bound == addr
+        {
+            return;
         }
         if let Some((old, handle)) = self.current.take() {
             info!(%old, new = %addr, "rebinding MCP listener for perimeter change");

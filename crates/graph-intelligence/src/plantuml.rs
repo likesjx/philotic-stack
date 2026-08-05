@@ -237,9 +237,9 @@ fn format_trait_uml(name: &str, signature: &str) -> String {
         if trimmed.starts_with("fn ") || trimmed.starts_with("async fn ") {
             // Extract the full signature up to where body would start
             let sig = if let Some(where_pos) = trimmed.find("where") {
-                &trimmed[..where_pos].trim()
+                trimmed[..where_pos].trim()
             } else if let Some(brace_pos) = trimmed.find('{') {
-                &trimmed[..brace_pos].trim()
+                trimmed[..brace_pos].trim()
             } else {
                 trimmed
             };
@@ -285,8 +285,7 @@ fn format_enum_uml(name: &str, signature: &str) -> String {
 }
 
 fn sanitize_name(name: &str) -> String {
-    name.replace('<', "_")
-        .replace('>', "_")
+    name.replace(['<', '>'], "_")
         .replace("::", "__")
         .replace(' ', "_")
 }

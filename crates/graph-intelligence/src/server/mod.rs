@@ -67,21 +67,6 @@ fn is_loopback_bind(addr: &str) -> bool {
             .unwrap_or(false)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::is_loopback_bind;
-
-    #[test]
-    fn loopback_binds_are_recognized() {
-        assert!(is_loopback_bind("127.0.0.1"));
-        assert!(is_loopback_bind("::1"));
-        assert!(is_loopback_bind("localhost"));
-        assert!(!is_loopback_bind("0.0.0.0"));
-        assert!(!is_loopback_bind("100.64.230.106"));
-        assert!(!is_loopback_bind("::"));
-    }
-}
-
 /// Reject requests lacking the configured bearer token. GET/HEAD/OPTIONS pass
 /// unauthenticated so the read-only web UI and health checks keep working; all
 /// mutating methods (which includes every MCP JSON-RPC POST) require the token.
@@ -226,4 +211,19 @@ pub async fn serve(config: ServerConfig) -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_loopback_bind;
+
+    #[test]
+    fn loopback_binds_are_recognized() {
+        assert!(is_loopback_bind("127.0.0.1"));
+        assert!(is_loopback_bind("::1"));
+        assert!(is_loopback_bind("localhost"));
+        assert!(!is_loopback_bind("0.0.0.0"));
+        assert!(!is_loopback_bind("100.64.230.106"));
+        assert!(!is_loopback_bind("::"));
+    }
 }
