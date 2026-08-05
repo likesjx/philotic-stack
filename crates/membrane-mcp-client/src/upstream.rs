@@ -20,6 +20,11 @@ use tracing::{info, warn};
 const MCP_PROTOCOL_VERSION: &str = "2024-11-05";
 
 /// Transport backend for one upstream: HTTP JSON-RPC or a spawned stdio child.
+// Exactly one Backend exists per configured upstream — a handful per process —
+// so the size gap between Http and Stdio costs a few hundred bytes in total.
+// Boxing the Stdio payload to close it would add an indirection on every
+// transport call for no measurable saving.
+#[allow(clippy::large_enum_variant)]
 enum Backend {
     Http,
     Stdio {

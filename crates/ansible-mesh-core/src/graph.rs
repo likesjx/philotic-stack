@@ -113,20 +113,20 @@ pub struct AbstractRightRecord {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "state", content = "data")]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum SkillValidationState {
+    #[default]
     Draft,
     Validated,
     Registered,
     Active,
-    Suspended { reason: String },
-    Invalid { errors: Vec<String> },
+    Suspended {
+        reason: String,
+    },
+    Invalid {
+        errors: Vec<String>,
+    },
     Deprecated,
-}
-
-impl Default for SkillValidationState {
-    fn default() -> Self {
-        Self::Draft
-    }
 }
 
 /// Provenance snapshot describing where and when a skill was registered.

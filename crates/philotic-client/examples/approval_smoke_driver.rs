@@ -67,11 +67,11 @@ async fn main() -> Result<()> {
         };
         let payload: serde_json::Value =
             serde_json::from_str(&task_json).context("failed to decode approval prompt")?;
-        if let Some(content) = payload.get("content").and_then(serde_json::Value::as_str) {
-            if !content.is_empty() {
-                wait_content = content.to_string();
-                break;
-            }
+        if let Some(content) = payload.get("content").and_then(serde_json::Value::as_str)
+            && !content.is_empty()
+        {
+            wait_content = content.to_string();
+            break;
         }
     }
 
@@ -86,7 +86,7 @@ async fn main() -> Result<()> {
     let second_turn_id = "approval-turn-2";
     let second_response = client
         .send_request(IpcRequest::EmitTask {
-            target_node: target_node.clone().into(),
+            target_node: target_node.clone(),
             target_role: "agent".into(),
             target_guest_id: None,
             task_json: serde_json::json!({
@@ -118,11 +118,11 @@ async fn main() -> Result<()> {
         };
         let payload: serde_json::Value =
             serde_json::from_str(&task_json).context("failed to decode approved reply")?;
-        if let Some(content) = payload.get("content").and_then(serde_json::Value::as_str) {
-            if !content.is_empty() {
-                final_content = content.to_string();
-                break;
-            }
+        if let Some(content) = payload.get("content").and_then(serde_json::Value::as_str)
+            && !content.is_empty()
+        {
+            final_content = content.to_string();
+            break;
         }
     }
     if final_content != expected_final {

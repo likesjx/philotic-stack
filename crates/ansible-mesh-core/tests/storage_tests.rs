@@ -621,8 +621,12 @@ fn graph_storage_seed_is_idempotent() {
     let store = open_graph_storage();
     let guest = sample_guest("g-idem", true);
 
-    store.seed_guests("test-hotel", &[guest.clone()]).unwrap();
-    store.seed_guests("test-hotel", &[guest.clone()]).unwrap(); // INSERT OR REPLACE
+    store
+        .seed_guests("test-hotel", std::slice::from_ref(&guest))
+        .unwrap();
+    store
+        .seed_guests("test-hotel", std::slice::from_ref(&guest))
+        .unwrap(); // INSERT OR REPLACE
 
     let all = store.list_guests("test-hotel", false).unwrap();
     assert_eq!(all.len(), 1, "idempotent seed must not duplicate");

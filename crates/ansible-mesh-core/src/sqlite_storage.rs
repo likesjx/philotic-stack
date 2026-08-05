@@ -5,18 +5,11 @@
 //! consume them as `Arc<dyn EventStorage>`, etc.
 
 use crate::event::{EventEnvelope, EventId, EventKind, EventPayload};
-use crate::graph::{
-    AbstractSkillRecord, AbstractToolRecord, GraphEdge, GraphNode, RoleIncarnationRecord,
-    RuleRecord, ToolsetProfileRecord,
-};
-use crate::storage::{
-    CursorStorage, EventStorage, GraphAdapter, GuestRecord, HotelRecord, SecretRecord,
-    SessionEventRecord, SessionParticipantRecord, SessionRecord, SessionTurnRecord,
-};
+use crate::graph::{GraphEdge, GraphNode};
+use crate::storage::{CursorStorage, EventStorage, GraphAdapter};
 use anyhow::{Context, Result};
 use rusqlite::types::{Type, ValueRef};
 use rusqlite::{params, Connection};
-use serde::Deserialize;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use tracing::{debug, info};
@@ -657,69 +650,5 @@ impl SqliteGraphStorage {
     /// (e.g., ad-hoc config seeding in `main.rs`).
     pub fn raw_conn(&self) -> &Arc<Mutex<Connection>> {
         &self.conn
-    }
-
-    fn config_node_key(key: &str) -> String {
-        format!("config:{key}")
-    }
-
-    fn hotel_node_key(hotel_name: &str) -> String {
-        format!("hotel:{hotel_name}")
-    }
-
-    fn guest_node_key(hotel_name: &str, guest_id: &str) -> String {
-        format!("hotel:{hotel_name}:guest:{guest_id}")
-    }
-
-    fn hotel_guest_edge_key(hotel_name: &str, guest_id: &str) -> String {
-        format!("edge:hotel:{hotel_name}:has_guest:{guest_id}")
-    }
-
-    fn agent_node_key(agent_id: &str) -> String {
-        format!("agent:{agent_id}")
-    }
-
-    fn agent_identity_node_key(agent_id: &str) -> String {
-        format!("agent:{agent_id}:identity")
-    }
-
-    fn apartment_node_key(agent_id: &str, memory_type: &str) -> String {
-        format!("agent:{agent_id}:apartment:{memory_type}")
-    }
-
-    fn agent_apartment_edge_key(agent_id: &str, memory_type: &str) -> String {
-        format!("edge:agent:{agent_id}:owns_apartment:{memory_type}")
-    }
-
-    fn session_node_key(session_id: &str) -> String {
-        format!("session:{session_id}")
-    }
-
-    fn session_participant_node_key(session_id: &str, component_id: &str) -> String {
-        format!("session:{session_id}:participant:{component_id}")
-    }
-
-    fn session_turn_node_key(session_id: &str, turn_id: &str) -> String {
-        format!("session:{session_id}:turn:{turn_id}")
-    }
-
-    fn session_event_node_key(session_id: &str, event_id: &str) -> String {
-        format!("session:{session_id}:event:{event_id}")
-    }
-
-    fn session_participant_edge_key(session_id: &str, component_id: &str) -> String {
-        format!("edge:session:{session_id}:has_participant:{component_id}")
-    }
-
-    fn session_turn_edge_key(session_id: &str, turn_id: &str) -> String {
-        format!("edge:session:{session_id}:has_turn:{turn_id}")
-    }
-
-    fn session_event_edge_key(session_id: &str, event_id: &str) -> String {
-        format!("edge:session:{session_id}:has_event:{event_id}")
-    }
-
-    fn turn_event_edge_key(session_id: &str, turn_id: &str, event_id: &str) -> String {
-        format!("edge:session:{session_id}:turn:{turn_id}:has_event:{event_id}")
     }
 }

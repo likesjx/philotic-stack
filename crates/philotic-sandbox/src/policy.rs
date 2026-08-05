@@ -113,6 +113,14 @@ impl Default for SeccompPolicy {
     }
 }
 
+impl std::str::FromStr for SandboxPolicy {
+    type Err = PolicyError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        SandboxPolicy::from_str(s)
+    }
+}
+
 fn default_seccomp_profile() -> String {
     "shell_executor".to_string()
 }
@@ -125,6 +133,11 @@ impl SandboxPolicy {
     }
 
     /// Parse a policy from a TOML string.
+    ///
+    /// `FromStr` is also implemented and delegates here, so `s.parse()` works.
+    /// The inherent method is kept because it is the documented entry point and
+    /// `from_file` calls it directly.
+    #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Result<Self, PolicyError> {
         let policy: SandboxPolicy = toml::from_str(s)?;
         policy.validate()?;

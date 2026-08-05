@@ -35,3 +35,7 @@ x25519-dalek = { version = "2", features = ["static_secrets"] }
 philotic-client = { path = "../philotic-client" }
 rusqlite = { version = "0.37", features = ["bundled"] }
 tempfile = "3"
+
+# Clippy ratchet: this crate is warning-free and must stay that way.
+[lints]
+workspace = true

@@ -13,6 +13,12 @@ pub struct ContextGraphInvoker {
     apartments: Arc<RwLock<HashMap<AgentId, MemoryApartment>>>,
 }
 
+impl Default for ContextGraphInvoker {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ContextGraphInvoker {
     pub fn new() -> Self {
         Self {

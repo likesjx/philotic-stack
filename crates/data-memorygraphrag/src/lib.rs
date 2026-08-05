@@ -1732,6 +1732,12 @@ impl LifeRecallStatsInput {
 /// batch calls under a declared plan.
 pub const MAX_OBSERVE_BATCH: usize = 25;
 
+/// The cap bounds one datasource round trip; keep it meaningfully below the
+/// cognitive-loop hard ceiling so two batches plus bookkeeping always fit a
+/// planned turn. Enforced at COMPILE time — the previous runtime `assert!` in
+/// a test could never fail, since both operands are constants.
+const _: () = assert!(MAX_OBSERVE_BATCH >= 10 && MAX_OBSERVE_BATCH <= 50);
+
 /// Input for `life.observe.batch` — bounded bulk observation write
 /// (lifegraph-batch-observe seam). Exists because seeding a linked structure
 /// through one `life.observe` call per node costs one model round-trip per
@@ -2438,10 +2444,9 @@ mod tests {
     fn life_observe_batch_input_defaults_empty_and_cap_is_sane() {
         let empty: LifeObserveBatchInput = serde_json::from_value(serde_json::json!({})).unwrap();
         assert!(empty.observations.is_empty());
-        // The cap bounds one datasource round trip; keep it meaningfully
-        // below the cognitive-loop hard ceiling so two batches + bookkeeping
-        // always fit a planned turn.
-        assert!(MAX_OBSERVE_BATCH >= 10 && MAX_OBSERVE_BATCH <= 50);
+        // The range check on MAX_OBSERVE_BATCH moved to a compile-time
+        // assertion (see below) — a runtime assert! on a constant can never
+        // fail at test time, so it was checking nothing.
     }
 
     #[test]

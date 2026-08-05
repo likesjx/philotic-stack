@@ -696,19 +696,15 @@ pub enum HookKind {
 /// The delegation skill owns this decision — infrastructure does not hardcode it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "data", rename_all = "snake_case")]
+#[derive(Default)]
 pub enum HookRoute {
     /// Deliver to the persona agent that spawned this subagent (default).
+    #[default]
     PersonaAgent,
     /// Deliver to any currently active role with this name on the mesh.
     Role { role_name: String },
     /// Do not deliver; fire locally for side-effects only (requires `handler_skill`).
     Discard,
-}
-
-impl Default for HookRoute {
-    fn default() -> Self {
-        Self::PersonaAgent
-    }
 }
 
 /// A single hook subscription declared by the delegation skill.
@@ -727,16 +723,12 @@ pub struct HookSubscription {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum IdleBehavior {
+    #[default]
     Terminate,
     NotifyPersona,
     AutoRenew,
-}
-
-impl Default for IdleBehavior {
-    fn default() -> Self {
-        Self::Terminate
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2939,8 +2931,8 @@ pub struct PhiloticClient {
     /// request — the hotel still processes it and writes exactly one reply
     /// frame back, later, in its turn. Every non-push frame read while this is
     /// > 0 is *that* stale reply (FIFO ordering guarantees it precedes the
-    /// reply to any request written after the timeout), so it is discarded
-    /// before normal response matching resumes. Pushes are never discarded.
+    /// > reply to any request written after the timeout), so it is discarded
+    /// > before normal response matching resumes. Pushes are never discarded.
     pending_stale_responses: u32,
 }
 
@@ -3344,6 +3336,14 @@ impl PhiloticClient {
 }
 
 #[cfg(test)]
+// These tests hold `ipc_env_guard()` across await points, which is the whole
+// point of that guard: it serialises tests that mutate process-wide env vars,
+// and the mutation has to stay exclusive for the entire test body — awaits
+// included. Dropping it earlier would let a concurrent test observe or clobber
+// the env mid-run, which is the exact class of bug that reddened develop in
+// #395. Note this is a std MutexGuard, so the compiler already guarantees the
+// future never moves across threads while it is held.
+#[allow(clippy::await_holding_lock)]
 mod tests {
     use super::*;
     use std::io::ErrorKind;
