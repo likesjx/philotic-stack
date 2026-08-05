@@ -696,7 +696,71 @@ impl IpcServer {
                 min_age_secs, "RepairStaleSessionTurns: repaired zombie turns"
             );
         }
-        IpcResponse::success("repair", Some(serde_json::json!({"repaired": repaired})))
+
+        // S6 (FLEET_SUPERVISION_PROPOSAL): silence is a signal. Both July
+        // outages were only ever noticed by a human wondering why it had gone
+        // quiet — agent-jane for 31h, then again for 17h. Nothing watched for
+        // "this session is being talked to and has stopped answering", so the
+        // system stayed confident while the operator lost every message.
+        //
+        // Runs on the zombie sweep's cadence because it needs no extra
+        // scheduling and the two are the same question one level apart: the
+        // reaper asks "did this turn die?", this asks "has this whole
+        // conversation died?".
+        let silent = Self::scan_silent_sessions(graph, heal_queue, now_secs);
+
+        IpcResponse::success(
+            "repair",
+            Some(serde_json::json!({"repaired": repaired, "silent_sessions": silent})),
+        )
+    }
+
+    /// Flag active sessions that are receiving messages and answering none.
+    /// Returns how many were flagged. See [`detect_session_silence`].
+    fn scan_silent_sessions(
+        graph: &GraphDomain,
+        heal_queue: Option<&dyn ansible_mesh_core::heal_queue::HealQueueStorage>,
+        now_secs: u64,
+    ) -> u32 {
+        let Ok(sessions) = graph.list_sessions() else {
+            return 0;
+        };
+        let mut flagged = 0u32;
+        for session in sessions.iter().filter(|s| s.status == "active") {
+            let turns = graph
+                .list_session_turns(&session.session_id, SILENCE_TURN_SCAN)
+                .unwrap_or_default();
+            let Some(silence) = detect_session_silence(&turns, now_secs) else {
+                continue;
+            };
+
+            let incarnation = session.active_incarnation_id.as_deref().unwrap_or("<none>");
+            let minutes = silence.silent_secs / 60;
+            warn!(
+                session_id = session.session_id.as_str(),
+                incarnation,
+                failed_turns = silence.failed_turns,
+                silent_secs = silence.silent_secs,
+                "silence-as-signal: session is receiving turns and answering none"
+            );
+            if let Some(hq) = heal_queue {
+                let message = format!(
+                    "[session_silent] session [{}] has failed {} consecutive turn(s) over {}m \
+                     with no successful reply (active incarnation [{}]). The session is being \
+                     talked to and is answering nothing — this is the shape of a silent outage, \
+                     not an idle conversation.",
+                    session.session_id, silence.failed_turns, minutes, incarnation
+                );
+                // Re-files each sweep while the silence persists. That is
+                // deliberate: DEF-070 made repeated escalate-only entries
+                // legible (`escalated`, not `resolved`) and the
+                // `heal.escalated-unrepaired` doctor check aggregates them by
+                // age, so a burning fault gets louder instead of scrolling past.
+                let _ = hq.push_classified(&session.session_id, &message, "high", "session_silent");
+            }
+            flagged += 1;
+        }
+        flagged
     }
 
     /// Re-point a session away from a role incarnation that has stopped
@@ -764,6 +828,88 @@ impl IpcServer {
 /// outage on 2026-07-28 — and that must not knock a session out of a role the
 /// operator deliberately chose.
 const ZOMBIE_DEMOTE_THRESHOLD: usize = 2;
+
+/// How long a session may go without a single successful turn — while still
+/// receiving turns — before it is flagged as silently broken.
+///
+/// One hour. Both July outages ran for 17h and 31h before a human noticed;
+/// anything under a few hours is a decisive improvement, and an hour is long
+/// enough that a slow model, a provider retry ladder, or a brief network
+/// outage cannot manufacture a false positive.
+const SESSION_SILENCE_SECS: u64 = 3600;
+
+/// Minimum consecutive failures before silence is credible. One failure is a
+/// blip; the mbp-jane Telegram/openrouter outage of 2026-07-28 produced exactly
+/// one.
+const SESSION_SILENCE_MIN_FAILURES: usize = 2;
+
+/// How many recent turns to scan per session when measuring silence.
+const SILENCE_TURN_SCAN: usize = 20;
+
+/// What a silent session looks like once detected.
+pub(super) struct SessionSilence {
+    /// Consecutive failed turns since the last success (or since the start).
+    pub failed_turns: usize,
+    /// How long the session has been failing, newest failure to oldest.
+    pub silent_secs: u64,
+}
+
+/// Decide whether a session is *silently broken* rather than merely idle.
+///
+/// The distinction is the whole point. An idle conversation has no recent
+/// turns at all and must never alert — the operator simply has not written.
+/// A silent outage has turns arriving and **none** succeeding, which is exactly
+/// what agent-jane looked like for 31h and then 17h while every existing
+/// detector stayed quiet.
+///
+/// Returns `None` unless: the newest turn is a failure, at least
+/// [`SESSION_SILENCE_MIN_FAILURES`] consecutive turns have failed with no
+/// success among them, and the oldest of those failures is at least
+/// [`SESSION_SILENCE_SECS`] old.
+///
+/// `turns` may arrive in any order; it is sorted newest-first internally
+/// because the graph listing is not time-ordered.
+pub(super) fn detect_session_silence(
+    turns: &[SessionTurnRecord],
+    now_secs: u64,
+) -> Option<SessionSilence> {
+    let mut ordered: Vec<&SessionTurnRecord> = turns.iter().collect();
+    ordered.sort_by_key(|t| std::cmp::Reverse(t.started_at));
+
+    let mut failed_turns = 0usize;
+    let mut oldest_failure_at: Option<u64> = None;
+
+    for turn in ordered {
+        match turn.status.as_str() {
+            // A success anywhere in the recent streak means the session is
+            // answering — whatever else is wrong, it is not silent.
+            "completed" => break,
+            "failed" => {
+                failed_turns += 1;
+                if let Some(started) = turn.started_at {
+                    oldest_failure_at = Some(started);
+                }
+            }
+            // `running` is the turn currently in flight, and anything else is
+            // inconclusive. Neither proves life nor death — skip without
+            // breaking the streak.
+            _ => {}
+        }
+    }
+
+    if failed_turns < SESSION_SILENCE_MIN_FAILURES {
+        return None;
+    }
+    let oldest = oldest_failure_at?;
+    let silent_secs = now_secs.saturating_sub(oldest);
+    if silent_secs < SESSION_SILENCE_SECS {
+        return None;
+    }
+    Some(SessionSilence {
+        failed_turns,
+        silent_secs,
+    })
+}
 
 /// How many recent turns to scan when measuring the consecutive zombie streak.
 const ZOMBIE_DEMOTE_TURN_SCAN: usize = 20;
@@ -967,6 +1113,156 @@ mod demotion_policy_tests {
             decide_role_incarnation_demotion(Some("agent-jane:orchestrator"), JANE, &turns),
             None
         );
+    }
+}
+
+#[cfg(test)]
+mod silence_signal_tests {
+    use super::*;
+
+    const NOW: u64 = 1_000_000;
+    const HOUR: u64 = 3600;
+
+    fn t(status: &str, started_at: u64) -> SessionTurnRecord {
+        SessionTurnRecord {
+            turn_id: format!("turn-{started_at}"),
+            session_id: "telegram:1:agent-jane".into(),
+            request_event_id: None,
+            user_message_json: serde_json::json!({}),
+            status: status.into(),
+            response_json: None,
+            error_json: None,
+            started_at: Some(started_at),
+            completed_at: Some(started_at + 300),
+        }
+    }
+
+    /// The agent-jane shape: turns keep arriving, none succeed, for hours.
+    #[test]
+    fn flags_a_session_that_receives_turns_and_answers_none() {
+        let turns = [
+            t("completed", NOW - 8 * HOUR),
+            t("failed", NOW - 5 * HOUR),
+            t("failed", NOW - 3 * HOUR),
+            t("failed", NOW - 2 * HOUR),
+        ];
+        let s = detect_session_silence(&turns, NOW).expect("should flag");
+        assert_eq!(s.failed_turns, 3);
+        assert_eq!(s.silent_secs, 5 * HOUR, "measured from the OLDEST failure");
+    }
+
+    /// The false positive that would make this feature unusable: an operator
+    /// who simply has not written in days must never page anyone.
+    #[test]
+    fn an_idle_conversation_is_never_flagged() {
+        // Silent for a week, but everything that did arrive succeeded.
+        let idle = [
+            t("completed", NOW - 7 * 24 * HOUR),
+            t("completed", NOW - 6 * 24 * HOUR),
+        ];
+        assert!(detect_session_silence(&idle, NOW).is_none());
+        // And a session with no turns at all.
+        assert!(detect_session_silence(&[], NOW).is_none());
+    }
+
+    /// A success newer than the failures means it is answering.
+    #[test]
+    fn a_recent_success_clears_the_signal() {
+        let turns = [
+            t("failed", NOW - 5 * HOUR),
+            t("failed", NOW - 4 * HOUR),
+            t("completed", NOW - 30 * 60),
+        ];
+        assert!(detect_session_silence(&turns, NOW).is_none());
+    }
+
+    /// One failure is a blip — mbp-jane produced exactly one during the
+    /// 2026-07-28 Telegram/openrouter outage. Two is a pattern.
+    #[test]
+    fn a_single_failure_is_a_blip() {
+        let one = [t("completed", NOW - 9 * HOUR), t("failed", NOW - 5 * HOUR)];
+        assert!(detect_session_silence(&one, NOW).is_none());
+
+        let two = [
+            t("completed", NOW - 9 * HOUR),
+            t("failed", NOW - 5 * HOUR),
+            t("failed", NOW - 4 * HOUR),
+        ];
+        assert!(detect_session_silence(&two, NOW).is_some());
+    }
+
+    /// Failures inside the window are still in progress, not yet an outage —
+    /// a provider retry ladder can burn two turns in minutes.
+    #[test]
+    fn recent_failures_are_below_the_time_threshold() {
+        let fresh = [t("failed", NOW - 10 * 60), t("failed", NOW - 5 * 60)];
+        assert!(detect_session_silence(&fresh, NOW).is_none());
+
+        // Exactly at the threshold fires; the boundary is inclusive.
+        let at_threshold = [
+            t("failed", NOW - SESSION_SILENCE_SECS),
+            t("failed", NOW - SESSION_SILENCE_SECS + 60),
+        ];
+        assert!(detect_session_silence(&at_threshold, NOW).is_some());
+    }
+
+    /// `running` is the turn in flight — it neither proves life nor breaks the
+    /// streak, or a wedged session would hide behind its own stuck turn.
+    #[test]
+    fn an_in_flight_turn_does_not_mask_silence() {
+        let turns = [
+            t("completed", NOW - 9 * HOUR),
+            t("failed", NOW - 5 * HOUR),
+            t("failed", NOW - 4 * HOUR),
+            t("running", NOW - 60),
+        ];
+        let s = detect_session_silence(&turns, NOW).expect("running must not mask the streak");
+        assert_eq!(s.failed_turns, 2);
+    }
+
+    /// Replays the real agent-jane timeline from
+    /// `session:telegram:7898847424:agent-jane` (unix epochs straight out of
+    /// the mbp-jane graph) and asserts the detector fires one hour in.
+    ///
+    /// The outage actually ran **31 hours** before a human noticed the silence.
+    /// This is the regression that keeps that from being possible again.
+    #[test]
+    fn would_have_caught_the_real_agent_jane_outage_in_one_hour() {
+        // 2026-07-25 15:16:14Z — last successful turn ("/sfw").
+        let last_success = 1_784_999_774;
+        // 15:17:00, 15:18:59, 15:19:27, 15:52:33 — every turn after it died.
+        let failures = [1_784_999_820, 1_784_999_939, 1_784_999_967, 1_785_001_953];
+        let mut turns = vec![t("completed", last_success)];
+        turns.extend(failures.iter().map(|&at| t("failed", at)));
+
+        // 15:47 — half an hour in. Real, but not yet conclusive.
+        assert!(
+            detect_session_silence(&turns, last_success + 1860).is_none(),
+            "must not fire before the silence window elapses"
+        );
+
+        // 16:17:00 — exactly one hour after the first failure.
+        let one_hour_in = failures[0] + SESSION_SILENCE_SECS;
+        let s = detect_session_silence(&turns, one_hour_in)
+            .expect("one hour of unanswered turns must page");
+        assert_eq!(s.failed_turns, 4);
+        assert_eq!(s.silent_secs, SESSION_SILENCE_SECS);
+
+        // For scale: the operator's "Are you there?" landed ~26 hours after
+        // this point, and was itself swallowed.
+        let when_a_human_noticed = failures[0] + 31 * 3600;
+        assert!(detect_session_silence(&turns, when_a_human_noticed).is_some());
+    }
+
+    /// The graph listing is not time-ordered.
+    #[test]
+    fn unordered_input_is_evaluated_newest_first() {
+        let scrambled = [
+            t("failed", NOW - 3 * HOUR),
+            t("completed", NOW - 30 * 60), // newest → session is alive
+            t("failed", NOW - 4 * HOUR),
+        ];
+        assert!(detect_session_silence(&scrambled, NOW).is_none());
     }
 }
 
