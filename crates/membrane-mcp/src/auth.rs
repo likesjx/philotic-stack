@@ -268,12 +268,12 @@ fn matching_bearer_grant<'a>(
             continue;
         }
 
-        if let Some(exp) = grant.expires_at {
-            if now_epoch > exp {
-                warn!(token_id = %grant.token_id, "presented token matches an expired grant");
-                matched_expired = true;
-                continue;
-            }
+        if let Some(exp) = grant.expires_at
+            && now_epoch > exp
+        {
+            warn!(token_id = %grant.token_id, "presented token matches an expired grant");
+            matched_expired = true;
+            continue;
         }
 
         return Ok(grant);

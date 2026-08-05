@@ -15,7 +15,13 @@ pub enum ProposalStatus {
 }
 
 impl ProposalStatus {
-    /// Parse from the various string formats used in frontmatter
+    /// Parse from the various string formats used in frontmatter.
+    ///
+    /// Deliberately NOT `std::str::FromStr`: this is a lenient parser over
+    /// hand-written frontmatter where an unrecognised value is simply "not a
+    /// status", not an error. `FromStr` would force a `Result` and an error
+    /// type that every caller would immediately discard.
+    #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Option<Self> {
         match s
             .trim()

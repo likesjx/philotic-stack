@@ -69,7 +69,7 @@ pub fn scan_rust_workspace(
         for entry in WalkDir::new(&src_dir)
             .into_iter()
             .filter_map(|e| e.ok())
-            .filter(|e| e.path().extension().map_or(false, |ext| ext == "rs"))
+            .filter(|e| e.path().extension().is_some_and(|ext| ext == "rs"))
         {
             let file_path = entry.path();
             let rel_path = file_path
@@ -781,7 +781,7 @@ fn has_test_attr(attrs: &[Attribute]) -> bool {
                     .path()
                     .segments
                     .last()
-                    .map_or(false, |s| s.ident == "test"))
+                    .is_some_and(|s| s.ident == "test"))
     })
 }
 
@@ -880,10 +880,7 @@ fn format_enum_signature(e: &syn::ItemEnum) -> String {
 }
 
 fn sanitize_id(s: &str) -> String {
-    s.replace(' ', "_")
-        .replace('<', "_")
-        .replace('>', "_")
-        .replace("::", "_")
+    s.replace([' ', '<', '>'], "_").replace("::", "_")
 }
 
 fn extract_use_crate(tree: &syn::UseTree) -> Option<String> {

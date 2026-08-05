@@ -138,10 +138,8 @@ async fn handle_health(
     headers: HeaderMap,
 ) -> axum::response::Response {
     let is_loopback = addr.ip().is_loopback();
-    if !is_loopback {
-        if let Some(denied) = ingress_fence_gate(&state, &headers, is_loopback) {
-            return denied;
-        }
+    if !is_loopback && let Some(denied) = ingress_fence_gate(&state, &headers, is_loopback) {
+        return denied;
     }
     (StatusCode::OK, "membrane-mcp ok").into_response()
 }

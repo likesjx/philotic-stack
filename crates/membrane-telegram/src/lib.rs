@@ -478,26 +478,26 @@ async fn hydrate_single_telegram_attachment(
                                 "Uploaded Telegram attachment [{}] to blob [{}]",
                                 file_id, blob_id
                             );
-                            return enrich_attachment_with_transport(
+                            enrich_attachment_with_transport(
                                 attachment,
                                 Some(&file_ref),
                                 Some(&blob_id),
                                 blob_base,
                                 None,
-                            );
+                            )
                         }
                         Err(err) => {
                             warn!(
                                 "Failed to upload Telegram attachment {} to blob service: {}",
                                 file_id, err
                             );
-                            return enrich_attachment_with_transport(
+                            enrich_attachment_with_transport(
                                 attachment,
                                 Some(&file_ref),
                                 None,
                                 blob_base,
                                 Some(&format!("blob_upload_failed:{err}")),
-                            );
+                            )
                         }
                     }
                 }
@@ -506,13 +506,13 @@ async fn hydrate_single_telegram_attachment(
                         "Failed to download Telegram attachment {}: {}",
                         file_id, err
                     );
-                    return enrich_attachment_with_transport(
+                    enrich_attachment_with_transport(
                         attachment,
                         Some(&file_ref),
                         None,
                         blob_base,
                         Some(&format!("telegram_download_failed:{err}")),
-                    );
+                    )
                 }
             }
         }
@@ -521,13 +521,13 @@ async fn hydrate_single_telegram_attachment(
                 "Failed to resolve Telegram attachment {} via getFile: {}",
                 file_id, err
             );
-            return enrich_attachment_with_transport(
+            enrich_attachment_with_transport(
                 attachment,
                 None,
                 None,
                 blob_base,
                 Some(&format!("telegram_get_file_failed:{err}")),
-            );
+            )
         }
     }
 }
@@ -1668,15 +1668,15 @@ fn telegram_message_attachments(message: &Value) -> Vec<Value> {
         ));
     }
 
-    if let Some(photo_sizes) = message.get("photo").and_then(Value::as_array) {
-        if let Some(photo) = photo_sizes.last() {
-            attachments.push(transport_attachment(
-                "photo",
-                photo.get("file_id"),
-                None,
-                None,
-            ));
-        }
+    if let Some(photo_sizes) = message.get("photo").and_then(Value::as_array)
+        && let Some(photo) = photo_sizes.last()
+    {
+        attachments.push(transport_attachment(
+            "photo",
+            photo.get("file_id"),
+            None,
+            None,
+        ));
     }
 
     attachments
@@ -2500,35 +2500,35 @@ async fn seat_process_update(
     // so it routes through handle_membrane_command and the
     // agent's command dispatch identically to a typed command.
     // Also ack the callback so Telegram removes the spinner.
-    if envelope.command.is_none() {
-        if let Some(data) = envelope.callback_data.as_deref() {
-            if data.starts_with('/') {
-                // Parse: first token is the command, rest are args.
-                let cmd = data.split_whitespace().next().unwrap_or(data);
-                envelope.command = Some(cmd.to_string());
-                // Re-surface as a text message with the full command string.
-                envelope.content = data.to_string();
-                // Ack the callback query to dismiss Telegram's loading indicator.
-                answer_callback_query(
-                    &ctx.http_client,
-                    &ctx.tg_base,
-                    &envelope.raw_transport_event,
-                )
-                .await;
-            } else if is_approval_callback(data) {
-                // Approve/Deny/Trust buttons: the envelope already carries the
-                // translated /approve or /deny content for philote, but the
-                // callback query itself was never answered — Telegram keeps
-                // showing the button's loading spinner until it times out.
-                // Ack it here (before the operator gate, so even a dropped
-                // non-operator tap doesn't spin).
-                answer_callback_query(
-                    &ctx.http_client,
-                    &ctx.tg_base,
-                    &envelope.raw_transport_event,
-                )
-                .await;
-            }
+    if envelope.command.is_none()
+        && let Some(data) = envelope.callback_data.as_deref()
+    {
+        if data.starts_with('/') {
+            // Parse: first token is the command, rest are args.
+            let cmd = data.split_whitespace().next().unwrap_or(data);
+            envelope.command = Some(cmd.to_string());
+            // Re-surface as a text message with the full command string.
+            envelope.content = data.to_string();
+            // Ack the callback query to dismiss Telegram's loading indicator.
+            answer_callback_query(
+                &ctx.http_client,
+                &ctx.tg_base,
+                &envelope.raw_transport_event,
+            )
+            .await;
+        } else if is_approval_callback(data) {
+            // Approve/Deny/Trust buttons: the envelope already carries the
+            // translated /approve or /deny content for philote, but the
+            // callback query itself was never answered — Telegram keeps
+            // showing the button's loading spinner until it times out.
+            // Ack it here (before the operator gate, so even a dropped
+            // non-operator tap doesn't spin).
+            answer_callback_query(
+                &ctx.http_client,
+                &ctx.tg_base,
+                &envelope.raw_transport_event,
+            )
+            .await;
         }
     }
 
@@ -3323,8 +3323,8 @@ impl TelegramSeatGuest {
                     })
                 };
 
-                if let Some((draft_message_id, thread_id)) = due_snapshot {
-                    if let Some(update) = upsert_streaming_draft(
+                if let Some((draft_message_id, thread_id)) = due_snapshot
+                    && let Some(update) = upsert_streaming_draft(
                         &self.http_client,
                         &tg_base,
                         &chat_id,
@@ -3333,19 +3333,16 @@ impl TelegramSeatGuest {
                         &content,
                     )
                     .await
-                    {
-                        if let Some(active) = self.active_turns.lock().unwrap().get_mut(&session_id)
-                        {
-                            active.streaming_last_edit = Some(now);
-                            match update {
-                                StreamingDraftUpdate::Rendered { message_id, text } => {
-                                    active.draft_message_id = Some(message_id);
-                                    active.draft_text = text;
-                                }
-                                StreamingDraftUpdate::Retained(message_id) => {
-                                    active.draft_message_id = Some(message_id);
-                                }
-                            }
+                    && let Some(active) = self.active_turns.lock().unwrap().get_mut(&session_id)
+                {
+                    active.streaming_last_edit = Some(now);
+                    match update {
+                        StreamingDraftUpdate::Rendered { message_id, text } => {
+                            active.draft_message_id = Some(message_id);
+                            active.draft_text = text;
+                        }
+                        StreamingDraftUpdate::Retained(message_id) => {
+                            active.draft_message_id = Some(message_id);
                         }
                     }
                 }
@@ -3384,8 +3381,8 @@ impl TelegramSeatGuest {
                         None => None,
                     }
                 };
-                if let Some((draft_snapshot, thread_id, draft_message_id)) = due_snapshot {
-                    if let Some(update) = upsert_streaming_draft(
+                if let Some((draft_snapshot, thread_id, draft_message_id)) = due_snapshot
+                    && let Some(update) = upsert_streaming_draft(
                         &self.http_client,
                         &tg_base,
                         &chat_id,
@@ -3394,19 +3391,16 @@ impl TelegramSeatGuest {
                         &draft_snapshot,
                     )
                     .await
-                    {
-                        if let Some(active) = self.active_turns.lock().unwrap().get_mut(&session_id)
-                        {
-                            active.streaming_last_edit = Some(now);
-                            match update {
-                                StreamingDraftUpdate::Rendered { message_id, text } => {
-                                    active.draft_message_id = Some(message_id);
-                                    active.draft_text = text;
-                                }
-                                StreamingDraftUpdate::Retained(message_id) => {
-                                    active.draft_message_id = Some(message_id);
-                                }
-                            }
+                    && let Some(active) = self.active_turns.lock().unwrap().get_mut(&session_id)
+                {
+                    active.streaming_last_edit = Some(now);
+                    match update {
+                        StreamingDraftUpdate::Rendered { message_id, text } => {
+                            active.draft_message_id = Some(message_id);
+                            active.draft_text = text;
+                        }
+                        StreamingDraftUpdate::Retained(message_id) => {
+                            active.draft_message_id = Some(message_id);
                         }
                     }
                 }
@@ -3439,10 +3433,9 @@ impl TelegramSeatGuest {
                     None,
                 )
                 .await
+                    && let Some(active) = self.active_turns.lock().unwrap().get_mut(&session_id)
                 {
-                    if let Some(active) = self.active_turns.lock().unwrap().get_mut(&session_id) {
-                        active.status_message_id = Some(new_id);
-                    }
+                    active.status_message_id = Some(new_id);
                 }
             }
         } else {
@@ -3731,64 +3724,64 @@ pub async fn run() -> Result<()> {
     // PHILOTIC_AGENT_ROSTER is set by aiua when running a multi-agent hotel.
     // It's a JSON array of {agent_key, agent_id} objects — one entry per agent.
     // One seat task is spawned per entry, each with its own IPC connection.
-    if let Ok(roster_json) = std::env::var("PHILOTIC_AGENT_ROSTER") {
-        if !roster_json.trim().is_empty() {
-            let roster: Vec<Value> = serde_json::from_str(&roster_json).unwrap_or_default();
-            let hotel_guest_id = local_guest_id(); // e.g. "default:membrane-gateway"
+    if let Ok(roster_json) = std::env::var("PHILOTIC_AGENT_ROSTER")
+        && !roster_json.trim().is_empty()
+    {
+        let roster: Vec<Value> = serde_json::from_str(&roster_json).unwrap_or_default();
+        let hotel_guest_id = local_guest_id(); // e.g. "default:membrane-gateway"
 
-            let mut tasks = Vec::new();
-            for entry in &roster {
-                let agent_key = entry.get("agent_key").and_then(Value::as_str).unwrap_or("");
-                let agent_id = entry.get("agent_id").and_then(Value::as_str).unwrap_or("");
-                if agent_key.is_empty() || agent_id.is_empty() {
-                    warn!(
-                        "Skipping roster entry with missing agent_key or agent_id: {}",
-                        entry
-                    );
-                    continue;
+        let mut tasks = Vec::new();
+        for entry in &roster {
+            let agent_key = entry.get("agent_key").and_then(Value::as_str).unwrap_or("");
+            let agent_id = entry.get("agent_id").and_then(Value::as_str).unwrap_or("");
+            if agent_key.is_empty() || agent_id.is_empty() {
+                warn!(
+                    "Skipping roster entry with missing agent_key or agent_id: {}",
+                    entry
+                );
+                continue;
+            }
+            // Each seat registers under the per-agent guest_id so that philote reply
+            // routing (final_reply_guest_id) lands in the correct seat's inbox.
+            let seat_guest_id = format!("{}-{}", hotel_guest_id, agent_key);
+            let token_key = format!("telegram_bot_token_{}", agent_key);
+
+            info!(
+                "Spawning seat for agent [{}] (guest_id: {})",
+                agent_id, seat_guest_id
+            );
+            let (inbound_tx, inbound_rx) = mpsc::channel::<InboundEnvelope>(64);
+            let guest = TelegramSeatGuest::new(
+                seat_guest_id.clone(),
+                token_key,
+                agent_id.to_string(),
+                http_client.clone(),
+                telegram_api_base.clone(),
+                telegram_file_api_base.clone(),
+                blob_base.clone(),
+                inbound_tx,
+            );
+            let runtime =
+                MembraneRuntime::new(hotel_socket_path(), &seat_guest_id, local_node_id())
+                    .with_inbound_rx(inbound_rx);
+
+            tasks.push(tokio::spawn(async move {
+                if let Err(e) = runtime.run(guest).await {
+                    error!("Seat [{}] exited with error: {}", seat_guest_id, e);
                 }
-                // Each seat registers under the per-agent guest_id so that philote reply
-                // routing (final_reply_guest_id) lands in the correct seat's inbox.
-                let seat_guest_id = format!("{}-{}", hotel_guest_id, agent_key);
-                let token_key = format!("telegram_bot_token_{}", agent_key);
+            }));
+        }
 
-                info!(
-                    "Spawning seat for agent [{}] (guest_id: {})",
-                    agent_id, seat_guest_id
-                );
-                let (inbound_tx, inbound_rx) = mpsc::channel::<InboundEnvelope>(64);
-                let guest = TelegramSeatGuest::new(
-                    seat_guest_id.clone(),
-                    token_key,
-                    agent_id.to_string(),
-                    http_client.clone(),
-                    telegram_api_base.clone(),
-                    telegram_file_api_base.clone(),
-                    blob_base.clone(),
-                    inbound_tx,
-                );
-                let runtime =
-                    MembraneRuntime::new(hotel_socket_path(), &seat_guest_id, local_node_id())
-                        .with_inbound_rx(inbound_rx);
-
-                tasks.push(tokio::spawn(async move {
-                    if let Err(e) = runtime.run(guest).await {
-                        error!("Seat [{}] exited with error: {}", seat_guest_id, e);
-                    }
-                }));
-            }
-
-            if tasks.is_empty() {
-                warn!("PHILOTIC_AGENT_ROSTER contained no valid seats. Membrane exiting.");
-                return Ok(());
-            }
-
-            // All seats run indefinitely. Wait for all to exit (IPC disconnect or ctrl-c).
-            for task in tasks {
-                let _ = task.await;
-            }
+        if tasks.is_empty() {
+            warn!("PHILOTIC_AGENT_ROSTER contained no valid seats. Membrane exiting.");
             return Ok(());
         }
+
+        // All seats run indefinitely. Wait for all to exit (IPC disconnect or ctrl-c).
+        for task in tasks {
+            let _ = task.await;
+        }
+        return Ok(());
     }
 
     // ── Single-seat legacy mode (backward compat / single-agent hotels) ────────

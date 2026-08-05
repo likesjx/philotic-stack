@@ -7,7 +7,7 @@ use philotic_client::{
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tracing::{error, info, warn};
@@ -362,7 +362,7 @@ async fn build_legacy_whisper_store() -> Result<Arc<dyn WhisperTrainingStorage>>
 async fn handle_whisper_capture(
     store: &Arc<dyn WhisperTrainingStorage>,
     http: &reqwest::Client,
-    audio_dir: &PathBuf,
+    audio_dir: &Path,
     capture: TranscriptionCapture,
 ) {
     let sample_id = Ulid::new().to_string();
