@@ -153,6 +153,18 @@ The default Philotic stack materializes a fleet of specialized agents, each with
 - **[Domain Map](docs/architecture/DOMAIN_MAP.md)** — architectural domains and their governing proposals.
 - **[Seam Registry](docs/architecture/SEAM_REGISTRY.md)** — all registered implementation seams.
 
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for the build commands, the branch model,
+and the verification ladder this project grades claims against
+(*test-green* / *smoke-green* / *watched-live-green*).
+
+## Security
+
+See [SECURITY.md](SECURITY.md) to report a vulnerability, and read the threat
+model there before deploying. The stack assumes a single operator on a private
+network; it is not currently hardened for multi-tenancy or untrusted networks.
+
 ## License
 
-MIT
+MIT — see [LICENSE](LICENSE).
