@@ -6,7 +6,7 @@ domain: memory-context
 status: accepted-current-slice
 disposition: accepted for current slice
 last_updated: 2026-07-24
-verification_level: smoke-green (S1-S3 live); S4 drill destructive path unexercised
+verification_level: smoke-green (S1-S3 live on mac-jane); S4 drill executed end-to-end on an isolated hotel
 tags:
 - muninn
 - memory
@@ -192,7 +192,7 @@ here to keep one canonical proposal per `proposal_id`.
   `FetchMemoryConfig` loads live from the Context Graph; heal response
   carries refreshed config; philote replaces cached `muninn_config` and
   retries once at auto-recall, `memory.recall`, and `memory.remember`.
-- S4 `key-wipe-drill` — **implemented, destructive path not yet exercised**.
+- S4 `key-wipe-drill` — **implemented and executed end-to-end**.
   New `memory-token-wipe` scenario in `scripts/chaos-smoke.sh` plus the
   `memory_token_drill_driver` example that drives it over IPC. Two phases:
   a **read-only probe** (memory config served live from the Context Graph +
@@ -210,23 +210,64 @@ here to keep one canonical proposal per `proposal_id`.
   alone), never auto-selected by the round-robin, never auto-creates a vault,
   original token captured and restored on every failure path.
 
-  Verification reached: **test-green + smoke-green (probe)**. The read-only
-  probe ran green against live mac-jane; the non-dry scenario ran end-to-end
-  and correctly REFUSED the destructive phase (no sacrificial vault
-  registered). `watched-live` is **not** reached — the corrupt→heal assertion
-  has never executed, and the "deliberately-missing admin credential produces
-  escalation" case is proven only by unit test, not by a live drill.
+  Verification reached: **the corrupt→heal circuit has now executed
+  end-to-end.** Run 2026-08-05 against a dedicated, isolated drill hotel
+  (`PHILOTIC_PROFILE=drill`, own `context.db`, own socket, own
+  auto-negotiated port cluster, **zero agents** so `derive_vault_names`
+  yields `[]` and no real vault is ever provisioned), driven by a locally
+  built binary so no Cellar deploy and no production hotel were involved.
 
-  Two blockers for a first watched-live cycle, both filed as next seams
-  rather than silently absorbed:
-  1. **No sacrificial vault exists on any hotel.** Provisioning one is an
-     operator action (`AddVaultEntry` + a muninn-side vault); the drill
-     refuses rather than creating it.
-  2. **The chaos preflight blocks every scenario on mac-jane.**
-     `preflight_check` refuses unless `phil doctor` reports `ok == true`, but
-     mac-jane's `ok` is `false` on **warnings only**
-     (`ports.hotel-record-drift`, `logs.rotation-missing` — the latter a known
-     false positive, since log rotation is handled by a copytruncate
-     LaunchAgent). Pre-existing in SUBSTRATE_HARDENING S4, not introduced
-     here; until the gate distinguishes warning from unhealthy, no chaos
-     scenario can run on that hotel.
+  Proven, with server-side evidence rather than the driver's own word:
+
+  | Case | Result |
+  |---|---|
+  | corrupt → heal → re-mint | **PASS** — placeholder `fp:8f64a815` corrupted, heal returned a different token `fp:c27e7dd0`, config refreshed with no restart |
+  | mint really happened | **PASS** — MuninnDB shows a new key `mcfCnMADo2I` (label `aiua-1785941607`) created 10:53:27.84, matching `aiua::muninn_provision: MuninnDB vault token re-minted and rotated in place` to the second |
+  | missing admin credential escalates | **PASS** — classified `NO_ADMIN_CREDENTIAL` refusal plus the `manual resync required` WARN; no mint attempted, no silence |
+  | failure restores state | **PASS** — the driver's restore path returned the vault to its pre-drill token on every failed run |
+
+  Note on the escalation case: the hotel's heal-queue write is optional
+  (`if let Some(hq) = heal_queue`), and this minimal drill hotel has no queue
+  wired, so the escalation there was log-only. The heal-queue leg was proven
+  separately on mac-jane, which filed and dispatched an entry for a failed
+  heal earlier the same session.
+
+  Three findings the drill surfaced that no test had:
+
+  1. **A heal that fails still consumes the mint budget.** The per-vault
+     budget slot is claimed *before* the admin-credential check, so a heal
+     that never attempted a mint still throttles the next attempt for the
+     full 10-minute window — during which the hotel serves the live (still
+     corrupted) config. Retrying a failed heal inside the window therefore
+     looks like "no re-mint happened" for the wrong reason. The budget
+     arguably belongs after the credential resolution.
+  2. **The mint path is not Cortex-aware — self-heal cannot work on an
+     observer hotel.** Mid-drill the local MuninnDB began rejecting the mint
+     with `421 Misdirected Request`: *"this node is not the cluster's Cortex;
+     writes are accepted only on the Cortex"*. Minting an API key is a write,
+     and `remint_vault_token` posts straight to the configured endpoint.
+     `MuninnConfig` already carries `shared_write_route` for forwarding
+     *data* writes to the Cortex, but the *admin mint* has no equivalent — so
+     on the Macs (observers) a token-401 can never self-heal. It works on
+     vps-jane because vps-jane *is* the Cortex, which happens to be where
+     both original incidents occurred. This is the highest-value next seam.
+  3. **Classified refusals were being reported as protocol errors.** The
+     hotel returns its designed refusals as `Standard{ok:false}`; the driver
+     treated that shape as "unexpected response" and dumped the debug struct.
+     Fixed: refusals now print `[CODE] message` with an operator hint.
+
+  Remaining blocker for a *scheduled* drill (the drill itself no longer
+  needs it): **the chaos preflight blocks every scenario on mac-jane.**
+  `preflight_check` refuses unless `phil doctor` reports `ok == true`, but
+  mac-jane's `ok` is `false` on **warnings only**
+  (`ports.hotel-record-drift`, `logs.rotation-missing` — the latter a known
+  false positive, since log rotation is handled by a copytruncate
+  LaunchAgent). Pre-existing in SUBSTRATE_HARDENING S4, not introduced here.
+
+  The earlier "no sacrificial vault can exist" blocker is **closed**: vaults
+  could not be registered at all until `AddVaultEntry` gained an explicit
+  `secret_kind` (PR #384), because `load_muninn_config` skips any entry whose
+  kind is not `muninn_vault_token` and `derive_vault_names` only ever emits
+  `self_*`/`user_*`. The driver's `provision` mode now registers a
+  `chaos_smoke*` vault with a placeholder token MuninnDB rejects, so the
+  first heal mints the real one and no admin credential lives in the driver.

@@ -184,7 +184,17 @@ async fn run_provision(socket_path: &str, vault: &str) -> Result<()> {
 
     let mut client = connect(socket_path).await?;
 
-    let existing = vault_tokens(&fetch_config(&mut client).await?)?;
+    // A hotel with an empty vault_registry has NO memory config at all
+    // (`load_muninn_config` returns None before it builds anything), so the
+    // "is it already registered?" probe must tolerate that — otherwise the
+    // very first vault can never be provisioned.
+    let existing = match client.send_request(IpcRequest::FetchMemoryConfig).await? {
+        IpcResponse::MemoryConfig(payload) => match payload.config_json {
+            Some(json) => vault_tokens(&json)?,
+            None => Vec::new(),
+        },
+        other => bail!("unexpected response to FetchMemoryConfig: {other:?}"),
+    };
     if existing.iter().any(|(name, _)| name == vault) {
         eprintln!("vault '{vault}' is already registered — nothing to do.");
         return Ok(());
@@ -319,6 +329,29 @@ async fn drill_assert_heal(
             .context("heal returned MemoryConfig with no config_json")?,
         IpcResponse::Error(msg) => {
             bail!("heal refused or failed: {msg}");
+        }
+        // The hotel's classified refusals arrive as Standard{ok:false}. These
+        // are DESIGNED outcomes, not protocol surprises — report them by their
+        // code so an operator reading a failed drill sees "no credential" or
+        // "budget exhausted" rather than a debug dump.
+        IpcResponse::Standard {
+            ok: false,
+            ref code,
+            ref message,
+            ..
+        } => {
+            let hint = match code.as_str() {
+                "NO_ADMIN_CREDENTIAL" => {
+                    " — this is the designed escalation: the hotel refused to mint and \
+                     warned loudly instead of failing silently"
+                }
+                "HEAL_BUDGET_EXHAUSTED" => {
+                    " — the per-vault mint budget is still open from a previous heal; \
+                     wait for the window to pass or restart the hotel to clear it"
+                }
+                _ => "",
+            };
+            bail!("heal refused: [{code}] {message}{hint}");
         }
         other => bail!("unexpected response to HealMemoryToken: {other:?}"),
     };
