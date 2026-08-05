@@ -442,10 +442,15 @@ fn step_list(plan: &ActivePlan, flags: &[bool], done: bool) -> String {
 
 /// The hotel's zombie-turn watchdog fails any turn still `running` this many
 /// seconds after its `started_at` (`heal-dispatcher` issues
-/// `RepairStaleSessionTurns { min_age_secs: 300 }`). There is no heartbeat that
+/// `RepairStaleSessionTurns { min_age_secs }`). There is no heartbeat that
 /// resets the clock, so this is a hard wall-clock ceiling on a single turn —
 /// not an iteration ceiling. `iteration_cap` was never the binding constraint.
-pub const TURN_ZOMBIE_REAP_SECS: u64 = 300;
+///
+/// Re-exported from [`ansible_mesh_core::turn_budget`] so this file and the
+/// hotel-side reaper cannot drift apart again: they were independently
+/// hardcoded to 300, which put the backstop at or below every guest-side
+/// budget it was supposed to outlast.
+pub use ansible_mesh_core::turn_budget::TURN_ZOMBIE_REAP_SECS;
 
 /// Wall-clock budget for executing plan steps inside one turn, measured from
 /// the turn's `started_at` (which includes queue time and the planning call).

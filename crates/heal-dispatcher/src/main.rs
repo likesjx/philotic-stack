@@ -399,10 +399,17 @@ async fn dispatch_cycle(
     notifier: &mut OperatorNotifier,
     intel_graph_url: Option<&str>,
 ) -> Result<()> {
-    // Proactively repair session turns stuck in "running" for more than 5 minutes.
+    // Proactively repair session turns the guest can no longer speak for. This is
+    // a BACKSTOP, not the primary turn timeout: philote bounds its own turns and
+    // reports honest errors, so this threshold must outlast the guest's ceiling.
+    // It was 300s — equal to philote's per-phase budget and below its 600s
+    // aggregate ceiling — so the hotel always won and slow-but-healthy turns died
+    // as ZOMBIE_TURN_REPAIR (46 of 96 turns fleet-wide on 2026-08-05).
     match send_request_timeout(
         ipc,
-        IpcRequest::RepairStaleSessionTurns { min_age_secs: 300 },
+        IpcRequest::RepairStaleSessionTurns {
+            min_age_secs: ansible_mesh_core::turn_budget::TURN_ZOMBIE_REAP_SECS,
+        },
         IPC_TIMEOUT,
     )
     .await

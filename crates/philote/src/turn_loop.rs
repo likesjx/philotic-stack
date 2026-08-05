@@ -70,7 +70,13 @@ impl AgentRuntime {
         // Exception: a turn blocking on a paracrine whisper is bounded by
         // PARACRINE_WHISPER_WAIT_SECS instead (see the CatchAll skip below), so this
         // ceiling does not preempt its longer, deliberately-larger deadline.
-        const MAX_TOTAL_ACTIVE_SECS: u64 = 600; // 10 min overall budget
+        //
+        // This ceiling only means anything if the hotel's zombie reaper outlasts
+        // it. It did not: heal-dispatcher reaped at 300s, so this 600s ceiling was
+        // unreachable and every phase budget below tied or exceeded the wall. The
+        // wall now lives in one place, above this ceiling, and
+        // `ansible_mesh_core::turn_budget` fails the build if they cross again.
+        const MAX_TOTAL_ACTIVE_SECS: u64 = ansible_mesh_core::turn_budget::GUEST_TOTAL_CEILING_SECS; // 10 min overall budget
 
         let now = std::time::Instant::now();
 
