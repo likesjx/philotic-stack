@@ -131,7 +131,7 @@ impl NodeRegistry {
         capabilities: NodeCapabilities,
         advertisements: Vec<CapabilityAdvertisement>,
         execution_reachability: Option<ExecutionReachability>,
-        node_health: Option<NodeHealthSnapshot>,
+        _node_health: Option<NodeHealthSnapshot>,
     ) {
         let sync_id = Uuid::new_v4();
         self.observe_capability_sync_chunk(
@@ -145,6 +145,11 @@ impl NodeRegistry {
         );
     }
 
+    // Each parameter is an independently-optional signal from a different
+    // subsystem, and callers pass different subsets. Collapsing them into a
+    // struct would move the same eight fields one level down without making
+    // any call site clearer.
+    #[allow(clippy::too_many_arguments)]
     pub fn observe_capability_sync_chunk(
         &mut self,
         capabilities: NodeCapabilities,
@@ -216,9 +221,9 @@ impl NodeRegistry {
         let Some(ref h) = status.node_health else {
             return true;
         };
-        h.disk_free_pct.map_or(true, |v| v > 10.0)
-            && h.mem_free_pct.map_or(true, |v| v > 5.0)
-            && h.load_avg_1m.map_or(true, |v| v < 16.0)
+        h.disk_free_pct.is_none_or(|v| v > 10.0)
+            && h.mem_free_pct.is_none_or(|v| v > 5.0)
+            && h.load_avg_1m.is_none_or(|v| v < 16.0)
     }
 
     fn prune_pending_syncs(&mut self) {

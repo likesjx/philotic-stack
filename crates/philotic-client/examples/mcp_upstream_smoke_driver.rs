@@ -170,26 +170,23 @@ async fn main() -> Result<()> {
         tokio::time::sleep(Duration::from_secs(1)).await;
         if let IpcResponse::McpUpstreamsState { mcp_upstreams } =
             client.send_request(IpcRequest::GetMcpUpstreams {}).await?
-        {
-            if let Some(entry) = mcp_upstreams
+            && let Some(entry) = mcp_upstreams
                 .iter()
                 .find(|e| e.config.upstream_id == UPSTREAM_ID)
+            && let Some(catalog) = &entry.catalog
+        {
+            let has_tool = catalog.tools.iter().any(|t| t.remote_name == tool);
+            println!(
+                "      attempt {attempt}: state={:?} projected={}",
+                catalog.state, has_tool
+            );
+            if matches!(
+                catalog.state,
+                ansible_mesh_core::mcp_upstream::McpUpstreamState::Connected
+            ) && has_tool
             {
-                if let Some(catalog) = &entry.catalog {
-                    let has_tool = catalog.tools.iter().any(|t| t.remote_name == tool);
-                    println!(
-                        "      attempt {attempt}: state={:?} projected={}",
-                        catalog.state, has_tool
-                    );
-                    if matches!(
-                        catalog.state,
-                        ansible_mesh_core::mcp_upstream::McpUpstreamState::Connected
-                    ) && has_tool
-                    {
-                        connected = true;
-                        break;
-                    }
-                }
+                connected = true;
+                break;
             }
         }
     }

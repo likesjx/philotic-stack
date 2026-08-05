@@ -98,8 +98,7 @@ async fn main() -> anyhow::Result<()> {
 
     // Verify node is readable back
     let verify_q = neo_query(
-        &"MATCH (n:Signal {id: $id}) RETURN n.validation_state AS vs, n.claim_summary AS cs"
-            .to_string(),
+        "MATCH (n:Signal {id: $id}) RETURN n.validation_state AS vs, n.claim_summary AS cs",
     )
     .param("id", compiled.node_id.as_str());
 

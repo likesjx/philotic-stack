@@ -44,20 +44,16 @@ pub enum HookKind {
 /// Where a hook event is routed when it fires.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "data", rename_all = "snake_case")]
+#[derive(Default)]
 pub enum HookRoute {
     /// Deliver to the persona agent that spawned this subagent (default).
+    #[default]
     PersonaAgent,
     /// Deliver to any currently active role with this name on the mesh.
     Role { role_name: String },
     /// Do not deliver outward; fire locally for side-effects only.
     /// Requires a `handler_skill` on the subscription — otherwise pointless.
     Discard,
-}
-
-impl Default for HookRoute {
-    fn default() -> Self {
-        Self::PersonaAgent
-    }
 }
 
 /// A single hook subscription declared by the delegation skill.

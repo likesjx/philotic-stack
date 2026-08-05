@@ -40,11 +40,11 @@ async fn emit_and_expect(
         };
         let payload: serde_json::Value =
             serde_json::from_str(&task_json).context("failed to decode session control reply")?;
-        if let Some(c) = payload.get("content").and_then(serde_json::Value::as_str) {
-            if !c.is_empty() {
-                actual = c.to_string();
-                break;
-            }
+        if let Some(c) = payload.get("content").and_then(serde_json::Value::as_str)
+            && !c.is_empty()
+        {
+            actual = c.to_string();
+            break;
         }
     }
 
