@@ -4,7 +4,7 @@ doc_type: proposal
 domain: operator-control-plane
 status: proposed
 disposition: proposed
-last_updated: 2026-07-30
+last_updated: 2026-08-05
 verification_level: field-evidence
 tags:
 - supervision
@@ -195,9 +195,35 @@ that may be the failing component. Folds in the previously-filed
 `operator-chat-bound-heal-push` (Telegram push without a live session).
 Covers evidence 2.
 
-**S6 — Silence as signal.** Alert when an active session receives zero dispatches
-over N hours, or a supervised service reports zero successful probes over N cycles.
-Both incidents would have been caught within an hour by this alone.
+**S6 — Silence as signal.** ✅ **Implemented (session half).**
+
+`detect_session_silence` (`aiua/src/service/session_activity.rs`) flags an active
+session that is **receiving turns and answering none**: two or more consecutive
+failures, no success among them, oldest failure at least an hour old. It files a
+`session_silent` heal entry at high severity and rides the zombie sweep's
+cadence — the two are the same question one level apart, one asking "did this
+turn die?" and the other "has this conversation died?".
+
+The distinction that makes it usable is idle vs. silent. An idle conversation
+has no recent turns and must never page anyone; a silent outage has turns
+arriving and none succeeding. That is exactly what agent-jane looked like for
+31h and then 17h while every existing detector stayed quiet.
+
+Validated against the real incident rather than a synthetic case — a regression
+test replays the actual epochs from
+`session:telegram:7898847424:agent-jane`: last success 15:16:14Z, first failure
+15:17:00Z, four dead turns by 15:52. It fires at **16:17:00Z, one hour in**,
+against the **31 hours** the outage really ran. It stays silent at the 30-minute
+mark, on a lone failure, and on a week-idle conversation.
+
+Thresholds are deliberately forgiving: one failure is a blip (the 2026-07-28
+Telegram/openrouter outage produced exactly one), and an hour is long enough
+that a slow model or a provider retry ladder cannot manufacture a false
+positive.
+
+*Still open:* the service half — alerting when a supervised service reports zero
+successful probes over N cycles. The muninn outage was already detected 919
+times, so that half is about action, not detection (S3).
 
 ## Already applied (2026-07-27)
 
