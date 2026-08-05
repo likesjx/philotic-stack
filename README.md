@@ -28,7 +28,14 @@ cd philotic-stack
 just preflight            # check system dependencies BEFORE the first build
 just install-git-hooks    # secret-push guard + pre-commit rustfmt gate
 cargo build --release
+
+# Put the operator CLI on your PATH as `phil`. Homebrew creates this symlink
+# for you; a source build does not, and every command below is named `phil`.
+ln -sf "$(pwd)/target/release/philotic-web" /usr/local/bin/phil
 ```
+
+> `just phil-install` does the same thing against `target/debug/` — use it when
+> you are iterating with `cargo build`, not after a `--release` build.
 
 #### System dependencies
 
@@ -79,7 +86,13 @@ Or manually:
 ```bash
 cp mesh-config.example.json mesh-config.json
 # Edit mesh-config.json with your API keys and node identity
-aiua --load-config mesh-config.json
+
+# Apply the config to the Context Graph DB. Run this once on first setup, and
+# again whenever the config changes.
+aiua load --file mesh-config.json --hotel default
+
+# Normal startup then runs purely from the DB — it does not re-read the file.
+aiua --hotel default
 ```
 
 ## Architecture Diagrams
