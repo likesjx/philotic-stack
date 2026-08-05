@@ -26,9 +26,31 @@ This installs the `phil` CLI (symlinked from `philotic-web`), the `aiua` hotel d
 git clone https://github.com/likesjx/philotic-stack.git
 cd philotic-stack
 cargo build --release
+
+# Put the operator CLI on your PATH as `phil`. Homebrew creates this symlink
+# for you; a source build does not, and every command below is named `phil`.
+ln -sf "$(pwd)/target/release/philotic-web" /usr/local/bin/phil
 ```
 
-Binaries are built to `target/release/`. A full release build emits ~24 binaries (the deployed set is pinned in `AIUA_BINS` in the [justfile](justfile) and mirrored by [.github/workflows/build-linux.yml](.github/workflows/build-linux.yml)). The primary ones:
+> `just phil-install` does the same thing against `target/debug/` — use it when
+> you are iterating with `cargo build`, not after a `--release` build.
+
+#### System dependencies
+
+The workspace links against a few things Cargo cannot install for you. `just
+preflight` checks all of them and tells you how to fix what is missing; this
+table is what it checks and why.
+
+| Requirement | Needed by | Notes |
+|---|---|---|
+| C compiler (`cc`) | `libsqlite3-sys` (`bundled`) | Compiles SQLite from source. `xcode-select --install` / `build-essential`. |
+| `pkg-config` | `audiopus_sys` | Used to locate a system Opus. |
+| **`opus`** | `membrane-discord` → `opus` | **`brew install opus`.** Without it `audiopus_sys` builds Opus from source, and its bundled `CMakeLists.txt` declares `cmake_minimum_required(VERSION <3.5)`, which **CMake 4 rejects**. This is not hypothetical — it broke the first CI run, and it was invisible for months because the dev Macs already had Opus via Homebrew. |
+| Network (first build) | `onnx-runner` → `ort` | `ort` uses `download-binaries`, so the first build fetches ONNX Runtime. Set `ORT_LIB_LOCATION` to use a local copy. |
+| `npm` (conditional) | `philotic-web/build.rs` | Only when `PHILOTIC_DESKTOP_DIR` or `PHILOTIC_REFRESH_DESKTOP_UI` is set — otherwise the committed `ui-dist` is reused. build.rs **panics** if npm is missing. |
+| `rustup` (recommended) | `rust-toolchain.toml` | The 1.94.0 pin is only honoured by rustup. With a Homebrew toolchain the file is inert and local builds drift from CI. |
+
+>Binaries are built to `target/release/`. A full release build emits ~24 binaries (the deployed set is pinned in `AIUA_BINS` in the [justfile](justfile) and mirrored by [.github/workflows/build-linux.yml](.github/workflows/build-linux.yml)). The primary ones:
 
 | Binary | Purpose |
 |---|---|
@@ -62,7 +84,13 @@ Or manually:
 ```bash
 cp mesh-config.example.json mesh-config.json
 # Edit mesh-config.json with your API keys and node identity
-aiua --load-config mesh-config.json
+
+# Apply the config to the Context Graph DB. Run this once on first setup, and
+# again whenever the config changes.
+aiua load --file mesh-config.json --hotel default
+
+# Normal startup then runs purely from the DB — it does not re-read the file.
+aiua --hotel default
 ```
 
 ## Architecture Diagrams
