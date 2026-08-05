@@ -843,6 +843,19 @@ const SESSION_SILENCE_SECS: u64 = 3600;
 /// one.
 const SESSION_SILENCE_MIN_FAILURES: usize = 2;
 
+/// How recent the *newest* failure must be for the silence to count as live.
+///
+/// The upper bound the first cut of this detector was missing. A session that
+/// failed twice and was then abandoned — `ops-glm-verify-3`,
+/// `smoke:life-graph:life.observe`, `mcp-perplexity-uat` — otherwise stays
+/// "silent" forever and re-alerts on every sweep. That shipped, and produced
+/// 264 alerts on mbp-jane inside an hour, every one of them a dead session
+/// whose last failure was 26 days old.
+///
+/// Six hours: long enough to cover an operator who steps away mid-outage and
+/// returns, short enough that a genuinely abandoned session falls out quickly.
+const SESSION_SILENCE_STILL_ACTIVE_SECS: u64 = 6 * 3600;
+
 /// How many recent turns to scan per session when measuring silence.
 const SILENCE_TURN_SCAN: usize = 20;
 
@@ -878,6 +891,7 @@ pub(super) fn detect_session_silence(
 
     let mut failed_turns = 0usize;
     let mut oldest_failure_at: Option<u64> = None;
+    let mut newest_failure_at: Option<u64> = None;
 
     for turn in ordered {
         match turn.status.as_str() {
@@ -888,6 +902,7 @@ pub(super) fn detect_session_silence(
                 failed_turns += 1;
                 if let Some(started) = turn.started_at {
                     oldest_failure_at = Some(started);
+                    newest_failure_at.get_or_insert(started);
                 }
             }
             // `running` is the turn currently in flight, and anything else is
@@ -900,6 +915,21 @@ pub(super) fn detect_session_silence(
     if failed_turns < SESSION_SILENCE_MIN_FAILURES {
         return None;
     }
+
+    // Silence must be bounded at BOTH ends. Without an upper bound, a one-off
+    // session that failed twice and was then abandoned — an ops check, a smoke
+    // run, a UAT probe — looks identical forever to a conversation failing
+    // right now. Shipping only the lower bound produced 264 alerts on mbp-jane
+    // within an hour, every one of them a dead `ops-*` / `smoke:*` session
+    // whose last failure was 26 days old.
+    //
+    // An ongoing outage keeps receiving turns; an abandoned session does not.
+    // So the newest failure has to be recent for this to be live.
+    let newest = newest_failure_at?;
+    if now_secs.saturating_sub(newest) > SESSION_SILENCE_STILL_ACTIVE_SECS {
+        return None;
+    }
+
     let oldest = oldest_failure_at?;
     let silent_secs = now_secs.saturating_sub(oldest);
     if silent_secs < SESSION_SILENCE_SECS {
@@ -1248,10 +1278,67 @@ mod silence_signal_tests {
         assert_eq!(s.failed_turns, 4);
         assert_eq!(s.silent_secs, SESSION_SILENCE_SECS);
 
+        // The operator kept writing — 16:26:37, 16:26:53, 16:26:54 all died
+        // too. While messages keep arriving it keeps paging.
+        let kept_trying = [1_785_004_e3 as u64 + 597, 1_785_004_e3 as u64 + 613];
+        let mut still_going = turns.clone();
+        still_going.extend(kept_trying.iter().map(|&at| t("failed", at)));
+        assert!(
+            detect_session_silence(&still_going, kept_trying[1] + 1800).is_some(),
+            "must keep paging while unanswered turns keep arriving"
+        );
+
+        // …and once the operator gives up for longer than the active window,
+        // it goes quiet. That is correct: it already paged at hour one, and a
+        // conversation nobody is writing to is no longer an ongoing outage.
+        assert!(
+            detect_session_silence(&still_going, kept_trying[1] + 7 * 3600).is_none(),
+            "stops paging once nothing new arrives for longer than the active window"
+        );
+
         // For scale: the operator's "Are you there?" landed ~26 hours after
-        // this point, and was itself swallowed.
-        let when_a_human_noticed = failures[0] + 31 * 3600;
-        assert!(detect_session_silence(&turns, when_a_human_noticed).is_some());
+        // this point and was itself swallowed. The alert this test pins would
+        // have arrived 30 hours before that message was ever typed.
+    }
+
+    /// The false positive that actually shipped. `ops-glm-verify-3`,
+    /// `smoke:life-graph:life.observe`, `mcp-perplexity-uat` and friends are
+    /// one-off sessions that failed twice and were then abandoned. With only a
+    /// lower bound they stayed "silent" forever and re-alerted every sweep —
+    /// 264 entries on mbp-jane inside an hour, last failure 26 days old.
+    ///
+    /// An abandoned session is not an outage. Nobody is waiting on it.
+    #[test]
+    fn an_abandoned_session_stops_alerting() {
+        // A realistic epoch, because 26 days does not fit under the small NOW.
+        let now = 1_786_000_000u64;
+        let abandoned_at = now - 26 * 24 * HOUR;
+        let dead = [t("failed", abandoned_at - HOUR), t("failed", abandoned_at)];
+        assert!(
+            detect_session_silence(&dead, now).is_none(),
+            "a session whose last failure is 26 days old is abandoned, not silent"
+        );
+
+        // The same session, checked while it was actually failing, still pages.
+        assert!(
+            detect_session_silence(&dead, abandoned_at + 600).is_some(),
+            "it must still have alerted at the time it was genuinely failing"
+        );
+    }
+
+    /// The boundary between "still failing" and "abandoned".
+    #[test]
+    fn silence_expires_once_the_newest_failure_goes_stale() {
+        let turns = [
+            t("failed", NOW - SESSION_SILENCE_STILL_ACTIVE_SECS - 2 * HOUR),
+            t("failed", NOW - SESSION_SILENCE_STILL_ACTIVE_SECS + HOUR),
+        ];
+        // Newest failure is inside the active window → still an outage.
+        assert!(detect_session_silence(&turns, NOW).is_some());
+
+        // Roll time forward past the window with no new turns → falls silent.
+        let later = NOW + 2 * SESSION_SILENCE_STILL_ACTIVE_SECS;
+        assert!(detect_session_silence(&turns, later).is_none());
     }
 
     /// The graph listing is not time-ordered.
