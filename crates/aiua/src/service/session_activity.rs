@@ -725,8 +725,29 @@ impl IpcServer {
         let Ok(sessions) = graph.list_sessions() else {
             return 0;
         };
+
+        // One outstanding entry per silent session, not one per sweep.
+        //
+        // The first cut relied on `push_classified`'s 60s flood window, on the
+        // assumption this sweep ran every few minutes. It runs roughly every
+        // 90s, so every silent session cleared the window and re-filed
+        // ~40 times an hour, accumulating as `pending` — which feeds
+        // `heal.queue-depth` (warn >100, critical >500) and would have drowned
+        // the real backlog signal within hours. A persistent fault should be
+        // one aging row, not a stream of them.
+        let already_open: std::collections::HashSet<String> = heal_queue
+            .and_then(|hq| hq.pending_errors(SILENCE_PENDING_SCAN).ok())
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|row| row.pattern_tag.as_deref() == Some("session_silent"))
+            .map(|row| row.guest_id)
+            .collect();
+
         let mut flagged = 0u32;
         for session in sessions.iter().filter(|s| s.status == "active") {
+            if already_open.contains(&session.session_id) {
+                continue;
+            }
             let turns = graph
                 .list_session_turns(&session.session_id, SILENCE_TURN_SCAN)
                 .unwrap_or_default();
@@ -858,6 +879,11 @@ const SESSION_SILENCE_STILL_ACTIVE_SECS: u64 = 6 * 3600;
 
 /// How many recent turns to scan per session when measuring silence.
 const SILENCE_TURN_SCAN: usize = 20;
+
+/// How many pending heal rows to scan when checking for an already-open
+/// `session_silent` entry. Generous: the check exists to stop this sweep from
+/// re-filing, so missing an open row would defeat it.
+const SILENCE_PENDING_SCAN: usize = 500;
 
 /// What a silent session looks like once detected.
 pub(super) struct SessionSilence {
