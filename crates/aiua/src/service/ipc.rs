@@ -3468,6 +3468,14 @@ impl IpcServer {
         true
     }
 
+    /// Deliver a task to every local inbox subscriber for `target_role`.
+    ///
+    /// Returns `true` when at least one subscriber received it. `false` means the
+    /// task was dropped permanently: `SubscribeInbox` does not replay, so a guest
+    /// that subscribes later never sees it. Callers that recorded a session turn
+    /// before dispatching must close it on `false` — otherwise the turn sits
+    /// `running` until the 300s stale-turn reaper mislabels it
+    /// `ZOMBIE_TURN_REPAIR`. See `fail_undelivered_session_turn`.
     pub(crate) async fn deliver_inbound_task(
         inboxes: &InboxRegistry,
         source_node: &str,
@@ -3475,7 +3483,7 @@ impl IpcServer {
         target_guest_id: Option<&str>,
         task_id: Uuid,
         task_json: String,
-    ) {
+    ) -> bool {
         if let Err(err) = Self::hydrate_agent_graph_snapshot(&task_json) {
             warn!(
                 "Failed to hydrate agent graph snapshot before delivering task {} to role='{}' guest={:?}: {}",
@@ -3506,7 +3514,7 @@ impl IpcServer {
                     target_role, task_id
                 ),
             }
-            return;
+            return false;
         }
 
         info!(
@@ -3700,6 +3708,74 @@ impl IpcServer {
             let mut guard = inboxes.lock().await;
             if let Some(entries) = guard.get_mut(target_role) {
                 entries.retain(|subscriber| !stale.contains(&subscriber.conn_id));
+            }
+        }
+        true
+    }
+
+    /// Roles delivered in-process by the hotel itself, which by design never
+    /// have an inbox subscriber (see `deliver_event_envelope_or_park`). An
+    /// empty subscriber set is normal for these, so they must be exempt from
+    /// undelivered-task accounting or every one would file a false failure.
+    pub(crate) fn is_hotel_intercepted_role(role: &str) -> bool {
+        role == philotic_client::OPERATOR_SURFACE_QUERY_ROLE
+            || role == philotic_client::MEMORY_WRITE_FORWARD_ROLE
+    }
+
+    /// A local task was accepted, then dropped because no guest serves its role.
+    /// Close the turn now and file the reason.
+    ///
+    /// `EmitTask` records the turn `running` before dispatching, and a dropped
+    /// task leaves nothing to move it off that state, so it used to sit until
+    /// `RepairStaleSessionTurns` failed it 300s later as `ZOMBIE_TURN_REPAIR`.
+    /// That reads as a timeout and hides the cause: a missing
+    /// `egress-http-runner` guest produced a phantom ~315s "stuck turn" every
+    /// 6h on every hotel for over a week, and `model-catalog-sync` never once
+    /// succeeded, because the only signal was a reaper message about staleness.
+    ///
+    /// This is deliberately a post-drop report rather than a pre-accept
+    /// rejection. Delivery here can be rewritten by a Golgi pipeline, satisfied
+    /// by the `Park` branch's on-demand materialization, or handled in-process
+    /// for the roles `is_hotel_intercepted_role` names — so "no subscriber right
+    /// now" is not sufficient grounds to refuse the task, and refusing early
+    /// would break all three. Once delivery has actually returned `false` the
+    /// drop is final: `SubscribeInbox` does not replay.
+    fn report_unserved_local_role(
+        graph: &GraphDomain,
+        heal_queue: Option<&dyn ansible_mesh_core::heal_queue::HealQueueStorage>,
+        target_role: &str,
+        target_guest_id: Option<&str>,
+        task_id: Uuid,
+        task_json: &str,
+    ) {
+        if Self::is_hotel_intercepted_role(target_role) {
+            return;
+        }
+        let guest_suffix = target_guest_id
+            .map(|g| format!(" guest [{g}]"))
+            .unwrap_or_default();
+        let message = format!(
+            "[emit_task_unserved_local_role] task {task_id} for local role [{target_role}]{guest_suffix} \
+             was accepted but no guest on this hotel subscribes that role — dropped undelivered \
+             (SubscribeInbox does not replay). Materialize a guest for this role."
+        );
+        warn!(
+            %task_id,
+            target_role,
+            target_guest_id = target_guest_id.unwrap_or("-"),
+            "EmitTask: local role has no subscriber — task dropped, failing its turn now"
+        );
+        if let Ok(payload) = serde_json::from_str::<serde_json::Value>(task_json) {
+            Self::fail_undelivered_session_turn(graph, &payload, "TARGET_ROLE_UNSERVED", &message);
+        }
+        if let Some(hq) = heal_queue {
+            if let Err(err) = hq.push_classified(
+                "aiua.emit_task_route",
+                &message,
+                "medium",
+                "emit_task_unserved_local_role",
+            ) {
+                warn!(error = %err, "Failed to push unserved-local-role to heal queue");
             }
         }
     }
@@ -6121,7 +6197,7 @@ impl IpcServer {
                                     "Golgi: intercepting task {} → capability '{}'",
                                     task_id, cap_role
                                 );
-                                Self::deliver_inbound_task(
+                                let delivered = Self::deliver_inbound_task(
                                     inboxes,
                                     local_node_id,
                                     &cap_role,
@@ -6130,16 +6206,31 @@ impl IpcServer {
                                     cap_json,
                                 )
                                 .await;
+                                if !delivered {
+                                    Self::report_unserved_local_role(
+                                        graph, heal_queue, &cap_role, None, task_id, &task_json,
+                                    );
+                                }
                             } else {
-                                Self::deliver_inbound_task(
+                                let delivered = Self::deliver_inbound_task(
                                     inboxes,
                                     local_node_id,
                                     &target_role,
                                     target_guest_id.as_deref(),
                                     task_id,
-                                    task_json,
+                                    task_json.clone(),
                                 )
                                 .await;
+                                if !delivered {
+                                    Self::report_unserved_local_role(
+                                        graph,
+                                        heal_queue,
+                                        &target_role,
+                                        target_guest_id.as_deref(),
+                                        task_id,
+                                        &task_json,
+                                    );
+                                }
                             }
                         }
                         AgentRouteResolution::Park { guest_id } => {
@@ -19513,6 +19604,210 @@ pub(crate) mod tests {
             .is_err(),
             "unreachable task must not be appended to the ledger"
         );
+
+        unsafe {
+            std::env::remove_var("PHILOTIC_HOTEL_SOCKET");
+        }
+        server_task.abort();
+        let _ = server_task.await;
+        if Path::new(&socket_path).exists() {
+            let _ = std::fs::remove_file(&socket_path);
+        }
+    }
+
+    /// A task emitted to a LOCAL role that no guest subscribes is dropped
+    /// permanently (`SubscribeInbox` does not replay). Its turn must be failed
+    /// right there with the real reason, not left `running` for the 300s
+    /// stale-turn reaper to relabel `ZOMBIE_TURN_REPAIR` — that relabelling is
+    /// what disguised a missing `egress-http-runner` as a ~315s timeout for
+    /// over a week while `model-catalog-sync` never once succeeded.
+    #[tokio::test]
+    async fn emit_task_to_unserved_local_role_fails_the_turn_immediately() {
+        let _env_guard = ipc_env_guard();
+        let socket_path = test_socket_path();
+        let (dispatcher_tx, _dispatcher_rx) = test_dispatcher_channel();
+        let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
+        let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
+        let heal_queue = Arc::new(RecordingHealQueue::default());
+        let server = IpcServer::new(
+            socket_path.clone(),
+            "local-aiua-01",
+            dispatcher_tx,
+            graph.clone(),
+        )
+        .with_heal_queue(heal_queue.clone());
+        let server_task = tokio::spawn(async move {
+            server.run().await.expect("ipc server should run");
+        });
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        unsafe {
+            std::env::set_var("PHILOTIC_HOTEL_SOCKET", &socket_path);
+        }
+
+        let mut caller = PhiloticClient::connect(GuestIdentity {
+            guest_id: "unserved-role-caller".into(),
+            role: "unserved-role-caller".into(),
+            supported_tools: Vec::new(),
+        })
+        .await
+        .expect("caller connect");
+
+        // Nothing ever subscribes "egress-http-runner" in this test hotel —
+        // exactly the live fleet condition.
+        caller
+            .send_request(IpcRequest::EmitTask {
+                target_node: "local-aiua-01".into(),
+                target_role: "egress-http-runner".into(),
+                target_guest_id: None,
+                task_json: serde_json::json!({
+                    "action": "execute_tool",
+                    "tool_name": "integration.http.model-catalog-openrouter.request",
+                    "session_id": "system:model-catalog-sync",
+                    "turn_id": "turn-unserved"
+                })
+                .to_string(),
+            })
+            .await
+            .expect("emit task response");
+
+        // Give the delivery attempt a moment to conclude.
+        tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+
+        let turn = graph
+            .get_session_turn("system:model-catalog-sync", "turn-unserved")
+            .expect("turn lookup")
+            .expect("turn recorded");
+        assert_eq!(
+            turn.status, "failed",
+            "an undelivered task must not leave its turn running: {turn:?}"
+        );
+        assert!(
+            turn.completed_at.is_some(),
+            "a failed turn must be closed, not left open for the reaper"
+        );
+        let err = turn.error_json.expect("error recorded");
+        assert_eq!(err["error"], "TARGET_ROLE_UNSERVED");
+        assert!(
+            err["reason"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("egress-http-runner"),
+            "the reason must name the unserved role: {err}"
+        );
+
+        let pushed = heal_queue.pushed.lock().unwrap();
+        assert!(
+            pushed
+                .iter()
+                .any(|entry| entry.3 == "emit_task_unserved_local_role"),
+            "the drop must reach the heal queue: {pushed:?}"
+        );
+        drop(pushed);
+
+        unsafe {
+            std::env::remove_var("PHILOTIC_HOTEL_SOCKET");
+        }
+        server_task.abort();
+        let _ = server_task.await;
+        if Path::new(&socket_path).exists() {
+            let _ = std::fs::remove_file(&socket_path);
+        }
+    }
+
+    /// The roles the hotel delivers in-process never have a subscriber by
+    /// design, so an empty subscriber set is normal for them. They must be
+    /// exempt, or every forwarded memory write would file a false failure.
+    #[test]
+    fn hotel_intercepted_roles_are_exempt_from_unserved_reporting() {
+        assert!(IpcServer::is_hotel_intercepted_role(
+            philotic_client::MEMORY_WRITE_FORWARD_ROLE
+        ));
+        assert!(IpcServer::is_hotel_intercepted_role(
+            philotic_client::OPERATOR_SURFACE_QUERY_ROLE
+        ));
+        assert!(!IpcServer::is_hotel_intercepted_role("egress-http-runner"));
+        assert!(!IpcServer::is_hotel_intercepted_role("agent"));
+    }
+
+    /// Guard the other direction: a role WITH a live subscriber must deliver
+    /// normally and must not be reported or failed.
+    #[tokio::test]
+    async fn emit_task_to_served_local_role_delivers_and_reports_nothing() {
+        let _env_guard = ipc_env_guard();
+        let socket_path = test_socket_path();
+        let (dispatcher_tx, _dispatcher_rx) = test_dispatcher_channel();
+        let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
+        let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
+        let heal_queue = Arc::new(RecordingHealQueue::default());
+        let server = IpcServer::new(
+            socket_path.clone(),
+            "local-aiua-01",
+            dispatcher_tx,
+            graph.clone(),
+        )
+        .with_heal_queue(heal_queue.clone());
+        let server_task = tokio::spawn(async move {
+            server.run().await.expect("ipc server should run");
+        });
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        unsafe {
+            std::env::set_var("PHILOTIC_HOTEL_SOCKET", &socket_path);
+        }
+
+        let mut runner = PhiloticClient::connect(GuestIdentity {
+            guest_id: "served-runner".into(),
+            role: "served-runner".into(),
+            supported_tools: Vec::new(),
+        })
+        .await
+        .expect("runner connect");
+        runner
+            .send_request(IpcRequest::SubscribeInbox {
+                role: "served-runner".into(),
+            })
+            .await
+            .expect("subscribe");
+
+        let mut caller = PhiloticClient::connect(GuestIdentity {
+            guest_id: "served-caller".into(),
+            role: "served-caller".into(),
+            supported_tools: Vec::new(),
+        })
+        .await
+        .expect("caller connect");
+        caller
+            .send_request(IpcRequest::EmitTask {
+                target_node: "local-aiua-01".into(),
+                target_role: "served-runner".into(),
+                target_guest_id: None,
+                task_json: serde_json::json!({
+                    "action": "execute_tool",
+                    "session_id": "system:served",
+                    "turn_id": "turn-served"
+                })
+                .to_string(),
+            })
+            .await
+            .expect("emit task response");
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+
+        let turn = graph
+            .get_session_turn("system:served", "turn-served")
+            .expect("turn lookup")
+            .expect("turn recorded");
+        assert_ne!(
+            turn.status, "failed",
+            "a delivered task must not be failed: {turn:?}"
+        );
+        let pushed = heal_queue.pushed.lock().unwrap();
+        assert!(
+            !pushed
+                .iter()
+                .any(|entry| entry.3 == "emit_task_unserved_local_role"),
+            "a delivered task must file no unserved-role report: {pushed:?}"
+        );
+        drop(pushed);
 
         unsafe {
             std::env::remove_var("PHILOTIC_HOTEL_SOCKET");

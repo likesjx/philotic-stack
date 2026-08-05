@@ -101,6 +101,44 @@ impl IpcServer {
         });
     }
 
+    /// Close a turn whose task was accepted but then dropped undelivered.
+    ///
+    /// `EmitTask` records the turn `running` before it dispatches. When local
+    /// delivery finds no subscriber the task is discarded permanently —
+    /// `SubscribeInbox` does not replay, so a guest that subscribes later never
+    /// sees it — and nothing was left to move that turn off `running`. It sat
+    /// until `RepairStaleSessionTurns` failed it 300s later as
+    /// `ZOMBIE_TURN_REPAIR`, which reads as a timeout and hides the real cause.
+    /// A missing `egress-http-runner` presented that way for over a week.
+    ///
+    /// Recording the true reason at the moment of the drop turns a phantom
+    /// ~315s "stuck turn" into an immediate, correctly-attributed failure.
+    pub(super) fn fail_undelivered_session_turn(
+        graph: &GraphDomain,
+        payload: &serde_json::Value,
+        error_code: &str,
+        reason: &str,
+    ) {
+        let envelope = Self::extract_session_envelope(payload);
+        let (Some(session_id), Some(turn_id)) = (envelope.session_id, envelope.turn_id) else {
+            return;
+        };
+        let Ok(Some(mut turn)) = graph.get_session_turn(&session_id, &turn_id) else {
+            return;
+        };
+        // Only rescue a turn still in flight. A turn that already reached a
+        // terminal state must not be rewritten by a late drop notice.
+        if turn.status != "running" && turn.status != "queued" {
+            return;
+        }
+        turn.status = "failed".into();
+        turn.error_json = Some(serde_json::json!({"error": error_code, "reason": reason}));
+        turn.completed_at = Some(unix_ts());
+        if let Err(e) = graph.upsert_session_turn(&turn) {
+            warn!("fail_undelivered_session_turn: {session_id}:{turn_id}: {e}");
+        }
+    }
+
     pub(super) fn record_session_activity_from_value(
         graph: &GraphDomain,
         payload: &serde_json::Value,
