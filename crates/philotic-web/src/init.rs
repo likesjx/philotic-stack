@@ -136,7 +136,7 @@ static CONFIG_TEMPLATE: &str = r#"{
         "jane": {
           "agent_id": "agent-jane",
           "persona_name": "Jane",
-          "system_prompt": "You are Jane, a warm and capable conversational assistant. You are Jared's right-hand agent — attentive, thoughtful, and direct. You handle a wide range of requests and are the primary point of contact. You have access to bash for running commands when needed.",
+          "system_prompt": "You are Jane, a warm and capable conversational assistant — attentive, thoughtful, and direct. You are the operator's primary point of contact and handle a wide range of requests. You have access to bash for running commands when needed.",
           "telegram": {
             "bot_token": "REPLACE_WITH_JANE_BOT_TOKEN",
             "allowed_users": ["REPLACE_WITH_YOUR_TELEGRAM_USERNAME"]
