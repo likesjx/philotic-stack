@@ -20,6 +20,7 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 use tokio::time::{Instant, timeout};
+use tracing::warn;
 use uuid::Uuid;
 
 const RUNNER_ROLE: &str = "egress-http-runner";
@@ -172,40 +173,98 @@ impl GovernedHttpService {
 
         let deadline = Instant::now()
             + Duration::from_secs(entry_timeout_secs(&task).saturating_add(10).max(15));
-        loop {
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
-                bail!(
-                    "timed out waiting for governed HTTP operation '{}'",
-                    operation
-                );
+        let outcome: Result<Response> = async {
+            loop {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    bail!(
+                        "timed out waiting for governed HTTP operation '{}'",
+                        operation
+                    );
+                }
+                let message =
+                    timeout(remaining, client.recv_task())
+                        .await
+                        .with_context(|| {
+                            format!("timed out waiting for governed HTTP operation '{operation}'")
+                        })??;
+                let IpcResponse::InboundTask { task_json, .. } = message else {
+                    continue;
+                };
+                let envelope: Value = serde_json::from_str(&task_json)
+                    .context("invalid governed HTTP reply envelope")?;
+                if envelope.get("correlation_id").and_then(Value::as_str)
+                    != Some(correlation_id.as_str())
+                    && envelope.get("turn_id").and_then(Value::as_str)
+                        != Some(correlation_id.as_str())
+                {
+                    continue;
+                }
+                if let Some(error) = envelope.get("error") {
+                    bail!("governed HTTP operation '{operation}' failed: {error}");
+                }
+                return serde_json::from_value(
+                    envelope
+                        .get("result")
+                        .cloned()
+                        .ok_or_else(|| anyhow!("governed HTTP reply omitted result"))?,
+                )
+                .with_context(|| format!("decoding governed operation '{operation}' response"));
             }
-            let message = timeout(remaining, client.recv_task())
-                .await
-                .with_context(|| {
-                    format!("timed out waiting for governed HTTP operation '{operation}'")
-                })??;
-            let IpcResponse::InboundTask { task_json, .. } = message else {
-                continue;
-            };
-            let envelope: Value =
-                serde_json::from_str(&task_json).context("invalid governed HTTP reply envelope")?;
-            if envelope.get("correlation_id").and_then(Value::as_str)
-                != Some(correlation_id.as_str())
-                && envelope.get("turn_id").and_then(Value::as_str) != Some(correlation_id.as_str())
-            {
-                continue;
-            }
-            if let Some(error) = envelope.get("error") {
-                bail!("governed HTTP operation '{operation}' failed: {error}");
-            }
-            return serde_json::from_value(
-                envelope
-                    .get("result")
-                    .cloned()
-                    .ok_or_else(|| anyhow!("governed HTTP reply omitted result"))?,
-            )
-            .with_context(|| format!("decoding governed operation '{operation}' response"));
+        }
+        .await;
+
+        // Close the turn this call opened, on EVERY exit path.
+        //
+        // Emitting the request made the hotel record a `running` session turn.
+        // Nothing else will ever close it: this service is the only party that
+        // knows the outcome, and it used to just return. The turn then sat until
+        // `RepairStaleSessionTurns` failed it 300s later as `ZOMBIE_TURN_REPAIR`
+        // — so a *successful* catalog sync (work done in ~15s) still logged a
+        // ~691s "stuck turn", and a fleet of them read as timeouts for a week.
+        Self::close_turn(
+            &mut client,
+            &session_id,
+            &correlation_id,
+            &outcome,
+            operation,
+        )
+        .await;
+
+        outcome
+    }
+
+    /// Mark this service's session turn terminal so it never reaches the
+    /// stale-turn reaper. Best-effort: a failure to close is logged, never
+    /// propagated, because it must not mask the operation's own result.
+    async fn close_turn<Response>(
+        client: &mut PhiloticClient,
+        session_id: &str,
+        turn_id: &str,
+        outcome: &Result<Response>,
+        operation: &str,
+    ) {
+        let request = match outcome {
+            Ok(_) => IpcRequest::CompleteTask {
+                task_id: Uuid::new_v4(),
+                result: json!({ "session_id": session_id, "turn_id": turn_id }),
+            },
+            Err(err) => IpcRequest::FailTask {
+                task_id: Uuid::new_v4(),
+                error_code: "GOVERNED_EGRESS_FAILED".into(),
+                reason: format!("governed operation '{operation}' failed: {err:#}"),
+                session_id: Some(session_id.to_string()),
+                turn_id: Some(turn_id.to_string()),
+            },
+        };
+        if let Err(err) = client
+            .send_request_with_timeout(request, Duration::from_secs(10))
+            .await
+        {
+            warn!(
+                session_id,
+                turn_id, "governed HTTP: failed to close session turn: {err:#}"
+            );
         }
     }
 }
