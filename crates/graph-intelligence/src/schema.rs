@@ -21,6 +21,11 @@ impl C4Level {
         }
     }
 
+    /// Deliberately NOT `std::str::FromStr`: this is a lenient parser over
+    /// values written by hand in docs and frontmatter, where an unrecognised
+    /// string is simply "not one of these" rather than an error. `FromStr`
+    /// would force a `Result` and an error type every caller would discard.
+    #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Option<Self> {
         match s {
             "c1_context" | "context" => Some(Self::Context),
@@ -198,6 +203,11 @@ impl NodeKind {
         }
     }
 
+    /// Deliberately NOT `std::str::FromStr`: this is a lenient parser over
+    /// values written by hand in docs and frontmatter, where an unrecognised
+    /// string is simply "not one of these" rather than an error. `FromStr`
+    /// would force a `Result` and an error type every caller would discard.
+    #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Option<Self> {
         match s {
             "proposal" => Some(Self::Proposal),
@@ -321,6 +331,11 @@ impl EdgeRelation {
         }
     }
 
+    /// Deliberately NOT `std::str::FromStr`: this is a lenient parser over
+    /// values written by hand in docs and frontmatter, where an unrecognised
+    /// string is simply "not one of these" rather than an error. `FromStr`
+    /// would force a `Result` and an error type every caller would discard.
+    #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Option<Self> {
         match s {
             "implements" => Some(Self::Implements),
@@ -401,6 +416,11 @@ impl SnippetKind {
         }
     }
 
+    /// Deliberately NOT `std::str::FromStr`: this is a lenient parser over
+    /// values written by hand in docs and frontmatter, where an unrecognised
+    /// string is simply "not one of these" rather than an error. `FromStr`
+    /// would force a `Result` and an error type every caller would discard.
+    #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Option<Self> {
         match s {
             "function" => Some(Self::Function),
