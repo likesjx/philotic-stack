@@ -430,10 +430,13 @@ mod tests {
     /// its id matches one of `succeed_on`. Tracks every task it was invoked
     /// with so tests can assert which (provider, model) pairs were actually
     /// tried, and in what order.
+    /// (model_id, prompt) pairs recorded by the stub provider.
+    type InvocationLog = Arc<std::sync::Mutex<Vec<(String, Option<String>)>>>;
+
     struct ScriptedProvider {
         id: &'static str,
         fail: bool,
-        invocations: Arc<std::sync::Mutex<Vec<(String, Option<String>)>>>,
+        invocations: InvocationLog,
         call_count: Arc<AtomicUsize>,
     }
 

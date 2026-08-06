@@ -489,11 +489,11 @@ impl ControllerTask {
             }
         }
 
-        if let Some(active_turn) = self.context.active_turn.as_ref() {
-            if let Some(text) = active_turn.text_content() {
-                let role = active_turn.role.as_deref().unwrap_or("user");
-                sections.push(format!("[Active turn]\n{role}: {text}"));
-            }
+        if let Some(active_turn) = self.context.active_turn.as_ref()
+            && let Some(text) = active_turn.text_content()
+        {
+            let role = active_turn.role.as_deref().unwrap_or("user");
+            sections.push(format!("[Active turn]\n{role}: {text}"));
         }
 
         if !self.context.tool_history.is_empty() {

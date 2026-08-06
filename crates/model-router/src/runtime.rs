@@ -564,15 +564,15 @@ pub async fn run_model_controller(config: ControllerGuestConfig) -> Result<()> {
                                     model_id,
                                     None,
                                 );
-                                if let Some(ref gd) = graph_domain {
-                                    if let Err(e) = gd.observe_model_outcome(
+                                if let Some(ref gd) = graph_domain
+                                    && let Err(e) = gd.observe_model_outcome(
                                         &provider_id,
                                         &local_node_id(),
                                         latency_ms,
                                         true,
-                                    ) {
-                                        warn!("observe_model_outcome (success): {e}");
-                                    }
+                                    )
+                                {
+                                    warn!("observe_model_outcome (success): {e}");
                                 }
                                 fire_transcription_capture_fanout(
                                     &controller_task,
@@ -901,11 +901,10 @@ pub async fn run_model_controller(config: ControllerGuestConfig) -> Result<()> {
 
                             match attempt_result {
                                 Ok(output) => {
-                                    if provider.id() == "gemini" {
-                                        if let Some(idx) = active_pool_member {
+                                    if provider.id() == "gemini"
+                                        && let Some(idx) = active_pool_member {
                                             gemini_pool.note_success(idx);
                                         }
-                                    }
                                     result = Some(Ok(output));
                                     break;
                                 }
@@ -1025,15 +1024,15 @@ pub async fn run_model_controller(config: ControllerGuestConfig) -> Result<()> {
                                 model_id,
                                 None,
                             );
-                            if let Some(ref gd) = graph_domain {
-                                if let Err(e) = gd.observe_model_outcome(
+                            if let Some(ref gd) = graph_domain
+                                && let Err(e) = gd.observe_model_outcome(
                                     &provider_id,
                                     &local_node_id(),
                                     latency_ms,
                                     true,
-                                ) {
-                                    warn!("observe_model_outcome (success): {e}");
-                                }
+                                )
+                            {
+                                warn!("observe_model_outcome (success): {e}");
                             }
 
                             // ── Transcription flywheel fan-out ────────────────
@@ -1072,15 +1071,15 @@ pub async fn run_model_controller(config: ControllerGuestConfig) -> Result<()> {
                                 None,
                                 None,
                             );
-                            if let Some(ref gd) = graph_domain {
-                                if let Err(e) = gd.observe_model_outcome(
+                            if let Some(ref gd) = graph_domain
+                                && let Err(e) = gd.observe_model_outcome(
                                     &provider_id,
                                     &local_node_id(),
                                     latency_ms,
                                     false,
-                                ) {
-                                    warn!("observe_model_outcome (failure): {e}");
-                                }
+                                )
+                            {
+                                warn!("observe_model_outcome (failure): {e}");
                             }
                             error!("Provider invocation failed: {}", err);
                             emit_failure(
@@ -1231,18 +1230,16 @@ async fn handle_stream_frame(
             if let (Some(session_id), Some(reply)) = (
                 transcribe_stream::stream_session_id(task_value),
                 transcribe_stream::reply_address(task_value),
-            ) {
-                if let Ok(mut sink) = IpcStreamReplySink::connect(controller_guest_id, reply).await
-                {
-                    let _ = sink
-                        .send(
-                            session_id,
-                            "",
-                            true,
-                            Some(&format!("invalid stream frame: {err}")),
-                        )
-                        .await;
-                }
+            ) && let Ok(mut sink) = IpcStreamReplySink::connect(controller_guest_id, reply).await
+            {
+                let _ = sink
+                    .send(
+                        session_id,
+                        "",
+                        true,
+                        Some(&format!("invalid stream frame: {err}")),
+                    )
+                    .await;
             }
         }
     }
@@ -1803,10 +1800,9 @@ fn extract_http_status(message: &str) -> Option<u16> {
         if let Ok(n) = std::str::from_utf8(&bytes[i..i + 3])
             .unwrap_or("")
             .parse::<u16>()
+            && (400..=599).contains(&n)
         {
-            if (400..=599).contains(&n) {
-                return Some(n);
-            }
+            return Some(n);
         }
     }
     None
@@ -1981,6 +1977,11 @@ fn extract_output_model_gen(output: &ProviderOutput) -> Option<String> {
 /// Record a routing decision into the training-tap store, if one is open.
 ///
 /// Failures to write are logged as warnings and do not abort the request path.
+// All nine parameters are flat fields of one RouterTrainingRecord, so a
+// RoutingTrace struct would genuinely read better than this positional list.
+// Not done here: there are nine call sites and the win is cosmetic, so it is
+// left as a deliberate follow-up rather than a rushed positional rewrite.
+#[allow(clippy::too_many_arguments)]
 fn record_routing_trace(
     store: Option<&dyn RouterTraceStorage>,
     reply: &ReplyRoute,

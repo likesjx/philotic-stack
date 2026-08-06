@@ -250,7 +250,7 @@ impl GeminiProvider {
         let model = task
             .model
             .as_deref()
-            .or_else(|| task.routing_hints.model_ref.as_deref())
+            .or(task.routing_hints.model_ref.as_deref())
             .unwrap_or(GEMINI_LIVE_DEFAULT_MODEL);
         if model.starts_with("models/") {
             model.to_string()
@@ -310,10 +310,10 @@ impl GeminiProvider {
     /// to `None` (standard/unset) — the wire payload is then byte-for-byte
     /// unchanged from before this feature existed.
     fn apply_safety_settings(payload: &mut Value, content_policy: Option<&str>) {
-        if let Some(settings) = Self::safety_settings_for_content_policy(content_policy) {
-            if let Value::Object(map) = payload {
-                map.insert("safetySettings".to_string(), settings);
-            }
+        if let Some(settings) = Self::safety_settings_for_content_policy(content_policy)
+            && let Value::Object(map) = payload
+        {
+            map.insert("safetySettings".to_string(), settings);
         }
     }
 
@@ -731,17 +731,17 @@ impl GeminiProvider {
                 // Fail loud in debug/test builds if a sanitized declaration is
                 // still structurally invalid for Gemini, so catalog schema drift
                 // is caught at build time instead of as a live empty-details 400.
-                if cfg!(debug_assertions) {
-                    if let Err(reason) = Self::validate_gemini_declaration_schema(
+                if cfg!(debug_assertions)
+                    && let Err(reason) = Self::validate_gemini_declaration_schema(
                         &parameters,
                         &format!("{alias}.parameters"),
                         true,
-                    ) {
-                        debug_assert!(
-                            false,
-                            "sanitized Gemini declaration [{alias}] is invalid: {reason}"
-                        );
-                    }
+                    )
+                {
+                    debug_assert!(
+                        false,
+                        "sanitized Gemini declaration [{alias}] is invalid: {reason}"
+                    );
                 }
 
                 Some(json!({
@@ -1389,8 +1389,7 @@ impl GeminiProvider {
     {
         ws.send(WsMessage::Text(
             serde_json::to_string(payload)
-                .context("failed to serialize Gemini Live websocket payload")?
-                .into(),
+                .context("failed to serialize Gemini Live websocket payload")?,
         ))
         .await
         .context("failed to send Gemini Live websocket payload")
@@ -1950,10 +1949,8 @@ impl ModelProvider for GeminiProvider {
         }
 
         if use_structured {
-            if has_tools {
-                if let Some(tool_call) = Self::parse_native_function_call(task, &body)? {
-                    return Ok(tool_call);
-                }
+            if has_tools && let Some(tool_call) = Self::parse_native_function_call(task, &body)? {
+                return Ok(tool_call);
             }
 
             let (content, spoken_text, memory_concept, memory_candidate, active_plan) =
@@ -1961,10 +1958,9 @@ impl ModelProvider for GeminiProvider {
 
             if let Ok(parsed) =
                 serde_json::from_str::<Value>(Self::strip_json_code_fences(&content))
+                && let Some(tool_call) = Self::parse_tool_call_candidate(task, &parsed)?
             {
-                if let Some(tool_call) = Self::parse_tool_call_candidate(task, &parsed)? {
-                    return Ok(tool_call);
-                }
+                return Ok(tool_call);
             }
 
             if content.trim().is_empty() {
@@ -2192,14 +2188,14 @@ impl ModelProvider for GeminiProvider {
                             // carry both a text part and a functionCall part simultaneously.
                             // Using a separate `if` (not `else if`) ensures the function call
                             // is captured even when text was also present in the same chunk.
-                            if pending_function_call.is_none() {
-                                if let Some(fc_chunk) = Self::parse_sse_function_call_chunk(&line) {
-                                    match Self::parse_native_function_call(task, &fc_chunk) {
-                                        Ok(Some(tc)) => pending_function_call = Some(tc),
-                                        Ok(None) => {}
-                                        Err(e) => {
-                                            warn!("Failed to parse SSE function call chunk: {}", e)
-                                        }
+                            if pending_function_call.is_none()
+                                && let Some(fc_chunk) = Self::parse_sse_function_call_chunk(&line)
+                            {
+                                match Self::parse_native_function_call(task, &fc_chunk) {
+                                    Ok(Some(tc)) => pending_function_call = Some(tc),
+                                    Ok(None) => {}
+                                    Err(e) => {
+                                        warn!("Failed to parse SSE function call chunk: {}", e)
                                     }
                                 }
                             }
@@ -2231,14 +2227,14 @@ impl ModelProvider for GeminiProvider {
                 if let Some(text_chunk) = Self::parse_sse_text_chunk(&line) {
                     full_text.push_str(&text_chunk);
                 }
-                if pending_function_call.is_none() {
-                    if let Some(fc_chunk) = Self::parse_sse_function_call_chunk(&line) {
-                        match Self::parse_native_function_call(task, &fc_chunk) {
-                            Ok(Some(tc)) => pending_function_call = Some(tc),
-                            Ok(None) => {}
-                            Err(e) => {
-                                warn!("Failed to parse SSE function call chunk: {}", e)
-                            }
+                if pending_function_call.is_none()
+                    && let Some(fc_chunk) = Self::parse_sse_function_call_chunk(&line)
+                {
+                    match Self::parse_native_function_call(task, &fc_chunk) {
+                        Ok(Some(tc)) => pending_function_call = Some(tc),
+                        Ok(None) => {}
+                        Err(e) => {
+                            warn!("Failed to parse SSE function call chunk: {}", e)
                         }
                     }
                 }
@@ -2291,10 +2287,9 @@ impl ModelProvider for GeminiProvider {
                 Self::parse_structured_response(reqwest::StatusCode::OK, body.clone());
             if let Ok(parsed) =
                 serde_json::from_str::<Value>(Self::strip_json_code_fences(&content))
+                && let Some(tool_call) = Self::parse_tool_call_candidate(task, &parsed)?
             {
-                if let Some(tool_call) = Self::parse_tool_call_candidate(task, &parsed)? {
-                    return Ok(tool_call);
-                }
+                return Ok(tool_call);
             }
             if content.trim().is_empty() {
                 bail!("Gemini streaming returned an empty structured response");
@@ -2616,6 +2611,77 @@ impl GeminiProvider {
 
         Ok(())
     }
+}
+
+fn attachment_mime_type(attachment: &AttachmentInput) -> Option<Cow<'_, str>> {
+    attachment
+        .mime_type
+        .as_deref()
+        .map(normalize_attachment_mime_type)
+        .or(match attachment.kind.as_deref() {
+            Some("photo") | Some("image") => Some(Cow::Borrowed("image/jpeg")),
+            Some("voice") => Some(Cow::Borrowed("audio/ogg")),
+            Some("sticker") => Some(Cow::Borrowed("image/webp")),
+            _ => None,
+        })
+}
+
+fn normalize_attachment_mime_type(mime_type: &str) -> Cow<'_, str> {
+    let normalized = mime_type.trim();
+    if normalized.eq_ignore_ascii_case("text/x-web-markdown")
+        || normalized.eq_ignore_ascii_case("text/markdown")
+        || normalized.eq_ignore_ascii_case("text/x-markdown")
+    {
+        Cow::Borrowed("text/plain")
+    } else {
+        Cow::Borrowed(normalized)
+    }
+}
+
+/// Convert base64-encoded i16 LE PCM audio to a WAV-format byte vector.
+///
+/// Builds a minimal RIFF/WAV header followed by the raw PCM data so that
+/// Gemini (and other providers) can consume it as `audio/wav`.
+fn pcm_i16_b64_to_wav(pcm_b64: &str, sample_rate: u32, channels: u16) -> Result<Vec<u8>> {
+    use base64::Engine;
+    let pcm_bytes = BASE64_STANDARD
+        .decode(pcm_b64)
+        .context("failed to base64-decode inline PCM audio")?;
+
+    // Validate byte alignment (each i16 sample = 2 bytes)
+    if pcm_bytes.len() % 2 != 0 {
+        anyhow::bail!("inline PCM audio has odd byte count ({})", pcm_bytes.len());
+    }
+
+    let bits_per_sample: u16 = 16;
+    let byte_rate = sample_rate * u32::from(channels) * u32::from(bits_per_sample) / 8;
+    let block_align: u16 = channels * bits_per_sample / 8;
+    let data_len = pcm_bytes.len() as u32;
+    let chunk_size = 36 + data_len; // 4-byte RIFF size field = header - 8 + data
+
+    let mut wav = Vec::with_capacity(44 + pcm_bytes.len());
+
+    // RIFF header
+    wav.extend_from_slice(b"RIFF");
+    wav.extend_from_slice(&chunk_size.to_le_bytes());
+    wav.extend_from_slice(b"WAVE");
+
+    // fmt sub-chunk
+    wav.extend_from_slice(b"fmt ");
+    wav.extend_from_slice(&16u32.to_le_bytes()); // sub-chunk size = 16 for PCM
+    wav.extend_from_slice(&1u16.to_le_bytes()); // AudioFormat = PCM
+    wav.extend_from_slice(&channels.to_le_bytes());
+    wav.extend_from_slice(&sample_rate.to_le_bytes());
+    wav.extend_from_slice(&byte_rate.to_le_bytes());
+    wav.extend_from_slice(&block_align.to_le_bytes());
+    wav.extend_from_slice(&bits_per_sample.to_le_bytes());
+
+    // data sub-chunk
+    wav.extend_from_slice(b"data");
+    wav.extend_from_slice(&data_len.to_le_bytes());
+    wav.extend_from_slice(&pcm_bytes);
+
+    Ok(wav)
 }
 
 #[cfg(test)]
@@ -3961,75 +4027,4 @@ mod tests {
         });
         assert!(GeminiProvider::detect_content_policy_block(&unspecified).is_none());
     }
-}
-
-fn attachment_mime_type(attachment: &AttachmentInput) -> Option<Cow<'_, str>> {
-    attachment
-        .mime_type
-        .as_deref()
-        .map(normalize_attachment_mime_type)
-        .or_else(|| match attachment.kind.as_deref() {
-            Some("photo") | Some("image") => Some(Cow::Borrowed("image/jpeg")),
-            Some("voice") => Some(Cow::Borrowed("audio/ogg")),
-            Some("sticker") => Some(Cow::Borrowed("image/webp")),
-            _ => None,
-        })
-}
-
-fn normalize_attachment_mime_type(mime_type: &str) -> Cow<'_, str> {
-    let normalized = mime_type.trim();
-    if normalized.eq_ignore_ascii_case("text/x-web-markdown")
-        || normalized.eq_ignore_ascii_case("text/markdown")
-        || normalized.eq_ignore_ascii_case("text/x-markdown")
-    {
-        Cow::Borrowed("text/plain")
-    } else {
-        Cow::Borrowed(normalized)
-    }
-}
-
-/// Convert base64-encoded i16 LE PCM audio to a WAV-format byte vector.
-///
-/// Builds a minimal RIFF/WAV header followed by the raw PCM data so that
-/// Gemini (and other providers) can consume it as `audio/wav`.
-fn pcm_i16_b64_to_wav(pcm_b64: &str, sample_rate: u32, channels: u16) -> Result<Vec<u8>> {
-    use base64::Engine;
-    let pcm_bytes = BASE64_STANDARD
-        .decode(pcm_b64)
-        .context("failed to base64-decode inline PCM audio")?;
-
-    // Validate byte alignment (each i16 sample = 2 bytes)
-    if pcm_bytes.len() % 2 != 0 {
-        anyhow::bail!("inline PCM audio has odd byte count ({})", pcm_bytes.len());
-    }
-
-    let bits_per_sample: u16 = 16;
-    let byte_rate = sample_rate * u32::from(channels) * u32::from(bits_per_sample) / 8;
-    let block_align: u16 = channels * bits_per_sample / 8;
-    let data_len = pcm_bytes.len() as u32;
-    let chunk_size = 36 + data_len; // 4-byte RIFF size field = header - 8 + data
-
-    let mut wav = Vec::with_capacity(44 + pcm_bytes.len());
-
-    // RIFF header
-    wav.extend_from_slice(b"RIFF");
-    wav.extend_from_slice(&chunk_size.to_le_bytes());
-    wav.extend_from_slice(b"WAVE");
-
-    // fmt sub-chunk
-    wav.extend_from_slice(b"fmt ");
-    wav.extend_from_slice(&16u32.to_le_bytes()); // sub-chunk size = 16 for PCM
-    wav.extend_from_slice(&1u16.to_le_bytes()); // AudioFormat = PCM
-    wav.extend_from_slice(&channels.to_le_bytes());
-    wav.extend_from_slice(&sample_rate.to_le_bytes());
-    wav.extend_from_slice(&byte_rate.to_le_bytes());
-    wav.extend_from_slice(&block_align.to_le_bytes());
-    wav.extend_from_slice(&bits_per_sample.to_le_bytes());
-
-    // data sub-chunk
-    wav.extend_from_slice(b"data");
-    wav.extend_from_slice(&data_len.to_le_bytes());
-    wav.extend_from_slice(&pcm_bytes);
-
-    Ok(wav)
 }

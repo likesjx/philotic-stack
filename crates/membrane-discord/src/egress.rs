@@ -23,13 +23,13 @@ pub async fn send_text_reply(
         let mut body = json!({ "content": chunk });
 
         // Only add message_reference on the first chunk
-        if i == 0 {
-            if let Some(msg_id) = reply_to_message_id {
-                body["message_reference"] = json!({
-                    "message_id": msg_id,
-                    "fail_if_not_exists": false,
-                });
-            }
+        if i == 0
+            && let Some(msg_id) = reply_to_message_id
+        {
+            body["message_reference"] = json!({
+                "message_id": msg_id,
+                "fail_if_not_exists": false,
+            });
         }
 
         let resp = http
