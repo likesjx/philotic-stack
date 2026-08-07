@@ -90,6 +90,13 @@ this crate is remote code execution, and why the mesh variant extends that to
 back on: every session is minted `posture: "admin"` against the single
 `default_operator_user_id(hotel)` (serve.rs:7589, 7680).
 
+**And philotic-web is the only thing checking.** The hotel does not
+re-authorize what arrives over the UDS — operator-session auth, the typed
+confirmation strings, and the remote config-key allowlist exist *only* in this
+crate (§8.1). That makes every finding below a hole in the sole wall rather
+than one layer of several, and it is the single most important fact in this
+document.
+
 **PROVEN — there is no TLS.** `Cargo.toml:32` pulls `rustls` only through
 `reqwest`, for *outbound* calls. There is no `axum-server` and no server-side
 rustls config; serve.rs:903–906 binds a plain `tokio::net::TcpListener` and
@@ -261,13 +268,27 @@ host completes a normal Google login **with their own account**, receives a
 of `/api/secrets` and write of `/api/vault`, plus the same against every
 reachable hotel via `/api/mesh/targets/:node/*`.
 
-**Why this is not currently live** (and why it is still the top priority):
-`oidc_loopback_bootstrap_only` blocks OIDC on a loopback-derived base URL, no
-deploy config sets `web_bind` or `PHILOTIC_WEB_BIND` anywhere in `ansible/`
-or `scripts/`, and the live hotel DB on mac-jane holds **0 rows** in
-`external_identity_links` — the flow has never been completed. This fires the
-day someone configures a provider with a public base URL, which is exactly
-what the `oidc_public_base_url` support exists for.
+**Why this is not currently live** (verified on the machine that matters, and
+why it is still the top priority):
+
+philotic-web **is** deployed on vps-jane, the public-IP host —
+`/opt/philotic/bin/philotic-web serve --port 7700 --db
+/opt/philotic/data/aiua_context.db` (binary dated 2026-08-05). Its own
+`node_config` has no `oidc*`, `web_bind`, or `web_edge*` keys, and its
+`external_identity_links` and `operator_sessions` tables both hold **0 rows**.
+No provider is configured, and the flow has never been completed anywhere.
+`oidc_loopback_bootstrap_only` covers the local case.
+
+This fires the day someone configures a provider with a public base URL —
+exactly what the `oidc_public_base_url` support exists for, on a host that is
+already serving the control plane.
+
+> **Correction to an earlier draft.** This section first cited "0 rows on
+> mac-jane" from `~/.philotic/bjork/aiua_context.db`. That file is not the
+> hotel DB (mac-jane's is `context.db`); it is the session store of the stale
+> UAT process described in §13, and its five tables are exactly the ones
+> `ensure_operator_auth_tables` creates. It was also the wrong machine —
+> the risk is about a public-IP host. Both were re-checked above.
 
 **Fix:** an explicit subject/email allowlist checked before
 `upsert_operator_external_identity_link`, failing closed when unset.
@@ -339,9 +360,26 @@ static invite is not strong enough for a public-facing bind" — stays open to
 the internet, and the loopback auth bypass that `Internet` tier is designed to
 remove stays active for every local process on that host.
 
-Not an auth bypass (the session requirement still holds), and not currently
-live (nothing sets a non-loopback bind). **Fix:** probe for a public IP, or
-refuse `0.0.0.0` without an explicit acknowledgement.
+Not an auth bypass — the session requirement still holds at every non-`Local`
+tier.
+
+**Live status, corrected.** An earlier draft said "nothing sets a non-loopback
+bind." That is wrong: vps-jane's philotic-web is bound to
+`100.64.212.8:7700` — its **Tailscale** address. That is CGNAT space, so
+`classify_bind_addr` returns `Mesh` **correctly**, WireGuard carries the
+confidentiality the missing TLS does not, and the open-enrollment and
+loopback-bypass behaviours at that tier are the documented design rather than
+the bug. The `has_public_ip` defect is genuinely latent — it needs a
+`0.0.0.0` or public-IP bind to fire, and today's deployment is neither.
+
+That said, the deployment posture is one config edit away: a `web_bind` of
+`0.0.0.0` on that same host silently drops it to `Lan` and reopens both. Note
+also that no config file sets the bind — it arrives by environment or DB, so
+grepping `ansible/` and `scripts/` does not answer this question. Observed
+listener state does.
+
+**Fix:** probe for a public IP, or refuse `0.0.0.0` without an explicit
+acknowledgement.
 
 ### 4.2 No `Host` allowlist; no `X-Content-Type-Options` — **INFERRED, medium**
 
@@ -544,27 +582,90 @@ operator data to an unguarded destructive verb (PR #404).
 | No CSP or referrer policy on the control-plane shell; bundle hardcodes `api.jaredlikes.com` | ui-dist/index.html | low |
 | `home_dir().expect(...)` panics on stripped `$HOME` | init.rs:11, service.rs:42, reset.rs:82 | low |
 
-## 8. The IPC Trust Boundary Is the Socket, Not an Identity
+## 8. philotic-web Is the Only Authorization Boundary — and That Raises Every Stake Above
 
-**PROVEN.** philotic-web connects to the hotel asserting its own identity
-(serve.rs:8597–8605):
+An earlier draft of this section called philotic-web "closer to a pass-through
+than a bastion." **That was exactly backwards, and the correction is the most
+important thing in this document.**
+
+### 8.1 The hotel does not re-authorize — it trusts the socket — **INFERRED, high**
+
+Three controls exist **only** in philotic-web and are replicated nowhere in
+the hotel: operator-session authentication, the exact-match confirmation
+strings on destructive routes, and the remote config-key allowlist. The
+corresponding `aiua` IPC handlers perform no caller check at all:
+
+| Handler | ipc.rs | Caller identity check |
+|---|---|---|
+| `AddVaultEntry` | 4807 | **none** — caller also chooses the new secret's `allowed_roles` |
+| `SetConfig` | 4777 | **none** — only a `__mcp_` reserved-prefix filter |
+| `RegisterComponent` | 7956 | **none** — and with `auto_start` it spawns the process immediately |
+| `SetComponentActive` (stop) | 7978 | **none** |
+| `RestartComponent` | 7988 | `steward_agent_admin_gate` — **fails open** for exactly this caller class |
+
+`steward_agent_admin_gate` (ipc.rs:15156–15185) names the pass-through class
+in its own doc comment: *"NOT an agent (heal-dispatcher, `phil` CLI, web,
+operator surface): proceed exactly as before this gate existed."*
+
+philotic-web connects asserting its own identity (serve.rs:8597–8605):
 
 ```rust
 GuestIdentity { guest_id: "philotic-web-oidc".into(), role: "management".into(), ... }
 ```
 
-and the hotel authorizes on exactly those two strings
-(`crates/aiua/src/service/ipc.rs:9645–9660`). The identity is **self-asserted**
-— there is no handshake, no signature, no peer-credential check. Any local
-process that can open the UDS can claim it.
+That identity is **self-asserted** — no handshake, no signature, and peer
+credentials are structurally unreachable (discarded at accept; `aiua` declares
+neither `libc` nor `nix`). So any local process, any materialized guest, or
+anything a guest executes can dial `~/.philotic/<profile>/aiua-<hotel>.sock`,
+claim `role: "management"`, and issue the same `AddVaultEntry` /
+`RegisterComponent` / `SetConfig` requests — bypassing all three controls.
+**`RegisterComponent` with `auto_start` is therefore unauthenticated arbitrary
+command execution for anything that can reach the socket.**
 
-On this machine the socket is `srwxr-xr-x` (`~/.philotic/bjork/aiua-mac-jane.sock`),
-so non-owner `connect()` is denied — but that mode is umask-derived, not
-explicitly enforced. This means philotic-web is closer to a **pass-through**
-than a bastion: it is the operator's *ergonomic* front door, not an
-independent authorization tier. Hardening the web surface is necessary but not
-sufficient; the identity gap is already tracked as MCP tech debt in
-`docs/DEFECTS.md` and deserves to be one seam, not two.
+The socket carries no explicit mode. On this machine it happens to be
+`srwxr-xr-x` (`~/.philotic/bjork/aiua-mac-jane.sock`), which denies non-owner
+`connect()` — but that is umask-derived, not enforced. The code documents this
+as accepted residual risk (ipc.rs:4204–4207: *"holding the hotel socket is
+already root-equivalent"*), a premise the socket's own creation does not
+establish.
+
+**Why this inverts the reading of everything above:** philotic-web is not a
+convenience layer in front of an independently-guarded hotel. It *is* the
+guard. Every finding in §2, §3, and §5 is therefore a hole in the only wall,
+not a redundant one.
+
+### 8.2 A mesh peer is effectively admin on every reachable hotel — **INFERRED, high**
+
+When `POST /api/mesh/targets/:node/vault` reaches the **remote** hotel, that
+hotel verifies the *sending node's* HMAC and then re-runs the mutation through
+its own unauthenticated local handlers. The caller's identity does not survive
+the hop:
+
+- The `*OperatorTarget*` family is dispatched without `current_identity` even
+  being passed (ipc.rs:5356–5380; `operator_surface.rs:65–71` has no such
+  parameter).
+- The forwarded payload hardcodes `caller_kind: "operator_surface_adapter"`,
+  `caller_id: local_node_id`, `visibility_scope: "operator"`, and
+  `grant_scope: "default"` as literals, never validated on receipt
+  (`operator_surface.rs:1763–1781`) — and carries the secret **plaintext**.
+- Receive-side verification is HMAC + nonce on the *node*
+  (`execution_transport.rs:97–124`), and it is conditional on
+  `enable_rust_auth`, overridable via `PHILOTIC_ENABLE_RUST_AUTH`
+  (`main.rs:762–764`).
+- The worker then substitutes its **own** identity
+  (`aiua-operator-surface-query-worker`, `main.rs:469–476`) and rewrites the
+  target to itself (`main.rs:283`), landing in the ungated local handlers.
+
+The one receive-side authority check (role-home,
+`operator_surface.rs:1827–1838`) validates `calling_role` — a self-asserted
+string read off the wire (`main.rs:371`). Config writes are key-allowlisted;
+secrets and components are not.
+
+This means mesh membership, not operator identity, is the real authorization
+boundary for cross-hotel mutation — which is precisely what
+`HOTEL_PERIMETER_TRUST_PROPOSAL.md` lists as **not** implemented (no
+revocation, no capability-scoped trust). It is also a bigger lever than any
+single web-tier finding, and it belongs in the same seam.
 
 ## 9. Test Coverage
 
@@ -632,9 +733,19 @@ TTL + one-shot bootstrap token with a constant-time compare and a throttle;
 128-bit session tokens, hashed at rest; expiry and a revocation API for edge
 devices; reaping for `operator_sessions` and `operator_auth_challenges`.
 
-**Slice 8 — Make the documentation stop lying (§11).**
+**Slice 8 — Close the IPC identity gap (§8.1, §8.2).**
+This is listed last by *sequence*, not by importance — it is the largest piece
+of work and it changes a boundary other threads build on, so it wants its own
+seam and its own slice. Two halves: give the hotel a caller identity it can
+actually verify (peer credentials or a registration handshake) so
+`AddVaultEntry` / `RegisterComponent` / `SetConfig` stop being reachable by
+anything that opens the socket; and preserve caller authority across the mesh
+hop instead of substituting the worker's identity. Until this lands, treat
+philotic-web as the sole wall and weight §§1–7 accordingly.
 
-**Slice 9 — Populate `seam:management-plane-security`.**
+**Slice 9 — Make the documentation stop lying (§11).**
+
+**Slice 10 — Populate `seam:management-plane-security`.**
 
 ## 11. Documentation Truth
 
@@ -685,6 +796,29 @@ Until it is populated, no claim about philotic-web's security posture is
 checkable by the graph — which is how a management plane grew a remote
 mutation surface without anyone's dashboard turning a different colour.
 
+## 13. Operational Findings (Not Code)
+
+**A nine-day-old UAT control plane is running against the live profile.**
+On mac-jane, PID 24009 has been running since 2026-07-28:
+
+```
+/opt/homebrew/Cellar/philotic-web/0.1.0-alpha/bin/philotic-web serve --port 7700
+  --db /Users/jaredlikes/.philotic/bjork/aiua_context.db
+  -c /Users/jaredlikes/.claude/jobs/5c81b5e7/tmp/mesh-config-uat.json
+```
+
+Its config path is inside a **deleted job tmp directory**, it holds a
+desktop-membrane lease, and it listens on `127.0.0.1:7700` — the same port a
+real local `phil serve` would want. It is also what produced the misleading
+"0 identity links" evidence corrected in §3.1. Recommend a deliberate
+shutdown by the operator; not touched by this analysis.
+
+Related: `serve.rs` defaults `--db` to a **relative** `aiua_context.db`, which
+is how `aiua_context.db-{shm,wal}.stale-quarantine` came to sit in the repo
+root. Operator sessions and identity links scatter across whatever DB each
+invocation happened to point at — which is its own reason the auth tables
+should live in one declared place.
+
 ## Proposed Defect Entries
 
 To be filed in `docs/DEFECTS.md` starting at DEF-080 (DEF-078/079 are already
@@ -703,6 +837,8 @@ used by merged PRs but absent from the ledger — see §11.5):
 | DEF-088 | med | Unvalidated `harness_id` interpolated into a persisted `SessionStart` hook (§7.3) |
 | DEF-089 | med | Bootstrap token: no TTL, unlimited use, printed to stdout, non-constant-time compare, unthrottled (§2.2) |
 | DEF-090 | med | `phil reset` wipes `~/.philotic` and `~/.muninn` with no confirmation (§7.4) |
+| DEF-091 | high | `AddVaultEntry` / `SetConfig` / `RegisterComponent` / guest-stop perform no caller check; `RegisterComponent` + `auto_start` is arbitrary command execution for anything that can open the UDS (§8.1) |
+| DEF-092 | high | Mesh-forwarded operator mutations lose caller identity at the hop; the remote hotel verifies the sending node's HMAC then re-runs through ungated local handlers (§8.2) |
 
 ## Disposition
 
