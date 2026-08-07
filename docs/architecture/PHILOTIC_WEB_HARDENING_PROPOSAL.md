@@ -213,6 +213,56 @@ chore.
 7. **`crates/philotic-web/README.md` does not exist**, against the repo's own
    documentation standard.
 
+## 4b. The OIDC Flow Is Good — With Two Sharp Edges
+
+**PROVEN.** `GET /auth/oidc/:provider/callback` (serve.rs:~1930–2065) is the
+strongest security code in the crate and deserves saying so plainly. It
+resolves the `state` parameter against a DB-persisted challenge nonce
+(`resolve_operator_auth_challenge_by_nonce`, serve.rs:1963), then rejects
+unless *all* of `auth_path == "oidc"`, `verifier_kind == provider.id`,
+`status == "pending"`, and `expires_at > now` hold (serve.rs:1977–1988). PKCE
+is real — the exchange fails closed when the verifier is missing
+(serve.rs:1990–1998). The challenge is consumed exactly once
+(`consume_operator_auth_challenge`, serve.rs:2025) before a session is issued.
+That is a correct, replay-resistant authorization-code flow.
+
+Two problems sit on top of it:
+
+### 4b.1 Open redirect via `bind_label` — **PROVEN, medium-low**
+
+serve.rs:2059 takes the post-login redirect target straight from the challenge:
+
+```rust
+let redirect_path = challenge.bind_label.unwrap_or_else(|| "/".into());
+```
+
+`bind_label` originates in the `POST /api/auth/challenges` request body and is
+only trimmed and non-empty-filtered before storage (serve.rs:1858–1863) — it is
+never constrained to a relative path. A challenge created with
+`bind_label: "https://evil.example/"` makes the OIDC callback `303` the
+operator's browser off-site immediately after a successful login.
+
+The session cookie is `HttpOnly; SameSite=Strict`, so it does not follow the
+operator to the attacker's origin — the impact is phishing/redirect-chain, not
+direct session theft. Still: reject any `bind_label` that does not start with a
+single `/`, at issuance.
+
+### 4b.2 Remote login may be impossible by construction — **INFERRED, needs resolution**
+
+`edge_fence_allows` (serve.rs:2152–2184) exempts only `OPTIONS`,
+`/api/edge/enroll`, `/api/edge/*`, and non-`/api/` non-`/ws` paths. The
+login-initiation routes `POST /api/auth/bootstrap`, `POST /api/auth/challenges`
+and `POST /api/auth/oidc/start` all live under `/api/`, so at any non-`Local`
+tier they fall through to `check_auth` — which requires a session that the
+caller is trying to obtain. `GET /auth/oidc/:provider/callback` is *not* under
+`/api/` and stays reachable, so the flow can complete once started; it just
+cannot be started remotely.
+
+Either this is deliberate (bootstrap only over loopback, then carry the cookie)
+and should be documented as such, or it is a functional gap that will surface
+the first time someone binds to the tailnet. Worth resolving explicitly before
+Slice 3 rather than discovering it during a deployment.
+
 ## 5. Secret Handling and Local Surface
 
 Findings from the CLI/PWA review pass. The four marked PROVEN were
