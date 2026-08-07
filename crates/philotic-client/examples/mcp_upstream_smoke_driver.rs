@@ -54,7 +54,9 @@ async fn main() -> Result<()> {
         .ok()
         .and_then(|s| s.parse::<u64>().ok());
     let inspect_only = std::env::var("MCP_SMOKE_MODE").as_deref() == Ok("inspect");
-    let stdio_cmd = std::env::var("MCP_SMOKE_STDIO_CMD").ok().filter(|s| !s.is_empty());
+    let stdio_cmd = std::env::var("MCP_SMOKE_STDIO_CMD")
+        .ok()
+        .filter(|s| !s.is_empty());
     let stdio_args: Vec<String> = std::env::var("MCP_SMOKE_STDIO_ARGS")
         .ok()
         .map(|s| s.split_whitespace().map(str::to_string).collect())
@@ -113,9 +115,9 @@ async fn main() -> Result<()> {
                 command: cmd.clone(),
                 args: stdio_args.clone(),
             },
-            None => ansible_mesh_core::mcp_upstream::McpUpstreamTransport::Http {
-                url: url.clone(),
-            },
+            None => {
+                ansible_mesh_core::mcp_upstream::McpUpstreamTransport::Http { url: url.clone() }
+            }
         },
         credential_ref: None,
         tool_allowlist: vec![ansible_mesh_core::mcp_upstream::McpUpstreamToolGrant {
