@@ -646,16 +646,20 @@ impl GraphDomain {
     /// Used by the hotel's zombie-turn repair sweep.
     pub fn list_zombie_session_turns(&self, max_started_at: u64) -> Result<Vec<SessionTurnRecord>> {
         let mut out = Vec::new();
-        for node in self.adapter.list_nodes_by_kind(NODE_KIND_SESSION_TURN)? {
+        for node in self.adapter.list_nodes_by_kind_json_eq(
+            NODE_KIND_SESSION_TURN,
+            "status",
+            "running",
+            "started_at",
+            0,
+        )? {
             let record = match serde_json::from_value::<SessionTurnRecord>(node.data) {
                 Ok(r) => r,
                 Err(_) => continue,
             };
-            if record.status == "running" {
-                if let Some(started_at) = record.started_at {
-                    if started_at <= max_started_at {
-                        out.push(record);
-                    }
+            if let Some(started_at) = record.started_at {
+                if started_at <= max_started_at {
+                    out.push(record);
                 }
             }
         }
@@ -679,24 +683,50 @@ impl GraphDomain {
         })
     }
 
-    /// List events for `session_id`, most recent `limit` entries.
+    /// List events for `session_id`, most recent `limit` entries, ascending by
+    /// `created_at`. The filter and limit are pushed into the store: answering
+    /// this by scanning every session_event ever recorded is what drove the
+    /// hotel's DB mutex to saturation fleet-wide (2026-08-07).
     pub fn list_session_events(
         &self,
         session_id: &str,
         limit: usize,
     ) -> Result<Vec<SessionEventRecord>> {
         let mut out: Vec<SessionEventRecord> = Vec::new();
-        for node in self.adapter.list_nodes_by_kind(NODE_KIND_SESSION_EVENT)? {
-            let record: SessionEventRecord = serde_json::from_value(node.data)
-                .context("GraphDomain::list_session_events: deserialize SessionEventRecord")?;
-            if record.session_id == session_id {
-                out.push(record);
-            }
-        }
-        if limit > 0 && out.len() > limit {
-            out.drain(..out.len() - limit);
+        for node in self.adapter.list_nodes_by_kind_json_eq(
+            NODE_KIND_SESSION_EVENT,
+            "session_id",
+            session_id,
+            "created_at",
+            limit,
+        )? {
+            out.push(
+                serde_json::from_value(node.data)
+                    .context("GraphDomain::list_session_events: deserialize SessionEventRecord")?,
+            );
         }
         Ok(out)
+    }
+
+    /// Delete session history older than `older_than_secs`: all session_event
+    /// nodes past the cutoff, and all non-running session_turn nodes past the
+    /// cutoff (running turns belong to the zombie repair sweep, not retention).
+    /// Returns (deleted_events, deleted_turns).
+    pub fn prune_session_history(&self, older_than_secs: u64) -> Result<(usize, usize)> {
+        let cutoff = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0)
+            .saturating_sub(older_than_secs);
+        let events =
+            self.adapter
+                .delete_nodes_by_kind_older_than(NODE_KIND_SESSION_EVENT, cutoff, None)?;
+        let turns = self.adapter.delete_nodes_by_kind_older_than(
+            NODE_KIND_SESSION_TURN,
+            cutoff,
+            Some(("status", "running")),
+        )?;
+        Ok((events, turns))
     }
 
     // ── Role incarnation methods ──────────────────────────────────────────────
