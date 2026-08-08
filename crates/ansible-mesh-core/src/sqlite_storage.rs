@@ -320,6 +320,12 @@ impl SqliteGraphAdapter {
 
             CREATE INDEX IF NOT EXISTS idx_graph_nodes_kind
                 ON graph_nodes(kind);
+            CREATE INDEX IF NOT EXISTS idx_graph_nodes_kind_session_id
+                ON graph_nodes(kind, json_extract(data_json, '$.session_id'));
+            CREATE INDEX IF NOT EXISTS idx_graph_nodes_kind_status
+                ON graph_nodes(kind, json_extract(data_json, '$.status'));
+            CREATE INDEX IF NOT EXISTS idx_graph_nodes_kind_updated_at
+                ON graph_nodes(kind, updated_at);
             CREATE INDEX IF NOT EXISTS idx_graph_edges_src_kind
                 ON graph_edges(src_node_key, edge_kind);
             CREATE INDEX IF NOT EXISTS idx_graph_edges_dst
@@ -416,6 +422,86 @@ impl GraphAdapter for SqliteGraphAdapter {
             out.push(row?);
         }
         Ok(out)
+    }
+
+    fn list_nodes_by_kind_json_eq(
+        &self,
+        kind: &str,
+        field: &str,
+        value: &str,
+        order_field: &str,
+        limit: usize,
+    ) -> Result<Vec<GraphNode>> {
+        // json_extract paths are inlined so expression indexes can match;
+        // field names come from domain-level constants, never user input.
+        for f in [field, order_field] {
+            if !f.chars().all(|c| c.is_ascii_lowercase() || c == '_') {
+                anyhow::bail!("list_nodes_by_kind_json_eq: invalid json field name {f:?}");
+            }
+        }
+        let sql = format!(
+            "SELECT node_key, kind, label, data_json
+             FROM graph_nodes
+             WHERE kind = ?1 AND json_extract(data_json, '$.{field}') = ?2
+             ORDER BY json_extract(data_json, '$.{order_field}') DESC
+             LIMIT ?3",
+        );
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(&sql)?;
+        let limit_sql: i64 = if limit == 0 { -1 } else { limit as i64 };
+        let rows = stmt.query_map(params![kind, value, limit_sql], |row| {
+            let data_json = json_column_as_string(row, 3)?;
+            Ok(GraphNode {
+                node_key: row.get(0)?,
+                kind: row.get(1)?,
+                label: row.get(2)?,
+                data: serde_json::from_str(&data_json).map_err(|e| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        3,
+                        rusqlite::types::Type::Text,
+                        Box::new(e),
+                    )
+                })?,
+            })
+        })?;
+
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        // Query returns newest-first for the LIMIT; callers expect ascending.
+        out.reverse();
+        Ok(out)
+    }
+
+    fn delete_nodes_by_kind_older_than(
+        &self,
+        kind: &str,
+        cutoff_unix_secs: u64,
+        keep_json_field_eq: Option<(&str, &str)>,
+    ) -> Result<usize> {
+        let conn = self.conn.lock().unwrap();
+        let deleted = match keep_json_field_eq {
+            None => conn.execute(
+                "DELETE FROM graph_nodes
+                 WHERE kind = ?1 AND updated_at < datetime(?2, 'unixepoch')",
+                params![kind, cutoff_unix_secs as i64],
+            )?,
+            Some((field, value)) => {
+                if !field.chars().all(|c| c.is_ascii_lowercase() || c == '_') {
+                    anyhow::bail!(
+                        "delete_nodes_by_kind_older_than: invalid json field name {field:?}"
+                    );
+                }
+                let sql = format!(
+                    "DELETE FROM graph_nodes
+                     WHERE kind = ?1 AND updated_at < datetime(?2, 'unixepoch')
+                       AND COALESCE(json_extract(data_json, '$.{field}'), '') <> ?3",
+                );
+                conn.execute(&sql, params![kind, cutoff_unix_secs as i64, value])?
+            }
+        };
+        Ok(deleted)
     }
 
     fn upsert_edge(&self, edge: &GraphEdge) -> Result<()> {

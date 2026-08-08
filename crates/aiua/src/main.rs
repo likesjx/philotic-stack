@@ -7836,6 +7836,53 @@ async fn run_load_command(file: &str, hotel_name: &str) -> Result<()> {
     Ok(())
 }
 
+/// Days of session_event / completed session_turn history the hotel retains.
+/// Override with PHILOTIC_SESSION_RETENTION_DAYS; 0 disables the sweep.
+///
+/// Unbounded session history is not an archival nicety — it is the load-bearing
+/// constraint that melted the fleet on 2026-08-07: session_events grew to 100k+
+/// rows / 642MB on mac-jane, and every last-N-events lookup deserialized all of
+/// it under the single DB connection mutex until model dispatch itself timed out.
+const SESSION_HISTORY_RETENTION_DAYS: u64 = 7;
+
+/// Prune old session history at startup and every 6 hours thereafter.
+fn spawn_session_history_retention(graph: Arc<GraphDomain>) {
+    let days = std::env::var("PHILOTIC_SESSION_RETENTION_DAYS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(SESSION_HISTORY_RETENTION_DAYS);
+    if days == 0 {
+        warn!("Session history retention disabled (PHILOTIC_SESSION_RETENTION_DAYS=0)");
+        return;
+    }
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(tokio::time::Duration::from_secs(6 * 60 * 60));
+        loop {
+            ticker.tick().await;
+            // The DELETEs run on the shared blocking connection; keep them off
+            // the async workers.
+            let graph = graph.clone();
+            let swept = tokio::task::spawn_blocking(move || {
+                graph.prune_session_history(days * 24 * 60 * 60)
+            })
+            .await;
+            match swept {
+                Ok(Ok((events, turns))) if events > 0 || turns > 0 => {
+                    info!(
+                        deleted_events = events,
+                        deleted_turns = turns,
+                        retention_days = days,
+                        "Session history retention sweep"
+                    );
+                }
+                Ok(Ok(_)) => {}
+                Ok(Err(e)) => warn!("Session history retention sweep failed: {e:#}"),
+                Err(e) => warn!("Session history retention task panicked: {e}"),
+            }
+        }
+    });
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     init_logging();
@@ -7991,6 +8038,8 @@ async fn main() -> Result<()> {
     // Config-time model-routing coherence: warn + heal-queue any fallback tier
     // that names a controller role with no seeded+active guest on this hotel.
     validate_hotel_fallback_ladders(&graph_domain_arc, &hotel_name, db_path);
+
+    spawn_session_history_retention(graph_domain_arc.clone());
 
     if let Some(test) = startup_test {
         prepare_startup_test_binaries(test)?;
