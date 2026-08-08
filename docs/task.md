@@ -1650,6 +1650,16 @@ Seam IDs: `wider-client-adoption`, `philotic-native-memory-integration`
 - [ ] Create a dedicated tap repository and first formula.
 - [ ] Add bottle automation for supported platforms.
 
+## New Project: Lyra Travel Specialist
+
+Seam ID: `lyra-travel-agent` — proposal: [LYRA_TRAVEL_AGENT_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/LYRA_TRAVEL_AGENT_PROPOSAL.md)
+
+- [x] Slice 1 — charter seeding: `lyra_charter.rs` seeds the three role incarnations (`vera`/`atlas`/`astra`) on an operator-configured agent (`PHILOTIC_LYRA_CHARTER_ENABLED` + `PHILOTIC_LYRA_AGENT`), plus the `travel` toolset profile (LifeGraph + memory classes, `capability.request`). Test-green.
+- [ ] Activate on the chosen hotel: declare the Lyra agent in that hotel's mesh-config `agents` stanza, set the two env vars, restart, and verify `role.list` shows the three incarnations (smoke).
+- [ ] Watched-live: one research→structure→steward pass over a real trip idea; verify the trip lands as `Project`/`Commitment`/`Event`/`NextAction` in the LifeGraph.
+- [ ] Ship-time closure: `just idea-sweep ship` for `idea:lyra-travel-agent` per the Aria idea pipeline.
+- [ ] Deferred (named in the charters): live research tooling for Vera (web/fares — via `capability.request` until granted); paracrine heartbeat subscription for Astra (day-of proactive nudges).
+
 ## Deferred Design Threads
 
 - [ ] Agent workflow formalization: adopt a standing Codex process for context gathering, slice sizing, verification ladders, watched live runs, proposal disposition updates, per-slice commit/push discipline, and assumption-vs-reality capture.

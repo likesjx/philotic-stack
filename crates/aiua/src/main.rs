@@ -40,6 +40,7 @@ mod auth;
 mod autonomy_sweep;
 mod dream;
 mod graph;
+mod lyra_charter;
 mod memory;
 mod memory_delta_digest;
 mod memory_hygiene;
@@ -5247,6 +5248,49 @@ fn seed_toolset_profiles(graph: &GraphDomain) -> anyhow::Result<()> {
                     .into(),
             ),
         },
+        ToolsetProfileRecord {
+            profile_name: "travel".into(),
+            allowed_tools: vec![
+                "session.status".into(),
+                "echo".into(),
+                "skill.list".into(),
+                "role.list".into(),
+                "memory.recall".into(),
+                "memory.remember".into(),
+                "graph.query".into(),
+                "graph.create".into(),
+                "graph.list".into(),
+            ],
+            // "life_graph": travel truth lives in the LifeGraph (trips as
+            // Project containing Commitment/Event/NextAction) — this class
+            // grant is what projects the life.* tools the Lyra charters
+            // instruct (`lyra_charter.rs`), and what makes the
+            // PHILOTIC_REMOTE_LIFE_GRAPH_RUNNER_NODE seeding below route
+            // them to the runner hotel.
+            allowed_classes: vec![
+                "session".into(),
+                "utility".into(),
+                "memory".into(),
+                "life_graph".into(),
+            ],
+            allowed_skills: vec![
+                "handoff.back".into(),
+                "capability.request".into(),
+                "context.synthesize".into(),
+                "session.recover".into(),
+                "life.steward".into(),
+                "lifegraph.truth_summarizer".into(),
+            ],
+            on_demand_skills: vec![],
+            remote_tool_runners: vec![],
+            seed_baseline: None,
+            description: Some(
+                "Travel specialist profile (Lyra incarnations) — LifeGraph itinerary \
+                 structure, memory, and research-by-proposal. Booking-adjacent actions \
+                 are approval-gated: the role proposes, the operator confirms."
+                    .into(),
+            ),
+        },
     ];
 
     // Reconcile, don't overwrite: runtime grant mutations (skill.assign /
@@ -8096,6 +8140,16 @@ async fn main() -> Result<()> {
         warn!(error = %e, "architect-charter: failed to ensure daily dev-brief cron job");
     }
 
+    // Lyra travel persona (`lyra-travel-agent` slice 1): idempotent, operator
+    // opt-in seeding of the three travel role incarnations (vera/atlas/astra).
+    // No-op unless PHILOTIC_LYRA_CHARTER_ENABLED and PHILOTIC_LYRA_AGENT are
+    // set for this hotel process; never overwrites an operator-edited role
+    // manifest. No cron is registered — Lyra activates via normal /role
+    // switching. See `lyra_charter.rs` module docs.
+    if let Err(e) = lyra_charter::ensure_roles(&graph_domain_arc, |k| std::env::var(k).ok()) {
+        warn!(error = %e, "lyra-charter: failed to ensure travel role incarnations");
+    }
+
     // Nightly dream sweep (consolidation): the shutdown-drain sweep alone
     // never runs on a long-lived hotel, so near-duplicate engrams accumulate
     // for days. Same opt-in/idempotency contract as memory.hygiene, gated on
@@ -9356,6 +9410,71 @@ mod tests {
                 .iter()
                 .any(|skill| skill == "mesh.steward"),
             "architect profile must carry mesh.steward so the heal-sweep doctrine reaches the charter role"
+        );
+    }
+
+    /// The Lyra travel charters (`lyra_charter.rs`) are prescriptive about
+    /// which tools the incarnations call — LifeGraph structure via life.*,
+    /// preference capture via memory.* — and the incarnations run on the
+    /// "travel" profile by default. Every tool a charter names must actually
+    /// be granted by the profile (directly or via an allowed_classes
+    /// expansion), otherwise the incarnation has instructions it cannot
+    /// follow (the same invisible-tool defect the architect test above pins).
+    #[test]
+    fn travel_profile_grants_every_tool_the_lyra_charters_name() {
+        use crate::lyra_charter::{
+            ASTRA_CHARTER_MANIFEST, ATLAS_CHARTER_MANIFEST, VERA_CHARTER_MANIFEST,
+        };
+
+        let storage = SqliteGraphStorage::open(":memory:").expect("open sqlite");
+        let graph = GraphDomain::new(Arc::new(storage.adapter()));
+        seed_toolset_profiles(&graph).expect("seed toolset profiles");
+
+        let travel = graph
+            .get_toolset_profile("travel")
+            .expect("read travel profile")
+            .expect("travel profile should exist");
+
+        let granted = |tool: &str| -> bool {
+            travel.allowed_tools.iter().any(|t| t == tool)
+                || travel.allowed_classes.iter().any(|class| {
+                    ansible_mesh_core::graph::tools_for_tool_class(class).contains(&tool)
+                })
+        };
+
+        let charters = [
+            VERA_CHARTER_MANIFEST,
+            ATLAS_CHARTER_MANIFEST,
+            ASTRA_CHARTER_MANIFEST,
+        ]
+        .join("\n");
+        for tool in [
+            "memory.recall",
+            "memory.remember",
+            "life.observe",
+            "life.recall",
+            "life.commit",
+            "life.patch.propose",
+        ] {
+            assert!(
+                charters.contains(tool),
+                "a Lyra charter should still name `{tool}` — if that stopped, update this test's list"
+            );
+            assert!(
+                granted(tool),
+                "travel profile must grant `{tool}` — a Lyra charter instructs the model to call it"
+            );
+        }
+
+        // capability.request is Vera's honest escape hatch for missing
+        // research tooling; the skill grant must exist for the charter's
+        // instruction to be followable.
+        assert!(
+            travel
+                .allowed_skills
+                .iter()
+                .any(|skill| skill == "capability.request"),
+            "travel profile must carry capability.request — Vera's charter depends on it"
         );
     }
 
