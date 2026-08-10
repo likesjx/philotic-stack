@@ -368,41 +368,57 @@ impl IpcServer {
 
         if let Some(turn_id) = envelope.turn_id.clone() {
             let existing = graph.get_session_turn(&session_id, &turn_id).ok().flatten();
-            let mut turn = existing.unwrap_or(SessionTurnRecord {
-                turn_id: turn_id.clone(),
-                session_id: session_id.clone(),
-                request_event_id: request_event_id.map(|id| id.to_string()),
-                user_message_json: serde_json::json!({}),
-                status: turn_status.unwrap_or("queued").to_string(),
-                response_json: None,
-                error_json: None,
-                started_at: Some(now),
-                completed_at: None,
-            });
-
-            if let Some(event_id) = request_event_id {
-                turn.request_event_id = Some(event_id.to_string());
-            }
-            if turn.user_message_json == serde_json::json!({}) {
-                turn.user_message_json = serde_json::json!({
-                    "source": envelope.source,
-                    "chat_id": envelope.chat_id,
-                    "content": envelope.content,
-                    "action": envelope.action,
+            // A turn-tail action (a response, result, or progress ping) CARRIES the
+            // id of a turn owned by the session's hotel — it never starts one. On a
+            // routing hotel (e.g. the datasource host forwarding its own
+            // `datasource_response` back cross-mesh) no local turn exists, and
+            // fabricating one here creates an orphan that no code path will ever
+            // close: the real turn completes on the owning hotel, the shadow row
+            // stays `running` until the zombie reaper marks it failed, and the
+            // session_silent detector then counts a phantom consecutive failure
+            // for a session that is actually healthy. Found live 2026-08-10 as
+            // Aria's LifeGraph replies "hanging": 3 mbp turns completed in 5-8s
+            // while 3 vps shadows of them died at the 660s wall. Update-only for
+            // tails; the session/participant/event records above still land.
+            let fabricating_from_tail =
+                existing.is_none() && is_turn_tail_action(envelope.action.as_deref());
+            if !fabricating_from_tail {
+                let mut turn = existing.unwrap_or(SessionTurnRecord {
+                    turn_id: turn_id.clone(),
+                    session_id: session_id.clone(),
+                    request_event_id: request_event_id.map(|id| id.to_string()),
+                    user_message_json: serde_json::json!({}),
+                    status: turn_status.unwrap_or("queued").to_string(),
+                    response_json: None,
+                    error_json: None,
+                    started_at: Some(now),
+                    completed_at: None,
                 });
-            }
-            if let Some(status) = merge_turn_status(&turn.status, turn_status) {
-                turn.status = status.clone();
-                if matches!(status.as_str(), "completed" | "failed") {
-                    turn.completed_at = Some(now);
+
+                if let Some(event_id) = request_event_id {
+                    turn.request_event_id = Some(event_id.to_string());
                 }
+                if turn.user_message_json == serde_json::json!({}) {
+                    turn.user_message_json = serde_json::json!({
+                        "source": envelope.source,
+                        "chat_id": envelope.chat_id,
+                        "content": envelope.content,
+                        "action": envelope.action,
+                    });
+                }
+                if let Some(status) = merge_turn_status(&turn.status, turn_status) {
+                    turn.status = status.clone();
+                    if matches!(status.as_str(), "completed" | "failed") {
+                        turn.completed_at = Some(now);
+                    }
+                }
+                if envelope.action.as_deref() == Some("model_response")
+                    || envelope.action.as_deref() == Some("send_reply")
+                {
+                    turn.response_json = Some(payload.clone());
+                }
+                let _ = graph.upsert_session_turn(&turn);
             }
-            if envelope.action.as_deref() == Some("model_response")
-                || envelope.action.as_deref() == Some("send_reply")
-            {
-                turn.response_json = Some(payload.clone());
-            }
-            let _ = graph.upsert_session_turn(&turn);
         }
 
         let turn_id = envelope.turn_id.clone();
@@ -1021,6 +1037,28 @@ fn is_zombie_repaired_turn(turn: &SessionTurnRecord) -> bool {
             .and_then(|e| e.get("error"))
             .and_then(serde_json::Value::as_str)
             == Some("ZOMBIE_TURN_REPAIR")
+}
+
+/// Actions that ride an EXISTING turn rather than starting one: responses,
+/// results, and progress pings all carry the turn id of a turn owned by the
+/// session's hotel. `record_session_activity_from_value` must never create a
+/// turn record from one of these — on a routing hotel the referenced turn is
+/// not local, and a fabricated copy has no closer (see the comment at the
+/// creation site). `tool_progress` matters as much as the responses: the
+/// datasource keepalive pings every 20s, so one slow tool call would fabricate
+/// and refresh a shadow turn for its whole duration.
+fn is_turn_tail_action(action: Option<&str>) -> bool {
+    matches!(
+        action,
+        Some(
+            "datasource_response"
+                | "model_response"
+                | "send_reply"
+                | "tool_result"
+                | "tool_progress"
+                | "task_error"
+        )
+    )
 }
 
 fn merge_turn_status(current: &str, incoming: Option<&str>) -> Option<String> {
@@ -1750,6 +1788,126 @@ mod tests {
         if Path::new(&socket_path).exists() {
             let _ = std::fs::remove_file(&socket_path);
         }
+    }
+
+    /// The live 2026-08-10 shape: a datasource host emits its own
+    /// `datasource_response` back toward a session owned by ANOTHER hotel. The
+    /// EmitTask handler records activity with turn_status "running" and the
+    /// payload carries the ORIGINAL turn's id — which does not exist locally.
+    /// Fabricating a local turn from it creates an orphan no code path closes:
+    /// it can only be reaped as ZOMBIE_TURN_REPAIR, which then feeds phantom
+    /// "consecutive failed turns" into the session_silent detector for a
+    /// session that is actually healthy.
+    #[test]
+    fn tail_action_never_fabricates_a_turn_on_a_routing_hotel() {
+        let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
+        let graph = GraphDomain::new(Arc::new(graph_store.adapter()));
+
+        for action in [
+            "datasource_response",
+            "model_response",
+            "send_reply",
+            "tool_result",
+            "tool_progress",
+            "task_error",
+        ] {
+            let session_id = format!("telegram:7898847424:agent-aria-{action}");
+            let turn_id = format!("turn-owned-elsewhere-{action}");
+            IpcServer::record_session_activity_from_value(
+                &graph,
+                &serde_json::json!({
+                    "session_id": session_id,
+                    "turn_id": turn_id,
+                    "action": action,
+                    "chat_id": "7898847424",
+                }),
+                Some(Uuid::new_v4()),
+                Some("running"),
+                Some("agent"),
+                "emit_task",
+            );
+            assert!(
+                graph
+                    .get_session_turn(&session_id, &turn_id)
+                    .expect("turn lookup should work")
+                    .is_none(),
+                "a `{action}` must not fabricate a local turn for an id it only references"
+            );
+            // The rest of the recording still lands — this is a narrow guard on
+            // turn CREATION, not a bypass of activity tracking.
+            assert!(
+                graph
+                    .get_session(&session_id)
+                    .expect("session lookup should work")
+                    .is_some(),
+                "session record must still be upserted for `{action}`"
+            );
+            assert_eq!(
+                graph
+                    .list_session_events(&session_id, 10)
+                    .expect("event list should work")
+                    .len(),
+                1,
+                "the session event must still be appended for `{action}`"
+            );
+        }
+    }
+
+    /// The guard must be creation-only: on the session-OWNING hotel the turn
+    /// exists (created when the request was recorded), and a tail arriving
+    /// there must keep updating it — response_json lands, status merges.
+    #[test]
+    fn tail_action_still_updates_an_existing_turn() {
+        let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
+        let graph = GraphDomain::new(Arc::new(graph_store.adapter()));
+        let session_id = "telegram:7898847424:agent-aria";
+        let turn_id = "turn-local-1";
+
+        // The request leg creates the turn (no action field — an inbound user
+        // message, not a tail).
+        IpcServer::record_session_activity_from_value(
+            &graph,
+            &serde_json::json!({
+                "session_id": session_id,
+                "turn_id": turn_id,
+                "content": "what's on my to-do list?",
+            }),
+            Some(Uuid::new_v4()),
+            Some("running"),
+            Some("agent"),
+            "emit_task",
+        );
+        assert!(
+            graph
+                .get_session_turn(session_id, turn_id)
+                .expect("turn lookup should work")
+                .is_some(),
+            "a non-tail dispatch must still create the turn (over-blocking guard)"
+        );
+
+        // The response tail must update that same turn, not be dropped.
+        IpcServer::record_session_activity_from_value(
+            &graph,
+            &serde_json::json!({
+                "session_id": session_id,
+                "turn_id": turn_id,
+                "action": "model_response",
+                "content": "here it is",
+            }),
+            Some(Uuid::new_v4()),
+            Some("running"),
+            Some("agent"),
+            "emit_task",
+        );
+        let turn = graph
+            .get_session_turn(session_id, turn_id)
+            .expect("turn lookup should work")
+            .expect("turn must still exist");
+        assert!(
+            turn.response_json.is_some(),
+            "a tail arriving on the owning hotel must still record response_json"
+        );
+        assert_eq!(turn.status, "running");
     }
 
     #[test]
