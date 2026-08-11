@@ -3,7 +3,7 @@ title: Lyra — Travel Specialist Agent
 doc_type: proposal
 domain: runtime-sessions
 status: active
-last_updated: 2026-08-08
+last_updated: 2026-08-09
 tags:
 - lyra
 - travel
@@ -51,11 +51,17 @@ incarnations:
 
 ## Disposition
 
-`accepted for current slice` — slice 1 (charter seeding) is implemented,
-test-green, not yet activated on any hotel. The idea's LifeGraph anchor is
-`idea:lyra-travel-agent` (`idea_status: promoted`, `graph_ref` → this
-proposal); ship-time closure flows through `just idea-sweep ship` per the
-Aria idea pipeline once a hotel activation is watched-live.
+`implemented` — slice 1 (charter seeding) merged via PR #420 and **activated
+on mbp-jane 2026-08-09, smoke-green**: `agent-lyra` seeded (identity,
+orchestrator + the three incarnations on the `travel` profile), philote
+guest registered live with the 4-role delegation roster, and the Muninn
+vault `self_agent-lyra` provisioned on the Cortex (local observers reject
+vault-creation writes — see the tunnel workaround in
+[docs/task.md](../task.md)). The idea's LifeGraph anchor
+`idea:lyra-travel-agent` is `shipped`. Watched-live validation (a real
+research→structure→steward trip pass) is the remaining rung; deferred seams
+(Vera web tooling, Astra heartbeat, direct Telegram surface) are named in
+the task list.
 
 ## Current Slice
 

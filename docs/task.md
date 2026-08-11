@@ -1655,9 +1655,11 @@ Seam IDs: `wider-client-adoption`, `philotic-native-memory-integration`
 Seam ID: `lyra-travel-agent` — proposal: [LYRA_TRAVEL_AGENT_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/LYRA_TRAVEL_AGENT_PROPOSAL.md)
 
 - [x] Slice 1 — charter seeding: `lyra_charter.rs` seeds the three role incarnations (`vera`/`atlas`/`astra`) on an operator-configured agent (`PHILOTIC_LYRA_CHARTER_ENABLED` + `PHILOTIC_LYRA_AGENT`), plus the `travel` toolset profile (LifeGraph + memory classes, `capability.request`). Test-green.
-- [ ] Activate on the chosen hotel: declare the Lyra agent in that hotel's mesh-config `agents` stanza, set the two env vars, restart, and verify `role.list` shows the three incarnations (smoke).
-- [ ] Watched-live: one research→structure→steward pass over a real trip idea; verify the trip lands as `Project`/`Commitment`/`Event`/`NextAction` in the LifeGraph.
-- [ ] Ship-time closure: `just idea-sweep ship` for `idea:lyra-travel-agent` per the Aria idea pipeline.
+- [x] Activate on the chosen hotel (mbp-jane, 2026-08-09, smoke-green): `lyra` agent stanza in mesh-config, env vars in the hotel plist, deployed + restarted; DB shows `orchestrator`+`vera`/`atlas`/`astra` on the `travel` profile and the `agent-lyra` philote guest registered live with the 4-role delegation roster. Muninn vault `self_agent-lyra` provisioned **via the Cortex through an SSH tunnel** (the local observer 421s vault-creation writes — the known mint-not-Cortex-aware seam; vault visible on the local observer after replication, endpoint restored to local).
+- [ ] Watched-live: one research→structure→steward pass over a real trip idea; verify the trip lands as `Project`/`Commitment`/`Event`/`NextAction` in the LifeGraph. First live turn also proves whether the Cortex-minted token is honored by the local observer for `memory.*` reads.
+- [ ] Operator: give Lyra a direct membrane surface if wanted (Telegram bot token under `agents.lyra.telegram` in mbp-jane's mesh-config + reload); until then she is reachable via philotic-web/desktop chat and delegation.
+- [x] Ship-time closure: `idea:lyra-travel-agent` → `shipped` in the LifeGraph (2026-08-09); Aria's closure digest delivers it.
+- [ ] Fleet seam (recurring): new-agent Muninn provisioning on the Macs requires the Cortex tunnel workaround — teach `provision_muninn_vaults` to follow the 421 Cortex redirect (the error body names the Cortex address).
 - [ ] Deferred (named in the charters): live research tooling for Vera (web/fares — via `capability.request` until granted); paracrine heartbeat subscription for Astra (day-of proactive nudges).
 
 ## Deferred Design Threads
