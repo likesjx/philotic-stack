@@ -3,9 +3,9 @@ title: Philotic Web Hardening — The Management Plane Nobody Declared
 doc_type: proposal
 domain: operator-control-plane
 status: active
-disposition: proposed
-last_updated: 2026-08-06
-verification_level: none
+disposition: accepted-current-slice
+last_updated: 2026-08-07
+verification_level: test-green
 tags:
 - philotic-web
 - management-plane
@@ -842,11 +842,41 @@ used by merged PRs but absent from the ledger — see §11.5):
 
 ## Disposition
 
-`proposed`. No code changed by this analysis. Verification: `check-only` for
-the document; the crate's own suite is `test-green` at `1a366e9f`.
+`accepted for current slice` — implementation started; see below.
 
 ## Current Slice
 
-None claimed. Slice 1 is the recommended start — small, independently
-verifiable, and it closes a pre-login information leak that is live right now
-on every loopback deployment.
+**Landed (test-green, PR #418).** 190 unit + 10 integration tests, 0 failed.
+
+| § | Fix | How |
+|---|---|---|
+| 3.1 | OIDC subject allowlist | `oidc_subject_allowlist`, **fails closed** when unset; `provider:subject`, `provider:login`, email, `@domain` |
+| 2.1 | `/api/auth/status` gated | key refs, identity links, and callback URLs withheld until authenticated |
+| 2.5 | Telegram `token_hint` removed | presence only, matching every sibling route |
+| 5.1 | Shared edge token cannot open a device session | it carries no device identity, so it cannot satisfy the per-node binding |
+| 5.2 | Chat sessions namespaced per caller | `scoped_operator_session_id` prefixes the server-derived marker |
+| 3.3 | Open redirect closed | `bind_label` re-sanitized at redirect time **and** rejected at issuance |
+| 2.2 | Bootstrap token compare | `constant_time_eq` |
+| 6 | WS framing bounded | 1 MiB/message, 256 KiB/frame on both sockets |
+| 7.1 | Secrets written `0600` | `write_private_file` (`O_CREAT|0600`), identity dir `0700` |
+| 7.5 | `secrets.master-key-permissions` | new `doctor` check, Error severity, narrowing-only repair |
+| 4.2 | `nosniff` | shell and embedded assets |
+
+Two notes on method, since both changed the work:
+
+- The first cut of §5.2 required a submitted `conversation_id` to carry the
+  caller's prefix. The e2e suite rejected it at once — real clients send opaque
+  ids and require them echoed verbatim. Namespacing the *hotel session id*
+  instead preserves the client contract and is the stronger property: cross-
+  caller addressing becomes unrepresentable rather than merely refused.
+- §5.1's existing test asserted the impersonation path **succeeded**. It was
+  rewritten. A test can pin a vulnerability as intended behaviour, and this one
+  did.
+
+**Not yet implemented** — the remaining items keep their analysis above:
+§8.1/§8.2 (the IPC and mesh identity gap — the largest piece, and the one that
+decides whether this crate is the only wall), §5.4 (edge token expiry and
+revocation), §5.5 (durable cursor ledger), §2.3/§2.4 (session entropy, hashing
+at rest, and reaping), §7.2 (reproducible `ui-dist`), §7.3 (identifier
+allowlist), §7.4 (`phil reset` confirmation), §3.2 (`X-Forwarded-Host`
+allowlist), Slice 5 (the TLS decision), and §11 (documentation truth).
