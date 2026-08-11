@@ -1118,6 +1118,25 @@ fn edge_session_marker(node_id: &str) -> String {
     format!("edge:{node_id}")
 }
 
+/// The wire-visible conversation id for a device-submitted turn.
+///
+/// Devices choose opaque conversation ids (`conv-e2e`, a UUID, …) and expect
+/// them echoed back verbatim on every `TurnEvent`, so this stays exactly what
+/// the client sent. Isolation between devices is enforced separately, and
+/// structurally, by [`super::scoped_operator_session_id`], which namespaces the
+/// *hotel session id* under the authenticated marker.
+fn resolve_edge_conversation_id(
+    requested: Option<&str>,
+    marker: &str,
+    target_agent_id: &str,
+) -> String {
+    requested
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("operator-chat:{marker}:{target_agent_id}"))
+}
+
 async fn send_text(socket: &mut WebSocket, frame: String) -> bool {
     socket.send(Message::Text(frame)).await.is_ok()
 }
@@ -1591,8 +1610,8 @@ async fn handle_edge_frame(
                     })
                 })
                 .collect();
-            let conversation_id = conversation_id
-                .unwrap_or_else(|| format!("operator-chat:{marker}:{target_agent_id}"));
+            let conversation_id =
+                resolve_edge_conversation_id(conversation_id.as_deref(), marker, &target_agent_id);
             let target_node_id = resolve_target_node_id(state, &target_node_id).await;
             match super::submit_operator_chat_turn(
                 state,
@@ -1774,10 +1793,11 @@ async fn handle_edge_frame(
                     retain: false,
                 };
             }
-            let conversation_id = assembly
-                .conversation_id
-                .clone()
-                .unwrap_or_else(|| format!("operator-chat:{marker}:{}", assembly.target_agent_id));
+            let conversation_id = resolve_edge_conversation_id(
+                assembly.conversation_id.as_deref(),
+                marker,
+                &assembly.target_agent_id,
+            );
             let (blob_id, download_url) =
                 match upload_to_blob_store(assembly.bytes, &assembly.mime_type).await {
                     Ok(ok) => ok,
@@ -2474,6 +2494,28 @@ mod tests {
         .unwrap_err();
         assert_eq!(reject.code, "not_enrolled");
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    #[test]
+    fn conversation_id_is_echoed_verbatim_or_defaulted() {
+        let marker = edge_session_marker("edge-phone");
+
+        // Omitted / blank → default id for this device and agent.
+        assert_eq!(
+            resolve_edge_conversation_id(None, &marker, "jane"),
+            "operator-chat:edge:edge-phone:jane"
+        );
+        assert_eq!(
+            resolve_edge_conversation_id(Some("   "), &marker, "jane"),
+            "operator-chat:edge:edge-phone:jane"
+        );
+        // A client-chosen opaque id is echoed verbatim — devices rely on this.
+        // Isolation is enforced by scoped_operator_session_id, not here.
+        assert_eq!(
+            resolve_edge_conversation_id(Some("conv-e2e"), &marker, "jane"),
+            "conv-e2e"
+        );
     }
 
     #[test]

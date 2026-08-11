@@ -1637,7 +1637,13 @@ async fn handle_auth_bootstrap(
     State(state): State<AppState>,
     Json(body): Json<BootstrapAuthBody>,
 ) -> Response {
-    if body.bootstrap_token != *state.bootstrap_token {
+    // Constant-time: this mints an admin session, and every other credential
+    // comparison in this crate already uses `constant_time_eq`. `String`'s `!=`
+    // short-circuits on the first differing byte.
+    if !constant_time_eq(
+        body.bootstrap_token.as_bytes(),
+        state.bootstrap_token.as_bytes(),
+    ) {
         return (
             StatusCode::UNAUTHORIZED,
             Json(json!({"error": "invalid bootstrap token"})),
@@ -1896,12 +1902,27 @@ async fn handle_create_auth_challenge(
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(str::to_string);
-    let bind_label = body
-        .bind_label
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(str::to_string);
+    // `bind_label` is the post-login redirect target (see the OIDC callback), so
+    // it must be a site-relative path. Reject rather than silently coerce, so a
+    // caller passing an absolute URL learns it was wrong instead of being
+    // quietly sent to `/`. Defence in depth only — the callback re-sanitizes.
+    let bind_label = match body.bind_label.as_deref().map(str::trim) {
+        None => None,
+        Some("") => None,
+        Some(value) => match sanitize_return_path(Some(value)) {
+            Some(path) => Some(path),
+            None => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({
+                        "error": "bind_label must be a site-relative path beginning with a \
+                                  single '/' (absolute and scheme-relative URLs are rejected)"
+                    })),
+                )
+                    .into_response();
+            }
+        },
+    };
 
     let challenge = match issue_operator_auth_challenge(
         &state.db_path,
@@ -2114,7 +2135,17 @@ async fn handle_auth_oidc_callback(
         }
     };
 
-    let redirect_path = challenge.bind_label.unwrap_or_else(|| "/".into());
+    // Re-sanitize at redirect time, not only at issuance.
+    //
+    // `bind_label` is stored from the `POST /api/auth/challenges` body, which
+    // is unauthenticated, and lands here as a `Location` header on the same
+    // response that sets a freshly minted admin session cookie. Validating it
+    // only when the challenge was created leaves the stored value trusted, so
+    // anything that can write a challenge row picks the post-login destination.
+    // `sanitize_return_path` requires a single leading `/`, which rejects both
+    // absolute URLs (`https://evil.example`) and scheme-relative ones (`//evil`).
+    let redirect_path =
+        sanitize_return_path(challenge.bind_label.as_deref()).unwrap_or_else(|| "/".into());
     let mut response = (
         StatusCode::SEE_OTHER,
         [(header::LOCATION, redirect_path.as_str())],
@@ -3072,6 +3103,35 @@ struct OperatorChatSubmitError {
 /// (SubscribeInbox reply role + EmitTask to the target agent) and fans the
 /// resulting turn events out on the broadcast bus. Used by the REST chat
 /// handler and the edge WebSocket mux (serve/edge.rs).
+/// Namespace a chat `conversation_id` into a hotel `session_id` scoped to the
+/// caller.
+///
+/// The conversation id is chosen by the client and is deliberately opaque —
+/// devices pick their own (`conv-e2e`, a UUID) and expect it echoed back. It
+/// used to become the hotel `session_id` verbatim, which meant the id space was
+/// shared by every caller: `/api/edge/sessions` hands each device the full list
+/// of session ids, so a device could submit a turn addressed at another
+/// device's — or the desktop operator's — conversation. That turn would be
+/// written into the victim's history, and the reply, carrying that
+/// conversation's accumulated context, delivered back to the submitter.
+///
+/// `operator_session_id` is derived server-side from the authenticated identity
+/// (`edge:{node_id}` from the Hello handshake, or `desktop-membrane`), never
+/// from client input, so prefixing it makes cross-caller addressing
+/// *unrepresentable* rather than merely rejected.
+///
+/// Ids already carrying the caller's own prefix — the default-minted
+/// `operator-chat:{marker}:{agent}` — pass through unchanged, so existing
+/// conversations keep their session id.
+fn scoped_operator_session_id(operator_session_id: &str, conversation_id: &str) -> String {
+    let prefix = format!("operator-chat:{operator_session_id}:");
+    if conversation_id.starts_with(&prefix) {
+        conversation_id.to_string()
+    } else {
+        format!("{prefix}{conversation_id}")
+    }
+}
+
 async fn submit_operator_chat_turn(
     state: &AppState,
     target_node_id: &str,
@@ -3107,7 +3167,7 @@ async fn submit_operator_chat_turn(
     };
     let local_node_id = local_target.target_node_id.clone();
 
-    let session_id = conversation_id.clone();
+    let session_id = scoped_operator_session_id(operator_session_id, &conversation_id);
     let turn_id = new_operator_chat_id("operator-chat-turn");
     let accepted = OperatorChatAcceptedView {
         accepted: true,
@@ -8876,6 +8936,78 @@ mod tests {
 
     fn temp_db_path(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!("philotic-web-{name}-{}.db", uuid::Uuid::new_v4()))
+    }
+
+    /// The OIDC callback derives its `Location` from the stored `bind_label` on
+    /// the same response that sets an admin session cookie, so an off-site
+    /// value there is an open redirect out of a successful login.
+    #[test]
+    fn post_login_redirect_rejects_offsite_targets() {
+        for hostile in [
+            "https://evil.example/",
+            "http://evil.example",
+            "//evil.example",  // scheme-relative
+            "///evil.example", // extra slashes
+            "javascript:alert(1)",
+            "evil.example/path", // no leading slash
+            "",
+            "   ",
+        ] {
+            assert_eq!(
+                sanitize_return_path(Some(hostile)),
+                None,
+                "{hostile:?} must not survive sanitization"
+            );
+        }
+
+        // Legitimate in-app destinations still work.
+        assert_eq!(
+            sanitize_return_path(Some("/desktop")),
+            Some("/desktop".into())
+        );
+        assert_eq!(sanitize_return_path(Some("/")), Some("/".into()));
+        assert_eq!(
+            sanitize_return_path(Some("  /settings/agents  ")),
+            Some("/settings/agents".into())
+        );
+
+        // And the callback's fallback is the app root, never the raw value.
+        let redirect = sanitize_return_path(Some("https://evil.example")).unwrap_or("/".into());
+        assert_eq!(redirect, "/");
+    }
+
+    /// Two callers asking for the *same* opaque conversation id must land in
+    /// different hotel sessions, and no caller may name another's session.
+    #[test]
+    fn operator_session_ids_are_namespaced_per_caller() {
+        let phone = "edge:edge-phone";
+        let laptop = "edge:edge-laptop";
+        let desktop = "desktop-membrane";
+
+        // Same client-chosen id, three callers, three distinct sessions.
+        let a = scoped_operator_session_id(phone, "conv-1");
+        let b = scoped_operator_session_id(laptop, "conv-1");
+        let c = scoped_operator_session_id(desktop, "conv-1");
+        assert_eq!(a, "operator-chat:edge:edge-phone:conv-1");
+        assert_eq!(b, "operator-chat:edge:edge-laptop:conv-1");
+        assert_eq!(c, "operator-chat:desktop-membrane:conv-1");
+        assert_ne!(a, b);
+        assert_ne!(a, c);
+
+        // The attack this closes: the phone submits using the laptop's session
+        // id verbatim. It still resolves under the phone's own namespace, so
+        // the laptop's history is untouched.
+        let spoof = scoped_operator_session_id(phone, "operator-chat:edge:edge-laptop:conv-1");
+        assert_ne!(
+            spoof, b,
+            "a device must not be able to name another's session"
+        );
+        assert!(spoof.starts_with("operator-chat:edge:edge-phone:"));
+
+        // Default-minted ids already carry the caller's prefix and must not be
+        // double-wrapped, so existing conversations keep their session id.
+        let already = "operator-chat:edge:edge-phone:jane";
+        assert_eq!(scoped_operator_session_id(phone, already), already);
     }
 
     fn oidc_identity(provider: &str, subject: &str) -> OidcIdentity {
