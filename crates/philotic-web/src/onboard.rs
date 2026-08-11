@@ -248,13 +248,15 @@ pub async fn run_interactive(config_path: &Path, force: bool) -> Result<()> {
         }
     });
 
-    // Write config
+    // Write config — owner-only.
+    //
+    // This document embeds live credentials: the Muninn admin password and
+    // every agent's Telegram bot token. At the umask default it would land
+    // 0644, readable by any other account on the machine. `.gitignore` covers
+    // the default `mesh-config.*` name but not `~/.philotic/<profile>/config.json`
+    // nor a custom `--config` path, so the permission is the real control.
     let pretty = serde_json::to_string_pretty(&config)?;
-    if let Some(parent) = config_path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    std::fs::write(config_path, &pretty)
-        .with_context(|| format!("write {}", config_path.display()))?;
+    crate::init::write_private_file(config_path, &pretty)?;
 
     crate::load::run(Some(config_path.to_path_buf()), hotel_name.clone())
         .await

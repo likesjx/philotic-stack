@@ -454,6 +454,8 @@ struct OidcProviderStatusView {
     provider: String,
     label: String,
     configured: bool,
+    /// Omitted entirely for unauthenticated callers — see `handle_auth_status`.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     callback_url: String,
 }
 
@@ -1298,6 +1300,10 @@ async fn serve_index_for_session(
     headers.insert(header::PRAGMA, HeaderValue::from_static("no-cache"));
     headers.insert(header::X_FRAME_OPTIONS, HeaderValue::from_static("DENY"));
     headers.insert(
+        header::X_CONTENT_TYPE_OPTIONS,
+        HeaderValue::from_static("nosniff"),
+    );
+    headers.insert(
         header::REFERRER_POLICY,
         HeaderValue::from_static("no-referrer"),
     );
@@ -1544,6 +1550,13 @@ async fn handle_static(
             .into_response();
         let headers = response.headers_mut();
         headers.insert(header::X_FRAME_OPTIONS, HeaderValue::from_static("DENY"));
+        // The MIME here is guessed from the embedded asset's extension, so a
+        // mistyped or attacker-influenced asset must not be sniffable into
+        // script by the browser.
+        headers.insert(
+            header::X_CONTENT_TYPE_OPTIONS,
+            HeaderValue::from_static("nosniff"),
+        );
         headers.insert(
             header::REFERRER_POLICY,
             HeaderValue::from_static("no-referrer"),
@@ -1565,15 +1578,44 @@ async fn handle_static(
 
 // ── Auth helper ───────────────────────────────────────────────────────────────
 
+/// Pre-login disclosure is deliberately minimal.
+///
+/// This route must stay reachable without a session — the login screen needs
+/// to know which OIDC providers to offer — but everything beyond that is
+/// operator data. An unauthenticated caller gets only `authenticated`,
+/// `hotel`, and each provider's id/label/configured flag.
+///
+/// Withheld until authenticated:
+/// - `root_user_key_refs` — the vault master key's *storage location*
+///   (`keychain://…`, `env://PHILOTIC_VAULT_MASTER_KEY/…`) and a `sha256:`
+///   fingerprint of the key itself.
+/// - `external_identity_links` — the operator's email, provider subject,
+///   login, and display name.
+/// - `callback_url` — deployment topology; not needed to render a button.
+///
+/// The bind tier is not a substitute for this check: at `Local` tier the
+/// perimeter fence allows every request, and at `Mesh` tier loopback peers
+/// bypass it, so any local process (or a DNS-rebound browser page) reaches
+/// this handler with no session at all.
 async fn handle_auth_status(headers: HeaderMap, State(state): State<AppState>) -> Response {
     let session = current_operator_session(&headers, &state);
-    let root_user_key_refs =
-        list_root_user_key_refs(&state.db_path, &state.hotel).unwrap_or_default();
-    let external_identity_links =
-        list_external_identity_links(&state.db_path, &state.hotel).unwrap_or_default();
-    let oidc_providers = list_oidc_provider_statuses(&state.socket, Some(&headers)).await;
+    let authenticated = session.is_some();
+    let mut oidc_providers = list_oidc_provider_statuses(&state.socket, Some(&headers)).await;
+
+    let (root_user_key_refs, external_identity_links) = if authenticated {
+        (
+            list_root_user_key_refs(&state.db_path, &state.hotel).unwrap_or_default(),
+            list_external_identity_links(&state.db_path, &state.hotel).unwrap_or_default(),
+        )
+    } else {
+        for provider in &mut oidc_providers {
+            provider.callback_url = String::new();
+        }
+        (Vec::new(), Vec::new())
+    };
+
     Json(AuthStatusView {
-        authenticated: session.is_some(),
+        authenticated,
         hotel: (*state.hotel).clone(),
         oidc_providers,
         root_user_key_refs,
@@ -2017,6 +2059,22 @@ async fn handle_auth_oidc_callback(
             );
         }
     };
+
+    // Authorization gate. The exchange above only proves the caller controls an
+    // account at the provider — it says nothing about whether they may operate
+    // *this* hotel. Everything past this point binds the identity to the root
+    // operator user and mints an admin session, so the check belongs here,
+    // before any state is written.
+    let allowlist_raw = oidc_config_string(&state.socket, OIDC_SUBJECT_ALLOWLIST_KEY)
+        .await
+        .unwrap_or(None);
+    if let Err(reason) = oidc_identity_allowed(&identity, allowlist_raw.as_deref()) {
+        eprintln!(
+            "rejected OIDC login for {}:{} — {reason}",
+            identity.provider, identity.provider_subject
+        );
+        return oidc_callback_error_response(StatusCode::FORBIDDEN, reason);
+    }
 
     if let Err(err) =
         upsert_operator_external_identity_link(&state.db_path, &state.hotel, &identity)
@@ -3946,16 +4004,16 @@ async fn handle_config_telegram(headers: HeaderMap, State(state): State<AppState
     if !check_auth(&headers, &state) {
         return unauthorized();
     }
-    // Return token ref name only — never the token value.
+    // Return presence only — never the token value, not even a prefix.
+    //
+    // This previously surfaced the first 8 characters as a "hint". A Telegram
+    // bot token is `<numeric bot id>:<secret>`, so those leading characters are
+    // the identifying half of the credential, not an opaque fragment. Every
+    // sibling config route reports a boolean and a ref; this one now matches.
+    // (The old slice was also a latent panic: `&s[..8]` splits a non-ASCII
+    // value mid-codepoint.)
     let token_ref = match ipc_get_config(&state.socket, "telegram_bot_token").await {
-        Ok(Some(val)) => {
-            // The value is the token itself. Surface only that it is set and its first 8 chars as a hint.
-            let hint = val
-                .as_str()
-                .map(|s| format!("{}…", &s[..s.len().min(8)]))
-                .unwrap_or_else(|| "(set)".into());
-            Some(hint)
-        }
+        Ok(Some(_)) => Some("(set)".to_string()),
         Ok(None) => None,
         Err(e) => {
             return (
@@ -4219,6 +4277,7 @@ const BASE_MUTABLE_CONFIG_KEYS: &[&str] = &[
     "oidc_google_client_secret_ref",
     "oidc_github_client_id",
     "oidc_github_client_secret_ref",
+    OIDC_SUBJECT_ALLOWLIST_KEY,
 ];
 
 #[derive(serde::Deserialize)]
@@ -7152,6 +7211,17 @@ fn parse_mesh_roster_value(value: &Value) -> Result<Vec<MeshRosterHotelView>> {
 
 // ── WebSocket /ws ─────────────────────────────────────────────────────────────
 
+/// Upper bound on a single inbound WebSocket message, for both the operator
+/// bus and the edge mux.
+///
+/// tungstenite's defaults are 64 MiB per message and 16 MiB per frame — sized
+/// for file transfer, not for a control-plane socket whose largest legitimate
+/// inbound frame is a small JSON command. A message is buffered in full before
+/// it reaches `serde_json`, so the default lets one connection reserve tens of
+/// megabytes at will. Outbound server pushes are unaffected by these limits.
+const WS_MAX_MESSAGE_BYTES: usize = 1024 * 1024;
+const WS_MAX_FRAME_BYTES: usize = 256 * 1024;
+
 async fn handle_ws(
     ws: WebSocketUpgrade,
     headers: HeaderMap,
@@ -7161,7 +7231,9 @@ async fn handle_ws(
         return unauthorized();
     }
 
-    ws.on_upgrade(move |socket| ws_handler(socket, state))
+    ws.max_message_size(WS_MAX_MESSAGE_BYTES)
+        .max_frame_size(WS_MAX_FRAME_BYTES)
+        .on_upgrade(move |socket| ws_handler(socket, state))
 }
 
 async fn ws_handler(mut socket: WebSocket, state: AppState) {
@@ -8363,6 +8435,88 @@ struct OidcIdentity {
     login: Option<String>,
 }
 
+/// Config key holding the set of external identities permitted to become the
+/// hotel operator. Comma- or newline-separated.
+const OIDC_SUBJECT_ALLOWLIST_KEY: &str = "oidc_subject_allowlist";
+
+/// Decide whether an OIDC identity that completed the flow may be linked to the
+/// operator user and issued a session.
+///
+/// **Authentication is not authorization.** Completing an OIDC flow proves only
+/// that the caller controls *some* account at the provider — Google and GitHub
+/// will happily authenticate the entire internet. Without this gate, any
+/// stranger who reaches a publicly-resolvable callback becomes `root-user:` with
+/// `posture: "admin"`, which on this control plane means arbitrary component
+/// registration (i.e. code execution on the hotel host).
+///
+/// **This fails closed.** An absent or blank allowlist rejects every identity
+/// rather than admitting all of them. That is deliberate: the failure mode of a
+/// forgotten allowlist must be "nobody can log in", never "anybody can".
+///
+/// Accepted entry forms (case-insensitive, whitespace-trimmed):
+/// - `google:1234567890`  — provider and subject (most precise; subjects are stable)
+/// - `github:octocat`     — provider and login handle
+/// - `you@example.com`    — exact email, any provider
+/// - `@example.com`       — any email at that domain
+///
+/// Emails are only honoured when the provider asserts them; an identity with no
+/// email cannot be matched by an email rule.
+fn oidc_identity_allowed(
+    identity: &OidcIdentity,
+    allowlist_raw: Option<&str>,
+) -> Result<(), String> {
+    let entries: Vec<String> = allowlist_raw
+        .unwrap_or("")
+        .split([',', '\n', '\r'])
+        .map(|entry| entry.trim().to_ascii_lowercase())
+        .filter(|entry| !entry.is_empty() && !entry.starts_with('#'))
+        .collect();
+
+    if entries.is_empty() {
+        return Err(format!(
+            "no OIDC subject allowlist configured — set `{OIDC_SUBJECT_ALLOWLIST_KEY}` \
+             (e.g. `phil config set {OIDC_SUBJECT_ALLOWLIST_KEY} \"google:<your-subject>\"`) \
+             before enabling OIDC login. Refusing to admit an unverified subject."
+        ));
+    }
+
+    let provider = identity.provider.trim().to_ascii_lowercase();
+    let subject = identity.provider_subject.trim().to_ascii_lowercase();
+    let login = identity
+        .login
+        .as_deref()
+        .map(|value| value.trim().to_ascii_lowercase());
+    let email = identity
+        .email
+        .as_deref()
+        .map(|value| value.trim().to_ascii_lowercase())
+        .filter(|value| !value.is_empty());
+
+    let matched = entries.iter().any(|entry| {
+        if let Some(domain) = entry.strip_prefix('@') {
+            return email
+                .as_deref()
+                .and_then(|value| value.rsplit_once('@'))
+                .is_some_and(|(_, host)| host == domain);
+        }
+        if let Some((entry_provider, rest)) = entry.split_once(':') {
+            if entry_provider == provider
+                && (rest == subject || login.as_deref().is_some_and(|value| value == rest))
+            {
+                return true;
+            }
+        }
+        email.as_deref().is_some_and(|value| value == entry)
+    });
+
+    if matched {
+        Ok(())
+    } else {
+        // Deliberately vague to the caller; the specifics go to the operator's log.
+        Err("this identity is not authorized to administer this hotel".to_string())
+    }
+}
+
 async fn list_oidc_provider_statuses(
     socket: &str,
     headers: Option<&HeaderMap>,
@@ -8722,6 +8876,83 @@ mod tests {
 
     fn temp_db_path(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!("philotic-web-{name}-{}.db", uuid::Uuid::new_v4()))
+    }
+
+    fn oidc_identity(provider: &str, subject: &str) -> OidcIdentity {
+        OidcIdentity {
+            provider: provider.into(),
+            provider_subject: subject.into(),
+            display_name: "Test Operator".into(),
+            email: None,
+            login: None,
+        }
+    }
+
+    #[test]
+    fn oidc_allowlist_fails_closed_when_unset_or_blank() {
+        let identity = oidc_identity("google", "1234567890");
+        // The security property: a missing allowlist admits NOBODY. If this
+        // ever flips to Ok, any Google/GitHub account on the internet that
+        // reaches the callback becomes a posture:admin operator.
+        for raw in [
+            None,
+            Some(""),
+            Some("   "),
+            Some(",,\n"),
+            Some("# only a comment"),
+        ] {
+            let err = oidc_identity_allowed(&identity, raw)
+                .expect_err("an empty allowlist must reject, never admit");
+            assert!(
+                err.contains(OIDC_SUBJECT_ALLOWLIST_KEY),
+                "the refusal should name the key to set, got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn oidc_allowlist_matches_provider_subject() {
+        let identity = oidc_identity("google", "1234567890");
+        assert!(oidc_identity_allowed(&identity, Some("google:1234567890")).is_ok());
+        // Case and surrounding whitespace are not security boundaries.
+        assert!(oidc_identity_allowed(&identity, Some("  GOOGLE:1234567890  ")).is_ok());
+        // Same subject at a different provider must not match.
+        assert!(oidc_identity_allowed(&identity, Some("github:1234567890")).is_err());
+        // A different subject at the right provider must not match.
+        assert!(oidc_identity_allowed(&identity, Some("google:9999999999")).is_err());
+    }
+
+    #[test]
+    fn oidc_allowlist_matches_login_and_email_forms() {
+        let mut identity = oidc_identity("github", "42");
+        identity.login = Some("octocat".into());
+        identity.email = Some("Octocat@Example.com".into());
+
+        assert!(oidc_identity_allowed(&identity, Some("github:octocat")).is_ok());
+        assert!(oidc_identity_allowed(&identity, Some("octocat@example.com")).is_ok());
+        assert!(oidc_identity_allowed(&identity, Some("@example.com")).is_ok());
+        // A domain rule must match the full domain, not a suffix of it.
+        assert!(oidc_identity_allowed(&identity, Some("@ample.com")).is_err());
+        // A login rule from another provider must not cross over.
+        assert!(oidc_identity_allowed(&identity, Some("google:octocat")).is_err());
+    }
+
+    #[test]
+    fn oidc_allowlist_email_rules_need_an_asserted_email() {
+        // No email claim → email and domain rules cannot match, even though the
+        // operator "meant" this person.
+        let identity = oidc_identity("google", "1234567890");
+        assert!(oidc_identity_allowed(&identity, Some("someone@example.com")).is_err());
+        assert!(oidc_identity_allowed(&identity, Some("@example.com")).is_err());
+    }
+
+    #[test]
+    fn oidc_allowlist_accepts_multi_entry_lists() {
+        let identity = oidc_identity("google", "1234567890");
+        assert!(
+            oidc_identity_allowed(&identity, Some("github:someone, google:1234567890")).is_ok()
+        );
+        assert!(oidc_identity_allowed(&identity, Some("github:someone\n@example.com\n")).is_err());
     }
 
     /// Sets an env var for a test and RESTORES the previous value on drop.
@@ -9506,6 +9737,68 @@ mod tests {
                 Some("INV-TEST".into()),
             ),
         }
+    }
+
+    /// `/api/auth/status` is unauthenticated by necessity — the login screen
+    /// needs the provider list — so it must disclose nothing else. Seeds real
+    /// rows first so this proves suppression, not merely an empty database.
+    #[tokio::test]
+    async fn auth_status_withholds_operator_data_until_authenticated() {
+        let state = test_state(None, ExposureTier::Local);
+        ensure_operator_auth_tables(&state.db_path, &state.hotel).unwrap();
+        upsert_operator_external_identity_link(
+            &state.db_path,
+            &state.hotel,
+            &OidcIdentity {
+                provider: "google".into(),
+                provider_subject: "1234567890".into(),
+                display_name: "Test Operator".into(),
+                email: Some("operator@example.com".into()),
+                login: None,
+            },
+        )
+        .unwrap();
+
+        // Precondition: the data this route used to leak really is present.
+        assert!(
+            !list_root_user_key_refs(&state.db_path, &state.hotel)
+                .unwrap()
+                .is_empty(),
+            "test needs a seeded key ref to prove suppression"
+        );
+
+        let response = handle_auth_status(HeaderMap::new(), State(state.clone())).await;
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(json["authenticated"], Value::Bool(false));
+        assert_eq!(json["hotel"], Value::String("mac-jane".into()));
+        assert!(
+            json["root_user_key_refs"].as_array().unwrap().is_empty(),
+            "vault key refs must not reach an unauthenticated caller: {json}"
+        );
+        assert!(
+            json["external_identity_links"]
+                .as_array()
+                .unwrap()
+                .is_empty(),
+            "operator identity links must not reach an unauthenticated caller: {json}"
+        );
+        assert!(json.get("session").is_none() || json["session"].is_null());
+
+        // Belt and braces: no vault-ref scheme or operator email anywhere in the
+        // serialized payload, regardless of which field might carry it.
+        let raw = String::from_utf8_lossy(&body);
+        for needle in ["keychain://", "env://", "sha256:", "operator@example.com"] {
+            assert!(
+                !raw.contains(needle),
+                "unauthenticated auth-status leaked {needle}: {raw}"
+            );
+        }
+
+        let _ = fs::remove_file(&state.db_path);
     }
 
     fn bearer_headers(token: &str) -> HeaderMap {
