@@ -862,6 +862,22 @@ used by merged PRs but absent from the ledger — see §11.5):
 | 7.5 | `secrets.master-key-permissions` | new `doctor` check, Error severity, narrowing-only repair |
 | 4.2 | `nosniff` | shell and embedded assets |
 
+### Live-data checks before merge
+
+Three of these changes alter behaviour in ways no test can observe, because
+tests mint their own fresh state. Each was checked against the running fleet:
+
+| Risk | Check | Result |
+|---|---|---|
+| §5.2 namespacing orphans existing chat history under a new session id | `graph_nodes` where `kind='session'`, both hotels | mac-jane 106 sessions (33 `operator-chat:`-shaped), vps-jane 178 (33) — **zero bare `conv*` ids**. Every operator-chat session already carries the `operator-chat:{caller}:{agent}` prefix, so `scoped_operator_session_id` passes them through unchanged. Nothing is orphaned. |
+| §5.1 refusing the shared token strands a live device | `edge-devices.json` on both hotels | 5 devices enrolled on mac-jane, registry present on vps-jane; **every entry holds its own `edge-tok-…`**. No device depends on the shared token. |
+| §7.4 the reset prompt breaks automation | `grep -rn "phil reset" justfile scripts/` | no callers. |
+
+A residual, documented discontinuity: a client that sends a *bare* conversation
+id (`conv-1`) now lands in `operator-chat:{caller}:conv-1` rather than `conv-1`.
+No such session exists on either hotel today, and the id is opaque to the
+client, which receives its own value back unchanged.
+
 Two notes on method, since both changed the work:
 
 - The first cut of §5.2 required a submitted `conversation_id` to carry the
