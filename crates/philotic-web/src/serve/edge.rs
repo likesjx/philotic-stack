@@ -553,7 +553,12 @@ pub(crate) async fn handle_edge_ws(
     let Some(auth) = edge_bearer_identity(&headers, &state) else {
         return super::unauthorized();
     };
-    ws.on_upgrade(move |socket| edge_ws_session(socket, state, auth))
+    // Bounded inbound framing — see WS_MAX_MESSAGE_BYTES. Audio arrives as
+    // chunked `AudioChunk` frames well under this ceiling, and the assembled
+    // stream is separately capped by AUDIO_STREAM_MAX_BYTES.
+    ws.max_message_size(super::WS_MAX_MESSAGE_BYTES)
+        .max_frame_size(super::WS_MAX_FRAME_BYTES)
+        .on_upgrade(move |socket| edge_ws_session(socket, state, auth))
 }
 
 /// Resolve a client-supplied chat target to a registry node id. Edge clients
@@ -1059,11 +1064,35 @@ fn process_hello(
             message: format!("node [{}] is not enrolled on this hotel", hello.node_id),
         });
     }
-    if let EdgeBearerIdentity::Device(token_node) = auth {
-        if token_node != &hello.node_id {
+    // Every accepted bearer must be bound to the node it claims to be.
+    //
+    // The `Device` arm was always checked. The `Shared` arm was not, which made
+    // the shared `PHILOTIC_WEB_EDGE_TOKEN` a universal impersonation key: node
+    // ids are discoverable (`/api/edge/sessions` returns
+    // `operator-chat:edge:{node_id}:{agent}`), so its holder could Hello as any
+    // enrolled device — replaying that device's retained frames, evicting its
+    // live session, and submitting turns under its identity.
+    //
+    // The shared token is a *fleet* credential with no device identity of its
+    // own, so it cannot satisfy a per-node binding. It is therefore no longer
+    // accepted for the session-bearing WebSocket handshake at all; per-device
+    // tokens from `POST /api/edge/enroll` are. It remains valid for the
+    // stateless `/api/edge/*` REST routes, which assert no node identity.
+    match auth {
+        EdgeBearerIdentity::Device(token_node) => {
+            if token_node != &hello.node_id {
+                return Err(HandshakeReject {
+                    code: "node_mismatch",
+                    message: "bearer token is bound to a different edge node".into(),
+                });
+            }
+        }
+        EdgeBearerIdentity::Shared => {
             return Err(HandshakeReject {
-                code: "node_mismatch",
-                message: "bearer token is bound to a different edge node".into(),
+                code: "shared_token_not_bindable",
+                message: "the shared edge token cannot open a device session — \
+                          enroll this device (POST /api/edge/enroll) and use its own token"
+                    .into(),
             });
         }
     }
@@ -1087,6 +1116,25 @@ fn process_hello(
 /// broadcast events tagged with it are routed back to the node's sessions.
 fn edge_session_marker(node_id: &str) -> String {
     format!("edge:{node_id}")
+}
+
+/// The wire-visible conversation id for a device-submitted turn.
+///
+/// Devices choose opaque conversation ids (`conv-e2e`, a UUID, …) and expect
+/// them echoed back verbatim on every `TurnEvent`, so this stays exactly what
+/// the client sent. Isolation between devices is enforced separately, and
+/// structurally, by [`super::scoped_operator_session_id`], which namespaces the
+/// *hotel session id* under the authenticated marker.
+fn resolve_edge_conversation_id(
+    requested: Option<&str>,
+    marker: &str,
+    target_agent_id: &str,
+) -> String {
+    requested
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("operator-chat:{marker}:{target_agent_id}"))
 }
 
 async fn send_text(socket: &mut WebSocket, frame: String) -> bool {
@@ -1562,8 +1610,8 @@ async fn handle_edge_frame(
                     })
                 })
                 .collect();
-            let conversation_id = conversation_id
-                .unwrap_or_else(|| format!("operator-chat:{marker}:{target_agent_id}"));
+            let conversation_id =
+                resolve_edge_conversation_id(conversation_id.as_deref(), marker, &target_agent_id);
             let target_node_id = resolve_target_node_id(state, &target_node_id).await;
             match super::submit_operator_chat_turn(
                 state,
@@ -1745,10 +1793,11 @@ async fn handle_edge_frame(
                     retain: false,
                 };
             }
-            let conversation_id = assembly
-                .conversation_id
-                .clone()
-                .unwrap_or_else(|| format!("operator-chat:{marker}:{}", assembly.target_agent_id));
+            let conversation_id = resolve_edge_conversation_id(
+                assembly.conversation_id.as_deref(),
+                marker,
+                &assembly.target_agent_id,
+            );
             let (blob_id, download_url) =
                 match upload_to_blob_store(assembly.bytes, &assembly.mime_type).await {
                     Ok(ok) => ok,
@@ -2448,6 +2497,28 @@ mod tests {
     }
 
     #[test]
+    #[test]
+    fn conversation_id_is_echoed_verbatim_or_defaulted() {
+        let marker = edge_session_marker("edge-phone");
+
+        // Omitted / blank → default id for this device and agent.
+        assert_eq!(
+            resolve_edge_conversation_id(None, &marker, "jane"),
+            "operator-chat:edge:edge-phone:jane"
+        );
+        assert_eq!(
+            resolve_edge_conversation_id(Some("   "), &marker, "jane"),
+            "operator-chat:edge:edge-phone:jane"
+        );
+        // A client-chosen opaque id is echoed verbatim — devices rely on this.
+        // Isolation is enforced by scoped_operator_session_id, not here.
+        assert_eq!(
+            resolve_edge_conversation_id(Some("conv-e2e"), &marker, "jane"),
+            "conv-e2e"
+        );
+    }
+
+    #[test]
     fn handshake_binds_device_token_to_its_node() {
         let path = temp_registry_path("node-binding");
         let state = edge_state(&path, Some("INV-1"));
@@ -2463,7 +2534,7 @@ mod tests {
         .unwrap_err();
         assert_eq!(reject.code, "node_mismatch");
 
-        // Matching device token and the shared token both pass.
+        // A device token matching its own node passes.
         let accept = process_hello(
             &state,
             &EdgeBearerIdentity::Device(a.node_id.clone()),
@@ -2475,14 +2546,22 @@ mod tests {
         assert_eq!(accept.client_seq, 1);
         assert_eq!(accept.replay_from, None);
 
-        let shared = process_hello(
-            &state,
-            &EdgeBearerIdentity::Shared,
-            &hello_frame(&b.node_id, None),
-        )
-        .unwrap();
-        assert_eq!(shared.node_id, b.node_id);
-        assert_ne!(shared.session_id, accept.session_id);
+        // The shared token carries no device identity, so it cannot satisfy the
+        // per-node binding and is refused for *every* node — including one that
+        // is legitimately enrolled. This previously succeeded, which made the
+        // shared token an impersonation key for any enrolled device.
+        for node in [&a.node_id, &b.node_id] {
+            let reject = process_hello(
+                &state,
+                &EdgeBearerIdentity::Shared,
+                &hello_frame(node, None),
+            )
+            .unwrap_err();
+            assert_eq!(
+                reject.code, "shared_token_not_bindable",
+                "shared token must not open a session for node {node}"
+            );
+        }
         let _ = std::fs::remove_file(&path);
     }
 
@@ -2492,18 +2571,19 @@ mod tests {
         let state = edge_state(&path, Some("INV-1"));
         let enrolled = state.enroll(&enroll_request("cHVia2V5")).unwrap();
 
-        let with_cursor = process_hello(
-            &state,
-            &EdgeBearerIdentity::Shared,
-            &hello_frame(&enrolled.node_id, Some("5")),
-        )
-        .unwrap();
+        // Cursor parsing is the subject here; authenticate as the device itself
+        // (the shared token no longer opens a session — see
+        // `handshake_binds_device_token_to_its_node`).
+        let device = EdgeBearerIdentity::Device(enrolled.node_id.clone());
+
+        let with_cursor =
+            process_hello(&state, &device, &hello_frame(&enrolled.node_id, Some("5"))).unwrap();
         assert_eq!(with_cursor.replay_from_seq, Some(5));
         assert_eq!(with_cursor.replay_from.as_deref(), Some("5"));
 
         let bad_cursor = process_hello(
             &state,
-            &EdgeBearerIdentity::Shared,
+            &device,
             &hello_frame(&enrolled.node_id, Some("not-a-seq")),
         )
         .unwrap();

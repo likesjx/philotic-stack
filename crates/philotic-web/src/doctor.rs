@@ -364,6 +364,7 @@ pub fn catalog() -> Vec<Box<dyn Check>> {
         Box::new(VaultKeySourceDivergence),
         Box::new(LogsRotationMissing),
         Box::new(SecretsStorePermissions),
+        Box::new(VaultMasterKeyPermissions),
         Box::new(HealQueueDepth),
         Box::new(HealEscalatedUnrepaired),
         Box::new(HealOldestPendingAge),
@@ -1786,6 +1787,106 @@ impl Check for SecretsStorePermissions {
                     "db_mode": db_after.map(|m| format!("{m:04o}")),
                     "dir_mode": dir_after.map(|m| format!("{m:04o}")),
                 }),
+            )?;
+            Ok(RepairOutcome::Applied { description })
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = (ctx, finding, apply);
+            Ok(RepairOutcome::NotRepairable)
+        }
+    }
+}
+
+/// Permissions on the vault master key file itself.
+///
+/// `SecretsStorePermissions` above deliberately reasons that a loose context DB
+/// is "not an immediate plaintext leak" *because the master key lives
+/// elsewhere*. That argument only holds while the key file is actually
+/// protected — and nothing was checking it. If `~/.philotic/vault-master-key.env`
+/// is group/other-readable, every secret in the vault is decryptable by any
+/// local reader and doctor would still report green.
+///
+/// Hence a separate check with a blunter message and Error severity: this is
+/// the key, not a key-adjacent store.
+struct VaultMasterKeyPermissions;
+
+/// Path checked by [`VaultMasterKeyPermissions`]; mirrors
+/// `start::load_vault_master_key_env_file`.
+fn vault_master_key_path() -> std::path::PathBuf {
+    crate::init::philotic_dir().join("vault-master-key.env")
+}
+
+impl Check for VaultMasterKeyPermissions {
+    fn id(&self) -> &'static str {
+        "secrets.master-key-permissions"
+    }
+
+    fn severity(&self) -> Severity {
+        Severity::Error
+    }
+
+    fn detect(&self, _ctx: &DoctorCtx) -> Result<Vec<Finding>> {
+        #[cfg(unix)]
+        {
+            let path = vault_master_key_path();
+            // Absent is fine — the key may live in the Keychain or the env.
+            let Some(mode) = unix_perms::mode(&path) else {
+                return Ok(Vec::new());
+            };
+            if mode & GROUP_OTHER_ANY_BIT == 0 {
+                return Ok(Vec::new());
+            }
+            let display = path.to_string_lossy().to_string();
+            return Ok(vec![Finding {
+                check_id: self.id().to_string(),
+                severity: Severity::Error,
+                message: format!(
+                    "vault master key {display} is {mode:04o} (want {WANT_DB_MODE:04o}) — any \
+                     local account can read the key and decrypt every vault secret; this is a \
+                     plaintext key exposure, not a hardening nicety"
+                ),
+                evidence: json!({
+                    "path": display,
+                    "mode": format!("{mode:04o}"),
+                    "want_mode": format!("{WANT_DB_MODE:04o}"),
+                }),
+                fix_hint: format!("chmod {WANT_DB_MODE:o} {display}"),
+                auto_repairable: true,
+            }]);
+        }
+        #[cfg(not(unix))]
+        {
+            Ok(Vec::new())
+        }
+    }
+
+    /// Narrowing-only, same rationale as `SecretsStorePermissions::repair`.
+    fn repair(&self, ctx: &DoctorCtx, finding: &Finding, apply: bool) -> Result<RepairOutcome> {
+        #[cfg(unix)]
+        {
+            let path = finding
+                .evidence
+                .get("path")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string();
+            let description = format!("chmod {WANT_DB_MODE:o} {path}");
+            if !apply {
+                return Ok(RepairOutcome::Planned { description });
+            }
+            use std::os::unix::fs::PermissionsExt;
+            let target = std::path::Path::new(&path);
+            let before = unix_perms::mode(target);
+            std::fs::set_permissions(target, std::fs::Permissions::from_mode(WANT_DB_MODE))
+                .with_context(|| format!("chmod {WANT_DB_MODE:o} {path}"))?;
+            let after = unix_perms::mode(target);
+            append_repair_journal(
+                &ctx.profile_dir,
+                self.id(),
+                "chmod-master-key-permissions",
+                json!({ "mode": before.map(|m| format!("{m:04o}")) }),
+                json!({ "mode": after.map(|m| format!("{m:04o}")) }),
             )?;
             Ok(RepairOutcome::Applied { description })
         }

@@ -3,8 +3,44 @@ use ed25519_dalek::{SigningKey, VerifyingKey};
 use rand::rngs::OsRng;
 use sha2::{Digest, Sha256};
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::PathBuf;
+
+/// Write `contents` to `path` such that it is never readable by another user,
+/// not even momentarily.
+///
+/// `fs::write` + `set_permissions` is the obvious spelling and it is racy: the
+/// file exists at the umask default (commonly `0644`) between the two calls, so
+/// a local watcher can read a key or token out of that window. Setting the mode
+/// in the open flags closes it — the file is `0600` from the instant it exists.
+///
+/// Use this for anything an attacker would want: private keys, API tokens,
+/// passwords, and configs that embed them. Truncates an existing file, and
+/// re-applies the mode so a file created loosely by an older build is corrected
+/// on the next write.
+pub fn write_private_file(path: &std::path::Path, contents: impl AsRef<[u8]>) -> Result<()> {
+    use std::io::Write;
+
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("create parent directory for {}", path.display()))?;
+    }
+
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)
+        .with_context(|| format!("open {} for private write", path.display()))?;
+    file.write_all(contents.as_ref())
+        .with_context(|| format!("write {}", path.display()))?;
+    // `.mode()` only applies at creation, so an existing loose file keeps its
+    // old permissions without this.
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+        .with_context(|| format!("chmod 0600 {}", path.display()))?;
+    Ok(())
+}
 
 /// Path to the philotic operator directory: `~/.philotic/`.
 pub fn philotic_dir() -> PathBuf {
@@ -57,6 +93,10 @@ pub async fn run_inner(config: Option<PathBuf>, force: bool, skip_config: bool) 
     // ── Operator identity ──────────────────────────────────────────────────
     let id_dir = identity_dir();
     fs::create_dir_all(&id_dir).context("failed to create ~/.philotic/identity/")?;
+    // The directory holds the operator signing key; keep it owner-only so the
+    // key's existence and rotation timing aren't observable either.
+    fs::set_permissions(&id_dir, fs::Permissions::from_mode(0o700))
+        .context("chmod 0700 ~/.philotic/identity/")?;
 
     let (_signing_key, verifying_key) = if private_key_path().exists() && !force {
         println!("  identity  already exists — skipping keygen (use --force to regenerate)");
@@ -71,10 +111,8 @@ pub async fn run_inner(config: Option<PathBuf>, force: bool, skip_config: bool) 
         let sk = SigningKey::generate(&mut OsRng);
         let vk = VerifyingKey::from(&sk);
 
-        // Write private key — 0600
-        fs::write(private_key_path(), sk.to_bytes()).context("write operator.key")?;
-        fs::set_permissions(private_key_path(), fs::Permissions::from_mode(0o600))
-            .context("chmod operator.key")?;
+        // Write private key — 0600 from creation, never briefly world-readable.
+        write_private_file(&private_key_path(), sk.to_bytes())?;
 
         // Write public key — hex encoded
         fs::write(public_key_path(), hex::encode(vk.to_bytes())).context("write operator.pub")?;
