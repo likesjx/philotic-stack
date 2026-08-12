@@ -76,10 +76,10 @@ impl ModelProvider for OllamaProvider {
         let mut messages: Vec<Value> = Vec::new();
 
         // Inject composed context (identity, instructions, memory) as system message.
-        if let Some(system_text) = task.composed_prompt_text() {
-            if !system_text.trim().is_empty() {
-                messages.push(json!({ "role": "system", "content": system_text }));
-            }
+        if let Some(system_text) = task.composed_prompt_text()
+            && !system_text.trim().is_empty()
+        {
+            messages.push(json!({ "role": "system", "content": system_text }));
         }
 
         // Active user prompt — required for text generation.

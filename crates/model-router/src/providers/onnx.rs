@@ -55,7 +55,7 @@ impl OnnxProvider {
         let emb_backend = cache
             .pull(&config.embeddings.repo_id, config.prefer_quantized)
             .and_then(|h| EmbeddingsBackend::load(&h, config.embeddings.max_seq_len))
-            .map(|b| { info!(model_gen = %b.model_gen(), "OnnxProvider embeddings loaded"); b })
+            .inspect(|b| { info!(model_gen = %b.model_gen(), "OnnxProvider embeddings loaded"); })
             .map_err(|e| tracing::warn!(err = %e, "EmbeddingsBackend failed to load — Embed will be unavailable"))
             .ok();
 
@@ -63,7 +63,7 @@ impl OnnxProvider {
         let whisper_backend = cache
             .pull_whisper(&config.transcribe.repo_id, config.prefer_quantized)
             .and_then(|h| WhisperBackend::load(&h, &config.transcribe))
-            .map(|b| { info!(model_gen = %b.model_gen(), "OnnxProvider Whisper loaded"); b })
+            .inspect(|b| { info!(model_gen = %b.model_gen(), "OnnxProvider Whisper loaded"); })
             .map_err(|e| tracing::warn!(err = %e, "WhisperBackend failed to load — AudioTranscribe will be unavailable"))
             .ok();
 
@@ -171,7 +171,7 @@ impl ModelProvider for OnnxProvider {
                 // Fetch the first audio attachment from blob storage.
                 let attachment = task
                     .media_attachments()
-                    .into_iter()
+                    .iter()
                     .find(|a| {
                         a.url
                             .as_deref()

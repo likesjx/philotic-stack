@@ -82,10 +82,10 @@ impl CooldownState {
 
     fn record_failure(&mut self, trigger: RotationTrigger, now: Instant) {
         // Reset escalation if the last failure is outside the window.
-        if let Some(last) = self.last_failure {
-            if now.duration_since(last) > Duration::from_secs(FAILURE_WINDOW_SECS) {
-                self.error_count = 0;
-            }
+        if let Some(last) = self.last_failure
+            && now.duration_since(last) > Duration::from_secs(FAILURE_WINDOW_SECS)
+        {
+            self.error_count = 0;
         }
         self.error_count = self.error_count.saturating_add(1);
         self.last_failure = Some(now);
@@ -190,10 +190,10 @@ impl CredentialPool {
             }
             m.plaintext.as_deref().map(|k| (idx, k))
         };
-        if let Some(pinned) = self.pinned {
-            if let Some(hit) = eligible(pinned) {
-                return Some(hit);
-            }
+        if let Some(pinned) = self.pinned
+            && let Some(hit) = eligible(pinned)
+        {
+            return Some(hit);
         }
         (0..self.members.len()).find_map(eligible)
     }

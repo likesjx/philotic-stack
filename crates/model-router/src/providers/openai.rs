@@ -55,6 +55,18 @@ pub struct OpenAIProvider {
     tools_catalog: tokio::sync::RwLock<Option<ToolsCatalog>>,
 }
 
+/// What `parse_structured_text` pulls out of a structured model reply:
+/// (text, thinking, tool_name, tool_args, raw). Named because the bare
+/// five-Option tuple is unreadable at the call site and identical in both
+/// providers.
+type StructuredTextParts = (
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<Value>,
+    Option<Value>,
+);
+
 impl OpenAIProvider {
     pub fn new(
         http_client: reqwest::Client,
@@ -536,15 +548,7 @@ impl OpenAIProvider {
         }
     }
 
-    fn parse_structured_text(
-        content: &str,
-    ) -> (
-        Option<String>,
-        Option<String>,
-        Option<String>,
-        Option<Value>,
-        Option<Value>,
-    ) {
+    fn parse_structured_text(content: &str) -> StructuredTextParts {
         let Ok(value) = serde_json::from_str::<Value>(content) else {
             return (None, None, None, None, None);
         };
@@ -749,18 +753,18 @@ impl OpenAIProvider {
                 Ok(false)
             }
             "response.output_item.done" => {
-                if let Some(item) = event.get("item") {
-                    if let Some(content) = item.get("content").and_then(Value::as_array) {
-                        for part in content {
-                            if let Some(text) = part
-                                .get("text")
-                                .and_then(Value::as_str)
-                                .or_else(|| part.get("transcript").and_then(Value::as_str))
-                            {
-                                let trimmed = text.trim();
-                                if !trimmed.is_empty() {
-                                    text_fragments.push(trimmed.to_string());
-                                }
+                if let Some(item) = event.get("item")
+                    && let Some(content) = item.get("content").and_then(Value::as_array)
+                {
+                    for part in content {
+                        if let Some(text) = part
+                            .get("text")
+                            .and_then(Value::as_str)
+                            .or_else(|| part.get("transcript").and_then(Value::as_str))
+                        {
+                            let trimmed = text.trim();
+                            if !trimmed.is_empty() {
+                                text_fragments.push(trimmed.to_string());
                             }
                         }
                     }
@@ -803,7 +807,7 @@ impl OpenAIProvider {
 
         let request = self.realtime_request_body(task)?;
         write
-            .send(Message::Text(serde_json::to_string(&request)?.into()))
+            .send(Message::Text(serde_json::to_string(&request)?))
             .await?;
 
         let mut text_fragments = Vec::new();
@@ -984,10 +988,10 @@ impl OpenAIProvider {
         }
         {
             let guard = self.tools_catalog.read().await;
-            if let Some(catalog) = guard.as_ref() {
-                if catalog.fetched_at.elapsed() < TOOLS_CATALOG_TTL {
-                    return !catalog.known.contains(model) || catalog.tool_capable.contains(model);
-                }
+            if let Some(catalog) = guard.as_ref()
+                && catalog.fetched_at.elapsed() < TOOLS_CATALOG_TTL
+            {
+                return !catalog.known.contains(model) || catalog.tool_capable.contains(model);
             }
         }
         let fresh = self.fetch_tools_catalog().await;
@@ -1726,8 +1730,7 @@ mod tests {
                             "model": "gpt-realtime"
                         }
                     })
-                    .to_string()
-                    .into(),
+                    .to_string(),
                 ))
                 .await
                 .unwrap();
@@ -1744,8 +1747,7 @@ mod tests {
                         "type": "response.output_text.delta",
                         "delta": "Hello "
                     })
-                    .to_string()
-                    .into(),
+                    .to_string(),
                 ))
                 .await
                 .unwrap();
@@ -1755,8 +1757,7 @@ mod tests {
                         "type": "response.output_text.done",
                         "text": "Hello websocket"
                     })
-                    .to_string()
-                    .into(),
+                    .to_string(),
                 ))
                 .await
                 .unwrap();
@@ -1766,8 +1767,7 @@ mod tests {
                         "type": "response.output_audio_transcript.done",
                         "transcript": "Hello websocket"
                     })
-                    .to_string()
-                    .into(),
+                    .to_string(),
                 ))
                 .await
                 .unwrap();
@@ -1779,8 +1779,7 @@ mod tests {
                             "status": "completed"
                         }
                     })
-                    .to_string()
-                    .into(),
+                    .to_string(),
                 ))
                 .await
                 .unwrap();

@@ -31,3 +31,7 @@ ulid = "1"
 # Used to prove the real philote tool catalog (life.* schemas) sanitizes into
 # Gemini-valid function declarations.
 philote = { path = "../philote" }
+
+# Clippy ratchet: this crate is warning-free and must stay that way.
+[lints]
+workspace = true

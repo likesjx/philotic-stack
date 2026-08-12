@@ -15,10 +15,7 @@ use aes_gcm::{
 ///
 /// Reference: https://discord.com/developers/docs/topics/voice-connections
 use anyhow::{Result, bail};
-use chacha20poly1305::{
-    XChaCha20Poly1305, XNonce,
-    aead::{Aead as _, KeyInit as _},
-};
+use chacha20poly1305::{XChaCha20Poly1305, XNonce};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EncryptionMode {

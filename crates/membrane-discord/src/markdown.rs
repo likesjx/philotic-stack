@@ -16,8 +16,7 @@ pub fn to_discord_markdown(input: &str) -> String {
     // 2. Ensure code blocks use ``` fences (not indentation)
     // 3. Truncate to Discord's 2000 char message limit if needed
 
-    let stripped = strip_html(input);
-    stripped
+    strip_html(input)
 }
 
 fn strip_html(input: &str) -> String {

@@ -49,6 +49,18 @@ pub struct AnthropicProvider {
     fast_model: String,
 }
 
+/// What `parse_structured_text` pulls out of a structured model reply:
+/// (text, thinking, tool_name, tool_args, raw). Named because the bare
+/// five-Option tuple is unreadable at the call site and identical in both
+/// providers.
+type StructuredTextParts = (
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<Value>,
+    Option<Value>,
+);
+
 impl AnthropicProvider {
     pub fn new(
         http_client: reqwest::Client,
@@ -323,10 +335,10 @@ impl AnthropicProvider {
 
         if let Some(stop) = task.provider_options.get("stop_sequences") {
             body["stop_sequences"] = stop.clone();
-        } else if let Some(stop) = task.provider_options.get("stop") {
-            if stop.is_array() {
-                body["stop_sequences"] = stop.clone();
-            }
+        } else if let Some(stop) = task.provider_options.get("stop")
+            && stop.is_array()
+        {
+            body["stop_sequences"] = stop.clone();
         }
 
         Ok(body)
@@ -367,15 +379,7 @@ impl AnthropicProvider {
 
     /// Parse the structured-contract JSON out of a text reply.
     /// Returns `(display_text, spoken_text, memory_concept, memory_candidate, active_plan)`.
-    fn parse_structured_text(
-        content: &str,
-    ) -> (
-        Option<String>,
-        Option<String>,
-        Option<String>,
-        Option<Value>,
-        Option<Value>,
-    ) {
+    fn parse_structured_text(content: &str) -> StructuredTextParts {
         let Ok(value) = serde_json::from_str::<Value>(Self::strip_json_code_fences(content)) else {
             return (None, None, None, None, None);
         };
@@ -789,10 +793,11 @@ impl ModelProvider for AnthropicProvider {
                             warn!("Anthropic SSE line was not valid JSON: {}", payload);
                             continue;
                         };
-                        if let Some(token) = fold.fold_event(&event) {
-                            if forward_tokens && !token.is_empty() {
-                                let _ = token_tx.send(token).await;
-                            }
+                        if let Some(token) = fold.fold_event(&event)
+                            && forward_tokens
+                            && !token.is_empty()
+                        {
+                            let _ = token_tx.send(token).await;
                         }
                         if fold.finished || fold.error.is_some() {
                             break 'stream;
