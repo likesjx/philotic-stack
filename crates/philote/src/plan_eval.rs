@@ -1040,8 +1040,19 @@ fn outstanding_lines(
 /// which.
 pub fn reentry_hint(turn: &WorkingTurn) -> String {
     let Some(plan) = turn.active_plan.as_ref() else {
+        // The interim-note invitation must appear here too, not only on the
+        // plan branch below. DEF-077's flush shipped on the ToolCall path for
+        // every re-entry, but a plan-less multi-tool turn never saw any prompt
+        // to use `partial_replies` — and watched-live (2026-08-06) a 458s,
+        // six-tool-call turn stayed silent throughout while the loop's gate
+        // was open the whole time. Models do not spontaneously use an
+        // unexplained optional contract field.
         return "Review the above tool results. If your task is complete, respond to the user \
-                now. Only call another tool if a specific next step is still required."
+                now. Only call another tool if a specific next step is still required. \
+                If you are continuing a long stretch of work, you may add one short line to \
+                `partial_replies` alongside the tool call to tell the user what you are doing — \
+                it reaches them without ending the turn, and the loop drops it if you are \
+                speaking too often. Use it when the silence would be long, not after every step."
             .to_string();
     };
 
@@ -1478,6 +1489,22 @@ mod tests {
         );
         // The blanket ban is gone, but the anti-chatter framing must remain.
         assert!(!hint.contains("do not send a progress receipt after each tool call"));
+        assert!(hint.contains("not after every step"));
+    }
+
+    /// The plan-less branch needs the same invitation. Watched-live
+    /// (2026-08-06): a 458s six-tool-call turn with no plan emitted zero
+    /// interim notes because this branch never mentioned `partial_replies`
+    /// while the plan branch did — the field was offered in the contract but
+    /// nothing told the model it existed.
+    #[test]
+    fn planless_reentry_hint_also_invites_interim_notes() {
+        let hint = reentry_hint(&turn_with(None, vec![]));
+        assert!(hint.contains("partial_replies"));
+        assert!(
+            hint.contains("without ending the turn"),
+            "the model must know speaking does not stop the work, got: {hint}"
+        );
         assert!(hint.contains("not after every step"));
     }
 
