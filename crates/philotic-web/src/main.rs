@@ -163,6 +163,9 @@ enum Command {
         /// Keep ~/.philotic/identity/ (preserves operator keypair)
         #[arg(long)]
         keep_identity: bool,
+        /// Skip the interactive confirmation (required for non-interactive use)
+        #[arg(long)]
+        yes: bool,
     },
 
     /// Apply a config file to the Context Graph DB (run once on setup or when config changes)
@@ -565,7 +568,7 @@ async fn main() -> Result<()> {
         ),
         Command::Explain { action } => explain::run(action),
         Command::Agents { config } => status::run_agents(config).await,
-        Command::Reset { keep_identity } => reset::run(keep_identity).await,
+        Command::Reset { keep_identity, yes } => reset::run(keep_identity, yes).await,
         Command::Service { action } => match action {
             ServiceAction::Install { hotel } => service::install(hotel).await,
             ServiceAction::Start { hotel } => service::start(hotel).await,

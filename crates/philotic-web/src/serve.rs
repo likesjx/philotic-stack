@@ -7105,10 +7105,26 @@ fn component_templates() -> Vec<ComponentTemplateView> {
     ]
 }
 
+/// Correlation id: turn ids, reply guest ids, and similar. 64 bits of CSPRNG
+/// output is ample for uniqueness — these are not credentials. Use
+/// [`new_secret_token`] for anything an attacker would want to guess.
 fn new_operator_chat_id(prefix: &str) -> String {
     let mut rng = rand::thread_rng();
     let suffix = format!("{:016x}", rng.r#gen::<u64>());
     format!("{prefix}-{suffix}")
+}
+
+/// Unguessable token for values that gate access: the operator session bearer
+/// and the OIDC `state` nonce.
+///
+/// Both were previously minted by `new_operator_chat_id`, i.e. 64 bits. That is
+/// unpredictable (it is a CSPRNG) but thin for a credential — the session token
+/// in particular is a bearer secret with an 8-hour life that appears in a
+/// cookie and an `Authorization` header. 256 bits removes the question, and
+/// costs nothing.
+fn new_secret_token(prefix: &str) -> String {
+    let bytes: [u8; 32] = rand::thread_rng().r#gen();
+    format!("{prefix}-{}", hex::encode(bytes))
 }
 
 async fn connect_management_client(socket: &str, guest_id: &str) -> Result<PhiloticClient> {
@@ -7713,7 +7729,7 @@ fn issue_operator_session(
     let expires_at = now + AUTH_COOKIE_MAX_AGE_SECS as i64;
     let session = OperatorSessionRecord {
         session_id: new_operator_chat_id("operator-session"),
-        session_token: new_operator_chat_id("operator-token"),
+        session_token: new_secret_token("operator-token"),
         user_id: default_operator_user_id(hotel),
         display_name: display_name.to_string(),
         issuing_hotel: hotel.to_string(),
@@ -7771,7 +7787,7 @@ fn issue_operator_auth_challenge(
         verifier_kind: verifier_kind.into(),
         verifier_hint,
         bind_label,
-        challenge_nonce: new_operator_chat_id("challenge-nonce"),
+        challenge_nonce: new_secret_token("challenge-nonce"),
         exchange_secret,
         issued_at: now,
         expires_at,
@@ -8936,6 +8952,30 @@ mod tests {
 
     fn temp_db_path(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!("philotic-web-{name}-{}.db", uuid::Uuid::new_v4()))
+    }
+
+    /// Credentials get 256 bits; correlation ids stay at 64.
+    #[test]
+    fn secret_tokens_are_long_and_unique() {
+        let token = new_secret_token("operator-token");
+        let hex_part = token.strip_prefix("operator-token-").expect("prefix");
+        assert_eq!(hex_part.len(), 64, "expected 32 bytes of hex: {token}");
+        assert!(hex_part.chars().all(|c| c.is_ascii_hexdigit()));
+
+        // Distinctness across a batch — a constant would pass the length check.
+        let batch: std::collections::HashSet<String> =
+            (0..256).map(|_| new_secret_token("t")).collect();
+        assert_eq!(batch.len(), 256, "tokens must not repeat");
+
+        // Correlation ids are deliberately shorter and are not credentials.
+        let chat_id = new_operator_chat_id("operator-chat-turn");
+        assert_eq!(
+            chat_id
+                .strip_prefix("operator-chat-turn-")
+                .expect("prefix")
+                .len(),
+            16
+        );
     }
 
     /// The OIDC callback derives its `Location` from the stored `bind_label` on
