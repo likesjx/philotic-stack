@@ -1121,10 +1121,32 @@ impl IpcServer {
                     )
                     .await;
                 } else {
-                    warn!(
-                        "Cross-hotel task {}: no subscriber for role '{}', no specific guest; task dropped.",
-                        event.event_id, target_role
-                    );
+                    // Same rescue as the local EmitTask path: a governed task
+                    // arriving over the mesh for a runner role this hotel seeds
+                    // (egress-http-runner dormant after a deploy, or any runner
+                    // dead after a hotel crash) revives the guest and parks the
+                    // task instead of dropping it. This is the exit-hotel side
+                    // of the black-hole: mac-jane's catalog syncs prefer
+                    // vps-jane as egress exit, and every one of them died here
+                    // whenever vps's runner was down — the caller only ever saw
+                    // its own deadline expire.
+                    let rescued = Self::rescue_unserved_role_task(
+                        graph,
+                        parked_inbound,
+                        mat_req,
+                        local_node_id,
+                        target_role,
+                        &event.source_node_id,
+                        event.event_id,
+                        data,
+                    )
+                    .await;
+                    if rescued.is_none() {
+                        warn!(
+                            "Cross-hotel task {}: no subscriber for role '{}', no specific guest; task dropped.",
+                            event.event_id, target_role
+                        );
+                    }
                 }
                 true
             }

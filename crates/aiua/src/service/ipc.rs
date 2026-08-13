@@ -3740,6 +3740,94 @@ impl IpcServer {
     /// now" is not sufficient grounds to refuse the task, and refusing early
     /// would break all three. Once delivery has actually returned `false` the
     /// drop is final: `SubscribeInbox` does not replay.
+    /// Try to rescue a task whose role has no live subscriber by reviving this
+    /// hotel's own guest for that role: park the task (flushed on the guest's
+    /// next registration) and ask the supervisor to bring the guest up.
+    ///
+    /// Returns the guest id the task was parked for, or `None` when no rescue
+    /// applies and the caller should fall through to its drop handling.
+    ///
+    /// Two revival cases, deliberately different:
+    /// - An ACTIVE record whose process is dead (hotel crash leaves
+    ///   `is_active=1` with a stale pid — observed live on mac-jane 2026-08-11
+    ///   when the hotel died and left `active_pid=4002` pointing at what became
+    ///   macOS ReportCrash): any role qualifies, this is pure respawn.
+    /// - A DORMANT record is revived only for `egress-http-runner`. That guest
+    ///   is seeded dormant-by-design, "until a binding selects this hotel" —
+    ///   and a governed task arriving for it IS that selection, just observed
+    ///   at dispatch instead of at binding registration (which only fires once,
+    ///   on first registration, and so cannot re-activate after a deploy wipes
+    ///   the flag). Other dormant guests stay down: an operator's deliberate
+    ///   deactivation must not be overridden by any task that names the role.
+    pub(super) async fn rescue_unserved_role_task(
+        graph: &GraphDomain,
+        parked_inbound: &ParkedInboundRegistry,
+        materialization_requester: Option<&dyn GuestMaterializationRequester>,
+        local_node_id: &str,
+        target_role: &str,
+        source_node: &str,
+        task_id: Uuid,
+        task_json: &str,
+    ) -> Option<String> {
+        if Self::is_hotel_intercepted_role(target_role) {
+            return None;
+        }
+        let hotel_name = Self::local_hotel_name(graph, local_node_id)?;
+        let record = graph
+            .list_guests(&hotel_name, false)
+            .ok()?
+            .into_iter()
+            .find(|guest| guest.role == target_role)?;
+
+        if !record.is_active && target_role != "egress-http-runner" {
+            return None;
+        }
+        if !record.is_active {
+            if let Err(err) = graph.set_guest_active(&hotel_name, &record.guest_id, true) {
+                warn!(
+                    guest_id = %record.guest_id,
+                    "rescue_unserved_role_task: failed to activate dormant guest: {err}"
+                );
+                return None;
+            }
+            info!(
+                guest_id = %record.guest_id,
+                target_role,
+                "Dormant runner guest activated by an arriving task for its role."
+            );
+        }
+
+        {
+            let mut guard = parked_inbound.lock().await;
+            let entry = guard.entry(record.guest_id.clone()).or_default();
+            // At-most-once park per task id, mirroring `repark_lost_task`.
+            if !entry.iter().any(|parked| parked.task_id == task_id) {
+                entry.push(ParkedInboundTask {
+                    source_node: source_node.to_string(),
+                    task_id,
+                    task_json: task_json.to_string(),
+                    activate_session_id: None,
+                });
+            }
+        }
+        info!(
+            %task_id,
+            guest_id = %record.guest_id,
+            target_role,
+            "Unserved-role task parked; will flush when the guest registers."
+        );
+
+        if let Some(requester) = materialization_requester {
+            if let Err(err) = requester.ensure_guest_active(&record.guest_id).await {
+                warn!(
+                    guest_id = %record.guest_id,
+                    "rescue_unserved_role_task: materialization request failed: {err}"
+                );
+            }
+        }
+        Some(record.guest_id)
+    }
+
     fn report_unserved_local_role(
         graph: &GraphDomain,
         heal_queue: Option<&dyn ansible_mesh_core::heal_queue::HealQueueStorage>,
@@ -6222,14 +6310,32 @@ impl IpcServer {
                                 )
                                 .await;
                                 if !delivered {
-                                    Self::report_unserved_local_role(
+                                    // Before declaring the drop final, try to revive
+                                    // this hotel's own guest for the role and park the
+                                    // task for it — the runner may be dormant after a
+                                    // deploy or dead after a hotel crash. Only when no
+                                    // rescue applies is the turn failed.
+                                    let rescued = Self::rescue_unserved_role_task(
                                         graph,
-                                        heal_queue,
+                                        &parked_inbound,
+                                        materialization_requester,
+                                        local_node_id,
                                         &target_role,
-                                        target_guest_id.as_deref(),
+                                        local_node_id,
                                         task_id,
                                         &task_json,
-                                    );
+                                    )
+                                    .await;
+                                    if rescued.is_none() {
+                                        Self::report_unserved_local_role(
+                                            graph,
+                                            heal_queue,
+                                            &target_role,
+                                            target_guest_id.as_deref(),
+                                            task_id,
+                                            &task_json,
+                                        );
+                                    }
                                 }
                             }
                         }
@@ -19817,6 +19923,219 @@ pub(crate) mod tests {
         if Path::new(&socket_path).exists() {
             let _ = std::fs::remove_file(&socket_path);
         }
+    }
+
+    /// Shared scaffold for the rescue tests: a live IPC server whose graph
+    /// carries a hotel record (so `local_hotel_name` resolves) plus one guest
+    /// record in the given activation state.
+    async fn rescue_test_server(
+        guest_role: &str,
+        is_active: bool,
+        active_pid: Option<&str>,
+    ) -> (
+        String,
+        Arc<GraphDomain>,
+        Arc<RecordingHealQueue>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let socket_path = test_socket_path();
+        let (dispatcher_tx, _dispatcher_rx) = test_dispatcher_channel();
+        let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
+        let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
+        graph
+            .upsert_hotel(&HotelRecord {
+                hotel_name: "local-hotel".into(),
+                capabilities: NodeCapabilities {
+                    node_id: "local-aiua-01".into(),
+                    roles: vec![],
+                    models: vec![],
+                    tools: vec![],
+                    constraints: Default::default(),
+                },
+                mesh_port: 9000,
+                blob_port: 9001,
+                execution_port: 9002,
+                ipc_socket_path: "/tmp/test.sock".into(),
+                active_pid: None,
+                mesh_host: None,
+            })
+            .expect("seed local hotel");
+        graph
+            .upsert_guest(&GuestRecord {
+                hotel_name: "local-hotel".into(),
+                guest_id: format!("local-hotel:{guest_role}"),
+                role: guest_role.into(),
+                config_json: serde_json::json!({
+                    "command": "true", "args": [], "env": {}
+                })
+                .to_string(),
+                is_active,
+                active_pid: active_pid.map(str::to_string),
+                last_active_at: None,
+            })
+            .expect("seed runner guest");
+        let heal_queue = Arc::new(RecordingHealQueue::default());
+        let server = IpcServer::new(
+            socket_path.clone(),
+            "local-aiua-01",
+            dispatcher_tx,
+            graph.clone(),
+        )
+        .with_heal_queue(heal_queue.clone());
+        let server_task = tokio::spawn(async move {
+            server.run().await.expect("ipc server should run");
+        });
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        unsafe {
+            std::env::set_var("PHILOTIC_HOTEL_SOCKET", &socket_path);
+        }
+        (socket_path, graph, heal_queue, server_task)
+    }
+
+    async fn rescue_test_emit(session_id: &str, turn_id: &str, target_role: &str) {
+        let mut caller = PhiloticClient::connect(GuestIdentity {
+            guest_id: "rescue-test-caller".into(),
+            role: "rescue-test-caller".into(),
+            supported_tools: Vec::new(),
+        })
+        .await
+        .expect("caller connect");
+        caller
+            .send_request(IpcRequest::EmitTask {
+                target_node: "local-aiua-01".into(),
+                target_role: target_role.into(),
+                target_guest_id: None,
+                task_json: serde_json::json!({
+                    "action": "execute_tool",
+                    "session_id": session_id,
+                    "turn_id": turn_id,
+                })
+                .to_string(),
+            })
+            .await
+            .expect("emit task response");
+        tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+    }
+
+    fn rescue_test_teardown(socket_path: String, server_task: tokio::task::JoinHandle<()>) {
+        unsafe {
+            std::env::remove_var("PHILOTIC_HOTEL_SOCKET");
+        }
+        server_task.abort();
+        if Path::new(&socket_path).exists() {
+            let _ = std::fs::remove_file(&socket_path);
+        }
+    }
+
+    /// A task arriving for `egress-http-runner` while its seeded guest is
+    /// DORMANT must revive the guest and park the task, not fail the turn.
+    /// This is the deploy-wipe black-hole: `aiua load` reseeded the runner
+    /// `is_active=false`, registration-time materialization never re-fires,
+    /// and every governed egress on that hotel died until manual DB surgery.
+    #[tokio::test]
+    async fn emit_task_revives_dormant_egress_guest_instead_of_failing() {
+        let _env_guard = ipc_env_guard();
+        let (socket_path, graph, heal_queue, server_task) =
+            rescue_test_server("egress-http-runner", false, None).await;
+
+        rescue_test_emit(
+            "system:model-catalog-sync",
+            "turn-revive",
+            "egress-http-runner",
+        )
+        .await;
+
+        let guest = graph
+            .get_guest("local-hotel", "local-hotel:egress-http-runner")
+            .expect("guest lookup")
+            .expect("guest exists");
+        assert!(
+            guest.is_active,
+            "an arriving egress task IS the binding selecting this hotel — the \
+             dormant runner must be activated"
+        );
+        let turn = graph
+            .get_session_turn("system:model-catalog-sync", "turn-revive")
+            .expect("turn lookup")
+            .expect("turn recorded");
+        assert_ne!(
+            turn.status, "failed",
+            "a rescued task's turn must stay open for the parked delivery: {turn:?}"
+        );
+        let pushed = heal_queue.pushed.lock().unwrap();
+        assert!(
+            !pushed
+                .iter()
+                .any(|entry| entry.3 == "emit_task_unserved_local_role"),
+            "a rescued task must not file an unserved-role failure: {pushed:?}"
+        );
+        drop(pushed);
+        rescue_test_teardown(socket_path, server_task);
+    }
+
+    /// The activation half of the rescue is egress-only. A dormant guest of
+    /// any other role stays down — an operator's deliberate deactivation must
+    /// not be overridden by whoever addresses a task to the role — and the
+    /// turn fails fast exactly as before.
+    #[tokio::test]
+    async fn emit_task_does_not_revive_dormant_non_egress_guest() {
+        let _env_guard = ipc_env_guard();
+        let (socket_path, graph, heal_queue, server_task) =
+            rescue_test_server("tool.echo", false, None).await;
+
+        rescue_test_emit("system:echo", "turn-dormant-tool", "tool.echo").await;
+
+        let guest = graph
+            .get_guest("local-hotel", "local-hotel:tool.echo")
+            .expect("guest lookup")
+            .expect("guest exists");
+        assert!(
+            !guest.is_active,
+            "a deliberately-deactivated guest must not be revived by an inbound task"
+        );
+        let turn = graph
+            .get_session_turn("system:echo", "turn-dormant-tool")
+            .expect("turn lookup")
+            .expect("turn recorded");
+        assert_eq!(turn.status, "failed");
+        assert_eq!(
+            turn.error_json.expect("error recorded")["error"],
+            "TARGET_ROLE_UNSERVED"
+        );
+        rescue_test_teardown(socket_path, server_task);
+        drop(heal_queue);
+    }
+
+    /// An ACTIVE guest whose process is gone (hotel crash leaves a stale
+    /// `active_pid`) is rescued for ANY role: the task parks and the turn
+    /// stays open for the respawned guest, instead of failing while the
+    /// record claims the runner is up.
+    #[tokio::test]
+    async fn emit_task_parks_for_active_guest_with_dead_process() {
+        let _env_guard = ipc_env_guard();
+        let (socket_path, graph, heal_queue, server_task) =
+            rescue_test_server("tool.echo", true, Some("999999")).await;
+
+        rescue_test_emit("system:echo", "turn-dead-pid", "tool.echo").await;
+
+        let turn = graph
+            .get_session_turn("system:echo", "turn-dead-pid")
+            .expect("turn lookup")
+            .expect("turn recorded");
+        assert_ne!(
+            turn.status, "failed",
+            "an active-but-dead guest must be respawned, not have its task's turn \
+             failed: {turn:?}"
+        );
+        let pushed = heal_queue.pushed.lock().unwrap();
+        assert!(
+            !pushed
+                .iter()
+                .any(|entry| entry.3 == "emit_task_unserved_local_role"),
+            "a parked task must not file an unserved-role failure: {pushed:?}"
+        );
+        drop(pushed);
+        rescue_test_teardown(socket_path, server_task);
     }
 
     #[tokio::test]
