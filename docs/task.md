@@ -1699,6 +1699,19 @@ Seam ID: `lyra-travel-agent` — proposal: [LYRA_TRAVEL_AGENT_PROPOSAL.md](/User
 - [x] Outbound integration fabric Slice 4 (`integration-binding-contract`):
   compile reviewed SkillDAG requirements into local integration bindings,
   grants, and `ToolExecutionRoute` records.
+- [x] Orchestrator skill administration plane (`codex/skill-admin-plane`,
+  2026-08-13): skill management and the SkillDAG are administrable by philote
+  orchestrators over governed IPC — `skill.register` persists SkillDAG edges
+  (`allowed_skills`), classes, subagent kind, goal template, and provenance
+  instead of discarding them; session snapshots resolve the transitive DAG
+  closure with cycle diagnostics; `skill.set_state` makes
+  suspended/deprecated/active reachable and gates projection;
+  `require_skill_admin` centralizes the orchestrator/management gate; every
+  mutation is audited fail-closed and `skill.audit` reads the trail;
+  exact-boundary agent ownership fixes the `aria2`-administers-`aria` prefix
+  hole. Open seams: on-demand skill administration, data-driven turn
+  relevance, `profile.*` ops, harness/repo catalog reconciliation (see
+  DATA_DRIVEN_TOOL_GRANTS_PROPOSAL).
 - [ ] Outbound integration fabric Slice 5 (`outbound-fleet-enforcement`):
   deployment inventories now install `membrane-mcp-client` and
   `egress-http-runner`; inventory remaining direct clients and migrate general

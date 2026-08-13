@@ -2,8 +2,8 @@
 title: Data-Driven Tool Grants (SkillDAG)
 doc_type: proposal
 domain: tooling-execution
-status: proposed
-last_updated: 2026-07-21
+status: accepted for current slice
+last_updated: 2026-08-13
 tags:
 - tooling
 - grants
@@ -57,6 +57,41 @@ against it, and those changes **compile down** to the local toolset
 2. **Runner routing as data** — the PR #277 reconcile is a precedent.
 3. **Governance/audit.**
 4. **Later** — SkillDAG reflection in the LifeGraph.
+
+## Slice: orchestrator skill administration plane — IMPLEMENTED 2026-08-13
+
+Disposition: implemented, `test-green` (`codex/skill-admin-plane`).
+
+Before this slice the SkillDAG was a name without a structure: `AbstractSkillRecord`
+had no skill→skill edge field, `skill.register` validated then **discarded**
+`allowed_skills`/`allowed_classes`/`goal`/`subagent_kind` at the IPC boundary,
+four lifecycle states (`Registered`/`Active`/`Suspended`/`Deprecated`) were
+unreachable, assign/revoke were unaudited, and a `starts_with(agent_id)` check
+let agent `aria2` administer agent `aria`.
+
+What landed:
+
+- **DAG edges persist**: `AbstractSkillRecord` gained `allowed_skills` (skill→skill
+  dependency edges), `implied_classes`, `subagent_kind`, `goal_template`, and a
+  populated `source_snapshot`; `skill.register` persists all of them.
+- **Transitive resolution**: `resolve_transitive_skills` (ansible-mesh-core)
+  expands the DAG closure with cycle/missing-edge diagnostics; session snapshot
+  composition resolves the closure hotel-side before projecting tools.
+- **Lifecycle is administrable**: new `skill.set_state` tool + `SetSkillState`
+  IPC op (`active`/`suspended`/`deprecated`); suspended/deprecated skills stop
+  contributing names, tools, and guidance to projection
+  (`SkillValidationState::is_projectable`), reversibly.
+- **One gate, audited**: `require_skill_admin` centralizes the
+  orchestrator/management gate across register/assign/revoke/set_state/audit;
+  every mutation writes a fail-closed `SkillRegistrationAuditRecord` (now with
+  `action` + `detail`); new `skill.audit` tool + `ListSkillAudits` IPC op read
+  the trail; `skill.list` now requires a registered identity; the agent-ownership
+  check is exact-boundary (`guest_owns_agent`).
+
+Still open (next seams): on-demand skill administration (`on_demand_skills` has
+no IPC writer), data-driven turn relevance (`skill_is_relevant_for_turn` is still
+compiled-in), profile-level ops (`profile.*`), harness/repo skill catalog
+reconciliation, and the slice-4 LifeGraph reflection above.
 
 ## Precedent
 

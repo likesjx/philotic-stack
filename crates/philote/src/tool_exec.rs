@@ -2911,6 +2911,7 @@ impl AgentRuntime {
                 };
                 let allowed_tools = str_vec("allowed_tools");
                 let allowed_classes = str_vec("allowed_classes");
+                let allowed_skills = str_vec("allowed_skills");
 
                 let response = self
                     .ipc_client
@@ -2921,6 +2922,7 @@ impl AgentRuntime {
                         goal,
                         allowed_tools,
                         allowed_classes,
+                        allowed_skills,
                         hook_subscriptions: vec![],
                         completion_route: Default::default(),
                         failure_route: Default::default(),
@@ -3172,6 +3174,211 @@ impl AgentRuntime {
                         let err = TaskErrorPayload::transport_error(
                             "philote",
                             format!("{op}: IPC transport error — {e}"),
+                        );
+                        (err.display_message(), Some(err))
+                    }
+                };
+
+                self.handle_tool_result(InboundTaskPayload {
+                    action: Some("tool_result".into()),
+                    agent_action: None,
+                    handoff_bundle: None,
+                    source: Some("agent".into()),
+                    session_id: Some(payload.session_id),
+                    turn_id: Some(payload.turn_id),
+                    transport: None,
+                    chat_id: Some(payload.chat_id),
+                    thread_id: None,
+                    sender_id: None,
+                    sender_username: None,
+                    message_kind: None,
+                    content: Some(content),
+                    attachments: Vec::new(),
+                    command: None,
+                    callback_data: None,
+                    raw_transport_event: None,
+                    error: tool_err,
+                    tool_name: Some(payload.tool_name),
+                    arguments: None,
+                    final_reply_to: Some(payload.final_reply_to),
+                    final_reply_role: Some(payload.final_reply_role),
+                    final_reply_guest_id: payload.final_reply_guest_id,
+                    ..Default::default()
+                })
+                .await
+            }
+
+            "skill.set_state" => {
+                let args = &payload.arguments;
+                let skill_name = match args.get("skill_name").and_then(|v| v.as_str()) {
+                    Some(s) => s.to_string(),
+                    None => {
+                        return self
+                            .fail_active_turn(
+                                payload.session_id,
+                                payload.turn_id,
+                                "skill.set_state: missing required argument 'skill_name'".into(),
+                            )
+                            .await;
+                    }
+                };
+                let state = match args.get("state").and_then(|v| v.as_str()) {
+                    Some(s) => s.to_string(),
+                    None => {
+                        return self
+                            .fail_active_turn(
+                                payload.session_id,
+                                payload.turn_id,
+                                "skill.set_state: missing required argument 'state'".into(),
+                            )
+                            .await;
+                    }
+                };
+                let reason = args
+                    .get("reason")
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string);
+
+                let (content, tool_err) = match self
+                    .ipc_client
+                    .send_request(IpcRequest::SetSkillState {
+                        skill_name: skill_name.clone(),
+                        state,
+                        reason,
+                    })
+                    .await
+                {
+                    Ok(IpcResponse::SkillStateSet {
+                        skill_name: name,
+                        skill_state,
+                    }) => (format!("Skill '{name}' is now '{skill_state}'."), None),
+                    Ok(IpcResponse::Standard {
+                        ok: false,
+                        code,
+                        message,
+                        ..
+                    }) => {
+                        let e = TaskErrorPayload::ipc_failure("aiua", &*code, message);
+                        (e.display_message(), Some(e))
+                    }
+                    Ok(IpcResponse::Error(msg)) => {
+                        let e = TaskErrorPayload::ipc_failure("aiua", "IPC_ERROR", msg);
+                        (e.display_message(), Some(e))
+                    }
+                    Ok(_) => {
+                        let e = TaskErrorPayload::ipc_failure(
+                            "aiua",
+                            "UNEXPECTED_RESPONSE",
+                            "skill.set_state: unexpected hotel response",
+                        );
+                        (e.display_message(), Some(e))
+                    }
+                    Err(e) => {
+                        let err = TaskErrorPayload::transport_error(
+                            "philote",
+                            format!("skill.set_state: IPC transport error — {e}"),
+                        );
+                        (err.display_message(), Some(err))
+                    }
+                };
+
+                self.handle_tool_result(InboundTaskPayload {
+                    action: Some("tool_result".into()),
+                    agent_action: None,
+                    handoff_bundle: None,
+                    source: Some("agent".into()),
+                    session_id: Some(payload.session_id),
+                    turn_id: Some(payload.turn_id),
+                    transport: None,
+                    chat_id: Some(payload.chat_id),
+                    thread_id: None,
+                    sender_id: None,
+                    sender_username: None,
+                    message_kind: None,
+                    content: Some(content),
+                    attachments: Vec::new(),
+                    command: None,
+                    callback_data: None,
+                    raw_transport_event: None,
+                    error: tool_err,
+                    tool_name: Some(payload.tool_name),
+                    arguments: None,
+                    final_reply_to: Some(payload.final_reply_to),
+                    final_reply_role: Some(payload.final_reply_role),
+                    final_reply_guest_id: payload.final_reply_guest_id,
+                    ..Default::default()
+                })
+                .await
+            }
+
+            "skill.audit" => {
+                let args = &payload.arguments;
+                let skill_name = args
+                    .get("skill_name")
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string);
+                let limit = args
+                    .get("limit")
+                    .and_then(|v| v.as_u64())
+                    .map(|v| v.min(u64::from(u32::MAX)) as u32);
+
+                let (content, tool_err) = match self
+                    .ipc_client
+                    .send_request(IpcRequest::ListSkillAudits { skill_name, limit })
+                    .await
+                {
+                    Ok(IpcResponse::SkillAuditList { skill_audits }) => {
+                        let msg = if skill_audits.is_empty() {
+                            "No skill administration audit entries.".to_string()
+                        } else {
+                            let lines: Vec<String> = skill_audits
+                                .iter()
+                                .map(|a| {
+                                    let skill =
+                                        a.get("skill_name").and_then(|v| v.as_str()).unwrap_or("?");
+                                    let action =
+                                        a.get("action").and_then(|v| v.as_str()).unwrap_or("?");
+                                    let by = a.get("by").and_then(|v| v.as_str()).unwrap_or("?");
+                                    let at = a.get("at").and_then(|v| v.as_u64()).unwrap_or(0);
+                                    let detail = a
+                                        .get("detail")
+                                        .and_then(|v| v.as_str())
+                                        .map(|d| format!(" — {d}"))
+                                        .unwrap_or_default();
+                                    format!("- [{at}] {action} {skill} by {by}{detail}")
+                                })
+                                .collect();
+                            format!("Skill administration audit trail:\n{}", lines.join("\n"))
+                        };
+                        (msg, None)
+                    }
+                    Ok(IpcResponse::Standard {
+                        ok: false,
+                        code,
+                        message,
+                        ..
+                    }) => {
+                        let e = TaskErrorPayload::ipc_failure("aiua", &*code, message);
+                        (e.display_message(), Some(e))
+                    }
+                    Ok(IpcResponse::Error(msg)) => {
+                        let e = TaskErrorPayload::ipc_failure("aiua", "IPC_ERROR", msg);
+                        (e.display_message(), Some(e))
+                    }
+                    Ok(_) => {
+                        let e = TaskErrorPayload::ipc_failure(
+                            "aiua",
+                            "UNEXPECTED_RESPONSE",
+                            "skill.audit: unexpected hotel response",
+                        );
+                        (e.display_message(), Some(e))
+                    }
+                    Err(e) => {
+                        let err = TaskErrorPayload::transport_error(
+                            "philote",
+                            format!("skill.audit: IPC transport error — {e}"),
                         );
                         (err.display_message(), Some(err))
                     }

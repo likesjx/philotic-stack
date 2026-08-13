@@ -7,6 +7,9 @@ catalog:
     - skill.list
     - skill.register
     - skill.assign
+    - skill.revoke
+    - skill.set_state
+    - skill.audit
   validation_state: validated
   skill_markers:
     - governed
@@ -20,6 +23,7 @@ catalog:
     optional_fields:
       - allowed_tools
       - allowed_classes
+      - allowed_skills
     repo_skill_path: skills/skill-authoring/SKILL.md
     workflow: "skill.list → skill.register → skill.assign"
 ---
@@ -54,6 +58,19 @@ Do not create a skill for a one-off task. Skills are for patterns.
 | `goal` | Yes | The goal template injected into the subagent at invocation. May include `{{placeholder}}` variables. |
 | `allowed_tools` | No | Explicit tool IDs the subagent may use. If omitted, falls back to class allowances. |
 | `allowed_classes` | No | Tool class names allowed (e.g. `workspace`, `utility`, `shell`). |
+| `allowed_skills` | No | SkillDAG edges: names of already-registered skills this skill depends on. Activating the skill transitively activates its dependencies. |
+
+## Lifecycle and audit
+
+Registered skills are living records, administered by the orchestrator:
+
+- Re-running `skill.register` with the same `skill_name` updates the record
+  (audited as `update`).
+- `skill.set_state` moves a skill between `active`, `suspended`, and
+  `deprecated`. Suspended/deprecated skills stop contributing tools and
+  guidance to sessions on their next snapshot; `active` reinstates them.
+- `skill.audit` reads the append-only administration trail: every register,
+  update, assign, revoke, and state change, with who and when.
 
 ## Minimal example
 

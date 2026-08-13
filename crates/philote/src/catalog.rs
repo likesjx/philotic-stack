@@ -387,7 +387,13 @@ pub fn tools_for_skill(skill_name: &str) -> &'static [&'static str] {
             "hotel.best_place_to_run",
         ],
         "role.authoring" => &["role.create_or_update"],
-        "skill.authoring" => &["skill.register", "skill.assign", "skill.revoke"],
+        "skill.authoring" => &[
+            "skill.register",
+            "skill.assign",
+            "skill.revoke",
+            "skill.set_state",
+            "skill.audit",
+        ],
         "context.synthesize" => &["workspace.list", "workspace.read"],
         "agent.initiate" => &["agent.graph.write", "agent.graph.recall"],
         "profile.manage" => &["role.configure"],
@@ -566,6 +572,8 @@ pub fn skill_is_relevant_for_turn(skill_name: &str, turn_text: &str) -> bool {
             t.contains("register skill")
                 || t.contains("skill.register")
                 || t.contains("skill.assign")
+                || t.contains("skill.set_state")
+                || t.contains("skill.audit")
                 || t.contains("create skill")
                 || t.contains("add skill")
                 || t.contains("assign skill")
@@ -573,6 +581,9 @@ pub fn skill_is_relevant_for_turn(skill_name: &str, turn_text: &str) -> bool {
                 || t.contains("with skill")
                 || t.contains("cron.manage")
                 || t.contains("revoke skill")
+                || t.contains("suspend skill")
+                || t.contains("deprecate skill")
+                || t.contains("skill audit")
         }
         "context.synthesize" => {
             t.contains("workspace")
@@ -1491,6 +1502,13 @@ fn build_catalog() -> HashMap<String, ToolDefinition> {
                         "items": { "type": "string" },
                         "description": "Optional list of tool class names the subagent may use \
                                         (e.g., 'utility', 'workspace')."
+                    },
+                    "allowed_skills": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Optional SkillDAG edges: names of already-registered \
+                                        skills this skill depends on. Activating this skill \
+                                        transitively activates its dependencies."
                     }
                 },
                 "required": ["skill_name", "description", "subagent_kind", "goal"]
@@ -1583,6 +1601,65 @@ fn build_catalog() -> HashMap<String, ToolDefinition> {
                 "required": ["role_name", "skill_name"]
             }),
             class: Some("config".into()),
+        },
+    );
+
+    m.insert(
+        "skill.set_state".into(),
+        ToolDefinition {
+            tool_name: "skill.set_state".into(),
+            description: "Administratively changes a registered skill's lifecycle state. \
+                          'suspended' and 'deprecated' retire the skill: it stops contributing \
+                          tools and guidance to sessions on their next snapshot. 'active' \
+                          reinstates it. Orchestrator/management only; every change is audited."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "skill_name": {
+                        "type": "string",
+                        "description": "The registered skill to change."
+                    },
+                    "state": {
+                        "type": "string",
+                        "enum": ["active", "suspended", "deprecated"],
+                        "description": "Target lifecycle state."
+                    },
+                    "reason": {
+                        "type": "string",
+                        "description": "Why the state is changing (recorded in the audit trail; \
+                                        required in spirit for suspended/deprecated)."
+                    }
+                },
+                "required": ["skill_name", "state"]
+            }),
+            class: Some("config".into()),
+        },
+    );
+
+    m.insert(
+        "skill.audit".into(),
+        ToolDefinition {
+            tool_name: "skill.audit".into(),
+            description: "Reads the append-only skill administration audit trail: every \
+                          register, update, assign, revoke, and state change, with who did it \
+                          and when. Orchestrator/management only. Use to review how the skill \
+                          catalog reached its current shape."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "skill_name": {
+                        "type": "string",
+                        "description": "Optional: only entries for this skill."
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Maximum entries to return, newest first. Defaults to 100."
+                    }
+                }
+            }),
+            class: Some("capability".into()),
         },
     );
 

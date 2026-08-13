@@ -29,6 +29,8 @@ pub const LOCAL_AGENT_TOOLS: &[&str] = &[
     "skill.list",
     "skill.assign",
     "skill.revoke",
+    "skill.set_state",
+    "skill.audit",
     "subagent.spawn",
     "role.configure",
     "role.create_or_update",

@@ -17,7 +17,7 @@ use ansible_mesh_core::event::{EventEnvelope, EventKind, EventPayload};
 use ansible_mesh_core::graph::{
     AbstractSkillRecord, MembraneTransportHomeRecord, MembraneTransportHomeStatus,
     ModelProfileRecord, RoleIncarnationRecord, RoleReadinessState, SkillRegistrationAuditRecord,
-    SkillValidationState,
+    SkillSourceSnapshot, SkillValidationState,
 };
 use ansible_mesh_core::membership::{
     DEFAULT_INVITE_TTL_SECS, MeshInvite, MeshInvitePayload, MeshJoinRequestPayload,
@@ -6992,7 +6992,8 @@ impl IpcServer {
                 subagent_kind,
                 goal,
                 allowed_tools,
-                allowed_classes: _,
+                allowed_classes,
+                allowed_skills,
                 hook_subscriptions: _,
                 completion_route: _,
                 failure_route: _,
@@ -7006,7 +7007,60 @@ impl IpcServer {
                 subagent_kind,
                 goal,
                 allowed_tools,
+                allowed_classes,
+                allowed_skills,
             ),
+            IpcRequest::SetSkillState {
+                skill_name,
+                state,
+                reason,
+            } => {
+                handle_set_skill_state(current_identity.as_ref(), graph, skill_name, state, reason)
+            }
+            IpcRequest::ListSkillAudits { skill_name, limit } => {
+                if let Err(response) = require_skill_admin(
+                    current_identity.as_ref(),
+                    "list_skill_audits",
+                    "LIST_SKILL_AUDITS",
+                    "reading the skill audit trail",
+                ) {
+                    return response;
+                }
+                let audits = match graph.list_skill_registration_audits() {
+                    Ok(audits) => audits,
+                    Err(e) => {
+                        return IpcResponse::error(
+                            "list_skill_audits",
+                            "LIST_SKILL_AUDITS_FAILED",
+                            format!("failed to list skill audits: {e}"),
+                        );
+                    }
+                };
+                let limit = limit.unwrap_or(100) as usize;
+                let skill_audits: Vec<serde_json::Value> = audits
+                    .iter()
+                    .filter(|audit| {
+                        skill_name
+                            .as_deref()
+                            .is_none_or(|name| audit.skill_name == name)
+                    })
+                    .rev()
+                    .take(limit)
+                    .map(|audit| {
+                        serde_json::json!({
+                            "audit_id": audit.audit_id,
+                            "skill_name": audit.skill_name,
+                            "action": audit.action,
+                            "by": audit.registered_by,
+                            "by_role": audit.registered_by_role,
+                            "validation_state": audit.validation_state,
+                            "at": audit.registered_at,
+                            "detail": audit.detail,
+                        })
+                    })
+                    .collect();
+                IpcResponse::SkillAuditList { skill_audits }
+            }
             IpcRequest::PatchAgentBundle {
                 agent_id,
                 persona_name,
@@ -7191,22 +7245,17 @@ impl IpcServer {
                 role_name,
                 skill_name,
             } => {
-                let Some(identity) = current_identity.as_ref() else {
-                    return IpcResponse::error(
-                        "assign_skill",
-                        "ASSIGN_UNREGISTERED",
-                        "guest must register before assigning skills",
-                    );
+                let identity = match require_skill_admin(
+                    current_identity.as_ref(),
+                    "assign_skill",
+                    "ASSIGN",
+                    "assigning skills",
+                ) {
+                    Ok(identity) => identity,
+                    Err(response) => return response,
                 };
                 let is_management = identity.role == "management";
-                if !is_management && identity.role != "orchestrator" {
-                    return IpcResponse::error(
-                        "assign_skill",
-                        "ASSIGN_FORBIDDEN",
-                        "only orchestrator or management guests may assign skills",
-                    );
-                }
-                if !is_management && !identity.guest_id.starts_with(&agent_id) {
+                if !is_management && !guest_owns_agent(&identity.guest_id, &agent_id) {
                     return IpcResponse::error(
                         "assign_skill",
                         "ASSIGN_FORBIDDEN",
@@ -7275,6 +7324,21 @@ impl IpcServer {
                 };
                 // Idempotent: if already assigned, return success.
                 if !profile.allowed_skills.contains(&skill_name) {
+                    // Fail-closed audit before the mutation.
+                    if let Err(response) = record_skill_admin_audit(
+                        graph,
+                        identity,
+                        "assign_skill",
+                        "assign",
+                        &skill_name,
+                        "",
+                        Some(format!(
+                            "agent={agent_id} role={role_name} profile={}",
+                            profile.profile_name
+                        )),
+                    ) {
+                        return response;
+                    }
                     profile.allowed_skills.push(skill_name.clone());
                     if let Err(e) = graph.upsert_toolset_profile(&profile) {
                         return IpcResponse::error(
@@ -7296,22 +7360,17 @@ impl IpcServer {
                 role_name,
                 skill_name,
             } => {
-                let Some(identity) = current_identity.as_ref() else {
-                    return IpcResponse::error(
-                        "revoke_skill",
-                        "REVOKE_UNREGISTERED",
-                        "guest must register before revoking skills",
-                    );
+                let identity = match require_skill_admin(
+                    current_identity.as_ref(),
+                    "revoke_skill",
+                    "REVOKE",
+                    "revoking skills",
+                ) {
+                    Ok(identity) => identity,
+                    Err(response) => return response,
                 };
                 let is_management = identity.role == "management";
-                if !is_management && identity.role != "orchestrator" {
-                    return IpcResponse::error(
-                        "revoke_skill",
-                        "REVOKE_FORBIDDEN",
-                        "only orchestrator or management guests may revoke skills",
-                    );
-                }
-                if !is_management && !identity.guest_id.starts_with(&agent_id) {
+                if !is_management && !guest_owns_agent(&identity.guest_id, &agent_id) {
                     return IpcResponse::error(
                         "revoke_skill",
                         "REVOKE_FORBIDDEN",
@@ -7362,6 +7421,21 @@ impl IpcServer {
                 };
                 // Idempotent: if not present, return success.
                 if profile.allowed_skills.contains(&skill_name) {
+                    // Fail-closed audit before the mutation.
+                    if let Err(response) = record_skill_admin_audit(
+                        graph,
+                        identity,
+                        "revoke_skill",
+                        "revoke",
+                        &skill_name,
+                        "",
+                        Some(format!(
+                            "agent={agent_id} role={role_name} profile={}",
+                            profile.profile_name
+                        )),
+                    ) {
+                        return response;
+                    }
                     profile.allowed_skills.retain(|s| s != &skill_name);
                     if let Err(e) = graph.upsert_toolset_profile(&profile) {
                         return IpcResponse::error(
@@ -7379,6 +7453,15 @@ impl IpcServer {
                 }
             }
             IpcRequest::ListSkills {} => {
+                // The catalog names every tool a skill can project; require at
+                // least a registered guest identity before enumerating it.
+                if current_identity.is_none() {
+                    return IpcResponse::error(
+                        "list_skills",
+                        "LIST_SKILLS_UNREGISTERED",
+                        "guest must register before listing skills",
+                    );
+                }
                 let skills = match graph.list_abstract_skills() {
                     Ok(s) => s,
                     Err(e) => {
@@ -7392,19 +7475,13 @@ impl IpcServer {
                 let json_skills: Vec<serde_json::Value> = skills
                     .iter()
                     .map(|s| {
-                        let state_str = match &s.validation_state {
-                            SkillValidationState::Validated => "validated",
-                            SkillValidationState::Invalid { .. } => "invalid",
-                            SkillValidationState::Draft => "draft",
-                            SkillValidationState::Registered => "registered",
-                            SkillValidationState::Active => "active",
-                            SkillValidationState::Suspended { .. } => "suspended",
-                            SkillValidationState::Deprecated => "deprecated",
-                        };
+                        let (state_str, _) = skill_state_label(&s.validation_state);
                         serde_json::json!({
                             "skill_name": s.skill_name,
                             "description": s.description,
                             "implied_tools": s.implied_tools,
+                            "implied_classes": s.implied_classes,
+                            "allowed_skills": s.allowed_skills,
                             "validation_state": state_str,
                         })
                     })
@@ -13727,22 +13804,66 @@ impl IpcServer {
                             .collect()
                     })
                     .unwrap_or_default();
-                let mut push_guidance = |skill_record: &AbstractSkillRecord| {
+                let mut allowed_classes: Vec<String> = bindings
+                    .get("allowed_classes")
+                    .and_then(|v| v.as_array())
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|v| v.as_str())
+                            .map(str::to_string)
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                fn push_guidance(
+                    skill_guidance: &mut Vec<String>,
+                    skill_record: &AbstractSkillRecord,
+                ) {
                     let guidance =
                         format!("{} — {}", skill_record.skill_name, skill_record.description);
                     if !skill_guidance.contains(&guidance) {
                         skill_guidance.push(guidance);
                     }
-                };
+                }
 
-                for skill_name in &skillset {
-                    if let Ok(Some(skill_record)) = graph.get_abstract_skill(skill_name) {
-                        for implied in &skill_record.implied_tools {
-                            if !toolset.contains(implied) {
-                                toolset.push(implied.clone());
+                // Resolve the transitive SkillDAG closure over allowed_skills
+                // edges. Cycles and dangling edges are tolerated (the
+                // reachable set still resolves) but logged for the operator.
+                let (resolved_skillset, dag_diagnostics) =
+                    ansible_mesh_core::graph::resolve_transitive_skills(&skillset, |name| {
+                        graph.get_abstract_skill(name).ok().flatten()
+                    });
+                if !dag_diagnostics.is_empty() {
+                    warn!(
+                        diagnostics = ?dag_diagnostics,
+                        "SkillDAG resolution reported unresolvable edges"
+                    );
+                }
+
+                // Administratively retired skills (suspended/deprecated) are
+                // dropped from projection entirely: no name, no implied tools,
+                // no guidance. Skills with no graph record pass through — they
+                // may be legacy compiled-in skills philote still recognizes.
+                let mut projected_skillset: Vec<String> = Vec::new();
+                for skill_name in &resolved_skillset {
+                    match graph.get_abstract_skill(skill_name) {
+                        Ok(Some(skill_record)) => {
+                            if !skill_record.validation_state.is_projectable() {
+                                continue;
                             }
+                            projected_skillset.push(skill_name.clone());
+                            for implied in &skill_record.implied_tools {
+                                if !toolset.contains(implied) {
+                                    toolset.push(implied.clone());
+                                }
+                            }
+                            for class in &skill_record.implied_classes {
+                                if !allowed_classes.contains(class) {
+                                    allowed_classes.push(class.clone());
+                                }
+                            }
+                            push_guidance(&mut skill_guidance, &skill_record);
                         }
-                        push_guidance(&skill_record);
+                        _ => projected_skillset.push(skill_name.clone()),
                     }
                 }
                 // On-demand skills project per-turn in philote, but their
@@ -13751,21 +13872,34 @@ impl IpcServer {
                 // model never sees the outcome-note / escalation discipline the
                 // catalog describes). Tools are deliberately NOT expanded here;
                 // per-turn on-demand tool visibility stays philote's decision.
+                // Administratively retired skills push no doctrine either.
                 for skill_name in &on_demand_skills {
                     if skillset.contains(skill_name) {
                         continue;
                     }
                     if let Ok(Some(skill_record)) = graph.get_abstract_skill(skill_name) {
-                        push_guidance(&skill_record);
+                        if skill_record.validation_state.is_projectable() {
+                            push_guidance(&mut skill_guidance, &skill_record);
+                        }
                     }
                 }
 
                 if let Some(obj) = bindings.as_object_mut() {
                     obj.insert("effective_toolset".to_string(), serde_json::json!(toolset));
                     obj.insert(
+                        "effective_skillset".to_string(),
+                        serde_json::json!(projected_skillset),
+                    );
+                    obj.insert(
                         "effective_skill_guidance".to_string(),
                         serde_json::json!(skill_guidance),
                     );
+                    if !allowed_classes.is_empty() {
+                        obj.insert(
+                            "allowed_classes".to_string(),
+                            serde_json::json!(allowed_classes),
+                        );
+                    }
                 }
             }
         }
@@ -15789,18 +15923,121 @@ fn selection_reason_for_incarnation(
     }
 }
 
+/// Shared authorization gate for every skill-administration IPC op
+/// (`RegisterSkill`, `AssignSkill`, `RevokeSkill`, `SetSkillState`,
+/// `ListSkillAudits`). Skills project tools onto agents, so administration is
+/// restricted to authenticated guests holding the `orchestrator` or
+/// `management` role. Centralized so new ops cannot fork the policy.
+#[allow(clippy::result_large_err)] // Err is the IpcResponse sent on the cold rejection path
+pub(super) fn require_skill_admin<'a>(
+    identity: Option<&'a GuestIdentity>,
+    op: &str,
+    code_prefix: &str,
+    verb: &str,
+) -> Result<&'a GuestIdentity, IpcResponse> {
+    let Some(identity) = identity else {
+        return Err(IpcResponse::error(
+            op,
+            format!("{code_prefix}_UNREGISTERED"),
+            format!("guest must register before {verb}"),
+        ));
+    };
+    if identity.role != "orchestrator" && identity.role != "management" {
+        warn!(
+            guest_id = %identity.guest_id,
+            role = %identity.role,
+            op = %op,
+            "Rejected skill administration from unauthorized role"
+        );
+        return Err(IpcResponse::error(
+            op,
+            format!("{code_prefix}_FORBIDDEN"),
+            format!("only orchestrator or management guests may {verb}"),
+        ));
+    }
+    Ok(identity)
+}
+
+/// Exact-boundary agent ownership check for orchestrator-scoped skill ops.
+///
+/// Guest ids are formed as `{agent_id}` (base agent) or `{agent_id}:{role}`.
+/// A bare `starts_with(agent_id)` lets agent `aria2` administer `aria`, so the
+/// prefix must terminate at the `:` separator.
+pub(super) fn guest_owns_agent(guest_id: &str, agent_id: &str) -> bool {
+    guest_id == agent_id
+        || guest_id
+            .strip_prefix(agent_id)
+            .is_some_and(|rest| rest.starts_with(':'))
+}
+
+/// Write one append-only skill administration audit entry, fail closed: the
+/// caller must abort the mutation when this returns an error response.
+#[allow(clippy::result_large_err)] // Err is the IpcResponse sent on the cold failure path
+pub(super) fn record_skill_admin_audit(
+    graph: &GraphDomain,
+    identity: &GuestIdentity,
+    op: &str,
+    action: &str,
+    skill_name: &str,
+    validation_state: &str,
+    detail: Option<String>,
+) -> Result<(), IpcResponse> {
+    let audit = SkillRegistrationAuditRecord {
+        audit_id: Uuid::new_v4().to_string(),
+        skill_name: skill_name.to_string(),
+        registered_by: identity.guest_id.clone(),
+        registered_by_role: identity.role.clone(),
+        validation_state: validation_state.to_string(),
+        registered_at: unix_ts(),
+        action: action.to_string(),
+        detail,
+    };
+    if let Err(e) = graph.record_skill_registration_audit(&audit) {
+        warn!(
+            skill_name = %skill_name,
+            action = %action,
+            "Failed to persist skill admin audit event: {e}"
+        );
+        return Err(IpcResponse::error(
+            op,
+            "SKILL_AUDIT_FAILED",
+            format!("Failed to record skill admin audit: {e}"),
+        ));
+    }
+    Ok(())
+}
+
+/// Wire label for a skill validation state, plus any carried errors/reason.
+pub(super) fn skill_state_label(state: &SkillValidationState) -> (String, Vec<String>) {
+    match state {
+        SkillValidationState::Validated => ("validated".to_string(), vec![]),
+        SkillValidationState::Invalid { errors } => ("invalid".to_string(), errors.clone()),
+        SkillValidationState::Draft => ("draft".to_string(), vec![]),
+        SkillValidationState::Registered => ("registered".to_string(), vec![]),
+        SkillValidationState::Active => ("active".to_string(), vec![]),
+        SkillValidationState::Suspended { reason } => {
+            ("suspended".to_string(), vec![reason.clone()])
+        }
+        SkillValidationState::Deprecated => ("deprecated".to_string(), vec![]),
+    }
+}
+
 /// Handle an `IpcRequest::RegisterSkill` at the IPC boundary.
 ///
 /// This is the actual authorization boundary: `skill.register` writes an abstract
 /// skill into the graph that can later project tools onto agents, so it must not be
 /// "open to any agent" via a raw IPC request. Registration is rejected unless the
-/// caller is an authenticated guest holding the `orchestrator` or `management` role
-/// (mirroring `AssignSkill`, its sibling in the skill-authoring class). Every
-/// accepted registration is recorded as an append-only audit graph event capturing
-/// who registered what and when.
+/// caller passes [`require_skill_admin`]. Every accepted registration is recorded
+/// as an append-only audit graph event capturing who registered what and when;
+/// re-registering an existing name is audited as `update`.
+///
+/// The SkillDAG edges (`allowed_skills`), tool classes, subagent kind, and goal
+/// template are persisted on the record — registration is the DAG authoring
+/// surface, not just a name+tools write.
 ///
 /// Extracted as a free function so the auth, persist, and audit behavior can be
 /// unit-tested without driving the full `process_request` connection loop.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn handle_register_skill(
     identity: Option<&GuestIdentity>,
     graph: &GraphDomain,
@@ -15809,37 +16046,23 @@ pub(super) fn handle_register_skill(
     subagent_kind: String,
     goal: String,
     allowed_tools: Vec<String>,
+    allowed_classes: Vec<String>,
+    allowed_skills: Vec<String>,
 ) -> IpcResponse {
-    // Authorization boundary — reject unauthenticated / unauthorized callers.
-    let Some(identity) = identity else {
-        return IpcResponse::error(
-            "register_skill",
-            "REGISTER_UNREGISTERED",
-            "guest must register before registering skills",
-        );
-    };
-    if identity.role != "orchestrator" && identity.role != "management" {
-        warn!(
-            guest_id = %identity.guest_id,
-            role = %identity.role,
-            skill_name = %skill_name,
-            "Rejected skill.register from unauthorized role"
-        );
-        return IpcResponse::error(
-            "register_skill",
-            "REGISTER_FORBIDDEN",
-            "only orchestrator or management guests may register skills",
-        );
-    }
+    let identity =
+        match require_skill_admin(identity, "register_skill", "REGISTER", "registering skills") {
+            Ok(identity) => identity,
+            Err(response) => return response,
+        };
 
     // Translate to a SkillDraft and run Layer 1 structural validation.
     let draft = SkillDraft {
         skill_name: skill_name.clone(),
         description: description.clone(),
-        subagent_kind,
-        goal_template: goal,
+        subagent_kind: subagent_kind.clone(),
+        goal_template: goal.clone(),
         allowed_tools: allowed_tools.clone(),
-        allowed_skills: vec![],
+        allowed_skills: allowed_skills.clone(),
         iteration_budget: None,
         lease_terms: ansible_mesh_core::validation::SkillLeaseTerms::default(),
         hook_subscriptions: vec![],
@@ -15852,47 +16075,45 @@ pub(super) fn handle_register_skill(
 
     let validation_result = validate_skill_layer1(&draft);
 
+    // Re-registering an existing name is an update, and is audited as such.
+    let action = match graph.get_abstract_skill(&skill_name) {
+        Ok(Some(_)) => "update",
+        _ => "register",
+    };
+
     let mut record = AbstractSkillRecord {
         skill_name: skill_name.clone(),
         description,
         implied_tools: allowed_tools,
+        implied_classes: allowed_classes,
+        allowed_skills,
+        subagent_kind: (!subagent_kind.is_empty()).then_some(subagent_kind),
+        goal_template: (!goal.is_empty()).then_some(goal),
+        source_snapshot: Some(SkillSourceSnapshot {
+            mesh_catalog_version: String::new(),
+            hotel_policy_version: String::new(),
+            registered_at: unix_ts(),
+            registered_by: identity.guest_id.clone(),
+        }),
         ..Default::default()
     };
     apply_validation_to_record(&mut record, validation_result);
 
-    let (state_str, errors) = match &record.validation_state {
-        SkillValidationState::Validated => ("validated".to_string(), vec![]),
-        SkillValidationState::Invalid { errors } => ("invalid".to_string(), errors.clone()),
-        SkillValidationState::Draft => ("draft".to_string(), vec![]),
-        SkillValidationState::Registered => ("registered".to_string(), vec![]),
-        SkillValidationState::Active => ("active".to_string(), vec![]),
-        SkillValidationState::Suspended { reason } => {
-            ("suspended".to_string(), vec![reason.clone()])
-        }
-        SkillValidationState::Deprecated => ("deprecated".to_string(), vec![]),
-    };
+    let (state_str, errors) = skill_state_label(&record.validation_state);
 
     // Audit trail — who / what / when — written as an append-only graph event
     // BEFORE the skill is persisted, so no skill can enter the catalog without a
     // corresponding audit record (fail closed).
-    let audit = SkillRegistrationAuditRecord {
-        audit_id: Uuid::new_v4().to_string(),
-        skill_name: skill_name.clone(),
-        registered_by: identity.guest_id.clone(),
-        registered_by_role: identity.role.clone(),
-        validation_state: state_str.clone(),
-        registered_at: unix_ts(),
-    };
-    if let Err(e) = graph.record_skill_registration_audit(&audit) {
-        warn!(
-            skill_name = %skill_name,
-            "Failed to persist skill registration audit event: {e}"
-        );
-        return IpcResponse::error(
-            "register_skill",
-            "SKILL_AUDIT_FAILED",
-            format!("Failed to record skill registration audit: {e}"),
-        );
+    if let Err(response) = record_skill_admin_audit(
+        graph,
+        identity,
+        "register_skill",
+        action,
+        &skill_name,
+        &state_str,
+        None,
+    ) {
+        return response;
     }
 
     if let Err(e) = graph.upsert_abstract_skill(&record) {
@@ -15909,6 +16130,7 @@ pub(super) fn handle_register_skill(
         validation_state = %state_str,
         registered_by = %identity.guest_id,
         registered_by_role = %identity.role,
+        action = %action,
         "Skill registered via IPC"
     );
 
@@ -15916,6 +16138,101 @@ pub(super) fn handle_register_skill(
         skill_name,
         validation_state: state_str,
         validation_errors: errors,
+    }
+}
+
+/// Handle an `IpcRequest::SetSkillState` at the IPC boundary.
+///
+/// The orchestrator's lifecycle lever: `active` reinstates a skill,
+/// `suspended`/`deprecated` administratively retire it — retired skills stop
+/// contributing implied tools and guidance to session projection (see
+/// `SkillValidationState::is_projectable`). Gated and audited like every other
+/// skill administration op.
+pub(super) fn handle_set_skill_state(
+    identity: Option<&GuestIdentity>,
+    graph: &GraphDomain,
+    skill_name: String,
+    state: String,
+    reason: Option<String>,
+) -> IpcResponse {
+    let identity = match require_skill_admin(
+        identity,
+        "set_skill_state",
+        "SET_SKILL_STATE",
+        "changing skill state",
+    ) {
+        Ok(identity) => identity,
+        Err(response) => return response,
+    };
+
+    let mut record = match graph.get_abstract_skill(&skill_name) {
+        Ok(Some(record)) => record,
+        Ok(None) => {
+            return IpcResponse::error(
+                "set_skill_state",
+                "SKILL_NOT_FOUND",
+                format!("skill [{skill_name}] not found in catalog"),
+            );
+        }
+        Err(e) => {
+            return IpcResponse::error(
+                "set_skill_state",
+                "SKILL_LOOKUP_FAILED",
+                format!("failed to look up skill: {e}"),
+            );
+        }
+    };
+
+    let new_state = match state.as_str() {
+        "active" => SkillValidationState::Active,
+        "suspended" => SkillValidationState::Suspended {
+            reason: reason.clone().unwrap_or_default(),
+        },
+        "deprecated" => SkillValidationState::Deprecated,
+        other => {
+            return IpcResponse::error(
+                "set_skill_state",
+                "SET_SKILL_STATE_INVALID",
+                format!(
+                    "unsupported skill state [{other}]; expected active, suspended, or deprecated"
+                ),
+            );
+        }
+    };
+    record.validation_state = new_state;
+    let (state_str, _) = skill_state_label(&record.validation_state);
+
+    if let Err(response) = record_skill_admin_audit(
+        graph,
+        identity,
+        "set_skill_state",
+        "set_state",
+        &skill_name,
+        &state_str,
+        reason,
+    ) {
+        return response;
+    }
+
+    if let Err(e) = graph.upsert_abstract_skill(&record) {
+        warn!("Failed to persist skill state for [{}]: {}", skill_name, e);
+        return IpcResponse::error(
+            "set_skill_state",
+            "SKILL_PERSIST_FAILED",
+            format!("Failed to persist skill: {e}"),
+        );
+    }
+
+    info!(
+        skill_name = %skill_name,
+        skill_state = %state_str,
+        changed_by = %identity.guest_id,
+        "Skill lifecycle state changed via IPC"
+    );
+
+    IpcResponse::SkillStateSet {
+        skill_name,
+        skill_state: state_str,
     }
 }
 
@@ -16833,6 +17150,8 @@ pub(crate) mod tests {
             "philote-worker".into(),
             "goal".into(),
             vec!["bash.exec".into()],
+            vec![],
+            vec![],
         );
         let (code, _) = expect_register_error(resp);
         assert_eq!(code, "REGISTER_UNREGISTERED");
@@ -16870,6 +17189,8 @@ pub(crate) mod tests {
             "philote-worker".into(),
             "goal".into(),
             vec![],
+            vec![],
+            vec![],
         );
         let (code, _) = expect_register_error(resp);
         assert_eq!(code, "REGISTER_FORBIDDEN");
@@ -16905,6 +17226,8 @@ pub(crate) mod tests {
             "philote-worker".into(),
             "Answer the operator's research question.".into(),
             vec!["web.search".into()],
+            vec!["workspace".into()],
+            vec!["memory".into()],
         );
         match resp {
             IpcResponse::SkillRegistered { skill_name, .. } => {
@@ -16918,6 +17241,24 @@ pub(crate) mod tests {
             .expect("query skill")
             .expect("skill should be persisted");
         assert_eq!(stored.skill_name, "research.assistant");
+        // The full registration payload persists — nothing is silently dropped
+        // at the IPC boundary anymore.
+        assert_eq!(stored.implied_tools, vec!["web.search".to_string()]);
+        assert_eq!(stored.implied_classes, vec!["workspace".to_string()]);
+        assert_eq!(
+            stored.allowed_skills,
+            vec!["memory".to_string()],
+            "SkillDAG edges must persist on the record"
+        );
+        assert_eq!(stored.subagent_kind.as_deref(), Some("philote-worker"));
+        assert_eq!(
+            stored.goal_template.as_deref(),
+            Some("Answer the operator's research question.")
+        );
+        let snapshot = stored
+            .source_snapshot
+            .expect("registration must populate provenance");
+        assert_eq!(snapshot.registered_by, "agent-jane-01:orchestrator");
 
         let audits = graph.list_skill_registration_audits().expect("list audits");
         assert_eq!(audits.len(), 1, "exactly one audit event expected");
@@ -16925,8 +17266,185 @@ pub(crate) mod tests {
         assert_eq!(audit.skill_name, "research.assistant");
         assert_eq!(audit.registered_by, "agent-jane-01:orchestrator");
         assert_eq!(audit.registered_by_role, "orchestrator");
+        assert_eq!(audit.action, "register");
         assert!(audit.registered_at > 0, "audit must record a timestamp");
         assert!(!audit.audit_id.is_empty(), "audit must have an id");
+    }
+
+    #[test]
+    fn reregister_skill_audits_as_update() {
+        // Registering an existing name overwrites the record, and the audit
+        // trail distinguishes the second write as an update.
+        let graph = register_skill_test_graph();
+        let identity = GuestIdentity {
+            guest_id: "agent-jane-01:orchestrator".into(),
+            role: "orchestrator".into(),
+            supported_tools: vec![],
+        };
+        for description in ["first", "second"] {
+            let resp = handle_register_skill(
+                Some(&identity),
+                &graph,
+                "evolving.skill".into(),
+                description.into(),
+                "philote-worker".into(),
+                "goal".into(),
+                vec![],
+                vec![],
+                vec![],
+            );
+            assert!(matches!(resp, IpcResponse::SkillRegistered { .. }));
+        }
+        let audits = graph.list_skill_registration_audits().expect("list audits");
+        assert_eq!(audits.len(), 2);
+        let actions: Vec<&str> = audits.iter().map(|a| a.action.as_str()).collect();
+        assert!(actions.contains(&"register"));
+        assert!(actions.contains(&"update"));
+    }
+
+    #[test]
+    fn guest_owns_agent_requires_exact_boundary() {
+        // `aria2` must NOT be able to administer `aria` — the old
+        // starts_with(agent_id) check allowed exactly that.
+        assert!(guest_owns_agent("aria", "aria"));
+        assert!(guest_owns_agent("aria:orchestrator", "aria"));
+        assert!(!guest_owns_agent("aria2", "aria"));
+        assert!(!guest_owns_agent("aria2:orchestrator", "aria"));
+        assert!(!guest_owns_agent("ari", "aria"));
+    }
+
+    #[test]
+    fn set_skill_state_rejects_unauthorized_role() {
+        let graph = register_skill_test_graph();
+        let identity = GuestIdentity {
+            guest_id: "agent-jane-01".into(),
+            role: "agent".into(),
+            supported_tools: vec![],
+        };
+        let resp = handle_set_skill_state(
+            Some(&identity),
+            &graph,
+            "any.skill".into(),
+            "suspended".into(),
+            None,
+        );
+        let (code, _) = expect_register_error(resp);
+        assert_eq!(code, "SET_SKILL_STATE_FORBIDDEN");
+    }
+
+    #[test]
+    fn set_skill_state_suspends_and_reinstates_with_audit() {
+        // The orchestrator lifecycle lever: suspend retires the skill from
+        // projection; active reinstates it. Both transitions are audited.
+        let graph = register_skill_test_graph();
+        let identity = GuestIdentity {
+            guest_id: "agent-jane-01:orchestrator".into(),
+            role: "orchestrator".into(),
+            supported_tools: vec![],
+        };
+        let resp = handle_register_skill(
+            Some(&identity),
+            &graph,
+            "lifecycle.skill".into(),
+            "desc".into(),
+            "philote-worker".into(),
+            "goal".into(),
+            vec!["web.search".into()],
+            vec![],
+            vec![],
+        );
+        assert!(matches!(resp, IpcResponse::SkillRegistered { .. }));
+
+        let resp = handle_set_skill_state(
+            Some(&identity),
+            &graph,
+            "lifecycle.skill".into(),
+            "suspended".into(),
+            Some("misbehaving".into()),
+        );
+        match resp {
+            IpcResponse::SkillStateSet {
+                skill_name,
+                skill_state,
+            } => {
+                assert_eq!(skill_name, "lifecycle.skill");
+                assert_eq!(skill_state, "suspended");
+            }
+            other => panic!("expected SkillStateSet, got: {other:?}"),
+        }
+        let stored = graph
+            .get_abstract_skill("lifecycle.skill")
+            .expect("query")
+            .expect("exists");
+        assert!(
+            !stored.validation_state.is_projectable(),
+            "suspended skills must not project"
+        );
+
+        let resp = handle_set_skill_state(
+            Some(&identity),
+            &graph,
+            "lifecycle.skill".into(),
+            "active".into(),
+            None,
+        );
+        assert!(matches!(resp, IpcResponse::SkillStateSet { .. }));
+        let stored = graph
+            .get_abstract_skill("lifecycle.skill")
+            .expect("query")
+            .expect("exists");
+        assert!(stored.validation_state.is_projectable());
+
+        let audits = graph.list_skill_registration_audits().expect("audits");
+        let set_state_audits: Vec<_> = audits.iter().filter(|a| a.action == "set_state").collect();
+        assert_eq!(set_state_audits.len(), 2);
+        assert!(
+            set_state_audits
+                .iter()
+                .any(|a| a.detail.as_deref() == Some("misbehaving")),
+            "suspension reason must land in the audit trail"
+        );
+    }
+
+    #[test]
+    fn set_skill_state_rejects_unknown_state_and_missing_skill() {
+        let graph = register_skill_test_graph();
+        let identity = GuestIdentity {
+            guest_id: "agent-jane-01:orchestrator".into(),
+            role: "orchestrator".into(),
+            supported_tools: vec![],
+        };
+        let resp = handle_set_skill_state(
+            Some(&identity),
+            &graph,
+            "missing.skill".into(),
+            "suspended".into(),
+            None,
+        );
+        let (code, _) = expect_register_error(resp);
+        assert_eq!(code, "SKILL_NOT_FOUND");
+
+        let resp = handle_register_skill(
+            Some(&identity),
+            &graph,
+            "typo.skill".into(),
+            "desc".into(),
+            "philote-worker".into(),
+            "goal".into(),
+            vec![],
+            vec![],
+            vec![],
+        );
+        assert!(matches!(resp, IpcResponse::SkillRegistered { .. }));
+        let resp = handle_set_skill_state(
+            Some(&identity),
+            &graph,
+            "typo.skill".into(),
+            "banished".into(),
+            None,
+        );
+        let (code, _) = expect_register_error(resp);
+        assert_eq!(code, "SET_SKILL_STATE_INVALID");
     }
 
     #[test]
@@ -16945,6 +17463,8 @@ pub(crate) mod tests {
             "desc".into(),
             "philote-worker".into(),
             "goal".into(),
+            vec![],
+            vec![],
             vec![],
         );
         assert!(matches!(resp, IpcResponse::SkillRegistered { .. }));

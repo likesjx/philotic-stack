@@ -129,6 +129,16 @@ pub enum SkillValidationState {
     Deprecated,
 }
 
+impl SkillValidationState {
+    /// Whether a skill in this state may contribute tools/guidance to a
+    /// session's effective toolset. `Suspended` and `Deprecated` are the two
+    /// administratively-retired states; everything else keeps historical
+    /// projection behavior (including `Draft`, which seeded skills use).
+    pub fn is_projectable(&self) -> bool {
+        !matches!(self, Self::Suspended { .. } | Self::Deprecated)
+    }
+}
+
 /// Provenance snapshot describing where and when a skill was registered.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct SkillSourceSnapshot {
@@ -149,6 +159,21 @@ pub struct AbstractSkillRecord {
     pub description: String,
     #[serde(default)]
     pub implied_tools: Vec<String>,
+    /// Tool class names this skill grants in addition to `implied_tools`.
+    #[serde(default)]
+    pub implied_classes: Vec<String>,
+    /// SkillDAG edges: names of skills this skill depends on. Activating this
+    /// skill transitively activates its dependencies (see
+    /// [`resolve_transitive_skills`]). Edges are followed depth-first with a
+    /// visited set, so cycles are tolerated at resolution time but reported.
+    #[serde(default)]
+    pub allowed_skills: Vec<String>,
+    /// Subagent kind this skill delegates to, when it is a delegation skill.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subagent_kind: Option<String>,
+    /// Goal template used when spawning this skill's delegation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub goal_template: Option<String>,
     #[serde(default)]
     pub skill_markers: Vec<String>,
     #[serde(default)]
@@ -180,6 +205,77 @@ pub struct SkillRegistrationAuditRecord {
     pub validation_state: String,
     /// Unix timestamp (seconds) when the registration was accepted.
     pub registered_at: u64,
+    /// Which admin mutation this entry records: `register`, `update`,
+    /// `assign`, `revoke`, or `set_state`. Pre-existing rows deserialize as
+    /// `register`.
+    #[serde(default = "default_skill_audit_action")]
+    pub action: String,
+    /// Action-specific detail (e.g. the target agent/role for `assign`, or
+    /// the state-change reason for `set_state`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+}
+
+fn default_skill_audit_action() -> String {
+    "register".to_string()
+}
+
+/// Resolve the transitive closure of the SkillDAG starting from `roots`,
+/// following each skill's `allowed_skills` edges via `lookup`.
+///
+/// Returns the resolved skill names in deterministic (sorted) order, plus a
+/// list of diagnostics for edges that could not be followed cleanly: names
+/// that resolve to no record (`missing:{name}`) and back-edges that would
+/// revisit a skill already on the current path (`cycle:{name}`). Cycles and
+/// missing nodes never fail resolution — the reachable set is still returned —
+/// but callers should surface the diagnostics.
+pub fn resolve_transitive_skills<F>(roots: &[String], lookup: F) -> (Vec<String>, Vec<String>)
+where
+    F: Fn(&str) -> Option<AbstractSkillRecord>,
+{
+    let mut resolved: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    let mut diagnostics: Vec<String> = Vec::new();
+    let mut path: Vec<String> = Vec::new();
+
+    fn visit<F>(
+        name: &str,
+        lookup: &F,
+        resolved: &mut std::collections::BTreeSet<String>,
+        diagnostics: &mut Vec<String>,
+        path: &mut Vec<String>,
+    ) where
+        F: Fn(&str) -> Option<AbstractSkillRecord>,
+    {
+        if path.iter().any(|p| p == name) {
+            diagnostics.push(format!("cycle:{name}"));
+            return;
+        }
+        if resolved.contains(name) {
+            return;
+        }
+        let Some(record) = lookup(name) else {
+            // Roots may legitimately name skills with no graph record (legacy
+            // compiled-in skills); only report missing DAG *edges*.
+            if !path.is_empty() {
+                diagnostics.push(format!("missing:{name}"));
+            }
+            resolved.insert(name.to_string());
+            return;
+        };
+        resolved.insert(name.to_string());
+        path.push(name.to_string());
+        for dep in &record.allowed_skills {
+            visit(dep, lookup, resolved, diagnostics, path);
+        }
+        path.pop();
+    }
+
+    for root in roots {
+        visit(root, &lookup, &mut resolved, &mut diagnostics, &mut path);
+    }
+    diagnostics.sort();
+    diagnostics.dedup();
+    (resolved.into_iter().collect(), diagnostics)
 }
 
 /// A governed workflow record defining an advanced process like handoff or delegation.
@@ -944,6 +1040,102 @@ fn default_model_status() -> String {
 
 fn default_true() -> bool {
     true
+}
+
+#[cfg(test)]
+mod skill_dag_tests {
+    use super::*;
+
+    fn skill(name: &str, deps: &[&str]) -> AbstractSkillRecord {
+        AbstractSkillRecord {
+            skill_name: name.into(),
+            allowed_skills: deps.iter().map(|d| d.to_string()).collect(),
+            ..Default::default()
+        }
+    }
+
+    fn lookup_in(
+        catalog: Vec<AbstractSkillRecord>,
+    ) -> impl Fn(&str) -> Option<AbstractSkillRecord> {
+        move |name| catalog.iter().find(|s| s.skill_name == name).cloned()
+    }
+
+    #[test]
+    fn transitive_resolution_follows_chains_and_diamonds() {
+        // a -> b -> d, a -> c -> d: diamond resolves each node once.
+        let lookup = lookup_in(vec![
+            skill("a", &["b", "c"]),
+            skill("b", &["d"]),
+            skill("c", &["d"]),
+            skill("d", &[]),
+        ]);
+        let (resolved, diagnostics) = resolve_transitive_skills(&["a".into()], lookup);
+        assert_eq!(resolved, vec!["a", "b", "c", "d"]);
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn transitive_resolution_tolerates_and_reports_cycles() {
+        // a -> b -> a: both remain reachable, cycle is diagnosed, no hang.
+        let lookup = lookup_in(vec![skill("a", &["b"]), skill("b", &["a"])]);
+        let (resolved, diagnostics) = resolve_transitive_skills(&["a".into()], lookup);
+        assert_eq!(resolved, vec!["a", "b"]);
+        assert_eq!(diagnostics, vec!["cycle:a"]);
+    }
+
+    #[test]
+    fn transitive_resolution_reports_missing_edges_but_keeps_roots() {
+        // A root with no record passes silently (legacy compiled-in skills);
+        // a dangling *edge* is diagnosed.
+        let lookup = lookup_in(vec![skill("a", &["ghost"])]);
+        let (resolved, diagnostics) =
+            resolve_transitive_skills(&["a".into(), "legacy".into()], lookup);
+        assert_eq!(resolved, vec!["a", "ghost", "legacy"]);
+        assert_eq!(diagnostics, vec!["missing:ghost"]);
+    }
+
+    #[test]
+    fn projectable_states_gate_only_administrative_retirement() {
+        assert!(SkillValidationState::Draft.is_projectable());
+        assert!(SkillValidationState::Validated.is_projectable());
+        assert!(SkillValidationState::Registered.is_projectable());
+        assert!(SkillValidationState::Active.is_projectable());
+        assert!(
+            SkillValidationState::Invalid { errors: vec![] }.is_projectable(),
+            "invalid keeps historical projection behavior"
+        );
+        assert!(!SkillValidationState::Suspended { reason: "x".into() }.is_projectable());
+        assert!(!SkillValidationState::Deprecated.is_projectable());
+    }
+
+    #[test]
+    fn legacy_skill_record_and_audit_rows_deserialize_with_new_fields_defaulted() {
+        // Pre-existing DB rows have none of the new fields.
+        let record: AbstractSkillRecord = serde_json::from_value(serde_json::json!({
+            "skill_name": "old.skill",
+            "description": "legacy",
+            "implied_tools": ["echo"],
+            "skill_markers": [],
+            "validation_state": {"state": "validated"},
+            "field_sources": {},
+        }))
+        .expect("legacy skill row decodes");
+        assert!(record.allowed_skills.is_empty());
+        assert!(record.implied_classes.is_empty());
+        assert!(record.subagent_kind.is_none());
+
+        let audit: SkillRegistrationAuditRecord = serde_json::from_value(serde_json::json!({
+            "audit_id": "x",
+            "skill_name": "old.skill",
+            "registered_by": "g",
+            "registered_by_role": "orchestrator",
+            "validation_state": "validated",
+            "registered_at": 1,
+        }))
+        .expect("legacy audit row decodes");
+        assert_eq!(audit.action, "register");
+        assert!(audit.detail.is_none());
+    }
 }
 
 #[cfg(test)]
