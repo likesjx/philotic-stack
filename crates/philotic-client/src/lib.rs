@@ -1249,6 +1249,9 @@ pub enum IpcRequest {
         allowed_tools: Vec<String>,
         #[serde(default)]
         allowed_classes: Vec<String>,
+        /// SkillDAG edges: skills this skill transitively activates.
+        #[serde(default)]
+        allowed_skills: Vec<String>,
         #[serde(default)]
         hook_subscriptions: Vec<HookSubscription>,
         #[serde(default)]
@@ -1273,6 +1276,24 @@ pub enum IpcRequest {
         agent_id: String,
         role_name: String,
         skill_name: String,
+    },
+    /// Administratively change a registered skill's lifecycle state.
+    /// Requires orchestrator or management identity. `state` is one of
+    /// `"active"`, `"suspended"`, `"deprecated"`; suspended/deprecated skills
+    /// stop contributing tools and guidance to session projection.
+    SetSkillState {
+        skill_name: String,
+        state: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
+    },
+    /// List the append-only skill administration audit trail.
+    /// Requires orchestrator or management identity.
+    ListSkillAudits {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        skill_name: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        limit: Option<u32>,
     },
     /// Patch mutable fields on an agent's identity bundle.
     /// Requires management identity. Only supplied fields are changed.
@@ -2569,6 +2590,16 @@ pub enum IpcResponse {
     /// Response to [`IpcRequest::ListSkills`].
     SkillList {
         skills: Vec<serde_json::Value>,
+    },
+    /// Response to [`IpcRequest::SetSkillState`].
+    SkillStateSet {
+        skill_name: String,
+        /// Resulting lifecycle state (`"active"`, `"suspended"`, `"deprecated"`).
+        skill_state: String,
+    },
+    /// Response to [`IpcRequest::ListSkillAudits`].
+    SkillAuditList {
+        skill_audits: Vec<serde_json::Value>,
     },
     InboundTask {
         source_node: String,

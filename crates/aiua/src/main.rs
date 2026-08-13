@@ -4393,6 +4393,9 @@ fn seed_abstract_skill_catalog(graph: &GraphDomain) -> anyhow::Result<()> {
                 "skill.list".into(),
                 "skill.register".into(),
                 "skill.assign".into(),
+                "skill.revoke".into(),
+                "skill.set_state".into(),
+                "skill.audit".into(),
             ],
             validation_state: ansible_mesh_core::graph::SkillValidationState::Validated,
             field_sources: serde_json::json!({
@@ -4404,7 +4407,8 @@ fn seed_abstract_skill_catalog(graph: &GraphDomain) -> anyhow::Result<()> {
                 ],
                 "optional_fields": [
                     "allowed_tools",
-                    "allowed_classes"
+                    "allowed_classes",
+                    "allowed_skills"
                 ],
                 "repo_skill_path": "skills/skill-authoring/SKILL.md",
                 "workflow": "skill.list → skill.register → skill.assign",
@@ -4884,6 +4888,8 @@ fn seed_toolset_profiles(graph: &GraphDomain) -> anyhow::Result<()> {
                 "skill.list".into(),
                 "skill.assign".into(),
                 "skill.revoke".into(),
+                "skill.set_state".into(),
+                "skill.audit".into(),
                 "subagent.spawn".into(),
                 "workspace.list".into(),
                 "workspace.read".into(),
@@ -5072,6 +5078,8 @@ fn seed_toolset_profiles(graph: &GraphDomain) -> anyhow::Result<()> {
                 "skill.list".into(),
                 "skill.assign".into(),
                 "skill.revoke".into(),
+                "skill.set_state".into(),
+                "skill.audit".into(),
                 "subagent.spawn".into(),
                 "role.configure".into(),
                 "role.create_or_update".into(),
@@ -5440,12 +5448,14 @@ fn seed_skill_crafting(graph: &GraphDomain) -> anyhow::Result<()> {
     use ansible_mesh_core::graph::{AbstractSkillRecord, SkillValidationState};
     let skill = AbstractSkillRecord {
         skill_name: "skill.crafting".into(),
-        description: "Grants access to skill management tools — register, list, assign, and revoke skills across roles. Intended for admin role use.".into(),
+        description: "Grants access to skill management tools — register, list, assign, revoke, lifecycle-manage, and audit skills across roles. Intended for admin role use.".into(),
         implied_tools: vec![
             "skill.register".into(),
             "skill.list".into(),
             "skill.assign".into(),
             "skill.revoke".into(),
+            "skill.set_state".into(),
+            "skill.audit".into(),
             "subagent.spawn".into(),
             "role.create_or_update".into(),
         ],
@@ -5453,6 +5463,7 @@ fn seed_skill_crafting(graph: &GraphDomain) -> anyhow::Result<()> {
         validation_state: SkillValidationState::Validated,
         source_snapshot: None,
         field_sources: serde_json::json!({}),
+        ..Default::default()
     };
     graph.upsert_abstract_skill(&skill)?;
     Ok(())

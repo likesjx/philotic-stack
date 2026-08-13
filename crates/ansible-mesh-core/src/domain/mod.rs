@@ -2218,6 +2218,7 @@ mod tests {
             registered_by_role: "orchestrator".into(),
             validation_state: "validated".into(),
             registered_at: 1000,
+            ..Default::default()
         };
         domain
             .record_skill_registration_audit(&first)
@@ -2230,6 +2231,7 @@ mod tests {
             registered_by_role: "management".into(),
             validation_state: "draft".into(),
             registered_at: 2000,
+            ..Default::default()
         };
         domain
             .record_skill_registration_audit(&second)
