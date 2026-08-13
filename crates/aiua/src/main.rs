@@ -3146,6 +3146,48 @@ fn reconcile_hotel_record(graph: &GraphDomain, hotel_name: &str) -> Result<Hotel
     Ok(hotel)
 }
 
+/// Never let `aiua load` downgrade a guest's runtime activation.
+///
+/// `seed_guests` → `upsert_guest` is an unconditional overwrite, and `aiua load`
+/// runs on every deploy. Dormant-by-default guests (`{hotel}:egress-http`,
+/// keyless cloud controllers) are seeded `is_active: false` — so a deploy
+/// silently returned an operator- or binding-activated runner to dormant, and
+/// every governed HTTP egress after it black-holed until someone noticed the
+/// catalog config had stopped updating. Observed live: mbp-jane's runner was
+/// activated 2026-08-05 15:10, its catalog updated 15:12 (first time in a
+/// week), and the 15:49 deploy wiped the flag — the next two syncs failed.
+///
+/// The rule is deliberately one-directional: an existing ACTIVE record keeps
+/// its activation (and `active_pid`, so the supervisor's liveness bookkeeping
+/// survives) when the seed default is dormant. Seeds that WANT a guest active
+/// still activate it, and `deactivate_legacy_managed_guests` still retires
+/// legacy guests explicitly — this only stops the silent downgrade.
+fn preserve_runtime_guest_activation(
+    graph: &GraphDomain,
+    hotel_name: &str,
+    desired: &mut [GuestRecord],
+) -> Result<()> {
+    let existing_active: std::collections::HashMap<String, Option<String>> = graph
+        .list_guests(hotel_name, true)?
+        .into_iter()
+        .map(|g| (g.guest_id.clone(), g.active_pid.clone()))
+        .collect();
+    for record in desired.iter_mut() {
+        if record.is_active {
+            continue;
+        }
+        if let Some(active_pid) = existing_active.get(&record.guest_id) {
+            info!(
+                guest_id = %record.guest_id,
+                "Preserving runtime activation across reseed (seed default is dormant)."
+            );
+            record.is_active = true;
+            record.active_pid = active_pid.clone();
+        }
+    }
+    Ok(())
+}
+
 fn deactivate_legacy_managed_guests(
     graph: &GraphDomain,
     hotel_name: &str,
@@ -7765,6 +7807,7 @@ async fn run_load_command(file: &str, hotel_name: &str) -> Result<()> {
         &all_profiles,
         &all_desired_guests,
     )?;
+    preserve_runtime_guest_activation(&graph_domain, hotel_name, &mut all_desired_guests)?;
     graph_domain.seed_guests(hotel_name, &all_desired_guests)?;
     info!("Seeded {} guest record(s).", all_desired_guests.len());
 
@@ -9063,7 +9106,8 @@ mod tests {
         execution_reachability_for_hotel, extract_context_graph_entries, guest_seed_for_profile,
         guest_supervision_enabled, guest_supervision_enabled_from, hotel_base_port,
         hotel_ipc_socket_path, local_capability_advertisements, mesh_target_addr_for_node,
-        migrate_plaintext_provider_api_keys, nearest_available_base_port, read_string_config,
+        migrate_plaintext_provider_api_keys, nearest_available_base_port,
+        preserve_runtime_guest_activation, read_string_config,
         reconcile_peer_execution_reachability, resolve_runtime_ports, resolve_secret,
         seed_abstract_skill_catalog, seed_orchestrator_roles, seed_skill_crafting,
         seed_toolset_profiles, startup_test_gemini_base_url,
@@ -9524,6 +9568,99 @@ mod tests {
                 .iter()
                 .any(|skill| skill == "capability.request"),
             "travel profile must carry capability.request — Vera's charter depends on it"
+        );
+    }
+
+    /// `aiua load` runs on every deploy, and its seed defaults mark the
+    /// egress runner dormant. Reseeding must not return an ACTIVATED runner to
+    /// dormant — that wipe black-holed every governed egress on mbp-jane after
+    /// the 2026-08-05 deploy. The preserve is one-directional: dormant seed +
+    /// active record keeps the record; everything else takes the seed.
+    #[test]
+    fn load_reseed_preserves_runtime_activation_of_dormant_by_default_guests() {
+        let storage = SqliteGraphStorage::open(":memory:").expect("open sqlite");
+        let graph = GraphDomain::new(Arc::new(storage.adapter()));
+
+        let guest = |guest_id: &str, role: &str, is_active: bool, pid: Option<&str>| GuestRecord {
+            hotel_name: "test-hotel".into(),
+            guest_id: guest_id.into(),
+            role: role.into(),
+            config_json: "{}".into(),
+            is_active,
+            active_pid: pid.map(str::to_string),
+            last_active_at: None,
+        };
+
+        // Runtime state before the deploy's reseed: the egress runner was
+        // activated (by a binding or operator) and is running; a cloud
+        // controller was deliberately deactivated by the operator.
+        graph
+            .upsert_guest(&guest(
+                "test-hotel:egress-http",
+                "egress-http-runner",
+                true,
+                Some("4242"),
+            ))
+            .expect("seed active egress");
+        graph
+            .upsert_guest(&guest(
+                "test-hotel:model-controller-openai",
+                "model.openai",
+                false,
+                None,
+            ))
+            .expect("seed deactivated controller");
+
+        // What `aiua load` wants to write: egress dormant (its default),
+        // the controller active (its key is present), plus a brand-new
+        // dormant guest this hotel has never seen.
+        let mut desired = vec![
+            guest("test-hotel:egress-http", "egress-http-runner", false, None),
+            guest(
+                "test-hotel:model-controller-openai",
+                "model.openai",
+                true,
+                None,
+            ),
+            guest("test-hotel:new-runner", "new-runner", false, None),
+        ];
+
+        preserve_runtime_guest_activation(&graph, "test-hotel", &mut desired)
+            .expect("preserve activation");
+        graph
+            .seed_guests("test-hotel", &desired)
+            .expect("reseed guests");
+
+        let egress = graph
+            .get_guest("test-hotel", "test-hotel:egress-http")
+            .expect("get egress")
+            .expect("egress exists");
+        assert!(
+            egress.is_active,
+            "reseed must not downgrade an activated dormant-by-default guest"
+        );
+        assert_eq!(
+            egress.active_pid.as_deref(),
+            Some("4242"),
+            "the supervisor's pid bookkeeping must survive the reseed"
+        );
+
+        let controller = graph
+            .get_guest("test-hotel", "test-hotel:model-controller-openai")
+            .expect("get controller")
+            .expect("controller exists");
+        assert!(
+            controller.is_active,
+            "a seed that WANTS a guest active still activates it (key-added upgrade path)"
+        );
+
+        let fresh = graph
+            .get_guest("test-hotel", "test-hotel:new-runner")
+            .expect("get new runner")
+            .expect("new runner exists");
+        assert!(
+            !fresh.is_active,
+            "a first-seen dormant seed stays dormant — activation is on-demand"
         );
     }
 
