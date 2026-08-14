@@ -127,7 +127,7 @@ The Philotic Stack is a distributed AI agent OS (Rust). Metaphor: **Hotel** (nod
 
 ### Communication
 
-- **Intra-hotel (IPC/UDS):** Over `/tmp/philotic-aiua.sock`. Newline-framed JSON (`IpcRequest` / `IpcResponse`).
+- **Intra-hotel (IPC/UDS):** Profile-scoped socket (e.g. `~/.philotic/<profile>/aiua-<hotel>.sock`). 4-byte big-endian length-prefixed JSON frames (`IpcRequest` / `IpcResponse`); the `operation` tag is snake_case.
 - **Inter-hotel (Mesh/UDP):** `BeaconMessage` on port 8999 (HMAC-PSK optional).
 - **Blob store (HTTP):** Large payloads over :9001.
 
