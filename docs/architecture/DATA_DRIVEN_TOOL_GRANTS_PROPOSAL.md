@@ -60,7 +60,14 @@ against it, and those changes **compile down** to the local toolset
 
 ## Slice: orchestrator skill administration plane — IMPLEMENTED 2026-08-13
 
-Disposition: implemented, `test-green` (`codex/skill-admin-plane`).
+Disposition: implemented, `watched-live-green` on `mac-jane` 2026-08-13
+(`codex/skill-admin-plane`, PR #430): 14/14 live drill checks against the
+installed supervised runtime — unauth/wrong-role rejection, SkillDAG edge
+persisted and listed, suspend/reinstate lifecycle, invalid-state rejection,
+audit trail with actor identity, and boot-seed reconciliation. Found during
+the drill: the Layer-1 validator flags dotted skill names
+(`invalid_skill_name_chars`) while the house seeds themselves use dots —
+pre-existing validator/catalog inconsistency, still open.
 
 Before this slice the SkillDAG was a name without a structure: `AbstractSkillRecord`
 had no skill→skill edge field, `skill.register` validated then **discarded**
