@@ -3,7 +3,7 @@ title: Model Graph Catalog Proposal
 doc_type: proposal
 domain: tooling-execution
 status: implemented
-last_updated: 2026-07-02
+last_updated: 2026-08-15
 tags:
 - model-controller
 - model-catalog
@@ -11,11 +11,13 @@ tags:
 - routing
 - consolidation
 - stale-branch-refresh
+- huggingface
 related_docs:
 - MODEL_CONTROLLER_PROPOSAL.md
 - ARCHITECTURE_STATUS.md
 - ARCHITECTURE.md
 - SEAM_REGISTRY.md
+- OUTBOUND_INTEGRATIONS.md
 task_refs:
 - docs/task.md
 proposal_id: model-graph-catalog
@@ -23,14 +25,17 @@ implements:
 - model-controller
 implemented_by:
 - crates/ansible-mesh-core/src/model_manager.rs
+- crates/ansible-mesh-core/src/model_catalog_discovery.rs
 - crates/ansible-mesh-core/src/heartbeat.rs
 - crates/ansible-mesh-core/src/beacon.rs
 - crates/aiua/src/main.rs
+- crates/aiua/src/service/model_catalog_sync.rs
 - crates/philotic-web/src/serve.rs
 active_seams:
 - model-graph-catalog-refresh
 - catalog-vs-routing-authority
 - model-trust-guidance
+- model-graph-controller
 source_of_truth_targets:
 - ARCHITECTURE_STATUS.md
 - ARCHITECTURE.md
@@ -97,10 +102,10 @@ Do not merge `origin/codex/model-graph-catalog` wholesale.
 Instead, extract the intended model-catalog work into small current seams and
 delete the stale branch after those seams are landed or intentionally abandoned.
 
-The remaining external-ingestion idea is intentionally split into the follow-on
-`model-graph-controller` seam: a centralized controller that fetches OpenRouter,
-Hugging Face, llm-stats-style feeds, and provider-native model inventories,
-normalizes them into catalog/provenance records, and refreshes trust inputs.
+External ingestion is intentionally split into the `model-graph-controller`
+seam. OpenRouter discovery and the first bounded Hugging Face metadata slice are
+now implemented; benchmark feeds, provider-native inventories, and broader trust
+refresh remain follow-ons rather than an excuse to make one universal crawler.
 
 As of 2026-07-01, the live runtime already has a partial model graph in the form
 of `ModelProfileRecord` plus health-aware routing:
@@ -141,6 +146,31 @@ Implemented as of 2026-07-01:
   default.
 - This slice does not change `model-router`, `model.manager.list`, provider
   selection, or fallback behavior.
+
+Implemented and isolated-smoke-green as of 2026-08-15:
+
+- `model.catalog.huggingface.ingest` is a code-owned SkillDAG capability record
+  seeded only when absent. Its lifecycle is administrable through the landed
+  skill plane; suspension or deprecation disables the periodic Hugging Face
+  fetch without boot seeding silently restoring it.
+- The `model-catalog-huggingface` binding is credential-free, `GET`-only, exact
+  to `/api/models`, zero-redirect, 30-second/4-MiB bounded, and executes through
+  the existing `egress-http-runner` with durable content-free audit. Its fixed
+  query asks for at most 100 public models sorted by downloads, and the parser
+  independently caps accepted rows at 100.
+- The full `model_catalog_discovery.huggingface` snapshot persists source URL,
+  fetch time, and repository revision. The separate
+  `model_catalog.huggingface` read projection retains model id, provider-native
+  task, conservatively mapped Philotic task kinds, license, library,
+  downloads/likes, and provenance.
+- Hugging Face repository facts do not enter `model_catalog.openrouter`, live
+  `ModelProfileRecord` availability, or routing. Popularity and a model-card
+  task are metadata claims, not execution proof.
+- An isolated binary smoke proves the active SkillDAG gate, both exact governed
+  bindings, runner execution, separate compact projections, Hugging Face
+  task/license/revision provenance, durable audits, and closed session turns.
+  Installed-runtime fetch, persistence, SkillDAG suspension, and selected-hotel
+  execution are not yet watched live.
 
 Routing conclusion as of 2026-07-01:
 
@@ -219,8 +249,9 @@ This slice should not:
   `ModelProfileRecord` entries through hotel-state sync.
 - `hotel-capability-model-routing`: later routing slice where the hotel ranks
   local and remote profiles, verifies reachability, and dispatches over the mesh.
-- `model-graph-controller`: future centralized ingestion controller for
-  OpenRouter, Hugging Face, llm-stats-style feeds, and provider-native catalogs.
+- `model-graph-controller`: partially implemented ingestion controller;
+  OpenRouter and bounded Hugging Face metadata are present, while
+  llm-stats-style feeds and additional provider-native catalogs remain deferred.
 
 ## Validation
 
@@ -239,7 +270,10 @@ compile/test truth until a runtime surface consumes it in a watched route.
 
 - Resolved for this slice: catalog/trust records live first in
   `ansible-mesh-core` and project through `philotic-web`.
-- Deferred: external-source ingestion cadence, rate limits, stale-source
-  semantics, and controller placement.
+- Resolved for the first Hugging Face slice: six-hour cadence shared with the
+  hotel catalog job, fixed top-100 request, parser-side top-100 cap, 4-MiB
+  response limit, governed placement, and no credential.
+- Deferred: stale-source semantics, pagination beyond the bounded top 100,
+  benchmark feeds, and broader controller placement policy.
 - Deferred: routing admission integration, especially how LifeGraph sensitivity
   is inferred on mixed-context turns.

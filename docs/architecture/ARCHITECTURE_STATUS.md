@@ -3,7 +3,7 @@ title: Philotic Architecture Status
 doc_type: status
 domain: runtime-sessions
 status: active
-last_updated: 2026-07-28
+last_updated: 2026-08-15
 tags:
 - source-of-truth
 - current-state
@@ -46,7 +46,7 @@ tracks_domains:
 
 # Philotic Architecture Status
 
-> **Status:** Transitional Snapshot | **Last Updated:** 2026-07-28
+> **Status:** Transitional Snapshot | **Last Updated:** 2026-08-15
 
 This document is a legacy human-readable projection of current architecture state.
 The SQLite graph is the canonical source of truth; this file exists for review,
@@ -152,6 +152,13 @@ Primary references:
 - local workspace tooling exists through `tool-runner`, and its shell path (`bash.exec`) can now delegate to `philotic-sandbox` as the backing enforcement worker when sandbox mode is configured, although broader routed error-envelope and management-plane work remains incomplete
 - computer-use automation is now scoped as a pinned desktop task-runner family (`desktop.*`/CUA); the first `desktop.observe` metadata-only scaffold is wired through `tool-runner` and pinned routing, while screenshot and input actions remain deferred, and the desktop membrane remains ingress/approval/visibility rather than executor
 - `model-router` is the shared model execution boundary for current providers
+- the hotel-owned model catalog now has an isolated-smoke-green, non-routing Hugging Face
+  metadata feed: an administrable SkillDAG lifecycle gate controls a bounded
+  credential-free `/api/models` request through `egress-http-runner`, and the
+  separate persisted projection retains task/license/provenance without
+  advertising live availability; the smoke proves the active SkillDAG gate,
+  bounded runner hop, projection, provenance, and durable audit, while installed
+  watched proof remains pending
 - an `OpenAIProvider` adapter and dedicated `model-controller-openai` guest now exist on that seam; OpenRouter now has a separate `model-controller-openrouter` guest/provider identity that reuses the OpenAI-compatible adapter while preserving distinct routing traces and OpenRouter fallback request fields
 - OpenAI auth now has hotel-side key management and validation commands, with endpoint-scoped secret refs, explicit base URL/default model settings, and optional project header support; the first real startup smoke is now green
 - OpenAI capability overrides for reasoning effort, verbosity, background mode, and explicit built-in tool passthrough now flow through `provider_options` on the OpenAI provider
@@ -233,7 +240,7 @@ These are the most clearly active seams as of 2026-07-08:
 | Tool execution envelope | catalog-backed tools and approval policy exist | extend structured error behavior across more routed components instead of falling back to ad hoc strings |
 | Autopoiesis / earned autonomy | the `AutonomyGrant` per-lane posture/budget/audit substrate is real (Slice A1, PR #156), with four lanes wired on top: `graph.bridge_edges` (A2, PR #163), `fleet.heal_slices` (A3, PR #161), `steward.active_checkins` (A5, PR #165), and `memory.hygiene` (Memory Transparency M4, `codex/memory-m4-hygiene-lane`, test-green only) | A4 `aria-architect-charter` and A6 `scheduled-slice-executor` are unstarted; A7/A8 exist only as proposal-doc slices (PR #181) with no lane implementation yet; `memory.hygiene` needs a deployed/watched-live nightly cycle before it counts as proven |
 | LifeGraph retrieval and self-heal loops | read+write loop is live end to end: auto-recall into turn prefetch (PR #152), auto-capture of turn outcomes (PR #168), Muninn provenance edges (PR #149), cross-domain/role-ranked/read-expanded retrieval (PRs #153/#154/#157/#159) with a calibrated recall threshold (PR #160); turn-level failures now feed the self-heal queue (PR #173) and repeated provider 4xx escalates fallback tiers (PR #176); routing now has a health-aware oracle beneath the static ladders (PR #167) and a native Anthropic model controller (PR #166, key not yet provisioned) | prove live feedback smoke beyond test-green, and provision the Anthropic provider key on at least one deployed hotel |
-| Outbound integration and egress | canonical bindings, SkillDAG dependency projection, owner/grant policy, local/preferred/required/deny placement, vault-only credentials, the bounded HTTP runner, success/failure audit, operator management, and MCP-over-HTTP delegation are implemented; both outbound binaries are installed on `mbp-jane` and `vps-jane`; 31 remaining production direct-client files have machine-checked dispositions and three migrated callers are regression-guarded; the hotel-owned OpenRouter model-catalog sync is watched-live-green from the launchd-managed MBP caller through `vps-jane-aiua-01`, with HTTP 200, bounded content-free audit, and a 342-model source-hotel projection; Philote now consumes only that hotel projection and has no direct OpenRouter catalog fallback; operator OIDC token/userinfo exchange is smoke-green through an exact local-only credential-safe binding with runner-local tokens, allowlisted claims, and per-leg durable audits; a separate watched two-hotel run proved required `vps-jane` execution, target-local credential resolution and durable audit, and response return to `mbp-jane` | decide the remaining Gemini CLI OAuth/provider-validation authority and preserve explicit model/provider, communication, local-resource, mesh, and artifact exceptions while migration continues |
+| Outbound integration and egress | canonical bindings, SkillDAG dependency projection, owner/grant policy, local/preferred/required/deny placement, vault-only credentials, the bounded HTTP runner, success/failure audit, operator management, and MCP-over-HTTP delegation are implemented; both outbound binaries are installed on `mbp-jane` and `vps-jane`; 31 remaining production direct-client files have machine-checked dispositions and three migrated callers are regression-guarded; the hotel-owned OpenRouter model-catalog sync is watched-live-green from the launchd-managed MBP caller through `vps-jane-aiua-01`, with HTTP 200, bounded content-free audit, and a 342-model source-hotel projection; Philote now consumes only that hotel projection and has no direct OpenRouter catalog fallback; a second Hugging Face metadata binding is isolated-smoke-green and SkillDAG-lifecycle-gated, persists a separate bounded task/license/provenance projection, and deliberately has no routing effect, but is not installed-runtime proven; operator OIDC token/userinfo exchange is smoke-green through an exact local-only credential-safe binding with runner-local tokens, allowlisted claims, and per-leg durable audits; a separate watched two-hotel run proved required `vps-jane` execution, target-local credential resolution and durable audit, and response return to `mbp-jane` | prove the Hugging Face binding and lifecycle suspension on an installed hotel, decide the remaining Gemini CLI OAuth/provider-validation authority, and preserve explicit model/provider, communication, local-resource, mesh, and artifact exceptions while migration continues |
 | Deployment hardening | VPS boundary and peer rendering contract are defined | remove plaintext secret assumptions and prove real VPS smokes |
 
 ## Domain Status Matrix

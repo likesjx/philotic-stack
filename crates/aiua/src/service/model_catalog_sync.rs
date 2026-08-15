@@ -6,10 +6,11 @@
 //! the self-heal queue for operator visibility. This is the early-warning that
 //! would have flagged the `gemini-2.0-flash` retirement before it wedged turns.
 //!
-//! First cut: **OpenRouter** (`/api/v1/models`, public — no key). OpenRouter
-//! aggregates Google/OpenAI/Anthropic models, so this already gives cross-
-//! provider coverage. The Google-direct fetch (which needs the vault-backed key)
-//! is a trivial add-on once this pattern is proven.
+//! Sources remain independently bounded. OpenRouter supplies routable provider
+//! inventory; Hugging Face supplies public repository/task/license metadata in
+//! a separate, non-routing projection governed by an administrable SkillDAG
+//! record. The Google-direct fetch (which needs the vault-backed key) remains a
+//! follow-on.
 //!
 //! Authority split (per MODEL_GRAPH_CATALOG_PROPOSAL): this writes catalog facts
 //! + provenance and raises alerts. It does not touch live availability,
@@ -23,13 +24,15 @@ use anyhow::{Context, Result, bail};
 use tracing::{info, warn};
 
 use ansible_mesh_core::domain::GraphDomain;
+use ansible_mesh_core::graph::{AbstractSkillRecord, SkillSourceSnapshot, SkillValidationState};
 use ansible_mesh_core::heal_queue::{HealQueueStorage, SqliteHealQueueStorage};
 use ansible_mesh_core::integration::{
     EgressFallback, EgressPlacementPolicy, EgressTrafficClass, HttpIntegrationRequest,
     HttpIntegrationTarget, IntegrationBinding, IntegrationTarget, infer_http_network_scope,
 };
 use ansible_mesh_core::model_catalog_discovery::{
-    CatalogDiffEvent, CatalogDiffKind, DiscoveredModel, diff_catalog, parse_openrouter_models,
+    CatalogDiffEvent, CatalogDiffKind, DiscoveredModel, HUGGINGFACE_MODEL_LIMIT, diff_catalog,
+    parse_huggingface_models, parse_openrouter_models,
 };
 use ansible_mesh_core::model_routing::{
     DEFAULT_FALLBACK_TIERS, ProviderRouting, RoutingImpact, routing_impact_for_model,
@@ -40,6 +43,9 @@ use super::governed_http::GovernedHttpService;
 
 const OPENROUTER_URL: &str = "https://openrouter.ai/api/v1/models";
 const BINDING_ID: &str = "model-catalog-openrouter";
+const HUGGINGFACE_URL: &str = "https://huggingface.co/api/models";
+const HUGGINGFACE_BINDING_ID: &str = "model-catalog-huggingface";
+const HUGGINGFACE_SKILL_NAME: &str = "model.catalog.huggingface.ingest";
 const SYSTEM_GUEST_ID: &str = "system:model-catalog-sync";
 const SYSTEM_ROLE: &str = "model-catalog-sync";
 const DEFAULT_EXIT_HOTEL: &str = "vps-jane";
@@ -55,6 +61,8 @@ const SNAPSHOT_KEY: &str = "model_catalog_discovery.openrouter";
 /// one terse object per model —
 /// `{"id","name","tools":bool?,"ctx":u32?,"in":f64?,"out":f64?,"think":bool?}`.
 pub const CATALOG_KEY: &str = "model_catalog.openrouter";
+const HUGGINGFACE_SNAPSHOT_KEY: &str = "model_catalog_discovery.huggingface";
+pub const HUGGINGFACE_CATALOG_KEY: &str = "model_catalog.huggingface";
 const GUEST_ID: &str = "model-catalog-sync";
 const SYNC_INTERVAL_SECS: u64 = 6 * 60 * 60;
 const INITIAL_DELAY_SECS: u64 = 45;
@@ -76,20 +84,92 @@ pub fn spawn_loop(
             }
         };
 
+        if let Err(error) = ensure_huggingface_ingestion_skill(&graph) {
+            warn!("model-catalog-sync: Hugging Face SkillDAG seed failed: {error:#}");
+        }
+
         tokio::time::sleep(Duration::from_secs(initial_delay_secs())).await;
         let mut interval = tokio::time::interval(Duration::from_secs(sync_interval_secs()));
         loop {
             interval.tick().await;
-            let result = async {
+            let openrouter_result = async {
                 let body = fetch_openrouter_catalog(&socket_path, &local_node_id).await?;
                 run_once(&graph, heal.as_ref(), &body).await
             }
             .await;
-            if let Err(e) = result {
+            if let Err(e) = openrouter_result {
                 warn!("model-catalog-sync: run failed: {e:#}");
+            }
+
+            match huggingface_ingestion_enabled(&graph) {
+                Ok(true) => {
+                    let result = async {
+                        let (body, source_url) =
+                            fetch_huggingface_catalog(&socket_path, &local_node_id).await?;
+                        run_huggingface_once(&graph, &body, &source_url)
+                    }
+                    .await;
+                    if let Err(error) = result {
+                        warn!("model-catalog-sync: Hugging Face run failed: {error:#}");
+                    }
+                }
+                Ok(false) => info!(
+                    skill = HUGGINGFACE_SKILL_NAME,
+                    "model-catalog-sync: Hugging Face ingestion is administratively disabled"
+                ),
+                Err(error) => {
+                    warn!("model-catalog-sync: Hugging Face SkillDAG state unavailable: {error:#}")
+                }
             }
         }
     });
+}
+
+/// Install the code-owned ingestion capability once. Subsequent lifecycle
+/// mutations are preserved, so `skill.set_state` can suspend or deprecate the
+/// background fetch without a restart silently re-enabling it.
+fn ensure_huggingface_ingestion_skill(graph: &GraphDomain) -> Result<()> {
+    if graph.get_abstract_skill(HUGGINGFACE_SKILL_NAME)?.is_some() {
+        return Ok(());
+    }
+    let registered_at = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(1)
+        .max(1);
+    graph.upsert_abstract_skill(&AbstractSkillRecord {
+        skill_name: HUGGINGFACE_SKILL_NAME.into(),
+        description: "Read a bounded public Hugging Face model index through governed egress and project model/task/license facts with provenance; never downloads weights or changes routing.".into(),
+        skill_markers: vec![
+            "governed".into(),
+            "read_only".into(),
+            "provenance_required".into(),
+        ],
+        validation_state: SkillValidationState::Active,
+        source_snapshot: Some(SkillSourceSnapshot {
+            mesh_catalog_version: env!("CARGO_PKG_VERSION").into(),
+            hotel_policy_version: "model-catalog-huggingface-v1".into(),
+            registered_at,
+            registered_by: SYSTEM_GUEST_ID.into(),
+        }),
+        field_sources: serde_json::json!({
+            "source": "built_in_model_catalog_sync",
+            "binding_id": HUGGINGFACE_BINDING_ID,
+            "method": "GET",
+            "path": "/api/models",
+            "max_models": HUGGINGFACE_MODEL_LIMIT,
+            "routing_effect": "none_read_only_projection"
+        }),
+        ..Default::default()
+    })?;
+    Ok(())
+}
+
+fn huggingface_ingestion_enabled(graph: &GraphDomain) -> Result<bool> {
+    Ok(graph
+        .get_abstract_skill(HUGGINGFACE_SKILL_NAME)?
+        .map(|skill| skill.validation_state.is_projectable())
+        .unwrap_or(false))
 }
 
 /// One discovery pass: fetch → diff vs persisted snapshot → persist → alert.
@@ -189,6 +269,31 @@ async fn fetch_openrouter_catalog(socket_path: &str, local_node_id: &str) -> Res
     Ok(response.body)
 }
 
+async fn fetch_huggingface_catalog(
+    socket_path: &str,
+    local_node_id: &str,
+) -> Result<(String, String)> {
+    let source_url = std::env::var("PHILOTIC_HUGGINGFACE_MODEL_CATALOG_URL")
+        .unwrap_or_else(|_| HUGGINGFACE_URL.into());
+    let (binding, request) = huggingface_binding(&source_url)?;
+    let response = GovernedHttpService {
+        socket_path: socket_path.to_string(),
+        local_node_id: local_node_id.to_string(),
+        guest_id: SYSTEM_GUEST_ID.into(),
+        role: SYSTEM_ROLE.into(),
+    }
+    .execute(binding, request, "Hugging Face model catalog")
+    .await
+    .context("fetch Hugging Face model list through governed egress")?;
+    if !(200..300).contains(&response.status) {
+        bail!(
+            "Hugging Face model list returned HTTP {} through governed egress",
+            response.status
+        );
+    }
+    Ok((response.body, source_url))
+}
+
 fn openrouter_binding(source_url: &str) -> Result<(IntegrationBinding, HttpIntegrationRequest)> {
     let exit_hotel = std::env::var("PHILOTIC_MODEL_CATALOG_EXIT_HOTEL")
         .unwrap_or_else(|_| DEFAULT_EXIT_HOTEL.into());
@@ -269,6 +374,173 @@ fn openrouter_binding_for_exit(
             body: None,
         },
     ))
+}
+
+fn huggingface_binding(source_url: &str) -> Result<(IntegrationBinding, HttpIntegrationRequest)> {
+    let exit_hotel = std::env::var("PHILOTIC_HUGGINGFACE_MODEL_CATALOG_EXIT_HOTEL")
+        .or_else(|_| std::env::var("PHILOTIC_MODEL_CATALOG_EXIT_HOTEL"))
+        .unwrap_or_else(|_| DEFAULT_EXIT_HOTEL.into());
+    huggingface_binding_for_exit(source_url, &exit_hotel)
+}
+
+fn huggingface_binding_for_exit(
+    source_url: &str,
+    exit_hotel: &str,
+) -> Result<(IntegrationBinding, HttpIntegrationRequest)> {
+    let parsed = reqwest::Url::parse(source_url).context("invalid Hugging Face source URL")?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        bail!("Hugging Face source URL must use HTTP(S)");
+    }
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        bail!("Hugging Face source URL must not contain userinfo");
+    }
+    if parsed.query().is_some() || parsed.fragment().is_some() {
+        bail!("Hugging Face source URL must not contain query or fragment");
+    }
+    let host = parsed
+        .host_str()
+        .context("Hugging Face source URL has no host")?;
+    let path = parsed.path().to_string();
+    let placement = if exit_hotel.trim().is_empty() || exit_hotel.eq_ignore_ascii_case("local") {
+        EgressPlacementPolicy::Local
+    } else {
+        EgressPlacementPolicy::PreferHotel {
+            hotel_id: exit_hotel.to_string(),
+            fallback: EgressFallback::LocalWithAudit,
+        }
+    };
+    let updated_at = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(1)
+        .max(1);
+    // Keeping the path on base_url with an empty allowlist makes the runner's
+    // path contract exact (`/api/models` only), not a prefix grant over model
+    // detail or mutation endpoints.
+    let binding = IntegrationBinding {
+        binding_id: HUGGINGFACE_BINDING_ID.into(),
+        owner_agent_id: SYSTEM_GUEST_ID.into(),
+        display_name: Some("Hugging Face public model catalog".into()),
+        target: IntegrationTarget::Http(HttpIntegrationTarget {
+            base_url: source_url.to_string(),
+            allowed_methods: vec!["GET".into()],
+            allowed_path_prefixes: Vec::new(),
+            allowed_request_headers: Vec::new(),
+            default_headers: BTreeMap::from([("accept".into(), "application/json".into())]),
+            response_header_allowlist: vec!["content-type".into()],
+            allowed_redirect_hosts: Vec::new(),
+            network_scope: infer_http_network_scope(host),
+            credential: None,
+            timeout_secs: 30,
+            max_request_bytes: 1024,
+            max_response_bytes: 4 * 1024 * 1024,
+            max_redirects: 0,
+        }),
+        grant_agents: Vec::new(),
+        grant_skills: vec![HUGGINGFACE_SKILL_NAME.into()],
+        traffic_class: EgressTrafficClass::GeneralApi,
+        placement,
+        requires_approval: false,
+        enabled: true,
+        updated_at,
+    };
+    binding
+        .validate()
+        .map_err(anyhow::Error::msg)
+        .context("invalid Hugging Face catalog integration binding")?;
+    Ok((
+        binding,
+        HttpIntegrationRequest {
+            binding_id: HUGGINGFACE_BINDING_ID.into(),
+            method: "GET".into(),
+            path,
+            query: BTreeMap::from([
+                ("sort".into(), "downloads".into()),
+                ("direction".into(), "-1".into()),
+                ("limit".into(), HUGGINGFACE_MODEL_LIMIT.to_string()),
+                ("full".into(), "true".into()),
+                ("cardData".into(), "true".into()),
+            ]),
+            headers: BTreeMap::new(),
+            body: None,
+        },
+    ))
+}
+
+/// Parse and persist a Hugging Face snapshot plus a compact, provenance-rich
+/// query projection. It is intentionally separate from the OpenRouter key so
+/// repository metadata can never become routing authority by adjacency.
+fn run_huggingface_once(graph: &GraphDomain, body: &str, source_url: &str) -> Result<usize> {
+    let fetched_at_secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .ok();
+    let discovered = parse_huggingface_models(body, fetched_at_secs, source_url)?;
+    let projection = compact_huggingface_catalog(&discovered, fetched_at_secs, source_url);
+    graph.set_config_value(
+        HUGGINGFACE_CATALOG_KEY,
+        &serde_json::to_string(&projection)?,
+    )?;
+    graph.set_config_value(
+        HUGGINGFACE_SNAPSHOT_KEY,
+        &serde_json::to_string(&discovered)?,
+    )?;
+    info!(
+        provider = "huggingface",
+        models = discovered.len(),
+        skill = HUGGINGFACE_SKILL_NAME,
+        "model-catalog-sync: public metadata synced"
+    );
+    Ok(discovered.len())
+}
+
+fn compact_huggingface_catalog(
+    models: &[DiscoveredModel],
+    fetched_at_secs: Option<u64>,
+    source_url: &str,
+) -> serde_json::Value {
+    let models = models
+        .iter()
+        .map(|model| {
+            let mut entry = serde_json::json!({
+                "id": model.model_ref,
+                "provider": model.provider,
+                "task_kinds": model.declared_task_kinds,
+                "provenance": {
+                    "source_url": model.source_url,
+                    "fetched_at_secs": model.fetched_at_secs,
+                    "revision": model.source_revision,
+                }
+            });
+            if let Some(task) = &model.provider_task {
+                entry["task"] = serde_json::json!(task);
+            }
+            if let Some(license) = &model.license {
+                entry["license"] = serde_json::json!(license);
+            }
+            if let Some(library) = &model.library_name {
+                entry["library"] = serde_json::json!(library);
+            }
+            if let Some(downloads) = model.downloads {
+                entry["downloads"] = serde_json::json!(downloads);
+            }
+            if let Some(likes) = model.likes {
+                entry["likes"] = serde_json::json!(likes);
+            }
+            entry
+        })
+        .collect::<Vec<_>>();
+    serde_json::json!({
+        "source": {
+            "kind": "huggingface_hub_api",
+            "url": source_url,
+            "fetched_at_secs": fetched_at_secs,
+            "requested_limit": HUGGINGFACE_MODEL_LIMIT,
+            "sort": "downloads_desc"
+        },
+        "routing_effect": "none_read_only_projection",
+        "models": models
+    })
 }
 
 fn initial_delay_secs() -> u64 {
@@ -502,9 +774,15 @@ mod tests {
             reasoning_default: None,
             supports_tools: Some(true),
             declared_task_kinds: vec!["text.generate".into()],
+            provider_task: None,
+            license: None,
+            library_name: None,
+            downloads: None,
+            likes: None,
             lifecycle_hint: None,
             source_url: "https://openrouter.ai/api/v1/models".into(),
             fetched_at_secs: Some(1),
+            source_revision: None,
         };
         let compact = compact_catalog(&[model]);
         assert_eq!(compact.len(), 1);
@@ -565,5 +843,96 @@ mod tests {
             ansible_mesh_core::integration::HttpNetworkScope::Loopback
         );
         assert_eq!(target.allowed_path_prefixes, ["/api/v1/models"]);
+    }
+
+    fn test_graph() -> GraphDomain {
+        let store = ansible_mesh_core::sqlite_storage::SqliteGraphStorage::open(":memory:")
+            .expect("open in-memory graph");
+        GraphDomain::new(Arc::new(store.adapter()))
+    }
+
+    #[test]
+    fn huggingface_skill_seed_is_administrable_and_preserves_suspension() {
+        let graph = test_graph();
+        ensure_huggingface_ingestion_skill(&graph).unwrap();
+        let skill = graph
+            .get_abstract_skill(HUGGINGFACE_SKILL_NAME)
+            .unwrap()
+            .unwrap();
+        assert!(skill.validation_state.is_projectable());
+        assert!(skill.skill_markers.contains(&"read_only".to_string()));
+
+        let mut suspended = skill;
+        suspended.validation_state = SkillValidationState::Suspended {
+            reason: "operator pause".into(),
+        };
+        graph.upsert_abstract_skill(&suspended).unwrap();
+        ensure_huggingface_ingestion_skill(&graph).unwrap();
+        assert!(!huggingface_ingestion_enabled(&graph).unwrap());
+    }
+
+    #[test]
+    fn huggingface_binding_is_exact_bounded_public_and_skill_gated() {
+        let (binding, request) =
+            huggingface_binding_for_exit("https://huggingface.co/api/models", "vps-jane").unwrap();
+        assert_eq!(binding.binding_id, HUGGINGFACE_BINDING_ID);
+        assert_eq!(binding.grant_skills, [HUGGINGFACE_SKILL_NAME]);
+        assert!(!binding.requires_approval);
+        let IntegrationTarget::Http(target) = binding.target else {
+            panic!("expected HTTP target");
+        };
+        assert_eq!(target.base_url, "https://huggingface.co/api/models");
+        assert!(target.allowed_path_prefixes.is_empty());
+        assert!(target.path_allowed("/api/models"));
+        assert!(!target.path_allowed("/api/models/org/private"));
+        assert_eq!(target.allowed_methods, ["GET"]);
+        assert!(target.credential.is_none());
+        assert_eq!(target.max_redirects, 0);
+        assert_eq!(target.max_response_bytes, 4 * 1024 * 1024);
+        assert_eq!(request.path, "/api/models");
+        assert_eq!(request.query.get("limit"), Some(&"100".to_string()));
+        assert_eq!(request.query.get("sort"), Some(&"downloads".to_string()));
+    }
+
+    #[test]
+    fn huggingface_run_persists_provenance_and_compact_metadata() {
+        let graph = test_graph();
+        let body = r#"[{
+          "id":"sentence-transformers/all-MiniLM-L6-v2",
+          "pipeline_tag":"sentence-similarity",
+          "library_name":"sentence-transformers",
+          "downloads":12,
+          "likes":3,
+          "private":false,
+          "sha":"abc123",
+          "cardData":{"license":"apache-2.0"}
+        }]"#;
+        assert_eq!(
+            run_huggingface_once(&graph, body, "http://127.0.0.1:8123/api/models").unwrap(),
+            1
+        );
+
+        let snapshot = graph
+            .get_config_value(HUGGINGFACE_SNAPSHOT_KEY)
+            .unwrap()
+            .unwrap();
+        let snapshot: Vec<DiscoveredModel> = serde_json::from_str(&snapshot).unwrap();
+        assert_eq!(snapshot[0].source_revision.as_deref(), Some("abc123"));
+        assert_eq!(snapshot[0].license.as_deref(), Some("apache-2.0"));
+
+        let projection = graph
+            .get_config_value(HUGGINGFACE_CATALOG_KEY)
+            .unwrap()
+            .unwrap();
+        let projection: serde_json::Value = serde_json::from_str(&projection).unwrap();
+        assert_eq!(projection["routing_effect"], "none_read_only_projection");
+        assert_eq!(
+            projection["source"]["url"],
+            "http://127.0.0.1:8123/api/models"
+        );
+        assert_eq!(projection["models"][0]["task"], "sentence-similarity");
+        assert_eq!(projection["models"][0]["task_kinds"][0], "text.embed");
+        assert_eq!(projection["models"][0]["license"], "apache-2.0");
+        assert_eq!(projection["models"][0]["provenance"]["revision"], "abc123");
     }
 }
