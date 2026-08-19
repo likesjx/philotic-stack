@@ -68,6 +68,12 @@ public final class LifeGraphStore {
     public private(set) var recentChanges: [LifeGraphChangeEvent] = []
 
     private let client = LifeGraphClient()
+    private let memoryClient = MemoryClient()
+
+    /// Minimum spacing between Muninn index refreshes, independent of how
+    /// often the Life surface reloads.
+    static let memoryRefreshInterval: TimeInterval = 300
+    private var lastMemoryIndexRefresh: Date?
 
     public init() {}
 
@@ -90,8 +96,59 @@ public final class LifeGraphStore {
             if response.data.status != "ok" {
                 lastError = "lens returned status \(response.data.status)"
             }
+            // Donate to the Spotlight semantic index (seam:
+            // apple-entity-index-plane). Only packets the server already
+            // released reach here, and LifeIndexMapper applies the
+            // validation-state filter before anything is indexed. Fire and
+            // forget: a Spotlight failure must never degrade the Life surface.
+            let donated = packets
+            Task.detached(priority: .utility) {
+                await LifeIndexDonor.applyLensPackets(donated)
+            }
+            // Muninn rides the same refresh so both memory planes reach the
+            // index together, but on its own failure path (see below).
+            let memoryContext = context
+            Task { [weak self] in
+                await self?.refreshMemoryIndex(
+                    baseURL: baseURL, bearerToken: bearerToken, context: memoryContext)
+            }
         } catch {
             lastError = String(describing: error)
+        }
+    }
+
+    /// Pull structured Muninn recall and mirror it into the Spotlight index
+    /// (seam: apple-entity-index-plane, Muninn extension).
+    ///
+    /// Kept separate from `refresh` because the two planes fail independently:
+    /// Muninn being unconfigured or unreachable must never blank the Life
+    /// surface, and a lens error must not stop memory indexing. Failures are
+    /// intentionally swallowed — this is a background index refresh, not an
+    /// operator-visible action.
+    public func refreshMemoryIndex(
+        baseURL: URL, bearerToken: String, context: String? = nil, force: Bool = false
+    ) async {
+        // `refresh` is called on appear, on every lens switch, on submit and
+        // on pull-to-refresh — four lenses would mean four identical Muninn
+        // round-trips. The memory plane does not vary by lens, so throttle it
+        // on its own cadence rather than the Life surface's.
+        if !force, let last = lastMemoryIndexRefresh,
+            Date().timeIntervalSince(last) < Self.memoryRefreshInterval
+        {
+            return
+        }
+        lastMemoryIndexRefresh = Date()
+        do {
+            let response = try await memoryClient.recall(
+                baseURL: baseURL,
+                bearerToken: bearerToken,
+                context: context,
+                maxResults: 25
+            )
+            guard response.status == "ok" else { return }
+            await LifeIndexDonor.applyMemories(response.memories)
+        } catch {
+            // Muninn is optional on a hotel; absence is not an error state.
         }
     }
 
@@ -110,6 +167,14 @@ public final class LifeGraphStore {
         )
         if recentChanges.count > 20 {
             recentChanges.removeLast(recentChanges.count - 20)
+        }
+        // A retirement must evict the node from the system index immediately,
+        // not wait for the next lens refresh — Spotlight would keep answering
+        // with a claim the graph has retracted. Non-removal kinds carry no
+        // provenance and are intentionally no-ops here.
+        Task.detached(priority: .utility) {
+            await LifeIndexDonor.applyChange(
+                changeKind: kind, nodeId: nodeId, label: label, summary: summary)
         }
     }
 
