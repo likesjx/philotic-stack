@@ -2753,8 +2753,8 @@ fn raw_recall_fallback_cypher(labels: &[&str], limit: usize) -> String {
             "MATCH (n) ",
             "WHERE any(label IN labels(n) WHERE label IN [{labels}]) ",
             "AND coalesce(n.validation_state, 'inferred') <> 'retired' ",
-            "AND coalesce(n.status, '') <> 'retired' ",
-            "AND coalesce(n.status, '') <> 'done' ",
+            "AND NOT coalesce(n.status, '') IN ['retired', 'done', 'fulfilled', 'abandoned', 'resolved'] ",
+            "AND NOT coalesce(n.loop_status, '') IN ['retired', 'done', 'fulfilled', 'abandoned', 'resolved'] ",
             "RETURN n AS node, 0.25 AS similarity ",
             "ORDER BY coalesce(n.observed_at, n.created_at, '') DESC ",
             "LIMIT {limit}"
@@ -3978,6 +3978,18 @@ mod tests {
         assert!(cypher.contains("'Habit'"));
         assert!(cypher.contains("RETURN n AS node, 0.25 AS similarity"));
         assert!(cypher.contains("LIMIT 6"));
+    }
+
+    #[test]
+    fn raw_recall_fallback_excludes_resolved_on_both_status_properties() {
+        let cypher = raw_recall_fallback_cypher(&["OpenLoop"], 6);
+
+        assert!(cypher.contains(
+            "NOT coalesce(n.status, '') IN ['retired', 'done', 'fulfilled', 'abandoned', 'resolved']"
+        ));
+        assert!(cypher.contains(
+            "NOT coalesce(n.loop_status, '') IN ['retired', 'done', 'fulfilled', 'abandoned', 'resolved']"
+        ));
     }
 
     #[test]
