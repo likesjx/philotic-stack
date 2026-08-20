@@ -177,10 +177,19 @@ impl VectorHit {
     }
 
     pub fn is_retired(&self) -> bool {
+        // "resolved" is what life.commit/life.resolve write on loop closure
+        // (cypher.rs `loop_status` commit path), so it must terminate recall
+        // the same way retired/done do. `loop_status` is checked as a
+        // fallback because production nodes exist where the closure landed
+        // on that property instead of `status`.
         matches!(self.validation_state(), ValidationState::Retired)
             || matches!(
                 self.prop_str("status").unwrap_or(""),
-                "retired" | "done" | "fulfilled" | "abandoned"
+                "retired" | "done" | "fulfilled" | "abandoned" | "resolved"
+            )
+            || matches!(
+                self.prop_str("loop_status").unwrap_or(""),
+                "retired" | "done" | "fulfilled" | "abandoned" | "resolved"
             )
     }
 }
@@ -856,6 +865,41 @@ mod tests {
         assert_eq!(surviving[0].node_id(), "l:ol:open");
         assert_eq!(log.len(), 1);
         assert!(log[0].contains("ExcludeRetired"));
+    }
+
+    /// Live regression (vps-jane, 2026-08-20): loops closed via the
+    /// life.commit/life.resolve path get `status = "resolved"`, and some
+    /// production nodes carry the closure on `loop_status` instead. Both
+    /// kept surfacing in daily-brief recall because neither value was in
+    /// the ExcludeRetired set.
+    #[test]
+    fn policy_filter_excludes_resolved_loops() {
+        let result = json!({
+            "rows": [
+                bolt_node_row(1, "OpenLoop",
+                    json!({ "id": "l:ol:open", "title": "Active loop",
+                             "confidence": 0.8, "validation_state": "confirmed",
+                             "status": "open" }),
+                    0.9),
+                bolt_node_row(2, "OpenLoop",
+                    json!({ "id": "l:ol:resolved-status", "title": "Resolved via status",
+                             "confidence": 0.8, "validation_state": "confirmed",
+                             "status": "resolved" }),
+                    0.88),
+                bolt_node_row(3, "OpenLoop",
+                    json!({ "id": "l:ol:resolved-loop-status", "title": "Resolved via loop_status",
+                             "confidence": 0.8, "validation_state": "confirmed",
+                             "loop_status": "resolved" }),
+                    0.87),
+            ]
+        });
+
+        let hits = parse_vector_search_rows(&result);
+        let (surviving, log) = apply_policy_filters(hits, &[PolicyFilter::ExcludeRetired]);
+
+        assert_eq!(surviving.len(), 1);
+        assert_eq!(surviving[0].node_id(), "l:ol:open");
+        assert_eq!(log.len(), 2);
     }
 
     #[test]
