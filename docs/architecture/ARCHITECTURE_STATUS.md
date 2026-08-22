@@ -3,7 +3,7 @@ title: Philotic Architecture Status
 doc_type: status
 domain: runtime-sessions
 status: active
-last_updated: 2026-07-28
+last_updated: 2026-08-22
 tags:
 - source-of-truth
 - current-state
@@ -31,6 +31,7 @@ related_docs:
 - DOC_TAGGING_FRONTMATTER_PROPOSAL.md
 - MCP_CLIENT_FABRIC_PROPOSAL.md
 - OUTBOUND_INTEGRATION_FABRIC_PROPOSAL.md
+- NATIVE_APPLE_APP_PROPOSAL.md
 task_refs:
 - docs/task.md
 tracks_domains:
@@ -46,7 +47,7 @@ tracks_domains:
 
 # Philotic Architecture Status
 
-> **Status:** Transitional Snapshot | **Last Updated:** 2026-07-28
+> **Status:** Transitional Snapshot | **Last Updated:** 2026-08-22
 
 This document is a legacy human-readable projection of current architecture state.
 The SQLite graph is the canonical source of truth; this file exists for review,
@@ -91,6 +92,7 @@ Philotic currently operates as a hotel-centered runtime:
 - LifeGraph now has a live read+write loop rather than write-only ingestion: `philote` auto-recalls cached LifeGraph context into turn prefetch (PR #152), auto-captures turn outcomes back into the graph (PR #168), retrieval carries Muninn-sourced provenance edges (PR #149) and cross-domain/role-ranked/read-expanded retrieval (PRs #153, #154, #157, #159) with a calibrated recall-confidence threshold (PR #160).
 - Model routing gained a health-aware oracle beneath the static fallback ladders (`model_oracle`, PR #167) and the model-controller fleet now includes a native `model-controller-anthropic` guest and `AnthropicProvider` (PR #166, "full model suite") alongside the existing gemini/elevenlabs/openai/openrouter/mlx/ollama/onnx/parakeet/vision controllers; provider key configuration for Anthropic is wired through the same vault-backed `provider_keys` path as the others but is not yet populated on any deployed hotel.
 - Turn-level failures (provider errors, watchdog evictions, fallback-ladder exhaustion) now flow into the self-heal queue instead of terminating silently (PR #173), and repeated 4xx responses from a provider now escalate to the next fallback tier instead of retrying the same dead provider (PR #176).
+- The native Apple app now has a transitional, operator-triggered Core Location surface: each tap sends one timestamped `Signal` observation through the existing LifeGraph write plane, approximate precision is the default, and there is no background tracking path. Snapshot/observation shaping is test-green and the Location UI is watched on an iOS 27 Simulator; physical-device installation, a live LifeGraph round trip, agent recall of the newest snapshot, and server persistence of the structured observation metadata remain unproven.
 
 ## Implemented Foundations
 

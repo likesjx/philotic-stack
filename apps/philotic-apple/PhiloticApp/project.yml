@@ -43,6 +43,7 @@ targets:
         INFOPLIST_KEY_LSApplicationCategoryType: "public.app-category.utilities"
         INFOPLIST_KEY_NSMicrophoneUsageDescription: "PhiloticApp uses the microphone for voice messages to your agents."
         INFOPLIST_KEY_NSSpeechRecognitionUsageDescription: "Speech is transcribed on-device to send voice messages."
+        INFOPLIST_KEY_NSLocationUsageDescription: "PhiloticApp shares a location snapshot with your agents only when you tap Share Current Location."
 
   PhiloticApp-iOS:
     type: application
@@ -73,6 +74,7 @@ targets:
         INFOPLIST_KEY_NSMicrophoneUsageDescription: "PhiloticApp uses the microphone for voice messages to your agents."
         INFOPLIST_KEY_NSSpeechRecognitionUsageDescription: "Speech is transcribed on-device to send voice messages."
         INFOPLIST_KEY_NSHealthShareUsageDescription: "PhiloticApp reads your health metrics to build your life graph."
+        INFOPLIST_KEY_NSLocationWhenInUseUsageDescription: "PhiloticApp shares a location snapshot with your agents only when you tap Share Current Location."
         TARGETED_DEVICE_FAMILY: "1,2"
         # Device-install ready. Automatic signing: open the project in Xcode,
         # select the PhiloticApp-iOS target -> Signing & Capabilities, and
@@ -90,6 +92,21 @@ targets:
         CODE_SIGN_IDENTITY: "Apple Development"
         DEVELOPMENT_TEAM: ""
 
+  PhiloticAppTests-macOS:
+    type: bundle.unit-test
+    platform: macOS
+    deploymentTarget: "14.0"
+    sources:
+      - path: Tests/PhiloticAppTests
+    dependencies:
+      - target: PhiloticApp-macOS
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.philotic.apple.mac.tests
+        GENERATE_INFOPLIST_FILE: "YES"
+        TEST_HOST: "$(BUILT_PRODUCTS_DIR)/PhiloticApp.app/Contents/MacOS/PhiloticApp"
+        BUNDLE_LOADER: "$(TEST_HOST)"
+
 schemes:
   PhiloticApp-macOS:
     build:
@@ -99,6 +116,8 @@ schemes:
       config: Debug
     test:
       config: Debug
+      targets:
+        - PhiloticAppTests-macOS
   PhiloticApp-iOS:
     build:
       targets:

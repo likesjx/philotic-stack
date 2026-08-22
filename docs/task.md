@@ -159,6 +159,18 @@ Seam IDs: `life-graph-schema`, `life-graph-memorygraphrag-runner`, `life-graph-a
 - [ ] Wire Beacon as the first Life Graph steward / chief-of-staff role once schema and retrieval are test-green.
 - [ ] Let specialized roles such as Coach consume and contribute to Life Graph OS through governed tools without owning the canonical cross-domain graph posture.
 
+## New Project: Native Apple Location Context
+
+Proposal: [NATIVE_APPLE_APP_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/NATIVE_APPLE_APP_PROPOSAL.md)
+
+- [x] Add a manual Core Location snapshot surface to the Swift app with approximate sharing as the default, precise sharing as an explicit choice, and no background tracking.
+- [x] Encode each share as a unique, timestamped LifeGraph `Signal` so agents can prefer recent evidence without a second current-location authority.
+- [x] Add macOS-hosted unit coverage for coordinate precision and the outbound observation contract; keep it in `just app-test`.
+- [x] Build macOS and iOS Simulator targets and watch the Location sheet render on an iOS 27 Simulator.
+- [ ] Connect, unlock, trust, sign, and install the app on Jared's iPhone; Simulator proof is not physical-device proof.
+- [ ] Share one real snapshot to the configured hotel, query the LifeGraph, and verify an agent recalls the newest snapshot with its observation time and accuracy.
+- [ ] Persist structured `EvidencePacket.metadata` in the `life.observe` compiler, then decide whether a governed derived `current location` projection is warranted; the immutable snapshot stream remains canonical meanwhile.
+
 ## New Project: Memory Cultivation and True-Up
 
 Proposal: [MEMORY_CULTIVATION_TRUE_UP_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/MEMORY_CULTIVATION_TRUE_UP_PROPOSAL.md)

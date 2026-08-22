@@ -9,7 +9,9 @@ struct RootView: View {
     @State private var showingSettings = false
     @State private var showingLife = false
     @State private var showingHealth = false
+    @State private var showingLocation = false
     @State private var health = HealthKitCaptureService()
+    @State private var location = LocationCaptureService()
 
     var body: some View {
         NavigationSplitView {
@@ -31,6 +33,14 @@ struct RootView: View {
                             Image(systemName: "heart.text.square")
                         }
                         .accessibilityLabel("Health sync")
+                    }
+                    ToolbarItem {
+                        Button {
+                            showingLocation = true
+                        } label: {
+                            Image(systemName: "location.circle")
+                        }
+                        .accessibilityLabel("Share location")
                     }
                     ToolbarItem {
                         Button {
@@ -72,6 +82,14 @@ struct RootView: View {
                 .frame(minWidth: 480, minHeight: 560)
             #endif
         }
+        .sheet(isPresented: $showingLocation) {
+            NavigationStack {
+                LocationView(session: session, location: location)
+            }
+            #if os(macOS)
+                .frame(minWidth: 480, minHeight: 520)
+            #endif
+        }
         .task {
             await session.loadConversations()
             if session.settings.isConfigured {
@@ -79,6 +97,14 @@ struct RootView: View {
             } else {
                 showingSettings = true
             }
+            #if DEBUG
+                // Deterministic Simulator/UI-test entry point. Release builds
+                // expose Location only through the operator-tapped toolbar.
+                if CommandLine.arguments.contains("--show-location") {
+                    showingSettings = false
+                    showingLocation = true
+                }
+            #endif
         }
     }
 }

@@ -3,7 +3,7 @@ title: Native Apple App — Edge Client Program
 doc_type: proposal
 domain: membrane-transport
 status: accepted-current-slice
-last_updated: 2026-07-11
+last_updated: 2026-08-22
 tags:
 - apple
 - ios
@@ -312,7 +312,27 @@ Two canonical owners, one mapping — no third source of truth:
   the app, ceremony per the operator-identity proposal.
 - EventKit/HealthKit data leaves the device only through explicit per-source
   observe toggles; capability advertisement is itself operator-configurable.
+- Core Location leaves the device only after an operator taps **Share Current
+  Location**. The current slice requests one foreground reading, defaults to
+  approximate precision, and has no passive or background upload path.
 - APNs (when built) carries wake signals only, never content.
+
+## Current Slice: Operator Location Snapshots (Transitional)
+
+The Apple app now has an operator-controlled Location sheet that turns one
+foreground Core Location reading into one timestamped LifeGraph `Signal` via
+the existing edge `life.observe` write plane. Approximate sharing (coordinates
+rounded to roughly 1 km) is the default; precise sharing is an explicit choice.
+Every tap creates a unique snapshot so agents can rank observations by recency
+instead of mistaking an old coordinate for mutable current-location truth.
+
+Current proof is `test-green` for snapshot shaping and observation contracts,
+plus a watched iOS 27 Simulator launch of the Location UI. This is not yet
+physical-device or live-LifeGraph proof: Jared's phone must be available for
+signing/install, and a real snapshot still needs to be observed through agent
+recall. The current `life.observe` compiler also does not persist the request's
+structured metadata map, so coordinates remain queryable through the claim
+summary until that server-side persistence gap is closed.
 
 ## Disposition
 
