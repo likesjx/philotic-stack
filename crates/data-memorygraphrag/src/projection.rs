@@ -177,20 +177,14 @@ impl VectorHit {
     }
 
     pub fn is_retired(&self) -> bool {
-        // "resolved" is what life.commit/life.resolve write on loop closure
-        // (cypher.rs `loop_status` commit path), so it must terminate recall
-        // the same way retired/done do. `loop_status` is checked as a
-        // fallback because production nodes exist where the closure landed
-        // on that property instead of `status`.
+        // The terminal vocabulary lives in `ontology` (single source):
+        // `resolved` is what life.commit/life.resolve write on loop closure
+        // (PR #434 regression), and the legacy `loop_status` alias is read
+        // because production nodes exist where the closure landed there.
         matches!(self.validation_state(), ValidationState::Retired)
-            || matches!(
-                self.prop_str("status").unwrap_or(""),
-                "retired" | "done" | "fulfilled" | "abandoned" | "resolved"
-            )
-            || matches!(
-                self.prop_str("loop_status").unwrap_or(""),
-                "retired" | "done" | "fulfilled" | "abandoned" | "resolved"
-            )
+            || crate::ontology::STATUS_PROPERTIES
+                .iter()
+                .any(|prop| crate::ontology::is_terminal_status(self.prop_str(prop).unwrap_or("")))
     }
 }
 
@@ -603,6 +597,8 @@ pub fn project_hit_to_evidence_packet(hit: &VectorHit, generated_at: &str) -> Ev
         validation_state: hit.validation_state(),
         observed_at: hit.prop_str("observed_at").map(str::to_string),
         valid_time_range: None,
+        due_at: None,
+        occurs_at: None,
         source_reliability: hit.confidence(),
         conflict_ids: Vec::new(),
         adjudication_status: AdjudicationStatus::NotNeeded,

@@ -8,6 +8,7 @@ pub mod attention_observer;
 pub mod cypher;
 pub mod entanglement;
 pub mod hygiene;
+pub mod ontology;
 pub mod projection;
 pub mod zoning;
 
@@ -154,6 +155,15 @@ pub struct EvidencePacket {
     pub observed_at: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub valid_time_range: Option<TimeRange>,
+    /// ISO 8601 deadline for the claimed item (commitments, next actions).
+    /// Structured dates are what deterministic maintenance queries see —
+    /// a date left in `claim_summary` prose is invisible to `life.list`
+    /// (ontology gap G1).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub due_at: Option<String>,
+    /// ISO 8601 point-in-time the claimed event happens (events).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub occurs_at: Option<String>,
     #[serde(default = "default_evidence_score")]
     pub source_reliability: f32,
     #[serde(default)]
@@ -978,6 +988,8 @@ pub enum LifeGraphToolName {
     LifeResolve,
     LifeConflict,
     LifePatchPropose,
+    LifeList,
+    LifeOntology,
 }
 
 impl LifeGraphToolName {
@@ -991,6 +1003,8 @@ impl LifeGraphToolName {
             Self::LifeResolve => "life.resolve",
             Self::LifeConflict => "life.conflict",
             Self::LifePatchPropose => "life.patch.propose",
+            Self::LifeList => "life.list",
+            Self::LifeOntology => "life.ontology",
         }
     }
 
@@ -1075,6 +1089,18 @@ pub fn life_graph_tool_catalog() -> Vec<LifeGraphToolSpec> {
             LifeGraphToolName::LifePatchPropose,
             "Propose a governed Life Graph schema, skill, tool, or policy patch.",
             true,
+        ),
+        LifeGraphToolSpec::new(
+            LifeGraphToolName::LifeList,
+            "Deterministically list Life Graph nodes by exact label/status/date \
+             predicates or a named maintenance query (read-only).",
+            false,
+        ),
+        LifeGraphToolSpec::new(
+            LifeGraphToolName::LifeOntology,
+            "Serve the canonical Life Graph vocabulary: labels, lifecycle states, \
+             property conventions, named queries, rules, and known gaps (read-only).",
+            false,
         ),
     ]
 }
@@ -1805,6 +1831,132 @@ pub struct LifeViewNodeInput {
     pub edge_limit: Option<usize>,
 }
 
+/// Input for `life.list` — the READ-ONLY deterministic maintenance query
+/// surface (lifegraph-steward-capability-plane seam). Either name a query
+/// from [`ontology::NamedMaintenanceQuery`] or compose typed filters; the
+/// two modes are mutually exclusive so a named query's semantics can never
+/// be silently narrowed by leftover filters.
+///
+/// Unlike `life.recall` (embedding similarity), every field here maps to an
+/// exact predicate built from the central [`ontology`] vocabulary, so the
+/// same call always returns the same rows for the same graph state.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct LifeListInput {
+    /// Named maintenance query (`past_dated_events`, `aging_loops_oldest_first`,
+    /// `duplicate_candidates`, `recently_retired`, `past_due_commitments`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub named_query: Option<String>,
+    /// Node labels to include. Empty = every ontology label.
+    #[serde(default)]
+    pub labels: Vec<String>,
+    /// Lifecycle statuses to require (matched on any status property).
+    #[serde(default)]
+    pub statuses: Vec<String>,
+    /// Validation states to require.
+    #[serde(default)]
+    pub validation_states: Vec<String>,
+    /// Include terminal (retired/resolved/done/…) nodes. Default false.
+    #[serde(default)]
+    pub include_terminal: bool,
+    /// ISO 8601 lower bound on `observed_at`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_after: Option<String>,
+    /// ISO 8601 upper bound on `observed_at`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_before: Option<String>,
+    /// ISO 8601 upper bound on the node's best structured date.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub date_before: Option<String>,
+    /// ISO 8601 lower bound on the node's best structured date.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub date_after: Option<String>,
+    /// Maximum rows. Default 50, clamped to `1..=200`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<usize>,
+}
+
+impl LifeListInput {
+    pub fn effective_limit(&self) -> usize {
+        self.limit.unwrap_or(50).clamp(1, 200)
+    }
+
+    fn has_filters(&self) -> bool {
+        !self.labels.is_empty()
+            || !self.statuses.is_empty()
+            || !self.validation_states.is_empty()
+            || self.observed_after.is_some()
+            || self.observed_before.is_some()
+            || self.date_before.is_some()
+            || self.date_after.is_some()
+            || self.include_terminal
+    }
+
+    /// Build the filtered-mode cypher. Date/observed bounds ride as Bolt
+    /// params (`$observed_after` etc.) — caller binds exactly the ones set.
+    /// Statuses and labels are validated against the ontology vocabulary by
+    /// `plan_list` before they are interpolated.
+    pub fn filtered_cypher(&self) -> String {
+        let labels: Vec<&str> = if self.labels.is_empty() {
+            ontology::NODE_LABELS.to_vec()
+        } else {
+            self.labels.iter().map(String::as_str).collect()
+        };
+        let label_list = labels
+            .iter()
+            .map(|l| format!("'{l}'"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let mut clauses = vec![format!(
+            "any(label IN labels(n) WHERE label IN [{label_list}])"
+        )];
+        if !self.include_terminal {
+            clauses.push(ontology::liveness_predicate("n"));
+        }
+        if !self.statuses.is_empty() {
+            let statuses = self
+                .statuses
+                .iter()
+                .map(|s| format!("'{s}'"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            clauses.push(format!(
+                "coalesce(n.status, n.loop_status, '') IN [{statuses}]"
+            ));
+        }
+        if !self.validation_states.is_empty() {
+            let states = self
+                .validation_states
+                .iter()
+                .map(|s| format!("'{s}'"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            clauses.push(format!(
+                "coalesce(n.validation_state, 'inferred') IN [{states}]"
+            ));
+        }
+        if self.observed_after.is_some() {
+            clauses.push("n.observed_at >= $observed_after".into());
+        }
+        if self.observed_before.is_some() {
+            clauses.push("n.observed_at <= $observed_before".into());
+        }
+        let best = ontology::best_date_expr("n");
+        if self.date_before.is_some() {
+            clauses.push(format!("{best} IS NOT NULL AND {best} < $date_before"));
+        }
+        if self.date_after.is_some() {
+            clauses.push(format!("{best} IS NOT NULL AND {best} >= $date_after"));
+        }
+        format!(
+            "MATCH (n) WHERE {where_clause} RETURN {row} \
+             ORDER BY coalesce(n.observed_at, n.created_at, '') DESC LIMIT {limit}",
+            where_clause = clauses.join(" AND "),
+            row = ontology::list_row_projection("n"),
+            limit = self.effective_limit(),
+        )
+    }
+}
+
 impl LifeViewNodeInput {
     pub fn effective_edge_limit(&self) -> usize {
         self.edge_limit.unwrap_or(50).clamp(1, 200)
@@ -1850,6 +2002,7 @@ pub enum LifeGraphToolRequest {
     LifeCommit(LifeCommitInput),
     LifeResolve(LifeResolveInput),
     LifePatchPropose(LifePatchProposalInput),
+    LifeList(LifeListInput),
 }
 
 impl LifeGraphToolRequest {
@@ -1861,6 +2014,7 @@ impl LifeGraphToolRequest {
             Self::LifeCommit(_) => LifeGraphToolName::LifeCommit,
             Self::LifeResolve(_) => LifeGraphToolName::LifeResolve,
             Self::LifePatchPropose(_) => LifeGraphToolName::LifePatchPropose,
+            Self::LifeList(_) => LifeGraphToolName::LifeList,
         }
     }
 }
@@ -1937,7 +2091,64 @@ impl MemoryGraphRagRunner {
             LifeGraphToolRequest::LifeCommit(input) => self.plan_commit(input),
             LifeGraphToolRequest::LifeResolve(input) => self.plan_resolve(input),
             LifeGraphToolRequest::LifePatchPropose(input) => self.plan_patch_propose(input),
+            LifeGraphToolRequest::LifeList(input) => self.plan_list(input),
         }
+    }
+
+    fn plan_list(&self, input: LifeListInput) -> Result<RunnerPlan, ContractError> {
+        let mut violations = Vec::new();
+        if let Some(name) = input.named_query.as_deref() {
+            if ontology::NamedMaintenanceQuery::parse(name).is_none() {
+                violations.push(format!(
+                    "named_query '{name}' is unknown (expected one of: {})",
+                    ontology::NamedMaintenanceQuery::ALL
+                        .iter()
+                        .map(|q| q.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ));
+            }
+            if input.has_filters() {
+                violations.push(
+                    "named_query cannot be combined with filters — a named query's \
+                     semantics must not be silently narrowed"
+                        .into(),
+                );
+            }
+        }
+        for label in &input.labels {
+            if !ontology::is_known_label(label) {
+                violations.push(format!("labels contains unknown label '{label}'"));
+            }
+        }
+        // Statuses and validation states are interpolated into cypher, so
+        // they must be plain identifiers — never quoted or spaced text.
+        let ident_ok =
+            |s: &str| !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+        for status in &input.statuses {
+            if !ident_ok(status) {
+                violations.push(format!("statuses contains invalid value '{status}'"));
+            }
+        }
+        for state in &input.validation_states {
+            if !ontology::VALIDATION_STATES.contains(&state.as_str()) {
+                violations.push(format!(
+                    "validation_states contains unknown state '{state}'"
+                ));
+            }
+        }
+        finish_validation(violations)?;
+
+        Ok(RunnerPlan {
+            tool_name: LifeGraphToolName::LifeList,
+            steps: vec![RunnerPlanStep {
+                target: RunnerPlanTarget::GraphDatasource,
+                action: "read".into(),
+                payload: serde_json::json!({ "read_only": true }),
+            }],
+            requires_operator: false,
+            blocked_reasons: Vec::new(),
+        })
     }
 
     fn plan_observe(&self, input: LifeObserveInput) -> Result<RunnerPlan, ContractError> {
@@ -2237,6 +2448,95 @@ fn finish_validation(violations: Vec<String>) -> Result<(), ContractError> {
 
 #[cfg(test)]
 mod tests {
+    mod life_list {
+        use crate::ontology::NamedMaintenanceQuery;
+        use crate::{LifeGraphToolRequest, LifeListInput, MemoryGraphRagRunner};
+
+        fn plan(input: LifeListInput) -> Result<crate::RunnerPlan, crate::ContractError> {
+            MemoryGraphRagRunner::default().plan(LifeGraphToolRequest::LifeList(input))
+        }
+
+        #[test]
+        fn named_query_plans_read_only() {
+            let p = plan(LifeListInput {
+                named_query: Some("past_dated_events".into()),
+                ..Default::default()
+            })
+            .expect("valid named query must plan");
+            assert!(p.allowed());
+            assert!(!p.tool_name.mutates_graph());
+        }
+
+        #[test]
+        fn unknown_named_query_is_rejected_with_catalog() {
+            let err = plan(LifeListInput {
+                named_query: Some("everything_stale".into()),
+                ..Default::default()
+            })
+            .expect_err("unknown named query must fail validation");
+            assert!(err.violations[0].contains("aging_loops_oldest_first"));
+        }
+
+        #[test]
+        fn named_query_plus_filters_is_rejected() {
+            let err = plan(LifeListInput {
+                named_query: Some("recently_retired".into()),
+                labels: vec!["Event".into()],
+                ..Default::default()
+            })
+            .expect_err("named query with filters must fail");
+            assert!(err.violations[0].contains("cannot be combined"));
+        }
+
+        #[test]
+        fn unknown_label_and_quote_injection_are_rejected() {
+            let err = plan(LifeListInput {
+                labels: vec!["Widget".into()],
+                statuses: vec!["open'] OR true //".into()],
+                validation_states: vec!["maybe".into()],
+                ..Default::default()
+            })
+            .expect_err("unknown label, bad status, bad state must all fail");
+            assert_eq!(err.violations.len(), 3);
+        }
+
+        #[test]
+        fn filtered_cypher_excludes_terminal_by_default_and_binds_dates() {
+            let input = LifeListInput {
+                labels: vec!["OpenLoop".into()],
+                date_before: Some("2026-08-22T00:00:00Z".into()),
+                ..Default::default()
+            };
+            let c = input.filtered_cypher();
+            assert!(c.contains("'OpenLoop'"));
+            assert!(c.contains("'resolved'"), "terminal filter must apply: {c}");
+            assert!(c.contains("$date_before"));
+            assert!(
+                !c.contains("2026-08-22"),
+                "date values must ride as params, never interpolated"
+            );
+            assert!(c.contains("LIMIT 50"));
+        }
+
+        #[test]
+        fn include_terminal_drops_the_liveness_predicate() {
+            let input = LifeListInput {
+                include_terminal: true,
+                ..Default::default()
+            };
+            assert!(!input.filtered_cypher().contains("'abandoned'"));
+        }
+
+        #[test]
+        fn every_named_query_compiles_with_projection() {
+            for q in NamedMaintenanceQuery::ALL {
+                let c = q.cypher(5);
+                assert!(c.contains("LIMIT 5"), "{c}");
+                assert!(c.contains("MATCH"), "{c}");
+            }
+        }
+    }
+
     /// The EXACT payload shape recorded failing on the operator's live graph
     /// (hotel session_event, 2026-07-28). Guards against "fixed it in principle
     /// but not for the case that actually happened".
@@ -2433,6 +2733,8 @@ mod tests {
                 starts_at: Some("2026-06-04T00:00:00Z".into()),
                 ends_at: None,
             }),
+            due_at: None,
+            occurs_at: None,
             source_reliability: 0.82,
             conflict_ids: vec![],
             adjudication_status: AdjudicationStatus::Pending,
@@ -2863,7 +3165,9 @@ mod tests {
                 "life.commit",
                 "life.resolve",
                 "life.conflict",
-                "life.patch.propose"
+                "life.patch.propose",
+                "life.list",
+                "life.ontology"
             ]
         );
         assert!(

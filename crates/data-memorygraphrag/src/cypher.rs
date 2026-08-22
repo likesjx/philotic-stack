@@ -174,6 +174,13 @@ pub struct ObserveCypher {
     pub claim_summary: String,
     pub observation_id: String,
     pub packet_id: String,
+    /// Structured temporal fields (ontology `DATE_PROPERTIES`). Empty-string
+    /// sentinel in params; the compiled CASE clauses preserve any existing
+    /// value on re-observe when the caller omits them.
+    pub due_at: Option<String>,
+    pub starts_at: Option<String>,
+    pub occurs_at: Option<String>,
+    pub ends_at: Option<String>,
     /// Muninn origin: engram ID of the first `MuninnEngram` source ref, if any.
     /// Preserved on the node so promotion (lifegraph-muninn-promotion seam)
     /// can trace a Life Graph fact back to its Muninn continuity source.
@@ -344,14 +351,22 @@ pub fn compile_observe(input: &LifeObserveInput, now_iso: &str) -> Result<Observ
             "n.observed_role = CASE $observed_role WHEN '' THEN null ELSE $observed_role END, ",
             "n.origin_engram_id = CASE $origin_engram_id WHEN '' THEN null ELSE $origin_engram_id END, ",
             "n.origin_trust = CASE WHEN $origin_trust < 0.0 THEN null ELSE $origin_trust END, ",
-            "n.provenance_envelope = CASE $provenance_envelope WHEN '' THEN null ELSE $provenance_envelope END ",
+            "n.provenance_envelope = CASE $provenance_envelope WHEN '' THEN null ELSE $provenance_envelope END, ",
+            "n.due_at = CASE $due_at WHEN '' THEN null ELSE $due_at END, ",
+            "n.starts_at = CASE $starts_at WHEN '' THEN null ELSE $starts_at END, ",
+            "n.occurs_at = CASE $occurs_at WHEN '' THEN null ELSE $occurs_at END, ",
+            "n.ends_at = CASE $ends_at WHEN '' THEN null ELSE $ends_at END ",
             "ON MATCH SET ",
             "n.confidence = $confidence, ",
             "n.observation_id = $observation_id, ",
             "n.packet_id = $packet_id, ",
             "n.observed_by = $observed_by, ",
             "n.observed_role = CASE $observed_role WHEN '' THEN null ELSE $observed_role END, ",
-            "n.provenance_envelope = CASE $provenance_envelope WHEN '' THEN n.provenance_envelope ELSE $provenance_envelope END ",
+            "n.provenance_envelope = CASE $provenance_envelope WHEN '' THEN n.provenance_envelope ELSE $provenance_envelope END, ",
+            "n.due_at = CASE $due_at WHEN '' THEN n.due_at ELSE $due_at END, ",
+            "n.starts_at = CASE $starts_at WHEN '' THEN n.starts_at ELSE $starts_at END, ",
+            "n.occurs_at = CASE $occurs_at WHEN '' THEN n.occurs_at ELSE $occurs_at END, ",
+            "n.ends_at = CASE $ends_at WHEN '' THEN n.ends_at ELSE $ends_at END ",
             "RETURN n.id AS id, n.validation_state AS validation_state",
         ),
         label = label
@@ -372,6 +387,18 @@ pub fn compile_observe(input: &LifeObserveInput, now_iso: &str) -> Result<Observ
         claim_summary: input.evidence.claim_summary.clone(),
         observation_id: input.observation_id.clone(),
         packet_id: input.evidence.packet_id.clone(),
+        due_at: input.evidence.due_at.clone(),
+        starts_at: input
+            .evidence
+            .valid_time_range
+            .as_ref()
+            .and_then(|r| r.starts_at.clone()),
+        occurs_at: input.evidence.occurs_at.clone(),
+        ends_at: input
+            .evidence
+            .valid_time_range
+            .as_ref()
+            .and_then(|r| r.ends_at.clone()),
         origin_engram_id,
         origin_trust,
         provenance_envelope_json,
@@ -1042,7 +1069,7 @@ mod tests {
     use crate::{
         AdjudicationStatus, EvidencePacket, GraphRecordRef, LifeObserveInput, ReliabilityBasis,
         RetrievalFeedbackInput, RetrievalFeedbackRating, SourceKind, SourceRef, SourceReliability,
-        ValidationState,
+        TimeRange, ValidationState,
     };
 
     fn minimal_observe_input(label: &str) -> LifeObserveInput {
@@ -1071,6 +1098,8 @@ mod tests {
                 validation_state: ValidationState::Proposed,
                 observed_at: Some("2026-06-04T00:00:00Z".to_string()),
                 valid_time_range: None,
+                due_at: None,
+                occurs_at: None,
                 source_reliability: 0.9,
                 conflict_ids: vec![],
                 adjudication_status: AdjudicationStatus::NotNeeded,
@@ -1082,6 +1111,44 @@ mod tests {
             edges: vec![],
             provenance: None,
         }
+    }
+
+    /// Structured temporal fields must ride the observe write (ontology gap
+    /// G1 closure): dates the caller extracts land as node properties, and
+    /// omitted dates preserve existing values on re-observe instead of
+    /// clobbering them to null.
+    #[test]
+    fn compile_observe_writes_structured_dates_and_preserves_on_match() {
+        let mut input = minimal_observe_input("Commitment");
+        input.evidence.due_at = Some("2026-09-01T00:00:00Z".to_string());
+        input.evidence.occurs_at = Some("2026-09-02T00:00:00Z".to_string());
+        input.evidence.valid_time_range = Some(TimeRange {
+            starts_at: Some("2026-08-30T00:00:00Z".to_string()),
+            ends_at: Some("2026-09-03T00:00:00Z".to_string()),
+        });
+        let compiled = compile_observe(&input, "2026-08-22T12:00:00Z").unwrap();
+
+        assert_eq!(compiled.due_at.as_deref(), Some("2026-09-01T00:00:00Z"));
+        assert_eq!(compiled.starts_at.as_deref(), Some("2026-08-30T00:00:00Z"));
+        assert_eq!(compiled.occurs_at.as_deref(), Some("2026-09-02T00:00:00Z"));
+        assert_eq!(compiled.ends_at.as_deref(), Some("2026-09-03T00:00:00Z"));
+        // ON CREATE nulls the sentinel; ON MATCH preserves the prior value.
+        assert!(
+            compiled
+                .query
+                .contains("n.due_at = CASE $due_at WHEN '' THEN null")
+        );
+        assert!(
+            compiled
+                .query
+                .contains("n.due_at = CASE $due_at WHEN '' THEN n.due_at")
+        );
+
+        // Omitted dates compile to None → empty-sentinel params.
+        let bare =
+            compile_observe(&minimal_observe_input("Signal"), "2026-08-22T12:00:00Z").unwrap();
+        assert!(bare.due_at.is_none());
+        assert!(bare.starts_at.is_none());
     }
 
     #[test]

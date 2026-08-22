@@ -304,6 +304,8 @@ pub fn skill_implied_tools(skill_name: &str) -> &'static [&'static str] {
             "life.resolve",
             "life.conflict",
             "life.patch.propose",
+            "life.list",
+            "life.ontology",
         ],
         "lifegraph.truth_summarizer" => &["life.recall", "graph.query"],
         "mesh.steward" => &[
@@ -336,6 +338,8 @@ pub fn tools_for_skill(skill_name: &str) -> &'static [&'static str] {
             "life.resolve",
             "life.conflict",
             "life.patch.propose",
+            "life.list",
+            "life.ontology",
         ],
         "lifegraph.truth_summarizer" => &["life.recall", "graph.query"],
         "mesh.steward" => &[
@@ -448,6 +452,17 @@ pub fn skill_is_relevant_for_turn(skill_name: &str, turn_text: &str) -> bool {
                 || t.contains("life.recall")
                 || t.contains("life.recall.feedback")
                 || t.contains("life.commit")
+                // Maintenance/gardening language (lifegraph-steward-capability-plane):
+                // the deterministic life.list/life.ontology surface must project
+                // when the operator or a cron asks for graph upkeep.
+                || t.contains("life.list")
+                || t.contains("life.ontology")
+                || t.contains("garden")
+                || t.contains("stale")
+                || t.contains("duplicate")
+                || t.contains("ontology")
+                || t.contains("past-dated")
+                || t.contains("past dated")
                 || t.contains("record this")
                 || t.contains("observe this")
                 || t.contains("note this")
@@ -3500,6 +3515,26 @@ fn build_catalog() -> HashMap<String, ToolDefinition> {
                                 "type": "string",
                                 "description": "One or two sentence summary of what was observed."
                             },
+                            "due_at": {
+                                "type": "string",
+                                "description": "ISO 8601 deadline for the claimed item (commitments, \
+                                    next actions). ALWAYS extract a concrete date mentioned in the \
+                                    claim into this field — dates left only in prose are invisible \
+                                    to deterministic maintenance queries."
+                            },
+                            "occurs_at": {
+                                "type": "string",
+                                "description": "ISO 8601 point-in-time the claimed event happens. \
+                                    Extract from the claim whenever a concrete date is known."
+                            },
+                            "valid_time_range": {
+                                "type": "object",
+                                "properties": {
+                                    "starts_at": {"type": "string", "description": "ISO 8601 start."},
+                                    "ends_at": {"type": "string", "description": "ISO 8601 end."}
+                                },
+                                "description": "Time window the claim spans (trips, multi-day events)."
+                            },
                             "source_refs": {
                                 "type": "array",
                                 "minItems": 1,
@@ -3946,6 +3981,78 @@ fn build_catalog() -> HashMap<String, ToolDefinition> {
                         "default": false
                     }
                 }
+            }),
+            class: Some("life_graph".into()),
+        },
+    );
+
+    m.insert(
+        "life.list".into(),
+        ToolDefinition {
+            tool_name: "life.list".into(),
+            description: "READ-ONLY deterministic Life Graph listing — exact predicates, not \
+                          similarity. Preferred for maintenance/gardening: pass a named_query \
+                          ('past_dated_events', 'aging_loops_oldest_first', \
+                          'duplicate_candidates', 'recently_retired', 'past_due_commitments') \
+                          OR typed filters (labels/statuses/validation_states/date bounds), \
+                          never both. Terminal (resolved/retired/done) nodes are excluded \
+                          unless include_terminal=true. Same call, same graph state → same \
+                          rows; every returned id is a real node id safe to cite."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "named_query": {
+                        "type": "string",
+                        "enum": ["past_dated_events", "aging_loops_oldest_first",
+                                 "duplicate_candidates", "recently_retired",
+                                 "past_due_commitments"],
+                        "description": "Named maintenance query. Mutually exclusive with the filter fields."
+                    },
+                    "labels": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Node labels to include (ontology labels, e.g. OpenLoop, Event). Empty = all."
+                    },
+                    "statuses": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Lifecycle statuses to require, matched on any status property."
+                    },
+                    "validation_states": {
+                        "type": "array",
+                        "items": {"type": "string", "enum": ["proposed", "inferred", "confirmed", "conflicted", "retired"]}
+                    },
+                    "include_terminal": {
+                        "type": "boolean",
+                        "default": false,
+                        "description": "Include resolved/retired/done nodes (self-audit)."
+                    },
+                    "observed_after": {"type": "string", "description": "ISO 8601 lower bound on observed_at."},
+                    "observed_before": {"type": "string", "description": "ISO 8601 upper bound on observed_at."},
+                    "date_before": {"type": "string", "description": "ISO 8601 upper bound on the node's best structured date (due/starts/occurs/ends)."},
+                    "date_after": {"type": "string", "description": "ISO 8601 lower bound on the node's best structured date."},
+                    "limit": {"type": "integer", "default": 50, "description": "Max rows, clamped 1..=200."}
+                }
+            }),
+            class: Some("life_graph".into()),
+        },
+    );
+
+    m.insert(
+        "life.ontology".into(),
+        ToolDefinition {
+            tool_name: "life.ontology".into(),
+            description: "READ-ONLY canonical Life Graph vocabulary: node labels, terminal \
+                          lifecycle statuses, status property conventions, structured date \
+                          fields, named maintenance queries, stewardship rules, and known \
+                          schema gaps. Consult this before composing life.list filters or \
+                          reasoning about node lifecycle — never restate vocabulary from \
+                          memory."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {}
             }),
             class: Some("life_graph".into()),
         },

@@ -7,13 +7,13 @@ use data_memorygraphrag::projection;
 use data_memorygraphrag::zoning;
 use data_memorygraphrag::{
     AdjudicationStatus, ConflictHandoff, ContextPacket, EvidencePacket, FeedbackEdgeSpec,
-    GraphRecordRef, LifeCommitInput, LifeGraphToolRequest, LifeObserveBatchInput, LifeObserveInput,
-    LifePatchApplyInput, LifePatchListInput, LifePatchProposalInput, LifeRecallStatsInput,
-    LifeResolveInput, LifeViewNeighborhoodInput, LifeViewNodeInput, MAX_OBSERVE_BATCH,
-    MemoryGraphRagRunner, PatchApplyDecision, PatchGate, PatchKind, PatchRisk, PolicyFilter,
-    RankingWeights, ReliabilityBasis, RetrievalFeedbackInput, RetrievalFeedbackRating,
-    RetrievalQuery, RetrievalStrategy, RunnerConfig, RunnerPlanTarget, SemanticSpace, SourceKind,
-    SourceRef, SourceReliability, ValidationState, feedback_edge_specs,
+    GraphRecordRef, LifeCommitInput, LifeGraphToolRequest, LifeListInput, LifeObserveBatchInput,
+    LifeObserveInput, LifePatchApplyInput, LifePatchListInput, LifePatchProposalInput,
+    LifeRecallStatsInput, LifeResolveInput, LifeViewNeighborhoodInput, LifeViewNodeInput,
+    MAX_OBSERVE_BATCH, MemoryGraphRagRunner, PatchApplyDecision, PatchGate, PatchKind, PatchRisk,
+    PolicyFilter, RankingWeights, ReliabilityBasis, RetrievalFeedbackInput,
+    RetrievalFeedbackRating, RetrievalQuery, RetrievalStrategy, RunnerConfig, RunnerPlanTarget,
+    SemanticSpace, SourceKind, SourceRef, SourceReliability, ValidationState, feedback_edge_specs,
 };
 use datasource::controller::{
     CONTRACT_ERROR_MARKER, DatasourceProvider, DatasourceTask, ProviderOutput, TaskKind,
@@ -544,6 +544,12 @@ impl DatasourceProvider for LifeGraphProvider {
             "life.recall.stats" => self.handle_recall_stats(task).await,
             "life.view.node" => self.handle_view_node(task).await,
             "life.view.neighborhood" => self.handle_view_neighborhood(task).await,
+            "life.list" => self.handle_list(task).await,
+            "life.ontology" => Ok(ProviderOutput::ResultSet(json!({
+                "status": "ok",
+                "read_only": true,
+                "ontology": data_memorygraphrag::ontology::ontology_document(),
+            }))),
             other => {
                 warn!(tool = other, "life.* tool not yet implemented in runner");
                 Ok(ProviderOutput::ResultSet(json!({
@@ -716,7 +722,13 @@ impl LifeGraphProvider {
             .param(
                 "provenance_envelope",
                 compiled.provenance_envelope_json.as_deref().unwrap_or(""),
-            );
+            )
+            // Structured temporal fields (ontology DATE_PROPERTIES); empty
+            // sentinel preserves any existing value on re-observe.
+            .param("due_at", compiled.due_at.as_deref().unwrap_or(""))
+            .param("starts_at", compiled.starts_at.as_deref().unwrap_or(""))
+            .param("occurs_at", compiled.occurs_at.as_deref().unwrap_or(""))
+            .param("ends_at", compiled.ends_at.as_deref().unwrap_or(""));
 
         let mut rows = bounded_query("observe_node_write", graph.execute(q)).await?;
         let first_row = rows.next().await?;
@@ -2193,6 +2205,83 @@ impl LifeGraphProvider {
     /// gating, two bounded read queries, never a write. The provenance
     /// envelope (validation_state, confidence, source_membrane, observed_at,
     /// …) rides in the returned node's `properties`.
+    /// Handle `life.list` — the READ-ONLY deterministic maintenance query
+    /// surface (lifegraph-steward-capability-plane seam). Named queries and
+    /// typed filters both compile from the central `ontology` vocabulary;
+    /// date bounds ride as Bolt params.
+    async fn handle_list(&self, task: &DatasourceTask) -> Result<ProviderOutput> {
+        let input: LifeListInput = match serde_json::from_value(task.parameters.clone()) {
+            Ok(input) => input,
+            Err(e) => {
+                return Ok(ProviderOutput::ResultSet(json!({
+                    "status": "invalid_request",
+                    "read_only": true,
+                    "error": format!("could not parse life.list parameters: {e}"),
+                })));
+            }
+        };
+        let plan = self
+            .runner
+            .plan(data_memorygraphrag::LifeGraphToolRequest::LifeList(
+                input.clone(),
+            ));
+        if let Err(err) = plan {
+            return Ok(ProviderOutput::ResultSet(json!({
+                "status": "invalid_request",
+                "read_only": true,
+                "violations": err.violations,
+            })));
+        }
+
+        let limit = input.effective_limit();
+        let now_iso = chrono::Utc::now().to_rfc3339();
+        let (query_kind, cypher) = match input.named_query.as_deref() {
+            Some(name) => {
+                // plan_list validated the name parses.
+                let named = data_memorygraphrag::ontology::NamedMaintenanceQuery::parse(name)
+                    .expect("plan_list validated named_query");
+                (named.as_str().to_string(), named.cypher(limit))
+            }
+            None => ("filtered".to_string(), input.filtered_cypher()),
+        };
+
+        let graph = self.connect().await?;
+        let mut q = query(&cypher);
+        if cypher.contains("$now") {
+            q = q.param("now", now_iso.as_str());
+        }
+        if let Some(v) = input.observed_after.as_deref() {
+            q = q.param("observed_after", v);
+        }
+        if let Some(v) = input.observed_before.as_deref() {
+            q = q.param("observed_before", v);
+        }
+        if let Some(v) = input.date_before.as_deref() {
+            q = q.param("date_before", v);
+        }
+        if let Some(v) = input.date_after.as_deref() {
+            q = q.param("date_after", v);
+        }
+        let mut rows = bounded_query("life_list", graph.execute(q)).await?;
+        let mut output_rows = Vec::new();
+        while let Some(row) = rows.next().await? {
+            output_rows.push(row_to_json(&row)?);
+        }
+        info!(
+            query = query_kind.as_str(),
+            rows = output_rows.len(),
+            "life.list: deterministic list served"
+        );
+        Ok(ProviderOutput::ResultSet(json!({
+            "status": "ok",
+            "read_only": true,
+            "query": query_kind,
+            "as_of": now_iso,
+            "count": output_rows.len(),
+            "rows": output_rows,
+        })))
+    }
+
     async fn handle_view_node(&self, task: &DatasourceTask) -> Result<ProviderOutput> {
         let input: LifeViewNodeInput =
             serde_json::from_value(task.parameters.clone()).unwrap_or_default();
@@ -2919,18 +3008,13 @@ fn raw_recall_fallback_cypher(labels: &[&str], limit: usize) -> String {
         .collect::<Vec<_>>()
         .join(", ");
     format!(
-        concat!(
-            "MATCH (n) ",
-            "WHERE any(label IN labels(n) WHERE label IN [{labels}]) ",
-            "AND coalesce(n.validation_state, 'inferred') <> 'retired' ",
-            "AND NOT coalesce(n.status, '') IN ['retired', 'done', 'fulfilled', 'abandoned', 'resolved'] ",
-            "AND NOT coalesce(n.loop_status, '') IN ['retired', 'done', 'fulfilled', 'abandoned', 'resolved'] ",
-            "RETURN n AS node, 0.25 AS similarity ",
-            "ORDER BY coalesce(n.observed_at, n.created_at, '') DESC ",
-            "LIMIT {limit}"
-        ),
-        labels = labels,
-        limit = limit
+        "MATCH (n) \
+         WHERE any(label IN labels(n) WHERE label IN [{labels}]) \
+         AND {live} \
+         RETURN n AS node, 0.25 AS similarity \
+         ORDER BY coalesce(n.observed_at, n.created_at, '') DESC \
+         LIMIT {limit}",
+        live = data_memorygraphrag::ontology::liveness_predicate("n"),
     )
 }
 
@@ -3177,6 +3261,8 @@ fn feedback_signal_evidence(input: &RetrievalFeedbackInput) -> EvidencePacket {
         validation_state: ValidationState::Confirmed,
         observed_at: None,
         valid_time_range: None,
+        due_at: None,
+        occurs_at: None,
         source_reliability: 1.0,
         conflict_ids: vec![],
         adjudication_status: AdjudicationStatus::NotNeeded,
@@ -3923,6 +4009,8 @@ mod tests {
                 validation_state: ValidationState::Proposed,
                 observed_at: Some("2026-07-10T00:00:00Z".to_string()),
                 valid_time_range: None,
+                due_at: None,
+                occurs_at: None,
                 source_reliability: 0.9,
                 conflict_ids: vec![],
                 adjudication_status: AdjudicationStatus::NotNeeded,

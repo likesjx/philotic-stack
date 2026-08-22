@@ -471,6 +471,8 @@ pub fn tools_for_tool_class(class: &str) -> &'static [&'static str] {
             "life.resolve",
             "life.conflict",
             "life.patch.propose",
+            "life.list",
+            "life.ontology",
         ],
         "agent_graph" => &[
             "agent.graph.read",
