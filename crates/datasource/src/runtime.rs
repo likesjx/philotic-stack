@@ -60,6 +60,8 @@ pub fn is_read_only_capability(kind: &str) -> bool {
             | "life.view.node"
             | "life.view.neighborhood"
             | "life.patch.list"
+            | "life.list"
+            | "life.ontology"
     )
 }
 

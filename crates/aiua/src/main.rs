@@ -4105,6 +4105,51 @@ fn seed_abstract_tool_catalog(graph: &GraphDomain) -> anyhow::Result<()> {
             tool_markers: Vec::new(),
         },
         AbstractToolRecord {
+            tool_name: "life.list".into(),
+            description: "READ-ONLY deterministic Life Graph listing by exact predicates or a \
+                          named maintenance query (past_dated_events, aging_loops_oldest_first, \
+                          duplicate_candidates, recently_retired, past_due_commitments). \
+                          Preferred over life.recall for gardening/maintenance — same call, \
+                          same graph state, same rows."
+                .into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "named_query": {
+                        "type": "string",
+                        "enum": ["past_dated_events", "aging_loops_oldest_first",
+                                 "duplicate_candidates", "recently_retired",
+                                 "past_due_commitments"],
+                        "description": "Named maintenance query; mutually exclusive with filters."
+                    },
+                    "labels": { "type": "array", "items": { "type": "string" } },
+                    "statuses": { "type": "array", "items": { "type": "string" } },
+                    "validation_states": { "type": "array", "items": { "type": "string" } },
+                    "include_terminal": { "type": "boolean", "default": false },
+                    "observed_after": { "type": "string" },
+                    "observed_before": { "type": "string" },
+                    "date_before": { "type": "string" },
+                    "date_after": { "type": "string" },
+                    "limit": { "type": "integer", "default": 50 }
+                }
+            }),
+            class: "life_graph".into(),
+            tool_markers: Vec::new(),
+        },
+        AbstractToolRecord {
+            tool_name: "life.ontology".into(),
+            description: "READ-ONLY canonical Life Graph vocabulary: labels, terminal statuses, \
+                          property conventions, date fields, named queries, rules, and known \
+                          gaps. Consult before composing life.list filters."
+                .into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {}
+            }),
+            class: "life_graph".into(),
+            tool_markers: Vec::new(),
+        },
+        AbstractToolRecord {
             tool_name: "cron.disable".into(),
             description: "Disable a cron job without removing it. The job record is preserved and \
                           can be re-enabled with cron.enable."
@@ -5384,7 +5429,9 @@ fn seed_toolset_profiles(graph: &GraphDomain) -> anyhow::Result<()> {
                     "life.commit",
                     "life.resolve",
                     "life.conflict",
-                    "life.patch.propose"
+                    "life.patch.propose",
+                    "life.list",
+                    "life.ontology"
                 ],
                 "execution_mode": "capability"
             });
