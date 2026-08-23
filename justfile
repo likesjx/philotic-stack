@@ -917,6 +917,15 @@ vps-deploy-ci:
       --limit jane-vps \
       --extra-vars "philotic_artifacts_remote=true philotic_artifacts_dir=${REMOTE_DIR}"
 
+# Live smoke of the orchestrator skill administration plane (PR #430) against
+# a RUNNING hotel socket: gate rejections, SkillDAG edge persistence,
+# suspend/reinstate lifecycle, audit trail. Registers a throwaway
+# `<agent>:skilldrill` orchestrator guest and retires its drill skills.
+#   just smoke-skill-admin ~/.philotic/bjork/aiua-mac-jane.sock agent-bjork-01
+#   ssh deploy@jane-vps sudo -u philotic python3 scripts/smoke-skill-admin.py /run/philotic/vps-jane.sock agent-beacon-01
+smoke-skill-admin socket agent="agent-bjork-01":
+    python3 scripts/smoke-skill-admin.py {{socket}} {{agent}}
+
 # Check that vps-jane host_vars peer ports match the live context graph.
 vps-port-drift-check:
     ./scripts/check-hotel-port-drift.py --host-vars ansible/host_vars/jane-vps.yml --ssh-target vps-jane
