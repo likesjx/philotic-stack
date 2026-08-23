@@ -13638,9 +13638,16 @@ impl IpcServer {
                 }
 
                 // Merge profile-level remote_tool_runners into
-                // allowed_tool_runner_incarnations.  Per-session overrides in
-                // summary_json.bindings are preserved; profile entries are
-                // appended only if not already present by incarnation_id.
+                // allowed_tool_runner_incarnations.  Session-only runners
+                // (incarnation_ids the profile does not know) are preserved,
+                // but for an incarnation_id the profile DOES declare, the
+                // profile entry replaces the stored one: sessions persist
+                // their bindings snapshot, so append-only merging froze
+                // `supported_tools` at whatever the session first saw — a
+                // long-lived session never learned about tools added to the
+                // runner later (live incident 2026-08-23: life.list was
+                // projected from the fresh profile but unroutable against the
+                // stale snapshot, hanging turns in WaitingTool).
                 if !profile.remote_tool_runners.is_empty() {
                     let mut incarnations: Vec<serde_json::Value> = bindings
                         .get("allowed_tool_runner_incarnations")
@@ -13652,14 +13659,17 @@ impl IpcServer {
                             .get("incarnation_id")
                             .and_then(serde_json::Value::as_str)
                             .unwrap_or("");
-                        if !runner_id.is_empty()
-                            && !incarnations.iter().any(|existing| {
-                                existing
-                                    .get("incarnation_id")
-                                    .and_then(serde_json::Value::as_str)
-                                    == Some(runner_id)
-                            })
-                        {
+                        if runner_id.is_empty() {
+                            continue;
+                        }
+                        if let Some(existing) = incarnations.iter_mut().find(|existing| {
+                            existing
+                                .get("incarnation_id")
+                                .and_then(serde_json::Value::as_str)
+                                == Some(runner_id)
+                        }) {
+                            *existing = runner.clone();
+                        } else {
                             incarnations.push(runner.clone());
                         }
                     }

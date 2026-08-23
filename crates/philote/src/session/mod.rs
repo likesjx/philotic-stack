@@ -2868,15 +2868,21 @@ impl SessionState {
     /// pathological skill catalog can never blow up the prompt. Guidance for
     /// non-projected skills is never returned — context cost tracks relevance.
     fn skill_guidance_for_turn(&self, projected_skill_names: &[String]) -> Vec<String> {
-        const MAX_SKILL_GUIDANCE_ENTRIES: usize = 6;
-        const MAX_SKILL_GUIDANCE_CHARS: usize = 1500;
+        const MAX_SKILL_GUIDANCE_ENTRIES: usize = 8;
+        const MAX_SKILL_GUIDANCE_CHARS: usize = 2400;
 
         if projected_skill_names.is_empty() || self.bindings.effective_skill_guidance.is_empty() {
             return Vec::new();
         }
-        let mut out: Vec<String> = Vec::new();
-        let mut total_chars = 0usize;
-        let mut truncated = 0usize;
+        // Role-ASSIGNED skills (resolved effective_skillset — the operator
+        // deliberately put these on the role) outrank on-demand extras when
+        // the budget bites. Live incident 2026-08-22: the freshly assigned
+        // lifegraph-gardener's doctrine was the entry the cap truncated,
+        // while incidental on-demand guidance survived. Relative order
+        // within each tier stays hotel-composition order.
+        let assigned = &self.bindings.effective_skillset;
+        let mut candidates: Vec<&String> = Vec::new();
+        let mut deferred: Vec<&String> = Vec::new();
         for entry in &self.bindings.effective_skill_guidance {
             // Hotel format: "{skill_name} — {description}" (ipc.rs
             // compose_session_snapshot). Entries that don't parse or don't
@@ -2887,6 +2893,18 @@ impl SessionState {
             if !projected_skill_names.iter().any(|skill| skill == name) {
                 continue;
             }
+            if assigned.iter().any(|skill| skill == name) {
+                candidates.push(entry);
+            } else {
+                deferred.push(entry);
+            }
+        }
+        candidates.extend(deferred);
+
+        let mut out: Vec<String> = Vec::new();
+        let mut total_chars = 0usize;
+        let mut truncated = 0usize;
+        for entry in candidates {
             if out.len() >= MAX_SKILL_GUIDANCE_ENTRIES
                 || total_chars + entry.len() > MAX_SKILL_GUIDANCE_CHARS
             {
@@ -5062,16 +5080,13 @@ fn is_graph_datasource_tool(tool_name: &str) -> bool {
 }
 
 fn is_life_graph_tool(tool_name: &str) -> bool {
-    matches!(
-        tool_name,
-        "life.observe"
-            | "life.recall"
-            | "life.recall.feedback"
-            | "life.commit"
-            | "life.resolve"
-            | "life.conflict"
-            | "life.patch.propose"
-    )
+    // Delegate to the shared grant surface instead of a private list: a
+    // hard-coded copy here silently broke the default execution route for
+    // every life.* tool added after it was written (live incident
+    // 2026-08-23: life.list calls from sessions with stale runner bindings
+    // fell through to the generic capability path and hung in WaitingTool
+    // until the turn watchdog evicted them).
+    ansible_mesh_core::graph::tools_for_tool_class("life_graph").contains(&tool_name)
 }
 
 fn is_table_datasource_tool(tool_name: &str) -> bool {
@@ -7499,33 +7514,73 @@ mod tests {
         );
     }
 
-    /// The guidance section is defensively capped (max 6 entries / 1500 chars)
+    /// The guidance section is defensively capped (max 8 entries / 2400 chars)
     /// so a pathological skill catalog cannot blow up the prompt.
     #[test]
     fn skill_guidance_for_turn_is_capped_defensively() {
         let mut state =
             SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
 
-        // Entry-count cap: 10 matching skills → 6 entries + truncation marker.
-        let names: Vec<String> = (0..10).map(|i| format!("skill{i}")).collect();
+        // Entry-count cap: 12 matching skills → 8 entries + truncation marker.
+        let names: Vec<String> = (0..12).map(|i| format!("skill{i}")).collect();
         state.bindings.effective_skill_guidance = names
             .iter()
             .map(|n| format!("{n} — doctrine text for {n}"))
             .collect();
         let out = state.skill_guidance_for_turn(&names);
-        assert_eq!(out.len(), 7, "6 capped entries + 1 truncation marker");
+        assert_eq!(out.len(), 9, "8 capped entries + 1 truncation marker");
         assert!(out.last().expect("marker").contains("truncated"));
 
         // Char cap: an oversized entry is dropped (marked truncated) while a
         // small one still renders.
         state.bindings.effective_skill_guidance = vec![
-            format!("big — {}", "x".repeat(2000)),
+            format!("big — {}", "x".repeat(3000)),
             "small — fits fine".into(),
         ];
         let out = state.skill_guidance_for_turn(&["big".into(), "small".into()]);
         assert!(out.iter().any(|e| e.starts_with("small — ")));
         assert!(!out.iter().any(|e| e.starts_with("big — ")));
         assert!(out.last().expect("marker").contains("truncated"));
+    }
+
+    /// Role-assigned skills outrank on-demand extras when the guidance budget
+    /// bites (live incident 2026-08-22: the freshly ASSIGNED
+    /// lifegraph-gardener doctrine was truncated while incidental guidance
+    /// survived).
+    #[test]
+    fn skill_guidance_prioritizes_role_assigned_skills_under_budget() {
+        let mut state =
+            SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
+
+        // Hotel-composition order puts the on-demand entries FIRST; only
+        // `assigned` is in the role's effective skillset. With a budget that
+        // fits a single entry, the assigned skill's guidance must win.
+        let filler = "y".repeat(2400);
+        state.bindings.effective_skill_guidance = vec![
+            format!("ondemand1 — {filler}"),
+            "assigned — the operator put this on the role".into(),
+        ];
+        state.bindings.effective_skillset = vec!["assigned".into()];
+        let out = state.skill_guidance_for_turn(&["ondemand1".into(), "assigned".into()]);
+        assert!(
+            out.first().expect("entry").starts_with("assigned — "),
+            "assigned-skill guidance must rank first: {out:?}"
+        );
+        assert!(out.last().expect("marker").contains("truncated"));
+    }
+
+    /// Lockstep guard for the life_graph execution-route fallback (live
+    /// incident 2026-08-23: a private hard-coded copy of the tool list broke
+    /// routing for life.list, hanging turns in WaitingTool). Every tool the
+    /// shared grant class declares must take the life_graph route.
+    #[test]
+    fn is_life_graph_tool_covers_the_shared_grant_class() {
+        for tool in ansible_mesh_core::graph::tools_for_tool_class("life_graph") {
+            assert!(
+                super::is_life_graph_tool(tool),
+                "life_graph class tool {tool} must route as a life_graph tool"
+            );
+        }
     }
 
     #[test]

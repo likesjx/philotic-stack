@@ -129,7 +129,8 @@ pub fn list_row_projection(var: &str) -> String {
          coalesce({var}.validation_state, 'inferred') AS validation_state, \
          substring(coalesce({var}.claim_summary, {var}.title, ''), 0, 200) AS claim_summary, \
          {var}.observed_at AS observed_at, {best} AS best_date, \
-         {var}.resolved_at AS resolved_at, {var}.retired_by AS retired_by",
+         {var}.resolved_at AS resolved_at, {var}.retired_at AS retired_at, \
+         {var}.retired_by AS retired_by",
         best = best_date_expr(var),
     )
 }
@@ -225,12 +226,17 @@ impl NamedMaintenanceQuery {
                 row = list_row_projection("n"),
             ),
             Self::DuplicateCandidates => format!(
+                // Cross-label on purpose: the same lived fact routinely lands
+                // as e.g. an Event AND an OpenLoop (live example 2026-08-22:
+                // parth_catchup_postpone Event vs parth_catchup_week OpenLoop),
+                // so restricting to same-label pairs hid real duplicates.
                 "MATCH (a), (b) \
-                 WHERE labels(a)[0] = labels(b)[0] AND a.id < b.id \
+                 WHERE a.id < b.id \
                  AND {live_a} AND {live_b} \
                  AND a.claim_summary IS NOT NULL AND b.claim_summary IS NOT NULL \
                  AND toLower(substring(a.claim_summary, 0, 60)) = toLower(substring(b.claim_summary, 0, 60)) \
                  RETURN a.id AS id, b.id AS duplicate_of, labels(a)[0] AS label, \
+                 labels(b)[0] AS duplicate_label, \
                  substring(a.claim_summary, 0, 120) AS claim_summary \
                  LIMIT {limit}",
                 live_a = liveness_predicate("a"),
@@ -239,7 +245,9 @@ impl NamedMaintenanceQuery {
             Self::RecentlyRetired => format!(
                 "MATCH (n) WHERE any(label IN labels(n) WHERE label IN [{labels}]) \
                  AND NOT ({live}) \
-                 RETURN {row} ORDER BY coalesce(n.observed_at, n.created_at, '') DESC LIMIT {limit}",
+                 RETURN {row} \
+                 ORDER BY coalesce(n.retired_at, n.resolved_at, n.observed_at, n.created_at, '') \
+                 DESC LIMIT {limit}",
                 labels = quoted_list(NODE_LABELS),
                 live = liveness_predicate("n"),
                 row = list_row_projection("n"),
@@ -297,8 +305,9 @@ pub fn ontology_document() -> Value {
         "known_gaps": [
             {"id": "G1", "gap": "Most live nodes carry dates only in claim_summary prose; \
               structured date backfill is pending, so date-window queries under-report."},
-            {"id": "G2", "gap": "No retired_at timestamp is stamped at retirement; \
-              recently_retired orders by observed_at as a proxy."},
+            {"id": "G2", "gap": "retired_at is stamped by the hygiene sweep going forward, \
+              but nodes retired earlier lack it; recently_retired falls back to \
+              resolved_at/observed_at for those."},
             {"id": "G3", "gap": "Legacy nodes exist with numeric ids and with \
               life:open-loop (dash) vs life:open_loop (underscore) naming."},
         ],
