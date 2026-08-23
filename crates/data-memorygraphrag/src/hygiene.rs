@@ -335,16 +335,23 @@ pub async fn sweep(graph: &Graph) -> Result<SweepSummary> {
     for write in planned {
         match write {
             PlannedWrite::Stale { label, id } => {
+                // retired_at closes ontology gap G2: without a stamp, the
+                // steward's recently_retired self-audit could only sort by
+                // observed_at, which reflects when the fact was SEEN, not
+                // when it was retired.
                 let cypher = format!(
                     "MATCH (n:{label} {{id: $id}}) \
                      WHERE n.validation_state = 'proposed' \
-                     SET n.validation_state = 'retired', n.retired_by = $retired_by"
+                     SET n.validation_state = 'retired', n.retired_by = $retired_by, \
+                     n.retired_at = $retired_at"
                 );
+                let retired_at = chrono::Utc::now().to_rfc3339();
                 let mut rows = graph
                     .execute(
                         query(&cypher)
                             .param("id", id.as_str())
-                            .param("retired_by", RETIRED_BY_TAG),
+                            .param("retired_by", RETIRED_BY_TAG)
+                            .param("retired_at", retired_at.as_str()),
                     )
                     .await?;
                 rows.next().await?;
@@ -354,14 +361,17 @@ pub async fn sweep(graph: &Graph) -> Result<SweepSummary> {
                 let cypher = "MATCH (dup {id: $dup_id}) \
                      WHERE dup.validation_state IN ['proposed', 'inferred'] \
                      MATCH (keeper {id: $keeper_id}) \
-                     SET dup.validation_state = 'retired', dup.retired_by = $retired_by \
+                     SET dup.validation_state = 'retired', dup.retired_by = $retired_by, \
+                     dup.retired_at = $retired_at \
                      MERGE (keeper)-[:SUPERSEDES]->(dup)";
+                let retired_at = chrono::Utc::now().to_rfc3339();
                 let mut rows = graph
                     .execute(
                         query(cypher)
                             .param("dup_id", dup_id.as_str())
                             .param("keeper_id", keeper_id.as_str())
-                            .param("retired_by", RETIRED_BY_TAG),
+                            .param("retired_by", RETIRED_BY_TAG)
+                            .param("retired_at", retired_at.as_str()),
                     )
                     .await?;
                 rows.next().await?;
