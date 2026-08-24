@@ -16,7 +16,7 @@ check:
 outbound-egress-check:
     python3 scripts/check-outbound-egress-inventory.py
 
-# Prove the hotel-owned OpenRouter catalog leaves through the governed runner.
+# Prove hotel-owned model catalogs leave through bounded governed runners.
 model-catalog-egress-smoke:
     ./scripts/smoke-model-catalog-egress-roundtrip.sh
 

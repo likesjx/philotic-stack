@@ -3,7 +3,7 @@ title: Governed Outbound Integrations
 doc_type: reference
 domain: tooling-execution
 status: active
-last_updated: 2026-07-28
+last_updated: 2026-08-15
 tags:
 - integrations
 - egress
@@ -11,6 +11,7 @@ tags:
 - placement
 - security
 - verification
+- huggingface
 related_docs:
 - ARCHITECTURE.md
 - ARCHITECTURE_STATUS.md
@@ -20,6 +21,7 @@ related_docs:
 - PERIMETER_EGRESS_CONTROL_PROPOSAL.md
 - DATA_DRIVEN_TOOL_GRANTS_PROPOSAL.md
 - INTER_HOTEL_ROUTING_PROPOSAL.md
+- MODEL_GRAPH_CATALOG_PROPOSAL.md
 task_refs:
 - docs/task.md
 tracks_domains:
@@ -349,6 +351,21 @@ installed two-hotel run additionally proves the `mbp-jane` system caller
 resolves and executes at `vps-jane-aiua-01`, receives HTTP 200, and persists
 the compact catalog while the content-free audit remains authoritative at the
 VPS exit.
+
+The next bounded catalog source is Hugging Face public model metadata. The
+`model-catalog-huggingface` binding permits credential-free `GET /api/models`
+only, fixes sorting and a 100-row limit in the request, enforces a second
+parser-side 100-row cap, allows no redirects, and caps the response at 4 MiB.
+Its code-owned `model.catalog.huggingface.ingest` SkillDAG record is seeded only
+when absent; administrators may suspend or deprecate it, which disables the
+background fetch without boot seeding undoing the lifecycle mutation. Full
+source/revision/fetch provenance and the compact model/task/license projection
+are stored separately from `model_catalog.openrouter`, so Hugging Face repository
+metadata cannot impersonate routeable provider inventory. An isolated binary
+smoke proves the active SkillDAG gate, bounded runner hop, separate projection,
+provenance, durable audit, and closed session turn. Installed execution,
+persistence, selected-hotel placement, and lifecycle suspension remain
+unverified.
 
 Philote now consumes only the hotel-owned compact catalog projection; it no
 longer constructs a direct OpenRouter client when that projection is absent.

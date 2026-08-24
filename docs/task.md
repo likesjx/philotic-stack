@@ -90,10 +90,20 @@ Seam IDs: `model-catalog-schema`, `model-catalog-seed`, `model-catalog-projectio
   - cross-hotel model selection must verify peer reachability and return-route support
   - model-router fallback should stay provider-local until hotel capability routing owns remote dispatch
 - [ ] Build the follow-on centralized `model-graph-controller`:
-  - ingest OpenRouter model/pricing/context metadata
-  - ingest Hugging Face model/task/license metadata
-  - ingest llm-stats-style benchmark/ranking feeds when a stable source is chosen
-  - normalize external facts into model catalog provenance and trust inputs
+  - [x] ingest OpenRouter model/pricing/context metadata through the governed
+    hotel-owned catalog binding
+  - [x] ingest a bounded public Hugging Face top-100 model/task/license slice
+    through `model-catalog-huggingface`; `model.catalog.huggingface.ingest`
+    provides the administrable SkillDAG lifecycle gate, full provenance lands in
+    `model_catalog_discovery.huggingface`, and the separate
+    `model_catalog.huggingface` projection has no routing effect
+    (isolated-smoke-green, installed-runtime proof pending)
+  - [ ] ingest llm-stats-style benchmark/ranking feeds when a stable source is chosen
+  - [x] normalize the landed OpenRouter/Hugging Face facts into bounded catalog
+    provenance records without treating declared task or popularity as observed
+    capability
+  - [ ] prove the Hugging Face binding, selected execution hotel, persisted
+    projection, SkillDAG suspension, and durable audit in an installed watched run
 - [ ] Move active development posture toward `mbp-jane`:
   - treat `mbp-jane` as the preferred development seat for new implementation work
   - keep Bjork/mac-jane available for local runtime verification and operator desktop work

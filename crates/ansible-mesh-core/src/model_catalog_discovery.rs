@@ -58,6 +58,21 @@ pub struct DiscoveredModel {
     /// Provider-declared task kinds (a claim, not verified capability).
     #[serde(default)]
     pub declared_task_kinds: Vec<String>,
+    /// Provider-native task label retained verbatim for provenance. This is
+    /// deliberately separate from `declared_task_kinds`, which contains only
+    /// task kinds Philotic can map without inventing capability.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_task: Option<String>,
+    /// Provider/model-card declared license. Absence means unreported, never
+    /// "unlicensed" or permission to use the model.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub license: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub library_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub downloads: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub likes: Option<u64>,
     /// Provider-declared lifecycle hint, e.g. `deprecating` when an expiration
     /// date is published. Retirement is otherwise inferred by [`diff_catalog`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -65,6 +80,9 @@ pub struct DiscoveredModel {
     pub source_url: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fetched_at_secs: Option<u64>,
+    /// Provider revision or immutable content identifier, when published.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_revision: Option<String>,
 }
 
 impl DiscoveredModel {
@@ -328,9 +346,15 @@ pub fn parse_openrouter_models(
             reasoning_default,
             supports_tools,
             declared_task_kinds,
+            provider_task: None,
+            license: None,
+            library_name: None,
+            downloads: None,
+            likes: None,
             lifecycle_hint: None,
             source_url: source_url.clone(),
             fetched_at_secs,
+            source_revision: None,
         });
     }
     Ok(out)
@@ -406,12 +430,162 @@ pub fn parse_google_models(
             modalities: Vec::new(),
             reasoning_default: m.thinking,
             declared_task_kinds,
+            provider_task: None,
+            license: None,
+            library_name: None,
+            downloads: None,
+            likes: None,
             lifecycle_hint: None,
             source_url: source_url.clone(),
             fetched_at_secs,
+            source_revision: None,
         });
     }
     Ok(out)
+}
+
+// ------------------------------------------------------------------------
+// Hugging Face Hub: GET https://huggingface.co/api/models
+// ------------------------------------------------------------------------
+
+/// Defense in depth if the Hub ignores or changes the request's `limit` query.
+pub const HUGGINGFACE_MODEL_LIMIT: usize = 100;
+
+#[derive(Debug, Deserialize)]
+struct HuggingFaceModel {
+    id: String,
+    #[serde(default)]
+    pipeline_tag: Option<String>,
+    #[serde(default)]
+    library_name: Option<String>,
+    #[serde(default)]
+    tags: Vec<String>,
+    #[serde(default)]
+    downloads: Option<u64>,
+    #[serde(default)]
+    likes: Option<u64>,
+    #[serde(default)]
+    private: bool,
+    #[serde(default)]
+    disabled: bool,
+    #[serde(default)]
+    sha: Option<String>,
+    #[serde(default, rename = "cardData")]
+    card_data: Option<HuggingFaceCardData>,
+}
+
+#[derive(Debug, Deserialize)]
+struct HuggingFaceCardData {
+    #[serde(default)]
+    license: Option<String>,
+    #[serde(default)]
+    pipeline_tag: Option<String>,
+    #[serde(default)]
+    library_name: Option<String>,
+}
+
+fn huggingface_license(model: &HuggingFaceModel) -> Option<String> {
+    model
+        .card_data
+        .as_ref()
+        .and_then(|card| card.license.as_deref())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .or_else(|| {
+            model.tags.iter().find_map(|tag| {
+                tag.strip_prefix("license:")
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_string)
+            })
+        })
+}
+
+fn huggingface_task_metadata(task: &str) -> (Vec<String>, Vec<String>) {
+    match task {
+        "text-generation" => (vec!["text.generate".into()], vec!["text".into()]),
+        "feature-extraction" | "sentence-similarity" => {
+            (vec!["text.embed".into()], vec!["text".into()])
+        }
+        "automatic-speech-recognition" => (
+            vec!["audio.transcribe".into()],
+            vec!["audio".into(), "text".into()],
+        ),
+        "text-to-speech" => (
+            vec!["voice.synthesize".into()],
+            vec!["text".into(), "audio".into()],
+        ),
+        "text-to-image" => (
+            vec!["image.generate".into()],
+            vec!["text".into(), "image".into()],
+        ),
+        "image-to-text" => (
+            vec!["media.analyze".into()],
+            vec!["image".into(), "text".into()],
+        ),
+        _ => (Vec::new(), Vec::new()),
+    }
+}
+
+/// Parse a bounded public Hugging Face Hub model-list response.
+///
+/// Private and disabled rows are ignored defensively. Provider-native task
+/// labels are always retained, while Philotic task kinds are populated only
+/// for conservative mappings we can state without treating popularity as
+/// capability proof.
+pub fn parse_huggingface_models(
+    body: &str,
+    fetched_at_secs: Option<u64>,
+    source_url: &str,
+) -> anyhow::Result<Vec<DiscoveredModel>> {
+    let models: Vec<HuggingFaceModel> = serde_json::from_str(body)?;
+    Ok(models
+        .into_iter()
+        .filter(|model| !model.private && !model.disabled)
+        .take(HUGGINGFACE_MODEL_LIMIT)
+        .map(|model| {
+            let provider_task = model.pipeline_tag.clone().or_else(|| {
+                model
+                    .card_data
+                    .as_ref()
+                    .and_then(|card| card.pipeline_tag.clone())
+            });
+            let (declared_task_kinds, modalities) = provider_task
+                .as_deref()
+                .map(huggingface_task_metadata)
+                .unwrap_or_default();
+            let library_name = model.library_name.clone().or_else(|| {
+                model
+                    .card_data
+                    .as_ref()
+                    .and_then(|card| card.library_name.clone())
+            });
+            DiscoveredModel {
+                provider: "huggingface".into(),
+                endpoint_family: "huggingface-hub".into(),
+                model_ref: model.id.clone(),
+                provider_model_ref: model.id.clone(),
+                display_name: None,
+                context_window_tokens: None,
+                input_cost_per_million: None,
+                output_cost_per_million: None,
+                modalities,
+                reasoning_default: None,
+                supports_tools: None,
+                declared_task_kinds,
+                provider_task,
+                license: huggingface_license(&model),
+                library_name,
+                downloads: model.downloads,
+                likes: model.likes,
+                lifecycle_hint: None,
+                source_url: source_url.to_string(),
+                fetched_at_secs,
+                source_revision: model.sha,
+            }
+        })
+        .collect())
 }
 
 #[cfg(test)]
@@ -454,6 +628,34 @@ mod tests {
       ]
     }"#;
 
+    const HUGGINGFACE_SAMPLE: &str = r#"[
+      {
+        "id": "sentence-transformers/all-MiniLM-L6-v2",
+        "cardData": {
+          "license": "apache-2.0",
+          "pipeline_tag": "sentence-similarity",
+          "library_name": "sentence-transformers"
+        },
+        "downloads": 259675300,
+        "likes": 5208,
+        "private": false,
+        "disabled": false,
+        "sha": "1110a243fdf4706b3f48f1d95db1a4f5529b4d41",
+        "tags": ["license:apache-2.0"]
+      },
+      {
+        "id": "example/tag-license-only",
+        "pipeline_tag": "text-generation",
+        "private": false,
+        "tags": ["transformers", "license:mit"]
+      },
+      {
+        "id": "private/hidden",
+        "private": true,
+        "tags": ["license:other"]
+      }
+    ]"#;
+
     #[test]
     fn openrouter_parse_extracts_context_cost_and_reasoning() {
         let models = parse_openrouter_models(OPENROUTER_SAMPLE, Some(42)).unwrap();
@@ -485,6 +687,48 @@ mod tests {
         assert!(m.declared_task_kinds.contains(&"text.generate".to_string()));
     }
 
+    #[test]
+    fn huggingface_parse_projects_task_license_popularity_and_revision() {
+        let models = parse_huggingface_models(
+            HUGGINGFACE_SAMPLE,
+            Some(99),
+            "https://huggingface.co/api/models",
+        )
+        .unwrap();
+        assert_eq!(models.len(), 2, "private rows must not enter the catalog");
+        let model = &models[0];
+        assert_eq!(model.provider, "huggingface");
+        assert_eq!(model.provider_task.as_deref(), Some("sentence-similarity"));
+        assert_eq!(model.declared_task_kinds, ["text.embed"]);
+        assert_eq!(model.license.as_deref(), Some("apache-2.0"));
+        assert_eq!(model.library_name.as_deref(), Some("sentence-transformers"));
+        assert_eq!(model.downloads, Some(259_675_300));
+        assert_eq!(model.likes, Some(5_208));
+        assert_eq!(model.fetched_at_secs, Some(99));
+        assert_eq!(
+            model.source_revision.as_deref(),
+            Some("1110a243fdf4706b3f48f1d95db1a4f5529b4d41")
+        );
+        assert_eq!(models[1].license.as_deref(), Some("mit"));
+        assert_eq!(models[1].declared_task_kinds, ["text.generate"]);
+    }
+
+    #[test]
+    fn huggingface_parse_caps_rows_even_if_upstream_ignores_limit() {
+        let body = serde_json::to_string(
+            &(0..(HUGGINGFACE_MODEL_LIMIT + 7))
+                .map(|i| serde_json::json!({ "id": format!("org/model-{i}") }))
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+        assert_eq!(
+            parse_huggingface_models(&body, None, "https://huggingface.co/api/models")
+                .unwrap()
+                .len(),
+            HUGGINGFACE_MODEL_LIMIT
+        );
+    }
+
     fn model(provider: &str, model_ref: &str, reasoning: Option<bool>) -> DiscoveredModel {
         DiscoveredModel {
             supports_tools: None,
@@ -499,9 +743,15 @@ mod tests {
             modalities: vec![],
             reasoning_default: reasoning,
             declared_task_kinds: vec![],
+            provider_task: None,
+            license: None,
+            library_name: None,
+            downloads: None,
+            likes: None,
             lifecycle_hint: None,
             source_url: "u".to_string(),
             fetched_at_secs: None,
+            source_revision: None,
         }
     }
 
