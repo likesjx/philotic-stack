@@ -410,13 +410,25 @@ impl SessionState {
             .map(|(id, task, _)| (id, task))
     }
 
-    /// Drop any queued tasks older than `max_age_secs`. Returns the number evicted.
-    pub fn evict_stale_queued_tasks(&mut self, max_age_secs: u64) -> usize {
+    /// Drop any queued tasks older than `max_age_secs`, returning the evicted
+    /// entries so the caller can close their ledger rows and tell the sender —
+    /// a silently dropped operator message is a lost message.
+    pub fn evict_stale_queued_tasks(
+        &mut self,
+        max_age_secs: u64,
+    ) -> Vec<(uuid::Uuid, InboundTaskPayload)> {
         let cutoff = std::time::Duration::from_secs(max_age_secs);
-        let before = self.pending_user_tasks.len();
-        self.pending_user_tasks
-            .retain(|(_, _, enqueued)| enqueued.elapsed() < cutoff);
-        before - self.pending_user_tasks.len()
+        let mut kept = std::collections::VecDeque::with_capacity(self.pending_user_tasks.len());
+        let mut dropped = Vec::new();
+        for (id, task, enqueued) in self.pending_user_tasks.drain(..) {
+            if enqueued.elapsed() < cutoff {
+                kept.push_back((id, task, enqueued));
+            } else {
+                dropped.push((id, task));
+            }
+        }
+        self.pending_user_tasks = kept;
+        dropped
     }
 
     /// How many tasks are waiting in the queue.
@@ -5653,6 +5665,34 @@ fn apply_string_list_op(list: &mut Vec<String>, item: &str, operation: &str) -> 
 
 #[cfg(test)]
 mod tests {
+    /// A queued task younger than the cutoff survives eviction; an older one
+    /// is RETURNED to the caller (for ledger close + sender notice), never
+    /// silently discarded — three operator messages were lost to the old
+    /// count-only drop.
+    #[test]
+    fn evict_stale_queued_tasks_returns_dropped_entries() {
+        let mut state =
+            SessionState::new("sess-q".into(), "agent-jane-01".into(), "telegram".into());
+        let task = crate::protocol::InboundTaskPayload {
+            content: Some("hello".into()),
+            ..Default::default()
+        };
+        let dropped_id = uuid::Uuid::new_v4();
+        state.enqueue_user_task(dropped_id, task.clone());
+        // max_age 0 → everything queued is already stale.
+        let dropped = state.evict_stale_queued_tasks(0);
+        assert_eq!(dropped.len(), 1, "stale task must be returned, not counted");
+        assert_eq!(dropped[0].0, dropped_id);
+        assert_eq!(dropped[0].1.content.as_deref(), Some("hello"));
+        assert_eq!(state.pending_user_task_count(), 0);
+
+        // A fresh task under a generous cutoff is untouched.
+        state.enqueue_user_task(uuid::Uuid::new_v4(), task);
+        let dropped = state.evict_stale_queued_tasks(3600);
+        assert!(dropped.is_empty());
+        assert_eq!(state.pending_user_task_count(), 1);
+    }
+
     use super::{
         ActivePlan, ApprovalPolicy, ApprovalRiskHint, CarryoverPlan, ComponentExecutionRoute,
         ComponentRouteAssembly, ComponentRouteBinding, Context1Advisory, ContextAuthority,
