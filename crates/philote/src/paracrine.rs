@@ -865,7 +865,25 @@ impl AgentRuntime {
             })
             .await;
 
-        if emit_result.is_ok() {
+        // Bind the hotel's refusal, not just transport failure. The hotel
+        // answers SPECIALIST_UNAVAILABLE (ok: false) when the target role
+        // cannot be delivered to or credibly parked — no incarnation, guest
+        // deactivated, materialization refused. Treating any Ok(_) as success
+        // parked this turn for the full whisper wait on a specialist that was
+        // never going to exist (Beacon → Chronos, 2026-08-25: the hotel knew
+        // 1ms after the park; the operator learned 660s later).
+        let hotel_refusal = match &emit_result {
+            Ok(philotic_client::IpcResponse::Standard {
+                ok: false,
+                code,
+                message,
+                ..
+            }) => Some(format!("{code}: {message}")),
+            Ok(philotic_client::IpcResponse::Error(msg)) => Some(msg.clone()),
+            _ => None,
+        };
+
+        if emit_result.is_ok() && hotel_refusal.is_none() {
             if let Some(state) = self.sessions.get_mut(&payload.session_id) {
                 state.open_paracrine_thread(
                     paracrine_id.clone(),
@@ -879,6 +897,48 @@ impl AgentRuntime {
                     approval_scope,
                 );
             }
+        }
+
+        if let Some(reason) = hotel_refusal {
+            warn!(
+                session_id = %payload.session_id,
+                role = %role,
+                reason = %reason,
+                "delegate.whisper refused by hotel — surfacing as immediate tool failure"
+            );
+            let err = TaskErrorPayload {
+                kind: "provider_failure".into(),
+                message: format!("delegate.whisper: specialist '{role}' unavailable — {reason}"),
+                code: Some("SPECIALIST_UNAVAILABLE".into()),
+                component: Some("aiua".into()),
+                provider: None,
+                capability: None,
+                retryable: Some(false),
+                sub_kind: None,
+                status: None,
+                error_class: None,
+            };
+            let content = format!(
+                "delegate.whisper failed: specialist role '{role}' is unavailable ({reason}). \
+                 Do not retry the whisper this turn — handle the request yourself or tell the \
+                 user what is blocked."
+            );
+            return self
+                .handle_tool_result(InboundTaskPayload {
+                    action: Some("tool_result".into()),
+                    source: Some("agent".into()),
+                    session_id: Some(payload.session_id),
+                    turn_id: Some(payload.turn_id),
+                    chat_id: Some(payload.chat_id),
+                    content: Some(content),
+                    error: Some(err),
+                    tool_name: Some(payload.tool_name),
+                    final_reply_to: Some(payload.final_reply_to),
+                    final_reply_role: Some(payload.final_reply_role),
+                    final_reply_guest_id: payload.final_reply_guest_id,
+                    ..Default::default()
+                })
+                .await;
         }
 
         let (content, tool_err) = match emit_result {
@@ -1147,6 +1207,182 @@ mod tests {
     use crate::protocol::{InboundTaskPayload, ToolExecutionPayload};
     use crate::session::PARACRINE_WHISPER_PROMPT_MAX_CHARS;
     use uuid::Uuid;
+
+    /// Stub hotel that REFUSES `ParacrineEmit` (ok: false,
+    /// SPECIALIST_UNAVAILABLE) and records everything else like
+    /// `run_recording_hotel`. Models the hotel that cannot deliver or
+    /// credibly park a whisper (no incarnation / guest deactivated /
+    /// materialization refused).
+    async fn run_whisper_refusing_hotel(
+        listener: tokio::net::UnixListener,
+        emitted: std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
+    ) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let (mut stream, _) = listener.accept().await.expect("accept");
+        loop {
+            let buf = match async {
+                let mut len_buf = [0u8; 4];
+                stream.read_exact(&mut len_buf).await?;
+                let len = u32::from_be_bytes(len_buf) as usize;
+                let mut buf = vec![0u8; len];
+                stream.read_exact(&mut buf).await?;
+                Ok::<_, std::io::Error>(buf)
+            }
+            .await
+            {
+                Ok(b) => b,
+                Err(_) => return,
+            };
+            let req: philotic_client::IpcRequest =
+                serde_json::from_slice(&buf).expect("decode request");
+            let reply = match &req {
+                philotic_client::IpcRequest::ParacrineEmit { role, .. } => {
+                    emitted
+                        .lock()
+                        .unwrap()
+                        .push(serde_json::json!({"paracrine_emit_refused": role}));
+                    serde_json::to_vec(&philotic_client::IpcResponse::Standard {
+                        ok: false,
+                        code: "SPECIALIST_UNAVAILABLE".into(),
+                        message: format!("no role incarnation named '{role}' exists"),
+                        corr_id: "paracrine_emit".into(),
+                        data: None,
+                    })
+                    .unwrap()
+                }
+                philotic_client::IpcRequest::EmitTask {
+                    target_role,
+                    task_json,
+                    ..
+                } => {
+                    let task: serde_json::Value =
+                        serde_json::from_str(task_json).unwrap_or(serde_json::Value::Null);
+                    emitted.lock().unwrap().push(serde_json::json!({
+                        "target_role": target_role,
+                        "task": task,
+                    }));
+                    serde_json::to_vec(&philotic_client::IpcResponse::success("ok", None)).unwrap()
+                }
+                _ => {
+                    serde_json::to_vec(&philotic_client::IpcResponse::success("ok", None)).unwrap()
+                }
+            };
+            let len = u32::try_from(reply.len()).expect("frame length fits u32");
+            stream
+                .write_all(&len.to_be_bytes())
+                .await
+                .expect("write header");
+            stream.write_all(&reply).await.expect("write payload");
+        }
+    }
+
+    /// The hotel's SPECIALIST_UNAVAILABLE refusal must surface as an
+    /// immediate tool failure the model can react to — NOT leave the turn
+    /// parked in WaitingTool for the whisper deadline. Live incident
+    /// 2026-08-25: Chronos could not be materialized, the hotel said so 1ms
+    /// later, and Beacon still sat deaf for 660s.
+    #[tokio::test]
+    async fn whisper_hotel_refusal_becomes_immediate_tool_failure() {
+        let socket_path = format!("/tmp/philote-wrefuse-{}.sock", Uuid::new_v4().simple());
+        let listener = tokio::net::UnixListener::bind(&socket_path).expect("bind");
+        let emitted = std::sync::Arc::new(std::sync::Mutex::new(Vec::<serde_json::Value>::new()));
+        let server = tokio::spawn(run_whisper_refusing_hotel(listener, emitted.clone()));
+
+        let identity = philotic_client::GuestIdentity {
+            guest_id: "agent-wrefuse".into(),
+            role: "agent".into(),
+            supported_tools: Vec::new(),
+        };
+        let client = philotic_client::PhiloticClient::connect_at(&socket_path, identity)
+            .await
+            .expect("connect to stub hotel");
+        let mut runtime = AgentRuntime::new(client, "agent-wrefuse");
+
+        let session_id = "sess-wrefuse";
+        let turn_id = "turn-wrefuse";
+        runtime
+            .ensure_session_loaded(session_id, "telegram")
+            .await
+            .expect("session load");
+        let turn = def004_working_turn(turn_id, "delegate.whisper");
+        runtime
+            .sessions
+            .get_mut(session_id)
+            .expect("session exists")
+            .start_turn(turn);
+
+        let payload = ToolExecutionPayload {
+            action: "execute_tool",
+            session_id: session_id.into(),
+            turn_id: turn_id.into(),
+            chat_id: "555".into(),
+            tool_name: "delegate.whisper".into(),
+            arguments: serde_json::json!({
+                "role": "ghost-role",
+                "prompt": "do the thing",
+                "wait_for_response": true,
+            }),
+            execution_mode: "local_agent".into(),
+            agent_id: "agent-wrefuse".into(),
+            user_id: None,
+            runner_id: None,
+            incarnation_id: None,
+            hotel_id: None,
+            environment_id: None,
+            task_runner_kind: None,
+            task_runner_config: None,
+            selection_reason: None,
+            workspace_ref: None,
+            task_runner_overlay: None,
+            return_route: None,
+            reply_to: "node-1".into(),
+            reply_role: "agent".into(),
+            reply_guest_id: None,
+            final_reply_to: "membrane-node-01".into(),
+            final_reply_role: "membrane".into(),
+            final_reply_guest_id: Some("membrane-seat-1".into()),
+        };
+        runtime
+            .execute_delegate_whisper_tool(payload)
+            .await
+            .expect("whisper handling");
+
+        let state = runtime.sessions.get(session_id).expect("session exists");
+        assert!(
+            state.paracrine_threads.is_empty(),
+            "a refused whisper must not open a paracrine thread"
+        );
+        let turn = state.active_turn.as_ref().expect("turn still active");
+        assert!(
+            !matches!(turn.phase, TurnPhase::WaitingTool),
+            "turn must not stay parked in WaitingTool on a refusal, got {:?}",
+            turn.phase
+        );
+
+        drop(runtime);
+        let _ = server.await;
+        let _ = std::fs::remove_file(&socket_path);
+
+        // The refusal must re-enter the model as a tool failure it can see.
+        let emitted = emitted.lock().unwrap();
+        assert!(
+            emitted
+                .iter()
+                .any(|e| e.get("paracrine_emit_refused").is_some()),
+            "stub must have refused the emit"
+        );
+        assert!(
+            emitted.iter().any(|e| {
+                e["task"]["action"] == "generate_text"
+                    && e["task"]["prompt"]
+                        .as_str()
+                        .map(|p| p.contains("unavailable"))
+                        .unwrap_or(false)
+            }),
+            "refusal must re-enter the model as a visible tool failure: {:#?}",
+            *emitted
+        );
+    }
 
     /// Stub hotel like `run_recording_hotel`, but answers
     /// `ConsumeAutonomyAction` with a configurable grant decision and records

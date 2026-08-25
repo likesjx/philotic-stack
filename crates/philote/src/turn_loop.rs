@@ -204,6 +204,129 @@ impl AgentRuntime {
         self.stuck_turn_signature
             .retain(|id, _| self.sessions.contains_key(id));
 
+        // Step 2w: graceful whisper timeout. A turn blocking on
+        // delegate.whisper past PARACRINE_WHISPER_WAIT_SECS gets the
+        // specialist's silence delivered as a tool_result — the model reacts
+        // (answers itself, tells the user what's blocked) and the turn
+        // CONTINUES, instead of the old behavior: evict the whole turn and
+        // apologize with a generic "I got stuck". Runs before eviction
+        // collection so a recovered turn is never double-handled this tick;
+        // the CatchAll backstop below still evicts if this recovery wedges.
+        let whisper_timed_out: Vec<(String, String, String, Vec<String>)> = self
+            .sessions
+            .iter()
+            .filter_map(|(session_id, state)| {
+                let elapsed = state.turn_waiting_since?.elapsed().as_secs();
+                if elapsed < PARACRINE_WHISPER_WAIT_SECS {
+                    return None;
+                }
+                let turn = state.active_turn.as_ref()?;
+                let is_whisper = matches!(turn.phase, TurnPhase::WaitingTool)
+                    && turn
+                        .pending_tool_call
+                        .as_ref()
+                        .map(|tool| tool.tool_name == "delegate.whisper")
+                        .unwrap_or(false);
+                if !is_whisper {
+                    return None;
+                }
+                Some((
+                    session_id.clone(),
+                    turn.turn_id.clone(),
+                    turn.chat_id.clone(),
+                    turn.associated_paracrine_ids.clone(),
+                ))
+            })
+            .collect();
+        for (session_id, turn_id, chat_id, paracrine_ids) in whisper_timed_out {
+            warn!(
+                session_id = %session_id,
+                turn_id = %turn_id,
+                "Whisper deadline: specialist never replied — converting to tool_result so the turn continues"
+            );
+            if let Some(state) = self.sessions.get_mut(&session_id) {
+                for pid in &paracrine_ids {
+                    state.close_paracrine_thread(
+                        pid,
+                        crate::session::ParacrineThreadStatus::Expired,
+                        None,
+                        Some("whisper wait deadline elapsed with no specialist reply".into()),
+                    );
+                }
+            }
+            self.push_heal_event(
+                "paracrine_whisper_timeout",
+                &format!(
+                    "delegate.whisper on session {session_id} turn {turn_id} got no specialist \
+                     reply within {PARACRINE_WHISPER_WAIT_SECS}s"
+                ),
+            )
+            .await;
+            let err = philotic_client::TaskErrorPayload {
+                kind: "provider_failure".into(),
+                message: format!(
+                    "delegate.whisper: the specialist did not reply within \
+                     {PARACRINE_WHISPER_WAIT_SECS}s"
+                ),
+                code: Some("SPECIALIST_TIMEOUT".into()),
+                component: Some("philote".into()),
+                provider: None,
+                capability: None,
+                retryable: Some(false),
+                sub_kind: None,
+                status: None,
+                error_class: None,
+            };
+            let (final_reply_to, final_reply_role, final_reply_guest_id) = self
+                .sessions
+                .get(&session_id)
+                .and_then(|s| s.active_turn.as_ref())
+                .map(|t| {
+                    (
+                        t.final_reply_to.clone(),
+                        t.final_reply_role.clone(),
+                        t.final_reply_guest_id.clone(),
+                    )
+                })
+                .unwrap_or_default();
+            // The whisper wait legitimately outlived the CatchAll ceiling (its
+            // deadline is deliberately larger). Restart the total-active clock
+            // so the recovered turn gets a fresh window to produce its answer —
+            // without this, the CatchAll in this same tick would evict the turn
+            // we just recovered. Bounded: the injected tool_result instructs
+            // the model not to whisper again this turn, and the iteration
+            // budget caps a model that ignores that.
+            self.total_active_since
+                .insert(session_id.clone(), std::time::Instant::now());
+            if let Err(e) = self
+                .handle_tool_result(InboundTaskPayload {
+                    action: Some("tool_result".into()),
+                    source: Some("agent".into()),
+                    session_id: Some(session_id.clone()),
+                    turn_id: Some(turn_id),
+                    chat_id: Some(chat_id),
+                    content: Some(format!(
+                        "delegate.whisper failed: the specialist did not respond within \
+                         {PARACRINE_WHISPER_WAIT_SECS}s. Do not whisper again this turn — \
+                         handle the request yourself or tell the user what is blocked."
+                    )),
+                    error: Some(err),
+                    tool_name: Some("delegate.whisper".into()),
+                    final_reply_to: Some(final_reply_to),
+                    final_reply_role: Some(final_reply_role),
+                    final_reply_guest_id,
+                    ..Default::default()
+                })
+                .await
+            {
+                warn!(
+                    session_id = %session_id,
+                    "Whisper deadline: tool_result injection failed (CatchAll will evict): {}",
+                    e
+                );
+            }
+        }
+
         // Step 2: collect sessions whose waiting turn has exceeded the deadline.
         // Parked approval turns (in parked_approval_turn) use WAITING_APPROVAL_SECS.
         let timed_out: Vec<(
@@ -260,6 +383,13 @@ impl AgentRuntime {
                 let limit = match turn.phase {
                     TurnPhase::WaitingModel => WAITING_MODEL_SECS,
                     TurnPhase::Thinking => THINKING_SECS,
+                    // A whisper past its deadline is handled by the graceful
+                    // whisper-timeout pass (Step 2w below): the specialist's
+                    // silence becomes a tool_result the model can react to,
+                    // and the turn CONTINUES instead of dying. Excluded here;
+                    // the CatchAll backstop still evicts if that recovery
+                    // itself wedges (its whisper skip ends at the same
+                    // deadline).
                     TurnPhase::WaitingTool
                         if turn
                             .pending_tool_call
@@ -267,7 +397,7 @@ impl AgentRuntime {
                             .map(|tool| tool.tool_name == "delegate.whisper")
                             .unwrap_or(false) =>
                     {
-                        PARACRINE_WHISPER_WAIT_SECS
+                        return None;
                     }
                     TurnPhase::WaitingTool => WAITING_TOOL_SECS,
                     TurnPhase::WaitingVoice => WAITING_VOICE_SECS,
