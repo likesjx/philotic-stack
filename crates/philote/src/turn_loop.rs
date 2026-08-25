@@ -457,6 +457,12 @@ impl AgentRuntime {
             self.push_heal_event(&format!("stuck_turn_evicted:{phase}"), &reason)
                 .await;
 
+            // The eviction freed the session — messages that queued up behind
+            // the stuck turn must now run. Completion and failure paths drain;
+            // before this, eviction was the one turn-ending path that did not,
+            // leaving queued operator messages to rot until the stale sweep.
+            self.drain_next_user_task(&session_id);
+
             // Notify the user that the session is unblocked.
             let notify_req = IpcRequest::EmitTask {
                 target_node: reply_to,
@@ -477,18 +483,69 @@ impl AgentRuntime {
             }
         }
 
-        // Step 4: evict stale queued tasks from all sessions.
-        const QUEUE_STALE_SECS: u64 = 120;
+        // Step 4: evict stale queued tasks from all sessions. The threshold
+        // sits ABOVE the longest possible active turn (GUEST_TOTAL_CEILING_SECS
+        // catch-all) so a message queued behind a slow-but-live turn is never
+        // dropped — it drains when that turn ends or is evicted. Anything
+        // older than this means the drain machinery itself failed; those are
+        // closed loudly (ledger row failed + sender notified), never silently:
+        // three operator messages were lost to the old 120s silent drop.
+        const QUEUE_STALE_SECS: u64 =
+            ansible_mesh_core::turn_budget::GUEST_TOTAL_CEILING_SECS + 300;
         let session_ids_for_stale: Vec<String> = self.sessions.keys().cloned().collect();
         for session_id in session_ids_for_stale {
-            if let Some(state) = self.sessions.get_mut(&session_id) {
-                let dropped = state.evict_stale_queued_tasks(QUEUE_STALE_SECS);
-                if dropped > 0 {
+            let dropped = match self.sessions.get_mut(&session_id) {
+                Some(state) => state.evict_stale_queued_tasks(QUEUE_STALE_SECS),
+                None => continue,
+            };
+            for (task_id, task) in dropped {
+                let turn_id = task.turn_id.clone().unwrap_or_default();
+                warn!(
+                    session_id = %session_id,
+                    turn_id = %turn_id,
+                    "Watchdog: dropping queued task older than {}s — closing its ledger row and notifying the sender",
+                    QUEUE_STALE_SECS
+                );
+                if let Err(e) = self
+                    .ipc_client
+                    .send_request(IpcRequest::FailTask {
+                        task_id,
+                        error_code: "QUEUED_MESSAGE_EXPIRED".into(),
+                        reason: format!(
+                            "queued behind an active turn for over {QUEUE_STALE_SECS}s and never dispatched"
+                        ),
+                        session_id: Some(session_id.clone()),
+                        turn_id: (!turn_id.is_empty()).then(|| turn_id.clone()),
+                    })
+                    .await
+                {
+                    warn!("Watchdog: failed to close dropped queued task: {}", e);
+                }
+                // Only user-visible messages warrant an apology; synthetic
+                // tasks (no chat routing) just close their ledger row.
+                let (Some(chat_id), Some(reply_to)) =
+                    (task.chat_id.clone(), task.final_reply_to.clone())
+                else {
+                    continue;
+                };
+                let notice = IpcRequest::EmitTask {
+                    target_node: reply_to,
+                    target_role: task.final_reply_role.clone().unwrap_or_else(|| "gateway".into()),
+                    target_guest_id: task.final_reply_guest_id.clone(),
+                    task_json: serde_json::json!({
+                        "action": "send_reply",
+                        "session_id": session_id,
+                        "turn_id": turn_id,
+                        "chat_id": chat_id,
+                        "content": "*(I couldn't get to this message — it waited behind a stuck turn until it expired. Please resend if it still matters.)*",
+                        "final": true,
+                    })
+                    .to_string(),
+                };
+                if let Err(e) = self.ipc_client.send_request(notice).await {
                     warn!(
-                        session_id = %session_id,
-                        dropped = dropped,
-                        "Watchdog: evicted stale queued tasks older than {}s",
-                        QUEUE_STALE_SECS
+                        "Watchdog: failed to notify sender of dropped queued task: {}",
+                        e
                     );
                 }
             }
@@ -3489,14 +3546,17 @@ impl AgentRuntime {
             .await?;
         self.sync_session_index(&index_state).await?;
 
+        // session_id + turn_id let the hotel close this turn's ledger row
+        // directly; without them the row stays "running" until the zombie
+        // sweep mislabels a cleanly-failed turn as ZOMBIE_TURN_REPAIR.
         let _ = self
             .ipc_client
             .send_request(IpcRequest::FailTask {
                 task_id,
                 error_code: "MODEL_EMPTY_RESPONSE".into(),
                 reason: message.clone(),
-                session_id: None,
-                turn_id: None,
+                session_id: Some(session_id.clone()),
+                turn_id: Some(turn_id.clone()),
             })
             .await?;
 

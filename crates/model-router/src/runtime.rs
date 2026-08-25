@@ -780,6 +780,11 @@ pub async fn run_model_controller(config: ControllerGuestConfig) -> Result<()> {
                         // (attempts + rotations) stays under the philote watchdog.
                         let mut active_pool_member = gemini_active_member;
                         let mut rotations_left: u8 = 2;
+                        // Network-outage patience: how many 5s connectivity
+                        // waits a dispatch may burn before giving up early.
+                        // The outer dispatch timeout stays the hard ceiling.
+                        const NETWORK_WAIT_SECS: u64 = 5;
+                        let mut network_waits_left: u8 = 20;
 
                         while attempt < retry.max_attempts {
                             if attempt > 0 {
@@ -953,6 +958,45 @@ pub async fn run_model_controller(config: ControllerGuestConfig) -> Result<()> {
                                         }
                                         // Rebuild lost the provider (should not happen) —
                                         // fall through to normal failure handling.
+                                    }
+                                    // Connect-class failures (DNS, refused,
+                                    // unreachable) are almost always the LOCAL
+                                    // network being down — e.g. a Mac waking
+                                    // from sleep before Wi-Fi is up — so tier
+                                    // escalation cannot help: every provider
+                                    // rides the same dead network. Wait it out
+                                    // here instead, bounded by the outer
+                                    // dispatch timeout (which converts a real
+                                    // sustained outage into provider_timeout →
+                                    // the ladder engages as before). Bounded
+                                    // attempt count is a belt against a
+                                    // misconfigured outer timeout.
+                                    let is_network_error = classified.sub_kind.as_deref()
+                                        == Some("network_error");
+                                    if is_network_error && network_waits_left > 0 {
+                                        network_waits_left -= 1;
+                                        warn!(
+                                            "Provider [{}] network-unreachable; waiting {}s for connectivity ({} waits left): {}",
+                                            provider.id(),
+                                            NETWORK_WAIT_SECS,
+                                            network_waits_left,
+                                            e
+                                        );
+                                        emit_dispatch_status(
+                                            &mut ipc_client,
+                                            &reply,
+                                            attempt,
+                                            "waiting_for_network",
+                                        )
+                                        .await;
+                                        tokio::time::sleep(Duration::from_secs(NETWORK_WAIT_SECS))
+                                            .await;
+                                        last_err = e;
+                                        // `continue` skips the attempt counter:
+                                        // network patience is time-bounded by
+                                        // the outer dispatch timeout, not the
+                                        // provider's attempt budget.
+                                        continue;
                                     }
                                     let retryable = classified.retryable.unwrap_or(false);
                                     let has_more = attempt + 1 < retry.max_attempts;

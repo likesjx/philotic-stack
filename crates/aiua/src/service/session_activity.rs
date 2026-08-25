@@ -366,7 +366,11 @@ impl IpcServer {
             });
         }
 
-        if let Some(turn_id) = envelope.turn_id.clone() {
+        if let Some(turn_id) = envelope
+            .turn_id
+            .clone()
+            .filter(|id| !is_synthetic_turn_id(id))
+        {
             let existing = graph.get_session_turn(&session_id, &turn_id).ok().flatten();
             let mut turn = existing.unwrap_or(SessionTurnRecord {
                 turn_id: turn_id.clone(),
@@ -639,6 +643,48 @@ impl IpcServer {
         for mut turn in zombie_turns {
             let sid = turn.session_id.clone();
             let tid = turn.turn_id.clone();
+
+            // Legacy synthetic rows (probes/sentinels ledgered before the
+            // intake filter existed): retire quietly — no heal entry, no
+            // demotion pressure. New synthetic dispatches never create rows.
+            if is_synthetic_turn_id(&tid) {
+                turn.status = "failed".into();
+                turn.error_json = Some(serde_json::json!({
+                    "error": "SYNTHETIC_TURN_RETIRED",
+                    "reason": "probe/sentinel dispatch has no turn closer by design",
+                }));
+                turn.completed_at = Some(now_secs);
+                if let Err(e) = graph.upsert_session_turn(&turn) {
+                    warn!("RepairStaleSessionTurns: retire synthetic {sid}:{tid}: {e}");
+                }
+                continue;
+            }
+
+            // A row still "running" whose final response already went out is a
+            // bookkeeping miss, not a lost turn — close it as completed so the
+            // ledger tells the truth, and keep it out of the heal queue and
+            // the consecutive-zombie demotion counter. A recorded fail-kind
+            // response still closes as a genuine zombie below.
+            let response_kind = turn
+                .response_json
+                .as_ref()
+                .and_then(|r| r.pointer("/agent_action/kind"))
+                .and_then(serde_json::Value::as_str);
+            if turn.response_json.is_some() && response_kind != Some("fail") {
+                turn.status = "completed".into();
+                turn.error_json = Some(serde_json::json!({
+                    "note": "LATE_CLOSE",
+                    "reason": "response was delivered but no closer marked the turn; closed by hotel watchdog",
+                }));
+                turn.completed_at = Some(now_secs);
+                if let Err(e) = graph.upsert_session_turn(&turn) {
+                    warn!("RepairStaleSessionTurns: late-close {sid}:{tid}: {e}");
+                    continue;
+                }
+                info!("RepairStaleSessionTurns: late-closed served turn {sid}:{tid}");
+                continue;
+            }
+
             turn.status = "failed".into();
             turn.error_json = Some(
                 serde_json::json!({"error": "ZOMBIE_TURN_REPAIR", "reason": "hotel watchdog: stale running turn"}),
@@ -1021,6 +1067,20 @@ fn is_zombie_repaired_turn(turn: &SessionTurnRecord) -> bool {
             .and_then(|e| e.get("error"))
             .and_then(serde_json::Value::as_str)
             == Some("ZOMBIE_TURN_REPAIR")
+}
+
+/// Turn ids that name synthetic dispatches rather than conversational turns:
+/// model-failover origin-tier probes (`probe-*`, philote `send_origin_probe`)
+/// and the LifeGraph cache-refresh sentinels (constant per-session ids). None
+/// of these ever get a `CompleteTask`/`FailTask` closer — the responses are
+/// intercepted before the turn machinery — so ledgering them as session turns
+/// guarantees one zombie row per dispatch. An empty turn id carries no
+/// correlation value either way.
+pub(super) fn is_synthetic_turn_id(turn_id: &str) -> bool {
+    turn_id.is_empty()
+        || turn_id.starts_with("probe-")
+        || turn_id == "life-autorecall-prefetch"
+        || turn_id == "life-autocapture"
 }
 
 fn merge_turn_status(current: &str, incoming: Option<&str>) -> Option<String> {
@@ -1749,6 +1809,156 @@ mod tests {
         let _ = server_task.await;
         if Path::new(&socket_path).exists() {
             let _ = std::fs::remove_file(&socket_path);
+        }
+    }
+
+    /// Synthetic dispatches (failover probes, LifeGraph cache sentinels,
+    /// blank ids) have no turn closer by design — ledgering them guaranteed
+    /// one ZOMBIE_TURN_REPAIR row per dispatch (77% of the 2026-08 fleet
+    /// zombie census). They must never open a session_turn row; the session
+    /// event log still records them.
+    #[test]
+    fn synthetic_turn_ids_never_open_ledger_rows() {
+        let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
+        let graph = GraphDomain::new(Arc::new(graph_store.adapter()));
+
+        for turn_id in [
+            "probe-dab823c0-b821-4bf1-bd06-095697f6b886",
+            "life-autorecall-prefetch",
+            "life-autocapture",
+            "",
+        ] {
+            let payload = serde_json::json!({
+                "session_id": "sess-synthetic",
+                "turn_id": turn_id,
+                "action": "generate_text",
+            });
+            IpcServer::record_session_activity_from_value(
+                &graph,
+                &payload,
+                None,
+                Some("running"),
+                Some("model"),
+                "emit_task",
+            );
+            assert!(
+                graph
+                    .get_session_turn("sess-synthetic", turn_id)
+                    .expect("turn lookup should work")
+                    .is_none(),
+                "synthetic turn id {turn_id:?} must not open a ledger row"
+            );
+        }
+
+        // A real conversational turn id still opens a row.
+        let payload = serde_json::json!({
+            "session_id": "sess-synthetic",
+            "turn_id": "telegram-update-1",
+            "action": "generate_text",
+        });
+        IpcServer::record_session_activity_from_value(
+            &graph,
+            &payload,
+            None,
+            Some("running"),
+            Some("model"),
+            "emit_task",
+        );
+        assert!(
+            graph
+                .get_session_turn("sess-synthetic", "telegram-update-1")
+                .expect("turn lookup should work")
+                .is_some(),
+            "real turn ids must still be ledgered"
+        );
+    }
+
+    fn running_turn(session_id: &str, turn_id: &str, started_at: u64) -> SessionTurnRecord {
+        SessionTurnRecord {
+            turn_id: turn_id.into(),
+            session_id: session_id.into(),
+            request_event_id: None,
+            user_message_json: serde_json::json!({}),
+            status: "running".into(),
+            response_json: None,
+            error_json: None,
+            started_at: Some(started_at),
+            completed_at: None,
+        }
+    }
+
+    /// A stale "running" row whose final response already went out is a
+    /// bookkeeping miss, not a lost turn: the sweep must close it as
+    /// completed (LATE_CLOSE), not brand it ZOMBIE_TURN_REPAIR — zombie
+    /// labels feed the consecutive-zombie role demotion counter.
+    #[test]
+    fn sweep_late_closes_served_turns_and_retires_synthetics() {
+        let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
+        let graph = GraphDomain::new(Arc::new(graph_store.adapter()));
+        let stale = unix_ts().saturating_sub(10_000);
+
+        // Served turn: response recorded, non-fail kind.
+        let mut served = running_turn("sess-sweep", "turn-served", stale);
+        served.response_json = Some(serde_json::json!({
+            "action": "model_response",
+            "agent_action": {"kind": "respond", "content": "pong"},
+        }));
+        graph.upsert_session_turn(&served).expect("upsert served");
+
+        // Legacy synthetic row (ledgered before the intake filter existed).
+        let synthetic = running_turn("sess-sweep", "life-autorecall-prefetch", stale);
+        graph
+            .upsert_session_turn(&synthetic)
+            .expect("upsert synthetic");
+
+        // Recorded fail-kind response: a genuine failure, still a zombie.
+        let mut failed_kind = running_turn("sess-sweep", "turn-failed-kind", stale);
+        failed_kind.response_json = Some(serde_json::json!({
+            "action": "model_response",
+            "agent_action": {"kind": "fail", "message": "provider dead"},
+        }));
+        graph
+            .upsert_session_turn(&failed_kind)
+            .expect("upsert failed-kind");
+
+        // True zombie: no response at all.
+        let zombie = running_turn("sess-sweep", "turn-zombie", stale);
+        graph.upsert_session_turn(&zombie).expect("upsert zombie");
+
+        let _response = IpcServer::handle_repair_stale_session_turns(&graph, None, 660);
+
+        let served = graph
+            .get_session_turn("sess-sweep", "turn-served")
+            .expect("lookup")
+            .expect("served row exists");
+        assert_eq!(served.status, "completed", "served turn late-closes");
+        assert_eq!(
+            served.error_json.as_ref().and_then(|e| e.get("note")),
+            Some(&serde_json::json!("LATE_CLOSE")),
+        );
+
+        let synthetic = graph
+            .get_session_turn("sess-sweep", "life-autorecall-prefetch")
+            .expect("lookup")
+            .expect("synthetic row exists");
+        assert_eq!(synthetic.status, "failed");
+        assert_eq!(
+            synthetic.error_json.as_ref().and_then(|e| e.get("error")),
+            Some(&serde_json::json!("SYNTHETIC_TURN_RETIRED")),
+            "synthetic rows retire quietly, not as zombies"
+        );
+
+        for tid in ["turn-failed-kind", "turn-zombie"] {
+            let row = graph
+                .get_session_turn("sess-sweep", tid)
+                .expect("lookup")
+                .expect("row exists");
+            assert_eq!(row.status, "failed");
+            assert_eq!(
+                row.error_json.as_ref().and_then(|e| e.get("error")),
+                Some(&serde_json::json!("ZOMBIE_TURN_REPAIR")),
+                "{tid} must still be reaped as a genuine zombie"
+            );
         }
     }
 
