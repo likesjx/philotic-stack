@@ -39,7 +39,15 @@ pub fn index_name(space: &SemanticSpace, label: &str) -> String {
 /// V001 migration index names.
 pub fn labels_for_space(space: &SemanticSpace) -> &'static [&'static str] {
     match space {
-        SemanticSpace::LifeEventSemantic => &["Event", "Signal", "OpenLoop"],
+        SemanticSpace::LifeEventSemantic => &[
+            "Event",
+            "Signal",
+            "OpenLoop",
+            "Trip",
+            "Appointment",
+            "Moment",
+            "Place",
+        ],
         SemanticSpace::GoalSystemSemantic => &[
             "Goal",
             "System",
@@ -47,6 +55,9 @@ pub fn labels_for_space(space: &SemanticSpace) -> &'static [&'static str] {
             "Project",
             "Routine",
             "NextAction",
+            "Subscription",
+            "Asset",
+            "CreativeWork",
         ],
         SemanticSpace::SkillToolSemantic => &[
             "GrowthHypothesis",
@@ -77,10 +88,11 @@ pub fn labels_for_space(space: &SemanticSpace) -> &'static [&'static str] {
 /// or `None` if the label has no vector index.
 pub fn embedding_space_for_label(label: &str) -> Option<&'static str> {
     match label {
-        "Event" | "Signal" | "OpenLoop" => Some("life_event_semantic"),
-        "Goal" | "System" | "Habit" | "Project" | "Routine" | "NextAction" => {
-            Some("goal_system_semantic")
+        "Event" | "Signal" | "OpenLoop" | "Trip" | "Appointment" | "Moment" | "Place" => {
+            Some("life_event_semantic")
         }
+        "Goal" | "System" | "Habit" | "Project" | "Routine" | "NextAction" | "Subscription"
+        | "Asset" | "CreativeWork" => Some("goal_system_semantic"),
         "GrowthHypothesis" | "GrowthExperiment" | "DriftFinding" | "CapabilityPatch"
         | "SkillPatch" | "ToolPatch" | "SchemaPatch" | "AttentionPatch" | "SystemPatch" => {
             Some("skill_tool_semantic")
@@ -1243,7 +1255,7 @@ mod tests {
         // relations (LIFE_GRAPH_ACTIVE S2) so recall expansion traverses
         // goal/commitment topology too.
         assert!(cypher.contains(
-            "MATCH (n)-[r:OWNS|SHAPES|SETS|SPAWNS|RELATES_TO|SCOPED_TO|ADVANCES|BLOCKED_BY|NEEDS_FOLLOWUP|PROMISED_TO|CONTAINS|SUPPORTS]-(related)"
+            "MATCH (n)-[r:OWNS|SHAPES|SETS|SPAWNS|RELATES_TO|SCOPED_TO|ADVANCES|BLOCKED_BY|NEEDS_FOLLOWUP|PROMISED_TO|CONTAINS|SUPPORTS|INVOLVES|OCCURS_AT|PART_OF|ABOUT|MAINTAINS|RENEWS]-(related)"
         ));
         assert!(cypher.contains("n.id IN ['l:ol:a', 'l:ol:b\\'quote']"));
         assert!(cypher.contains("coalesce(related.validation_state, 'inferred') <> 'retired'"));
@@ -1267,7 +1279,13 @@ mod tests {
                 "NEEDS_FOLLOWUP",
                 "PROMISED_TO",
                 "CONTAINS",
-                "SUPPORTS"
+                "SUPPORTS",
+                "INVOLVES",
+                "OCCURS_AT",
+                "PART_OF",
+                "ABOUT",
+                "MAINTAINS",
+                "RENEWS"
             ]
         );
         assert_eq!(

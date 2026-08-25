@@ -3500,9 +3500,18 @@ fn build_catalog() -> HashMap<String, ToolDefinition> {
                                         "description": "Life Graph node type. Must be one of: \
                                             Person, Role, Goal, System, Habit, Project, Commitment, \
                                             OpenLoop, NextAction, Routine, Decision, Preference, Value, \
-                                            Concern, Event, Signal, GrowthHypothesis, GrowthExperiment, \
+                                            Concern, Event, Signal, Place, Trip, Appointment, \
+                                            Subscription, Asset, CreativeWork, Moment, \
+                                            GrowthHypothesis, GrowthExperiment, \
                                             DriftFinding, CapabilityPatch, SkillPatch, ToolPatch, \
-                                            SchemaPatch, AttentionPatch, SystemPatch, StewardshipInstruction."
+                                            SchemaPatch, AttentionPatch, SystemPatch, StewardshipInstruction. \
+                                            Prefer the concrete lived-world nouns (Place, Trip, \
+                                            Appointment, Subscription, Asset, CreativeWork, Moment) \
+                                            over generic Events/Signals when one fits, and wire them \
+                                            with edges (INVOLVES→Person, OCCURS_AT→Place, \
+                                            PART_OF→Trip/Project, ABOUT→the thing a loop concerns, \
+                                            MAINTAINS/RENEWS→Asset/Subscription/CreativeWork). \
+                                            Consult life.ontology for the full vocabulary."
                                     },
                                     "datasource": {
                                         "type": "string",

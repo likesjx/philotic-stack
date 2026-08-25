@@ -19,7 +19,7 @@
 use serde_json::{Value, json};
 
 /// Bump when the vocabulary, conventions, or named query set changes shape.
-pub const ONTOLOGY_VERSION: &str = "1";
+pub const ONTOLOGY_VERSION: &str = "2";
 
 // ── Lifecycle vocabulary ─────────────────────────────────────────────────────
 
@@ -71,6 +71,13 @@ pub const NODE_LABELS: &[&str] = &[
     "Concern",
     "Commitment",
     "Decision",
+    "Place",
+    "Trip",
+    "Appointment",
+    "Subscription",
+    "Asset",
+    "CreativeWork",
+    "Moment",
 ];
 
 /// Structured date/time properties, in the order a "best date" coalesce
@@ -298,6 +305,32 @@ pub fn ontology_document() -> Value {
                         "provenance", "confidence", "resolved_at", "retired_by"],
             "auto_retirement_tag": "life-hygiene",
         },
+        "relationships": {
+            "living_cycle": crate::cypher::LIVING_CYCLE_REL_TYPES,
+            "endpoint_validated": crate::cypher::AGENDA_EDGE_RULES
+                .iter()
+                .map(|rule| json!({
+                    "rel_type": rule.rel_type,
+                    "source_labels": rule.source_labels,
+                    "target_labels": rule.target_labels,
+                }))
+                .collect::<Vec<_>>(),
+            "rule": "Edges are written on life.observe. The vocabulary is CLOSED: \
+                     living-cycle types are freeform-endpoint, endpoint-validated types \
+                     reject wrong source labels and report target_missing for wrong \
+                     targets. Prefer an edge over restating a noun in claim prose.",
+        },
+        "noun_guidance": {
+            "Place": "Somewhere life happens (home, an office, a park, an airport). Target of OCCURS_AT.",
+            "Trip": "A bounded journey with a date range (starts_at/ends_at); its Events/Appointments attach via PART_OF.",
+            "Appointment": "A scheduled slot with a provider or person (medical, service). Carries due_at/starts_at; INVOLVES the people.",
+            "Subscription": "A recurring paid membership or pass. Renewal work points at it via RENEWS.",
+            "Asset": "A durable owned thing (vehicle, home, passport, instrument). Upkeep points at it via MAINTAINS.",
+            "CreativeWork": "A piece the operator makes or maintains (music repertoire piece, writing). MAINTAINS keeps it alive.",
+            "Moment": "KEPT lived history — a past experience worth remembering (a dinner, a show, a milestone). \
+                       Confirmed past Events worth keeping become Moments (same INVOLVES/OCCURS_AT edges); \
+                       gardening retires stale proposed Events but NEVER retires Moments.",
+        },
         "named_queries": NamedMaintenanceQuery::ALL
             .iter()
             .map(NamedMaintenanceQuery::catalog_entry)
@@ -315,6 +348,8 @@ pub fn ontology_document() -> Value {
             "Terminal nodes never resurface in recall, briefs, or default lists.",
             "Every mutation must be verified by re-reading the node before it is reported.",
             "Report only node ids returned by tools; never invent ids.",
+            "Prefer nouns + edges over prose: a loop ABOUT an Asset beats restating the asset in text.",
+            "Kept history lives as Moment nodes; gardening never retires a Moment.",
         ],
     })
 }
@@ -365,6 +400,86 @@ mod tests {
         let c = NamedMaintenanceQuery::RecentlyRetired.cypher(10);
         assert!(c.contains("NOT ("));
         assert!(c.contains("retired_by"));
+    }
+
+    /// Lockstep: every endpoint-validated edge names only labels the write
+    /// path accepts and the ontology documents; every vector-swept label is
+    /// a known + documented label. Catches noun/verb drift across cypher.rs,
+    /// projection.rs, and ontology.rs at compile-test time.
+    #[test]
+    fn vocabulary_lockstep_across_edges_spaces_and_labels() {
+        for rule in crate::cypher::AGENDA_EDGE_RULES {
+            for label in rule.source_labels.iter().chain(rule.target_labels) {
+                assert!(
+                    crate::cypher::is_known_label(label),
+                    "{} endpoint {label} must be a known write label",
+                    rule.rel_type
+                );
+                assert!(
+                    is_known_label(label),
+                    "{} endpoint {label} must be in the ontology",
+                    rule.rel_type
+                );
+            }
+        }
+        for space in [
+            crate::SemanticSpace::LifeEventSemantic,
+            crate::SemanticSpace::GoalSystemSemantic,
+            crate::SemanticSpace::SkillToolSemantic,
+            crate::SemanticSpace::RolePersonSemantic,
+            crate::SemanticSpace::MemoryBridgeSemantic,
+        ] {
+            for label in crate::projection::labels_for_space(&space) {
+                assert!(
+                    crate::projection::embedding_space_for_label(label).is_some(),
+                    "swept label {label} must map to an embedding space"
+                );
+            }
+        }
+        // Every new lived-world noun is swept, so it MUST have a space (and
+        // therefore a V006 index).
+        for label in [
+            "Place",
+            "Trip",
+            "Appointment",
+            "Subscription",
+            "Asset",
+            "CreativeWork",
+            "Moment",
+        ] {
+            assert!(
+                crate::projection::embedding_space_for_label(label).is_some(),
+                "lived-world noun {label} needs an embedding space + vector index"
+            );
+        }
+    }
+
+    #[test]
+    fn ontology_document_carries_relationship_vocabulary() {
+        let doc = ontology_document();
+        let rels = &doc["relationships"]["endpoint_validated"];
+        let names: Vec<&str> = rels
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["rel_type"].as_str().unwrap())
+            .collect();
+        for verb in [
+            "INVOLVES",
+            "OCCURS_AT",
+            "PART_OF",
+            "ABOUT",
+            "MAINTAINS",
+            "RENEWS",
+        ] {
+            assert!(names.contains(&verb), "missing verb {verb}");
+        }
+        assert!(
+            doc["noun_guidance"]["Moment"]
+                .as_str()
+                .unwrap()
+                .contains("NEVER retires")
+        );
     }
 
     #[test]
