@@ -124,6 +124,18 @@ impl NodeRegistry {
         );
     }
 
+    /// Test-only support: backdate a node's `last_seen` so freshness-gated
+    /// paths can be exercised without real waits. Hidden from docs; never
+    /// call from production code.
+    #[doc(hidden)]
+    pub fn backdate_last_seen(&mut self, node_id: &str, age: Duration) {
+        if let Some(status) = self.nodes.get_mut(node_id) {
+            if let Some(backdated) = Instant::now().checked_sub(age) {
+                status.last_seen = backdated;
+            }
+        }
+    }
+
     /// Transitional compatibility shim for older call sites that still update a whole node in
     /// one shot. New code should prefer `observe_heartbeat` and `observe_capability_sync_chunk`.
     pub fn update_node(

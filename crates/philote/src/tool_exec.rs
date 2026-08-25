@@ -835,7 +835,9 @@ impl AgentRuntime {
                 );
             }
 
-            self.ipc_client
+            let dispatch_target_role = route.target_role.clone();
+            let response = self
+                .ipc_client
                 .send_request_with_timeout(
                     IpcRequest::EmitTask {
                         target_node: route.target_node,
@@ -847,6 +849,55 @@ impl AgentRuntime {
                 )
                 .await
                 .context("tool dispatch: ipc ack failed or timed out after 30s")?;
+
+            // The hotel REFUSES an emit whose target node is unknown or whose
+            // mesh link is down (TARGET_NODE_UNREACHABLE). That refusal used
+            // to be dropped on the floor here — the `?` above only fires on
+            // transport failure, not on `ok: false` — so the turn sat in
+            // WaitingTool for the full 300s watchdog (live incident
+            // 2026-08-25: mac-jane's tailnet down, every cross-hotel life.*
+            // call black-holed). Convert the refusal into an immediate tool
+            // failure the model can see and adapt to.
+            if let philotic_client::IpcResponse::Standard {
+                ok: false,
+                code,
+                message,
+                ..
+            } = response
+            {
+                warn!(
+                    tool = tool_req.tool_name.as_str(),
+                    code = code.as_str(),
+                    "tool dispatch refused by hotel — surfacing as tool failure"
+                );
+                let content = format!(
+                    "Tool call failed: {message} (provider: {dispatch_target_role}, capability: {})",
+                    tool_req.tool_name
+                );
+                return self
+                    .handle_tool_result(InboundTaskPayload {
+                        action: Some("tool_result".into()),
+                        session_id: Some(tool_req.session_id.clone()),
+                        turn_id: Some(tool_req.turn_id.clone()),
+                        chat_id: Some(tool_req.chat_id.clone()),
+                        tool_name: Some(tool_req.tool_name.clone()),
+                        content: Some(content),
+                        error: Some(philotic_client::TaskErrorPayload {
+                            kind: "provider_failure".into(),
+                            message,
+                            code: Some(code),
+                            component: Some("mesh_dispatch".into()),
+                            provider: Some(dispatch_target_role),
+                            capability: Some(tool_req.tool_name.clone()),
+                            retryable: Some(true),
+                            sub_kind: Some("network_error".into()),
+                            status: None,
+                            error_class: Some("retry_same_provider".into()),
+                        }),
+                        ..Default::default()
+                    })
+                    .await;
+            }
 
             Ok(())
         })
