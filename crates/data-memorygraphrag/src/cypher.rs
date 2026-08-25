@@ -35,6 +35,16 @@ const KNOWN_LABELS: &[&str] = &[
     "AttentionPatch",
     "SystemPatch",
     "StewardshipInstruction",
+    // Lived-world nouns (nouns-verbs expansion, 2026-08-25): concrete things
+    // an operator's life is made of, so loops/actions can be ABOUT something
+    // instead of restating it in prose.
+    "Place",
+    "Trip",
+    "Appointment",
+    "Subscription",
+    "Asset",
+    "CreativeWork",
+    "Moment",
 ];
 
 /// Living-cycle relationship types allowed on `life.observe` edge writes.
@@ -104,6 +114,52 @@ pub const AGENDA_EDGE_RULES: &[AgendaEdgeRule] = &[
         rel_type: "SUPPORTS",
         source_labels: &["System", "Habit", "Routine"],
         target_labels: &["Goal", "Habit"],
+    },
+    // Lived-world verbs (nouns-verbs expansion, 2026-08-25). Same closed,
+    // endpoint-validated contract as the agenda six.
+    AgendaEdgeRule {
+        rel_type: "INVOLVES",
+        source_labels: &["Event", "Trip", "Appointment", "Moment", "Commitment"],
+        target_labels: &["Person"],
+    },
+    AgendaEdgeRule {
+        rel_type: "OCCURS_AT",
+        source_labels: &["Event", "Trip", "Appointment", "Moment", "Routine"],
+        target_labels: &["Place"],
+    },
+    AgendaEdgeRule {
+        rel_type: "PART_OF",
+        source_labels: &["Event", "Appointment", "Moment", "NextAction"],
+        target_labels: &["Trip", "Project"],
+    },
+    AgendaEdgeRule {
+        rel_type: "ABOUT",
+        source_labels: &[
+            "OpenLoop",
+            "NextAction",
+            "Commitment",
+            "Decision",
+            "Concern",
+            "Signal",
+        ],
+        target_labels: &[
+            "Person",
+            "Place",
+            "Asset",
+            "Subscription",
+            "CreativeWork",
+            "Trip",
+        ],
+    },
+    AgendaEdgeRule {
+        rel_type: "MAINTAINS",
+        source_labels: &["Routine", "Habit", "NextAction"],
+        target_labels: &["Asset", "CreativeWork", "Subscription"],
+    },
+    AgendaEdgeRule {
+        rel_type: "RENEWS",
+        source_labels: &["NextAction", "OpenLoop", "Commitment"],
+        target_labels: &["Subscription", "Asset"],
     },
 ];
 
@@ -1048,6 +1104,50 @@ mod tests {
                     "SUPPORTS",
                     vec!["System", "Habit", "Routine"],
                     vec!["Goal", "Habit"]
+                ),
+                (
+                    "INVOLVES",
+                    vec!["Event", "Trip", "Appointment", "Moment", "Commitment"],
+                    vec!["Person"]
+                ),
+                (
+                    "OCCURS_AT",
+                    vec!["Event", "Trip", "Appointment", "Moment", "Routine"],
+                    vec!["Place"]
+                ),
+                (
+                    "PART_OF",
+                    vec!["Event", "Appointment", "Moment", "NextAction"],
+                    vec!["Trip", "Project"]
+                ),
+                (
+                    "ABOUT",
+                    vec![
+                        "OpenLoop",
+                        "NextAction",
+                        "Commitment",
+                        "Decision",
+                        "Concern",
+                        "Signal"
+                    ],
+                    vec![
+                        "Person",
+                        "Place",
+                        "Asset",
+                        "Subscription",
+                        "CreativeWork",
+                        "Trip"
+                    ]
+                ),
+                (
+                    "MAINTAINS",
+                    vec!["Routine", "Habit", "NextAction"],
+                    vec!["Asset", "CreativeWork", "Subscription"]
+                ),
+                (
+                    "RENEWS",
+                    vec!["NextAction", "OpenLoop", "Commitment"],
+                    vec!["Subscription", "Asset"]
                 ),
             ],
             "agenda edge vocabulary changed — update LIFE_GRAPH_SCHEMA.md too"
