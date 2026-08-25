@@ -5242,8 +5242,8 @@ impl AgentRuntime {
                 task_id: original_task_id,
                 error_code: "APPROVAL_CANCELLED".into(),
                 reason: cancel_reason.to_string(),
-                session_id: None,
-                turn_id: None,
+                session_id: Some(session_id.clone()),
+                turn_id: Some(original_turn_id.clone()),
             })
             .await?;
 
