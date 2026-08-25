@@ -7025,11 +7025,23 @@ impl AgentRuntime {
         // Auto-activate the agent's default role incarnation on fresh sessions so the
         // correct manifest, toolset, and skill guidance are present from turn zero
         // without requiring an explicit handoff.to_role call.
+        //
+        // A role-incarnation process (PHILOTIC_ROLE_NAME set) exists to serve
+        // exactly that role: its fresh sessions activate ITS role, not the
+        // agent's default. Before this, a whisper to Chronos materialized a
+        // Chronos philote whose paracrine session then auto-activated
+        // `orchestrator` — the specialist answered without the specialist's
+        // lens, manifest, or toolset (found live 2026-08-25).
         let default_role = self
-            .default_agent_profile
-            .default_role_name
+            .role_name
             .clone()
             .filter(|role| !role.trim().is_empty())
+            .or_else(|| {
+                self.default_agent_profile
+                    .default_role_name
+                    .clone()
+                    .filter(|role| !role.trim().is_empty())
+            })
             .unwrap_or_else(|| "orchestrator".into());
         {
             if let Some(activation) = self.fetch_role_activation(&default_role).await {

@@ -3230,6 +3230,39 @@ fn deactivate_legacy_managed_guests(
                 return true;
             }
 
+            // Dynamically-materialized role-philotes are NOT legacy. Their
+            // config carries PHILOTIC_ROLE_NAME (seeded by ParacrineEmit /
+            // the role plane at first whisper) and they are never in the
+            // static seed list — so the `{hotel}:philote-*` legacy shape
+            // below matched every one of them, and each hotel boot
+            // deactivated them all. A deactivated role guest can never be
+            // re-materialized (`ensure_guest_active` honors is_active=0 as
+            // operator intent), so one restart permanently killed delegation
+            // to that role — found live 2026-08-25 as Beacon's whisper to
+            // Chronos black-holing (DEF-085/DEF-086).
+            let is_role_philote = serde_json::from_str::<serde_json::Value>(&guest.config_json)
+                .ok()
+                .and_then(|v| {
+                    v.pointer("/env/PHILOTIC_ROLE_NAME")
+                        .and_then(|r| r.as_str())
+                        .map(str::to_string)
+                })
+                .is_some_and(|r| !r.is_empty());
+            if is_role_philote {
+                return false;
+            }
+            // Role-incarnation identity records ("{agent}:{role}", role
+            // "agent") are likewise live delegation surface, not legacy —
+            // the bare legacy ids the role-set arm below targets never
+            // contained ':'. Hotel-prefixed ids are NOT exempted here; the
+            // hotel-prefixed legacy shapes keep their existing sweep.
+            if guest.role == "agent"
+                && guest.guest_id.contains(':')
+                && !guest.guest_id.starts_with(&format!("{hotel_name}:"))
+            {
+                return false;
+            }
+
             let hotel_prefixed_legacy_guest = guest
                 .guest_id
                 .strip_prefix(&format!("{hotel_name}:"))
@@ -10625,6 +10658,91 @@ mod tests {
             .find(|guest| guest.guest_id == format!("{hotel_name}:hegemon-gateway-jane"))
             .expect("legacy hegemon predecessor guest should remain in graph");
         assert!(!legacy_hegemon.is_active);
+    }
+
+    /// DEF-086: the legacy sweep matched `{hotel}:philote-*` — the exact
+    /// shape ParacrineEmit seeds for dynamically-materialized role-philotes —
+    /// so every hotel boot deactivated every specialist role guest, and a
+    /// deactivated role guest can never be re-materialized (whispers to it
+    /// black-holed). Role-philotes (config env carries PHILOTIC_ROLE_NAME)
+    /// and role-incarnation identity records (`{agent}:{role}`, role
+    /// "agent") must survive the sweep; genuine legacy rows still fall.
+    #[test]
+    fn deactivate_legacy_managed_guests_spares_role_philotes_and_incarnations() {
+        let storage = SqliteGraphStorage::open(":memory:").expect("open sqlite");
+        let graph = GraphDomain::new(Arc::new(storage.adapter()));
+        let hotel_name = "startup-test-hotel";
+        let profile = default_agent_profile_for_hotel(hotel_name);
+        let desired = guest_seed_for_profile(hotel_name, &profile);
+        let guests = vec![
+            // Dynamic role-philote (seeded by ParacrineEmit at first whisper).
+            GuestRecord {
+                hotel_name: hotel_name.into(),
+                guest_id: format!("{hotel_name}:philote-Chronos"),
+                role: "Chronos".into(),
+                config_json: serde_json::json!({
+                    "command": "philote",
+                    "args": [],
+                    "env": {
+                        "PHILOTIC_AGENT_ID": "agent-beacon",
+                        "PHILOTIC_ROLE_NAME": "Chronos",
+                    }
+                })
+                .to_string(),
+                is_active: true,
+                active_pid: None,
+                last_active_at: None,
+            },
+            // Role-incarnation identity record.
+            GuestRecord {
+                hotel_name: hotel_name.into(),
+                guest_id: "agent-beacon:Chronos".into(),
+                role: "agent".into(),
+                config_json: serde_json::json!({}).to_string(),
+                is_active: true,
+                active_pid: None,
+                last_active_at: None,
+            },
+            // Genuine legacy row: bare philote shape, no PHILOTIC_ROLE_NAME.
+            GuestRecord {
+                hotel_name: hotel_name.into(),
+                guest_id: format!("{hotel_name}:philote-jane"),
+                role: "agent".into(),
+                config_json: serde_json::json!({ "command": "target/debug/philote" }).to_string(),
+                is_active: true,
+                active_pid: None,
+                last_active_at: None,
+            },
+        ];
+        graph.seed_guests(hotel_name, &guests).expect("seed guests");
+        graph
+            .seed_guests(hotel_name, &desired)
+            .expect("seed desired guests");
+
+        deactivate_legacy_managed_guests(&graph, hotel_name, &[profile], &desired)
+            .expect("sweep should succeed");
+
+        let stored = graph
+            .list_guests(hotel_name, false)
+            .expect("list guests after cleanup");
+        let by_id = |id: &str| {
+            stored
+                .iter()
+                .find(|g| g.guest_id == id)
+                .unwrap_or_else(|| panic!("guest {id} should remain in graph"))
+        };
+        assert!(
+            by_id(&format!("{hotel_name}:philote-Chronos")).is_active,
+            "role-philote must survive the boot sweep"
+        );
+        assert!(
+            by_id("agent-beacon:Chronos").is_active,
+            "role-incarnation identity record must survive the boot sweep"
+        );
+        assert!(
+            !by_id(&format!("{hotel_name}:philote-jane")).is_active,
+            "genuine legacy philote row must still be deactivated"
+        );
     }
 
     #[test]
