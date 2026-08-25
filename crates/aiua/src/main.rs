@@ -4192,9 +4192,10 @@ fn seed_abstract_tool_catalog(graph: &GraphDomain) -> anyhow::Result<()> {
                 "type": "object",
                 "properties": {
                     "patch_id": { "type": "string" },
-                    "decision": { "type": "string", "enum": ["confirm", "reject"] }
+                    "decision": { "type": "string", "enum": ["confirm", "reject"] },
+                    "operator_approved": { "type": "boolean", "description": "Must be true; set only after explicit operator approval in conversation." }
                 },
-                "required": ["patch_id", "decision"]
+                "required": ["patch_id", "decision", "operator_approved"]
             }),
             class: "life_graph".into(),
             tool_markers: Vec::new(),

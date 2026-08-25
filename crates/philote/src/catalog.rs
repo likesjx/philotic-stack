@@ -4084,10 +4084,16 @@ fn build_catalog() -> HashMap<String, ToolDefinition> {
                 .into(),
             input_schema: json!({
                 "type": "object",
-                "required": ["patch_id", "decision"],
+                "required": ["patch_id", "decision", "operator_approved"],
                 "properties": {
                     "patch_id": {"type": "string", "description": "The patch to decide."},
-                    "decision": {"type": "string", "enum": ["confirm", "reject"]}
+                    "decision": {"type": "string", "enum": ["confirm", "reject"]},
+                    "operator_approved": {
+                        "type": "boolean",
+                        "description": "MUST be true, and only after the operator explicitly \
+                            approved or rejected this patch in conversation — this call IS the \
+                            operator-confirmation step. Omitting it blocks the apply."
+                    }
                 }
             }),
             class: Some("life_graph".into()),
