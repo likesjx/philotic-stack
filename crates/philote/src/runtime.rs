@@ -10449,6 +10449,104 @@ mod tests {
         );
     }
 
+    /// A whisper past its deadline must DEGRADE, not die: the specialist's
+    /// silence is converted into a tool_result the model can react to, the
+    /// turn continues (re-enters the model), no eviction fires, and the heal
+    /// queue gets `paracrine_whisper_timeout` instead of a stuck-turn event.
+    #[tokio::test]
+    async fn whisper_deadline_converts_to_tool_result_not_eviction() {
+        let socket_path = format!("/tmp/philote-wdl-{}.sock", Uuid::new_v4().simple());
+        let listener = tokio::net::UnixListener::bind(&socket_path).expect("bind");
+        let emitted = std::sync::Arc::new(std::sync::Mutex::new(Vec::<serde_json::Value>::new()));
+        let server = tokio::spawn(run_recording_hotel(listener, emitted.clone()));
+
+        let identity = philotic_client::GuestIdentity {
+            guest_id: "agent-wdl".into(),
+            role: "agent".into(),
+            supported_tools: Vec::new(),
+        };
+        let client = philotic_client::PhiloticClient::connect_at(&socket_path, identity)
+            .await
+            .expect("connect to stub hotel");
+        let mut runtime = AgentRuntime::new(client, "agent-wdl");
+
+        let session_id = "sess-wdl";
+        runtime
+            .ensure_session_loaded(session_id, "telegram")
+            .await
+            .expect("session load");
+
+        let turn = def004_working_turn("turn-wdl", "delegate.whisper");
+        runtime
+            .sessions
+            .get_mut(session_id)
+            .expect("session exists")
+            .start_turn(turn);
+
+        // Backdate past PARACRINE_WHISPER_WAIT_SECS (660s).
+        let past = std::time::Instant::now()
+            .checked_sub(std::time::Duration::from_secs(700))
+            .expect("backdate instant");
+        {
+            let state = runtime
+                .sessions
+                .get_mut(session_id)
+                .expect("session exists");
+            state.turn_waiting_since = Some(past);
+            state.active_turn_since = Some(past);
+        }
+        runtime
+            .total_active_since
+            .insert(session_id.to_string(), past);
+
+        runtime.evict_timed_out_turns().await;
+
+        let state = runtime.sessions.get(session_id).expect("session");
+        let turn = state
+            .active_turn
+            .as_ref()
+            .expect("whisper deadline must NOT evict the turn");
+        assert!(
+            !matches!(turn.phase, TurnPhase::WaitingTool),
+            "turn must have moved on from WaitingTool, got {:?}",
+            turn.phase
+        );
+
+        drop(runtime);
+        let _ = server.await;
+        let _ = std::fs::remove_file(&socket_path);
+
+        let emitted = emitted.lock().unwrap();
+        assert!(
+            emitted
+                .iter()
+                .any(|e| e["heal_event"]["pattern_tag"] == "paracrine_whisper_timeout"),
+            "must push the whisper-timeout heal event: {:#?}",
+            *emitted
+        );
+        assert!(
+            !emitted.iter().any(|e| {
+                e["heal_event"]["pattern_tag"]
+                    .as_str()
+                    .map(|t| t.starts_with("stuck_turn_evicted"))
+                    .unwrap_or(false)
+            }),
+            "no eviction heal event may fire for a whisper deadline: {:#?}",
+            *emitted
+        );
+        assert!(
+            emitted.iter().any(|e| {
+                e["task"]["action"] == "generate_text"
+                    && e["task"]["prompt"]
+                        .as_str()
+                        .map(|p| p.contains("did not respond"))
+                        .unwrap_or(false)
+            }),
+            "specialist silence must re-enter the model as a visible tool failure: {:#?}",
+            *emitted
+        );
+    }
+
     /// Fallback-ladder + oracle exhaustion must push a
     /// `fallback_exhausted:{last_provider}` heal event before failing the turn.
     #[tokio::test]

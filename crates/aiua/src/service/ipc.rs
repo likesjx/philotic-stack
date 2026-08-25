@@ -8509,8 +8509,18 @@ impl IpcServer {
                     guard.get(&role).is_some_and(|subs| !subs.is_empty())
                 };
 
+                // A whisper the hotel cannot deliver-or-credibly-park must be
+                // REFUSED, not swallowed: a philote blocking on
+                // wait_for_response trusts a success response and parks its
+                // whole turn for PARACRINE_WHISPER_WAIT_SECS. Live incident
+                // 2026-08-25: Chronos could not be materialized (1ms after the
+                // park) yet the handler returned success — Beacon sat deaf for
+                // 660s and the operator got an eviction apology instead of an
+                // immediate, actionable "specialist unavailable".
+                let mut refusal: Option<String> = None;
+
                 if has_subscriber {
-                    Self::deliver_inbound_task(
+                    let delivered = Self::deliver_inbound_task(
                         inboxes,
                         local_node_id,
                         &role,
@@ -8519,6 +8529,11 @@ impl IpcServer {
                         task_json,
                     )
                     .await;
+                    if !delivered {
+                        refusal = Some(format!(
+                            "specialist role '{role}' lost its inbox subscriber before delivery"
+                        ));
+                    }
                 } else {
                     // No live subscriber — look up the role incarnation, park the task
                     // under the incarnation's guest_id, and trigger materialization of
@@ -8709,23 +8724,41 @@ impl IpcServer {
                                     }
                                 }
 
-                                // Trigger materialization of philote.
+                                // Trigger materialization of philote. A park is only
+                                // credible when a specialist will actually connect to
+                                // flush it — a refused/failed materialization means the
+                                // parked task would wait forever, so refuse the emit.
                                 if let Some(requester) = materialization_requester {
                                     match requester.ensure_guest_active(&hotel_guest_id).await {
                                         Ok(true) => info!(
                                             "Role-philote [{}] materialization triggered.",
                                             hotel_guest_id
                                         ),
-                                        Ok(false) => warn!(
-                                            "Role-philote [{}] could not be materialized.",
-                                            hotel_guest_id
-                                        ),
-                                        Err(e) => warn!(
-                                            "Role-philote [{}] materialization error: {e}",
-                                            hotel_guest_id
-                                        ),
+                                        Ok(false) => {
+                                            warn!(
+                                                "Role-philote [{}] could not be materialized.",
+                                                hotel_guest_id
+                                            );
+                                            refusal = Some(format!(
+                                                "specialist role '{role}' could not be \
+                                                 materialized (guest {hotel_guest_id} refused — \
+                                                 likely deactivated)"
+                                            ));
+                                        }
+                                        Err(e) => {
+                                            warn!(
+                                                "Role-philote [{}] materialization error: {e}",
+                                                hotel_guest_id
+                                            );
+                                            refusal = Some(format!(
+                                                "specialist role '{role}' materialization \
+                                                 error: {e}"
+                                            ));
+                                        }
                                     }
-                                    // Trigger materialization of the companion agent-graph guest.
+                                    // Trigger materialization of the companion agent-graph
+                                    // guest. Non-fatal: the specialist can still answer
+                                    // (datasource tools degrade, cognition does not).
                                     match requester.ensure_guest_active(&graph_runner_id).await {
                                         Ok(true) => info!(
                                             "Agent-graph guest [{}] materialization triggered.",
@@ -8740,32 +8773,64 @@ impl IpcServer {
                                             graph_runner_id
                                         ),
                                     }
+                                } else {
+                                    refusal = Some(format!(
+                                        "specialist role '{role}' is not running and this \
+                                         hotel has no materializer to spawn it"
+                                    ));
                                 }
                             } else {
                                 warn!(
                                     "Cannot materialize role-philote for '{}': local hotel record missing.",
                                     role
                                 );
+                                refusal = Some(format!(
+                                    "cannot materialize specialist role '{role}': local \
+                                     hotel record missing"
+                                ));
+                            }
+
+                            // A refused park must not linger: a specialist that later
+                            // materializes for another reason would flush a task whose
+                            // caller already gave up and was told so.
+                            if refusal.is_some() {
+                                let mut guard = parked_inbound.lock().await;
+                                if let Some(parked) = guard.get_mut(&role_guest_id) {
+                                    parked.retain(|t| t.task_id != task_id);
+                                    if parked.is_empty() {
+                                        guard.remove(&role_guest_id);
+                                    }
+                                }
                             }
                         }
                         Ok(None) => {
                             warn!(
                                 role = %role,
-                                "No role incarnation found for paracrine target '{}'; task dropped.",
+                                "No role incarnation found for paracrine target '{}'; refusing emit.",
                                 role
                             );
+                            refusal = Some(format!(
+                                "no role incarnation named '{role}' exists on this hotel"
+                            ));
                         }
                         Err(e) => {
                             warn!(
                                 role = %role,
-                                "Role incarnation lookup failed for '{}': {e}; task dropped.",
+                                "Role incarnation lookup failed for '{}': {e}; refusing emit.",
                                 role
                             );
+                            refusal =
+                                Some(format!("role incarnation lookup failed for '{role}': {e}"));
                         }
                     }
                 }
 
-                IpcResponse::success("paracrine_emit", None)
+                match refusal {
+                    Some(reason) => {
+                        IpcResponse::error("paracrine_emit", "SPECIALIST_UNAVAILABLE", reason)
+                    }
+                    None => IpcResponse::success("paracrine_emit", None),
+                }
             }
 
             IpcRequest::GetHotelStatus => {
@@ -18810,6 +18875,78 @@ pub(crate) mod tests {
         assert_eq!(guest_id, "vps-jane:life-graph-runner");
         assert_eq!(severity, "medium");
         assert_eq!(tag, "cross_hotel_misroute");
+    }
+
+    /// A whisper the hotel cannot deliver or credibly park must be REFUSED
+    /// (ok: false, SPECIALIST_UNAVAILABLE) — never swallowed with success.
+    /// A blocking philote trusts a success and parks its whole turn for the
+    /// 660s whisper deadline (live: Beacon → Chronos, 2026-08-25).
+    #[tokio::test]
+    async fn paracrine_emit_to_unknown_role_is_refused_not_swallowed() {
+        let _env_guard = ipc_env_guard();
+        let socket_path = test_socket_path();
+        let (dispatcher_tx, _dispatcher_rx) = test_dispatcher_channel();
+        // Empty graph: no role incarnation named anything exists.
+        let graph = Arc::new(GraphDomain::new(Arc::new(TestGraphAdapter)));
+        let server = IpcServer::new(socket_path.clone(), "local-aiua-01", dispatcher_tx, graph);
+
+        let server_task = tokio::spawn(async move {
+            server.run().await.expect("ipc server should run");
+        });
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        unsafe {
+            std::env::set_var("PHILOTIC_HOTEL_SOCKET", &socket_path);
+        }
+
+        let mut agent = PhiloticClient::connect(GuestIdentity {
+            guest_id: "agent-whisperer".into(),
+            role: "agent".into(),
+            supported_tools: Vec::new(),
+        })
+        .await
+        .expect("agent connect");
+
+        let resp = agent
+            .send_request(IpcRequest::ParacrineEmit {
+                role: "ghost-role".into(),
+                exosome: philotic_client::Exosome {
+                    prompt: "ping".into(),
+                    context: None,
+                    paracrine_id: Some("test-paracrine-1".into()),
+                    response_routing: None,
+                    source_session_id: Some("telegram:1:agent-whisperer".into()),
+                    source_chat_id: Some("1".into()),
+                },
+                reply_to_node: "local-aiua-01".into(),
+                reply_to_role: "agent".into(),
+                reply_to_guest_id: None,
+                timeout_secs: None,
+            })
+            .await
+            .expect("transport must succeed — the refusal rides the response");
+
+        match resp {
+            IpcResponse::Standard {
+                ok, code, message, ..
+            } => {
+                assert!(!ok, "unknown specialist must be refused, got ok=true");
+                assert_eq!(code, "SPECIALIST_UNAVAILABLE");
+                assert!(
+                    message.contains("ghost-role"),
+                    "refusal must name the role: {message}"
+                );
+            }
+            other => panic!("expected Standard refusal, got {other:?}"),
+        }
+
+        unsafe {
+            std::env::remove_var("PHILOTIC_HOTEL_SOCKET");
+        }
+        server_task.abort();
+        let _ = server_task.await;
+        if std::path::Path::new(&socket_path).exists() {
+            let _ = std::fs::remove_file(&socket_path);
+        }
     }
 
     #[tokio::test]
