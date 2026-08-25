@@ -16,7 +16,17 @@
 //! drift: closures written to a non-canonical property (`loop_status`) and a
 //! terminal value (`resolved`) missing from the exclusion set.
 
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+
+/// The five semantic-space index prefixes (see `projection::index_name`).
+pub const SEMANTIC_SPACE_PREFIXES: &[&str] = &[
+    "life_event_semantic",
+    "goal_system_semantic",
+    "skill_tool_semantic",
+    "role_person_semantic",
+    "memory_bridge_semantic",
+];
 
 /// Bump when the vocabulary, conventions, or named query set changes shape.
 pub const ONTOLOGY_VERSION: &str = "2";
@@ -140,6 +150,197 @@ pub fn list_row_projection(var: &str) -> String {
          {var}.retired_by AS retired_by",
         best = best_date_expr(var),
     )
+}
+
+// ── Runtime ontology extensions (governed self-serve vocabulary) ─────────────
+//
+// The compiled vocabulary above is the CORE. Extensions are new labels and
+// endpoint-validated edges added at RUNTIME through the governed patch
+// pipeline: the steward proposes them via `life.patch.propose`
+// (`patch_kind: schema_patch`, `ontology_extension` payload), the operator
+// confirms, and `life.patch.apply` validates the spec, creates the vector
+// index for each new label, and persists the merged set on the
+// `OntologyExtension` graph node. Every read/write surface consults
+// core ∪ extensions, so an applied extension is live vocabulary immediately —
+// no code change, no deploy. Structural changes (new named queries, date
+// semantics, new spaces) still go through code.
+
+/// A label added at runtime. `space` must be one of
+/// [`SEMANTIC_SPACE_PREFIXES`]; apply creates `{space}__{name}` in Memgraph.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExtensionLabel {
+    pub name: String,
+    pub space: String,
+    #[serde(default)]
+    pub guidance: String,
+}
+
+/// An endpoint-validated relationship added at runtime. Same closed-contract
+/// semantics as [`crate::cypher::AGENDA_EDGE_RULES`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExtensionEdge {
+    pub rel_type: String,
+    pub source_labels: Vec<String>,
+    pub target_labels: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OntologyExtensions {
+    #[serde(default)]
+    pub labels: Vec<ExtensionLabel>,
+    #[serde(default)]
+    pub edges: Vec<ExtensionEdge>,
+}
+
+/// Identifier shape for an extension LABEL: PascalCase, letters/digits only.
+/// Interpolated into Cypher (index names, label predicates) — the shape gate
+/// IS the injection guard.
+pub fn valid_extension_label_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    matches!(chars.next(), Some(c) if c.is_ascii_uppercase())
+        && name.len() >= 2
+        && name.len() <= 40
+        && chars.all(|c| c.is_ascii_alphanumeric())
+}
+
+/// Identifier shape for an extension REL_TYPE: SCREAMING_SNAKE.
+pub fn valid_extension_rel_type(rel: &str) -> bool {
+    let mut chars = rel.chars();
+    matches!(chars.next(), Some(c) if c.is_ascii_uppercase())
+        && rel.len() >= 2
+        && rel.len() <= 40
+        && chars.all(|c| c.is_ascii_uppercase() || c == '_')
+}
+
+impl OntologyExtensions {
+    pub fn is_extension_label(&self, label: &str) -> bool {
+        self.labels.iter().any(|l| l.name == label)
+    }
+
+    pub fn edge(&self, rel_type: &str) -> Option<&ExtensionEdge> {
+        self.edges.iter().find(|e| e.rel_type == rel_type)
+    }
+
+    /// Extension labels swept by a given semantic-space index prefix.
+    pub fn labels_for_space_prefix(&self, prefix: &str) -> Vec<&str> {
+        self.labels
+            .iter()
+            .filter(|l| l.space == prefix)
+            .map(|l| l.name.as_str())
+            .collect()
+    }
+
+    /// Validate a spec against the core vocabulary plus `existing` extensions
+    /// (endpoints may reference either). Collisions with core names are
+    /// rejected — an extension can never shadow compiled vocabulary.
+    pub fn validate_against(&self, existing: &OntologyExtensions) -> Result<(), Vec<String>> {
+        let mut violations = Vec::new();
+        if self.labels.is_empty() && self.edges.is_empty() {
+            violations.push("ontology_extension must add at least one label or edge".into());
+        }
+        for label in &self.labels {
+            if !valid_extension_label_name(&label.name) {
+                violations.push(format!(
+                    "label '{}' is not a valid identifier (PascalCase, 2-40 alphanumeric chars)",
+                    label.name
+                ));
+            }
+            if crate::cypher::is_known_label(&label.name) {
+                violations.push(format!(
+                    "label '{}' collides with the compiled core vocabulary",
+                    label.name
+                ));
+            }
+            if !SEMANTIC_SPACE_PREFIXES.contains(&label.space.as_str()) {
+                violations.push(format!(
+                    "label '{}' names unknown space '{}' (expected one of: {})",
+                    label.name,
+                    label.space,
+                    SEMANTIC_SPACE_PREFIXES.join(", ")
+                ));
+            }
+        }
+        let label_known = |name: &str| {
+            crate::cypher::is_known_label(name)
+                || existing.is_extension_label(name)
+                || self.labels.iter().any(|l| l.name == name)
+        };
+        for edge in &self.edges {
+            if !valid_extension_rel_type(&edge.rel_type) {
+                violations.push(format!(
+                    "rel_type '{}' is not a valid identifier (SCREAMING_SNAKE, 2-40 chars)",
+                    edge.rel_type
+                ));
+            }
+            if crate::cypher::is_living_cycle_rel_type(&edge.rel_type)
+                || crate::cypher::is_agenda_rel_type(&edge.rel_type)
+            {
+                violations.push(format!(
+                    "rel_type '{}' collides with the compiled core vocabulary",
+                    edge.rel_type
+                ));
+            }
+            if edge.source_labels.is_empty() || edge.target_labels.is_empty() {
+                violations.push(format!(
+                    "rel_type '{}' must declare source_labels and target_labels",
+                    edge.rel_type
+                ));
+            }
+            for endpoint in edge.source_labels.iter().chain(&edge.target_labels) {
+                if !label_known(endpoint) {
+                    violations.push(format!(
+                        "rel_type '{}' endpoint '{}' is not a known or extension label",
+                        edge.rel_type, endpoint
+                    ));
+                }
+            }
+        }
+        if violations.is_empty() {
+            Ok(())
+        } else {
+            Err(violations)
+        }
+    }
+
+    /// Merge `incoming` into self: same-name labels / same-rel edges are
+    /// REPLACED (the newly applied spec wins), everything else appends.
+    pub fn merge(&mut self, incoming: OntologyExtensions) {
+        for label in incoming.labels {
+            self.labels.retain(|l| l.name != label.name);
+            self.labels.push(label);
+        }
+        for edge in incoming.edges {
+            self.edges.retain(|e| e.rel_type != edge.rel_type);
+            self.edges.push(edge);
+        }
+    }
+}
+
+/// The agent-facing vocabulary document with runtime extensions merged in.
+pub fn ontology_document_with(ext: &OntologyExtensions) -> Value {
+    let mut doc = ontology_document();
+    if let Some(labels) = doc["labels"].as_array_mut() {
+        for label in &ext.labels {
+            labels.push(json!(label.name));
+        }
+    }
+    doc["extensions"] = json!({
+        "labels": ext.labels,
+        "edges": ext.edges,
+        "rule": "Runtime extensions added through the governed patch pipeline \
+                 (life.patch.propose patch_kind=schema_patch with an \
+                 ontology_extension payload → operator confirm → \
+                 life.patch.apply). They are full vocabulary: writable, swept, \
+                 listable.",
+    });
+    if let Some(guidance) = doc["noun_guidance"].as_object_mut() {
+        for label in &ext.labels {
+            if !label.guidance.is_empty() {
+                guidance.insert(label.name.clone(), json!(label.guidance));
+            }
+        }
+    }
+    doc
 }
 
 // ── Named maintenance queries ────────────────────────────────────────────────
@@ -266,6 +467,28 @@ impl NamedMaintenanceQuery {
                 live = liveness_predicate("n"),
                 row = list_row_projection("n"),
             ),
+        }
+    }
+
+    /// Extension-aware variant: queries that enumerate the label universe
+    /// include runtime extension labels too.
+    pub fn cypher_with_extensions(&self, limit: usize, ext: &OntologyExtensions) -> String {
+        match self {
+            Self::RecentlyRetired if !ext.labels.is_empty() => {
+                let mut labels: Vec<&str> = NODE_LABELS.to_vec();
+                labels.extend(ext.labels.iter().map(|l| l.name.as_str()));
+                format!(
+                    "MATCH (n) WHERE any(label IN labels(n) WHERE label IN [{labels}]) \
+                     AND NOT ({live}) \
+                     RETURN {row} \
+                     ORDER BY coalesce(n.retired_at, n.resolved_at, n.observed_at, n.created_at, '') \
+                     DESC LIMIT {limit}",
+                    labels = quoted_list(&labels),
+                    live = liveness_predicate("n"),
+                    row = list_row_projection("n"),
+                )
+            }
+            _ => self.cypher(limit),
         }
     }
 
@@ -452,6 +675,88 @@ mod tests {
                 "lived-world noun {label} needs an embedding space + vector index"
             );
         }
+    }
+
+    fn sample_extension() -> OntologyExtensions {
+        OntologyExtensions {
+            labels: vec![ExtensionLabel {
+                name: "Pet".into(),
+                space: "life_event_semantic".into(),
+                guidance: "A companion animal.".into(),
+            }],
+            edges: vec![ExtensionEdge {
+                rel_type: "CARES_FOR".into(),
+                source_labels: vec!["Routine".into(), "Person".into()],
+                target_labels: vec!["Pet".into()],
+            }],
+        }
+    }
+
+    #[test]
+    fn extension_validation_accepts_well_formed_and_rejects_bad_specs() {
+        let ext = sample_extension();
+        assert!(ext.validate_against(&OntologyExtensions::default()).is_ok());
+
+        // Core collision, bad identifier, unknown space, unknown endpoint,
+        // core rel collision — every class of violation reported.
+        let bad = OntologyExtensions {
+            labels: vec![
+                ExtensionLabel {
+                    name: "Event".into(),
+                    space: "life_event_semantic".into(),
+                    guidance: String::new(),
+                },
+                ExtensionLabel {
+                    name: "drop table".into(),
+                    space: "nope_space".into(),
+                    guidance: String::new(),
+                },
+            ],
+            edges: vec![ExtensionEdge {
+                rel_type: "ABOUT".into(),
+                source_labels: vec!["Ghost".into()],
+                target_labels: vec![],
+            }],
+        };
+        let violations = bad
+            .validate_against(&OntologyExtensions::default())
+            .expect_err("bad spec must fail");
+        assert!(violations.iter().any(|v| v.contains("collides")));
+        assert!(
+            violations
+                .iter()
+                .any(|v| v.contains("not a valid identifier"))
+        );
+        assert!(violations.iter().any(|v| v.contains("unknown space")));
+        assert!(violations.iter().any(|v| v.contains("Ghost")));
+    }
+
+    #[test]
+    fn extension_merge_replaces_same_name_entries() {
+        let mut current = sample_extension();
+        current.merge(OntologyExtensions {
+            labels: vec![ExtensionLabel {
+                name: "Pet".into(),
+                space: "life_event_semantic".into(),
+                guidance: "Updated guidance.".into(),
+            }],
+            edges: vec![],
+        });
+        assert_eq!(current.labels.len(), 1);
+        assert_eq!(current.labels[0].guidance, "Updated guidance.");
+        assert_eq!(current.edges.len(), 1);
+    }
+
+    #[test]
+    fn extension_labels_join_document_lists_and_named_queries() {
+        let ext = sample_extension();
+        let doc = ontology_document_with(&ext);
+        assert!(doc["labels"].as_array().unwrap().iter().any(|l| l == "Pet"));
+        assert_eq!(doc["noun_guidance"]["Pet"], "A companion animal.");
+        assert_eq!(doc["extensions"]["edges"][0]["rel_type"], "CARES_FOR");
+
+        let cypher = NamedMaintenanceQuery::RecentlyRetired.cypher_with_extensions(5, &ext);
+        assert!(cypher.contains("'Pet'"), "{cypher}");
     }
 
     #[test]

@@ -23,14 +23,19 @@ use serde_json::Value;
 ///
 /// Must stay in sync with the index names created by V001 migration.
 pub fn index_name(space: &SemanticSpace, label: &str) -> String {
-    let prefix = match space {
+    format!("{}__{}", space_prefix(space), label)
+}
+
+/// The index-name prefix for a semantic space (matches
+/// `ontology::SEMANTIC_SPACE_PREFIXES` and the V00x migrations).
+pub fn space_prefix(space: &SemanticSpace) -> &'static str {
+    match space {
         SemanticSpace::LifeEventSemantic => "life_event_semantic",
         SemanticSpace::GoalSystemSemantic => "goal_system_semantic",
         SemanticSpace::SkillToolSemantic => "skill_tool_semantic",
         SemanticSpace::RolePersonSemantic => "role_person_semantic",
         SemanticSpace::MemoryBridgeSemantic => "memory_bridge_semantic",
-    };
-    format!("{}__{}", prefix, label)
+    }
 }
 
 /// All node labels that participate in a given semantic space.

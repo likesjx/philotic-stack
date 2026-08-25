@@ -63,6 +63,7 @@ pub fn is_read_only_capability(kind: &str) -> bool {
             | "life.list"
             | "life.ontology"
     )
+    // life.patch.apply is a WRITE (vocabulary mutation) — stays sequential.
 }
 
 /// How often a still-running provider tells its caller it is alive.

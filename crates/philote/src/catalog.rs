@@ -306,6 +306,8 @@ pub fn skill_implied_tools(skill_name: &str) -> &'static [&'static str] {
             "life.patch.propose",
             "life.list",
             "life.ontology",
+            "life.patch.apply",
+            "life.patch.list",
         ],
         "lifegraph.truth_summarizer" => &["life.recall", "graph.query"],
         "mesh.steward" => &[
@@ -340,6 +342,8 @@ pub fn tools_for_skill(skill_name: &str) -> &'static [&'static str] {
             "life.patch.propose",
             "life.list",
             "life.ontology",
+            "life.patch.apply",
+            "life.patch.list",
         ],
         "lifegraph.truth_summarizer" => &["life.recall", "graph.query"],
         "mesh.steward" => &[
@@ -4062,6 +4066,47 @@ fn build_catalog() -> HashMap<String, ToolDefinition> {
             input_schema: json!({
                 "type": "object",
                 "properties": {}
+            }),
+            class: Some("life_graph".into()),
+        },
+    );
+
+    m.insert(
+        "life.patch.apply".into(),
+        ToolDefinition {
+            tool_name: "life.patch.apply".into(),
+            description: "Confirm or reject an awaiting_confirmation Life Graph patch — call \
+                          ONLY after the operator has explicitly approved or rejected it in \
+                          conversation. Confirming a schema_patch that carries an \
+                          ontology_extension makes the new nouns/verbs live vocabulary \
+                          immediately (vector indexes are created automatically). Verify the \
+                          result with life.ontology afterwards."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "required": ["patch_id", "decision"],
+                "properties": {
+                    "patch_id": {"type": "string", "description": "The patch to decide."},
+                    "decision": {"type": "string", "enum": ["confirm", "reject"]}
+                }
+            }),
+            class: Some("life_graph".into()),
+        },
+    );
+
+    m.insert(
+        "life.patch.list".into(),
+        ToolDefinition {
+            tool_name: "life.patch.list".into(),
+            description: "READ-ONLY list of Life Graph patch proposals and their statuses \
+                          (pending by default). Use before proposing (avoid duplicates) and \
+                          when the operator asks what is awaiting their approval."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "status": {"type": "string", "description": "Filter by patch status (default: pending set)."}
+                }
             }),
             class: Some("life_graph".into()),
         },

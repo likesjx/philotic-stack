@@ -324,8 +324,23 @@ pub struct RecallFeedbackCypher {
 }
 
 pub fn compile_observe(input: &LifeObserveInput, now_iso: &str) -> Result<ObserveCypher, String> {
+    compile_observe_with_extensions(
+        input,
+        now_iso,
+        &crate::ontology::OntologyExtensions::default(),
+    )
+}
+
+/// Extension-aware compile: runtime ontology extension labels are writable.
+/// Extension label names pass [`crate::ontology::valid_extension_label_name`]
+/// at apply time, so interpolation stays safe.
+pub fn compile_observe_with_extensions(
+    input: &LifeObserveInput,
+    now_iso: &str,
+    ext: &crate::ontology::OntologyExtensions,
+) -> Result<ObserveCypher, String> {
     let label = &input.evidence.claim_ref.label;
-    if !is_known_label(label) {
+    if !is_known_label(label) && !ext.is_extension_label(label) {
         return Err(format!("unknown Life Graph label: {label}"));
     }
 
@@ -470,14 +485,41 @@ pub fn compile_observe(input: &LifeObserveInput, now_iso: &str) -> Result<Observ
 /// `upsert_target: true` (structural anchors, e.g. SCOPED_TO) instead `MERGE`
 /// the target so it always resolves.
 pub fn compile_observe_edges(input: &LifeObserveInput) -> Result<Vec<ObserveEdgeCypher>, String> {
+    compile_observe_edges_with_extensions(input, &crate::ontology::OntologyExtensions::default())
+}
+
+/// Endpoint rule resolved from either the compiled agenda table or a runtime
+/// ontology extension — one shape for the validation + query emission below.
+struct ResolvedEdgeRule<'a> {
+    rel_type: &'a str,
+    source_labels: Vec<&'a str>,
+    target_labels: Vec<&'a str>,
+}
+
+pub fn compile_observe_edges_with_extensions(
+    input: &LifeObserveInput,
+    ext: &crate::ontology::OntologyExtensions,
+) -> Result<Vec<ObserveEdgeCypher>, String> {
     let label = &input.evidence.claim_ref.label;
-    if !is_known_label(label) {
+    if !is_known_label(label) && !ext.is_extension_label(label) {
         return Err(format!("unknown Life Graph label: {label}"));
     }
 
     let mut compiled = Vec::with_capacity(input.edges.len());
     for edge in &input.edges {
-        let agenda_rule = agenda_edge_rule(&edge.rel_type);
+        let agenda_rule = agenda_edge_rule(&edge.rel_type)
+            .map(|rule| ResolvedEdgeRule {
+                rel_type: rule.rel_type,
+                source_labels: rule.source_labels.to_vec(),
+                target_labels: rule.target_labels.to_vec(),
+            })
+            .or_else(|| {
+                ext.edge(&edge.rel_type).map(|rule| ResolvedEdgeRule {
+                    rel_type: rule.rel_type.as_str(),
+                    source_labels: rule.source_labels.iter().map(String::as_str).collect(),
+                    target_labels: rule.target_labels.iter().map(String::as_str).collect(),
+                })
+            });
         if !is_living_cycle_rel_type(&edge.rel_type) && agenda_rule.is_none() {
             return Err(format!(
                 "unknown rel_type: {} (expected one of {})",
@@ -488,11 +530,11 @@ pub fn compile_observe_edges(input: &LifeObserveInput) -> Result<Vec<ObserveEdge
         if edge.target_id.trim().is_empty() {
             return Err("edge target_id must not be empty".to_string());
         }
-        // Agenda edges are endpoint-validated (living-cycle edges are not):
-        // wrong source label is a compile-time rejection; the target label
-        // constraint is baked into the MATCH below, so a wrong-label target
-        // writes nothing and surfaces as target_missing.
-        if let Some(rule) = agenda_rule
+        // Agenda and extension edges are endpoint-validated (living-cycle
+        // edges are not): wrong source label is a compile-time rejection; the
+        // target label constraint is baked into the MATCH below, so a
+        // wrong-label target writes nothing and surfaces as target_missing.
+        if let Some(rule) = &agenda_rule
             && !rule.source_labels.contains(&label.as_str())
         {
             return Err(format!(
@@ -1891,6 +1933,7 @@ mod tests {
                 operator_approved: false,
                 edge_specs: vec![],
                 autonomy_audit_id: None,
+                ontology_extension: None,
             },
             "2026-06-05T09:00:00Z",
         )
@@ -2012,6 +2055,7 @@ mod tests {
             operator_approved: false,
             edge_specs: vec![bridge_spec()],
             autonomy_audit_id: Some("autonomy:graph.bridge_edges:abc".into()),
+            ontology_extension: None,
         };
 
         let compiled = compile_patch_proposal_with_status(

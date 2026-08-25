@@ -4183,6 +4183,35 @@ fn seed_abstract_tool_catalog(graph: &GraphDomain) -> anyhow::Result<()> {
             tool_markers: Vec::new(),
         },
         AbstractToolRecord {
+            tool_name: "life.patch.apply".into(),
+            description: "Confirm or reject an awaiting_confirmation Life Graph patch (call \
+                          only after explicit operator approval). Confirming a schema_patch \
+                          with an ontology_extension makes the new vocabulary live."
+                .into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "patch_id": { "type": "string" },
+                    "decision": { "type": "string", "enum": ["confirm", "reject"] }
+                },
+                "required": ["patch_id", "decision"]
+            }),
+            class: "life_graph".into(),
+            tool_markers: Vec::new(),
+        },
+        AbstractToolRecord {
+            tool_name: "life.patch.list".into(),
+            description: "READ-ONLY list of Life Graph patch proposals and statuses.".into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "status": { "type": "string" }
+                }
+            }),
+            class: "life_graph".into(),
+            tool_markers: Vec::new(),
+        },
+        AbstractToolRecord {
             tool_name: "cron.disable".into(),
             description: "Disable a cron job without removing it. The job record is preserved and \
                           can be re-enabled with cron.enable."
@@ -5464,7 +5493,9 @@ fn seed_toolset_profiles(graph: &GraphDomain) -> anyhow::Result<()> {
                     "life.conflict",
                     "life.patch.propose",
                     "life.list",
-                    "life.ontology"
+                    "life.ontology",
+                    "life.patch.apply",
+                    "life.patch.list"
                 ],
                 "execution_mode": "capability"
             });
