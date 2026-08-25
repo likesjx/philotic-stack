@@ -1744,7 +1744,16 @@ impl LifeGraphProvider {
             .plan_with_extensions(LifeGraphToolRequest::LifePatchPropose(input.clone()), &ext)
             .map_err(|e| anyhow::anyhow!("life.patch.propose plan validation failed: {e}"))?;
         let now = chrono::Utc::now().to_rfc3339();
-        let compiled = cypher::compile_patch_proposal(&input, &now)
+        // An ontology_extension is by definition a confirm-gated change:
+        // park it as awaiting_confirmation so `life.patch.apply` (called
+        // after explicit operator approval) can actually act on it — the
+        // default `proposed` status is invisible to apply.
+        let status = if input.ontology_extension.is_some() {
+            cypher::PATCH_STATUS_AWAITING_CONFIRMATION
+        } else {
+            cypher::PATCH_STATUS_PROPOSED
+        };
+        let compiled = cypher::compile_patch_proposal_with_status(&input, &now, status)
             .map_err(|e| anyhow::anyhow!("life.patch.propose Cypher compilation failed: {e}"))?;
 
         let graph = self.connect().await?;
