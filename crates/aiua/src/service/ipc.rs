@@ -6159,10 +6159,11 @@ impl IpcServer {
                 // the explicit peer bridge. A later node appearance cannot
                 // rescue a caller that already received a false-success reply.
                 if target_node != local_node_id {
+                    let has_peer_socket = peer_sockets.read().await.contains_key(&target_node);
                     let node_known = {
                         let reg = registry.read().await;
                         reg.get_node(&target_node).is_some()
-                    } || peer_sockets.read().await.contains_key(&target_node);
+                    } || has_peer_socket;
                     if !node_known {
                         let message = format!(
                             "[emit_task_unknown_target_node] task for role [{target_role}] addressed to node [{target_node}] unknown to this hotel (no registry entry, no peer socket) — undeliverable until that node appears on the mesh"
@@ -6186,6 +6187,63 @@ impl IpcServer {
                             }
                         }
                         return IpcResponse::error("emit_task", "TARGET_NODE_UNREACHABLE", message);
+                    }
+
+                    // Fail-fast for INTERACTIVE tool dispatch to a peer whose
+                    // mesh link is down: a registered peer that has stopped
+                    // heartbeating (>TTL) still passes the unknown-node gate,
+                    // so the task enters the store-and-forward ledger and the
+                    // caller's turn hangs in WaitingTool until the 300s
+                    // watchdog (live incident 2026-08-25: mac-jane's tailnet
+                    // was down; every cross-hotel life.* call black-holed).
+                    // Scoped to execute_tool payloads on purpose — replies and
+                    // turn events keep riding store-and-forward through brief
+                    // peer blips, which is exactly what the ledger is for.
+                    // The peer-socket bridge has no heartbeat behind it and is
+                    // exempt.
+                    let is_tool_dispatch = serde_json::from_str::<serde_json::Value>(&task_json)
+                        .ok()
+                        .and_then(|v| {
+                            v.get("action")
+                                .and_then(serde_json::Value::as_str)
+                                .map(|a| a == "execute_tool")
+                        })
+                        .unwrap_or(false);
+                    if is_tool_dispatch && !has_peer_socket {
+                        let stale = {
+                            let reg = registry.read().await;
+                            reg.is_node_stale(&target_node)
+                        };
+                        if stale {
+                            let ttl =
+                                ansible_mesh_core::registry::NodeRegistry::freshness_ttl_secs();
+                            let message = format!(
+                                "[emit_task_unknown_target_node:stale] tool dispatch for role [{target_role}] addressed to node [{target_node}], which has not heartbeated in >{ttl}s — mesh link down; failing fast instead of queueing an interactive task"
+                            );
+                            warn!(
+                                target_node = target_node.as_str(),
+                                target_role = target_role.as_str(),
+                                "EmitTask: tool dispatch to stale peer — failing fast"
+                            );
+                            if let Some(hq) = heal_queue {
+                                if let Err(err) = hq.push_classified(
+                                    "aiua.emit_task_route",
+                                    &message,
+                                    "medium",
+                                    "emit_task_unknown_target_node:stale",
+                                ) {
+                                    warn!(
+                                        error = %err,
+                                        "Failed to push stale-target-node route to heal queue"
+                                    );
+                                }
+                            }
+                            return IpcResponse::error(
+                                "emit_task",
+                                "TARGET_NODE_UNREACHABLE",
+                                message,
+                            );
+                        }
                     }
                 }
                 info!(
@@ -20239,6 +20297,146 @@ pub(crate) mod tests {
             .await
             .is_err(),
             "unreachable task must not be appended to the ledger"
+        );
+
+        unsafe {
+            std::env::remove_var("PHILOTIC_HOTEL_SOCKET");
+        }
+        server_task.abort();
+        let _ = server_task.await;
+        if Path::new(&socket_path).exists() {
+            let _ = std::fs::remove_file(&socket_path);
+        }
+    }
+
+    /// Live incident 2026-08-25: mac-jane's tailnet dropped, so vps stayed in
+    /// the registry (stale entry) and every cross-hotel tool dispatch entered
+    /// the store-and-forward ledger and hung the turn in WaitingTool for the
+    /// 300s watchdog. Tool dispatch (`action == "execute_tool"`) to a peer
+    /// whose heartbeat is older than the freshness TTL must fail fast; a
+    /// non-tool payload to the same stale peer must still ride
+    /// store-and-forward (that is what the ledger is FOR).
+    #[tokio::test]
+    async fn emit_task_tool_dispatch_to_stale_peer_fails_fast_but_replies_still_queue() {
+        let _env_guard = ipc_env_guard();
+        let socket_path = test_socket_path();
+        let (dispatcher_tx, mut dispatcher_rx) = test_dispatcher_channel();
+        let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
+        let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
+        let heal_queue = Arc::new(RecordingHealQueue::default());
+
+        // A peer that heartbeated once, then went silent past the TTL.
+        let registry = Arc::new(RwLock::new(NodeRegistry::new()));
+        {
+            let mut reg = registry.write().await;
+            reg.observe_heartbeat(
+                NodeCapabilities {
+                    node_id: "stale-aiua-01".into(),
+                    roles: vec![],
+                    models: vec![],
+                    tools: vec![],
+                    constraints: Default::default(),
+                },
+                None,
+                None,
+            );
+            reg.backdate_last_seen(
+                "stale-aiua-01",
+                std::time::Duration::from_secs(NodeRegistry::freshness_ttl_secs() + 5),
+            );
+        }
+
+        let server = IpcServer::new(socket_path.clone(), "local-aiua-01", dispatcher_tx, graph)
+            .with_heal_queue(heal_queue.clone())
+            .with_registry(registry);
+
+        let server_task = tokio::spawn(async move {
+            server.run().await.expect("ipc server should run");
+        });
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        unsafe {
+            std::env::set_var("PHILOTIC_HOTEL_SOCKET", &socket_path);
+        }
+
+        let mut client = PhiloticClient::connect(GuestIdentity {
+            guest_id: "stale-peer-smoke".into(),
+            role: "agent".into(),
+            supported_tools: Vec::new(),
+        })
+        .await
+        .expect("smoke client connect");
+
+        // Tool dispatch → fail fast with TARGET_NODE_UNREACHABLE.
+        let response = client
+            .send_request(IpcRequest::EmitTask {
+                target_node: "stale-aiua-01".into(),
+                target_role: "life-graph-runner".into(),
+                target_guest_id: None,
+                task_json: serde_json::json!({
+                    "action": "execute_tool",
+                    "tool_name": "life.list",
+                    "session_id": "smoke:stale-node",
+                    "turn_id": "smoke-turn-stale-node"
+                })
+                .to_string(),
+            })
+            .await
+            .expect("emit task response");
+        match response {
+            IpcResponse::Standard {
+                ok: false,
+                code,
+                message,
+                ..
+            } => {
+                assert_eq!(code, "TARGET_NODE_UNREACHABLE");
+                assert!(message.contains("stale-aiua-01"));
+                assert!(message.contains("has not heartbeated"));
+            }
+            other => panic!("expected stale-node fail-fast, got {other:?}"),
+        }
+        assert!(
+            tokio::time::timeout(
+                tokio::time::Duration::from_millis(100),
+                dispatcher_rx.recv()
+            )
+            .await
+            .is_err(),
+            "stale-peer tool dispatch must not enter the ledger"
+        );
+        {
+            let pushed = heal_queue.pushed.lock().unwrap();
+            assert_eq!(pushed.len(), 1);
+            assert_eq!(pushed[0].3, "emit_task_unknown_target_node:stale");
+        }
+
+        // Non-tool payload (a reply) → still accepted into store-and-forward.
+        let response = client
+            .send_request(IpcRequest::EmitTask {
+                target_node: "stale-aiua-01".into(),
+                target_role: "membrane".into(),
+                target_guest_id: None,
+                task_json: serde_json::json!({
+                    "action": "send_reply",
+                    "chat_id": "123",
+                    "content": "late but deliverable"
+                })
+                .to_string(),
+            })
+            .await
+            .expect("emit reply response");
+        assert!(
+            matches!(response, IpcResponse::Standard { ok: true, .. }),
+            "replies to a stale peer must keep riding store-and-forward, got {response:?}"
+        );
+        assert!(
+            tokio::time::timeout(
+                tokio::time::Duration::from_millis(200),
+                dispatcher_rx.recv()
+            )
+            .await
+            .is_ok(),
+            "the reply must be appended to the ledger"
         );
 
         unsafe {
