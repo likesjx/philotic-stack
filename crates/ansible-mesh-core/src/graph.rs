@@ -473,6 +473,8 @@ pub fn tools_for_tool_class(class: &str) -> &'static [&'static str] {
             "life.patch.propose",
             "life.list",
             "life.ontology",
+            "life.patch.apply",
+            "life.patch.list",
         ],
         "agent_graph" => &[
             "agent.graph.read",

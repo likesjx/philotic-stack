@@ -990,6 +990,8 @@ pub enum LifeGraphToolName {
     LifePatchPropose,
     LifeList,
     LifeOntology,
+    LifePatchApply,
+    LifePatchList,
 }
 
 impl LifeGraphToolName {
@@ -1005,6 +1007,8 @@ impl LifeGraphToolName {
             Self::LifePatchPropose => "life.patch.propose",
             Self::LifeList => "life.list",
             Self::LifeOntology => "life.ontology",
+            Self::LifePatchApply => "life.patch.apply",
+            Self::LifePatchList => "life.patch.list",
         }
     }
 
@@ -1017,6 +1021,7 @@ impl LifeGraphToolName {
                 | Self::LifeCommit
                 | Self::LifeResolve
                 | Self::LifePatchPropose
+                | Self::LifePatchApply
         )
     }
 }
@@ -1100,6 +1105,18 @@ pub fn life_graph_tool_catalog() -> Vec<LifeGraphToolSpec> {
             LifeGraphToolName::LifeOntology,
             "Serve the canonical Life Graph vocabulary: labels, lifecycle states, \
              property conventions, named queries, rules, and known gaps (read-only).",
+            false,
+        ),
+        LifeGraphToolSpec::new(
+            LifeGraphToolName::LifePatchApply,
+            "Confirm or reject an awaiting_confirmation Life Graph patch. Confirming a \
+             schema_patch with an ontology_extension makes the new vocabulary live \
+             (indexes created automatically). Call ONLY after the operator approves.",
+            true,
+        ),
+        LifeGraphToolSpec::new(
+            LifeGraphToolName::LifePatchList,
+            "List Life Graph patches and their statuses (read-only).",
             false,
         ),
     ]
@@ -1615,6 +1632,13 @@ pub struct LifePatchProposalInput {
     /// trust.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub autonomy_audit_id: Option<String>,
+    /// Governed ontology self-serve (nouns-verbs automation): a schema_patch
+    /// may carry new vocabulary — labels and endpoint-validated edges. On
+    /// operator confirm, `life.patch.apply` validates the spec, creates the
+    /// vector index for each new label, and persists the merged extension
+    /// set; the vocabulary is live immediately, no code change or deploy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ontology_extension: Option<ontology::OntologyExtensions>,
 }
 
 /// Operator decision on an `awaiting_confirmation` patch.
@@ -1896,8 +1920,17 @@ impl LifeListInput {
     /// Statuses and labels are validated against the ontology vocabulary by
     /// `plan_list` before they are interpolated.
     pub fn filtered_cypher(&self) -> String {
+        self.filtered_cypher_with_extensions(&ontology::OntologyExtensions::default())
+    }
+
+    /// Extension-aware variant: the all-labels default includes runtime
+    /// extension labels.
+    pub fn filtered_cypher_with_extensions(&self, ext: &ontology::OntologyExtensions) -> String {
+        let ext_names: Vec<&str> = ext.labels.iter().map(|l| l.name.as_str()).collect();
         let labels: Vec<&str> = if self.labels.is_empty() {
-            ontology::NODE_LABELS.to_vec()
+            let mut all = ontology::NODE_LABELS.to_vec();
+            all.extend(ext_names);
+            all
         } else {
             self.labels.iter().map(String::as_str).collect()
         };
@@ -2082,20 +2115,36 @@ impl MemoryGraphRagRunner {
     }
 
     pub fn plan(&self, request: LifeGraphToolRequest) -> Result<RunnerPlan, ContractError> {
+        self.plan_with_extensions(request, &ontology::OntologyExtensions::default())
+    }
+
+    /// Extension-aware planning: runtime ontology extensions (governed
+    /// self-serve vocabulary) are accepted everywhere the compiled core is.
+    pub fn plan_with_extensions(
+        &self,
+        request: LifeGraphToolRequest,
+        ext: &ontology::OntologyExtensions,
+    ) -> Result<RunnerPlan, ContractError> {
         match request {
-            LifeGraphToolRequest::LifeObserve(input) => self.plan_observe(input),
+            LifeGraphToolRequest::LifeObserve(input) => self.plan_observe_ext(input, ext),
             LifeGraphToolRequest::LifeRecall(query) => self.plan_recall(query),
             LifeGraphToolRequest::LifeRecallFeedback(feedback) => {
                 self.plan_recall_feedback(feedback)
             }
             LifeGraphToolRequest::LifeCommit(input) => self.plan_commit(input),
             LifeGraphToolRequest::LifeResolve(input) => self.plan_resolve(input),
-            LifeGraphToolRequest::LifePatchPropose(input) => self.plan_patch_propose(input),
-            LifeGraphToolRequest::LifeList(input) => self.plan_list(input),
+            LifeGraphToolRequest::LifePatchPropose(input) => {
+                self.plan_patch_propose_ext(input, ext)
+            }
+            LifeGraphToolRequest::LifeList(input) => self.plan_list_ext(input, ext),
         }
     }
 
-    fn plan_list(&self, input: LifeListInput) -> Result<RunnerPlan, ContractError> {
+    fn plan_list_ext(
+        &self,
+        input: LifeListInput,
+        ext: &ontology::OntologyExtensions,
+    ) -> Result<RunnerPlan, ContractError> {
         let mut violations = Vec::new();
         if let Some(name) = input.named_query.as_deref() {
             if ontology::NamedMaintenanceQuery::parse(name).is_none() {
@@ -2117,9 +2166,11 @@ impl MemoryGraphRagRunner {
             }
         }
         for label in &input.labels {
-            if !ontology::is_known_label(label) {
+            if !ontology::is_known_label(label) && !ext.is_extension_label(label) {
                 violations.push(format!("labels contains unknown label '{label}'"));
             }
+            // Extension label names pass valid_extension_label_name at apply
+            // time, so interpolating them into filtered_cypher stays safe.
         }
         // Statuses and validation states are interpolated into cypher, so
         // they must be plain identifiers — never quoted or spaced text.
@@ -2151,15 +2202,21 @@ impl MemoryGraphRagRunner {
         })
     }
 
-    fn plan_observe(&self, input: LifeObserveInput) -> Result<RunnerPlan, ContractError> {
+    fn plan_observe_ext(
+        &self,
+        input: LifeObserveInput,
+        ext: &ontology::OntologyExtensions,
+    ) -> Result<RunnerPlan, ContractError> {
         let mut violations = Vec::new();
         require_non_empty(&mut violations, "observation_id", &input.observation_id);
         if let Err(err) = input.evidence.validate() {
             violations.extend(err.violations);
         }
         for (idx, edge) in input.edges.iter().enumerate() {
+            let ext_rule = ext.edge(&edge.rel_type);
             if !cypher::is_living_cycle_rel_type(&edge.rel_type)
                 && !cypher::is_agenda_rel_type(&edge.rel_type)
+                && ext_rule.is_none()
             {
                 violations.push(format!(
                     "edges[{idx}].rel_type '{}' is not an allowed relation (expected one of {})",
@@ -2167,8 +2224,8 @@ impl MemoryGraphRagRunner {
                     cypher::observe_rel_type_vocabulary()
                 ));
             }
+            let source_label = &input.evidence.claim_ref.label;
             if let Some(rule) = cypher::agenda_edge_rule(&edge.rel_type) {
-                let source_label = &input.evidence.claim_ref.label;
                 if !rule.source_labels.contains(&source_label.as_str()) {
                     violations.push(format!(
                         "edges[{idx}].rel_type {} not allowed from {source_label} (allowed sources: {})",
@@ -2176,6 +2233,14 @@ impl MemoryGraphRagRunner {
                         rule.source_labels.join(", ")
                     ));
                 }
+            } else if let Some(rule) = ext_rule
+                && !rule.source_labels.iter().any(|l| l == source_label)
+            {
+                violations.push(format!(
+                    "edges[{idx}].rel_type {} not allowed from {source_label} (allowed sources: {})",
+                    rule.rel_type,
+                    rule.source_labels.join(", ")
+                ));
             }
             require_non_empty(
                 &mut violations,
@@ -2362,10 +2427,24 @@ impl MemoryGraphRagRunner {
         })
     }
 
-    fn plan_patch_propose(
+    fn plan_patch_propose_ext(
         &self,
         input: LifePatchProposalInput,
+        ext: &ontology::OntologyExtensions,
     ) -> Result<RunnerPlan, ContractError> {
+        // Ontology self-serve: reject a malformed extension spec at PROPOSE
+        // time — endpoints may reference core vocabulary, already-applied
+        // extensions, or labels introduced in this same spec.
+        if let Some(extension) = &input.ontology_extension {
+            if input.patch_kind != PatchKind::SchemaPatch {
+                return Err(ContractError {
+                    violations: vec!["ontology_extension requires patch_kind schema_patch".into()],
+                });
+            }
+            if let Err(violations) = extension.validate_against(ext) {
+                return Err(ContractError { violations });
+            }
+        }
         let evaluation = GrowthLoopPolicy::default().evaluate_patch(&input)?;
 
         let requires_operator = evaluation.requires_operator;
@@ -3167,7 +3246,9 @@ mod tests {
                 "life.conflict",
                 "life.patch.propose",
                 "life.list",
-                "life.ontology"
+                "life.ontology",
+                "life.patch.apply",
+                "life.patch.list"
             ]
         );
         assert!(
@@ -3494,6 +3575,7 @@ mod tests {
                     operator_approved: false,
                     edge_specs: vec![],
                     autonomy_audit_id: None,
+                    ontology_extension: None,
                 },
             ))
             .expect("patch proposal should plan");
@@ -3547,6 +3629,7 @@ mod tests {
                 operator_approved: false,
                 edge_specs: vec![],
                 autonomy_audit_id: None,
+                ontology_extension: None,
             })
             .expect("low-risk patch should evaluate");
 
@@ -3574,6 +3657,7 @@ mod tests {
                 operator_approved: false,
                 edge_specs: vec![],
                 autonomy_audit_id: None,
+                ontology_extension: None,
             })
             .expect("medium-risk patch should evaluate");
 
