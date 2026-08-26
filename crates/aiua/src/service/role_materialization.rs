@@ -60,6 +60,7 @@ impl IpcServer {
                             task_id,
                             task_json,
                             activate_session_id: None,
+                            parked_at: unix_ts(),
                         },
                     );
                 }
@@ -102,6 +103,7 @@ impl IpcServer {
                             task_id,
                             task_json,
                             activate_session_id: None,
+                            parked_at: unix_ts(),
                         });
                 }
                 info!(
