@@ -826,6 +826,16 @@ Seam IDs: `secret-handling-hardening`, `watched-live-vps-smoke`, `artifact-distr
 - [x] Move remote model/tool/task execution off raw UDP Beacon payload bodies.
 - [ ] Define NAT traversal / relay requirements explicitly before committing to a self-hosted overlay transport.
 
+## New Project: Perimeter Egress Control
+
+Seam refs and the implemented slice detail live in [PERIMETER_EGRESS_CONTROL_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/PERIMETER_EGRESS_CONTROL_PROPOSAL.md).
+
+- [x] Close the `bash.exec` egress bypass (shell egress fence): compiled-in `exec_guard::detect_network_egress` detector + `McpEgressPolicy` decision at both raw-shell dispatch points (tool-runner, philote runtime); loopback/tailnet allowed, all else denied and redirected to `http:<binding>.request`; `PHILOTIC_SHELL_EGRESS_ALLOW` env widening. Verified: test-green (exec-guard net_egress suite + tool-runner boundary tests). `Slice: codex/exec-guard-network-fence`.
+- [ ] Unify the shell egress allowlist into a hotel config node alongside `mcp_egress_policy` (retire the transitional `PHILOTIC_SHELL_EGRESS_ALLOW` env var). Seam: `shell-egress-fence`.
+- [ ] macOS network enforcement gap: `Direct`-mode tool-runner has no kernel-level network sandbox, so the fence is the only shell-egress control on Macs. Decide whether a macOS sandbox profile (or forcing Sandboxed mode) is in scope.
+- [ ] Widen the detector's honest scope as needed (base64/written-then-run/`exec 3<>/dev/tcp` are known regex-evadable; `ssh`/`scp`/`git`/package-managers deliberately out of the current slice).
+- [ ] Deploy + watched-live-green the fence across the fleet (mac-jane, vps-jane; mbp-jane blocked on Tailscale re-auth).
+
 ## New Project: Hotel Perimeter Trust
 
 - [ ] Review [HOTEL_PERIMETER_TRUST_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/HOTEL_PERIMETER_TRUST_PROPOSAL.md).
