@@ -1046,12 +1046,34 @@ async fn send_telegram_text(
     }
     match http_client.post(&send_url).json(&payload).send().await {
         Ok(res) => {
-            if let Ok(body) = res.json::<Value>().await {
-                body.get("result")
-                    .and_then(|r| r.get("message_id"))
-                    .and_then(Value::as_i64)
-            } else {
-                None
+            // Telegram answers errors (400 bad entities, 401, 429, …) with a
+            // well-formed JSON body — `ok: false`, no `result`. Parsing alone
+            // therefore cannot distinguish success from rejection, and the
+            // draft-streaming path has no other failure surface: swallow the
+            // body here and a rejected send is invisible.
+            let status = res.status();
+            match res.json::<Value>().await {
+                Ok(body) => {
+                    let message_id = body
+                        .get("result")
+                        .and_then(|r| r.get("message_id"))
+                        .and_then(Value::as_i64);
+                    if message_id.is_none() {
+                        warn!(
+                            "sendMessage rejected: status={} body={}",
+                            status,
+                            truncate_for_log(&body.to_string(), 500)
+                        );
+                    }
+                    message_id
+                }
+                Err(e) => {
+                    warn!(
+                        "sendMessage response unparseable: status={} err={}",
+                        status, e
+                    );
+                    None
+                }
             }
         }
         Err(e) => {
@@ -1059,6 +1081,19 @@ async fn send_telegram_text(
             None
         }
     }
+}
+
+/// Clamp a log payload to `limit` bytes at a char boundary so an oversized
+/// Telegram error body cannot flood the journal.
+fn truncate_for_log(s: &str, limit: usize) -> &str {
+    if s.len() <= limit {
+        return s;
+    }
+    let mut end = limit;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
 }
 
 async fn edit_telegram_text(
@@ -1252,9 +1287,15 @@ async fn upsert_streaming_draft(
     } else {
         send_telegram_text(http_client, tg_base, chat_id, thread_id, &first_chunk, None)
             .await
-            .map(|message_id| StreamingDraftUpdate::Rendered {
-                message_id,
-                text: first_chunk,
+            .map(|message_id| {
+                info!(
+                    "Streaming draft created for chat [{}]: message_id [{}]",
+                    chat_id, message_id
+                );
+                StreamingDraftUpdate::Rendered {
+                    message_id,
+                    text: first_chunk,
+                }
             })
     }
 }
@@ -4435,6 +4476,15 @@ mod tests {
     /// URL (trailing slash included, matching production) and the ordered
     /// list of API method paths it received.
     async fn spawn_mock_telegram(edit_response: MockEdit) -> (String, Arc<Mutex<Vec<String>>>) {
+        spawn_mock_telegram_with(edit_response, true).await
+    }
+
+    /// Like [`spawn_mock_telegram`], but `sendMessage` can be made to answer
+    /// a Telegram-style rejection (HTTP 400, `ok: false`, no `result`).
+    async fn spawn_mock_telegram_with(
+        edit_response: MockEdit,
+        send_ok: bool,
+    ) -> (String, Arc<Mutex<Vec<String>>>) {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -4493,10 +4543,19 @@ mod tests {
                                 r#"{"ok":false,"error_code":400,"description":"Bad Request: message to edit not found"}"#,
                             ),
                         },
-                        "sendMessage" => (
-                            "HTTP/1.1 200 OK",
-                            r#"{"ok":true,"result":{"message_id":777}}"#,
-                        ),
+                        "sendMessage" => {
+                            if send_ok {
+                                (
+                                    "HTTP/1.1 200 OK",
+                                    r#"{"ok":true,"result":{"message_id":777}}"#,
+                                )
+                            } else {
+                                (
+                                    "HTTP/1.1 400 Bad Request",
+                                    r#"{"ok":false,"error_code":400,"description":"Bad Request: can't parse entities"}"#,
+                                )
+                            }
+                        }
                         _ => ("HTTP/1.1 200 OK", r#"{"ok":true,"result":true}"#),
                     };
                     let response = format!(
@@ -4562,6 +4621,30 @@ mod tests {
         assert_eq!(result, Some(StreamingDraftUpdate::Retained(42)));
         let calls = calls.lock().unwrap();
         assert_eq!(*calls, vec!["editMessageText".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn streaming_send_rejection_returns_none_so_next_partial_retries() {
+        let (tg_base, calls) = spawn_mock_telegram_with(MockEdit::Ok, false).await;
+        let client = reqwest::Client::new();
+
+        let result =
+            upsert_streaming_draft(&client, &tg_base, "123", None, None, "partial **trunc").await;
+
+        // A rejected sendMessage must not fabricate a draft id: the caller
+        // leaves `draft_message_id` unset and the next due partial retries.
+        assert_eq!(result, None);
+        let calls = calls.lock().unwrap();
+        assert_eq!(*calls, vec!["sendMessage".to_string()]);
+    }
+
+    #[test]
+    fn truncate_for_log_respects_char_boundaries() {
+        assert_eq!(super::truncate_for_log("short", 500), "short");
+        // 3-byte char straddling the limit: clamp back to the boundary.
+        let s = "ab€cd";
+        assert_eq!(super::truncate_for_log(s, 3), "ab");
+        assert_eq!(super::truncate_for_log(s, 5), "ab€");
     }
 
     #[tokio::test]
