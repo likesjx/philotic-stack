@@ -4,7 +4,7 @@ doc_type: proposal
 domain: operator-control-plane
 status: proposed
 disposition: accepted-current-slice
-last_updated: 2026-03-31
+last_updated: 2026-08-26
 tags:
 - egress
 - perimeter
@@ -21,10 +21,16 @@ task_refs:
 - docs/task.md
 proposal_id: perimeter-egress-control
 implements: []
-implemented_by: []
+implemented_by:
+- crates/exec-guard/src/net_egress.rs
+- crates/ansible-mesh-core/src/mcp_upstream.rs
+- crates/tool-runner/src/main.rs
+- crates/philote/src/runtime.rs
+- crates/philotic-web/src/explain.rs
 active_seams:
 - egress-policy-object
 - outbound-classification
+- shell-egress-fence
 source_of_truth_targets:
 - ARCHITECTURE_STATUS.md
 ---
@@ -62,9 +68,49 @@ This means Philotic should not silently allow every guest to make arbitrary outb
 
 ## Disposition
 
-Proposed.
+Proposed, with one implemented slice landed (the shell egress fence, below).
 
 Track follow-on work in [docs/task.md](/Users/jaredlikes/code/philotic-stack/docs/task.md).
+
+### Implemented Slice: Shell Egress Fence (2026-08-26)
+
+The governed outbound fabric (binding-scoped `http:<binding>.request` tools with
+host allowlists, DNS pinning, the secret-ref credential boundary, and a
+content-free audit trail) was being bypassed by a single tool: `bash.exec`. The
+L0 `exec-guard` floor blocks only unrecoverable destruction and has no network
+predicate, so `curl`/`wget`/`nc`/`/dev/tcp`/interpreter-socket one-liners
+egressed with no allowlist, no credential boundary, and no audit — on macOS
+`Direct` mode there is also no sandbox network enforcement. This is General
+HTTP / Tool Egress (§2 above) escaping the perimeter through the shell.
+
+The fence closes the *accidental and lightly-injected* path:
+
+- **Detector, config-free, in `exec-guard`** — `detect_network_egress` recognizes
+  the raw fetch/exfil primitives and extracts the target host when it is written
+  literally. It is a detector, not a policy: it reads no config, exactly like the
+  L0 hardline floor.
+- **Policy at the call site** — both raw-shell dispatch points
+  (`tool_runner::execute_bash_tool`, `philote::runtime::run_bash_command`) reuse
+  `McpEgressPolicy` (loopback + tailnet CGNAT always allowed; everything else must
+  be allowlisted). A resolvable loopback/tailnet host passes; any other host, and
+  any host that cannot be statically proven, is denied and the model is redirected
+  to the governed binding path. Fail-closed on an unresolvable host mirrors the
+  MCP stdio allowlist's empty-default-deny.
+- **Config surface (transitional)** — `PHILOTIC_SHELL_EGRESS_ALLOW` (env var,
+  same host grammar as the MCP egress policy) widens the allowlist. This matches
+  the `PHILOTIC_SANDBOX_SOCKET` env idiom and is deliberately transitional; the
+  durable home is a hotel config node unified with `mcp_egress_policy`
+  (**next seam: `shell-egress-fence` → config-node unification**).
+
+Honest scope (named per AGENTS.md §2.4, Proven vs Intended): this is a regex over
+shell text under exec-guard's stated threat model — an honest-but-wrong or
+lightly-injected agent, **not** containment against a process that already
+controls the guest binary. It loses to base64, a written-then-run script, or
+`exec 3<>/dev/tcp`, and macOS `Direct` mode still has no kernel-level network
+enforcement. What it buys: the ungoverned shell door closes for the common case
+and the governed door becomes the obvious one. Deliberately out of scope for this
+slice: `git`, `gh`, `ssh`/`scp`, and package managers (`brew`/`cargo`/`npm`/`pip`)
+— network-capable dev/admin tooling with their own semantics.
 
 ## Why This Needs Its Own Proposal
 

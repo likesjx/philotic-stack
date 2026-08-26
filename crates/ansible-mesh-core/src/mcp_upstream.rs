@@ -183,6 +183,30 @@ pub struct McpEgressPolicy {
 }
 
 impl McpEgressPolicy {
+    /// Build the egress policy governing raw `bash.exec` network commands from
+    /// the `PHILOTIC_SHELL_EGRESS_ALLOW` env var (comma/whitespace-separated
+    /// host patterns, same `exact`/`*.suffix` grammar as [`Self::allowed_hosts`]).
+    ///
+    /// Loopback and the tailnet CGNAT range are always allowed regardless, so
+    /// the default (env unset) still permits the fleet's own loopback and
+    /// tailnet traffic — e.g. `curl http://127.0.0.1:8900/...` from AGENTS.md —
+    /// while denying arbitrary public egress. This env-var surface is a
+    /// deliberately transitional slice; the durable home is a hotel config node
+    /// unified with the MCP egress policy (next seam: shell-egress-policy-node).
+    pub fn shell_egress_from_env() -> Self {
+        let allowed_hosts = std::env::var("PHILOTIC_SHELL_EGRESS_ALLOW")
+            .ok()
+            .map(|raw| {
+                raw.split([',', ' ', '\t', '\n'])
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default();
+        Self { allowed_hosts }
+    }
+
     /// Whether `host` (a hostname or IP literal from a URL) is permitted.
     ///
     /// Always allowed: loopback names/addresses and IPs in `100.64.0.0/10`
