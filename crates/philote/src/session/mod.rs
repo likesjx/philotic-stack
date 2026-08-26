@@ -102,6 +102,29 @@ fn dropped_active_turn_record(checkpoint: &serde_json::Value) -> Option<TurnReco
     })
 }
 
+/// Render a cron fire time (ms since epoch) in UTC and, when an operator
+/// timezone is configured and parses, in the operator's local clock too —
+/// e.g. `2026-08-27 00:30 UTC (operator local: 2026-08-26 20:30 EDT)`.
+/// Used by the cron tools so the model sees the ACTUAL registered time in
+/// the operator's clock and can catch conversion mistakes in the same turn.
+pub(crate) fn render_fire_time(fire_at_ms: u64, user_timezone: Option<&str>) -> String {
+    let Some(utc) = chrono::DateTime::<chrono::Utc>::from_timestamp_millis(fire_at_ms as i64)
+    else {
+        return format!("{fire_at_ms} (unrenderable epoch ms)");
+    };
+    let base = format!("{} UTC", utc.format("%Y-%m-%d %H:%M"));
+    let local = user_timezone
+        .and_then(|tz| tz.parse::<chrono_tz::Tz>().ok())
+        .map(|zone| {
+            format!(
+                " (operator local: {})",
+                utc.with_timezone(&zone).format("%Y-%m-%d %H:%M %Z")
+            )
+        })
+        .unwrap_or_default();
+    format!("{base}{local}")
+}
+
 fn sanitize_timezone_for_prompt(raw: &str) -> Option<String> {
     let tz = raw.trim();
     if tz.is_empty() || tz.len() > 128 {
@@ -2554,12 +2577,27 @@ impl SessionState {
 
     fn render_prompt_from_projection(&self, projection: &ContextProjection) -> String {
         let mut prompt = String::new();
+        // Show the operator's LIVE local clock, not just the zone name: with
+        // only a UTC timestamp in view, models hand-convert local times and
+        // get scheduling wrong while sounding confident (live 2026-08-26:
+        // "8:30pm tonight" registered 4 hours off). A worked example every
+        // turn anchors the offset. Falls back to the zone-name suffix when
+        // the zone doesn't parse, and to nothing when no zone is configured.
         let tz_suffix = self
             .agent_profile
             .user_timezone
             .as_deref()
             .and_then(sanitize_timezone_for_prompt)
-            .map(|tz| format!(" (user timezone: {tz})"))
+            .map(|tz| match tz.parse::<chrono_tz::Tz>() {
+                Ok(zone) => {
+                    let local = chrono::Utc::now().with_timezone(&zone);
+                    format!(
+                        " | Operator local time: {} ({tz})",
+                        local.format("%Y-%m-%d %H:%M %Z")
+                    )
+                }
+                Err(_) => format!(" (user timezone: {tz})"),
+            })
             .unwrap_or_default();
         let persona_line = if let Some(ref name) = self.agent_profile.persona_name {
             format!(
@@ -5665,6 +5703,33 @@ fn apply_string_list_op(list: &mut Vec<String>, item: &str, operation: &str) -> 
 
 #[cfg(test)]
 mod tests {
+    /// The fire-time echo must render both clocks, honor DST (EDT in August,
+    /// EST in January), and degrade cleanly with no/invalid timezone — this
+    /// echo is what lets the model catch a local-time-written-as-UTC cron in
+    /// the same turn (live 2026-08-26: "8:30pm tonight" registered 4h off).
+    #[test]
+    fn render_fire_time_shows_operator_clock_across_dst() {
+        // 2026-08-27 00:30 UTC == 2026-08-26 20:30 EDT.
+        let aug = super::render_fire_time(1_787_790_600_000, Some("America/New_York"));
+        assert_eq!(
+            aug,
+            "2026-08-27 00:30 UTC (operator local: 2026-08-26 20:30 EDT)"
+        );
+        // 2026-01-15 12:00 UTC == 07:00 EST (standard time).
+        let jan = super::render_fire_time(1_768_478_400_000, Some("America/New_York"));
+        assert!(jan.ends_with("07:00 EST)"), "winter must render EST: {jan}");
+        // No timezone configured → UTC only.
+        assert_eq!(
+            super::render_fire_time(1_787_790_600_000, None),
+            "2026-08-27 00:30 UTC"
+        );
+        // Unparseable zone → UTC only, no panic.
+        assert_eq!(
+            super::render_fire_time(1_787_790_600_000, Some("Mars/Olympus")),
+            "2026-08-27 00:30 UTC"
+        );
+    }
+
     /// A queued task younger than the cutoff survives eviction; an older one
     /// is RETURNED to the caller (for ledger close + sender notice), never
     /// silently discarded — three operator messages were lost to the old

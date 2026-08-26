@@ -4784,7 +4784,28 @@ impl AgentRuntime {
                     .await
                 {
                     Ok(IpcResponse::Standard { ok: true, .. }) => {
-                        (format!("Cron job registered. id={job_id}"), None)
+                        // Echo the ACTUAL first fire time in both clocks. The
+                        // schedule string is raw UTC fields, and models
+                        // hand-converting operator-local times into it have
+                        // registered jobs hours off while telling the user
+                        // the right time (live 2026-08-26: "8:30pm tonight"
+                        // registered as 20:30 UTC = 4:30pm operator time).
+                        // Showing the rendered fire time makes the mistake
+                        // visible in the same turn, where the model can fix
+                        // it — remove + re-register — before confirming.
+                        (
+                            format!(
+                                "Cron job registered. id={job_id}. First fire: {}. VERIFY this \
+                                 matches the time the user asked for BEFORE confirming; if it is \
+                                 wrong, cron.remove this id and re-register with corrected UTC \
+                                 fields now.",
+                                crate::session::render_fire_time(
+                                    next_fire,
+                                    self.default_agent_profile.user_timezone.as_deref(),
+                                )
+                            ),
+                            None,
+                        )
                     }
                     Ok(IpcResponse::Standard {
                         ok: false,
