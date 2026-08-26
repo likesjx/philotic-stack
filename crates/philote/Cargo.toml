@@ -19,6 +19,7 @@ path = "src/bin/agent_worker.rs"
 anyhow = "1.0"
 ansible-mesh-core = { path = "../ansible-mesh-core" }
 chrono = { version = "0.4", features = ["clock"] }
+chrono-tz = "0.10"
 data-memorygraphrag = { path = "../data-memorygraphrag" }
 exec-guard = { path = "../exec-guard" }
 media-prep = { path = "../media-prep" }
