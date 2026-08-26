@@ -926,6 +926,10 @@ vps-deploy-ci:
 smoke-skill-admin socket agent="agent-bjork-01":
     python3 scripts/smoke-skill-admin.py {{socket}} {{agent}}
 
+# Paracrine delegation plane smoke against a live hotel socket.
+smoke-paracrine socket role="Chronos":
+    python3 scripts/smoke-paracrine.py {{socket}} {{role}}
+
 # Check that vps-jane host_vars peer ports match the live context graph.
 vps-port-drift-check:
     ./scripts/check-hotel-port-drift.py --host-vars ansible/host_vars/jane-vps.yml --ssh-target vps-jane

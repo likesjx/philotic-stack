@@ -1225,7 +1225,19 @@ pub(crate) struct ParkedInboundTask {
     pub(super) task_id: Uuid,
     pub(super) task_json: String,
     pub(super) activate_session_id: Option<String>,
+    /// Unix epoch (seconds) when this task was parked. A park older than
+    /// [`PARKED_TASK_TTL_SECS`] is dead on arrival — the caller's turn has
+    /// long since timed out — and is dropped at flush time instead of being
+    /// delivered as a stale prompt to a freshly-woken guest (live 2026-08-25:
+    /// a 17:29 whisper park was still parked at 18:20 and flushed alongside
+    /// the fresh whisper that woke the specialist).
+    pub(super) parked_at: u64,
 }
+
+/// How long a parked inbound task stays deliverable. Matches the paracrine
+/// whisper wait (the longest any caller waits on a parked dispatch) plus one
+/// watchdog tick of slack.
+pub(crate) const PARKED_TASK_TTL_SECS: u64 = 720;
 
 pub(crate) type ParkedInboundRegistry = Arc<Mutex<HashMap<String, Vec<ParkedInboundTask>>>>;
 
@@ -3354,6 +3366,23 @@ impl IpcServer {
     ) {
         let mut guard = inboxes.lock().await;
         let entry = guard.entry(role.to_string()).or_default();
+        // One live subscription per guest identity: a guest registering again
+        // (reconnect, respawn, or a raced duplicate spawn) REPLACES its older
+        // subscription instead of accumulating. Two subscribers sharing one
+        // guest_id double-deliver every task — live 2026-08-25: duplicate
+        // philote-Chronos processes each ran the same whisper and their LWW
+        // apartment checkpoints clobbered each other mid-turn, dropping the
+        // reply ("Dropped stale active turn on checkpoint restore").
+        let before = entry.len();
+        entry.retain(|subscriber| subscriber.guest_id != guest_id || subscriber.conn_id == conn_id);
+        if entry.len() < before {
+            warn!(
+                role,
+                guest_id,
+                dropped = before - entry.len(),
+                "Inbox subscription replaced: newer registration for this guest supersedes stale one(s)"
+            );
+        }
         if !entry.iter().any(|subscriber| subscriber.conn_id == conn_id) {
             entry.push(RoleSubscriber {
                 conn_id,
@@ -3459,6 +3488,7 @@ impl IpcServer {
             task_id,
             task_json: task_json.clone(),
             activate_session_id: None,
+            parked_at: unix_ts(),
         });
         info!(
             %task_id,
@@ -3807,6 +3837,7 @@ impl IpcServer {
                     task_id,
                     task_json: task_json.to_string(),
                     activate_session_id: None,
+                    parked_at: unix_ts(),
                 });
             }
         }
@@ -4695,6 +4726,37 @@ impl IpcServer {
                     let mut guard = parked_inbound.lock().await;
                     guard.remove(&identity.guest_id)
                 } {
+                    // Expired parks are dead on arrival: their caller's turn
+                    // timed out long ago. Close their ledger rows with the
+                    // real reason and drop them instead of delivering stale
+                    // prompts to the freshly-registered guest.
+                    let now = unix_ts();
+                    let (parked, expired): (Vec<_>, Vec<_>) =
+                        parked.into_iter().partition(|task| {
+                            now.saturating_sub(task.parked_at) <= PARKED_TASK_TTL_SECS
+                        });
+                    for task in expired {
+                        warn!(
+                            guest_id = %identity.guest_id,
+                            task_id = %task.task_id,
+                            age_secs = now.saturating_sub(task.parked_at),
+                            "Dropping expired parked task at flush — caller timed out long ago"
+                        );
+                        if let Ok(payload) =
+                            serde_json::from_str::<serde_json::Value>(&task.task_json)
+                        {
+                            Self::fail_undelivered_session_turn(
+                                graph,
+                                &payload,
+                                "PARKED_TASK_EXPIRED",
+                                &format!(
+                                    "parked for guest {} longer than {PARKED_TASK_TTL_SECS}s; \
+                                     dropped at flush",
+                                    identity.guest_id
+                                ),
+                            );
+                        }
+                    }
                     let mut activated_sessions = std::collections::HashSet::new();
                     for task in &parked {
                         if let Some(session_id) = task.activate_session_id.as_deref() {
@@ -5858,7 +5920,24 @@ impl IpcServer {
                 } else {
                     target_guest_id
                 };
-                if target_guest_id.is_none() {
+                if target_guest_id.is_none() && target_node != local_node_id {
+                    // A response bound for a REMOTE hotel cannot be resolved
+                    // here: the return guest and its session live on the
+                    // target hotel, so local subscriber inference is
+                    // meaningless. Rejecting these locally silently ate
+                    // cross-hotel replies (live 2026-08-25: mac-jane's life.*
+                    // datasource_response returns died at this gate on vps).
+                    // Forward; the target hotel resolves or rejects with the
+                    // session context only it has.
+                    if let Some(action) = response_like_agent_action.as_deref() {
+                        info!(
+                            action,
+                            target_node = target_node.as_str(),
+                            "EmitTask: forwarding guest-less response-like task to its home hotel for resolution"
+                        );
+                    }
+                }
+                if target_guest_id.is_none() && target_node == local_node_id {
                     if let Some(action) = response_like_agent_action {
                         let message = format!(
                             "[response_route_unresolved] response-like action [{action}] targeted role [agent] without a concrete return guest"
@@ -6406,6 +6485,7 @@ impl IpcServer {
                                         task_id,
                                         task_json: task_json.clone(),
                                         activate_session_id: None,
+                                        parked_at: unix_ts(),
                                     },
                                 );
                             }
@@ -8615,6 +8695,7 @@ impl IpcServer {
                                         task_id,
                                         task_json,
                                         activate_session_id: None,
+                                        parked_at: unix_ts(),
                                     },
                                 );
                             }
@@ -14374,6 +14455,7 @@ impl IpcServer {
                 task_id,
                 task_json,
                 activate_session_id: Some(session_id.to_string()),
+                parked_at: unix_ts(),
             });
             return;
         }
@@ -31286,6 +31368,77 @@ pub(crate) mod tests {
             )
             .await;
             (rx, drained)
+        }
+
+        /// One live subscription per guest identity: a re-registration (new
+        /// process, reconnect, raced duplicate spawn) must REPLACE the older
+        /// subscription for the same guest_id — two subscribers sharing a
+        /// guest double-deliver every task (live 2026-08-25: duplicate
+        /// philote-Chronos processes each ran the same whisper and their LWW
+        /// checkpoints clobbered each other). Distinct guests keep coexisting.
+        #[tokio::test]
+        async fn add_subscription_replaces_stale_same_guest_subscription() {
+            let inboxes: InboxRegistry = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+            let mk_sender = || {
+                let (tx, rx) = mpsc::unbounded_channel::<IpcResponse>();
+                (CountedSender::new(tx, None, None), rx)
+            };
+            let (s1, _r1) = mk_sender();
+            let (s2, _r2) = mk_sender();
+            let (s3, _r3) = mk_sender();
+            let mut roles1 = Vec::new();
+            let mut roles2 = Vec::new();
+            let mut roles3 = Vec::new();
+            let conn2 = Uuid::new_v4();
+
+            IpcServer::add_subscription(
+                &inboxes,
+                "agent",
+                Uuid::new_v4(),
+                "agent-beacon:Chronos",
+                &[],
+                &s1,
+                &mut roles1,
+            )
+            .await;
+            IpcServer::add_subscription(
+                &inboxes,
+                "agent",
+                conn2,
+                "agent-beacon:Chronos",
+                &[],
+                &s2,
+                &mut roles2,
+            )
+            .await;
+            IpcServer::add_subscription(
+                &inboxes,
+                "agent",
+                Uuid::new_v4(),
+                "agent-beacon",
+                &[],
+                &s3,
+                &mut roles3,
+            )
+            .await;
+
+            let guard = inboxes.lock().await;
+            let subs = guard.get("agent").expect("role entry");
+            let chronos: Vec<_> = subs
+                .iter()
+                .filter(|s| s.guest_id == "agent-beacon:Chronos")
+                .collect();
+            assert_eq!(
+                chronos.len(),
+                1,
+                "same-guest re-registration must replace, not accumulate"
+            );
+            assert_eq!(chronos[0].conn_id, conn2, "newest registration wins");
+            assert_eq!(
+                subs.iter().filter(|s| s.guest_id == "agent-beacon").count(),
+                1,
+                "a distinct guest under the same role must be untouched"
+            );
         }
 
         #[test]

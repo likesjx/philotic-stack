@@ -3545,7 +3545,8 @@ impl AgentRuntime {
             serde_json::to_string(&reply_payload)?
         };
 
-        self.ipc_client
+        let reply_emit = self
+            .ipc_client
             .send_request(IpcRequest::EmitTask {
                 target_node: completed_turn.final_reply_to,
                 target_role: completed_turn.final_reply_role,
@@ -3553,6 +3554,31 @@ impl AgentRuntime {
                 task_json,
             })
             .await?;
+        // A refused final reply / paracrine_response is a silently lost
+        // answer — the hotel rejects routes it cannot resolve
+        // (RESPONSE_ROUTE_UNRESOLVED, stale-peer fail-fast). Make the loss
+        // loud so it surfaces as a heal work item instead of only as the
+        // caller's timeout.
+        if let philotic_client::IpcResponse::Standard {
+            ok: false,
+            code,
+            message,
+            ..
+        } = &reply_emit
+        {
+            warn!(
+                session_id = %attend_session_id,
+                code = %code,
+                "final reply emit REJECTED by hotel — the recipient will never see this response"
+            );
+            self.push_heal_event(
+                "reply_emit_rejected",
+                &format!(
+                    "final reply for session {attend_session_id} rejected by hotel: {code}: {message}"
+                ),
+            )
+            .await;
+        }
 
         // After completing this turn, schedule the next pending user task for dispatch.
         self.drain_next_user_task(&attend_session_id);

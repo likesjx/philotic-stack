@@ -1153,7 +1153,7 @@ impl AgentRuntime {
                 reply_session = %reply_session_id,
                 "delegate.merge: emitting paracrine_response to orchestrator"
             );
-            let _ = self
+            let emit = self
                 .ipc_client
                 .send_request(IpcRequest::EmitTask {
                     target_node: final_reply_to,
@@ -1162,6 +1162,31 @@ impl AgentRuntime {
                     task_json: merge_task.to_string(),
                 })
                 .await;
+            // The hotel refuses responses it cannot route
+            // (RESPONSE_ROUTE_UNRESOLVED / stale-peer fail-fast). The caller
+            // cannot be reached — the route IS what failed — so make the loss
+            // loud: without this, the specialist's answer vanished and the
+            // only trace was the caller's whisper timeout.
+            if let Ok(philotic_client::IpcResponse::Standard {
+                ok: false,
+                code,
+                message,
+                ..
+            }) = &emit
+            {
+                warn!(
+                    session_id = %session_id,
+                    code = %code,
+                    "delegate.merge: paracrine_response REJECTED by hotel — the caller will only see its whisper time out"
+                );
+                self.push_heal_event(
+                    "paracrine_response_rejected",
+                    &format!(
+                        "specialist merge response for session {session_id} rejected: {code}: {message}"
+                    ),
+                )
+                .await;
+            }
         }
 
         // Return a tool result so the specialist's turn can continue or close.
