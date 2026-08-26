@@ -3316,7 +3316,33 @@ impl TelegramSeatGuest {
                 }
             }
             // waiting_tool and waiting_model: typing continues — no action needed.
-            else if event == "model_fallback" || event == "model_fallback_cleared" {
+            else if event == "plan_continuation" {
+                // A continuation model call follows on this same session, but
+                // the final reply that preceded this event already removed the
+                // ActiveTurn entry — without re-arming, every continuation
+                // step's partial_reply finds no entry and progressive
+                // streaming silently stops after the plan's first step
+                // (DEF-091). Re-arm exactly as an inbound message would:
+                // fresh typing heartbeat + fresh draft state, so the next
+                // step streams into its own draft message. The step's final
+                // reply (or eviction fan-out / waiting_approval) removes the
+                // entry again, same as the base path.
+                if !chat_id.is_empty() {
+                    let thread_id = task
+                        .get("thread_id")
+                        .and_then(Value::as_str)
+                        .map(str::to_string);
+                    let mut turns = self.active_turns.lock().unwrap();
+                    if !turns.contains_key(&session_id) {
+                        let (cancel_tx, _handle) = spawn_typing_heartbeat(
+                            self.http_client.clone(),
+                            tg_base.clone(),
+                            chat_id.clone(),
+                        );
+                        turns.insert(session_id.clone(), ActiveTurn::new(cancel_tx, thread_id));
+                    }
+                }
+            } else if event == "model_fallback" || event == "model_fallback_cleared" {
                 // Model-tier fallback/recovery notice (Slice 3 of Model
                 // Failover Layers): a one-time plain operational message, not
                 // an assistant reply — no draft-edit streaming and no TTS.
@@ -4621,6 +4647,77 @@ mod tests {
         assert_eq!(result, Some(StreamingDraftUpdate::Retained(42)));
         let calls = calls.lock().unwrap();
         assert_eq!(*calls, vec!["editMessageText".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn plan_continuation_rearms_turn_so_next_step_streams() {
+        let (tg_base, calls) = spawn_mock_telegram(MockEdit::Ok).await;
+        let mut guest = new_test_seat_guest();
+        guest.tg_base = Some(tg_base);
+
+        // Step 1's final reply removes the ActiveTurn entry (none existed here
+        // to begin with — matches a continuation arriving turn-less).
+        let final_json = json!({
+            "session_id": "sess-plan-1",
+            "turn_id": "turn-step-1",
+            "action": "send_reply",
+            "chat_id": "123",
+            "content": "step one answer"
+        })
+        .to_string();
+        guest.handle_inbound_task(&final_json).await;
+
+        // plan_continuation re-arms the turn for the next model call.
+        let cont_json = json!({
+            "session_id": "sess-plan-1",
+            "turn_id": "turn-step-2",
+            "action": "turn_event",
+            "event": "plan_continuation",
+            "chat_id": "123"
+        })
+        .to_string();
+        guest.handle_inbound_task(&cont_json).await;
+        assert!(
+            guest
+                .active_turns
+                .lock()
+                .unwrap()
+                .contains_key("sess-plan-1"),
+            "plan_continuation must re-arm the ActiveTurn entry"
+        );
+
+        // Step 2's first partial now finds the entry and creates a fresh draft.
+        let partial_json = json!({
+            "session_id": "sess-plan-1",
+            "turn_id": "turn-step-2",
+            "action": "partial_reply",
+            "chat_id": "123",
+            "content": "step two partial"
+        })
+        .to_string();
+        guest.handle_inbound_task(&partial_json).await;
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let sent = calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|c| *c == "sendMessage")
+            .count();
+        // One final (step 1) + one streaming draft (step 2).
+        assert_eq!(
+            sent, 2,
+            "continuation partial must create a streaming draft after re-arm"
+        );
+        assert_eq!(
+            guest
+                .active_turns
+                .lock()
+                .unwrap()
+                .get("sess-plan-1")
+                .and_then(|a| a.draft_message_id),
+            Some(777),
+        );
     }
 
     #[tokio::test]
