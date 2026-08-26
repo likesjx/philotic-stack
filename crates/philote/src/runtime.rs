@@ -7003,6 +7003,20 @@ impl AgentRuntime {
                             }
                         }
 
+                        // Checkpoint-restored sessions carry the agent
+                        // profile as of when the checkpoint was written —
+                        // fields configured SINCE then (user_timezone from the
+                        // hotel user profile) never reach long-lived sessions
+                        // otherwise. Overlay missing fields from the current
+                        // default profile; never override what the session
+                        // already has. Same bug class as the voice-routing
+                        // loss on restore (restore must apply
+                        // default_agent_profile).
+                        if state.agent_profile.user_timezone.is_none() {
+                            state.agent_profile.user_timezone =
+                                self.default_agent_profile.user_timezone.clone();
+                        }
+
                         self.sessions.insert(session_id.to_string(), state);
                         self.apply_mcp_upstream_projection(session_id);
                         self.apply_http_integration_projection(session_id);
