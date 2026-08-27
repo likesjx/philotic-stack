@@ -322,8 +322,20 @@ pub struct CarryoverPlan {
     #[serde(default)]
     pub stalled_continuations: u32,
     /// Number of continuation turns already synthesized for this plan.
+    ///
+    /// Refunded to zero whenever a continuation settles a new step, so the
+    /// budget only ever binds stretches that are not making progress — a plan
+    /// that keeps verifiably landing steps is never cut off mid-goal. See
+    /// `PLAN_CONTINUATION_LIFETIME_CAP` for the absolute backstop.
     #[serde(default)]
     pub continuations_used: u32,
+    /// Total continuation turns synthesized over this plan's whole lifetime.
+    ///
+    /// Never refunded. Progress resets `continuations_used`, so without this a
+    /// plan that alternates one settled step with a fresh batch of self-added
+    /// steps could hold the loop forever. See `PLAN_CONTINUATION_LIFETIME_CAP`.
+    #[serde(default)]
+    pub lifetime_continuations: u32,
     /// The turn that originally produced this carryover.
     pub created_turn_id: String,
 }
