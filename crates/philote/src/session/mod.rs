@@ -2101,6 +2101,44 @@ impl SessionState {
     }
 
     pub fn project_tools_for_turn(&self, user_content: &str) -> Vec<ToolDefinition> {
+        let mut tools = self.project_tools_for_turn_by_relevance(user_content);
+
+        // A turn that carries an active plan must always be able to execute
+        // the tools its steps are bound to, whatever the keyword gates below
+        // make of the turn's text. This is load-bearing for continuation
+        // turns: their user_content is the synthesized brief, and a goal or
+        // step phrased with a `?` classifies the whole brief as conversational
+        // — which used to project ZERO tools, guarantee two stalls, and get
+        // the plan blocked without a single step ever being attempted.
+        let plan_bound: Vec<&str> = self
+            .active_turn
+            .as_ref()
+            .and_then(|t| t.active_plan.as_ref())
+            .map(|plan| {
+                plan.steps
+                    .iter()
+                    .filter_map(|s| s.tool_name.as_deref())
+                    .filter(|t| !t.is_empty())
+                    .collect()
+            })
+            .unwrap_or_default();
+        for name in plan_bound {
+            if tools.iter().any(|t| t.tool_name == name) {
+                continue;
+            }
+            if let Some(tool) = self
+                .tool_assembly
+                .tools_for_model
+                .iter()
+                .find(|t| t.tool_name == name)
+            {
+                tools.push(tool.clone());
+            }
+        }
+        tools
+    }
+
+    fn project_tools_for_turn_by_relevance(&self, user_content: &str) -> Vec<ToolDefinition> {
         let mut all_tools = self.tool_assembly.tools_for_model.clone();
 
         // Paracrine context: auto-inject delegate.merge so the specialist can explicitly
@@ -5846,6 +5884,7 @@ mod tests {
             verified_step_ids: vec![1],
             stalled_continuations: 1,
             continuations_used: 2,
+            lifetime_continuations: 2,
             created_turn_id: "turn-origin".into(),
         }
     }
@@ -8428,6 +8467,46 @@ mod tests {
         assert!(
             projected.is_empty(),
             "expected ordinary thanks/filler turn to still collapse to zero tools, got {:?}",
+            projected
+                .iter()
+                .map(|t| t.tool_name.as_str())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn plan_bound_tools_survive_the_conversational_gate() {
+        // A continuation turn's user_content is the synthesized brief; a goal
+        // or step containing `?` classifies the whole brief as conversational,
+        // which used to project ZERO tools — the continuation could not
+        // execute a single step, stalled twice, and the plan was blocked.
+        // Tools bound by the active plan's steps must always be projected.
+        let mut state =
+            SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
+        for tool in ["life.observe", "life.recall", "memory.remember"] {
+            state.add_tool_binding(tool);
+        }
+        let mut turn = test_working_turn(Some(ActivePlan {
+            goal: "answer: what's on the calendar?".into(),
+            steps: vec![PlanStep {
+                id: 1,
+                description: "look up today's events".into(),
+                tool_name: Some("life.recall".into()),
+                status: "pending".into(),
+            }],
+            status: "executing".into(),
+            context_1_advisory: None,
+        }));
+        turn.plan_confirmed = true;
+        state.start_turn(turn);
+
+        let projected = state.project_tools_for_turn(
+            "[Plan continuation 1/3] Continue executing your existing plan. \
+             Goal: answer: what's on the calendar?",
+        );
+        assert!(
+            projected.iter().any(|t| t.tool_name == "life.recall"),
+            "plan-bound tool must survive projection, got {:?}",
             projected
                 .iter()
                 .map(|t| t.tool_name.as_str())

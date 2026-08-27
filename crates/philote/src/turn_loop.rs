@@ -9,9 +9,10 @@
 use super::*;
 
 use crate::plan_eval::{
-    DEFAULT_PLAN_CONTINUATION_BUDGET, PlanEvalVerdict, PriorPlanState, evaluate_plan,
-    interim_reply_admissible, plan_continuation_brief, plan_continuation_disabled,
-    plan_stop_notice, scaled_continuation_budget, unix_now,
+    DEFAULT_PLAN_CONTINUATION_BUDGET, MAX_CONSECUTIVE_PLAN_STALLS, PLAN_CONTINUATION_LIFETIME_CAP,
+    PlanEvalVerdict, PriorPlanState, evaluate_plan, interim_reply_admissible,
+    plan_continuation_brief, plan_continuation_disabled, plan_stop_notice,
+    scaled_continuation_budget, unix_now,
 };
 use crate::session::CarryoverPlan;
 
@@ -595,14 +596,14 @@ impl AgentRuntime {
 
             // Notify the user that the session is unblocked.
             let notify_req = IpcRequest::EmitTask {
-                target_node: reply_to,
-                target_role: reply_role,
-                target_guest_id: reply_guest_id,
+                target_node: reply_to.clone(),
+                target_role: reply_role.clone(),
+                target_guest_id: reply_guest_id.clone(),
                 task_json: serde_json::json!({
                     "action": "send_reply",
-                    "session_id": session_id,
-                    "turn_id": turn_id,
-                    "chat_id": chat_id,
+                    "session_id": session_id.clone(),
+                    "turn_id": turn_id.clone(),
+                    "chat_id": chat_id.clone(),
                     "content": "*(I seem to have gotten stuck waiting for a response. The session is unblocked — please try again.)*",
                     "final": true,
                 })
@@ -611,6 +612,19 @@ impl AgentRuntime {
             if let Err(e) = self.ipc_client.send_request(notify_req).await {
                 warn!("Turn watchdog: failed to send unblock notification: {}", e);
             }
+
+            // An evicted turn must not strand the plan carryover — same
+            // contract as `fail_active_turn`: the completion path (the only
+            // synthesizer of continuations) will never run for this turn.
+            self.resume_carryover_after_failed_turn(
+                &session_id,
+                &turn_id,
+                &chat_id,
+                &reply_to,
+                &reply_role,
+                reply_guest_id,
+            )
+            .await;
         }
 
         // Step 4: evict stale queued tasks from all sessions. The threshold
@@ -3355,7 +3369,14 @@ impl AgentRuntime {
             .await;
 
         let plan_budget = self.plan_continuation_budget_for(&session_id);
-        let (completed_turn, checkpoint_memory_type, checkpoint_json, index_state, plan_followup) = {
+        let (
+            completed_turn,
+            checkpoint_memory_type,
+            checkpoint_json,
+            index_state,
+            plan_followup,
+            plan_superseded_notice,
+        ) = {
             let Some(state) = self.sessions.get_mut(&session_id) else {
                 warn!("deliver_text_reply: unknown session {}", session_id);
                 return Ok(());
@@ -3380,7 +3401,8 @@ impl AgentRuntime {
             // Plan-eval-repeat: derive the completion verdict for this turn's
             // plan (or a deferred carryover) and update the checkpointed
             // carryover BEFORE the checkpoint below is built.
-            let plan_followup = plan_followup_after_turn(state, &completed_turn, plan_budget);
+            let (plan_followup, plan_superseded_notice) =
+                plan_followup_after_turn(state, &completed_turn, plan_budget);
 
             (
                 completed_turn,
@@ -3388,12 +3410,13 @@ impl AgentRuntime {
                 state.checkpoint_json(),
                 state.clone(),
                 plan_followup,
+                plan_superseded_notice,
             )
         };
 
         // Routing snapshot for post-completion plan events / continuation, taken
         // before `completed_turn` fields are moved into the reply payload below.
-        let plan_route = plan_followup.as_ref().map(|_| {
+        let plan_route = (plan_followup.is_some() || plan_superseded_notice.is_some()).then(|| {
             (
                 completed_turn.turn_id.clone(),
                 completed_turn.chat_id.clone(),
@@ -3587,27 +3610,43 @@ impl AgentRuntime {
         // budgeted continuation turn or notify the operator why the loop stopped.
         // Runs after the drain so a queued user task keeps priority — the
         // carryover then resumes after that user turn completes.
-        if let (Some(followup), Some((p_turn_id, p_chat_id, p_reply_to, p_reply_role, p_guest))) =
-            (plan_followup, plan_route)
-        {
-            if let Err(e) = self
-                .dispatch_plan_followup(
-                    &attend_session_id,
-                    followup,
-                    plan_budget,
-                    p_turn_id,
-                    p_chat_id,
-                    p_reply_to,
-                    p_reply_role,
-                    p_guest,
-                )
-                .await
-            {
-                warn!(
-                    session_id = %attend_session_id,
-                    "Plan follow-up dispatch failed (non-fatal): {}",
-                    e
-                );
+        if let Some((p_turn_id, p_chat_id, p_reply_to, p_reply_role, p_guest)) = plan_route {
+            // A prior plan this turn superseded left unfinished work behind —
+            // record it as a plan_stopped event so the abandonment is auditable.
+            if let Some(notice) = plan_superseded_notice {
+                let _ = self
+                    .emit_plan_turn_event(
+                        &attend_session_id,
+                        "plan_stopped",
+                        Some(notice),
+                        &p_turn_id,
+                        &p_chat_id,
+                        &p_reply_to,
+                        &p_reply_role,
+                        p_guest.clone(),
+                    )
+                    .await;
+            }
+            if let Some(followup) = plan_followup {
+                if let Err(e) = self
+                    .dispatch_plan_followup(
+                        &attend_session_id,
+                        followup,
+                        plan_budget,
+                        p_turn_id,
+                        p_chat_id,
+                        p_reply_to,
+                        p_reply_role,
+                        p_guest,
+                    )
+                    .await
+                {
+                    warn!(
+                        session_id = %attend_session_id,
+                        "Plan follow-up dispatch failed (non-fatal): {}",
+                        e
+                    );
+                }
             }
         }
 
@@ -3717,6 +3756,8 @@ impl AgentRuntime {
             .await?;
 
         let drain_session_id = session_id.clone();
+        let failed_turn_id = turn_id.clone();
+        let failed_chat_id = chat_id.clone();
         let reply_payload = FinalReplyPayload {
             action: "send_reply",
             session_id,
@@ -3730,15 +3771,28 @@ impl AgentRuntime {
 
         self.ipc_client
             .send_request(IpcRequest::EmitTask {
-                target_node: final_reply_to,
-                target_role: final_reply_role,
-                target_guest_id: final_reply_guest_id,
+                target_node: final_reply_to.clone(),
+                target_role: final_reply_role.clone(),
+                target_guest_id: final_reply_guest_id.clone(),
                 task_json: serde_json::to_string(&reply_payload)?,
             })
             .await?;
 
         // After failing this turn, schedule the next pending user task for dispatch.
         self.drain_next_user_task(&drain_session_id);
+
+        // A failed turn must not strand the plan carryover: without this, the
+        // completion path (the only place continuations are synthesized) never
+        // runs again and the plan goes silently dormant.
+        self.resume_carryover_after_failed_turn(
+            &drain_session_id,
+            &failed_turn_id,
+            &failed_chat_id,
+            &final_reply_to,
+            &final_reply_role,
+            final_reply_guest_id,
+        )
+        .await;
 
         Ok(())
     }
@@ -3925,6 +3979,9 @@ impl AgentRuntime {
                     );
                     let brief = plan_continuation_brief(carry, budget);
                     carry.continuations_used += 1;
+                    // Never refunded — the absolute backstop behind the
+                    // progress-refunded per-stretch budget.
+                    carry.lifetime_continuations += 1;
                     (brief, budget)
                 };
                 // Re-persist so the charged budget survives a restart.
@@ -3980,6 +4037,71 @@ impl AgentRuntime {
     }
 }
 
+impl AgentRuntime {
+    /// A turn died (model failure, watchdog eviction) while the session holds
+    /// a plan carryover. The completion path never ran, so nothing would ever
+    /// resume the plan — historically it went dormant until an unrelated
+    /// plan-less turn happened to complete, which with plan-by-default almost
+    /// never occurs. Resume it here: the failed turn is charged as a stall
+    /// (two consecutive dead turns stop the plan, mirroring
+    /// `MAX_CONSECUTIVE_PLAN_STALLS`), then the normal budget checks apply.
+    /// `dispatch_plan_followup` itself defers to queued user work.
+    pub(super) async fn resume_carryover_after_failed_turn(
+        &mut self,
+        session_id: &str,
+        turn_id: &str,
+        chat_id: &str,
+        reply_to: &str,
+        reply_role: &str,
+        reply_guest_id: Option<String>,
+    ) {
+        let budget = self.plan_continuation_budget_for(session_id);
+        let followup = {
+            let Some(state) = self.sessions.get_mut(session_id) else {
+                return;
+            };
+            let Some(carry) = state.carryover_plan.as_mut() else {
+                return;
+            };
+            carry.stalled_continuations += 1;
+            if carry.stalled_continuations >= MAX_CONSECUTIVE_PLAN_STALLS {
+                let carry = state.carryover_plan.take().expect("checked above");
+                Some(PlanFollowup::Stop {
+                    eval_json: None,
+                    notice: plan_stop_notice(&carry, "the turn failed repeatedly"),
+                })
+            } else {
+                carryover_resume_followup(state, budget)
+            }
+        };
+        let Some(followup) = followup else {
+            return;
+        };
+        // Persist the charged stall (and any cleared carryover) so a restart
+        // cannot resurrect an already-stopped plan.
+        let _ = self.persist_session_checkpoint(session_id).await;
+        if let Err(e) = self
+            .dispatch_plan_followup(
+                session_id,
+                followup,
+                budget,
+                turn_id.to_string(),
+                chat_id.to_string(),
+                reply_to.to_string(),
+                reply_role.to_string(),
+                reply_guest_id,
+            )
+            .await
+        {
+            warn!(
+                session_id = %session_id,
+                "Carryover resume after failed turn failed (non-fatal): {}",
+                e
+            );
+        }
+    }
+}
+
 /// Follow-up decision derived from a completed turn's plan eval.
 #[derive(Debug)]
 pub(super) enum PlanFollowup {
@@ -4004,27 +4126,48 @@ pub(super) fn plan_followup_after_turn(
     state: &mut SessionState,
     completed_turn: &WorkingTurn,
     budget: u32,
-) -> Option<PlanFollowup> {
+) -> (Option<PlanFollowup>, Option<String>) {
     if completed_turn.scripted_loop_context.is_some() || completed_turn.paracrine_origin.is_some() {
-        return None;
+        return (None, None);
     }
     let disabled = plan_continuation_disabled();
 
+    // A carryover with work left that this turn's plan (or lack of one) is
+    // about to replace or drop must not vanish silently — abandonment without
+    // a record is the same failure as a false success claim. The notice is a
+    // turn event, never chat.
+    let superseded_notice = |carry: &CarryoverPlan| {
+        (carry.steps_done_count() < carry.plan.steps.len())
+            .then(|| plan_stop_notice(carry, "superseded by a new plan"))
+    };
+
     if let Some(plan) = completed_turn.active_plan.as_ref() {
         if plan.steps.is_empty() {
+            let notice = state.carryover_plan.as_ref().and_then(superseded_notice);
             state.carryover_plan = None;
-            return None;
+            return (None, notice);
         }
         // The same plan (by goal) continues an existing carryover's budget,
         // evidence and stall count; a different plan replaces it (user
-        // redirected the work).
-        let (prior_carry, used, origin) = match state.carryover_plan.as_ref() {
+        // redirected the work) — and the replaced plan's remaining work is
+        // surfaced, not dropped on the floor.
+        let (prior_carry, used, lifetime, origin, superseded) = match state.carryover_plan.as_ref()
+        {
             Some(c) if c.plan.goal == plan.goal => (
                 Some(c.clone()),
                 c.continuations_used,
+                c.lifetime_continuations,
                 c.created_turn_id.clone(),
+                None,
             ),
-            _ => (None, 0, completed_turn.turn_id.clone()),
+            Some(c) => (
+                None,
+                0,
+                0,
+                completed_turn.turn_id.clone(),
+                superseded_notice(c),
+            ),
+            None => (None, 0, 0, completed_turn.turn_id.clone(), None),
         };
 
         // Evidence from this turn merges with evidence carried from earlier
@@ -4078,10 +4221,22 @@ pub(super) fn plan_followup_after_turn(
             "Plan eval"
         );
 
+        // Progress refunds the per-stretch budget. The stall ceiling already
+        // blocks a spinning plan after two empty continuations, so a budget
+        // that keeps charging productive turns only ever truncates plans that
+        // are verifiably landing steps — the one kind of plan the loop exists
+        // to finish. `lifetime_continuations` (checked below) is the absolute
+        // backstop that a refund-based budget needs.
+        let made_progress = prior_carry
+            .as_ref()
+            .map(|c| outcome.steps_done > c.steps_done_count())
+            .unwrap_or(false);
+        let used = if made_progress { 0 } else { used };
+
         match outcome.verdict {
             PlanEvalVerdict::Complete => {
                 state.carryover_plan = None;
-                Some(PlanFollowup::Settled { eval_json })
+                (Some(PlanFollowup::Settled { eval_json }), superseded)
             }
             PlanEvalVerdict::Blocked => {
                 let carry = CarryoverPlan {
@@ -4090,20 +4245,24 @@ pub(super) fn plan_followup_after_turn(
                     verified_step_ids,
                     stalled_continuations: outcome.stalled_continuations,
                     continuations_used: used,
+                    lifetime_continuations: lifetime,
                     created_turn_id: origin,
                 };
                 state.carryover_plan = None;
                 let notice =
                     plan_stop_notice(&carry, "a step failed or no forward progress was made");
-                Some(PlanFollowup::Stop {
-                    eval_json: Some(eval_json),
-                    notice,
-                })
+                (
+                    Some(PlanFollowup::Stop {
+                        eval_json: Some(eval_json),
+                        notice,
+                    }),
+                    superseded,
+                )
             }
             PlanEvalVerdict::Continue => {
                 if disabled {
                     state.carryover_plan = None;
-                    return Some(PlanFollowup::Settled { eval_json });
+                    return (Some(PlanFollowup::Settled { eval_json }), superseded);
                 }
                 let carry = CarryoverPlan {
                     plan: plan.clone(),
@@ -4111,23 +4270,34 @@ pub(super) fn plan_followup_after_turn(
                     verified_step_ids,
                     stalled_continuations: outcome.stalled_continuations,
                     continuations_used: used,
+                    lifetime_continuations: lifetime,
                     created_turn_id: origin,
                 };
-                if used >= budget {
+                if used >= budget || lifetime >= PLAN_CONTINUATION_LIFETIME_CAP {
                     state.carryover_plan = None;
-                    let notice = plan_stop_notice(
-                        &carry,
-                        &format!("auto-continuation budget of {budget} exhausted"),
+                    let reason = if lifetime >= PLAN_CONTINUATION_LIFETIME_CAP {
+                        format!(
+                            "lifetime continuation cap of {PLAN_CONTINUATION_LIFETIME_CAP} reached"
+                        )
+                    } else {
+                        format!("auto-continuation budget of {budget} exhausted")
+                    };
+                    let notice = plan_stop_notice(&carry, &reason);
+                    return (
+                        Some(PlanFollowup::Stop {
+                            eval_json: Some(eval_json),
+                            notice,
+                        }),
+                        superseded,
                     );
-                    return Some(PlanFollowup::Stop {
-                        eval_json: Some(eval_json),
-                        notice,
-                    });
                 }
                 state.carryover_plan = Some(carry);
-                Some(PlanFollowup::Continue {
-                    eval_json: Some(eval_json),
-                })
+                (
+                    Some(PlanFollowup::Continue {
+                        eval_json: Some(eval_json),
+                    }),
+                    superseded,
+                )
             }
         }
     } else if state.carryover_plan.is_some() {
@@ -4135,38 +4305,55 @@ pub(super) fn plan_followup_after_turn(
         // interleaved user turn finished. Resume the deferred carryover without
         // re-evaluating against this unrelated turn's tool history.
         if disabled {
-            state.carryover_plan = None;
-            return None;
-        }
-        let used = state
-            .carryover_plan
-            .as_ref()
-            .map(|c| c.continuations_used)
-            .unwrap_or(0);
-        // Scale on the same basis as the evaluated path, or a plan deferred by
-        // an interleaved user turn would be held to a narrower budget than the
-        // one it was running under.
-        let outstanding = state
-            .carryover_plan
-            .as_ref()
-            .map(|c| c.plan.steps.len().saturating_sub(c.steps_done_count()))
-            .unwrap_or(0);
-        let budget = scaled_continuation_budget(budget, outstanding);
-        if used >= budget {
-            let carry = state.carryover_plan.take().expect("checked above");
-            let notice = plan_stop_notice(
-                &carry,
-                &format!("auto-continuation budget of {budget} exhausted"),
-            );
-            return Some(PlanFollowup::Stop {
-                eval_json: None,
-                notice,
+            let notice = state.carryover_plan.as_ref().map(|c| {
+                plan_stop_notice(
+                    c,
+                    "plan continuation disabled (PHILOTIC_DISABLE_PLAN_CONTINUATION)",
+                )
             });
+            state.carryover_plan = None;
+            return (None, notice);
         }
-        Some(PlanFollowup::Continue { eval_json: None })
+        (carryover_resume_followup(state, budget), None)
     } else {
-        None
+        (None, None)
     }
+}
+
+/// Resume (or stop) a dormant carryover outside the evaluated path: after an
+/// interleaved plan-less user turn, or after a failed/evicted turn. Applies
+/// the same budget scaling and lifetime cap as the evaluated path; clears the
+/// carryover and returns `Stop` when the budget is spent.
+pub(super) fn carryover_resume_followup(
+    state: &mut SessionState,
+    budget: u32,
+) -> Option<PlanFollowup> {
+    let carry = state.carryover_plan.as_ref()?;
+    let used = carry.continuations_used;
+    let lifetime = carry.lifetime_continuations;
+    // Scale on the same basis as the evaluated path, or a plan deferred by
+    // an interleaved user turn would be held to a narrower budget than the
+    // one it was running under.
+    let outstanding = carry
+        .plan
+        .steps
+        .len()
+        .saturating_sub(carry.steps_done_count());
+    let budget = scaled_continuation_budget(budget, outstanding);
+    if used >= budget || lifetime >= PLAN_CONTINUATION_LIFETIME_CAP {
+        let carry = state.carryover_plan.take().expect("checked above");
+        let reason = if lifetime >= PLAN_CONTINUATION_LIFETIME_CAP {
+            format!("lifetime continuation cap of {PLAN_CONTINUATION_LIFETIME_CAP} reached")
+        } else {
+            format!("auto-continuation budget of {budget} exhausted")
+        };
+        let notice = plan_stop_notice(&carry, &reason);
+        return Some(PlanFollowup::Stop {
+            eval_json: None,
+            notice,
+        });
+    }
+    Some(PlanFollowup::Continue { eval_json: None })
 }
 
 #[cfg(test)]

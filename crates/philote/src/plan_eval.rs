@@ -57,6 +57,17 @@ pub const DEFAULT_PLAN_CONTINUATION_BUDGET: u32 = 3;
 /// stage so a plan can never loop indefinitely, however many steps it declares.
 pub const PLAN_CONTINUATION_BUDGET_CEILING: u32 = 8;
 
+/// Absolute cap on continuation turns over a plan's whole lifetime.
+///
+/// The per-stretch budget is refunded whenever a continuation settles a new
+/// step (progress must never be what exhausts the loop — stalls are what the
+/// budget exists to bound, and `MAX_CONSECUTIVE_PLAN_STALLS` already blocks a
+/// spin). This cap is the backstop the refund needs: a plan that keeps growing
+/// its own step list could otherwise alternate one settled step with fresh
+/// work forever. Sized at 3× the per-stretch ceiling — far above any plan the
+/// loop legitimately runs, so hitting it is itself a signal worth surfacing.
+pub const PLAN_CONTINUATION_LIFETIME_CAP: u32 = 24;
+
 /// Consecutive stalled continuations tolerated before the plan is `Blocked`.
 ///
 /// One stall is not failure. Under grounded evaluation a turn only counts as
@@ -416,8 +427,8 @@ pub fn plan_stop_notice(carryover: &CarryoverPlan, reason: &str) -> String {
         remaining_list
     };
     format!(
-        "*(Plan paused: {reason}. Goal: {}. {done}/{total} steps done. Remaining:\n{remaining}\n\
-         Send a message to keep going manually, or /plan drop to discard.)*",
+        "*(Plan stopped: {reason}. Goal: {}. {done}/{total} steps done. Remaining:\n{remaining}\n\
+         The carryover has been cleared — the remaining steps will not run automatically.)*",
         carryover.plan.goal
     )
 }
@@ -427,9 +438,26 @@ fn step_list(plan: &ActivePlan, flags: &[bool], done: bool) -> String {
         .iter()
         .enumerate()
         .filter(|(i, _)| flags.get(*i).copied().unwrap_or(false) == done)
-        .map(|(_, s)| format!("- step {}: {}", s.id, s.description))
+        .map(|(_, s)| format!("- step {}{}: {}", s.id, step_tool_suffix(s), s.description))
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+/// ` (tool: X)` for a tool-bound step, empty otherwise.
+///
+/// Load-bearing in continuation briefs, not decoration: the brief is the
+/// continuation turn's only tool-projection relevance text, and the keyword
+/// gates in `project_tools_for_turn` know nothing about the plan. A brief that
+/// names only step descriptions can have exactly the tools the remaining steps
+/// need stripped from the projection — worst case, a goal phrased with a `?`
+/// trips the conversational gate and the continuation runs with zero tools,
+/// stalls twice, and the plan is blocked. Naming the bound tool makes the
+/// explicit tool-name match fire first, which bypasses those gates entirely.
+fn step_tool_suffix(step: &PlanStep) -> String {
+    match step.tool_name.as_deref() {
+        Some(t) if !t.is_empty() => format!(" (tool: {t})"),
+        _ => String::new(),
+    }
 }
 
 // ── Grounded step verification ──────────────────────────────────────────────
@@ -1007,7 +1035,12 @@ fn outstanding_lines(
                 }
                 _ => "",
             };
-            Some(format!("- step {}: {}{marker}", step.id, step.description))
+            Some(format!(
+                "- step {}{}: {}{marker}",
+                step.id,
+                step_tool_suffix(step),
+                step.description
+            ))
         })
         .collect();
 
@@ -1149,6 +1182,7 @@ mod tests {
             verified_step_ids: Vec::new(),
             stalled_continuations: 0,
             continuations_used: used,
+            lifetime_continuations: 0,
             created_turn_id: "turn-0".into(),
         }
     }
@@ -1767,7 +1801,33 @@ mod tests {
         assert!(notice.contains("1/2 steps done"));
         assert!(notice.contains("continuation budget exhausted"));
         assert!(notice.contains("- step 2: apply fix"));
-        assert!(notice.contains("/plan drop"));
+        // The notice must tell the truth about what the loop did: the
+        // carryover is gone, so it must not advertise resumption paths
+        // ("send a message", "/plan drop") that no longer exist.
+        assert!(notice.contains("will not run automatically"));
+        assert!(!notice.contains("/plan drop"));
+    }
+
+    #[test]
+    fn step_lists_name_bound_tools_for_projection() {
+        // The brief is the continuation turn's only tool-projection relevance
+        // text: a bound tool must be named so the explicit tool-name match
+        // fires before any keyword gate can strip it (or zero-tool the turn).
+        let carry = carryover(
+            plan(
+                "executing",
+                &[
+                    ("read config", None, "done"),
+                    ("apply fix", Some("bash.exec"), "pending"),
+                ],
+            ),
+            vec![true, false],
+            0,
+        );
+        let brief = plan_continuation_brief(&carry, 3);
+        assert!(brief.contains("(tool: bash.exec)"), "{brief}");
+        let notice = plan_stop_notice(&carry, "whatever");
+        assert!(notice.contains("(tool: bash.exec)"), "{notice}");
     }
 
     // ── Grounded verification ───────────────────────────────────────────

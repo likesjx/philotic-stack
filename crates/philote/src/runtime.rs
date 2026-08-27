@@ -12639,12 +12639,17 @@ mod tests {
                 verified_step_ids: vec![1],
                 stalled_continuations: 0,
                 continuations_used: 3,
+                lifetime_continuations: 3,
                 created_turn_id: "turn-origin".into(),
             });
-            // This continuation made progress (step 2 done) but one step remains.
+            // This continuation settled nothing new (first stall — not yet
+            // Blocked), so the spent budget is NOT refunded and must bind.
             let mut turn = test_working_turn(TurnPhase::WaitingModel);
             turn.turn_id = "turn-plan-4".into();
-            turn.active_plan = Some(plan_with_statuses("ship it", &["done", "done", "pending"]));
+            turn.active_plan = Some(plan_with_statuses(
+                "ship it",
+                &["done", "pending", "pending"],
+            ));
             state.start_turn(turn);
         }
 
@@ -12694,8 +12699,282 @@ mod tests {
             .collect();
         assert_eq!(stopped.len(), 1, "one plan_stopped event: {:#?}", *emitted);
         let notice = stopped[0]["task"]["partial_content"].as_str().unwrap();
-        assert!(notice.contains("2/3 steps done"), "{notice}");
+        assert!(notice.contains("1/3 steps done"), "{notice}");
         assert!(notice.contains("work item 3"), "{notice}");
+    }
+
+    /// Progress refunds the per-stretch budget: a continuation that settles a
+    /// new step must keep the loop going even with `continuations_used` at the
+    /// configured budget. The stall ceiling — not the budget — is what stops a
+    /// plan; the budget only binds stretches that settle nothing.
+    #[tokio::test]
+    async fn plan_continuation_progress_refunds_budget() {
+        let _guard = plan_env_guard();
+        unsafe {
+            std::env::remove_var("PHILOTIC_DISABLE_PLAN_CONTINUATION");
+        }
+        let (mut runtime, _emitted, server, socket_path) = plan_test_runtime("planrefund").await;
+        let session_id = "sess-planrefund";
+        runtime
+            .ensure_session_loaded(session_id, "telegram")
+            .await
+            .expect("session load");
+
+        {
+            let state = runtime.sessions.get_mut(session_id).expect("session");
+            // Budget fully spent — but this continuation lands step 2.
+            state.carryover_plan = Some(CarryoverPlan {
+                plan: plan_with_statuses("ship it", &["done", "pending", "pending"]),
+                steps_done: vec![true, false, false],
+                verified_step_ids: vec![1],
+                stalled_continuations: 0,
+                continuations_used: 3,
+                lifetime_continuations: 3,
+                created_turn_id: "turn-origin".into(),
+            });
+            let mut turn = test_working_turn(TurnPhase::WaitingModel);
+            turn.turn_id = "turn-plan-4".into();
+            turn.active_plan = Some(plan_with_statuses("ship it", &["done", "done", "pending"]));
+            state.start_turn(turn);
+        }
+
+        runtime
+            .handle_model_response(respond_payload(session_id, "turn-plan-4", "more progress"))
+            .await
+            .expect("respond");
+
+        let state = runtime.session(session_id).expect("session");
+        let carry = state
+            .carryover_plan
+            .as_ref()
+            .expect("carryover must survive — progress refunds the budget");
+        assert_eq!(
+            carry.continuations_used, 1,
+            "refund resets the stretch, then the synthesized continuation charges 1"
+        );
+        assert_eq!(
+            carry.lifetime_continuations, 4,
+            "the lifetime counter is never refunded"
+        );
+        assert!(
+            !runtime.pending_drains.is_empty(),
+            "a continuation must be synthesized for the remaining step"
+        );
+
+        drop(runtime);
+        let _ = server.await;
+        let _ = std::fs::remove_file(&socket_path);
+    }
+
+    /// The lifetime cap is the absolute backstop behind the refund: a plan at
+    /// the cap stops even when its latest continuation made progress.
+    #[tokio::test]
+    async fn plan_continuation_lifetime_cap_stops_even_with_progress() {
+        let _guard = plan_env_guard();
+        unsafe {
+            std::env::remove_var("PHILOTIC_DISABLE_PLAN_CONTINUATION");
+        }
+        let (mut runtime, emitted, server, socket_path) = plan_test_runtime("planlifetime").await;
+        let session_id = "sess-planlifetime";
+        runtime
+            .ensure_session_loaded(session_id, "telegram")
+            .await
+            .expect("session load");
+
+        {
+            let state = runtime.sessions.get_mut(session_id).expect("session");
+            state.carryover_plan = Some(CarryoverPlan {
+                plan: plan_with_statuses("ship it", &["done", "pending", "pending"]),
+                steps_done: vec![true, false, false],
+                verified_step_ids: vec![1],
+                stalled_continuations: 0,
+                continuations_used: 0,
+                lifetime_continuations: crate::plan_eval::PLAN_CONTINUATION_LIFETIME_CAP,
+                created_turn_id: "turn-origin".into(),
+            });
+            let mut turn = test_working_turn(TurnPhase::WaitingModel);
+            turn.turn_id = "turn-plan-cap".into();
+            turn.active_plan = Some(plan_with_statuses("ship it", &["done", "done", "pending"]));
+            state.start_turn(turn);
+        }
+
+        runtime
+            .handle_model_response(respond_payload(session_id, "turn-plan-cap", "progress"))
+            .await
+            .expect("respond");
+
+        let state = runtime.session(session_id).expect("session");
+        assert!(
+            state.carryover_plan.is_none(),
+            "lifetime cap must clear the carryover"
+        );
+        assert!(runtime.pending_drains.is_empty());
+
+        drop(runtime);
+        let _ = server.await;
+        let _ = std::fs::remove_file(&socket_path);
+
+        let emitted = emitted.lock().unwrap();
+        let stopped: Vec<_> = emitted
+            .iter()
+            .filter(|e| e["task"]["action"] == "turn_event" && e["task"]["event"] == "plan_stopped")
+            .collect();
+        assert_eq!(stopped.len(), 1, "one plan_stopped event: {:#?}", *emitted);
+        assert!(
+            stopped[0]["task"]["partial_content"]
+                .as_str()
+                .unwrap()
+                .contains("lifetime continuation cap"),
+        );
+    }
+
+    /// A failed turn must resume — not strand — the session's carryover.
+    /// The first dead turn charges a stall and synthesizes a continuation;
+    /// a second consecutive dead turn stops the plan with a plan_stopped
+    /// event instead of retrying forever.
+    #[tokio::test]
+    async fn failed_turn_resumes_carryover_then_stops_on_repeat() {
+        let _guard = plan_env_guard();
+        unsafe {
+            std::env::remove_var("PHILOTIC_DISABLE_PLAN_CONTINUATION");
+        }
+        let (mut runtime, emitted, server, socket_path) = plan_test_runtime("planfail").await;
+        let session_id = "sess-planfail";
+        runtime
+            .ensure_session_loaded(session_id, "telegram")
+            .await
+            .expect("session load");
+
+        {
+            let state = runtime.sessions.get_mut(session_id).expect("session");
+            state.carryover_plan = Some(CarryoverPlan {
+                plan: plan_with_statuses("ship it", &["done", "pending", "pending"]),
+                steps_done: vec![true, false, false],
+                verified_step_ids: vec![1],
+                stalled_continuations: 0,
+                continuations_used: 1,
+                lifetime_continuations: 1,
+                created_turn_id: "turn-origin".into(),
+            });
+            let mut turn = test_working_turn(TurnPhase::WaitingModel);
+            turn.turn_id = "turn-plan-dead".into();
+            state.start_turn(turn);
+        }
+
+        runtime
+            .fail_active_turn(
+                session_id.to_string(),
+                "turn-plan-dead".to_string(),
+                "model died".to_string(),
+            )
+            .await
+            .expect("fail turn");
+
+        {
+            let state = runtime.session(session_id).expect("session");
+            let carry = state
+                .carryover_plan
+                .as_ref()
+                .expect("first failure must keep the carryover and resume it");
+            assert_eq!(carry.stalled_continuations, 1, "failure charged as a stall");
+            assert!(
+                !runtime.pending_drains.is_empty(),
+                "a continuation must be synthesized after the failed turn"
+            );
+            runtime.pending_drains.clear();
+        }
+
+        // Second consecutive dead turn: the plan stops instead of spinning.
+        {
+            let state = runtime.sessions.get_mut(session_id).expect("session");
+            let mut turn = test_working_turn(TurnPhase::WaitingModel);
+            turn.turn_id = "turn-plan-dead-2".into();
+            state.start_turn(turn);
+        }
+        runtime
+            .fail_active_turn(
+                session_id.to_string(),
+                "turn-plan-dead-2".to_string(),
+                "model died again".to_string(),
+            )
+            .await
+            .expect("fail turn 2");
+
+        let state = runtime.session(session_id).expect("session");
+        assert!(
+            state.carryover_plan.is_none(),
+            "second consecutive failure must stop the plan"
+        );
+        assert!(runtime.pending_drains.is_empty());
+
+        drop(runtime);
+        let _ = server.await;
+        let _ = std::fs::remove_file(&socket_path);
+
+        let emitted = emitted.lock().unwrap();
+        let stopped: Vec<_> = emitted
+            .iter()
+            .filter(|e| e["task"]["action"] == "turn_event" && e["task"]["event"] == "plan_stopped")
+            .collect();
+        assert_eq!(stopped.len(), 1, "one plan_stopped event: {:#?}", *emitted);
+        assert!(
+            stopped[0]["task"]["partial_content"]
+                .as_str()
+                .unwrap()
+                .contains("failed repeatedly"),
+        );
+    }
+
+    /// A new plan with a different goal replacing an unfinished carryover must
+    /// leave an auditable plan_stopped record, not vanish the old goal.
+    #[tokio::test]
+    async fn superseded_carryover_emits_plan_stopped() {
+        let _guard = plan_env_guard();
+        unsafe {
+            std::env::remove_var("PHILOTIC_DISABLE_PLAN_CONTINUATION");
+        }
+        let (mut runtime, emitted, server, socket_path) = plan_test_runtime("plansuper").await;
+        let session_id = "sess-plansuper";
+        runtime
+            .ensure_session_loaded(session_id, "telegram")
+            .await
+            .expect("session load");
+
+        {
+            let state = runtime.sessions.get_mut(session_id).expect("session");
+            state.carryover_plan = Some(CarryoverPlan {
+                plan: plan_with_statuses("old goal", &["done", "pending"]),
+                steps_done: vec![true, false],
+                verified_step_ids: vec![1],
+                stalled_continuations: 0,
+                continuations_used: 1,
+                lifetime_continuations: 1,
+                created_turn_id: "turn-origin".into(),
+            });
+            let mut turn = test_working_turn(TurnPhase::WaitingModel);
+            turn.turn_id = "turn-new-goal".into();
+            turn.active_plan = Some(plan_with_statuses("new goal", &["done"]));
+            state.start_turn(turn);
+        }
+
+        runtime
+            .handle_model_response(respond_payload(session_id, "turn-new-goal", "done"))
+            .await
+            .expect("respond");
+
+        drop(runtime);
+        let _ = server.await;
+        let _ = std::fs::remove_file(&socket_path);
+
+        let emitted = emitted.lock().unwrap();
+        let stopped: Vec<_> = emitted
+            .iter()
+            .filter(|e| e["task"]["action"] == "turn_event" && e["task"]["event"] == "plan_stopped")
+            .collect();
+        assert_eq!(stopped.len(), 1, "one plan_stopped event: {:#?}", *emitted);
+        let notice = stopped[0]["task"]["partial_content"].as_str().unwrap();
+        assert!(notice.contains("superseded by a new plan"), "{notice}");
+        assert!(notice.contains("old goal"), "{notice}");
     }
 
     #[tokio::test]
@@ -12775,6 +13054,7 @@ mod tests {
                 verified_step_ids: vec![1],
                 stalled_continuations: 0,
                 continuations_used: 1,
+                lifetime_continuations: 0,
                 created_turn_id: "turn-old".into(),
             });
             let mut turn = test_working_turn(TurnPhase::Thinking);
@@ -12912,6 +13192,7 @@ mod tests {
             verified_step_ids: vec![1],
             stalled_continuations: 0,
             continuations_used: 1,
+            lifetime_continuations: 0,
             created_turn_id: "turn-origin".into(),
         });
 
