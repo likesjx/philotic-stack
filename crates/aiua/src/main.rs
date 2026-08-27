@@ -5556,6 +5556,58 @@ fn seed_toolset_profiles(graph: &GraphDomain) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Seed the hotel's operator timezone into `user_profile:{hotel}` at boot so
+/// EVERY philote on EVERY hotel gets a local clock by default — philotes pull
+/// it via `GetUserProfile` at startup, and the prompt header + cron fire-time
+/// echoes render it. Before this, the profile node only existed where an
+/// operator had hand-patched the DB (DEF-090: the whole fleet was
+/// timezone-blind; agents hand-converted local times into UTC cron fields and
+/// registered jobs hours off).
+///
+/// Sources, in order: `PHILOTIC_OPERATOR_TZ` env, then top-level
+/// `operator_timezone` in mesh-config. Fill-only: an existing timezone (e.g.
+/// updated via `PatchUserProfile` when the operator travels) is never
+/// overridden by static config. Invalid zone names are rejected loudly at the
+/// boundary rather than propagated to every prompt.
+fn seed_operator_timezone(
+    graph: &GraphDomain,
+    hotel_name: &str,
+    config_json: &serde_json::Value,
+) -> anyhow::Result<()> {
+    let configured = std::env::var("PHILOTIC_OPERATOR_TZ")
+        .ok()
+        .filter(|tz| !tz.trim().is_empty())
+        .or_else(|| {
+            config_json
+                .get("operator_timezone")
+                .and_then(|v| v.as_str())
+                .filter(|tz| !tz.trim().is_empty())
+                .map(str::to_string)
+        });
+    let Some(tz) = configured else {
+        return Ok(());
+    };
+    let tz = tz.trim().to_string();
+    if tz.parse::<chrono_tz::Tz>().is_err() {
+        warn!(
+            timezone = %tz,
+            "operator_timezone is not a valid IANA zone name — NOT seeding (agents would render a broken clock)"
+        );
+        return Ok(());
+    }
+    let existing = graph.get_user_profile(hotel_name)?.unwrap_or_default();
+    if existing.timezone.is_some() {
+        return Ok(());
+    }
+    let profile = ansible_mesh_core::storage::UserProfile {
+        timezone: Some(tz.clone()),
+        ..existing
+    };
+    graph.upsert_user_profile(hotel_name, &profile)?;
+    info!(hotel = %hotel_name, timezone = %tz, "Seeded operator timezone into hotel user profile.");
+    Ok(())
+}
+
 fn seed_skill_crafting(graph: &GraphDomain) -> anyhow::Result<()> {
     use ansible_mesh_core::graph::{AbstractSkillRecord, SkillValidationState};
     let skill = AbstractSkillRecord {
@@ -7934,6 +7986,7 @@ async fn run_load_command(file: &str, hotel_name: &str) -> Result<()> {
     graph_domain.seed_guests(hotel_name, &all_desired_guests)?;
     info!("Seeded {} guest record(s).", all_desired_guests.len());
 
+    seed_operator_timezone(&graph_domain, hotel_name, &config_json)?;
     seed_orchestrator_roles(&graph_domain, &all_profiles)?;
     seed_abstract_tool_catalog(&graph_domain)?;
     seed_abstract_skill_catalog(&graph_domain)?;
@@ -9232,8 +9285,8 @@ mod tests {
         migrate_plaintext_provider_api_keys, nearest_available_base_port,
         preserve_runtime_guest_activation, read_string_config,
         reconcile_peer_execution_reachability, resolve_runtime_ports, resolve_secret,
-        seed_abstract_skill_catalog, seed_orchestrator_roles, seed_skill_crafting,
-        seed_toolset_profiles, startup_test_gemini_base_url,
+        seed_abstract_skill_catalog, seed_operator_timezone, seed_orchestrator_roles,
+        seed_skill_crafting, seed_toolset_profiles, startup_test_gemini_base_url,
     };
 
     #[test]
@@ -10635,6 +10688,56 @@ mod tests {
         assert_eq!(profile.agent_key, "beacon");
         assert_eq!(profile.agent_id, "agent-beacon-01");
         assert_eq!(profile.persona_name, "Beacon");
+    }
+
+    /// The operator timezone must provision itself at boot (config/env →
+    /// user_profile) so every philote gets a local clock by default — but a
+    /// live value (operator traveled, PatchUserProfile) must never be
+    /// clobbered by static config, and an invalid zone must be refused.
+    #[test]
+    fn seed_operator_timezone_fills_missing_never_overrides_rejects_garbage() {
+        let storage = SqliteGraphStorage::open(":memory:").expect("open sqlite");
+        let graph = GraphDomain::new(Arc::new(storage.adapter()));
+        let cfg = serde_json::json!({ "operator_timezone": "America/New_York" });
+
+        // Fills when absent.
+        seed_operator_timezone(&graph, "tz-test-hotel", &cfg).expect("seed");
+        let p = graph
+            .get_user_profile("tz-test-hotel")
+            .expect("get")
+            .expect("profile exists");
+        assert_eq!(p.timezone.as_deref(), Some("America/New_York"));
+
+        // Never overrides an existing value.
+        let traveled = ansible_mesh_core::storage::UserProfile {
+            timezone: Some("Europe/Paris".into()),
+            ..Default::default()
+        };
+        graph
+            .upsert_user_profile("tz-test-hotel", &traveled)
+            .expect("upsert");
+        seed_operator_timezone(&graph, "tz-test-hotel", &cfg).expect("seed again");
+        let p = graph
+            .get_user_profile("tz-test-hotel")
+            .expect("get")
+            .expect("profile exists");
+        assert_eq!(
+            p.timezone.as_deref(),
+            Some("Europe/Paris"),
+            "a live timezone must never be clobbered by static config"
+        );
+
+        // Garbage zone: refused, nothing seeded.
+        let bad = serde_json::json!({ "operator_timezone": "Mars/Olympus" });
+        seed_operator_timezone(&graph, "tz-fresh-hotel", &bad).expect("seed bad");
+        assert!(
+            graph
+                .get_user_profile("tz-fresh-hotel")
+                .expect("get")
+                .and_then(|p| p.timezone)
+                .is_none(),
+            "an invalid zone must not be seeded"
+        );
     }
 
     #[test]
