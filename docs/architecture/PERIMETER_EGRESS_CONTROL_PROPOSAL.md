@@ -37,9 +37,11 @@ implemented_by:
 - crates/tool-runner/src/main.rs
 - crates/philote/src/runtime.rs
 - crates/philotic-web/src/explain.rs
+- crates/aiua/src/main.rs
 active_seams:
 - outbound-fleet-enforcement
 - shell-egress-fence
+- skilldag-egress-capability
 source_of_truth_targets:
 - ARCHITECTURE_STATUS.md
 ---
@@ -133,6 +135,40 @@ enforcement. What it buys: the ungoverned shell door closes for the common case
 and the governed door becomes the obvious one. Deliberately out of scope for this
 slice: `git`, `gh`, `ssh`/`scp`, and package managers (`brew`/`cargo`/`npm`/`pip`)
 — network-capable dev/admin tooling with their own semantics.
+
+### Implemented Slice: Governed Egress as a SkillDAG Capability — `net.http` (2026-08-26)
+
+Closing the shell door only helps if the governed door is a real, granted
+capability. `IntegrationBinding` already carries a SkillDAG gate
+(`grant_skills` — "at least one named skill must be in the session's effective
+skill set"), but no egress skill was seeded, so bindings either left the gate
+empty (agent-only) or referenced a skill that did not exist.
+
+This slice seeds a `net.http` skill (validated) and assigns it to **every**
+philote toolset profile (all ten seeded profiles), so any binding may gate on
+`grant_skills: ["net.http"]` and know every philote is eligible. The seed
+reconciler unions new seed entries into already-deployed profiles while
+preserving operator edits, so the fleet picks it up on the next boot without a
+wipe.
+
+The design is deliberately **scoped eligibility**, not blanket access:
+
+- `net.http` is a *pure eligibility gate* — it implies no tools, so it adds no
+  standing tool surface to any philote. The real `http:<binding>.request` tools
+  project dynamically, per binding the agent is granted, during session snapshot
+  composition.
+- It is *necessary but not sufficient*: `IntegrationBinding.is_available_to`
+  requires the agent to hold `net.http` **and** be granted by the binding
+  (`owner`/`grant_agents`), and the binding's host allowlist, exit placement, and
+  approval flag still scope what and where. Holding the skill with no binding
+  granting the agent reaches nothing.
+
+So "each philote has access" means each philote is *eligible* for governed
+egress; an operator authorizes specific destinations by registering a binding
+that grants the agent and gates on `net.http`. No broad "fetch anything" binding
+is seeded — that was the rejected blanket-access option. Next seam:
+`shell-egress-fence` config-node unification also gives operators a first-class
+place to attach `net.http`-gated bindings.
 
 ## Why This Needs Its Own Proposal
 
