@@ -7323,6 +7323,20 @@ impl IpcServer {
                 timezone,
                 display_name,
             } => {
+                // Timezone is fanned out into every agent's prompt clock and
+                // every cron fire-time echo — validate at THIS boundary so a
+                // typo can't silently break time rendering fleet-wide.
+                if let Some(tz) = timezone.as_deref() {
+                    if tz.parse::<chrono_tz::Tz>().is_err() {
+                        return IpcResponse::error(
+                            "patch_user_profile",
+                            "INVALID_TIMEZONE",
+                            format!(
+                                "'{tz}' is not a valid IANA timezone name (e.g. America/New_York)"
+                            ),
+                        );
+                    }
+                }
                 let existing = match graph.get_user_profile(&hotel_name) {
                     Ok(profile) => profile.unwrap_or_default(),
                     Err(e) => {

@@ -4631,48 +4631,56 @@ impl AgentRuntime {
 
             "cron.list" => {
                 use philotic_client::IpcRequest;
-                let (content, tool_err) = match self
-                    .ipc_client
-                    .send_request(IpcRequest::ListCronJobs)
-                    .await
-                {
-                    Ok(IpcResponse::CronJobList { jobs }) => {
-                        if jobs.is_empty() {
-                            ("No cron jobs registered on this hotel.".into(), None)
-                        } else {
-                            let lines: Vec<String> = jobs
-                                .iter()
-                                .map(|j| {
-                                    format!(
-                                        "- id={} role={} schedule={} enabled={} next_fire={}",
-                                        j.id, j.target_role, j.schedule, j.enabled, j.next_fire_at,
-                                    )
-                                })
-                                .collect();
-                            (
-                                format!("Cron jobs ({}):\n{}", jobs.len(), lines.join("\n")),
-                                None,
-                            )
+                let (content, tool_err) =
+                    match self.ipc_client.send_request(IpcRequest::ListCronJobs).await {
+                        Ok(IpcResponse::CronJobList { jobs }) => {
+                            if jobs.is_empty() {
+                                ("No cron jobs registered on this hotel.".into(), None)
+                            } else {
+                                // Fire times render in both clocks (raw epoch ms
+                                // is unreadable to the model, and schedule fields
+                                // are raw UTC — DEF-090's confusion surface).
+                                let user_tz = self.default_agent_profile.user_timezone.clone();
+                                let lines: Vec<String> = jobs
+                                    .iter()
+                                    .map(|j| {
+                                        format!(
+                                            "- id={} role={} schedule={} enabled={} next_fire={}",
+                                            j.id,
+                                            j.target_role,
+                                            j.schedule,
+                                            j.enabled,
+                                            crate::session::render_fire_time(
+                                                j.next_fire_at,
+                                                user_tz.as_deref(),
+                                            ),
+                                        )
+                                    })
+                                    .collect();
+                                (
+                                    format!("Cron jobs ({}):\n{}", jobs.len(), lines.join("\n")),
+                                    None,
+                                )
+                            }
                         }
-                    }
-                    Ok(IpcResponse::Standard {
-                        ok: false,
-                        code,
-                        message,
-                        ..
-                    }) => {
-                        let e = TaskErrorPayload::ipc_failure("aiua", &*code, message);
-                        (e.display_message(), Some(e))
-                    }
-                    Ok(_) => ("cron.list: unexpected response".into(), None),
-                    Err(e) => {
-                        let err = TaskErrorPayload::transport_error(
-                            "philote",
-                            format!("cron.list: IPC transport error — {e}"),
-                        );
-                        (err.display_message(), Some(err))
-                    }
-                };
+                        Ok(IpcResponse::Standard {
+                            ok: false,
+                            code,
+                            message,
+                            ..
+                        }) => {
+                            let e = TaskErrorPayload::ipc_failure("aiua", &*code, message);
+                            (e.display_message(), Some(e))
+                        }
+                        Ok(_) => ("cron.list: unexpected response".into(), None),
+                        Err(e) => {
+                            let err = TaskErrorPayload::transport_error(
+                                "philote",
+                                format!("cron.list: IPC transport error — {e}"),
+                            );
+                            (err.display_message(), Some(err))
+                        }
+                    };
                 self.handle_tool_result(InboundTaskPayload {
                     action: Some("tool_result".into()),
                     source: Some("agent".into()),
