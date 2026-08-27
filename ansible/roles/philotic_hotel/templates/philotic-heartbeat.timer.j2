@@ -1,0 +1,10 @@
+[Unit]
+Description=Run the philotic heartbeat every 5 minutes
+
+[Timer]
+OnCalendar={{ heartbeat_oncalendar | default('*-*-* *:00/5:00') }}
+Persistent=true
+AccuracySec=30
+
+[Install]
+WantedBy=timers.target
