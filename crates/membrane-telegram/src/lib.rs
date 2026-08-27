@@ -3482,27 +3482,43 @@ impl TelegramSeatGuest {
                 .unwrap_or_default()
                 .to_string();
             if !chat_id.is_empty() && !status.is_empty() {
-                let (existing_id, thread_id) = {
+                // Only render a status line for a turn this seat is tracking.
+                // An untracked status message could never be edited in place
+                // (its id has nowhere to live) or deleted at final delivery,
+                // so every tool call would post a fresh italic message that
+                // lingers in the chat forever — exactly what continuation
+                // turns did before DEF-091's re-arm (DEF-096).
+                let tracked = {
                     let turns = self.active_turns.lock().unwrap();
                     turns
                         .get(&session_id)
                         .map(|a| (a.status_message_id, a.thread_id.clone()))
-                        .unwrap_or((None, None))
                 };
-                let formatted = format!("_{}_", status);
-                if let Some(new_id) = upsert_formatted_text(
-                    &self.http_client,
-                    &tg_base,
-                    &chat_id,
-                    thread_id.as_deref(),
-                    existing_id,
-                    &formatted,
-                    None,
-                )
-                .await
-                    && let Some(active) = self.active_turns.lock().unwrap().get_mut(&session_id)
-                {
-                    active.status_message_id = Some(new_id);
+                if let Some((existing_id, thread_id)) = tracked {
+                    let formatted = format!("_{}_", status);
+                    if let Some(new_id) = upsert_formatted_text(
+                        &self.http_client,
+                        &tg_base,
+                        &chat_id,
+                        thread_id.as_deref(),
+                        existing_id,
+                        &formatted,
+                        None,
+                    )
+                    .await
+                        && let Some(active) = self.active_turns.lock().unwrap().get_mut(&session_id)
+                    {
+                        info!(
+                            "Turn status upserted for session [{}]: message_id [{}] ({})",
+                            session_id, new_id, status
+                        );
+                        active.status_message_id = Some(new_id);
+                    }
+                } else {
+                    info!(
+                        "Turn status skipped for session [{}] (no tracked turn): {}",
+                        session_id, status
+                    );
                 }
             }
         } else {
@@ -4647,6 +4663,84 @@ mod tests {
         assert_eq!(result, Some(StreamingDraftUpdate::Retained(42)));
         let calls = calls.lock().unwrap();
         assert_eq!(*calls, vec!["editMessageText".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn turn_status_untracked_session_posts_nothing() {
+        let (tg_base, calls) = spawn_mock_telegram(MockEdit::Ok).await;
+        let mut guest = new_test_seat_guest();
+        guest.tg_base = Some(tg_base);
+
+        // No ActiveTurn entry for this session: the status line must be
+        // skipped, not posted as an orphan that nothing can ever delete.
+        let status_json = json!({
+            "session_id": "sess-untracked",
+            "turn_id": "turn-x",
+            "action": "turn_status",
+            "chat_id": "123",
+            "status": "Running life.list..."
+        })
+        .to_string();
+        guest.handle_inbound_task(&status_json).await;
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            calls.lock().unwrap().is_empty(),
+            "untracked turn_status must not reach the Telegram API"
+        );
+    }
+
+    #[tokio::test]
+    async fn turn_status_tracked_session_posts_once_then_edits() {
+        let (tg_base, calls) = spawn_mock_telegram(MockEdit::Ok).await;
+        let mut guest = new_test_seat_guest();
+        guest.tg_base = Some(tg_base.clone());
+
+        // Track the turn the way plan_continuation re-arm does.
+        let cont_json = json!({
+            "session_id": "sess-status-1",
+            "turn_id": "turn-1",
+            "action": "turn_event",
+            "event": "plan_continuation",
+            "chat_id": "123"
+        })
+        .to_string();
+        guest.handle_inbound_task(&cont_json).await;
+
+        for label in ["Running life.list...", "Running role.configure..."] {
+            let status_json = json!({
+                "session_id": "sess-status-1",
+                "turn_id": "turn-1",
+                "action": "turn_status",
+                "chat_id": "123",
+                "status": label
+            })
+            .to_string();
+            guest.handle_inbound_task(&status_json).await;
+        }
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let api_calls: Vec<String> = calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|c| *c != "sendChatAction")
+            .cloned()
+            .collect();
+        // First status sends the message; the second edits it in place.
+        assert_eq!(
+            api_calls,
+            vec!["sendMessage".to_string(), "editMessageText".to_string()]
+        );
+        assert_eq!(
+            guest
+                .active_turns
+                .lock()
+                .unwrap()
+                .get("sess-status-1")
+                .and_then(|a| a.status_message_id),
+            Some(777),
+        );
     }
 
     #[tokio::test]
