@@ -603,6 +603,12 @@ pub fn skill_is_relevant_for_turn(skill_name: &str, turn_text: &str) -> bool {
                 || t.contains("suspend skill")
                 || t.contains("deprecate skill")
                 || t.contains("skill audit")
+                || t.contains("skill patch")
+                || t.contains("skill_patch")
+                || (t.contains("skill")
+                    && ["author", "build", "compile", "apply", "activate", "make"]
+                        .iter()
+                        .any(|verb| t.contains(verb)))
         }
         "context.synthesize" => {
             t.contains("workspace")
@@ -1495,7 +1501,8 @@ fn build_catalog() -> HashMap<String, ToolDefinition> {
                     "skill_name": {
                         "type": "string",
                         "description": "Stable identifier for the skill. Lowercase alphanumeric, \
-                                        hyphens, and underscores only. Max 64 characters."
+                                        dots, hyphens, and underscores only. Max 64 characters; \
+                                        dotted names are the Philotic house style."
                     },
                     "description": {
                         "type": "string",
@@ -3966,7 +3973,11 @@ fn build_catalog() -> HashMap<String, ToolDefinition> {
             tool_name: "life.patch.propose".into(),
             description: "Propose a governed Life Graph improvement: schema change, skill update, \
                           tool addition, attention policy change, or system-level change. \
-                          High-risk patches require operator approval before applying."
+                          A schema_patch is executable only when it carries an \
+                          ontology_extension (new labels and/or edges; not properties or core-label \
+                          edits). A SkillPatch is a review artifact, not a skill-catalog write: \
+                          after approval, register it with skill.register and activate it with \
+                          skill.assign. High-risk patches remain proposal-only."
                 .into(),
             input_schema: json!({
                 "type": "object",
@@ -3992,6 +4003,38 @@ fn build_catalog() -> HashMap<String, ToolDefinition> {
                     "operator_approved": {
                         "type": "boolean",
                         "default": false
+                    },
+                    "ontology_extension": {
+                        "type": "object",
+                        "description": "Executable schema_patch payload for NEW Life Graph labels \
+                            and endpoint-validated edges only. Cannot add properties or modify a \
+                            compiled core label.",
+                        "properties": {
+                            "labels": {
+                                "type": "array",
+                                "items": {
+                                    "type": "object",
+                                    "required": ["name", "space"],
+                                    "properties": {
+                                        "name": {"type": "string", "description": "New PascalCase label name."},
+                                        "space": {"type": "string", "description": "Existing semantic-space prefix."},
+                                        "guidance": {"type": "string"}
+                                    }
+                                }
+                            },
+                            "edges": {
+                                "type": "array",
+                                "items": {
+                                    "type": "object",
+                                    "required": ["rel_type", "source_labels", "target_labels"],
+                                    "properties": {
+                                        "rel_type": {"type": "string", "description": "New SCREAMING_SNAKE relationship name."},
+                                        "source_labels": {"type": "array", "items": {"type": "string"}},
+                                        "target_labels": {"type": "array", "items": {"type": "string"}}
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
             }),
@@ -4079,8 +4122,10 @@ fn build_catalog() -> HashMap<String, ToolDefinition> {
                           ONLY after the operator has explicitly approved or rejected it in \
                           conversation. Confirming a schema_patch that carries an \
                           ontology_extension makes the new nouns/verbs live vocabulary \
-                          immediately (vector indexes are created automatically). Verify the \
-                          result with life.ontology afterwards."
+                          immediately (vector indexes are created automatically). It does NOT \
+                          register SkillPatch records; use skill.register followed by skill.assign \
+                          for those. Prose-only patches remain review artifacts and are not \
+                          executable. Verify schema changes with life.ontology afterwards."
                 .into(),
             input_schema: json!({
                 "type": "object",
@@ -4327,6 +4372,51 @@ mod tests {
                 "life.steward implied tool {tool} should have a real catalog schema"
             );
         }
+    }
+
+    #[test]
+    fn skill_authoring_relevant_for_build_and_apply_language() {
+        for turn in [
+            "build these four skills",
+            "apply the skill patch",
+            "compile and activate my music skills",
+            "author a new skill",
+        ] {
+            assert!(
+                skill_is_relevant_for_turn("skill.authoring", turn),
+                "expected skill.authoring to be relevant for {turn:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn life_patch_catalog_exposes_real_actuator_boundaries() {
+        let catalog = tool_catalog();
+        let propose = catalog
+            .get("life.patch.propose")
+            .expect("life.patch.propose catalog entry");
+        let apply = catalog
+            .get("life.patch.apply")
+            .expect("life.patch.apply catalog entry");
+
+        assert!(propose.input_schema["properties"]["ontology_extension"].is_object());
+        assert!(propose.description.contains("skill.register"));
+        assert!(apply.description.contains("does NOT register SkillPatch"));
+        assert!(apply.description.contains("skill.assign"));
+    }
+
+    #[test]
+    fn skill_register_schema_advertises_dotted_house_names() {
+        let catalog = tool_catalog();
+        let register = catalog
+            .get("skill.register")
+            .expect("skill.register catalog entry");
+        let name_description = register.input_schema["properties"]["skill_name"]["description"]
+            .as_str()
+            .expect("skill_name description");
+
+        assert!(name_description.contains("dots"));
+        assert!(name_description.contains("house style"));
     }
 
     /// Memory Transparency Slice M3: `memory.delta_digest` must have a real
