@@ -15,9 +15,14 @@
 #      EVERY `git status --porcelain` line EXCEPT untracked `target/` dirs
 #      (those are exactly the build artifacts we want to reclaim). A dirty
 #      worktree is always PRESERVED.
-#   3. NEVER remove a worktree whose HEAD is not an ancestor of origin/develop
-#      (i.e. it still holds unmerged commits). Merged is verified against a
-#      FRESH `git fetch origin` so the check reflects current origin/develop.
+#   3. NEVER remove a worktree whose work is not on origin/develop. Merged
+#      means EITHER the tip is an ancestor of origin/develop (merge-commit /
+#      fast-forward PRs) OR the tip is EXACTLY the head commit (headRefOid) of
+#      a squash-merged PR per the GitHub API — squash merges rewrite history,
+#      so ancestry alone preserved every squashed branch forever. A commit
+#      added after the squash merge makes the tip differ -> preserved. If `gh`
+#      is unavailable the fallback is skipped (fail safe: preserve). Ancestry
+#      is verified against a FRESH `git fetch origin`.
 #   4. NEVER remove an EXCLUDE-listed branch (held-epic bookmarks, operator
 #      pins via PHILOTIC_WTGC_KEEP).
 #   5. NEVER remove a detached-HEAD worktree (no branch to reason about).
@@ -124,6 +129,41 @@ is_excluded() {
     return 1
 }
 
+# --- squash-merge detection ---------------------------------------------------
+# PRs into develop are often SQUASH-merged, so a merged branch tip is never an
+# ancestor of origin/develop and the ancestry check alone preserves everything
+# forever (observed: 27 worktrees / ~75GB of target/ accumulated while every
+# 2h apply run reclaimed 0.00 GB). Fallback: ask GitHub for merged PRs and
+# treat a branch as merged IFF its CURRENT tip commit is exactly the head
+# commit a merged PR was squashed from (headRefOid). Any commit added to the
+# branch after the merge makes the tip differ from headRefOid -> preserved.
+# FAIL SAFE: if gh is missing or the API call fails, the list stays empty and
+# every non-ancestor branch is preserved, exactly as before this fallback.
+# Newline-separated "branch<SP>oid" lines (macOS bash 3.2: no assoc arrays).
+SQUASH_MERGED_LINES=""
+load_squash_merged_lines() {
+    if ! command -v gh >/dev/null 2>&1; then
+        log "WARNING: gh unavailable — squash-merge detection disabled (ancestry check only)"
+        return 0
+    fi
+    local rows
+    if rows="$(cd "${MAIN_REPO}" && gh pr list --state merged --limit 300 \
+        --json headRefName,headRefOid,baseRefName \
+        --jq '.[] | select(.baseRefName == "develop" or .baseRefName == "main") | "\(.headRefName) \(.headRefOid)"' 2>>"${LOG_FILE}")"; then
+        SQUASH_MERGED_LINES="${rows}"
+        log "loaded $(printf '%s\n' "${rows}" | grep -c .) merged-PR head refs for squash-merge detection"
+    else
+        log "WARNING: gh pr list failed — squash-merge detection disabled (ancestry check only)"
+    fi
+}
+
+# True iff this branch's tip is exactly the head commit of a merged PR.
+is_squash_merged() {
+    local branch="$1" head="$2"
+    [[ -n "${SQUASH_MERGED_LINES}" ]] || return 1
+    printf '%s\n' "${SQUASH_MERGED_LINES}" | grep -qxF "${branch} ${head}"
+}
+
 # has_uncommitted <worktree>: true if any porcelain line is NOT an untracked
 # target/ dir. Anchored on `^\?\? ` so modified/staged tracked files (which
 # start with ` M`, `M `, `A `, etc.) are ALWAYS counted, and a directory that
@@ -216,6 +256,8 @@ if ! git -C "${MAIN_REPO}" rev-parse --verify --quiet origin/develop >/dev/null;
     exit 1
 fi
 
+load_squash_merged_lines
+
 FREE_BEFORE_KB="$(disk_free_kb)"
 
 # --- main loop ----------------------------------------------------------------
@@ -250,11 +292,17 @@ process_worktree() {
         return
     fi
 
-    # Invariant 3: unmerged commits are always preserved.
+    # Invariant 3: unmerged commits are always preserved. Merged means either
+    # the tip is an ancestor of origin/develop (merge-commit / fast-forward
+    # PRs) OR the tip is exactly the head commit of a squash-merged PR.
     if ! git -C "${MAIN_REPO}" merge-base --is-ancestor "${head}" origin/develop 2>/dev/null; then
-        log "PRESERVE (unmerged): ${wt} (${branch})"
-        n_preserved=$((n_preserved + 1))
-        return
+        if is_squash_merged "${branch}" "${head}"; then
+            log "merged via squash PR (tip ${head} == merged PR headRefOid): ${wt} (${branch})"
+        else
+            log "PRESERVE (unmerged): ${wt} (${branch})"
+            n_preserved=$((n_preserved + 1))
+            return
+        fi
     fi
 
     # Invariant 4: excluded branches are always preserved.
