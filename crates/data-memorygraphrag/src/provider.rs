@@ -2131,10 +2131,19 @@ impl LifeGraphProvider {
         let current_status: String = row.get("status").unwrap_or_default();
         let patch_json: String = row.get("patch_json").unwrap_or_default();
         if current_status != cypher::PATCH_STATUS_AWAITING_CONFIRMATION {
+            let stored_patch = serde_json::from_str::<LifePatchProposalInput>(&patch_json).ok();
+            let patch_kind = stored_patch
+                .as_ref()
+                .and_then(|patch| serde_json::to_value(&patch.patch_kind).ok())
+                .and_then(|kind| kind.as_str().map(str::to_string));
+            let next_action = patch_apply_next_action(stored_patch.as_ref());
             return Ok(ProviderOutput::ResultSet(json!({
                 "status": "not_applicable",
                 "patch_id": input.patch_id,
                 "current_status": current_status,
+                "patch_kind": patch_kind,
+                "reason": "patch is not awaiting_confirmation",
+                "next_action": next_action,
             })));
         }
         let patch: LifePatchProposalInput = serde_json::from_str(&patch_json)
@@ -3730,6 +3739,22 @@ fn bolt_unbounded_relation_to_json(v: BoltUnboundedRelation) -> Value {
     })
 }
 
+fn patch_apply_next_action(patch: Option<&LifePatchProposalInput>) -> &'static str {
+    match patch.map(|patch| &patch.patch_kind) {
+        Some(PatchKind::SkillPatch) => {
+            "SkillPatch is a review artifact. Author an executable skill definition, then use skill.register and skill.assign."
+        }
+        Some(PatchKind::SchemaPatch)
+            if patch.is_some_and(|patch| patch.ontology_extension.is_none()) =>
+        {
+            "This prose-only SchemaPatch has no executable ontology_extension. Propose a new schema_patch with labels/edges in ontology_extension; property or core-label changes require a code change."
+        }
+        _ => {
+            "Only patches parked in awaiting_confirmation with an executable payload can be applied. Review or replace this proposal with the correct actuator payload."
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3746,6 +3771,35 @@ mod tests {
             parameters,
             identity: json!({}),
         }
+    }
+
+    #[test]
+    fn not_applicable_patch_guidance_routes_to_the_real_actuator() {
+        let skill_patch: LifePatchProposalInput = serde_json::from_value(json!({
+            "patch_id": "patch:music-skills",
+            "patch_kind": "skill_patch",
+            "summary": "Register music skills",
+            "rationale": "Operator requested them",
+            "evidence_packets": [],
+            "risk": "medium"
+        }))
+        .unwrap();
+        let schema_patch: LifePatchProposalInput = serde_json::from_value(json!({
+            "patch_id": "patch:music-schema",
+            "patch_kind": "schema_patch",
+            "summary": "Add music fields",
+            "rationale": "Track repertoire",
+            "evidence_packets": [],
+            "risk": "medium"
+        }))
+        .unwrap();
+
+        assert!(patch_apply_next_action(Some(&skill_patch)).contains("skill.register"));
+        assert!(patch_apply_next_action(Some(&skill_patch)).contains("skill.assign"));
+        assert!(
+            patch_apply_next_action(Some(&schema_patch))
+                .contains("property or core-label changes require a code change")
+        );
     }
 
     #[tokio::test]

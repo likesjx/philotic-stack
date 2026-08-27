@@ -4118,21 +4118,57 @@ fn seed_abstract_tool_catalog(graph: &GraphDomain) -> anyhow::Result<()> {
         },
         AbstractToolRecord {
             tool_name: "life.patch.propose".into(),
-            description: "Propose a structured patch to an existing life graph node — modify \
-                          properties without overwriting the node. Creates a pending patch record \
-                          for adjudication."
+            description: "Propose a governed Life Graph improvement. A schema_patch is executable \
+                          only when it carries an ontology_extension containing new labels and/or \
+                          edges; it cannot add properties or edit compiled core labels. A \
+                          SkillPatch is a review artifact: use skill.register and skill.assign as \
+                          the catalog actuator after approval."
                 .into(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "node_id": { "type": "string", "description": "The life graph node to patch." },
-                    "patch": {
-                        "type": "object",
-                        "description": "Key-value properties to update on the node."
+                    "patch_id": {"type": "string"},
+                    "patch_kind": {
+                        "type": "string",
+                        "enum": ["schema_patch", "skill_patch", "tool_patch", "attention_patch", "system_patch"]
                     },
-                    "patch_summary": { "type": "string", "description": "Why this patch is proposed." }
+                    "summary": {"type": "string"},
+                    "rationale": {"type": "string"},
+                    "evidence_packets": {"type": "array", "minItems": 1, "items": {"type": "object"}},
+                    "risk": {"type": "string", "enum": ["low", "medium", "high"]},
+                    "operator_approved": {"type": "boolean", "default": false},
+                    "ontology_extension": {
+                        "type": "object",
+                        "description": "Executable schema_patch payload for NEW labels and endpoint-validated edges only.",
+                        "properties": {
+                            "labels": {
+                                "type": "array",
+                                "items": {
+                                    "type": "object",
+                                    "required": ["name", "space"],
+                                    "properties": {
+                                        "name": {"type": "string"},
+                                        "space": {"type": "string"},
+                                        "guidance": {"type": "string"}
+                                    }
+                                }
+                            },
+                            "edges": {
+                                "type": "array",
+                                "items": {
+                                    "type": "object",
+                                    "required": ["rel_type", "source_labels", "target_labels"],
+                                    "properties": {
+                                        "rel_type": {"type": "string"},
+                                        "source_labels": {"type": "array", "items": {"type": "string"}},
+                                        "target_labels": {"type": "array", "items": {"type": "string"}}
+                                    }
+                                }
+                            }
+                        }
+                    }
                 },
-                "required": ["node_id", "patch", "patch_summary"]
+                "required": ["patch_id", "patch_kind", "summary", "rationale", "evidence_packets", "risk"]
             }),
             class: "life_graph".into(),
             tool_markers: Vec::new(),
@@ -4186,7 +4222,8 @@ fn seed_abstract_tool_catalog(graph: &GraphDomain) -> anyhow::Result<()> {
             tool_name: "life.patch.apply".into(),
             description: "Confirm or reject an awaiting_confirmation Life Graph patch (call \
                           only after explicit operator approval). Confirming a schema_patch \
-                          with an ontology_extension makes the new vocabulary live."
+                          with an ontology_extension makes the new vocabulary live. This does NOT \
+                          register SkillPatch records; use skill.register then skill.assign."
                 .into(),
             input_schema: serde_json::json!({
                 "type": "object",
@@ -9285,8 +9322,9 @@ mod tests {
         migrate_plaintext_provider_api_keys, nearest_available_base_port,
         preserve_runtime_guest_activation, read_string_config,
         reconcile_peer_execution_reachability, resolve_runtime_ports, resolve_secret,
-        seed_abstract_skill_catalog, seed_operator_timezone, seed_orchestrator_roles,
-        seed_skill_crafting, seed_toolset_profiles, startup_test_gemini_base_url,
+        seed_abstract_skill_catalog, seed_abstract_tool_catalog, seed_operator_timezone,
+        seed_orchestrator_roles, seed_skill_crafting, seed_toolset_profiles,
+        startup_test_gemini_base_url,
     };
 
     #[test]
@@ -9298,6 +9336,26 @@ mod tests {
     fn retention_days_parses_valid_value() {
         assert_eq!(resolve_retention_days(Some("7")), 7);
         assert_eq!(resolve_retention_days(Some(" 30 ")), 30);
+    }
+
+    #[test]
+    fn seeded_life_patch_contract_names_the_real_actuators() {
+        let storage = SqliteGraphStorage::open(":memory:").expect("open sqlite");
+        let graph = GraphDomain::new(Arc::new(storage.adapter()));
+        seed_abstract_tool_catalog(&graph).expect("seed abstract tool catalog");
+
+        let propose = graph
+            .get_abstract_tool("life.patch.propose")
+            .expect("read life.patch.propose")
+            .expect("life.patch.propose should be seeded");
+        let apply = graph
+            .get_abstract_tool("life.patch.apply")
+            .expect("read life.patch.apply")
+            .expect("life.patch.apply should be seeded");
+
+        assert!(propose.input_schema["properties"]["ontology_extension"].is_object());
+        assert!(propose.description.contains("skill.register"));
+        assert!(apply.description.contains("skill.assign"));
     }
 
     #[test]

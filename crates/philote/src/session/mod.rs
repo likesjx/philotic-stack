@@ -2347,7 +2347,9 @@ impl SessionState {
     }
 
     fn projection_relevance_text(&self, normalized_current: &str) -> String {
-        if !looks_like_retry_goal(normalized_current) {
+        if !looks_like_retry_goal(normalized_current)
+            && !looks_like_approval_continuation(normalized_current)
+        {
             return normalized_current.to_string();
         }
 
@@ -4695,6 +4697,25 @@ fn looks_like_retry_goal(normalized: &str) -> bool {
     ]
     .iter()
     .any(|phrase| normalized.contains(phrase))
+}
+
+/// Short approval turns derive their executable intent from the immediately
+/// preceding exchange. Include that exchange in relevance projection so a
+/// response such as "yes, apply both" keeps the authoring/admin tools that the
+/// model just proposed instead of collapsing to an unrelated generic surface.
+fn looks_like_approval_continuation(normalized: &str) -> bool {
+    let trimmed = normalized.trim_matches(|c: char| c.is_ascii_punctuation() || c.is_whitespace());
+    let first_word = trimmed
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .find(|part| !part.is_empty())
+        .unwrap_or_default();
+    matches!(
+        first_word,
+        "yes" | "yep" | "confirm" | "confirmed" | "approved" | "approve" | "proceed"
+    ) || trimmed == "go ahead"
+        || trimmed.starts_with("go ahead ")
+        || trimmed == "do it"
+        || trimmed.starts_with("do it ")
 }
 
 fn looks_like_execution_goal(normalized: &str) -> bool {
@@ -8949,6 +8970,36 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert!(projected_names.contains(&"life.recall"));
+    }
+
+    #[test]
+    fn approval_followup_keeps_skill_authoring_actuators_projected() {
+        let mut state =
+            SessionState::new("sess-1".into(), "agent-beacon-01".into(), "telegram".into());
+        state.clear_tool_bindings();
+        for tool in ["skill.list", "skill.register", "skill.assign"] {
+            state.add_tool_binding(tool);
+        }
+        state.bindings.on_demand_skills = vec!["skill.authoring".into()];
+        state.recent_turns.push(TurnRecord {
+            turn_id: "proposal-turn".into(),
+            user_content: "Build the four proposed music skills and assign them to my roles."
+                .into(),
+            assistant_content: Some(
+                "I can register each definition with skill.register, then activate it with skill.assign. Approve both steps?"
+                    .into(),
+            ),
+            created_at: 1,
+        });
+
+        let projected = state.project_tools_for_turn("Yes, apply both.");
+        let projected_names = projected
+            .iter()
+            .map(|tool| tool.tool_name.as_str())
+            .collect::<std::collections::BTreeSet<_>>();
+
+        assert!(projected_names.contains("skill.register"));
+        assert!(projected_names.contains("skill.assign"));
     }
 
     #[test]
