@@ -95,34 +95,49 @@ pub fn load_muninn_config(graph: &GraphDomain) -> Result<Option<MuninnConfig>> {
     Ok(Some(config))
 }
 
-/// Apply a mesh-forwarded shared-vault memory write to THIS hotel's muninn —
-/// the Cortex-side of `MuninnConfig::shared_write_route` (single-writer
-/// routing). The payload is the `memory.write_forward` task JSON emitted by
-/// a lobe philote's `forward_shared_memory_write`; the vault name arrives
-/// already resolved by the originating guest, so this writes directly into
-/// that vault (`remember_in_vault`) rather than re-resolving against a local
-/// identity. Idempotent per `{vault}:{concept}` — a redelivered mesh
-/// envelope reinforces instead of duplicating.
-pub async fn apply_forwarded_write(graph: &GraphDomain, task_json: &str) -> Result<String> {
-    let payload: serde_json::Value = serde_json::from_str(task_json)?;
-    let op = payload.get("op").and_then(|v| v.as_str()).unwrap_or("");
-    if op != "remember" {
-        anyhow::bail!("memory.write_forward: unsupported op {op:?}");
-    }
-    let vault = payload
-        .get("vault")
+/// A shared-vault write op forwarded to the Cortex. Parsed from the
+/// `memory.write_forward` task JSON before any engine call so the dispatch is
+/// pure and unit-testable (proposal S2: route ALL write verbs to the Cortex,
+/// not just `remember`). The vault arrives already resolved by the originating
+/// guest.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ForwardedWriteOp {
+    Remember {
+        vault: String,
+        concept: String,
+        content: String,
+        tags: Vec<String>,
+        metadata: serde_json::Value,
+    },
+    Evolve {
+        id: String,
+        content: String,
+        tags: Option<Vec<String>>,
+    },
+    Forget {
+        id: String,
+    },
+    /// A batch of remembers into one vault. Applied as a loop of
+    /// `remember_in_vault` because the batch carries an explicit vault, not a
+    /// scope (the engine's scope-based `remember_batch` would resolve against
+    /// the Cortex hotel identity, not the originating vault).
+    RememberBatch {
+        vault: String,
+        entries: Vec<(String, String, Vec<String>)>,
+    },
+}
+
+fn str_field(payload: &serde_json::Value, key: &str) -> Result<String> {
+    payload
+        .get(key)
         .and_then(|v| v.as_str())
         .filter(|v| !v.is_empty())
-        .ok_or_else(|| anyhow::anyhow!("memory.write_forward: missing vault"))?;
-    let concept = payload
-        .get("concept")
-        .and_then(|v| v.as_str())
-        .unwrap_or("untitled");
-    let content = payload
-        .get("content")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
-    let tags: Vec<String> = payload
+        .map(str::to_string)
+        .ok_or_else(|| anyhow::anyhow!("memory.write_forward: missing `{key}`"))
+}
+
+fn tags_field(payload: &serde_json::Value) -> Vec<String> {
+    payload
         .get("tags")
         .and_then(|v| v.as_array())
         .map(|arr| {
@@ -130,19 +145,131 @@ pub async fn apply_forwarded_write(graph: &GraphDomain, task_json: &str) -> Resu
                 .filter_map(|t| t.as_str().map(str::to_string))
                 .collect()
         })
-        .unwrap_or_default();
-    let metadata = payload
-        .get("metadata")
-        .cloned()
-        .unwrap_or(serde_json::Value::Null);
+        .unwrap_or_default()
+}
+
+/// Parse the forwarded-write payload into a typed op. Pure — no I/O.
+pub fn parse_forwarded_write_op(payload: &serde_json::Value) -> Result<ForwardedWriteOp> {
+    // Default to `remember` for backward compatibility with pre-S2 payloads,
+    // which omitted `op`.
+    let op = payload
+        .get("op")
+        .and_then(|v| v.as_str())
+        .unwrap_or("remember");
+    match op {
+        "remember" => Ok(ForwardedWriteOp::Remember {
+            vault: str_field(payload, "vault")?,
+            concept: payload
+                .get("concept")
+                .and_then(|v| v.as_str())
+                .unwrap_or("untitled")
+                .to_string(),
+            content: payload
+                .get("content")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
+            tags: tags_field(payload),
+            metadata: payload
+                .get("metadata")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null),
+        }),
+        "evolve" => Ok(ForwardedWriteOp::Evolve {
+            id: str_field(payload, "id")?,
+            content: payload
+                .get("content")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
+            tags: payload.get("tags").and_then(|v| v.as_array()).map(|arr| {
+                arr.iter()
+                    .filter_map(|t| t.as_str().map(str::to_string))
+                    .collect()
+            }),
+        }),
+        "forget" => Ok(ForwardedWriteOp::Forget {
+            id: str_field(payload, "id")?,
+        }),
+        "remember_batch" => {
+            let entries = payload
+                .get("entries")
+                .and_then(|v| v.as_array())
+                .ok_or_else(|| {
+                    anyhow::anyhow!("memory.write_forward: remember_batch missing `entries`")
+                })?
+                .iter()
+                .map(|e| {
+                    let concept = e
+                        .get("concept")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("untitled")
+                        .to_string();
+                    let content = e
+                        .get("content")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    (concept, content, tags_field(e))
+                })
+                .collect();
+            Ok(ForwardedWriteOp::RememberBatch {
+                vault: str_field(payload, "vault")?,
+                entries,
+            })
+        }
+        other => anyhow::bail!("memory.write_forward: unsupported op {other:?}"),
+    }
+}
+
+/// Apply a mesh-forwarded shared-vault memory write to THIS hotel's muninn —
+/// the Cortex-side of `MuninnConfig::shared_write_route` (single-writer
+/// routing). The payload is the `memory.write_forward` task JSON emitted by a
+/// lobe philote's `forward_shared_memory_write`. `remember` writes are
+/// idempotent per `{vault}:{concept}`; `evolve`/`forget` act on an engram id;
+/// `remember_batch` fans out to `remember_in_vault`. See [`ForwardedWriteOp`].
+pub async fn apply_forwarded_write(graph: &GraphDomain, task_json: &str) -> Result<String> {
+    use memory_core::MemoryEngine as _;
+
+    let payload: serde_json::Value = serde_json::from_str(task_json)?;
+    let parsed = parse_forwarded_write_op(&payload)?;
 
     let config = load_muninn_config(graph)?
         .ok_or_else(|| anyhow::anyhow!("memory.write_forward: MuninnDB not configured here"))?;
     let engine = engine_for_agent(config, "hotel", "hotel");
-    let engram = engine
-        .remember_in_vault(vault, concept, content, tags, metadata)
-        .await?;
-    Ok(engram.id)
+
+    match parsed {
+        ForwardedWriteOp::Remember {
+            vault,
+            concept,
+            content,
+            tags,
+            metadata,
+        } => {
+            let engram = engine
+                .remember_in_vault(&vault, &concept, &content, tags, metadata)
+                .await?;
+            Ok(engram.id)
+        }
+        ForwardedWriteOp::Evolve { id, content, tags } => {
+            let engram = engine.evolve(&id, &content, tags).await?;
+            Ok(engram.id)
+        }
+        ForwardedWriteOp::Forget { id } => {
+            engine.forget(&id).await?;
+            Ok(format!("forgotten:{id}"))
+        }
+        ForwardedWriteOp::RememberBatch { vault, entries } => {
+            let mut ids = Vec::with_capacity(entries.len());
+            for (concept, content, tags) in entries {
+                let engram = engine
+                    .remember_in_vault(&vault, &concept, &content, tags, serde_json::Value::Null)
+                    .await?;
+                ids.push(engram.id);
+            }
+            Ok(ids.join(","))
+        }
+    }
 }
 
 /// Create a `MuninnRestEngine` scoped to a specific agent+user identity.
@@ -169,19 +296,82 @@ mod tests {
     use ansible_mesh_core::storage::VaultRegistryEntry;
     use std::sync::Arc;
 
+    // ── S2: forwarded-write op dispatch (pure parse, no engine) ──────────────
+
+    #[test]
+    fn parse_forwarded_write_defaults_to_remember_for_legacy_payloads() {
+        // Pre-S2 payloads omitted `op`; they must still parse as remember.
+        let p = serde_json::json!({"vault": "default", "concept": "c", "content": "x"});
+        assert!(matches!(
+            parse_forwarded_write_op(&p).unwrap(),
+            ForwardedWriteOp::Remember { .. }
+        ));
+    }
+
+    #[test]
+    fn parse_forwarded_write_dispatches_every_verb() {
+        let evolve = serde_json::json!({"op":"evolve","id":"01ABC","content":"new"});
+        match parse_forwarded_write_op(&evolve).unwrap() {
+            ForwardedWriteOp::Evolve { id, content, tags } => {
+                assert_eq!(id, "01ABC");
+                assert_eq!(content, "new");
+                assert!(tags.is_none());
+            }
+            other => panic!("expected Evolve, got {other:?}"),
+        }
+
+        let forget = serde_json::json!({"op":"forget","id":"01XYZ"});
+        assert_eq!(
+            parse_forwarded_write_op(&forget).unwrap(),
+            ForwardedWriteOp::Forget { id: "01XYZ".into() }
+        );
+
+        let batch = serde_json::json!({
+            "op":"remember_batch","vault":"fleet_knowledge",
+            "entries":[{"concept":"a","content":"1"},{"concept":"b","content":"2","tags":["t"]}]
+        });
+        match parse_forwarded_write_op(&batch).unwrap() {
+            ForwardedWriteOp::RememberBatch { vault, entries } => {
+                assert_eq!(vault, "fleet_knowledge");
+                assert_eq!(entries.len(), 2);
+                assert_eq!(entries[1].2, vec!["t".to_string()]);
+            }
+            other => panic!("expected RememberBatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_forwarded_write_rejects_unknown_and_missing_fields() {
+        assert!(parse_forwarded_write_op(&serde_json::json!({"op":"nuke"})).is_err());
+        // evolve requires an id
+        assert!(
+            parse_forwarded_write_op(&serde_json::json!({"op":"evolve","content":"x"})).is_err()
+        );
+        // remember requires a vault
+        assert!(
+            parse_forwarded_write_op(&serde_json::json!({"op":"remember","concept":"c"})).is_err()
+        );
+    }
+
     #[tokio::test]
     async fn apply_forwarded_write_rejects_bad_payloads() {
         let (_s, domain) = open_domain();
-        // unsupported op
-        let err = apply_forwarded_write(&domain, r#"{"op":"forget","vault":"default"}"#)
+        // genuinely unsupported op (remember/evolve/forget/remember_batch are
+        // all supported since S2)
+        let err = apply_forwarded_write(&domain, r#"{"op":"nuke"}"#)
             .await
             .unwrap_err();
         assert!(err.to_string().contains("unsupported op"), "{err}");
+        // forget without an id is rejected at parse time
+        let err = apply_forwarded_write(&domain, r#"{"op":"forget"}"#)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("missing `id`"), "{err}");
         // missing vault
         let err = apply_forwarded_write(&domain, r#"{"op":"remember","concept":"c"}"#)
             .await
             .unwrap_err();
-        assert!(err.to_string().contains("missing vault"), "{err}");
+        assert!(err.to_string().contains("missing `vault`"), "{err}");
         // valid shape but no muninn configured on this hotel
         let err = apply_forwarded_write(
             &domain,

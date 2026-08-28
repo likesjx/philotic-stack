@@ -13557,7 +13557,13 @@ mod tests {
                 "sess-memroute",
             )
             .await;
-        assert!(routed.is_some(), "SharedUser write must be forwarded");
+        assert!(
+            matches!(
+                routed,
+                super::memory_integration::ForwardOutcome::Forwarded(_)
+            ),
+            "SharedUser write must be forwarded"
+        );
 
         {
             let emitted = emitted.lock().unwrap();
@@ -13586,7 +13592,10 @@ mod tests {
                 "sess-memroute-fallback",
             )
             .await;
-        assert!(routed_fallback.is_some());
+        assert!(matches!(
+            routed_fallback,
+            super::memory_integration::ForwardOutcome::Forwarded(_)
+        ));
         {
             let emitted = emitted.lock().unwrap();
             let fwd = emitted
@@ -13613,7 +13622,13 @@ mod tests {
                 "sess-memroute",
             )
             .await;
-        assert!(not_routed.is_none(), "SelfOnly write must stay local");
+        assert!(
+            matches!(
+                not_routed,
+                super::memory_integration::ForwardOutcome::NotApplicable
+            ),
+            "SelfOnly write must stay local"
+        );
 
         drop(runtime);
         let _ = server.await;
@@ -13638,7 +13653,10 @@ mod tests {
                 "sess-memnoroute",
             )
             .await;
-        assert!(routed.is_none());
+        assert!(matches!(
+            routed,
+            super::memory_integration::ForwardOutcome::NotApplicable
+        ));
         assert!(
             emitted
                 .lock()
