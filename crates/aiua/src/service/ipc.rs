@@ -6781,6 +6781,13 @@ impl IpcServer {
                     );
                 }
 
+                // Spawn-by-name: resolve the registered skill's template, kind,
+                // and tool bounds into the delegation (fail closed).
+                let delegation = match resolve_skill_delegation(graph, delegation) {
+                    Ok(delegation) => delegation,
+                    Err(response) => return response,
+                };
+
                 Self::handle_spawn_subagent(
                     local_node_id,
                     graph,
@@ -7634,6 +7641,8 @@ impl IpcServer {
                             "implied_tools": s.implied_tools,
                             "implied_classes": s.implied_classes,
                             "allowed_skills": s.allowed_skills,
+                            "subagent_kind": s.subagent_kind,
+                            "goal_template": s.goal_template,
                             "validation_state": state_str,
                         })
                     })
@@ -16251,6 +16260,119 @@ pub(super) fn skill_state_label(state: &SkillValidationState) -> (String, Vec<St
     }
 }
 
+/// Resolve a spawn-by-skill-name delegation against the skill catalog.
+///
+/// When `delegation.skill_name` is set, the registered skill is the authority:
+/// its stored `goal_template` (with `{{placeholder}}`s filled from
+/// `skill_inputs`) becomes the goal, its `subagent_kind` overrides the
+/// caller's, its `implied_tools` — plus the implied tools of its transitive
+/// SkillDAG dependencies — bound the subagent's toolset, and its dependency
+/// skills activate on the subagent. Unknown or administratively retired
+/// (suspended/deprecated) skills are refused, fail closed. A non-empty caller
+/// `goal` is appended to the rendered template as delegating-agent context.
+///
+/// Delegations with no `skill_name` pass through untouched.
+#[allow(clippy::result_large_err)] // Err is the IpcResponse sent on the cold rejection path
+pub(super) fn resolve_skill_delegation(
+    graph: &GraphDomain,
+    mut delegation: philotic_client::SubagentDelegation,
+) -> Result<philotic_client::SubagentDelegation, IpcResponse> {
+    let Some(skill_name) = delegation.skill_name.clone() else {
+        return Ok(delegation);
+    };
+
+    let record = match graph.get_abstract_skill(&skill_name) {
+        Ok(Some(record)) => record,
+        Ok(None) => {
+            return Err(IpcResponse::error(
+                "spawn_subagent",
+                "SKILL_NOT_FOUND",
+                format!("skill [{skill_name}] not found in catalog"),
+            ));
+        }
+        Err(e) => {
+            return Err(IpcResponse::error(
+                "spawn_subagent",
+                "SKILL_LOOKUP_FAILED",
+                format!("failed to look up skill [{skill_name}]: {e}"),
+            ));
+        }
+    };
+    if !record.validation_state.is_projectable() {
+        let (state, _) = skill_state_label(&record.validation_state);
+        return Err(IpcResponse::error(
+            "spawn_subagent",
+            "SKILL_RETIRED",
+            format!("skill [{skill_name}] is {state} and cannot be spawned"),
+        ));
+    }
+
+    // Goal: rendered template, caller goal appended as context.
+    let mut goal = record.goal_template.clone().unwrap_or_default();
+    for (key, value) in &delegation.skill_inputs {
+        goal = goal.replace(&format!("{{{{{key}}}}}"), value);
+    }
+    let caller_goal = delegation.goal.trim().to_string();
+    if goal.trim().is_empty() {
+        goal = caller_goal.clone();
+    } else if !caller_goal.is_empty() {
+        goal = format!("{goal}\n\nAdditional context from the delegating agent: {caller_goal}");
+    }
+    if goal.trim().is_empty() {
+        return Err(IpcResponse::error(
+            "spawn_subagent",
+            "SKILL_NO_GOAL",
+            format!("skill [{skill_name}] has no goal template and no goal was provided"),
+        ));
+    }
+    delegation.goal = goal;
+
+    if let Some(kind) = record
+        .subagent_kind
+        .as_deref()
+        .map(str::trim)
+        .filter(|kind| !kind.is_empty())
+    {
+        delegation.subagent_kind = kind.to_string();
+    }
+
+    // Tool bounds and dependency skills from the transitive DAG closure.
+    let (resolved, diagnostics) =
+        ansible_mesh_core::graph::resolve_transitive_skills(&[skill_name.clone()], |name| {
+            graph.get_abstract_skill(name).ok().flatten()
+        });
+    if !diagnostics.is_empty() {
+        warn!(
+            skill_name = %skill_name,
+            diagnostics = ?diagnostics,
+            "SkillDAG resolution reported unresolvable edges during spawn-by-name"
+        );
+    }
+    for dep_name in &resolved {
+        if let Ok(Some(dep)) = graph.get_abstract_skill(dep_name) {
+            if !dep.validation_state.is_projectable() {
+                continue;
+            }
+            for tool in &dep.implied_tools {
+                if !delegation.allowed_tools.contains(tool) {
+                    delegation.allowed_tools.push(tool.clone());
+                }
+            }
+        }
+        if *dep_name != skill_name && !delegation.allowed_skills.contains(dep_name) {
+            delegation.allowed_skills.push(dep_name.clone());
+        }
+    }
+
+    info!(
+        skill_name = %skill_name,
+        subagent_kind = %delegation.subagent_kind,
+        tool_count = delegation.allowed_tools.len(),
+        "Resolved spawn-by-name delegation from skill catalog"
+    );
+    Ok(delegation)
+}
+
 /// Handle an `IpcRequest::RegisterSkill` at the IPC boundary.
 ///
 /// This is the actual authorization boundary: `skill.register` writes an abstract
@@ -17674,6 +17796,144 @@ pub(crate) mod tests {
         );
         let (code, _) = expect_register_error(resp);
         assert_eq!(code, "SET_SKILL_STATE_INVALID");
+    }
+
+    fn spawn_test_delegation(
+        skill_name: Option<&str>,
+        goal: &str,
+        inputs: &[(&str, &str)],
+    ) -> philotic_client::SubagentDelegation {
+        philotic_client::SubagentDelegation {
+            parent_agent_id: "agent-jane-01".into(),
+            parent_role: "agent".into(),
+            subagent_kind: "philote-worker".into(),
+            goal: goal.into(),
+            skill_name: skill_name.map(str::to_string),
+            skill_inputs: inputs
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn spawn_by_name_resolves_template_kind_and_dag_tools() {
+        // The registered skill is the authority: goal template rendered with
+        // inputs, caller goal appended as context, implied tools of the skill
+        // AND its SkillDAG dependencies bound the subagent, and dependency
+        // skills activate on it.
+        let graph = register_skill_test_graph();
+        let identity = GuestIdentity {
+            guest_id: "agent-jane-01:orchestrator".into(),
+            role: "orchestrator".into(),
+            supported_tools: vec![],
+        };
+        let resp = handle_register_skill(
+            Some(&identity),
+            &graph,
+            "spawn.dep".into(),
+            "dependency".into(),
+            "philote-worker".into(),
+            "dep goal".into(),
+            vec!["echo".into()],
+            vec![],
+            vec![],
+        );
+        assert!(matches!(resp, IpcResponse::SkillRegistered { .. }));
+        let resp = handle_register_skill(
+            Some(&identity),
+            &graph,
+            "spawn.main".into(),
+            "main".into(),
+            "research-worker".into(),
+            "Research {{topic}} thoroughly.".into(),
+            vec!["session.status".into()],
+            vec![],
+            vec!["spawn.dep".into()],
+        );
+        assert!(matches!(resp, IpcResponse::SkillRegistered { .. }));
+
+        let delegation = spawn_test_delegation(
+            Some("spawn.main"),
+            "focus on the mesh layer",
+            &[("topic", "hotel supervision")],
+        );
+        let resolved = resolve_skill_delegation(&graph, delegation).expect("resolves");
+        assert!(
+            resolved
+                .goal
+                .starts_with("Research hotel supervision thoroughly."),
+            "template rendered with inputs: {}",
+            resolved.goal
+        );
+        assert!(
+            resolved.goal.contains("focus on the mesh layer"),
+            "caller goal appended as context: {}",
+            resolved.goal
+        );
+        assert_eq!(resolved.subagent_kind, "research-worker");
+        assert!(
+            resolved
+                .allowed_tools
+                .contains(&"session.status".to_string())
+        );
+        assert!(
+            resolved.allowed_tools.contains(&"echo".to_string()),
+            "DAG dependency tools merged: {:?}",
+            resolved.allowed_tools
+        );
+        assert!(resolved.allowed_skills.contains(&"spawn.dep".to_string()));
+    }
+
+    #[test]
+    fn spawn_by_name_refuses_missing_and_retired_skills() {
+        let graph = register_skill_test_graph();
+        let identity = GuestIdentity {
+            guest_id: "agent-jane-01:orchestrator".into(),
+            role: "orchestrator".into(),
+            supported_tools: vec![],
+        };
+
+        let delegation = spawn_test_delegation(Some("spawn.ghost"), "", &[]);
+        let err = resolve_skill_delegation(&graph, delegation).expect_err("missing refused");
+        let (code, _) = expect_register_error(err);
+        assert_eq!(code, "SKILL_NOT_FOUND");
+
+        let resp = handle_register_skill(
+            Some(&identity),
+            &graph,
+            "spawn.retired".into(),
+            "d".into(),
+            "philote-worker".into(),
+            "goal".into(),
+            vec![],
+            vec![],
+            vec![],
+        );
+        assert!(matches!(resp, IpcResponse::SkillRegistered { .. }));
+        let resp = handle_set_skill_state(
+            Some(&identity),
+            &graph,
+            "spawn.retired".into(),
+            "suspended".into(),
+            Some("test".into()),
+        );
+        assert!(matches!(resp, IpcResponse::SkillStateSet { .. }));
+        let delegation = spawn_test_delegation(Some("spawn.retired"), "", &[]);
+        let err = resolve_skill_delegation(&graph, delegation).expect_err("retired refused");
+        let (code, _) = expect_register_error(err);
+        assert_eq!(code, "SKILL_RETIRED");
+    }
+
+    #[test]
+    fn spawn_without_skill_name_passes_through_unchanged() {
+        let graph = register_skill_test_graph();
+        let delegation = spawn_test_delegation(None, "plain goal", &[]);
+        let resolved = resolve_skill_delegation(&graph, delegation).expect("passthrough");
+        assert_eq!(resolved.goal, "plain goal");
+        assert_eq!(resolved.subagent_kind, "philote-worker");
+        assert!(resolved.allowed_tools.is_empty());
     }
 
     #[test]

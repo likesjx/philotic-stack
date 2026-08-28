@@ -1695,19 +1695,40 @@ fn build_catalog() -> HashMap<String, ToolDefinition> {
             tool_name: "subagent.spawn".into(),
             description: "Spawns a new subagent worker in the hotel. The subagent runs \
                           independently with its own lease and model turn budget. Use this to \
-                          delegate a discrete, self-contained task to a worker process. The hotel \
-                          responds with the subagent's guest ID and confirmed lease details."
+                          delegate a discrete, self-contained task to a worker process. Either \
+                          pass 'goal' directly, OR pass 'skill_name' to spawn a registered \
+                          delegation skill from the catalog — the skill's stored goal template \
+                          (with {{placeholder}}s filled from 'inputs'), worker kind, and tool \
+                          bounds are used automatically. The hotel responds with the subagent's \
+                          guest ID and confirmed lease details."
                 .into(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
                     "goal": {
                         "type": "string",
-                        "description": "The mission goal text delivered to the subagent."
+                        "description": "The mission goal text delivered to the subagent. \
+                                        Required unless 'skill_name' is given; with 'skill_name' \
+                                        it is appended to the skill's template as extra context."
+                    },
+                    "skill_name": {
+                        "type": "string",
+                        "description": "Name of a registered delegation skill (see skill.list). \
+                                        The skill's goal template, subagent kind, tool bounds, \
+                                        and dependencies are resolved by the hotel. Suspended or \
+                                        deprecated skills are refused."
+                    },
+                    "inputs": {
+                        "type": "object",
+                        "additionalProperties": { "type": "string" },
+                        "description": "Values substituted into the skill goal template's \
+                                        {{placeholder}}s, e.g. {\"topic\": \"...\"}."
                     },
                     "subagent_kind": {
                         "type": "string",
-                        "description": "The worker role to spawn. Defaults to 'philote-worker'."
+                        "description": "The worker role to spawn. Defaults to 'philote-worker'; \
+                                        overridden by the skill's stored kind when 'skill_name' \
+                                        is given."
                     },
                     "context_summary": {
                         "type": "string",
@@ -1717,14 +1738,15 @@ fn build_catalog() -> HashMap<String, ToolDefinition> {
                     "allowed_tools": {
                         "type": "array",
                         "items": { "type": "string" },
-                        "description": "Optional list of tool IDs the subagent may use."
+                        "description": "Optional list of tool IDs the subagent may use \
+                                        (merged with the skill's implied tools when spawning by name)."
                     },
                     "iteration_budget": {
                         "type": "integer",
                         "description": "Maximum model-turn iterations for the subagent. Defaults to 5."
                     }
                 },
-                "required": ["goal"]
+                "required": []
             }),
             class: Some("capability".into()),
         },
