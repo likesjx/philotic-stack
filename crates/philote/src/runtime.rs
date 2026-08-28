@@ -45,6 +45,9 @@ mod paracrine;
 #[path = "tool_exec.rs"]
 mod tool_exec;
 
+#[path = "deterministic_capture.rs"]
+mod deterministic_capture;
+
 #[path = "memory_integration.rs"]
 mod memory_integration;
 use memory_integration::*;
