@@ -246,8 +246,22 @@ Every verb declares its own gate; destructive verbs are never inherited as
 
 ## Current Slice
 
-`S6a — Muninn Admin Observability (reporting, read-only)`. See
-[docs/task.md](/Users/jaredlikes/code/philotic-stack/docs/task.md).
+All five **in-repo** slices are implemented and test-green on `codex/muninn-memory-core`
+(PR #466): S1 (fleet-knowledge recall scope), S2 (write-routing completeness +
+loud strand), S6a (admin `memory.report` tool on the honest-sourcing assembler),
+S4 (promotion criterion + posture gate), and S3 (deterministic capture
+classifier). S3 and S4 land their judgment-heavy cores test-green; their
+store-mutating wiring (S3 attend-hook capture, S4 sweep fetch+write) is
+deliberately held until it can be **live-validated**, since those paths write to
+the store this proposal is hardening.
+
+The remaining two slices are **not in-repo code**: **S6b** needs a new
+replication-status API in the `muninndb` Go project (cross-repo + deploy), and
+**S5** is live-ops (pin binaries, repair the observer apply layer, merge the two
+muninndb fix branches, fleet deploy, reconcile the 179 mac-only memories first)
+that restarts the live memory daemon and must be driven with the operator.
+
+See [docs/task.md](/Users/jaredlikes/code/philotic-stack/docs/task.md).
 
 > Graph-intelligence was unavailable during authoring; this proposal is
 > file-backed and its graph node/decision are deferred until the graph server
