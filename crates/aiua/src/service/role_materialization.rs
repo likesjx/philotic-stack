@@ -148,13 +148,23 @@ impl IpcServer {
                     .flatten()
                     .is_none()
                 {
+                    // Mirror role_worker_manifest's env exactly (ipc.rs, Self::role_worker_manifest):
+                    // PHILOTIC_ROLE_INBOX/PHILOTIC_GUEST_ID/PHILOTIC_HOTEL_NAME are what let the
+                    // spawned philote self-report the canonical role_incarnation identity
+                    // ("role:{agent_id}:{role_name}" / "{agent_id}:{role_name}") instead of
+                    // falling back to a bare role name that can never pass
+                    // Self::is_agent_handoff_caller — omitting them here previously produced a
+                    // process that could materialize into a role but never hand back out of it.
                     let config_json = serde_json::json!({
                         "command": "philote",
                         "args": [],
                         "env": {
                             "PHILOTIC_AGENT_ID": inc.agent_id,
+                            "PHILOTIC_GUEST_ID": inc.guest_id,
                             "PHILOTIC_ROLE_NAME": inc.role_name,
+                            "PHILOTIC_ROLE_INBOX": inc.routing_role(),
                             "PHILOTIC_HOTEL_SOCKET": socket_path,
+                            "PHILOTIC_HOTEL_NAME": hotel_name,
                             "PHILOTIC_NODE_ID": local_node_id,
                         }
                     });
@@ -2029,6 +2039,17 @@ mod tests {
             .expect("cross-hotel arm must seed the philote hotel guest record");
         assert!(guest.is_active);
         assert_eq!(guest.role, "orchestrator");
+
+        let config: serde_json::Value =
+            serde_json::from_str(&guest.config_json).expect("config_json must be valid JSON");
+        let env = config["env"].clone();
+        assert_eq!(
+            env["PHILOTIC_ROLE_INBOX"], "role:agent-test:orchestrator",
+            "spawned philote must self-report the canonical routing role, or it can never \
+             pass Self::is_agent_handoff_caller and hand back out of the role"
+        );
+        assert_eq!(env["PHILOTIC_GUEST_ID"], "agent-test:orchestrator");
+        assert_eq!(env["PHILOTIC_HOTEL_NAME"], "local-hotel");
     }
 
     #[tokio::test]
