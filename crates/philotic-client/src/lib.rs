@@ -1981,6 +1981,10 @@ pub enum IpcRequest {
     /// Return a safe view of hotel state: hotel name, active guests, agent identities.
     /// No secret or credential values are included.
     GetHotelStatus,
+    /// Return the Muninn admin observability report (proposal S6a): recall
+    /// effectiveness and other memory-health fields, each honest about whether
+    /// it could be sourced. Read-only; no memory content or secrets included.
+    GetMemoryReport,
     /// Return the hotel's current network security perimeter snapshot.
     GetPerimeterStatus,
     /// Force the hotel's PerimeterService to re-derive the snapshot from live interfaces.

@@ -708,6 +708,25 @@ impl GraphDomain {
         Ok(out)
     }
 
+    /// Count recent session events of a given `kind` across all sessions,
+    /// bounded by `window`. Used by the Muninn admin report (proposal S6a) to
+    /// measure recall effectiveness (`memory_auto_recall_completed` vs
+    /// `_skipped`) without a full-history scan — the DEF-080 meltdown class.
+    /// The backend pushes the `kind` filter into the store and honours `limit`,
+    /// so this never loads the whole event ledger; a return equal to `window`
+    /// means the true count is `>= window` (saturated), which the caller should
+    /// surface rather than treat as exact.
+    pub fn count_recent_session_events_by_kind(&self, kind: &str, window: usize) -> Result<usize> {
+        let nodes = self.adapter.list_nodes_by_kind_json_eq(
+            NODE_KIND_SESSION_EVENT,
+            "kind",
+            kind,
+            "created_at",
+            window,
+        )?;
+        Ok(nodes.len())
+    }
+
     /// Delete session history older than `older_than_secs`: all session_event
     /// nodes past the cutoff, and all non-running session_turn nodes past the
     /// cutoff (running turns belong to the zombie repair sweep, not retention).
@@ -1978,6 +1997,56 @@ mod tests {
         let storage =
             SqliteGraphStorage::open_in_memory().expect("in-memory SqliteGraphStorage failed");
         GraphDomain::new(Arc::new(storage.adapter()))
+    }
+
+    #[test]
+    fn count_recent_session_events_by_kind_is_windowed() {
+        use crate::storage::SessionEventRecord;
+        let domain = make_domain();
+        let ev = |id: &str, kind: &str, sess: &str, at: u64| SessionEventRecord {
+            event_id: id.into(),
+            session_id: sess.into(),
+            turn_id: None,
+            component_id: "philote".into(),
+            kind: kind.into(),
+            payload_json: serde_json::Value::Null,
+            created_at: at,
+        };
+        // Recall events across DIFFERENT sessions must all count (fleet-wide),
+        // and a different kind must not leak in.
+        domain
+            .append_session_event(&ev("e1", "memory_auto_recall_completed", "s1", 1))
+            .unwrap();
+        domain
+            .append_session_event(&ev("e2", "memory_auto_recall_completed", "s2", 2))
+            .unwrap();
+        domain
+            .append_session_event(&ev("e3", "memory_auto_recall_skipped", "s1", 3))
+            .unwrap();
+        domain
+            .append_session_event(&ev("e4", "plan_ready", "s1", 4))
+            .unwrap();
+
+        assert_eq!(
+            domain
+                .count_recent_session_events_by_kind("memory_auto_recall_completed", 5000)
+                .unwrap(),
+            2
+        );
+        assert_eq!(
+            domain
+                .count_recent_session_events_by_kind("memory_auto_recall_skipped", 5000)
+                .unwrap(),
+            1
+        );
+        // The window caps the count — never an unbounded scan (DEF-080 guard).
+        assert_eq!(
+            domain
+                .count_recent_session_events_by_kind("memory_auto_recall_completed", 1)
+                .unwrap(),
+            1,
+            "a window of 1 must cap the returned count at 1"
+        );
     }
 
     #[test]

@@ -18,7 +18,45 @@
 // S6a follow-up. Until then these items are exercised only by unit tests.
 #![allow(dead_code)]
 
+use ansible_mesh_core::domain::GraphDomain;
 use serde::{Deserialize, Serialize};
+
+/// Window for the recall-effectiveness event count — bounds the query so it can
+/// never become a full-history scan (the DEF-080 meltdown class).
+const RECALL_EVENT_WINDOW: usize = 5000;
+
+/// Assemble the admin report from live hotel sources available in S6a today.
+///
+/// Currently sources **recall effectiveness** from the session-event ledger
+/// (`memory_auto_recall_completed` / `_skipped`, windowed) — the metric that
+/// answers "are philotes actually using memory?". Every other field is honestly
+/// [`ReportField::Unavailable`]: per-node vault counts + divergence need the
+/// multi-node Muninn status calls (S6a-wire follow-up), and replication
+/// lag/peer/backlog need a muninndb API (S6b). Nothing is guessed.
+pub fn assemble_live_memory_report(graph: &GraphDomain) -> MemoryReport {
+    let recall = match (
+        graph.count_recent_session_events_by_kind(
+            "memory_auto_recall_completed",
+            RECALL_EVENT_WINDOW,
+        ),
+        graph
+            .count_recent_session_events_by_kind("memory_auto_recall_skipped", RECALL_EVENT_WINDOW),
+    ) {
+        (Ok(completed), Ok(skipped)) => Some(RecallEffectiveness {
+            completed: completed as u64,
+            skipped: skipped as u64,
+        }),
+        _ => None,
+    };
+
+    assemble_memory_report(MemoryReportInputs {
+        recall,
+        // Multi-node status/divergence is the S6a-wire follow-up; until then the
+        // report is honest that it compared nothing rather than implying parity.
+        cortex_reachable: false,
+        ..Default::default()
+    })
+}
 
 /// A reported value that is honest about whether it could be sourced.
 ///

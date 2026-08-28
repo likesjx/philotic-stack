@@ -52,6 +52,7 @@ pub const LOCAL_AGENT_TOOLS: &[&str] = &[
     "memory.promote_candidate",
     "memory.fix",
     "memory.status",
+    "memory.report",
     // Previously in NEITHER copy (live bug: the architect profile grants
     // memory.delta_digest but the hotel-side list couldn't route it).
     "memory.explain",

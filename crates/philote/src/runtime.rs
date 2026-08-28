@@ -486,6 +486,7 @@ fn low_progress_tool_name(tool_name: &str) -> bool {
             | "hotel.logs"
             | "hotel.status"
             | "mcp.status"
+            | "memory.report"
             | "memory.status"
             | "role.list"
             | "session.status"

@@ -2791,6 +2791,26 @@ fn build_catalog() -> HashMap<String, ToolDefinition> {
     );
 
     m.insert(
+        "memory.report".into(),
+        ToolDefinition {
+            tool_name: "memory.report".into(),
+            description: "Admin memory-health report for Muninn (read-only). Returns recall \
+                          effectiveness (auto-recall completed vs skipped) and other \
+                          memory-health fields. Each field is explicit about whether it could be \
+                          sourced — fields shown as `unavailable` were NOT measured and must not \
+                          be read as healthy zeros. Use to check whether philotes are actually \
+                          recalling memory and whether the store is healthy."
+                .into(),
+            input_schema: json!({ "type": "object", "properties": {} }),
+            // Deliberately class-less: memory.report is admin-gated by explicit
+            // grant on the admin/orchestrator profiles, not by the broad
+            // `memory` class every memory-capable agent holds (proposal S6a
+            // authz: admin-role, audited read).
+            class: None,
+        },
+    );
+
+    m.insert(
         "memory.fix".into(),
         ToolDefinition {
             tool_name: "memory.fix".into(),
