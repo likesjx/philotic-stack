@@ -44,6 +44,7 @@ mod lyra_charter;
 mod memory;
 mod memory_delta_digest;
 mod memory_hygiene;
+mod memory_promotion;
 mod memory_report;
 mod mesh;
 mod muninn_provision;
