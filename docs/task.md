@@ -169,9 +169,9 @@ Seam IDs: `fleet-knowledge-recall-scope`, `memory-write-routing-completeness`, `
 
 Sequence: **S6a → S1 → S2 → S3/S4 → S6b → S5** (one slice per branch/PR).
 
-- [ ] **S6a** — Muninn admin observability (reporting, read-only): `memory.report` admin-gated tool sourcing only data that exists today (per-vault counts both nodes, divergence sweep, recall completed/skipped + write rates from session events, contradictions/soft-deleted, disk); unsourceable fields report `unavailable`, never guessed. **CURRENT SLICE.**
-- [ ] S1 — `SharedFleet` MemoryScope → curated `fleet_knowledge` vault in default recall scope (trust/importance filtered); update `VaultResolver` + `is_fleet_shared_vault`. Inert until S4 fills it — seed or ship paired with S4.
-- [ ] S2 — write-routing completeness: op-dispatch evolve/forget/remember_batch through the Cortex forward path; silent local-fallback → loud failure + durable reconcile queue.
+- [~] **S6a** — Muninn admin observability (reporting). **Foundation landed** (PR #466): `memory_report.rs` model + `assemble_memory_report` with the honest-sourcing contract (`ReportField` available/unavailable), 6 tests. **Remaining (S6a-wire):** the live `memory.report` IPC op + admin-gated philote tool that fetch the inputs (per-node `muninn_status`, session-event recall/write counts, contradictions/soft-deleted, disk) and call the assembler.
+- [x] S1 — `SharedFleet` MemoryScope → `fleet_knowledge` vault in default recall scope; `VaultResolver` + `is_fleet_shared_vault` + tool-arg + `memory.remember` schema updated. Curated at write time. test-green (PR #466). Non-inert: `scope=fleet` writes are usable now; S4 adds auto-promotion.
+- [x] S2 — write-routing completeness: `apply_forwarded_write` op-dispatches remember/evolve/forget/remember_batch (pure `ForwardedWriteOp` parser); `forward_shared_memory_write` returns `ForwardOutcome` so a stranded shared write is surfaced loudly. test-green (PR #466). **Remaining:** durable auto-reconcile queue for stranded writes.
 - [ ] S3 — less model-dependent capture: deterministic operator-fact/preference classifier proposing Muninn candidates.
 - [ ] S4 — cultivation mutations (consolidate/evolve/dedup/archive) + promotion of durable self_/session memories into fleet_knowledge, gated + privacy-filtered.
 - [ ] S6b — reporting fields needing a muninndb API (replication lag, peer/streamer state, backlog depth) — upstream fork work.
