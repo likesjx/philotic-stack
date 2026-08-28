@@ -604,6 +604,50 @@ impl LifeGraphProvider {
         created
     }
 
+    /// One heartbeat tick of the reminders sensor (hotel-managed, see
+    /// `data_memorygraphrag::heartbeat`): select due un-dispatched nodes,
+    /// stamp them, return the pre-formatted delivery message — or None on a
+    /// quiet tick. Stamp-then-emit: at-most-once by construction; a lost
+    /// emit is caught by the daily-brief safety net, never duplicated.
+    pub async fn heartbeat_reminders_tick(&self, window_secs: u64) -> Result<Option<String>> {
+        use data_memorygraphrag::heartbeat;
+        let now = chrono::Utc::now();
+        let result = self
+            .execute_cypher(&heartbeat::due_reminders_cypher(now, window_secs))
+            .await?;
+        let rows = result
+            .get("rows")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        if rows.is_empty() {
+            return Ok(None);
+        }
+        let tz = heartbeat::operator_tz();
+        let mut ids = Vec::new();
+        let mut lines = Vec::new();
+        for row in &rows {
+            let id = row.get("id").and_then(Value::as_str).unwrap_or("");
+            if id.is_empty() {
+                continue;
+            }
+            let due = row.get("due_at").and_then(Value::as_str).unwrap_or("");
+            let claim = row.get("claim").and_then(Value::as_str).unwrap_or("");
+            ids.push(id.to_string());
+            lines.push(heartbeat::format_reminder_line(claim, due, id, &tz));
+        }
+        if ids.is_empty() {
+            return Ok(None);
+        }
+        self.execute_cypher(&heartbeat::stamp_cypher(&ids, now))
+            .await?;
+        info!(
+            reminders = ids.len(),
+            "heartbeat: reminders selected, stamped, handing to delivery"
+        );
+        Ok(Some(heartbeat::dispatch_message(&lines)))
+    }
+
     pub async fn hygiene_sweep(&self) -> Result<data_memorygraphrag::hygiene::SweepSummary> {
         let graph = self.connect().await?;
         data_memorygraphrag::hygiene::sweep(&graph).await
