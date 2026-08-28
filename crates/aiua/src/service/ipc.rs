@@ -4261,14 +4261,26 @@ impl IpcServer {
         let Some(agent_id) = session.primary_agent_id else {
             anyhow::bail!("session [{}] has no primary_agent_id", session_id);
         };
-        let Some(role_record) = graph.get_role_incarnation(&agent_id, role_name)? else {
-            anyhow::bail!(
-                "role [{}] is not configured for agent [{}]",
-                role_name,
-                agent_id
-            );
-        };
-        Ok(role_record)
+        if let Some(role_record) = graph.get_role_incarnation(&agent_id, role_name)? {
+            return Ok(role_record);
+        }
+        // Role names are stored with whatever casing they were configured with
+        // (e.g. "Chronos"), but operators type `/role chronos` from memory or a
+        // model emits a lowercased argument. Fall back to a case-insensitive
+        // scan rather than forcing exact-case recall for a lookup that's
+        // effectively an enum choice over a short, known list.
+        if let Some(role_record) = graph
+            .list_role_incarnations(&agent_id)?
+            .into_iter()
+            .find(|r| r.role_name.eq_ignore_ascii_case(role_name))
+        {
+            return Ok(role_record);
+        }
+        anyhow::bail!(
+            "role [{}] is not configured for agent [{}]",
+            role_name,
+            agent_id
+        );
     }
 
     pub(super) fn role_worker_manifest(

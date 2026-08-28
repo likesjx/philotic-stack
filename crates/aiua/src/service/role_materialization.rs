@@ -1266,7 +1266,12 @@ impl IpcServer {
             materialization_requester,
             local_node_id,
             &target_role.agent_id,
-            &role_name,
+            // Use the resolved record's canonical role_name, not the raw
+            // caller-supplied `role_name` — resolve_role_incarnation above
+            // may have matched it case-insensitively (e.g. "chronos" against
+            // a role stored as "Chronos"), and ensure_role_materialized does
+            // its own exact-match lookup that would otherwise re-fail here.
+            &target_role.role_name,
         )
         .await
         {
@@ -3055,6 +3060,133 @@ mod tests {
             session.active_incarnation_id.as_deref(),
             Some("agent-jane:developer")
         );
+
+        unsafe {
+            std::env::remove_var("PHILOTIC_HOTEL_SOCKET");
+        }
+        server_task.abort();
+        let _ = server_task.await;
+        if Path::new(&socket_path).exists() {
+            let _ = std::fs::remove_file(&socket_path);
+        }
+    }
+
+    #[tokio::test]
+    async fn handoff_to_role_resolves_role_name_case_insensitively() {
+        // Role names are stored with whatever casing they were configured with
+        // (e.g. "Chronos"), but an operator typing `/role chronos` from memory,
+        // or a model emitting a lowercased argument, must still resolve —
+        // live-observed: HANDOFF_ROLE_UNKNOWN for `/role chronos` against a
+        // role stored as "Chronos".
+        let _env_guard = ipc_env_guard();
+        let socket_path = test_socket_path();
+        let (dispatcher_tx, _dispatcher_rx) = test_dispatcher_channel();
+        let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
+        let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
+        graph
+            .upsert_session(&SessionRecord {
+                session_id: "sess-role-case-insensitive".into(),
+                session_kind: "conversation".into(),
+                primary_agent_id: Some("agent-beacon".into()),
+                active_incarnation_id: Some("agent-beacon".into()),
+                channel_kind: Some("telegram".into()),
+                channel_session_key: Some("456".into()),
+                status: "active".into(),
+                lease_owner_component_id: None,
+                lease_expires_at: None,
+                summary_json: serde_json::json!({}),
+                created_at: 1,
+                updated_at: 2,
+            })
+            .expect("session should seed");
+        graph
+            .upsert_role_incarnation(&RoleIncarnationRecord {
+                agent_id: "agent-beacon".into(),
+                role_name: "Chronos".into(),
+                guest_id: "agent-beacon:Chronos".into(),
+                toolset_profile: "scheduler".into(),
+                role_identity_addendum: None,
+                role_manifest: None,
+                is_admin: false,
+                readiness_state: RoleReadinessState::Configured,
+                inactive_ttl_seconds: None,
+                turn_loop_config: TurnLoopConfig::default(),
+                home_node: None,
+                ..Default::default()
+            })
+            .expect("Chronos role should seed");
+        let server = IpcServer::new(
+            socket_path.clone(),
+            "local-aiua-01",
+            dispatcher_tx,
+            graph.clone(),
+        );
+
+        let server_task = tokio::spawn(async move {
+            server.run().await.expect("ipc server should run");
+        });
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        unsafe {
+            std::env::set_var("PHILOTIC_HOTEL_SOCKET", &socket_path);
+        }
+
+        let mut base_agent = PhiloticClient::connect(GuestIdentity {
+            guest_id: "agent-beacon".into(),
+            role: "agent".into(),
+            supported_tools: Vec::new(),
+        })
+        .await
+        .expect("base agent connect");
+        let mut chronos = PhiloticClient::connect(GuestIdentity {
+            guest_id: "agent-beacon:Chronos".into(),
+            role: "role:agent-beacon:Chronos".into(),
+            supported_tools: Vec::new(),
+        })
+        .await
+        .expect("chronos connect");
+        chronos
+            .send_request(IpcRequest::SubscribeInbox {
+                role: "agent".into(),
+            })
+            .await
+            .expect("chronos agent inbox subscribe");
+
+        let response = base_agent
+            .send_request(IpcRequest::HandoffToRole {
+                session_id: "sess-role-case-insensitive".into(),
+                role_name: "chronos".into(),
+                handoff_bundle: HandoffBundle {
+                    goal: "switch role".into(),
+                    context_excerpt: "manual slash command".into(),
+                    session_id: "sess-role-case-insensitive".into(),
+                    initiating_turn_id: "turn-1".into(),
+                    return_to: Some("orchestrator".into()),
+                    handoff_reason: Some("manual_role_switch".into()),
+                    active_goal: None,
+                    active_constraints: Vec::new(),
+                    relevant_session_facts: Vec::new(),
+                    working_summary: None,
+                    from_role: Some("orchestrator".into()),
+                    to_role: Some("chronos".into()),
+                    suggested_memory_refs: Vec::new(),
+                    expected_return_mode: Some("required".into()),
+                    cleanup_actions: Vec::new(),
+                },
+            })
+            .await
+            .expect("handoff request");
+
+        match response {
+            IpcResponse::HandoffAck {
+                handoff_guest_id,
+                became_active,
+            } => {
+                assert_eq!(handoff_guest_id, "agent-beacon:Chronos");
+                assert!(became_active);
+            }
+            other => panic!("lowercase role name must still resolve, got: {other:?}"),
+        }
 
         unsafe {
             std::env::remove_var("PHILOTIC_HOTEL_SOCKET");
