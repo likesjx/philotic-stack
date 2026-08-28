@@ -1960,13 +1960,29 @@ impl AgentRuntime {
         // turn that is legitimately waiting for the life-graph-runner response.
         let response_is_life_observe =
             matches!(tool_result.tool_name.as_str(), "life.observe" | "");
+        // A contract error is retry-relevant even for model-invoked calls, so
+        // it still routes through the special block below.
+        let is_life_observe_contract_error = step_failed
+            && task.error.as_ref().and_then(|e| e.sub_kind.as_deref()) == Some("invalid_request");
         let direct_life_observe_command = self
             .sessions
             .get(&session_id)
             .and_then(|s| s.active_turn.as_ref())
             .and_then(|turn| {
                 turn.pending_tool_call.as_ref().and_then(|call| {
-                    (call.tool_name == "life.observe" && response_is_life_observe)
+                    // The turn-ending receipt below is ONLY for the operator's
+                    // direct text command ("record this ..."), which runs with
+                    // no model in the loop. A life.observe the MODEL invoked
+                    // must fall through to the normal re-entry path instead:
+                    // short-circuiting it ended every turn after its FIRST
+                    // observation with a canned receipt — live 2026-08-27, an
+                    // operator listing five habits got exactly one recorded
+                    // per message and had to ask six times. Contract errors
+                    // still enter the block for the bounded model retry.
+                    (call.tool_name == "life.observe"
+                        && response_is_life_observe
+                        && (is_direct_life_observe_origin(&call.arguments)
+                            || is_life_observe_contract_error))
                         .then(|| direct_life_observe_command_from_arguments(&call.arguments))
                         .flatten()
                 })
