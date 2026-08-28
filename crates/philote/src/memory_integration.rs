@@ -313,6 +313,7 @@ pub(super) fn memory_spatial_scope_from_arg(
         _ => match scope {
             MemoryScope::SharedUser => MemorySpatialScope::User,
             MemoryScope::Session(_) => MemorySpatialScope::Session,
+            MemoryScope::SharedFleet => MemorySpatialScope::Mesh,
             MemoryScope::CrossScope(_) => MemorySpatialScope::Mesh,
             MemoryScope::SelfOnly => MemorySpatialScope::SelfScope,
         },
@@ -729,6 +730,11 @@ pub(super) fn default_turn_recall_scope(session_id: &str) -> MemoryScope {
         MemoryScope::SelfOnly,
         MemoryScope::SharedUser,
         MemoryScope::Session(session_id.to_string()),
+        // Fleet knowledge: every philote recalls the shared, curated
+        // `fleet_knowledge` vault so cross-agent/cross-hotel knowledge actually
+        // reaches turns (proposal S1). Curated at write time, so this stays
+        // high-signal; the per-turn relevance gate + char budget bound it.
+        MemoryScope::SharedFleet,
     ])
 }
 
@@ -736,6 +742,7 @@ pub(super) fn memory_scope_from_tool_arg(scope: Option<&str>, session_id: &str) 
     match scope.unwrap_or("self") {
         "shared_user" | "user" => MemoryScope::SharedUser,
         "session" | "working" => MemoryScope::Session(session_id.to_string()),
+        "fleet" | "shared_fleet" | "knowledge" => MemoryScope::SharedFleet,
         "cross" | "all" => default_turn_recall_scope(session_id),
         _ => MemoryScope::SelfOnly,
     }
@@ -2772,6 +2779,37 @@ impl AgentRuntime {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn default_turn_recall_scope_includes_fleet_knowledge() {
+        // Regression guard for proposal S1: every philote turn must recall the
+        // shared fleet_knowledge vault, or cross-agent knowledge never reaches
+        // the model.
+        let MemoryScope::CrossScope(scopes) = default_turn_recall_scope("session_x") else {
+            panic!("default recall scope must be a cross-scope");
+        };
+        assert!(
+            scopes.iter().any(|s| matches!(s, MemoryScope::SharedFleet)),
+            "default recall scope must include SharedFleet"
+        );
+    }
+
+    #[test]
+    fn fleet_scope_arg_maps_to_shared_fleet() {
+        assert!(matches!(
+            memory_scope_from_tool_arg(Some("fleet"), "s"),
+            MemoryScope::SharedFleet
+        ));
+        assert!(matches!(
+            memory_scope_from_tool_arg(Some("knowledge"), "s"),
+            MemoryScope::SharedFleet
+        ));
+        // Unknown/absent still defaults to the private self scope.
+        assert!(matches!(
+            memory_scope_from_tool_arg(None, "s"),
+            MemoryScope::SelfOnly
+        ));
+    }
 
     #[test]
     fn inbound_primary_user_id_prefers_lowercased_username_over_numeric_id() {

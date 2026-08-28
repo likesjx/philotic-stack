@@ -2565,10 +2565,14 @@ fn build_catalog() -> HashMap<String, ToolDefinition> {
                     },
                     "scope": {
                         "type": "string",
-                        "enum": ["self", "shared_user", "session"],
+                        "enum": ["self", "shared_user", "session", "fleet"],
                         "description": "Optional write scope. Use 'shared_user' for operator \
                                         preferences, 'session' for active workstream context, \
-                                        and 'self' for the agent's own habits or observations."
+                                        'self' for the agent's own habits or observations, and \
+                                        'fleet' for durable knowledge every philote across the \
+                                        fleet should be able to recall (goes to the shared, \
+                                        replicated fleet_knowledge vault — reserve for high-signal, \
+                                        broadly-useful facts, not per-agent trivia)."
                     },
                     "temporal_kind": {
                         "type": "string",
