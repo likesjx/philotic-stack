@@ -997,6 +997,21 @@ pub fn should_plan(user_content: &str) -> bool {
         return true;
     }
 
+    // An enumeration is work even when it is one short sentence with no
+    // request verb: "more habits that i am building: duolingo morning and
+    // evening, morning supplements and evening, reading before bed" carries
+    // five artifacts, no marker word, no `?`, and only 17 words — live
+    // 2026-08-27 it got no plan, and only the first item was captured. Same
+    // separator threshold as `description_enumerates_artifacts`: two or more
+    // separators means several distinct items.
+    let separators = lower.matches(", ").count()
+        + lower.matches("; ").count()
+        + lower.matches(" and ").count()
+        + lower.matches(" & ").count();
+    if separators >= 2 {
+        return true;
+    }
+
     false
 }
 
@@ -2121,6 +2136,25 @@ mod tests {
         ] {
             assert!(should_plan(msg), "should plan: {msg}");
         }
+    }
+
+    /// The live 2026-08-27 habit incident: a short single-sentence message
+    /// with no request-marker word and no `?` enumerated five habits — it got
+    /// no plan, only the first item was captured, and the operator had to ask
+    /// six times. Two or more separators means several distinct items.
+    #[test]
+    fn short_enumerations_get_a_plan() {
+        for msg in [
+            "more habits that i am building: duolingo morning and evening, \
+             morning supplements and evening, reading before bed.",
+            "my current systems: morning pages, duolingo, evening reading",
+        ] {
+            assert!(should_plan(msg), "should plan: {msg}");
+        }
+        // A single "and"/comma is still conversation, not an enumeration.
+        assert!(!should_plan(
+            "Kelley and I are watching The Bear - fourth season 😉"
+        ));
     }
 
     // ── Re-entry hint ───────────────────────────────────────────────────

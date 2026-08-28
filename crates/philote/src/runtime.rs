@@ -10250,26 +10250,179 @@ mod tests {
         let _ = std::fs::remove_file(&socket_path);
 
         let emitted = emitted.lock().unwrap();
+        // A MODEL-invoked life.observe transport failure flows through the
+        // normal loop re-entry: the model sees the error in its tool history
+        // and decides what to do (try differently, continue other work, or
+        // tell the user itself). It must NOT be short-circuited with a canned
+        // apology that ends the turn — that short-circuit is reserved for the
+        // operator's direct text command, which has no model in the loop.
         assert!(
             emitted
                 .iter()
-                .all(|e| e["task"]["action"] != "generate_text"),
-            "a non-contract error must never trigger the life.observe retry: {:#?}",
+                .any(|e| e["task"]["action"] == "generate_text"),
+            "a model-invoked failure must re-enter the model loop: {:#?}",
             *emitted
         );
         assert!(
             emitted.iter().all(|e| e.get("heal_event").is_none()),
-            "a non-contract error must not use the new life.observe heal path: {:#?}",
+            "a non-contract error must not use the life.observe heal path: {:#?}",
             *emitted
         );
-        let send_replies: Vec<_> = emitted
+        assert!(
+            emitted.iter().all(|e| e["task"]["action"] != "send_reply"),
+            "no canned apology may end a model-invoked turn: {:#?}",
+            *emitted
+        );
+    }
+
+    /// The live 2026-08-27 habit incident: the model called life.observe as
+    /// the first of several captures, and the turn was force-completed with a
+    /// canned "Recorded this …" receipt — one artifact per turn, the operator
+    /// asked six times. A model-invoked SUCCESS must re-enter the loop so the
+    /// model can execute the remaining items and write its own final reply.
+    #[tokio::test]
+    async fn life_observe_model_invoked_success_reenters_loop() {
+        let socket_path = format!(
+            "/tmp/philote-lifeobs-modelok-{}.sock",
+            Uuid::new_v4().simple()
+        );
+        let listener = tokio::net::UnixListener::bind(&socket_path).expect("bind");
+        let emitted = std::sync::Arc::new(std::sync::Mutex::new(Vec::<serde_json::Value>::new()));
+        let server = tokio::spawn(run_recording_hotel(listener, emitted.clone()));
+
+        let identity = philotic_client::GuestIdentity {
+            guest_id: "agent-lifeobs-modelok".into(),
+            role: "agent".into(),
+            supported_tools: Vec::new(),
+        };
+        let client = philotic_client::PhiloticClient::connect_at(&socket_path, identity)
+            .await
+            .expect("connect to stub hotel");
+        let mut runtime = AgentRuntime::new(client, "agent-lifeobs-modelok");
+
+        let session_id = "sess-lifeobs-modelok";
+        let turn_id = "turn-lifeobs-modelok";
+        runtime
+            .ensure_session_loaded(session_id, "telegram")
+            .await
+            .expect("session load");
+        runtime
+            .sessions
+            .get_mut(session_id)
+            .expect("session exists")
+            .start_turn(life_observe_working_turn(turn_id, false));
+
+        runtime
+            .handle_tool_result(InboundTaskPayload {
+                action: Some("tool_result".into()),
+                session_id: Some(session_id.into()),
+                turn_id: Some(turn_id.into()),
+                tool_name: Some("life.observe".into()),
+                content: Some(
+                    r#"{"status":"proposed","node_id":"life:habit:duolingo_morning"}"#.into(),
+                ),
+                ..Default::default()
+            })
+            .await
+            .expect("tool result handled");
+
+        {
+            let state = runtime.session(session_id).expect("session");
+            assert!(
+                state.active_turn.is_some(),
+                "the turn must still be alive after a model-invoked life.observe"
+            );
+        }
+
+        drop(runtime);
+        let _ = server.await;
+        let _ = std::fs::remove_file(&socket_path);
+
+        let emitted = emitted.lock().unwrap();
+        assert!(
+            emitted
+                .iter()
+                .any(|e| e["task"]["action"] == "generate_text"),
+            "a model-invoked life.observe success must re-enter the model loop: {:#?}",
+            *emitted
+        );
+        assert!(
+            emitted.iter().all(|e| !(e["task"]["action"] == "send_reply"
+                && e["task"]["content"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("Recorded this"))),
+            "the canned receipt must never end a model-invoked turn: {:#?}",
+            *emitted
+        );
+    }
+
+    /// The operator's direct text command ("record this …") has no model in
+    /// the loop — its success must still complete the turn with the canned
+    /// receipt exactly as before.
+    #[tokio::test]
+    async fn life_observe_direct_origin_success_still_receipts() {
+        let socket_path = format!(
+            "/tmp/philote-lifeobs-directok-{}.sock",
+            Uuid::new_v4().simple()
+        );
+        let listener = tokio::net::UnixListener::bind(&socket_path).expect("bind");
+        let emitted = std::sync::Arc::new(std::sync::Mutex::new(Vec::<serde_json::Value>::new()));
+        let server = tokio::spawn(run_recording_hotel(listener, emitted.clone()));
+
+        let identity = philotic_client::GuestIdentity {
+            guest_id: "agent-lifeobs-directok".into(),
+            role: "agent".into(),
+            supported_tools: Vec::new(),
+        };
+        let client = philotic_client::PhiloticClient::connect_at(&socket_path, identity)
+            .await
+            .expect("connect to stub hotel");
+        let mut runtime = AgentRuntime::new(client, "agent-lifeobs-directok");
+
+        let session_id = "sess-lifeobs-directok";
+        let turn_id = "turn-lifeobs-directok";
+        runtime
+            .ensure_session_loaded(session_id, "telegram")
+            .await
+            .expect("session load");
+        runtime
+            .sessions
+            .get_mut(session_id)
+            .expect("session exists")
+            .start_turn(life_observe_working_turn(turn_id, true));
+
+        runtime
+            .handle_tool_result(InboundTaskPayload {
+                action: Some("tool_result".into()),
+                session_id: Some(session_id.into()),
+                turn_id: Some(turn_id.into()),
+                tool_name: Some("life.observe".into()),
+                content: Some(r#"{"status":"proposed","node_id":"life:openloop:1"}"#.into()),
+                ..Default::default()
+            })
+            .await
+            .expect("tool result handled");
+
+        drop(runtime);
+        let _ = server.await;
+        let _ = std::fs::remove_file(&socket_path);
+
+        let emitted = emitted.lock().unwrap();
+        let receipts: Vec<_> = emitted
             .iter()
-            .filter(|e| e["task"]["action"] == "send_reply")
+            .filter(|e| {
+                e["task"]["action"] == "send_reply"
+                    && e["task"]["content"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .contains("Recorded this")
+            })
             .collect();
         assert_eq!(
-            send_replies.len(),
+            receipts.len(),
             1,
-            "existing apology-to-user behavior must be unchanged: {:#?}",
+            "the direct-command path must keep its canned receipt: {:#?}",
             *emitted
         );
     }
