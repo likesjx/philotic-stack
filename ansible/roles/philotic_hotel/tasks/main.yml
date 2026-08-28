@@ -405,46 +405,25 @@
     daemon_reload: true
   when: muninn_enabled | default(true) | bool
 
-# ── Philotic heartbeat (deterministic sensors → conditional agent turn) ──────
-# Operator-directed 2026-08-27: sensing runs as a plain script every 5 min;
-# a Beacon turn fires ONLY when a check finds work (v1: due reminders, with
-# reminder_dispatched_at stamping for exact at-most-once dispatch).
+# ── Philotic heartbeat cleanup ───────────────────────────────────────────────
+# The heartbeat now ticks inside the life-graph-runner (data-memorygraphrag),
+# shipping with every build. Remove the retired systemd timer + script so a
+# host deployed before the port doesn't keep a second sensor running.
 
-- name: Install philotic heartbeat script
-  template:
-    src: philotic-heartbeat.py.j2
-    dest: /usr/local/bin/philotic-heartbeat.py
-    owner: root
-    group: root
-    mode: "0755"
-  when: heartbeat_enabled | default(true) | bool
-
-- name: Install philotic heartbeat systemd unit
-  template:
-    src: philotic-heartbeat.service.j2
-    dest: /etc/systemd/system/philotic-heartbeat.service
-    owner: root
-    group: root
-    mode: "0644"
-  notify:
-    - Reload systemd
-  when: heartbeat_enabled | default(true) | bool
-
-- name: Install philotic heartbeat timer
-  template:
-    src: philotic-heartbeat.timer.j2
-    dest: /etc/systemd/system/philotic-heartbeat.timer
-    owner: root
-    group: root
-    mode: "0644"
-  notify:
-    - Reload systemd
-  when: heartbeat_enabled | default(true) | bool
-
-- name: Enable and start philotic heartbeat timer
+- name: Stop and disable retired philotic heartbeat timer
   systemd:
     name: philotic-heartbeat.timer
-    enabled: true
-    state: started
-    daemon_reload: true
-  when: heartbeat_enabled | default(true) | bool
+    enabled: false
+    state: stopped
+  failed_when: false
+
+- name: Remove retired philotic heartbeat files
+  file:
+    path: "{{ item }}"
+    state: absent
+  loop:
+    - /etc/systemd/system/philotic-heartbeat.timer
+    - /etc/systemd/system/philotic-heartbeat.service
+    - /usr/local/bin/philotic-heartbeat.py
+  notify:
+    - Reload systemd
