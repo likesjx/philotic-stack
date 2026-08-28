@@ -1661,6 +1661,75 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ensure_guest_active_requires_guest_seeded_under_hotel_name_not_node_id() {
+        // Regression for a subagent-materialization dead-lease found live
+        // 2026-08-28: `handle_spawn_subagent` seeded the fresh subagent guest
+        // record under `local_node_id` (e.g. "mac-jane-aiua-01"), but
+        // `GuestManager` — and every other seed_guests call site — is keyed by
+        // `hotel_name` (e.g. "mac-jane", a distinct string). `list_guests`
+        // builds its lookup prefix from `hotel_name`, so the guest was
+        // invisible to `ensure_guest_active`: it silently returned `Ok(false)`,
+        // no spawn was attempted, and `subagent.spawn` returned success with a
+        // lease that no worker process ever backed.
+        let hotel_name = "mac-jane";
+        let local_node_id = "mac-jane-aiua-01"; // distinct from hotel_name, as in production
+        let storage = ansible_mesh_core::sqlite_storage::SqliteGraphStorage::open(":memory:")
+            .expect("open sqlite");
+        let graph = Arc::new(GraphDomain::new(Arc::new(storage.adapter())));
+
+        let subagent_guest = GuestRecord {
+            hotel_name: hotel_name.into(),
+            guest_id: "subagent-fixture-01".into(),
+            role: "philote-worker".into(),
+            config_json: json!({ "command": "philote-worker" }).to_string(),
+            is_active: true,
+            active_pid: None,
+            last_active_at: None,
+        };
+
+        let mock = MockMaterializer::new(HashMap::new());
+        let spawn_count = mock.spawn_count.clone();
+        let manager = GuestManager::new(hotel_name, graph.clone(), Box::new(mock));
+
+        // The fix: seeded under hotel_name — the materializer finds and spawns it.
+        graph
+            .seed_guests(hotel_name, &[subagent_guest.clone()])
+            .expect("seed under hotel_name");
+        let activated = manager
+            .ensure_guest_active("subagent-fixture-01")
+            .await
+            .expect("ensure_guest_active");
+        assert!(activated, "guest seeded under hotel_name must materialize");
+        assert_eq!(spawn_count.load(Ordering::SeqCst), 1);
+
+        // Characterizes the bug: seeded under node_id instead (the original
+        // `handle_spawn_subagent` set BOTH the seed_guests argument and the
+        // GuestRecord.hotel_name field to local_node_id) — invisible to the
+        // hotel-name-keyed lookup, so no spawn is attempted for it.
+        let orphaned = GuestRecord {
+            hotel_name: local_node_id.into(),
+            guest_id: "subagent-fixture-02".into(),
+            ..subagent_guest
+        };
+        graph
+            .seed_guests(local_node_id, std::slice::from_ref(&orphaned))
+            .expect("seed under node_id (the old bug)");
+        let activated_orphan = manager
+            .ensure_guest_active("subagent-fixture-02")
+            .await
+            .expect("ensure_guest_active");
+        assert!(
+            !activated_orphan,
+            "guest seeded under node_id must NOT be found by a hotel-name-keyed manager"
+        );
+        assert_eq!(
+            spawn_count.load(Ordering::SeqCst),
+            1,
+            "no spawn attempted for the node-id-keyed orphan"
+        );
+    }
+
+    #[tokio::test]
     async fn reconcile_all_does_not_respawn_healthy_active_guest() {
         let pid = std::process::id().to_string();
         let graph = make_domain(TestGraphAdapter::with_guests(vec![GuestRecord {

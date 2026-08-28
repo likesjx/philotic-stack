@@ -598,6 +598,23 @@ impl IpcServer {
         let subagent_guest_id = Uuid::new_v4().to_string();
         let ttl = delegation.lease_terms.ttl_seconds;
 
+        // Guest records are keyed by hotel NAME (list_guests/get_guest build the
+        // node_key prefix from it), not by node ID — every other seed_guests call
+        // site in this codebase resolves the name first. This one didn't: it seeded
+        // under `local_node_id` (e.g. "mac-jane-aiua-01"), so `GuestManager`'s
+        // `ensure_guest_active` — which looks guests up by `hotel_name` (e.g.
+        // "mac-jane") — could never find the row and silently returned `Ok(false)`.
+        // Every subagent.spawn call granted a lease and returned success, but no
+        // worker process was ever materialized. Found live 2026-08-28 proving PR
+        // #465's spawn-by-name resolution.
+        let Some(hotel_name) = Self::local_hotel_name(graph, local_node_id) else {
+            return IpcResponse::error(
+                "spawn_subagent",
+                "SUBAGENT_HOTEL_UNKNOWN",
+                format!("current hotel authority could not be resolved for node [{local_node_id}]"),
+            );
+        };
+
         // 1. Register the subagent guest in the context graph so the materializer
         //    can spawn and supervise it.
         let config_json = serde_json::json!({
@@ -610,7 +627,7 @@ impl IpcServer {
             },
         });
         let guest_record = ansible_mesh_core::storage::GuestRecord {
-            hotel_name: local_node_id.to_string(),
+            hotel_name: hotel_name.clone(),
             guest_id: subagent_guest_id.clone(),
             role: delegation.subagent_kind.clone(),
             config_json: config_json.to_string(),
@@ -618,7 +635,7 @@ impl IpcServer {
             active_pid: None,
             last_active_at: None,
         };
-        if let Err(e) = graph.seed_guests(local_node_id, &[guest_record]) {
+        if let Err(e) = graph.seed_guests(&hotel_name, &[guest_record]) {
             return IpcResponse::error(
                 "spawn_subagent",
                 "SUBAGENT_GUEST_REGISTER_FAILED",
@@ -1718,6 +1735,30 @@ mod tests {
         let (dispatcher_tx, _dispatcher_rx) = test_dispatcher_channel();
         let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
         let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
+        // A hotel record is required so `local_hotel_name` can resolve
+        // "local-aiua-01" (the node id) to "local-hotel" (the name that
+        // seed_guests/list_guests key on) — see
+        // ensure_guest_active_requires_guest_seeded_under_hotel_name_not_node_id
+        // for why that resolution is load-bearing.
+        graph
+            .upsert_hotel(&HotelRecord {
+                hotel_name: "local-hotel".into(),
+                capabilities: NodeCapabilities {
+                    node_id: "local-aiua-01".into(),
+                    roles: vec![],
+                    models: vec![],
+                    tools: vec![],
+                    constraints: Default::default(),
+                },
+                mesh_port: 9000,
+                blob_port: 9001,
+                execution_port: 9002,
+                ipc_socket_path: socket_path.clone(),
+                active_pid: None,
+                mesh_host: None,
+            })
+            .expect("seed local hotel");
+        let graph_check = graph.clone();
         let server = IpcServer::new(socket_path.clone(), "local-aiua-01", dispatcher_tx, graph);
 
         let server_task = tokio::spawn(async move {
@@ -1785,6 +1826,15 @@ mod tests {
                     confirmed_lease.owner_component_type.as_deref(),
                     Some("philote-worker")
                 );
+                // The guest record must be discoverable under the HOTEL NAME
+                // ("local-hotel"), not the node id — that's the exact lookup
+                // GuestManager::ensure_guest_active performs to materialize it.
+                let seeded = graph_check
+                    .get_guest("local-hotel", &subagent_guest_id)
+                    .expect("query guest")
+                    .expect("subagent guest must be seeded under the hotel name");
+                assert_eq!(seeded.hotel_name, "local-hotel");
+                assert!(seeded.is_active);
             }
             other => panic!("unexpected spawn_subagent response: {other:?}"),
         }
