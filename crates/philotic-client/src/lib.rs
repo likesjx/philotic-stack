@@ -771,6 +771,16 @@ pub struct SubagentDelegation {
     pub allowed_tools: Vec<String>,
     #[serde(default)]
     pub allowed_skills: Vec<String>,
+    /// Spawn by registered skill: the hotel resolves this skill's stored goal
+    /// template, subagent kind, tool bounds, and SkillDAG dependencies into
+    /// the delegation before granting the lease. Suspended/deprecated or
+    /// unknown skills are refused. When set, `goal` may be empty — a non-empty
+    /// `goal` is appended to the rendered template as delegating-agent context.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skill_name: Option<String>,
+    /// Values substituted into the skill goal template's `{{placeholder}}`s.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub skill_inputs: std::collections::BTreeMap<String, String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub memory_allowance: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

@@ -3467,18 +3467,35 @@ impl AgentRuntime {
             "subagent.spawn" => {
                 let args = &payload.arguments;
 
+                let skill_name = args
+                    .get("skill_name")
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.trim().is_empty())
+                    .map(str::to_string);
+                // Spawn-by-name: the registered skill supplies the goal
+                // template, so an explicit goal is only required without one.
                 let goal = match args.get("goal").and_then(|v| v.as_str()) {
                     Some(s) => s.to_string(),
+                    None if skill_name.is_some() => String::new(),
                     None => {
                         return self
                             .fail_active_turn(
                                 payload.session_id,
                                 payload.turn_id,
-                                "subagent.spawn: missing required argument 'goal'".into(),
+                                "subagent.spawn: missing required argument 'goal' (or pass 'skill_name' to spawn a registered skill)".into(),
                             )
                             .await;
                     }
                 };
+                let skill_inputs: std::collections::BTreeMap<String, String> = args
+                    .get("inputs")
+                    .and_then(|v| v.as_object())
+                    .map(|obj| {
+                        obj.iter()
+                            .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+                            .collect()
+                    })
+                    .unwrap_or_default();
                 let subagent_kind = args
                     .get("subagent_kind")
                     .and_then(|v| v.as_str())
@@ -3514,6 +3531,8 @@ impl AgentRuntime {
                     },
                     allowed_tools,
                     iteration_budget,
+                    skill_name,
+                    skill_inputs,
                     ..Default::default()
                 };
 
