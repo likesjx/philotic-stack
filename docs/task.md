@@ -161,6 +161,22 @@ Seam IDs: `life-graph-schema`, `life-graph-memorygraphrag-runner`, `life-graph-a
 - [ ] Wire Beacon as the first Life Graph steward / chief-of-staff role once schema and retrieval are test-green.
 - [ ] Let specialized roles such as Coach consume and contribute to Life Graph OS through governed tools without owning the canonical cross-domain graph posture.
 
+## New Project: Muninn Memory Core
+
+Proposal: [MUNINN_MEMORY_CORE_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/MUNINN_MEMORY_CORE_PROPOSAL.md) — consolidates the create/recall/disperse gaps + adds the admin observability plane (2026-08-27/28 audit).
+
+Seam IDs: `fleet-knowledge-recall-scope`, `memory-write-routing-completeness`, `deterministic-memory-capture`, `memory-cultivation-mutations`, `muninn-replication-repair`, `muninn-admin-observability-plane`
+
+Sequence: **S6a → S1 → S2 → S3/S4 → S6b → S5** (one slice per branch/PR).
+
+- [ ] **S6a** — Muninn admin observability (reporting, read-only): `memory.report` admin-gated tool sourcing only data that exists today (per-vault counts both nodes, divergence sweep, recall completed/skipped + write rates from session events, contradictions/soft-deleted, disk); unsourceable fields report `unavailable`, never guessed. **CURRENT SLICE.**
+- [ ] S1 — `SharedFleet` MemoryScope → curated `fleet_knowledge` vault in default recall scope (trust/importance filtered); update `VaultResolver` + `is_fleet_shared_vault`. Inert until S4 fills it — seed or ship paired with S4.
+- [ ] S2 — write-routing completeness: op-dispatch evolve/forget/remember_batch through the Cortex forward path; silent local-fallback → loud failure + durable reconcile queue.
+- [ ] S3 — less model-dependent capture: deterministic operator-fact/preference classifier proposing Muninn candidates.
+- [ ] S4 — cultivation mutations (consolidate/evolve/dedup/archive) + promotion of durable self_/session memories into fleet_knowledge, gated + privacy-filtered.
+- [ ] S6b — reporting fields needing a muninndb API (replication lag, peer/streamer state, backlog depth) — upstream fork work.
+- [ ] S5 — replication repair: merge fix/observer-cache-invalidation (#869) + fix/replication-log-retention into muninndb develop; pin binaries (kill mac dev skew); repair observer apply + :8490; reconcile 179 mac-only up BEFORE any reseed.
+
 ## New Project: Memory Cultivation and True-Up
 
 Proposal: [MEMORY_CULTIVATION_TRUE_UP_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/MEMORY_CULTIVATION_TRUE_UP_PROPOSAL.md)
