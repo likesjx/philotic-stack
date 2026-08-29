@@ -8618,10 +8618,28 @@ impl IpcServer {
                 let task_json = paracrine_task.to_string();
                 let task_id = Uuid::new_v4();
 
+                // Resolve the role incarnation once, up front. Role-incarnation
+                // philotes register their inbox under `routing_role()`
+                // ("role:{agent_id}:{role_name}"), never under the bare role
+                // name — checking `inboxes.get(&role)` here always missed even
+                // when the role was already live, which forced every whisper
+                // down the "no subscriber" branch unconditionally and
+                // materialized a SECOND, colliding process for a role that
+                // may already be live (e.g. via an operator's own
+                // `/role <name>` handoff) — the actual root cause of two
+                // Chronos processes fighting over one inbox subscription.
+                let incarnation = graph.find_role_incarnation_by_name(&role);
+                let subscription_key = match &incarnation {
+                    Ok(Some(inc)) => inc.routing_role(),
+                    _ => role.clone(),
+                };
+
                 // Check if the target role has a live inbox subscriber.
                 let has_subscriber = {
                     let guard = inboxes.lock().await;
-                    guard.get(&role).is_some_and(|subs| !subs.is_empty())
+                    guard
+                        .get(&subscription_key)
+                        .is_some_and(|subs| !subs.is_empty())
                 };
 
                 // A whisper the hotel cannot deliver-or-credibly-park must be
@@ -8638,7 +8656,7 @@ impl IpcServer {
                     let delivered = Self::deliver_inbound_task(
                         inboxes,
                         local_node_id,
-                        &role,
+                        &subscription_key,
                         None,
                         task_id,
                         task_json,
@@ -8653,7 +8671,7 @@ impl IpcServer {
                     // No live subscriber — look up the role incarnation, park the task
                     // under the incarnation's guest_id, and trigger materialization of
                     // a dedicated role-philote so it can connect and flush the park.
-                    match graph.find_role_incarnation_by_name(&role) {
+                    match incarnation {
                         Ok(Some(inc)) => {
                             // The philote that handles this role incarnation registers
                             // with guest_id = "{agent_id}:{role_name}".
@@ -19305,6 +19323,126 @@ pub(crate) mod tests {
                 );
             }
             other => panic!("expected Standard refusal, got {other:?}"),
+        }
+
+        unsafe {
+            std::env::remove_var("PHILOTIC_HOTEL_SOCKET");
+        }
+        server_task.abort();
+        let _ = server_task.await;
+        if std::path::Path::new(&socket_path).exists() {
+            let _ = std::fs::remove_file(&socket_path);
+        }
+    }
+
+    #[tokio::test]
+    async fn paracrine_emit_delivers_directly_to_already_live_role_incarnation_without_materializing()
+     {
+        // Live incident 2026-08-29: the "does a live subscriber exist" check
+        // used to key on the bare role name ("Chronos"), but role-incarnation
+        // philotes only ever register their inbox under routing_role()
+        // ("role:{agent_id}:{role_name}") — so it could never see an
+        // already-live role and ALWAYS materialized a second, colliding
+        // process for the SAME guest_id, even when the operator's own
+        // `/role chronos` incarnation was already live. That second process
+        // is what stole the "agent" inbox subscription and permanently
+        // blocked handoff_back (HANDOFF_FORBIDDEN) — see
+        // chronos_handoff_forbidden_dup_guest.md.
+        let _env_guard = ipc_env_guard();
+        let socket_path = test_socket_path();
+        let (dispatcher_tx, _dispatcher_rx) = test_dispatcher_channel();
+        let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
+        let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
+        graph
+            .upsert_role_incarnation(&RoleIncarnationRecord {
+                agent_id: "agent-beacon".into(),
+                role_name: "Chronos".into(),
+                guest_id: "agent-beacon:Chronos".into(),
+                toolset_profile: "scheduler".into(),
+                ..Default::default()
+            })
+            .expect("Chronos role should seed");
+
+        let mat_req = Arc::new(MockMaterializationRequester::default());
+        let server = IpcServer::new(socket_path.clone(), "local-aiua-01", dispatcher_tx, graph)
+            .with_materialization_requester(mat_req.clone());
+
+        let server_task = tokio::spawn(async move {
+            server.run().await.expect("ipc server should run");
+        });
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        unsafe {
+            std::env::set_var("PHILOTIC_HOTEL_SOCKET", &socket_path);
+        }
+
+        // The already-live Chronos role-incarnation philote — registers its
+        // inbox under "role:agent-beacon:Chronos", exactly like a real
+        // philote materialized via role_worker_manifest.
+        let mut chronos = PhiloticClient::connect(GuestIdentity {
+            guest_id: "agent-beacon:Chronos".into(),
+            role: "role:agent-beacon:Chronos".into(),
+            supported_tools: Vec::new(),
+        })
+        .await
+        .expect("chronos connect");
+
+        let mut orchestrator = PhiloticClient::connect(GuestIdentity {
+            guest_id: "agent-beacon:orchestrator".into(),
+            role: "agent".into(),
+            supported_tools: Vec::new(),
+        })
+        .await
+        .expect("orchestrator connect");
+
+        let resp = orchestrator
+            .send_request(IpcRequest::ParacrineEmit {
+                role: "Chronos".into(),
+                exosome: philotic_client::Exosome {
+                    prompt: "what's on the calendar?".into(),
+                    context: None,
+                    paracrine_id: Some("test-paracrine-2".into()),
+                    response_routing: None,
+                    source_session_id: Some("telegram:1:agent-beacon".into()),
+                    source_chat_id: Some("1".into()),
+                },
+                reply_to_node: "local-aiua-01".into(),
+                reply_to_role: "agent".into(),
+                reply_to_guest_id: None,
+                timeout_secs: None,
+            })
+            .await
+            .expect("transport must succeed");
+
+        match resp {
+            IpcResponse::Standard { ok, message, .. } => {
+                assert!(
+                    ok,
+                    "whisper to an already-live role must succeed: {message}"
+                );
+            }
+            other => panic!("expected Standard success, got {other:?}"),
+        }
+
+        assert_eq!(
+            mat_req.calls.load(Ordering::SeqCst),
+            0,
+            "an already-live role incarnation must not trigger a second, colliding materialization"
+        );
+
+        let pushed = tokio::time::timeout(tokio::time::Duration::from_secs(1), chronos.recv_task())
+            .await
+            .expect("must deliver directly to the already-live subscriber, not park it")
+            .expect("recv_task should not error");
+        match pushed {
+            IpcResponse::InboundTask { task_json, .. } => {
+                let payload: serde_json::Value =
+                    serde_json::from_str(&task_json).expect("decode pushed task");
+                assert_eq!(payload["action"], "paracrine_request");
+                assert_eq!(payload["content"], "what's on the calendar?");
+            }
+            other => {
+                panic!("expected InboundTask delivered to the live Chronos guest, got {other:?}")
+            }
         }
 
         unsafe {
