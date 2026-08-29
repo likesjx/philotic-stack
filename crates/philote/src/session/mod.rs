@@ -4078,8 +4078,21 @@ impl SessionState {
             "pending_preapproval_thresholds": self.pending_preapproval_thresholds,
             "paracrine_threads": self.paracrine_threads,
             "active_turn": active_turn,
+            // Wait-clock stamps as wall-clock unix seconds (Instant has no
+            // fixed epoch and cannot round-trip through JSON). Without this,
+            // a session reload (idle eviction, guest restart) silently reset
+            // every in-flight watchdog deadline to "now" — an approval or
+            // tool wait that had already run long could then sit for a
+            // SECOND full deadline before eviction, and the eventual
+            // "elapsed_secs" in the eviction log under-reported the true
+            // wait by however long the session was unloaded (DEF-097; live
+            // 2026-08-29: architect-charter's approval sat 84 minutes,
+            // logged as a 304s eviction).
+            "turn_waiting_since_unix": self.turn_waiting_since.map(instant_to_unix_ts),
             "parked_approval_turn": parked_approval_turn,
+            "parked_approval_since_unix": self.parked_approval_since.map(instant_to_unix_ts),
             "parked_plan_turn": parked_plan_turn,
+            "parked_plan_since_unix": self.parked_plan_since.map(instant_to_unix_ts),
             "carryover_plan": self.carryover_plan,
             "active_user_task_id": self.active_user_task_id,
             "pinned_tier_role": self.pinned_tier_role,
@@ -4451,6 +4464,19 @@ impl SessionState {
         // Everything else (WaitingModel, WaitingVoice, Thinking, Queued, Failed,
         // unknown phase strings) is dropped so the queue can drain cleanly.
         let active_turn = active_turn.filter(|t| matches!(t.phase, TurnPhase::WaitingTool));
+        // Reconstruct the wait-clock from its persisted wall-clock stamp,
+        // gated on the corresponding state actually surviving restore above.
+        // See the checkpoint_json comment (DEF-097): without this, every
+        // reload reset the deadline to "now", silently extending how long a
+        // stuck approval or tool call could sit past the watchdog's
+        // intended grace window (live 2026-08-29: an approval sat 84
+        // minutes, logged by the watchdog as a 304s eviction).
+        let turn_waiting_since = active_turn.as_ref().and_then(|_| {
+            checkpoint
+                .get("turn_waiting_since_unix")
+                .and_then(serde_json::Value::as_u64)
+                .map(unix_ts_to_instant)
+        });
 
         // Restore parked approval turn if one was checkpointed.
         let parked_approval_turn = checkpoint
@@ -4458,6 +4484,12 @@ impl SessionState {
             .and_then(|v| if v.is_null() { None } else { Some(v) })
             .and_then(|v| serde_json::from_value::<WorkingTurn>(v.clone()).ok())
             .filter(|t| t.phase == TurnPhase::WaitingApproval);
+        let parked_approval_since = parked_approval_turn.as_ref().and_then(|_| {
+            checkpoint
+                .get("parked_approval_since_unix")
+                .and_then(serde_json::Value::as_u64)
+                .map(unix_ts_to_instant)
+        });
 
         // Restore parked plan turn if one was checkpointed.
         let parked_plan_turn = checkpoint
@@ -4465,6 +4497,12 @@ impl SessionState {
             .and_then(|v| if v.is_null() { None } else { Some(v) })
             .and_then(|v| serde_json::from_value::<WorkingTurn>(v.clone()).ok())
             .filter(|t| t.phase == TurnPhase::PlanningDiscussion);
+        let parked_plan_since = parked_plan_turn.as_ref().and_then(|_| {
+            checkpoint
+                .get("parked_plan_since_unix")
+                .and_then(serde_json::Value::as_u64)
+                .map(unix_ts_to_instant)
+        });
 
         // Restore the plan carryover if one was checkpointed. Missing key
         // (older checkpoints) or unparseable value degrades to None.
@@ -4510,12 +4548,12 @@ impl SessionState {
                 .get("queue_arbiter_role")
                 .and_then(serde_json::Value::as_str)
                 .map(str::to_string),
-            turn_waiting_since: None,
+            turn_waiting_since,
             active_turn_since: None,
             parked_approval_turn,
-            parked_approval_since: None,
+            parked_approval_since,
             parked_plan_turn,
-            parked_plan_since: None,
+            parked_plan_since,
             carryover_plan,
             tool_success_streak,
             pending_preapproval_thresholds,
@@ -5709,6 +5747,24 @@ fn current_unix_ts() -> u64 {
         .as_secs()
 }
 
+/// Convert a monotonic wait-clock stamp to a wall-clock unix timestamp so it
+/// can survive a checkpoint round-trip. `Instant` has no fixed epoch and
+/// cannot be serialized directly.
+fn instant_to_unix_ts(instant: std::time::Instant) -> u64 {
+    current_unix_ts().saturating_sub(instant.elapsed().as_secs())
+}
+
+/// Reconstruct an approximate `Instant` for a wait-clock stamp that was
+/// persisted as a wall-clock unix timestamp. Used only on checkpoint
+/// restore — see the module note on why restore-time clock loss silently
+/// extended the watchdog's effective deadline (DEF-097).
+fn unix_ts_to_instant(unix_ts: u64) -> std::time::Instant {
+    let elapsed = current_unix_ts().saturating_sub(unix_ts);
+    std::time::Instant::now()
+        .checked_sub(std::time::Duration::from_secs(elapsed))
+        .unwrap_or_else(std::time::Instant::now)
+}
+
 /// Format current UTC time as "YYYY-MM-DD HH:MM:SS UTC" using only std.
 fn utc_datetime_string() -> String {
     let secs = current_unix_ts();
@@ -5976,6 +6032,58 @@ mod tests {
         let restored = SessionState::from_checkpoint(&checkpoint).expect("rehydrate state");
 
         assert_eq!(restored.pinned_tier_role.as_deref(), Some("model.ollama"));
+    }
+
+    /// DEF-097: without a persisted wall-clock stamp, restoring a parked
+    /// approval reset its wait-clock to "now" — a session reload (idle
+    /// eviction, guest restart) silently extended an already-long wait by a
+    /// full extra watchdog deadline, and the eventual eviction's
+    /// `elapsed_secs` under-reported the true wait. Live 2026-08-29:
+    /// architect-charter's approval sat 84 minutes, logged as 304s.
+    #[test]
+    fn parked_approval_wait_clock_survives_checkpoint_round_trip() {
+        let mut state =
+            SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
+        let mut turn = test_working_turn(None);
+        turn.phase = TurnPhase::WaitingApproval;
+        state.start_turn(turn);
+        state.park_active_turn_for_approval();
+
+        // Backdate the park stamp by 84 minutes, mirroring the live incident.
+        let long_ago = std::time::Instant::now()
+            .checked_sub(std::time::Duration::from_secs(84 * 60))
+            .expect("backdate instant");
+        state.parked_approval_since = Some(long_ago);
+
+        let checkpoint = state.checkpoint_json();
+        let restored = SessionState::from_checkpoint(&checkpoint).expect("rehydrate state");
+
+        assert!(
+            restored.parked_approval_turn.is_some(),
+            "parked approval turn must survive restore"
+        );
+        let restored_since = restored
+            .parked_approval_since
+            .expect("wait-clock must be reconstructed, not reset to None");
+        let elapsed = restored_since.elapsed().as_secs();
+        assert!(
+            elapsed >= 84 * 60 - 5,
+            "restore must preserve the ORIGINAL wait duration (~{}s), got {elapsed}s — \
+             a value near 0 means the clock was reset to \"now\" on reload",
+            84 * 60
+        );
+    }
+
+    /// A session with no parked approval must restore with no wait-clock
+    /// stamp either — the reconstruction is gated on the turn surviving,
+    /// not unconditional.
+    #[test]
+    fn no_parked_approval_means_no_reconstructed_wait_clock() {
+        let state = SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
+        let checkpoint = state.checkpoint_json();
+        let restored = SessionState::from_checkpoint(&checkpoint).expect("rehydrate state");
+        assert!(restored.parked_approval_turn.is_none());
+        assert!(restored.parked_approval_since.is_none());
     }
 
     #[test]
