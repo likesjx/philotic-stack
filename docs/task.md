@@ -1652,6 +1652,11 @@ Seam IDs: `wider-client-adoption`, `philotic-native-memory-integration`
 - [ ] Create a dedicated tap repository and first formula.
 - [ ] Add bottle automation for supported platforms.
 
+## New Feature: `/hotel` Operator Command
+
+- [x] Add `/hotel` slash command to philote — a quick "where am I running" readout (hotel name, node id, agent id, active role, composed guest identity). Threaded through `commands.rs` parsing/manifest and every `SlashCommand` dispatch site in `runtime.rs` and `tool_exec.rs` (mirrors `/status`/`/context` read-only, turn-bypassing treatment). Test-green (`cargo test -p philote --lib`, 523 passed); not yet watched-live in Telegram.
+- [ ] Confirm live in Telegram against a running hotel (mac-jane or vps-jane) that `/hotel` reports the real hotel name, not the `"unknown"` fallback.
+
 ## New Project: Lyra Travel Specialist
 
 Seam ID: `lyra-travel-agent` — proposal: [LYRA_TRAVEL_AGENT_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/LYRA_TRAVEL_AGENT_PROPOSAL.md)

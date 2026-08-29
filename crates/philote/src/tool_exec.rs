@@ -1008,6 +1008,7 @@ impl AgentRuntime {
                 SlashCommand::Ping
                 | SlashCommand::Status
                 | SlashCommand::Context
+                | SlashCommand::Hotel
                 | SlashCommand::Pause
                 | SlashCommand::Resume
                 | SlashCommand::Role { .. }
@@ -1029,7 +1030,6 @@ impl AgentRuntime {
                 | SlashCommand::Voice { .. }
                 | SlashCommand::Model { .. }
                 | SlashCommand::ModelPreset { .. }
-                | SlashCommand::Models { .. }
                 | SlashCommand::Models { .. }
                 | SlashCommand::Dirty
                 | SlashCommand::Sfw
@@ -1240,6 +1240,7 @@ impl AgentRuntime {
             SlashCommand::Ping
             | SlashCommand::Status
             | SlashCommand::Context
+            | SlashCommand::Hotel
             | SlashCommand::Pause
             | SlashCommand::Resume
             | SlashCommand::Role { .. }

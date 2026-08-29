@@ -1544,7 +1544,7 @@ fn build_capability_request(
 fn command_bypasses_turn_start(command: &SlashCommand) -> bool {
     matches!(
         command,
-        SlashCommand::Ping | SlashCommand::Status | SlashCommand::Context
+        SlashCommand::Ping | SlashCommand::Status | SlashCommand::Context | SlashCommand::Hotel
     )
 }
 
@@ -2528,7 +2528,7 @@ impl AgentRuntime {
                             )
                             .await
                         }
-                        SlashCommand::Status | SlashCommand::Context => {
+                        SlashCommand::Status | SlashCommand::Context | SlashCommand::Hotel => {
                             self.handle_read_only_session_command(
                                 task_id,
                                 session_id,
@@ -2544,7 +2544,10 @@ impl AgentRuntime {
                         _ => unreachable!("command_bypasses_turn_start gate should be exhaustive"),
                     };
                 }
-                SlashCommand::Ping | SlashCommand::Status | SlashCommand::Context => {
+                SlashCommand::Ping
+                | SlashCommand::Status
+                | SlashCommand::Context
+                | SlashCommand::Hotel => {
                     unreachable!("read-only commands should bypass turn start")
                 }
                 SlashCommand::Pause | SlashCommand::Resume => {}
@@ -3264,6 +3267,7 @@ impl AgentRuntime {
                 }
                 SlashCommand::Status
                 | SlashCommand::Context
+                | SlashCommand::Hotel
                 | SlashCommand::Pause
                 | SlashCommand::Resume
                 | SlashCommand::ToolsAdd { .. }
@@ -6016,6 +6020,28 @@ impl AgentRuntime {
                         "chat_id": command_chat_id,
                     }),
                 ),
+                SlashCommand::Hotel => (
+                    {
+                        let hotel = local_hotel_name().unwrap_or_else(|| "unknown".into());
+                        let node = local_node_id();
+                        hotel_location_text(
+                            &hotel,
+                            &node,
+                            &self.agent_id,
+                            self.role_name.as_deref(),
+                        )
+                    },
+                    "hotel_location_reported",
+                    serde_json::json!({
+                        "session_id": session_id,
+                        "turn_id": command_turn_id,
+                        "chat_id": command_chat_id,
+                        "hotel_name": local_hotel_name(),
+                        "node_id": local_node_id(),
+                        "agent_id": self.agent_id,
+                        "role_name": self.role_name,
+                    }),
+                ),
                 SlashCommand::Pause => {
                     state.set_status("paused");
                     (
@@ -6306,6 +6332,23 @@ impl AgentRuntime {
                     "session_id": session_id,
                     "turn_id": command_turn_id,
                     "chat_id": command_chat_id,
+                })),
+            ),
+            SlashCommand::Hotel => (
+                {
+                    let hotel = local_hotel_name().unwrap_or_else(|| "unknown".into());
+                    let node = local_node_id();
+                    hotel_location_text(&hotel, &node, &self.agent_id, self.role_name.as_deref())
+                },
+                Some("hotel_location_reported"),
+                Some(serde_json::json!({
+                    "session_id": session_id,
+                    "turn_id": command_turn_id,
+                    "chat_id": command_chat_id,
+                    "hotel_name": local_hotel_name(),
+                    "node_id": local_node_id(),
+                    "agent_id": self.agent_id,
+                    "role_name": self.role_name,
                 })),
             ),
             _ => {
@@ -7178,6 +7221,19 @@ fn local_hotel_name() -> Option<String> {
         .ok()
         .map(|name| name.trim().to_string())
         .filter(|name| !name.is_empty())
+}
+
+/// Builds the `/hotel` reply: a quick "where am I running" readout — which
+/// hotel (node) materialized this philote, and under which role, if any.
+/// Takes resolved values rather than reading env vars itself, so callers
+/// (and tests) control the source and formatting stays independent of the
+/// process environment.
+fn hotel_location_text(hotel: &str, node: &str, agent_id: &str, role_name: Option<&str>) -> String {
+    let role = role_name.unwrap_or("orchestrator");
+    let guest_identity = compose_guest_identity(agent_id, role_name);
+    format!(
+        "Hotel: {hotel}. Node: {node}. Agent: {agent_id}. Role: {role}. Guest identity: {guest_identity}."
+    )
 }
 
 fn projected_user_context_from_profile(profile: &UserProfileDataPayload) -> Option<String> {
@@ -9199,10 +9255,23 @@ mod tests {
         assert!(super::command_bypasses_turn_start(&SlashCommand::Ping));
         assert!(super::command_bypasses_turn_start(&SlashCommand::Status));
         assert!(super::command_bypasses_turn_start(&SlashCommand::Context));
+        assert!(super::command_bypasses_turn_start(&SlashCommand::Hotel));
         assert!(!super::command_bypasses_turn_start(&SlashCommand::Pause));
         assert!(!super::command_bypasses_turn_start(
             &SlashCommand::Approve { note: None }
         ));
+    }
+
+    #[test]
+    fn hotel_location_text_reports_agent_and_role() {
+        assert_eq!(
+            super::hotel_location_text("mac-jane", "local-aiua-01", "astrid", None),
+            "Hotel: mac-jane. Node: local-aiua-01. Agent: astrid. Role: orchestrator. Guest identity: astrid."
+        );
+        assert_eq!(
+            super::hotel_location_text("vps-jane", "vps-01", "astrid", Some("chronos")),
+            "Hotel: vps-jane. Node: vps-01. Agent: astrid. Role: chronos. Guest identity: astrid:chronos."
+        );
     }
 
     #[test]
