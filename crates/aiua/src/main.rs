@@ -46,6 +46,7 @@ mod memory_delta_digest;
 mod memory_hygiene;
 mod mesh;
 mod muninn_provision;
+mod sensor_scripts;
 mod vault;
 
 mod service;
