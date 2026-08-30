@@ -1654,8 +1654,8 @@ Seam IDs: `wider-client-adoption`, `philotic-native-memory-integration`
 
 ## New Feature: `/hotel` Operator Command
 
-- [x] Add `/hotel` slash command to philote — a quick "where am I running" readout (hotel name, node id, agent id, active role, composed guest identity). Threaded through `commands.rs` parsing/manifest and every `SlashCommand` dispatch site in `runtime.rs` and `tool_exec.rs` (mirrors `/status`/`/context` read-only, turn-bypassing treatment). Test-green (`cargo test -p philote --lib`, 523 passed); not yet watched-live in Telegram.
-- [ ] Confirm live in Telegram against a running hotel (mac-jane or vps-jane) that `/hotel` reports the real hotel name, not the `"unknown"` fallback.
+- [x] Add `/hotel` slash command to philote — a quick "where am I running" readout (hotel name, node id, agent id, active role, composed guest identity). Threaded through `commands.rs` parsing/manifest and every `SlashCommand` dispatch site in `runtime.rs` and `tool_exec.rs` (mirrors `/status`/`/context` read-only, turn-bypassing treatment). Merged develop c0b94593 (PR #471), deployed vps-jane, binary checksum-verified against the CI build before handoff.
+- [x] Confirm live against a running hotel that `/hotel` reports the real hotel name, not the `"unknown"` fallback — **watched-live-green: operator-confirmed on Beacon (vps-jane) 2026-08-30.**
 
 ## New Project: Lyra Travel Specialist
 
