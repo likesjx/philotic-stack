@@ -266,6 +266,16 @@ pub struct SessionState {
     /// stamp silently restarts the budget whenever ticks are missed, which is exactly
     /// how turns escaped the ceiling for hours (see `evict_timed_out_turns`).
     pub active_turn_since: Option<std::time::Instant>,
+    /// Wall-clock unix seconds when the current turn was first created.
+    ///
+    /// Unlike every other clock on this struct, this one is **never re-stamped**
+    /// while the turn lives — not on an approval park, not on the resume that
+    /// follows it. It is the only measure of a turn's true total age, and it is
+    /// what bounds a turn that loops park -> approve -> park (see
+    /// [`ansible_mesh_core::turn_budget::TURN_TOTAL_AGE_CEILING_SECS`]). Cleared
+    /// only when the turn genuinely ends. Persisted as unix seconds because an
+    /// `Instant` has no fixed epoch and cannot survive a checkpoint.
+    pub active_turn_started_unix: Option<u64>,
     /// A turn that entered WaitingApproval and was parked so the session stays free
     /// for new work while the operator decides. Restored when the operator approves
     /// or denies via `/approve`, `/deny`, or a paracrine ApprovalResolution response.
@@ -358,6 +368,7 @@ impl SessionState {
             queue_arbiter_role: None,
             turn_waiting_since: None,
             active_turn_since: None,
+            active_turn_started_unix: None,
             parked_approval_turn: None,
             parked_approval_since: None,
             parked_plan_turn: None,
@@ -407,6 +418,8 @@ impl SessionState {
     pub fn start_turn(&mut self, turn: WorkingTurn) {
         self.active_turn = Some(turn);
         self.active_turn_since = Some(std::time::Instant::now());
+        // The only stamp that survives an approval park/resume round-trip.
+        self.active_turn_started_unix = Some(current_unix_ts());
     }
 
     /// Returns true if a turn is currently active (any phase except Completed/Failed).
@@ -618,9 +631,15 @@ impl SessionState {
         if let Some(turn) = self.parked_approval_turn.take() {
             self.parked_approval_since = None;
             self.active_turn = Some(turn);
-            // Fresh total budget on resume: the ceiling bounds agent work, and the
-            // operator's deliberation time (already bounded by WAITING_APPROVAL_SECS)
-            // must not be charged against it.
+            // Fresh *active* budget on resume: the ceiling bounds agent work, and the
+            // operator's deliberation time must not be charged against it.
+            //
+            // `active_turn_started_unix` is deliberately left alone. Resetting both
+            // clocks here is what let a turn live forever: each approval round-trip
+            // re-armed the aggregate ceiling *and* the park clock, so a turn that
+            // parked repeatedly was never measured end to end. The premise that
+            // deliberation is "already bounded by WAITING_APPROVAL_SECS" holds for a
+            // single park and fails for a loop of them.
             self.active_turn_since = Some(std::time::Instant::now());
             true
         } else {
@@ -650,7 +669,8 @@ impl SessionState {
             turn.plan_confirmed = true;
             turn.plan_confirm_note = operator_note;
             self.active_turn = Some(turn);
-            // Fresh total budget on resume — see `restore_parked_approval_turn`.
+            // Fresh active budget on resume; `active_turn_started_unix` untouched —
+            // see `restore_parked_approval_turn`.
             self.active_turn_since = Some(std::time::Instant::now());
             true
         } else {
@@ -3276,16 +3296,9 @@ impl SessionState {
     ) -> String {
         let mut sections = Vec::new();
 
-        if !self.recent_turns.is_empty() {
-            let mut recent = String::from("[Recent session context]\n");
-            for turn in &self.recent_turns {
-                let display_content = sanitize_turn_content_for_history(&turn.user_content);
-                recent.push_str(&format!("User: {}\n", display_content));
-                if let Some(reply) = &turn.assistant_content {
-                    recent.push_str(&format!("Assistant: {}\n", reply));
-                }
-            }
-            sections.push(recent.trim_end().to_string());
+        let dialogue = self.render_dialogue_window(self.settings.injection_budget.dialogue_chars);
+        if !dialogue.is_empty() {
+            sections.push(dialogue);
         }
 
         let mut policy = String::from("[Approval policy]\n");
@@ -3315,9 +3328,11 @@ impl SessionState {
             );
         }
         sections.push(policy.trim_end().to_string());
-        if !self.summary_text().is_empty() {
-            sections.push(format!("[Recent summary]\n{}.", self.summary_text()));
-        }
+        // [Recent summary] used to be emitted here as well. It is the last three
+        // turns, which `[Recent session context]` above already carries in full — in
+        // this same layer — so it was a verbatim second copy in every request. The
+        // Session layer keeps its own one-line recap; that one is a different layer
+        // with a different authority, and stays.
 
         if let Some(memory_summary) = self
             .agent_profile
@@ -4085,10 +4100,13 @@ impl SessionState {
             // tool wait that had already run long could then sit for a
             // SECOND full deadline before eviction, and the eventual
             // "elapsed_secs" in the eviction log under-reported the true
-            // wait by however long the session was unloaded (DEF-097; live
+            // wait by however long the session was unloaded (DEF-100; live
             // 2026-08-29: architect-charter's approval sat 84 minutes,
             // logged as a 304s eviction).
             "turn_waiting_since_unix": self.turn_waiting_since.map(instant_to_unix_ts),
+            // Already wall-clock; stored verbatim so a guest restart cannot rewind
+            // the turn's true age the way it once rewound every phase deadline.
+            "active_turn_started_unix": self.active_turn_started_unix,
             "parked_approval_turn": parked_approval_turn,
             "parked_approval_since_unix": self.parked_approval_since.map(instant_to_unix_ts),
             "parked_plan_turn": parked_plan_turn,
@@ -4124,6 +4142,63 @@ impl SessionState {
                 || self.parked_plan_turn.is_some(),
             "updated_at": current_unix_ts(),
         })
+    }
+
+    /// Render `[Recent session context]` under a character budget.
+    ///
+    /// The rolling window bounds how many turns are kept (`memory_window_size`)
+    /// and how old they may be, but until 2026-08-30 nothing bounded their SIZE.
+    /// A single pasted document therefore entered the window and was re-sent on
+    /// every request until it aged out — coach was shipping 236KB requests, and
+    /// the model-router's 55s dispatch budget is not generous with those.
+    ///
+    /// Turns are admitted newest-first so the budget is spent on what is most
+    /// relevant, then rendered oldest-first so the dialogue still reads in order.
+    /// Dropped turns are named rather than silently vanished: the full text is
+    /// still in the hotel's `session_turn` ledger, and anything that must outlive
+    /// the window belongs in Muninn, which is the memory of record.
+    fn render_dialogue_window(&self, budget_chars: usize) -> String {
+        if self.recent_turns.is_empty() {
+            return String::new();
+        }
+
+        let rendered: Vec<String> = self
+            .recent_turns
+            .iter()
+            .map(|turn| {
+                let user = sanitize_turn_content_for_history(&turn.user_content);
+                match &turn.assistant_content {
+                    Some(reply) => format!("User: {user}\nAssistant: {reply}\n"),
+                    None => format!("User: {user}\n"),
+                }
+            })
+            .collect();
+
+        let mut kept: Vec<&String> = Vec::new();
+        let mut used = 0usize;
+        for entry in rendered.iter().rev() {
+            let cost = entry.chars().count();
+            // Always admit the newest turn, even if it alone exceeds the budget:
+            // dropping the turn being replied to would be worse than overrunning.
+            if !kept.is_empty() && used + cost > budget_chars {
+                break;
+            }
+            used += cost;
+            kept.push(entry);
+        }
+        let dropped = rendered.len() - kept.len();
+
+        let mut out = String::from("[Recent session context]\n");
+        if dropped > 0 {
+            out.push_str(&format!(
+                "[{dropped} earlier turn(s) elided to stay inside the {budget_chars}-char \
+                 dialogue budget — recall from memory if they matter]\n"
+            ));
+        }
+        for entry in kept.iter().rev() {
+            out.push_str(entry);
+        }
+        out.trim_end().to_string()
     }
 
     fn summary_text(&self) -> String {
@@ -4466,7 +4541,7 @@ impl SessionState {
         let active_turn = active_turn.filter(|t| matches!(t.phase, TurnPhase::WaitingTool));
         // Reconstruct the wait-clock from its persisted wall-clock stamp,
         // gated on the corresponding state actually surviving restore above.
-        // See the checkpoint_json comment (DEF-097): without this, every
+        // See the checkpoint_json comment (DEF-100): without this, every
         // reload reset the deadline to "now", silently extending how long a
         // stuck approval or tool call could sit past the watchdog's
         // intended grace window (live 2026-08-29: an approval sat 84
@@ -4550,6 +4625,9 @@ impl SessionState {
                 .map(str::to_string),
             turn_waiting_since,
             active_turn_since: None,
+            active_turn_started_unix: checkpoint
+                .get("active_turn_started_unix")
+                .and_then(serde_json::Value::as_u64),
             parked_approval_turn,
             parked_approval_since,
             parked_plan_turn,
@@ -5740,7 +5818,7 @@ fn memory_space_summary(frame: &MemorySpacetimeFrame) -> Option<String> {
     }
 }
 
-fn current_unix_ts() -> u64 {
+pub(crate) fn current_unix_ts() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
@@ -5757,7 +5835,7 @@ fn instant_to_unix_ts(instant: std::time::Instant) -> u64 {
 /// Reconstruct an approximate `Instant` for a wait-clock stamp that was
 /// persisted as a wall-clock unix timestamp. Used only on checkpoint
 /// restore — see the module note on why restore-time clock loss silently
-/// extended the watchdog's effective deadline (DEF-097).
+/// extended the watchdog's effective deadline (DEF-100).
 fn unix_ts_to_instant(unix_ts: u64) -> std::time::Instant {
     let elapsed = current_unix_ts().saturating_sub(unix_ts);
     std::time::Instant::now()
@@ -6034,7 +6112,7 @@ mod tests {
         assert_eq!(restored.pinned_tier_role.as_deref(), Some("model.ollama"));
     }
 
-    /// DEF-097: without a persisted wall-clock stamp, restoring a parked
+    /// DEF-100: without a persisted wall-clock stamp, restoring a parked
     /// approval reset its wait-clock to "now" — a session reload (idle
     /// eviction, guest restart) silently extended an already-long wait by a
     /// full extra watchdog deadline, and the eventual eviction's
@@ -6770,6 +6848,89 @@ mod tests {
         assert!(
             knowledge.contains("[voice message]"),
             "placeholder must appear in context"
+        );
+    }
+
+    /// Builds a checkpoint with `n` turns whose user content is `chars` long each.
+    fn checkpoint_with_bulky_turns(n: usize, chars: usize) -> serde_json::Value {
+        let turns: Vec<serde_json::Value> = (0..n)
+            .map(|i| {
+                serde_json::json!({
+                    "turn_id": format!("t{i}"),
+                    "user_content": format!("TURN{i}-{}", "x".repeat(chars)),
+                    "assistant_content": format!("reply{i}"),
+                    "created_at": 0u64
+                })
+            })
+            .collect();
+        serde_json::json!({
+            "session_id": "sess-1",
+            "agent_id": "agent-coach",
+            "source": "telegram",
+            "recent_turns": turns,
+        })
+    }
+
+    /// The rolling window bounded turn COUNT but never turn SIZE, so one pasted
+    /// document rode along in every request until it aged out. Live 2026-08-30:
+    /// coach was sending 236KB requests and OpenRouter timed out at 55s.
+    #[test]
+    fn dialogue_window_is_bounded_by_the_injection_budget() {
+        let state = SessionState::from_checkpoint(&checkpoint_with_bulky_turns(5, 4_000))
+            .expect("from_checkpoint must succeed");
+        let budget = state.settings.injection_budget.dialogue_chars;
+        let knowledge = state.project_knowledge("", &[]);
+
+        assert!(
+            knowledge.chars().count() < budget * 2,
+            "dialogue window must stay near its {budget}-char budget, got {}",
+            knowledge.chars().count()
+        );
+        assert!(
+            knowledge.contains("elided to stay inside"),
+            "elided turns must be announced, not silently dropped"
+        );
+        // Newest turn survives; the oldest is the one dropped.
+        assert!(
+            knowledge.contains("TURN4"),
+            "the most recent turn must always be kept"
+        );
+        assert!(
+            !knowledge.contains("TURN0"),
+            "the oldest turn must be the first evicted under budget pressure"
+        );
+    }
+
+    /// Dropping the turn currently being replied to would be worse than
+    /// overrunning the budget, so the newest turn is admitted unconditionally.
+    #[test]
+    fn dialogue_window_keeps_the_newest_turn_even_if_it_alone_exceeds_budget() {
+        let state = SessionState::from_checkpoint(&checkpoint_with_bulky_turns(1, 40_000))
+            .expect("from_checkpoint must succeed");
+        let knowledge = state.project_knowledge("", &[]);
+        assert!(
+            knowledge.contains("TURN0"),
+            "a single oversized turn must still be projected — it is the one being answered"
+        );
+    }
+
+    /// `project_knowledge` used to emit `[Recent session context]` (the whole
+    /// window) AND `[Recent summary]` (its last three turns) into the same layer,
+    /// so those turns were sent twice in every request.
+    #[test]
+    fn knowledge_layer_does_not_duplicate_recent_turns() {
+        let state = SessionState::from_checkpoint(&checkpoint_with_bulky_turns(2, 10))
+            .expect("from_checkpoint must succeed");
+        let knowledge = state.project_knowledge("", &[]);
+
+        assert!(
+            !knowledge.contains("[Recent summary]"),
+            "the in-layer duplicate of the dialogue window must be gone"
+        );
+        assert_eq!(
+            knowledge.matches("TURN1").count(),
+            1,
+            "the newest turn must appear exactly once in the knowledge layer"
         );
     }
 

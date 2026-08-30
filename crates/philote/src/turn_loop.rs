@@ -78,6 +78,11 @@ impl AgentRuntime {
         // wall now lives in one place, above this ceiling, and
         // `ansible_mesh_core::turn_budget` fails the build if they cross again.
         const MAX_TOTAL_ACTIVE_SECS: u64 = ansible_mesh_core::turn_budget::GUEST_TOTAL_CEILING_SECS; // 10 min overall budget
+        // Bounds a turn's TOTAL age including operator deliberation. Every budget
+        // above is re-stamped on a phase change; this one never is, so it is what
+        // stops a park -> approve -> park loop from living forever.
+        const TURN_TOTAL_AGE_CEILING_SECS: u64 =
+            ansible_mesh_core::turn_budget::TURN_TOTAL_AGE_CEILING_SECS; // 30 min
 
         let now = std::time::Instant::now();
 
@@ -346,9 +351,32 @@ impl AgentRuntime {
             .filter_map(|(session_id, state)| {
                 let first_seen = *self.stuck_turn_first_seen.get(session_id)?;
                 let elapsed = first_seen.elapsed().as_secs();
+                // Parked turns answer to TWO deadlines. `elapsed` bounds the CURRENT
+                // park and is re-stamped every time the turn parks again; the total-age
+                // ceiling bounds the whole turn and is never re-stamped. Without the
+                // second one a turn that loops park -> approve -> park re-arms its only
+                // deadline on every round-trip and lives indefinitely (live 2026-08-30:
+                // 2h58m48s, evicted reporting 302s).
+                //
+                // The label carries the true turn age either way, because the reported
+                // `elapsed` for a park-clock eviction is the age of the last park alone
+                // and reading it as the outage length understated this one ~35x.
+                let total_age = state
+                    .active_turn_started_unix
+                    .map(|started| crate::session::current_unix_ts().saturating_sub(started));
+                let age_expired = total_age
+                    .map(|age| age >= TURN_TOTAL_AGE_CEILING_SECS)
+                    .unwrap_or(false);
+                let park_label = |phase: &str| match total_age {
+                    Some(age) if age_expired => {
+                        format!("{phase}(parked, total-age ceiling; turn_age={age}s)")
+                    }
+                    Some(age) => format!("{phase}(parked; turn_age={age}s)"),
+                    None => format!("{phase}(parked)"),
+                };
                 // Parked approval turn: check it first, since active_turn is None when parked.
                 if let Some(turn) = state.parked_approval_turn.as_ref() {
-                    if elapsed >= WAITING_APPROVAL_SECS {
+                    if elapsed >= WAITING_APPROVAL_SECS || age_expired {
                         return Some((
                             session_id.clone(),
                             turn.task_id,
@@ -357,7 +385,7 @@ impl AgentRuntime {
                             turn.final_reply_role.clone(),
                             turn.final_reply_guest_id.clone(),
                             turn.chat_id.clone(),
-                            "WaitingApproval(parked)".into(),
+                            park_label("WaitingApproval"),
                             elapsed,
                         ));
                     }
@@ -365,7 +393,7 @@ impl AgentRuntime {
                 }
                 // Parked plan turn: same timeout budget as approval — operator may be slow.
                 if let Some(turn) = state.parked_plan_turn.as_ref() {
-                    if elapsed >= WAITING_APPROVAL_SECS {
+                    if elapsed >= WAITING_APPROVAL_SECS || age_expired {
                         return Some((
                             session_id.clone(),
                             turn.task_id,
@@ -374,7 +402,7 @@ impl AgentRuntime {
                             turn.final_reply_role.clone(),
                             turn.final_reply_guest_id.clone(),
                             turn.chat_id.clone(),
-                            "PlanningDiscussion(parked)".into(),
+                            park_label("PlanningDiscussion"),
                             elapsed,
                         ));
                     }
@@ -553,6 +581,7 @@ impl AgentRuntime {
                 state.parked_approval_since = None;
                 state.turn_waiting_since = None;
                 state.active_turn_since = None;
+                state.active_turn_started_unix = None;
 
                 // Persist clean checkpoint so a restart also starts unblocked.
                 let mem_type = state.checkpoint_memory_type();
@@ -3740,6 +3769,7 @@ impl AgentRuntime {
             state.active_turn = None;
             state.turn_waiting_since = None;
             state.active_turn_since = None;
+            state.active_turn_started_unix = None;
             (
                 task_id,
                 checkpoint_memory_type,
@@ -4463,6 +4493,94 @@ mod watchdog_clock_tests {
                 !turn_still_active,
                 "a turn 400s past its WaitingTool budget must be evicted on the first \
                  tick after a missed-tick gap, not granted a fresh budget"
+            );
+
+            drop(runtime);
+            let _ = server.await;
+            let _ = std::fs::remove_file(&socket_path);
+        });
+    }
+
+    /// THE park-loop regression. A multi-step plan requests approval per step, so the
+    /// turn parks, is approved, and parks again. Every park re-stamped
+    /// `parked_approval_since` and every resume re-stamped `active_turn_since`, so both
+    /// deadlines restarted on each round-trip and nothing measured the turn end to end.
+    /// Live 2026-08-30: an `agent-bjork-01` turn survived 2h58m48s that way and was
+    /// finally evicted reporting `elapsed_secs=302` — the age of the last park alone.
+    ///
+    /// The total-age stamp is never re-stamped, so a freshly-parked turn that is
+    /// nonetheless hours old is now evicted on the strength of its true age.
+    #[test]
+    fn evicts_a_freshly_reparked_turn_that_is_past_the_total_age_ceiling() {
+        run_big_stack(|| async {
+            let (mut runtime, socket_path, server, _emitted) =
+                runtime_with_stub_hotel("parkloop").await;
+
+            let session_id = "telegram:7898847424:agent-bjork-01".to_string();
+            let mut state = SessionState::new(
+                session_id.clone(),
+                "agent-bjork-01".into(),
+                "telegram".into(),
+            );
+            state.start_turn(test_working_turn(TurnPhase::WaitingApproval));
+            state.park_active_turn_for_approval();
+            // The operator just approved the previous step and the turn re-parked one
+            // second ago: the park clock is nowhere near WAITING_APPROVAL_SECS.
+            state.parked_approval_since = Some(Instant::now() - Duration::from_secs(1));
+            // But the turn itself was created two hours ago.
+            state.active_turn_started_unix =
+                Some(crate::session::current_unix_ts().saturating_sub(7_200));
+            runtime.sessions.insert(session_id.clone(), state);
+
+            runtime.evict_timed_out_turns().await;
+
+            let still_parked = runtime
+                .sessions
+                .get(&session_id)
+                .and_then(|s| s.parked_approval_turn.as_ref())
+                .is_some();
+            assert!(
+                !still_parked,
+                "a turn two hours old must be evicted even though it re-parked one \
+                 second ago — otherwise every approval round-trip re-arms its only \
+                 deadline and the turn never dies"
+            );
+
+            drop(runtime);
+            let _ = server.await;
+            let _ = std::fs::remove_file(&socket_path);
+        });
+    }
+
+    /// The companion guarantee: the ceiling must not cut short a legitimate approval
+    /// wait. An operator who takes a couple of minutes on a young turn keeps it.
+    #[test]
+    fn keeps_a_recently_parked_turn_that_is_inside_the_total_age_ceiling() {
+        run_big_stack(|| async {
+            let (mut runtime, socket_path, server, _emitted) =
+                runtime_with_stub_hotel("parkkeep").await;
+
+            let session_id = "telegram:7898847424:agent-coach".to_string();
+            let mut state =
+                SessionState::new(session_id.clone(), "agent-coach".into(), "telegram".into());
+            state.start_turn(test_working_turn(TurnPhase::WaitingApproval));
+            state.park_active_turn_for_approval();
+            state.parked_approval_since = Some(Instant::now() - Duration::from_secs(30));
+            state.active_turn_started_unix =
+                Some(crate::session::current_unix_ts().saturating_sub(120));
+            runtime.sessions.insert(session_id.clone(), state);
+
+            runtime.evict_timed_out_turns().await;
+
+            let still_parked = runtime
+                .sessions
+                .get(&session_id)
+                .and_then(|s| s.parked_approval_turn.as_ref())
+                .is_some();
+            assert!(
+                still_parked,
+                "a two-minute-old turn parked 30s ago is a normal approval wait and \
+                 must survive"
             );
 
             drop(runtime);
