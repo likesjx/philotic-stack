@@ -73,7 +73,10 @@ MAIN_CHECKOUT="$(dirname "$(git rev-parse --path-format=absolute --git-common-di
 # aiua`, which is a known macOS-keychain hang here.) Resolve each build process
 # to its working directory instead, and only protect the worktree it is in.
 BUSY_DIRS=""
-build_pids="$( { pgrep -x cargo; pgrep -x rustc; } 2>/dev/null | sort -u | tr '\n' ' ')"
+# pgrep exits 1 when nothing matches, and `set -o pipefail` propagates that, so
+# without `|| true` this assignment aborts the whole script -- silently, and only
+# when NO build is running, i.e. exactly when the sweep should proceed.
+build_pids="$( { pgrep -x cargo; pgrep -x rustc; } 2>/dev/null | sort -u | tr '\n' ' ' || true)"
 if [ -n "${build_pids// /}" ]; then
     for pid in $build_pids; do
         # A pid can exit between pgrep and lsof; tolerate that rather than
@@ -96,11 +99,26 @@ is_busy() {
     return 1
 }
 
-# Invariant 3 (per-dir): is this target/'s cargo lock held by a live process?
+# Invariant 3 (per-dir): is a cargo lock under this target/ held by a live process?
+#
+# This is the backstop for a build whose cwd is NOT the worktree root (e.g. a
+# wrapper that cd's elsewhere and passes --manifest-path), which is_busy cannot
+# see. Cargo 1.94 keeps the lock at target/<profile>/.cargo-lock -- NOT at
+# target/.cargo-lock -- so check every profile dir. Getting this path wrong makes
+# the whole invariant silently decorative, which it was until measured.
 lock_held() {
-    local target=$1
-    local lock="$target/.cargo-lock"
-    [ -f "$lock" ] || return 1
+    local target=$1 lock
+    for lock in "$target"/*/.cargo-lock; do
+        [ -f "$lock" ] || continue
+        if lock_file_held "$lock"; then
+            return 0
+        fi
+    done
+    return 1
+}
+
+lock_file_held() {
+    local lock=$1
     python3 - "$lock" <<'PY' 2>/dev/null
 import fcntl, sys
 try:
