@@ -1299,6 +1299,13 @@ pub struct InjectionBudget {
     pub reflex_snapshot_chars: usize,
     /// Cap for the Rules layer (`project_rules`).
     pub rules_chars: usize,
+    /// Cap for the dialogue window (`[Recent session context]`).
+    ///
+    /// This layer is the only one whose size the operator controls directly —
+    /// one pasted document lands in it and is then re-sent on every request for
+    /// as long as it stays inside the window. It was the one unbudgeted layer
+    /// until 2026-08-30, when coach was sending 236KB requests.
+    pub dialogue_chars: usize,
     /// Whole-envelope ceiling (sum of all rendered layer chars). Drives
     /// `ReflexEvent::ContextPressure` emission — see `BudgetLedger`.
     pub total_envelope_chars: usize,
@@ -1313,6 +1320,7 @@ impl Default for InjectionBudget {
             skills_chars: 2_500,
             reflex_snapshot_chars: 1_000,
             rules_chars: 2_000,
+            dialogue_chars: 8_000,
             total_envelope_chars: 60_000,
         }
     }

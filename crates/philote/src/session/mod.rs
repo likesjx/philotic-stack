@@ -3296,16 +3296,9 @@ impl SessionState {
     ) -> String {
         let mut sections = Vec::new();
 
-        if !self.recent_turns.is_empty() {
-            let mut recent = String::from("[Recent session context]\n");
-            for turn in &self.recent_turns {
-                let display_content = sanitize_turn_content_for_history(&turn.user_content);
-                recent.push_str(&format!("User: {}\n", display_content));
-                if let Some(reply) = &turn.assistant_content {
-                    recent.push_str(&format!("Assistant: {}\n", reply));
-                }
-            }
-            sections.push(recent.trim_end().to_string());
+        let dialogue = self.render_dialogue_window(self.settings.injection_budget.dialogue_chars);
+        if !dialogue.is_empty() {
+            sections.push(dialogue);
         }
 
         let mut policy = String::from("[Approval policy]\n");
@@ -3335,9 +3328,11 @@ impl SessionState {
             );
         }
         sections.push(policy.trim_end().to_string());
-        if !self.summary_text().is_empty() {
-            sections.push(format!("[Recent summary]\n{}.", self.summary_text()));
-        }
+        // [Recent summary] used to be emitted here as well. It is the last three
+        // turns, which `[Recent session context]` above already carries in full — in
+        // this same layer — so it was a verbatim second copy in every request. The
+        // Session layer keeps its own one-line recap; that one is a different layer
+        // with a different authority, and stays.
 
         if let Some(memory_summary) = self
             .agent_profile
@@ -4147,6 +4142,63 @@ impl SessionState {
                 || self.parked_plan_turn.is_some(),
             "updated_at": current_unix_ts(),
         })
+    }
+
+    /// Render `[Recent session context]` under a character budget.
+    ///
+    /// The rolling window bounds how many turns are kept (`memory_window_size`)
+    /// and how old they may be, but until 2026-08-30 nothing bounded their SIZE.
+    /// A single pasted document therefore entered the window and was re-sent on
+    /// every request until it aged out — coach was shipping 236KB requests, and
+    /// the model-router's 55s dispatch budget is not generous with those.
+    ///
+    /// Turns are admitted newest-first so the budget is spent on what is most
+    /// relevant, then rendered oldest-first so the dialogue still reads in order.
+    /// Dropped turns are named rather than silently vanished: the full text is
+    /// still in the hotel's `session_turn` ledger, and anything that must outlive
+    /// the window belongs in Muninn, which is the memory of record.
+    fn render_dialogue_window(&self, budget_chars: usize) -> String {
+        if self.recent_turns.is_empty() {
+            return String::new();
+        }
+
+        let rendered: Vec<String> = self
+            .recent_turns
+            .iter()
+            .map(|turn| {
+                let user = sanitize_turn_content_for_history(&turn.user_content);
+                match &turn.assistant_content {
+                    Some(reply) => format!("User: {user}\nAssistant: {reply}\n"),
+                    None => format!("User: {user}\n"),
+                }
+            })
+            .collect();
+
+        let mut kept: Vec<&String> = Vec::new();
+        let mut used = 0usize;
+        for entry in rendered.iter().rev() {
+            let cost = entry.chars().count();
+            // Always admit the newest turn, even if it alone exceeds the budget:
+            // dropping the turn being replied to would be worse than overrunning.
+            if !kept.is_empty() && used + cost > budget_chars {
+                break;
+            }
+            used += cost;
+            kept.push(entry);
+        }
+        let dropped = rendered.len() - kept.len();
+
+        let mut out = String::from("[Recent session context]\n");
+        if dropped > 0 {
+            out.push_str(&format!(
+                "[{dropped} earlier turn(s) elided to stay inside the {budget_chars}-char \
+                 dialogue budget — recall from memory if they matter]\n"
+            ));
+        }
+        for entry in kept.iter().rev() {
+            out.push_str(entry);
+        }
+        out.trim_end().to_string()
     }
 
     fn summary_text(&self) -> String {
@@ -6796,6 +6848,89 @@ mod tests {
         assert!(
             knowledge.contains("[voice message]"),
             "placeholder must appear in context"
+        );
+    }
+
+    /// Builds a checkpoint with `n` turns whose user content is `chars` long each.
+    fn checkpoint_with_bulky_turns(n: usize, chars: usize) -> serde_json::Value {
+        let turns: Vec<serde_json::Value> = (0..n)
+            .map(|i| {
+                serde_json::json!({
+                    "turn_id": format!("t{i}"),
+                    "user_content": format!("TURN{i}-{}", "x".repeat(chars)),
+                    "assistant_content": format!("reply{i}"),
+                    "created_at": 0u64
+                })
+            })
+            .collect();
+        serde_json::json!({
+            "session_id": "sess-1",
+            "agent_id": "agent-coach",
+            "source": "telegram",
+            "recent_turns": turns,
+        })
+    }
+
+    /// The rolling window bounded turn COUNT but never turn SIZE, so one pasted
+    /// document rode along in every request until it aged out. Live 2026-08-30:
+    /// coach was sending 236KB requests and OpenRouter timed out at 55s.
+    #[test]
+    fn dialogue_window_is_bounded_by_the_injection_budget() {
+        let state = SessionState::from_checkpoint(&checkpoint_with_bulky_turns(5, 4_000))
+            .expect("from_checkpoint must succeed");
+        let budget = state.settings.injection_budget.dialogue_chars;
+        let knowledge = state.project_knowledge("", &[]);
+
+        assert!(
+            knowledge.chars().count() < budget * 2,
+            "dialogue window must stay near its {budget}-char budget, got {}",
+            knowledge.chars().count()
+        );
+        assert!(
+            knowledge.contains("elided to stay inside"),
+            "elided turns must be announced, not silently dropped"
+        );
+        // Newest turn survives; the oldest is the one dropped.
+        assert!(
+            knowledge.contains("TURN4"),
+            "the most recent turn must always be kept"
+        );
+        assert!(
+            !knowledge.contains("TURN0"),
+            "the oldest turn must be the first evicted under budget pressure"
+        );
+    }
+
+    /// Dropping the turn currently being replied to would be worse than
+    /// overrunning the budget, so the newest turn is admitted unconditionally.
+    #[test]
+    fn dialogue_window_keeps_the_newest_turn_even_if_it_alone_exceeds_budget() {
+        let state = SessionState::from_checkpoint(&checkpoint_with_bulky_turns(1, 40_000))
+            .expect("from_checkpoint must succeed");
+        let knowledge = state.project_knowledge("", &[]);
+        assert!(
+            knowledge.contains("TURN0"),
+            "a single oversized turn must still be projected — it is the one being answered"
+        );
+    }
+
+    /// `project_knowledge` used to emit `[Recent session context]` (the whole
+    /// window) AND `[Recent summary]` (its last three turns) into the same layer,
+    /// so those turns were sent twice in every request.
+    #[test]
+    fn knowledge_layer_does_not_duplicate_recent_turns() {
+        let state = SessionState::from_checkpoint(&checkpoint_with_bulky_turns(2, 10))
+            .expect("from_checkpoint must succeed");
+        let knowledge = state.project_knowledge("", &[]);
+
+        assert!(
+            !knowledge.contains("[Recent summary]"),
+            "the in-layer duplicate of the dialogue window must be gone"
+        );
+        assert_eq!(
+            knowledge.matches("TURN1").count(),
+            1,
+            "the newest turn must appear exactly once in the knowledge layer"
         );
     }
 
