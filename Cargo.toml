@@ -51,3 +51,24 @@ resolver = "2"
 # only `cargo clippy` enforces them.
 [workspace.lints.clippy]
 all = "deny"
+
+# Build-artifact budget — see docs/guides/CARGO_BUILD_ARTIFACT_BUDGET.md.
+#
+# A `target/` for this workspace (605 deps, 32 members) reached 11 GB, and every
+# parallel worktree pays that again. Debuginfo in the dev profile is the largest
+# single term we control from the repo.
+#
+# NOTE: worktrees deliberately do NOT share one `target/` dir. Cargo fingerprints
+# a unit by package name/version/profile/features — not by workspace path — so
+# two worktrees of this repo collide: `cargo build` in worktree A reports
+# "Finished" without rebuilding and leaves worktree B's binary at
+# `target/debug/<bin>`. The 98 `${ROOT_DIR}/target/...` call sites in scripts/
+# would then smoke-test the wrong build, silently. Share the *compiler cache*
+# (sccache) instead — see the doc above.
+#
+# `line-tables-only` keeps file/line in panics and backtraces — which is how this
+# stack is actually debugged (runtime logs, `sample`, smoke scripts) — and drops
+# only variable inspection under a debugger. If you need lldb locals for a
+# session, override for that build with CARGO_PROFILE_DEV_DEBUG=2.
+[profile.dev]
+debug = "line-tables-only"
