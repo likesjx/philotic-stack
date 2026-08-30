@@ -4100,7 +4100,7 @@ impl SessionState {
             // tool wait that had already run long could then sit for a
             // SECOND full deadline before eviction, and the eventual
             // "elapsed_secs" in the eviction log under-reported the true
-            // wait by however long the session was unloaded (DEF-097; live
+            // wait by however long the session was unloaded (DEF-100; live
             // 2026-08-29: architect-charter's approval sat 84 minutes,
             // logged as a 304s eviction).
             "turn_waiting_since_unix": self.turn_waiting_since.map(instant_to_unix_ts),
@@ -4541,7 +4541,7 @@ impl SessionState {
         let active_turn = active_turn.filter(|t| matches!(t.phase, TurnPhase::WaitingTool));
         // Reconstruct the wait-clock from its persisted wall-clock stamp,
         // gated on the corresponding state actually surviving restore above.
-        // See the checkpoint_json comment (DEF-097): without this, every
+        // See the checkpoint_json comment (DEF-100): without this, every
         // reload reset the deadline to "now", silently extending how long a
         // stuck approval or tool call could sit past the watchdog's
         // intended grace window (live 2026-08-29: an approval sat 84
@@ -5835,7 +5835,7 @@ fn instant_to_unix_ts(instant: std::time::Instant) -> u64 {
 /// Reconstruct an approximate `Instant` for a wait-clock stamp that was
 /// persisted as a wall-clock unix timestamp. Used only on checkpoint
 /// restore — see the module note on why restore-time clock loss silently
-/// extended the watchdog's effective deadline (DEF-097).
+/// extended the watchdog's effective deadline (DEF-100).
 fn unix_ts_to_instant(unix_ts: u64) -> std::time::Instant {
     let elapsed = current_unix_ts().saturating_sub(unix_ts);
     std::time::Instant::now()
@@ -6112,7 +6112,7 @@ mod tests {
         assert_eq!(restored.pinned_tier_role.as_deref(), Some("model.ollama"));
     }
 
-    /// DEF-097: without a persisted wall-clock stamp, restoring a parked
+    /// DEF-100: without a persisted wall-clock stamp, restoring a parked
     /// approval reset its wait-clock to "now" — a session reload (idle
     /// eviction, guest restart) silently extended an already-long wait by a
     /// full extra watchdog deadline, and the eventual eviction's
