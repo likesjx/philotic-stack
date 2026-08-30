@@ -82,7 +82,9 @@ cmd_status() {
             [ -d "$wt/target" ] || continue
             printf '  %-6s %s\n' "$(du -sh "$wt/target" 2>/dev/null | cut -f1)" "$wt/target"
         done
-    info "(reclaim merged ones with: scripts/worktree-gc.sh)"
+    info ""
+    info "reclaim idle ones:  scripts/target-sweep.sh          (live worktrees, keeps the worktree)"
+    info "reclaim merged ones: scripts/worktree-gc.sh          (removes the whole worktree)"
 }
 
 cmd_disable() {
@@ -148,7 +150,9 @@ worktree — hits it.
   sccache --zero-stats                     reset counters before a timing run
 
 NOTE: worktrees still each keep their own target/. That is deliberate — see the
-header of this script. Reclaim merged ones with scripts/worktree-gc.sh.
+header of this script. sccache makes a fresh worktree build FAST, not SMALL; to
+reclaim disk use scripts/target-sweep.sh (idle live worktrees) or
+scripts/worktree-gc.sh (fully merged ones).
 EOF
 }
 

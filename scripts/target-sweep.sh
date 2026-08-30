@@ -23,8 +23,11 @@
 #      never a branch. Nothing tracked by git is touched.
 #   2. NEVER sweeps a worktree whose target/ was built within --idle-days
 #      (default 14) — that is someone's warm cache.
-#   3. NEVER sweeps while a build could be running: refuses if any cargo/rustc
-#      process is alive, and skips any target/ whose cargo lock is held.
+#   3. NEVER sweeps a worktree with a build in it: every live cargo/rustc process
+#      is resolved to its working directory and that worktree is skipped, as is
+#      any target/ whose cargo lock is held. Deliberately per-worktree, not a
+#      global "is cargo running" refusal -- with ~19 parallel agents something is
+#      almost always building, and a global guard would never let the sweep run.
 #   4. NEVER sweeps the main checkout unless --include-main is passed explicitly
 #      (it is the deploy checkout; push-homebrew-remote.sh reads its
 #      target/release).
@@ -62,13 +65,36 @@ done
 
 MAIN_CHECKOUT="$(dirname "$(git rev-parse --path-format=absolute --git-common-dir)")"
 
-# Invariant 3: a global build check. Cheap, and catches the common case of a
-# sibling agent mid-build in some other worktree.
-if pgrep -x cargo >/dev/null 2>&1 || pgrep -x rustc >/dev/null 2>&1; then
-    echo "refusing to sweep: a cargo/rustc build is running right now." >&2
-    echo "re-run when the machine is idle." >&2
-    exit 1
+# Invariant 3: identify which worktrees have a LIVE build, and skip exactly those.
+#
+# A global "refuse if any cargo is running" check is wrong on this machine: with
+# ~19 parallel agents some cargo is almost always alive somewhere, so a global
+# guard means the sweep can never run. (It also trips on a hung `cargo test -p
+# aiua`, which is a known macOS-keychain hang here.) Resolve each build process
+# to its working directory instead, and only protect the worktree it is in.
+BUSY_DIRS=""
+build_pids="$( { pgrep -x cargo; pgrep -x rustc; } 2>/dev/null | sort -u | tr '\n' ' ')"
+if [ -n "${build_pids// /}" ]; then
+    for pid in $build_pids; do
+        # A pid can exit between pgrep and lsof; tolerate that rather than
+        # aborting the sweep (a failing $(...) in an assignment trips set -e).
+        cwd="$(lsof -a -p "$pid" -d cwd -Fn 2>/dev/null | sed -n 's/^n//p' | head -1 || true)"
+        if [ -n "$cwd" ]; then
+            BUSY_DIRS="$BUSY_DIRS
+$cwd"
+        fi
+    done
 fi
+
+# Is $1 (a worktree) the cwd of, or an ancestor of the cwd of, a live build?
+is_busy() {
+    local wt=$1 d
+    while IFS= read -r d; do
+        [ -n "$d" ] || continue
+        case "$d/" in "$wt"/*) return 0 ;; esac
+    done <<< "$BUSY_DIRS"
+    return 1
+}
 
 # Invariant 3 (per-dir): is this target/'s cargo lock held by a live process?
 lock_held() {
@@ -108,11 +134,19 @@ while read -r wt; do
     target="$wt/target"
 
     if [ "$wt" = "$MAIN_CHECKOUT" ] && [ "$INCLUDE_MAIN" -eq 0 ]; then
-        [ -d "$target" ] && { printf 'KEEP  (main checkout)   %-6s %s\n' "$(human "$target")" "$wt"; kept=$((kept+1)); }
+        if [ -d "$target" ]; then
+            printf 'KEEP  (main checkout)   %-6s %s\n' "$(human "$target")" "$wt"
+            kept=$((kept+1))
+        fi
         continue
     fi
 
     [ -d "$target" ] || continue
+
+    if is_busy "$wt"; then
+        printf 'KEEP  (build running)   %-6s %s\n' "$(human "$target")" "$wt"
+        kept=$((kept+1)); continue
+    fi
 
     if lock_held "$target"; then
         printf 'KEEP  (build lock held) %-6s %s\n' "$(human "$target")" "$wt"

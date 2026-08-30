@@ -84,6 +84,21 @@ The workspace root `Cargo.toml` sets:
 debug = "line-tables-only"
 ```
 
+Measured on this workspace — two clean `cargo build --workspace --all-targets`
+runs at the same commit, same machine:
+
+| | baseline (`debug = 2`) | `line-tables-only` | change |
+|---|---|---|---|
+| `target/` total | 12 GB | **9.7 GB** | −2.3 GB (−19%) |
+| `debug/deps` | 6.3 GB | 4.3 GB | −32% |
+| `debug/incremental` | 6.1 GB | 4.6 GB | −25% |
+| `debug/examples` | 1.1 GB | 857 MB | −22% |
+| wall clock | 210 s | 196 s | −7% |
+
+Worth having across ~19 worktrees, but note honestly that this is a **19% cut,
+not a fix** — a worktree still costs ~10 GB. Step 3 is the lever that actually
+reclaims space.
+
 Panics and backtraces keep file and line numbers — which is how this stack is
 actually debugged (runtime logs, `sample`, smoke scripts). Only debugger variable
 inspection is lost. Need lldb locals for one session:
