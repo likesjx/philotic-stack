@@ -266,6 +266,16 @@ pub struct SessionState {
     /// stamp silently restarts the budget whenever ticks are missed, which is exactly
     /// how turns escaped the ceiling for hours (see `evict_timed_out_turns`).
     pub active_turn_since: Option<std::time::Instant>,
+    /// Wall-clock unix seconds when the current turn was first created.
+    ///
+    /// Unlike every other clock on this struct, this one is **never re-stamped**
+    /// while the turn lives — not on an approval park, not on the resume that
+    /// follows it. It is the only measure of a turn's true total age, and it is
+    /// what bounds a turn that loops park -> approve -> park (see
+    /// [`ansible_mesh_core::turn_budget::TURN_TOTAL_AGE_CEILING_SECS`]). Cleared
+    /// only when the turn genuinely ends. Persisted as unix seconds because an
+    /// `Instant` has no fixed epoch and cannot survive a checkpoint.
+    pub active_turn_started_unix: Option<u64>,
     /// A turn that entered WaitingApproval and was parked so the session stays free
     /// for new work while the operator decides. Restored when the operator approves
     /// or denies via `/approve`, `/deny`, or a paracrine ApprovalResolution response.
@@ -358,6 +368,7 @@ impl SessionState {
             queue_arbiter_role: None,
             turn_waiting_since: None,
             active_turn_since: None,
+            active_turn_started_unix: None,
             parked_approval_turn: None,
             parked_approval_since: None,
             parked_plan_turn: None,
@@ -407,6 +418,8 @@ impl SessionState {
     pub fn start_turn(&mut self, turn: WorkingTurn) {
         self.active_turn = Some(turn);
         self.active_turn_since = Some(std::time::Instant::now());
+        // The only stamp that survives an approval park/resume round-trip.
+        self.active_turn_started_unix = Some(current_unix_ts());
     }
 
     /// Returns true if a turn is currently active (any phase except Completed/Failed).
@@ -618,9 +631,15 @@ impl SessionState {
         if let Some(turn) = self.parked_approval_turn.take() {
             self.parked_approval_since = None;
             self.active_turn = Some(turn);
-            // Fresh total budget on resume: the ceiling bounds agent work, and the
-            // operator's deliberation time (already bounded by WAITING_APPROVAL_SECS)
-            // must not be charged against it.
+            // Fresh *active* budget on resume: the ceiling bounds agent work, and the
+            // operator's deliberation time must not be charged against it.
+            //
+            // `active_turn_started_unix` is deliberately left alone. Resetting both
+            // clocks here is what let a turn live forever: each approval round-trip
+            // re-armed the aggregate ceiling *and* the park clock, so a turn that
+            // parked repeatedly was never measured end to end. The premise that
+            // deliberation is "already bounded by WAITING_APPROVAL_SECS" holds for a
+            // single park and fails for a loop of them.
             self.active_turn_since = Some(std::time::Instant::now());
             true
         } else {
@@ -650,7 +669,8 @@ impl SessionState {
             turn.plan_confirmed = true;
             turn.plan_confirm_note = operator_note;
             self.active_turn = Some(turn);
-            // Fresh total budget on resume — see `restore_parked_approval_turn`.
+            // Fresh active budget on resume; `active_turn_started_unix` untouched —
+            // see `restore_parked_approval_turn`.
             self.active_turn_since = Some(std::time::Instant::now());
             true
         } else {
@@ -4089,6 +4109,9 @@ impl SessionState {
             // 2026-08-29: architect-charter's approval sat 84 minutes,
             // logged as a 304s eviction).
             "turn_waiting_since_unix": self.turn_waiting_since.map(instant_to_unix_ts),
+            // Already wall-clock; stored verbatim so a guest restart cannot rewind
+            // the turn's true age the way it once rewound every phase deadline.
+            "active_turn_started_unix": self.active_turn_started_unix,
             "parked_approval_turn": parked_approval_turn,
             "parked_approval_since_unix": self.parked_approval_since.map(instant_to_unix_ts),
             "parked_plan_turn": parked_plan_turn,
@@ -4550,6 +4573,9 @@ impl SessionState {
                 .map(str::to_string),
             turn_waiting_since,
             active_turn_since: None,
+            active_turn_started_unix: checkpoint
+                .get("active_turn_started_unix")
+                .and_then(serde_json::Value::as_u64),
             parked_approval_turn,
             parked_approval_since,
             parked_plan_turn,
@@ -5740,7 +5766,7 @@ fn memory_space_summary(frame: &MemorySpacetimeFrame) -> Option<String> {
     }
 }
 
-fn current_unix_ts() -> u64 {
+pub(crate) fn current_unix_ts() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
