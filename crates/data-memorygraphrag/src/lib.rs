@@ -11,6 +11,7 @@ pub mod heartbeat;
 pub mod hygiene;
 pub mod ontology;
 pub mod projection;
+pub mod sensor_scripts;
 pub mod zoning;
 
 use serde::{Deserialize, Serialize};

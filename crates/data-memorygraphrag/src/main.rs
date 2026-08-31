@@ -1,9 +1,11 @@
 mod provider;
+mod sensor_provider;
 
 use anyhow::Result;
 use data_memorygraphrag::hygiene;
 use datasource::runtime::{DatasourceGuestConfig, run_datasource_controller};
 use provider::LifeGraphProvider;
+use sensor_provider::SensorProvider;
 use std::sync::Arc;
 use std::time::Duration;
 use tracing::{info, warn};
@@ -202,7 +204,15 @@ async fn main() -> Result<()> {
     run_datasource_controller(DatasourceGuestConfig {
         guest_id: guest_id_static,
         role: "life-graph-runner",
-        providers: Box::new(|| vec![Arc::new(LifeGraphProvider::from_env())]),
+        providers: Box::new(move || {
+            let life = Arc::new(LifeGraphProvider::from_env());
+            let sensor = Arc::new(SensorProvider::new(
+                Arc::clone(&life),
+                guest_id_static.to_string(),
+                "life-graph-runner".to_string(),
+            ));
+            vec![life, sensor]
+        }),
     })
     .await
 }
