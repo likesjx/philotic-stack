@@ -7311,6 +7311,27 @@ async fn run_bash_command(
         }));
     }
 
+    // L1 network-egress fence: keep raw shell fetch/exfil primitives from
+    // bypassing the governed outbound fabric. Detection is compiled-in and
+    // config-free; loopback/tailnet pass, an unresolvable or non-allowlisted
+    // host is denied and redirected to `http:<binding>.request`.
+    if let Some(egress) = exec_guard::detect_network_egress(&command) {
+        let policy = ansible_mesh_core::mcp_upstream::McpEgressPolicy::shell_egress_from_env();
+        let permitted = egress
+            .host
+            .as_deref()
+            .map(|host| policy.host_allowed(host))
+            .unwrap_or(false);
+        if !permitted {
+            return Ok(serde_json::json!({
+                "stdout": "",
+                "stderr": egress.denial_message(),
+                "exit_code": 126,
+                "success": false,
+            }));
+        }
+    }
+
     let mut cmd = Command::new("sh");
     cmd.arg("-c").arg(&command);
     cmd.stdout(std::process::Stdio::piped());

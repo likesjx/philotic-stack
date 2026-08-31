@@ -5010,6 +5010,37 @@ fn seed_abstract_skill_catalog(graph: &GraphDomain) -> anyhow::Result<()> {
             }),
             ..Default::default()
         },
+        // The SkillDAG gate for governed outbound HTTP. Held persistently by
+        // every philote profile (see seed_toolset_profiles), so any integration
+        // binding may gate on it via `grant_skills: ["net.http"]` and know every
+        // philote is eligible. It is deliberately a *pure eligibility gate* that
+        // implies no tools of its own: the real `http:<binding>.request` tools
+        // project dynamically per granted binding (session snapshot composition),
+        // so this skill adds no standing tool surface to any philote. It is also
+        // *necessary but not sufficient* — an actual outbound request still
+        // requires the binding to grant the agent (`grant_agents`/owner), and the
+        // binding's host allowlist, exit placement, and approval flag still scope
+        // what and where. Raw shell egress (curl/wget/nc) is fenced off separately
+        // (exec-guard net_egress), so this skill + a granted binding is the
+        // sanctioned outbound path.
+        AbstractSkillRecord {
+            skill_name: "net.http".into(),
+            description: "Use governed outbound HTTP. This skill makes the agent eligible for \
+                          integration bindings that gate on it (their `grant_skills`). It grants no \
+                          tools by itself: an actual request goes through the projected \
+                          `http:<binding>.request` tool of a binding the agent is also granted, and \
+                          that binding scopes the destinations, credentials (via secret_ref, never \
+                          exposed), exit placement, and approval. Holding this skill is necessary \
+                          but not sufficient. Raw shell egress (curl/wget/nc) is fenced off; a \
+                          granted binding is the sanctioned path out."
+                .into(),
+            validation_state: ansible_mesh_core::graph::SkillValidationState::Validated,
+            field_sources: serde_json::json!({
+                "source": "PERIMETER_EGRESS_CONTROL_PROPOSAL.md — shell egress fence / SkillDAG egress capability",
+                "gate": "IntegrationBinding.grant_skills; necessary-not-sufficient with grant_agents"
+            }),
+            ..Default::default()
+        },
     ];
 
     for skill in &catalog {
@@ -5080,6 +5111,9 @@ fn seed_toolset_profiles(graph: &GraphDomain) -> anyhow::Result<()> {
             ],
             allowed_classes: vec!["session".into(), "utility".into(), "config".into(), "memory".into(), "graph".into(), "agent_graph".into(), "table".into(), "cron".into(), "mcp".into(), "desktop".into(), "life_graph".into()],
             allowed_skills: vec![
+                // Governed outbound HTTP eligibility (necessary, not sufficient —
+                // a binding must still grant the agent). See the net.http skill.
+                "net.http".into(),
                 "handoff.to_role".into(),
                 "handoff.back".into(),
                 "memory.fix".into(),
@@ -5129,6 +5163,9 @@ fn seed_toolset_profiles(graph: &GraphDomain) -> anyhow::Result<()> {
             ],
             allowed_classes: vec!["session".into(), "utility".into(), "workspace".into(), "life_graph".into()],
             allowed_skills: vec![
+                // Governed outbound HTTP eligibility (necessary, not sufficient —
+                // a binding must still grant the agent). See the net.http skill.
+                "net.http".into(),
                 "handoff.back".into(),
                 "capability.request".into(),
                 "context.synthesize".into(),
@@ -5154,6 +5191,9 @@ fn seed_toolset_profiles(graph: &GraphDomain) -> anyhow::Result<()> {
             ],
             allowed_classes: vec!["session".into(), "utility".into(), "life_graph".into()],
             allowed_skills: vec![
+                // Governed outbound HTTP eligibility (necessary, not sufficient —
+                // a binding must still grant the agent). See the net.http skill.
+                "net.http".into(),
                 "handoff.back".into(),
                 "capability.request".into(),
                 "context.synthesize".into(),
@@ -5179,6 +5219,9 @@ fn seed_toolset_profiles(graph: &GraphDomain) -> anyhow::Result<()> {
             ],
             allowed_classes: vec!["session".into(), "utility".into(), "life_graph".into()],
             allowed_skills: vec![
+                // Governed outbound HTTP eligibility (necessary, not sufficient —
+                // a binding must still grant the agent). See the net.http skill.
+                "net.http".into(),
                 "capability.request".into(),
                 "context.synthesize".into(),
                 "session.recover".into(),
@@ -5209,6 +5252,9 @@ fn seed_toolset_profiles(graph: &GraphDomain) -> anyhow::Result<()> {
                 "life_graph".into(),
             ],
             allowed_skills: vec![
+                // Governed outbound HTTP eligibility (necessary, not sufficient —
+                // a binding must still grant the agent). See the net.http skill.
+                "net.http".into(),
                 "handoff.back".into(),
                 "capability.request".into(),
                 "context.synthesize".into(),
@@ -5306,6 +5352,9 @@ fn seed_toolset_profiles(graph: &GraphDomain) -> anyhow::Result<()> {
                 "heal".into(),
             ],
             allowed_skills: vec![
+                // Governed outbound HTTP eligibility (necessary, not sufficient —
+                // a binding must still grant the agent). See the net.http skill.
+                "net.http".into(),
                 "skill.crafting".into(),
                 "handoff.to_role".into(),
                 "handoff.back".into(),
@@ -5366,6 +5415,9 @@ fn seed_toolset_profiles(graph: &GraphDomain) -> anyhow::Result<()> {
             // gate); this grant only makes the read surface visible.
             allowed_classes: vec!["session".into(), "utility".into(), "workspace".into(), "memory".into(), "graph".into(), "agent_graph".into(), "life_graph".into(), "heal".into()],
             allowed_skills: vec![
+                // Governed outbound HTTP eligibility (necessary, not sufficient —
+                // a binding must still grant the agent). See the net.http skill.
+                "net.http".into(),
                 "handoff.back".into(),
                 "capability.request".into(),
                 "memory.fix".into(),
@@ -5414,6 +5466,9 @@ fn seed_toolset_profiles(graph: &GraphDomain) -> anyhow::Result<()> {
                 "life_graph".into(),
             ],
             allowed_skills: vec![
+                // Governed outbound HTTP eligibility (necessary, not sufficient —
+                // a binding must still grant the agent). See the net.http skill.
+                "net.http".into(),
                 "handoff.back".into(),
                 "capability.request".into(),
                 "memory.fix".into(),
@@ -5443,6 +5498,9 @@ fn seed_toolset_profiles(graph: &GraphDomain) -> anyhow::Result<()> {
             ],
             allowed_classes: vec!["session".into(), "utility".into(), "life_graph".into()],
             allowed_skills: vec![
+                // Governed outbound HTTP eligibility (necessary, not sufficient —
+                // a binding must still grant the agent). See the net.http skill.
+                "net.http".into(),
                 "handoff.back".into(),
                 "context.synthesize".into(),
                 "session.recover".into(),
@@ -5483,6 +5541,9 @@ fn seed_toolset_profiles(graph: &GraphDomain) -> anyhow::Result<()> {
                 "life_graph".into(),
             ],
             allowed_skills: vec![
+                // Governed outbound HTTP eligibility (necessary, not sufficient —
+                // a binding must still grant the agent). See the net.http skill.
+                "net.http".into(),
                 "handoff.back".into(),
                 "capability.request".into(),
                 "context.synthesize".into(),
@@ -9984,6 +10045,89 @@ mod tests {
                 .allowed_skills
                 .iter()
                 .any(|s| s == "handoff.to_role")
+        );
+    }
+
+    #[test]
+    fn net_http_egress_skill_is_seeded_and_held_by_every_philote_profile() {
+        let storage = SqliteGraphStorage::open(":memory:").expect("open sqlite");
+        let graph = GraphDomain::new(Arc::new(storage.adapter()));
+        seed_abstract_skill_catalog(&graph).expect("seed skill catalog");
+        seed_toolset_profiles(&graph).expect("seed toolset profiles");
+
+        // The governed-egress SkillDAG gate exists and is validated (so it
+        // projects and can gate an IntegrationBinding's grant_skills).
+        let skill = graph
+            .get_abstract_skill("net.http")
+            .expect("read net.http")
+            .expect("net.http must be seeded");
+        assert_eq!(
+            skill.validation_state,
+            ansible_mesh_core::graph::SkillValidationState::Validated
+        );
+        assert!(
+            skill.implied_tools.is_empty(),
+            "net.http is a pure eligibility gate — it must add no standing tool surface; \
+             the http:<binding>.request tools project dynamically per granted binding"
+        );
+
+        // Every philote profile carries net.http, so any binding may gate on it
+        // and know every philote is eligible ("each philote has access").
+        for profile_name in [
+            "orchestrator",
+            "codex",
+            "research",
+            "utility",
+            "scheduler",
+            "admin",
+            "architect",
+            "brain",
+            "virtuoso",
+            "travel",
+        ] {
+            let profile = graph
+                .get_toolset_profile(profile_name)
+                .expect("read profile")
+                .unwrap_or_else(|| panic!("{profile_name} profile must exist"));
+            assert!(
+                profile.allowed_skills.iter().any(|s| s == "net.http"),
+                "{profile_name} profile must hold net.http for governed egress eligibility"
+            );
+        }
+
+        // Necessary-but-not-sufficient: holding the skill does not itself grant
+        // any binding. A binding gated on net.http is available only to an agent
+        // that ALSO appears in its grant (owner/grant_agents). is_available_to
+        // never reads the HTTP target, so a minimal serde-defaulted binding
+        // suffices.
+        let binding: ansible_mesh_core::integration::IntegrationBinding =
+            serde_json::from_value(serde_json::json!({
+                "binding_id": "example-egress",
+                "owner_agent_id": "agent-owner",
+                "target": {
+                    "kind": "http",
+                    "base_url": "https://api.example.com",
+                    "allowed_methods": ["GET"]
+                },
+                "grant_agents": ["agent-granted"],
+                "grant_skills": ["net.http"],
+                "requires_approval": true,
+                "enabled": true,
+                "updated_at": 1
+            }))
+            .expect("construct example binding");
+        let holder_skills = vec!["net.http".to_string()];
+        assert!(
+            binding.is_available_to("agent-granted", &holder_skills),
+            "an agent both granted and holding net.http can use the binding"
+        );
+        assert!(
+            !binding.is_available_to("agent-other", &holder_skills),
+            "holding net.http without a binding grant must NOT grant egress"
+        );
+        assert!(
+            !binding.is_available_to("agent-granted", &[]),
+            "being granted without holding net.http must NOT satisfy the SkillDAG gate"
         );
     }
 

