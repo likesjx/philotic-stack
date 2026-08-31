@@ -55,7 +55,6 @@ mod memory_promotion;
 mod memory_report;
 mod mesh;
 mod muninn_provision;
-mod sensor_scripts;
 mod vault;
 
 mod service;

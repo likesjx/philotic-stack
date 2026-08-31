@@ -15,6 +15,7 @@ pub mod loop_action;
 pub mod node_edit;
 pub mod ontology;
 pub mod projection;
+pub mod sensor_scripts;
 pub mod zoning;
 
 use serde::{Deserialize, Serialize};

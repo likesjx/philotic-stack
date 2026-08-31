@@ -3,7 +3,7 @@ title: Scripted Hotel Sensors Proposal
 doc_type: proposal
 domain: runtime-and-sessions
 status: proposed
-last_updated: 2026-08-29
+last_updated: 2026-08-31
 tags:
 - cron
 - scheduling
@@ -62,36 +62,62 @@ Rust living in a guest instead of hotel-native scheduling:
    jobs are graph rows with `cron.list`; sensors should be too.
 
 This proposal keeps the debugged core (the due-reminder check itself is
-correct and stays; only its home changes) and moves scheduling + execution
-into the hotel's existing `CronTicker`, exactly where the Distributed Cron
-Scheduler ([DISTRIBUTED_CRON_PROPOSAL.md](DISTRIBUTED_CRON_PROPOSAL.md))
-already fires `memory.hygiene`, dream-sweep, and autonomy-sweep in-process
-via a sentinel `target_role` intercept in `fire()`.
+correct and stays; only its home changes).
+
+**Pivot, 2026-08-31**: the first design (below the line, for history) put
+the Rhai engine in `aiua`'s `CronTicker`, reusing the sentinel `target_role`
+intercept the Distributed Cron Scheduler
+([DISTRIBUTED_CRON_PROPOSAL.md](DISTRIBUTED_CRON_PROPOSAL.md)) already uses
+for `memory.hygiene`, dream-sweep, and autonomy-sweep. Tracing the mesh/tool
+dispatch code (`crates/philote/src/tool_exec.rs`, `turn_loop.rs`,
+`crates/datasource/src/runtime.rs`) to design `query_remote` surfaced a
+better fit: `data-memorygraphrag` already runs a generic inbound-task loop
+(`run_datasource_controller`) that resolves a `DatasourceProvider` by task
+kind and calls `invoke()` — exactly what `LifeGraphProvider` already does
+for the 18 `life.*` tools. A sensor is now a `SensorProvider` living in that
+*same* process, implementing that *same* trait, holding an `Arc` to the
+guest's own `LifeGraphProvider` — so `life_call` binds directly to
+`LifeGraphProvider::invoke()` with zero IPC hop, and the mesh-LifeGraph
+question (the proposal's biggest open question below) disappears rather
+than needing a new proxy. `aiua`'s `CronTicker` needed **no new code at
+all**: a sensor `CronJob` is an ordinary `target_role: "life-graph-runner"`
+delivery, identical to any other cron job. The slice-1 sentinel intercept
+and in-process engine that had briefly lived in `crates/aiua/src/
+sensor_scripts.rs` were removed in the same commit as this rewrite.
 
 ## Core Recommendation
 
-**One new sentinel, N graph-stored scripts** — not one sentinel per sensor.
-`fire()` gains a single new intercept: jobs whose `target_role` is
-`crate::sensor_scripts::CRON_TARGET_ROLE`. The job's `payload` names a
-`sensor_id`; the actual check logic is a **Rhai script** stored as a graph
-node (`config:sensor_script:<sensor_id>`, same `NODE_KIND_CONFIG` storage
+**One new `DatasourceProvider`, N hotel-config-stored scripts.**
+`data-memorygraphrag` gains `SensorProvider` (`crates/data-memorygraphrag/
+src/sensor_provider.rs`), registered alongside `LifeGraphProvider` in the
+guest's provider list. It matches `DatasourceTask.kind == "sensor.run"`.
+The task's `parameters.sensor_id` names the sensor; the check logic is a
+**Rhai script** (`crates/data-memorygraphrag/src/sensor_scripts.rs`) stored
+as ordinary hotel config (`sensor_script:<sensor_id>`, same storage
 `heartbeat_chat_id` already uses — durable, no ansible, active on the very
-next tick).
+next tick, read/written over the guest's existing `GetConfig`/`SetConfig`
+IPC).
 
 ```
-CronJob { target_role: sensor_scripts::CRON_TARGET_ROLE,
-          payload: {"sensor_id": "reminders"}, schedule: "0 */5 * * * * *" }
+CronJob { target_role: "life-graph-runner",
+          payload: {"kind": "sensor.run", "sensor_id": "reminders"},
+          schedule: "0 */5 * * * * *" }
         │
-        ▼ fire() intercepts
-sensor_scripts::evaluate(sensor_id)
-        │  loads config:sensor_script:reminders (Rhai source)
-        │  binds a curated function surface (below)
+        ▼ ordinary cron→role delivery — no aiua-side special case
+data-memorygraphrag's run_datasource_controller receives the task
+        │  ProviderRegistry resolves SensorProvider (kind == "sensor.run")
+        ▼
+SensorProvider::invoke()
+        │  loads sensor_script:reminders over GetConfig (guest's real identity)
+        │  runs the Rhai engine (sensor_scripts::run_script), binding a
+        │  curated function surface (below) — life_call goes straight to
+        │  this process's own LifeGraphProvider::invoke(), no IPC
         ▼
 Rhai script returns: Quiet | Deliver{target_role, message} | Investigate{target_role, brief}
         │
-        ▼ Deliver/Investigate fall through to the SAME TaskInvoke / paracrine
-          dispatch paths fire() and delegate.whisper already use — no new
-          delivery machinery.
+        ▼ Deliver reuses the SAME EmitTask IPC call PR #463's heartbeat
+          prototype already proved live — under the guest's real identity,
+          not a synthetic "philotic-heartbeat" one.
 ```
 
 Why Rhai: pure Rust (`rhai` crate, no C dependency — worth protecting,
@@ -99,7 +125,10 @@ vps-jane already OOM-kills release links on a heavier build), sandboxed by
 default (no file/process/network access unless a function is explicitly
 registered into the engine), and cheap to embed. The operator only ever
 writes the check logic; the framework owns everything that can hurt the
-hotel.
+hotel. Rhai's native functions are synchronous, but `life_call`'s
+underlying work (`LifeGraphProvider::invoke`) is `async` — the bridge is
+`tokio::task::block_in_place` + `Handle::block_on`, which requires (and
+gets, by default) a multi-threaded Tokio runtime.
 
 ## Script API surface (curated, not general-purpose)
 
@@ -108,12 +137,12 @@ script gets, deliberately narrow:
 
 | Function | Purpose | Status |
 |---|---|---|
-| `config_value(key) -> string` | Read a single hotel config value. | Implemented (slice 1) |
-| `now_iso()` | Current UTC time, ISO 8601. | Implemented (slice 1) |
-| `operator_local(iso, tz) -> string` | Format a UTC timestamp in an operator timezone. | Implemented (slice 1) |
-| `deliver(target_role, message)` | Pure delivery — pre-formatted text, the agent just relays it. | Implemented (slice 1) |
-| `investigate(target_role, brief)` | Hand a finding to a philote for actual reasoning, via the paracrine lookaside (`delegate.whisper`, see [WHISPER_PROTOCOL_PROPOSAL.md](WHISPER_PROTOCOL_PROPOSAL.md)). | Reserved — errors until wired |
-| `query_remote(cypher) -> [map]` | Read the mesh LifeGraph (Memgraph/bolt). | Not started — see Open Questions |
+| `config_value(key) -> string` | Read a single hotel config value. | Implemented |
+| `now_iso()` | Current UTC time, ISO 8601. | Implemented |
+| `operator_local(iso, tz) -> string` | Format a UTC timestamp in an operator timezone. | Implemented |
+| `deliver(target_role, message)` | Pure delivery — pre-formatted text, the agent just relays it. | Implemented |
+| `investigate(target_role, brief)` | Hand a finding to a philote for actual reasoning, via the paracrine lookaside (`delegate.whisper`, see [WHISPER_PROTOCOL_PROPOSAL.md](WHISPER_PROTOCOL_PROPOSAL.md)). | Verdict wired, dispatch path not yet built |
+| `life_call(tool, args) -> map` | Call any `life.*` tool (`life.recall`, `life.list`, `life.view.node`, …) against the mesh LifeGraph, in-process. | Implemented — replaces the `query_remote` design below |
 
 No file IO, no process spawn, no arbitrary network — a script that needs a
 capability outside this surface is a signal the framework needs a new
@@ -122,8 +151,9 @@ function, not that scripts should get broader access.
 ## Data model
 
 ```rust
-// crates/aiua/src/sensor_scripts.rs — NODE_KIND_CONFIG-backed record, not a
-// new table, same pattern as config:heartbeat_chat_id.
+// crates/data-memorygraphrag/src/sensor_scripts.rs — hotel-config-backed
+// record (sensor_script:<id>), same pattern as config:heartbeat_chat_id,
+// read/written by the guest over GetConfig/SetConfig IPC.
 struct SensorScript {
     id: String,              // "reminders", "stale-open-loops", ...
     source: String,          // Rhai source
@@ -139,7 +169,7 @@ struct SensorScript {
 ```
 
 No new `CronJob` fields — `payload` already carries arbitrary JSON,
-`target_role` already selects an in-process intercept for other job kinds.
+`target_role` is an ordinary role-delivery target (not a sentinel).
 Intentionally the smallest possible extension of an already-implemented,
 already-mesh-aware system. A hotel with no matching `sensor_script:<id>`
 row simply has nothing to run when a `CronJobSync`-replicated job
@@ -152,8 +182,15 @@ no separate enabled-locally flag needed (unlike `memory.hygiene`/
 - `data-memorygraphrag::heartbeat` module and `spawn_heartbeat_timer` —
   the due-reminder check becomes the first `SensorScript`, translated
   from Rust cypher-builders (already just string templates) into Rhai.
-- The `philotic-heartbeat` pseudo-guest IPC self-connect pattern
-  (`fetch_hotel_config`/`emit_delivery_turn` in `main.rs`).
+  (Not done yet — see Status, slice 2.)
+- The `philotic-heartbeat` *synthetic-identity* pseudo-guest pattern in
+  `fetch_hotel_config`/`emit_delivery_turn` (`main.rs`) — `SensorProvider`'s
+  equivalents (`fetch_config`/`deliver` in `sensor_provider.rs`) still open
+  a fresh IPC connection per call (`DatasourceProvider::invoke` has no
+  access to the runtime's already-open connection, and changing that trait
+  would touch every provider), but now under the guest's *real* identity,
+  and the quiet-tick path — the overwhelming common case — never connects
+  at all.
 - `PHILOTIC_HEARTBEAT_*` env vars — schedule and chat routing become
   ordinary `CronJob` fields, administered the same way every other cron
   job already is.
@@ -162,51 +199,55 @@ no separate enabled-locally flag needed (unlike `memory.hygiene`/
   `guaranteed`/staggered-offset/`CronFired` dedup already solves
   exactly-once-across-the-mesh properly, for free, if a sensor ever needs
   it.
+- The `aiua`-side sentinel intercept and in-process Rhai engine slice 1
+  originally built (`crates/aiua/src/sensor_scripts.rs`, the `fire()`
+  intercept, the `rhai` dependency in `crates/aiua/Cargo.toml`) — removed
+  in the same commit as this pivot. A sensor `CronJob` needs no special
+  case in `CronTicker` at all.
 
 ## Status
 
-**Slice 1 — done, test-green** (`codex/scripted-hotel-sensors`, commit
-`98e03e3d`): `fire()` sentinel intercept, `SensorScript` graph storage,
-`config_value`/`now_iso`/`operator_local`/`deliver` wired end to end.
-`investigate` registered but errors (not yet wired to a dispatch path).
-`query_remote` deliberately not registered this slice.
+**Framework — done, test-green** (`codex/scripted-hotel-sensors`):
+`SensorProvider` registered in `data-memorygraphrag`'s provider list,
+`SensorScript` hotel-config storage (over `GetConfig`/`SetConfig` IPC),
+`config_value`/`now_iso`/`operator_local`/`deliver`/`life_call` wired end
+to end, `life_call` bound directly to the guest's own
+`LifeGraphProvider::invoke` (201 tests green across the crate: 195 lib +
+53 bin, including 6 new `sensor_scripts` tests and the round-trip through
+`life_call`). `investigate` returns a verdict but has no dispatch path yet.
 
-**Slice 2 — not started.** Port `heartbeat.rs`'s due-reminder logic to a
-Rhai script; requires resolving the `query_remote` open question first,
-since the reminders check reads the mesh LifeGraph (Memgraph), which
-`aiua` has no client for today.
+**Slice 2 — not started.** Port `heartbeat.rs`'s due-reminder logic
+(`due_reminders_cypher`/`stamp_cypher`/`format_reminder_line`) to a Rhai
+script driving `life_call`, replacing `heartbeat_reminders_tick`. No
+longer blocked on a `query_remote` proxy — `life_call` already reads the
+mesh LifeGraph in-process.
 
 **Slice 3 — not started.** Delete the retired `data-memorygraphrag`
-module/pseudo-guest/env-vars once slice 2 is watched-live-green on
-vps-jane. Extend `cron.list`-style tooling to show sensor jobs with their
-`last_result`.
+heartbeat module/pseudo-guest/env-vars once slice 2 is watched-live-green
+on vps-jane. Extend `cron.list`-style tooling to show sensor jobs with
+their `last_result`.
 
 ## Open Questions
 
 - ~~Sentinel `target_role` intercept vs. a new `job_kind` discriminant
-  field on `CronJob`?~~ **Resolved by slice 1**: the sentinel pattern
-  works cleanly and is now the 4th job type using it
-  (`memory_hygiene`, `dream_sweep`, `autonomy_sweep`, `sensor_scripts`).
-  No reason to introduce a schema change for one dispatch point.
-- **How should a sensor script read the mesh LifeGraph, given `aiua` has
-  no bolt/cypher client and only the `data-memorygraphrag` guest does?**
-  This is bigger than the original "graceful degrade" framing — it's an
-  unbuilt IPC proxy. Candidate shapes:
-  - (a) A new synchronous-shaped `IpcRequest`/`IpcResponse` pair the
-    ticker sends to the guest and awaits with a timeout inside `fire()`
-    (blocking one cron tick on a guest round-trip — acceptable if bounded
-    and rare, since sensors already tolerate a 5-minute cadence).
-  - (b) `aiua` grows its own thin bolt client, duplicating what the guest
-    already has — more code, but no cross-process hop per tick.
-  - (c) Sensors that need remote data register on `data-memorygraphrag`'s
-    own tick loop instead of the hotel's, splitting the framework across
-    two processes — closest to today's shape, but reintroduces problem 2
-    above for exactly the sensors that need it most.
-  Lean (a): smallest new surface, keeps the "one hotel-native framework"
-  property, and the existing `EmitTask`/`GetConfig` IPC pattern already
-  proves guest round-trips from the hotel are workable.
+  field on `CronJob`?~~ **Resolved, then superseded**: the sentinel
+  pattern worked cleanly in slice 1, but the pivot to `SensorProvider`
+  removed the need for any `aiua`-side dispatch special-case at all — a
+  sensor `CronJob` is now an ordinary role delivery.
+- ~~How should a sensor script read the mesh LifeGraph, given `aiua` has
+  no bolt/cypher client and only the `data-memorygraphrag` guest does?~~
+  **Resolved by the pivot**: it doesn't need to — the engine now lives
+  *in* `data-memorygraphrag`, so `life_call` is an in-process call to
+  `LifeGraphProvider::invoke`, not a cross-process proxy.
 - Does `operator_approved` on a `SensorScript` need UI/ceremony beyond "an
   operator or an agent with standing approval authority wrote this row"?
   Leaning no for now — matches `heartbeat_chat_id`'s existing trust
-  boundary (whoever can write to this hotel's graph). Revisit if a script
+  boundary (whoever can write to this hotel's config). Revisit if a script
   surface becomes reachable from a lower-trust caller.
+- Should `sensor.run` join `is_read_only_capability`'s whitelist in
+  `crates/datasource/src/runtime.rs`? Deliberately left off for now: an
+  unlisted kind takes the *write* path (inline, sequential, and the
+  runtime's own comment confirms partial writes before a timeout deadline
+  stay durable, not rolled back) — the right default for a sensor that
+  stamps dispatch state before emitting. Revisit only if sensor volume
+  ever needs the read path's off-critical-path concurrency.
