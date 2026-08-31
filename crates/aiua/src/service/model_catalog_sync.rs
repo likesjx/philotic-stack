@@ -6,10 +6,17 @@
 //! the self-heal queue for operator visibility. This is the early-warning that
 //! would have flagged the `gemini-2.0-flash` retirement before it wedged turns.
 //!
-//! First cut: **OpenRouter** (`/api/v1/models`, public — no key). OpenRouter
-//! aggregates Google/OpenAI/Anthropic models, so this already gives cross-
-//! provider coverage. The Google-direct fetch (which needs the vault-backed key)
-//! is a trivial add-on once this pattern is proven.
+//! Providers: **OpenRouter** (public, no key), **Gemini** (Google
+//! generativelanguage, vault-backed key), **OpenAI** and **Anthropic** (vault
+//! keys), **Ollama** (local `/api/tags` — per-hotel by design), and **MLX**
+//! (operator-declared `mlx_available_models` config list). Each provider is
+//! fetched independently; a missing key or unreachable local server skips
+//! that provider without failing the pass.
+//!
+//! Each pass also assembles the MODEL-GRAPH PROJECTION payload
+//! (`model_graph.projection`): catalogs + agents + role ladders/bindings in
+//! one config node, consumed by the Memgraph ingest on vps-jane (a DERIVED
+//! analytical read-model — never routing authority).
 //!
 //! Authority split (per MODEL_GRAPH_CATALOG_PROPOSAL): this writes catalog facts
 //! + provenance and raises alerts. It does not touch live availability,
@@ -24,18 +31,18 @@ use tracing::{info, warn};
 use ansible_mesh_core::domain::GraphDomain;
 use ansible_mesh_core::heal_queue::{HealQueueStorage, SqliteHealQueueStorage};
 use ansible_mesh_core::model_catalog_discovery::{
-    CatalogDiffEvent, CatalogDiffKind, DiscoveredModel, diff_catalog, parse_openrouter_models,
+    CatalogDiffEvent, CatalogDiffKind, DiscoveredModel, diff_catalog, parse_anthropic_models,
+    parse_google_models, parse_ollama_models, parse_openai_models, parse_openrouter_models,
 };
 use ansible_mesh_core::model_routing::{
     DEFAULT_FALLBACK_TIERS, ProviderRouting, RoutingImpact, routing_impact_for_model,
 };
-use ansible_mesh_core::provider_keys::provider_key_specs;
+use ansible_mesh_core::provider_keys::{provider_key_spec, provider_key_specs};
 
-const OPENROUTER_URL: &str = "https://openrouter.ai/api/v1/models";
-/// Config-node key holding the last OpenRouter discovery snapshot, so diffs
-/// survive hotel restarts (the deprecation that bit us happened *during*
-/// downtime — an in-memory `prev` would have missed it).
-const SNAPSHOT_KEY: &str = "model_catalog_discovery.openrouter";
+/// Providers this job knows how to fetch, in sync order. Each gets its own
+/// `model_catalog.<provider>` compact node and
+/// `model_catalog_discovery.<provider>` diff snapshot.
+const PROVIDERS: &[&str] = &["openrouter", "gemini", "openai", "anthropic", "ollama", "mlx"];
 /// Config-node key holding the COMPACT queryable catalog guests read over
 /// `GetConfig` — the hotel's "possible models" surface. philote's `/models`
 /// drill-down and `/model` tool badges consume this instead of each guest
@@ -44,6 +51,9 @@ const SNAPSHOT_KEY: &str = "model_catalog_discovery.openrouter";
 /// one terse object per model —
 /// `{"id","name","tools":bool?,"ctx":u32?,"in":f64?,"out":f64?,"think":bool?}`.
 pub const CATALOG_KEY: &str = "model_catalog.openrouter";
+/// Config-node key holding the assembled model-graph projection payload
+/// (catalogs + agents + role ladders/bindings) the Memgraph ingest consumes.
+pub const PROJECTION_KEY: &str = "model_graph.projection";
 const GUEST_ID: &str = "model-catalog-sync";
 const SYNC_INTERVAL_SECS: u64 = 6 * 60 * 60;
 const INITIAL_DELAY_SECS: u64 = 45;
@@ -75,7 +85,10 @@ pub fn spawn_loop(graph: Arc<GraphDomain>, db_path: String) {
     });
 }
 
-/// One discovery pass: fetch → diff vs persisted snapshot → persist → alert.
+/// One discovery pass over every provider: fetch → diff vs persisted
+/// snapshot → persist compact catalog → alert, each provider independent (a
+/// missing key or unreachable local server skips that provider). Ends by
+/// assembling the model-graph projection payload.
 pub async fn run_once(
     graph: &GraphDomain,
     heal: Option<&Arc<dyn HealQueueStorage>>,
@@ -86,35 +99,214 @@ pub async fn run_once(
         .map(|d| d.as_secs())
         .ok();
 
-    let body = http
-        .get(OPENROUTER_URL)
+    let mut catalogs: std::collections::BTreeMap<String, Vec<serde_json::Value>> =
+        std::collections::BTreeMap::new();
+    for provider in PROVIDERS {
+        match fetch_provider_models(graph, http, provider, now_secs).await {
+            Ok(Some(discovered)) => {
+                if let Err(e) = sync_provider(graph, heal, provider, &discovered) {
+                    warn!("model-catalog-sync: [{provider}] sync failed: {e:#}");
+                    continue;
+                }
+                catalogs.insert(provider.to_string(), compact_catalog(&discovered));
+            }
+            Ok(None) => {
+                info!(provider, "model-catalog-sync: skipped (no key/config or local server absent)");
+            }
+            Err(e) => {
+                warn!("model-catalog-sync: [{provider}] fetch failed: {e:#}");
+            }
+        }
+    }
+
+    if let Err(e) = persist_model_graph_projection(graph, &catalogs, now_secs) {
+        warn!("model-catalog-sync: projection persist failed: {e:#}");
+    }
+    Ok(())
+}
+
+/// Fetch one provider's live model list. `Ok(None)` = provider intentionally
+/// skipped (no key configured, local server absent, no MLX list declared).
+async fn fetch_provider_models(
+    graph: &GraphDomain,
+    http: &reqwest::Client,
+    provider: &str,
+    now_secs: Option<u64>,
+) -> Result<Option<Vec<DiscoveredModel>>> {
+    match provider {
+        "openrouter" => {
+            let base = provider_base(graph, "openrouter");
+            let body = fetch_text(http.get(format!("{base}/v1/models"))).await?;
+            Ok(Some(parse_openrouter_models(&body, now_secs)?))
+        }
+        "gemini" => {
+            let Some(key) = provider_api_key(graph, "gemini") else {
+                return Ok(None);
+            };
+            let base = provider_base(graph, "gemini");
+            let body = fetch_text(
+                http.get(format!("{base}/v1beta/models"))
+                    .query(&[("key", key.as_str()), ("pageSize", "1000")]),
+            )
+            .await?;
+            Ok(Some(parse_google_models(&body, now_secs)?))
+        }
+        "openai" => {
+            let Some(key) = provider_api_key(graph, "openai") else {
+                return Ok(None);
+            };
+            let base = provider_base(graph, "openai");
+            let body = fetch_text(
+                http.get(format!("{base}/v1/models"))
+                    .header("Authorization", format!("Bearer {key}")),
+            )
+            .await?;
+            Ok(Some(parse_openai_models(&body, now_secs)?))
+        }
+        "anthropic" => {
+            let Some(key) = provider_api_key(graph, "anthropic") else {
+                return Ok(None);
+            };
+            let base = provider_base(graph, "anthropic");
+            let body = fetch_text(
+                http.get(format!("{base}/v1/models?limit=1000"))
+                    .header("x-api-key", key)
+                    .header("anthropic-version", "2023-06-01"),
+            )
+            .await?;
+            Ok(Some(parse_anthropic_models(&body, now_secs)?))
+        }
+        "ollama" => {
+            let base = config_string(graph, "ollama_base_url")
+                .unwrap_or_else(|| "http://localhost:11434".to_string());
+            let base = base.trim_end_matches('/');
+            // A hotel without a local Ollama is normal — connection refusal
+            // is a skip, not an error.
+            let response = match http.get(format!("{base}/api/tags")).send().await {
+                Ok(r) => r,
+                Err(_) => return Ok(None),
+            };
+            let body = response
+                .error_for_status()
+                .context("ollama /api/tags returned an error status")?
+                .text()
+                .await
+                .context("read ollama /api/tags body")?;
+            Ok(Some(parse_ollama_models(&body, now_secs)?))
+        }
+        "mlx" => {
+            // MLX has no listing endpoint; the operator declares installed
+            // models via the `mlx_available_models` config key (JSON array).
+            let Some(raw) = graph.get_config_value("mlx_available_models")? else {
+                return Ok(None);
+            };
+            let ids: Vec<String> = serde_json::from_str(&raw).unwrap_or_default();
+            if ids.is_empty() {
+                return Ok(None);
+            }
+            Ok(Some(
+                ids.into_iter()
+                    .map(|id| DiscoveredModel {
+                        provider: "mlx".to_string(),
+                        endpoint_family: "mlx-local".to_string(),
+                        model_ref: id.clone(),
+                        provider_model_ref: id,
+                        display_name: None,
+                        context_window_tokens: None,
+                        input_cost_per_million: Some(0.0),
+                        output_cost_per_million: Some(0.0),
+                        modalities: vec!["text".to_string()],
+                        reasoning_default: None,
+                        supports_tools: None,
+                        declared_task_kinds: vec!["text.generate".to_string()],
+                        lifecycle_hint: None,
+                        source_url: "config:mlx_available_models".to_string(),
+                        fetched_at_secs: now_secs,
+                    })
+                    .collect(),
+            ))
+        }
+        other => anyhow::bail!("unknown catalog provider '{other}'"),
+    }
+}
+
+/// GET a URL and return the body text, folding HTTP-status errors in.
+async fn fetch_text(request: reqwest::RequestBuilder) -> Result<String> {
+    request
         .send()
         .await
-        .context("fetch OpenRouter model list")?
+        .context("fetch model list")?
         .error_for_status()
-        .context("OpenRouter model list returned an error status")?
+        .context("model list returned an error status")?
         .text()
         .await
-        .context("read OpenRouter model list body")?;
+        .context("read model list body")
+}
 
-    let discovered = parse_openrouter_models(&body, now_secs)?;
+/// Resolve a provider's API key: process env first (ephemeral/CI), then the
+/// vault-backed config ref. `None` = provider not configured on this hotel.
+fn provider_api_key(graph: &GraphDomain, provider: &str) -> Option<String> {
+    let spec = provider_key_spec(provider)?;
+    if let Ok(v) = std::env::var(spec.env_api_key) {
+        let v = v.trim().to_string();
+        if !v.is_empty() {
+            return Some(v);
+        }
+    }
+    let secret_ref = config_string(graph, spec.api_key_ref_key)?;
+    crate::vault::resolve_secret(
+        graph,
+        &secret_ref,
+        &crate::vault::SecretAccess {
+            role: "model".to_string(),
+            guest_id: GUEST_ID.to_string(),
+        },
+    )
+    .ok()
+    .flatten()
+}
 
-    let prev: Vec<DiscoveredModel> = match graph.get_config_value(SNAPSHOT_KEY)? {
+/// Provider base URL: configured override, else the spec default. Trailing
+/// slashes and `/v1` are normalized off so path joins stay predictable.
+fn provider_base(graph: &GraphDomain, provider: &str) -> String {
+    let spec = provider_key_spec(provider);
+    let configured = spec
+        .and_then(|s| s.base_url_key)
+        .and_then(|key| config_string(graph, key));
+    let base = configured
+        .or_else(|| {
+            spec.and_then(|s| s.default_base_url)
+                .map(str::to_string)
+        })
+        .unwrap_or_else(|| "https://openrouter.ai/api".to_string());
+    base.trim_end_matches('/')
+        .trim_end_matches("/v1")
+        .trim_end_matches('/')
+        .to_string()
+}
+
+/// Diff one provider's snapshot, persist compact catalog + snapshot, alert.
+fn sync_provider(
+    graph: &GraphDomain,
+    heal: Option<&Arc<dyn HealQueueStorage>>,
+    provider: &str,
+    discovered: &[DiscoveredModel],
+) -> Result<()> {
+    let snapshot_key = format!("model_catalog_discovery.{provider}");
+    let catalog_key = format!("model_catalog.{provider}");
+
+    let prev: Vec<DiscoveredModel> = match graph.get_config_value(&snapshot_key)? {
         Some(json) => serde_json::from_str(&json).unwrap_or_default(),
         None => Vec::new(),
     };
     let first_run = prev.is_empty();
-
-    let diffs = diff_catalog(&prev, &discovered);
+    let diffs = diff_catalog(&prev, discovered);
 
     // Persist the guest-facing compact catalog FIRST — even a first run makes
     // "possible models" immediately queryable — then the diff snapshot before
     // alerting so a restart mid-run can't cause the same change to alert twice.
-    graph.set_config_value(
-        CATALOG_KEY,
-        &serde_json::to_string(&compact_catalog(&discovered))?,
-    )?;
-    graph.set_config_value(SNAPSHOT_KEY, &serde_json::to_string(&discovered)?)?;
+    graph.set_config_value(&catalog_key, &serde_json::to_string(&compact_catalog(discovered))?)?;
+    graph.set_config_value(&snapshot_key, &serde_json::to_string(discovered)?)?;
 
     let mut alerts = 0usize;
     // Skip alerts on the first run — with no baseline everything is "Added" and
@@ -151,7 +343,7 @@ pub async fn run_once(
     }
 
     info!(
-        provider = "openrouter",
+        provider,
         models = discovered.len(),
         diffs = diffs.len(),
         alerts,
@@ -159,6 +351,57 @@ pub async fn run_once(
         "model-catalog-sync: catalog synced"
     );
     Ok(())
+}
+
+/// Assemble and persist the model-graph projection payload: every provider's
+/// compact catalog plus this hotel's agents and role ladders/bindings, in one
+/// config node the Memgraph ingest (vps-jane, co-located with the LifeGraph
+/// runner) consumes over `GetConfig`. Derived read-model input only — nothing
+/// on the dispatch path reads this.
+fn persist_model_graph_projection(
+    graph: &GraphDomain,
+    catalogs: &std::collections::BTreeMap<String, Vec<serde_json::Value>>,
+    now_secs: Option<u64>,
+) -> Result<()> {
+    let hotel =
+        std::env::var("PHILOTIC_NODE_ID").unwrap_or_else(|_| "local-aiua-01".to_string());
+    let agents: Vec<String> = graph
+        .list_agent_identities()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|a| a.agent_id)
+        .collect();
+    let roles: Vec<serde_json::Value> = graph
+        .list_all_role_incarnations()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|rec| {
+            let ladder = if rec.turn_loop_config.fallback_tiers.is_empty() {
+                DEFAULT_FALLBACK_TIERS
+                    .iter()
+                    .map(|t| t.to_string())
+                    .collect()
+            } else {
+                rec.turn_loop_config.fallback_tiers.clone()
+            };
+            serde_json::json!({
+                "agent_id": rec.agent_id,
+                "role_name": rec.role_name,
+                "guest_id": rec.guest_id,
+                "ladder": ladder,
+                "bindings": rec.turn_loop_config.model_bindings,
+                "content_policy": rec.content_policy,
+            })
+        })
+        .collect();
+    let payload = serde_json::json!({
+        "hotel": hotel,
+        "generated_at": now_secs,
+        "providers": catalogs,
+        "agents": agents,
+        "roles": roles,
+    });
+    graph.set_config_value(PROJECTION_KEY, &serde_json::to_string(&payload)?)
 }
 
 /// Project the full discovery snapshot into the compact guest-facing catalog
@@ -390,6 +633,62 @@ mod tests {
         assert!(
             compact[0].get("think").is_none(),
             "unreported fields are omitted"
+        );
+    }
+
+    #[test]
+    fn projection_payload_includes_roles_and_catalogs() {
+        use ansible_mesh_core::graph::{RoleIncarnationRecord, RoleReadinessState, TurnLoopConfig};
+        use ansible_mesh_core::sqlite_storage::SqliteGraphStorage;
+
+        let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
+        let graph = GraphDomain::new(std::sync::Arc::new(graph_store.adapter()));
+        graph
+            .upsert_role_incarnation(&RoleIncarnationRecord {
+                agent_id: "agent-jane".into(),
+                role_name: "vixen".into(),
+                guest_id: "agent-jane:vixen".into(),
+                toolset_profile: "orchestrator".into(),
+                role_identity_addendum: None,
+                role_manifest: None,
+                is_admin: false,
+                readiness_state: RoleReadinessState::Configured,
+                inactive_ttl_seconds: None,
+                turn_loop_config: TurnLoopConfig {
+                    fallback_tiers: vec!["model.openrouter".into()],
+                    model_bindings: [(
+                        "model.openrouter".to_string(),
+                        "sao10k/l3.1-euryale-70b".to_string(),
+                    )]
+                    .into_iter()
+                    .collect(),
+                    ..Default::default()
+                },
+                home_node: None,
+                ..Default::default()
+            })
+            .expect("seed role");
+
+        let mut catalogs = std::collections::BTreeMap::new();
+        catalogs.insert(
+            "openrouter".to_string(),
+            vec![serde_json::json!({"id": "sao10k/l3.1-euryale-70b", "tools": true})],
+        );
+        persist_model_graph_projection(&graph, &catalogs, Some(42)).expect("persist projection");
+
+        let raw = graph
+            .get_config_value(PROJECTION_KEY)
+            .expect("read projection")
+            .expect("projection present");
+        let payload: serde_json::Value = serde_json::from_str(&raw).expect("valid JSON");
+        assert_eq!(payload["generated_at"], 42);
+        assert_eq!(payload["providers"]["openrouter"][0]["id"], "sao10k/l3.1-euryale-70b");
+        let role = &payload["roles"][0];
+        assert_eq!(role["role_name"], "vixen");
+        assert_eq!(role["ladder"][0], "model.openrouter");
+        assert_eq!(
+            role["bindings"]["model.openrouter"],
+            "sao10k/l3.1-euryale-70b"
         );
     }
 }

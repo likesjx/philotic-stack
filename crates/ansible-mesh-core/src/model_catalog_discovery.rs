@@ -414,6 +414,147 @@ pub fn parse_google_models(
     Ok(out)
 }
 
+// ------------------------------------------------------------------------
+// OpenAI: GET https://api.openai.com/v1/models  (Bearer key)
+// ------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+struct OpenAIList {
+    data: Vec<OpenAIModel>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenAIModel {
+    id: String,
+}
+
+/// Parse an OpenAI `/v1/models` response. The endpoint is capability-sparse
+/// (ids only — no context/pricing/tool metadata), so most fields stay `None`;
+/// existence + retirement diffing is the value.
+pub fn parse_openai_models(
+    body: &str,
+    fetched_at_secs: Option<u64>,
+) -> anyhow::Result<Vec<DiscoveredModel>> {
+    let list: OpenAIList = serde_json::from_str(body)?;
+    let source_url = "https://api.openai.com/v1/models".to_string();
+    Ok(list
+        .data
+        .into_iter()
+        .map(|m| DiscoveredModel {
+            provider: "openai".to_string(),
+            endpoint_family: "openai-hosted".to_string(),
+            model_ref: m.id.clone(),
+            provider_model_ref: m.id,
+            display_name: None,
+            context_window_tokens: None,
+            input_cost_per_million: None,
+            output_cost_per_million: None,
+            modalities: Vec::new(),
+            reasoning_default: None,
+            supports_tools: None,
+            declared_task_kinds: Vec::new(),
+            lifecycle_hint: None,
+            source_url: source_url.clone(),
+            fetched_at_secs,
+        })
+        .collect())
+}
+
+// ------------------------------------------------------------------------
+// Anthropic: GET https://api.anthropic.com/v1/models  (x-api-key + version)
+// ------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+struct AnthropicList {
+    data: Vec<AnthropicModel>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AnthropicModel {
+    id: String,
+    #[serde(default)]
+    display_name: Option<String>,
+}
+
+/// Parse an Anthropic `/v1/models` response. Every currently-listed Claude
+/// model supports tool use, so `supports_tools` is declared `Some(true)`.
+pub fn parse_anthropic_models(
+    body: &str,
+    fetched_at_secs: Option<u64>,
+) -> anyhow::Result<Vec<DiscoveredModel>> {
+    let list: AnthropicList = serde_json::from_str(body)?;
+    let source_url = "https://api.anthropic.com/v1/models".to_string();
+    Ok(list
+        .data
+        .into_iter()
+        .map(|m| DiscoveredModel {
+            provider: "anthropic".to_string(),
+            endpoint_family: "anthropic-hosted".to_string(),
+            model_ref: m.id.clone(),
+            provider_model_ref: m.id,
+            display_name: m.display_name,
+            context_window_tokens: None,
+            input_cost_per_million: None,
+            output_cost_per_million: None,
+            modalities: vec!["text".to_string()],
+            reasoning_default: None,
+            supports_tools: Some(true),
+            declared_task_kinds: vec!["text.generate".to_string()],
+            lifecycle_hint: None,
+            source_url: source_url.clone(),
+            fetched_at_secs,
+        })
+        .collect())
+}
+
+// ------------------------------------------------------------------------
+// Ollama (local): GET http://localhost:11434/api/tags
+// ------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+struct OllamaList {
+    #[serde(default)]
+    models: Vec<OllamaModel>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OllamaModel {
+    name: String,
+}
+
+/// Parse a local Ollama `/api/tags` response. The catalog is PER-HOTEL by
+/// design (whatever the operator pulled locally), so consumers must treat
+/// each hotel's `model_catalog.ollama` as hotel-scoped truth. Local models
+/// are free — costs are declared zero rather than unknown.
+pub fn parse_ollama_models(
+    body: &str,
+    fetched_at_secs: Option<u64>,
+) -> anyhow::Result<Vec<DiscoveredModel>> {
+    let list: OllamaList = serde_json::from_str(body)?;
+    let source_url = "http://localhost:11434/api/tags".to_string();
+    Ok(list
+        .models
+        .into_iter()
+        .map(|m| DiscoveredModel {
+            provider: "ollama".to_string(),
+            endpoint_family: "ollama-local".to_string(),
+            model_ref: m.name.clone(),
+            provider_model_ref: m.name,
+            display_name: None,
+            context_window_tokens: None,
+            input_cost_per_million: Some(0.0),
+            output_cost_per_million: Some(0.0),
+            modalities: vec!["text".to_string()],
+            reasoning_default: None,
+            supports_tools: None,
+            declared_task_kinds: vec!["text.generate".to_string()],
+            lifecycle_hint: None,
+            source_url: source_url.clone(),
+            fetched_at_secs,
+        })
+        .collect())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

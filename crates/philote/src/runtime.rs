@@ -1590,13 +1590,14 @@ pub struct AgentRuntime {
     muninn_available: bool,
     /// Role configurations registered via `role.configure`, keyed by role_name.
     configured_roles: HashMap<String, CachedRoleConfig>,
-    /// Cached OpenRouter catalog snapshot for `/model` display: the set of
-    /// model ids whose endpoints accept tool calls, plus the set of all known
-    /// ids (absent-from-catalog models stay unannotated). Refreshed lazily
-    /// when older than [`OPENROUTER_CATALOG_TTL`]; `None` until first fetch or
-    /// when the last fetch failed (annotation is best-effort — dispatch-time
-    /// tools handling lives in model-router, not here).
-    openrouter_tools_catalog: Option<OpenRouterToolsCatalog>,
+    /// Cached per-provider model catalogs for `/model` badges and the
+    /// `/models` drill-down, read hotel-first from the config nodes
+    /// `model_catalog.<provider>` (written by aiua's model-catalog-sync) with
+    /// a direct-OpenRouter fallback. Refreshed lazily when older than
+    /// [`OPENROUTER_CATALOG_TTL`]; `None` until first fetch or when the last
+    /// fetch failed (annotation is best-effort — dispatch-time tools handling
+    /// lives in model-router, not here).
+    model_catalogs: Option<ModelCatalogs>,
     /// Agent profile (identity_text, soul_text, etc.) fetched from hotel at startup.
     /// Applied to every new session so the correct persona is used from the first turn.
     default_agent_profile: AgentProfile,
@@ -1662,23 +1663,30 @@ struct CatalogModelEntry {
     ctx: Option<u32>,
 }
 
-/// OpenRouter catalog snapshot. See the field docs on
-/// `AgentRuntime::openrouter_tools_catalog`.
-struct OpenRouterToolsCatalog {
+/// Per-provider catalog snapshots. See the field docs on
+/// `AgentRuntime::model_catalogs`.
+struct ModelCatalogs {
     fetched_at: std::time::Instant,
-    entries: Vec<CatalogModelEntry>,
+    by_provider: std::collections::BTreeMap<String, Vec<CatalogModelEntry>>,
 }
 
-impl OpenRouterToolsCatalog {
-    /// `Some(bool)` when the catalog lists the model AND reports its tool
-    /// capability; `None` for unknown models or unreported capability.
-    fn supports_tools(&self, model_id: &str) -> Option<bool> {
-        self.entries
+impl ModelCatalogs {
+    /// `Some(bool)` when the provider's catalog lists the model AND reports
+    /// its tool capability; `None` for unknown models or unreported.
+    fn supports_tools(&self, provider: &str, model_id: &str) -> Option<bool> {
+        self.by_provider
+            .get(provider)?
             .iter()
             .find(|e| e.id == model_id)
             .and_then(|e| e.tools)
     }
 }
+
+/// Providers whose `model_catalog.<provider>` config nodes the runtime reads.
+/// Mirrors aiua's discovery list; a provider without a node simply has no
+/// catalog on this hotel.
+const CATALOG_PROVIDERS: &[&str] =
+    &["openrouter", "gemini", "openai", "anthropic", "ollama", "mlx"];
 
 /// Refresh cadence for the `/model` tool-capability annotation catalog.
 const OPENROUTER_CATALOG_TTL: Duration = Duration::from_secs(600);
@@ -1716,10 +1724,10 @@ impl AgentRuntime {
     /// unreachable or the model isn't listed (annotation is skipped — the
     /// dispatch-time no-tools handling lives in model-router, not here).
     async fn openrouter_model_supports_tools(&mut self, model_id: &str) -> Option<bool> {
-        self.ensure_openrouter_catalog().await;
-        self.openrouter_tools_catalog
+        self.ensure_model_catalogs().await;
+        self.model_catalogs
             .as_ref()
-            .and_then(|c| c.supports_tools(model_id))
+            .and_then(|c| c.supports_tools("openrouter", model_id))
     }
 
     /// Refresh the cached catalog if stale. HOTEL-FIRST: reads the compact
@@ -1727,23 +1735,32 @@ impl AgentRuntime {
     /// `model_catalog.openrouter` (one fetch per hotel, mesh-consistent);
     /// falls back to a direct OpenRouter fetch when the hotel hasn't run
     /// discovery yet. A failed refresh keeps the previous snapshot.
-    async fn ensure_openrouter_catalog(&mut self) {
+    async fn ensure_model_catalogs(&mut self) {
         let stale = self
-            .openrouter_tools_catalog
+            .model_catalogs
             .as_ref()
             .map(|c| c.fetched_at.elapsed() > OPENROUTER_CATALOG_TTL)
             .unwrap_or(true);
         if !stale {
             return;
         }
-        let fresh = match self.fetch_hotel_catalog().await {
-            Some(entries) => Some(entries),
-            None => self.fetch_openrouter_catalog_direct().await,
-        };
-        if let Some(entries) = fresh {
-            self.openrouter_tools_catalog = Some(OpenRouterToolsCatalog {
+        let mut by_provider = std::collections::BTreeMap::new();
+        for provider in CATALOG_PROVIDERS {
+            if let Some(entries) = self.fetch_hotel_catalog(provider).await {
+                by_provider.insert(provider.to_string(), entries);
+            }
+        }
+        // A hotel that has never run discovery still gets the openrouter
+        // catalog via the public endpoint.
+        if !by_provider.contains_key("openrouter") {
+            if let Some(entries) = self.fetch_openrouter_catalog_direct().await {
+                by_provider.insert("openrouter".to_string(), entries);
+            }
+        }
+        if !by_provider.is_empty() {
+            self.model_catalogs = Some(ModelCatalogs {
                 fetched_at: std::time::Instant::now(),
-                entries,
+                by_provider,
             });
         }
     }
@@ -1751,12 +1768,12 @@ impl AgentRuntime {
     /// Read the hotel's compact model catalog (config node
     /// `model_catalog.openrouter`): a JSON array of
     /// `{"id","name"?,"tools"?,"ctx"?,...}` objects.
-    async fn fetch_hotel_catalog(&mut self) -> Option<Vec<CatalogModelEntry>> {
+    async fn fetch_hotel_catalog(&mut self, provider: &str) -> Option<Vec<CatalogModelEntry>> {
         let raw = match self
             .ipc_client
             .send_request_with_timeout(
                 IpcRequest::GetConfig {
-                    key: "model_catalog.openrouter".into(),
+                    key: format!("model_catalog.{provider}"),
                 },
                 Duration::from_secs(5),
             )
@@ -1855,29 +1872,97 @@ impl AgentRuntime {
         }
     }
 
-    /// Build the `/models` drill-down reply: bare → vendor buttons; with a
-    /// query → matching-model buttons whose taps fire `/model <id>`.
+    /// Build the `/models` drill-down reply. Bare → provider buttons; a
+    /// provider name → its vendor page (openrouter) or model page (others);
+    /// anything else → search across every provider's catalog. Model buttons
+    /// fire `/model <id>` (openrouter slugs) or `/model <provider>:<id>`.
     async fn build_models_browse_reply(
         &mut self,
         query: Option<&str>,
     ) -> (String, Option<serde_json::Value>) {
-        self.ensure_openrouter_catalog().await;
-        let Some(catalog) = self.openrouter_tools_catalog.as_ref() else {
+        self.ensure_model_catalogs().await;
+        let Some(catalogs) = self.model_catalogs.as_ref() else {
             return (
                 "Model catalog unavailable — the hotel's discovery job hasn't run yet and \
-                 OpenRouter is unreachable. You can still bind directly: /model <vendor/model>."
+                 OpenRouter is unreachable. You can still bind directly: /model <vendor/model> \
+                 or /model <provider>:<id>."
                     .to_string(),
                 None,
             );
         };
 
+        /// Button rows for a page of models within one provider.
+        fn model_rows(provider: &str, entries: &[&CatalogModelEntry]) -> Vec<Vec<serde_json::Value>> {
+            let mut rows = Vec::new();
+            for entry in entries.iter().take(MODELS_PAGE_SIZE) {
+                let callback = if provider == "openrouter" {
+                    format!("/model {}", entry.id)
+                } else {
+                    format!("/model {provider}:{}", entry.id)
+                };
+                if callback.len() > TELEGRAM_CALLBACK_LIMIT {
+                    continue;
+                }
+                let badge = match entry.tools {
+                    Some(true) => " 🔧",
+                    Some(false) => " 💬",
+                    None => "",
+                };
+                let ctx = entry
+                    .ctx
+                    .map(|c| format!(" · {}k", c / 1000))
+                    .unwrap_or_default();
+                rows.push(vec![serde_json::json!({
+                    "text": format!("{}{}{}", entry.id, badge, ctx),
+                    "callback_data": callback,
+                })]);
+            }
+            rows
+        }
+
         let query = query.map(str::trim).filter(|q| !q.is_empty());
-        match query {
-            None => {
-                // Vendor page: group by the id's vendor prefix, largest first.
+        let Some(q) = query else {
+            // Provider page: one button per provider with a catalog.
+            let total: usize = catalogs.by_provider.values().map(Vec::len).sum();
+            let mut providers: Vec<(&String, usize)> = catalogs
+                .by_provider
+                .iter()
+                .map(|(p, entries)| (p, entries.len()))
+                .collect();
+            providers.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(b.0)));
+            let rows: Vec<Vec<serde_json::Value>> = providers
+                .chunks(2)
+                .map(|chunk| {
+                    chunk
+                        .iter()
+                        .map(|(provider, count)| {
+                            serde_json::json!({
+                                "text": format!("{provider} ({count})"),
+                                "callback_data": format!("/models {provider}"),
+                            })
+                        })
+                        .collect()
+                })
+                .collect();
+            let text = format!(
+                "🗂 {total} models across {} providers. Tap a provider to drill down, or \
+                 search with /models <text>.",
+                providers.len(),
+            );
+            return (text, Some(serde_json::json!({ "inline_keyboard": rows })));
+        };
+
+        // Provider-scoped drill-down: first token names a provider.
+        let mut tokens = q.splitn(2, char::is_whitespace);
+        let head = tokens.next().unwrap_or_default().to_lowercase();
+        let sub = tokens.next().map(str::trim).filter(|s| !s.is_empty());
+        if let Some(entries) = catalogs.by_provider.get(&head) {
+            let provider = head;
+            // OpenRouter with no sub-query: vendor page (hundreds of models).
+            if provider == "openrouter" && sub.is_none() {
                 let mut counts: std::collections::BTreeMap<&str, usize> =
                     std::collections::BTreeMap::new();
-                for entry in &catalog.entries {
+                for entry in entries {
                     let vendor = entry.id.split('/').next().unwrap_or(&entry.id);
                     *counts.entry(vendor).or_default() += 1;
                 }
@@ -1892,81 +1977,107 @@ impl AgentRuntime {
                             .map(|(vendor, count)| {
                                 serde_json::json!({
                                     "text": format!("{vendor} ({count})"),
-                                    "callback_data": format!("/models {vendor}"),
+                                    "callback_data": format!("/models openrouter {vendor}"),
                                 })
                             })
                             .collect()
                     })
                     .collect();
                 let text = format!(
-                    "🗂 {} models from {} vendors. Tap a vendor to drill down, or search with \
-                     /models <text>.",
-                    catalog.entries.len(),
+                    "🗂 openrouter: {} models from {} vendors. Tap a vendor, or \
+                     /models openrouter <search>.",
+                    entries.len(),
                     vendors.len(),
                 );
-                (text, Some(serde_json::json!({ "inline_keyboard": rows })))
+                return (text, Some(serde_json::json!({ "inline_keyboard": rows })));
             }
-            Some(q) => {
-                let lowered = q.to_lowercase();
-                let matches: Vec<&CatalogModelEntry> = catalog
-                    .entries
-                    .iter()
-                    .filter(|e| {
-                        let vendor = e.id.split('/').next().unwrap_or("");
-                        vendor.eq_ignore_ascii_case(&lowered)
-                            || e.id.to_lowercase().contains(&lowered)
-                            || e.name
-                                .as_deref()
-                                .map(|n| n.to_lowercase().contains(&lowered))
-                                .unwrap_or(false)
-                    })
-                    .collect();
-                if matches.is_empty() {
-                    return (
-                        format!(
-                            "No catalog models match `{q}`. Try /models for the vendor list, or \
-                             bind directly with /model <vendor/model>."
-                        ),
-                        None,
-                    );
+            let filtered: Vec<&CatalogModelEntry> = match sub {
+                None => entries.iter().collect(),
+                Some(sub) => {
+                    let lowered = sub.to_lowercase();
+                    entries
+                        .iter()
+                        .filter(|e| {
+                            let vendor = e.id.split('/').next().unwrap_or("");
+                            vendor.eq_ignore_ascii_case(&lowered)
+                                || e.id.to_lowercase().contains(&lowered)
+                                || e.name
+                                    .as_deref()
+                                    .map(|n| n.to_lowercase().contains(&lowered))
+                                    .unwrap_or(false)
+                        })
+                        .collect()
                 }
-                let total = matches.len();
-                let mut rows: Vec<Vec<serde_json::Value>> = Vec::new();
-                for entry in matches.iter().take(MODELS_PAGE_SIZE) {
-                    let callback = format!("/model {}", entry.id);
-                    if callback.len() > TELEGRAM_CALLBACK_LIMIT {
-                        continue;
-                    }
-                    let badge = match entry.tools {
-                        Some(true) => " 🔧",
-                        Some(false) => " 💬",
-                        None => "",
-                    };
-                    let ctx = entry
-                        .ctx
-                        .map(|c| format!(" · {}k", c / 1000))
-                        .unwrap_or_default();
-                    rows.push(vec![serde_json::json!({
-                        "text": format!("{}{}{}", entry.id, badge, ctx),
-                        "callback_data": callback,
-                    })]);
-                }
-                let mut text = format!(
-                    "🎯 {total} match(es) for `{q}` — tap to bind (🔧 tools · 💬 chat-only):"
+            };
+            if filtered.is_empty() {
+                return (
+                    format!("No {provider} models match `{}`.", sub.unwrap_or("")),
+                    None,
                 );
-                if total > MODELS_PAGE_SIZE {
-                    text.push_str(&format!(
-                        "\nShowing {MODELS_PAGE_SIZE} — refine with /models <more specific>."
-                    ));
-                }
-                let keyboard = if rows.is_empty() {
-                    None
-                } else {
-                    Some(serde_json::json!({ "inline_keyboard": rows }))
-                };
-                (text, keyboard)
+            }
+            let total = filtered.len();
+            let rows = model_rows(&provider, &filtered);
+            let mut text = format!(
+                "🎯 {provider}: {total} model(s) — tap to bind (🔧 tools · 💬 chat-only):"
+            );
+            if total > MODELS_PAGE_SIZE {
+                text.push_str(&format!(
+                    "\nShowing {MODELS_PAGE_SIZE} — refine with /models {provider} <search>."
+                ));
+            }
+            let keyboard = if rows.is_empty() {
+                None
+            } else {
+                Some(serde_json::json!({ "inline_keyboard": rows }))
+            };
+            return (text, keyboard);
+        }
+
+        // Free-text search across every provider.
+        let lowered = q.to_lowercase();
+        let mut rows: Vec<Vec<serde_json::Value>> = Vec::new();
+        let mut total = 0usize;
+        for (provider, entries) in &catalogs.by_provider {
+            let matches: Vec<&CatalogModelEntry> = entries
+                .iter()
+                .filter(|e| {
+                    let vendor = e.id.split('/').next().unwrap_or("");
+                    vendor.eq_ignore_ascii_case(&lowered)
+                        || e.id.to_lowercase().contains(&lowered)
+                        || e.name
+                            .as_deref()
+                            .map(|n| n.to_lowercase().contains(&lowered))
+                            .unwrap_or(false)
+                })
+                .collect();
+            total += matches.len();
+            let remaining = MODELS_PAGE_SIZE.saturating_sub(rows.len());
+            if remaining > 0 {
+                rows.extend(model_rows(provider, &matches[..matches.len().min(remaining)]));
             }
         }
+        if total == 0 {
+            return (
+                format!(
+                    "No catalog models match `{q}`. Try /models for the provider list, or bind \
+                     directly with /model <vendor/model> or /model <provider>:<id>."
+                ),
+                None,
+            );
+        }
+        let mut text =
+            format!("🎯 {total} match(es) for `{q}` — tap to bind (🔧 tools · 💬 chat-only):");
+        if total > MODELS_PAGE_SIZE {
+            text.push_str(&format!(
+                "\nShowing {MODELS_PAGE_SIZE} — refine with /models <more specific>."
+            ));
+        }
+        let keyboard = if rows.is_empty() {
+            None
+        } else {
+            Some(serde_json::json!({ "inline_keyboard": rows }))
+        };
+        (text, keyboard)
     }
 
     pub fn new(ipc_client: PhiloticClient, agent_id: impl Into<String>) -> Self {
@@ -1977,7 +2088,7 @@ impl AgentRuntime {
             muninn_config: None,
             muninn_available: true,
             configured_roles: HashMap::new(),
-            openrouter_tools_catalog: None,
+            model_catalogs: None,
             default_agent_profile: AgentProfile::default(),
             mcp_upstream_tools: Vec::new(),
             pending_drains: std::collections::VecDeque::new(),
