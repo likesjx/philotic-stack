@@ -9,6 +9,7 @@
 //! behavior change.
 
 use super::*;
+use crate::session::SessionBindings;
 
 /// Parse the optional `fallback_tiers` tool argument (a JSON array of tier
 /// role-name strings) into the `Option<Vec<String>>` the hotel's ConfigureRole
@@ -122,6 +123,53 @@ impl AgentRuntime {
             "skill.register" => Some("skill_register"),
             _ => None,
         }
+    }
+
+    /// Whether a `skill.register` call's declared grant (`allowed_tools` +
+    /// `allowed_classes`) is already fully covered by the registering
+    /// session's OWN current bindings — i.e. the skill cannot hand the
+    /// registrant anything it doesn't already have. When true, the call is
+    /// SAFE TO DOWNGRADE from the unconditional gate to the normal
+    /// policy-governed approval path (`auto_approve_all`, preapproved
+    /// classes, session trust all then apply normally).
+    ///
+    /// Deliberately conservative: any declared `allowed_skills` (SkillDAG
+    /// edges to other skills) keeps the call unconditional — resolving
+    /// those transitively needs the hotel's graph, which philote does not
+    /// hold locally, and silently treating unresolved edges as "grants
+    /// nothing" would be a false-negative risk assessment. A skill with no
+    /// DAG edges that only wraps tools/classes the registrant can already
+    /// reach is the common, low-risk case this exists for — e.g. a
+    /// practice-tracking skill built entirely on `life.observe`, which the
+    /// registrant already holds.
+    pub(super) fn skill_register_call_within_bindings(
+        arguments: &serde_json::Value,
+        bindings: &SessionBindings,
+    ) -> bool {
+        let has_skill_edges = arguments
+            .get("allowed_skills")
+            .and_then(|v| v.as_array())
+            .is_some_and(|arr| !arr.is_empty());
+        if has_skill_edges {
+            return false;
+        }
+        let declared_tools = arguments
+            .get("allowed_tools")
+            .and_then(|v| v.as_array())
+            .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>())
+            .unwrap_or_default();
+        let declared_classes = arguments
+            .get("allowed_classes")
+            .and_then(|v| v.as_array())
+            .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>())
+            .unwrap_or_default();
+        let class_covered = |class: &str| bindings.allowed_classes.iter().any(|c| c == class);
+        let tool_covered = |tool: &str| {
+            bindings.effective_toolset.iter().any(|t| t == tool)
+                || crate::catalog::tool_class(tool).is_some_and(class_covered)
+        };
+        declared_tools.iter().all(|t| tool_covered(t))
+            && declared_classes.iter().all(|c| class_covered(c))
     }
 
     pub(super) async fn handle_approval_request(
@@ -440,7 +488,29 @@ impl AgentRuntime {
             let unconditional_gate = if bypass_approval {
                 None
             } else {
-                Self::unconditional_approval_gate(&tool_call.tool_name, &tool_call.arguments)
+                let gate =
+                    Self::unconditional_approval_gate(&tool_call.tool_name, &tool_call.arguments);
+                // Risk-tiered downgrade: a skill.register call that cannot
+                // grant the registrant anything beyond its own current
+                // bindings falls through to the normal policy-governed
+                // approval path (still gated if the session has no
+                // auto-approve/preapproval policy — this only removes the
+                // UNCONDITIONAL floor, it does not itself grant silence).
+                // Live 2026-08-27: four narrow, no-new-capability skill
+                // registrations each demanded their own live approval with
+                // no way to batch or preapprove them, and a plan that never
+                // gets past step 1 of 4 never registers anything.
+                if gate == Some("skill_register") {
+                    let within_bindings = self.sessions.get(&session_id).is_some_and(|state| {
+                        Self::skill_register_call_within_bindings(
+                            &tool_call.arguments,
+                            &state.bindings,
+                        )
+                    });
+                    if within_bindings { None } else { gate }
+                } else {
+                    gate
+                }
             };
             let is_admin_role_creation = unconditional_gate == Some("admin_role_creation");
             let is_rule_propose = unconditional_gate == Some("rule_propose");
@@ -462,30 +532,67 @@ impl AgentRuntime {
                 } else {
                     String::new()
                 };
+                // How many OTHER not-yet-done steps in the current plan will hit
+                // this exact same unconditional gate. A repeated identical-looking
+                // approval card reads as a duplicate of one already answered —
+                // live 2026-08-27: a 4-step skill.register plan fired this card
+                // three separate times and the operator, having just approved
+                // one, let each next one time out assuming it was already
+                // resolved. Naming the count up front makes a repeat legible
+                // instead of confusing.
+                let pending_siblings = self
+                    .sessions
+                    .get(&session_id)
+                    .and_then(|state| state.active_turn.as_ref())
+                    .and_then(|turn| turn.active_plan.as_ref())
+                    .map(|plan| {
+                        plan.steps
+                            .iter()
+                            .filter(|s| {
+                                s.tool_name.as_deref() == Some(tool_call.tool_name.as_str())
+                                    && s.status != "done"
+                            })
+                            .count()
+                    })
+                    .unwrap_or(0);
+                let sibling_note = if pending_siblings > 1 {
+                    format!(
+                        " (this plan has {pending_siblings} steps that each need this same \
+                         live approval — expect this card to repeat; each one is a DIFFERENT \
+                         step, not a duplicate of one you already answered.)"
+                    )
+                } else {
+                    String::new()
+                };
                 let (reason, approved_response) = if is_admin_role_creation {
                     (
                         format!(
                             "Admin role '{}' creation requires your explicit live approval. \
-                         This cannot be preapproved or bypassed by policy.",
+                         This cannot be preapproved or bypassed by policy.{sibling_note}",
                             role_name_hint
                         ),
                         format!("Admin role '{}' approved.", role_name_hint),
                     )
                 } else if is_rule_propose {
                     (
-                        "Rule proposal requires your explicit live approval.".to_string(),
+                        format!(
+                            "Rule proposal requires your explicit live approval.{sibling_note}"
+                        ),
                         "Rule proposal approved.".to_string(),
                     )
                 } else if is_routing_policy_propose {
                     (
-                        "Routing policy proposal requires your explicit live approval.".to_string(),
+                        format!(
+                            "Routing policy proposal requires your explicit live approval.{sibling_note}"
+                        ),
                         "Routing policy proposal approved.".to_string(),
                     )
                 } else if is_skill_register {
                     (
-                        "Skill registration requires your explicit live approval. \
-                         This cannot be preapproved or bypassed by policy."
-                            .to_string(),
+                        format!(
+                            "Skill registration requires your explicit live approval. \
+                         This cannot be preapproved or bypassed by policy.{sibling_note}"
+                        ),
                         "Skill registration approved.".to_string(),
                     )
                 } else {
@@ -7990,6 +8097,64 @@ mod tests {
     use super::super::tests::test_working_turn;
     use super::*;
     use crate::r#loop::{ToolCall, TurnPhase};
+
+    /// A skill.register call that only wraps tools/classes the registrant
+    /// already has must be recognized as within-bindings so the gate can
+    /// downgrade from unconditional. Any `allowed_skills` DAG edge keeps it
+    /// conservative (philote cannot resolve DAG edges locally), and a tool
+    /// or class NOT already held keeps it conservative too.
+    #[test]
+    fn skill_register_within_bindings_subset_check() {
+        let bindings = SessionBindings {
+            effective_toolset: vec!["life.observe".into(), "life.list".into()],
+            allowed_classes: vec!["memory".into()],
+            ..Default::default()
+        };
+
+        // Fully covered: both declared tools already held.
+        let covered = serde_json::json!({
+            "allowed_tools": ["life.observe", "life.list"],
+        });
+        assert!(AgentRuntime::skill_register_call_within_bindings(
+            &covered, &bindings
+        ));
+
+        // A tool not already held keeps it unconditional.
+        let uncovered_tool = serde_json::json!({
+            "allowed_tools": ["life.observe", "bash.exec"],
+        });
+        assert!(!AgentRuntime::skill_register_call_within_bindings(
+            &uncovered_tool,
+            &bindings
+        ));
+
+        // A class not already held keeps it unconditional.
+        let uncovered_class = serde_json::json!({
+            "allowed_classes": ["shell"],
+        });
+        assert!(!AgentRuntime::skill_register_call_within_bindings(
+            &uncovered_class,
+            &bindings
+        ));
+
+        // ANY declared allowed_skills edge is conservative-unconditional,
+        // even if the flat tools/classes would otherwise be covered —
+        // philote cannot resolve the DAG locally.
+        let with_dag_edge = serde_json::json!({
+            "allowed_tools": ["life.observe"],
+            "allowed_skills": ["some.other.skill"],
+        });
+        assert!(!AgentRuntime::skill_register_call_within_bindings(
+            &with_dag_edge,
+            &bindings
+        ));
+
+        // No declared grant at all is trivially within-bindings.
+        let empty = serde_json::json!({});
+        assert!(AgentRuntime::skill_register_call_within_bindings(
+            &empty, &bindings
+        ));
+    }
 
     #[test]
     fn inject_scoped_to_anchor_appends_edge_when_agent_resolves_and_no_edges() {

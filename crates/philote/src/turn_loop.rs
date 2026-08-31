@@ -576,6 +576,54 @@ impl AgentRuntime {
             self.clear_voice_chunk_pipeline(&session_id);
 
             if let Some(state) = self.sessions.get_mut(&session_id) {
+                // Stash the evicted turn's plan into carryover BEFORE clearing
+                // state, so the resume call below has something to resume.
+                // Without this, a multi-step approval-gated plan (e.g. four
+                // `skill.register` calls, each needing its own live approval)
+                // silently restarted from step 1 on every timeout instead of
+                // continuing at the step that actually timed out — live
+                // 2026-08-27: three separate evictions, three restarts from
+                // scratch, zero of four skills ever registered. Preserve any
+                // existing budget accounting (stall/continuation counters) —
+                // only the plan and its step-completion snapshot refresh.
+                let plan_source = state
+                    .parked_approval_turn
+                    .as_ref()
+                    .or(state.active_turn.as_ref());
+                if let Some(plan) = plan_source.and_then(|turn| turn.active_plan.clone()) {
+                    let steps_done: Vec<bool> =
+                        plan.steps.iter().map(|s| s.status == "done").collect();
+                    let verified_step_ids: Vec<u32> = plan_source
+                        .map(|turn| turn.plan_steps_verified.as_slice())
+                        .unwrap_or(&[])
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, verified)| **verified)
+                        .filter_map(|(i, _)| plan.steps.get(i).map(|s| s.id))
+                        .collect();
+                    let prior = state.carryover_plan.take();
+                    state.carryover_plan = Some(CarryoverPlan {
+                        plan,
+                        steps_done,
+                        verified_step_ids,
+                        stalled_continuations: prior
+                            .as_ref()
+                            .map(|c| c.stalled_continuations)
+                            .unwrap_or(0),
+                        continuations_used: prior
+                            .as_ref()
+                            .map(|c| c.continuations_used)
+                            .unwrap_or(0),
+                        lifetime_continuations: prior
+                            .as_ref()
+                            .map(|c| c.lifetime_continuations)
+                            .unwrap_or(0),
+                        created_turn_id: prior
+                            .map(|c| c.created_turn_id)
+                            .unwrap_or_else(|| turn_id.clone()),
+                    });
+                }
+
                 state.active_turn = None;
                 state.parked_approval_turn = None;
                 state.parked_approval_since = None;
@@ -623,7 +671,19 @@ impl AgentRuntime {
             // leaving queued operator messages to rot until the stale sweep.
             self.drain_next_user_task(&session_id);
 
-            // Notify the user that the session is unblocked.
+            // Notify the user that the session is unblocked. An approval
+            // timeout means specifically "you weren't asked in time to
+            // answer" (and, when a plan carryover was just stashed above,
+            // that the NEXT message resumes rather than restarts) —
+            // distinct from a tool/model hang, which is an internal fault
+            // with nothing for the operator to have answered.
+            let unblock_message = if phase.starts_with("WaitingApproval") {
+                "*(An approval request timed out waiting for your answer. \
+                 The session is unblocked — if you were mid-plan, your next \
+                 message resumes it rather than starting over.)*"
+            } else {
+                "*(I seem to have gotten stuck waiting for a response. The session is unblocked — please try again.)*"
+            };
             let notify_req = IpcRequest::EmitTask {
                 target_node: reply_to.clone(),
                 target_role: reply_role.clone(),
@@ -633,7 +693,7 @@ impl AgentRuntime {
                     "session_id": session_id.clone(),
                     "turn_id": turn_id.clone(),
                     "chat_id": chat_id.clone(),
-                    "content": "*(I seem to have gotten stuck waiting for a response. The session is unblocked — please try again.)*",
+                    "content": unblock_message,
                     "final": true,
                 })
                 .to_string(),
