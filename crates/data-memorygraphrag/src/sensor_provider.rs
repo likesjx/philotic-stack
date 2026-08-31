@@ -276,3 +276,77 @@ async fn deliver(identity: &GuestIdentity, target_role: &str, message: &str) -> 
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use datasource::controller::TaskKind;
+
+    fn sensor_run_task(sensor_id: &str) -> DatasourceTask {
+        DatasourceTask {
+            kind: TaskKind::Custom(SENSOR_TASK_KIND.to_string()),
+            provider: None,
+            db: None,
+            graph_id: None,
+            query: None,
+            parameters: json!({ "sensor_id": sensor_id }),
+            identity: json!({}),
+        }
+    }
+
+    /// No hotel IPC socket reachable (no aiua process in a unit test) must
+    /// degrade to a quiet result, not hang or error — exercises
+    /// `SensorProvider::invoke`'s real code path end to end (identity,
+    /// `load_script`'s `fetch_config` over a socket that isn't there,
+    /// `PhiloticClient::connect` failing gracefully) for the first time;
+    /// `sensor_scripts::run_script` itself is covered separately with
+    /// hand-built closures. Deliberately does not exercise the
+    /// `block_in_place`/`life_call` bridge — that requires a script to
+    /// actually be loaded, which needs a live hotel config store.
+    #[tokio::test]
+    async fn invoke_is_quiet_when_hotel_ipc_is_unavailable() {
+        let life = Arc::new(LifeGraphProvider::from_env());
+        let provider = SensorProvider::new(
+            life,
+            "test-sensor-guest".to_string(),
+            "life-graph-runner".to_string(),
+        );
+        let task = sensor_run_task("reminders");
+
+        assert!(provider.supports(&task));
+
+        let output =
+            tokio::time::timeout(std::time::Duration::from_secs(5), provider.invoke(&task))
+                .await
+                .expect("invoke must not hang when the hotel socket is unreachable")
+                .expect("invoke must degrade gracefully, not error");
+
+        let ProviderOutput::ResultSet(v) = output else {
+            panic!("expected ResultSet");
+        };
+        assert_eq!(v["status"], "quiet");
+        assert_eq!(v["sensor_id"], "reminders");
+    }
+
+    #[tokio::test]
+    async fn invoke_rejects_task_missing_sensor_id() {
+        let life = Arc::new(LifeGraphProvider::from_env());
+        let provider = SensorProvider::new(
+            life,
+            "test-sensor-guest".to_string(),
+            "life-graph-runner".to_string(),
+        );
+        let task = DatasourceTask {
+            kind: TaskKind::Custom(SENSOR_TASK_KIND.to_string()),
+            provider: None,
+            db: None,
+            graph_id: None,
+            query: None,
+            parameters: json!({}),
+            identity: json!({}),
+        };
+
+        let err = provider.invoke(&task).await.unwrap_err();
+        assert!(format!("{err:#}").contains("sensor_id"));
+    }
+}
