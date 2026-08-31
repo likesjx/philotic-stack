@@ -100,10 +100,16 @@ IPC).
 
 ```
 CronJob { target_role: "life-graph-runner",
-          payload: {"kind": "sensor.run", "sensor_id": "reminders"},
+          payload: {"kind": "sensor.run", "parameters": {"sensor_id": "reminders"}},
           schedule: "0 */5 * * * * *" }
         │
-        ▼ ordinary cron→role delivery — no aiua-side special case
+        ▼ ordinary cron→role delivery — the ONE thing fire() needed to learn:
+          a DatasourceTask-shaped payload (top-level "kind") is passed
+          through unwrapped, not run through the philote-turn-shaped
+          build_cron_task_json (which nests payload as a string and would
+          hide "kind"/"parameters" from DatasourceTask::from_value —
+          caught by review before any live traffic hit it; regression test:
+          datasource_shaped_cron_payload_survives_fire_unwrapped)
 data-memorygraphrag's run_datasource_controller receives the task
         │  ProviderRegistry resolves SensorProvider (kind == "sensor.run")
         ▼
@@ -212,9 +218,20 @@ no separate enabled-locally flag needed (unlike `memory.hygiene`/
 `SensorScript` hotel-config storage (over `GetConfig`/`SetConfig` IPC),
 `config_value`/`now_iso`/`operator_local`/`deliver`/`life_call` wired end
 to end, `life_call` bound directly to the guest's own
-`LifeGraphProvider::invoke` (201 tests green across the crate: 195 lib +
-53 bin, including 6 new `sensor_scripts` tests and the round-trip through
-`life_call`). `investigate` returns a verdict but has no dispatch path yet.
+`LifeGraphProvider::invoke`. 248 tests green across `data-memorygraphrag`
+(195 lib + 53 bin — 6 new `sensor_scripts` tests covering `run_script`
+against hand-built closures including the `life_call` round-trip, plus 2
+new `sensor_provider` tests exercising `SensorProvider::invoke` itself:
+graceful quiet-degrade when the hotel IPC socket is unreachable, and
+`contract_error` rejection of a task missing `sensor_id`). A separate
+`aiua` regression test
+(`datasource_shaped_cron_payload_survives_fire_unwrapped`) locks the wire
+contract between `fire()`'s emitted JSON and `DatasourceTask::from_value`.
+Not yet covered: the `block_in_place`/`life_call` bridge and `deliver`'s
+`EmitTask` path both require a script to actually load, which needs a
+live hotel IPC socket — no test exercises them end to end yet; that gap
+closes naturally once slice 2 is watched-live-green on a real hotel.
+`investigate` returns a verdict but has no dispatch path yet.
 
 **Slice 2 — not started.** Port `heartbeat.rs`'s due-reminder logic
 (`due_reminders_cypher`/`stamp_cypher`/`format_reminder_line`) to a Rhai

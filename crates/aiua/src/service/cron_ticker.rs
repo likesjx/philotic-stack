@@ -475,7 +475,19 @@ impl CronTicker {
         let payload_data = interpolate_payload(&job.payload, &vars);
 
         let task_id = Uuid::new_v4();
-        let task_json = build_cron_task_json(job, fire_epoch, &self.local_node_id, payload_data);
+        // A DatasourceTask-shaped payload (top-level `kind`, e.g. a scripted
+        // sensor's `sensor.run`) targets a guest's `run_datasource_controller`
+        // loop, not a philote turn. `build_cron_task_json` wraps the payload
+        // as a nested string and promotes turn-display fields
+        // (content/chat_id) — that hides `kind` from
+        // `datasource::controller::DatasourceTask::from_value`, which
+        // requires it at the top level. Pass such payloads through
+        // unwrapped instead of routing them through the turn-shaped builder.
+        let task_json = if is_datasource_task_payload(&payload_data) {
+            payload_data.clone()
+        } else {
+            build_cron_task_json(job, fire_epoch, &self.local_node_id, payload_data)
+        };
 
         // Single-delivery ownership: claim the event id BEFORE the envelope is
         // visible to any other consumer. `fire()` is the sole delivery owner of
@@ -816,6 +828,18 @@ impl CronTicker {
 
         self.graph.upsert_cron_job(&updated)
     }
+}
+
+/// True when `payload_data` is a `DatasourceTask`-shaped JSON object (a
+/// top-level `kind` field) rather than a philote-turn payload — see
+/// `datasource::controller::DatasourceTask::from_value`, which requires
+/// `kind`/`tool_name`/`tool` at the top level and would otherwise never see
+/// it once `build_cron_task_json` nests the payload under a `payload`
+/// string field.
+fn is_datasource_task_payload(payload_data: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(payload_data)
+        .ok()
+        .is_some_and(|v| v.get("kind").and_then(|k| k.as_str()).is_some())
 }
 
 pub fn now_ms() -> u64 {
@@ -1593,6 +1617,80 @@ mod tests {
                 .strip_prefix("role:")
                 .is_none(),
             "the sentinel must never be mistaken for a role incarnation routing key"
+        );
+    }
+
+    // ── Scripted hotel sensors — cron→datasource-guest wire contract ───────
+
+    /// A sensor `CronJob`'s payload (`{"kind": "sensor.run", "parameters":
+    /// {"sensor_id": ...}}`) must survive `fire()` unwrapped: the emitted
+    /// task JSON has `kind`/`parameters` at the TOP LEVEL, exactly what
+    /// `datasource::controller::DatasourceTask::from_value` requires
+    /// (`kind_str = task.get("kind")...`, no fallback into a nested
+    /// object). Regression coverage for a bug the advisor caught before any
+    /// live traffic hit it: `build_cron_task_json` normally nests the
+    /// payload under a `payload` *string* field and promotes turn-display
+    /// fields (`content`/`chat_id`) for a philote turn — a
+    /// `data-memorygraphrag`-targeted task is not a philote turn and never
+    /// goes through that shape.
+    #[tokio::test]
+    async fn datasource_shaped_cron_payload_survives_fire_unwrapped() {
+        use ansible_mesh_core::sqlite_storage::SqliteGraphStorage;
+
+        let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
+        let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
+        let (ticker, _parked_inbound, mut dispatcher_rx) = memory_hygiene_ticker(graph.clone());
+
+        let job = CronJob {
+            id: "sensor:reminders".to_string(),
+            schedule: "0 */5 * * * * *".to_string(),
+            target_role: "life-graph-runner".to_string(),
+            target_node_id: None,
+            payload: serde_json::json!({
+                "kind": "sensor.run",
+                "parameters": { "sensor_id": "reminders" },
+            })
+            .to_string(),
+            guaranteed: false,
+            enabled: true,
+            last_fired_epoch: None,
+            next_fire_at: 1_000,
+            created_at: 0,
+            created_by: {
+                use ansible_mesh_core::cron::CronJobSource;
+                CronJobSource::Operator
+            },
+            silent_ok: false,
+            session_target: ansible_mesh_core::cron::CronSessionTarget::Main,
+        };
+        graph.upsert_cron_job(&job).expect("seed job");
+
+        tokio::time::timeout(Duration::from_secs(2), ticker.fire(&job, 1_000))
+            .await
+            .expect("fire() must not hang");
+
+        let received = tokio::time::timeout(Duration::from_secs(2), dispatcher_rx.recv())
+            .await
+            .expect("must not hang waiting for the sensor task")
+            .expect("must append a TaskInvoke");
+        let LedgerCommand::AppendLocal(envelope) = received else {
+            panic!("expected AppendLocal");
+        };
+        let EventPayload::Inline { data } = &envelope.payload else {
+            panic!("expected inline payload");
+        };
+        let task: serde_json::Value = serde_json::from_str(data).expect("task json parses");
+        assert_eq!(
+            task.get("kind").and_then(|v| v.as_str()),
+            Some("sensor.run"),
+            "kind must be at the top level for DatasourceTask::from_value: {task}"
+        );
+        assert_eq!(
+            task.get("parameters")
+                .and_then(|p| p.get("sensor_id"))
+                .and_then(|v| v.as_str()),
+            Some("reminders"),
+            "parameters.sensor_id must be at the top level: {task}"
         );
     }
 
