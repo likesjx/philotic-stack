@@ -10590,6 +10590,140 @@ mod tests {
 
     // ── Turn-failure heal intake (self-heal) ─────────────────────────────────
 
+    /// An approval that times out mid-plan must leave the plan resumable —
+    /// not discarded. Before this fix, eviction cleared `parked_approval_turn`
+    /// (and everything it carried) with no carryover set, so the NEXT user
+    /// message restarted the whole goal from step 1 instead of continuing at
+    /// the step whose approval actually timed out. Live 2026-08-27: a
+    /// 4-step `skill.register` plan restarted from scratch three separate
+    /// times and never registered anything.
+    #[tokio::test]
+    async fn approval_timeout_eviction_stashes_plan_into_carryover() {
+        let socket_path = format!(
+            "/tmp/philote-approvalcarry-{}.sock",
+            Uuid::new_v4().simple()
+        );
+        let listener = tokio::net::UnixListener::bind(&socket_path).expect("bind");
+        let emitted = std::sync::Arc::new(std::sync::Mutex::new(Vec::<serde_json::Value>::new()));
+        let server = tokio::spawn(run_recording_hotel(listener, emitted.clone()));
+
+        let identity = philotic_client::GuestIdentity {
+            guest_id: "agent-approval-carry".into(),
+            role: "agent".into(),
+            supported_tools: Vec::new(),
+        };
+        let client = philotic_client::PhiloticClient::connect_at(&socket_path, identity)
+            .await
+            .expect("connect to stub hotel");
+        let mut runtime = AgentRuntime::new(client, "agent-approval-carry");
+
+        let session_id = "sess-approval-carry";
+        runtime
+            .ensure_session_loaded(session_id, "telegram")
+            .await
+            .expect("session load");
+
+        let mut turn = def004_working_turn("turn-approval-carry", "skill.register");
+        turn.phase = TurnPhase::WaitingApproval;
+        turn.active_plan = Some(ActivePlan {
+            goal: "Register four music stewardship skills".into(),
+            steps: vec![
+                PlanStep {
+                    id: 1,
+                    description: "register practice-tracker".into(),
+                    tool_name: Some("skill.register".into()),
+                    status: "done".into(),
+                },
+                PlanStep {
+                    id: 2,
+                    description: "register fatigue-monitor".into(),
+                    tool_name: Some("skill.register".into()),
+                    status: "pending".into(),
+                },
+                PlanStep {
+                    id: 3,
+                    description: "register tempo-log".into(),
+                    tool_name: Some("skill.register".into()),
+                    status: "pending".into(),
+                },
+            ],
+            status: "executing".into(),
+            context_1_advisory: None,
+        });
+        turn.plan_steps_verified = vec![true, false, false];
+
+        {
+            let state = runtime
+                .sessions
+                .get_mut(session_id)
+                .expect("session exists");
+            state.start_turn(turn);
+            state.park_active_turn_for_approval();
+        }
+
+        let past = std::time::Instant::now()
+            .checked_sub(std::time::Duration::from_secs(400))
+            .expect("backdate instant");
+        {
+            let state = runtime
+                .sessions
+                .get_mut(session_id)
+                .expect("session exists");
+            state.parked_approval_since = Some(past);
+        }
+        runtime
+            .stuck_turn_first_seen
+            .insert(session_id.to_string(), past);
+        runtime.stuck_turn_signature.insert(
+            session_id.to_string(),
+            "parked_approval:turn-approval-carry".to_string(),
+        );
+
+        runtime.evict_timed_out_turns().await;
+
+        let state = runtime
+            .sessions
+            .get(session_id)
+            .expect("session survives eviction");
+        assert!(
+            state.parked_approval_turn.is_none(),
+            "eviction must still clear the parked turn"
+        );
+        let carry = state
+            .carryover_plan
+            .as_ref()
+            .expect("the plan must survive as a carryover, not vanish");
+        assert_eq!(carry.plan.goal, "Register four music stewardship skills");
+        assert_eq!(
+            carry.steps_done,
+            vec![true, false, false],
+            "steps_done must mirror each step's own status"
+        );
+        assert_eq!(
+            carry.verified_step_ids,
+            vec![1],
+            "only the step actually backed by a verified tool result carries forward"
+        );
+
+        drop(runtime);
+        let _ = server.await;
+        let _ = std::fs::remove_file(&socket_path);
+
+        // The unblock notice must name it as an approval timeout, distinct
+        // from a generic tool/model hang, and hint that the next message
+        // resumes rather than restarts.
+        let emitted = emitted.lock().unwrap();
+        let reply = emitted
+            .iter()
+            .find(|e| e["task"]["action"] == "send_reply")
+            .expect("unblock notice must be sent");
+        let content = reply["task"]["content"].as_str().unwrap_or_default();
+        assert!(
+            content.contains("timed out") && content.contains("resumes"),
+            "approval-timeout unblock message must name the timeout and resumability: {content}"
+        );
+    }
+
     /// A watchdog eviction must push a `stuck_turn_evicted:{phase}` heal
     /// event to the hotel (turn-failure heal intake) in addition to failing
     /// the task and unblocking the session.
