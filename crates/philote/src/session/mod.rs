@@ -3876,11 +3876,24 @@ impl SessionState {
         handoff_reason: &str,
         return_to: Option<String>,
     ) -> HandoffBundle {
+        // Live incident 2026-08-30: when this bundle is built WHILE handling a
+        // manual `/role <name>` (or `/back`) command, `active_turn.user_content`
+        // IS that very command — carrying it over as `active_goal` makes the
+        // receiving role auto-execute "/role chronos" as its first inbound
+        // task (see handle_handoff_bundle's auto_execute_goal), which
+        // re-triggers the SAME same-identity handoff from the specialist's own
+        // process. Its local session state hasn't yet recorded the new
+        // incarnation as active, so the self-handoff guard in
+        // handle_role_command never catches it, and the cycle repeats until
+        // the ROLE_SWITCH_MAX throttle intervenes. A slash command is a
+        // control-flow instruction, never a task to auto-execute in the new
+        // role, so it can never be a valid `active_goal`.
         let active_goal = self
             .active_turn
             .as_ref()
             .map(|turn| turn.user_content.clone())
             .filter(|text| !text.trim().is_empty())
+            .filter(|text| crate::commands::parse_slash_command(text).is_none())
             .or_else(|| {
                 let summary = self.summary_text();
                 (!summary.is_empty()).then_some(summary)
@@ -8219,6 +8232,76 @@ mod tests {
             bundle
                 .cleanup_actions
                 .contains(&"persist_role_local_working_state".to_string())
+        );
+    }
+
+    #[test]
+    fn same_identity_handoff_bundle_never_carries_a_slash_command_as_active_goal() {
+        // Live incident 2026-08-30: a manual `/role chronos` command IS the
+        // session's active_turn.user_content while it's being handled. If that
+        // text were carried over as active_goal, the receiving role would
+        // auto-execute "/role chronos" as its first inbound task and
+        // re-trigger the same handoff from its own process — a
+        // self-perpetuating loop only bounded by the ROLE_SWITCH_MAX throttle.
+        let mut state =
+            SessionState::new("sess-1".into(), "agent-beacon-01".into(), "telegram".into());
+        state.status = "active".into();
+        state.active_incarnation_id = Some("agent-beacon:orchestrator".into());
+        state.start_turn(WorkingTurn {
+            task_id: Uuid::nil(),
+            turn_id: "turn-handoff-2".into(),
+            chat_id: "123".into(),
+            primary_user_id: None,
+            user_content: "/role chronos".into(),
+            final_reply_to: "local-aiua-01".into(),
+            final_reply_role: "membrane".into(),
+            final_reply_guest_id: None,
+            phase: TurnPhase::WaitingModel,
+            iteration: 0,
+            pending_tool_call: None,
+            pending_approval: None,
+            working_tool_history: Vec::new(),
+            recalled_memories: Vec::new(),
+            active_plan: None,
+            consecutive_step_failures: 0,
+            streak_extension: 0,
+            provider_repair_note: None,
+            provider_repair_attempts: 0,
+            pending_text_reply: None,
+            had_voice_input: false,
+            awaiting_transcription_reentry: false,
+            scripted_loop_context: None,
+            associated_paracrine_ids: Vec::new(),
+            paracrine_origin: None,
+            paracrine_reply_session_id: None,
+            paracrine_reply_chat_id: None,
+            paracrine_response_routing: None,
+            paracrine_merge_completed: false,
+            plan_confirmed: false,
+            plan_confirm_note: None,
+            fallback_tier: 0,
+            ladder_tier0_dispatched: false,
+            streaming_retry_attempts: 0,
+            streamed_content: String::new(),
+            paracrine_hop_count: 0,
+            paracrine_chain_started_at: None,
+            started_at_unix: None,
+            last_interim_at_unix: None,
+            plan_steps_verified: Vec::new(),
+            selection_source: SelectionSource::default(),
+        });
+
+        let bundle = state.build_same_identity_handoff_bundle(
+            "chronos",
+            "turn-handoff-2",
+            "manual_role_switch",
+            Some("orchestrator".into()),
+        );
+
+        assert_eq!(
+            bundle.active_goal, None,
+            "a slash command must never become an auto-executed active_goal: {:?}",
+            bundle.active_goal
         );
     }
 

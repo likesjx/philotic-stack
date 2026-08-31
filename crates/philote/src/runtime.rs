@@ -12799,6 +12799,67 @@ mod tests {
         let _ = std::fs::remove_file(&socket_path);
     }
 
+    /// Live incident 2026-08-30: a handoff bundle whose `active_goal` is a
+    /// slash command (e.g. "/role chronos") — because it was built while the
+    /// sender's active_turn.user_content WAS that very command — must never
+    /// be auto-executed. The receiving role's local session state hasn't yet
+    /// recorded the new incarnation as active, so re-parsing that goal as a
+    /// fresh command and re-dispatching it re-triggers the same same-identity
+    /// handoff from the specialist's own process, evading
+    /// handle_role_command's self-handoff guard and looping until the
+    /// ROLE_SWITCH_MAX throttle intervenes. `build_same_identity_handoff_bundle`
+    /// is fixed to never construct such a bundle in the first place; this is
+    /// the defense-in-depth check on the receiving side.
+    #[tokio::test]
+    async fn handoff_bundle_never_auto_executes_a_slash_command_active_goal() {
+        let socket_path = format!("/tmp/philote-selfloop-{}.sock", Uuid::new_v4().simple());
+        let listener = tokio::net::UnixListener::bind(&socket_path).expect("bind");
+        let emitted = std::sync::Arc::new(std::sync::Mutex::new(Vec::<serde_json::Value>::new()));
+        let server = tokio::spawn(run_recording_hotel(listener, emitted.clone()));
+
+        let identity = philotic_client::GuestIdentity {
+            guest_id: "agent-beacon:Chronos".into(),
+            role: "role:agent-beacon:Chronos".into(),
+            supported_tools: Vec::new(),
+        };
+        let client = philotic_client::PhiloticClient::connect_at(&socket_path, identity)
+            .await
+            .expect("connect to stub hotel");
+        let mut runtime = AgentRuntime::new(client, "agent-beacon");
+
+        let session_id = "sess-selfloop";
+        let bundle = philotic_client::HandoffBundle {
+            to_role: Some("chronos".into()),
+            from_role: Some("orchestrator".into()),
+            handoff_reason: Some("manual_role_switch".into()),
+            active_goal: Some("/role chronos".into()),
+            ..Default::default()
+        };
+        runtime
+            .handle_handoff_bundle(
+                InboundTaskPayload {
+                    action: Some("handoff_bundle".into()),
+                    session_id: Some(session_id.into()),
+                    turn_id: Some("turn-selfloop".into()),
+                    handoff_bundle: Some(bundle),
+                    ..Default::default()
+                },
+                Uuid::new_v4(),
+            )
+            .await
+            .expect("handoff bundle");
+
+        assert!(
+            runtime.pending_drains.is_empty(),
+            "a slash-command active_goal must never be queued for auto-execution: {:?}",
+            runtime.pending_drains
+        );
+
+        drop(runtime);
+        let _ = server.await;
+        let _ = std::fs::remove_file(&socket_path);
+    }
+
     // ── Plan-eval-repeat loop ───────────────────────────────────────────────
 
     /// Serializes tests that read or mutate PHILOTIC_DISABLE_PLAN_CONTINUATION,
