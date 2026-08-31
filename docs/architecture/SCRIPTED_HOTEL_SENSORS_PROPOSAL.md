@@ -218,15 +218,22 @@ no separate enabled-locally flag needed (unlike `memory.hygiene`/
 `SensorScript` hotel-config storage (over `GetConfig`/`SetConfig` IPC),
 `config_value`/`now_iso`/`operator_local`/`deliver`/`life_call` wired end
 to end, `life_call` bound directly to the guest's own
-`LifeGraphProvider::invoke`. 248 tests green across `data-memorygraphrag`
-(195 lib + 53 bin — 6 new `sensor_scripts` tests covering `run_script`
+`LifeGraphProvider::invoke`. 250 tests green across `data-memorygraphrag`
+(195 lib + 55 bin — 6 new `sensor_scripts` tests covering `run_script`
 against hand-built closures including the `life_call` round-trip, plus 2
 new `sensor_provider` tests exercising `SensorProvider::invoke` itself:
 graceful quiet-degrade when the hotel IPC socket is unreachable, and
-`contract_error` rejection of a task missing `sensor_id`). A separate
-`aiua` regression test
-(`datasource_shaped_cron_payload_survives_fire_unwrapped`) locks the wire
-contract between `fire()`'s emitted JSON and `DatasourceTask::from_value`.
+`contract_error` rejection of a task missing `sensor_id`). Two `aiua`
+regression tests lock the wire contract between `fire()`'s emitted JSON
+and `DatasourceTask::from_value`:
+`datasource_shaped_cron_payload_survives_fire_unwrapped` (a
+`life-graph-runner`-targeted `sensor.run` payload passes through
+unwrapped, `kind`/`parameters` land at the top level) and
+`kind_shaped_payload_to_a_philote_role_still_gets_content_promoted` (the
+passthrough is gated on `target_role == "life-graph-runner"`, not payload
+shape alone — a philote-targeted job whose payload happens to carry a
+top-level `kind` still gets the normal `content` promotion, since `kind`
+is a generic word with no reserved meaning outside a `DatasourceTask`).
 Not yet covered: the `block_in_place`/`life_call` bridge and `deliver`'s
 `EmitTask` path both require a script to actually load, which needs a
 live hotel IPC socket — no test exercises them end to end yet; that gap
