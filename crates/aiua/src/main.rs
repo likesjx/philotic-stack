@@ -57,6 +57,20 @@ use std::sync::Arc;
 
 const DEFAULT_GRAPH_DATASOURCE_HOME_HOTEL: &str = "vps-jane";
 
+/// Bind address for the blob HTTP listener.
+///
+/// This MUST stay in lockstep with the `blob` [`ListenerDecl`] in the perimeter
+/// declaration below. The hotel classifies its own exposure tier from that
+/// declaration and persists it to `__hotel_perimeter__`, so binding wider here
+/// than we declare does not just widen the listener — it makes the perimeter
+/// snapshot report `Local` for a socket that is actually world-reachable.
+///
+/// The blob plane is unauthenticated (`POST /upload` accepts anonymous writes,
+/// `GET /download` is a bare `ServeDir`), and every real consumer reaches it over
+/// loopback via `PHILOTIC_BLOB_BASE_URL=http://127.0.0.1:<blob_port>`. Do not widen
+/// this without adding authentication first.
+const BLOB_BIND_ADDR: std::net::Ipv4Addr = std::net::Ipv4Addr::LOCALHOST;
+
 fn graph_datasource_home_hotel() -> String {
     std::env::var("PHILOTIC_GRAPH_DATASOURCE_HOME_HOTEL")
         .ok()
@@ -8563,7 +8577,7 @@ async fn main() -> Result<()> {
             },
             ListenerDecl {
                 purpose: "blob",
-                bind_addr: IpAddr::V4(Ipv4Addr::LOCALHOST),
+                bind_addr: IpAddr::V4(BLOB_BIND_ADDR),
                 port: hotel.blob_port,
                 iface: None,
             },
@@ -9228,7 +9242,7 @@ async fn main() -> Result<()> {
 
     // PORT-BP-005: Large Payload Transport via Dedicated HTTP Server
     let blob_port = hotel.blob_port;
-    let blob_addr = format!("0.0.0.0:{}", blob_port);
+    let blob_addr = format!("{}:{}", BLOB_BIND_ADDR, blob_port);
     let blob_dir = std::path::Path::new(db_path)
         .parent()
         .unwrap_or(std::path::Path::new("."))
@@ -9309,6 +9323,7 @@ async fn main() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use super::BLOB_BIND_ADDR;
     use super::resolve_retention_days;
     use super::{
         AgentProfile, BASE64_STANDARD, SecretAccess, StartupTest, agent_graph_guest_record,
@@ -11396,5 +11411,23 @@ mod tests {
             .expect("get role incarnation")
             .expect("role exists");
         assert_eq!(reseeded.content_policy, "unrestricted");
+    }
+
+    /// The blob plane is unauthenticated: `POST /upload` accepts anonymous 100MB
+    /// multipart writes and `GET /download` is a bare `ServeDir`. It is declared to
+    /// the perimeter as a `Local` listener, and the hotel persists that classification
+    /// to `__hotel_perimeter__`.
+    ///
+    /// Regression guard for the case where the declaration said `LOCALHOST` while the
+    /// actual bind was hardcoded `0.0.0.0`: on a host with a public IP that exposed an
+    /// anonymous write endpoint to the internet while the perimeter snapshot still
+    /// reported `Local`. Widening this bind requires adding authentication first.
+    #[test]
+    fn blob_listener_binds_loopback_to_match_perimeter_declaration() {
+        assert!(
+            BLOB_BIND_ADDR.is_loopback(),
+            "blob listener must bind loopback — the blob plane has no authentication"
+        );
+        assert_eq!(format!("{}:{}", BLOB_BIND_ADDR, 16371), "127.0.0.1:16371");
     }
 }
