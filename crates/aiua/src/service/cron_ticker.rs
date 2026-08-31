@@ -483,7 +483,19 @@ impl CronTicker {
         // `datasource::controller::DatasourceTask::from_value`, which
         // requires it at the top level. Pass such payloads through
         // unwrapped instead of routing them through the turn-shaped builder.
-        let task_json = if is_datasource_task_payload(&payload_data) {
+        //
+        // Gated on `target_role == "life-graph-runner"` as well as payload
+        // shape — NOT shape alone. `kind` is a generic word; an unrelated
+        // philote-targeted job whose payload happens to carry a top-level
+        // `kind` (e.g. `{"kind": "daily", "message": "..."}`) must still go
+        // through `build_cron_task_json`, or it silently loses `content`
+        // promotion (`handle_user_message` drops a task with no `content`,
+        // per that function's own doc comment), `apply_cron_session_routing`,
+        // and tool-preapproval promotion — a silent-drop failure mode, not a
+        // loud one.
+        let task_json = if job.target_role == "life-graph-runner"
+            && is_datasource_task_payload(&payload_data)
+        {
             payload_data.clone()
         } else {
             build_cron_task_json(job, fire_epoch, &self.local_node_id, payload_data)
@@ -1691,6 +1703,69 @@ mod tests {
                 .and_then(|v| v.as_str()),
             Some("reminders"),
             "parameters.sensor_id must be at the top level: {task}"
+        );
+    }
+
+    /// The unwrap-passthrough is gated on `target_role == "life-graph-runner"`
+    /// as well as payload shape — NOT shape alone. A philote-targeted job
+    /// whose payload happens to carry a top-level `kind` (a generic word;
+    /// nothing reserves it for `DatasourceTask`) must still go through
+    /// `build_cron_task_json`, or it silently loses `content` promotion —
+    /// `handle_user_message` drops a task with no `content`, per that
+    /// function's own doc comment, with no error anywhere.
+    #[tokio::test]
+    async fn kind_shaped_payload_to_a_philote_role_still_gets_content_promoted() {
+        use ansible_mesh_core::sqlite_storage::SqliteGraphStorage;
+
+        let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
+        let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
+        let (ticker, _parked_inbound, mut dispatcher_rx) = memory_hygiene_ticker(graph.clone());
+
+        let job = CronJob {
+            id: "daily-brief".to_string(),
+            schedule: "0 0 8 * * * *".to_string(),
+            target_role: "role:agent-beacon:orchestrator".to_string(),
+            target_node_id: None,
+            payload: serde_json::json!({
+                "kind": "daily",
+                "message": "good morning",
+            })
+            .to_string(),
+            guaranteed: false,
+            enabled: true,
+            last_fired_epoch: None,
+            next_fire_at: 1_000,
+            created_at: 0,
+            created_by: {
+                use ansible_mesh_core::cron::CronJobSource;
+                CronJobSource::Operator
+            },
+            silent_ok: false,
+            session_target: ansible_mesh_core::cron::CronSessionTarget::Main,
+        };
+        graph.upsert_cron_job(&job).expect("seed job");
+
+        tokio::time::timeout(Duration::from_secs(2), ticker.fire(&job, 1_000))
+            .await
+            .expect("fire() must not hang");
+
+        let received = tokio::time::timeout(Duration::from_secs(2), dispatcher_rx.recv())
+            .await
+            .expect("must not hang waiting for the daily-brief task")
+            .expect("must append a TaskInvoke");
+        let LedgerCommand::AppendLocal(envelope) = received else {
+            panic!("expected AppendLocal");
+        };
+        let EventPayload::Inline { data } = &envelope.payload else {
+            panic!("expected inline payload");
+        };
+        let task: serde_json::Value = serde_json::from_str(data).expect("task json parses");
+        assert_eq!(
+            task.get("content").and_then(|v| v.as_str()),
+            Some("good morning"),
+            "a philote-targeted job must still get content promoted, not be routed \
+             through the unwrap passthrough just because its payload has a `kind` \
+             key: {task}"
         );
     }
 
