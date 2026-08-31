@@ -167,6 +167,26 @@ impl DiskReport {
     }
 }
 
+/// Recall-engine health from Muninn's 0.11.0 Prometheus metrics
+/// (`muninndb_recall_embed_fallback_total`, `muninndb_recall_errors_total`). A
+/// non-zero `embed_fallback_total` is the **silent BM25-degradation** signal —
+/// recall fell back from the semantic embedder to lexical BM25 (e.g. a
+/// CGO_ENABLED=0 build shipped with no embedder), which quietly tanks recall
+/// quality without any error. Sourcing it needs a scrape of Muninn's `/metrics`
+/// endpoint (S6a-extra wiring).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RecallHealth {
+    pub embed_fallback_total: u64,
+    pub recall_errors_total: u64,
+}
+
+impl RecallHealth {
+    /// Whether recall is currently degraded to BM25 (any embed fallbacks seen).
+    pub fn is_degraded(&self) -> bool {
+        self.embed_fallback_total > 0
+    }
+}
+
 /// The inputs a caller has managed to source. Each is `Option`: `None` means the
 /// caller could not fetch it, which the assembler renders as `Unavailable` with
 /// a specific reason — the honest-sourcing contract.
@@ -183,6 +203,9 @@ pub struct MemoryReportInputs {
     pub contradictions: Option<u64>,
     pub soft_deleted: Option<u64>,
     pub disk: Option<DiskReport>,
+    /// Recall-engine health from Muninn's `/metrics` (embed→BM25 fallback +
+    /// recall errors). `None` until the metrics scrape is wired.
+    pub recall_health: Option<RecallHealth>,
     /// Whether the Cortex admin endpoint was reachable at all — distinguishes
     /// "no divergence" from "could not compare".
     pub cortex_reachable: bool,
@@ -199,6 +222,9 @@ pub struct MemoryReport {
     pub contradictions: ReportField<u64>,
     pub soft_deleted: ReportField<u64>,
     pub disk: ReportField<DiskReport>,
+    /// Recall-engine health (embed→BM25 fallback + recall errors) from Muninn's
+    /// 0.11.0 Prometheus metrics — the silent-degradation detector.
+    pub recall_health: ReportField<RecallHealth>,
     /// Fields this slice (S6a) cannot source at all — they need a muninndb API
     /// (S6b). Always reported as unavailable so the reader knows they exist and
     /// are pending, not that they are healthy.
@@ -261,6 +287,12 @@ pub fn assemble_memory_report(inputs: MemoryReportInputs) -> MemoryReport {
         disk: match inputs.disk {
             Some(d) => ReportField::available(d, "statvfs"),
             None => ReportField::unavailable("disk stat unavailable on this host"),
+        },
+        recall_health: match inputs.recall_health {
+            Some(h) => ReportField::available(h, "muninn_metrics"),
+            None => ReportField::unavailable(
+                "muninn /metrics not scraped (recall_embed_fallback + recall_errors counters — S6a-extra)",
+            ),
         },
         replication_lag: ReportField::unavailable(S6B_REASON),
         peer_state: ReportField::unavailable(S6B_REASON),
@@ -343,6 +375,40 @@ mod tests {
             ..Default::default()
         });
         assert_eq!(report.recall_hit_rate.value().copied(), Some(0.75));
+    }
+
+    #[test]
+    fn recall_health_unavailable_until_metrics_scraped() {
+        // Not sourced by default — must NOT read as "healthy zero fallbacks".
+        let report = assemble_memory_report(MemoryReportInputs::default());
+        assert!(!report.recall_health.is_available());
+    }
+
+    #[test]
+    fn recall_health_flags_bm25_degradation_when_sourced() {
+        let report = assemble_memory_report(MemoryReportInputs {
+            recall_health: Some(RecallHealth {
+                embed_fallback_total: 12,
+                recall_errors_total: 0,
+            }),
+            ..Default::default()
+        });
+        let h = report
+            .recall_health
+            .value()
+            .expect("recall_health available");
+        assert!(
+            h.is_degraded(),
+            "non-zero embed fallbacks = degraded to BM25"
+        );
+        // Zero fallbacks = healthy.
+        assert!(
+            !RecallHealth {
+                embed_fallback_total: 0,
+                recall_errors_total: 0
+            }
+            .is_degraded()
+        );
     }
 
     #[test]

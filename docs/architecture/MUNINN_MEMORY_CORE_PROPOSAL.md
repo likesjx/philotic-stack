@@ -146,7 +146,13 @@ An admin-role-gated read surface aggregating the data that **exists today**:
   the same ledger;
 - **contradictions / stale candidates** (`muninn_contradictions`, the hygiene
   sweep) and **soft-deleted** counts (`muninn_list_deleted`);
-- host **disk** headroom (the ENOSPC/silent-wedge risk, DEF-078).
+- host **disk** headroom (the ENOSPC/silent-wedge risk, DEF-078);
+- **recall health** from Muninn's 0.11.0 Prometheus metrics
+  (`muninndb_recall_embed_fallback_total`, `muninndb_recall_errors_total`) — a
+  non-zero embed-fallback count is the **silent BM25-degradation** detector
+  (recall dropped from the semantic embedder to lexical BM25). Sourcing needs a
+  scrape of Muninn's `/metrics`; the report field exists and is honest
+  `unavailable` until that scrape is wired (S6a-extra).
 
 Surface: a `memory.report` philote tool (admin-role gated, read-only) returning
 a structured report, and — stretch — a Muninn panel in philotic-web (the
