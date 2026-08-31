@@ -123,18 +123,10 @@
     path: "{{ philotic_artifacts_dir }}/{{ item }}"
   loop: "{{ philotic_binaries }}"
   register: philotic_remote_artifact_stats
+  until: philotic_remote_artifact_stats.stat.exists
+  retries: 3
+  delay: 2
   when: philotic_artifacts_remote | bool
-  tags: [binary]
-
-- name: Warn about missing remote Philotic binaries
-  debug:
-    msg: >
-      Skipping remote artifact {{ item.item }} because {{ philotic_artifacts_dir }}/{{ item.item }}
-      is not present on the target host.
-  loop: "{{ philotic_remote_artifact_stats.results }}"
-  when:
-    - philotic_artifacts_remote | bool
-    - not item.stat.exists
   tags: [binary]
 
 - name: Install Philotic binaries (already built on host)

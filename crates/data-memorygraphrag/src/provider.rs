@@ -1748,7 +1748,7 @@ impl LifeGraphProvider {
         // park it as awaiting_confirmation so `life.patch.apply` (called
         // after explicit operator approval) can actually act on it — the
         // default `proposed` status is invisible to apply.
-        let status = if input.ontology_extension.is_some() {
+        let status = if input.ontology_extension.is_some() || !input.skill_definitions.is_empty() {
             cypher::PATCH_STATUS_AWAITING_CONFIRMATION
         } else {
             cypher::PATCH_STATUS_PROPOSED
@@ -2151,6 +2151,7 @@ impl LifeGraphProvider {
 
         let now = chrono::Utc::now().to_rfc3339();
         let mut ontology_applied: Option<Value> = None;
+        let mut skill_compilation: Option<Value> = None;
         let (new_status, edges_written, missing_targets, outcome) = match input.decision {
             PatchApplyDecision::Confirm => {
                 let (written, missing) =
@@ -2188,8 +2189,20 @@ impl LifeGraphProvider {
                         }
                     }
                 }
+                if !patch.skill_definitions.is_empty() {
+                    skill_compilation = Some(json!({
+                        "status": "approved",
+                        "patch_id": input.patch_id,
+                        "definitions": patch.skill_definitions,
+                        "next_action": "Call skill.register_batch with this patch_id and these exact definitions."
+                    }));
+                }
                 (
-                    cypher::PATCH_STATUS_APPLIED,
+                    if skill_compilation.is_some() {
+                        cypher::PATCH_STATUS_APPROVED_FOR_COMPILATION
+                    } else {
+                        cypher::PATCH_STATUS_APPLIED
+                    },
                     written,
                     missing,
                     "confirmed_good",
@@ -2255,6 +2268,9 @@ impl LifeGraphProvider {
         });
         if let Some(ontology) = ontology_applied {
             result["ontology_extension"] = ontology;
+        }
+        if let Some(compilation) = skill_compilation {
+            result["skill_compilation"] = compilation;
         }
         Ok(ProviderOutput::ResultSet(result))
     }
@@ -3401,6 +3417,7 @@ fn recall_feedback_patch_proposal(
         edge_specs: Vec::new(),
         autonomy_audit_id: None,
         ontology_extension: None,
+        skill_definitions: vec![],
     })
 }
 

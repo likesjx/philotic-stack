@@ -119,7 +119,7 @@ impl AgentRuntime {
             "routing.policy.propose" => Some("routing_policy_propose"),
             // Skill registration writes an abstract skill into the graph that can
             // later project tools onto agents — must not be silently accepted.
-            "skill.register" => Some("skill_register"),
+            "skill.register" | "skill.register_batch" => Some("skill_register"),
             _ => None,
         }
     }
@@ -3055,6 +3055,131 @@ impl AgentRuntime {
                     error: tool_err,
                     tool_name: Some(payload.tool_name),
                     arguments: None,
+                    final_reply_to: Some(payload.final_reply_to),
+                    final_reply_role: Some(payload.final_reply_role),
+                    final_reply_guest_id: payload.final_reply_guest_id,
+                    ..Default::default()
+                })
+                .await
+            }
+
+            "skill.register_batch" => {
+                let Some(patch_id) = payload
+                    .arguments
+                    .get("patch_id")
+                    .and_then(|value| value.as_str())
+                    .map(str::to_string)
+                else {
+                    return self
+                        .fail_active_turn(
+                            payload.session_id,
+                            payload.turn_id,
+                            "skill.register_batch: missing required argument 'patch_id'".into(),
+                        )
+                        .await;
+                };
+                let definitions = match payload.arguments.get("definitions").cloned() {
+                    Some(value) => match serde_json::from_value::<
+                        Vec<philotic_client::SkillDefinitionSpec>,
+                    >(value)
+                    {
+                        Ok(definitions) => definitions,
+                        Err(error) => {
+                            return self
+                                .fail_active_turn(
+                                    payload.session_id,
+                                    payload.turn_id,
+                                    format!(
+                                        "skill.register_batch: invalid definitions payload: {error}"
+                                    ),
+                                )
+                                .await;
+                        }
+                    },
+                    None => {
+                        return self
+                            .fail_active_turn(
+                                payload.session_id,
+                                payload.turn_id,
+                                "skill.register_batch: missing required argument 'definitions'"
+                                    .into(),
+                            )
+                            .await;
+                    }
+                };
+
+                let (content, tool_err) = match self
+                    .ipc_client
+                    .send_request(IpcRequest::RegisterSkillBatch {
+                        patch_id: patch_id.clone(),
+                        definitions,
+                    })
+                    .await
+                {
+                    Ok(IpcResponse::SkillsRegistered { patch_id, results }) => {
+                        let lines = results
+                            .iter()
+                            .map(|result| {
+                                if result.validation_errors.is_empty() {
+                                    format!("- {} [{}]", result.skill_name, result.validation_state)
+                                } else {
+                                    format!(
+                                        "- {} [{}]: {}",
+                                        result.skill_name,
+                                        result.validation_state,
+                                        result.validation_errors.join("; ")
+                                    )
+                                }
+                            })
+                            .collect::<Vec<_>>()
+                            .join("\n");
+                        (
+                            format!(
+                                "Skill patch '{}' compiled into the catalog:\n{}",
+                                patch_id, lines
+                            ),
+                            None,
+                        )
+                    }
+                    Ok(IpcResponse::Standard {
+                        ok: false,
+                        code,
+                        message,
+                        ..
+                    }) => {
+                        let error = TaskErrorPayload::ipc_failure("aiua", &*code, message);
+                        (error.display_message(), Some(error))
+                    }
+                    Ok(IpcResponse::Error(message)) => {
+                        let error = TaskErrorPayload::ipc_failure("aiua", "IPC_ERROR", message);
+                        (error.display_message(), Some(error))
+                    }
+                    Ok(_) => {
+                        let error = TaskErrorPayload::ipc_failure(
+                            "aiua",
+                            "UNEXPECTED_RESPONSE",
+                            "skill.register_batch: unexpected hotel response",
+                        );
+                        (error.display_message(), Some(error))
+                    }
+                    Err(error) => {
+                        let error = TaskErrorPayload::transport_error(
+                            "philote",
+                            format!("skill.register_batch: IPC transport error — {error}"),
+                        );
+                        (error.display_message(), Some(error))
+                    }
+                };
+
+                self.handle_tool_result(InboundTaskPayload {
+                    action: Some("tool_result".into()),
+                    source: Some("agent".into()),
+                    session_id: Some(payload.session_id),
+                    turn_id: Some(payload.turn_id),
+                    chat_id: Some(payload.chat_id),
+                    content: Some(content),
+                    error: tool_err,
+                    tool_name: Some(payload.tool_name),
                     final_reply_to: Some(payload.final_reply_to),
                     final_reply_role: Some(payload.final_reply_role),
                     final_reply_guest_id: payload.final_reply_guest_id,

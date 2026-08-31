@@ -136,7 +136,10 @@ Seam IDs: `life-graph-schema`, `life-graph-memorygraphrag-runner`, `life-graph-a
   - [x] Deploy and smoke the LifeGraph MCP endpoint against the live `life-graph-runner` before claiming `watched-live-green`.
   - [x] Harden the model-facing LifeGraph tool contracts: `life.recall` now supports the advertised text-only auto-embed path, governed patch approval defaults safely to false, and every `life.steward` implied tool has a concrete catalog schema.
   - [x] Separate LifeGraph review patches from their executable actuators (DEF-097): `SkillPatch` now points to `skill.register` + `skill.assign`, executable `SchemaPatch` payloads expose `ontology_extension`, `not_applicable` responses explain the real next action, and approval follow-ups retain the skill-authoring tool surface.
-  - [ ] Deploy DEF-097 to `vps-jane`, have Beacon register and assign the four proposed music skills through the installed runtime, and watch the catalog/role projection before upgrading beyond `test-green`.
+  - [x] Deploy DEF-097 to `vps-jane` and prove the installed skill administration plane with a 14/14 live drill (auth gates, register/list, DAG persistence, lifecycle, audit, and retirement).
+  - [x] Add typed SkillPatch compile-down: confirmation returns the exact `skill_definitions` batch and `skill.register_batch` preserves source-patch provenance under the existing human/admin gates (`test-green`, fleet rollout pending).
+  - [x] Scope `skill.assign` / `skill.revoke` to `RoleIncarnationRecord.assigned_skills` so one role grant cannot mutate the shared profile for every philote using it (`test-green`, fleet rollout pending).
+  - [ ] Deploy the typed batch/scoped-grant slice, have Beacon register and assign the four proposed music skills through the installed runtime, and watch catalog, role projection, and audit before upgrading the new path beyond `test-green`.
 - [ ] Add semantic indexing for Life Graph nodes with a `768`-dimension baseline, explicit embedding model generation, vector space, and source-text hash metadata.
 - [ ] Define the embeddings flywheel: retrieval outcome capture, useful/stale/missing/noisy feedback, ranking/bridge tuning, and re-embedding triggers.
   - [x] Add `life.recall.feedback` contracts/provider handler to record retrieval reward/friction as `Signal` nodes and emit governed improvement-candidate steps from usefulness, staleness, missing context, noise, overconfidence, and low connectivity.
@@ -891,11 +894,11 @@ Seam IDs: `multi-hotel-route-consistency`, `cross-host-distributed-validation`, 
   - move member-record sync from “first converged path” to audited canonical mesh authority
   - make cross-hotel philote / role transport consume the converged membership view directly
   - close the retroactive convergence gap so already-paired hotels learn the full current circle without requiring a fresh admission ceremony
-- [x] Sync the canonical mesh catalog across hotels instead of seeding hotel-local tool/skill/profile folklore:
-  - replicate `abstract_tool`, `abstract_skill`, and `toolset_profile` records on change and periodic full sync
-  - use the built-in `admin` profile as the first proving profile
-  - let newly admitted hotels receive the current canonical catalog as part of the singular-mesh convergence path
-- [ ] Decide whether ad hoc `skill.register` writes are canonical mesh-catalog truth or hotel-local overlays, then implement that authority boundary instead of leaving dynamic skill propagation to vibes.
+- [ ] Converge governed runtime catalog changes without pretending release seeds and local grants have one owner:
+  - [x] Decide that `skill.register` writes with real source provenance are mesh-visible shared definitions, while compiled seeds stay release-owned and role assignments stay hotel-local.
+  - [x] Replicate governed dynamic `abstract_skill` records on change and periodic full sync over authenticated reliable transport with deterministic conflict handling (`test-green`, fleet rollout pending).
+  - [ ] Prove dynamic skill convergence watched-live across two installed hotels.
+  - [ ] Define and implement separate dynamic authority for `abstract_tool` and `toolset_profile` mutations; the earlier checked-off claim of full tool/skill/profile convergence was not supported by the runtime.
 - [x] Expose the first hotel-owned placement judgment API:
   - add `hotel.best_place_to_run`
   - respect explicit role home pins first

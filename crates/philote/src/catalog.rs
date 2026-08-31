@@ -397,6 +397,7 @@ pub fn tools_for_skill(skill_name: &str) -> &'static [&'static str] {
         "role.authoring" => &["role.create_or_update"],
         "skill.authoring" => &[
             "skill.register",
+            "skill.register_batch",
             "skill.assign",
             "skill.revoke",
             "skill.set_state",
@@ -590,6 +591,7 @@ pub fn skill_is_relevant_for_turn(skill_name: &str, turn_text: &str) -> bool {
         "skill.authoring" => {
             t.contains("register skill")
                 || t.contains("skill.register")
+                || t.contains("skill.register_batch")
                 || t.contains("skill.assign")
                 || t.contains("skill.set_state")
                 || t.contains("skill.audit")
@@ -1544,6 +1546,57 @@ fn build_catalog() -> HashMap<String, ToolDefinition> {
     );
 
     m.insert(
+        "skill.register_batch".into(),
+        ToolDefinition {
+            tool_name: "skill.register_batch".into(),
+            description: "Compiles one typed, operator-approved SkillPatch into the hotel's shared \
+                          skill catalog. The whole definition set is submitted under one patch id \
+                          and every registration is validated and audited with that provenance. \
+                          Use the definitions returned by life.patch.apply; do not invent or omit \
+                          fields during compilation. This call always requires live approval."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "required": ["patch_id", "definitions"],
+                "properties": {
+                    "patch_id": {
+                        "type": "string",
+                        "description": "Approved LifeGraph SkillPatch id preserved in registration audits."
+                    },
+                    "definitions": {
+                        "type": "array",
+                        "minItems": 1,
+                        "maxItems": 32,
+                        "items": {
+                            "type": "object",
+                            "required": ["skill_name", "description", "subagent_kind", "goal"],
+                            "properties": {
+                                "skill_name": {"type": "string"},
+                                "description": {"type": "string"},
+                                "subagent_kind": {"type": "string"},
+                                "goal": {"type": "string"},
+                                "allowed_tools": {
+                                    "type": "array",
+                                    "items": {"type": "string"}
+                                },
+                                "allowed_classes": {
+                                    "type": "array",
+                                    "items": {"type": "string"}
+                                },
+                                "allowed_skills": {
+                                    "type": "array",
+                                    "items": {"type": "string"}
+                                }
+                            }
+                        }
+                    }
+                }
+            }),
+            class: Some("capability".into()),
+        },
+    );
+
+    m.insert(
         "skill.list".into(),
         ToolDefinition {
             tool_name: "skill.list".into(),
@@ -1581,9 +1634,10 @@ fn build_catalog() -> HashMap<String, ToolDefinition> {
         "skill.assign".into(),
         ToolDefinition {
             tool_name: "skill.assign".into(),
-            description: "Assigns a registered skill to a role's toolset profile. Once assigned, \
+            description: "Assigns a registered skill to one specific role incarnation. Once assigned, \
                           the skill's implied tools become available to the role on its next session. \
-                          The skill must exist in the catalog. Idempotent."
+                          Shared toolset profiles remain unchanged. The skill must exist in the \
+                          catalog. Idempotent."
                 .into(),
             input_schema: json!({
                 "type": "object",
@@ -1607,11 +1661,10 @@ fn build_catalog() -> HashMap<String, ToolDefinition> {
         "skill.revoke".into(),
         ToolDefinition {
             tool_name: "skill.revoke".into(),
-            description:
-                "Removes a skill from a role's toolset profile. The skill's implied tools \
+            description: "Removes a role-incarnation skill grant. The skill's implied tools \
                           will no longer be available to the role after the next session reset. \
                           Idempotent."
-                    .into(),
+                .into(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -3975,9 +4028,10 @@ fn build_catalog() -> HashMap<String, ToolDefinition> {
                           tool addition, attention policy change, or system-level change. \
                           A schema_patch is executable only when it carries an \
                           ontology_extension (new labels and/or edges; not properties or core-label \
-                          edits). A SkillPatch is a review artifact, not a skill-catalog write: \
-                          after approval, register it with skill.register and activate it with \
-                          skill.assign. High-risk patches remain proposal-only."
+                          edits). A SkillPatch becomes executable only when it carries typed \
+                          skill_definitions; confirmation releases that exact batch for \
+                          skill.register_batch. Prose-only SkillPatch records remain review \
+                          artifacts. High-risk patches remain proposal-only."
                 .into(),
             input_schema: json!({
                 "type": "object",
@@ -4033,6 +4087,23 @@ fn build_catalog() -> HashMap<String, ToolDefinition> {
                                         "target_labels": {"type": "array", "items": {"type": "string"}}
                                     }
                                 }
+                            }
+                        }
+                    },
+                    "skill_definitions": {
+                        "type": "array",
+                        "description": "Typed executable definitions for a skill_patch. Confirmation returns this exact batch for skill.register_batch.",
+                        "items": {
+                            "type": "object",
+                            "required": ["skill_name", "description", "subagent_kind", "goal"],
+                            "properties": {
+                                "skill_name": {"type": "string"},
+                                "description": {"type": "string"},
+                                "subagent_kind": {"type": "string"},
+                                "goal": {"type": "string"},
+                                "allowed_tools": {"type": "array", "items": {"type": "string"}},
+                                "allowed_classes": {"type": "array", "items": {"type": "string"}},
+                                "allowed_skills": {"type": "array", "items": {"type": "string"}}
                             }
                         }
                     }
@@ -4123,9 +4194,10 @@ fn build_catalog() -> HashMap<String, ToolDefinition> {
                           conversation. Confirming a schema_patch that carries an \
                           ontology_extension makes the new nouns/verbs live vocabulary \
                           immediately (vector indexes are created automatically). It does NOT \
-                          register SkillPatch records; use skill.register followed by skill.assign \
-                          for those. Prose-only patches remain review artifacts and are not \
-                          executable. Verify schema changes with life.ontology afterwards."
+                          directly register SkillPatch records. Confirming a typed SkillPatch \
+                          returns skill_compilation definitions for skill.register_batch; \
+                          prose-only patches remain review artifacts. Verify catalog results with \
+                          skill.list and schema changes with life.ontology."
                 .into(),
             input_schema: json!({
                 "type": "object",

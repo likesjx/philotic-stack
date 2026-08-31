@@ -3,7 +3,7 @@ title: Life Graph OS Proposal
 doc_type: proposal
 domain: memory-context
 status: accepted-current-slice
-last_updated: 2026-06-24
+last_updated: 2026-08-27
 tags:
 - life-graph
 - context-engine
@@ -88,6 +88,7 @@ The first Life Graph OS boundary is now substantially implemented. Current proof
 - `life-graph-memorygraphrag-runner` (`provider-handlers-green`): `data-memorygraphrag` runner with full `life.*` tool catalog, planner, and provider handlers for `life.observe`, `life.recall`, `life.recall.feedback`, `life.commit`, `life.resolve`, `life.conflict`, and `life.patch.propose`. `life.observe` MERGE live and verified against Memgraph. `life.recall` now dispatches the five named strategies from `SEMANTIC_RETRIEVAL.md`. Provider write handlers compile and execute Memgraph MERGE/SET writes for commit, conflict, resolve, patch proposal, and recall-feedback flows. Commits `1883ea6`, `0265091`.
 - `life-graph-philote-access` (`watched-live-green`): all seeded role profiles (`orchestrator`, `admin`, `codex`, `research`, `utility`, `architect`, `brain`, `virtuoso`) now carry the `life_graph` class and a vps-jane remote runner binding. mac-jane, mbp-jane, and vps-jane were deployed/restarted and live-smoked through `life.observe`/`life.recall` to the canonical vps-jane LifeGraph runner.
 - `life-graph-agentic-growth-loop` (`test-green-contracts`): `data-memorygraphrag` defines patch gates, growth signals, drift categories, and risk-tiered policy evaluation.
+- `life-graph-skill-patch-compiler` (`test-green-contracts`): `SkillPatch` proposals may carry typed executable definitions. Confirmation returns the exact approved batch for hotel-local `skill.register_batch`, preserving the source patch in registration audit while keeping LifeGraph out of runtime grant resolution.
 - `life-graph-attention-steward` (`test-green-observe-policy`): SIL data model (`StewardshipInstruction`), Beacon stewardship contract, observe-only paracrine subscriber interface (8 signal types, 4 response types), anti-policy checklist. Spec at `docs/architecture/life-graph/ATTENTION_STEWARD.md`. Commit `86a730b`.
 
 ## Still Open (Backlog)
@@ -100,13 +101,14 @@ Per-seam open items for the next implementation round:
 | `life-graph-semantic-retrieval` | Named strategy dispatch is provider-green; read-only retrieval-quality aggregation now ships as `life.recall.stats` (per-rating counts, weighted connectivity, useful-rate); next is recording `named_strategy` on feedback signals for per-strategy grouping, then flag-gated ranking/bridge tuning and live feedback smoke |
 | `life-graph-evidence-conflict` | Runtime conflict detection still needs first-class triggering; provider `handle_conflict` / `handle_resolve` are test-green, and Muninn-facing resolve plans now route implemented `true_up` / `contradiction_review` / `trust_update` intents through Philote's `memory.true_up` surface |
 | `life-graph-attention-steward` | Active SIL entries and operator confirmation gate in philote (first slice is observe-only; active interruptions unlock after 5 confirmed SIL entries) |
-| `life-graph-agentic-growth-loop` | Growth-loop philote role; background drift detector job |
+| `life-graph-agentic-growth-loop` | Typed SkillPatch compile-down is test-green; next is the growth-loop philote role and background drift detector job |
 
 Cross-cutting next pressure:
 
 - embed `life.recall` in Beacon's turn context pipeline (claude-local)
 - connect runtime conflict detection to LifeGraph conflict handoff packets; resolved handoffs use Philote `memory.true_up` for `true_up`, `contradiction_review`, and `trust_update` intents until a narrower reviewed tool exists
 - live-smoke `life.recall.feedback` through hotel IPC and expose the resulting patch proposals for Beacon/operator review
+- deploy and conversationally prove typed SkillPatch confirmation -> `skill.register_batch` -> role-scoped assignment on Beacon
 
 ## Codex Handoff — Group B Provider Completions
 
@@ -134,6 +136,15 @@ Follow the `handle_observe` method (line ~108) as the pattern for every handler 
 - Call `runner.plan(...)`. Check `plan.allowed()`. High-risk patches (`PatchRisk::High`) require `operator_approved: true`.
 - Write the patch as a node of the appropriate `*Patch` label (e.g. `SchemaPatch`, `SkillPatch`) using `MERGE (n:{label} {id: $id}) ON CREATE SET ...` with all fields from `input`: `summary`, `rationale`, `risk`, `status: "proposed"`, provenance fields.
 - Return `{ status: "proposed", patch_id, patch_kind, risk, requires_operator }`.
+
+Current executable SkillPatch refinement: `skill_definitions` is a typed optional
+payload on `LifePatchProposalInput`. A typed medium-risk SkillPatch is parked at
+`awaiting_confirmation`; `life.patch.apply(decision=confirm,
+operator_approved=true)` moves it to `approved_for_compilation` and returns
+`skill_compilation { patch_id, definitions, next_action }`. The caller must pass
+that exact batch to `skill.register_batch`. Prose-only historical SkillPatch
+records remain review artifacts and return actuator guidance instead of claiming
+to have changed the runtime.
 
 ### 4. Named strategy dispatch in `handle_recall`
 

@@ -26,6 +26,7 @@ pub const LOCAL_AGENT_TOOLS: &[&str] = &[
     // ── Agent / role / skill governance ─────────────────────────────────────
     "agent.configure",
     "skill.register",
+    "skill.register_batch",
     "skill.list",
     "skill.assign",
     "skill.revoke",

@@ -10,6 +10,7 @@ use ansible_mesh_core::event::EventEnvelope;
 use ansible_mesh_core::heartbeat::{
     CapabilitySyncPayload, HeartbeatPayload, emit_capability_sync, emit_heartbeat,
 };
+use ansible_mesh_core::membership::MeshCatalogSyncPayload as SharedCatalogSyncPayload;
 use ansible_mesh_core::registry::NodeRegistry;
 use ansible_mesh_core::storage::{CursorStorage, EventStorage, HotelRecord};
 use anyhow::{Context, Result};
@@ -26,6 +27,114 @@ use crate::{
     mesh_target_addr_for_node, mesh_targets_for_graph, reconcile_peer_execution_reachability,
     sample_node_health,
 };
+
+fn shared_skill_catalog_payload(graph: &GraphDomain) -> Result<(SharedCatalogSyncPayload, String)> {
+    let mut abstract_skills = graph
+        .list_abstract_skills()?
+        .into_iter()
+        // Compiled seeds already exist on every compatible hotel. Replicate
+        // only governed runtime registrations with real provenance.
+        .filter(|skill| {
+            skill
+                .source_snapshot
+                .as_ref()
+                .is_some_and(|source| source.registered_at > 0)
+        })
+        .collect::<Vec<_>>();
+    abstract_skills.sort_by(|left, right| left.skill_name.cmp(&right.skill_name));
+    let payload = SharedCatalogSyncPayload {
+        mesh_id: "default".into(),
+        issued_at: ansible_mesh_core::membership::now_epoch_secs(),
+        abstract_tools: Vec::new(),
+        abstract_skills,
+        toolset_profiles: Vec::new(),
+    };
+    let fingerprint = blake3::hash(&serde_json::to_vec(&payload.abstract_skills)?)
+        .to_hex()
+        .to_string();
+    Ok((payload, fingerprint))
+}
+
+fn incoming_skill_is_newer(
+    local: Option<&ansible_mesh_core::graph::AbstractSkillRecord>,
+    incoming: &ansible_mesh_core::graph::AbstractSkillRecord,
+) -> bool {
+    let Some(incoming_source) = incoming.source_snapshot.as_ref() else {
+        return false;
+    };
+    if incoming_source.registered_at == 0 {
+        return false;
+    }
+    let Some(local_source) = local.and_then(|skill| skill.source_snapshot.as_ref()) else {
+        return true;
+    };
+    let incoming_key = (
+        incoming_source.registered_at,
+        incoming_source.registered_by.as_str(),
+    );
+    let local_key = (
+        local_source.registered_at,
+        local_source.registered_by.as_str(),
+    );
+    incoming_key > local_key
+        || (incoming_key == local_key
+            && serde_json::to_string(incoming).unwrap_or_default()
+                > local
+                    .and_then(|skill| serde_json::to_string(skill).ok())
+                    .unwrap_or_default())
+}
+
+fn apply_shared_skill_catalog(
+    graph: &GraphDomain,
+    payload: SharedCatalogSyncPayload,
+) -> Result<usize> {
+    if payload.mesh_id != "default" {
+        anyhow::bail!("unsupported mesh catalog id [{}]", payload.mesh_id);
+    }
+    let mut applied = 0usize;
+    for skill in payload.abstract_skills {
+        let local = graph.get_abstract_skill(&skill.skill_name)?;
+        if incoming_skill_is_newer(local.as_ref(), &skill) {
+            graph.upsert_abstract_skill(&skill)?;
+            applied += 1;
+        }
+    }
+    Ok(applied)
+}
+
+async fn send_shared_skill_catalog(
+    graph: &GraphDomain,
+    local_node_id: &str,
+    target_node_id: &str,
+    payload: &SharedCatalogSyncPayload,
+) -> Result<()> {
+    let target_addr = mesh_target_addr_for_node(graph, target_node_id)?
+        .with_context(|| format!("missing execution address for {target_node_id}"))?;
+    let auth_key = mesh_auth_key_for_node(graph, target_node_id)?
+        .with_context(|| format!("missing mesh auth key for {target_node_id}"))?;
+    let payload_bytes = serde_json::to_vec(payload)?;
+    let msg_id = uuid::Uuid::new_v4();
+    let timestamp = ansible_mesh_core::membership::now_epoch_secs();
+    let hmac = ansible_mesh_core::authz::MeshAuth::new(auth_key).sign(
+        &msg_id,
+        0,
+        &payload_bytes,
+        timestamp,
+    );
+    let message = ansible_mesh_core::BeaconMessage {
+        version: 1,
+        msg_id,
+        src_node: local_node_id.to_string(),
+        dest_node: target_node_id.to_string(),
+        msg_type: ansible_mesh_core::MsgType::MeshCatalogSync,
+        seq: 0,
+        total: 1,
+        payload: payload_bytes.into(),
+        timestamp,
+        hmac: hmac.into(),
+    };
+    crate::service::execution_transport::send_execution_message(&target_addr, &message).await
+}
 
 type BeaconInboxReceiver = Arc<Mutex<Option<mpsc::Receiver<ansible_mesh_core::BeaconMessage>>>>;
 type WebRtcSignalReceiver =
@@ -325,6 +434,73 @@ pub(crate) async fn activate_mesh_runtime(ctx: MeshRuntimeContext) -> Result<()>
         });
     }
 
+    // Governed runtime skill registrations converge over the authenticated,
+    // reliable execution transport. UDP remains the lightweight peer-address
+    // handshake; shipping a catalog through it would exceed macOS datagram
+    // limits as soon as the system became interesting.
+    {
+        let catalog_graph = ctx.graph_domain.clone();
+        let catalog_local_node_id = ctx.caps.node_id.clone();
+        let mut catalog_shutdown = ctx.shutdown_tx.subscribe();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(10));
+            let mut last_fingerprint: Option<String> = None;
+            let mut last_full_sync =
+                std::time::Instant::now() - std::time::Duration::from_secs(3600);
+            loop {
+                tokio::select! {
+                    _ = interval.tick() => {
+                        let (payload, fingerprint) = match shared_skill_catalog_payload(catalog_graph.as_ref()) {
+                            Ok(value) => value,
+                            Err(error) => {
+                                warn!("skill-catalog sync: failed to assemble payload: {error}");
+                                continue;
+                            }
+                        };
+                        let should_sync = last_fingerprint.as_ref() != Some(&fingerprint)
+                            || last_full_sync.elapsed() >= std::time::Duration::from_secs(3600);
+                        if !should_sync {
+                            continue;
+                        }
+                        let targets = match catalog_graph.list_hotels() {
+                            Ok(hotels) => hotels
+                                .into_iter()
+                                .map(|hotel| hotel.capabilities.node_id)
+                                .filter(|node_id| node_id != &catalog_local_node_id)
+                                .collect::<Vec<_>>(),
+                            Err(error) => {
+                                warn!("skill-catalog sync: failed to list targets: {error}");
+                                continue;
+                            }
+                        };
+                        let has_targets = !targets.is_empty();
+                        let mut all_targets_synced = true;
+                        for target_node_id in targets {
+                            if let Err(error) = send_shared_skill_catalog(
+                                catalog_graph.as_ref(),
+                                &catalog_local_node_id,
+                                &target_node_id,
+                                &payload,
+                            ).await {
+                                all_targets_synced = false;
+                                warn!("skill-catalog sync to {target_node_id} failed: {error}");
+                            }
+                        }
+                        // Do not suppress the next 10-second attempt when the
+                        // peer directory was not ready yet or any target send
+                        // failed. Startup races are exactly when convergence
+                        // needs retries instead of an hour-long confidence nap.
+                        if has_targets && all_targets_synced {
+                            last_fingerprint = Some(fingerprint);
+                            last_full_sync = std::time::Instant::now();
+                        }
+                    }
+                    _ = catalog_shutdown.recv() => break,
+                }
+            }
+        });
+    }
+
     {
         let dispatcher_inbound_tx = ctx.dispatcher_tx.clone();
         let inbound_graph = ctx.graph_domain.clone();
@@ -549,6 +725,33 @@ pub(crate) async fn activate_mesh_runtime(ctx: MeshRuntimeContext) -> Result<()>
                             );
                         }
                     }
+                    ansible_mesh_core::MsgType::MeshCatalogSync => {
+                        match serde_json::from_slice::<SharedCatalogSyncPayload>(&msg.payload) {
+                            Ok(payload) => {
+                                match apply_shared_skill_catalog(inbound_graph.as_ref(), payload) {
+                                    Ok(applied) if applied > 0 => info!(
+                                        source_node = %msg.src_node,
+                                        applied,
+                                        "Applied newer governed skill-catalog records"
+                                    ),
+                                    Ok(_) => debug!(
+                                        source_node = %msg.src_node,
+                                        "Skill-catalog sync contained no newer records"
+                                    ),
+                                    Err(error) => warn!(
+                                        source_node = %msg.src_node,
+                                        "Rejected skill-catalog sync: {error}"
+                                    ),
+                                }
+                            }
+                            // The UDP reconnect handshake still uses the older
+                            // peer-directory payload under the same message kind.
+                            Err(_) => debug!(
+                                source_node = %msg.src_node,
+                                "Ignoring peer-directory MeshCatalogSync in shared-skill handler"
+                            ),
+                        }
+                    }
                     ansible_mesh_core::MsgType::WebRtcSignal => {
                         info!("Received WebRTC Signaling Payload from {}", msg.src_node);
                         if let Ok(signal_msg) = serde_json::from_slice::<
@@ -701,4 +904,112 @@ pub(crate) async fn activate_mesh_runtime(ctx: MeshRuntimeContext) -> Result<()>
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ansible_mesh_core::graph::{AbstractSkillRecord, SkillSourceSnapshot};
+    use ansible_mesh_core::sqlite_storage::SqliteGraphStorage;
+
+    fn test_graph() -> GraphDomain {
+        let storage = SqliteGraphStorage::open(":memory:").expect("open sqlite");
+        GraphDomain::new(Arc::new(storage.adapter()))
+    }
+
+    fn dynamic_skill(name: &str, description: &str, registered_at: u64) -> AbstractSkillRecord {
+        AbstractSkillRecord {
+            skill_name: name.into(),
+            description: description.into(),
+            source_snapshot: Some(SkillSourceSnapshot {
+                mesh_catalog_version: String::new(),
+                hotel_policy_version: String::new(),
+                registered_at,
+                registered_by: "agent-beacon-01:orchestrator".into(),
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn shared_catalog_publishes_only_governed_dynamic_skills() {
+        let graph = test_graph();
+        graph
+            .upsert_abstract_skill(&AbstractSkillRecord {
+                skill_name: "compiled.seed".into(),
+                description: "already installed everywhere".into(),
+                ..Default::default()
+            })
+            .expect("seed compiled skill");
+        graph
+            .upsert_abstract_skill(&dynamic_skill("music.practice.steward", "dynamic", 100))
+            .expect("seed dynamic skill");
+
+        let (payload, fingerprint) = shared_skill_catalog_payload(&graph).expect("payload");
+        assert_eq!(payload.abstract_skills.len(), 1);
+        assert_eq!(
+            payload.abstract_skills[0].skill_name,
+            "music.practice.steward"
+        );
+        assert!(!fingerprint.is_empty());
+        assert!(payload.abstract_tools.is_empty());
+        assert!(payload.toolset_profiles.is_empty());
+    }
+
+    #[test]
+    fn shared_catalog_applies_last_writer_and_rejects_stale_records() {
+        let graph = test_graph();
+        graph
+            .upsert_abstract_skill(&dynamic_skill(
+                "music.practice.steward",
+                "local version",
+                200,
+            ))
+            .expect("seed local skill");
+        let payload = |skill| SharedCatalogSyncPayload {
+            mesh_id: "default".into(),
+            issued_at: 300,
+            abstract_tools: vec![],
+            abstract_skills: vec![skill],
+            toolset_profiles: vec![],
+        };
+
+        let applied = apply_shared_skill_catalog(
+            &graph,
+            payload(dynamic_skill(
+                "music.practice.steward",
+                "stale remote version",
+                100,
+            )),
+        )
+        .expect("stale payload handled");
+        assert_eq!(applied, 0);
+        assert_eq!(
+            graph
+                .get_abstract_skill("music.practice.steward")
+                .expect("lookup")
+                .expect("skill")
+                .description,
+            "local version"
+        );
+
+        let applied = apply_shared_skill_catalog(
+            &graph,
+            payload(dynamic_skill(
+                "music.practice.steward",
+                "new remote version",
+                300,
+            )),
+        )
+        .expect("new payload handled");
+        assert_eq!(applied, 1);
+        assert_eq!(
+            graph
+                .get_abstract_skill("music.practice.steward")
+                .expect("lookup")
+                .expect("skill")
+                .description,
+            "new remote version"
+        );
+    }
 }

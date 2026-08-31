@@ -822,6 +822,12 @@ impl IpcServer {
             role_name: role_name.clone(),
             guest_id,
             toolset_profile,
+            // Role configuration changes do not implicitly revoke runtime
+            // skill grants. `skill.revoke` is the audited owner of that state.
+            assigned_skills: previous
+                .as_ref()
+                .map(|p| p.assigned_skills.clone())
+                .unwrap_or_default(),
             role_identity_addendum: preserved
                 .map(|p| p.role_identity_addendum.clone())
                 .unwrap_or(role_identity_addendum),

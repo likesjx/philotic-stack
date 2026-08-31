@@ -1611,6 +1611,20 @@ pub struct LifeResolveInput {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SkillPatchDefinition {
+    pub skill_name: String,
+    pub description: String,
+    pub subagent_kind: String,
+    pub goal: String,
+    #[serde(default)]
+    pub allowed_tools: Vec<String>,
+    #[serde(default)]
+    pub allowed_classes: Vec<String>,
+    #[serde(default)]
+    pub allowed_skills: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct LifePatchProposalInput {
     pub patch_id: String,
     pub patch_kind: PatchKind,
@@ -1639,6 +1653,11 @@ pub struct LifePatchProposalInput {
     /// set; the vocabulary is live immediately, no code change or deploy.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ontology_extension: Option<ontology::OntologyExtensions>,
+    /// Executable definitions carried by a SkillPatch. Operator confirmation
+    /// releases this exact typed batch for `skill.register_batch`; prose-only
+    /// SkillPatch records remain review artifacts.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub skill_definitions: Vec<SkillPatchDefinition>,
 }
 
 /// Operator decision on an `awaiting_confirmation` patch.
@@ -2445,6 +2464,11 @@ impl MemoryGraphRagRunner {
                 return Err(ContractError { violations });
             }
         }
+        if !input.skill_definitions.is_empty() && input.patch_kind != PatchKind::SkillPatch {
+            return Err(ContractError {
+                violations: vec!["skill_definitions requires patch_kind skill_patch".into()],
+            });
+        }
         let evaluation = GrowthLoopPolicy::default().evaluate_patch(&input)?;
 
         let requires_operator = evaluation.requires_operator;
@@ -2483,6 +2507,34 @@ fn validate_patch_proposal(input: &LifePatchProposalInput) -> Result<(), Contrac
             for violation in err.violations {
                 violations.push(format!("evidence_packets[{idx}].{violation}"));
             }
+        }
+    }
+    let mut skill_names = std::collections::BTreeSet::new();
+    for (idx, definition) in input.skill_definitions.iter().enumerate() {
+        require_non_empty(
+            &mut violations,
+            &format!("skill_definitions[{idx}].skill_name"),
+            &definition.skill_name,
+        );
+        require_non_empty(
+            &mut violations,
+            &format!("skill_definitions[{idx}].description"),
+            &definition.description,
+        );
+        require_non_empty(
+            &mut violations,
+            &format!("skill_definitions[{idx}].subagent_kind"),
+            &definition.subagent_kind,
+        );
+        require_non_empty(
+            &mut violations,
+            &format!("skill_definitions[{idx}].goal"),
+            &definition.goal,
+        );
+        if !skill_names.insert(definition.skill_name.as_str()) {
+            violations.push(format!(
+                "skill_definitions[{idx}].skill_name duplicates another definition"
+            ));
         }
     }
     finish_validation(violations)
@@ -3576,6 +3628,7 @@ mod tests {
                     edge_specs: vec![],
                     autonomy_audit_id: None,
                     ontology_extension: None,
+                    skill_definitions: vec![],
                 },
             ))
             .expect("patch proposal should plan");
@@ -3630,6 +3683,7 @@ mod tests {
                 edge_specs: vec![],
                 autonomy_audit_id: None,
                 ontology_extension: None,
+                skill_definitions: vec![],
             })
             .expect("low-risk patch should evaluate");
 
@@ -3658,6 +3712,7 @@ mod tests {
                 edge_specs: vec![],
                 autonomy_audit_id: None,
                 ontology_extension: None,
+                skill_definitions: vec![],
             })
             .expect("medium-risk patch should evaluate");
 
@@ -3820,6 +3875,60 @@ mod tests {
         assert_eq!(
             back.autonomy_audit_id.as_deref(),
             Some("autonomy:graph.bridge_edges:abc")
+        );
+    }
+
+    #[test]
+    fn typed_skill_patch_round_trips_and_requires_complete_unique_definitions() {
+        let raw = serde_json::json!({
+            "patch_id": "patch_music_skills_registration_v2",
+            "patch_kind": "skill_patch",
+            "summary": "Register music stewardship skills",
+            "rationale": "Beacon needs governed executable definitions.",
+            "evidence_packets": [evidence_packet()],
+            "risk": "medium",
+            "skill_definitions": [
+                {
+                    "skill_name": "music.practice.steward",
+                    "description": "Maintain music practice history.",
+                    "subagent_kind": "philote-worker",
+                    "goal": "Maintain {{practice_update}} with evidence.",
+                    "allowed_skills": ["life.steward"]
+                },
+                {
+                    "skill_name": "music.repertoire.steward",
+                    "description": "Maintain repertoire state.",
+                    "subagent_kind": "philote-worker",
+                    "goal": "Maintain {{repertoire_update}} with evidence.",
+                    "allowed_skills": ["life.steward"]
+                }
+            ]
+        });
+        let patch: LifePatchProposalInput = serde_json::from_value(raw).expect("typed patch");
+        validate_patch_proposal(&patch).expect("complete typed patch must validate");
+        let round_trip: LifePatchProposalInput =
+            serde_json::from_value(serde_json::to_value(&patch).expect("serialize typed patch"))
+                .expect("round trip typed patch");
+        assert_eq!(round_trip.skill_definitions, patch.skill_definitions);
+
+        let mut duplicate = patch.clone();
+        duplicate.skill_definitions[1].skill_name = "music.practice.steward".into();
+        let error = validate_patch_proposal(&duplicate).expect_err("duplicates must fail");
+        assert!(
+            error
+                .violations
+                .iter()
+                .any(|violation| violation.contains("duplicates another definition"))
+        );
+
+        let mut missing_goal = patch;
+        missing_goal.skill_definitions[0].goal.clear();
+        let error = validate_patch_proposal(&missing_goal).expect_err("goal is executable input");
+        assert!(
+            error
+                .violations
+                .iter()
+                .any(|violation| violation.contains("skill_definitions[0].goal"))
         );
     }
 

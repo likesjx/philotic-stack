@@ -649,6 +649,12 @@ pub struct RoleIncarnationRecord {
     pub role_name: String,
     pub guest_id: String,
     pub toolset_profile: String,
+    /// Skills granted specifically to this role incarnation. These are layered
+    /// over the referenced toolset profile at session activation time, so a
+    /// runtime `skill.assign` does not mutate a profile shared by other agents
+    /// or roles.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub assigned_skills: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub role_identity_addendum: Option<String>,
     /// Governance document projected into the agent's Identity context layer when this role is
@@ -695,6 +701,7 @@ impl Default for RoleIncarnationRecord {
             role_name: String::new(),
             guest_id: String::new(),
             toolset_profile: String::new(),
+            assigned_skills: Vec::new(),
             role_identity_addendum: None,
             role_manifest: None,
             content_policy: default_content_policy(),

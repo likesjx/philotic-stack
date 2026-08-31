@@ -2,13 +2,28 @@
 title: Data-Driven Tool Grants (SkillDAG)
 doc_type: proposal
 domain: tooling-execution
-status: accepted for current slice
-last_updated: 2026-08-13
+status: accepted-current-slice
+last_updated: 2026-08-27
 tags:
 - tooling
 - grants
 - skilldag
 - autopoiesis
+related_docs:
+- ARCHITECTURE_STATUS.md
+- LIFE_GRAPH_OS_PROPOSAL.md
+- SINGULAR_MESH_MEMBERSHIP_PROPOSAL.md
+task_refs:
+- docs/task.md
+proposal_id: data-driven-tool-grants-skilldag
+implemented_by:
+- skill-admin-plane
+- typed-skill-patch-compiler
+active_seams:
+- mesh-canonical-catalog-sync
+source_of_truth_targets:
+- ARCHITECTURE_STATUS.md
+- docs/task.md
 ---
 
 # proposal:data-driven-tool-grants-skilldag — PROPOSED (spec stage)
@@ -98,7 +113,34 @@ What landed:
 Still open (next seams): on-demand skill administration (`on_demand_skills` has
 no IPC writer), data-driven turn relevance (`skill_is_relevant_for_turn` is still
 compiled-in), profile-level ops (`profile.*`), harness/repo skill catalog
-reconciliation, and the slice-4 LifeGraph reflection above.
+reconciliation, and richer patch-result/rollback reporting.
+
+## Slice: typed SkillPatch compiler and scoped grants — IMPLEMENTED 2026-08-27
+
+Disposition: implemented in `codex/skill-self-build`; test-green, pending fleet
+rollout and Beacon conversational UAT.
+
+This closes the missing compiler boundary without making LifeGraph the hot-path
+catalog owner:
+
+- a `SkillPatch` may carry typed `skill_definitions`; operator confirmation moves
+  it to `approved_for_compilation` and returns the exact immutable definitions
+  plus source `patch_id`
+- `skill.register_batch` compiles 1–32 definitions into the local catalog under
+  the existing unconditional human-approval and skill-admin gates, rejects
+  duplicate names before any write, and stamps the patch id into each audit
+- `skill.assign` and `skill.revoke` now mutate
+  `RoleIncarnationRecord.assigned_skills`; the shared profile remains a baseline,
+  so granting Beacon's orchestrator no longer silently grants every orchestrator
+- runtime-registered skills with real source provenance converge between hotels
+  over authenticated reliable execution transport with deterministic
+  last-writer-wins conflict handling; compiled seeds remain release-owned and
+  role assignments remain hotel-local authority
+
+`life.patch.apply` still does not write the local catalog directly. It is the
+review/confirmation boundary that releases an executable batch; the hotel-owned
+skill administration plane remains the mutation boundary. That separation is
+deliberate, not another politely worded dead end.
 
 ## Precedent
 

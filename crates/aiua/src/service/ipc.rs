@@ -7148,6 +7148,12 @@ impl IpcServer {
                 allowed_classes,
                 allowed_skills,
             ),
+            IpcRequest::RegisterSkillBatch {
+                patch_id,
+                definitions,
+            } => {
+                handle_register_skill_batch(current_identity.as_ref(), graph, patch_id, definitions)
+            }
             IpcRequest::SetSkillState {
                 skill_name,
                 state,
@@ -7433,7 +7439,7 @@ impl IpcServer {
                     Ok(Some(_)) => {}
                 }
                 // Load the role incarnation record.
-                let role_record = match graph.get_role_incarnation(&agent_id, &role_name) {
+                let mut role_record = match graph.get_role_incarnation(&agent_id, &role_name) {
                     Ok(Some(r)) => r,
                     Ok(None) => {
                         return IpcResponse::error(
@@ -7453,29 +7459,8 @@ impl IpcServer {
                         );
                     }
                 };
-                // Load the toolset profile.
-                let mut profile = match graph.get_toolset_profile(&role_record.toolset_profile) {
-                    Ok(Some(p)) => p,
-                    Ok(None) => {
-                        return IpcResponse::error(
-                            "assign_skill",
-                            "PROFILE_NOT_FOUND",
-                            format!(
-                                "toolset profile [{}] not found",
-                                role_record.toolset_profile
-                            ),
-                        );
-                    }
-                    Err(e) => {
-                        return IpcResponse::error(
-                            "assign_skill",
-                            "PROFILE_LOOKUP_FAILED",
-                            format!("failed to look up toolset profile: {e}"),
-                        );
-                    }
-                };
                 // Idempotent: if already assigned, return success.
-                if !profile.allowed_skills.contains(&skill_name) {
+                if !role_record.assigned_skills.contains(&skill_name) {
                     // Fail-closed audit before the mutation.
                     if let Err(response) = record_skill_admin_audit(
                         graph,
@@ -7485,18 +7470,17 @@ impl IpcServer {
                         &skill_name,
                         "",
                         Some(format!(
-                            "agent={agent_id} role={role_name} profile={}",
-                            profile.profile_name
+                            "agent={agent_id} role={role_name} scope=role_incarnation"
                         )),
                     ) {
                         return response;
                     }
-                    profile.allowed_skills.push(skill_name.clone());
-                    if let Err(e) = graph.upsert_toolset_profile(&profile) {
+                    role_record.assigned_skills.push(skill_name.clone());
+                    if let Err(e) = graph.upsert_role_incarnation(&role_record) {
                         return IpcResponse::error(
                             "assign_skill",
-                            "PROFILE_PERSIST_FAILED",
-                            format!("failed to persist toolset profile: {e}"),
+                            "ROLE_PERSIST_FAILED",
+                            format!("failed to persist role skill grant: {e}"),
                         );
                     }
                 }
@@ -7530,7 +7514,7 @@ impl IpcServer {
                     );
                 }
                 // Load the role incarnation record.
-                let role_record = match graph.get_role_incarnation(&agent_id, &role_name) {
+                let mut role_record = match graph.get_role_incarnation(&agent_id, &role_name) {
                     Ok(Some(r)) => r,
                     Ok(None) => {
                         return IpcResponse::error(
@@ -7550,29 +7534,8 @@ impl IpcServer {
                         );
                     }
                 };
-                // Load the toolset profile.
-                let mut profile = match graph.get_toolset_profile(&role_record.toolset_profile) {
-                    Ok(Some(p)) => p,
-                    Ok(None) => {
-                        return IpcResponse::error(
-                            "revoke_skill",
-                            "PROFILE_NOT_FOUND",
-                            format!(
-                                "toolset profile [{}] not found",
-                                role_record.toolset_profile
-                            ),
-                        );
-                    }
-                    Err(e) => {
-                        return IpcResponse::error(
-                            "revoke_skill",
-                            "PROFILE_LOOKUP_FAILED",
-                            format!("failed to look up toolset profile: {e}"),
-                        );
-                    }
-                };
                 // Idempotent: if not present, return success.
-                if profile.allowed_skills.contains(&skill_name) {
+                if role_record.assigned_skills.contains(&skill_name) {
                     // Fail-closed audit before the mutation.
                     if let Err(response) = record_skill_admin_audit(
                         graph,
@@ -7582,18 +7545,17 @@ impl IpcServer {
                         &skill_name,
                         "",
                         Some(format!(
-                            "agent={agent_id} role={role_name} profile={}",
-                            profile.profile_name
+                            "agent={agent_id} role={role_name} scope=role_incarnation"
                         )),
                     ) {
                         return response;
                     }
-                    profile.allowed_skills.retain(|s| s != &skill_name);
-                    if let Err(e) = graph.upsert_toolset_profile(&profile) {
+                    role_record.assigned_skills.retain(|s| s != &skill_name);
+                    if let Err(e) = graph.upsert_role_incarnation(&role_record) {
                         return IpcResponse::error(
                             "revoke_skill",
-                            "PROFILE_PERSIST_FAILED",
-                            format!("failed to persist toolset profile: {e}"),
+                            "ROLE_PERSIST_FAILED",
+                            format!("failed to persist role skill grant: {e}"),
                         );
                     }
                 }
@@ -13816,6 +13778,11 @@ impl IpcServer {
                         skillset.push(skill.clone());
                     }
                 }
+                for skill in &role_record.assigned_skills {
+                    if !skillset.contains(skill) {
+                        skillset.push(skill.clone());
+                    }
+                }
                 // Merge on_demand_skills from profile (without expanding their tools).
                 // These skills gate which tool schemas are visible per-turn in philote.
                 let mut on_demand: Vec<String> = bindings
@@ -16278,6 +16245,102 @@ pub(super) fn handle_register_skill(
     allowed_classes: Vec<String>,
     allowed_skills: Vec<String>,
 ) -> IpcResponse {
+    handle_register_skill_with_source(
+        identity,
+        graph,
+        skill_name,
+        description,
+        subagent_kind,
+        goal,
+        allowed_tools,
+        allowed_classes,
+        allowed_skills,
+        None,
+    )
+}
+
+fn handle_register_skill_batch(
+    identity: Option<&GuestIdentity>,
+    graph: &GraphDomain,
+    patch_id: String,
+    definitions: Vec<philotic_client::SkillDefinitionSpec>,
+) -> IpcResponse {
+    if let Err(response) = require_skill_admin(
+        identity,
+        "register_skill_batch",
+        "REGISTER_BATCH",
+        "registering skill batches",
+    ) {
+        return response;
+    }
+    if patch_id.trim().is_empty() {
+        return IpcResponse::error(
+            "register_skill_batch",
+            "PATCH_ID_REQUIRED",
+            "skill batches require the approved source patch id",
+        );
+    }
+    if definitions.is_empty() || definitions.len() > 32 {
+        return IpcResponse::error(
+            "register_skill_batch",
+            "INVALID_BATCH_SIZE",
+            "skill batches must contain between 1 and 32 definitions",
+        );
+    }
+    let mut names = std::collections::BTreeSet::new();
+    if definitions
+        .iter()
+        .any(|definition| !names.insert(definition.skill_name.clone()))
+    {
+        return IpcResponse::error(
+            "register_skill_batch",
+            "DUPLICATE_SKILL_NAME",
+            "a skill batch may define each skill name only once",
+        );
+    }
+
+    let mut results = Vec::with_capacity(definitions.len());
+    for definition in definitions {
+        match handle_register_skill_with_source(
+            identity,
+            graph,
+            definition.skill_name,
+            definition.description,
+            definition.subagent_kind,
+            definition.goal,
+            definition.allowed_tools,
+            definition.allowed_classes,
+            definition.allowed_skills,
+            Some(&patch_id),
+        ) {
+            IpcResponse::SkillRegistered {
+                skill_name,
+                validation_state,
+                validation_errors,
+            } => results.push(philotic_client::SkillRegistrationResult {
+                skill_name,
+                validation_state,
+                validation_errors,
+            }),
+            error => return error,
+        }
+    }
+    IpcResponse::SkillsRegistered { patch_id, results }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn handle_register_skill_with_source(
+    identity: Option<&GuestIdentity>,
+    graph: &GraphDomain,
+    skill_name: String,
+    description: String,
+    subagent_kind: String,
+    goal: String,
+    allowed_tools: Vec<String>,
+    allowed_classes: Vec<String>,
+    allowed_skills: Vec<String>,
+    source_patch_id: Option<&str>,
+) -> IpcResponse {
     let identity =
         match require_skill_admin(identity, "register_skill", "REGISTER", "registering skills") {
             Ok(identity) => identity,
@@ -16340,7 +16403,7 @@ pub(super) fn handle_register_skill(
         action,
         &skill_name,
         &state_str,
-        None,
+        source_patch_id.map(|patch_id| format!("source_patch_id={patch_id}")),
     ) {
         return response;
     }
@@ -17498,6 +17561,97 @@ pub(crate) mod tests {
         assert_eq!(audit.action, "register");
         assert!(audit.registered_at > 0, "audit must record a timestamp");
         assert!(!audit.audit_id.is_empty(), "audit must have an id");
+    }
+
+    #[test]
+    fn register_skill_batch_compiles_typed_patch_with_provenance() {
+        let graph = register_skill_test_graph();
+        let identity = GuestIdentity {
+            guest_id: "agent-beacon-01:orchestrator".into(),
+            role: "orchestrator".into(),
+            supported_tools: vec![],
+        };
+        let definitions = ["music.practice.steward", "music.repertoire.steward"]
+            .into_iter()
+            .map(|skill_name| philotic_client::SkillDefinitionSpec {
+                skill_name: skill_name.into(),
+                description: format!("Definition for {skill_name}"),
+                subagent_kind: "philote-worker".into(),
+                goal: format!("Maintain {{{{{skill_name}}}}} with evidence."),
+                allowed_tools: vec![],
+                allowed_classes: vec![],
+                allowed_skills: vec!["life.steward".into()],
+            })
+            .collect();
+
+        let response = handle_register_skill_batch(
+            Some(&identity),
+            &graph,
+            "patch_music_skills_registration_v2".into(),
+            definitions,
+        );
+        let IpcResponse::SkillsRegistered { patch_id, results } = response else {
+            panic!("expected SkillsRegistered, got {response:?}");
+        };
+        assert_eq!(patch_id, "patch_music_skills_registration_v2");
+        assert_eq!(results.len(), 2);
+        assert!(
+            results
+                .iter()
+                .all(|result| result.validation_errors.is_empty())
+        );
+
+        let audits = graph.list_skill_registration_audits().expect("audits");
+        assert_eq!(audits.len(), 2);
+        assert!(audits.iter().all(|audit| {
+            audit.detail.as_deref() == Some("source_patch_id=patch_music_skills_registration_v2")
+        }));
+        for result in results {
+            let stored = graph
+                .get_abstract_skill(&result.skill_name)
+                .expect("skill lookup")
+                .expect("skill persisted");
+            assert_eq!(stored.allowed_skills, vec!["life.steward"]);
+        }
+    }
+
+    #[test]
+    fn register_skill_batch_rejects_duplicates_before_any_write() {
+        let graph = register_skill_test_graph();
+        let identity = GuestIdentity {
+            guest_id: "agent-beacon-01:orchestrator".into(),
+            role: "orchestrator".into(),
+            supported_tools: vec![],
+        };
+        let definition = philotic_client::SkillDefinitionSpec {
+            skill_name: "music.practice.steward".into(),
+            description: "Practice stewardship".into(),
+            subagent_kind: "philote-worker".into(),
+            goal: "Maintain {{practice_update}} with evidence.".into(),
+            allowed_tools: vec![],
+            allowed_classes: vec![],
+            allowed_skills: vec!["life.steward".into()],
+        };
+        let response = handle_register_skill_batch(
+            Some(&identity),
+            &graph,
+            "patch_music_skills_registration_v2".into(),
+            vec![definition.clone(), definition],
+        );
+        let (code, _) = expect_register_error(response);
+        assert_eq!(code, "DUPLICATE_SKILL_NAME");
+        assert!(
+            graph
+                .list_skill_registration_audits()
+                .expect("audits")
+                .is_empty()
+        );
+        assert!(
+            graph
+                .get_abstract_skill("music.practice.steward")
+                .expect("skill lookup")
+                .is_none()
+        );
     }
 
     #[test]
@@ -29510,7 +29664,7 @@ pub(crate) mod tests {
     /// Scenario 2 — AcquireDiscordGatewayLease injects `kind: "discord_text"` into
     /// the agent's bundle reflex_context.membrane_bindings.
     #[tokio::test]
-    async fn assign_skill_adds_skill_to_toolset_profile() {
+    async fn assign_skill_adds_skill_to_target_role_only() {
         let _env_guard = ipc_env_guard();
         let socket_path = test_socket_path();
         let (dispatcher_tx, _dispatcher_rx) = test_dispatcher_channel();
@@ -29597,13 +29751,21 @@ pub(crate) mod tests {
             other => panic!("unexpected assign skill response: {other:?}"),
         }
 
+        let role = graph
+            .get_role_incarnation("agent-beacon-01", "orchestrator")
+            .expect("role lookup")
+            .expect("role exists");
+        assert!(
+            role.assigned_skills.contains(&"research".to_string()),
+            "skill should be assigned to the target role incarnation"
+        );
         let profile = graph
             .get_toolset_profile("orchestrator")
             .expect("profile lookup")
             .expect("profile exists");
         assert!(
-            profile.allowed_skills.contains(&"research".to_string()),
-            "skill should be in allowed_skills after assignment"
+            profile.allowed_skills.is_empty(),
+            "assigning one role must not mutate the shared profile"
         );
 
         unsafe {
@@ -29617,7 +29779,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn revoke_skill_removes_skill_from_toolset_profile() {
+    async fn revoke_skill_removes_role_assignment_without_mutating_profile() {
         let _env_guard = ipc_env_guard();
         let socket_path = test_socket_path();
         let (dispatcher_tx, _dispatcher_rx) = test_dispatcher_channel();
@@ -29649,6 +29811,7 @@ pub(crate) mod tests {
                 inactive_ttl_seconds: None,
                 turn_loop_config: TurnLoopConfig::default(),
                 home_node: None,
+                assigned_skills: vec!["research".into()],
                 ..Default::default()
             })
             .expect("seed role incarnation");
@@ -29701,13 +29864,21 @@ pub(crate) mod tests {
             .get_toolset_profile("orchestrator")
             .expect("profile lookup")
             .expect("profile exists");
+        let role = graph
+            .get_role_incarnation("agent-beacon-01", "orchestrator")
+            .expect("role lookup")
+            .expect("role exists");
         assert!(
-            !profile.allowed_skills.contains(&"research".to_string()),
-            "revoked skill must not remain in allowed_skills"
+            role.assigned_skills.is_empty(),
+            "role grant must be removed"
+        );
+        assert!(
+            profile.allowed_skills.contains(&"research".to_string()),
+            "role revocation must not remove a shared profile baseline"
         );
         assert!(
             profile.allowed_skills.contains(&"handoff.back".to_string()),
-            "unrevoked skill must remain in allowed_skills"
+            "unrelated profile skills must remain"
         );
 
         unsafe {
@@ -29824,7 +29995,7 @@ pub(crate) mod tests {
                 profile_name: "orchestrator".into(),
                 allowed_tools: vec![],
                 allowed_classes: vec![],
-                allowed_skills: vec!["research".into()],
+                allowed_skills: vec![],
                 on_demand_skills: vec![],
                 remote_tool_runners: vec![],
                 seed_baseline: None,
@@ -29844,6 +30015,7 @@ pub(crate) mod tests {
                 inactive_ttl_seconds: None,
                 turn_loop_config: TurnLoopConfig::default(),
                 home_node: None,
+                assigned_skills: vec!["research".into()],
                 ..Default::default()
             })
             .expect("seed role incarnation");
@@ -29885,19 +30057,16 @@ pub(crate) mod tests {
             "idempotent assign must still return SkillAssigned{{operation: assigned}}, got: {response:?}"
         );
 
-        let profile = graph
-            .get_toolset_profile("orchestrator")
-            .expect("profile lookup")
-            .expect("profile exists");
-        let count = profile
-            .allowed_skills
+        let role = graph
+            .get_role_incarnation("agent-beacon-01", "orchestrator")
+            .expect("role lookup")
+            .expect("role exists");
+        let count = role
+            .assigned_skills
             .iter()
             .filter(|s| *s == "research")
             .count();
-        assert_eq!(
-            count, 1,
-            "idempotent assign must not duplicate: {profile:?}"
-        );
+        assert_eq!(count, 1, "idempotent assign must not duplicate: {role:?}");
 
         unsafe {
             std::env::remove_var("PHILOTIC_HOTEL_SOCKET");

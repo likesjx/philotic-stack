@@ -3,7 +3,7 @@ title: Singular Mesh Membership Proposal
 doc_type: proposal
 domain: mesh-placement
 status: accepted-current-slice
-last_updated: 2026-04-30
+last_updated: 2026-08-27
 tags:
 - mesh
 - membership
@@ -93,7 +93,7 @@ Current truth is still transitional, but no longer purely pairwise:
 - mesh invite/accept is real and secure
 - payload routing and WebRTC can work across joined hotel pairs
 - accepted membership now propagates mesh member records to the existing circle of trust and syncs the current circle back to the new member
-- mesh-canonical abstract tools, abstract skills, and toolset profiles now replicate as shared catalog truth instead of hotel-local startup folklore
+- governed runtime-registered abstract skills now replicate as shared catalog truth; compiled tool/profile seeds remain release-owned and do not yet have a dynamic convergence path
 - hotels now expose a first `hotel.best_place_to_run` decision surface that ranks live candidates while respecting role home pins and local-only markers
 - direct peer auth can now be derived from long-lived transport identities when a freshly learned member has not yet spoken directly
 - revocation, richer audit, and full mesh-wide authority semantics are still open
@@ -108,10 +108,10 @@ This slice now does six things:
 2. name the current implementation gap honestly
 3. propagate accepted member records to the current mesh and sync the current mesh back to the newly accepted hotel
 4. derive direct peer auth from stable transport identities when a pairwise cached key is missing
-5. replicate the canonical tool/skill/profile catalog across the mesh on change and on periodic full sync
+5. replicate governed runtime skill registrations across the mesh on change and periodic full sync, without exporting role-local assignments
 6. expose a first hotel-owned best-place-to-run decision API backed by role home pins, ghost-mirror health, reachability, and locality
 
-This is still transitional rather than “finished singular mesh.” The first converged membership path is implemented; catalog convergence and first placement judgment are real; revocation, richer audit lineage, durable peer-graph projection policy, and fully policy-driven role transport are not.
+This is still transitional rather than “finished singular mesh.” The first converged membership path is implemented; dynamic skill convergence and first placement judgment are real; tool/profile convergence, revocation, richer audit lineage, durable peer-graph projection policy, and fully policy-driven role transport are not.
 
 ## Current Truth Vs Intended Truth
 
@@ -123,7 +123,7 @@ What is proven today:
 - the outside hotel can join via a secure invite ceremony
 - paired hotels can exchange mesh payloads
 - paired hotels can complete WebRTC when both runtimes are current
-- canonical tool/skill/profile catalog truth can now converge mesh-wide
+- governed runtime skill registrations can converge mesh-wide over authenticated reliable transport
 - hotels can answer a first bounded placement question across the live mesh
 
 What is not yet true:
@@ -132,6 +132,7 @@ What is not yet true:
 - hotels can still end up with pair-specific trust state
 - some routing surfaces still behave as though trust is local to the inviter pair
 - placement remains a heuristic ranking API rather than a full resource-contract planner
+- abstract tool and toolset-profile runtime mutations do not yet converge dynamically; installed release seeds remain their practical common source
 
 ### Intended truth
 

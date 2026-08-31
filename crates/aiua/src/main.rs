@@ -4120,9 +4120,9 @@ fn seed_abstract_tool_catalog(graph: &GraphDomain) -> anyhow::Result<()> {
             tool_name: "life.patch.propose".into(),
             description: "Propose a governed Life Graph improvement. A schema_patch is executable \
                           only when it carries an ontology_extension containing new labels and/or \
-                          edges; it cannot add properties or edit compiled core labels. A \
-                          SkillPatch is a review artifact: use skill.register and skill.assign as \
-                          the catalog actuator after approval."
+                          edges; it cannot add properties or edit compiled core labels. A typed \
+                          SkillPatch carries skill_definitions which confirmation releases for \
+                          skill.register_batch; prose-only SkillPatch records remain review artifacts."
                 .into(),
             input_schema: serde_json::json!({
                 "type": "object",
@@ -4164,6 +4164,22 @@ fn seed_abstract_tool_catalog(graph: &GraphDomain) -> anyhow::Result<()> {
                                         "target_labels": {"type": "array", "items": {"type": "string"}}
                                     }
                                 }
+                            }
+                        }
+                    },
+                    "skill_definitions": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "required": ["skill_name", "description", "subagent_kind", "goal"],
+                            "properties": {
+                                "skill_name": {"type": "string"},
+                                "description": {"type": "string"},
+                                "subagent_kind": {"type": "string"},
+                                "goal": {"type": "string"},
+                                "allowed_tools": {"type": "array", "items": {"type": "string"}},
+                                "allowed_classes": {"type": "array", "items": {"type": "string"}},
+                                "allowed_skills": {"type": "array", "items": {"type": "string"}}
                             }
                         }
                     }
@@ -4537,6 +4553,7 @@ fn seed_abstract_skill_catalog(graph: &GraphDomain) -> anyhow::Result<()> {
             implied_tools: vec![
                 "skill.list".into(),
                 "skill.register".into(),
+                "skill.register_batch".into(),
                 "skill.assign".into(),
                 "skill.revoke".into(),
                 "skill.set_state".into(),
@@ -4556,7 +4573,7 @@ fn seed_abstract_skill_catalog(graph: &GraphDomain) -> anyhow::Result<()> {
                     "allowed_skills"
                 ],
                 "repo_skill_path": "skills/skill-authoring/SKILL.md",
-                "workflow": "skill.list → skill.register → skill.assign",
+                "workflow": "skill.list → skill.register or skill.register_batch → skill.assign",
                 "format_example": {
                     "skill_name": "deep-search",
                     "description": "Delegate a multi-source research task to a focused subagent.",
@@ -5030,6 +5047,7 @@ fn seed_toolset_profiles(graph: &GraphDomain) -> anyhow::Result<()> {
                 "mcp.set_credential".into(),
                 "desktop.observe".into(),
                 "skill.register".into(),
+                "skill.register_batch".into(),
                 "skill.list".into(),
                 "skill.assign".into(),
                 "skill.revoke".into(),

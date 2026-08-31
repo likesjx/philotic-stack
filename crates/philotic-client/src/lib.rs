@@ -932,6 +932,28 @@ pub enum RestartReason {
 }
 
 /// Represents the types of operations a Guest can perform locally over IPC to the Ansible Hotel.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SkillDefinitionSpec {
+    pub skill_name: String,
+    pub description: String,
+    pub subagent_kind: String,
+    pub goal: String,
+    #[serde(default)]
+    pub allowed_tools: Vec<String>,
+    #[serde(default)]
+    pub allowed_classes: Vec<String>,
+    #[serde(default)]
+    pub allowed_skills: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SkillRegistrationResult {
+    pub skill_name: String,
+    pub validation_state: String,
+    #[serde(default)]
+    pub validation_errors: Vec<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "operation", content = "payload")]
 #[serde(rename_all = "snake_case")]
@@ -1263,14 +1285,20 @@ pub enum IpcRequest {
         #[serde(default)]
         lease_terms: SubagentLeaseTerms,
     },
-    /// Assign a registered skill to a role's toolset profile.
+    /// Register a typed, operator-approved batch of skills from one governed
+    /// patch. The hotel preserves the patch id in each registration audit.
+    RegisterSkillBatch {
+        patch_id: String,
+        definitions: Vec<SkillDefinitionSpec>,
+    },
+    /// Assign a registered skill to one specific role incarnation.
     /// Requires orchestrator identity. Skill must exist in catalog.
     AssignSkill {
         agent_id: String,
         role_name: String,
         skill_name: String,
     },
-    /// Remove a skill from a role's toolset profile.
+    /// Remove a skill grant from one specific role incarnation.
     /// Requires orchestrator identity.
     RevokeSkill {
         agent_id: String,
@@ -2576,6 +2604,11 @@ pub enum IpcResponse {
         /// Human-readable summary of any validation errors; empty on success.
         #[serde(default)]
         validation_errors: Vec<String>,
+    },
+    /// Response to [`IpcRequest::RegisterSkillBatch`].
+    SkillsRegistered {
+        patch_id: String,
+        results: Vec<SkillRegistrationResult>,
     },
     /// Response to [`IpcRequest::PatchAgentBundle`].
     AgentUpdated {

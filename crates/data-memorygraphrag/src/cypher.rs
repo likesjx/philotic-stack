@@ -724,6 +724,9 @@ pub const PATCH_STATUS_PROPOSED: &str = "proposed";
 pub const PATCH_STATUS_AWAITING_CONFIRMATION: &str = "awaiting_confirmation";
 /// The embedded edge specs were executed (auto or via confirmation).
 pub const PATCH_STATUS_APPLIED: &str = "applied";
+/// A typed SkillPatch has been confirmed and its exact definitions are ready
+/// for the local hotel catalog actuator.
+pub const PATCH_STATUS_APPROVED_FOR_COMPILATION: &str = "approved_for_compilation";
 /// The operator rejected the patch; nothing was written.
 pub const PATCH_STATUS_REJECTED: &str = "rejected";
 
@@ -1934,6 +1937,7 @@ mod tests {
                 edge_specs: vec![],
                 autonomy_audit_id: None,
                 ontology_extension: None,
+                skill_definitions: vec![],
             },
             "2026-06-05T09:00:00Z",
         )
@@ -2056,6 +2060,7 @@ mod tests {
             edge_specs: vec![bridge_spec()],
             autonomy_audit_id: Some("autonomy:graph.bridge_edges:abc".into()),
             ontology_extension: None,
+            skill_definitions: vec![],
         };
 
         let compiled = compile_patch_proposal_with_status(
