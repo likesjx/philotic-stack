@@ -840,6 +840,14 @@ Seam IDs: `secret-handling-hardening`, `watched-live-vps-smoke`, `artifact-distr
 - [ ] Require authenticated control-plane traffic outside explicit dev mode.
 - [ ] Define authorization scope for which trusted hotels may receive which routed capability classes.
 
+## New Project: Blob and Execution Plane Perimeter Hardening
+
+- [ ] Review [BLOB_EXECUTION_PERIMETER_HARDENING_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/BLOB_EXECUTION_PERIMETER_HARDENING_PROPOSAL.md).
+- [ ] Slice 1 — merge PR #479 (blob bind/declaration consistency, DEF-104); correct its "no cross-hotel transfer to break" claim before/at merge.
+- [ ] Slice 2 — restore authenticated cross-hotel blob transfer (`agent.deploy_bundle` migration path) by reusing `mesh_auth_key_for_node`; widen the blob bind only to the mesh interface, never `0.0.0.0`; add an aggregate storage quota.
+- [ ] Slice 3 — harden the execution port's connection layer (cap claimed frame length before allocation, add a connection accept limit + read timeout, move `NonceTracker` open out of the per-connection hot path); add the missing Ansible firewall rule for the execution port.
+- [ ] Slice 4 — fix firewall-rule parity on hosts without `ufw` installed (confirmed silently no-op on `vps-jane`); harden `PHILOTIC_ENABLE_RUST_AUTH` from a plain boolean global kill switch to a loudly-logged, non-default opt-out (or exclude it from release builds), matching the existing `PHILOTIC_MESH_DEV_MODE` open decision in MESH_PKI_HOTEL_IDENTITY_PROPOSAL.md.
+
 ## New Project: Inter-Hotel Routing And Placement
 
 Seam IDs: `placement-policy-broadening`, `multi-host-watched-validation`
