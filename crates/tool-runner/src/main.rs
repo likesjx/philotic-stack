@@ -476,6 +476,7 @@ fn parse_scope(s: Option<&str>, session_id: &str) -> MemoryScope {
     match s {
         Some("user") => MemoryScope::SharedUser,
         Some("session") => MemoryScope::Session(session_id.to_string()),
+        Some("fleet") | Some("knowledge") => MemoryScope::SharedFleet,
         _ => MemoryScope::SelfOnly,
     }
 }

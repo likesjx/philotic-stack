@@ -44,6 +44,8 @@ mod lyra_charter;
 mod memory;
 mod memory_delta_digest;
 mod memory_hygiene;
+mod memory_promotion;
+mod memory_report;
 mod mesh;
 mod muninn_provision;
 mod vault;
@@ -5026,6 +5028,8 @@ fn seed_toolset_profiles(graph: &GraphDomain) -> anyhow::Result<()> {
                 "session.status".into(),
                 "hotel.status".into(),
                 "hotel.logs".into(),
+                // S6a: admin memory-health report (read-only, honest-sourcing).
+                "memory.report".into(),
                 "hotel.best_place_to_run".into(),
                 "echo".into(),
                 "agent.configure".into(),
@@ -5231,6 +5235,8 @@ fn seed_toolset_profiles(graph: &GraphDomain) -> anyhow::Result<()> {
                 "session.status".into(),
                 "hotel.status".into(),
                 "hotel.logs".into(),
+                // S6a: admin memory-health report (read-only, honest-sourcing).
+                "memory.report".into(),
                 "echo".into(),
                 "agent.configure".into(),
                 "skill.register".into(),

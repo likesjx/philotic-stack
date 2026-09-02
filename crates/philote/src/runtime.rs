@@ -45,6 +45,9 @@ mod paracrine;
 #[path = "tool_exec.rs"]
 mod tool_exec;
 
+#[path = "deterministic_capture.rs"]
+mod deterministic_capture;
+
 #[path = "memory_integration.rs"]
 mod memory_integration;
 use memory_integration::*;
@@ -486,6 +489,7 @@ fn low_progress_tool_name(tool_name: &str) -> bool {
             | "hotel.logs"
             | "hotel.status"
             | "mcp.status"
+            | "memory.report"
             | "memory.status"
             | "role.list"
             | "session.status"
@@ -13821,7 +13825,13 @@ mod tests {
                 "sess-memroute",
             )
             .await;
-        assert!(routed.is_some(), "SharedUser write must be forwarded");
+        assert!(
+            matches!(
+                routed,
+                super::memory_integration::ForwardOutcome::Forwarded(_)
+            ),
+            "SharedUser write must be forwarded"
+        );
 
         {
             let emitted = emitted.lock().unwrap();
@@ -13850,7 +13860,10 @@ mod tests {
                 "sess-memroute-fallback",
             )
             .await;
-        assert!(routed_fallback.is_some());
+        assert!(matches!(
+            routed_fallback,
+            super::memory_integration::ForwardOutcome::Forwarded(_)
+        ));
         {
             let emitted = emitted.lock().unwrap();
             let fwd = emitted
@@ -13877,7 +13890,13 @@ mod tests {
                 "sess-memroute",
             )
             .await;
-        assert!(not_routed.is_none(), "SelfOnly write must stay local");
+        assert!(
+            matches!(
+                not_routed,
+                super::memory_integration::ForwardOutcome::NotApplicable
+            ),
+            "SelfOnly write must stay local"
+        );
 
         drop(runtime);
         let _ = server.await;
@@ -13902,7 +13921,10 @@ mod tests {
                 "sess-memnoroute",
             )
             .await;
-        assert!(routed.is_none());
+        assert!(matches!(
+            routed,
+            super::memory_integration::ForwardOutcome::NotApplicable
+        ));
         assert!(
             emitted
                 .lock()

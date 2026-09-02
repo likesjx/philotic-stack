@@ -49,11 +49,12 @@ pub struct MuninnConfig {
 }
 
 /// True for vaults whose contents are fleet-visible and therefore must be
-/// written on the cluster PRIMARY: the shared `default` vault and `user_*`
-/// vaults. Agent (`self_*`) and `session_*` vaults are per-host by design —
+/// written on the cluster PRIMARY: the shared `default` vault, the curated
+/// `fleet_knowledge` vault, and `user_*` vaults. Agent (`self_*`) and
+/// `session_*` vaults are per-host by design —
 /// the muninn vault registry does not replicate — and always write locally.
 pub fn is_fleet_shared_vault(vault: &str) -> bool {
-    vault == "default" || vault.starts_with("user_")
+    vault == "default" || vault == "fleet_knowledge" || vault.starts_with("user_")
 }
 
 impl MuninnConfig {
@@ -156,6 +157,10 @@ impl VaultResolver {
             MemoryScope::Session(id) => {
                 vec![format!("session_{}", sanitize_vault_component(id))]
             }
+            // A single fleet-wide vault (not per-agent/per-user): every philote
+            // resolves the same `fleet_knowledge` name, so a write by one is
+            // recallable by all.
+            MemoryScope::SharedFleet => vec!["fleet_knowledge".to_string()],
             MemoryScope::CrossScope(scopes) => {
                 scopes.iter().flat_map(|s| self.resolve(s)).collect()
             }
@@ -1553,11 +1558,27 @@ mod shared_write_route_tests {
         };
         assert_eq!(r.resolve_primary(&MemoryScope::SharedUser), "user_likesjx");
         assert_eq!(r.resolve_primary(&MemoryScope::SelfOnly), "self_agent-aria");
+        // SharedFleet is a single fleet-wide vault, identical for every agent —
+        // that sameness is what makes one philote's write recallable by all.
+        assert_eq!(
+            r.resolve_primary(&MemoryScope::SharedFleet),
+            "fleet_knowledge"
+        );
+        let other = VaultResolver {
+            agent_id: "agent-beacon".into(),
+            user_id: "someone-else".into(),
+        };
+        assert_eq!(
+            other.resolve_primary(&MemoryScope::SharedFleet),
+            "fleet_knowledge",
+            "fleet_knowledge must not be namespaced per agent/user"
+        );
     }
 
     #[test]
     fn fleet_shared_vault_predicate() {
         assert!(is_fleet_shared_vault("default"));
+        assert!(is_fleet_shared_vault("fleet_knowledge"));
         assert!(is_fleet_shared_vault("user_likesjx"));
         assert!(!is_fleet_shared_vault("self_agent-aria"));
         assert!(!is_fleet_shared_vault("session_01abc"));

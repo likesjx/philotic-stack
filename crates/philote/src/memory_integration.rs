@@ -313,6 +313,7 @@ pub(super) fn memory_spatial_scope_from_arg(
         _ => match scope {
             MemoryScope::SharedUser => MemorySpatialScope::User,
             MemoryScope::Session(_) => MemorySpatialScope::Session,
+            MemoryScope::SharedFleet => MemorySpatialScope::Mesh,
             MemoryScope::CrossScope(_) => MemorySpatialScope::Mesh,
             MemoryScope::SelfOnly => MemorySpatialScope::SelfScope,
         },
@@ -729,6 +730,11 @@ pub(super) fn default_turn_recall_scope(session_id: &str) -> MemoryScope {
         MemoryScope::SelfOnly,
         MemoryScope::SharedUser,
         MemoryScope::Session(session_id.to_string()),
+        // Fleet knowledge: every philote recalls the shared, curated
+        // `fleet_knowledge` vault so cross-agent/cross-hotel knowledge actually
+        // reaches turns (proposal S1). Curated at write time, so this stays
+        // high-signal; the per-turn relevance gate + char budget bound it.
+        MemoryScope::SharedFleet,
     ])
 }
 
@@ -736,9 +742,27 @@ pub(super) fn memory_scope_from_tool_arg(scope: Option<&str>, session_id: &str) 
     match scope.unwrap_or("self") {
         "shared_user" | "user" => MemoryScope::SharedUser,
         "session" | "working" => MemoryScope::Session(session_id.to_string()),
+        "fleet" | "shared_fleet" | "knowledge" => MemoryScope::SharedFleet,
         "cross" | "all" => default_turn_recall_scope(session_id),
         _ => MemoryScope::SelfOnly,
     }
+}
+
+/// Result of attempting to forward a shared-vault write to the cluster primary.
+/// Distinguishing `Failed` from `NotApplicable` is what makes the strand
+/// **loud** (proposal S2): a fleet-shared write that could not reach the Cortex
+/// must not silently report success after landing only on a local replica.
+#[derive(Debug, Clone, PartialEq)]
+pub(super) enum ForwardOutcome {
+    /// Forwarded to the primary; carries the operator-facing confirmation text.
+    Forwarded(String),
+    /// This write does not need forwarding (no route configured, this host IS
+    /// the primary, or the vault is per-host) — a local write is correct.
+    NotApplicable,
+    /// A fleet-shared write that FAILED to forward. The caller still writes
+    /// locally so nothing is lost, but must surface the strand rather than
+    /// claim clean success.
+    Failed { vault: String, cortex: String },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -2189,14 +2213,17 @@ impl AgentRuntime {
         tags: &[String],
         metadata: &serde_json::Value,
         session_id: &str,
-    ) -> Option<String> {
-        let route = self
+    ) -> ForwardOutcome {
+        let Some(route) = self
             .muninn_config
             .as_ref()
-            .and_then(|cfg| cfg.shared_write_route.clone())?;
+            .and_then(|cfg| cfg.shared_write_route.clone())
+        else {
+            return ForwardOutcome::NotApplicable;
+        };
         let local_node = local_node_id();
         if route == local_node {
-            return None;
+            return ForwardOutcome::NotApplicable;
         }
         let vault = memory_core::VaultResolver {
             agent_id: self.agent_id.clone(),
@@ -2215,7 +2242,7 @@ impl AgentRuntime {
             vault
         };
         if !memory_core::is_fleet_shared_vault(&vault) {
-            return None;
+            return ForwardOutcome::NotApplicable;
         }
 
         let task_json = serde_json::json!({
@@ -2249,7 +2276,7 @@ impl AgentRuntime {
                     cortex = %route,
                     "memory.remember: shared-vault write forwarded to cluster primary"
                 );
-                Some(format!(
+                ForwardOutcome::Forwarded(format!(
                     "Stored memory '{}' (vault: {}, routed to cluster primary {}; \
                      it will appear in local recall after replication).",
                     concept, vault, route
@@ -2260,10 +2287,13 @@ impl AgentRuntime {
                     vault = %vault,
                     cortex = %route,
                     ?other,
-                    "memory.remember: shared-write forward failed — falling back to local write \
-                     (memory will strand on this replica until reconciled)"
+                    "memory.remember: shared-write forward FAILED — writing locally as a fallback; \
+                     the memory will strand on this replica until reconciled"
                 );
-                None
+                ForwardOutcome::Failed {
+                    vault,
+                    cortex: route,
+                }
             }
         }
     }
@@ -2351,7 +2381,19 @@ impl AgentRuntime {
             )
             .await;
 
-        let result_text = if let Some(routed) = routed_result {
+        // Fail-loud (S2): if a fleet-shared write could not reach the Cortex, we
+        // still write locally below so nothing is lost — but the result must say
+        // so rather than report a clean success on a stranded replica write.
+        let strand_note = match &routed_result {
+            ForwardOutcome::Failed { vault, cortex } => Some(format!(
+                "⚠ NOT fleet-visible yet: the shared write to vault '{vault}' could not reach the \
+                 Cortex primary {cortex}, so it is stored on this local replica ONLY — it will not \
+                 appear in other agents'/hotels' recall, and would be lost on a reseed, until \
+                 replication reconciles."
+            )),
+            _ => None,
+        };
+        let result_text = if let ForwardOutcome::Forwarded(routed) = routed_result {
             routed
         } else {
             match self.memory_engine_for(&self.agent_id, &memory_user_id) {
@@ -2401,6 +2443,10 @@ impl AgentRuntime {
                     }
                 }
             }
+        };
+        let result_text = match strand_note {
+            Some(note) => format!("{result_text}\n{note}"),
+            None => result_text,
         };
 
         self.handle_tool_result(InboundTaskPayload {
@@ -2772,6 +2818,37 @@ impl AgentRuntime {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn default_turn_recall_scope_includes_fleet_knowledge() {
+        // Regression guard for proposal S1: every philote turn must recall the
+        // shared fleet_knowledge vault, or cross-agent knowledge never reaches
+        // the model.
+        let MemoryScope::CrossScope(scopes) = default_turn_recall_scope("session_x") else {
+            panic!("default recall scope must be a cross-scope");
+        };
+        assert!(
+            scopes.iter().any(|s| matches!(s, MemoryScope::SharedFleet)),
+            "default recall scope must include SharedFleet"
+        );
+    }
+
+    #[test]
+    fn fleet_scope_arg_maps_to_shared_fleet() {
+        assert!(matches!(
+            memory_scope_from_tool_arg(Some("fleet"), "s"),
+            MemoryScope::SharedFleet
+        ));
+        assert!(matches!(
+            memory_scope_from_tool_arg(Some("knowledge"), "s"),
+            MemoryScope::SharedFleet
+        ));
+        // Unknown/absent still defaults to the private self scope.
+        assert!(matches!(
+            memory_scope_from_tool_arg(None, "s"),
+            MemoryScope::SelfOnly
+        ));
+    }
 
     #[test]
     fn inbound_primary_user_id_prefers_lowercased_username_over_numeric_id() {

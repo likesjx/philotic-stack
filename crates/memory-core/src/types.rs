@@ -20,6 +20,11 @@ pub enum MemoryScope {
     SharedUser,
     /// Active working context — vault `session:{session_id}`
     Session(SessionId),
+    /// Shared fleet knowledge every philote should be able to recall — vault
+    /// `fleet_knowledge`. Curated by construction: only deliberate `scope=fleet`
+    /// writes and gated promotion (proposal S4) land here, so it stays a
+    /// high-signal shared layer rather than a dump of every self memory.
+    SharedFleet,
     /// Fan-out query across multiple vaults simultaneously
     CrossScope(Vec<MemoryScope>),
 }

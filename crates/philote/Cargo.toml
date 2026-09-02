@@ -18,6 +18,7 @@ path = "src/bin/agent_worker.rs"
 [dependencies]
 anyhow = "1.0"
 ansible-mesh-core = { path = "../ansible-mesh-core" }
+regex = "1.12"
 chrono = { version = "0.4", features = ["clock"] }
 chrono-tz = "0.10"
 data-memorygraphrag = { path = "../data-memorygraphrag" }

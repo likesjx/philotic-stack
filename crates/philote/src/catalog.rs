@@ -2587,10 +2587,14 @@ fn build_catalog() -> HashMap<String, ToolDefinition> {
                     },
                     "scope": {
                         "type": "string",
-                        "enum": ["self", "shared_user", "session"],
+                        "enum": ["self", "shared_user", "session", "fleet"],
                         "description": "Optional write scope. Use 'shared_user' for operator \
                                         preferences, 'session' for active workstream context, \
-                                        and 'self' for the agent's own habits or observations."
+                                        'self' for the agent's own habits or observations, and \
+                                        'fleet' for durable knowledge every philote across the \
+                                        fleet should be able to recall (goes to the shared, \
+                                        replicated fleet_knowledge vault — reserve for high-signal, \
+                                        broadly-useful facts, not per-agent trivia)."
                     },
                     "temporal_kind": {
                         "type": "string",
@@ -2805,6 +2809,26 @@ fn build_catalog() -> HashMap<String, ToolDefinition> {
                 .into(),
             input_schema: json!({ "type": "object", "properties": {} }),
             class: Some("memory".into()),
+        },
+    );
+
+    m.insert(
+        "memory.report".into(),
+        ToolDefinition {
+            tool_name: "memory.report".into(),
+            description: "Admin memory-health report for Muninn (read-only). Returns recall \
+                          effectiveness (auto-recall completed vs skipped) and other \
+                          memory-health fields. Each field is explicit about whether it could be \
+                          sourced — fields shown as `unavailable` were NOT measured and must not \
+                          be read as healthy zeros. Use to check whether philotes are actually \
+                          recalling memory and whether the store is healthy."
+                .into(),
+            input_schema: json!({ "type": "object", "properties": {} }),
+            // Deliberately class-less: memory.report is admin-gated by explicit
+            // grant on the admin/orchestrator profiles, not by the broad
+            // `memory` class every memory-capable agent holds (proposal S6a
+            // authz: admin-role, audited read).
+            class: None,
         },
     );
 

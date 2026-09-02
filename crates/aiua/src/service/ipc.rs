@@ -9043,6 +9043,14 @@ impl IpcServer {
                 )
             }
 
+            IpcRequest::GetMemoryReport => {
+                // Proposal S6a: honest-sourcing memory-health report. Read-only;
+                // sources recall effectiveness from the session-event ledger and
+                // marks the multi-node/replication fields `unavailable`.
+                let report = crate::memory_report::assemble_live_memory_report(graph);
+                IpcResponse::success("memory_report", serde_json::to_value(&report).ok())
+            }
+
             IpcRequest::BestPlaceToRun {
                 agent_id,
                 role_name,
