@@ -161,6 +161,13 @@ This registry makes the seam layer explicit without forcing every task bullet to
 | `onnx-music-analysis-surface` | `tooling-execution` | [STREAMING_TTS_AND_MUSIC_ANALYSIS_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/STREAMING_TTS_AND_MUSIC_ANALYSIS_PROPOSAL.md) | `docs/task.md` → `New Project: Streaming TTS And Music Analysis` |
 | `midi-output-artifact` | `tooling-execution` | [STREAMING_TTS_AND_MUSIC_ANALYSIS_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/STREAMING_TTS_AND_MUSIC_ANALYSIS_PROPOSAL.md) | `docs/task.md` → `New Project: Streaming TTS And Music Analysis` |
 | `graph-harness-control-plane` | `operator-control-plane` | [AGENT_WORKSTREAM_TRACKING_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/AGENT_WORKSTREAM_TRACKING_PROPOSAL.md) | `docs/task.md` → Harness desired/rendered/observed state management in intel-graph |
+| `skills-distill-trigger` | `runtime-sessions` | [SELF_IMPROVEMENT_LOOP_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/SELF_IMPROVEMENT_LOOP_PROPOSAL.md) | proposed | `docs/task.md` → `New Project: Self-Improvement Loop` |
+| `skills-curate-sweep` | `tooling-execution` | [SELF_IMPROVEMENT_LOOP_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/SELF_IMPROVEMENT_LOOP_PROPOSAL.md) | proposed | `docs/task.md` → `New Project: Self-Improvement Loop` |
+| `skill-patch-pending-queue` | `tooling-execution` | [SELF_IMPROVEMENT_LOOP_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/SELF_IMPROVEMENT_LOOP_PROPOSAL.md) | proposed | `docs/task.md` → `New Project: Self-Improvement Loop` |
+| `standing-notes-budget` | `memory-context` | [SELF_IMPROVEMENT_LOOP_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/SELF_IMPROVEMENT_LOOP_PROPOSAL.md) | proposed | `docs/task.md` → `New Project: Self-Improvement Loop` |
+| `prompt-guard-scan` | `tooling-execution` | [SELF_IMPROVEMENT_LOOP_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/SELF_IMPROVEMENT_LOOP_PROPOSAL.md) | proposed | `docs/task.md` → `New Project: Self-Improvement Loop` |
+| `cron-continuity` | `runtime-sessions` | [SELF_IMPROVEMENT_LOOP_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/SELF_IMPROVEMENT_LOOP_PROPOSAL.md) | proposed | `docs/task.md` → `New Project: Self-Improvement Loop` |
+| `session-search-fts` | `memory-context` | [SELF_IMPROVEMENT_LOOP_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/SELF_IMPROVEMENT_LOOP_PROPOSAL.md) | proposed | `docs/task.md` → `New Project: Self-Improvement Loop` |
 
 ## Usage Rule
 

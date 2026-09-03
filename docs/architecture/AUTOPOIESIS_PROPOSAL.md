@@ -129,6 +129,15 @@ A8c waits on A6. A9 depends only on A1's audit records. A10 depends on A9
 plus SUBSTRATE_HARDENING slices S1–S3 (supervision invariant, heal-the-healer,
 verification-as-data) being live.
 
+**A7 amendment (2026-09-03):** [SELF_IMPROVEMENT_LOOP_PROPOSAL.md](SELF_IMPROVEMENT_LOOP_PROPOSAL.md)
+supplies the mechanics A7 assumed but never specified — a single-turn distill
+trigger (`skills.distill`, L1) feeding the same `Draft` pool, a
+provenance-scoped curator (`skills.curate`, L2) so that pool cannot sprawl,
+`skill.patch` with a durable pending queue (L3), and a `prompt-guard` scan (L5)
+on every distilled artifact. A7's "≥3 completed plans" signal is retained as
+the `Draft → Validated` promotion hint rather than the sole trigger. Read A7
+together with that proposal; do not implement A7 alone.
+
 **Prerequisite:** the LifeGraph epic's in-flight slices (retrieval lane 3–4,
 charter, hygiene, auto-capture) land first — a self-building world needs its
 world-model working. A2 specifically builds on the retrieval lane's Slice 4
