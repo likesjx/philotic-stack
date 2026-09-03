@@ -1912,3 +1912,17 @@ Seam IDs: `active-proposal-frontmatter-rollout`, `architecture-doc-metadata-roll
   - whether local `develop` is behind `origin/develop`
   - whether watched-live verification is about to run from stale local truth
   - proposal: [docs/architecture/WORKTREE_REINTEGRATION_TRACKING_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/WORKTREE_REINTEGRATION_TRACKING_PROPOSAL.md)
+
+## New Project: Self-Improvement Loop
+
+Proposal: [docs/architecture/SELF_IMPROVEMENT_LOOP_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/SELF_IMPROVEMENT_LOOP_PROPOSAL.md) (proposed 2026-09-03; amends Autopoiesis A7).
+
+Order: L5 → L1 → L2, then L3/L4/L6/L7 independently.
+
+- [ ] L5 `prompt-guard` crate (exec-guard shape) + gate points on `skill.register`, `memory.promote_candidate`, MCP catalog report — test-green on a 50/50 fixture corpus
+- [ ] L1 `skills.distill` lane: three turn-close predicates at `complete_agent_response`, lookaside distill whisper, `Draft`-only output, 3/day budget, kill switch — watched-live: one Draft skill from a real turn on mac-jane
+- [ ] L2 `skills.curate`: `provenance` / `last_invoked_at` / `invocation_count` on `AbstractSkillRecord`, nightly sweep after the `fire_memory_hygiene` pattern, never deletes, `pinned` marker — smoke-green + `phil skill list --stale`
+- [ ] L3 `skill.patch` tool + `skill_registration_pending` nodes + philotic-web `/api/skills/pending` approve/reject
+- [ ] L4 standing-notes: `agent_notes` 2,200 / `operator_profile` 1,375 chars, `notes.add|replace|remove`, fail-loud cap, usage header — first task: audit what `InjectionBudget.memory_snapshot_chars` feeds today
+- [ ] L6 cron `continuity` + `cron_scratch` node injected as `[Previous run]` — watched-live on the vps Chronos check-in
+- [ ] L7 `session_turn_fts` FTS5 table + `SearchSessionTurns` IPC + `session.search` tool — smoke-green on vps-jane Beacon history
