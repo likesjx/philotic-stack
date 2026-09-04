@@ -260,7 +260,32 @@ every prior registration in the audit trail came from drill guests. Filed as
 latent governance bug the drills had masked — which is what a watched-live
 gate is for.
 
-Next: L2 before the Draft pool grows; skip auto-recall for distill turns. Recorded in the intel graph on
+**Fourth and fifth drills, 18:25–18:36 UTC — plumbing all correct, still
+`DISTILL: nothing` in 1–3 s.** The lookaside session persists per role, and
+the request that reached the model carried **32 copies of its own earlier
+"DISTILL: nothing"** through the structured `dialogue_window`, the session
+envelope and the rendered prompt, plus the projected `skill.authoring`
+doctrine ("3 or more times", "not for one-off tasks") arguing against the
+brief. Fixed: a distill turn calls `forget_dialogue_for_lookaside()` before
+it starts, skill guidance is suppressed inside distill turns, no Muninn
+auto-recall / LifeGraph prefetch or injection, and the brief states that
+reaching the review already satisfies the pattern threshold.
+
+**Watched-live-green, 2026-09-04 18:46 UTC (mac-jane, PR #483 build):**
+`trigger=tool_count` → `autonomy action consulted … allowed=true filing=true`
+→ whisper to `role:agent-bjork-01:orchestrator` → `lookaside session dialogue
+forgotten before review forgotten_turns=6` → `Skill registered via IPC
+skill_name=music.weekly-practice-review validation_state=draft
+registered_by=agent-bjork-01:orchestrator` → `routed Discard`. Four seconds.
+The Draft carries `skill_markers=[agent_authored, distilled]`,
+`field_sources={origin: distill:tool_count, trigger: tool_count}`,
+`implied_tools=[life.list, life.recall, hotel.status, graph.query]`, and a
+goal template the operator can read in `phil`/the desktop skills view. Nothing
+surfaced in Telegram. This closes L1's gate; the operator's next act is
+`skill.set_state music.weekly-practice-review validated` (or deprecated),
+which is exactly the review the proposal promised.
+
+Next: L2 before the Draft pool grows. Recorded in the intel graph on
 `doc:autopoiesis-proposal` (observation + writeback items, 2026-09-03) and as a
 decision on `seam:a2a-membrane-contract` for the Hermes interop half, which is
 a separate proposal.
