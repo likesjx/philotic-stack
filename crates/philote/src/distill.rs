@@ -235,9 +235,15 @@ pub(super) fn build_distill_prompt(
         "DISTILL REVIEW — silent lookaside. Nothing you write here reaches the operator; only your tool calls matter.\n\
          A turn just completed and {trigger_line}.\n\n\
          User asked: «{user}»\n\
+         {goal_line}\
          Tools used, in order:\n{tools}\
          Final reply: «{reply}»\n\n\
-         Decide whether this was a reusable procedure worth naming.\n\
+         Decide whether this was a reusable procedure worth naming. Reaching this review already means the \
+         turn met the pattern threshold — you do not need to have seen it three times; the operator reviews \
+         every Draft, so a plausible procedure is worth drafting and a wrong one costs nothing. Say YES when \
+         the turn followed an ordered, repeatable sequence of tool steps that someone could ask for again \
+         (a review, a digest, a check, a report). Say nothing only when the turn was a one-tool lookup, \
+         pure conversation, or a failure with no working path.\n\
          - If YES: call skill.register ONCE with skill_name (lowercase dotted, e.g. research.github-digest), \
          description (one sentence, when to use it), subagent_kind \"philote-worker\", goal (the procedure as a \
          template with {{{{placeholders}}}} for the parts that vary), and allowed_tools = exactly the tools used above. \
@@ -247,6 +253,17 @@ pub(super) fn build_distill_prompt(
          - If neither applies, reply exactly: DISTILL: nothing\n\
          Do not repeat the task. Do not call any other tool.",
         user = excerpt(&turn.user_content, USER_EXCERPT_CHARS),
+        // A plan-continuation turn's user_content is the synthesized
+        // continuation brief; the plan's own goal is the request the
+        // operator actually made.
+        goal_line = turn
+            .active_plan
+            .as_ref()
+            .map(|p| format!(
+                "Original goal: «{}»\n",
+                excerpt(&p.goal, USER_EXCERPT_CHARS)
+            ))
+            .unwrap_or_default(),
         reply = excerpt(reply, REPLY_EXCERPT_CHARS),
     );
     truncate_for_wire(&prompt, PARACRINE_WHISPER_PROMPT_MAX_CHARS)

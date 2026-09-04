@@ -866,6 +866,20 @@ impl SessionState {
         })
     }
 
+    /// Self-Improvement Loop L1: a distill lookaside session is reused for
+    /// every whisper to the same role, so before a distill turn starts the
+    /// session forgets its dialogue. Every consumer of `recent_turns` — the
+    /// rendered window, the structured `dialogue_window`, the session
+    /// envelope, the previous-turn hint — then sees an empty history, and the
+    /// review reads only its brief. Live 2026-09-04 18:36: with the renderer
+    /// alone blanked, the request still carried 32 copies of the session's
+    /// own earlier "DISTILL: nothing".
+    pub fn forget_dialogue_for_lookaside(&mut self) -> usize {
+        let forgotten = self.recent_turns.len();
+        self.recent_turns.clear();
+        forgotten
+    }
+
     pub fn complete_active_turn(&mut self, assistant_content: String) -> Option<WorkingTurn> {
         self.turn_waiting_since = None;
         let turn = self.active_turn.take()?;
@@ -3175,7 +3189,18 @@ impl SessionState {
         // on the philote side ever rendered it: the model saw bare skill ids
         // with the charter text (outcome-note discipline, respawn-budget
         // escalation, …) silently dropped. Capped in skill_guidance_for_turn.
-        let skill_guidance = self.skill_guidance_for_turn(projected_skills);
+        // Self-Improvement Loop L1: the distill brief IS the doctrine for a
+        // distill turn. The projected skill.authoring guidance ("3 or more
+        // times", "not for one-off tasks") would argue against the brief.
+        let skill_guidance = if self
+            .active_turn
+            .as_ref()
+            .is_some_and(crate::runtime::distill::turn_is_distill)
+        {
+            Vec::new()
+        } else {
+            self.skill_guidance_for_turn(projected_skills)
+        };
         if !skill_guidance.is_empty() {
             let mut section = String::from("\n[Skill guidance]");
             for entry in &skill_guidance {
