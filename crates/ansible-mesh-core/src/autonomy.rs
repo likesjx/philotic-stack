@@ -34,18 +34,38 @@ pub const LANE_WORK_EXECUTE_SLICES: &str = "work.execute_slices";
 /// Known lane: nightly Muninn contradiction/staleness sweep files aggregated
 /// annotation-only findings (Memory Transparency Slice M4).
 pub const LANE_MEMORY_HYGIENE: &str = "memory.hygiene";
+/// Known lane: a turn that met a distill predicate (≥ 5 tool calls, an error
+/// recovered, a corrective user message) emits a silent lookaside whisper
+/// whose only legal outputs are a `Draft` skill or a Muninn write
+/// (Self-Improvement Loop Slice L1). A Draft is a proposal, so this lane's
+/// action is a *filing* and is permitted at `ProposalOnly`.
+pub const LANE_SKILLS_DISTILL: &str = "skills.distill";
 
 /// All lanes named by the Autopoiesis proposal. Lanes are open vocabulary —
 /// this list exists for enumeration (dashboards, kill-switch sweeps), not as a
 /// closed set.
-pub const KNOWN_LANES: [&str; 6] = [
+pub const KNOWN_LANES: [&str; 7] = [
     LANE_GRAPH_BRIDGE_EDGES,
     LANE_FLEET_HEAL_SLICES,
     LANE_WORK_FILE_PROPOSALS,
     LANE_STEWARD_ACTIVE_CHECKINS,
     LANE_WORK_EXECUTE_SLICES,
     LANE_MEMORY_HYGIENE,
+    LANE_SKILLS_DISTILL,
 ];
+
+/// Per-lane default daily budget. Most lanes take [`AutonomyBudget::default`];
+/// `skills.distill` is capped at 3 whispers per hotel per day (proposal L1) so
+/// a chatty day cannot flood the Draft pool before the curator (L2) exists.
+pub fn default_budget_for_lane(lane: &str) -> AutonomyBudget {
+    match lane {
+        LANE_SKILLS_DISTILL => AutonomyBudget {
+            max_actions_per_day: 3,
+            ..AutonomyBudget::default()
+        },
+        _ => AutonomyBudget::default(),
+    }
+}
 
 /// Prefix for the per-lane env kill switch.
 pub const AUTONOMY_KILL_SWITCH_ENV_PREFIX: &str = "PHILOTIC_AUTONOMY_DISABLE_";
@@ -221,10 +241,11 @@ impl AutonomyGrant {
     /// Autonomy Contract rule 2 forbids any lane starting above ConfirmFirst;
     /// creation uses the safest level and trust is earned from there.
     pub fn new(lane: AutonomyLane, now: u64) -> Self {
+        let budget = default_budget_for_lane(lane.as_str());
         Self {
             lane,
             posture: AutonomyPosture::ProposalOnly,
-            budget: AutonomyBudget::default(),
+            budget,
             earned: AutonomyEarned::default(),
             frozen_until_operator_review: false,
             actions_today: 0,
@@ -853,6 +874,10 @@ mod tests {
             (
                 LANE_MEMORY_HYGIENE,
                 "PHILOTIC_AUTONOMY_DISABLE_MEMORY_HYGIENE",
+            ),
+            (
+                LANE_SKILLS_DISTILL,
+                "PHILOTIC_AUTONOMY_DISABLE_SKILLS_DISTILL",
             ),
         ];
         assert_eq!(expected.len(), KNOWN_LANES.len());

@@ -2,8 +2,8 @@
 title: Self-Improvement Loop — Mechanical Triggers, Curation, and Fail-Loud Memory Under Philotic Gates
 doc_type: proposal
 domain: runtime-sessions
-status: proposed
-disposition: proposed
+status: accepted-current-slice
+disposition: accepted-current-slice
 last_updated: 2026-09-03
 tags:
   - self-improvement
@@ -179,10 +179,57 @@ action is a reversible state transition on records the agent authored itself.
 
 ## Disposition
 
-`proposed` — awaiting operator review. Recommended first slice: **L5 then L1**
-(the trigger, with its output scanned), because that is the change that turns
-the loop from prose into mechanism. L2 next, because the moment L1 works the
-Draft pool starts growing. Recorded in the intel graph on
+`accepted-current-slice` — operator chose **L5 + L1** as the first slice on
+2026-09-03 (`codex/self-improvement-l5-l1`). Implemented, test-green:
+
+- **L5** `crates/prompt-guard` (exec-guard shape; `Dangerous` / `Caution`;
+  hidden-char and embedded-hardline checks in code, 9 + 7 regex rules;
+  100-fixture corpus). Gate points live: `skill.register` on both sides
+  (philote `route_tool_call_execution` denies Dangerous before approval and
+  pins Caution to the unconditional tier; hotel
+  `handle_register_skill_with_origin` rejects Dangerous with a `rejected`
+  audit row and records Caution in `field_sources.prompt_guard`) and
+  `memory.promote_candidate` (Dangerous → `allowed:false`). The MCP-catalog
+  annotation and the `phil doctor` scan counts named in the L5 row are **not**
+  in this slice.
+- **L1** `crates/philote/src/distill.rs`: three predicates at
+  `deliver_text_reply`, lookaside whisper to the philote's own role with the
+  new `ParacrineRouting::Discard`, `context.intent = skills.distill:<trigger>`
+  recognised by the tool layer (fixed allowlist `skill.register`,
+  `skill.list`, `memory.remember`, `memory.recall`; anything else is a
+  tool-result denial), `RegisterSkill.origin` forces the hotel to `Draft` +
+  `agent_authored`/`distilled` markers + `field_sources.trigger`. Budget via
+  `ConsumeAutonomyAction { filing: true }` — a new flag that lets a lane
+  *file* at `ProposalOnly` (budgeted, audited `Pending`); lane
+  `skills.distill` defaults to 3/day per hotel. Kill switch
+  `PHILOTIC_AUTONOMY_DISABLE_SKILLS_DISTILL`; role override
+  `PHILOTIC_SKILLS_DISTILL_ROLE`.
+
+**Reality gap found while implementing (feeds L2/L3):**
+`SkillValidationState::is_projectable()` returns true for `Draft` — only
+`Suspended`/`Deprecated` are excluded — so "a Draft grants nothing" holds
+today only because a Draft is never *assigned* until an operator runs the
+gated `skill.assign`. The distill turn's tool allowlist deliberately omits
+`skill.assign`/`skill.set_state` for exactly this reason. L2 should make
+`Draft` non-projectable explicitly rather than rely on the assignment gate.
+
+**Watched-live on mac-jane, 2026-09-04 16:09 UTC (deploy `10efe433`, hotel
+restarted 14:58):** the operator's corrective Telegram turn ("No, that's not
+what I asked…", one tool) fired `trigger=user_correction`; the hotel created
+`autonomy_grant:skills.distill` (`proposal_only`, budget 3, `actions_today=1`)
+and a `pending` audit; the whisper was delivered to Bjork's own role
+(`architect`) as session `paracrine:7898847424:architect`, ran one Gemini
+turn, replied `DISTILL: nothing`, and the response was `routed Discard —
+thread closed, nothing surfaced`. Whisper-to-close: 3 s. No Draft was
+written — the distiller correctly judged a status check not worth a skill —
+so the *mechanism* is watched-live-green while the "first Draft skill" gate
+still waits for a turn with a reusable procedure in it. Two follow-ups seen in
+the trace: the distill session ran the full LifeGraph auto-recall prefetch
+(four `life.recall` payloads of 20–34 KB) for a review that needs none of it
+— distill turns should skip the recall lane; and a first turn with only two
+tools (`hotel.status`, `skill.list`) stayed silent as designed.
+
+Next: L2 before the Draft pool grows; skip auto-recall for distill turns. Recorded in the intel graph on
 `doc:autopoiesis-proposal` (observation + writeback items, 2026-09-03) and as a
 decision on `seam:a2a-membrane-contract` for the Hermes interop half, which is
 a separate proposal.

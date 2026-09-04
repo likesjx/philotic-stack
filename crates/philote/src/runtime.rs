@@ -45,6 +45,9 @@ mod paracrine;
 #[path = "tool_exec.rs"]
 mod tool_exec;
 
+#[path = "distill.rs"]
+mod distill;
+
 #[path = "memory_integration.rs"]
 mod memory_integration;
 use memory_integration::*;
@@ -2979,6 +2982,7 @@ impl AgentRuntime {
                 paracrine_reply_session_id,
                 paracrine_reply_chat_id,
                 paracrine_response_routing,
+                paracrine_intent,
             ) = {
                 let exosome = task
                     .exosome
@@ -2989,6 +2993,13 @@ impl AgentRuntime {
                     exosome.as_ref().and_then(|e| e.source_session_id.clone()),
                     exosome.as_ref().and_then(|e| e.source_chat_id.clone()),
                     exosome.as_ref().and_then(|e| e.response_routing.clone()),
+                    exosome.as_ref().and_then(|e| {
+                        e.context
+                            .as_ref()
+                            .and_then(|c| c.get("intent"))
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.to_string())
+                    }),
                 )
             };
 
@@ -3079,6 +3090,7 @@ impl AgentRuntime {
                 paracrine_reply_chat_id,
                 paracrine_response_routing,
                 paracrine_merge_completed: false,
+                paracrine_intent,
                 plan_confirmed: seeded_plan_confirmed,
                 plan_confirm_note: None,
                 fallback_tier: if self.network_offline { 1 } else { 0 },
@@ -7571,6 +7583,7 @@ mod tests {
             paracrine_reply_chat_id: None,
             paracrine_response_routing: None,
             paracrine_merge_completed: false,
+            paracrine_intent: None,
             plan_confirmed: false,
             plan_confirm_note: None,
             fallback_tier: 0,
@@ -8663,6 +8676,7 @@ mod tests {
             paracrine_reply_chat_id: None,
             paracrine_response_routing: None,
             paracrine_merge_completed: false,
+            paracrine_intent: None,
             plan_confirmed: false,
             plan_confirm_note: None,
             fallback_tier: 0,

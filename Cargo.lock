@@ -105,6 +105,7 @@ dependencies = [
  "parakeet-runner",
  "perimeter-core",
  "philotic-client",
+ "prompt-guard",
  "rand 0.8.5",
  "reqwest",
  "rusqlite",
@@ -3418,6 +3419,7 @@ dependencies = [
  "media-prep",
  "memory-core",
  "philotic-client",
+ "prompt-guard",
  "reqwest",
  "serde",
  "serde_json",
@@ -3675,6 +3677,14 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8fd00f0bb2e90d81d1044c2b32617f68fcb9fa3bb7640c23e9c748e53fb30934"
 dependencies = [
  "unicode-ident",
+]
+
+[[package]]
+name = "prompt-guard"
+version = "0.1.0"
+dependencies = [
+ "exec-guard",
+ "regex",
 ]
 
 [[package]]

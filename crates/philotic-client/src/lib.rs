@@ -882,6 +882,12 @@ pub enum ParacrineRouting {
     /// the parked turn and applies the resolution (approve or deny) without re-entering
     /// the model loop. Carries `decision` ("approved"/"denied") and optional `note`.
     ApprovalResolution,
+    /// Fire-and-forget. The emitter logs the specialist's reply, closes the
+    /// paracrine thread, and does nothing else: no model invocation, nothing
+    /// surfaces to the operator. Used by lookaside work whose *side effects*
+    /// are the point (a distill whisper that registers a Draft skill) and
+    /// whose final text is noise.
+    Discard,
 }
 
 /// Paracrine message envelope — the vesicle a philote secretes when performing a
@@ -1262,6 +1268,13 @@ pub enum IpcRequest {
         /// SkillDAG edges: skills this skill transitively activates.
         #[serde(default)]
         allowed_skills: Vec<String>,
+        /// Where this registration came from. `None` = an ordinary
+        /// operator-approved `skill.register`. `Some("distill:<trigger>")` =
+        /// the Self-Improvement Loop's L1 distill whisper; the hotel forces
+        /// such records to `Draft` and marks them `agent_authored`/`distilled`
+        /// so nothing distilled ever projects without an operator promotion.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        origin: Option<String>,
         #[serde(default)]
         hook_subscriptions: Vec<HookSubscription>,
         #[serde(default)]
@@ -2187,6 +2200,12 @@ pub enum IpcRequest {
         action_summary: String,
         evidence: String,
         reversal_hint: String,
+        /// When true the action *is* a filing (a Draft skill, a proposal
+        /// record) rather than an effect on the world, so it is permitted —
+        /// budgeted and audited — at `ProposalOnly`. Default false keeps
+        /// every existing caller's semantics.
+        #[serde(default)]
+        filing: bool,
     },
     /// Operator/steward → hotel: report the reviewed outcome of an audited
     /// autonomous action so the lane earns (or loses) trust (Autopoiesis
@@ -4915,6 +4934,7 @@ mod tests {
             action_summary: "bridge 2 RELATES_TO edge(s)".into(),
             evidence: "feedback_id=feedback:recall:1 rating=Disconnected".into(),
             reversal_hint: "MATCH ()-[r:RELATES_TO {feedback_signal_id: 'f1'}]-() DELETE r".into(),
+            filing: false,
         };
         let wire = serde_json::to_string(&req).expect("serialize");
         assert!(wire.contains("\"consume_autonomy_action\""), "wire: {wire}");
@@ -4925,6 +4945,7 @@ mod tests {
                 action_summary,
                 evidence,
                 reversal_hint,
+                filing: false,
             } => {
                 assert_eq!(lane, "graph.bridge_edges");
                 assert!(action_summary.contains("RELATES_TO"));

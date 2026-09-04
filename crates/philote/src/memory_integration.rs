@@ -1985,6 +1985,7 @@ impl AgentRuntime {
                 paracrine_reply_chat_id: None,
                 paracrine_response_routing: None,
                 paracrine_merge_completed: false,
+                paracrine_intent: None,
                 plan_confirmed: false,
                 plan_confirm_note: None,
                 fallback_tier: if self.network_offline { 1 } else { 0 },
@@ -2577,7 +2578,30 @@ impl AgentRuntime {
         &mut self,
         payload: ToolExecutionPayload,
     ) -> Result<()> {
-        let report = promotion_gate_report(&payload.arguments);
+        let mut report = promotion_gate_report(&payload.arguments);
+        // Self-Improvement Loop L5: a candidate that would be rendered back
+        // into prompts as durable shared memory passes the prompt safety
+        // floor first. Dangerous text is refused regardless of authority,
+        // validation level, evidence, or operator_approved.
+        if let Some(hazard) = payload
+            .arguments
+            .get("candidate")
+            .and_then(|v| v.as_str())
+            .and_then(prompt_guard::detect_prompt_hazard)
+            .filter(|h| h.is_dangerous())
+        {
+            if let Some(obj) = report.as_object_mut() {
+                obj.insert("allowed".into(), serde_json::Value::Bool(false));
+                obj.insert(
+                    "prompt_guard".into(),
+                    serde_json::Value::String(hazard.description.to_string()),
+                );
+                obj.insert(
+                    "denial".into(),
+                    serde_json::Value::String(hazard.denial_message()),
+                );
+            }
+        }
 
         self.handle_tool_result(InboundTaskPayload {
             action: Some("tool_result".into()),

@@ -1919,8 +1919,9 @@ Proposal: [docs/architecture/SELF_IMPROVEMENT_LOOP_PROPOSAL.md](/Users/jaredlike
 
 Order: L5 → L1 → L2, then L3/L4/L6/L7 independently.
 
-- [ ] L5 `prompt-guard` crate (exec-guard shape) + gate points on `skill.register`, `memory.promote_candidate`, MCP catalog report — test-green on a 50/50 fixture corpus
-- [ ] L1 `skills.distill` lane: three turn-close predicates at `complete_agent_response`, lookaside distill whisper, `Draft`-only output, 3/day budget, kill switch — watched-live: one Draft skill from a real turn on mac-jane
+- [x] L5 `prompt-guard` crate (exec-guard shape) + gate points on `skill.register` (both sides), `memory.promote_candidate` — **test-green** 2026-09-03 (`codex/self-improvement-l5-l1`, 50/50 corpus). MCP catalog annotation + `phil doctor` counts deferred to a follow-up.
+- [x] L1 `skills.distill` lane: three turn-close predicates at `deliver_text_reply`, lookaside distill whisper (`ParacrineRouting::Discard`, fixed tool allowlist), `Draft`-only output via `RegisterSkill.origin`, 3/day budget via `ConsumeAutonomyAction { filing: true }`, kill switch — **test-green** 2026-09-03; **watched-live 2026-09-04 on mac-jane** — user_correction trigger → grant + pending audit → whisper to own role → `DISTILL: nothing` → Discard, 3 s, nothing surfaced. First Draft skill still pending a turn with a reusable procedure.
+- [ ] L1 follow-up: distill lookaside turns should skip the LifeGraph auto-recall prefetch (trace showed four `life.recall` payloads of 20–34 KB injected into a review that needs none).
 - [ ] L2 `skills.curate`: `provenance` / `last_invoked_at` / `invocation_count` on `AbstractSkillRecord`, nightly sweep after the `fire_memory_hygiene` pattern, never deletes, `pinned` marker — smoke-green + `phil skill list --stale`
 - [ ] L3 `skill.patch` tool + `skill_registration_pending` nodes + philotic-web `/api/skills/pending` approve/reject
 - [ ] L4 standing-notes: `agent_notes` 2,200 / `operator_profile` 1,375 chars, `notes.add|replace|remove`, fail-loud cap, usage header — first task: audit what `InjectionBudget.memory_snapshot_chars` feeds today
