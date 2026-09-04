@@ -894,6 +894,15 @@ impl GraphDomain {
         &self,
         role_name: &str,
     ) -> Result<Option<RoleIncarnationRecord>> {
+        // An agent-scoped routing key (`role:{agent_id}:{role_name}`, the
+        // form `RoleIncarnationRecord::routing_role` produces) resolves to
+        // exactly that agent's incarnation. A bare role name keeps the
+        // historical first-match behaviour — which on a hotel with several
+        // agents each owning an `orchestrator` is ambiguous, so callers that
+        // know the agent should pass the routing key (the distill whisper does).
+        let scoped = role_name
+            .strip_prefix("role:")
+            .and_then(|rest| rest.split_once(':'));
         for node in self
             .adapter
             .list_nodes_by_kind(NODE_KIND_ROLE_INCARNATION)?
@@ -901,7 +910,11 @@ impl GraphDomain {
             let record: RoleIncarnationRecord = serde_json::from_value(node.data).context(
                 "GraphDomain::find_role_incarnation_by_name: deserialize RoleIncarnationRecord",
             )?;
-            if record.role_name == role_name {
+            let matches = match scoped {
+                Some((agent_id, name)) => record.agent_id == agent_id && record.role_name == name,
+                None => record.role_name == role_name,
+            };
+            if matches {
                 return Ok(Some(record));
             }
         }
@@ -2599,6 +2612,53 @@ mod tests {
 
         let by_guest = d.list_role_incarnations_by_guest_id("guest-1").unwrap();
         assert_eq!(by_guest.len(), 1);
+    }
+
+    /// An agent-scoped routing key resolves to exactly that agent's
+    /// incarnation even when several agents own the same role name; a bare
+    /// name keeps first-match behaviour.
+    #[test]
+    fn find_role_incarnation_by_name_accepts_agent_scoped_routing_key() {
+        use crate::graph::TurnLoopConfig;
+        let d = make_domain();
+        let mk = |agent: &str, role: &str| RoleIncarnationRecord {
+            agent_id: agent.to_string(),
+            role_name: role.to_string(),
+            guest_id: format!("{agent}:{role}"),
+            toolset_profile: "default".to_string(),
+            role_identity_addendum: None,
+            role_manifest: None,
+            is_admin: false,
+            readiness_state: RoleReadinessState::Configured,
+            inactive_ttl_seconds: None,
+            turn_loop_config: TurnLoopConfig::default(),
+            home_node: None,
+            ..Default::default()
+        };
+        d.upsert_role_incarnation(&mk("agent-coach", "orchestrator"))
+            .unwrap();
+        d.upsert_role_incarnation(&mk("agent-bjork-01", "orchestrator"))
+            .unwrap();
+
+        let scoped = d
+            .find_role_incarnation_by_name("role:agent-bjork-01:orchestrator")
+            .unwrap()
+            .expect("scoped lookup resolves");
+        assert_eq!(scoped.agent_id, "agent-bjork-01");
+        assert_eq!(scoped.routing_role(), "role:agent-bjork-01:orchestrator");
+
+        assert!(
+            d.find_role_incarnation_by_name("role:agent-nobody:orchestrator")
+                .unwrap()
+                .is_none(),
+            "a scoped key for an unknown agent must not fall back to another agent"
+        );
+
+        let bare = d
+            .find_role_incarnation_by_name("orchestrator")
+            .unwrap()
+            .expect("bare name still resolves");
+        assert_eq!(bare.role_name, "orchestrator");
     }
 
     #[test]

@@ -2121,6 +2121,26 @@ impl SessionState {
     }
 
     pub fn project_tools_for_turn(&self, user_content: &str) -> Vec<ToolDefinition> {
+        // Self-Improvement Loop L1: a distill lookaside turn sees exactly the
+        // allowlisted tools the role actually holds — no keyword gates, no
+        // on-demand suppression. Live 2026-09-04: the brief named
+        // `skill.register`, the orchestrator profile keeps it behind the
+        // on-demand `skill.authoring` skill, and the relevance heuristics
+        // hid it, so the distiller could only answer "DISTILL: nothing".
+        if self
+            .active_turn
+            .as_ref()
+            .is_some_and(crate::runtime::distill::turn_is_distill)
+        {
+            return self
+                .tool_assembly
+                .tools_for_model
+                .iter()
+                .filter(|t| crate::runtime::distill::tool_allowed(&t.tool_name))
+                .cloned()
+                .collect();
+        }
+
         let mut tools = self.project_tools_for_turn_by_relevance(user_content);
 
         // A turn that carries an active plan must always be able to execute
@@ -7938,6 +7958,49 @@ mod tests {
     /// for skills projected on this turn. Before this existed the strings were
     /// discarded (`.clear()` + vec![] resets) and no skill doctrine ever
     /// reached the model.
+    /// Self-Improvement Loop L1: a distill lookaside turn projects exactly the
+    /// allowlisted tools the role holds — keyword gates and on-demand
+    /// suppression do not apply. Live 2026-09-04 the distiller was offered
+    /// 33 tools without `skill.register` and could only decline.
+    #[test]
+    fn distill_turn_projects_only_the_allowlist() {
+        let mut state =
+            SessionState::new("sess-1".into(), "agent-bjork-01".into(), "telegram".into());
+        state.clear_tool_bindings();
+        for tool in [
+            "skill.register",
+            "skill.list",
+            "memory.remember",
+            "bash.exec",
+            "hotel.status",
+        ] {
+            state.add_tool_binding(tool);
+        }
+        // Even with skill.register hidden behind an on-demand skill.
+        state.bindings.on_demand_skills = vec!["skill.authoring".into()];
+
+        let mut turn = WorkingTurn::test_turn("t-distill", "DISTILL REVIEW — silent lookaside.");
+        turn.paracrine_origin = Some("pid-1".into());
+        turn.paracrine_intent = Some("skills.distill:tool_count".into());
+        state.start_turn(turn);
+
+        let mut names: Vec<String> = state
+            .project_tools_for_turn("DISTILL REVIEW — silent lookaside.")
+            .into_iter()
+            .map(|t| t.tool_name)
+            .collect();
+        names.sort();
+        assert_eq!(
+            names,
+            vec![
+                "memory.remember".to_string(),
+                "skill.list".to_string(),
+                "skill.register".to_string()
+            ],
+            "distill turn must see the allowlisted tools it holds and nothing else"
+        );
+    }
+
     #[test]
     fn skill_guidance_renders_for_projected_skills_only() {
         let mut state =
