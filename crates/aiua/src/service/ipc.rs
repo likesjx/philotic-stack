@@ -8501,6 +8501,15 @@ impl IpcServer {
             // ── Cron scheduler ──────────────────────────────────────────────
             IpcRequest::RegisterCronJob { mut job } => {
                 Self::normalize_cron_target_role(graph, &mut job);
+                // Ownership is stamped from the connection identity, never
+                // trusted from the wire: a guest's jobs belong to its agent.
+                if let Some(identity) = current_identity.as_ref() {
+                    if !cron_admin_identity(identity) {
+                        job.created_by = ansible_mesh_core::cron::CronJobSource::Guest(
+                            cron_owner_agent_of_guest(&identity.guest_id).to_string(),
+                        );
+                    }
+                }
                 // New job registrations always get an isolated `cron:<job_id>`
                 // session — `session_target` only defaults to `Main` via serde
                 // when deserializing legacy rows straight from storage
@@ -8523,6 +8532,14 @@ impl IpcServer {
             }
             IpcRequest::RemoveCronJob { job_id } => {
                 info!("RemoveCronJob: id={}", job_id);
+                if let Err(refusal) = cron_job_mutation_allowed(
+                    graph,
+                    &job_id,
+                    current_identity.as_ref(),
+                    "remove_cron_job",
+                ) {
+                    return refusal;
+                }
                 match graph.remove_cron_job(&job_id) {
                     Ok(_) => {
                         Self::broadcast_cron_sync_remove(dispatcher_tx, local_node_id, &job_id)
@@ -8533,11 +8550,25 @@ impl IpcServer {
                 }
             }
             IpcRequest::ListCronJobs => match graph.list_cron_jobs() {
-                Ok(jobs) => IpcResponse::CronJobList { jobs },
+                // Every role may list, but a guest sees only its own agent's
+                // crontab; orchestrator/management/operator surfaces see all.
+                Ok(jobs) => IpcResponse::CronJobList {
+                    jobs: jobs
+                        .into_iter()
+                        .filter(|job| cron_job_visible_to(job, current_identity.as_ref()))
+                        .collect(),
+                },
                 Err(e) => IpcResponse::Error(format!("ListCronJobs failed: {e}")),
             },
             IpcRequest::EnableCronJob { job_id } => match graph.get_cron_job(&job_id) {
                 Ok(Some(mut job)) => {
+                    if !cron_job_visible_to(&job, current_identity.as_ref()) {
+                        return cron_forbidden(
+                            "enable_cron_job",
+                            &job_id,
+                            current_identity.as_ref(),
+                        );
+                    }
                     job.enabled = true;
                     match graph.upsert_cron_job(&job) {
                         Ok(_) => {
@@ -8553,6 +8584,13 @@ impl IpcServer {
             },
             IpcRequest::DisableCronJob { job_id } => match graph.get_cron_job(&job_id) {
                 Ok(Some(mut job)) => {
+                    if !cron_job_visible_to(&job, current_identity.as_ref()) {
+                        return cron_forbidden(
+                            "disable_cron_job",
+                            &job_id,
+                            current_identity.as_ref(),
+                        );
+                    }
                     job.enabled = false;
                     match graph.upsert_cron_job(&job) {
                         Ok(_) => {
@@ -16232,7 +16270,102 @@ fn selection_reason_for_incarnation(
 /// `ListSkillAudits`). Skills project tools onto agents, so administration is
 /// restricted to authenticated guests holding the `orchestrator` or
 /// `management` role. Centralized so new ops cannot fork the policy.
-#[allow(clippy::result_large_err)] // Err is the IpcResponse sent on the cold rejection path
+#[allow(clippy::result_large_err)]
+// Err is the IpcResponse sent on the cold rejection path
+// ── Cron ownership scoping ───────────────────────────────────────────────────
+//
+// Every role holds the cron tools (operator decision 2026-09-04: "open to
+// everyone — but maybe only their crontabs"). The hotel scopes them: a guest
+// sees and mutates only jobs its AGENT owns; orchestrator/management and the
+// operator surfaces (philotic-web, CLI) see the whole hotel.
+
+/// The agent that owns a guest: `agent-x` or `agent-x:role` → `agent-x`.
+pub(super) fn cron_owner_agent_of_guest(guest_id: &str) -> &str {
+    guest_id.split_once(':').map(|(a, _)| a).unwrap_or(guest_id)
+}
+
+/// Identities that see the whole hotel crontab: skill-admin roles
+/// (orchestrator/management, bare or `role:{agent}:`-scoped) and the operator
+/// surfaces. An unregistered connection is treated as the operator's own
+/// process (the CLI/socket path that predates guest identities).
+pub(super) fn cron_admin_identity(identity: &GuestIdentity) -> bool {
+    skill_admin_role(&identity.role)
+        || matches!(
+            identity.role.as_str(),
+            "operator" | "cli" | "philotic-web" | "desktop" | "membrane"
+        )
+}
+
+/// Does `identity` own `job`? Ownership is by AGENT: a job created by any of
+/// the agent's guests, or an operator job whose target role belongs to the
+/// agent (`role:{agent}:{name}`, `{agent}:{name}`, or the bare agent id).
+pub(super) fn cron_job_owned_by(job: &ansible_mesh_core::cron::CronJob, guest_id: &str) -> bool {
+    let agent = cron_owner_agent_of_guest(guest_id);
+    let created_by_agent = match &job.created_by {
+        ansible_mesh_core::cron::CronJobSource::Guest(g) => cron_owner_agent_of_guest(g) == agent,
+        ansible_mesh_core::cron::CronJobSource::Operator => false,
+    };
+    if created_by_agent {
+        return true;
+    }
+    let target = job
+        .target_role
+        .strip_prefix("role:")
+        .unwrap_or(&job.target_role);
+    target == agent
+        || target
+            .strip_prefix(agent)
+            .is_some_and(|rest| rest.starts_with(':'))
+}
+
+pub(super) fn cron_job_visible_to(
+    job: &ansible_mesh_core::cron::CronJob,
+    identity: Option<&GuestIdentity>,
+) -> bool {
+    match identity {
+        None => true,
+        Some(id) => cron_admin_identity(id) || cron_job_owned_by(job, &id.guest_id),
+    }
+}
+
+pub(super) fn cron_forbidden(
+    op: &str,
+    job_id: &str,
+    identity: Option<&GuestIdentity>,
+) -> IpcResponse {
+    warn!(
+        op,
+        job_id,
+        guest_id = identity.map(|i| i.guest_id.as_str()).unwrap_or("-"),
+        "cron mutation refused: job is not owned by the caller's agent"
+    );
+    IpcResponse::error(
+        op,
+        "CRON_FORBIDDEN",
+        format!(
+            "cron job {job_id} is not in your crontab — only jobs owned by your agent can be changed"
+        ),
+    )
+}
+
+/// Ownership gate for a mutation that must look the job up first (remove).
+/// `Ok(())` when the job is missing (the existing handler reports that), or
+/// when the caller owns it / is an admin surface.
+#[allow(clippy::result_large_err)]
+pub(super) fn cron_job_mutation_allowed(
+    graph: &GraphDomain,
+    job_id: &str,
+    identity: Option<&GuestIdentity>,
+    op: &str,
+) -> Result<(), IpcResponse> {
+    match graph.get_cron_job(job_id) {
+        Ok(Some(job)) if !cron_job_visible_to(&job, identity) => {
+            Err(cron_forbidden(op, job_id, identity))
+        }
+        _ => Ok(()),
+    }
+}
+
 /// Is this guest identity's `role` a skill-administration role?
 ///
 /// Accepts the bare names `orchestrator` / `management` AND their
@@ -17967,6 +18100,110 @@ pub(crate) mod tests {
                 .is_empty(),
             "rejected registration must not write an audit event"
         );
+    }
+
+    /// Cron ownership scoping: every role may list/mutate, but only its own
+    /// agent's crontab; operator jobs count as the targeted agent's; the
+    /// orchestrator/management/operator surfaces see everything.
+    #[test]
+    fn cron_jobs_are_scoped_to_the_owning_agent() {
+        use ansible_mesh_core::cron::{CronJob, CronJobSource};
+        fn job(id: &str, target_role: &str, created_by: CronJobSource) -> CronJob {
+            let mut j: CronJob = serde_json::from_value(serde_json::json!({
+                "id": id,
+                "schedule": "0 0 * * * * *",
+                "target_role": target_role,
+                "target_node_id": null,
+                "payload": "{}",
+                "guaranteed": false,
+                "enabled": true,
+                "last_fired_epoch": null,
+                "next_fire_at": 0,
+                "created_at": 0,
+                "created_by": "operator",
+            }))
+            .expect("job");
+            j.created_by = created_by;
+            j
+        }
+        let bjork_arch = GuestIdentity {
+            guest_id: "agent-bjork-01:architect".into(),
+            role: "role:agent-bjork-01:architect".into(),
+            supported_tools: vec![],
+        };
+        let coach = GuestIdentity {
+            guest_id: "agent-coach".into(),
+            role: "agent".into(),
+            supported_tools: vec![],
+        };
+        let orch = GuestIdentity {
+            guest_id: "agent-coach:orchestrator".into(),
+            role: "role:agent-coach:orchestrator".into(),
+            supported_tools: vec![],
+        };
+        let web = GuestIdentity {
+            guest_id: "philotic-web-component".into(),
+            role: "management".into(),
+            supported_tools: vec![],
+        };
+
+        let bjork_own = job("j1", "agent", CronJobSource::Guest("agent-bjork-01".into()));
+        let bjork_role = job(
+            "j2",
+            "agent",
+            CronJobSource::Guest("agent-bjork-01:virtuosa".into()),
+        );
+        let op_for_bjork = job("j3", "role:agent-bjork-01:chronos", CronJobSource::Operator);
+        let op_for_coach = job(
+            "j4",
+            "role:agent-coach:orchestrator",
+            CronJobSource::Operator,
+        );
+        let coach_own = job("j5", "agent", CronJobSource::Guest("agent-coach".into()));
+        // `agent-bjork-012` must not be treated as agent-bjork-01's.
+        let lookalike = job(
+            "j6",
+            "agent",
+            CronJobSource::Guest("agent-bjork-012".into()),
+        );
+
+        let sees = |id: &GuestIdentity, j: &CronJob| cron_job_visible_to(j, Some(id));
+        assert!(sees(&bjork_arch, &bjork_own));
+        assert!(
+            sees(&bjork_arch, &bjork_role),
+            "all roles of one agent share a crontab"
+        );
+        assert!(
+            sees(&bjork_arch, &op_for_bjork),
+            "operator job targeting my role is mine"
+        );
+        assert!(!sees(&bjork_arch, &op_for_coach));
+        assert!(!sees(&bjork_arch, &coach_own));
+        assert!(!sees(&bjork_arch, &lookalike));
+        assert!(sees(&coach, &coach_own));
+        assert!(!sees(&coach, &bjork_own));
+        // Admin surfaces see all.
+        for j in [
+            &bjork_own,
+            &bjork_role,
+            &op_for_bjork,
+            &op_for_coach,
+            &coach_own,
+            &lookalike,
+        ] {
+            assert!(sees(&orch, j), "orchestrator sees {}", j.id);
+            assert!(sees(&web, j), "management sees {}", j.id);
+            assert!(
+                cron_job_visible_to(j, None),
+                "unregistered socket sees {}",
+                j.id
+            );
+        }
+        assert_eq!(
+            cron_owner_agent_of_guest("agent-bjork-01:architect"),
+            "agent-bjork-01"
+        );
+        assert_eq!(cron_owner_agent_of_guest("agent-coach"), "agent-coach");
     }
 
     /// DEF-105: a role-incarnation philote registers with its routing key as
