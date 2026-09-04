@@ -309,6 +309,7 @@ impl AutonomyGate for HotelAutonomyGate {
             action_summary: action_summary.to_string(),
             evidence: evidence.to_string(),
             reversal_hint: reversal_hint.to_string(),
+            filing: false,
         })
         .await?;
         Ok(AutonomyDecision::from_response_data(&data))

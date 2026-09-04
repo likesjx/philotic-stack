@@ -164,6 +164,7 @@ impl AgentRuntime {
                                 steward.active_checkins one posture level \
                                 (record_outcome OperatorReversal)"
                     .into(),
+                filing: false,
             })
             .await;
 
@@ -564,6 +565,36 @@ impl AgentRuntime {
                     ..task
                 })
                 .await?;
+            }
+
+            ParacrineRouting::Discard => {
+                // Fire-and-forget: the whisper's side effects (a Draft skill,
+                // a memory write) were the point; its final text is noise.
+                // Close the thread, log an excerpt for the audit trail, and
+                // never touch the model or the operator.
+                let excerpt: String = task
+                    .content
+                    .as_deref()
+                    .unwrap_or("")
+                    .chars()
+                    .take(240)
+                    .collect();
+                info!(
+                    paracrine_id = ?paracrine_id,
+                    session_id = ?session_id,
+                    excerpt = %excerpt,
+                    "paracrine_response routed Discard — thread closed, nothing surfaced"
+                );
+                if let (Some(sid), Some(pid)) = (&session_id, &paracrine_id) {
+                    if let Some(state) = self.sessions.get_mut(sid) {
+                        state.close_paracrine_thread(
+                            pid,
+                            ParacrineThreadStatus::Completed,
+                            task.content.clone(),
+                            Some("discard".into()),
+                        );
+                    }
+                }
             }
 
             ParacrineRouting::ReflectiveReEntry => {

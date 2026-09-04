@@ -446,12 +446,72 @@ impl AgentRuntime {
                     inject_scoped_to_anchor(args);
                 }
             }
+            // Self-Improvement Loop L1: a distill lookaside turn runs on a
+            // fixed minimal tool surface regardless of the role's default
+            // toolset — it may draft a skill or write memory, nothing else.
+            // Enforced here, at dispatch, so no prompt wording can widen it.
+            let distill_turn = self
+                .sessions
+                .get(&session_id)
+                .and_then(|s| s.active_turn.as_ref())
+                .is_some_and(super::distill::turn_is_distill);
+            if distill_turn && !super::distill::tool_allowed(&tool_call.tool_name) {
+                warn!(
+                    session_id = %session_id,
+                    tool = %tool_call.tool_name,
+                    "skills.distill: tool outside the distill allowlist refused"
+                );
+                let denial = format!(
+                    "'{}' is not available in a distill review turn — only {} may be used here. \
+                     Either call skill.register / memory.remember, or reply exactly: DISTILL: nothing",
+                    tool_call.tool_name,
+                    super::distill::TOOL_ALLOWLIST.join(", ")
+                );
+                return self
+                    .deliver_tool_denial(session_id, turn_id, tool_call.tool_name, denial)
+                    .await;
+            }
+
+            // Self-Improvement Loop L5: the prompt safety floor on text that
+            // will be rendered into future worker prompts. A Dangerous verdict
+            // is a tool-result denial BEFORE any approval is requested — the
+            // operator must never be asked to approve text whose effect they
+            // cannot see. (Caution is handled at the gate below: it pins the
+            // call to the unconditional tier.)
+            if tool_call.tool_name == "skill.register" && !bypass_approval {
+                let fields: Vec<&str> = ["description", "goal"]
+                    .iter()
+                    .filter_map(|k| tool_call.arguments.get(*k).and_then(|v| v.as_str()))
+                    .collect();
+                if let Some(hazard) = prompt_guard::detect_prompt_hazard_in(fields.iter().copied())
+                    .filter(|h| h.is_dangerous())
+                {
+                    warn!(
+                        session_id = %session_id,
+                        hazard = hazard.description,
+                        "skill.register refused by prompt-guard (philote side)"
+                    );
+                    return self
+                        .deliver_tool_denial(
+                            session_id,
+                            turn_id,
+                            tool_call.tool_name,
+                            hazard.denial_message(),
+                        )
+                        .await;
+                }
+            }
+
             // Agent-level approval enforcement: if the tool's policy annotation marks it as
             // requiring approval, and the current approval policy does not preapprove it,
             // synthesize an ApprovalRequest before executing. This runs independently of
             // whether the model itself requested approval — it is the agent's safety gate.
             // Skipped when bypass_approval is true (i.e. we are resuming after a resolution).
-            let force_approval = if bypass_approval {
+            // Also skipped for a distill turn's skill.register: the hotel forces
+            // that record to Draft, and a Draft grants nothing — filing is free,
+            // promotion is what the operator gates.
+            let distill_draft_write = distill_turn && tool_call.tool_name == "skill.register";
+            let force_approval = if bypass_approval || distill_draft_write {
                 false
             } else {
                 self.sessions
@@ -501,13 +561,28 @@ impl AgentRuntime {
                 // no way to batch or preapprove them, and a plan that never
                 // gets past step 1 of 4 never registers anything.
                 if gate == Some("skill_register") {
-                    let within_bindings = self.sessions.get(&session_id).is_some_and(|state| {
-                        Self::skill_register_call_within_bindings(
-                            &tool_call.arguments,
-                            &state.bindings,
-                        )
-                    });
-                    if within_bindings { None } else { gate }
+                    if distill_draft_write {
+                        // L1: Draft-only write, see `distill_draft_write` above.
+                        None
+                    } else {
+                        // L5 Caution pins the call to the unconditional tier
+                        // even when the subset check would downgrade it.
+                        let caution = ["description", "goal"]
+                            .iter()
+                            .filter_map(|k| tool_call.arguments.get(*k).and_then(|v| v.as_str()))
+                            .any(|f| prompt_guard::detect_prompt_hazard(f).is_some());
+                        let within_bindings = self.sessions.get(&session_id).is_some_and(|state| {
+                            Self::skill_register_call_within_bindings(
+                                &tool_call.arguments,
+                                &state.bindings,
+                            )
+                        });
+                        if within_bindings && !caution {
+                            None
+                        } else {
+                            gate
+                        }
+                    }
                 } else {
                     gate
                 }
@@ -3071,6 +3146,16 @@ impl AgentRuntime {
                 let allowed_tools = str_vec("allowed_tools");
                 let allowed_classes = str_vec("allowed_classes");
                 let allowed_skills = str_vec("allowed_skills");
+                // Self-Improvement Loop L1: a registration made inside a
+                // distill lookaside turn is stamped with its origin so the
+                // hotel forces it to Draft. Derived from the turn, never
+                // from model-supplied arguments.
+                let origin = self
+                    .sessions
+                    .get(&payload.session_id)
+                    .and_then(|s| s.active_turn.as_ref())
+                    .and_then(|t| t.paracrine_intent.as_deref())
+                    .and_then(super::distill::origin_from_intent);
 
                 let response = self
                     .ipc_client
@@ -3082,6 +3167,7 @@ impl AgentRuntime {
                         allowed_tools,
                         allowed_classes,
                         allowed_skills,
+                        origin,
                         hook_subscriptions: vec![],
                         completion_route: Default::default(),
                         failure_route: Default::default(),

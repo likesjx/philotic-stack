@@ -22,6 +22,7 @@ chrono = { version = "0.4", features = ["clock"] }
 chrono-tz = "0.10"
 data-memorygraphrag = { path = "../data-memorygraphrag" }
 exec-guard = { path = "../exec-guard" }
+prompt-guard = { path = "../prompt-guard" }
 media-prep = { path = "../media-prep" }
 memory-core = { path = "../memory-core" }
 clap = { version = "4.5", features = ["derive"] }

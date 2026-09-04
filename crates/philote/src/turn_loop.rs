@@ -3519,6 +3519,11 @@ impl AgentRuntime {
             )
         };
 
+        // Self-Improvement Loop L1: keep the whole completed turn so the
+        // distill predicates can read tool history after the reply payload
+        // has moved the routing fields out of `completed_turn`.
+        let distill_snapshot = completed_turn.clone();
+
         // Routing snapshot for post-completion plan events / continuation, taken
         // before `completed_turn` fields are moved into the reply payload below.
         let plan_route = (plan_followup.is_some() || plan_superseded_notice.is_some()).then(|| {
@@ -3710,6 +3715,13 @@ impl AgentRuntime {
 
         // After completing this turn, schedule the next pending user task for dispatch.
         self.drain_next_user_task(&attend_session_id);
+
+        // Self-Improvement Loop L1: with the reply out and the queue drained,
+        // ask whether this turn earned a distill whisper. Never fails the
+        // turn, never runs for paracrine-origin turns, budgeted by the
+        // `skills.distill` lane.
+        self.maybe_distill_after_turn(&attend_session_id, &distill_snapshot, &_attend_content)
+            .await;
 
         // Plan-eval-repeat: emit the plan_eval event and either synthesize a
         // budgeted continuation turn or notify the operator why the loop stopped.

@@ -716,6 +716,59 @@ pub struct FallbackOverride {
     pub notice_sent: bool,
 }
 
+#[cfg(test)]
+impl WorkingTurn {
+    /// Minimal fresh working turn for unit tests across the runtime
+    /// submodules: no tools, no plan, no paracrine state, budget counters
+    /// at their starting values.
+    pub(crate) fn test_turn(turn_id: &str, user_content: &str) -> WorkingTurn {
+        WorkingTurn {
+            task_id: Uuid::new_v4(),
+            turn_id: turn_id.into(),
+            chat_id: "chat-1".into(),
+            primary_user_id: None,
+            user_content: user_content.into(),
+            final_reply_to: "node-1".into(),
+            final_reply_role: "membrane".into(),
+            final_reply_guest_id: None,
+            phase: TurnPhase::WaitingTool,
+            iteration: 0,
+            pending_tool_call: None,
+            pending_approval: None,
+            working_tool_history: Vec::new(),
+            recalled_memories: Vec::new(),
+            active_plan: None,
+            consecutive_step_failures: 0,
+            streak_extension: 0,
+            provider_repair_note: None,
+            provider_repair_attempts: 0,
+            pending_text_reply: None,
+            had_voice_input: false,
+            awaiting_transcription_reentry: false,
+            scripted_loop_context: None,
+            associated_paracrine_ids: Vec::new(),
+            paracrine_origin: None,
+            paracrine_reply_session_id: None,
+            paracrine_reply_chat_id: None,
+            paracrine_response_routing: None,
+            paracrine_merge_completed: false,
+            paracrine_intent: None,
+            plan_confirmed: false,
+            plan_confirm_note: None,
+            fallback_tier: 0,
+            ladder_tier0_dispatched: false,
+            streaming_retry_attempts: 0,
+            streamed_content: String::new(),
+            paracrine_hop_count: 0,
+            paracrine_chain_started_at: None,
+            selection_source: SelectionSource::default(),
+            started_at_unix: None,
+            last_interim_at_unix: None,
+            plan_steps_verified: Vec::new(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkingTurn {
     pub task_id: Uuid,
@@ -789,6 +842,12 @@ pub struct WorkingTurn {
     /// Captured from the inbound exosome and echoed back on `paracrine_response`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub paracrine_response_routing: Option<philotic_client::ParacrineRouting>,
+    /// Structured intent carried in the inbound exosome's `context.intent`
+    /// (e.g. `skills.distill:tool_count`). Lets the tool layer recognise a
+    /// lookaside turn whose legal tool surface is narrower than the role's
+    /// default — a distill whisper may only draft a skill or write memory.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub paracrine_intent: Option<String>,
     /// Set to true when the specialist explicitly calls `delegate.merge` during a turn.
     /// Suppresses the auto-emit of `paracrine_response` in deliver_text_reply so there
     /// is no duplicate delivery after the explicit merge already fired.
@@ -910,6 +969,7 @@ impl WorkingTurn {
             paracrine_reply_chat_id: None,
             paracrine_response_routing: None,
             paracrine_merge_completed: false,
+            paracrine_intent: None,
             plan_confirmed: false,
             plan_confirm_note: None,
             fallback_tier: 0,
@@ -2048,6 +2108,7 @@ mod paracrine_budget_tests {
             paracrine_reply_chat_id: None,
             paracrine_response_routing: None,
             paracrine_merge_completed: false,
+            paracrine_intent: None,
             plan_confirmed: false,
             plan_confirm_note: None,
             fallback_tier: 0,

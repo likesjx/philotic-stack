@@ -1,0 +1,15 @@
+[package]
+name = "prompt-guard"
+version = "0.1.0"
+edition = "2024"
+description = "Compiled-in, non-configurable scan for text that will be rendered back into a model prompt (skill goals, promoted memories, standing notes) — the prompt-side sibling of exec-guard"
+
+[dependencies]
+regex = "1.12"
+exec-guard = { path = "../exec-guard" }
+
+[dev-dependencies]
+
+# Clippy ratchet: this crate is warning-free and must stay that way.
+[lints]
+workspace = true

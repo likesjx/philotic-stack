@@ -32,6 +32,7 @@ members = [
     "crates/perimeter-core",
     "crates/heal-dispatcher",
     "crates/exec-guard",
+    "crates/prompt-guard",
 ]
 resolver = "2"
 
