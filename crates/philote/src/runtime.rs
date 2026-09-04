@@ -46,7 +46,7 @@ mod paracrine;
 mod tool_exec;
 
 #[path = "distill.rs"]
-mod distill;
+pub(crate) mod distill;
 
 #[path = "memory_integration.rs"]
 mod memory_integration;

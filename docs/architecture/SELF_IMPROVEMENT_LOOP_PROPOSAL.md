@@ -229,6 +229,22 @@ the trace: the distill session ran the full LifeGraph auto-recall prefetch
 — distill turns should skip the recall lane; and a first turn with only two
 tools (`hotel.status`, `skill.list`) stayed silent as designed.
 
+**Second live drill, 17:12 UTC — `trigger=tool_count` fired on a five-tool
+"weekly practice review" turn and the distiller again declined in 3 s.** The
+ledger showed why: the lookaside session was offered 33 tools and
+`skill.register` was not one of them. Two causes, both fixed the same day
+(`codex/self-improvement-l5-l1`, second commit): (1) Bjork was incarnated as
+her `architect` role, whose toolset profile has no `skill.register` at all —
+only `orchestrator`/`admin` do — so a self-whisper could never register;
+the whisper now targets the current role only when the session's bindings
+hold `skill.register`, otherwise the agent's own `orchestrator` by
+agent-scoped routing key (`role:{agent_id}:orchestrator`, which
+`find_role_incarnation_by_name` now resolves exactly; a bare `orchestrator`
+would be ambiguous on a hotel where four agents each own one). (2) Even in
+the orchestrator profile `skill.register` sits behind the on-demand
+`skill.authoring` skill and the keyword gates, so distill turns now project
+exactly the allowlisted tools the role holds, bypassing relevance heuristics.
+
 Next: L2 before the Draft pool grows; skip auto-recall for distill turns. Recorded in the intel graph on
 `doc:autopoiesis-proposal` (observation + writeback items, 2026-09-03) and as a
 decision on `seam:a2a-membrane-contract` for the Hermes interop half, which is
