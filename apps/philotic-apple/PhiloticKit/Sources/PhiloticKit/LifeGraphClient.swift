@@ -346,9 +346,11 @@ public struct LifeGraphClient: Sendable {
             )
             merged.append(contentsOf: result.results)
             switch result.status {
-            case "error": sawError = true
+            case "ok": break
             case "partial": sawPartial = true
-            default: break
+            // Failed, invalid_request, unknown, and future statuses must not
+            // become a successful health/location upload by default.
+            default: sawError = true
             }
         }
 

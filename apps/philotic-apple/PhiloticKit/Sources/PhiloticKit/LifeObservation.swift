@@ -157,8 +157,16 @@ public struct ObserveResultItem: Codable, Equatable, Sendable {
         case nodeId = "node_id"
     }
 
+    private enum EnvelopeKeys: String, CodingKey { case result }
+
     public init(from decoder: Decoder) throws {
-        let c = try decoder.container(keyedBy: CodingKeys.self)
+        let outer = try decoder.container(keyedBy: EnvelopeKeys.self)
+        // life.observe.batch wraps each attempted write as {index, result}.
+        // Retain decoding support for the older flat response fixtures.
+        let c =
+            outer.contains(.result)
+            ? try outer.nestedContainer(keyedBy: CodingKeys.self, forKey: .result)
+            : try decoder.container(keyedBy: CodingKeys.self)
         observationId = try c.decodeIfPresent(String.self, forKey: .observationId)
         status = try c.decodeIfPresent(String.self, forKey: .status)
         message = try c.decodeIfPresent(String.self, forKey: .message)

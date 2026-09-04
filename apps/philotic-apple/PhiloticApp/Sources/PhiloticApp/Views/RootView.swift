@@ -32,7 +32,7 @@ struct RootView: View {
                         } label: {
                             Image(systemName: "heart.text.square")
                         }
-                        .accessibilityLabel("Health sync")
+                        .accessibilityLabel("Health summaries")
                     }
                     ToolbarItem {
                         Button {
@@ -74,7 +74,7 @@ struct RootView: View {
                 .frame(minWidth: 480, minHeight: 560)
             #endif
         }
-        .sheet(isPresented: $showingHealth) {
+        .sheet(isPresented: $showingHealth, onDismiss: { health.discardPreview() }) {
             NavigationStack {
                 HealthView(session: session, health: health)
             }
@@ -103,6 +103,10 @@ struct RootView: View {
                 if CommandLine.arguments.contains("--show-location") {
                     showingSettings = false
                     showingLocation = true
+                }
+                if CommandLine.arguments.contains("--show-health") {
+                    showingSettings = false
+                    showingHealth = true
                 }
             #endif
         }

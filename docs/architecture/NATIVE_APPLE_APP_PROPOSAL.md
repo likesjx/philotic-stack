@@ -3,7 +3,7 @@ title: Native Apple App — Edge Client Program
 doc_type: proposal
 domain: membrane-transport
 status: accepted-current-slice
-last_updated: 2026-08-22
+last_updated: 2026-09-04
 tags:
 - apple
 - ios
@@ -20,6 +20,7 @@ related_docs:
 - MCP_COORDINATION_ENDPOINT_PROPOSAL.md
 - DISTRIBUTED_CRON_PROPOSAL.md
 - OPERATOR_IDENTITY_AND_DANGEROUS_ACTION_CEREMONIES_PROPOSAL.md
+- ARCHITECTURE_STATUS.md
 task_refs:
 - docs/task.md
 proposal_id: native-apple-app-proposal
@@ -60,7 +61,7 @@ Philotic mesh:
    the device: lenses, node detail with provenance, confirm/retire, conflict
    and patch review.
 3. **Device capabilities** — the iPhone/Mac becomes a first-class tool runner
-   in the mesh: Reminders, Calendar (EventKit), and later HealthKit/Shortcuts,
+   in the mesh: Reminders, Calendar (EventKit), and later remote HealthKit/Shortcuts,
    invocable by philotes under approval policy.
 4. **Attention** — the Attention Steward gets its operator surface: a Today
    view fed by commitments, open loops, and re-entry context, with humane
@@ -310,14 +311,65 @@ Two canonical owners, one mapping — no third source of truth:
 - Mutations from device are limited to the governed `life.*` verbs; risk
   tiers per the Life Graph OS patch policy; high-risk = proposal-only from
   the app, ceremony per the operator-identity proposal.
-- EventKit/HealthKit data leaves the device only through explicit per-source
-  observe toggles; capability advertisement is itself operator-configurable.
+- EventKit data leaves the device only through explicit per-source observe
+  toggles; capability advertisement is itself operator-configurable.
+- HealthKit reading and external sharing are separate actions. Metrics start
+  unselected; only selected types are requested read-only through Apple Health.
+  Local previews require an explicit, destination-bound confirmation before
+  sending summaries to LifeGraph. HealthKit is not advertised as a remote tool.
 - Core Location leaves the device only after an operator taps **Share Current
   Location**. The current slice requests one foreground reading, defaults to
   approximate precision, and has no passive or background upload path.
 - APNs (when built) carries wake signals only, never content.
 
-## Current Slice: Operator Location Snapshots (Transitional)
+## Current Slice: Read-Only HealthKit Preview and Sharing (Transitional)
+
+The existing Health surface now supports steps, resting/average heart rate,
+asleep minutes, and active energy through `DeviceHealthReader`. The old
+synthetic-upload fallback is removed: unavailable stores and empty reads never
+become plausible measurements. Authorization completion is not a read grant;
+HealthKit intentionally does not reveal read denial.
+
+The operator selects metrics and either yesterday or the last seven completed
+local days, reads on demand, reviews an in-memory preview, then separately
+confirms sharing that exact preview to the displayed hotel. No background
+queries, Health writes, persisted previews, clinical records, or automatic
+retries. Preview invalidation covers selection/period changes, dismissal, and
+backgrounding. Sleep intervals are clipped to local day boundaries and unioned
+to avoid duplicate-source/stage overlap; quantity summaries use available
+samples fully contained in each day. They are not clinical assessments or
+proof of a complete health history.
+
+Each reading becomes a unique proposed `Signal`, with the actual read timestamp
+and the aggregation window, time zone, unit, and value in its claim summary.
+The structured metadata map is still not persisted by the server, so text
+contains the durable facts. Batch replies decode the runner's nested
+`results[].result`; unknown/failed replies cannot normalize to success, and the
+UI requires matching per-observation `proposed` acknowledgments. An uncertain
+or partial write consumes the attempt and asks the operator to check LifeGraph
+before sending again; this is not an idempotent retry/repair implementation.
+
+Sharing explicitly warns that LifeGraph-capable agents and configured AI
+providers may process the summaries, beyond the current chat. Revoking Apple
+Health permissions does not retract previously shared copies. This is a
+personal-device integration, **not App Store/privacy-policy approval**. A
+health-only role/provider allowlist, retention/deletion controls, provider-specific
+disclosure, and clinical use are not implemented by this slice.
+
+Verification: shared transport tests and app tests on macOS and iOS Simulator
+pass; the Health screen was visually inspected on iOS 27. Real-device
+authorization, capture, live sharing, and agent recall remain unproven.
+Hosted unit tests now avoid constructing the real chat session, so they neither
+read the operator's Keychain nor connect to a hotel during test startup.
+
+References: [Apple authorization semantics](https://developer.apple.com/documentation/healthkit/authorizing-access-to-health-data),
+[privacy requirements](https://developer.apple.com/documentation/healthkit/protecting-user-privacy),
+[supported capabilities](https://developer.apple.com/help/account/reference/supported-capabilities-ios).
+HealthKit is listed for free Apple Developer accounts as well as paid programs;
+physical installation still requires a valid signing identity and trusted device.
+Active work: [docs/task.md](../task.md#new-project-native-apple-healthkit-context).
+
+## Previous Slice: Operator Location Snapshots (Transitional)
 
 The Apple app now has an operator-controlled Location sheet that turns one
 foreground Core Location reading into one timestamped LifeGraph `Signal` via

@@ -1,7 +1,7 @@
 ---
 doc_type: defect-tracker
 status: active
-last_updated: 2026-08-07
+last_updated: 2026-09-04
 ---
 
 # Defects and Technical Debt
@@ -97,6 +97,16 @@ Tracked defects and known technical debt. Each entry carries status, severity, p
 | DEF-080 | Unbounded session history + O(all-history) lookups melted the fleet — `list_session_events(session_id, 20)` loaded and deserialized EVERY `session_event` node ever recorded (mac-jane: 106k rows / 642MB since March; vps-jane: 187k; mbp-jane: 48k / 985MB) under the single SQLite connection mutex on every last-N-events call; hotels saturated at ~100% CPU, IPC calls hit 10s timeouts, model-router config load exceeded its 55s ceiling so every philote turn failed pre-dispatch, heal-dispatcher heartbeats staled >90s into respawn-budget exhaustion (healing dead ~35h on mac-jane). Aggravators: session_turn rows up to 8.6MB carrying inline `audio_base64` TTS output that belongs in the blob store; "most recent 20" was actually ordered by node_key = random UUIDs. Live-fixed 2026-08-07 by pruning >7d history + VACUUM on all 3 hotels (927MB→87MB, 684MB→76MB, 1.1GB→35MB) | high | fixed | 3 | 2026-08-07 | codex/session-event-scan-fix — SQL-side filter/order/limit via `list_nodes_by_kind_json_eq` + expression indexes; retention sweep in aiua (`PHILOTIC_SESSION_RETENTION_DAYS`, default 7d, running turns exempt); regression tests in `session_history_tests.rs` |
 
 ---
+
+## HealthKit slice fixes (2026-09-04)
+
+IDs allocated after checking `origin/develop` (through DEF-104); this stacked branch predates DEF-081 through DEF-104.
+
+| ID | Title | Severity | Status | Pts | Found | Fixed by |
+|---|---|---|---|---|---|---|
+| DEF-105 | Unavailable HealthKit generated plausible sample values and uploaded them with real-health provenance; metrics defaulted on and missing data was reported as no metrics enabled | high | fixed | 2 | 2026-09-04 | `codex/ios-healthkit` — real-data-only reader, selected-type consent, local preview and separate confirmation; service regression tests. Seam: device-tool-plane. |
+| DEF-106 | Swift observe client normalized `failed`/unknown server statuses to `ok`, and ignored nested batch result acknowledgments | high | fixed | 1 | 2026-09-04 | `codex/ios-healthkit` — fail-closed status mapping, nested result decoding, exact per-observation acknowledgment check; transport/service tests. Seam: lifegraph-read-plane (adjacent write adapter). |
+| DEF-107 | macOS hosted app tests initialized real connection settings and blocked in `SecItemCopyMatching` before XCTest started | medium | fixed | 1 | 2026-09-04 | `codex/ios-healthkit` — DEBUG XCTest host renders without a ChatSessionManager; macOS app tests pass without Keychain interaction. Seam: device-tool-plane validation. |
 
 ## Open defects — detail
 

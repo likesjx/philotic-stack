@@ -171,6 +171,19 @@ Proposal: [NATIVE_APPLE_APP_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/d
 - [ ] Share one real snapshot to the configured hotel, query the LifeGraph, and verify an agent recalls the newest snapshot with its observation time and accuracy.
 - [ ] Persist structured `EvidencePacket.metadata` in the `life.observe` compiler, then decide whether a governed derived `current location` projection is warranted; the immutable snapshot stream remains canonical meanwhile.
 
+## New Project: Native Apple HealthKit Context
+
+Proposal: [NATIVE_APPLE_APP_PROPOSAL.md](architecture/NATIVE_APPLE_APP_PROPOSAL.md)
+Seam: `device-tool-plane`; branch: `codex/ios-healthkit` (based on the location branch).
+
+- [x] Replace synthetic health uploads with selected-type read-only capture and an ephemeral local preview; metrics start unselected.
+- [x] Separate Apple read permission from exact-preview and destination-bound external-sharing confirmation; no background sync or Health writes.
+- [x] Bound reads to yesterday or seven completed local days; preserve missing/error states, clip and union sleep overlaps, and emit unique timestamped proposed Signals with durable metric/window text.
+- [x] Decode nested observe acknowledgments and prevent failed/unknown/partial uploads from being reported as complete; no automatic retries after uncertain writes.
+- [x] Cover service consent/invalidation/error/time-window contracts and transport responses; run app tests on macOS and iOS Simulator and inspect the Health UI.
+- [ ] Sign/install on the connected trusted iPhone, exercise selected/denied/revoked Health permissions, compare readings with Apple Health, and confirm one operator-approved live share plus agent recall.
+- [ ] Decide server-enforced health-only role/provider access, named-provider disclosure, retention/deletion, and App Store privacy requirements before widening distribution or adding passive ingestion.
+
 ## New Project: Memory Cultivation and True-Up
 
 Proposal: [MEMORY_CULTIVATION_TRUE_UP_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/MEMORY_CULTIVATION_TRUE_UP_PROPOSAL.md)

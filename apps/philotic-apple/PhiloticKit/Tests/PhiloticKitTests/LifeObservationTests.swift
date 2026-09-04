@@ -24,7 +24,7 @@ final class LifeObservationTests: XCTestCase {
           "observation_id": "obs-uuid",
           "evidence": {
             "packet_id": "pkt-uuid",
-            "claim_ref": { "id": "healthmetric:resting-hr:2026-07-14", "label": "HealthMetric", "datasource": "memgraph" },
+            "claim_ref": { "id": "healthmetric:resting-hr:2026-07-14", "label": "Signal", "datasource": "memgraph" },
             "claim_summary": "Resting heart rate 58 bpm (daily avg, 2026-07-14)",
             "source_refs": [{ "source_id": "edge:ios-healthkit", "source_kind": "runtime_observation", "reliability": { "score": 0.95, "basis": "direct_observation" } }],
             "confidence": 0.95,
@@ -46,7 +46,7 @@ final class LifeObservationTests: XCTestCase {
                 packetId: "pkt-uuid",
                 claimRef: GraphRecordRef(
                     id: "healthmetric:resting-hr:2026-07-14",
-                    label: "HealthMetric",
+                    label: "Signal",
                     datasource: "memgraph"
                 ),
                 claimSummary: "Resting heart rate 58 bpm (daily avg, 2026-07-14)",
@@ -104,7 +104,9 @@ final class LifeObservationTests: XCTestCase {
             capturedBody.value = StubURLProtocol.resolvedBody(for: request)
             return .init(
                 statusCode: 200,
-                body: Data(#"{"status":"ok","results":[{"observation_id":"obs-uuid","status":"ok"}]}"#.utf8)
+                body: Data(
+                    #"{"status":"ok","results":[{"observation_id":"obs-uuid","status":"ok"}]}"#.utf8
+                )
             )
         }
 
@@ -181,6 +183,41 @@ final class LifeObservationTests: XCTestCase {
         } catch {
             XCTFail("unexpected error: \(error)")
         }
+    }
+
+    func testNestedBatchAcknowledgmentDecodesRealRunnerShape() async throws {
+        StubURLProtocol.responder = { _ in
+            .init(
+                statusCode: 200,
+                body: Data(
+                    #"{"status":"ok","results":[{"index":0,"result":{"observation_id":"obs-uuid","status":"proposed","node_id":"signal:health"}}]}"#
+                        .utf8))
+        }
+        let result = try await LifeGraphClient(session: .stubbed()).postObservations(
+            [makeGoldenObservation()], baseURL: baseURL, bearerToken: "test")
+        XCTAssertEqual(result.status, "ok")
+        XCTAssertEqual(result.results.first?.status, "proposed")
+        XCTAssertEqual(result.results.first?.observationId, "obs-uuid")
+        XCTAssertEqual(result.results.first?.nodeId, "signal:health")
+    }
+
+    func testFailedInvalidAndUnknownBatchStatusesCannotBecomeOK() async throws {
+        for status in ["failed", "invalid_request", "unknown", "blocked"] {
+            let response = Data("{\"status\":\"\(status)\",\"results\":[]}".utf8)
+            StubURLProtocol.responder = { _ in .init(statusCode: 200, body: response) }
+            let result = try await LifeGraphClient(session: .stubbed()).postObservations(
+                [makeGoldenObservation()], baseURL: baseURL, bearerToken: "test")
+            XCTAssertEqual(result.status, "error", status)
+        }
+    }
+
+    func testPartialBatchRemainsPartial() async throws {
+        StubURLProtocol.responder = { _ in
+            .init(statusCode: 200, body: Data(#"{"status":"partial","results":[]}"#.utf8))
+        }
+        let result = try await LifeGraphClient(session: .stubbed()).postObservations(
+            [makeGoldenObservation()], baseURL: baseURL, bearerToken: "test")
+        XCTAssertEqual(result.status, "partial")
     }
 
     /// Key-order-insensitive deep structural equality via JSONSerialization.
