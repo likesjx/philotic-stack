@@ -46,7 +46,7 @@ mod paracrine;
 mod tool_exec;
 
 #[path = "distill.rs"]
-mod distill;
+pub(crate) mod distill;
 
 #[path = "memory_integration.rs"]
 mod memory_integration;
@@ -3059,6 +3059,23 @@ impl AgentRuntime {
             } else {
                 SelectionSource::ConfiguredDefault
             };
+
+            // Self-Improvement Loop L1: a distill review starts from a clean
+            // slate — the lookaside session's earlier verdicts must not steer
+            // this one. See `SessionState::forget_dialogue_for_lookaside`.
+            if paracrine_intent
+                .as_deref()
+                .is_some_and(|i| i == distill::INTENT || i.starts_with("skills.distill:"))
+            {
+                let forgotten = state.forget_dialogue_for_lookaside();
+                if forgotten > 0 {
+                    info!(
+                        session_id = %session_id,
+                        forgotten_turns = forgotten,
+                        "skills.distill: lookaside session dialogue forgotten before review"
+                    );
+                }
+            }
 
             state.start_turn(WorkingTurn {
                 task_id,

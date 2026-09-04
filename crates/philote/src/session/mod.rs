@@ -866,6 +866,20 @@ impl SessionState {
         })
     }
 
+    /// Self-Improvement Loop L1: a distill lookaside session is reused for
+    /// every whisper to the same role, so before a distill turn starts the
+    /// session forgets its dialogue. Every consumer of `recent_turns` — the
+    /// rendered window, the structured `dialogue_window`, the session
+    /// envelope, the previous-turn hint — then sees an empty history, and the
+    /// review reads only its brief. Live 2026-09-04 18:36: with the renderer
+    /// alone blanked, the request still carried 32 copies of the session's
+    /// own earlier "DISTILL: nothing".
+    pub fn forget_dialogue_for_lookaside(&mut self) -> usize {
+        let forgotten = self.recent_turns.len();
+        self.recent_turns.clear();
+        forgotten
+    }
+
     pub fn complete_active_turn(&mut self, assistant_content: String) -> Option<WorkingTurn> {
         self.turn_waiting_since = None;
         let turn = self.active_turn.take()?;
@@ -2121,6 +2135,26 @@ impl SessionState {
     }
 
     pub fn project_tools_for_turn(&self, user_content: &str) -> Vec<ToolDefinition> {
+        // Self-Improvement Loop L1: a distill lookaside turn sees exactly the
+        // allowlisted tools the role actually holds — no keyword gates, no
+        // on-demand suppression. Live 2026-09-04: the brief named
+        // `skill.register`, the orchestrator profile keeps it behind the
+        // on-demand `skill.authoring` skill, and the relevance heuristics
+        // hid it, so the distiller could only answer "DISTILL: nothing".
+        if self
+            .active_turn
+            .as_ref()
+            .is_some_and(crate::runtime::distill::turn_is_distill)
+        {
+            return self
+                .tool_assembly
+                .tools_for_model
+                .iter()
+                .filter(|t| crate::runtime::distill::tool_allowed(&t.tool_name))
+                .cloned()
+                .collect();
+        }
+
         let mut tools = self.project_tools_for_turn_by_relevance(user_content);
 
         // A turn that carries an active plan must always be able to execute
@@ -3155,7 +3189,18 @@ impl SessionState {
         // on the philote side ever rendered it: the model saw bare skill ids
         // with the charter text (outcome-note discipline, respawn-budget
         // escalation, …) silently dropped. Capped in skill_guidance_for_turn.
-        let skill_guidance = self.skill_guidance_for_turn(projected_skills);
+        // Self-Improvement Loop L1: the distill brief IS the doctrine for a
+        // distill turn. The projected skill.authoring guidance ("3 or more
+        // times", "not for one-off tasks") would argue against the brief.
+        let skill_guidance = if self
+            .active_turn
+            .as_ref()
+            .is_some_and(crate::runtime::distill::turn_is_distill)
+        {
+            Vec::new()
+        } else {
+            self.skill_guidance_for_turn(projected_skills)
+        };
         if !skill_guidance.is_empty() {
             let mut section = String::from("\n[Skill guidance]");
             for entry in &skill_guidance {
@@ -3391,7 +3436,7 @@ impl SessionState {
         let Some(turn) = self.active_turn.as_ref() else {
             return String::new();
         };
-        if turn.recalled_memories.is_empty() {
+        if turn.recalled_memories.is_empty() || crate::runtime::distill::turn_is_distill(turn) {
             return String::new();
         }
 
@@ -4173,6 +4218,18 @@ impl SessionState {
     /// the window belongs in Muninn, which is the memory of record.
     fn render_dialogue_window(&self, budget_chars: usize) -> String {
         if self.recent_turns.is_empty() {
+            return String::new();
+        }
+        // Self-Improvement Loop L1: a distill review reads the brief and
+        // nothing else. The lookaside session persists across whispers, so
+        // its own earlier "DISTILL: nothing" completions (and a refused
+        // register) would otherwise sit in the window and be echoed back —
+        // live 2026-09-04 18:25: two clean-tooled reviews declined in 3 s.
+        if self
+            .active_turn
+            .as_ref()
+            .is_some_and(crate::runtime::distill::turn_is_distill)
+        {
             return String::new();
         }
 
@@ -7938,6 +7995,80 @@ mod tests {
     /// for skills projected on this turn. Before this existed the strings were
     /// discarded (`.clear()` + vec![] resets) and no skill doctrine ever
     /// reached the model.
+    /// Self-Improvement Loop L1: a distill lookaside turn projects exactly the
+    /// allowlisted tools the role holds — keyword gates and on-demand
+    /// suppression do not apply. Live 2026-09-04 the distiller was offered
+    /// 33 tools without `skill.register` and could only decline.
+    /// Self-Improvement Loop L1: a distill review carries no dialogue window
+    /// and no recalled memory — the lookaside session persists across
+    /// whispers and its own earlier declines must not steer the next one.
+    #[test]
+    fn distill_turn_renders_no_dialogue_window_or_recall() {
+        let mut state =
+            SessionState::new("sess-1".into(), "agent-bjork-01".into(), "telegram".into());
+        state.recent_turns.push(TurnRecord {
+            turn_id: "t-0".into(),
+            user_content: "DISTILL REVIEW — earlier brief".into(),
+            assistant_content: Some("DISTILL: nothing".into()),
+            created_at: 1,
+        });
+        let mut turn = WorkingTurn::test_turn("t-1", "DISTILL REVIEW — new brief");
+        turn.paracrine_origin = Some("pid-1".into());
+        turn.paracrine_intent = Some("skills.distill:tool_count".into());
+        state.start_turn(turn);
+
+        assert_eq!(state.render_dialogue_window(8_000), "");
+        assert_eq!(state.project_recalled_memory(), "");
+
+        // An ordinary turn in the same session still sees the window.
+        state.active_turn = None;
+        state.start_turn(WorkingTurn::test_turn("t-2", "hello"));
+        assert!(
+            state
+                .render_dialogue_window(8_000)
+                .contains("DISTILL: nothing")
+        );
+    }
+
+    #[test]
+    fn distill_turn_projects_only_the_allowlist() {
+        let mut state =
+            SessionState::new("sess-1".into(), "agent-bjork-01".into(), "telegram".into());
+        state.clear_tool_bindings();
+        for tool in [
+            "skill.register",
+            "skill.list",
+            "memory.remember",
+            "bash.exec",
+            "hotel.status",
+        ] {
+            state.add_tool_binding(tool);
+        }
+        // Even with skill.register hidden behind an on-demand skill.
+        state.bindings.on_demand_skills = vec!["skill.authoring".into()];
+
+        let mut turn = WorkingTurn::test_turn("t-distill", "DISTILL REVIEW — silent lookaside.");
+        turn.paracrine_origin = Some("pid-1".into());
+        turn.paracrine_intent = Some("skills.distill:tool_count".into());
+        state.start_turn(turn);
+
+        let mut names: Vec<String> = state
+            .project_tools_for_turn("DISTILL REVIEW — silent lookaside.")
+            .into_iter()
+            .map(|t| t.tool_name)
+            .collect();
+        names.sort();
+        assert_eq!(
+            names,
+            vec![
+                "memory.remember".to_string(),
+                "skill.list".to_string(),
+                "skill.register".to_string()
+            ],
+            "distill turn must see the allowlisted tools it holds and nothing else"
+        );
+    }
+
     #[test]
     fn skill_guidance_renders_for_projected_skills_only() {
         let mut state =

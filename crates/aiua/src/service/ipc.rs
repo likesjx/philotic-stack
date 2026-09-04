@@ -16233,6 +16233,25 @@ fn selection_reason_for_incarnation(
 /// restricted to authenticated guests holding the `orchestrator` or
 /// `management` role. Centralized so new ops cannot fork the policy.
 #[allow(clippy::result_large_err)] // Err is the IpcResponse sent on the cold rejection path
+/// Is this guest identity's `role` a skill-administration role?
+///
+/// Accepts the bare names `orchestrator` / `management` AND their
+/// role-incarnation routing form `role:{agent_id}:{name}` — which is what a
+/// materialized role-incarnation philote actually registers as (see
+/// `RoleIncarnationRecord::routing_role` and `philote/src/main.rs`).
+/// DEF-105 (2026-09-04): the gate only compared against the bare names, so no
+/// real incarnation had ever passed it — every prior registration in the
+/// audit trail came from drill guests whose identity role was literally
+/// `orchestrator`. Bjork's own orchestrator incarnation was refused
+/// `register_skill` live while the distill whisper watched.
+pub(super) fn skill_admin_role(role: &str) -> bool {
+    let name = role
+        .strip_prefix("role:")
+        .and_then(|rest| rest.rsplit_once(':').map(|(_, name)| name))
+        .unwrap_or(role);
+    name == "orchestrator" || name == "management"
+}
+
 pub(super) fn require_skill_admin<'a>(
     identity: Option<&'a GuestIdentity>,
     op: &str,
@@ -16246,7 +16265,7 @@ pub(super) fn require_skill_admin<'a>(
             format!("guest must register before {verb}"),
         ));
     };
-    if identity.role != "orchestrator" && identity.role != "management" {
+    if !skill_admin_role(&identity.role) {
         warn!(
             guest_id = %identity.guest_id,
             role = %identity.role,
@@ -17947,6 +17966,52 @@ pub(crate) mod tests {
                 .expect("list audits")
                 .is_empty(),
             "rejected registration must not write an audit event"
+        );
+    }
+
+    /// DEF-105: a role-incarnation philote registers with its routing key as
+    /// the identity role (`role:{agent}:orchestrator`), and that must pass the
+    /// skill-admin gate exactly like the bare `orchestrator`; other scoped
+    /// roles must not.
+    #[test]
+    fn register_skill_accepts_scoped_orchestrator_incarnation() {
+        assert!(skill_admin_role("orchestrator"));
+        assert!(skill_admin_role("management"));
+        assert!(skill_admin_role("role:agent-bjork-01:orchestrator"));
+        assert!(skill_admin_role("role:agent-bjork-01:management"));
+        assert!(!skill_admin_role("role:agent-bjork-01:architect"));
+        assert!(!skill_admin_role("agent"));
+        assert!(!skill_admin_role("orchestrator:evil"));
+
+        let graph = register_skill_test_graph();
+        let identity = GuestIdentity {
+            guest_id: "agent-bjork-01:orchestrator".into(),
+            role: "role:agent-bjork-01:orchestrator".into(),
+            supported_tools: vec![],
+        };
+        let resp = handle_register_skill_with_origin(
+            Some(&identity),
+            &graph,
+            "music.weekly-practice-review".into(),
+            "Weekly practice review.".into(),
+            "philote-worker".into(),
+            "Review practice since {{date_after}}.".into(),
+            vec!["life.list".into()],
+            vec![],
+            vec![],
+            Some("distill:tool_count".into()),
+        );
+        match resp {
+            IpcResponse::SkillRegistered {
+                validation_state, ..
+            } => assert_eq!(validation_state, "draft"),
+            other => panic!("expected SkillRegistered, got: {other:?}"),
+        }
+        let audits = graph.list_skill_registration_audits().expect("list audits");
+        assert_eq!(audits.len(), 1);
+        assert_eq!(
+            audits[0].registered_by_role,
+            "role:agent-bjork-01:orchestrator"
         );
     }
 

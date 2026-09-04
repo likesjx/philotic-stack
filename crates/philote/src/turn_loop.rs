@@ -3557,8 +3557,13 @@ impl AgentRuntime {
         // LifeGraph auto-recall lane: refresh the prefetch cache after each
         // completed turn so the NEXT turn starts with current graph context
         // (staleness-by-one-turn is the intended latency design).
-        self.dispatch_life_recall_prefetch(&session_id, &completed_turn.user_content)
-            .await;
+        // Self-Improvement Loop L1: a distill review's session never needs
+        // life context — skip the prefetch (the active-turn check inside
+        // the dispatcher cannot see this turn, which is already completed).
+        if !crate::runtime::distill::turn_is_distill(&distill_snapshot) {
+            self.dispatch_life_recall_prefetch(&session_id, &completed_turn.user_content)
+                .await;
+        }
 
         // Capture for attend hook before moving into reply_payload.
         let _attend_turn_id = turn_id.clone();

@@ -32,13 +32,13 @@ use super::*;
 
 /// Intent marker carried in the exosome's `context.intent`, prefixing the
 /// trigger name (`skills.distill:tool_count`). Recognised by the tool layer.
-pub(super) const INTENT: &str = "skills.distill";
+pub(crate) const INTENT: &str = "skills.distill";
 
 /// The only tools a distill lookaside turn may call. Anything else is
 /// refused at dispatch with a tool-result denial, regardless of the role's
 /// default toolset. `skill.assign`/`skill.set_state` are deliberately absent:
 /// a distilled skill is a proposal and must not be able to grant itself.
-pub(super) const TOOL_ALLOWLIST: &[&str] = &[
+pub(crate) const TOOL_ALLOWLIST: &[&str] = &[
     "skill.register",
     "skill.list",
     "memory.remember",
@@ -59,6 +59,10 @@ const USER_EXCERPT_CHARS: usize = 400;
 /// Default: this philote's own role (a self-lookaside).
 const ENV_DISTILL_ROLE: &str = "PHILOTIC_SKILLS_DISTILL_ROLE";
 
+/// Role name a distill whisper falls back to when the current role cannot
+/// register skills. Targeted by agent-scoped routing key, never by bare name.
+const DISTILL_FALLBACK_ROLE: &str = "orchestrator";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum DistillTrigger {
     ToolCount,
@@ -77,13 +81,13 @@ impl DistillTrigger {
 }
 
 /// Is this turn a distill lookaside (serving a whisper with our intent)?
-pub(super) fn turn_is_distill(turn: &WorkingTurn) -> bool {
+pub(crate) fn turn_is_distill(turn: &WorkingTurn) -> bool {
     turn.paracrine_intent
         .as_deref()
         .is_some_and(|i| i == INTENT || i.starts_with(&format!("{INTENT}:")))
 }
 
-pub(super) fn tool_allowed(tool_name: &str) -> bool {
+pub(crate) fn tool_allowed(tool_name: &str) -> bool {
     TOOL_ALLOWLIST.contains(&tool_name)
 }
 
@@ -231,9 +235,15 @@ pub(super) fn build_distill_prompt(
         "DISTILL REVIEW — silent lookaside. Nothing you write here reaches the operator; only your tool calls matter.\n\
          A turn just completed and {trigger_line}.\n\n\
          User asked: «{user}»\n\
+         {goal_line}\
          Tools used, in order:\n{tools}\
          Final reply: «{reply}»\n\n\
-         Decide whether this was a reusable procedure worth naming.\n\
+         Decide whether this was a reusable procedure worth naming. Reaching this review already means the \
+         turn met the pattern threshold — you do not need to have seen it three times; the operator reviews \
+         every Draft, so a plausible procedure is worth drafting and a wrong one costs nothing. Say YES when \
+         the turn followed an ordered, repeatable sequence of tool steps that someone could ask for again \
+         (a review, a digest, a check, a report). Say nothing only when the turn was a one-tool lookup, \
+         pure conversation, or a failure with no working path.\n\
          - If YES: call skill.register ONCE with skill_name (lowercase dotted, e.g. research.github-digest), \
          description (one sentence, when to use it), subagent_kind \"philote-worker\", goal (the procedure as a \
          template with {{{{placeholders}}}} for the parts that vary), and allowed_tools = exactly the tools used above. \
@@ -243,6 +253,17 @@ pub(super) fn build_distill_prompt(
          - If neither applies, reply exactly: DISTILL: nothing\n\
          Do not repeat the task. Do not call any other tool.",
         user = excerpt(&turn.user_content, USER_EXCERPT_CHARS),
+        // A plan-continuation turn's user_content is the synthesized
+        // continuation brief; the plan's own goal is the request the
+        // operator actually made.
+        goal_line = turn
+            .active_plan
+            .as_ref()
+            .map(|p| format!(
+                "Original goal: «{}»\n",
+                excerpt(&p.goal, USER_EXCERPT_CHARS)
+            ))
+            .unwrap_or_default(),
         reply = excerpt(reply, REPLY_EXCERPT_CHARS),
     );
     truncate_for_wire(&prompt, PARACRINE_WHISPER_PROMPT_MAX_CHARS)
@@ -287,19 +308,42 @@ impl AgentRuntime {
         .await
     }
 
-    /// The role a self-whisper targets: the operator override, else this
-    /// philote's own role (`agent` for a default philote, the role name for a
-    /// role incarnation — the hotel resolves names to routing keys).
-    fn distill_target_role(&self) -> String {
+    /// The role a distill whisper targets, with the reason for the log.
+    ///
+    /// 1. Operator override `PHILOTIC_SKILLS_DISTILL_ROLE`.
+    /// 2. This philote's own role, when the session's bindings already hold
+    ///    `skill.register` — a self-lookaside.
+    /// 3. Otherwise this agent's `orchestrator` incarnation by its
+    ///    agent-scoped routing key (`role:{agent_id}:orchestrator`), so a
+    ///    hotel with several agents' orchestrators cannot deliver Bjork's
+    ///    distill to someone else's. Live 2026-09-04: Bjork was incarnated as
+    ///    `architect`, whose toolset profile has no `skill.register`; a
+    ///    self-whisper could only ever decline.
+    fn distill_target_role(&self, session_id: &str) -> (String, &'static str) {
         if let Ok(role) = std::env::var(ENV_DISTILL_ROLE) {
             let role = role.trim().to_string();
             if !role.is_empty() {
-                return role;
+                return (role, "env_override");
             }
         }
-        self.role_name
-            .clone()
-            .unwrap_or_else(|| "agent".to_string())
+        let self_can_register = self.sessions.get(session_id).is_some_and(|s| {
+            s.bindings
+                .effective_toolset
+                .iter()
+                .any(|t| t == "skill.register")
+        });
+        if self_can_register {
+            return (
+                self.role_name
+                    .clone()
+                    .unwrap_or_else(|| "agent".to_string()),
+                "self_holds_skill_register",
+            );
+        }
+        (
+            format!("role:{}:{}", self.agent_id, DISTILL_FALLBACK_ROLE),
+            "fallback_to_agent_orchestrator",
+        )
     }
 
     /// Turn-close hook. Evaluates the predicates, consults the lane, and
@@ -398,7 +442,13 @@ impl AgentRuntime {
             return;
         }
 
-        let role = self.distill_target_role();
+        let (role, role_reason) = self.distill_target_role(session_id);
+        info!(
+            session_id = %session_id,
+            role = %role,
+            reason = role_reason,
+            "skills.distill: target role selected"
+        );
         let prompt = build_distill_prompt(turn, trigger, reply);
         let paracrine_id = Uuid::new_v4().to_string();
         let node_id = local_node_id();

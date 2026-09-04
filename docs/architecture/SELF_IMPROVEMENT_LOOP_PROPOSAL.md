@@ -229,7 +229,63 @@ the trace: the distill session ran the full LifeGraph auto-recall prefetch
 — distill turns should skip the recall lane; and a first turn with only two
 tools (`hotel.status`, `skill.list`) stayed silent as designed.
 
-Next: L2 before the Draft pool grows; skip auto-recall for distill turns. Recorded in the intel graph on
+**Second live drill, 17:12 UTC — `trigger=tool_count` fired on a five-tool
+"weekly practice review" turn and the distiller again declined in 3 s.** The
+ledger showed why: the lookaside session was offered 33 tools and
+`skill.register` was not one of them. Two causes, both fixed the same day
+(`codex/self-improvement-l5-l1`, second commit): (1) Bjork was incarnated as
+her `architect` role, whose toolset profile has no `skill.register` at all —
+only `orchestrator`/`admin` do — so a self-whisper could never register;
+the whisper now targets the current role only when the session's bindings
+hold `skill.register`, otherwise the agent's own `orchestrator` by
+agent-scoped routing key (`role:{agent_id}:orchestrator`, which
+`find_role_incarnation_by_name` now resolves exactly; a bare `orchestrator`
+would be ambiguous on a hotel where four agents each own one). (2) Even in
+the orchestrator profile `skill.register` sits behind the on-demand
+`skill.authoring` skill and the keyword gates, so distill turns now project
+exactly the allowlisted tools the role holds, bypassing relevance heuristics.
+
+**Third drill, 18:07 UTC — the whisper reached Bjork's `orchestrator`
+incarnation, was offered exactly the four allowlisted tools, and the model
+made a well-formed `skill.register` (`music.weekly-practice-review`, goal
+template with a `{{date_after}}` placeholder, the four tools it had used).
+The hotel refused it:** `Rejected skill administration from unauthorized role
+guest_id=agent-bjork-01:orchestrator role=role:agent-bjork-01:orchestrator`.
+The skill-admin gate compared the identity role against the literal
+`orchestrator`/`management`, but role-incarnation philotes register with
+their routing key as the role — so no real incarnation had ever passed it;
+every prior registration in the audit trail came from drill guests. Filed as
+**DEF-105**, fixed the same day (`skill_admin_role()` strips the
+`role:{agent}:` prefix). The distill loop is now the mechanism that found a
+latent governance bug the drills had masked — which is what a watched-live
+gate is for.
+
+**Fourth and fifth drills, 18:25–18:36 UTC — plumbing all correct, still
+`DISTILL: nothing` in 1–3 s.** The lookaside session persists per role, and
+the request that reached the model carried **32 copies of its own earlier
+"DISTILL: nothing"** through the structured `dialogue_window`, the session
+envelope and the rendered prompt, plus the projected `skill.authoring`
+doctrine ("3 or more times", "not for one-off tasks") arguing against the
+brief. Fixed: a distill turn calls `forget_dialogue_for_lookaside()` before
+it starts, skill guidance is suppressed inside distill turns, no Muninn
+auto-recall / LifeGraph prefetch or injection, and the brief states that
+reaching the review already satisfies the pattern threshold.
+
+**Watched-live-green, 2026-09-04 18:46 UTC (mac-jane, PR #483 build):**
+`trigger=tool_count` → `autonomy action consulted … allowed=true filing=true`
+→ whisper to `role:agent-bjork-01:orchestrator` → `lookaside session dialogue
+forgotten before review forgotten_turns=6` → `Skill registered via IPC
+skill_name=music.weekly-practice-review validation_state=draft
+registered_by=agent-bjork-01:orchestrator` → `routed Discard`. Four seconds.
+The Draft carries `skill_markers=[agent_authored, distilled]`,
+`field_sources={origin: distill:tool_count, trigger: tool_count}`,
+`implied_tools=[life.list, life.recall, hotel.status, graph.query]`, and a
+goal template the operator can read in `phil`/the desktop skills view. Nothing
+surfaced in Telegram. This closes L1's gate; the operator's next act is
+`skill.set_state music.weekly-practice-review validated` (or deprecated),
+which is exactly the review the proposal promised.
+
+Next: L2 before the Draft pool grows. Recorded in the intel graph on
 `doc:autopoiesis-proposal` (observation + writeback items, 2026-09-03) and as a
 decision on `seam:a2a-membrane-contract` for the Hermes interop half, which is
 a separate proposal.
