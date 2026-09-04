@@ -245,6 +245,21 @@ the orchestrator profile `skill.register` sits behind the on-demand
 `skill.authoring` skill and the keyword gates, so distill turns now project
 exactly the allowlisted tools the role holds, bypassing relevance heuristics.
 
+**Third drill, 18:07 UTC — the whisper reached Bjork's `orchestrator`
+incarnation, was offered exactly the four allowlisted tools, and the model
+made a well-formed `skill.register` (`music.weekly-practice-review`, goal
+template with a `{{date_after}}` placeholder, the four tools it had used).
+The hotel refused it:** `Rejected skill administration from unauthorized role
+guest_id=agent-bjork-01:orchestrator role=role:agent-bjork-01:orchestrator`.
+The skill-admin gate compared the identity role against the literal
+`orchestrator`/`management`, but role-incarnation philotes register with
+their routing key as the role — so no real incarnation had ever passed it;
+every prior registration in the audit trail came from drill guests. Filed as
+**DEF-105**, fixed the same day (`skill_admin_role()` strips the
+`role:{agent}:` prefix). The distill loop is now the mechanism that found a
+latent governance bug the drills had masked — which is what a watched-live
+gate is for.
+
 Next: L2 before the Draft pool grows; skip auto-recall for distill turns. Recorded in the intel graph on
 `doc:autopoiesis-proposal` (observation + writeback items, 2026-09-03) and as a
 decision on `seam:a2a-membrane-contract` for the Hermes interop half, which is
