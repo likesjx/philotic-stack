@@ -3411,7 +3411,7 @@ impl SessionState {
         let Some(turn) = self.active_turn.as_ref() else {
             return String::new();
         };
-        if turn.recalled_memories.is_empty() {
+        if turn.recalled_memories.is_empty() || crate::runtime::distill::turn_is_distill(turn) {
             return String::new();
         }
 
@@ -4193,6 +4193,18 @@ impl SessionState {
     /// the window belongs in Muninn, which is the memory of record.
     fn render_dialogue_window(&self, budget_chars: usize) -> String {
         if self.recent_turns.is_empty() {
+            return String::new();
+        }
+        // Self-Improvement Loop L1: a distill review reads the brief and
+        // nothing else. The lookaside session persists across whispers, so
+        // its own earlier "DISTILL: nothing" completions (and a refused
+        // register) would otherwise sit in the window and be echoed back —
+        // live 2026-09-04 18:25: two clean-tooled reviews declined in 3 s.
+        if self
+            .active_turn
+            .as_ref()
+            .is_some_and(crate::runtime::distill::turn_is_distill)
+        {
             return String::new();
         }
 
@@ -7962,6 +7974,37 @@ mod tests {
     /// allowlisted tools the role holds — keyword gates and on-demand
     /// suppression do not apply. Live 2026-09-04 the distiller was offered
     /// 33 tools without `skill.register` and could only decline.
+    /// Self-Improvement Loop L1: a distill review carries no dialogue window
+    /// and no recalled memory — the lookaside session persists across
+    /// whispers and its own earlier declines must not steer the next one.
+    #[test]
+    fn distill_turn_renders_no_dialogue_window_or_recall() {
+        let mut state =
+            SessionState::new("sess-1".into(), "agent-bjork-01".into(), "telegram".into());
+        state.recent_turns.push(TurnRecord {
+            turn_id: "t-0".into(),
+            user_content: "DISTILL REVIEW — earlier brief".into(),
+            assistant_content: Some("DISTILL: nothing".into()),
+            created_at: 1,
+        });
+        let mut turn = WorkingTurn::test_turn("t-1", "DISTILL REVIEW — new brief");
+        turn.paracrine_origin = Some("pid-1".into());
+        turn.paracrine_intent = Some("skills.distill:tool_count".into());
+        state.start_turn(turn);
+
+        assert_eq!(state.render_dialogue_window(8_000), "");
+        assert_eq!(state.project_recalled_memory(), "");
+
+        // An ordinary turn in the same session still sees the window.
+        state.active_turn = None;
+        state.start_turn(WorkingTurn::test_turn("t-2", "hello"));
+        assert!(
+            state
+                .render_dialogue_window(8_000)
+                .contains("DISTILL: nothing")
+        );
+    }
+
     #[test]
     fn distill_turn_projects_only_the_allowlist() {
         let mut state =

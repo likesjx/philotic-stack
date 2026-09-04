@@ -1415,6 +1415,17 @@ impl AgentRuntime {
         if query_text.is_empty() || query_text.starts_with('/') {
             return;
         }
+        // Self-Improvement Loop L1: never prefetch life context for a distill
+        // review — it reads only its brief, and the prefetch is four
+        // life.recall round-trips of 20–34 KB each.
+        if self
+            .sessions
+            .get(session_id)
+            .and_then(|s| s.active_turn.as_ref())
+            .is_some_and(crate::runtime::distill::turn_is_distill)
+        {
+            return;
+        }
         let Some((target_node, target_role)) = self.sessions.get(session_id).and_then(|state| {
             state.resolve_tool_route("life.recall").map(|route| {
                 let node = if route.target_node.trim().is_empty() {
@@ -1537,6 +1548,16 @@ impl AgentRuntime {
             let Some(state) = self.sessions.get_mut(session_id) else {
                 return;
             };
+            // Self-Improvement Loop L1: a distill review needs no life
+            // context (live trace: four 20–34 KB payloads injected into a
+            // review that reads only its brief).
+            if state
+                .active_turn
+                .as_ref()
+                .is_some_and(crate::runtime::distill::turn_is_distill)
+            {
+                return;
+            }
             if state.resolve_tool_route("life.recall").is_none() {
                 return;
             }
@@ -1681,6 +1702,12 @@ impl AgentRuntime {
             return Ok(());
         };
         if active_turn.user_content.trim_start().starts_with('/') {
+            return Ok(());
+        }
+        // Self-Improvement Loop L1: a distill review reads only its brief —
+        // no Muninn auto-recall, so the lookaside stays cheap and its own
+        // earlier verdicts cannot leak back in as "memory".
+        if crate::runtime::distill::turn_is_distill(active_turn) {
             return Ok(());
         }
 
