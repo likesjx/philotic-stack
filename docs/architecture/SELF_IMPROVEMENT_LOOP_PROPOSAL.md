@@ -213,9 +213,23 @@ gated `skill.assign`. The distill turn's tool allowlist deliberately omits
 `skill.assign`/`skill.set_state` for exactly this reason. L2 should make
 `Draft` non-projectable explicitly rather than rely on the assignment gate.
 
-Next: watched-live on mac-jane (one real ≥5-tool turn → a Draft skill visible
-in the hotel graph with `origin=distill:*`), then L2 before the Draft pool
-grows. Recorded in the intel graph on
+**Watched-live on mac-jane, 2026-09-04 16:09 UTC (deploy `10efe433`, hotel
+restarted 14:58):** the operator's corrective Telegram turn ("No, that's not
+what I asked…", one tool) fired `trigger=user_correction`; the hotel created
+`autonomy_grant:skills.distill` (`proposal_only`, budget 3, `actions_today=1`)
+and a `pending` audit; the whisper was delivered to Bjork's own role
+(`architect`) as session `paracrine:7898847424:architect`, ran one Gemini
+turn, replied `DISTILL: nothing`, and the response was `routed Discard —
+thread closed, nothing surfaced`. Whisper-to-close: 3 s. No Draft was
+written — the distiller correctly judged a status check not worth a skill —
+so the *mechanism* is watched-live-green while the "first Draft skill" gate
+still waits for a turn with a reusable procedure in it. Two follow-ups seen in
+the trace: the distill session ran the full LifeGraph auto-recall prefetch
+(four `life.recall` payloads of 20–34 KB) for a review that needs none of it
+— distill turns should skip the recall lane; and a first turn with only two
+tools (`hotel.status`, `skill.list`) stayed silent as designed.
+
+Next: L2 before the Draft pool grows; skip auto-recall for distill turns. Recorded in the intel graph on
 `doc:autopoiesis-proposal` (observation + writeback items, 2026-09-03) and as a
 decision on `seam:a2a-membrane-contract` for the Hermes interop half, which is
 a separate proposal.
