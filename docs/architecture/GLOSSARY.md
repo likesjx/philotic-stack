@@ -3,7 +3,7 @@ title: Philotic Working Vocabulary
 doc_type: reference
 domain: workflow-docs
 status: active
-last_updated: 2026-03-31
+last_updated: 2026-09-05
 tags:
 - glossary
 - vocabulary
@@ -34,6 +34,12 @@ Proposals carry a `Disposition` lifecycle: `proposed` → `accepted for current 
 
 A proposal is a design artifact, not an execution unit.
 It is not the same as a task, a slice, or a seam.
+
+### materialization
+The act by which a hotel turns a component definition (guest template, role incarnation, membrane, controller, runner, datasource) into a live, supervised process it owns. Materialization creates a candidate; readiness makes it routeable; a lease, where the resource is singleton-scoped, makes it allowed to act. The founding tenet is that materialization can happen on any admitted hotel at any time — see `materialization-anywhere-anytime` in `ARCH_RULES.md`.
+
+### relocation ceremony
+The recorded, resumable sequence (intent → feasibility → standby → continuity → switch → reconcile → close) by which a philote moves one or more of its components from its current hotel to another without operator hands or a service gap. Defined in `RELOCATION_CEREMONY_PROPOSAL.md`.
 
 ### slice
 The smallest coherent code change that:

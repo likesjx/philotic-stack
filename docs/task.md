@@ -1943,3 +1943,37 @@ Goal: any philote can safely put an MCP endpoint in front of itself and answer i
 - [ ] Smoke: provision a loopback endpoint with a static tool, a `memory.recall` tool with `escalate_on_empty`, and an `error` fallback; prove (a) malformed args → `isError` with no turn in `session.status`, (b) static answers without a model call, (c) empty recall escalates to exactly one model turn — **smoke-green** target.
 - [ ] Watched-live: re-provision `lifegraph-readonly` on vps-jane unchanged (datasource target, no handler) and add one philote-targeted descriptor tool with a static handler; `phil mcp uat live` from off-host — **watched-live-green** target. Blocked in the authoring session: no network to vps-jane or GitHub.
 - [ ] Follow-ups: `Template` transforms (B5) remain unimplemented; `McpPreapprovalRule.target` still inert (routing matches action only); `phil mcp list|status|revoke` operator CLI (C5).
+
+## New Project: Graph Doors and Life Core
+
+Proposal: [docs/architecture/GRAPH_DOORS_AND_LIFE_CORE_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/GRAPH_DOORS_AND_LIFE_CORE_PROPOSAL.md) (proposed 2026-09-05; operator decisions: tiered doors, 100% Cypher + MAGE, mutations only through the writing door, admin door, containers per graph class, Life is core).
+
+Order: G0 → G1 → G2 → G3 → G6 → G4 → G5 → G7.
+
+- [ ] G0 `graph_registry` node kind + seed (`life`, `agents`, `sandbox`); vps-jane compose split into three Memgraph services (life keeps its volume, MAGE image); provider resolves endpoint by graph id — smoke-green: `life` answers with the same node count after the split
+- [ ] G1 `crates/cypher-guard` classifier wall (read / algorithm / mutation / admin / refused), destructive-shape floor, ≥100-statement corpus, wired ahead of every Bolt call
+- [ ] G2 `graph.query` on the wall with bounds + forced LIMIT; `life.query` with ontology injection; Bjork's `music.practice-log` + rewritten `music.weekly-practice-review` on `virtuosa`/`orchestrator`; Beacon rule reduced to "whisper Bjork's virtuosa" — watched-live: Beacon whisper → Bjork Event in Memgraph → her review's `life.query` returns it
+- [ ] G3 `graph.mutate` (dry run, provenance stamps, audit + reversal hint, destructive floor); `life.observe`/`commit`/`resolve`/`patch` re-based; lane `graph.mutate` ConfirmFirst per graph
+- [ ] G6 `AbstractSkillRecord.guidance` + register/patch args + rendering + prompt-guard scan; distill brief may fill it
+- [ ] G4 `graph.analyze` MAGE allowlist + lane budget; `life.analyze`
+- [ ] G5 `graph.admin` under the unconditional operator gate
+- [ ] G7 life-graph-runner consumes the Layer 1 provider
+
+## New Project: Agent-Initiated Relocation
+
+Proposal: [docs/architecture/RELOCATION_CEREMONY_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/RELOCATION_CEREMONY_PROPOSAL.md) (proposed 2026-09-05). Seam IDs: `relocation-ceremony`, `graph-truth-over-seed`, `remote-materialization-ceremony`, `membrane-transport-home`.
+
+Tenet: materialization anywhere, at any time, by philote initiation — membrane, agent, controllers, runners, datasources. First watched-live gate: every orchestrator incarnation relocates to `vps-jane` from a Telegram turn, Mac-bound specialists stay pinned and are reached by whisper.
+
+Order: R0 → R1 → R2 → R3 → R4 → R6 (degraded continuity) → R5 → R7; R8 when DEF-108 is confirmed live.
+
+- [x] R0 Name the tenet: proposal, `materialization-anywhere-anytime` + `graph-truth-outlives-config-seed` in `ARCH_RULES.md`, glossary terms, DEF-106/107/108 filed (2026-09-05, `codex/relocation-ceremony`).
+- [ ] R1 Graph truth outlives seed: `seed_orchestrator_roles` preserves `home_node`; guest seeding preserves placement fields; `home_node` + `membrane_transport_home` join `HotelStateSync` gossip — test-green, then smoke: restart origin hotel, home survives (closes DEF-106, half of DEF-107).
+- [ ] R2 Membrane standby + push stand-down: every membrane startup path exposes standby before acting (also closes the unchecked item under Multi-Hotel Component Distribution); `TransportHomeChanged` mesh event; old poller stands down on receipt — watched-live: Beacon token vps ↔ mac with no dropped message (closes DEF-107).
+- [ ] R3 `materialize.request` / `materialize.ready` on the TCP execution plane carrying component template refs, `agent_identity`, role + toolset records, transport-home standby; target resolves binaries, admits, spawns, reports — test-green two local hotels; smoke mac ↔ mbp.
+- [ ] R4 Feasibility + placement: offer/decline with reasons (binary, secret refs, controller resources, headroom, `max_concurrent_jobs`, version); `best_place_to_run` consumes the same checks — test-green.
+- [ ] R5 Continuity blob: session snapshot + checkpoint + dialogue window + apartment exported as an authenticated blob, imported before switch — requires blob-plane auth (BLOB_EXECUTION_PERIMETER_HARDENING, DEF-104 follow-on) — smoke: parked turn survives a move.
+- [ ] R6 `hotel.relocate` tool + `relocation_ceremony` graph record (phases, risk tiers, drain contract, rollback, resume) — watched-live: Bjork orchestrator + Telegram membrane `mac-jane` → `vps-jane` from one Telegram request; Architect stays pinned; next message answered from the VPS; whisper to Architect round-trips. Then Coach, Mac, then `mbp-jane` agents.
+- [ ] R7 Sealed secret transfer (AEAD over peer-authenticated channel or TLS execution plane); until then secrets are pre-provisioned via the vault plane and R4 declines — security review + smoke.
+- [ ] R8 Confirm DEF-108 live; wire the real canonical `MeshCatalogSync` payload (rename one of the two structs) — smoke.
+- [ ] Prerequisites tracked elsewhere but gating the watched-live gate: redeploy `vps-jane` (blob bind fix, public :16467/:16468), fix `ansible/host_vars/jane-vps.yml` mac-jane peer ports (24849-24851 → 16370-16371), measure `vps-jane` headroom, rotate Beacon's Telegram token.

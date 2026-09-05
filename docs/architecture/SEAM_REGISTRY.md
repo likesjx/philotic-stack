@@ -3,7 +3,7 @@ title: Philotic Seam Registry
 doc_type: workflow
 domain: workflow-docs
 status: active
-last_updated: 2026-07-26
+last_updated: 2026-09-05
 tags:
 - seams
 - ids
@@ -72,8 +72,10 @@ This registry makes the seam layer explicit without forcing every task bullet to
 | `multi-host-watched-validation` | `mesh-placement` | [INTER_HOTEL_ROUTING_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/INTER_HOTEL_ROUTING_PROPOSAL.md) | `docs/task.md` → multi-host routing and VPS validation work |
 | `multi-hotel-route-consistency` | `mesh-placement` | [MULTI_HOTEL_COMPONENT_DISTRIBUTION_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/MULTI_HOTEL_COMPONENT_DISTRIBUTION_PROPOSAL.md) | `docs/task.md` → `New Project: Multi-Hotel Component Distribution` |
 | `cross-host-distributed-validation` | `mesh-placement` | [MULTI_HOTEL_COMPONENT_DISTRIBUTION_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/MULTI_HOTEL_COMPONENT_DISTRIBUTION_PROPOSAL.md) | `docs/task.md` → `New Project: Multi-Hotel Component Distribution` |
-| `remote-materialization-ceremony` | `mesh-placement` | [MULTI_HOTEL_COMPONENT_DISTRIBUTION_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/MULTI_HOTEL_COMPONENT_DISTRIBUTION_PROPOSAL.md) | `docs/task.md` → `New Project: Multi-Hotel Component Distribution` |
+| `remote-materialization-ceremony` | `mesh-placement` | [MULTI_HOTEL_COMPONENT_DISTRIBUTION_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/MULTI_HOTEL_COMPONENT_DISTRIBUTION_PROPOSAL.md), [RELOCATION_CEREMONY_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/RELOCATION_CEREMONY_PROPOSAL.md) (R3) | `docs/task.md` → `New Project: Multi-Hotel Component Distribution` |
 | `capacity-relief-placement` | `mesh-placement` | [MULTI_HOTEL_COMPONENT_DISTRIBUTION_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/MULTI_HOTEL_COMPONENT_DISTRIBUTION_PROPOSAL.md) | `docs/task.md` → `New Project: Multi-Hotel Component Distribution` |
+| `relocation-ceremony` | `mesh-placement` | [RELOCATION_CEREMONY_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/RELOCATION_CEREMONY_PROPOSAL.md) | proposed | `docs/task.md` → `New Project: Agent-Initiated Relocation` |
+| `graph-truth-over-seed` | `mesh-placement` | [RELOCATION_CEREMONY_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/RELOCATION_CEREMONY_PROPOSAL.md) | proposed | `docs/task.md` → `New Project: Agent-Initiated Relocation` (R1) |
 | `mesh-visible-state-contract` | `mesh-placement` | [MESH_VISIBILITY_AND_STATE_PLACEMENT_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/MESH_VISIBILITY_AND_STATE_PLACEMENT_PROPOSAL.md) | `docs/task.md` → `New Project: Mesh Visibility And State Placement` |
 | `secret-handling-hardening` | `deployment-distribution` | [RH_ANSIBLE_VPS_DEPLOYMENT_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/RH_ANSIBLE_VPS_DEPLOYMENT_PROPOSAL.md) | `docs/task.md` → `Red Hat Ansible / VPS Deployment Boundary` |
 | `watched-live-vps-smoke` | `deployment-distribution` | [RH_ANSIBLE_VPS_DEPLOYMENT_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/RH_ANSIBLE_VPS_DEPLOYMENT_PROPOSAL.md) | `docs/task.md` → VPS smoke follow-ons |
@@ -168,6 +170,14 @@ This registry makes the seam layer explicit without forcing every task bullet to
 | `prompt-guard-scan` | `tooling-execution` | [SELF_IMPROVEMENT_LOOP_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/SELF_IMPROVEMENT_LOOP_PROPOSAL.md) | proposed | `docs/task.md` → `New Project: Self-Improvement Loop` |
 | `cron-continuity` | `runtime-sessions` | [SELF_IMPROVEMENT_LOOP_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/SELF_IMPROVEMENT_LOOP_PROPOSAL.md) | proposed | `docs/task.md` → `New Project: Self-Improvement Loop` |
 | `session-search-fts` | `memory-context` | [SELF_IMPROVEMENT_LOOP_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/SELF_IMPROVEMENT_LOOP_PROPOSAL.md) | proposed | `docs/task.md` → `New Project: Self-Improvement Loop` |
+| `cypher-classifier-wall` | `memory-context` | [GRAPH_DOORS_AND_LIFE_CORE_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/GRAPH_DOORS_AND_LIFE_CORE_PROPOSAL.md) | proposed | `docs/task.md` → `New Project: Graph Doors and Life Core` |
+| `graph-registry-containers` | `memory-context` | [GRAPH_DOORS_AND_LIFE_CORE_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/GRAPH_DOORS_AND_LIFE_CORE_PROPOSAL.md) | proposed | `docs/task.md` → `New Project: Graph Doors and Life Core` |
+| `graph-door-query` | `memory-context` | [GRAPH_DOORS_AND_LIFE_CORE_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/GRAPH_DOORS_AND_LIFE_CORE_PROPOSAL.md) | proposed | `docs/task.md` → `New Project: Graph Doors and Life Core` |
+| `graph-door-mutate` | `memory-context` | [GRAPH_DOORS_AND_LIFE_CORE_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/GRAPH_DOORS_AND_LIFE_CORE_PROPOSAL.md) | proposed | `docs/task.md` → `New Project: Graph Doors and Life Core` |
+| `graph-door-analyze` | `memory-context` | [GRAPH_DOORS_AND_LIFE_CORE_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/GRAPH_DOORS_AND_LIFE_CORE_PROPOSAL.md) | proposed | `docs/task.md` → `New Project: Graph Doors and Life Core` |
+| `graph-door-admin` | `operator-control-plane` | [GRAPH_DOORS_AND_LIFE_CORE_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/GRAPH_DOORS_AND_LIFE_CORE_PROPOSAL.md) | proposed | `docs/task.md` → `New Project: Graph Doors and Life Core` |
+| `life-core-layer` | `memory-context` | [GRAPH_DOORS_AND_LIFE_CORE_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/GRAPH_DOORS_AND_LIFE_CORE_PROPOSAL.md) | proposed | `docs/task.md` → `New Project: Graph Doors and Life Core` |
+| `skill-guidance-cypher` | `tooling-execution` | [GRAPH_DOORS_AND_LIFE_CORE_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/GRAPH_DOORS_AND_LIFE_CORE_PROPOSAL.md) | proposed | `docs/task.md` → `New Project: Graph Doors and Life Core` |
 
 ## Usage Rule
 

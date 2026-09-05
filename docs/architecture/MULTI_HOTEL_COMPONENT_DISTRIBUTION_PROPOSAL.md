@@ -14,6 +14,7 @@ related_docs:
 - ARCHITECTURE_STATUS.md
 - INTER_HOTEL_ROUTING_PROPOSAL.md
 - HOTEL_PERIMETER_TRUST_PROPOSAL.md
+- RELOCATION_CEREMONY_PROPOSAL.md
 task_refs:
 - docs/task.md
 proposal_id: multi-hotel-component-distribution
@@ -131,6 +132,8 @@ What remains open:
 - durable approval / reply routing proof when ingress is VPS-local and cognition lands elsewhere
 
 ## Remote Materialization Ceremony
+
+> Elaborated 2026-09-05 as its own proposal: [RELOCATION_CEREMONY_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/RELOCATION_CEREMONY_PROPOSAL.md) names the founding tenet (materialization anywhere, at any time, by philote initiation), audits the ten gaps that keep it from being true, and slices the ceremony R0–R8. The flow below remains the reference shape.
 
 When a hotel needs a component that is not currently live or routeable, the platform should treat that as an explicit ceremony rather than a lucky timeout cascade.
 
