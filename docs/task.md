@@ -1927,3 +1927,22 @@ Order: L5 → L1 → L2, then L3/L4/L6/L7 independently.
 - [ ] L4 standing-notes: `agent_notes` 2,200 / `operator_profile` 1,375 chars, `notes.add|replace|remove`, fail-loud cap, usage header — first task: audit what `InjectionBudget.memory_snapshot_chars` feeds today
 - [ ] L6 cron `continuity` + `cron_scratch` node injected as `[Previous run]` — watched-live on the vps Chronos check-in
 - [ ] L7 `session_turn_fts` FTS5 table + `SearchSessionTurns` IPC + `session.search` tool — smoke-green on vps-jane Beacon history
+
+## New Project: Agent-Initiated Relocation
+
+Proposal: [docs/architecture/RELOCATION_CEREMONY_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/RELOCATION_CEREMONY_PROPOSAL.md) (proposed 2026-09-05). Seam IDs: `relocation-ceremony`, `graph-truth-over-seed`, `remote-materialization-ceremony`, `membrane-transport-home`.
+
+Tenet: materialization anywhere, at any time, by philote initiation — membrane, agent, controllers, runners, datasources. First watched-live gate: every orchestrator incarnation relocates to `vps-jane` from a Telegram turn, Mac-bound specialists stay pinned and are reached by whisper.
+
+Order: R0 → R1 → R2 → R3 → R4 → R6 (degraded continuity) → R5 → R7; R8 when DEF-108 is confirmed live.
+
+- [x] R0 Name the tenet: proposal, `materialization-anywhere-anytime` + `graph-truth-outlives-config-seed` in `ARCH_RULES.md`, glossary terms, DEF-106/107/108 filed (2026-09-05, `codex/relocation-ceremony`).
+- [ ] R1 Graph truth outlives seed: `seed_orchestrator_roles` preserves `home_node`; guest seeding preserves placement fields; `home_node` + `membrane_transport_home` join `HotelStateSync` gossip — test-green, then smoke: restart origin hotel, home survives (closes DEF-106, half of DEF-107).
+- [ ] R2 Membrane standby + push stand-down: every membrane startup path exposes standby before acting (also closes the unchecked item under Multi-Hotel Component Distribution); `TransportHomeChanged` mesh event; old poller stands down on receipt — watched-live: Beacon token vps ↔ mac with no dropped message (closes DEF-107).
+- [ ] R3 `materialize.request` / `materialize.ready` on the TCP execution plane carrying component template refs, `agent_identity`, role + toolset records, transport-home standby; target resolves binaries, admits, spawns, reports — test-green two local hotels; smoke mac ↔ mbp.
+- [ ] R4 Feasibility + placement: offer/decline with reasons (binary, secret refs, controller resources, headroom, `max_concurrent_jobs`, version); `best_place_to_run` consumes the same checks — test-green.
+- [ ] R5 Continuity blob: session snapshot + checkpoint + dialogue window + apartment exported as an authenticated blob, imported before switch — requires blob-plane auth (BLOB_EXECUTION_PERIMETER_HARDENING, DEF-104 follow-on) — smoke: parked turn survives a move.
+- [ ] R6 `hotel.relocate` tool + `relocation_ceremony` graph record (phases, risk tiers, drain contract, rollback, resume) — watched-live: Bjork orchestrator + Telegram membrane `mac-jane` → `vps-jane` from one Telegram request; Architect stays pinned; next message answered from the VPS; whisper to Architect round-trips. Then Coach, Mac, then `mbp-jane` agents.
+- [ ] R7 Sealed secret transfer (AEAD over peer-authenticated channel or TLS execution plane); until then secrets are pre-provisioned via the vault plane and R4 declines — security review + smoke.
+- [ ] R8 Confirm DEF-108 live; wire the real canonical `MeshCatalogSync` payload (rename one of the two structs) — smoke.
+- [ ] Prerequisites tracked elsewhere but gating the watched-live gate: redeploy `vps-jane` (blob bind fix, public :16467/:16468), fix `ansible/host_vars/jane-vps.yml` mac-jane peer ports (24849-24851 → 16370-16371), measure `vps-jane` headroom, rotate Beacon's Telegram token.
