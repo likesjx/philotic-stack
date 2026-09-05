@@ -299,6 +299,57 @@ where
     }
 }
 
+/// Write half of a split [`RelayClient`]: forwards frames to the relay.
+pub struct RelayWriter<W> {
+    write: W,
+}
+
+impl<W: AsyncWrite + Unpin> RelayWriter<W> {
+    /// Forward an opaque, already-signed mesh frame to `to_node_id` on `plane`.
+    pub async fn send(&mut self, to_node_id: &str, plane: Plane, inner: &[u8]) -> Result<()> {
+        use base64::Engine;
+        let inner_b64 = base64::engine::general_purpose::STANDARD.encode(inner);
+        write_frame(
+            &mut self.write,
+            &ClientMsg::Relay {
+                to_node_id: to_node_id.to_string(),
+                plane,
+                inner_b64,
+            },
+        )
+        .await
+    }
+}
+
+/// Read half of a split [`RelayClient`]: yields messages from the relay.
+pub struct RelayReader<R> {
+    read: R,
+}
+
+impl<R: AsyncRead + Unpin> RelayReader<R> {
+    /// Await the next message from the relay, or `Ok(None)` on stream close.
+    pub async fn recv(&mut self) -> Result<Option<ServerMsg>> {
+        read_frame::<_, ServerMsg>(&mut self.read).await
+    }
+}
+
+impl<S> RelayClient<S>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    /// Split an authenticated client into independent write and read halves so
+    /// sending and receiving can run concurrently in separate tasks.
+    pub fn into_split(
+        self,
+    ) -> (
+        RelayWriter<tokio::io::WriteHalf<S>>,
+        RelayReader<tokio::io::ReadHalf<S>>,
+    ) {
+        let (read, write) = tokio::io::split(self.stream);
+        (RelayWriter { write }, RelayReader { read })
+    }
+}
+
 /// Decode a delivered frame's inner bytes (base64 -> the opaque signed mesh
 /// frame), for the receiving hotel to inject into its inbox.
 pub fn decode_inner(inner_b64: &str) -> Result<Vec<u8>> {

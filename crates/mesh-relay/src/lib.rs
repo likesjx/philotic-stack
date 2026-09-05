@@ -10,6 +10,7 @@
 //!
 //! See [`protocol`] for the trust model.
 
+pub mod link;
 pub mod protocol;
 pub mod quic;
 pub mod transport;
