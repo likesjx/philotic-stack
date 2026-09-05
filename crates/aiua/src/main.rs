@@ -5169,6 +5169,14 @@ fn seed_toolset_profiles(graph: &GraphDomain) -> anyhow::Result<()> {
                 "graph.query".into(),
                 "graph.create".into(),
                 "graph.list".into(),
+                // Operator decision 2026-09-04: cron tools are open to every
+                // role; the hotel scopes list/enable/disable/remove to the
+                // caller agent's own crontab (`cron_job_visible_to`).
+                "cron.register".into(),
+                "cron.list".into(),
+                "cron.enable".into(),
+                "cron.disable".into(),
+                "cron.remove".into(),
             ],
             allowed_classes: vec!["session".into(), "utility".into(), "workspace".into(), "life_graph".into()],
             allowed_skills: vec![
@@ -5179,7 +5187,7 @@ fn seed_toolset_profiles(graph: &GraphDomain) -> anyhow::Result<()> {
                 "graph.knowledge".into(),
                 "lifegraph.truth_summarizer".into(),
             ],
-            on_demand_skills: vec![],
+            on_demand_skills: vec!["cron.manage".into()],
             remote_tool_runners: vec![],
             seed_baseline: None,
             description: Some("Codex specialist role profile — workspace read access.".into()),
@@ -5194,6 +5202,14 @@ fn seed_toolset_profiles(graph: &GraphDomain) -> anyhow::Result<()> {
                 "graph.query".into(),
                 "graph.create".into(),
                 "graph.list".into(),
+                // Operator decision 2026-09-04: cron tools are open to every
+                // role; the hotel scopes list/enable/disable/remove to the
+                // caller agent's own crontab (`cron_job_visible_to`).
+                "cron.register".into(),
+                "cron.list".into(),
+                "cron.enable".into(),
+                "cron.disable".into(),
+                "cron.remove".into(),
             ],
             allowed_classes: vec!["session".into(), "utility".into(), "life_graph".into()],
             allowed_skills: vec![
@@ -5204,7 +5220,7 @@ fn seed_toolset_profiles(graph: &GraphDomain) -> anyhow::Result<()> {
                 "graph.knowledge".into(),
                 "lifegraph.truth_summarizer".into(),
             ],
-            on_demand_skills: vec![],
+            on_demand_skills: vec!["cron.manage".into()],
             remote_tool_runners: vec![],
             seed_baseline: None,
             description: Some("Research specialist role profile — minimal tool surface.".into()),
@@ -5219,6 +5235,14 @@ fn seed_toolset_profiles(graph: &GraphDomain) -> anyhow::Result<()> {
                 "graph.query".into(),
                 "graph.create".into(),
                 "graph.list".into(),
+                // Operator decision 2026-09-04: cron tools are open to every
+                // role; the hotel scopes list/enable/disable/remove to the
+                // caller agent's own crontab (`cron_job_visible_to`).
+                "cron.register".into(),
+                "cron.list".into(),
+                "cron.enable".into(),
+                "cron.disable".into(),
+                "cron.remove".into(),
             ],
             allowed_classes: vec!["session".into(), "utility".into(), "life_graph".into()],
             allowed_skills: vec![
@@ -5227,7 +5251,7 @@ fn seed_toolset_profiles(graph: &GraphDomain) -> anyhow::Result<()> {
                 "session.recover".into(),
                 "lifegraph.truth_summarizer".into(),
             ],
-            on_demand_skills: vec![],
+            on_demand_skills: vec!["cron.manage".into()],
             remote_tool_runners: vec![],
             seed_baseline: None,
             description: Some("Bare utility profile — session and echo only.".into()),
@@ -5260,7 +5284,7 @@ fn seed_toolset_profiles(graph: &GraphDomain) -> anyhow::Result<()> {
                 "life.steward".into(),
                 "lifegraph.truth_summarizer".into(),
             ],
-            on_demand_skills: vec![],
+            on_demand_skills: vec!["cron.manage".into()],
             remote_tool_runners: vec![],
             seed_baseline: None,
             description: Some(
@@ -5369,7 +5393,7 @@ fn seed_toolset_profiles(graph: &GraphDomain) -> anyhow::Result<()> {
                 "lifegraph.truth_summarizer".into(),
                 "mesh.steward".into(),
             ],
-            on_demand_skills: vec!["mcp.endpoint_steward".into()],
+            on_demand_skills: vec!["cron.manage".into(), "mcp.endpoint_steward".into()],
             remote_tool_runners: vec![],
             seed_baseline: None,
             description: Some(
@@ -5399,6 +5423,14 @@ fn seed_toolset_profiles(graph: &GraphDomain) -> anyhow::Result<()> {
                 "graph.query".into(),
                 "graph.create".into(),
                 "graph.list".into(),
+                // Operator decision 2026-09-04: cron tools are open to every
+                // role; the hotel scopes list/enable/disable/remove to the
+                // caller agent's own crontab (`cron_job_visible_to`).
+                "cron.register".into(),
+                "cron.list".into(),
+                "cron.enable".into(),
+                "cron.disable".into(),
+                "cron.remove".into(),
             ],
             // "heal": the architect-charter daily brief (DEFAULT_CHARTER_MANIFEST
             // in architect_charter.rs) instructs the typed heal.list /
@@ -5420,7 +5452,7 @@ fn seed_toolset_profiles(graph: &GraphDomain) -> anyhow::Result<()> {
                 // charter's heal.list instruction depends on.
                 "mesh.steward".into(),
             ],
-            on_demand_skills: vec!["mcp.endpoint_steward".into()],
+            on_demand_skills: vec!["cron.manage".into(), "mcp.endpoint_steward".into()],
             remote_tool_runners: vec![],
             seed_baseline: None,
             description: Some(
@@ -5446,6 +5478,14 @@ fn seed_toolset_profiles(graph: &GraphDomain) -> anyhow::Result<()> {
                 "graph.query".into(),
                 "graph.create".into(),
                 "graph.list".into(),
+                // Operator decision 2026-09-04: cron tools are open to every
+                // role; the hotel scopes list/enable/disable/remove to the
+                // caller agent's own crontab (`cron_job_visible_to`).
+                "cron.register".into(),
+                "cron.list".into(),
+                "cron.enable".into(),
+                "cron.disable".into(),
+                "cron.remove".into(),
             ],
             allowed_classes: vec![
                 "session".into(),
@@ -5465,7 +5505,7 @@ fn seed_toolset_profiles(graph: &GraphDomain) -> anyhow::Result<()> {
                 "graph.knowledge".into(),
                 "lifegraph.truth_summarizer".into(),
             ],
-            on_demand_skills: vec![],
+            on_demand_skills: vec!["cron.manage".into()],
             remote_tool_runners: vec![],
             seed_baseline: None,
             description: Some(
@@ -5483,6 +5523,14 @@ fn seed_toolset_profiles(graph: &GraphDomain) -> anyhow::Result<()> {
                 "graph.query".into(),
                 "graph.create".into(),
                 "graph.list".into(),
+                // Operator decision 2026-09-04: cron tools are open to every
+                // role; the hotel scopes list/enable/disable/remove to the
+                // caller agent's own crontab (`cron_job_visible_to`).
+                "cron.register".into(),
+                "cron.list".into(),
+                "cron.enable".into(),
+                "cron.disable".into(),
+                "cron.remove".into(),
             ],
             allowed_classes: vec!["session".into(), "utility".into(), "life_graph".into()],
             allowed_skills: vec![
@@ -5491,7 +5539,7 @@ fn seed_toolset_profiles(graph: &GraphDomain) -> anyhow::Result<()> {
                 "session.recover".into(),
                 "lifegraph.truth_summarizer".into(),
             ],
-            on_demand_skills: vec![],
+            on_demand_skills: vec!["cron.manage".into()],
             remote_tool_runners: vec![],
             seed_baseline: None,
             description: Some(
@@ -5512,6 +5560,14 @@ fn seed_toolset_profiles(graph: &GraphDomain) -> anyhow::Result<()> {
                 "graph.query".into(),
                 "graph.create".into(),
                 "graph.list".into(),
+                // Operator decision 2026-09-04: cron tools are open to every
+                // role; the hotel scopes list/enable/disable/remove to the
+                // caller agent's own crontab (`cron_job_visible_to`).
+                "cron.register".into(),
+                "cron.list".into(),
+                "cron.enable".into(),
+                "cron.disable".into(),
+                "cron.remove".into(),
             ],
             // "life_graph": travel truth lives in the LifeGraph (trips as
             // Project containing Commitment/Event/NextAction) — this class
@@ -5533,7 +5589,7 @@ fn seed_toolset_profiles(graph: &GraphDomain) -> anyhow::Result<()> {
                 "life.steward".into(),
                 "lifegraph.truth_summarizer".into(),
             ],
-            on_demand_skills: vec![],
+            on_demand_skills: vec!["cron.manage".into()],
             remote_tool_runners: vec![],
             seed_baseline: None,
             description: Some(
@@ -9954,6 +10010,47 @@ mod tests {
             !fresh.is_active,
             "a first-seen dormant seed stays dormant — activation is on-demand"
         );
+    }
+
+    /// Operator decision 2026-09-04: the hotel's native cron tools are open to
+    /// every role (the hotel scopes them to the caller agent's own crontab).
+    /// Every seeded profile must carry all five tools and reach `cron.manage`
+    /// (on-demand or allowed) so the tools project on cron-shaped turns.
+    #[test]
+    fn seed_toolset_profiles_grant_cron_tools_to_every_profile() {
+        let storage = SqliteGraphStorage::open(":memory:").expect("open sqlite");
+        let graph = GraphDomain::new(Arc::new(storage.adapter()));
+        seed_toolset_profiles(&graph).expect("seed toolset profiles");
+        let profiles = graph.list_toolset_profiles().expect("list profiles");
+        assert!(
+            profiles.len() >= 10,
+            "expected the full seeded set, got {}",
+            profiles.len()
+        );
+        for profile in &profiles {
+            for tool in [
+                "cron.register",
+                "cron.list",
+                "cron.enable",
+                "cron.disable",
+                "cron.remove",
+            ] {
+                assert!(
+                    profile.allowed_tools.iter().any(|t| t == tool),
+                    "profile {} is missing {tool}",
+                    profile.profile_name
+                );
+            }
+            assert!(
+                profile
+                    .on_demand_skills
+                    .iter()
+                    .chain(profile.allowed_skills.iter())
+                    .any(|s| s == "cron.manage"),
+                "profile {} cannot reach cron.manage",
+                profile.profile_name
+            );
+        }
     }
 
     #[test]

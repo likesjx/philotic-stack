@@ -1438,9 +1438,11 @@ fn build_catalog() -> HashMap<String, ToolDefinition> {
         "cron.register".into(),
         ToolDefinition {
             tool_name: "cron.register".into(),
-            description: "Register a cron job on the hotel. Use cron.list first to avoid \
+            description: "Register a cron job in your crontab on the hotel's native scheduler \
+                          (never system cron or launchd). Use cron.list first to avoid \
                           duplicates. The schedule is a 7-field cron expression and the payload \
-                          is a JSON string delivered to the target role."
+                          is a JSON string delivered to the target role. The job is owned by \
+                          your agent; only your agent or the orchestrator can change it later."
                 .into(),
             input_schema: json!({
                 "type": "object",
@@ -1476,8 +1478,11 @@ fn build_catalog() -> HashMap<String, ToolDefinition> {
         "cron.list".into(),
         ToolDefinition {
             tool_name: "cron.list".into(),
-            description: "List cron jobs registered on this hotel, including schedule, target \
-                          role, enabled state, and next fire time."
+            description: "List the cron jobs in YOUR crontab on the hotel's native scheduler, \
+                          including schedule, target role, enabled state, and next fire time. \
+                          This is the only cron a philote consults — system crontab and \
+                          launchd are out of scope. You see jobs owned by your agent; the \
+                          orchestrator sees the whole hotel."
                 .into(),
             input_schema: json!({
                 "type": "object",
