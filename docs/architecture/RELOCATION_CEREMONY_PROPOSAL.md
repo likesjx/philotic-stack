@@ -2,10 +2,10 @@
 title: Relocation Ceremony — Materialization Anywhere, At Any Time, By Philote Initiation
 doc_type: proposal
 domain: mesh-placement
-status: proposed
-disposition: proposed
+status: accepted-current-slice
+disposition: accepted-current-slice
 last_updated: 2026-09-05
-verification_level: none
+verification_level: test-green
 tags:
 - placement
 - relocation
@@ -66,7 +66,10 @@ ceremony that closes the gap.
 
 ## Disposition
 
-`proposed` (2026-09-05). No slice implemented. The first concrete relocation
+`accepted-current-slice` (2026-09-05). **R1 test-green** on `codex/relocation-r1`: placement
+stamps on both home record kinds, reseed preserves `home_node` (DEF-106), runtime
+homes gossip in `HotelStateSync` with last-writer-wins apply (`placement_sync`).
+R2 onward not started. The first concrete relocation
 this ceremony must carry is moving every orchestrator incarnation (Bjork, Coach,
 Mac on `mac-jane`; Astrid, Ariel, Jane, Aria on `mbp-jane`) to `vps-jane`, with
 Mac-bound specialists (Architect and anything holding `bash.exec`, desktop, ONNX
@@ -192,7 +195,7 @@ uselessness.
 | Slice | Content | Closes | Rung |
 |---|---|---|---|
 | **R0** Tenet and rules | This proposal; `materialization-anywhere-anytime` and `graph-truth-outlives-config-seed` in `ARCH_RULES.md`; glossary terms | — | docs |
-| **R1** Graph truth outlives seed | `seed_orchestrator_roles` preserves `home_node`; guest seeding preserves placement fields like it already preserves `is_active`; `home_node` and `membrane_transport_home` join the `HotelStateSync` gossip so every hotel agrees who is home | G1, G6 | test-green, then smoke: restart origin, home survives |
+| **R1** Graph truth outlives seed | **test-green 2026-09-05.** `seed_orchestrator_roles` and `role.configure` preserve `home_node` + a placement stamp; runtime-stamped role homes and `membrane_transport_home` records ride `HotelStateSync` and peers apply last-writer-wins (`placement_sync`); home changes mark hotel state dirty so they gossip at once | G1, G6 | test-green ✓; smoke pending: restart origin, home survives |
 | **R2** Membrane standby and push stand-down | every membrane startup path exposes standby before acting; `TransportHomeChanged` mesh event; old poller stands down on receipt; standby acquires within one lease tick | G7 | watched-live: move Beacon's token vps ↔ mac and back with no dropped message |
 | **R3** Remote materialization request/ready | `materialize.request` / `materialize.ready` on the TCP execution plane carrying component template refs, `agent_identity`, role and toolset records, transport-home standby; target resolves binaries (Guest Binary Resolution), admits, spawns, reports | G2, G3 | test-green on two local hotels; smoke mac ↔ mbp |
 | **R4** Feasibility and placement | offer/decline with reasons: binary resolvable, secret refs present, controller resources present, `NodeHealthSnapshot` headroom, `max_concurrent_jobs`, version compatibility; `best_place_to_run` consumes the same checks | G8, G9 (readiness half) | test-green |

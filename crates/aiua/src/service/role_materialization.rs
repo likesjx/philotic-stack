@@ -868,6 +868,7 @@ impl IpcServer {
                 },
             },
             home_node: preserved.and_then(|p| p.home_node.clone()),
+            placement_updated_unix: preserved.map(|p| p.placement_updated_unix).unwrap_or(0),
         };
 
         if let Err(e) = graph.upsert_role_incarnation(&record) {
@@ -1636,6 +1637,7 @@ impl IpcServer {
         };
 
         record.home_node = target_hotel.clone();
+        record.placement_updated_unix = ansible_mesh_core::graph::placement_stamp_now();
         if let Err(err) = graph.upsert_role_incarnation(&record) {
             return IpcResponse::error(
                 "set_role_home",
