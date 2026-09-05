@@ -63,6 +63,10 @@ pub(crate) struct MeshRuntimeContext {
     /// Shared hotel roster snapshot used by BeaconDaemon for anchor handshakes.
     pub(crate) local_hotel_state:
         Arc<RwLock<Option<ansible_mesh_core::heartbeat::HotelStateSyncPayload>>>,
+    /// Newly applied gossiped placement records flow here so the hotel can
+    /// push `TransportHomeChanged` to local guests at once (DEF-107).
+    pub(crate) placement_change_tx:
+        Option<mpsc::UnboundedSender<ansible_mesh_core::placement_sync::PlacementChange>>,
 }
 
 pub(crate) async fn activate_mesh_runtime(ctx: MeshRuntimeContext) -> Result<()> {
@@ -76,7 +80,8 @@ pub(crate) async fn activate_mesh_runtime(ctx: MeshRuntimeContext) -> Result<()>
             ctx.enable_rust_auth,
             ctx.registry.clone(),
         )
-        .await?,
+        .await?
+        .with_placement_change_tx(ctx.placement_change_tx.clone()),
     );
     *daemon.local_hotel_state.write().await = ctx.local_hotel_state.read().await.clone();
     // Keep beacon's snapshot in sync: whenever the shared Arc is updated, propagate here.

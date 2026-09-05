@@ -13,22 +13,63 @@
 //! the gossip entry is a small `(agent, role, home, stamp)` tuple, not the
 //! full record. A hotel that has never seen the role learns it from the next
 //! `session.handoff` push, which carries the whole record including its home.
+//!
+//! Every applied record is also reported back to the caller (and, through
+//! [`BeaconDaemon::with_placement_change_tx`], to the hotel) as a
+//! [`PlacementChange`], so the hotel can push the change to its local guests
+//! immediately — a membrane seat on the new home probes on its next tick and
+//! the seat on the old home stops polling now, instead of waiting for a lease
+//! denial plus a 180 s re-probe.
+//!
+//! [`BeaconDaemon::with_placement_change_tx`]: crate::beacon::BeaconDaemon::with_placement_change_tx
 
 use crate::domain::GraphDomain;
 use crate::graph::MembraneTransportHomeRecord;
 use crate::heartbeat::HotelStateSyncRoleHome;
 use tracing::{debug, warn};
 
+/// One placement record that was newly applied to the local graph.
+#[derive(Debug, Clone, PartialEq)]
+pub enum PlacementChange {
+    RoleHome(HotelStateSyncRoleHome),
+    TransportHome(MembraneTransportHomeRecord),
+}
+
+/// What [`apply_remote_placement`] actually wrote.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct PlacementApplied {
+    pub role_homes: Vec<HotelStateSyncRoleHome>,
+    pub transport_homes: Vec<MembraneTransportHomeRecord>,
+}
+
+impl PlacementApplied {
+    pub fn is_empty(&self) -> bool {
+        self.role_homes.is_empty() && self.transport_homes.is_empty()
+    }
+
+    pub fn into_changes(self) -> impl Iterator<Item = PlacementChange> {
+        self.role_homes
+            .into_iter()
+            .map(PlacementChange::RoleHome)
+            .chain(
+                self.transport_homes
+                    .into_iter()
+                    .map(PlacementChange::TransportHome),
+            )
+    }
+}
+
 /// Apply gossiped role homes and transport homes from `from_node`.
 ///
-/// Returns `(role_homes_applied, transport_homes_applied)`.
+/// Returns the records that were newly applied (strictly newer than the local
+/// copy, or absent locally for transport homes).
 pub fn apply_remote_placement(
     graph: &GraphDomain,
     from_node: &str,
     role_homes: &[HotelStateSyncRoleHome],
     transport_homes: &[MembraneTransportHomeRecord],
-) -> (usize, usize) {
-    let mut roles_applied = 0usize;
+) -> PlacementApplied {
+    let mut applied = PlacementApplied::default();
     for home in role_homes {
         if home.placement_updated_unix == 0 {
             continue;
@@ -39,7 +80,7 @@ pub fn apply_remote_placement(
                     local.home_node = home.home_node.clone();
                     local.placement_updated_unix = home.placement_updated_unix;
                     match graph.upsert_role_incarnation(&local) {
-                        Ok(()) => roles_applied += 1,
+                        Ok(()) => applied.role_homes.push(home.clone()),
                         Err(err) => warn!(
                             "placement sync from {}: failed to apply home for {}:{}: {}",
                             from_node, home.agent_id, home.role_name, err
@@ -58,7 +99,6 @@ pub fn apply_remote_placement(
         }
     }
 
-    let mut transports_applied = 0usize;
     for home in transport_homes {
         if home.updated_unix == 0 {
             continue;
@@ -80,7 +120,7 @@ pub fn apply_remote_placement(
         };
         if apply {
             match graph.upsert_membrane_transport_home(home) {
-                Ok(()) => transports_applied += 1,
+                Ok(()) => applied.transport_homes.push(home.clone()),
                 Err(err) => warn!(
                     "placement sync from {}: failed to apply transport home {}:{}:{}: {}",
                     from_node, home.agent_id, home.transport, home.resource_ref, err
@@ -89,7 +129,7 @@ pub fn apply_remote_placement(
         }
     }
 
-    (roles_applied, transports_applied)
+    applied
 }
 
 #[cfg(test)]
@@ -145,9 +185,9 @@ mod tests {
         let d = make_domain();
         d.upsert_role_incarnation(&role(None, 100)).unwrap();
 
-        let (applied, _) =
+        let applied =
             apply_remote_placement(&d, "vps", &[role_home(Some("vps-jane-aiua-01"), 200)], &[]);
-        assert_eq!(applied, 1);
+        assert_eq!(applied.role_homes.len(), 1);
         let local = d
             .get_role_incarnation("agent-bjork-01", "orchestrator")
             .unwrap()
@@ -156,10 +196,8 @@ mod tests {
         assert_eq!(local.placement_updated_unix, 200);
 
         // A stale hotel re-gossiping the old (unset) home must not flip it back.
-        let (applied, _) = apply_remote_placement(&d, "mac", &[role_home(None, 150)], &[]);
-        assert_eq!(applied, 0);
-        let (applied, _) = apply_remote_placement(&d, "mac", &[role_home(None, 200)], &[]);
-        assert_eq!(applied, 0);
+        assert!(apply_remote_placement(&d, "mac", &[role_home(None, 150)], &[]).is_empty());
+        assert!(apply_remote_placement(&d, "mac", &[role_home(None, 200)], &[]).is_empty());
         let local = d
             .get_role_incarnation("agent-bjork-01", "orchestrator")
             .unwrap()
@@ -167,8 +205,8 @@ mod tests {
         assert_eq!(local.home_node.as_deref(), Some("vps-jane-aiua-01"));
 
         // A newer explicit un-home does apply.
-        let (applied, _) = apply_remote_placement(&d, "vps", &[role_home(None, 300)], &[]);
-        assert_eq!(applied, 1);
+        let applied = apply_remote_placement(&d, "vps", &[role_home(None, 300)], &[]);
+        assert_eq!(applied.role_homes.len(), 1);
         assert_eq!(
             d.get_role_incarnation("agent-bjork-01", "orchestrator")
                 .unwrap()
@@ -182,9 +220,13 @@ mod tests {
     fn zero_stamp_and_unknown_role_are_ignored() {
         let d = make_domain();
         // Unknown role: nothing to apply onto.
-        let (applied, _) =
-            apply_remote_placement(&d, "vps", &[role_home(Some("vps-jane-aiua-01"), 200)], &[]);
-        assert_eq!(applied, 0);
+        assert!(apply_remote_placement(
+            &d,
+            "vps",
+            &[role_home(Some("vps-jane-aiua-01"), 200)],
+            &[]
+        )
+        .is_empty());
         assert!(d
             .get_role_incarnation("agent-bjork-01", "orchestrator")
             .unwrap()
@@ -192,24 +234,32 @@ mod tests {
 
         // Legacy zero stamp: never applied even onto an existing record.
         d.upsert_role_incarnation(&role(None, 0)).unwrap();
-        let (applied, _) =
-            apply_remote_placement(&d, "vps", &[role_home(Some("vps-jane-aiua-01"), 0)], &[]);
-        assert_eq!(applied, 0);
+        assert!(
+            apply_remote_placement(&d, "vps", &[role_home(Some("vps-jane-aiua-01"), 0)], &[])
+                .is_empty()
+        );
     }
 
     #[test]
     fn transport_home_is_created_when_missing_and_replaced_only_by_newer() {
         let d = make_domain();
-        let (_, applied) =
-            apply_remote_placement(&d, "vps", &[], &[transport_home("vps-jane", 100)]);
-        assert_eq!(applied, 1);
+        let applied = apply_remote_placement(&d, "vps", &[], &[transport_home("vps-jane", 100)]);
+        assert_eq!(applied.transport_homes.len(), 1);
+        // The applied record is reported as a change for the hotel to push.
+        let changes: Vec<PlacementChange> = applied.into_changes().collect();
+        assert_eq!(
+            changes,
+            vec![PlacementChange::TransportHome(transport_home(
+                "vps-jane", 100
+            ))]
+        );
 
-        let (_, applied) =
-            apply_remote_placement(&d, "mac", &[], &[transport_home("mac-jane", 90)]);
-        assert_eq!(applied, 0);
-        let (_, applied) =
-            apply_remote_placement(&d, "mac", &[], &[transport_home("mac-jane", 100)]);
-        assert_eq!(applied, 0);
+        assert!(
+            apply_remote_placement(&d, "mac", &[], &[transport_home("mac-jane", 90)]).is_empty()
+        );
+        assert!(
+            apply_remote_placement(&d, "mac", &[], &[transport_home("mac-jane", 100)]).is_empty()
+        );
         assert_eq!(
             d.get_membrane_transport_home("agent-bjork-01", "telegram", "telegram_bot_token_bjork")
                 .unwrap()
@@ -218,9 +268,8 @@ mod tests {
             "vps-jane"
         );
 
-        let (_, applied) =
-            apply_remote_placement(&d, "mac", &[], &[transport_home("mac-jane", 101)]);
-        assert_eq!(applied, 1);
+        let applied = apply_remote_placement(&d, "mac", &[], &[transport_home("mac-jane", 101)]);
+        assert_eq!(applied.transport_homes.len(), 1);
         assert_eq!(
             d.get_membrane_transport_home("agent-bjork-01", "telegram", "telegram_bot_token_bjork")
                 .unwrap()
@@ -230,7 +279,8 @@ mod tests {
         );
 
         // Legacy zero-stamp records never travel.
-        let (_, applied) = apply_remote_placement(&d, "mbp", &[], &[transport_home("mbp-jane", 0)]);
-        assert_eq!(applied, 0);
+        assert!(
+            apply_remote_placement(&d, "mbp", &[], &[transport_home("mbp-jane", 0)]).is_empty()
+        );
     }
 }

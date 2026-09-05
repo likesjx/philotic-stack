@@ -2645,6 +2645,29 @@ pub enum IpcResponse {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         home_node: Option<String>,
     },
+    /// Hotel push: a membrane transport home changed — a local
+    /// `transport.set_home`, or a newer record applied from mesh gossip
+    /// (`placement_sync`). Seats for this agent/transport/resource act at
+    /// once instead of waiting for a lease denial plus the 180 s re-probe
+    /// (DEF-107): the seat on the new home probes on its next lease tick,
+    /// the seat on the old home stops polling now and stands by.
+    ///
+    /// Untagged-enum note: `transport_home_changed` is a required marker so
+    /// this decodes to its own variant and never as [`Self::TransportHomeSet`],
+    /// which shares the other field names; it must stay declared BEFORE it.
+    TransportHomeChanged {
+        transport_home_changed: bool,
+        agent_id: String,
+        transport: String,
+        resource_ref: String,
+        active_home_hotel: String,
+        #[serde(default)]
+        standby_hotels: Vec<String>,
+        #[serde(default)]
+        updated_unix: u64,
+        /// Whether the pushing hotel is the new active home.
+        hotel_is_home: bool,
+    },
     /// Response to [`IpcRequest::SetTransportHome`].
     TransportHomeSet {
         agent_id: String,
@@ -3542,6 +3565,48 @@ mod tests {
             }
             other => panic!("unexpected decoded response: {other:?}"),
         }
+    }
+
+    #[test]
+    fn transport_home_changed_and_set_roundtrip_to_their_own_variants() {
+        // The push shares every field name with TransportHomeSet except its
+        // required marker; both must survive the untagged round trip.
+        let changed = IpcResponse::TransportHomeChanged {
+            transport_home_changed: true,
+            agent_id: "agent-bjork-01".into(),
+            transport: "telegram".into(),
+            resource_ref: "telegram_bot_token_bjork".into(),
+            active_home_hotel: "vps-jane".into(),
+            standby_hotels: vec!["mac-jane".into()],
+            updated_unix: 1_757_000_000,
+            hotel_is_home: false,
+        };
+        let bytes = serde_json::to_vec(&changed).expect("serialize");
+        match serde_json::from_slice::<IpcResponse>(&bytes).expect("deserialize") {
+            IpcResponse::TransportHomeChanged {
+                active_home_hotel,
+                hotel_is_home,
+                updated_unix,
+                ..
+            } => {
+                assert_eq!(active_home_hotel, "vps-jane");
+                assert!(!hotel_is_home);
+                assert_eq!(updated_unix, 1_757_000_000);
+            }
+            other => panic!("TransportHomeChanged decoded as wrong variant: {other:?}"),
+        }
+        let set = IpcResponse::TransportHomeSet {
+            agent_id: "agent-bjork-01".into(),
+            transport: "telegram".into(),
+            resource_ref: "telegram_bot_token_bjork".into(),
+            active_home_hotel: "vps-jane".into(),
+            standby_hotels: vec![],
+        };
+        let bytes = serde_json::to_vec(&set).expect("serialize");
+        assert!(matches!(
+            serde_json::from_slice::<IpcResponse>(&bytes).expect("deserialize"),
+            IpcResponse::TransportHomeSet { .. }
+        ));
     }
 
     #[test]

@@ -3339,6 +3339,39 @@ impl IpcServer {
                                 let _ = tx.try_send(());
                             }
                         }
+                        // R2 (DEF-107): tell every local guest NOW that a transport
+                        // home moved, so the affected membrane seat stands down or
+                        // probes on its next tick instead of after a lease denial +
+                        // 180 s re-probe. Remote (gossiped) changes take the same
+                        // push path from main.rs.
+                        if let IpcResponse::TransportHomeSet {
+                            agent_id,
+                            transport,
+                            resource_ref,
+                            active_home_hotel,
+                            standby_hotels,
+                        } = &response
+                        {
+                            let hotel_is_home =
+                                Self::local_hotel_name(graph.as_ref(), &local_node_id)
+                                    .is_some_and(|name| name == *active_home_hotel);
+                            let updated_unix = graph
+                                .get_membrane_transport_home(agent_id, transport, resource_ref)
+                                .ok()
+                                .flatten()
+                                .map(|home| home.updated_unix)
+                                .unwrap_or(0);
+                            let _ = network_broadcast_tx.send(IpcResponse::TransportHomeChanged {
+                                transport_home_changed: true,
+                                agent_id: agent_id.clone(),
+                                transport: transport.clone(),
+                                resource_ref: resource_ref.clone(),
+                                active_home_hotel: active_home_hotel.clone(),
+                                standby_hotels: standby_hotels.clone(),
+                                updated_unix,
+                                hotel_is_home,
+                            });
+                        }
                         let _ = outbound_tx.send(response);
                         for follow_up in follow_up_responses {
                             let _ = outbound_tx.send(follow_up);
@@ -29213,6 +29246,134 @@ pub(crate) mod tests {
         assert_eq!(home.active_home_hotel, "vps-jane");
         assert_eq!(home.lease_type, "telegram_poll");
         assert_eq!(home.managed_by_role, "orchestrator");
+
+        unsafe {
+            std::env::remove_var("PHILOTIC_HOTEL_SOCKET");
+        }
+        server_task.abort();
+        let _ = server_task.await;
+        if Path::new(&socket_path).exists() {
+            let _ = std::fs::remove_file(&socket_path);
+        }
+    }
+
+    // R2 (DEF-107): a local transport.set_home must push TransportHomeChanged to
+    // every connected guest at once, naming whether THIS hotel is the new home.
+    #[tokio::test]
+    async fn set_transport_home_pushes_transport_home_changed_to_guests() {
+        let _env_guard = ipc_env_guard();
+        let socket_path = test_socket_path();
+        let (dispatcher_tx, _dispatcher_rx) = test_dispatcher_channel();
+        let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
+        let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
+        graph
+            .upsert_hotel(&HotelRecord {
+                hotel_name: "vps-jane".into(),
+                capabilities: NodeCapabilities {
+                    node_id: "vps-jane".into(),
+                    roles: vec![],
+                    models: vec![],
+                    tools: vec![],
+                    constraints: Default::default(),
+                },
+                mesh_port: 9000,
+                blob_port: 9001,
+                execution_port: 9002,
+                ipc_socket_path: socket_path.clone(),
+                active_pid: None,
+                mesh_host: None,
+            })
+            .expect("seed hotel");
+        graph
+            .upsert_agent_identity(&AgentIdentityRecord {
+                agent_id: "agent-beacon".into(),
+                persona_name: "Beacon".into(),
+                authority_hotel: "vps-jane".into(),
+                bundle_json: serde_json::json!({}),
+            })
+            .expect("seed agent identity");
+        graph
+            .upsert_role_incarnation(&RoleIncarnationRecord {
+                agent_id: "agent-beacon".into(),
+                role_name: "orchestrator".into(),
+                guest_id: "agent-beacon:orchestrator".into(),
+                toolset_profile: "orchestrator".into(),
+                is_admin: true,
+                readiness_state: RoleReadinessState::Configured,
+                ..Default::default()
+            })
+            .expect("seed orchestrator role");
+        let server = IpcServer::new(
+            socket_path.clone(),
+            "vps-jane",
+            dispatcher_tx,
+            graph.clone(),
+        );
+        let mut pushes = server.network_broadcast_tx().subscribe();
+
+        let server_task = tokio::spawn(async move {
+            server.run().await.expect("ipc server should run");
+        });
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        unsafe {
+            std::env::set_var("PHILOTIC_HOTEL_SOCKET", &socket_path);
+        }
+
+        let mut agent = PhiloticClient::connect(GuestIdentity {
+            guest_id: "agent-beacon:orchestrator".into(),
+            role: "agent".into(),
+            supported_tools: Vec::new(),
+        })
+        .await
+        .expect("agent connect");
+
+        // Move the token AWAY from this hotel: the push must say hotel_is_home=false.
+        let response = agent
+            .send_request(IpcRequest::SetTransportHome {
+                agent_id: "agent-beacon".into(),
+                transport: "telegram".into(),
+                resource_ref: "telegram_bot_token_beacon".into(),
+                calling_role: "orchestrator".into(),
+                target_hotel: "mac-jane".into(),
+                standby_hotels: vec!["vps-jane".into()],
+            })
+            .await
+            .expect("set transport home");
+        assert!(matches!(response, IpcResponse::TransportHomeSet { .. }));
+
+        let pushed = tokio::time::timeout(tokio::time::Duration::from_secs(2), async {
+            loop {
+                match pushes.recv().await {
+                    Ok(msg @ IpcResponse::TransportHomeChanged { .. }) => break msg,
+                    Ok(_) => continue,
+                    Err(err) => panic!("broadcast closed: {err}"),
+                }
+            }
+        })
+        .await
+        .expect("TransportHomeChanged must be pushed promptly");
+        match pushed {
+            IpcResponse::TransportHomeChanged {
+                agent_id,
+                transport,
+                resource_ref,
+                active_home_hotel,
+                standby_hotels,
+                updated_unix,
+                hotel_is_home,
+                ..
+            } => {
+                assert_eq!(agent_id, "agent-beacon");
+                assert_eq!(transport, "telegram");
+                assert_eq!(resource_ref, "telegram_bot_token_beacon");
+                assert_eq!(active_home_hotel, "mac-jane");
+                assert_eq!(standby_hotels, vec!["vps-jane"]);
+                assert!(updated_unix > 0, "push carries the placement stamp");
+                assert!(!hotel_is_home, "vps-jane is no longer home");
+            }
+            other => panic!("unexpected push: {other:?}"),
+        }
 
         unsafe {
             std::env::remove_var("PHILOTIC_HOTEL_SOCKET");

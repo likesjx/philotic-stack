@@ -25,6 +25,10 @@ pub struct BeaconDaemon {
     // and WAL contention on the main context.db under concurrent UDP load.
     nonce_tracker: Option<Mutex<NonceTracker>>,
     enable_rust_auth: bool,
+    /// Where newly applied gossiped placement records are reported so the
+    /// hotel can push them to local guests at once (DEF-107). `None` = no
+    /// subscriber; records are still applied to the graph.
+    placement_change_tx: Option<mpsc::UnboundedSender<crate::placement_sync::PlacementChange>>,
     /// Shared snapshot of this hotel's current guest+agent roster. Written by aiua
     /// whenever the roster changes; read by the beacon to include in anchor handshakes.
     pub local_hotel_state: Arc<RwLock<Option<HotelStateSyncPayload>>>,
@@ -92,8 +96,18 @@ impl BeaconDaemon {
             inbox_tx,
             nonce_tracker,
             enable_rust_auth,
+            placement_change_tx: None,
             local_hotel_state: Arc::new(RwLock::new(None)),
         })
+    }
+    /// Report newly applied gossiped placement records (role homes,
+    /// transport homes) on `tx` so the hotel can push them to local guests.
+    pub fn with_placement_change_tx(
+        mut self,
+        tx: Option<mpsc::UnboundedSender<crate::placement_sync::PlacementChange>>,
+    ) -> Self {
+        self.placement_change_tx = tx;
+        self
     }
     pub fn socket(&self) -> Arc<UdpSocket> {
         self.socket.clone()
@@ -421,18 +435,24 @@ impl BeaconDaemon {
                         }
                         // Placement is graph truth every hotel must agree on
                         // (DEF-107): apply newer role/transport homes, LWW.
-                        let (role_homes_applied, transport_homes_applied) =
-                            crate::placement_sync::apply_remote_placement(
-                                &self.graph,
-                                &payload.node_id,
-                                &payload.role_homes,
-                                &payload.transport_homes,
-                            );
-                        if role_homes_applied + transport_homes_applied > 0 {
+                        let applied = crate::placement_sync::apply_remote_placement(
+                            &self.graph,
+                            &payload.node_id,
+                            &payload.role_homes,
+                            &payload.transport_homes,
+                        );
+                        if !applied.is_empty() {
                             info!(
                                 "Hotel state sync from {}: applied {} role home(s), {} transport home(s)",
-                                payload.node_id, role_homes_applied, transport_homes_applied
+                                payload.node_id,
+                                applied.role_homes.len(),
+                                applied.transport_homes.len()
                             );
+                            if let Some(tx) = &self.placement_change_tx {
+                                for change in applied.into_changes() {
+                                    let _ = tx.send(change);
+                                }
+                            }
                         }
                         info!(
                             "Hotel state sync from {} ({}): {} guests, {} agents, {} model profiles",

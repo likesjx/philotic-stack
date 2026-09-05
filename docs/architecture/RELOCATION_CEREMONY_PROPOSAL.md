@@ -66,10 +66,13 @@ ceremony that closes the gap.
 
 ## Disposition
 
-`accepted-current-slice` (2026-09-05). **R1 test-green** on `codex/relocation-r1`: placement
+`accepted-current-slice` (2026-09-05). **R1 test-green** (merged, PR #488): placement
 stamps on both home record kinds, reseed preserves `home_node` (DEF-106), runtime
 homes gossip in `HotelStateSync` with last-writer-wins apply (`placement_sync`).
-R2 onward not started. The first concrete relocation
+**R2 test-green** on `codex/relocation-r2`: `TransportHomeChanged` push on local and
+gossiped home changes; Telegram seat `Standby` state, stop-now, release-next-tick,
+immediate re-probe when the home moves here (DEF-107). R3 onward not started.
+The first concrete relocation
 this ceremony must carry is moving every orchestrator incarnation (Bjork, Coach,
 Mac on `mac-jane`; Astrid, Ariel, Jane, Aria on `mbp-jane`) to `vps-jane`, with
 Mac-bound specialists (Architect and anything holding `bash.exec`, desktop, ONNX
@@ -196,7 +199,7 @@ uselessness.
 |---|---|---|---|
 | **R0** Tenet and rules | This proposal; `materialization-anywhere-anytime` and `graph-truth-outlives-config-seed` in `ARCH_RULES.md`; glossary terms | — | docs |
 | **R1** Graph truth outlives seed | **test-green 2026-09-05.** `seed_orchestrator_roles` and `role.configure` preserve `home_node` + a placement stamp; runtime-stamped role homes and `membrane_transport_home` records ride `HotelStateSync` and peers apply last-writer-wins (`placement_sync`); home changes mark hotel state dirty so they gossip at once | G1, G6 | test-green ✓; smoke pending: restart origin, home survives |
-| **R2** Membrane standby and push stand-down | every membrane startup path exposes standby before acting; `TransportHomeChanged` mesh event; old poller stands down on receipt; standby acquires within one lease tick | G7 | watched-live: move Beacon's token vps ↔ mac and back with no dropped message |
+| **R2** Membrane standby and push stand-down | **test-green 2026-09-05.** Hotel pushes `IpcResponse::TransportHomeChanged` to local guests on a local `transport.set_home` and on a gossiped record applied by `placement_sync`; the Telegram seat has an explicit `Standby` state, stops polling at once when the home moves away, releases the lease on the next tick, and re-probes on the next 20 s lease tick when the home moves here. Discord/desktop/MCP standby pending | G7 | test-green ✓; watched-live pending: Beacon's token vps ↔ mac with no dropped message |
 | **R3** Remote materialization request/ready | `materialize.request` / `materialize.ready` on the TCP execution plane carrying component template refs, `agent_identity`, role and toolset records, transport-home standby; target resolves binaries (Guest Binary Resolution), admits, spawns, reports | G2, G3 | test-green on two local hotels; smoke mac ↔ mbp |
 | **R4** Feasibility and placement | offer/decline with reasons: binary resolvable, secret refs present, controller resources present, `NodeHealthSnapshot` headroom, `max_concurrent_jobs`, version compatibility; `best_place_to_run` consumes the same checks | G8, G9 (readiness half) | test-green |
 | **R5** Continuity transfer | export session snapshot + checkpoint + dialogue window + apartment as an authenticated blob; import on target before switch. Requires blob-plane auth and mesh-interface bind (DEF-104 follow-on). Until then the ceremony runs in a declared degraded mode carrying only the `HandoffBundle` | G5 | smoke: in-flight parked turn survives a move |
