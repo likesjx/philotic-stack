@@ -168,6 +168,14 @@ This registry makes the seam layer explicit without forcing every task bullet to
 | `prompt-guard-scan` | `tooling-execution` | [SELF_IMPROVEMENT_LOOP_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/SELF_IMPROVEMENT_LOOP_PROPOSAL.md) | proposed | `docs/task.md` → `New Project: Self-Improvement Loop` |
 | `cron-continuity` | `runtime-sessions` | [SELF_IMPROVEMENT_LOOP_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/SELF_IMPROVEMENT_LOOP_PROPOSAL.md) | proposed | `docs/task.md` → `New Project: Self-Improvement Loop` |
 | `session-search-fts` | `memory-context` | [SELF_IMPROVEMENT_LOOP_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/SELF_IMPROVEMENT_LOOP_PROPOSAL.md) | proposed | `docs/task.md` → `New Project: Self-Improvement Loop` |
+| `cypher-classifier-wall` | `memory-context` | [GRAPH_DOORS_AND_LIFE_CORE_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/GRAPH_DOORS_AND_LIFE_CORE_PROPOSAL.md) | proposed | `docs/task.md` → `New Project: Graph Doors and Life Core` |
+| `graph-registry-containers` | `memory-context` | [GRAPH_DOORS_AND_LIFE_CORE_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/GRAPH_DOORS_AND_LIFE_CORE_PROPOSAL.md) | proposed | `docs/task.md` → `New Project: Graph Doors and Life Core` |
+| `graph-door-query` | `memory-context` | [GRAPH_DOORS_AND_LIFE_CORE_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/GRAPH_DOORS_AND_LIFE_CORE_PROPOSAL.md) | proposed | `docs/task.md` → `New Project: Graph Doors and Life Core` |
+| `graph-door-mutate` | `memory-context` | [GRAPH_DOORS_AND_LIFE_CORE_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/GRAPH_DOORS_AND_LIFE_CORE_PROPOSAL.md) | proposed | `docs/task.md` → `New Project: Graph Doors and Life Core` |
+| `graph-door-analyze` | `memory-context` | [GRAPH_DOORS_AND_LIFE_CORE_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/GRAPH_DOORS_AND_LIFE_CORE_PROPOSAL.md) | proposed | `docs/task.md` → `New Project: Graph Doors and Life Core` |
+| `graph-door-admin` | `operator-control-plane` | [GRAPH_DOORS_AND_LIFE_CORE_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/GRAPH_DOORS_AND_LIFE_CORE_PROPOSAL.md) | proposed | `docs/task.md` → `New Project: Graph Doors and Life Core` |
+| `life-core-layer` | `memory-context` | [GRAPH_DOORS_AND_LIFE_CORE_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/GRAPH_DOORS_AND_LIFE_CORE_PROPOSAL.md) | proposed | `docs/task.md` → `New Project: Graph Doors and Life Core` |
+| `skill-guidance-cypher` | `tooling-execution` | [GRAPH_DOORS_AND_LIFE_CORE_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/GRAPH_DOORS_AND_LIFE_CORE_PROPOSAL.md) | proposed | `docs/task.md` → `New Project: Graph Doors and Life Core` |
 
 ## Usage Rule
 
