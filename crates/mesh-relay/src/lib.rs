@@ -11,6 +11,7 @@
 //! See [`protocol`] for the trust model.
 
 pub mod protocol;
+pub mod quic;
 pub mod transport;
 
 /// Resolves a mesh node's **published** ed25519 member public key (base64url),
