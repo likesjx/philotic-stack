@@ -1930,14 +1930,14 @@ Order: L5 → L1 → L2, then L3/L4/L6/L7 independently.
 
 ## New Project: MCP Endpoint Steward
 
-Skill: [skills/mcp-endpoint-steward/SKILL.md](/Users/jaredlikes/code/philotic-stack/skills/mcp-endpoint-steward/SKILL.md) (`mcp.endpoint_steward`, seeded 2026-09-05). Amends `mcp-membrane-gateway` (deterministic-first dispatch for philote targets) and closes DEF-106. Related: `mcp-membrane-hardening` (H1–H4 landed; S4 identity check already enforced at `ProvisionMcpEndpoint`).
+Skill: [skills/mcp-endpoint-steward/SKILL.md](/Users/jaredlikes/code/philotic-stack/skills/mcp-endpoint-steward/SKILL.md) (`mcp.endpoint_steward`, seeded 2026-09-05). Amends `mcp-membrane-gateway` (deterministic-first dispatch for philote targets) and closes DEF-109. Related: `mcp-membrane-hardening` (H1–H4 landed; S4 identity check already enforced at `ProvisionMcpEndpoint`).
 
 Goal: any philote can safely put an MCP endpoint in front of itself and answer inbound `tools/call` requests deterministically first, by model inference only as the declared fallback.
 
 - [x] Shared contract: `McpToolSpec.handler` → `McpHandlerPolicy { validate_input, steps: [static | reflex(echo|memory.recall|memory.capture, args template, escalate_on_empty)], fallback: model{instructions} | error{message} }`; `McpHandlerPolicy::validate()` (closed reflex list, non-empty error message) — **test-green** (`ansible-mesh-core` 346/346).
 - [x] membrane-mcp forwards `handler`, `input_schema`, and raw `args` in `raw_transport` for philote-targeted calls — **test-green** (`tools_call_forwards_handler_policy_schema_and_args_to_philote`, membrane-mcp 28/28).
 - [x] `send_error` reply → `OutboundReply::Error` → `isError: true` tool result (previously philote errors could only surface as successful text) — **test-green** (membrane 16/16).
-- [x] philote `mcp_ingress` (parse config + legacy shapes, JSON-Schema `required`/`type`/`enum` validation, `${payload.x}` templating, model-fallback prompt) — **test-green** (7/7); `mcp_handling` ladder runs before `handle_user_message`; reflexes skipped on approval-gated calls; `context.capture` uses the shared parser (DEF-106).
+- [x] philote `mcp_ingress` (parse config + legacy shapes, JSON-Schema `required`/`type`/`enum` validation, `${payload.x}` templating, model-fallback prompt) — **test-green** (7/7); `mcp_handling` ladder runs before `handle_user_message`; reflexes skipped on approval-gated calls; `context.capture` uses the shared parser (DEF-109).
 - [x] Provision-time policy validation on both sides (`mcp.provision` handler in philote, `ProvisionMcpEndpoint` in aiua → `INVALID_HANDLER_POLICY`).
 - [x] Skill: `mcp.endpoint_steward` seeded (`seed_abstract_skill_catalog`), in `tools_for_skill` + keyword gate, on-demand for `orchestrator`, `admin`, `architect`; other roles via `skill.assign`. `mcp.provision` schema documents `handler`.
 - [ ] Smoke: provision a loopback endpoint with a static tool, a `memory.recall` tool with `escalate_on_empty`, and an `error` fallback; prove (a) malformed args → `isError` with no turn in `session.status`, (b) static answers without a model call, (c) empty recall escalates to exactly one model turn — **smoke-green** target.

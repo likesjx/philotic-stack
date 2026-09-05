@@ -43,22 +43,22 @@ impl AgentRuntime {
         let policy = call.policy.clone().unwrap_or_default();
         let has_policy = call.policy.is_some();
 
-        if policy.validate_input {
-            if let Err(msg) = mcp_ingress::validate_args(&call.input_schema, &call.args) {
-                info!(
-                    tool = %call.tool,
-                    turn_id = ?task.turn_id,
-                    reason = %msg,
-                    "MCP call rejected deterministically (schema)"
-                );
-                return self
-                    .emit_mcp_error(
-                        &task,
-                        task_id,
-                        format!("invalid arguments for '{}': {msg}", call.tool),
-                    )
-                    .await;
-            }
+        if policy.validate_input
+            && let Err(msg) = mcp_ingress::validate_args(&call.input_schema, &call.args)
+        {
+            info!(
+                tool = %call.tool,
+                turn_id = ?task.turn_id,
+                reason = %msg,
+                "MCP call rejected deterministically (schema)"
+            );
+            return self
+                .emit_mcp_error(
+                    &task,
+                    task_id,
+                    format!("invalid arguments for '{}': {msg}", call.tool),
+                )
+                .await;
         }
 
         for (idx, step) in policy.steps.iter().enumerate() {
@@ -242,10 +242,7 @@ impl AgentRuntime {
 
     fn mcp_reply_route(&self, task: &InboundTaskPayload, task_id: Uuid) -> McpReplyRoute {
         McpReplyRoute {
-            final_reply_to: task
-                .final_reply_to
-                .clone()
-                .unwrap_or_else(|| local_node_id()),
+            final_reply_to: task.final_reply_to.clone().unwrap_or_else(local_node_id),
             final_reply_role: task
                 .final_reply_role
                 .clone()

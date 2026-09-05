@@ -1601,7 +1601,7 @@ impl AgentRuntime {
         // Legacy route-table endpoints send {"tool": "context.capture",
         // "args": {...}}; config-driven endpoints send {"action":
         // "context.capture", "payload": {...}} plus the raw args in
-        // raw_transport_event. Accept both (DEF-106).
+        // raw_transport_event. Accept both (DEF-109).
         let args: serde_json::Value = crate::mcp_ingress::extract_args(&task);
 
         let capture_text = args

@@ -65,21 +65,21 @@ fn content_json(task: &InboundTaskPayload) -> Option<Value> {
 /// `content.payload`; legacy route-table endpoints put the raw args under
 /// `content.args`. Returns an empty object when neither is present.
 pub fn extract_args(task: &InboundTaskPayload) -> Value {
-    if let Some(args) = raw(task).and_then(|r| r.get("args")) {
-        if args.is_object() {
-            return args.clone();
-        }
+    if let Some(args) = raw(task).and_then(|r| r.get("args"))
+        && args.is_object()
+    {
+        return args.clone();
     }
     let content = content_json(task).unwrap_or(Value::Null);
-    if let Some(payload) = content.get("payload") {
-        if payload.is_object() {
-            return payload.clone();
-        }
+    if let Some(payload) = content.get("payload")
+        && payload.is_object()
+    {
+        return payload.clone();
     }
-    if let Some(args) = content.get("args") {
-        if args.is_object() {
-            return args.clone();
-        }
+    if let Some(args) = content.get("args")
+        && args.is_object()
+    {
+        return args.clone();
     }
     Value::Object(Map::new())
 }
@@ -201,10 +201,10 @@ pub fn validate_args(schema: &Value, args: &Value) -> Result<(), String> {
                     "argument '{key}' has the wrong type (expected {expected})"
                 ));
             }
-            if let Some(allowed) = prop.get("enum").and_then(Value::as_array) {
-                if !allowed.contains(value) {
-                    return Err(format!("argument '{key}' is not one of the allowed values"));
-                }
+            if let Some(allowed) = prop.get("enum").and_then(Value::as_array)
+                && !allowed.contains(value)
+            {
+                return Err(format!("argument '{key}' is not one of the allowed values"));
             }
         }
     }
@@ -251,14 +251,14 @@ pub fn render_template(template: &Value, payload: &Value) -> Value {
 
 fn render_string(s: &str, payload: &Value) -> Value {
     // Whole-value substitution keeps the JSON type of the referenced field.
-    if let Some(inner) = s.strip_prefix("${").and_then(|r| r.strip_suffix('}')) {
-        if !inner.contains("${") {
-            if inner == "payload" {
-                return payload.clone();
-            }
-            if let Some(path) = inner.strip_prefix("payload.") {
-                return dot_path(payload, path).cloned().unwrap_or(Value::Null);
-            }
+    if let Some(inner) = s.strip_prefix("${").and_then(|r| r.strip_suffix('}'))
+        && !inner.contains("${")
+    {
+        if inner == "payload" {
+            return payload.clone();
+        }
+        if let Some(path) = inner.strip_prefix("payload.") {
+            return dot_path(payload, path).cloned().unwrap_or(Value::Null);
         }
     }
 
