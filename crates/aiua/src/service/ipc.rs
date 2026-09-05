@@ -3328,6 +3328,17 @@ impl IpcServer {
                                 let _ = tx.try_send(());
                             }
                         }
+                        // A placement change (role home / transport home) is graph
+                        // truth peers must learn NOW, not on the next roster change
+                        // (DEF-107): mark hotel state dirty so the next sync carries it.
+                        if matches!(
+                            response,
+                            IpcResponse::RoleHomeSet { .. } | IpcResponse::TransportHomeSet { .. }
+                        ) {
+                            if let Some(ref tx) = hotel_state_dirty_tx {
+                                let _ = tx.try_send(());
+                            }
+                        }
                         let _ = outbound_tx.send(response);
                         for follow_up in follow_up_responses {
                             let _ = outbound_tx.send(follow_up);
@@ -6630,6 +6641,7 @@ impl IpcServer {
                     },
                     failover_policy: "manual-or-explicit-delegation".to_string(),
                     status: MembraneTransportHomeStatus::Active,
+                    updated_unix: ansible_mesh_core::graph::placement_stamp_now(),
                 };
 
                 if let Err(err) = graph.upsert_membrane_transport_home(&home) {

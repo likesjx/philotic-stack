@@ -681,6 +681,13 @@ pub struct RoleIncarnationRecord {
     /// materializing locally. When `None`, the role runs on the authority hotel.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub home_node: Option<String>,
+    /// Unix-seconds stamp of the last placement (`home_node`) change. Peers
+    /// apply a gossiped home only when this is strictly newer than their own
+    /// copy (last-writer-wins, see `placement_sync`), so a stale hotel cannot
+    /// flip a relocation back. `0` = never placed at runtime (seed default);
+    /// zero-stamped homes never travel.
+    #[serde(default)]
+    pub placement_updated_unix: u64,
 }
 
 impl Default for RoleIncarnationRecord {
@@ -703,6 +710,7 @@ impl Default for RoleIncarnationRecord {
             inactive_ttl_seconds: None,
             turn_loop_config: TurnLoopConfig::default(),
             home_node: None,
+            placement_updated_unix: 0,
         }
     }
 }
@@ -790,6 +798,21 @@ pub struct MembraneTransportHomeRecord {
     pub failover_policy: String,
     #[serde(default)]
     pub status: MembraneTransportHomeStatus,
+    /// Unix-seconds stamp of the last placement change. Same last-writer-wins
+    /// contract as [`RoleIncarnationRecord::placement_updated_unix`]: peers apply
+    /// a gossiped record only when strictly newer; `0` never travels.
+    #[serde(default)]
+    pub updated_unix: u64,
+}
+
+/// Current unix seconds, for stamping placement changes on
+/// [`RoleIncarnationRecord`] and [`MembraneTransportHomeRecord`].
+pub fn placement_stamp_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+        .max(1)
 }
 
 impl MembraneTransportHomeRecord {

@@ -34,6 +34,7 @@ pub mod model_catalog_discovery;
 pub mod model_manager;
 pub mod model_oracle;
 pub mod model_routing;
+pub mod placement_sync;
 pub mod provenance;
 pub mod provider_keys;
 pub mod registry;
