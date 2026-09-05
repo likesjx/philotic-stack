@@ -1928,6 +1928,21 @@ Order: L5 → L1 → L2, then L3/L4/L6/L7 independently.
 - [ ] L6 cron `continuity` + `cron_scratch` node injected as `[Previous run]` — watched-live on the vps Chronos check-in
 - [ ] L7 `session_turn_fts` FTS5 table + `SearchSessionTurns` IPC + `session.search` tool — smoke-green on vps-jane Beacon history
 
+## New Project: Graph Doors and Life Core
+
+Proposal: [docs/architecture/GRAPH_DOORS_AND_LIFE_CORE_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/GRAPH_DOORS_AND_LIFE_CORE_PROPOSAL.md) (proposed 2026-09-05; operator decisions: tiered doors, 100% Cypher + MAGE, mutations only through the writing door, admin door, containers per graph class, Life is core).
+
+Order: G0 → G1 → G2 → G3 → G6 → G4 → G5 → G7.
+
+- [ ] G0 `graph_registry` node kind + seed (`life`, `agents`, `sandbox`); vps-jane compose split into three Memgraph services (life keeps its volume, MAGE image); provider resolves endpoint by graph id — smoke-green: `life` answers with the same node count after the split
+- [ ] G1 `crates/cypher-guard` classifier wall (read / algorithm / mutation / admin / refused), destructive-shape floor, ≥100-statement corpus, wired ahead of every Bolt call
+- [ ] G2 `graph.query` on the wall with bounds + forced LIMIT; `life.query` with ontology injection; Bjork's `music.practice-log` + rewritten `music.weekly-practice-review` on `virtuosa`/`orchestrator`; Beacon rule reduced to "whisper Bjork's virtuosa" — watched-live: Beacon whisper → Bjork Event in Memgraph → her review's `life.query` returns it
+- [ ] G3 `graph.mutate` (dry run, provenance stamps, audit + reversal hint, destructive floor); `life.observe`/`commit`/`resolve`/`patch` re-based; lane `graph.mutate` ConfirmFirst per graph
+- [ ] G6 `AbstractSkillRecord.guidance` + register/patch args + rendering + prompt-guard scan; distill brief may fill it
+- [ ] G4 `graph.analyze` MAGE allowlist + lane budget; `life.analyze`
+- [ ] G5 `graph.admin` under the unconditional operator gate
+- [ ] G7 life-graph-runner consumes the Layer 1 provider
+
 ## New Project: Agent-Initiated Relocation
 
 Proposal: [docs/architecture/RELOCATION_CEREMONY_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/RELOCATION_CEREMONY_PROPOSAL.md) (proposed 2026-09-05). Seam IDs: `relocation-ceremony`, `graph-truth-over-seed`, `remote-materialization-ceremony`, `membrane-transport-home`.
