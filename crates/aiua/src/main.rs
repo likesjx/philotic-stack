@@ -9021,6 +9021,9 @@ async fn main() -> Result<()> {
     let ipc_delivery_claims = crate::service::ipc::new_delivery_claim_registry();
     let network_broadcast_tx = ipc_server.network_broadcast_tx();
     let perimeter_broadcast_tx = network_broadcast_tx.clone();
+    // Placement-change push (R2, DEF-107) — cloned before the network monitor
+    // task below takes ownership of `network_broadcast_tx`.
+    let placement_push_tx = network_broadcast_tx.clone();
 
     tokio::spawn(async move {
         if let Err(e) = ipc_server.run().await {
@@ -9152,6 +9155,50 @@ async fn main() -> Result<()> {
         shutdown_rx.resubscribe(),
     ));
 
+    // R2 (DEF-107): a transport home applied from mesh gossip is pushed to
+    // local guests immediately, so a membrane seat on the new home probes on
+    // its next lease tick and the seat on the old home stops polling now —
+    // instead of waiting for a lease denial plus a 180 s re-probe.
+    let (placement_change_tx, mut placement_change_rx) = tokio::sync::mpsc::unbounded_channel::<
+        ansible_mesh_core::placement_sync::PlacementChange,
+    >();
+    {
+        use ansible_mesh_core::placement_sync::PlacementChange;
+        let push_tx = placement_push_tx;
+        let push_hotel_name = hotel_name.clone();
+        let mut push_shutdown = shutdown_tx.subscribe();
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    Some(change) = placement_change_rx.recv() => {
+                        if let PlacementChange::TransportHome(home) = change {
+                            let hotel_is_home = home.is_active_home(&push_hotel_name);
+                            info!(
+                                agent_id = %home.agent_id,
+                                transport = %home.transport,
+                                resource_ref = %home.resource_ref,
+                                active_home_hotel = %home.active_home_hotel,
+                                hotel_is_home,
+                                "Transport home changed via mesh gossip — pushing TransportHomeChanged to local guests"
+                            );
+                            let _ = push_tx.send(IpcResponse::TransportHomeChanged {
+                                transport_home_changed: true,
+                                agent_id: home.agent_id,
+                                transport: home.transport,
+                                resource_ref: home.resource_ref,
+                                active_home_hotel: home.active_home_hotel,
+                                standby_hotels: home.standby_hotels,
+                                updated_unix: home.updated_unix,
+                                hotel_is_home,
+                            });
+                        }
+                    }
+                    _ = push_shutdown.recv() => break,
+                }
+            }
+        });
+    }
+
     let mesh_runtime = MeshRuntimeContext {
         hotel_name: hotel_name.clone(),
         hotel: hotel.clone(),
@@ -9178,6 +9225,7 @@ async fn main() -> Result<()> {
         perimeter_svc: perimeter_svc.clone(),
         ipc_operator_surface_tx: Some(inbound_operator_surface_tx),
         local_hotel_state: local_hotel_state.clone(),
+        placement_change_tx: Some(placement_change_tx),
     };
 
     if let Err(e) = activate_mesh_runtime(mesh_runtime.clone()).await {
