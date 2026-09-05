@@ -66,7 +66,7 @@ Approval-gated calls (no matching `preapproval_rules` entry) still get schema va
 
 1. **Audit** — `mcp.status` for every endpoint you already own. Do not create a second endpoint for the same client; re-provision the existing `endpoint_id` instead (the hotel rejects a takeover of someone else's).
 2. **Design the surface** — one endpoint per authority level (`perplexity-memory` and `lifegraph-readonly` are separate on purpose). For each tool decide:
-   - **Target.** Reads and writes that a runner owns go to `{kind:"datasource"}` or `{kind:"tool"}`; those never reach your cognitive loop. Only tools that genuinely need you get `{kind:"philote", agent_id:<you>}`.
+   - **Target.** Reads and writes that a runner owns go to `{kind:"datasource"}` or `{kind:"tool"}`; those never reach your cognitive loop. Only tools that genuinely need you get `{kind:"philote", agent_id:<you>}`. Use your materialized guest id (`agent-x:orchestrator`) when you want a specific incarnation; a bare agent id (`agent-x`) resolves to that agent's orchestrator incarnation. A philote target always reaches exactly one philote (DEF-110).
    - **Schema.** Declare `required` and `type` for every argument. The philote enforces them; a caller that violates the schema gets an `isError` result and no model turn.
    - **Handler policy** (philote targets only). Start with `validate_input: true`, then:
      - `static` for anything known at provisioning time (health, capability descriptor, fixed lookups),

@@ -147,7 +147,7 @@ impl MembraneRuntime {
 
                     // Inbound from guest → forward to hotel.
                     Some(envelope) = inbound_rx.recv() => {
-                        if let Err(e) = dispatch_inbound(&mut client, envelope).await {
+                        if let Err(e) = dispatch_inbound(&mut client, envelope, &self.node_id).await {
                             if philotic_client::is_ipc_disconnect(&e) {
                                 warn!("IPC disconnect while dispatching inbound");
                                 break true;
@@ -223,21 +223,35 @@ impl MembraneRuntime {
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-/// Forward an inbound envelope to the hotel as a `CreateTask` (local) or
-/// `EmitTask` (cross-hotel when `raw_transport.target_node` is set).
+/// Forward an inbound envelope to the hotel as a `CreateTask` (local role
+/// broadcast), or `EmitTask` (cross-hotel when `raw_transport.target_node` is
+/// set, or pinned to one local guest when the target names a philote).
 ///
 /// Maps `InboundEnvelope` fields to the field names that philote's
 /// `InboundTaskPayload` expects. The two structs serve different layers
 /// (protocol-agnostic vs. philote-specific) so names don't match directly.
-async fn dispatch_inbound(client: &mut PhiloticClient, envelope: InboundEnvelope) -> Result<()> {
-    let req = build_inbound_request(&envelope);
+async fn dispatch_inbound(
+    client: &mut PhiloticClient,
+    envelope: InboundEnvelope,
+    local_node_id: &str,
+) -> Result<()> {
+    let req = build_inbound_request(&envelope, local_node_id);
     client.send_request(req).await?;
     Ok(())
 }
 
 /// Build the IPC request for an inbound envelope. Pure so variants can unit-test
 /// their dispatch payload shape without a live IPC connection.
-fn build_inbound_request(envelope: &InboundEnvelope) -> philotic_client::IpcRequest {
+///
+/// `local_node_id` is this membrane's hotel: a philote-targeted envelope with
+/// no explicit `target_node` is emitted to it with the guest id pinned, because
+/// `CreateTask` is a ROLE broadcast — every `agent` guest on the hotel receives
+/// it. Live 2026-09-05 an MCP `tools/call` aimed at one agent was answered by
+/// all eight philotes on mac-jane and the first reply (a different agent's) won.
+fn build_inbound_request(
+    envelope: &InboundEnvelope,
+    local_node_id: &str,
+) -> philotic_client::IpcRequest {
     use philotic_client::IpcRequest;
 
     // Extract transport hint from raw_transport metadata.
@@ -311,6 +325,15 @@ fn build_inbound_request(envelope: &InboundEnvelope) -> philotic_client::IpcRequ
         // Route to a specific node (possibly the local one) via mesh dispatch.
         IpcRequest::EmitTask {
             target_node: node,
+            target_role,
+            target_guest_id,
+            task_json: payload.to_string(),
+        }
+    } else if target_kind == Some("philote") && target_guest_id.is_some() {
+        // Pinned local philote: the hotel filters inbox subscribers by guest
+        // id only on the EmitTask path, so address this hotel explicitly.
+        IpcRequest::EmitTask {
+            target_node: local_node_id.to_string(),
             target_role,
             target_guest_id,
             task_json: payload.to_string(),
@@ -566,7 +589,7 @@ mod tests {
         .cloned()
         .unwrap();
 
-        let req = build_inbound_request(&envelope);
+        let req = build_inbound_request(&envelope, "local-test-node");
         let IpcRequest::EmitTask {
             target_node,
             target_role,
@@ -599,7 +622,7 @@ mod tests {
         let mut envelope = mcp_datasource_envelope();
         envelope.raw_transport = serde_json::json!({ "transport": "mcp" });
 
-        let req = build_inbound_request(&envelope);
+        let req = build_inbound_request(&envelope, "local-test-node");
         let IpcRequest::CreateTask {
             target_role,
             payload,
@@ -610,5 +633,54 @@ mod tests {
         assert_eq!(target_role, "agent");
         assert_eq!(payload["transport"], "mcp");
         assert_eq!(payload["requires_approval"], false);
+    }
+
+    #[test]
+    fn philote_target_without_node_is_pinned_to_local_guest_via_emit_task() {
+        use philotic_client::IpcRequest;
+
+        let mut envelope = mcp_datasource_envelope();
+        envelope.raw_transport = serde_json::json!({
+            "transport": "mcp",
+            "tool": "ping",
+            "target_kind": "philote",
+            "target_id": "agent-bjork-01:orchestrator",
+        });
+
+        let req = build_inbound_request(&envelope, "mac-jane-aiua-01");
+        let IpcRequest::EmitTask {
+            target_node,
+            target_role,
+            target_guest_id,
+            task_json,
+        } = req
+        else {
+            panic!("expected pinned EmitTask, got {req:?}");
+        };
+        assert_eq!(target_node, "mac-jane-aiua-01");
+        assert_eq!(target_role, "agent");
+        assert_eq!(
+            target_guest_id.as_deref(),
+            Some("agent-bjork-01:orchestrator")
+        );
+        let payload: serde_json::Value = serde_json::from_str(&task_json).unwrap();
+        assert_eq!(payload["raw_transport_event"]["tool"], "ping");
+    }
+
+    #[test]
+    fn tool_target_without_node_keeps_role_broadcast() {
+        use philotic_client::IpcRequest;
+
+        let mut envelope = mcp_datasource_envelope();
+        envelope.raw_transport = serde_json::json!({
+            "transport": "mcp",
+            "target_kind": "tool",
+            "target_id": "bash.exec@1",
+        });
+        let req = build_inbound_request(&envelope, "mac-jane-aiua-01");
+        assert!(
+            matches!(req, IpcRequest::CreateTask { ref target_role, .. } if target_role == "tool-runner"),
+            "tool targets are not guest ids and must stay a role dispatch: {req:?}"
+        );
     }
 }
