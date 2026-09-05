@@ -2175,6 +2175,7 @@ mod tests {
                 lease_type: "telegram_poll".into(),
                 failover_policy: "manual-or-explicit-delegation".into(),
                 status: MembraneTransportHomeStatus::Active,
+                updated_unix: 0,
             })
             .expect("seed transport home");
         let server = IpcServer::new(socket_path.clone(), "local-aiua-01", dispatcher_tx, graph);

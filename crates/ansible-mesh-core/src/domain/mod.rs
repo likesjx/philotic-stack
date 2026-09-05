@@ -2737,6 +2737,7 @@ mod tests {
             lease_type: "telegram_poll".to_string(),
             failover_policy: "manual-or-explicit-delegation".to_string(),
             status: crate::graph::MembraneTransportHomeStatus::Active,
+            updated_unix: 0,
         };
 
         d.upsert_membrane_transport_home(&home).unwrap();
@@ -2802,6 +2803,7 @@ mod tests {
             lease_type: "telegram_poll".to_string(),
             failover_policy: "manual-or-explicit-delegation".to_string(),
             status: crate::graph::MembraneTransportHomeStatus::Active,
+            updated_unix: 0,
         })
         .unwrap();
 

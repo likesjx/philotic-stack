@@ -1,5 +1,5 @@
 use crate::authz::MeshAuth;
-use crate::graph::ModelProfileRecord;
+use crate::graph::{MembraneTransportHomeRecord, ModelProfileRecord};
 use crate::registry::{CapabilityAdvertisement, ExecutionReachability};
 use crate::{BeaconMessage, MsgType, NodeCapabilities, NodeHealthSnapshot};
 use anyhow::Result;
@@ -81,6 +81,18 @@ pub struct HotelStateSyncAgent {
     pub persona_name: String,
 }
 
+/// One runtime-placed role home in a [`HotelStateSyncPayload`]. Only roles
+/// with a non-zero `placement_updated_unix` are gossiped; receivers apply
+/// last-writer-wins onto role records they already hold (`placement_sync`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct HotelStateSyncRoleHome {
+    pub agent_id: String,
+    pub role_name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub home_node: Option<String>,
+    pub placement_updated_unix: u64,
+}
+
 /// Payload for `MsgType::HotelStateSync`.
 /// Broadcast whenever a hotel's routable state changes so every peer on the mesh
 /// can route to any agent/model without querying the authority hotel.
@@ -92,6 +104,14 @@ pub struct HotelStateSyncPayload {
     pub agents: Vec<HotelStateSyncAgent>,
     #[serde(default)]
     pub model_profiles: Vec<ModelProfileRecord>,
+    /// Runtime role placements (graph truth), so every hotel agrees who is
+    /// home for a role. Rides every chunk like the roster.
+    #[serde(default)]
+    pub role_homes: Vec<HotelStateSyncRoleHome>,
+    /// Runtime transport placements (Telegram poll authority etc.). Rides
+    /// every chunk like the roster.
+    #[serde(default)]
+    pub transport_homes: Vec<MembraneTransportHomeRecord>,
 }
 
 /// Emits a `HotelStateSync` to a target carrying the sender's current routable state.
@@ -168,6 +188,8 @@ fn chunk_hotel_state_payloads(
         guests: payload.guests.clone(),
         agents: payload.agents.clone(),
         model_profiles,
+        role_homes: payload.role_homes.clone(),
+        transport_homes: payload.transport_homes.clone(),
     };
 
     let base_len = hotel_state_wire_len(&with_profiles(Vec::new()))?;
@@ -479,6 +501,8 @@ mod tests {
             hotel_name: "aria".into(),
             guests: Vec::new(),
             agents: Vec::new(),
+            role_homes: Vec::new(),
+            transport_homes: Vec::new(),
             model_profiles: vec![ModelProfileRecord {
                 model_ref: "openrouter".into(),
                 node_id: "aria-node".into(),
@@ -552,6 +576,8 @@ mod tests {
         HotelStateSyncPayload {
             node_id: "mbp-jane-aiua-01".into(),
             hotel_name: "mbp-jane".into(),
+            role_homes: Vec::new(),
+            transport_homes: Vec::new(),
             guests: (0..20)
                 .map(|ix| HotelStateSyncGuest {
                     guest_id: format!("mbp-jane:model-controller-openrouter-{ix}"),

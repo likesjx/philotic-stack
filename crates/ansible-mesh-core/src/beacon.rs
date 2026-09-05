@@ -419,6 +419,21 @@ impl BeaconDaemon {
                                 replicated_profiles += 1;
                             }
                         }
+                        // Placement is graph truth every hotel must agree on
+                        // (DEF-107): apply newer role/transport homes, LWW.
+                        let (role_homes_applied, transport_homes_applied) =
+                            crate::placement_sync::apply_remote_placement(
+                                &self.graph,
+                                &payload.node_id,
+                                &payload.role_homes,
+                                &payload.transport_homes,
+                            );
+                        if role_homes_applied + transport_homes_applied > 0 {
+                            info!(
+                                "Hotel state sync from {}: applied {} role home(s), {} transport home(s)",
+                                payload.node_id, role_homes_applied, transport_homes_applied
+                            );
+                        }
                         info!(
                             "Hotel state sync from {} ({}): {} guests, {} agents, {} model profiles",
                             payload.hotel_name,

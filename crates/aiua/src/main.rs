@@ -5882,6 +5882,14 @@ fn seed_orchestrator_roles(graph: &GraphDomain, profiles: &[AgentProfile]) -> an
         let content_policy = mesh_content_policy
             .or_else(|| existing.as_ref().map(|r| r.content_policy.clone()))
             .unwrap_or_else(ansible_mesh_core::graph::default_content_policy);
+        // Placement is graph truth, not seed truth (ARCH rule
+        // `graph-truth-outlives-config-seed`, DEF-106): a runtime `role.set_home`
+        // must survive every restart, so carry the existing home + stamp forward
+        // instead of resetting to `None` on every `aiua load`.
+        let (home_node, placement_updated_unix) = existing
+            .as_ref()
+            .map(|r| (r.home_node.clone(), r.placement_updated_unix))
+            .unwrap_or((None, 0));
         let role_identity_addendum = existing.and_then(|r| r.role_identity_addendum);
 
         let record = ansible_mesh_core::graph::RoleIncarnationRecord {
@@ -5896,7 +5904,8 @@ fn seed_orchestrator_roles(graph: &GraphDomain, profiles: &[AgentProfile]) -> an
             readiness_state: ansible_mesh_core::graph::RoleReadinessState::Configured,
             inactive_ttl_seconds: None,
             turn_loop_config,
-            home_node: None,
+            home_node,
+            placement_updated_unix,
             ..Default::default()
         };
         // Always upsert — the hotel seed is the canonical source for the orchestrator manifest.
@@ -8930,7 +8939,7 @@ async fn main() -> Result<()> {
 
     {
         use ansible_mesh_core::heartbeat::{
-            HotelStateSyncAgent, HotelStateSyncGuest, HotelStateSyncPayload,
+            HotelStateSyncAgent, HotelStateSyncGuest, HotelStateSyncPayload, HotelStateSyncRoleHome,
         };
         let sync_graph = graph_domain_arc.clone();
         let sync_hotel = hotel.clone();
@@ -8971,12 +8980,35 @@ async fn main() -> Result<()> {
                             .into_iter()
                             .filter(|profile| profile.node_id == sync_caps.node_id)
                             .collect();
+                        // Runtime placements are graph truth every peer must share
+                        // (DEF-107). Only runtime-stamped records travel; seed-only
+                        // (zero-stamp) homes stay local.
+                        let role_homes: Vec<HotelStateSyncRoleHome> = sync_graph
+                            .list_all_role_incarnations()
+                            .unwrap_or_default()
+                            .into_iter()
+                            .filter(|r| r.placement_updated_unix > 0)
+                            .map(|r| HotelStateSyncRoleHome {
+                                agent_id: r.agent_id,
+                                role_name: r.role_name,
+                                home_node: r.home_node,
+                                placement_updated_unix: r.placement_updated_unix,
+                            })
+                            .collect();
+                        let transport_homes = sync_graph
+                            .list_membrane_transport_homes(None)
+                            .unwrap_or_default()
+                            .into_iter()
+                            .filter(|h| h.updated_unix > 0)
+                            .collect();
                         let payload = HotelStateSyncPayload {
                             node_id: sync_caps.node_id.clone(),
                             hotel_name: sync_hotel.hotel_name.clone(),
                             guests,
                             agents,
                             model_profiles,
+                            role_homes,
+                            transport_homes,
                         };
                         *sync_state.write().await = Some(payload.clone());
                     }
@@ -11419,6 +11451,40 @@ mod tests {
             reseeded.turn_loop_config.fallback_tiers, jane_turn_loop_config.fallback_tiers,
             "fallback_tiers must survive the same reseed"
         );
+    }
+
+    #[test]
+    fn seed_orchestrator_roles_preserves_runtime_home_node_across_reseed() {
+        // DEF-106: a runtime `role.set_home` (graph truth) must survive the
+        // origin hotel's next `aiua load`, which reseeds every orchestrator.
+        let storage = SqliteGraphStorage::open(":memory:").expect("open sqlite graph");
+        let graph = GraphDomain::new(Arc::new(storage.adapter()));
+        seed_orchestrator_roles(&graph, &[model_bindings_test_profile(None)])
+            .expect("initial seed");
+        let mut relocated = graph
+            .get_role_incarnation("agent-jane", "orchestrator")
+            .expect("get role incarnation")
+            .expect("role exists");
+        assert_eq!(relocated.home_node, None);
+        assert_eq!(relocated.placement_updated_unix, 0);
+        relocated.home_node = Some("vps-jane-aiua-01".to_string());
+        relocated.placement_updated_unix = 1_757_000_000;
+        graph
+            .upsert_role_incarnation(&relocated)
+            .expect("runtime relocation");
+
+        seed_orchestrator_roles(&graph, &[model_bindings_test_profile(None)])
+            .expect("reseed on restart");
+        let reseeded = graph
+            .get_role_incarnation("agent-jane", "orchestrator")
+            .expect("get role incarnation")
+            .expect("role exists");
+        assert_eq!(
+            reseeded.home_node.as_deref(),
+            Some("vps-jane-aiua-01"),
+            "a restart must never un-migrate a relocated orchestrator (DEF-106)"
+        );
+        assert_eq!(reseeded.placement_updated_unix, 1_757_000_000);
     }
 
     #[test]
