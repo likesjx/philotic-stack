@@ -4990,6 +4990,48 @@ fn seed_abstract_skill_catalog(graph: &GraphDomain) -> anyhow::Result<()> {
             ..Default::default()
         },
         AbstractSkillRecord {
+            skill_name: "mcp.endpoint_steward".into(),
+            description: "Safely expose this agent to external MCP clients and answer their \
+                          calls deterministically first, by inference only as the declared \
+                          fallback. Workflow: mcp.status (audit what already exists) → design \
+                          the smallest tool surface, naming the storage each tool touches → \
+                          set a handler policy per philote-targeted tool (validate_input, \
+                          static/reflex steps, then a model or error fallback) and route \
+                          data reads to datasource/tool targets so they never reach the \
+                          cognitive loop → mcp.provision with exposure no wider than needed \
+                          and bearer auth on anything beyond loopback (never set \
+                          allow_unauthenticated without the operator saying so) → \
+                          mcp.grant_token per client with an allotment and expiry, relay the \
+                          raw token ONCE → smoke tools/list and one tools/call from the \
+                          client's network position → record the grant. Preapproval rules \
+                          must be narrower than the tool list. Rotate with mcp.rotate_token; \
+                          retire with mcp.revoke_token / mcp.revoke. Doctrine: \
+                          skills/mcp-endpoint-steward/SKILL.md."
+                .into(),
+            implied_tools: vec![
+                "mcp.status".into(),
+                "mcp.provision".into(),
+                "mcp.grant_token".into(),
+                "mcp.rotate_token".into(),
+                "mcp.revoke_token".into(),
+                "mcp.revoke".into(),
+                "session.status".into(),
+            ],
+            validation_state: ansible_mesh_core::graph::SkillValidationState::Validated,
+            skill_markers: vec![
+                "governed".into(),
+                "membrane".into(),
+                "boundary_hygiene".into(),
+            ],
+            field_sources: serde_json::json!({
+                "required_fields": ["endpoint_id", "intended_client", "tools", "exposure"],
+                "optional_fields": ["handler", "preapproval_rules", "allotment", "expires_at"],
+                "repo_skill_path": "skills/mcp-endpoint-steward/SKILL.md",
+                "workflow": "mcp.status → design surface + handler policies → mcp.provision → mcp.grant_token → smoke tools/list + tools/call → record grant"
+            }),
+            ..Default::default()
+        },
+        AbstractSkillRecord {
             skill_name: "mcp.manage".into(),
             description: "Provision, inspect, and revoke MCP endpoints and their access tokens. \
                           mcp.provision declares or updates an endpoint this agent exposes; \
@@ -5105,6 +5147,7 @@ fn seed_toolset_profiles(graph: &GraphDomain) -> anyhow::Result<()> {
                 "agent.initiate".into(),
                 "profile.manage".into(),
                 "mcp.manage".into(),
+                "mcp.endpoint_steward".into(),
                 // Projects only on maintenance-language turns; the server-side
                 // operational-admin gate protects the mutating heal ops from
                 // non-admin agents.
@@ -5326,7 +5369,7 @@ fn seed_toolset_profiles(graph: &GraphDomain) -> anyhow::Result<()> {
                 "lifegraph.truth_summarizer".into(),
                 "mesh.steward".into(),
             ],
-            on_demand_skills: vec![],
+            on_demand_skills: vec!["mcp.endpoint_steward".into()],
             remote_tool_runners: vec![],
             seed_baseline: None,
             description: Some(
@@ -5377,7 +5420,7 @@ fn seed_toolset_profiles(graph: &GraphDomain) -> anyhow::Result<()> {
                 // charter's heal.list instruction depends on.
                 "mesh.steward".into(),
             ],
-            on_demand_skills: vec![],
+            on_demand_skills: vec!["mcp.endpoint_steward".into()],
             remote_tool_runners: vec![],
             seed_baseline: None,
             description: Some(

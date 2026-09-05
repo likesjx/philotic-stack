@@ -9371,6 +9371,21 @@ impl IpcServer {
                     }
                 }
 
+                // Handler policies must be structurally valid (known reflexes,
+                // non-empty error fallbacks). The philote checks this too, but
+                // operator scripts talk to this socket directly.
+                for tool in &config.tools {
+                    if let Some(policy) = &tool.handler {
+                        if let Err(e) = policy.validate() {
+                            return IpcResponse::error(
+                                "mcp_endpoint",
+                                "INVALID_HANDLER_POLICY",
+                                format!("endpoint '{}' tool '{}': {e}", endpoint_id, tool.name),
+                            );
+                        }
+                    }
+                }
+
                 // Persist the endpoint config in the context graph.
                 let config_key = format!("__mcp_endpoint__:{endpoint_id}");
                 let preapproval_key = format!("__mcp_preapproval__:{endpoint_id}");

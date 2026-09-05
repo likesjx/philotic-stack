@@ -1169,6 +1169,17 @@ impl AgentRuntime {
                                 let _ = self.emit_error_reply(&task_ref, task_id, err).await;
                             }
                         }
+                        Ok(task) if crate::mcp_ingress::is_mcp_call(&task) => {
+                            // External MCP tools/call aimed at this philote:
+                            // deterministic ladder (schema validation, static
+                            // answers, reflexes) first; the cognitive loop only
+                            // as the declared fallback.
+                            let task_ref = task.clone();
+                            if let Err(err) = self.handle_mcp_call(task, task_id).await {
+                                error!("Failed to handle MCP call: {}", err);
+                                let _ = self.emit_error_reply(&task_ref, task_id, err).await;
+                            }
+                        }
                         Ok(task) => {
                             let task_ref = task.clone();
                             if let Err(err) = self.handle_user_message(task, task_id).await {

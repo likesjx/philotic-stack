@@ -6120,6 +6120,15 @@ impl AgentRuntime {
                         }
                     };
 
+                // A handler policy that names an unknown reflex (or an empty
+                // error message) must fail here, in the approved provisioning
+                // turn, not on the first external call.
+                if let Err(e) = validate_handler_policies(&tools) {
+                    return self
+                        .fail_active_turn(session_id, turn_id, format!("mcp.provision: {e}"))
+                        .await;
+                }
+
                 let preapproval_rules: Vec<ansible_mesh_core::mcp_endpoint::McpPreapprovalRule> =
                     args.get("preapproval_rules")
                         .and_then(|v| {

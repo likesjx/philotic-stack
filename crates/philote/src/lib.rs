@@ -2,6 +2,7 @@ pub mod catalog;
 pub mod commands;
 pub mod driver;
 pub mod r#loop;
+pub mod mcp_ingress;
 pub mod plan_eval;
 pub mod protocol;
 pub mod reflex;

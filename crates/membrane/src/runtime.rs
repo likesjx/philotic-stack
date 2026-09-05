@@ -411,6 +411,20 @@ fn extract_outbound_reply(msg: &IpcResponse) -> Option<OutboundReply> {
                 token,
             })
         }
+        // A terminal failure the philote decided deterministically (schema
+        // rejection, a handler policy with an `error` fallback, a reflex
+        // failure). Transports surface it as an error, not as text — for
+        // membrane-mcp that means `isError: true` on the tool result.
+        "send_error" => {
+            let session_id = payload.get("session_id")?.as_str()?.to_string();
+            let turn_id = payload.get("turn_id")?.as_str()?.to_string();
+            let message = payload.get("message")?.as_str()?.to_string();
+            Some(OutboundReply::Error {
+                session_id,
+                turn_id,
+                message,
+            })
+        }
         "approval_required" => {
             let session_id = payload.get("session_id")?.as_str()?.to_string();
             let turn_id = payload.get("turn_id")?.as_str()?.to_string();
@@ -488,6 +502,34 @@ mod tests {
         let (role, guest_id) = resolve_target(Some("datasource"), Some("life-graph-runner".into()));
         assert_eq!(role, "life-graph-runner");
         assert_eq!(guest_id, None);
+    }
+
+    #[test]
+    fn send_error_reply_maps_to_outbound_error() {
+        let task_json = serde_json::json!({
+            "action": "send_error",
+            "session_id": "mcp-reader-abc",
+            "turn_id": "turn-9",
+            "message": "missing required argument 'query'",
+        })
+        .to_string();
+        let msg = IpcResponse::InboundTask {
+            source_node: "node".into(),
+            task_id: Default::default(),
+            task_json,
+        };
+        match extract_outbound_reply(&msg) {
+            Some(OutboundReply::Error {
+                session_id,
+                turn_id,
+                message,
+            }) => {
+                assert_eq!(session_id, "mcp-reader-abc");
+                assert_eq!(turn_id, "turn-9");
+                assert_eq!(message, "missing required argument 'query'");
+            }
+            other => panic!("expected Error reply, got {other:?}"),
+        }
     }
 
     #[test]
