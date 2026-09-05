@@ -11,6 +11,7 @@
 //! See [`protocol`] for the trust model.
 
 pub mod protocol;
+pub mod transport;
 
 /// Resolves a mesh node's **published** ed25519 member public key (base64url),
 /// as stored in `config:mesh_member_public_key:<hotel>`.
