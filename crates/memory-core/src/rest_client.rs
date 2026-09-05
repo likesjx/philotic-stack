@@ -237,6 +237,12 @@ struct ActivateRequest {
     vault: Option<String>,
     context: Vec<String>,
     max_results: Option<usize>,
+    /// Ask Muninn (>= 0.11.2-rc1) for the self-knowledge surface: a model-free
+    /// contradiction pass over the RETURNED result set (`contradicts_ids`) plus
+    /// explicit-supersession staleness (`superseded_by`). Cheap (sub-ms, O(k^2)
+    /// on k<=max_results) and never reorders results. Older servers ignore it.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    self_knowledge: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -253,6 +259,16 @@ struct ActivationItem {
     #[serde(default)]
     tags: Vec<String>,
     confidence: f32,
+    /// Self-knowledge surface (Muninn >= 0.11.2-rc1, request `self_knowledge`):
+    /// ids of OTHER returned results this one contradicts.
+    #[serde(default)]
+    contradicts_ids: Vec<String>,
+    /// Explicit supersession: a newer version of this memory exists.
+    #[serde(default)]
+    superseded_by: Option<String>,
+    /// Advisory: a newer, highly-similar memory exists (not a declared edge).
+    #[serde(default)]
+    possibly_superseded_by: Option<String>,
     /// Server-side activation relevance for the query (semantic + graph
     /// blend). Defaults to 0.0 against servers that predate the field, in
     /// which case cross-scope ranking degrades to recency + confidence.
@@ -292,6 +308,39 @@ struct LinkRequest {
 
 impl From<ActivationItem> for Engram {
     fn from(item: ActivationItem) -> Self {
+        // Fold the self-knowledge surface into `metadata.annotations` so it
+        // flows to consumers through the existing annotations path (the philote
+        // reads `metadata["annotations"]` — no struct ripple through Engram).
+        let mut metadata = item.metadata;
+        let has_signal = !item.contradicts_ids.is_empty()
+            || item.superseded_by.is_some()
+            || item.possibly_superseded_by.is_some();
+        if has_signal {
+            if !metadata.is_object() {
+                metadata = serde_json::json!({});
+            }
+            let ann = metadata
+                .as_object_mut()
+                .expect("metadata is an object")
+                .entry("annotations")
+                .or_insert_with(|| serde_json::json!({}));
+            if !ann.is_object() {
+                *ann = serde_json::json!({});
+            }
+            let ann = ann.as_object_mut().expect("annotations is an object");
+            if !item.contradicts_ids.is_empty() {
+                ann.insert(
+                    "contradicts_ids".into(),
+                    serde_json::json!(item.contradicts_ids),
+                );
+            }
+            if let Some(sb) = item.superseded_by {
+                ann.insert("superseded_by".into(), serde_json::json!(sb));
+            }
+            if let Some(psb) = item.possibly_superseded_by {
+                ann.insert("possibly_superseded_by".into(), serde_json::json!(psb));
+            }
+        }
         Engram {
             id: item.id.clone(),
             vault_id: String::new(), // not returned by activate; filled by context
@@ -301,7 +350,7 @@ impl From<ActivationItem> for Engram {
             confidence: item.confidence,
             created_at: item.created_at as u64,
             updated_at: item.updated_at.unwrap_or(item.created_at) as u64,
-            metadata: item.metadata,
+            metadata,
         }
     }
 }
@@ -1009,6 +1058,7 @@ impl MemoryEngine for MuninnRestEngine {
                     vault: Some(vault.clone()),
                     context: vec![context.to_string()],
                     max_results: max,
+                    self_knowledge: true,
                 };
                 async move {
                     let resp: anyhow::Result<ActivateResponse> = async {
@@ -1572,6 +1622,48 @@ mod shared_write_route_tests {
             other.resolve_primary(&MemoryScope::SharedFleet),
             "fleet_knowledge",
             "fleet_knowledge must not be namespaced per agent/user"
+        );
+    }
+
+    #[test]
+    fn activation_item_folds_self_knowledge_into_annotations() {
+        // Muninn >= 0.11.2-rc1 self-knowledge fields must reach consumers via
+        // metadata.annotations (the path the philote already renders).
+        let item: ActivationItem = serde_json::from_str(
+            r#"{"id":"01A","concept":"c","content":"x","confidence":1.0,"created_at":1,
+                "contradicts_ids":["01B","01D"],"superseded_by":"01C"}"#,
+        )
+        .unwrap();
+        let e: Engram = item.into();
+        let ann = e
+            .metadata
+            .get("annotations")
+            .expect("self-knowledge folded into annotations");
+        assert_eq!(ann["contradicts_ids"], serde_json::json!(["01B", "01D"]));
+        assert_eq!(ann["superseded_by"], serde_json::json!("01C"));
+        assert!(ann.get("possibly_superseded_by").is_none());
+
+        // No signal → metadata left exactly as received (no empty annotations).
+        let plain: ActivationItem = serde_json::from_str(
+            r#"{"id":"01A","concept":"c","content":"x","confidence":1.0,"created_at":1}"#,
+        )
+        .unwrap();
+        let e2: Engram = plain.into();
+        assert!(e2.metadata.get("annotations").is_none());
+
+        // Pre-existing metadata is preserved and annotations merged, not clobbered.
+        let merged: ActivationItem = serde_json::from_str(
+            r#"{"id":"01A","concept":"c","content":"x","confidence":1.0,"created_at":1,
+                "metadata":{"summary":"s","annotations":{"stale":true}},
+                "possibly_superseded_by":"01E"}"#,
+        )
+        .unwrap();
+        let e3: Engram = merged.into();
+        assert_eq!(e3.metadata["summary"], serde_json::json!("s"));
+        assert_eq!(e3.metadata["annotations"]["stale"], serde_json::json!(true));
+        assert_eq!(
+            e3.metadata["annotations"]["possibly_superseded_by"],
+            serde_json::json!("01E")
         );
     }
 

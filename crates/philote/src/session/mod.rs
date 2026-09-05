@@ -3480,6 +3480,30 @@ impl SessionState {
                     memory.relationships.len()
                 ));
             }
+            // Self-knowledge surface (Muninn `self_knowledge` recall): make the
+            // store's own contradiction/staleness signals unmissable, so a
+            // contradicted or superseded item is never presented as the answer.
+            if let Some(ann) = memory.annotations.as_ref().filter(|v| v.is_object()) {
+                if let Some(ids) = ann.get("contradicts_ids").and_then(|v| v.as_array()) {
+                    let ids: Vec<&str> = ids.iter().filter_map(|v| v.as_str()).collect();
+                    if !ids.is_empty() {
+                        out.push_str(&format!(
+                            "\n   ⚠ CONTRADICTS other recalled item(s) {}: the store detected a value/polarity conflict — do not present either as settled; prefer the newer/verified one or resolve via memory.remember.",
+                            ids.join(", ")
+                        ));
+                    }
+                }
+                if let Some(sb) = ann.get("superseded_by").and_then(|v| v.as_str()) {
+                    out.push_str(&format!(
+                        "\n   ⚠ STALE — superseded by {sb}: a newer version of this memory exists; treat this one as history, not current fact."
+                    ));
+                }
+                if let Some(psb) = ann.get("possibly_superseded_by").and_then(|v| v.as_str()) {
+                    out.push_str(&format!(
+                        "\n   possibly stale — a newer, highly-similar item exists ({psb}); check it before relying on this one."
+                    ));
+                }
+            }
             if let Some(annotations) = memory.annotations.as_ref().filter(|v| !v.is_null()) {
                 out.push_str(&format!("\n   annotations: {annotations}"));
             }
@@ -9783,6 +9807,12 @@ mod tests {
                 trust: Some("verified".into()),
                 entities: vec![serde_json::json!({"name": "Muninn", "type": "memory_system"})],
                 recall_reason: Some("meaningful_user_turn".into()),
+                // Self-knowledge surface as folded by memory-core from Muninn's
+                // `contradicts_ids` / `superseded_by` (self_knowledge recall).
+                annotations: Some(serde_json::json!({
+                    "contradicts_ids": ["01OTHER"],
+                    "superseded_by": "01NEWER"
+                })),
                 ..Default::default()
             }],
             active_plan: None,
@@ -9837,6 +9867,17 @@ mod tests {
         assert!(text.contains("CURRENT TURN is ground truth"));
         assert!(text.contains("life.commit"));
         assert!(text.contains("memory.remember"));
+        // Self-knowledge signals must be rendered as explicit, unmissable lines
+        // (not buried in the generic annotations JSON) so the model never
+        // presents a contradicted or superseded item as the answer.
+        assert!(
+            text.contains("⚠ CONTRADICTS other recalled item(s) 01OTHER"),
+            "contradiction signal must be rendered: {text}"
+        );
+        assert!(
+            text.contains("⚠ STALE — superseded by 01NEWER"),
+            "supersession/staleness signal must be rendered: {text}"
+        );
     }
 
     #[test]
