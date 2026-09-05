@@ -49,6 +49,21 @@ targets:
     type: application
     platform: iOS
     deploymentTarget: "17.0"
+    # Nested Info.plist dictionaries must be emitted as properties; an
+    # INFOPLIST_KEY_NSAppTransportSecurity_NSAllowsLocalNetworking setting
+    # does not produce an ATS dictionary in Xcode's generated app plist.
+    info:
+      path: PhiloticApp-iOS-Info.plist
+      properties:
+        CFBundleShortVersionString: "$(MARKETING_VERSION)"
+        CFBundleVersion: "$(CURRENT_PROJECT_VERSION)"
+        NSAppTransportSecurity:
+          NSExceptionDomains:
+            # Transitional private vps-jane endpoint. Requires Tailscale on
+            # the phone; remove this exception when the edge has HTTPS.
+            "100.64.212.8":
+              NSExceptionAllowsInsecureHTTPLoads: true
+        NSLocalNetworkUsageDescription: "Connect to your configured Philotic server on your private network."
     sources:
       - path: Sources/PhiloticApp
     dependencies:
@@ -70,7 +85,6 @@ targets:
         INFOPLIST_KEY_UILaunchScreen_Generation: "YES"
         INFOPLIST_KEY_UIApplicationSceneManifest_Generation: "YES"
         INFOPLIST_KEY_UISupportedInterfaceOrientations: "UIInterfaceOrientationPortrait UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight"
-        INFOPLIST_KEY_NSAppTransportSecurity_NSAllowsLocalNetworking: "YES"
         INFOPLIST_KEY_NSMicrophoneUsageDescription: "PhiloticApp uses the microphone for voice messages to your agents."
         INFOPLIST_KEY_NSSpeechRecognitionUsageDescription: "Speech is transcribed on-device to send voice messages."
         INFOPLIST_KEY_NSHealthShareUsageDescription: "Review selected activity, sleep, and heart-rate summaries for personal wellness. Data stays on this device unless you separately confirm sharing summaries with your LifeGraph and agents."

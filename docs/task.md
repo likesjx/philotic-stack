@@ -167,7 +167,7 @@ Proposal: [NATIVE_APPLE_APP_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/d
 - [x] Encode each share as a unique, timestamped LifeGraph `Signal` so agents can prefer recent evidence without a second current-location authority.
 - [x] Add macOS-hosted unit coverage for coordinate precision and the outbound observation contract; keep it in `just app-test`.
 - [x] Build macOS and iOS Simulator targets and watch the Location sheet render on an iOS 27 Simulator.
-- [ ] Connect, unlock, trust, sign, and install the app on Jared's iPhone; Simulator proof is not physical-device proof.
+- [x] Connect, unlock, trust, sign, and install the app on Jared's iPhone; wireless install and launch confirmed 2026-09-05 (Personal Team, iOS 27).
 - [ ] Share one real snapshot to the configured hotel, query the LifeGraph, and verify an agent recalls the newest snapshot with its observation time and accuracy.
 - [ ] Persist structured `EvidencePacket.metadata` in the `life.observe` compiler, then decide whether a governed derived `current location` projection is warranted; the immutable snapshot stream remains canonical meanwhile.
 
@@ -181,7 +181,9 @@ Seam: `device-tool-plane`; branch: `codex/ios-healthkit` (based on the location 
 - [x] Bound reads to yesterday or seven completed local days; preserve missing/error states, clip and union sleep overlaps, and emit unique timestamped proposed Signals with durable metric/window text.
 - [x] Decode nested observe acknowledgments and prevent failed/unknown/partial uploads from being reported as complete; no automatic retries after uncertain writes.
 - [x] Cover service consent/invalidation/error/time-window contracts and transport responses; run app tests on macOS and iOS Simulator and inspect the Health UI.
-- [ ] Sign/install on the connected trusted iPhone, exercise selected/denied/revoked Health permissions, compare readings with Apple Health, and confirm one operator-approved live share plus agent recall.
+- [x] Sign and install on the trusted physical iPhone over Wi-Fi; build 2 installed and launched 2026-09-05.
+- [x] Fix missing packaged ATS policy with an exact private-server exception; built-host iOS regression test passes. See [connection setup](../apps/philotic-apple/CONNECTION.md). Phone enrollment retry remains pending.
+- [ ] Exercise selected/denied/revoked Health permissions, compare readings with Apple Health, and confirm one operator-approved live share plus agent recall.
 - [ ] Decide server-enforced health-only role/provider access, named-provider disclosure, retention/deletion, and App Store privacy requirements before widening distribution or adding passive ingestion.
 
 ## New Project: Memory Cultivation and True-Up
