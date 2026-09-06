@@ -114,6 +114,7 @@ Template rules: `"${payload}"` is the whole transformed payload, `"${payload.a.b
 
 - A tool with `{kind:"philote"}` and **no** handler policy behaves as before: a full model turn per call. Treat that as a smell, not a default.
 - `memory.recall` is capped at 25 results and reads only your own vault (or the shared user vault with `scope:"user"`). `memory.capture` writes only your own vault and tags the engram `mcp`.
+- `escalate_on_empty` means **zero hits**. Muninn's activate returns nearest neighbours for almost any query, so with a populated vault the recall reflex answers rather than escalates; put a `model` fallback with instructions behind it only when a weak match is acceptable, otherwise design the tool as `static`/`error` or route it to a datasource.
 - Reflex names are a closed list (`echo`, `memory.recall`, `memory.capture`). Provisioning with any other name fails in the provisioning turn, on both the philote and the hotel side.
 - Exposure is validated against the hotel's perimeter ceiling; a tier the hotel cannot defend is a provisioning error.
 - The hotel checks that `owner_agent_id` matches your registered identity. Do not provision on another agent's behalf; hand them this skill instead.
