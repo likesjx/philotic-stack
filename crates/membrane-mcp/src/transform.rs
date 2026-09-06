@@ -156,6 +156,7 @@ mod tests {
             },
             outbound_transform: outbound,
             auth: None,
+            handler: None,
         }
     }
 

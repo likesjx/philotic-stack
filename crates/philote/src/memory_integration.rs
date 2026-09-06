@@ -1598,13 +1598,11 @@ impl AgentRuntime {
     ) -> Result<()> {
         use memory_core::MemoryEngine as _;
 
-        // Content is JSON: {"tool": "context.capture", "args": {...}}
-        let args: serde_json::Value = task
-            .content
-            .as_deref()
-            .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
-            .and_then(|v| v.get("args").cloned())
-            .unwrap_or_default();
+        // Legacy route-table endpoints send {"tool": "context.capture",
+        // "args": {...}}; config-driven endpoints send {"action":
+        // "context.capture", "payload": {...}} plus the raw args in
+        // raw_transport_event. Accept both (DEF-109).
+        let args: serde_json::Value = crate::mcp_ingress::extract_args(&task);
 
         let capture_text = args
             .get("content")

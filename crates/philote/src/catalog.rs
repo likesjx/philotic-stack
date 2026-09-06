@@ -416,6 +416,19 @@ pub fn tools_for_skill(skill_name: &str) -> &'static [&'static str] {
             "mcp.upstreams",
             "mcp.set_credential",
         ],
+        // The full-lifecycle endpoint skill: audit → design the tool surface
+        // and handler policies → provision → mint credentials → smoke → keep
+        // the surface clean. Endpoint-side only; upstream (client) tools stay
+        // under mcp.manage.
+        "mcp.endpoint_steward" => &[
+            "mcp.status",
+            "mcp.provision",
+            "mcp.grant_token",
+            "mcp.rotate_token",
+            "mcp.revoke_token",
+            "mcp.revoke",
+            "session.status",
+        ],
         "integration.manage" => &[
             "integration.bind_http",
             "integration.unbind",
@@ -642,6 +655,21 @@ pub fn skill_is_relevant_for_turn(skill_name: &str, turn_text: &str) -> bool {
                 || t.contains("mcp route")
                 || t.contains("upstream")
                 || t.contains("connect mcp")
+        }
+        "mcp.endpoint_steward" => {
+            // Endpoint-exposure language. Shares the mcp.manage vocabulary and
+            // adds the words an operator uses when asking an agent to expose
+            // itself to an external client (Perplexity, Claude, Codex, n8n).
+            t.contains("mcp")
+                || t.contains("endpoint")
+                || t.contains("provision")
+                || t.contains("expose")
+                || t.contains("external client")
+                || t.contains("bearer")
+                || t.contains("token grant")
+                || t.contains("tools/list")
+                || t.contains("perplexity")
+                || t.contains("claude desktop")
         }
         "integration.manage" => {
             t.contains("integration")
@@ -3011,6 +3039,47 @@ fn build_catalog() -> HashMap<String, ToolDefinition> {
                                         "grants": { "type": "array", "items": { "type": "object" } }
                                     },
                                     "required": ["scheme"]
+                                },
+                                "handler": {
+                                    "type": "object",
+                                    "description": "How THIS agent answers calls to a philote-targeted tool: a \
+                                                    deterministic ladder runs BEFORE any model turn, then the \
+                                                    declared fallback. validate_input (default true) rejects \
+                                                    args that violate input_schema. steps run in order: \
+                                                    {kind:'static',result:{...}} answers with a fixed value; \
+                                                    {kind:'reflex',reflex:'echo'|'memory.recall'|'memory.capture', \
+                                                    args:{...},escalate_on_empty:bool} runs a built-in reflex \
+                                                    with args templated from the payload ('${payload.query}'). \
+                                                    fallback: {kind:'model',instructions:'...'} hands the call to \
+                                                    your cognitive loop with those instructions; \
+                                                    {kind:'error',message:'...'} refuses deterministically. \
+                                                    Omit for datasource/tool targets (they never reach you).",
+                                    "properties": {
+                                        "validate_input": { "type": "boolean" },
+                                        "steps": {
+                                            "type": "array",
+                                            "items": {
+                                                "type": "object",
+                                                "properties": {
+                                                    "kind": { "type": "string", "enum": ["static", "reflex"] },
+                                                    "result": { "type": "object" },
+                                                    "reflex": { "type": "string", "enum": ["echo", "memory.recall", "memory.capture"] },
+                                                    "args": { "type": "object" },
+                                                    "escalate_on_empty": { "type": "boolean" }
+                                                },
+                                                "required": ["kind"]
+                                            }
+                                        },
+                                        "fallback": {
+                                            "type": "object",
+                                            "properties": {
+                                                "kind": { "type": "string", "enum": ["model", "error"] },
+                                                "instructions": { "type": "string" },
+                                                "message": { "type": "string" }
+                                            },
+                                            "required": ["kind"]
+                                        }
+                                    }
                                 }
                             },
                             "required": ["name", "description", "input_schema",

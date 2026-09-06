@@ -3569,10 +3569,25 @@ impl IpcServer {
             let guard = inboxes.lock().await;
             let role_subscribers = guard.get(target_role).cloned().unwrap_or_default();
             match target_guest_id {
-                Some(guest_id) => role_subscribers
-                    .into_iter()
-                    .filter(|subscriber| subscriber.guest_id == guest_id)
-                    .collect(),
+                Some(guest_id) => {
+                    let live: Vec<&str> = role_subscribers
+                        .iter()
+                        .map(|subscriber| subscriber.guest_id.as_str())
+                        .collect();
+                    let chosen = select_guest_targets(&live, guest_id);
+                    if chosen.len() == 1 && chosen[0] != guest_id {
+                        info!(
+                            target_role,
+                            requested = guest_id,
+                            resolved = chosen[0].as_str(),
+                            "Resolved unscoped guest target to a single live incarnation"
+                        );
+                    }
+                    role_subscribers
+                        .into_iter()
+                        .filter(|subscriber| chosen.iter().any(|c| c == &subscriber.guest_id))
+                        .collect()
+                }
                 None => role_subscribers,
             }
         };
@@ -9451,6 +9466,21 @@ impl IpcServer {
                                 endpoint_id, config.exposure, ceiling
                             ),
                         );
+                    }
+                }
+
+                // Handler policies must be structurally valid (known reflexes,
+                // non-empty error fallbacks). The philote checks this too, but
+                // operator scripts talk to this socket directly.
+                for tool in &config.tools {
+                    if let Some(policy) = &tool.handler {
+                        if let Err(e) = policy.validate() {
+                            return IpcResponse::error(
+                                "mcp_endpoint",
+                                "INVALID_HANDLER_POLICY",
+                                format!("endpoint '{}' tool '{}': {e}", endpoint_id, tool.name),
+                            );
+                        }
                     }
                 }
 
@@ -16430,6 +16460,37 @@ pub(super) fn skill_admin_role(role: &str) -> bool {
     name == "orchestrator" || name == "management"
 }
 
+/// Pick the inbox subscriber(s) a guest-targeted task should reach.
+///
+/// Exact guest ids match exactly. An UNSCOPED agent id (no `:role` suffix,
+/// e.g. `agent-bjork-01`) never matches a materialized incarnation
+/// (`agent-bjork-01:orchestrator`), so resolve it to exactly ONE live
+/// incarnation: the orchestrator when present, else the lexically first.
+/// Never more than one — a task addressed to one agent must not fan out
+/// (live 2026-09-05: an MCP `tools/call` reached every philote on mac-jane).
+pub(super) fn select_guest_targets(live_guest_ids: &[&str], target: &str) -> Vec<String> {
+    if live_guest_ids.iter().any(|id| *id == target) {
+        return vec![target.to_string()];
+    }
+    if target.contains(':') {
+        return Vec::new();
+    }
+    let prefix = format!("{target}:");
+    let mut incarnations: Vec<&str> = live_guest_ids
+        .iter()
+        .copied()
+        .filter(|id| id.starts_with(&prefix))
+        .collect();
+    incarnations.sort_unstable();
+    if let Some(orchestrator) = incarnations.iter().find(|id| id.ends_with(":orchestrator")) {
+        return vec![(*orchestrator).to_string()];
+    }
+    incarnations
+        .first()
+        .map(|id| vec![(*id).to_string()])
+        .unwrap_or_default()
+}
+
 pub(super) fn require_skill_admin<'a>(
     identity: Option<&'a GuestIdentity>,
     op: &str,
@@ -18249,6 +18310,38 @@ pub(crate) mod tests {
             "agent-bjork-01"
         );
         assert_eq!(cron_owner_agent_of_guest("agent-coach"), "agent-coach");
+    }
+
+    #[test]
+    fn select_guest_targets_never_fans_out() {
+        let live = [
+            "agent-astrid:brain",
+            "agent-bjork-01:virtuosa",
+            "agent-bjork-01:architect",
+            "agent-bjork-01:orchestrator",
+            "agent-coach:orchestrator",
+        ];
+        // Exact ids match exactly.
+        assert_eq!(
+            select_guest_targets(&live, "agent-bjork-01:architect"),
+            vec!["agent-bjork-01:architect".to_string()]
+        );
+        // Unscoped agent id → its orchestrator, and only it.
+        assert_eq!(
+            select_guest_targets(&live, "agent-bjork-01"),
+            vec!["agent-bjork-01:orchestrator".to_string()]
+        );
+        // No orchestrator incarnation → the lexically first one, still just one.
+        assert_eq!(
+            select_guest_targets(&live, "agent-astrid"),
+            vec!["agent-astrid:brain".to_string()]
+        );
+        // Scoped id with no live subscriber → nobody (never a role broadcast).
+        assert!(select_guest_targets(&live, "agent-bjork-01:coach").is_empty());
+        // Unknown agent → nobody.
+        assert!(select_guest_targets(&live, "agent-nobody").is_empty());
+        // A prefix that is not a full agent id must not match.
+        assert!(select_guest_targets(&live, "agent-bjork").is_empty());
     }
 
     /// DEF-105: a role-incarnation philote registers with its routing key as

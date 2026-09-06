@@ -56,6 +56,10 @@ use memory_integration::*;
 mod life_capture;
 use life_capture::*;
 
+#[path = "mcp_handling.rs"]
+mod mcp_handling;
+use mcp_handling::*;
+
 #[path = "memory_explain_tool.rs"]
 mod memory_explain_tool;
 

@@ -1928,6 +1928,24 @@ Order: L5 → L1 → L2, then L3/L4/L6/L7 independently.
 - [ ] L6 cron `continuity` + `cron_scratch` node injected as `[Previous run]` — watched-live on the vps Chronos check-in
 - [ ] L7 `session_turn_fts` FTS5 table + `SearchSessionTurns` IPC + `session.search` tool — smoke-green on vps-jane Beacon history
 
+## New Project: MCP Endpoint Steward
+
+Skill: [skills/mcp-endpoint-steward/SKILL.md](/Users/jaredlikes/code/philotic-stack/skills/mcp-endpoint-steward/SKILL.md) (`mcp.endpoint_steward`, seeded 2026-09-05). Amends `mcp-membrane-gateway` (deterministic-first dispatch for philote targets) and closes DEF-109. Related: `mcp-membrane-hardening` (H1–H4 landed; S4 identity check already enforced at `ProvisionMcpEndpoint`).
+
+Goal: any philote can safely put an MCP endpoint in front of itself and answer inbound `tools/call` requests deterministically first, by model inference only as the declared fallback.
+
+- [x] Shared contract: `McpToolSpec.handler` → `McpHandlerPolicy { validate_input, steps: [static | reflex(echo|memory.recall|memory.capture, args template, escalate_on_empty)], fallback: model{instructions} | error{message} }`; `McpHandlerPolicy::validate()` (closed reflex list, non-empty error message) — **test-green** (`ansible-mesh-core` 346/346).
+- [x] membrane-mcp forwards `handler`, `input_schema`, and raw `args` in `raw_transport` for philote-targeted calls — **test-green** (`tools_call_forwards_handler_policy_schema_and_args_to_philote`, membrane-mcp 28/28).
+- [x] `send_error` reply → `OutboundReply::Error` → `isError: true` tool result (previously philote errors could only surface as successful text) — **test-green** (membrane 16/16).
+- [x] philote `mcp_ingress` (parse config + legacy shapes, JSON-Schema `required`/`type`/`enum` validation, `${payload.x}` templating, model-fallback prompt) — **test-green** (7/7); `mcp_handling` ladder runs before `handle_user_message`; reflexes skipped on approval-gated calls; `context.capture` uses the shared parser (DEF-109).
+- [x] Provision-time policy validation on both sides (`mcp.provision` handler in philote, `ProvisionMcpEndpoint` in aiua → `INVALID_HANDLER_POLICY`).
+- [x] Skill: `mcp.endpoint_steward` seeded (`seed_abstract_skill_catalog`), in `tools_for_skill` + keyword gate, on-demand for `orchestrator`, `admin`, `architect`; other roles via `skill.assign`. `mcp.provision` schema documents `handler`.
+- [x] Smoke on live mac-jane (2026-09-05, endpoint `steward-smoke` :8919, deployed build): (b) static `ping` answered in 37 ms with no model turn; (a) `strict` with a wrong-typed arg → `isError` in 19 ms, and its `error` fallback → `isError` in 33 ms; the ladder logged `escalating` → `falling through to cognitive loop` for an empty `memory.recall`. **Found DEF-110**: every call was answered by all 8 philotes (role-broadcast `CreateTask` + unscoped agent id) — fixed on this branch (membrane pins local philote targets via `EmitTask`; hotel resolves an unscoped id to one incarnation).
+- [x] Re-smoke after the DEF-110 fix (2026-09-05 17:0x, redeployed build, endpoint re-materialized from persisted config on boot): static 22 ms, schema reject 17 ms, error fallback 20 ms, `recall_note` answered by **bjork's own** `memory.recall` reflex in 114 ms; every ladder counter in the hotel log rose by exactly one — **smoke-green**. Smoke endpoint revoked afterwards.
+- [ ] Limitation found: `memory.recall` cannot judge relevance — `memory_core::ActivationResult` carries no score, and Muninn's activate returns nearest neighbours even for a nonsense query, so `escalate_on_empty` fires only on zero hits (empty vault / backend down). Follow-up: surface Muninn's `relevance_band`/score through memory-core and add a `min_relevance` knob to the reflex.
+- [ ] Watched-live: re-provision `lifegraph-readonly` on vps-jane unchanged (datasource target, no handler) and add one philote-targeted descriptor tool with a static handler; `phil mcp uat live` from off-host — **watched-live-green** target. Blocked in the authoring session: no network to vps-jane or GitHub.
+- [ ] Follow-ups: `Template` transforms (B5) remain unimplemented; `McpPreapprovalRule.target` still inert (routing matches action only); `phil mcp list|status|revoke` operator CLI (C5).
+
 ## New Project: Graph Doors and Life Core
 
 Proposal: [docs/architecture/GRAPH_DOORS_AND_LIFE_CORE_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/GRAPH_DOORS_AND_LIFE_CORE_PROPOSAL.md) (proposed 2026-09-05; operator decisions: tiered doors, 100% Cypher + MAGE, mutations only through the writing door, admin door, containers per graph class, Life is core).
