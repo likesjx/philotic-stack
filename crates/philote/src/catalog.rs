@@ -434,6 +434,17 @@ pub fn tools_for_skill(skill_name: &str) -> &'static [&'static str] {
             "integration.unbind",
             "integration.list",
         ],
+        // Full-lifecycle external-API skill: audit → contract → narrow bind →
+        // operator-provisioned credential → smoke → poll. See
+        // skills/integration-steward/SKILL.md.
+        "integration.steward" => &[
+            "integration.list",
+            "integration.bind_http",
+            "integration.unbind",
+            "session.status",
+            "cron.list",
+            "cron.register",
+        ],
         _ => &[],
     }
 }
@@ -678,6 +689,33 @@ pub fn skill_is_relevant_for_turn(skill_name: &str, turn_text: &str) -> bool {
                 || t.contains("outbound api")
                 || t.contains("egress")
                 || t.contains("exit hotel")
+        }
+        "integration.steward" => {
+            // Operator language for "hook me up to <service>": the vendor
+            // words, the mechanism words, and the failure words. Without the
+            // failure vocabulary the triage rules never project on the turn
+            // where the agent is about to blame the network (2026-09-05 Hevy).
+            t.contains("integration")
+                || t.contains("api key")
+                || t.contains("api ")
+                || t.contains("webhook")
+                || t.contains("web hook")
+                || t.contains("connect to")
+                || t.contains("hook up")
+                || t.contains("sync from")
+                || t.contains("pull my")
+                || t.contains("binding")
+                || t.contains("egress")
+                || t.contains("hevy")
+                || t.contains("strava")
+                || t.contains("garmin")
+                || t.contains("oura")
+                || t.contains("whoop")
+                || t.contains("fitbit")
+                || t.contains("blocked")
+                || t.contains("timed out")
+                || t.contains("401")
+                || t.contains("404")
         }
         "mesh.steward" => {
             // Fleet maintenance language: the heal queue, host pressure,
@@ -3384,10 +3422,20 @@ fn build_catalog() -> HashMap<String, ToolDefinition> {
             description: "Create or update a governed outbound HTTP integration. The binding \
                           grants a named API capability, never arbitrary network access: base URL, \
                           methods, path prefixes, headers, address scope, byte/time limits, agent \
-                          grants, and hotel exit placement are all explicit. Prefer \
-                          {mode:'prefer_hotel',hotel_id:'vps-jane',fallback:'deny'} for public APIs \
-                          that should normally exit through vps-jane; use local for device-bound \
-                          resources. This is a high-agency configuration action."
+                          grants, and hotel exit placement are all explicit. A successful bind is a \
+                          PERMISSION GRANT, not a connection — the integration is live only after \
+                          one http:<binding_id>.request returns 2xx. Before binding: run \
+                          integration.list (re-use an existing binding for the same host), and \
+                          take paths and the auth header from the vendor's documented contract \
+                          (a 404 on the smoke means YOUR path is wrong; 401 means the credential \
+                          is missing). Declare credential_header + credential_format when the API \
+                          needs a key — the operator provisions the value with \
+                          `phil integration set-credential`; never ask for it in chat. Use \
+                          placement {mode:'local'} unless the operator named an exit hotel that \
+                          integration.list reports reachable (an unreachable exit hotel makes \
+                          every call hang ~30s and time out). Webhooks need an inbound ingress \
+                          the stack does not have; bind for polling instead. This is a \
+                          high-agency configuration action."
                 .into(),
             input_schema: json!({
                 "type": "object",

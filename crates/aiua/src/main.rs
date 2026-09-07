@@ -5032,6 +5032,42 @@ fn seed_abstract_skill_catalog(graph: &GraphDomain) -> anyhow::Result<()> {
             ..Default::default()
         },
         AbstractSkillRecord {
+            skill_name: "integration.steward".into(),
+            description: "Connect to an external HTTP API on the operator's behalf through a \
+                          governed binding, in order: integration.list (reuse an existing \
+                          binding for the same host) → read the vendor's contract (exact \
+                          paths, auth header name/format, push vs poll) → integration.bind_http \
+                          with the narrowest path prefixes and methods, credential_header + \
+                          credential_format declared, placement local unless a remote exit \
+                          hotel is proven reachable → the OPERATOR provisions the secret with \
+                          `phil integration set-credential` (never paste keys in chat) → smoke \
+                          one http:<binding>.request and read the status code (200 live; \
+                          401 credential; 404 your path; timeout = runner/placement, never \
+                          'network issues') → only then automate with cron.register polling \
+                          + life.observe. A bind is a permission grant, not a connection: \
+                          never say 'live' before a 2xx smoke. Webhooks need an inbound \
+                          ingress the stack does not have; offer polling. Doctrine: \
+                          skills/integration-steward/SKILL.md."
+                .into(),
+            implied_tools: vec![
+                "integration.list".into(),
+                "integration.bind_http".into(),
+                "integration.unbind".into(),
+                "session.status".into(),
+                "cron.list".into(),
+                "cron.register".into(),
+            ],
+            validation_state: ansible_mesh_core::graph::SkillValidationState::Validated,
+            skill_markers: vec!["governed".into(), "egress".into(), "high_agency".into()],
+            field_sources: serde_json::json!({
+                "required_fields": ["binding_id", "base_url", "allowed_methods", "allowed_path_prefixes"],
+                "optional_fields": ["credential_header", "credential_format", "placement", "traffic_class", "grant_agents"],
+                "repo_skill_path": "skills/integration-steward/SKILL.md",
+                "workflow": "integration.list → read contract → integration.bind_http → operator set-credential → smoke http:<binding>.request → cron poll → record"
+            }),
+            ..Default::default()
+        },
+        AbstractSkillRecord {
             skill_name: "mcp.manage".into(),
             description: "Provision, inspect, and revoke MCP endpoints and their access tokens. \
                           mcp.provision declares or updates an endpoint this agent exposes; \
@@ -5148,6 +5184,7 @@ fn seed_toolset_profiles(graph: &GraphDomain) -> anyhow::Result<()> {
                 "profile.manage".into(),
                 "mcp.manage".into(),
                 "mcp.endpoint_steward".into(),
+                "integration.steward".into(),
                 // Projects only on maintenance-language turns; the server-side
                 // operational-admin gate protects the mutating heal ops from
                 // non-admin agents.
@@ -5393,7 +5430,11 @@ fn seed_toolset_profiles(graph: &GraphDomain) -> anyhow::Result<()> {
                 "lifegraph.truth_summarizer".into(),
                 "mesh.steward".into(),
             ],
-            on_demand_skills: vec!["cron.manage".into(), "mcp.endpoint_steward".into()],
+            on_demand_skills: vec![
+                "cron.manage".into(),
+                "mcp.endpoint_steward".into(),
+                "integration.steward".into(),
+            ],
             remote_tool_runners: vec![],
             seed_baseline: None,
             description: Some(
@@ -5452,7 +5493,11 @@ fn seed_toolset_profiles(graph: &GraphDomain) -> anyhow::Result<()> {
                 // charter's heal.list instruction depends on.
                 "mesh.steward".into(),
             ],
-            on_demand_skills: vec!["cron.manage".into(), "mcp.endpoint_steward".into()],
+            on_demand_skills: vec![
+                "cron.manage".into(),
+                "mcp.endpoint_steward".into(),
+                "integration.steward".into(),
+            ],
             remote_tool_runners: vec![],
             seed_baseline: None,
             description: Some(
