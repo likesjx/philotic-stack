@@ -1946,6 +1946,20 @@ Goal: any philote can safely put an MCP endpoint in front of itself and answer i
 - [ ] Watched-live: re-provision `lifegraph-readonly` on vps-jane unchanged (datasource target, no handler) and add one philote-targeted descriptor tool with a static handler; `phil mcp uat live` from off-host — **watched-live-green** target. Blocked in the authoring session: no network to vps-jane or GitHub.
 - [ ] Follow-ups: `Template` transforms (B5) remain unimplemented; `McpPreapprovalRule.target` still inert (routing matches action only); `phil mcp list|status|revoke` operator CLI (C5).
 
+## New Project: Integration Steward
+
+Skill: [skills/integration-steward/SKILL.md](/Users/jaredlikes/code/philotic-stack/skills/integration-steward/SKILL.md) (`integration.steward`, seeded 2026-09-06; on-demand for orchestrator, admin, architect). Amends `outbound-integration-fabric` with the agent-side doctrine. Trigger: coach's Hevy attempt on 2026-09-05 — wrong path prefix (`/v1/webhooks` is a 404 at Hevy), no credential declared and no key in the vault, remote placement that black-holed the first call (DEF-111), "integration is live" announced after a bare bind, then Tailscale and Muninn blamed for the hang.
+
+Goal: any philote can connect to an external HTTP API by instinct — audit, read the contract, bind the narrowest surface with the credential declared and local placement, hand the secret step to the operator (`phil integration set-credential`), smoke one call and read the status code honestly, then automate with a polling cron.
+
+- [x] Skill doctrine + seeded `AbstractSkillRecord` (`integration.list`, `integration.bind_http`, `integration.unbind`, `session.status`, `cron.list`, `cron.register`), `tools_for_skill` group, keyword gate (vendor words, mechanism words, and the failure vocabulary so the triage rules project on the turn where the agent is about to blame the network).
+- [x] `integration.bind_http` description now states that a bind is a permission grant, not a connection; names the 401/404/timeout meanings; points to `phil integration set-credential`; says webhooks need an ingress the stack does not have.
+- [x] Hevy binding re-registered live on mac-jane (2026-09-06): paths `/v1/workouts` + `/v1/webhook-subscription`, `api-key` credential header from `pending:integration/hevy-webhook-api`, placement local, `phil integration list` reports ExecuteLocal at `mac-jane-aiua-01`, reachable.
+- [ ] Operator: provision the Hevy key — `phil integration set-credential hevy-webhook-api --owner agent-coach --credential-file <file>` — then coach smokes `GET /v1/workouts?page=1&pageSize=1` (expect 200) and registers a polling cron on `/v1/workouts/events?since=…` writing `life.observe` — **smoke-green** target.
+- [ ] Watched-live: a fresh "connect me to <vendor>" request handled by a philote end to end using only the skill (no operator correction) — **watched-live-green** target.
+- [ ] DEF-111: root-cause why a `prefer_hotel: vps-jane` egress TaskInvoke never arrived at vps-jane while datasource tasks did.
+- [ ] Webhook ingress in philotic-web (signed inbound HTTP → philote task), so `/v1/webhook-subscription` style pushes become possible; until then the skill steers to polling.
+
 ## New Project: Graph Doors and Life Core
 
 Proposal: [docs/architecture/GRAPH_DOORS_AND_LIFE_CORE_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/GRAPH_DOORS_AND_LIFE_CORE_PROPOSAL.md) (proposed 2026-09-05; operator decisions: tiered doors, 100% Cypher + MAGE, mutations only through the writing door, admin door, containers per graph class, Life is core).
