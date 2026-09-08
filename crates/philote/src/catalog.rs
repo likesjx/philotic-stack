@@ -263,6 +263,8 @@ pub fn skill_implied_tools(skill_name: &str) -> &'static [&'static str] {
             "role.create_or_update",
             "role.set_home",
             "transport.set_home",
+            "hotel.materialize_request",
+            "hotel.materialize_status",
         ],
         "role.authoring" => &["session.status", "role.create_or_update", "handoff.to_role"],
         "memory" => &[
@@ -393,6 +395,8 @@ pub fn tools_for_skill(skill_name: &str) -> &'static [&'static str] {
             "role.set_home",
             "transport.set_home",
             "hotel.best_place_to_run",
+            "hotel.materialize_request",
+            "hotel.materialize_status",
         ],
         "role.authoring" => &["role.create_or_update"],
         "skill.authoring" => &[
@@ -1987,6 +1991,62 @@ fn build_catalog() -> HashMap<String, ToolDefinition> {
                 "required": ["role_name", "reason"]
             }),
             class: Some("config".into()),
+        },
+    );
+
+    m.insert(
+        "hotel.materialize_request".into(),
+        ToolDefinition {
+            tool_name: "hotel.materialize_request".into(),
+            description: "Ask a target hotel to pre-warm (spawn and register) a role's process \
+                          right now, WITHOUT changing which hotel owns the role — the role keeps \
+                          running wherever role.set_home last pinned it. Use this before a \
+                          relocation to bring a warm standby up on the destination hotel so the \
+                          eventual role.set_home switch has nothing left to wait on. Requires \
+                          operator approval. Poll hotel.materialize_status with the returned \
+                          request_id to see when the standby is ready."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "role_name": {
+                        "type": "string",
+                        "description": "The role to pre-warm. Use your current active role name to pre-warm yourself elsewhere."
+                    },
+                    "target_hotel": {
+                        "type": "string",
+                        "description": "The hotel node_id to materialize the role's process on (e.g. 'vps-jane')."
+                    },
+                    "reason": {
+                        "type": "string",
+                        "description": "Why this standby is needed. Required for operator visibility."
+                    }
+                },
+                "required": ["role_name", "target_hotel", "reason"]
+            }),
+            class: Some("config".into()),
+        },
+    );
+
+    m.insert(
+        "hotel.materialize_status".into(),
+        ToolDefinition {
+            tool_name: "hotel.materialize_status".into(),
+            description: "Check the outcome of a prior hotel.materialize_request call. Returns \
+                          pending (no reply yet), ready (the target hotel's standby process is \
+                          spawned and routable), or failed with an error."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "request_id": {
+                        "type": "string",
+                        "description": "The request_id returned by hotel.materialize_request."
+                    }
+                },
+                "required": ["request_id"]
+            }),
+            class: Some("session".into()),
         },
     );
 

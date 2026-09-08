@@ -1655,6 +1655,167 @@ impl IpcServer {
             home_node: target_hotel,
         }
     }
+
+    /// Relocation Ceremony R3 (STANDBY phase): dispatch a `MaterializeRequest`
+    /// mesh event asking `target_hotel` to pre-warm `role_name`'s process,
+    /// without touching `home_node` — that stays [`Self::handle_set_role_home`]'s
+    /// job alone, so STANDBY can complete well before SWITCH. Gated identically
+    /// to `set_role_home`/`set_transport_home` (G9): only operational-admin
+    /// roles may request cross-hotel materialization.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) async fn handle_materialize_request(
+        graph: &GraphDomain,
+        dispatcher_tx: &mpsc::Sender<LedgerCommand>,
+        local_node_id: &str,
+        current_identity: Option<&GuestIdentity>,
+        agent_id: String,
+        role_name: String,
+        calling_role: String,
+        target_hotel: String,
+    ) -> IpcResponse {
+        let Some(identity) = current_identity else {
+            return IpcResponse::error(
+                "materialize_request",
+                "MATERIALIZE_REQUEST_UNREGISTERED",
+                "guest must register before calling hotel.materialize_request",
+            );
+        };
+        if identity.role != "agent" {
+            return IpcResponse::error(
+                "materialize_request",
+                "MATERIALIZE_REQUEST_FORBIDDEN",
+                "only agent guests may call hotel.materialize_request",
+            );
+        }
+
+        let calling_role_record = graph.get_role_incarnation(&agent_id, &calling_role);
+        let is_admin = calling_role_record
+            .ok()
+            .flatten()
+            .map(|r| r.has_operational_admin_authority())
+            .unwrap_or(false);
+        if !is_admin {
+            return IpcResponse::error(
+                "materialize_request",
+                "MATERIALIZE_REQUEST_FORBIDDEN",
+                format!(
+                    "role '{}' does not have authority to request cross-hotel materialization",
+                    calling_role
+                ),
+            );
+        }
+
+        if target_hotel == local_node_id {
+            return IpcResponse::error(
+                "materialize_request",
+                "MATERIALIZE_REQUEST_LOCAL_TARGET",
+                "target_hotel is this hotel — the role is already local; nothing to pre-warm remotely",
+            );
+        }
+
+        let record = match graph.get_role_incarnation(&agent_id, &role_name) {
+            Ok(Some(r)) => r,
+            Ok(None) => {
+                return IpcResponse::error(
+                    "materialize_request",
+                    "MATERIALIZE_REQUEST_ROLE_UNKNOWN",
+                    format!("role '{}' not found for agent '{}'", role_name, agent_id),
+                );
+            }
+            Err(err) => {
+                return IpcResponse::error(
+                    "materialize_request",
+                    "MATERIALIZE_REQUEST_DB_ERROR",
+                    err.to_string(),
+                );
+            }
+        };
+        let toolset_record = graph
+            .get_toolset_profile(&record.toolset_profile)
+            .ok()
+            .flatten();
+
+        let request_id = Uuid::new_v4();
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let event = EventEnvelope {
+            event_id: request_id,
+            seq: 0,
+            source_node_id: local_node_id.to_string(),
+            target_node_id: Some(target_hotel.clone()),
+            source_agent_id: identity.guest_id.clone(),
+            target_agent_id: None,
+            kind: EventKind::MaterializeRequest,
+            corr_id: request_id.to_string(),
+            attempt: 0,
+            created_at: ts,
+            expires_at: None,
+            payload: EventPayload::Inline {
+                data: serde_json::json!({
+                    "request_id": request_id.to_string(),
+                    "role_record": record,
+                    "toolset_record": toolset_record,
+                })
+                .to_string(),
+            },
+            trace: vec![],
+        };
+        let _ = dispatcher_tx.send(LedgerCommand::AppendLocal(event)).await;
+
+        info!(
+            "Materialize request [{}] dispatched: role '{}' (agent '{}') -> hotel '{}', requested by '{}'",
+            request_id, role_name, agent_id, target_hotel, calling_role
+        );
+
+        IpcResponse::MaterializeRequested {
+            materialize_requested: true,
+            request_id: request_id.to_string(),
+            role_name,
+            target_hotel,
+        }
+    }
+
+    /// Poll the outcome of a prior [`Self::handle_materialize_request`]. `None`
+    /// fields mean the target hotel's `MaterializeReady` reply has not landed
+    /// yet — a pending request, not an error.
+    pub(super) fn handle_materialize_status(
+        graph: &GraphDomain,
+        request_id: String,
+    ) -> IpcResponse {
+        let key = format!("materialize_ready:{request_id}");
+        match graph.get_config_value(&key) {
+            Ok(Some(raw)) => {
+                let parsed: serde_json::Value = serde_json::from_str(&raw).unwrap_or_default();
+                IpcResponse::MaterializeStatus {
+                    materialize_status: true,
+                    request_id,
+                    ok: parsed.get("ok").and_then(|v| v.as_bool()),
+                    readiness: parsed
+                        .get("readiness")
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string),
+                    error: parsed
+                        .get("error")
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string),
+                }
+            }
+            Ok(None) => IpcResponse::MaterializeStatus {
+                materialize_status: true,
+                request_id,
+                ok: None,
+                readiness: None,
+                error: None,
+            },
+            Err(err) => IpcResponse::error(
+                "materialize_status",
+                "MATERIALIZE_STATUS_DB_ERROR",
+                err.to_string(),
+            ),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1742,6 +1903,179 @@ mod tests {
         IpcServer::normalize_cron_target_role(&graph, &mut job);
 
         assert_eq!(job.target_role, "role:agent-beacon:orchestrator");
+    }
+
+    #[tokio::test]
+    async fn materialize_request_rejects_caller_without_operational_admin_authority() {
+        let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
+        let graph = GraphDomain::new(Arc::new(graph_store.adapter()));
+        graph
+            .upsert_role_incarnation(&RoleIncarnationRecord {
+                agent_id: "agent-beacon".into(),
+                role_name: "vixen".into(),
+                guest_id: "agent-beacon:vixen".into(),
+                toolset_profile: "vixen".into(),
+                is_admin: false,
+                readiness_state: RoleReadinessState::Routable,
+                turn_loop_config: TurnLoopConfig::default(),
+                home_node: None,
+                ..Default::default()
+            })
+            .expect("seed non-admin calling role");
+        let (dispatcher_tx, _rx) = test_dispatcher_channel();
+        let identity = GuestIdentity {
+            guest_id: "agent-beacon".into(),
+            role: "agent".into(),
+            supported_tools: vec![],
+        };
+
+        let resp = IpcServer::handle_materialize_request(
+            &graph,
+            &dispatcher_tx,
+            "mac-jane",
+            Some(&identity),
+            "agent-beacon".into(),
+            "vixen".into(),
+            "vixen".into(), // calling_role: the non-admin role itself, not orchestrator
+            "vps-jane".into(),
+        )
+        .await;
+
+        match resp {
+            IpcResponse::Standard {
+                ok: false, message, ..
+            } => assert!(
+                message.contains("does not have authority"),
+                "expected authority-denial message, got: {message}"
+            ),
+            other => panic!("expected a rejecting IpcResponse::Standard, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn materialize_request_dispatches_mesh_event_carrying_role_and_toolset_records() {
+        let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
+        let graph = GraphDomain::new(Arc::new(graph_store.adapter()));
+        graph
+            .upsert_role_incarnation(&RoleIncarnationRecord {
+                agent_id: "agent-beacon".into(),
+                role_name: "orchestrator".into(),
+                guest_id: "agent-beacon:orchestrator".into(),
+                toolset_profile: "orchestrator".into(),
+                is_admin: true,
+                readiness_state: RoleReadinessState::Routable,
+                turn_loop_config: TurnLoopConfig::default(),
+                home_node: Some("mac-jane".into()),
+                ..Default::default()
+            })
+            .expect("seed admin orchestrator role");
+        let (dispatcher_tx, mut rx) = test_dispatcher_channel();
+        let identity = GuestIdentity {
+            guest_id: "agent-beacon".into(),
+            role: "agent".into(),
+            supported_tools: vec![],
+        };
+
+        let resp = IpcServer::handle_materialize_request(
+            &graph,
+            &dispatcher_tx,
+            "mac-jane",
+            Some(&identity),
+            "agent-beacon".into(),
+            "orchestrator".into(),
+            "orchestrator".into(),
+            "vps-jane".into(),
+        )
+        .await;
+
+        let (request_id, role_name, target_hotel) = match resp {
+            IpcResponse::MaterializeRequested {
+                materialize_requested,
+                request_id,
+                role_name,
+                target_hotel,
+            } => {
+                assert!(materialize_requested);
+                (request_id, role_name, target_hotel)
+            }
+            other => panic!("expected IpcResponse::MaterializeRequested, got {other:?}"),
+        };
+        assert_eq!(role_name, "orchestrator");
+        assert_eq!(target_hotel, "vps-jane");
+
+        let cmd = rx.recv().await.expect("mesh envelope dispatched");
+        let LedgerCommand::AppendLocal(event) = cmd else {
+            panic!("expected LedgerCommand::AppendLocal");
+        };
+        assert_eq!(event.kind, EventKind::MaterializeRequest);
+        assert_eq!(event.target_node_id.as_deref(), Some("vps-jane"));
+        let EventPayload::Inline { data } = &event.payload else {
+            panic!("expected inline payload");
+        };
+        let v: serde_json::Value = serde_json::from_str(data).expect("valid json payload");
+        assert_eq!(v["request_id"].as_str(), Some(request_id.as_str()));
+        assert_eq!(v["role_record"]["home_node"].as_str(), Some("mac-jane"));
+        assert_eq!(v["role_record"]["readiness_state"], "routable");
+    }
+
+    #[test]
+    fn materialize_status_reports_pending_when_no_reply_has_landed() {
+        let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
+        let graph = GraphDomain::new(Arc::new(graph_store.adapter()));
+
+        let resp = IpcServer::handle_materialize_status(&graph, "no-such-request".into());
+
+        match resp {
+            IpcResponse::MaterializeStatus {
+                materialize_status,
+                request_id,
+                ok,
+                readiness,
+                error,
+            } => {
+                assert!(materialize_status);
+                assert_eq!(request_id, "no-such-request");
+                assert_eq!(ok, None);
+                assert_eq!(readiness, None);
+                assert_eq!(error, None);
+            }
+            other => panic!("expected IpcResponse::MaterializeStatus, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn materialize_status_surfaces_a_landed_ready_reply() {
+        let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
+        let graph = GraphDomain::new(Arc::new(graph_store.adapter()));
+        graph
+            .set_config_value(
+                "materialize_ready:req-123",
+                &serde_json::json!({
+                    "request_id": "req-123",
+                    "guest_id": "agent-beacon:orchestrator",
+                    "ok": true,
+                    "readiness": "routable",
+                    "error": null,
+                })
+                .to_string(),
+            )
+            .expect("seed materialize_ready reply");
+
+        let resp = IpcServer::handle_materialize_status(&graph, "req-123".into());
+
+        match resp {
+            IpcResponse::MaterializeStatus {
+                ok,
+                readiness,
+                error,
+                ..
+            } => {
+                assert_eq!(ok, Some(true));
+                assert_eq!(readiness.as_deref(), Some("routable"));
+                assert_eq!(error, None);
+            }
+            other => panic!("expected IpcResponse::MaterializeStatus, got {other:?}"),
+        }
     }
 
     #[tokio::test]

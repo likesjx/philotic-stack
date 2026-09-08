@@ -2301,6 +2301,24 @@ pub enum IpcRequest {
     CloseHealWorkItem {
         work_item_id: String,
     },
+    /// Relocation Ceremony R3 (STANDBY phase): ask a `target_hotel` to
+    /// pre-warm `role_name`'s process ahead of any traffic switch, without
+    /// changing `home_node` — that stays a separate act via
+    /// [`IpcRequest::SetRoleHome`]. Gated identically to `SetRoleHome`
+    /// (`calling_role` must carry operational admin authority). Fire-and-track:
+    /// answered immediately with [`IpcResponse::MaterializeRequested`]; actual
+    /// readiness arrives asynchronously over the mesh and is polled with
+    /// [`IpcRequest::MaterializeStatus`].
+    MaterializeRequest {
+        agent_id: String,
+        role_name: String,
+        calling_role: String,
+        target_hotel: String,
+    },
+    /// Poll the outcome of a prior [`IpcRequest::MaterializeRequest`].
+    MaterializeStatus {
+        request_id: String,
+    },
 }
 
 fn default_heal_queue_limit() -> usize {
@@ -2929,6 +2947,35 @@ pub enum IpcResponse {
     /// makes this variant structurally unambiguous.
     MeshRosterView {
         mesh_roster: Vec<MeshRosterEntryView>,
+    },
+    /// Response to [`IpcRequest::MaterializeRequest`] — an immediate ack that
+    /// the request was dispatched, not that the guest is warm yet. Poll
+    /// [`IpcRequest::MaterializeStatus`] with `request_id` for the outcome.
+    ///
+    /// Untagged-serde safety: the required, uniquely-named
+    /// `materialize_requested` marker field disambiguates this variant.
+    MaterializeRequested {
+        materialize_requested: bool,
+        request_id: String,
+        role_name: String,
+        target_hotel: String,
+    },
+    /// Response to [`IpcRequest::MaterializeStatus`]. `ok`/`readiness`/`error`
+    /// are all `None` until the target hotel's [`EventKind::MaterializeReady`]
+    /// mesh reply lands — a still-pending request is not an error.
+    ///
+    /// Untagged-serde safety: the required, uniquely-named `materialize_status`
+    /// marker field plus the required `request_id` disambiguate this variant
+    /// from `MaterializeRequested` and from `Standard`/`Error`.
+    MaterializeStatus {
+        materialize_status: bool,
+        request_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ok: Option<bool>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        readiness: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
     },
     // CRITICAL: `MemoryConfig` (all-optional payload) must remain the LAST
     // variant of this untagged enum — see `project_cron_scheduler.md` /

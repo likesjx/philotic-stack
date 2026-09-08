@@ -71,8 +71,22 @@ stamps on both home record kinds, reseed preserves `home_node` (DEF-106), runtim
 homes gossip in `HotelStateSync` with last-writer-wins apply (`placement_sync`).
 **R2 test-green** on `codex/relocation-r2`: `TransportHomeChanged` push on local and
 gossiped home changes; Telegram seat `Standby` state, stop-now, release-next-tick,
-immediate re-probe when the home moves here (DEF-107). R3 onward not started.
-The first concrete relocation
+immediate re-probe when the home moves here (DEF-107). **R3 test-green** on
+`codex/relocation-r3-materialize`: new `EventKind::MaterializeRequest`/`MaterializeReady`
+mesh event pair (extends the existing "session.handoff" remote-materialize path
+that only fires inline during a live conversational handoff) lets an admin-authority
+role ask a target hotel to pre-warm another role's process — spawn it and bring it
+to a live, routable state — *without* touching `home_node`; SWITCH (`role.set_home`)
+stays the only act that moves authority, so STANDBY can finish well ahead of it.
+New philote tools `hotel.materialize_request`/`hotel.materialize_status` (gated
+identically to `role.set_home`/`transport.set_home`: `has_operational_admin_authority`
+only). Cross-hotel binary resolution (G3) turned out to already be closed by the
+Guest Binary Resolution proposal — every hotel resolves its own guest binaries
+locally via `PHILOTIC_BIN_DIR`/`PATH`, so materialization only needs to replicate
+the role/toolset *records*, not binaries, which `MaterializeRequest`'s payload
+already does (same pattern `handle_remote_role_handoff` established). Not yet
+watched-live — that is an operator-timed live-service action like R2's, not a
+solo test. R4 onward not started. The first concrete relocation
 this ceremony must carry is moving every orchestrator incarnation (Bjork, Coach,
 Mac on `mac-jane`; Astrid, Ariel, Jane, Aria on `mbp-jane`) to `vps-jane`, with
 Mac-bound specialists (Architect and anything holding `bash.exec`, desktop, ONNX
