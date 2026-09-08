@@ -6712,6 +6712,27 @@ impl IpcServer {
                     standby_hotels,
                 }
             }
+            IpcRequest::MaterializeRequest {
+                agent_id,
+                role_name,
+                calling_role,
+                target_hotel,
+            } => {
+                Self::handle_materialize_request(
+                    graph,
+                    dispatcher_tx,
+                    local_node_id,
+                    current_identity.as_ref(),
+                    agent_id,
+                    role_name,
+                    calling_role,
+                    target_hotel,
+                )
+                .await
+            }
+            IpcRequest::MaterializeStatus { request_id } => {
+                Self::handle_materialize_status(graph, request_id)
+            }
             IpcRequest::DelegateToPeer {
                 target_agent_id,
                 task_description,
@@ -14679,6 +14700,254 @@ impl IpcServer {
                 role_name, err
             );
         }
+    }
+
+    /// Relocation Ceremony R3 (STANDBY phase), target side: receive a
+    /// `MaterializeRequest` for a role_record this hotel doesn't own yet,
+    /// bring it up locally, and reply with `MaterializeReady`.
+    ///
+    /// Deliberately mirrors `handle_remote_role_handoff`'s upsert step
+    /// (readiness reset to `Configured`, `home_node` left exactly as the
+    /// source sent it) — this hotel does not invent authority over the role
+    /// just by pre-warming it; SWITCH (`role.set_home`) stays the only act
+    /// that moves `home_node`. Idempotent: a retransmitted/duplicate request
+    /// just re-upserts the same record and re-checks liveness.
+    pub(crate) async fn handle_remote_materialize_request(
+        graph: &GraphDomain,
+        inboxes: &InboxRegistry,
+        materialization_requester: Option<Arc<dyn GuestMaterializationRequester>>,
+        dispatcher_tx: mpsc::Sender<LedgerCommand>,
+        local_node_id: &str,
+        source_node_id: &str,
+        data: &str,
+    ) {
+        let Ok(payload) = serde_json::from_str::<serde_json::Value>(data) else {
+            warn!("handle_remote_materialize_request: failed to parse payload");
+            return;
+        };
+        let Some(request_id) = payload
+            .get("request_id")
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+        else {
+            warn!("handle_remote_materialize_request: missing request_id");
+            return;
+        };
+        let Some(role_val) = payload.get("role_record") else {
+            Self::reply_materialize_ready(
+                &dispatcher_tx,
+                local_node_id,
+                source_node_id,
+                &request_id,
+                "",
+                false,
+                None,
+                Some("missing role_record".into()),
+            )
+            .await;
+            return;
+        };
+        let Ok(mut role_record) = serde_json::from_value::<
+            ansible_mesh_core::graph::RoleIncarnationRecord,
+        >(role_val.clone()) else {
+            Self::reply_materialize_ready(
+                &dispatcher_tx,
+                local_node_id,
+                source_node_id,
+                &request_id,
+                "",
+                false,
+                None,
+                Some("malformed role_record".into()),
+            )
+            .await;
+            return;
+        };
+        let agent_id = role_record.agent_id.clone();
+        let role_name = role_record.role_name.clone();
+        let guest_id = role_record.guest_id.clone();
+
+        role_record.readiness_state = ansible_mesh_core::graph::RoleReadinessState::Configured;
+        if let Err(err) = graph.upsert_role_incarnation(&role_record) {
+            warn!(
+                "handle_remote_materialize_request: failed to upsert role_record for '{}': {}",
+                role_name, err
+            );
+            Self::reply_materialize_ready(
+                &dispatcher_tx,
+                local_node_id,
+                source_node_id,
+                &request_id,
+                &guest_id,
+                false,
+                None,
+                Some(err.to_string()),
+            )
+            .await;
+            return;
+        }
+        if let Some(ts_val) = payload.get("toolset_record") {
+            if ts_val.is_object() {
+                if let Ok(profile) = serde_json::from_value::<
+                    ansible_mesh_core::graph::ToolsetProfileRecord,
+                >(ts_val.clone())
+                {
+                    let _ = graph.upsert_toolset_profile(&profile);
+                }
+            }
+        }
+
+        let mut readiness = match Self::ensure_role_materialized(
+            graph,
+            inboxes,
+            materialization_requester.as_deref(),
+            local_node_id,
+            &agent_id,
+            &role_name,
+        )
+        .await
+        {
+            Ok(r) => r,
+            Err(err) => {
+                warn!(
+                    "handle_remote_materialize_request: ensure_role_materialized failed for '{}': {}",
+                    role_name, err
+                );
+                Self::reply_materialize_ready(
+                    &dispatcher_tx,
+                    local_node_id,
+                    source_node_id,
+                    &request_id,
+                    &guest_id,
+                    false,
+                    None,
+                    Some(err.to_string()),
+                )
+                .await;
+                return;
+            }
+        };
+
+        // Spawn is async; give it a bounded window to settle to a live state
+        // before answering — same 250ms cadence as HandoffPending's existing
+        // retry contract.
+        let mut attempts = 0;
+        while matches!(
+            readiness,
+            ansible_mesh_core::graph::RoleReadinessState::Configured
+                | ansible_mesh_core::graph::RoleReadinessState::Materializing
+        ) && attempts < 20
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+            readiness = match Self::ensure_role_materialized(
+                graph,
+                inboxes,
+                materialization_requester.as_deref(),
+                local_node_id,
+                &agent_id,
+                &role_name,
+            )
+            .await
+            {
+                Ok(r) => r,
+                Err(err) => {
+                    warn!(
+                        "handle_remote_materialize_request: re-check failed for '{}': {}",
+                        role_name, err
+                    );
+                    break;
+                }
+            };
+            attempts += 1;
+        }
+
+        let ok = matches!(
+            readiness,
+            ansible_mesh_core::graph::RoleReadinessState::Routable
+                | ansible_mesh_core::graph::RoleReadinessState::Materialized
+                | ansible_mesh_core::graph::RoleReadinessState::ActiveInSession
+        );
+        info!(
+            "Materialize request [{}] for role '{}' (agent '{}') settled: readiness={:?} ok={}",
+            request_id, role_name, agent_id, readiness, ok
+        );
+        Self::reply_materialize_ready(
+            &dispatcher_tx,
+            local_node_id,
+            source_node_id,
+            &request_id,
+            &guest_id,
+            ok,
+            Some(readiness.as_str().to_string()),
+            None,
+        )
+        .await;
+    }
+
+    async fn reply_materialize_ready(
+        dispatcher_tx: &mpsc::Sender<LedgerCommand>,
+        local_node_id: &str,
+        dest_node_id: &str,
+        request_id: &str,
+        guest_id: &str,
+        ok: bool,
+        readiness: Option<String>,
+        error: Option<String>,
+    ) {
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let event = EventEnvelope {
+            event_id: Uuid::new_v4(),
+            seq: 0,
+            source_node_id: local_node_id.to_string(),
+            target_node_id: Some(dest_node_id.to_string()),
+            source_agent_id: local_node_id.to_string(),
+            target_agent_id: None,
+            kind: ansible_mesh_core::event::EventKind::MaterializeReady,
+            corr_id: request_id.to_string(),
+            attempt: 0,
+            created_at: ts,
+            expires_at: None,
+            payload: ansible_mesh_core::event::EventPayload::Inline {
+                data: serde_json::json!({
+                    "request_id": request_id,
+                    "guest_id": guest_id,
+                    "ok": ok,
+                    "readiness": readiness,
+                    "error": error,
+                })
+                .to_string(),
+            },
+            trace: vec![],
+        };
+        let _ = dispatcher_tx.send(LedgerCommand::AppendLocal(event)).await;
+    }
+
+    /// Relocation Ceremony R3, source side: receive the `MaterializeReady`
+    /// reply and persist it so `hotel.materialize_status` can answer a poll.
+    pub(crate) fn handle_remote_materialize_ready(graph: &GraphDomain, data: &str) {
+        let Ok(payload) = serde_json::from_str::<serde_json::Value>(data) else {
+            warn!("handle_remote_materialize_ready: failed to parse payload");
+            return;
+        };
+        let Some(request_id) = payload.get("request_id").and_then(|v| v.as_str()) else {
+            warn!("handle_remote_materialize_ready: missing request_id");
+            return;
+        };
+        let key = format!("materialize_ready:{request_id}");
+        if let Err(err) = graph.set_config_value(&key, data) {
+            warn!(
+                "handle_remote_materialize_ready: failed to persist status for '{}': {}",
+                request_id, err
+            );
+            return;
+        }
+        info!(
+            "Materialize ready recorded for request [{}]: {}",
+            request_id, data
+        );
     }
 
     // ── Training data admin handlers ──────────────────────────────────────────

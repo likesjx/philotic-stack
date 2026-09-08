@@ -74,6 +74,21 @@ pub enum EventKind {
     /// Non-secret user identity ghost mirror replicated across hotels so the
     /// same human can be recognized mesh-wide without copying sessions or secrets.
     ProjectedUserIdentitySync,
+    /// Relocation Ceremony R3: ask a target hotel to pre-warm (materialize) a
+    /// role incarnation's process *without* changing which hotel owns it —
+    /// `home_node` on the carried `role_record` is left as-is, so the STANDBY
+    /// phase can finish before the SWITCH phase (`role.set_home`) flips
+    /// authority. Decoupled from any in-flight conversational handoff, unlike
+    /// the existing `SessionControl` "session.handoff" remote-materialize path.
+    /// Payload: `{ "request_id": "...", "role_record": RoleIncarnationRecord,
+    /// "toolset_record": ToolsetProfileRecord|null }`.
+    MaterializeRequest,
+    /// Reply to [`EventKind::MaterializeRequest`], sent by the target hotel
+    /// once it has resolved (or failed to resolve) readiness for the
+    /// requested guest.
+    /// Payload: `{ "request_id": "...", "guest_id": "...", "ok": bool,
+    /// "readiness": "..."|null, "error": "..."|null }`.
+    MaterializeReady,
 }
 
 /// The payload definition. Large files must use `BlobRef`.
