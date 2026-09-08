@@ -182,7 +182,10 @@ Seam: `device-tool-plane`; branch: `codex/ios-healthkit` (based on the location 
 - [x] Decode nested observe acknowledgments and prevent failed/unknown/partial uploads from being reported as complete; no automatic retries after uncertain writes.
 - [x] Cover service consent/invalidation/error/time-window contracts and transport responses; run app tests on macOS and iOS Simulator and inspect the Health UI.
 - [x] Sign and install on the trusted physical iPhone over Wi-Fi; build 2 installed and launched 2026-09-05.
-- [x] Fix missing packaged ATS policy with an exact private-server exception; built-host iOS regression test passes. See [connection setup](../apps/philotic-apple/CONNECTION.md). Phone enrollment retry remains pending.
+- [x] Fix missing packaged ATS policy with an exact private-server exception; built-host iOS regression test passes. See [connection setup](../apps/philotic-apple/CONNECTION.md). Operator subsequently reported successful enrollment and uploads; newest server observations and agent recall still need independent verification.
+- [x] Fix LifeGraph lens decoding for the server's string-valued `fallback_used`; preserve legacy boolean support and reject unknown values. Regression reproduced the reported type mismatch; shared package suite passes (95 passed, 1 skipped), 2026-09-08.
+- [x] Build and sign iPhone build 4 with the decoder fix and new icon; verify signature, icon declaration, and exact-host ATS policy in the resulting bundle (2026-09-08).
+- [ ] Install build 4 on the physical iPhone, then confirm the Life tab renders its lists. Wireless install failed with CoreDevice error 4016 (device unavailable); build/push alone is not phone validation.
 - [ ] Exercise selected/denied/revoked Health permissions, compare readings with Apple Health, and confirm one operator-approved live share plus agent recall.
 - [ ] Decide server-enforced health-only role/provider access, named-provider disclosure, retention/deletion, and App Store privacy requirements before widening distribution or adding passive ingestion.
 

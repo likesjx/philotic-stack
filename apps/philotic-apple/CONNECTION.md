@@ -19,3 +19,10 @@ app bundle and caused enrollment to fail with `NSURLErrorDomain -1022`.
 
 After regenerating the project, select your Personal Team again (or provide
 `DEVELOPMENT_TEAM` when building). Signing identities stay local to the Mac.
+
+The Life tab reads the server's LifeGraph lenses. Its `fallback_used` response
+field is a string (`"false"`, `"topped_up"`, or `"full_fallback"`), not a JSON
+boolean. The client maps those values to its boolean indicator and also accepts
+legacy booleans and absent/null values. Unknown values remain decoding errors.
+`LifeGraphClientTests` covers this contract, including a populated lens response;
+the original boolean-only fixture hid a physical-phone `DecodingError.typeMismatch`.
