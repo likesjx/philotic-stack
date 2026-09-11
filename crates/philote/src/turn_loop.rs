@@ -2857,11 +2857,17 @@ impl AgentRuntime {
                 .iter()
                 .any(|s| s.status != "done" && s.status != "failed")
         });
-        if plan_pending || !reply_promises_unexecuted_action(content) {
+        if plan_pending
+            || !(reply_promises_unexecuted_action(content) || reply_claims_unbacked_write(content))
+        {
             return SayDoDisposition::Deliver;
         }
         let cap = effective_iteration_cap(state.settings.execution.iteration_cap, turn);
-        if turn.say_do_nudged || turn.iteration >= cap {
+        // Re-entry is only worth a model call if the turn would actually get
+        // tools this time; a conversational-gated turn with none projected
+        // would just promise (or claim) again.
+        let can_act = !state.project_tools_for_turn(&turn.user_content).is_empty();
+        if turn.say_do_nudged || turn.iteration >= cap || !can_act {
             SayDoDisposition::Trailer
         } else {
             SayDoDisposition::Reenter
@@ -4478,16 +4484,73 @@ pub(super) enum SayDoDisposition {
 
 /// Appended to the re-entry prompt by [`reenter_for_say_do_check`].
 pub(super) const SAY_DO_REENTRY_HINT: &str = "\n\n[Say-do check] Your reply tells the user you \
-are executing work now, but this turn has made NO tool call — the turn ends with your reply and \
-nothing you announced will run. Either call the tools now (declare an active_plan with one \
-verifiable outcome per step and start executing it), or rewrite the reply to say plainly that \
-nothing has been executed yet and what you need from the user. Never announce work you are not \
-doing in this turn.";
+are executing work now or have already recorded something, but this turn has made NO tool call \
+— the turn ends with your reply, nothing you announced will run, and nothing you claimed was \
+written exists. Either call the tools now (declare an active_plan with one verifiable outcome \
+per step and start executing it), or rewrite the reply to say plainly that nothing has been \
+executed or recorded yet and what you need from the user. Never announce or claim work that no \
+tool call in this turn performed.";
 
-/// Appended to a promise-only reply that could not be re-entered (cap
-/// reached, or already nudged once).
-pub(super) const SAY_DO_UNEXECUTED_TRAILER: &str = "⚠️ Nothing described above as executing has \
-actually run yet — this turn ended before any tool call. Reply \"go\" to have me execute it.";
+/// Appended to a promise-only or claim-only reply that could not be
+/// re-entered (cap reached, already nudged once, or no tools projected).
+pub(super) const SAY_DO_UNEXECUTED_TRAILER: &str = "⚠️ Correction: no tool call ran in this \
+turn, so nothing described above as executed or logged has actually been written yet. Reply \
+\"go\" to have me do it.";
+
+/// Does this reply tell the user that a write already happened?
+///
+/// The past-tense twin of [`reply_promises_unexecuted_action`]. Only
+/// consulted for a turn with an EMPTY tool history, where any such claim is
+/// false by construction. Live 2026-09-11 18:23 UTC: "I have logged this
+/// historic event on your LifeGraph to memorialize the speech" from a turn
+/// that was offered zero tools.
+pub(super) fn reply_claims_unbacked_write(content: &str) -> bool {
+    let lower = content.to_lowercase();
+    const VERBS: &[&str] = &[
+        "logged",
+        "recorded",
+        "updated",
+        "captured",
+        "committed",
+        "saved",
+        "added",
+        "marked",
+        "resolved",
+        "closed",
+        "noted",
+        "filed",
+        "memorialized",
+        "stored",
+        "registered",
+    ];
+    const SUBJECTS: &[&str] = &[
+        "i have ",
+        "i've ",
+        "i ",
+        "has been ",
+        "have been ",
+        "is now ",
+    ];
+    for verb in VERBS {
+        for subject in SUBJECTS {
+            let needle = format!("{subject}{verb}");
+            let mut search = lower.as_str();
+            while let Some(idx) = search.find(&needle) {
+                let rest = &search[idx + needle.len()..];
+                // "I logged in to the portal" is not a write claim.
+                let login = *verb == "logged"
+                    && (rest.starts_with(" in")
+                        || rest.starts_with(" on")
+                        || rest.starts_with(" off"));
+                if !login {
+                    return true;
+                }
+                search = rest;
+            }
+        }
+    }
+    false
+}
 
 /// Does this reply tell the user that the agent is executing work right now?
 ///
@@ -4896,6 +4959,31 @@ mod say_do_tests {
             "On it — executing step 2 now."
         ));
         assert!(reply_promises_unexecuted_action("Let me update that now."));
+    }
+
+    /// Live 2026-09-11 18:23 UTC: the past-tense false claim.
+    #[test]
+    fn unbacked_write_claims_are_detected() {
+        assert!(reply_claims_unbacked_write(
+            "Congratulations! I have logged this historic event on your LifeGraph to \
+             memorialize the speech and track Nadi's support."
+        ));
+        assert!(reply_claims_unbacked_write(
+            "Done — I've updated the commitment."
+        ));
+        assert!(reply_claims_unbacked_write(
+            "The loop has been resolved and is now closed."
+        ));
+        // Not write claims.
+        assert!(!reply_claims_unbacked_write(
+            "Congratulations on giving your speech today!"
+        ));
+        assert!(!reply_claims_unbacked_write(
+            "Want me to log that on your LifeGraph?"
+        ));
+        assert!(!reply_claims_unbacked_write(
+            "I logged in to the portal yesterday and it was slow."
+        ));
     }
 
     #[test]
