@@ -2339,9 +2339,19 @@ impl SessionState {
             // conversational zero-tools gate — a gratitude/filler turn stays
             // tool-free even mid-stewardship (tool projection is policy).
             .any(|skill| crate::catalog::skill_is_relevant_for_turn(skill, &normalized));
+        // …unless the turn is plainly ABOUT something the harness just
+        // recalled from the LifeGraph. Live 2026-09-11 18:23 UTC: "I gave my
+        // icebreaker speech in toastmasters today! And i did ok." tripped the
+        // gate on "ok" while auto-recall had injected the very open loop it
+        // resolves; the model got a [Plan first] directive and ZERO tools,
+        // replied "I have logged this historic event on your LifeGraph", and
+        // nothing was written. A lived-fact report that names a recalled
+        // node is stewardship, not filler — the life tools stay projected
+        // (the on-demand filter below keeps them via the session signal).
         if looks_like_conversational_goal(&normalized)
             && !looks_like_retry_goal(&normalized_current)
             && !on_demand_relevant
+            && !self.turn_reports_on_recalled_life_context(&normalized)
         {
             return Vec::new();
         }
@@ -2406,6 +2416,43 @@ impl SessionState {
                     .any(|memory| memory.vault_id.as_deref() == Some("life-graph"))
             })
             .unwrap_or(false)
+    }
+
+    /// True when the current message shares at least two distinctive words
+    /// with a LifeGraph record the auto-recall lane injected for this turn —
+    /// the operator is reporting on a known loop, event, or commitment, and
+    /// the model must be able to act on it (observe the outcome, commit or
+    /// resolve the node). Gratitude and filler share no such words with a
+    /// recalled node, so the conversational gate still holds for them.
+    fn turn_reports_on_recalled_life_context(&self, normalized: &str) -> bool {
+        let Some(turn) = self.active_turn.as_ref() else {
+            return false;
+        };
+        let message_words: std::collections::HashSet<&str> = normalized
+            .split(|c: char| !c.is_alphanumeric())
+            .filter(|w| w.len() >= 5)
+            .collect();
+        if message_words.is_empty() {
+            return false;
+        }
+        turn.recalled_memories
+            .iter()
+            .filter(|memory| memory.vault_id.as_deref() == Some("life-graph"))
+            .any(|memory| {
+                let text = format!(
+                    "{} {} {}",
+                    memory.concept,
+                    memory.content,
+                    memory.summary.as_deref().unwrap_or_default()
+                )
+                .to_lowercase();
+                let overlap: std::collections::HashSet<&str> = text
+                    .split(|c: char| !c.is_alphanumeric())
+                    .filter(|w| w.len() >= 5 && !LIFE_CONTEXT_STOPWORDS.contains(w))
+                    .filter(|w| message_words.contains(w))
+                    .collect();
+                overlap.len() >= 2
+            })
     }
 
     /// Skill relevance with a session-state fallback for `life.steward`.
@@ -4904,6 +4951,81 @@ fn contains_word_boundary(text: &str, phrase: &str) -> bool {
     }
     false
 }
+
+/// Words too common in LifeGraph records to count as "about the same thing"
+/// (five letters or longer, since shorter words are already ignored).
+const LIFE_CONTEXT_STOPWORDS: &[&str] = &[
+    "about",
+    "after",
+    "again",
+    "before",
+    "being",
+    "could",
+    "doing",
+    "every",
+    "first",
+    "going",
+    "having",
+    "jared",
+    "later",
+    "might",
+    "needs",
+    "operator",
+    "other",
+    "should",
+    "since",
+    "still",
+    "their",
+    "there",
+    "these",
+    "thing",
+    "things",
+    "think",
+    "those",
+    "today",
+    "tomorrow",
+    "tonight",
+    "under",
+    "until",
+    "watch",
+    "where",
+    "which",
+    "while",
+    "would",
+    "week",
+    "weeks",
+    "month",
+    "morning",
+    "evening",
+    "night",
+    "afternoon",
+    "friday",
+    "monday",
+    "tuesday",
+    "wednesday",
+    "thursday",
+    "saturday",
+    "sunday",
+    "project",
+    "proposed",
+    "confirmed",
+    "resolved",
+    "status",
+    "update",
+    "updated",
+    "check",
+    "loop",
+    "loops",
+    "commitment",
+    "event",
+    "events",
+    "goal",
+    "goals",
+    "habit",
+    "habits",
+    "routine",
+    "reminder",
+];
 
 fn looks_like_conversational_goal(normalized: &str) -> bool {
     normalized.contains('?')
@@ -9284,6 +9406,71 @@ mod tests {
                 .iter()
                 .map(|t| t.tool_name.as_str())
                 .collect::<Vec<_>>()
+        );
+    }
+
+    /// Live 2026-09-11 18:23 UTC: the operator reported the outcome of a
+    /// recalled open loop, the "ok" in the message tripped the conversational
+    /// gate, and the model — with zero tools — told him it had logged the
+    /// event. A report that names a recalled node keeps the life tools.
+    #[test]
+    fn lived_fact_report_about_recalled_loop_keeps_life_tools() {
+        let mut state =
+            SessionState::new("sess-1".into(), "agent-beacon".into(), "telegram".into());
+        for tool in [
+            "life.observe",
+            "life.recall",
+            "life.commit",
+            "cron.register",
+        ] {
+            state.add_tool_binding(tool);
+        }
+        state.bindings.on_demand_skills = vec!["life.steward".into(), "cron.manage".into()];
+
+        let msg = "I gave my icebreaker speech in toastmasters today! And i did ok. Nadi came in support.";
+        let mut turn = make_plain_turn();
+        turn.user_content = msg.into();
+        let mut life_memory = life_record(
+            "life:open_loop:toastmasters_icebreaker_speech_20260906",
+            "Jared is starting work on his Toastmasters Icebreaker speech project.",
+        );
+        life_memory.vault_id = Some("life-graph".into());
+        turn.recalled_memories = vec![life_memory];
+        state.start_turn(turn);
+
+        let names: Vec<String> = state
+            .project_tools_for_turn(msg)
+            .into_iter()
+            .map(|t| t.tool_name)
+            .collect();
+        for expected in ["life.observe", "life.commit", "life.recall"] {
+            assert!(
+                names.contains(&expected.to_string()),
+                "missing {expected}: {names:?}"
+            );
+        }
+        assert!(
+            !names.contains(&"cron.register".to_string()),
+            "unrelated on-demand tools stay stripped: {names:?}"
+        );
+
+        // The same message with unrelated recalled context is still filler.
+        let mut state2 =
+            SessionState::new("sess-2".into(), "agent-beacon".into(), "telegram".into());
+        for tool in ["life.observe", "life.recall", "life.commit"] {
+            state2.add_tool_binding(tool);
+        }
+        state2.bindings.on_demand_skills = vec!["life.steward".into()];
+        let mut turn2 = make_plain_turn();
+        turn2.user_content = "ok, that looks great today!".into();
+        let mut other = life_record("life:openloop:ypt", "YPT training due this week");
+        other.vault_id = Some("life-graph".into());
+        turn2.recalled_memories = vec![other];
+        state2.start_turn(turn2);
+        assert!(
+            state2
+                .project_tools_for_turn("ok, that looks great today!")
+                .is_empty()
         );
     }
 
