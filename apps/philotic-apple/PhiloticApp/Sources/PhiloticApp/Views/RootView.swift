@@ -80,6 +80,32 @@ struct RootView: View {
                 showingSettings = true
             }
         }
+        .modifier(LifeIntentPresentation(showingLife: $showingLife))
+    }
+}
+
+/// Presents the Life surface when an App Intent (Spotlight tap, Siri phrase)
+/// asks to open a Life Graph entry.
+///
+/// Split into a ViewModifier so the whole intent surface stays behind one
+/// availability gate — `LifeIntentRouter` is iOS 18 / macOS 15 only, and
+/// RootView itself still deploys to iOS 17 / macOS 14.
+private struct LifeIntentPresentation: ViewModifier {
+    @Binding var showingLife: Bool
+
+    func body(content: Content) -> some View {
+        if #available(iOS 18.0, macOS 15.0, *) {
+            content.onChange(of: LifeIntentRouter.shared.pendingNodeId) { _, newValue in
+                guard newValue != nil else { return }
+                showingLife = true
+                // Consume so a re-render does not re-present. The Life surface
+                // opening is the observable outcome; node-level focus lands
+                // with the node-detail route (proposal Plane 2, slice 4).
+                LifeIntentRouter.shared.consume()
+            }
+        } else {
+            content
+        }
     }
 }
 

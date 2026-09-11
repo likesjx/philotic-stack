@@ -526,6 +526,79 @@ async fn execute_memory_tool(
             }
         }
 
+        // Structured sibling of `memory.recall`. Same retrieval, but returns
+        // JSON carrying the provenance fields an index or UI needs instead of
+        // a flattened human string.
+        //
+        // This exists because donating memory to a *system* index (Spotlight,
+        // via the Apple entity index plane) requires knowing trust tier and
+        // recency per memory: without them there is no way to withhold a
+        // low-trust or retracted memory from Siri. `memory.recall`'s
+        // "[id] concept: content" rendering discards exactly that. Agents keep
+        // using `memory.recall`; machine consumers use this.
+        //
+        // Trust tier is read from Muninn's `metadata.trust` when present and
+        // otherwise reported as "unknown" — never silently upgraded. See
+        // ProvenanceEnvelope / TrustTier in ansible-mesh-core, and Standing
+        // Rule 2 of the Memory Transparency proposal.
+        "memory.recall.structured" => {
+            let context = match arguments.get("context").and_then(|v| v.as_str()) {
+                Some(c) => c,
+                None => return "memory.recall.structured error: missing `context`".into(),
+            };
+            let max_results = arguments
+                .get("max_results")
+                .and_then(|v| v.as_u64())
+                .map(|n| n as usize);
+
+            match engine.activate(context, scope, max_results).await {
+                Ok(result) => {
+                    let memories: Vec<serde_json::Value> = result
+                        .engrams
+                        .iter()
+                        .map(|e| {
+                            let trust = e
+                                .metadata
+                                .get("trust")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("unknown");
+                            // Muninn soft-deletes; a memory carrying a
+                            // deletion marker must be reported so consumers
+                            // can purge rather than re-index it.
+                            let deleted = e
+                                .metadata
+                                .get("deleted")
+                                .and_then(|v| v.as_bool())
+                                .unwrap_or(false);
+                            serde_json::json!({
+                                "id": e.id,
+                                "vault_id": e.vault_id,
+                                "concept": e.concept,
+                                "content": e.content,
+                                "tags": e.tags,
+                                "confidence": e.confidence,
+                                "created_at": e.created_at,
+                                "updated_at": e.updated_at,
+                                "trust": trust,
+                                "deleted": deleted,
+                            })
+                        })
+                        .collect();
+                    serde_json::json!({
+                        "status": "ok",
+                        "total": result.total,
+                        "memories": memories,
+                    })
+                    .to_string()
+                }
+                Err(e) => serde_json::json!({
+                    "status": "error",
+                    "error": e.to_string(),
+                })
+                .to_string(),
+            }
+        }
+
         "memory.remember" => {
             let concept = match arguments.get("concept").and_then(|v| v.as_str()) {
                 Some(c) => c,
@@ -717,6 +790,7 @@ async fn main() -> Result<()> {
             "workspace.read".into(),
             "workspace.search".into(),
             "memory.recall".into(),
+            "memory.recall.structured".into(),
             "memory.remember".into(),
             "memory.forget".into(),
             "memory.link".into(),
@@ -733,6 +807,7 @@ async fn main() -> Result<()> {
         "tool.workspace.search",
         "tool.desktop.observe",
         "tool.memory.recall",
+        "tool.memory.recall.structured",
         "tool.memory.remember",
         "tool.memory.forget",
         "tool.memory.link",

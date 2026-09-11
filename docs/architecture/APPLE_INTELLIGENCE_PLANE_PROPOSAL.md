@@ -2,7 +2,7 @@
 title: Apple Intelligence Plane — Siri, App Schemas, Foundation Models
 doc_type: proposal
 domain: membrane-transport
-status: proposed
+status: active
 last_updated: 2026-07-26
 tags:
 - apple
@@ -22,7 +22,7 @@ implements:
 - native-apple-app-proposal
 implemented_by: []
 active_seams:
-- apple-entity-index-plane
+- apple-entity-index-plane  # shipped
 - apple-schema-intents
 - apple-custom-intents
 - apple-fm-provider
@@ -108,6 +108,59 @@ Governance carries over unchanged: only nodes already permitted through
 entity's display representation, and zoning/validation-state filtering happens
 server-side before anything reaches the index. Nothing raw-Cypher, nothing
 unzoned. Index only what the device is already allowed to cache.
+
+### Status: SHIPPED (LifeGraph + Muninn)
+
+Layering keeps the governance decision testable without a device:
+
+| Component | Responsibility | Verified by |
+|---|---|---|
+| `LifeIndexMapper` (PhiloticKit) | decides **what may be indexed** | 30 unit tests |
+| `LifeIndexCache` | remembers what **was** indexed; resolves offline | — |
+| `LifeIndexDonor` | talks to CoreSpotlight | compile-checked |
+
+Rules as implemented:
+
+- **LifeGraph**: `confirmed` / `proposed` / `inferred` indexable; `retired` and
+  `conflicted` not. Unknown or missing states fail closed.
+- **Non-indexable is *purged*, never skipped.** Skipping would leave a
+  retracted claim answerable by Siri indefinitely. Retirement dominates
+  regardless of batch order.
+- **Live `LifeGraphChange` frames can only remove.** They carry no provenance
+  envelope, so they are never treated as authorisation to index.
+- **Ids are namespaced by plane** (`life:` / `muninn:`) so the two memory
+  planes cannot collide in one index.
+
+### Muninn extension — the blocker was a missing structured read, not the envelope
+
+Original assessment was that Muninn indexing waited on the Memory Transparency
+proposal's unified provenance envelope. Investigation showed something more
+specific and more fixable: `ProvenanceEnvelope` **already exists**
+(`ansible-mesh-core`, Slice M1), but there was **no edge-reachable Muninn read
+at all**, and `memory.recall` renders engrams to `"[id] concept: content"` —
+discarding exactly the trust tier and soft-delete marker that decide whether a
+memory may be donated to a system index.
+
+Shipped to close it:
+
+- `memory.recall.structured` (tool-runner) — same retrieval, JSON out, carrying
+  `trust`, `deleted`, `confidence`, and timestamps. Agents keep using
+  `memory.recall`; machine consumers use this.
+- `GET /api/edge/memory/recall` (philotic-web) — edge-bearer, bounded at 50,
+  routed through the new `ipc_tool_runner_call` helper (tool-runner replies
+  `tool_result`, not `datasource_response`, so it needed its own path).
+- `MemoryClient` + Muninn branch of `LifeIndexMapper`.
+
+**Muninn's rule is deliberately stricter than LifeGraph's.** LifeGraph
+`inferred` is a positive assertion by the graph; Muninn `unknown` is the
+*absence* of any assertion. So trust tiers `observed` / `inferred` / `told` are
+indexable, `unknown` is withheld, and soft-deleted memories are purged.
+
+Withheld memories are **counted on the plan and logged**, not dropped silently
+— a silently-empty index is indistinguishable from a working one, and Standing
+Rule 1 requires the adoption gap be visible. Expect withholding to dominate
+until envelope adoption lands on Muninn's write path; that is the honest state
+of the world, not a bug in this plane.
 
 ## Slice B — Schema Intents
 
@@ -211,8 +264,9 @@ Per-platform intent emphasis:
 
 ## Build Order
 
-1. **A** — `IndexedEntity` on LifeGraph/Muninn entities → Spotlight. Highest
-   value, rides an existing seam.
+1. ~~**A** — `IndexedEntity` on LifeGraph/Muninn entities → Spotlight.~~
+   **SHIPPED** (LifeGraph + Muninn, incl. the structured Muninn read the
+   extension required).
 2. **F** — `AppIntentsTesting` harness, alongside A.
 3. **B** — `system.Open`, then `reminders`/`calendar` on the EventKit work.
 4. **D1** — on-device `SystemLanguageModel` triage for Today/capture.

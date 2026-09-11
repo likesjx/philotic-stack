@@ -1012,6 +1012,73 @@ pub(crate) async fn handle_edge_lifegraph_observe(
     }
 }
 
+/// Upper bound on memories returned to a device in one call. Devices mirror
+/// these into a system index, so an unbounded read is both a payload and a
+/// privacy-surface problem.
+const EDGE_MEMORY_MAX_RESULTS: u32 = 50;
+
+#[derive(Deserialize)]
+pub(crate) struct EdgeMemoryRecallQuery {
+    context: Option<String>,
+    max_results: Option<u32>,
+}
+
+/// `GET /api/edge/memory/recall` — edge-bearer structured Muninn recall.
+///
+/// Read-only, and deliberately routed through `memory.recall.structured`
+/// rather than `memory.recall`: the plain tool renders engrams to a human
+/// string, discarding the trust tier and soft-delete marker a consumer needs
+/// in order to withhold low-trust or retracted memories. Devices donate this
+/// content to the Spotlight semantic index (seam: apple-entity-index-plane),
+/// so shipping it without provenance would put unattributable memory in front
+/// of Siri with no way to retract it.
+///
+/// Governance is applied twice, as everywhere else on the edge tier: the
+/// runner bounds and filters server-side, and the device applies its own
+/// fail-closed policy before anything is indexed.
+pub(crate) async fn handle_edge_memory_recall(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Query(query): Query<EdgeMemoryRecallQuery>,
+) -> Response {
+    if edge_bearer_identity(&headers, &state).is_none() {
+        return super::unauthorized();
+    }
+    let context = query
+        .context
+        .as_deref()
+        .map(str::trim)
+        .filter(|c| !c.is_empty())
+        .unwrap_or("recent operator context")
+        .to_string();
+    let max_results = query
+        .max_results
+        .unwrap_or(25)
+        .clamp(1, EDGE_MEMORY_MAX_RESULTS);
+
+    let arguments = json!({
+        "context": context,
+        "max_results": max_results,
+    });
+    match super::ipc_tool_runner_call(&state.socket, "memory.recall.structured", arguments).await {
+        Ok(content) => match serde_json::from_str::<serde_json::Value>(&content) {
+            Ok(data) => Json(data).into_response(),
+            // The tool returns a bare error string on misconfiguration
+            // (e.g. "memory not configured on this hotel") rather than JSON.
+            Err(_) => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({ "status": "error", "error": content })),
+            )
+                .into_response(),
+        },
+        Err(err) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({ "status": "error", "error": err.to_string() })),
+        )
+            .into_response(),
+    }
+}
+
 /// Outcome of a successful handshake ([`process_hello`]).
 #[derive(Debug, PartialEq)]
 struct HandshakeAccept {
