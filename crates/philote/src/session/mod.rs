@@ -2497,52 +2497,88 @@ impl SessionState {
         if !crate::plan_eval::reports_an_outcome(&normalized) {
             return None;
         }
-        let can_observe = self
-            .tool_assembly
-            .tools_for_model
-            .iter()
-            .any(|t| t.tool_name == "life.observe");
-        let can_commit = self
-            .tool_assembly
-            .tools_for_model
-            .iter()
-            .any(|t| t.tool_name == "life.commit");
-        if !(can_observe && can_commit) {
+        let has_tool = |name: &str| {
+            self.tool_assembly
+                .tools_for_model
+                .iter()
+                .any(|t| t.tool_name == name)
+        };
+        if !(has_tool("life.observe") && has_tool("life.commit") && has_tool("life.recall")) {
             return None;
         }
-        let target = self
+        let excerpt: String = user_content.trim().chars().take(160).collect();
+        let recalled_target = self
             .recalled_life_records_named_by(&normalized)
             .into_iter()
             .find(|m| record_is_loop_like(m))
-            .and_then(|m| m.id.clone())?;
-        let excerpt: String = user_content.trim().chars().take(160).collect();
-        let plan = ActivePlan {
-            goal: format!(
-                "Outcome reflex: record the outcome the operator just reported and resolve {target}"
+            .and_then(|m| m.id.clone());
+
+        // Two shapes. With the loop already in context, two steps bound to
+        // its exact id. Without it — the prefetch cache is stale after a
+        // quiet spell (live 2026-09-11 20:46 UTC: 2h23m since the last turn,
+        // cache max age 30 min, nothing injected, nothing seeded) — a recall
+        // step comes first and the commit resolves whatever it finds, or
+        // confirms the outcome Event itself so the step is still a real
+        // write. Either way the model executes and the evaluator checks.
+        let (goal, steps) = match recalled_target.as_deref() {
+            Some(target) => (
+                format!(
+                    "Outcome reflex: record the outcome the operator just reported and resolve {target}"
+                ),
+                vec![
+                    PlanStep {
+                        id: 1,
+                        description: format!(
+                            "Record the reported outcome as a confirmed Event with life.observe — what happened, when, who was involved — linked to {target}. Operator said: \"{excerpt}\""
+                        ),
+                        tool_name: Some("life.observe".into()),
+                        status: "pending".into(),
+                    },
+                    PlanStep {
+                        id: 2,
+                        description: format!(
+                            "Resolve {target} with life.commit using that exact id: loop_status \"resolved\", resolution_note citing the outcome event."
+                        ),
+                        tool_name: Some("life.commit".into()),
+                        status: "pending".into(),
+                    },
+                ],
             ),
+            None => (
+                "Outcome reflex: record the outcome the operator just reported and resolve the LifeGraph loop it settles"
+                    .to_string(),
+                vec![
+                    PlanStep {
+                        id: 1,
+                        description: format!(
+                            "Find the open loop / commitment / next action this outcome settles with life.recall (named_strategy \"open_loops_by_context\", query_text = the operator's message). Operator said: \"{excerpt}\""
+                        ),
+                        tool_name: Some("life.recall".into()),
+                        status: "pending".into(),
+                    },
+                    PlanStep {
+                        id: 2,
+                        description: "Record the reported outcome as a confirmed Event with life.observe — what happened, when, who was involved — linked to the loop found in step 1 if any.".into(),
+                        tool_name: Some("life.observe".into()),
+                        status: "pending".into(),
+                    },
+                    PlanStep {
+                        id: 3,
+                        description: "life.commit: if step 1 found the matching loop, resolve it by its exact id (loop_status \"resolved\", resolution_note citing the outcome event); if it found none, commit the step-2 Event's node id as confirmed instead. Never invent an id.".into(),
+                        tool_name: Some("life.commit".into()),
+                        status: "pending".into(),
+                    },
+                ],
+            ),
+        };
+        let plan = ActivePlan {
+            goal,
             status: "executing".into(),
-            steps: vec![
-                PlanStep {
-                    id: 1,
-                    description: format!(
-                        "Record the reported outcome as a confirmed Event with life.observe — what happened, when, who was involved — linked to {target}. Operator said: \"{excerpt}\""
-                    ),
-                    tool_name: Some("life.observe".into()),
-                    status: "pending".into(),
-                },
-                PlanStep {
-                    id: 2,
-                    description: format!(
-                        "Resolve {target} with life.commit using that exact id: loop_status \"resolved\", resolution_note citing the outcome event."
-                    ),
-                    tool_name: Some("life.commit".into()),
-                    status: "pending".into(),
-                },
-            ],
+            steps,
             context_1_advisory: None,
         };
         self.active_turn.as_mut()?.active_plan = Some(plan);
-        Some(target)
+        Some(recalled_target.unwrap_or_else(|| "(loop to be recalled)".to_string()))
     }
 
     /// Skill relevance with a session-state fallback for `life.steward`.
@@ -9666,11 +9702,13 @@ mod tests {
         let prompt = state.build_prompt(msg);
         assert!(prompt.contains("[Outcome reflex]"), "{prompt}");
 
-        // No loop-like record recalled → no seed (an event alone is not
-        // something an outcome resolves).
+        // No loop-like record recalled (stale prefetch cache, or only an
+        // event) → the plan opens with a life.recall step and the commit
+        // resolves whatever it finds. Live 2026-09-11 20:46 UTC: nothing was
+        // injected after a 2h23m quiet spell and nothing was seeded.
         let mut state2 =
             SessionState::new("sess-2".into(), "agent-beacon".into(), "telegram".into());
-        for tool in ["life.observe", "life.commit"] {
+        for tool in ["life.observe", "life.commit", "life.recall"] {
             state2.add_tool_binding(tool);
         }
         let mut turn2 = make_plain_turn();
@@ -9682,12 +9720,31 @@ mod tests {
         only_event.concept = "Event".into();
         turn2.recalled_memories = vec![only_event];
         state2.start_turn(turn2);
-        assert!(state2.seed_outcome_plan().is_none());
+        assert_eq!(
+            state2.seed_outcome_plan().as_deref(),
+            Some("(loop to be recalled)")
+        );
+        let plan2 = state2
+            .active_turn
+            .as_ref()
+            .and_then(|t| t.active_plan.clone())
+            .expect("recall-first plan seeded");
+        let tools2: Vec<Option<&str>> =
+            plan2.steps.iter().map(|s| s.tool_name.as_deref()).collect();
+        assert_eq!(
+            tools2,
+            vec![
+                Some("life.recall"),
+                Some("life.observe"),
+                Some("life.commit")
+            ]
+        );
+        assert!(plan2.steps[2].description.contains("Never invent an id"));
 
         // A request (not an outcome) never seeds.
         let mut state3 =
             SessionState::new("sess-3".into(), "agent-beacon".into(), "telegram".into());
-        for tool in ["life.observe", "life.commit"] {
+        for tool in ["life.observe", "life.commit", "life.recall"] {
             state3.add_tool_binding(tool);
         }
         let mut turn3 = make_plain_turn();

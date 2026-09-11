@@ -3730,6 +3730,31 @@ impl AgentRuntime {
         // Attend hook below still receives the same candidate. Runs before
         // turn completion so the turn event has an active turn to attach to;
         // fire-and-forget, so it never blocks or fails the reply.
+        // A reply that claims or promises a write from a turn that called no
+        // tool must not become memory either: live 2026-09-11, the 18:23 UTC
+        // false "I have logged this historic event" stored a Muninn engram
+        // "toastmasters-icebreaker-delivered", which the 20:46 UTC turn then
+        // recalled as proof that the work was already done. Poisoned memory
+        // is worse than no memory — drop both the LifeGraph auto-capture and
+        // the Attend-hook candidate for such a turn.
+        let reply_is_unbacked = self
+            .sessions
+            .get(&session_id)
+            .and_then(|s| s.active_turn.as_ref())
+            .is_some_and(|t| t.working_tool_history.is_empty())
+            && (reply_claims_unbacked_write(&content)
+                || reply_promises_unexecuted_action(&content));
+        let memory_candidate = if reply_is_unbacked {
+            if memory_candidate.is_some() {
+                warn!(
+                    session_id = %session_id,
+                    "dropping memory_candidate: reply claims work but the turn made no tool call"
+                );
+            }
+            None
+        } else {
+            memory_candidate
+        };
         self.maybe_autocapture_life_fact(&session_id, memory_candidate.as_ref())
             .await;
 
@@ -4546,7 +4571,22 @@ turn, so nothing described above as executed or logged has actually been written
 /// historic event on your LifeGraph to memorialize the speech" from a turn
 /// that was offered zero tools.
 pub(super) fn reply_claims_unbacked_write(content: &str) -> bool {
-    let lower = content.to_lowercase();
+    // Adverbs between subject and verb hide the claim: live 2026-09-11 20:46
+    // UTC, "we already successfully initialized and processed the … event"
+    // and "we already executed that update and registered your milestone".
+    let mut lower = content.to_lowercase();
+    for adverb in [
+        "successfully ",
+        "already ",
+        "just ",
+        "now ",
+        "also ",
+        "previously ",
+        "fully ",
+        "officially ",
+    ] {
+        lower = lower.replace(adverb, "");
+    }
     const VERBS: &[&str] = &[
         "logged",
         "recorded",
@@ -4563,14 +4603,26 @@ pub(super) fn reply_claims_unbacked_write(content: &str) -> bool {
         "memorialized",
         "stored",
         "registered",
+        "executed",
+        "processed",
+        "initialized",
+        "applied",
+        "written",
+        "persisted",
     ];
     const SUBJECTS: &[&str] = &[
         "i have ",
         "i've ",
         "i ",
+        "we have ",
+        "we've ",
+        "we ",
         "has been ",
         "have been ",
         "is now ",
+        "are now ",
+        "was ",
+        "were ",
     ];
     for verb in VERBS {
         for subject in SUBJECTS {
@@ -5011,6 +5063,13 @@ mod say_do_tests {
         ));
         assert!(reply_claims_unbacked_write(
             "Done — I've updated the commitment."
+        ));
+        // Live 2026-09-11 20:46 UTC: the second false claim.
+        assert!(reply_claims_unbacked_write(
+            "It looks like you've sent this message again after we already successfully \
+             initialized and processed the Toastmasters Icebreaker event on your LifeGraph. \
+             Since we already executed that update and registered your milestone, no further \
+             database changes are needed."
         ));
         assert!(reply_claims_unbacked_write(
             "The loop has been resolved and is now closed."
