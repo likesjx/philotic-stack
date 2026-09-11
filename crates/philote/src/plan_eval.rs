@@ -782,22 +782,60 @@ pub fn verify_plan_steps(
 /// Mali and Daxton" was marked done after only Zerin landed, and the agent
 /// then told the operator all five children were in place when Daxton did not
 /// exist. One step must mean one verifiable outcome.
+///
+/// Two shapes are exempt, because for them "one call cleared it while the
+/// rest never happened" cannot occur (live 2026-09-11, Beacon morning brief:
+/// `Log Jared's drive with Daxton to school on Thursday morning, 2026-09-10,
+/// as a proposed event` and `Retrieve oldest active open loops, aspirations,
+/// and roles` were both flagged, could never settle, and the plan burned its
+/// whole continuation budget re-observing the same two facts — four Telegram
+/// messages, two duplicate LifeGraph events, and a final "fully executed and
+/// verified" over a `blocked` verdict):
+/// - a step bound to a read-only tool (`life.recall`, `life.list`, …) produces
+///   no artifact per list item — one retrieval covers every topic it names;
+/// - a description whose commas are not a list (dates, appositives) — a real
+///   enumeration of artifacts reads `A, B and C` / `A and B and C`, never
+///   `on Thursday morning, 2026-09-10, as a proposed event`.
 pub fn atomicity_violations(plan: &ActivePlan) -> Vec<u32> {
     plan.steps
         .iter()
+        .filter(|s| !step_tool_is_read_only(s))
         .filter(|s| description_enumerates_artifacts(&s.description))
         .map(|s| s.id)
         .collect()
 }
 
+/// Tools that retrieve rather than create. A step bound to one of these
+/// cannot bundle *artifacts*, however many topics its description lists.
+fn step_tool_is_read_only(step: &PlanStep) -> bool {
+    let Some(tool) = step.tool_name.as_deref() else {
+        return false;
+    };
+    let tool = tool.trim().to_ascii_lowercase();
+    const READ_ONLY_SUFFIXES: &[&str] = &[
+        ".recall",
+        ".recall.feedback",
+        ".list",
+        ".search",
+        ".get",
+        ".status",
+        ".read",
+        ".inspect",
+        ".describe",
+        ".feedback",
+    ];
+    READ_ONLY_SUFFIXES.iter().any(|s| tool.ends_with(s))
+}
+
 fn description_enumerates_artifacts(description: &str) -> bool {
     let lower = description.to_lowercase();
-    let separators = lower.matches(", ").count()
-        + lower.matches("; ").count()
-        + lower.matches(" and ").count()
-        + lower.matches(" & ").count()
-        + lower.matches('\n').count();
-    separators >= 2
+    let conjunctions = lower.matches(" and ").count() + lower.matches(" & ").count();
+    let list_separators = lower.matches(", ").count() + lower.matches("; ").count();
+    let newlines = lower.matches('\n').count();
+    // `A, B and C` (Oxford or not), `A and B and C`, or a multi-line bullet
+    // list. Commas alone are not a list: `on Thursday morning, 2026-09-10, as
+    // a proposed event` names one artifact.
+    (conjunctions >= 1 && list_separators >= 1) || conjunctions >= 2 || newlines >= 2
 }
 
 /// Whole-plan verdict for the turn, grounded in [`verify_plan_steps`].
@@ -2101,6 +2139,85 @@ mod tests {
             ],
         );
         assert!(atomicity_violations(&p).is_empty());
+    }
+
+    /// Live 2026-09-11 (Beacon morning brief): these two steps were flagged
+    /// non-atomic, could never settle, and drove four continuation turns that
+    /// re-observed the same facts. Commas that are not a list, and read-only
+    /// retrieval steps, are not bundles.
+    #[test]
+    fn date_commas_and_read_only_steps_are_not_bundles() {
+        let p = plan(
+            "executing",
+            &[
+                (
+                    "Log Jared's drive with Daxton to school on Thursday morning, 2026-09-10, as a proposed event.",
+                    Some("life.observe"),
+                    "pending",
+                ),
+                (
+                    "Retrieve oldest active open loops, aspirations, and roles to anchor the brief.",
+                    Some("life.recall"),
+                    "pending",
+                ),
+                (
+                    "List open loops, commitments, and next actions",
+                    Some("life.list"),
+                    "pending",
+                ),
+            ],
+        );
+        assert!(
+            atomicity_violations(&p).is_empty(),
+            "got {:?}",
+            atomicity_violations(&p)
+        );
+
+        // A one-step plan that verifies must then settle, so the brief does
+        // not loop on a step that cannot be split any further.
+        let single = plan(
+            "executing",
+            &[(
+                "Log Jared's drive with Daxton to school on Thursday morning, 2026-09-10, as a proposed event.",
+                Some("life.observe"),
+                "done",
+            )],
+        );
+        let h = history_args(&[("life.observe", observe("drive Daxton school"), "ok")]);
+        let v = verify_plan_steps(&single, &h, &[]);
+        assert!(evaluate_whole_plan(&single, &v).complete);
+    }
+
+    #[test]
+    fn real_enumerations_are_still_bundles() {
+        let p = plan(
+            "executing",
+            &[
+                (
+                    "Propose Zerin, Mali and Daxton as Person nodes",
+                    Some("life.observe"),
+                    "pending",
+                ),
+                (
+                    "Record the run and the bike ride and the swim",
+                    Some("life.observe"),
+                    "pending",
+                ),
+                (
+                    "Log:\n- the run\n- the ride\n- the swim",
+                    Some("life.observe"),
+                    "pending",
+                ),
+                // Same enumeration on a read-only tool is fine: one recall
+                // covers every topic it names.
+                (
+                    "Recall Zerin, Mali and Daxton",
+                    Some("life.recall"),
+                    "pending",
+                ),
+            ],
+        );
+        assert_eq!(atomicity_violations(&p), vec![1, 2, 3]);
     }
 
     // ── Plan-by-default gate ────────────────────────────────────────────

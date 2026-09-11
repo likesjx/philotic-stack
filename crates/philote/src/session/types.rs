@@ -741,6 +741,7 @@ impl WorkingTurn {
             consecutive_step_failures: 0,
             streak_extension: 0,
             provider_repair_note: None,
+            say_do_nudged: false,
             provider_repair_attempts: 0,
             pending_text_reply: None,
             had_voice_input: false,
@@ -812,6 +813,14 @@ pub struct WorkingTurn {
     pub provider_repair_note: Option<String>,
     /// Number of corrective provider retries attempted for this turn.
     pub provider_repair_attempts: u32,
+    /// True once this turn has been sent back to the model for a say-do
+    /// check: the model replied with text that tells the user it is
+    /// executing work now, while the turn had made no tool call. One nudge
+    /// per turn; a second promise-only reply is delivered with an honest
+    /// trailer instead of looping. Never persisted — a turn that survives a
+    /// checkpoint restore is mid-`WaitingTool`, past this gate.
+    #[serde(default)]
+    pub say_do_nudged: bool,
     /// Stashed text content while waiting for voice synthesis to complete.
     pub pending_text_reply: Option<String>,
     pub had_voice_input: bool,
@@ -958,6 +967,7 @@ impl WorkingTurn {
             consecutive_step_failures: 0,
             streak_extension: 0,
             provider_repair_note: None,
+            say_do_nudged: false,
             provider_repair_attempts: 0,
             pending_text_reply: None,
             had_voice_input: false,
@@ -2097,6 +2107,7 @@ mod paracrine_budget_tests {
             consecutive_step_failures: 0,
             streak_extension: 0,
             provider_repair_note: None,
+            say_do_nudged: false,
             provider_repair_attempts: 0,
             pending_text_reply: None,
             had_voice_input: false,

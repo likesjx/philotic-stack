@@ -63,6 +63,29 @@ fn sanitize_turn_content_for_history(content: &str) -> String {
     content.to_string()
 }
 
+/// Collapse a synthesized plan-continuation brief to its headline when it
+/// is replayed as dialogue. The brief is loop-internal (remaining steps,
+/// verification notes) and several hundred chars long; replayed verbatim it
+/// crowded the 8000-char dialogue budget until the human exchange was elided
+/// — live 2026-09-11 13:26 UTC, the operator's own morning conversation was
+/// gone and "[7 earlier turn(s) elided]" led into three copies of "[Plan
+/// continuation 1/3] Continue executing your existing plan…". The full text
+/// stays in the hotel's `session_turn` ledger.
+fn collapse_internal_turn_content(content: &str) -> String {
+    let trimmed = content.trim_start();
+    if !trimmed.starts_with("[Plan continuation") {
+        return content.to_string();
+    }
+    let headline: String = trimmed
+        .lines()
+        .next()
+        .unwrap_or(trimmed)
+        .chars()
+        .take(200)
+        .collect();
+    format!("{headline} (internal continuation brief; step list elided)")
+}
+
 fn dropped_active_turn_record(checkpoint: &serde_json::Value) -> Option<TurnRecord> {
     let turn = checkpoint.get("active_turn")?;
     if turn.is_null() {
@@ -2820,14 +2843,19 @@ impl SessionState {
 
         let mut dialogue_window = Vec::new();
         for turn in windowed_turns {
+            // `at`: the turn's own absolute clock, so a consumer can anchor
+            // relative words ("tomorrow") to when they were said.
+            let at = self.turn_stamp(turn.created_at);
             dialogue_window.push(json!({
                 "role": "user",
-                "text": turn.user_content,
+                "text": collapse_internal_turn_content(&turn.user_content),
+                "at": at,
             }));
             if let Some(reply) = turn.assistant_content.as_deref() {
                 dialogue_window.push(json!({
                     "role": "assistant",
                     "text": reply,
+                    "at": at,
                 }));
             }
         }
@@ -4233,14 +4261,30 @@ impl SessionState {
             return String::new();
         }
 
+        // Every turn carries its own absolute clock. Without one, "tomorrow"
+        // from last night's check-in reads as tomorrow again this morning —
+        // live 2026-09-11 07:00 EDT, Beacon's brief for "Friday, September
+        // 11" announced the speech as "scheduled for tomorrow (Friday,
+        // September 11)" because the evening turn saying "tomorrow" was
+        // replayed with no date on it.
+        let mut any_stamped = false;
         let rendered: Vec<String> = self
             .recent_turns
             .iter()
             .map(|turn| {
-                let user = sanitize_turn_content_for_history(&turn.user_content);
+                let user = collapse_internal_turn_content(&sanitize_turn_content_for_history(
+                    &turn.user_content,
+                ));
+                let stamp = match self.turn_stamp(turn.created_at) {
+                    Some(s) => {
+                        any_stamped = true;
+                        format!("[{s}] ")
+                    }
+                    None => String::new(),
+                };
                 match &turn.assistant_content {
-                    Some(reply) => format!("User: {user}\nAssistant: {reply}\n"),
-                    None => format!("User: {user}\n"),
+                    Some(reply) => format!("{stamp}User: {user}\n{stamp}Assistant: {reply}\n"),
+                    None => format!("{stamp}User: {user}\n"),
                 }
             })
             .collect();
@@ -4260,6 +4304,14 @@ impl SessionState {
         let dropped = rendered.len() - kept.len();
 
         let mut out = String::from("[Recent session context]\n");
+        if any_stamped {
+            out.push_str(
+                "Each line is stamped with that turn's own clock. Relative words inside a turn \
+                 (today, tomorrow, tonight, this morning) are relative to THAT stamp, not to the \
+                 current time in the [System] header — re-derive them against the current date \
+                 before repeating them.\n",
+            );
+        }
         if dropped > 0 {
             out.push_str(&format!(
                 "[{dropped} earlier turn(s) elided to stay inside the {budget_chars}-char \
@@ -4278,14 +4330,42 @@ impl SessionState {
             .rev()
             .take(3)
             .map(|turn| {
-                let uc = sanitize_turn_content_for_history(&turn.user_content);
+                let uc = collapse_internal_turn_content(&sanitize_turn_content_for_history(
+                    &turn.user_content,
+                ));
+                let stamp = self
+                    .turn_stamp(turn.created_at)
+                    .map(|s| format!("[{s}] "))
+                    .unwrap_or_default();
                 match &turn.assistant_content {
-                    Some(reply) => format!("{} -> {}", uc, reply),
-                    None => uc,
+                    Some(reply) => format!("{stamp}{} -> {}", uc, reply),
+                    None => format!("{stamp}{uc}"),
                 }
             })
             .collect::<Vec<_>>()
             .join(" | ")
+    }
+
+    /// Absolute stamp for a dialogue turn — the operator's zone when one is
+    /// configured, else UTC. `None` for legacy records without a timestamp.
+    fn turn_stamp(&self, created_at: u64) -> Option<String> {
+        if created_at == 0 {
+            return None;
+        }
+        let utc = chrono::DateTime::<chrono::Utc>::from_timestamp(created_at as i64, 0)?;
+        let zone = self
+            .agent_profile
+            .user_timezone
+            .as_deref()
+            .and_then(sanitize_timezone_for_prompt)
+            .and_then(|tz| tz.parse::<chrono_tz::Tz>().ok());
+        Some(match zone {
+            Some(zone) => utc
+                .with_timezone(&zone)
+                .format("%Y-%m-%d %H:%M %Z")
+                .to_string(),
+            None => utc.format("%Y-%m-%d %H:%M UTC").to_string(),
+        })
     }
 
     pub fn from_checkpoint(checkpoint: &serde_json::Value) -> Option<Self> {
@@ -4506,6 +4586,7 @@ impl SessionState {
                     .get("provider_repair_attempts")
                     .and_then(serde_json::Value::as_u64)
                     .unwrap_or(0) as u32,
+                say_do_nudged: false,
                 pending_text_reply: turn
                     .get("pending_text_reply")
                     .and_then(serde_json::Value::as_str)
@@ -6063,6 +6144,7 @@ mod tests {
             consecutive_step_failures: 0,
             streak_extension: 0,
             provider_repair_note: None,
+            say_do_nudged: false,
             provider_repair_attempts: 0,
             pending_text_reply: Some("hello back".into()),
             had_voice_input: true,
@@ -6368,6 +6450,7 @@ mod tests {
             consecutive_step_failures: 0,
             streak_extension: 0,
             provider_repair_note: None,
+            say_do_nudged: false,
             provider_repair_attempts: 0,
             pending_text_reply: Some("hello back".into()),
             had_voice_input: true,
@@ -6806,6 +6889,7 @@ mod tests {
             consecutive_step_failures: 0,
             streak_extension: 0,
             provider_repair_note: None,
+            say_do_nudged: false,
             provider_repair_attempts: 0,
             pending_text_reply: None,
             had_voice_input: false,
@@ -6865,6 +6949,7 @@ mod tests {
             consecutive_step_failures: 0,
             streak_extension: 0,
             provider_repair_note: None,
+            say_do_nudged: false,
             provider_repair_attempts: 0,
             pending_text_reply: None,
             had_voice_input: false,
@@ -7829,6 +7914,7 @@ mod tests {
             consecutive_step_failures: 0,
             streak_extension: 0,
             provider_repair_note: None,
+            say_do_nudged: false,
             provider_repair_attempts: 0,
             pending_text_reply: None,
             had_voice_input: false,
@@ -7931,6 +8017,7 @@ mod tests {
             consecutive_step_failures: 0,
             streak_extension: 0,
             provider_repair_note: None,
+            say_do_nudged: false,
             provider_repair_attempts: 0,
             pending_text_reply: None,
             had_voice_input: false,
@@ -7961,6 +8048,88 @@ mod tests {
         assert!(prompt.contains("[Session projection]"));
         assert!(prompt.contains("[Working projection]"));
         assert!(prompt.contains("Active conversation turn: turn-ctx-2."));
+    }
+
+    /// Live 2026-09-11: the evening turn saying "tomorrow" was replayed the
+    /// next morning with no date on it, and the internal
+    /// "[Plan continuation n/N]" briefs crowded the human exchange out of
+    /// the dialogue budget. Every replayed turn now carries its own
+    /// operator-local stamp and continuation briefs collapse to a headline.
+    #[test]
+    fn dialogue_window_stamps_turns_and_collapses_continuation_briefs() {
+        let mut state =
+            SessionState::new("sess-1".into(), "agent-beacon".into(), "telegram".into());
+        state.agent_profile.user_timezone = Some("America/New_York".into());
+        // 2026-09-11 02:00:05 UTC == 2026-09-10 22:00 EDT
+        state.recent_turns.push(TurnRecord {
+            turn_id: "t1".into(),
+            user_content: "Trigger the daily Evening Check-In prompt for Jared.".into(),
+            assistant_content: Some(
+                "Your Toastmasters Icebreaker Speech is scheduled for tomorrow!".into(),
+            ),
+            created_at: 1_789_092_005,
+        });
+        state.recent_turns.push(TurnRecord {
+            turn_id: "t2".into(),
+            user_content: "[Plan continuation 1/3] Continue executing your existing plan. Goal: \
+                           deliver a clean morning brief.\nRemaining steps:\n- step 1 (tool: \
+                           life.observe): Log Jared's drive with Daxton\n- step 2 …"
+                .into(),
+            assistant_content: Some("Good morning, Jared! Here is your brief.".into()),
+            created_at: 1_789_124_424,
+        });
+        // Legacy record without a timestamp: rendered, but unstamped.
+        state.recent_turns.push(TurnRecord {
+            turn_id: "t0".into(),
+            user_content: "ok".into(),
+            assistant_content: Some("👍".into()),
+            created_at: 0,
+        });
+
+        let window = state.render_dialogue_window(8000);
+        assert!(
+            window.contains("[2026-09-10 22:00 EDT] User: Trigger the daily Evening Check-In"),
+            "{window}"
+        );
+        assert!(
+            window.contains("[2026-09-10 22:00 EDT] Assistant: Your Toastmasters"),
+            "{window}"
+        );
+        assert!(window.contains("[2026-09-11 07:00 EDT] User: [Plan continuation 1/3]"));
+        assert!(window.contains("(internal continuation brief; step list elided)"));
+        assert!(
+            !window.contains("Remaining steps:"),
+            "brief body must be elided: {window}"
+        );
+        assert!(
+            window.contains("relative to THAT stamp"),
+            "legend: {window}"
+        );
+        assert!(window.contains("\nUser: ok\nAssistant: 👍"), "{window}");
+
+        // Structured window carries the same stamp as `at`.
+        let (_, context, _) = state.model_request_payloads("next", &[]);
+        let dw = context["dialogue_window"]
+            .as_array()
+            .expect("dialogue_window");
+        let first = dw
+            .iter()
+            .find(|m| m["role"] == "user")
+            .expect("a user entry");
+        assert!(first.get("at").is_some(), "{first}");
+
+        // Recent summary collapses the brief too.
+        let summary = state.summary_text();
+        assert!(!summary.contains("Remaining steps:"), "{summary}");
+        assert!(summary.contains("[Plan continuation 1/3]"), "{summary}");
+
+        // No zone configured: stamps fall back to UTC.
+        state.agent_profile.user_timezone = None;
+        let window = state.render_dialogue_window(8000);
+        assert!(
+            window.contains("[2026-09-11 02:00 UTC] User: Trigger"),
+            "{window}"
+        );
     }
 
     #[test]
@@ -8323,6 +8492,7 @@ mod tests {
             consecutive_step_failures: 0,
             streak_extension: 0,
             provider_repair_note: None,
+            say_do_nudged: false,
             provider_repair_attempts: 0,
             pending_text_reply: None,
             had_voice_input: false,
@@ -8409,6 +8579,7 @@ mod tests {
             consecutive_step_failures: 0,
             streak_extension: 0,
             provider_repair_note: None,
+            say_do_nudged: false,
             provider_repair_attempts: 0,
             pending_text_reply: None,
             had_voice_input: false,
@@ -8487,6 +8658,7 @@ mod tests {
             consecutive_step_failures: 0,
             streak_extension: 0,
             provider_repair_note: None,
+            say_do_nudged: false,
             provider_repair_attempts: 0,
             pending_text_reply: None,
             had_voice_input: false,
@@ -9687,6 +9859,7 @@ mod tests {
             consecutive_step_failures: 0,
             streak_extension: 0,
             provider_repair_note: None,
+            say_do_nudged: false,
             provider_repair_attempts: 0,
             pending_text_reply: None,
             had_voice_input: false,
@@ -9753,6 +9926,7 @@ mod tests {
             consecutive_step_failures: 0,
             streak_extension: 0,
             provider_repair_note: None,
+            say_do_nudged: false,
             provider_repair_attempts: 0,
             pending_text_reply: None,
             had_voice_input: false,
@@ -9834,6 +10008,7 @@ mod tests {
             consecutive_step_failures: 0,
             streak_extension: 0,
             provider_repair_note: None,
+            say_do_nudged: false,
             provider_repair_attempts: 0,
             pending_text_reply: None,
             had_voice_input: false,
@@ -9916,6 +10091,7 @@ mod tests {
             consecutive_step_failures: 0,
             streak_extension: 0,
             provider_repair_note: None,
+            say_do_nudged: false,
             provider_repair_attempts: 0,
             pending_text_reply: None,
             had_voice_input: true,
@@ -10290,6 +10466,7 @@ mod tests {
             consecutive_step_failures: 0,
             streak_extension: 0,
             provider_repair_note: None,
+            say_do_nudged: false,
             provider_repair_attempts: 0,
             pending_text_reply: None,
             had_voice_input: false,
@@ -10636,6 +10813,7 @@ mod tests {
             consecutive_step_failures: 0,
             streak_extension: 0,
             provider_repair_note: None,
+            say_do_nudged: false,
             provider_repair_attempts: 0,
             pending_text_reply: None,
             had_voice_input: false,
@@ -11180,6 +11358,7 @@ mod tests {
             consecutive_step_failures: 0,
             streak_extension: 0,
             provider_repair_note: None,
+            say_do_nudged: false,
             provider_repair_attempts: 0,
             pending_text_reply: None,
             had_voice_input: false,

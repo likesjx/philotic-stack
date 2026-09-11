@@ -1728,6 +1728,36 @@ impl AgentRuntime {
 
         match action {
             AgentAction::Respond { content } => {
+                // Say-do gate: a text reply that tells the user work is being
+                // executed right now, from a turn that has not called a single
+                // tool, is a promise the loop will never keep — the turn ends
+                // with this reply. Send the model back once with the tools
+                // still available; if it cannot or will not act, deliver the
+                // reply with an honest trailer instead of the bare promise.
+                match self.say_do_disposition(&session_id, &content) {
+                    SayDoDisposition::Reenter => {
+                        return self.reenter_for_say_do_check(session_id, turn_id).await;
+                    }
+                    SayDoDisposition::Trailer => {
+                        for partial in partial_replies {
+                            self.emit_partial_reply(&session_id, partial).await?;
+                        }
+                        let content =
+                            format!("{}\n\n{SAY_DO_UNEXECUTED_TRAILER}", content.trim_end());
+                        return self
+                            .complete_agent_response(
+                                session_id,
+                                turn_id,
+                                content,
+                                spoken_text,
+                                audio_artifact,
+                                memory_concept,
+                                memory_candidate,
+                            )
+                            .await;
+                    }
+                    SayDoDisposition::Deliver => {}
+                }
                 for partial in partial_replies {
                     self.emit_partial_reply(&session_id, partial).await?;
                 }
@@ -2374,9 +2404,20 @@ impl AgentRuntime {
                 is_finalizing = true;
                 match state.build_reentry_context_envelope() {
                     Some((mut prompt, context, context_projection, _tools)) => {
+                        // Live 2026-09-11 13:26 UTC: at this cap Beacon wrote
+                        // "here is our battle plan… Executing Step 1 now." and
+                        // the turn ended with nothing executed; the operator
+                        // had to ask "Did you execute that?". The wrap-up must
+                        // account, not promise — and hand the remainder to the
+                        // continuation loop via active_plan.
                         prompt.push_str(
                             "\n\n[You have reached the maximum number of tool calls for this turn. \
-                             Do not call any more tools. Provide your final response to the user now.]",
+                             Do not call any more tools — NOTHING MORE RUNS in this turn. Report to \
+                             the user exactly what was completed (only what the tool results above \
+                             confirm) and what was not. Do not say you are executing, moving to, or \
+                             about to do anything. If work remains, put it in active_plan as pending \
+                             steps (one verifiable outcome per step, each bound to a tool) so it \
+                             continues automatically in the next turn, and tell the user it will.]",
                         );
                         let active_turn = state.active_turn.as_ref().expect("turn exists");
                         Ok((
@@ -2777,6 +2818,179 @@ impl AgentRuntime {
         // Shadow-mode (PHILOTIC_SHADOW_ORACLE, default OFF): log-only oracle-vs-
         // ladder annotation. Never alters the dispatch target. Zero cost when
         // the flag is off (guarded inside `shadow_oracle_pick`).
+        let (shadow_pick, shadow_agreement) = self.shadow_oracle_pick(&target_role).await;
+        model_req.oracle_pick = shadow_pick;
+        model_req.oracle_agreement = shadow_agreement;
+
+        self.ipc_client
+            .send_request(IpcRequest::EmitTask {
+                target_node,
+                target_role,
+                target_guest_id,
+                task_json: serde_json::to_string(&model_req)?,
+            })
+            .await?;
+
+        Ok(())
+    }
+
+    /// Decide what to do with a text-only reply under the say-do gate.
+    fn say_do_disposition(&self, session_id: &str, content: &str) -> SayDoDisposition {
+        let Some(state) = self.sessions.get(session_id) else {
+            return SayDoDisposition::Deliver;
+        };
+        let Some(turn) = state.active_turn.as_ref() else {
+            return SayDoDisposition::Deliver;
+        };
+        // Only a turn that has done nothing can be promising in vain. A turn
+        // with tool results behind it is judged by plan_eval, not by phrasing.
+        if !turn.working_tool_history.is_empty()
+            || turn.scripted_loop_context.is_some()
+            || turn.paracrine_origin.is_some()
+        {
+            return SayDoDisposition::Deliver;
+        }
+        // A declared plan with pending steps is the honest form of "working on
+        // it": the continuation loop picks it up after this reply.
+        let plan_pending = turn.active_plan.as_ref().is_some_and(|plan| {
+            plan.steps
+                .iter()
+                .any(|s| s.status != "done" && s.status != "failed")
+        });
+        if plan_pending || !reply_promises_unexecuted_action(content) {
+            return SayDoDisposition::Deliver;
+        }
+        let cap = effective_iteration_cap(state.settings.execution.iteration_cap, turn);
+        if turn.say_do_nudged || turn.iteration >= cap {
+            SayDoDisposition::Trailer
+        } else {
+            SayDoDisposition::Reenter
+        }
+    }
+
+    /// Send the turn back to the model once, tools intact, with the say-do
+    /// hint appended. Mirrors the provider-failure retry re-entry.
+    pub(super) async fn reenter_for_say_do_check(
+        &mut self,
+        session_id: String,
+        turn_id: String,
+    ) -> Result<()> {
+        let retry_plan = {
+            let Some(state) = self.sessions.get_mut(&session_id) else {
+                return Ok(());
+            };
+            match state.build_reentry_context_envelope() {
+                Some((mut prompt, context, context_projection, tools_for_model)) => {
+                    prompt.push_str(SAY_DO_REENTRY_HINT);
+                    if let Some(turn) = state.active_turn.as_mut() {
+                        turn.say_do_nudged = true;
+                        turn.iteration += 1;
+                        turn.phase = TurnPhase::WaitingModel;
+                    }
+                    let active_turn = state.active_turn.as_ref().expect("turn exists");
+                    Ok((
+                        prompt,
+                        context,
+                        context_projection,
+                        active_turn.user_content.clone(),
+                        active_turn.chat_id.clone(),
+                        active_turn.final_reply_to.clone(),
+                        active_turn.final_reply_role.clone(),
+                        active_turn.final_reply_guest_id.clone(),
+                        tools_for_model,
+                        state.checkpoint_memory_type(),
+                        state.checkpoint_json(),
+                        state.clone(),
+                    ))
+                }
+                None => Err(anyhow::anyhow!(
+                    "Active turn vanished before say-do re-entry context could be built"
+                )),
+            }
+        }?;
+
+        let (
+            prompt,
+            context,
+            context_projection,
+            user_content,
+            chat_id,
+            final_reply_to,
+            final_reply_role,
+            final_reply_guest_id,
+            tools_for_model,
+            checkpoint_memory_type,
+            checkpoint_json,
+            index_state,
+        ) = retry_plan;
+
+        warn!(
+            session_id = %session_id,
+            turn_id = %turn_id,
+            "say-do check: reply promised execution with no tool call this turn; re-entering model once"
+        );
+        self.ipc_client
+            .sync_apartment(&self.agent_id, &checkpoint_memory_type, checkpoint_json)
+            .await?;
+        self.sync_session_index(&index_state).await?;
+        let _ = self
+            .emit_turn_event(&session_id, "say_do_check", None)
+            .await;
+
+        let response_contract = Some(cognitive_response_contract(&[
+            "spoken_text",
+            "memory_candidate",
+            "active_plan",
+        ]));
+        let response_route = Some(model_response_route(
+            self.sessions.get(&session_id),
+            response_contract.as_ref(),
+            &Map::new(),
+            &Vec::new(),
+        ));
+        let ligand = planning_ligand(self.sessions.get(&session_id), &prompt, &tools_for_model);
+        let affordances = model_affordances(
+            self.sessions.get(&session_id),
+            &user_content,
+            &tools_for_model,
+        );
+        let mut model_req = ModelRequestPayload {
+            action: "generate_text".to_string(),
+            request_class: Some("cognitive".to_string()),
+            session_id: session_id.clone(),
+            turn_id,
+            prompt,
+            user_content,
+            context: Some(context),
+            context_projection: Some(context_projection),
+            affordances,
+            attachments: Vec::new(),
+            tools_for_model,
+            response_contract,
+            response_route,
+            ligand,
+            model: None,
+            provider_options: resolve_content_policy_provider_options(
+                self.sessions.get(&session_id),
+            ),
+            chat_id,
+            reply_to: local_node_id(),
+            reply_role: "agent".into(),
+            reply_guest_id: Some(self.own_guest_id()),
+            final_reply_to,
+            final_reply_role,
+            final_reply_guest_id,
+            agent_id: Some(self.agent_id.clone()),
+            oracle_pick: None,
+            oracle_agreement: None,
+        };
+
+        let (target_node, target_role, target_guest_id) = resolve_model_execution_target(
+            self.sessions.get(&session_id),
+            "text.generate",
+            DEFAULT_TEXT_MODEL_ROLE,
+        );
+        model_req.model = role_model_binding(self.sessions.get(&session_id), &target_role);
         let (shadow_pick, shadow_agreement) = self.shadow_oracle_pick(&target_role).await;
         model_req.oracle_pick = shadow_pick;
         model_req.oracle_agreement = shadow_agreement;
@@ -3530,6 +3744,20 @@ impl AgentRuntime {
             )
         };
 
+        // Plan status trailer: the verdict is computed BEFORE the reply goes
+        // out, so the reply can carry it. Without this, the model's own
+        // completion claim was the only thing the operator ever saw — live
+        // 2026-09-11 11:01 UTC, "All steps … fully executed and verified"
+        // went out over a `blocked` verdict with two steps outstanding, and
+        // the plan_stopped event that knew better stays a turn event by
+        // design. One line, only when the plan is not settled.
+        let content = match plan_status_trailer(plan_followup.as_ref()) {
+            Some(trailer) if !content.trim().is_empty() => {
+                format!("{}\n\n{trailer}", content.trim_end())
+            }
+            _ => content,
+        };
+
         // Self-Improvement Loop L1: keep the whole completed turn so the
         // distill predicates can read tool history after the reply payload
         // has moved the routing fields out of `completed_turn`.
@@ -4236,6 +4464,167 @@ impl AgentRuntime {
     }
 }
 
+/// What the say-do gate decided for a text-only reply.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum SayDoDisposition {
+    /// Deliver the reply as-is.
+    Deliver,
+    /// Re-enter the model once with the tools still available.
+    Reenter,
+    /// Deliver, but append [`SAY_DO_UNEXECUTED_TRAILER`] so the user is not
+    /// told work is running when nothing will run.
+    Trailer,
+}
+
+/// Appended to the re-entry prompt by [`reenter_for_say_do_check`].
+pub(super) const SAY_DO_REENTRY_HINT: &str = "\n\n[Say-do check] Your reply tells the user you \
+are executing work now, but this turn has made NO tool call — the turn ends with your reply and \
+nothing you announced will run. Either call the tools now (declare an active_plan with one \
+verifiable outcome per step and start executing it), or rewrite the reply to say plainly that \
+nothing has been executed yet and what you need from the user. Never announce work you are not \
+doing in this turn.";
+
+/// Appended to a promise-only reply that could not be re-entered (cap
+/// reached, or already nudged once).
+pub(super) const SAY_DO_UNEXECUTED_TRAILER: &str = "⚠️ Nothing described above as executing has \
+actually run yet — this turn ended before any tool call. Reply \"go\" to have me execute it.";
+
+/// Does this reply tell the user that the agent is executing work right now?
+///
+/// Deliberately narrow: present-tense, first-person assertions of action in
+/// progress. Offers ("I can…"), questions ("Shall I execute…?"), and reports
+/// of finished work ("I updated…") are not promises and must pass. Live
+/// 2026-09-11 13:26 UTC the reply matched twice: "I am moving immediately to
+/// hard-align your LifeGraph" and "Executing Step 1 now."
+pub(super) fn reply_promises_unexecuted_action(content: &str) -> bool {
+    let lower = content.to_lowercase();
+    const PATTERNS: &[&str] = &[
+        "executing step",
+        "executing now",
+        "executing this now",
+        "executing that now",
+        "executing these now",
+        "executing the plan now",
+        "executing immediately",
+        "i am moving immediately",
+        "i'm moving immediately",
+        "moving immediately to",
+        "i am now executing",
+        "i'm now executing",
+        "i am now running",
+        "i'm now running",
+        "i am now updating",
+        "i'm now updating",
+        "i am now recording",
+        "i'm now recording",
+        "i am now logging",
+        "i'm now logging",
+        "i am executing",
+        "i'm executing",
+        "i am running the",
+        "i'm running the",
+        "running that now",
+        "running this now",
+        "running these now",
+        "doing that now",
+        "doing this now",
+        "kicking this off now",
+        "starting step",
+        "proceeding now",
+        "proceeding immediately",
+        "let me run that now",
+        "let me run this now",
+        "let me execute that now",
+        "let me execute this now",
+        "let me update that now",
+        "let me update this now",
+        "let me record that now",
+        "let me log that now",
+        "let me commit that now",
+        "let me apply that now",
+        "i'll do that now",
+        "i will do that now",
+        "i'll run that now",
+        "i will run that now",
+        "i'll execute that now",
+        "i will execute that now",
+        "i'll update that now",
+        "i will update that now",
+        "i'll record that now",
+        "i will record that now",
+        "i'll log that now",
+        "i will log that now",
+        "i'll commit that now",
+        "i will commit that now",
+        "i'll apply that now",
+        "i will apply that now",
+        "i'll do that right away",
+        "i will do that right away",
+        "i'll run that right away",
+        "i will run that right away",
+        "i'll execute that right away",
+        "i will execute that right away",
+    ];
+    PATTERNS.iter().any(|p| lower.contains(p))
+}
+
+/// One user-facing line describing an unsettled plan, from the eval that
+/// was computed for this turn before the reply went out. `None` when the
+/// plan is settled or there is nothing to say.
+pub(super) fn plan_status_trailer(followup: Option<&PlanFollowup>) -> Option<String> {
+    fn summarize(eval: &Value) -> Option<(usize, usize, String)> {
+        let done = eval.get("steps_done")?.as_u64()? as usize;
+        let total = eval.get("steps_total")?.as_u64()? as usize;
+        let outstanding = eval
+            .get("outstanding_steps")
+            .and_then(Value::as_array)
+            .map(|ids| {
+                ids.iter()
+                    .filter_map(Value::as_u64)
+                    .map(|id| id.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            })
+            .unwrap_or_default();
+        Some((done, total, outstanding))
+    }
+    match followup? {
+        PlanFollowup::Settled { .. } => None,
+        PlanFollowup::Continue { eval_json } => {
+            let (done, total, outstanding) = summarize(eval_json.as_ref()?)?;
+            if total == 0 || done >= total {
+                return None;
+            }
+            let which = if outstanding.is_empty() {
+                String::new()
+            } else {
+                format!(" — still working on step(s) {outstanding}")
+            };
+            Some(format!(
+                "⏳ Plan status: {done}/{total} steps verified so far{which}. I'll follow up here when they land."
+            ))
+        }
+        PlanFollowup::Stop { eval_json, .. } => match eval_json.as_ref().and_then(summarize) {
+            Some((done, total, _)) if total > 0 && done >= total => None,
+            Some((done, total, outstanding)) => {
+                let which = if outstanding.is_empty() {
+                    String::new()
+                } else {
+                    format!(" — not done: step(s) {outstanding}")
+                };
+                Some(format!(
+                    "⚠️ Plan stopped before finishing: {done}/{total} steps verified{which}. Tell me to retry, or what to change."
+                ))
+            }
+            None => Some(
+                "⚠️ Plan stopped before finishing — the automatic continuation budget ran out. \
+                 Tell me to retry, or what to change."
+                    .to_string(),
+            ),
+        },
+    }
+}
+
 /// Follow-up decision derived from a completed turn's plan eval.
 #[derive(Debug)]
 pub(super) enum PlanFollowup {
@@ -4488,6 +4877,92 @@ pub(super) fn carryover_resume_followup(
         });
     }
     Some(PlanFollowup::Continue { eval_json: None })
+}
+
+#[cfg(test)]
+mod say_do_tests {
+    use super::*;
+
+    /// Live 2026-09-11 13:26 UTC: the reply that announced a four-step
+    /// "battle plan" and ended the turn with zero tool calls.
+    #[test]
+    fn promise_only_replies_are_detected() {
+        let live = "Understood, Jared. I am moving immediately to hard-align your LifeGraph so \
+                    that every single point of your reality is perfectly reflected on-disk.\n\n\
+                    Here is our immediate true-up battle plan:\n1. Speech Practice Event\n\
+                    Executing Step 1 now.";
+        assert!(reply_promises_unexecuted_action(live));
+        assert!(reply_promises_unexecuted_action(
+            "On it — executing step 2 now."
+        ));
+        assert!(reply_promises_unexecuted_action("Let me update that now."));
+    }
+
+    #[test]
+    fn honest_replies_pass_the_gate() {
+        // The reply that followed "Did you execute that?" — an offer, not a promise.
+        assert!(!reply_promises_unexecuted_action(
+            "No, I did not actually execute those updates yet. I am ready to execute this \
+             exact plan right now. Shall we execute these updates immediately?"
+        ));
+        // Reports of finished work.
+        assert!(!reply_promises_unexecuted_action(
+            "I have corrected the MEI references to MRI and committed the update."
+        ));
+        // Plain conversation.
+        assert!(!reply_promises_unexecuted_action(
+            "Good drive, Jared! Fingers crossed for Daxton."
+        ));
+        assert!(!reply_promises_unexecuted_action(
+            "Working on it: Conduct distillation sweep"
+        ));
+    }
+
+    fn eval(done: u64, total: u64, outstanding: &[u64]) -> Value {
+        serde_json::json!({
+            "steps_done": done,
+            "steps_total": total,
+            "outstanding_steps": outstanding,
+            "verdict": if done >= total { "complete" } else { "continue" },
+        })
+    }
+
+    #[test]
+    fn plan_status_trailer_only_when_unsettled() {
+        assert!(plan_status_trailer(None).is_none());
+        assert!(
+            plan_status_trailer(Some(&PlanFollowup::Settled {
+                eval_json: eval(3, 3, &[])
+            }))
+            .is_none()
+        );
+        // Continue with nothing settled yet — the "Working on it" turn.
+        let t = plan_status_trailer(Some(&PlanFollowup::Continue {
+            eval_json: Some(eval(0, 3, &[1, 2, 3])),
+        }))
+        .expect("trailer");
+        assert!(t.contains("0/3 steps verified"), "{t}");
+        assert!(t.contains("step(s) 1, 2, 3"), "{t}");
+        // Carryover resume after an interleaved user turn: no eval, no trailer.
+        assert!(plan_status_trailer(Some(&PlanFollowup::Continue { eval_json: None })).is_none());
+        // Blocked: live 2026-09-11 11:01 UTC, "fully executed and verified" went
+        // out over this verdict.
+        let t = plan_status_trailer(Some(&PlanFollowup::Stop {
+            eval_json: Some(eval(1, 3, &[1, 3])),
+            notice: "stopped".into(),
+        }))
+        .expect("trailer");
+        assert!(t.contains("stopped before finishing"), "{t}");
+        assert!(t.contains("1/3 steps verified"), "{t}");
+        assert!(t.contains("not done: step(s) 1, 3"), "{t}");
+        // Budget-exhausted stop without an eval still says so.
+        let t = plan_status_trailer(Some(&PlanFollowup::Stop {
+            eval_json: None,
+            notice: "budget".into(),
+        }))
+        .expect("trailer");
+        assert!(t.contains("continuation budget ran out"), "{t}");
+    }
 }
 
 #[cfg(test)]

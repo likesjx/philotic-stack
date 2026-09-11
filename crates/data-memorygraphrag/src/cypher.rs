@@ -270,6 +270,9 @@ pub struct ObserveEdgeCypher {
 pub struct CommitCypher {
     pub query: String,
     pub node_id: String,
+    /// `node_id` parsed as a Memgraph internal id when it is all digits,
+    /// else -1 (the query's `$id_numeric >= 0` guard makes it inert).
+    pub node_id_numeric: i64,
     pub label: String,
     pub packet_id: String,
     pub confidence: f64,
@@ -624,9 +627,19 @@ pub fn compile_commit(input: &LifeCommitInput, now_iso: &str) -> Result<CommitCy
     // pattern as observed_role/origin_engram_id in compile_observe: an empty
     // string parameter means "leave the existing property untouched" rather
     // than overwriting it with null.
+    //
+    // MATCH, never MERGE: a commit promotes an EXISTING node to confirmed
+    // truth. MERGE on an unknown id manufactured a brand-new node — live
+    // 2026-09-11, Beacon committed `claim_ref.id = "557"` (the Memgraph
+    // internal id it had just read via graph.query) and the graph gained a
+    // stray `Commitment {id: "557"}` marked confirmed while the real node
+    // `life:commitment:mei_due_date_update_20260909` stayed proposed. The
+    // provider reports a miss when no row comes back. As a courtesy to that
+    // exact mistake, an all-digit id also matches the internal `id(n)`.
     let query = format!(
         concat!(
-            "MERGE (n:{label} {{id: $id}}) ",
+            "MATCH (n:{label}) ",
+            "WHERE n.id = $id OR ($id_numeric >= 0 AND id(n) = $id_numeric) ",
             "SET n.validation_state = 'confirmed', ",
             "n.last_confirmed_at = $confirmed_at, ",
             "n.confidence = $confidence, ",
@@ -643,6 +656,7 @@ pub fn compile_commit(input: &LifeCommitInput, now_iso: &str) -> Result<CommitCy
     Ok(CommitCypher {
         query,
         node_id: input.evidence.claim_ref.id.clone(),
+        node_id_numeric: numeric_node_id(&input.evidence.claim_ref.id),
         label: label.clone(),
         packet_id: input.evidence.packet_id.clone(),
         confidence: input.evidence.confidence as f64,
@@ -651,6 +665,17 @@ pub fn compile_commit(input: &LifeCommitInput, now_iso: &str) -> Result<CommitCy
         loop_status: input.loop_status.clone().unwrap_or_default(),
         resolution_note: input.resolution_note.clone().unwrap_or_default(),
     })
+}
+
+/// An all-digit claim id is (almost certainly) a Memgraph internal `id(n)`
+/// the model copied out of a `graph.query` row. Returns it as an integer so
+/// the commit can match on `id(n)`; -1 for anything else.
+fn numeric_node_id(id: &str) -> i64 {
+    let trimmed = id.trim();
+    if trimmed.is_empty() || !trimmed.bytes().all(|b| b.is_ascii_digit()) {
+        return -1;
+    }
+    trimmed.parse::<i64>().unwrap_or(-1)
 }
 
 pub fn compile_conflict_handoff(
@@ -1805,7 +1830,16 @@ mod tests {
 
         assert_eq!(compiled.label, "OpenLoop");
         assert_eq!(compiled.confirmed_at, "2026-06-05T09:00:00Z");
-        assert!(compiled.query.contains("MERGE (n:OpenLoop {id: $id})"));
+        // MATCH, not MERGE: a commit promotes an existing node and must never
+        // manufacture one from an unknown id (live 2026-09-11: stray
+        // `Commitment {id: "557"}`).
+        assert!(
+            compiled
+                .query
+                .contains("MATCH (n:OpenLoop) WHERE n.id = $id")
+        );
+        assert!(!compiled.query.contains("MERGE"));
+        assert_eq!(compiled.node_id_numeric, -1, "life: ids are not numeric");
         assert!(compiled.query.contains("n.validation_state = 'confirmed'"));
         // No loop_status supplied — the sentinel is empty, so the query must
         // preserve the existing n.status rather than clobbering it with null.
@@ -1849,6 +1883,31 @@ mod tests {
                 .query
                 .contains("n.resolution_note = CASE $resolution_note")
         );
+    }
+
+    #[test]
+    fn compile_commit_numeric_id_matches_internal_id() {
+        // The model copied Memgraph's internal id out of a graph.query row.
+        // Match it on id(n) rather than creating `Commitment {id: "557"}`.
+        let mut evidence = minimal_observe_input("Commitment").evidence;
+        evidence.validation_state = ValidationState::Confirmed;
+        evidence.claim_ref.id = "557".to_string();
+        let compiled = compile_commit(
+            &crate::LifeCommitInput {
+                evidence,
+                operator_approved: true,
+                loop_status: None,
+                resolution_note: None,
+            },
+            "2026-09-11T13:28:11Z",
+        )
+        .unwrap();
+        assert_eq!(compiled.node_id_numeric, 557);
+        assert!(compiled.query.contains("id(n) = $id_numeric"));
+        assert_eq!(numeric_node_id(" 12 "), 12);
+        assert_eq!(numeric_node_id("life:open_loop:x"), -1);
+        assert_eq!(numeric_node_id(""), -1);
+        assert_eq!(numeric_node_id("12a"), -1);
     }
 
     #[test]
