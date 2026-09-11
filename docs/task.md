@@ -1993,3 +1993,16 @@ Order: R0 → R1 → R2 → R3 → R4 → R6 (degraded continuity) → R5 → R7
 - [ ] R7 Sealed secret transfer (AEAD over peer-authenticated channel or TLS execution plane); until then secrets are pre-provisioned via the vault plane and R4 declines — security review + smoke.
 - [ ] R8 Confirm DEF-108 live; wire the real canonical `MeshCatalogSync` payload (rename one of the two structs) — smoke.
 - [ ] Prerequisites tracked elsewhere but gating the watched-live gate: redeploy `vps-jane` (blob bind fix, public :16467/:16468), fix `ansible/host_vars/jane-vps.yml` mac-jane peer ports (24849-24851 → 16370-16371), measure `vps-jane` headroom, rotate Beacon's Telegram token.
+
+## Philote Say-Do + Continuity (Beacon 2026-09-11 forensics)
+
+Branch `codex/philote-say-do-continuity`. Source: Beacon's Telegram session on vps-jane, 2026-09-10 23:58 → 2026-09-11 13:28 UTC (`session_turn` + `session_event` ledger, not journald). Defects DEF-113..117. Tenet: a philote must do what it says, the evaluator's verdict must reach the operator, and every replayed turn must carry its own clock.
+
+- [x] Forensics: 4-message cron burst = atomicity false positive (DEF-113); "battle plan … Executing Step 1 now." with zero writes = iteration-cap wrap-up + no say-do gate (DEF-114); "tomorrow" on the day of = unstamped dialogue replay + continuation briefs crowding the window (DEF-115); every explicit `life.recall` empty = pivot-less SemanticPivot (DEF-116); stray confirmed `Commitment {id:"557"}` = MERGE commit (DEF-117).
+- [x] `plan_eval`: list-shaped enumeration only; read-only tool steps exempt; regression tests from the live step texts.
+- [x] `turn_loop`: say-do gate (`SayDoDisposition`: re-enter once with tools, else honest trailer); cap wrap-up demands an account + `active_plan` for the remainder; plan status trailer from the pre-send eval on continue/stop replies.
+- [x] `session`: per-turn operator-local stamps + legend in `[Recent session context]`, `at` on structured `dialogue_window`, continuation briefs collapsed in window + `Recent summary`.
+- [x] `data-memorygraphrag`: bare `life.recall` → `current_prompt_semantic`; `life.commit` MATCH-only with numeric-id courtesy and a not-found error.
+- [ ] Live LifeGraph cleanup on vps Memgraph (operator-run; remote DB writes are classifier-blocked from this harness): delete stray 590, confirm 557, retire 584/585, resolve 531/532 with `RESOLVES` from `life:event:daxton_gsu_reinstated_20260911`.
+- [ ] Deploy vps-jane (`just vps-deploy-ci` from the main checkout under `script -q`) + mac-jane; watched-live: next 11:00 UTC Beacon brief = exactly 2 messages ("Working on it" + brief, or brief alone), replayed turns stamped, an explicit `life.recall` returns packets.
+- [ ] Follow-ups not taken here: `life.observe` near-duplicate detection (584/585 would still be re-proposed by a model that cannot see the graph — DEF-116 removes the cause, not the possibility); Gemini adapter's synthesized "Working on it:" reply (`model-router/providers/gemini.rs`) is a provider-specific hack; the `lifegraph-daily-brief` cron should run `session_target: isolated` so its continuation turns stop consuming the conversational `memory_window_size`; the Delta/Utah trip is now 4 overlapping nodes (25, 499/505, 525, 558, 589) — a gardening pass should retire 499 and fold 558/589.

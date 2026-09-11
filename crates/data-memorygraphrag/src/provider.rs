@@ -1334,7 +1334,25 @@ impl LifeGraphProvider {
     async fn handle_recall(&self, task: &DatasourceTask) -> Result<ProviderOutput> {
         let query_val: RetrievalQuery = serde_json::from_value(task.parameters.clone())
             .context("failed to parse life.recall parameters as RetrievalQuery")?;
-        let named_strategy = NamedRecallStrategy::from_task(task);
+        let mut named_strategy = NamedRecallStrategy::from_task(task);
+        // A bare call — `{query_id, query_text}` and nothing else — lands on
+        // SemanticPivot with no pivots, whose dispatch loop then runs zero
+        // queries and whose fallback labels come from the same empty list.
+        // The result was a well-formed, "ok", EMPTY packet on every explicit
+        // life.recall Beacon made on 2026-09-11, so the model re-observed
+        // facts already in the graph and fell back to raw Cypher to find a
+        // node. There is a query_text and an embedding: sweep the core
+        // spaces with it instead of silently returning nothing.
+        if matches!(named_strategy, NamedRecallStrategy::SemanticPivot)
+            && query_val.semantic_pivots.is_empty()
+        {
+            info!(
+                query_id = %query_val.query_id,
+                "life.recall: no named_strategy/operator_intent and no semantic_pivots; \
+                 dispatching as current_prompt_semantic instead of an empty pivot sweep"
+            );
+            named_strategy = NamedRecallStrategy::CurrentPromptSemantic;
+        }
         if !named_strategy.agrees_with(&query_val.strategy) {
             warn!(
                 named_strategy = named_strategy.as_str(),
@@ -1699,6 +1717,7 @@ impl LifeGraphProvider {
             .execute(
                 query(&compiled.query)
                     .param("id", compiled.node_id.as_str())
+                    .param("id_numeric", compiled.node_id_numeric)
                     .param("confirmed_at", compiled.confirmed_at.as_str())
                     .param("confidence", compiled.confidence)
                     .param("claim_summary", compiled.claim_summary.as_str())
@@ -1708,6 +1727,18 @@ impl LifeGraphProvider {
             )
             .await?;
         let first_row = rows.next().await?;
+        // MATCH semantics: no row means no such node. Say so instead of
+        // reporting "committed" for a write that touched nothing (or, under
+        // the old MERGE, manufactured a stray node).
+        let Some(first_row) = first_row else {
+            anyhow::bail!(
+                "life.commit target not found: no {} node with id '{}'. Call life.recall or \
+                 life.list first and commit the exact `id` it returns (e.g. life:open_loop:…).",
+                compiled.label,
+                compiled.node_id
+            );
+        };
+        let first_row = Some(first_row);
         let node_id = first_row
             .as_ref()
             .and_then(|r| r.get::<String>("id").ok())
