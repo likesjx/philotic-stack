@@ -1735,8 +1735,10 @@ impl AgentRuntime {
                 // still available; if it cannot or will not act, deliver the
                 // reply with an honest trailer instead of the bare promise.
                 match self.say_do_disposition(&session_id, &content) {
-                    SayDoDisposition::Reenter => {
-                        return self.reenter_for_say_do_check(session_id, turn_id).await;
+                    SayDoDisposition::Reenter { hint, event } => {
+                        return self
+                            .reenter_for_say_do_check(session_id, turn_id, hint, event)
+                            .await;
                     }
                     SayDoDisposition::Trailer => {
                         for partial in partial_replies {
@@ -2857,9 +2859,7 @@ impl AgentRuntime {
                 .iter()
                 .any(|s| s.status != "done" && s.status != "failed")
         });
-        if plan_pending
-            || !(reply_promises_unexecuted_action(content) || reply_claims_unbacked_write(content))
-        {
+        if plan_pending {
             return SayDoDisposition::Deliver;
         }
         let cap = effective_iteration_cap(state.settings.execution.iteration_cap, turn);
@@ -2867,11 +2867,39 @@ impl AgentRuntime {
         // tools this time; a conversational-gated turn with none projected
         // would just promise (or claim) again.
         let can_act = !state.project_tools_for_turn(&turn.user_content).is_empty();
-        if turn.say_do_nudged || turn.iteration >= cap || !can_act {
-            SayDoDisposition::Trailer
-        } else {
-            SayDoDisposition::Reenter
+        let may_reenter = !turn.say_do_nudged && turn.iteration < cap && can_act;
+
+        if reply_promises_unexecuted_action(content) || reply_claims_unbacked_write(content) {
+            return if may_reenter {
+                SayDoDisposition::Reenter {
+                    hint: SAY_DO_REENTRY_HINT,
+                    event: "say_do_check",
+                }
+            } else {
+                SayDoDisposition::Trailer
+            };
         }
+
+        // Plan gate: the plan contract has teeth. A plan-worthy STATEMENT (a
+        // request, a multi-fact report, an outcome about something recalled)
+        // that came back as plain text — no plan declared, no tool called —
+        // goes back once: declare and execute, or say plainly that no action
+        // is needed and why. Questions are exempt; they are answered from
+        // context. Live 2026-09-11 18:23 UTC the [Plan first] directive was
+        // in the prompt and the model simply did not follow it.
+        let normalized = turn.user_content.trim().to_ascii_lowercase();
+        let plan_worthy = turn.active_plan.is_none()
+            && !normalized.starts_with("[plan continuation")
+            && (crate::plan_eval::is_plan_worthy_statement(&turn.user_content)
+                || (!normalized.contains('?')
+                    && state.turn_reports_on_recalled_life_context(&normalized)));
+        if plan_worthy && may_reenter {
+            return SayDoDisposition::Reenter {
+                hint: PLAN_GATE_REENTRY_HINT,
+                event: "plan_gate",
+            };
+        }
+        SayDoDisposition::Deliver
     }
 
     /// Send the turn back to the model once, tools intact, with the say-do
@@ -2880,6 +2908,8 @@ impl AgentRuntime {
         &mut self,
         session_id: String,
         turn_id: String,
+        hint: &'static str,
+        event: &'static str,
     ) -> Result<()> {
         let retry_plan = {
             let Some(state) = self.sessions.get_mut(&session_id) else {
@@ -2887,7 +2917,7 @@ impl AgentRuntime {
             };
             match state.build_reentry_context_envelope() {
                 Some((mut prompt, context, context_projection, tools_for_model)) => {
-                    prompt.push_str(SAY_DO_REENTRY_HINT);
+                    prompt.push_str(hint);
                     if let Some(turn) = state.active_turn.as_mut() {
                         turn.say_do_nudged = true;
                         turn.iteration += 1;
@@ -2933,15 +2963,14 @@ impl AgentRuntime {
         warn!(
             session_id = %session_id,
             turn_id = %turn_id,
-            "say-do check: reply promised execution with no tool call this turn; re-entering model once"
+            gate = event,
+            "text-only reply on a turn with no tool call failed the gate; re-entering model once"
         );
         self.ipc_client
             .sync_apartment(&self.agent_id, &checkpoint_memory_type, checkpoint_json)
             .await?;
         self.sync_session_index(&index_state).await?;
-        let _ = self
-            .emit_turn_event(&session_id, "say_do_check", None)
-            .await;
+        let _ = self.emit_turn_event(&session_id, event, None).await;
 
         let response_contract = Some(cognitive_response_contract(&[
             "spoken_text",
@@ -4475,8 +4504,12 @@ impl AgentRuntime {
 pub(super) enum SayDoDisposition {
     /// Deliver the reply as-is.
     Deliver,
-    /// Re-enter the model once with the tools still available.
-    Reenter,
+    /// Re-enter the model once with the tools still available, appending
+    /// `hint` to the prompt and emitting `event` as the turn event.
+    Reenter {
+        hint: &'static str,
+        event: &'static str,
+    },
     /// Deliver, but append [`SAY_DO_UNEXECUTED_TRAILER`] so the user is not
     /// told work is running when nothing will run.
     Trailer,
@@ -4490,6 +4523,14 @@ written exists. Either call the tools now (declare an active_plan with one verif
 per step and start executing it), or rewrite the reply to say plainly that nothing has been \
 executed or recorded yet and what you need from the user. Never announce or claim work that no \
 tool call in this turn performed.";
+
+/// Appended to the re-entry prompt when a plan-worthy statement came back
+/// as plain text with no plan and no tool call.
+pub(super) const PLAN_GATE_REENTRY_HINT: &str = "\n\n[Plan gate] This message asks for work or \
+reports facts to record, but your reply declared no active_plan and made no tool call. Either \
+declare the plan now (goal + one tool-bound step per verifiable outcome) and execute it in this \
+turn, or state plainly that no action is needed and why. Do not just acknowledge or \
+congratulate.";
 
 /// Appended to a promise-only or claim-only reply that could not be
 /// re-entered (cap reached, already nudged once, or no tools projected).

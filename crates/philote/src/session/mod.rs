@@ -2348,10 +2348,15 @@ impl SessionState {
         // nothing was written. A lived-fact report that names a recalled
         // node is stewardship, not filler — the life tools stay projected
         // (the on-demand filter below keeps them via the session signal).
+        // A plan-worthy statement (a request, a multi-fact report, an
+        // enumeration) keeps its tools too: the plan directive asks for
+        // tool-bound steps, and a plan cannot bind tools it was not given.
+        // Questions are still answered from context without tools.
         if looks_like_conversational_goal(&normalized)
             && !looks_like_retry_goal(&normalized_current)
             && !on_demand_relevant
             && !self.turn_reports_on_recalled_life_context(&normalized)
+            && !crate::plan_eval::is_plan_worthy_statement(user_content)
         {
             return Vec::new();
         }
@@ -2424,21 +2429,29 @@ impl SessionState {
     /// the model must be able to act on it (observe the outcome, commit or
     /// resolve the node). Gratitude and filler share no such words with a
     /// recalled node, so the conversational gate still holds for them.
-    fn turn_reports_on_recalled_life_context(&self, normalized: &str) -> bool {
+    pub(crate) fn turn_reports_on_recalled_life_context(&self, normalized: &str) -> bool {
+        !self.recalled_life_records_named_by(normalized).is_empty()
+    }
+
+    /// The injected LifeGraph records this message is about, best match
+    /// first (most distinctive words in common; ties broken by loop-like
+    /// labels so an open loop outranks the event that mentions it).
+    fn recalled_life_records_named_by(&self, normalized: &str) -> Vec<&RecalledMemoryRecord> {
         let Some(turn) = self.active_turn.as_ref() else {
-            return false;
+            return Vec::new();
         };
         let message_words: std::collections::HashSet<&str> = normalized
             .split(|c: char| !c.is_alphanumeric())
             .filter(|w| w.len() >= 5)
             .collect();
         if message_words.is_empty() {
-            return false;
+            return Vec::new();
         }
-        turn.recalled_memories
+        let mut scored: Vec<(usize, &RecalledMemoryRecord)> = turn
+            .recalled_memories
             .iter()
             .filter(|memory| memory.vault_id.as_deref() == Some("life-graph"))
-            .any(|memory| {
+            .filter_map(|memory| {
                 let text = format!(
                     "{} {} {}",
                     memory.concept,
@@ -2451,8 +2464,85 @@ impl SessionState {
                     .filter(|w| w.len() >= 5 && !LIFE_CONTEXT_STOPWORDS.contains(w))
                     .filter(|w| message_words.contains(w))
                     .collect();
-                overlap.len() >= 2
+                (overlap.len() >= 2).then_some((overlap.len(), memory))
             })
+            .collect();
+        scored.sort_by(|a, b| {
+            b.0.cmp(&a.0)
+                .then_with(|| record_is_loop_like(b.1).cmp(&record_is_loop_like(a.1)))
+        });
+        scored.into_iter().map(|(_, m)| m).collect()
+    }
+
+    /// Outcome reflex: when the operator reports that something happened
+    /// ("I gave my speech", "finished the report", "tickets are booked") and
+    /// the harness has already recalled the open loop / commitment it
+    /// settles, seed the turn with a two-step plan — record the outcome as
+    /// an Event, then resolve that exact node — so the model executes and
+    /// the evaluator checks, instead of the model deciding whether to act.
+    /// Returns the resolved node id when a plan was seeded.
+    ///
+    /// Live 2026-09-11 18:23 UTC: "I gave my icebreaker speech in toastmasters
+    /// today! And i did ok." got congratulations and a false "I have logged
+    /// this" — no plan, no tool call, loop left open.
+    pub fn seed_outcome_plan(&mut self) -> Option<String> {
+        let user_content = self.active_turn.as_ref()?.user_content.clone();
+        if self.active_turn.as_ref()?.active_plan.is_some()
+            || self.active_turn.as_ref()?.paracrine_origin.is_some()
+            || user_content.trim_start().starts_with("[Plan continuation")
+        {
+            return None;
+        }
+        let normalized = normalized_turn_text(&user_content);
+        if !crate::plan_eval::reports_an_outcome(&normalized) {
+            return None;
+        }
+        let can_observe = self
+            .tool_assembly
+            .tools_for_model
+            .iter()
+            .any(|t| t.tool_name == "life.observe");
+        let can_commit = self
+            .tool_assembly
+            .tools_for_model
+            .iter()
+            .any(|t| t.tool_name == "life.commit");
+        if !(can_observe && can_commit) {
+            return None;
+        }
+        let target = self
+            .recalled_life_records_named_by(&normalized)
+            .into_iter()
+            .find(|m| record_is_loop_like(m))
+            .and_then(|m| m.id.clone())?;
+        let excerpt: String = user_content.trim().chars().take(160).collect();
+        let plan = ActivePlan {
+            goal: format!(
+                "Outcome reflex: record the outcome the operator just reported and resolve {target}"
+            ),
+            status: "executing".into(),
+            steps: vec![
+                PlanStep {
+                    id: 1,
+                    description: format!(
+                        "Record the reported outcome as a confirmed Event with life.observe — what happened, when, who was involved — linked to {target}. Operator said: \"{excerpt}\""
+                    ),
+                    tool_name: Some("life.observe".into()),
+                    status: "pending".into(),
+                },
+                PlanStep {
+                    id: 2,
+                    description: format!(
+                        "Resolve {target} with life.commit using that exact id: loop_status \"resolved\", resolution_note citing the outcome event."
+                    ),
+                    tool_name: Some("life.commit".into()),
+                    status: "pending".into(),
+                },
+            ],
+            context_1_advisory: None,
+        };
+        self.active_turn.as_mut()?.active_plan = Some(plan);
+        Some(target)
     }
 
     /// Skill relevance with a session-state fallback for `life.steward`.
@@ -3870,6 +3960,15 @@ impl SessionState {
                 plan.status,
                 plan.steps.len()
             ));
+            if plan.goal.starts_with("Outcome reflex:") {
+                lines.push(
+                    "[Outcome reflex] The harness seeded this plan from the operator's message. \
+                     Execute both steps NOW with the bound tools (life.observe the outcome, then \
+                     life.commit the exact node id with loop_status \"resolved\"), then reply with \
+                     what you wrote. Do not answer with congratulations or acknowledgment alone."
+                        .into(),
+                );
+            }
             // A continuation turn opens with its plan already seeded and an
             // empty tool history, so the re-entry footer below (which is gated
             // on that history) has not fired yet. Without a guard here the
@@ -4950,6 +5049,40 @@ fn contains_word_boundary(text: &str, phrase: &str) -> bool {
         }
     }
     false
+}
+
+/// A recalled record that an outcome can settle: open loops, commitments,
+/// next actions, goals — by id prefix or by the label the recall lane put
+/// in `concept`.
+fn record_is_loop_like(memory: &RecalledMemoryRecord) -> bool {
+    let id = memory
+        .id
+        .as_deref()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let concept = memory.concept.to_ascii_lowercase();
+    [
+        "life:open_loop",
+        "life:open-loop",
+        "life:openloop",
+        "life:commitment",
+        "life:next_action",
+        "life:next-action",
+        "life:goal",
+    ]
+    .iter()
+    .any(|p| id.starts_with(p))
+        || [
+            "openloop",
+            "open_loop",
+            "open loop",
+            "commitment",
+            "nextaction",
+            "next_action",
+            "goal",
+        ]
+        .iter()
+        .any(|p| concept.contains(p))
 }
 
 /// Words too common in LifeGraph records to count as "about the same thing"
@@ -9472,6 +9605,99 @@ mod tests {
                 .project_tools_for_turn("ok, that looks great today!")
                 .is_empty()
         );
+    }
+
+    /// Outcome reflex: the operator's report seeds a two-step plan bound to
+    /// life.observe + life.commit on the recalled loop's exact id, and that
+    /// plan makes the tools project even on a "conversational" message.
+    #[test]
+    fn outcome_report_seeds_observe_and_commit_plan_for_recalled_loop() {
+        let mut state =
+            SessionState::new("sess-1".into(), "agent-beacon".into(), "telegram".into());
+        for tool in ["life.observe", "life.recall", "life.commit"] {
+            state.add_tool_binding(tool);
+        }
+        state.bindings.on_demand_skills = vec!["life.steward".into()];
+        let msg = "I gave my icebreaker speech in toastmasters today! And i did ok. Nadi came in support.";
+        let mut turn = make_plain_turn();
+        turn.user_content = msg.into();
+        // An event that also mentions the speech must not outrank the loop.
+        let mut event = life_record(
+            "life:event:toastmasters_meeting_20260911",
+            "Toastmasters meeting on Friday, September 11 where Jared delivers his Icebreaker speech.",
+        );
+        event.concept = "Event".into();
+        let loop_rec = life_record(
+            "life:open_loop:toastmasters_icebreaker_speech_20260906",
+            "Jared is starting work on his Toastmasters Icebreaker speech project.",
+        );
+        turn.recalled_memories = vec![event, loop_rec];
+        state.start_turn(turn);
+
+        let seeded = state.seed_outcome_plan();
+        assert_eq!(
+            seeded.as_deref(),
+            Some("life:open_loop:toastmasters_icebreaker_speech_20260906")
+        );
+        let plan = state
+            .active_turn
+            .as_ref()
+            .and_then(|t| t.active_plan.clone())
+            .expect("plan seeded");
+        assert!(plan.goal.starts_with("Outcome reflex:"));
+        assert_eq!(plan.steps.len(), 2);
+        assert_eq!(plan.steps[0].tool_name.as_deref(), Some("life.observe"));
+        assert_eq!(plan.steps[1].tool_name.as_deref(), Some("life.commit"));
+        assert!(
+            plan.steps[1]
+                .description
+                .contains("life:open_loop:toastmasters_icebreaker_speech_20260906")
+        );
+        // Seeding is idempotent: a second call leaves the plan alone.
+        assert!(state.seed_outcome_plan().is_none());
+
+        let names: Vec<String> = state
+            .project_tools_for_turn(msg)
+            .into_iter()
+            .map(|t| t.tool_name)
+            .collect();
+        assert!(names.contains(&"life.observe".to_string()), "{names:?}");
+        assert!(names.contains(&"life.commit".to_string()), "{names:?}");
+        let prompt = state.build_prompt(msg);
+        assert!(prompt.contains("[Outcome reflex]"), "{prompt}");
+
+        // No loop-like record recalled → no seed (an event alone is not
+        // something an outcome resolves).
+        let mut state2 =
+            SessionState::new("sess-2".into(), "agent-beacon".into(), "telegram".into());
+        for tool in ["life.observe", "life.commit"] {
+            state2.add_tool_binding(tool);
+        }
+        let mut turn2 = make_plain_turn();
+        turn2.user_content = msg.into();
+        let mut only_event = life_record(
+            "life:event:toastmasters_meeting_20260911",
+            "Toastmasters meeting where Jared delivers his Icebreaker speech.",
+        );
+        only_event.concept = "Event".into();
+        turn2.recalled_memories = vec![only_event];
+        state2.start_turn(turn2);
+        assert!(state2.seed_outcome_plan().is_none());
+
+        // A request (not an outcome) never seeds.
+        let mut state3 =
+            SessionState::new("sess-3".into(), "agent-beacon".into(), "telegram".into());
+        for tool in ["life.observe", "life.commit"] {
+            state3.add_tool_binding(tool);
+        }
+        let mut turn3 = make_plain_turn();
+        turn3.user_content = "please remind me about my icebreaker speech tomorrow".into();
+        turn3.recalled_memories = vec![life_record(
+            "life:open_loop:toastmasters_icebreaker_speech_20260906",
+            "Jared is starting work on his Toastmasters Icebreaker speech project.",
+        )];
+        state3.start_turn(turn3);
+        assert!(state3.seed_outcome_plan().is_none());
     }
 
     #[test]

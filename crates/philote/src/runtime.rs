@@ -3261,11 +3261,17 @@ impl AgentRuntime {
             model_context,
             context_projection,
             tools_for_model,
+            seeded_outcome_target,
         ) = {
             let state = self
                 .sessions
                 .get_mut(&session_id)
                 .expect("session should exist after ensuring and binding transport target");
+            // Outcome reflex: an operator report that settles a recalled loop
+            // gets a harness-seeded observe+commit plan BEFORE tools are
+            // projected, so the plan binds its tools and the evaluator has
+            // something to check. See SessionState::seed_outcome_plan.
+            let seeded_outcome_target = state.seed_outcome_plan();
             let tools_for_model = state.project_tools_for_turn(&content);
             let (model_prompt, model_context, context_projection) =
                 state.model_request_payloads(&content, &tools_for_model);
@@ -3285,6 +3291,7 @@ impl AgentRuntime {
                 model_context,
                 context_projection,
                 tools_for_model,
+                seeded_outcome_target,
             )
         };
 
@@ -3292,6 +3299,21 @@ impl AgentRuntime {
             .sync_apartment(&self.agent_id, &checkpoint_memory_type, checkpoint_json)
             .await?;
         self.sync_session_index(&index_state).await?;
+
+        if let Some(target) = seeded_outcome_target.as_deref() {
+            info!(
+                session_id = %session_id,
+                target,
+                "outcome reflex seeded an observe+commit plan for a recalled loop"
+            );
+            let _ = self
+                .emit_turn_event(
+                    &session_id,
+                    "plan_seeded",
+                    Some(format!("outcome reflex: observe outcome, resolve {target}")),
+                )
+                .await;
+        }
 
         if let Some(command) = parse_slash_command(&content) {
             return match command {

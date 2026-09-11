@@ -954,6 +954,45 @@ pub fn plan_integrity_note(
 ///
 /// The skip branch is not a nicety. A four-step plan attached to "Going for a
 /// run tonight." is a worse experience than the bug being fixed here.
+/// Word-boundary request markers that make a message plan-worthy.
+const REQUEST_MARKERS: &[&str] = &[
+    "can you",
+    "could you",
+    "would you",
+    "please",
+    "i need",
+    "i want",
+    "lets",
+    "let s",
+    "add",
+    "create",
+    "set",
+    "update",
+    "change",
+    "get",
+    "find",
+    "make",
+    "show",
+    "list",
+    "record",
+    "track",
+    "plan",
+    "fix",
+    "check",
+    "remove",
+    "delete",
+    "schedule",
+    "remind",
+    "write",
+    "build",
+    "send",
+    "look up",
+    "figure out",
+    "help me",
+    "map",
+    "propose",
+];
+
 pub fn should_plan(user_content: &str) -> bool {
     let trimmed = user_content.trim();
     if trimmed.is_empty() {
@@ -968,58 +1007,8 @@ pub fn should_plan(user_content: &str) -> bool {
     // "get", "forget it" contains "get", and "planning to relax" contains
     // "plan". A false positive only costs a one-step plan, but it costs it on
     // exactly the chit-chat the skip branch exists to protect.
-    const REQUEST_MARKERS: &[&str] = &[
-        "can you",
-        "could you",
-        "would you",
-        "please",
-        "i need",
-        "i want",
-        "lets",
-        "let s",
-        "add",
-        "create",
-        "set",
-        "update",
-        "change",
-        "get",
-        "find",
-        "make",
-        "show",
-        "list",
-        "record",
-        "track",
-        "plan",
-        "fix",
-        "check",
-        "remove",
-        "delete",
-        "schedule",
-        "remind",
-        "write",
-        "build",
-        "send",
-        "look up",
-        "figure out",
-        "help me",
-        "map",
-        "propose",
-    ];
-    let words_padded = format!(
-        " {} ",
-        lower
-            .chars()
-            .map(|c| if c.is_alphanumeric() { c } else { ' ' })
-            .collect::<String>()
-            .split_whitespace()
-            .collect::<Vec<_>>()
-            .join(" ")
-    );
-    if trimmed.contains('?')
-        || REQUEST_MARKERS
-            .iter()
-            .any(|m| words_padded.contains(&format!(" {m} ")))
-    {
+    let words_padded = words_padded(&lower);
+    if trimmed.contains('?') || request_marker_present(&words_padded) {
         return true;
     }
 
@@ -1042,15 +1031,165 @@ pub fn should_plan(user_content: &str) -> bool {
     // 2026-08-27 it got no plan, and only the first item was captured. Same
     // separator threshold as `description_enumerates_artifacts`: two or more
     // separators means several distinct items.
+    enumeration_present(&lower)
+}
+
+fn request_marker_present(words_padded: &str) -> bool {
+    REQUEST_MARKERS
+        .iter()
+        .any(|m| words_padded.contains(&format!(" {m} ")))
+}
+
+fn enumeration_present(lower: &str) -> bool {
     let separators = lower.matches(", ").count()
         + lower.matches("; ").count()
         + lower.matches(" and ").count()
         + lower.matches(" & ").count();
-    if separators >= 2 {
+    separators >= 2
+}
+
+fn words_padded(lower: &str) -> String {
+    format!(
+        " {} ",
+        lower
+            .chars()
+            .map(|c| if c.is_alphanumeric() { c } else { ' ' })
+            .collect::<String>()
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+    )
+}
+
+/// A plan-worthy message that is a statement rather than a question and
+/// carries an explicit signal of work: a request marker, an enumeration, or
+/// a reported outcome. Deliberately narrower than [`should_plan`], which
+/// also treats any two-sentence message as plan-worthy — that rule is right
+/// for prompting a plan but wrong for handing tools to, or re-entering, a
+/// two-sentence thank-you. Questions are answered from context.
+pub fn is_plan_worthy_statement(user_content: &str) -> bool {
+    if user_content.contains('?') {
+        return false;
+    }
+    let lower = user_content.trim().to_lowercase();
+    request_marker_present(&words_padded(&lower))
+        || enumeration_present(&lower)
+        || reports_an_outcome(&lower)
+}
+
+/// Does this message report that something HAPPENED — an outcome the
+/// operator lived, rather than a request or a question? Past-tense
+/// completion language on word boundaries. Drives the outcome reflex.
+pub fn reports_an_outcome(normalized: &str) -> bool {
+    if normalized.contains('?') {
+        return false;
+    }
+    let padded = words_padded(normalized);
+    // "haven't received", "didn't finish", "never sent": not an outcome.
+    if [
+        "not",
+        "haven t",
+        "havent",
+        "hasn t",
+        "hasnt",
+        "didn t",
+        "didnt",
+        "never",
+        "still need",
+    ]
+    .iter()
+    .any(|n| padded.contains(&format!(" {n} ")))
+    {
+        return false;
+    }
+    // Bare past participles that only ever report completion.
+    if [
+        "renewed",
+        "purchased",
+        "submitted",
+        "delivered",
+        "completed",
+        "finished",
+        "booked",
+        "reinstated",
+    ]
+    .iter()
+    .any(|w| padded.contains(&format!(" {w} ")))
+    {
         return true;
     }
-
-    false
+    const OUTCOME_PHRASES: &[&str] = &[
+        "i gave",
+        "gave my",
+        "gave the",
+        "i finished",
+        "finished my",
+        "finished the",
+        "i completed",
+        "completed my",
+        "completed the",
+        "i delivered",
+        "delivered my",
+        "delivered the",
+        "i submitted",
+        "submitted my",
+        "submitted the",
+        "i sent",
+        "sent the",
+        "i booked",
+        "booked the",
+        "tickets purchased",
+        "tickets are booked",
+        "i purchased",
+        "i bought",
+        "i paid",
+        "paid the",
+        "i passed",
+        "passed my",
+        "passed the",
+        "i attended",
+        "i went to",
+        "we went to",
+        "i did it",
+        "got it done",
+        "is done",
+        "are done",
+        "all done",
+        "done with",
+        "wrapped up",
+        "i closed",
+        "closed the",
+        "i resolved",
+        "resolved the",
+        "took care of",
+        "i handled",
+        "i signed",
+        "i renewed",
+        "renewed my",
+        "renewed the",
+        "i received",
+        "received my",
+        "received the",
+        "picked up",
+        "dropped off",
+        "i fixed",
+        "fixed the",
+        "i installed",
+        "i shipped",
+        "i mailed",
+        "i called",
+        "met with",
+        "i talked to",
+        "i spoke with",
+        "got him back",
+        "got her back",
+        "got back into",
+        "is back in",
+        "reinstated",
+    ];
+    OUTCOME_PHRASES
+        .iter()
+        .any(|p| padded.contains(&format!(" {p} ")))
 }
 
 /// Instruction injected when a plan-worthy turn has not declared a plan yet.
@@ -2221,6 +2360,48 @@ mod tests {
     }
 
     // ── Plan-by-default gate ────────────────────────────────────────────
+
+    /// Live 2026-09-11 18:23 UTC: the outcome report that got congratulations
+    /// instead of a plan.
+    #[test]
+    fn outcome_reports_are_detected() {
+        for msg in [
+            "i gave my icebreaker speech in toastmasters today! and i did ok. nadi came in support.",
+            "finished the expense reports",
+            "delta tickets purchased for utah trip: 28 sept - 4 october",
+            "daxton's teacher got him back into the gsu class",
+            "passport renewed and received",
+        ] {
+            assert!(reports_an_outcome(msg), "should read as an outcome: {msg}");
+        }
+        for msg in [
+            "can you remind me to finish the report tomorrow?",
+            "going for a run tonight.",
+            "did i finish the report?",
+            "i will give my speech on friday",
+            "thanks!",
+            "i haven't received the passport yet",
+            "thanks bjork, i really appreciate it. looks like you're working pretty well now.",
+        ] {
+            assert!(
+                !reports_an_outcome(msg),
+                "should NOT read as an outcome: {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn plan_worthy_statements_exclude_questions() {
+        assert!(is_plan_worthy_statement(
+            "please update the MRI commitment and confirm it"
+        ));
+        assert!(is_plan_worthy_statement(
+            "On the open loops:\n1 - I am still working on the icebreaker speech\n2 - Daxton's teacher got him back into the GSU class"
+        ));
+        assert!(!is_plan_worthy_statement("what's on my plate today?"));
+        assert!(!is_plan_worthy_statement("can you show me my open loops?"));
+        assert!(!is_plan_worthy_statement("ok"));
+    }
 
     #[test]
     fn trivial_chat_does_not_get_a_plan() {
