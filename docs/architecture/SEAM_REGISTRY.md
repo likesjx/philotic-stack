@@ -3,7 +3,7 @@ title: Philotic Seam Registry
 doc_type: workflow
 domain: workflow-docs
 status: active
-last_updated: 2026-09-05
+last_updated: 2026-09-12
 tags:
 - seams
 - ids
@@ -170,6 +170,12 @@ This registry makes the seam layer explicit without forcing every task bullet to
 | `prompt-guard-scan` | `tooling-execution` | [SELF_IMPROVEMENT_LOOP_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/SELF_IMPROVEMENT_LOOP_PROPOSAL.md) | proposed | `docs/task.md` → `New Project: Self-Improvement Loop` |
 | `cron-continuity` | `runtime-sessions` | [SELF_IMPROVEMENT_LOOP_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/SELF_IMPROVEMENT_LOOP_PROPOSAL.md) | proposed | `docs/task.md` → `New Project: Self-Improvement Loop` |
 | `session-search-fts` | `memory-context` | [SELF_IMPROVEMENT_LOOP_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/SELF_IMPROVEMENT_LOOP_PROPOSAL.md) | proposed | `docs/task.md` → `New Project: Self-Improvement Loop` |
+| `procedure-graph-record` | `runtime-sessions` | [PROCEDURAL_GRAPHS_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/PROCEDURAL_GRAPHS_PROPOSAL.md) | accepted-current-slice | `docs/task.md` → `New Project: Procedural Graphs` |
+| `procedure-run-ledger` | `runtime-sessions` | [PROCEDURAL_GRAPHS_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/PROCEDURAL_GRAPHS_PROPOSAL.md) | accepted-current-slice | `docs/task.md` → `New Project: Procedural Graphs` |
+| `procedure-localized-guidance` | `runtime-sessions` | [PROCEDURAL_GRAPHS_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/PROCEDURAL_GRAPHS_PROPOSAL.md) | accepted-current-slice | `docs/task.md` → `New Project: Procedural Graphs` |
+| `procedure-seeded-plans` | `runtime-sessions` | [PROCEDURAL_GRAPHS_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/PROCEDURAL_GRAPHS_PROPOSAL.md) | proposed | `docs/task.md` → `New Project: Procedural Graphs` |
+| `procedure-refiner-gate` | `runtime-sessions` | [PROCEDURAL_GRAPHS_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/PROCEDURAL_GRAPHS_PROPOSAL.md) | proposed | `docs/task.md` → `New Project: Procedural Graphs` |
+| `procedure-generative-guidance` | `runtime-sessions` | [PROCEDURAL_GRAPHS_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/PROCEDURAL_GRAPHS_PROPOSAL.md) | deferred | `docs/task.md` → `New Project: Procedural Graphs` |
 | `cypher-classifier-wall` | `memory-context` | [GRAPH_DOORS_AND_LIFE_CORE_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/GRAPH_DOORS_AND_LIFE_CORE_PROPOSAL.md) | proposed | `docs/task.md` → `New Project: Graph Doors and Life Core` |
 | `graph-registry-containers` | `memory-context` | [GRAPH_DOORS_AND_LIFE_CORE_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/GRAPH_DOORS_AND_LIFE_CORE_PROPOSAL.md) | proposed | `docs/task.md` → `New Project: Graph Doors and Life Core` |
 | `graph-door-query` | `memory-context` | [GRAPH_DOORS_AND_LIFE_CORE_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/GRAPH_DOORS_AND_LIFE_CORE_PROPOSAL.md) | proposed | `docs/task.md` → `New Project: Graph Doors and Life Core` |
