@@ -827,6 +827,148 @@ fn step_tool_is_read_only(step: &PlanStep) -> bool {
     READ_ONLY_SUFFIXES.iter().any(|s| tool.ends_with(s))
 }
 
+/// Split every bundled, tool-bound step of a model-declared plan into one
+/// step per enumerated item, in place. Returns `(original_id, new_ids)` for
+/// each split so callers can log it.
+///
+/// The evaluator refuses to settle a bundled step ("Log Nadi, Daxton, Gabby,
+/// and Brandon as Person nodes") because one call cannot prove four
+/// artifacts — and it tells the model to split. Live 2026-09-12 11:00 UTC
+/// the model instead re-ran all four observes on every continuation, the
+/// step stayed outstanding, and the plan burned three continuations (four
+/// Telegram messages) to a `blocked` verdict with all four people actually
+/// written. The harness now splits for it: each item becomes its own step
+/// with the same tool, so the distinctive-token pass in
+/// [`verify_plan_steps`] can credit each observe to its own person.
+///
+/// Read-only tool steps and non-enumerating steps are left alone (see
+/// [`atomicity_violations`]). Items are the comma/`and`-separated pieces of
+/// the description; the lead-in before a colon is kept on every piece so
+/// the steps still read as instructions.
+pub fn split_bundled_steps(plan: &mut ActivePlan) -> Vec<(u32, Vec<u32>)> {
+    let bundled = atomicity_violations(plan);
+    if bundled.is_empty() {
+        return Vec::new();
+    }
+    let mut next_id = plan.steps.iter().map(|s| s.id).max().unwrap_or(0) + 1;
+    let mut out = Vec::new();
+    let mut new_steps: Vec<PlanStep> = Vec::with_capacity(plan.steps.len() + 4);
+    for step in plan.steps.drain(..) {
+        if !bundled.contains(&step.id) {
+            new_steps.push(step);
+            continue;
+        }
+        let mut items = enumerated_items(&step.description);
+        if items.len() < 2 {
+            new_steps.push(step);
+            continue;
+        }
+        let (mut lead, _) = split_lead_in(&step.description);
+        // No colon: "Propose Zerin, Mali and Daxton" — the first item carries
+        // the verb. Lift a leading imperative onto every item so the steps
+        // read "Propose Zerin" / "Propose Mali" instead of "Mali".
+        if lead.is_none() {
+            const VERBS: &[&str] = &[
+                "propose", "log", "record", "create", "add", "register", "observe", "capture",
+                "update", "resolve", "commit", "mark", "retire", "confirm", "write", "store",
+                "save", "set", "schedule", "send", "note",
+            ];
+            if let Some((first, rest)) = items[0].split_once(' ') {
+                if VERBS.contains(&first.to_lowercase().as_str()) {
+                    lead = Some(first.to_string());
+                    items[0] = rest.trim().to_string();
+                }
+            }
+        }
+        let mut ids = Vec::with_capacity(items.len());
+        for item in items {
+            let description = match lead.as_deref() {
+                Some(lead) => format!("{lead} {item}"),
+                None => item,
+            };
+            new_steps.push(PlanStep {
+                id: next_id,
+                description,
+                tool_name: step.tool_name.clone(),
+                // A split step is never inherited as done: each item must be
+                // proven by its own call.
+                status: if step.status == "done" || step.status == "in_progress" {
+                    "pending".to_string()
+                } else {
+                    step.status.clone()
+                },
+            });
+            ids.push(next_id);
+            next_id += 1;
+        }
+        out.push((step.id, ids));
+    }
+    plan.steps = new_steps;
+    out
+}
+
+/// "Log key contacts: Nadi, Daxton, Gabby, and Brandon as Person nodes" →
+/// lead-in "Log key contacts:" and body "Nadi, Daxton, Gabby, and Brandon as
+/// Person nodes". Without a colon the whole description is the body.
+fn split_lead_in(description: &str) -> (Option<String>, String) {
+    match description.find(':') {
+        Some(idx) if idx + 1 < description.len() => (
+            Some(description[..=idx].trim().to_string()),
+            description[idx + 1..].trim().to_string(),
+        ),
+        _ => (None, description.trim().to_string()),
+    }
+}
+
+/// The enumerated pieces of a bundled description, split on `, `, `; `,
+/// ` and `, ` & ` and newlines, with bullet markers and the Oxford comma's
+/// leading "and" stripped. A trailing clause after the last item ("as
+/// Person nodes") stays attached to that item — it is harmless to the
+/// distinctive-token match and keeps the step readable.
+fn enumerated_items(description: &str) -> Vec<String> {
+    let (_, body) = split_lead_in(description);
+    let mut pieces: Vec<String> = Vec::new();
+    for line in body.split('\n') {
+        let line = line
+            .trim()
+            .trim_start_matches(['-', '*', '•'])
+            .trim_start_matches(|c: char| c.is_ascii_digit() || c == '.' || c == ')')
+            .trim();
+        if line.is_empty() {
+            continue;
+        }
+        let mut buf = line.replace(" & ", ", ").replace("; ", ", ");
+        buf = buf.replace(", and ", ", ").replace(" and ", ", ");
+        for piece in buf.split(", ") {
+            let piece = piece.trim().trim_start_matches("and ").trim();
+            if !piece.is_empty() {
+                pieces.push(piece.to_string());
+            }
+        }
+    }
+    // The last item usually drags the shared trailing clause with it
+    // ("Brandon as Person nodes scoped to the Chief of Staff role"). Cut it
+    // at the first clause marker so the item is just the item: otherwise
+    // its words ("person", "scoped", "staff") become distinctive tokens that
+    // let a sibling's call be credited to it.
+    if let Some(last) = pieces.last_mut() {
+        const CLAUSE_MARKERS: &[&str] = &[
+            " as ", " to ", " into ", " with ", " for ", " under ", " scoped", " linked", " via ",
+            " so ", " on the ", " in the ",
+        ];
+        let lower = last.to_lowercase();
+        let cut = CLAUSE_MARKERS
+            .iter()
+            .filter_map(|m| lower.find(m))
+            .filter(|&i| i > 0)
+            .min();
+        if let Some(i) = cut {
+            *last = last[..i].trim().to_string();
+        }
+    }
+    pieces
+}
+
 fn description_enumerates_artifacts(description: &str) -> bool {
     let lower = description.to_lowercase();
     let conjunctions = lower.matches(" and ").count() + lower.matches(" & ").count();
@@ -2325,6 +2467,118 @@ mod tests {
         let h = history_args(&[("life.observe", observe("drive Daxton school"), "ok")]);
         let v = verify_plan_steps(&single, &h, &[]);
         assert!(evaluate_whole_plan(&single, &v).complete);
+    }
+
+    /// Live 2026-09-12 11:00 UTC: the bundled Person step that burned three
+    /// continuations. After the split, each observe settles its own item and
+    /// the plan completes on the same tool history.
+    #[test]
+    fn bundled_step_is_split_per_item_and_settles_on_per_item_evidence() {
+        let mut p = plan(
+            "executing",
+            &[
+                (
+                    "Log key contacts: Nadi, Daxton, Gabby, and Brandon as Person nodes scoped to the Chief of Staff role",
+                    Some("life.observe"),
+                    "done",
+                ),
+                (
+                    "Retrieve oldest open loops, aspirations, and roles to anchor the brief",
+                    Some("life.recall"),
+                    "pending",
+                ),
+            ],
+        );
+        let splits = split_bundled_steps(&mut p);
+        assert_eq!(
+            splits.len(),
+            1,
+            "only the observe step is bundled: {splits:?}"
+        );
+        assert_eq!(splits[0].0, 1);
+        assert_eq!(splits[0].1, vec![3, 4, 5, 6]);
+        assert_eq!(p.steps.len(), 5);
+        let descs: Vec<&str> = p.steps.iter().map(|s| s.description.as_str()).collect();
+        assert_eq!(descs[0], "Log key contacts: Nadi");
+        assert_eq!(descs[1], "Log key contacts: Daxton");
+        assert_eq!(descs[2], "Log key contacts: Gabby");
+        assert!(descs[3] == "Log key contacts: Brandon", "{}", descs[3]);
+        assert!(
+            p.steps[..4]
+                .iter()
+                .all(|s| s.status == "pending" && s.tool_name.as_deref() == Some("life.observe"))
+        );
+        assert_eq!(p.steps[4].id, 2, "unsplit steps keep their ids");
+        assert!(
+            atomicity_violations(&p).is_empty(),
+            "nothing bundled remains"
+        );
+
+        // Idempotent.
+        assert!(split_bundled_steps(&mut p).is_empty());
+
+        // Four observes, one per person, plus the recall: complete.
+        let h = history_args(&[
+            ("life.observe", observe("Nadi"), "ok"),
+            ("life.observe", observe("Daxton"), "ok"),
+            ("life.observe", observe("Gabby"), "ok"),
+            ("life.observe", observe("Brandon"), "ok"),
+            (
+                "life.recall",
+                serde_json::json!({"query_text": "open loops"}),
+                "ok",
+            ),
+        ]);
+        let v = verify_plan_steps(&p, &h, &[]);
+        let c = evaluate_whole_plan(&p, &v);
+        assert!(c.complete, "outstanding: {:?}", c.outstanding);
+
+        // Three observes only: Brandon stays outstanding, nothing else.
+        let h3 = history_args(&[
+            ("life.observe", observe("Nadi"), "ok"),
+            ("life.observe", observe("Daxton"), "ok"),
+            ("life.observe", observe("Gabby"), "ok"),
+            (
+                "life.recall",
+                serde_json::json!({"query_text": "open loops"}),
+                "ok",
+            ),
+        ]);
+        let v3 = verify_plan_steps(&p, &h3, &[]);
+        let c3 = evaluate_whole_plan(&p, &v3);
+        assert_eq!(c3.outstanding, vec![3]);
+    }
+
+    #[test]
+    fn enumerated_items_handles_bullets_and_oxford_commas() {
+        assert_eq!(
+            enumerated_items("Propose Zerin, Mali and Daxton as Person nodes"),
+            vec!["Propose Zerin", "Mali", "Daxton"]
+        );
+        assert_eq!(
+            enumerated_items("Log:\n- the run\n- the ride\n- the swim"),
+            vec!["the run", "the ride", "the swim"]
+        );
+        assert_eq!(
+            enumerated_items("Record the run and the bike ride and the swim"),
+            vec!["Record the run", "the bike ride", "the swim"]
+        );
+
+        // No colon: the verb is lifted onto every item.
+        let mut p = plan(
+            "executing",
+            &[(
+                "Propose Zerin, Mali and Daxton as Person nodes",
+                Some("life.observe"),
+                "pending",
+            )],
+        );
+        split_bundled_steps(&mut p);
+        let descs: Vec<&str> = p.steps.iter().map(|s| s.description.as_str()).collect();
+        assert_eq!(
+            descs,
+            vec!["Propose Zerin", "Propose Mali", "Propose Daxton"]
+        );
     }
 
     #[test]
