@@ -1721,6 +1721,12 @@ pub struct SessionBindings {
     pub effective_skillset: Vec<String>,
     #[serde(default)]
     pub effective_skill_guidance: Vec<String>,
+    /// Procedural graphs projected for this session (doc:procedural-graphs):
+    /// the hotel sends the full records for the skills in play so philote
+    /// can localize the active step without an IPC round trip. Prompt-facing
+    /// only — never affects tool routing or the tool assembly.
+    #[serde(default)]
+    pub effective_procedures: Vec<ansible_mesh_core::procedure::ProcedureGraphRecord>,
     /// Skills whose tools are in the ToolAssembly but suppressed per-turn unless
     /// the turn content signals the skill is needed. Populated from the role's
     /// toolset profile `on_demand_skills` list at session snapshot time.

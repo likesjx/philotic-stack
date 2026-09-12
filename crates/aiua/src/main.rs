@@ -5096,6 +5096,30 @@ fn seed_abstract_skill_catalog(graph: &GraphDomain) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Procedural graphs (doc:procedural-graphs P0): the repo expert prior.
+/// Fill-only — `GraphDomain::seed_procedure` never clobbers a record an
+/// operator, an agent, or the refiner has since edited, and only bumps a
+/// repo-provenance record to a newer repo version.
+fn seed_procedure_catalog(graph: &GraphDomain) -> anyhow::Result<()> {
+    for seed in ansible_mesh_core::procedure::seeded_procedures() {
+        if let Err(errors) = seed.validate() {
+            anyhow::bail!(
+                "seeded procedure {} is invalid: {}",
+                seed.procedure_id,
+                errors.join("; ")
+            );
+        }
+        if graph.seed_procedure(&seed)? {
+            info!(
+                procedure_id = %seed.procedure_id,
+                version = seed.version,
+                "Seeded procedure"
+            );
+        }
+    }
+    Ok(())
+}
+
 fn seed_toolset_profiles(graph: &GraphDomain) -> anyhow::Result<()> {
     let profiles = [
         ToolsetProfileRecord {
@@ -8196,6 +8220,7 @@ async fn run_load_command(file: &str, hotel_name: &str) -> Result<()> {
     seed_abstract_skill_catalog(&graph_domain)?;
     seed_toolset_profiles(&graph_domain)?;
     seed_skill_crafting(&graph_domain)?;
+    seed_procedure_catalog(&graph_domain)?;
 
     for profile in &all_profiles {
         let agent_config = raw_agent_config_for_key(&config_json, hotel_name, &profile.agent_key);
@@ -8457,6 +8482,7 @@ async fn main() -> Result<()> {
     seed_abstract_skill_catalog(&graph_domain_arc)?;
     seed_toolset_profiles(&graph_domain_arc)?;
     seed_skill_crafting(&graph_domain_arc)?;
+    seed_procedure_catalog(&graph_domain_arc)?;
 
     // Config-time model-routing coherence: warn + heal-queue any fallback tier
     // that names a controller role with no seeded+active guest on this hotel.

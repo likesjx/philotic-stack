@@ -1355,6 +1355,35 @@ pub enum IpcRequest {
     },
     /// List all registered skills with their validation states.
     ListSkills {},
+    /// Register a procedural graph, or a new version of one
+    /// (doc:procedural-graphs). `procedure` is a serialized
+    /// `ProcedureGraphRecord`. Gated like [`IpcRequest::RegisterSkill`]; an
+    /// `origin` of `distill:*` / `agent` forces the record to `Draft`.
+    RegisterProcedure {
+        procedure: serde_json::Value,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        origin: Option<String>,
+    },
+    /// Fetch one procedural graph by id.
+    GetProcedure {
+        procedure_id: String,
+    },
+    /// List every procedural graph with its version and validation state.
+    ListProcedures {},
+    /// Append one terminal plan evaluation to a procedure's run ledger.
+    /// `run` is a serialized `ProcedureRunRecord`; the hotel stamps
+    /// `recorded_at` and the caller's `agent_id` when absent.
+    RecordProcedureRun {
+        run: serde_json::Value,
+    },
+    /// Newest-first runs for a procedure, optionally pinned to a graph version.
+    ListProcedureRuns {
+        procedure_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        graph_version: Option<u32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        limit: Option<usize>,
+    },
     /// Get a single toolset profile by name.
     GetToolsetProfile {
         profile_name: String,

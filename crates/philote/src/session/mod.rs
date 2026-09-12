@@ -7495,6 +7495,7 @@ mod tests {
                 effective_toolset: vec!["echo".into(), "workspace.read".into()],
                 effective_skillset: vec!["planning".into()],
                 effective_skill_guidance: Vec::new(),
+                effective_procedures: Vec::new(),
                 effective_workspace_ref: Some("workspace://main".into()),
                 transport_reply_target: Some(TransportReplyTargetBinding {
                     target_node: "local-aiua-01".into(),
@@ -8117,6 +8118,7 @@ mod tests {
             effective_toolset: vec!["echo".into()],
             effective_skillset: vec!["planning".into()],
             effective_skill_guidance: Vec::new(),
+            effective_procedures: Vec::new(),
             effective_workspace_ref: Some("workspace://main".into()),
             transport_reply_target: Some(TransportReplyTargetBinding {
                 target_node: "local-aiua-01".into(),
