@@ -431,6 +431,19 @@ pub fn compile_observe_with_extensions(
             "n.occurs_at = CASE $occurs_at WHEN '' THEN null ELSE $occurs_at END, ",
             "n.ends_at = CASE $ends_at WHEN '' THEN null ELSE $ends_at END ",
             "ON MATCH SET ",
+            // A fresh observation of a node that is still proposed/inferred
+            // carries the newest lived fact — take it. Live 2026-09-12 16:49
+            // UTC: "My home address is 137 Harmony Grove Rd" re-observed
+            // `life:place:home`, the runner answered "observed", the model
+            // told the operator it was recorded, and the node kept its
+            // generic summary. Confirmed and retired nodes keep their
+            // summary (only life.commit may rewrite confirmed truth); the
+            // latest observation is still kept beside it so nothing is lost,
+            // and `summary_updated` tells the caller which happened.
+            "n.summary_updated = NOT coalesce(n.validation_state, '') IN ['confirmed', 'retired'], ",
+            "n.claim_summary = CASE WHEN coalesce(n.validation_state, '') IN ['confirmed', 'retired'] THEN n.claim_summary ELSE $claim_summary END, ",
+            "n.last_observed_summary = $claim_summary, ",
+            "n.observed_at = $observed_at, ",
             "n.confidence = $confidence, ",
             "n.observation_id = $observation_id, ",
             "n.packet_id = $packet_id, ",
@@ -441,7 +454,8 @@ pub fn compile_observe_with_extensions(
             "n.starts_at = CASE $starts_at WHEN '' THEN n.starts_at ELSE $starts_at END, ",
             "n.occurs_at = CASE $occurs_at WHEN '' THEN n.occurs_at ELSE $occurs_at END, ",
             "n.ends_at = CASE $ends_at WHEN '' THEN n.ends_at ELSE $ends_at END ",
-            "RETURN n.id AS id, n.validation_state AS validation_state",
+            "RETURN n.id AS id, n.validation_state AS validation_state, ",
+            "coalesce(n.summary_updated, true) AS summary_updated",
         ),
         label = label
     );
@@ -1278,6 +1292,45 @@ mod tests {
             edges: vec![],
             provenance: None,
         }
+    }
+
+    /// Live 2026-09-12 16:49 UTC: re-observing `life:place:home` with the
+    /// operator's address kept the generic summary — ON MATCH never touched
+    /// `claim_summary`. A still-proposed node now takes the newest
+    /// observation; confirmed/retired nodes keep theirs; the caller learns
+    /// which via `summary_updated`.
+    #[test]
+    fn compile_observe_on_match_updates_summary_unless_confirmed() {
+        let compiled =
+            compile_observe(&minimal_observe_input("Place"), "2026-09-12T16:49:00Z").unwrap();
+        let q = &compiled.query;
+        let on_match = &q[q.find("ON MATCH SET").expect("on match clause")..];
+        assert!(on_match.contains(
+            "n.claim_summary = CASE WHEN coalesce(n.validation_state, '') IN ['confirmed', 'retired'] THEN n.claim_summary ELSE $claim_summary END"
+        ));
+        assert!(on_match.contains("n.last_observed_summary = $claim_summary"));
+        assert!(on_match.contains("n.observed_at = $observed_at"));
+        assert!(q.contains("coalesce(n.summary_updated, true) AS summary_updated"));
+    }
+
+    #[test]
+    fn commit_normalize_defaults_fills_packet_id() {
+        let mut evidence = minimal_observe_input("Commitment").evidence;
+        evidence.packet_id = String::new();
+        let mut input = crate::LifeCommitInput {
+            evidence,
+            operator_approved: true,
+            loop_status: None,
+            resolution_note: None,
+        };
+        input.normalize_defaults();
+        assert!(input.evidence.packet_id.starts_with("commit-"));
+        // Validation would have rejected the empty id before.
+        assert!(input.evidence.validate().is_ok());
+        // A caller-supplied id is left alone.
+        input.evidence.packet_id = "pkt:mine".into();
+        input.normalize_defaults();
+        assert_eq!(input.evidence.packet_id, "pkt:mine");
     }
 
     /// Structured temporal fields must ride the observe write (ontology gap

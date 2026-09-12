@@ -880,6 +880,14 @@ impl LifeGraphProvider {
             .as_ref()
             .and_then(|r| r.get::<String>("id").ok())
             .unwrap_or_else(|| compiled.node_id.clone());
+        // False only when the node already existed as confirmed/retired and
+        // kept its summary (the observation is retained as
+        // `last_observed_summary`); the caller must not report the new text
+        // as recorded in that case.
+        let summary_updated = first_row
+            .as_ref()
+            .and_then(|r| r.get::<bool>("summary_updated").ok())
+            .unwrap_or(true);
 
         info!(
             node_id = %node_id,
@@ -887,6 +895,7 @@ impl LifeGraphProvider {
             observation_id = %compiled.observation_id,
             packet_id = %compiled.packet_id,
             observed_by = %compiled.observed_by,
+            summary_updated,
             "life.observe: proposed evidence node written to Memgraph"
         );
 
@@ -988,6 +997,10 @@ impl LifeGraphProvider {
             "origin_engram_id": compiled.origin_engram_id,
             "origin_trust": compiled.origin_trust,
             "embed_status": embed_status,
+            "summary_updated": summary_updated,
+            "summary_note": if summary_updated { Value::Null } else {
+                Value::String("node is confirmed/retired: claim_summary kept, this observation stored as last_observed_summary — use life.commit to rewrite confirmed truth".into())
+            },
             "edges": edge_reports,
         })))
     }
@@ -1696,8 +1709,9 @@ impl LifeGraphProvider {
     }
 
     async fn handle_commit(&self, task: &DatasourceTask) -> Result<ProviderOutput> {
-        let input: LifeCommitInput = serde_json::from_value(task.parameters.clone())
+        let mut input: LifeCommitInput = serde_json::from_value(task.parameters.clone())
             .context("failed to parse life.commit parameters as LifeCommitInput")?;
+        input.normalize_defaults();
         let plan = self
             .runner
             .plan(LifeGraphToolRequest::LifeCommit(input.clone()))
