@@ -88,7 +88,7 @@ already does (same pattern `handle_remote_role_handoff` established).
 **Watched-live 2026-09-09**: `hotel.materialize_request` mac-jane → vps-jane
 pre-warmed a real philote process end to end (confirmed by pid on vps-jane),
 replied `MaterializeReady`, and left `home_node` untouched — but only after
-finding and fixing **DEF-122**: `target_hotel` must be the hotel's real mesh
+finding and fixing **DEF-124**: `target_hotel` must be the hotel's real mesh
 `node_id` (e.g. `"vps-jane-aiua-01"`), not the bare `hotel_name` the tools'
 own documentation used as an example (`"vps-jane"`) — passing the documented
 example silently delivered nowhere. `codex/relocation-node-id-resolve` adds

@@ -1428,7 +1428,7 @@ impl IpcServer {
     /// (`home_node != local_node_id`, `target_node_id` on an `EventEnvelope`)
     /// is actually keyed on the full `node_id` (e.g. `"vps-jane-aiua-01"`,
     /// `hotels.capabilities.node_id`). Passing the documented example
-    /// silently fails to route anywhere — no error, no delivery (DEF-113,
+    /// silently fails to route anywhere — no error, no delivery (DEF-124,
     /// found live 2026-09-09 rehearsing the R3 watched-live gate).
     ///
     /// Accepts either form so both the documented example and the "correct"
@@ -6707,7 +6707,7 @@ impl IpcServer {
 
                 // Resolve a bare hotel_name (documented example, e.g. "vps-jane")
                 // or an already-canonical node_id to the node_id every routing
-                // comparison actually keys on (DEF-113).
+                // comparison actually keys on (DEF-124).
                 let Some(target_hotel) = Self::resolve_hotel_node_id(graph, &target_hotel) else {
                     return IpcResponse::error(
                         "set_transport_home",
@@ -29578,7 +29578,7 @@ pub(crate) mod tests {
                 mesh_host: None,
             })
             .expect("seed hotel");
-        // DEF-113: resolve_hotel_node_id requires every referenced hotel —
+        // DEF-124: resolve_hotel_node_id requires every referenced hotel —
         // including standby_hotels — to be a seeded hotel record.
         for peer in ["mbp-jane", "mac-jane"] {
             graph
@@ -29721,7 +29721,7 @@ pub(crate) mod tests {
                 mesh_host: None,
             })
             .expect("seed hotel");
-        // DEF-113: resolve_hotel_node_id needs mac-jane seeded too — it's
+        // DEF-124: resolve_hotel_node_id needs mac-jane seeded too — it's
         // the target_hotel this test moves the transport home to.
         graph
             .upsert_hotel(&HotelRecord {
