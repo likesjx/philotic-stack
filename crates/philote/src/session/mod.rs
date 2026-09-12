@@ -716,7 +716,19 @@ impl SessionState {
     /// unverified (or, worse, a fresh unverified step inherits a stale
     /// `true`). Re-key by step id so a step keeps its own evidence and a
     /// genuinely new step starts unverified.
-    pub fn set_active_plan(&mut self, plan: ActivePlan) {
+    pub fn set_active_plan(&mut self, mut plan: ActivePlan) {
+        // Normalize before anything else: a bundled step is split into one
+        // step per item so each can be proven by its own call (live
+        // 2026-09-12 11:00 UTC: four people in one step, four observes, plan
+        // still "outstanding" through three continuations).
+        let splits = crate::plan_eval::split_bundled_steps(&mut plan);
+        if !splits.is_empty() {
+            tracing::info!(
+                session_id = %self.session_id,
+                splits = ?splits,
+                "plan normalization: split bundled step(s) into one step per item"
+            );
+        }
         if let Some(turn) = self.active_turn.as_mut() {
             let carried: Vec<(u32, bool)> = turn
                 .active_plan
