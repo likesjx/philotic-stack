@@ -249,7 +249,7 @@ learn/reinforce/suppress loop the stack already runs for role handoffs.
 |---|---|---|---|
 | P0 `procedure-graph-record` | `ProcedureGraphRecord` / `ProcedureNode` / `ProcedureEdge` / `ProcedureRelation` / `ProcedureProvenance` + `validate()`, `linear_backbone()`, `locate()` in `ansible-mesh-core/src/graph.rs`; node kinds `procedure`, `procedure_run`, `procedure_patch` in `domain/kinds.rs`; `GraphDomain` upsert/get/list; IPC `RegisterProcedure`, `GetProcedure`, `ListProcedures` (+ `ProcedureList` response, inserted **before** `MemoryConfig`); `seed_procedure_catalog` at boot with `outcome-reflex`; `effective_procedures` composed into session bindings and carried by `merge_snapshot_bindings`; `phil procedure list\|show`. | M | test-green: validate rejects dangling edges / oversize / hazard text; backbone walks a branch deterministically; locate disambiguates a shared tool by predecessor; bind projects only projectable procedures |
 | P1 `procedure-run-ledger` | `ActivePlan.procedure_id` (serde default); plan→procedure match (stamped id, else Jaccard ≥ 0.5 over tool names); `RecordProcedureRun` IPC sent fire-and-forget from the terminal branches of the plan eval in `turn_loop.rs` (`Settled`, `Stop`), never on `Continue`; hotel persists `procedure_run`; `ListProcedureRuns { procedure_id, version, limit }`; `phil procedure runs <id>`. | S | test-green: a Complete grounded eval records score 1.0 with the tool sequence; a Blocked eval records 0.0; a Continue records nothing; an unmatched plan records nothing |
-| P2 `procedure-localized-guidance` | `philote/src/procedure_guidance.rs`: active-procedure resolution, `locate` on the last successful call, deterministic `Next/when/do/avoid` render, cap, kill switch; appended by `reentry_hint` and `plan_continuation_brief`; `guidance_rendered` stamped on the run. | S–M | test-green: guidance names only the active node's out-edges; absent with no match; capped; disabled by env; the say-do and plan gates are untouched (existing plan_eval tests stay green) |
+| P2 `procedure-localized-guidance` | `philote/src/procedures.rs`: active-procedure resolution, `locate` on the last successful call, deterministic `Next/when/do/avoid` render, cap, kill switch; appended by `reentry_hint` and `plan_continuation_brief`; `guidance_rendered` stamped on the run. | S–M | test-green: guidance names only the active node's out-edges; absent with no match; capped; disabled by env; the say-do and plan gates are untouched (existing plan_eval tests stay green) |
 | P3 `procedure-seeded-plans` | `seed_plan_from_procedure` replaces the literals in `seed_outcome_plan` when a triggered procedure is bound (branch on recalled target), stamps `procedure_id`; literal fallback retained; `lifegraph.gardening` seeded from the existing gardener SkillDAG shape. | S | test-green: the four existing `seed_outcome_plan` tests pass unchanged against the seeded graph; a hotel with no bound procedure still seeds the literal; `procedure_id` lands on the run |
 | P4 `procedure-refiner-gate` | `DistillTrigger::ProcedureContrast`; `procedure.patch` + `procedure.get` tools and IPC (`ProposeProcedurePatch`, `ListProcedurePatches`, `DecideProcedurePatch`); `procedure_patch` records; approval → `Trial` version with `trial_of`; trial-window scoring on `RecordProcedureRun`, accept/revert; rejected patches rendered into the refiner prompt; distill YES path emits a linear Draft procedure; lane `procedures.refine` + kill switch; `phil procedure patches\|approve\|reject`. | L | test-green: contrast fires only with both a success and a failure at the current version; a patch with a dangling edge is refused; approve produces `v+1` on trial; K candidate runs ≥ baseline accept, < baseline revert and keep the patch; a rejected patch appears in the next refiner prompt + watched-live: one real `Pending` patch from a Beacon plan failure on vps-jane, approved, trialled, and decided without a deploy |
 | P5 `procedure-generative-guidance` | Optional Ψ: when the deterministic render is empty or the plan has stalled once, a bounded whisper turns the 2-hop subgraph + last three steps into one paragraph of situational guidance, cached per (procedure, node) for the plan's lifetime. Deferred until P2 has a watched-live baseline to compare against. | M | deferred |
@@ -286,7 +286,14 @@ procedure is the promotion signal from `Draft → Validated`.
 
 ## Disposition
 
-`accepted-current-slice` — P0–P2 on `codex/procedural-graphs`; P3–P4
-follow on the same branch or one sibling. Status truth for what has landed
-lives in [ARCHITECTURE_STATUS.md](ARCHITECTURE_STATUS.md); execution order in
-[docs/task.md](../task.md) → `New Project: Procedural Graphs`.
+`accepted-current-slice` — **P0–P4 implemented test-green 2026-09-12** on
+`codex/procedural-graphs` (core 365, philote 576, hotel procedure tests
+green; clippy clean). Two deviations from the slice table, both deliberate:
+`guidance_rendered` on a run row is derived from the kill switch plus
+attribution rather than a per-turn flag (the `&self` prompt builders cannot
+set one), and the `lifegraph.gardening` seed is deferred until the
+gardener's live shape is read on vps-jane. Watched-live for P4 (a real
+`Pending` patch approved, trialled, and decided on vps-jane) is the open
+gate. Status truth lives in [ARCHITECTURE_STATUS.md](ARCHITECTURE_STATUS.md);
+execution order in [docs/task.md](../task.md) → `New Project: Procedural
+Graphs`.
