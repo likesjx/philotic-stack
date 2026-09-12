@@ -1928,6 +1928,19 @@ Order: L5 → L1 → L2, then L3/L4/L6/L7 independently.
 - [ ] L6 cron `continuity` + `cron_scratch` node injected as `[Previous run]` — watched-live on the vps Chronos check-in
 - [ ] L7 `session_turn_fts` FTS5 table + `SearchSessionTurns` IPC + `session.search` tool — smoke-green on vps-jane Beacon history
 
+## New Project: Procedural Graphs
+
+Proposal: [docs/architecture/PROCEDURAL_GRAPHS_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/PROCEDURAL_GRAPHS_PROPOSAL.md) (accepted 2026-09-12; adopts arXiv 2609.09153 on the existing plan-eval validator, distill whisper, and reflex-preference suppression; gives Autopoiesis A7's "≥3 completed plans" hint a concrete object).
+
+Order: P0 → P1 → P2 ∥ P3 → P4. P5 deferred.
+
+- [ ] P0 `procedure-graph-record`: `ProcedureGraphRecord` + `validate()` / `linear_backbone()` / `locate()`; node kinds `procedure` / `procedure_run` / `procedure_patch`; `GraphDomain` CRUD; IPC `RegisterProcedure` / `GetProcedure` / `ListProcedures`; boot seed `outcome-reflex`; `effective_procedures` in session bindings; `phil procedure list|show` — test-green
+- [ ] P1 `procedure-run-ledger`: `ActivePlan.procedure_id`; plan→procedure match; `RecordProcedureRun` from the terminal plan-eval branches only; `ListProcedureRuns`; `phil procedure runs` — test-green
+- [ ] P2 `procedure-localized-guidance`: `philote/src/procedure_guidance.rs` deterministic `Next/when/do/avoid` render on `reentry_hint` + `plan_continuation_brief`, 900-char cap, `PHILOTIC_DISABLE_PROCEDURE_GUIDANCE` — test-green
+- [ ] P3 `procedure-seeded-plans`: `seed_plan_from_procedure` behind the `reports_an_outcome` trigger, literal fallback retained — the four existing `seed_outcome_plan` tests pass unchanged
+- [ ] P4 `procedure-refiner-gate`: `DistillTrigger::ProcedureContrast`, `procedure.patch` / `procedure.get`, `procedure_patch` records, approve → `Trial` version, K-run scoring accept/revert, rejected patches in the refiner prompt, lane `procedures.refine` + kill switch, `phil procedure patches|approve|reject` — test-green + watched-live on vps-jane
+- [ ] P5 `procedure-generative-guidance` — deferred until P2 has a watched-live baseline
+
 ## New Project: MCP Endpoint Steward
 
 Skill: [skills/mcp-endpoint-steward/SKILL.md](/Users/jaredlikes/code/philotic-stack/skills/mcp-endpoint-steward/SKILL.md) (`mcp.endpoint_steward`, seeded 2026-09-05). Amends `mcp-membrane-gateway` (deterministic-first dispatch for philote targets) and closes DEF-109. Related: `mcp-membrane-hardening` (H1–H4 landed; S4 identity check already enforced at `ProvisionMcpEndpoint`).
