@@ -589,6 +589,370 @@ pub fn seeded_procedures() -> Vec<ProcedureGraphRecord> {
     vec![outcome_reflex_procedure()]
 }
 
+// ── P4: patches and the trial gate ───────────────────────────────────────────
+
+/// Hard cap on ops per patch. The paper's refiner edits are small, targeted
+/// add/delete sets; a patch that rewrites half the graph is a re-registration.
+pub const MAX_PATCH_OPS: usize = 16;
+/// Default terminal runs a candidate version must accumulate before the trial
+/// decides (`PHILOTIC_PROCEDURE_TRIAL_RUNS`).
+pub const DEFAULT_TRIAL_RUNS: usize = 5;
+/// Score bar for a candidate when its procedure has no baseline runs at all.
+pub const TRIAL_BAR_WITHOUT_BASELINE: f32 = 0.5;
+
+/// One edit to a procedure. The paper's refiner emits add/delete sets;
+/// attribute rewrites are a delete + re-add there and a `set_*` here.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "op", rename_all = "snake_case")]
+pub enum ProcedurePatchOp {
+    AddNode {
+        node: ProcedureNode,
+    },
+    /// Removes the node and every edge incident to it.
+    DeleteNode {
+        id: String,
+    },
+    AddEdge {
+        edge: ProcedureEdge,
+    },
+    DeleteEdge {
+        from: String,
+        to: String,
+        #[serde(default)]
+        relation: ProcedureRelation,
+    },
+    SetEdgeAttrs {
+        from: String,
+        to: String,
+        #[serde(default)]
+        relation: ProcedureRelation,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        condition: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        guidance: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pitfalls: Option<String>,
+    },
+    SetNodeLabel {
+        id: String,
+        label: String,
+    },
+}
+
+impl ProcedurePatchOp {
+    /// Every string an op could put into a prompt, for the prompt-guard scan.
+    pub fn text_fields(&self) -> Vec<&str> {
+        match self {
+            Self::AddNode { node } => vec![node.label.as_str()],
+            Self::AddEdge { edge } => vec![
+                edge.condition.as_str(),
+                edge.guidance.as_str(),
+                edge.pitfalls.as_str(),
+            ],
+            Self::SetEdgeAttrs {
+                condition,
+                guidance,
+                pitfalls,
+                ..
+            } => [condition, guidance, pitfalls]
+                .into_iter()
+                .flatten()
+                .map(String::as_str)
+                .collect(),
+            Self::SetNodeLabel { label, .. } => vec![label.as_str()],
+            Self::DeleteNode { .. } | Self::DeleteEdge { .. } => Vec::new(),
+        }
+    }
+
+    pub fn summary(&self) -> String {
+        match self {
+            Self::AddNode { node } => format!("add_node {}", node.id),
+            Self::DeleteNode { id } => format!("delete_node {id}"),
+            Self::AddEdge { edge } => {
+                format!(
+                    "add_edge {} -{}-> {}",
+                    edge.from,
+                    edge.relation.as_str(),
+                    edge.to
+                )
+            }
+            Self::DeleteEdge { from, to, relation } => {
+                format!("delete_edge {from} -{}-> {to}", relation.as_str())
+            }
+            Self::SetEdgeAttrs {
+                from, to, relation, ..
+            } => format!("set_edge_attrs {from} -{}-> {to}", relation.as_str()),
+            Self::SetNodeLabel { id, .. } => format!("set_node_label {id}"),
+        }
+    }
+}
+
+impl ProcedureGraphRecord {
+    /// Apply a patch to a copy of this record: the candidate for the next
+    /// version. Every op must hit an existing target (or add a new one);
+    /// the result is re-validated in full, so a patch can never leave a
+    /// dangling edge or an oversize graph behind. `version` is bumped and
+    /// `trial_of` cleared; the caller sets provenance and the trial marker.
+    pub fn apply_patch(
+        &self,
+        ops: &[ProcedurePatchOp],
+    ) -> Result<ProcedureGraphRecord, Vec<String>> {
+        if ops.is_empty() {
+            return Err(vec!["a patch needs at least one op".into()]);
+        }
+        if ops.len() > MAX_PATCH_OPS {
+            return Err(vec![format!(
+                "{} ops exceeds the cap of {MAX_PATCH_OPS}",
+                ops.len()
+            )]);
+        }
+        let mut next = self.clone();
+        let mut errors = Vec::new();
+        for (i, op) in ops.iter().enumerate() {
+            match op {
+                ProcedurePatchOp::AddNode { node } => {
+                    if next.nodes.iter().any(|n| n.id == node.id) {
+                        errors.push(format!("op {i}: node {:?} already exists", node.id));
+                    } else {
+                        next.nodes.push(node.clone());
+                    }
+                }
+                ProcedurePatchOp::DeleteNode { id } => {
+                    if *id == next.entry {
+                        errors.push(format!("op {i}: cannot delete the entry node {id:?}"));
+                    } else if !next.nodes.iter().any(|n| n.id == *id) {
+                        errors.push(format!("op {i}: node {id:?} does not exist"));
+                    } else {
+                        next.nodes.retain(|n| n.id != *id);
+                        next.edges.retain(|e| e.from != *id && e.to != *id);
+                    }
+                }
+                ProcedurePatchOp::AddEdge { edge } => {
+                    if next.edges.iter().any(|e| {
+                        e.from == edge.from && e.to == edge.to && e.relation == edge.relation
+                    }) {
+                        errors.push(format!(
+                            "op {i}: edge {} -{}-> {} already exists",
+                            edge.from,
+                            edge.relation.as_str(),
+                            edge.to
+                        ));
+                    } else {
+                        next.edges.push(edge.clone());
+                    }
+                }
+                ProcedurePatchOp::DeleteEdge { from, to, relation } => {
+                    let before = next.edges.len();
+                    next.edges
+                        .retain(|e| !(e.from == *from && e.to == *to && e.relation == *relation));
+                    if next.edges.len() == before {
+                        errors.push(format!(
+                            "op {i}: edge {from} -{}-> {to} does not exist",
+                            relation.as_str()
+                        ));
+                    }
+                }
+                ProcedurePatchOp::SetEdgeAttrs {
+                    from,
+                    to,
+                    relation,
+                    condition,
+                    guidance,
+                    pitfalls,
+                } => {
+                    match next
+                        .edges
+                        .iter_mut()
+                        .find(|e| e.from == *from && e.to == *to && e.relation == *relation)
+                    {
+                        Some(edge) => {
+                            if let Some(c) = condition {
+                                edge.condition = c.clone();
+                            }
+                            if let Some(g) = guidance {
+                                edge.guidance = g.clone();
+                            }
+                            if let Some(p) = pitfalls {
+                                edge.pitfalls = p.clone();
+                            }
+                        }
+                        None => errors.push(format!(
+                            "op {i}: edge {from} -{}-> {to} does not exist",
+                            relation.as_str()
+                        )),
+                    }
+                }
+                ProcedurePatchOp::SetNodeLabel { id, label } => {
+                    match next.nodes.iter_mut().find(|n| n.id == *id) {
+                        Some(node) => node.label = label.clone(),
+                        None => errors.push(format!("op {i}: node {id:?} does not exist")),
+                    }
+                }
+            }
+        }
+        if !errors.is_empty() {
+            return Err(errors);
+        }
+        next.version = self.version + 1;
+        next.trial_of = None;
+        next.validate()?;
+        Ok(next)
+    }
+}
+
+/// Lifecycle of a refiner-proposed edit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ProcedurePatchStatus {
+    #[default]
+    Pending,
+    Trial,
+    Accepted,
+    Rejected,
+}
+
+impl ProcedurePatchStatus {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Trial => "trial",
+            Self::Accepted => "accepted",
+            Self::Rejected => "rejected",
+        }
+    }
+}
+
+/// The live trial window a candidate version runs under (the paper's
+/// held-out validation, done online after operator approval).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct TrialWindow {
+    pub started_at: u64,
+    pub candidate_version: u32,
+    #[serde(default)]
+    pub required_runs: usize,
+    #[serde(default)]
+    pub baseline_n: usize,
+    #[serde(default)]
+    pub baseline_mean: f32,
+    #[serde(default)]
+    pub candidate_n: usize,
+    #[serde(default)]
+    pub candidate_mean: f32,
+}
+
+/// A refiner-proposed edit and everything the gate decided about it.
+///
+/// Node kind: `procedure_patch`. Node key: `procedure_patch:{patch_id}`.
+/// **Never deleted** — a `Rejected` patch is the paper's rejection memory.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct ProcedurePatchRecord {
+    pub patch_id: String,
+    pub procedure_id: String,
+    /// The version the ops were written against.
+    pub base_version: u32,
+    /// The version the ops produced, once approved into trial.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub candidate_version: Option<u32>,
+    #[serde(default)]
+    pub ops: Vec<ProcedurePatchOp>,
+    #[serde(default)]
+    pub rationale: String,
+    #[serde(default)]
+    pub evidence_run_ids: Vec<String>,
+    /// Guest id of the proposer (the refiner whisper's session, or `phil`).
+    #[serde(default)]
+    pub proposed_by: String,
+    #[serde(default)]
+    pub status: ProcedurePatchStatus,
+    /// The record as it was before approval, so a failed trial reverts to
+    /// exactly what ran before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_snapshot: Option<ProcedureGraphRecord>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trial: Option<TrialWindow>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rejection_reason: Option<String>,
+    #[serde(default)]
+    pub created_at: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decided_at: Option<u64>,
+}
+
+impl ProcedurePatchRecord {
+    /// Every string the ops could put into a prompt, plus the rationale.
+    pub fn text_fields(&self) -> Vec<&str> {
+        let mut out = vec![self.rationale.as_str()];
+        for op in &self.ops {
+            out.extend(op.text_fields());
+        }
+        out
+    }
+
+    /// One line per op, for the refiner's rejection-memory rendering.
+    pub fn summary(&self) -> String {
+        self.ops
+            .iter()
+            .map(ProcedurePatchOp::summary)
+            .collect::<Vec<_>>()
+            .join("; ")
+    }
+}
+
+/// Number of candidate runs a trial needs: `PHILOTIC_PROCEDURE_TRIAL_RUNS`
+/// clamped to 1..=50, default [`DEFAULT_TRIAL_RUNS`].
+pub fn trial_runs_required() -> usize {
+    std::env::var("PHILOTIC_PROCEDURE_TRIAL_RUNS")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .map(|k| k.clamp(1, 50))
+        .unwrap_or(DEFAULT_TRIAL_RUNS)
+}
+
+/// Outcome of checking a trial window against the ledger.
+#[derive(Debug, Clone, PartialEq)]
+pub enum TrialDecision {
+    /// Fewer than `required` candidate runs so far.
+    Undecided { candidate_n: usize, required: usize },
+    Decided {
+        accept: bool,
+        candidate_n: usize,
+        candidate_mean: f32,
+        baseline_n: usize,
+        baseline_mean: f32,
+    },
+}
+
+/// The paper's gate, `S_val(G_cand) >= S_val(G_prev)`, over live runs.
+///
+/// `candidate` and `baseline` are newest-first score lists; the candidate
+/// must have at least `required` runs, and the baseline is its newest
+/// `required` runs (fewer if that is all there is). With no baseline at all
+/// the bar is [`TRIAL_BAR_WITHOUT_BASELINE`]. Ties accept, as in the paper.
+pub fn decide_trial(candidate: &[f32], baseline: &[f32], required: usize) -> TrialDecision {
+    let required = required.max(1);
+    if candidate.len() < required {
+        return TrialDecision::Undecided {
+            candidate_n: candidate.len(),
+            required,
+        };
+    }
+    let cand: &[f32] = &candidate[..required];
+    let candidate_mean = cand.iter().sum::<f32>() / cand.len() as f32;
+    let base: &[f32] = &baseline[..baseline.len().min(required)];
+    let (baseline_n, baseline_mean) = if base.is_empty() {
+        (0, TRIAL_BAR_WITHOUT_BASELINE)
+    } else {
+        (base.len(), base.iter().sum::<f32>() / base.len() as f32)
+    };
+    TrialDecision::Decided {
+        accept: candidate_mean >= baseline_mean,
+        candidate_n: cand.len(),
+        candidate_mean,
+        baseline_n,
+        baseline_mean,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -791,5 +1155,209 @@ mod tests {
         assert_eq!(minimal.version, 1);
         assert_eq!(minimal.provenance, ProcedureProvenance::Repo);
         assert_eq!(minimal.validate(), Ok(()));
+    }
+
+    // ── P4 ────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn apply_patch_edits_a_copy_bumps_version_and_revalidates() {
+        let p = outcome_reflex_procedure();
+        let ops = vec![
+            ProcedurePatchOp::AddNode {
+                node: tool("verify", "life.recall"),
+            },
+            ProcedurePatchOp::AddEdge {
+                edge: ProcedureEdge {
+                    from: "commit".into(),
+                    to: "verify".into(),
+                    relation: ProcedureRelation::LeadsTo,
+                    condition: "commit returned".into(),
+                    guidance: "re-read the loop to confirm loop_status".into(),
+                    pitfalls: "trusting the commit reply without reading back".into(),
+                    branch: None,
+                },
+            },
+            ProcedurePatchOp::SetEdgeAttrs {
+                from: "observe".into(),
+                to: "commit".into(),
+                relation: ProcedureRelation::LeadsTo,
+                condition: None,
+                guidance: Some("new guidance".into()),
+                pitfalls: None,
+            },
+            ProcedurePatchOp::SetNodeLabel {
+                id: "observe".into(),
+                label: "Record it".into(),
+            },
+        ];
+        let next = p.apply_patch(&ops).expect("applies");
+        assert_eq!(next.version, p.version + 1);
+        assert!(next.trial_of.is_none());
+        assert_eq!(next.nodes.len(), p.nodes.len() + 1);
+        assert_eq!(next.edges.len(), p.edges.len() + 1);
+        assert_eq!(next.node("observe").unwrap().label, "Record it");
+        let oc = next
+            .edges
+            .iter()
+            .find(|e| e.from == "observe" && e.to == "commit")
+            .unwrap();
+        assert_eq!(oc.guidance, "new guidance");
+        assert_eq!(oc.condition, "the outcome Event is recorded");
+        // The original is untouched.
+        assert_eq!(p.version, 1);
+        assert_eq!(
+            p.node("observe")
+                .unwrap()
+                .label
+                .starts_with("Record the reported"),
+            true
+        );
+
+        // Delete a node: its edges go with it and the graph still validates.
+        let next = p
+            .apply_patch(&[ProcedurePatchOp::DeleteNode {
+                id: "recall".into(),
+            }])
+            .expect("applies");
+        assert!(next.node("recall").is_none());
+        assert!(next
+            .edges
+            .iter()
+            .all(|e| e.from != "recall" && e.to != "recall"));
+        assert_eq!(next.validate(), Ok(()));
+    }
+
+    #[test]
+    fn apply_patch_refuses_bad_targets_entry_deletion_and_invalid_results() {
+        let p = outcome_reflex_procedure();
+        let errors = p
+            .apply_patch(&[
+                ProcedurePatchOp::DeleteNode { id: "start".into() },
+                ProcedurePatchOp::DeleteEdge {
+                    from: "a".into(),
+                    to: "b".into(),
+                    relation: ProcedureRelation::LeadsTo,
+                },
+                ProcedurePatchOp::SetNodeLabel {
+                    id: "zzz".into(),
+                    label: "x".into(),
+                },
+                ProcedurePatchOp::AddNode {
+                    node: tool("commit", "life.commit"),
+                },
+            ])
+            .unwrap_err();
+        assert_eq!(errors.len(), 4, "{errors:?}");
+        assert!(errors[0].contains("entry"));
+        assert!(errors[1].contains("does not exist"));
+        assert!(errors[3].contains("already exists"));
+
+        // An op set that applies but yields an invalid graph is refused too.
+        let errors = p
+            .apply_patch(&[ProcedurePatchOp::AddEdge {
+                edge: ProcedureEdge {
+                    from: "commit".into(),
+                    to: "commit".into(),
+                    ..Default::default()
+                },
+            }])
+            .unwrap_err();
+        assert!(errors.iter().any(|e| e.contains("self-loop")), "{errors:?}");
+        assert!(p.apply_patch(&[]).is_err());
+        let too_many: Vec<ProcedurePatchOp> = (0..(MAX_PATCH_OPS + 1))
+            .map(|i| ProcedurePatchOp::SetNodeLabel {
+                id: "commit".into(),
+                label: format!("l{i}"),
+            })
+            .collect();
+        assert!(p.apply_patch(&too_many).is_err());
+    }
+
+    #[test]
+    fn trial_decision_follows_the_papers_gate() {
+        // Not enough candidate runs.
+        assert_eq!(
+            decide_trial(&[1.0, 1.0], &[1.0], 3),
+            TrialDecision::Undecided {
+                candidate_n: 2,
+                required: 3
+            }
+        );
+        // Ties accept; only the newest `required` of each side count.
+        match decide_trial(&[1.0, 0.0, 1.0, 0.0, 0.0], &[1.0, 0.0, 0.0, 1.0, 1.0], 3) {
+            TrialDecision::Decided {
+                accept,
+                candidate_n,
+                candidate_mean,
+                baseline_n,
+                baseline_mean,
+            } => {
+                assert!(accept);
+                assert_eq!(candidate_n, 3);
+                assert_eq!(baseline_n, 3);
+                assert!((candidate_mean - 2.0 / 3.0).abs() < 1e-6);
+                assert!((baseline_mean - 1.0 / 3.0).abs() < 1e-6);
+            }
+            other => panic!("{other:?}"),
+        }
+        // Worse than baseline rejects.
+        match decide_trial(&[0.0, 0.5, 0.0], &[1.0, 1.0, 1.0], 3) {
+            TrialDecision::Decided { accept, .. } => assert!(!accept),
+            other => panic!("{other:?}"),
+        }
+        // No baseline: the bar is 0.5.
+        match decide_trial(&[0.5, 0.5], &[], 2) {
+            TrialDecision::Decided {
+                accept,
+                baseline_n,
+                baseline_mean,
+                ..
+            } => {
+                assert!(accept);
+                assert_eq!(baseline_n, 0);
+                assert_eq!(baseline_mean, TRIAL_BAR_WITHOUT_BASELINE);
+            }
+            other => panic!("{other:?}"),
+        }
+        match decide_trial(&[0.0, 0.5], &[], 2) {
+            TrialDecision::Decided { accept, .. } => assert!(!accept),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn patch_record_round_trips_and_summarizes() {
+        let rec = ProcedurePatchRecord {
+            patch_id: "patch-1".into(),
+            procedure_id: "outcome-reflex".into(),
+            base_version: 1,
+            ops: vec![
+                ProcedurePatchOp::DeleteEdge {
+                    from: "recall".into(),
+                    to: "observe".into(),
+                    relation: ProcedureRelation::LeadsTo,
+                },
+                ProcedurePatchOp::AddNode {
+                    node: tool("verify", "life.recall"),
+                },
+            ],
+            rationale: "the failed run skipped the read-back".into(),
+            evidence_run_ids: vec!["r1".into(), "r2".into()],
+            proposed_by: "agent-beacon:orchestrator".into(),
+            ..Default::default()
+        };
+        let json = serde_json::to_value(&rec).unwrap();
+        assert_eq!(json["ops"][0]["op"], "delete_edge");
+        assert_eq!(json["status"], "pending");
+        let back: ProcedurePatchRecord = serde_json::from_value(json).unwrap();
+        assert_eq!(back, rec);
+        assert_eq!(
+            rec.summary(),
+            "delete_edge recall -LEADS_TO-> observe; add_node verify"
+        );
+        assert!(rec
+            .text_fields()
+            .contains(&"the failed run skipped the read-back"));
+        assert!(rec.text_fields().contains(&"do verify"));
     }
 }

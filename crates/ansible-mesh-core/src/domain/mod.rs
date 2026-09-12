@@ -27,7 +27,10 @@ use crate::graph::{
 use crate::heal_queue::{
     HealWorkItemRecord, HEAL_WORK_ITEM_STATUS_CLOSED, HEAL_WORK_ITEM_STATUS_OPEN,
 };
-use crate::procedure::{ProcedureGraphRecord, ProcedureProvenance, ProcedureRunRecord};
+use crate::procedure::{
+    ProcedureGraphRecord, ProcedurePatchRecord, ProcedurePatchStatus, ProcedureProvenance,
+    ProcedureRunRecord,
+};
 use crate::storage::{
     AgentIdentityRecord, GraphAdapter, GraphRunnerInstanceRecord, GuestRecord, HotelRecord,
     ProjectedUserIdentityRecord, SecretRecord, SessionEventRecord, SessionParticipantRecord,
@@ -1195,6 +1198,68 @@ impl GraphDomain {
         Ok(runs)
     }
 
+    fn procedure_patch_key(patch_id: &str) -> String {
+        format!("{}:{}", NODE_KIND_PROCEDURE_PATCH, patch_id)
+    }
+
+    /// Upsert a patch record. Patches are never deleted: a `Rejected` one is
+    /// the refiner's negative evidence.
+    pub fn upsert_procedure_patch(&self, patch: &ProcedurePatchRecord) -> Result<()> {
+        let data = serde_json::to_value(patch)
+            .context("GraphDomain::upsert_procedure_patch: serialize ProcedurePatchRecord")?;
+        self.adapter.upsert_node(&GraphNode {
+            node_key: Self::procedure_patch_key(&patch.patch_id),
+            kind: NODE_KIND_PROCEDURE_PATCH.to_string(),
+            label: Some(format!("{}:{}", patch.procedure_id, patch.status.as_str())),
+            data,
+        })
+    }
+
+    pub fn get_procedure_patch(&self, patch_id: &str) -> Result<Option<ProcedurePatchRecord>> {
+        match self
+            .adapter
+            .get_node(&Self::procedure_patch_key(patch_id))?
+        {
+            None => Ok(None),
+            Some(node) => Ok(Some(serde_json::from_value(node.data).context(
+                "GraphDomain::get_procedure_patch: deserialize ProcedurePatchRecord",
+            )?)),
+        }
+    }
+
+    /// Newest-first patches, optionally for one procedure and/or one status.
+    pub fn list_procedure_patches(
+        &self,
+        procedure_id: Option<&str>,
+        status: Option<ProcedurePatchStatus>,
+    ) -> Result<Vec<ProcedurePatchRecord>> {
+        let mut out: Vec<ProcedurePatchRecord> = Vec::new();
+        for node in self.adapter.list_nodes_by_kind(NODE_KIND_PROCEDURE_PATCH)? {
+            match serde_json::from_value::<ProcedurePatchRecord>(node.data.clone()) {
+                Ok(p) => {
+                    if procedure_id.is_some_and(|id| p.procedure_id != id) {
+                        continue;
+                    }
+                    if status.is_some_and(|s| p.status != s) {
+                        continue;
+                    }
+                    out.push(p);
+                }
+                Err(err) => warn!(
+                    node_key = %node.node_key,
+                    "Skipping incompatible procedure_patch record: {}",
+                    err
+                ),
+            }
+        }
+        out.sort_by(|a, b| {
+            b.created_at
+                .cmp(&a.created_at)
+                .then(b.patch_id.cmp(&a.patch_id))
+        });
+        Ok(out)
+    }
+
     // ── Skill registration audit methods ──────────────────────────────────────
 
     fn skill_registration_audit_key(audit_id: &str) -> String {
@@ -2195,6 +2260,57 @@ mod tests {
             .list_procedure_runs("nope", None, 10)
             .expect("empty")
             .is_empty());
+    }
+
+    #[test]
+    fn procedure_patch_storage_filters_and_orders_newest_first() {
+        use crate::procedure::{ProcedurePatchOp, ProcedurePatchRecord, ProcedurePatchStatus};
+        let domain = make_domain();
+        for (i, (pid, status)) in [
+            ("outcome-reflex", ProcedurePatchStatus::Pending),
+            ("outcome-reflex", ProcedurePatchStatus::Rejected),
+            ("other.proc", ProcedurePatchStatus::Trial),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            domain
+                .upsert_procedure_patch(&ProcedurePatchRecord {
+                    patch_id: format!("patch-{i}"),
+                    procedure_id: pid.into(),
+                    base_version: 1,
+                    ops: vec![ProcedurePatchOp::SetNodeLabel {
+                        id: "commit".into(),
+                        label: "x".into(),
+                    }],
+                    status,
+                    created_at: 10 + i as u64,
+                    ..Default::default()
+                })
+                .expect("upsert");
+        }
+        let all = domain.list_procedure_patches(None, None).expect("list");
+        assert_eq!(
+            all.iter().map(|p| p.patch_id.as_str()).collect::<Vec<_>>(),
+            vec!["patch-2", "patch-1", "patch-0"]
+        );
+        let rejected = domain
+            .list_procedure_patches(Some("outcome-reflex"), Some(ProcedurePatchStatus::Rejected))
+            .expect("filter");
+        assert_eq!(rejected.len(), 1);
+        assert_eq!(rejected[0].patch_id, "patch-1");
+        assert_eq!(
+            domain
+                .list_procedure_patches(Some("other.proc"), None)
+                .expect("by id")
+                .len(),
+            1
+        );
+        assert!(domain
+            .get_procedure_patch("patch-0")
+            .expect("get")
+            .is_some());
+        assert!(domain.get_procedure_patch("nope").expect("get").is_none());
     }
 
     #[test]

@@ -14,7 +14,11 @@ const RECORD_PROCEDURE_RUN_TIMEOUT: std::time::Duration = std::time::Duration::f
 impl AgentRuntime {
     /// Append one terminal plan evaluation to the hotel's procedure run
     /// ledger. Best-effort by design (see module docs).
-    pub(super) async fn record_procedure_run(&mut self, session_id: &str, run: ProcedureRunRecord) {
+    pub(super) async fn record_procedure_run(
+        &mut self,
+        session_id: &str,
+        run: ProcedureRunRecord,
+    ) -> bool {
         let run_json = match serde_json::to_value(&run) {
             Ok(v) => v,
             Err(err) => {
@@ -24,7 +28,7 @@ impl AgentRuntime {
                     error = %err,
                     "procedure run not recorded: serialize failed"
                 );
-                return;
+                return false;
             }
         };
         let send = self
@@ -41,6 +45,7 @@ impl AgentRuntime {
                     tools = run.tool_sequence.len(),
                     "procedure run recorded"
                 );
+                return true;
             }
             Ok(Ok(IpcResponse::Standard { code, message, .. })) => {
                 warn!(
@@ -76,5 +81,6 @@ impl AgentRuntime {
                 );
             }
         }
+        false
     }
 }

@@ -29,6 +29,9 @@
 //! - the whisper prompt is bounded by `PARACRINE_WHISPER_PROMPT_MAX_CHARS`.
 
 use super::*;
+use ansible_mesh_core::procedure::{
+    ProcedureGraphRecord, ProcedurePatchRecord, ProcedureRunRecord,
+};
 
 /// Intent marker carried in the exosome's `context.intent`, prefixing the
 /// trigger name (`skills.distill:tool_count`). Recognised by the tool layer.
@@ -43,6 +46,12 @@ pub(crate) const TOOL_ALLOWLIST: &[&str] = &[
     "skill.list",
     "memory.remember",
     "memory.recall",
+    // Procedural graphs P4: a distilled skill may arrive with its procedure,
+    // and the contrast whisper may read a graph and file one patch. Both
+    // land Draft / Pending — filings, gated at promotion.
+    "procedure.register",
+    "procedure.get",
+    "procedure.patch",
 ];
 
 /// Predicate 1 threshold.
@@ -68,6 +77,9 @@ pub(super) enum DistillTrigger {
     ToolCount,
     ErrorRecovered,
     UserCorrection,
+    /// Procedural graphs P4: the run ledger holds both a failed and a
+    /// successful run of one procedure at its current version.
+    ProcedureContrast,
 }
 
 impl DistillTrigger {
@@ -76,6 +88,7 @@ impl DistillTrigger {
             DistillTrigger::ToolCount => "tool_count",
             DistillTrigger::ErrorRecovered => "error_recovered",
             DistillTrigger::UserCorrection => "user_correction",
+            DistillTrigger::ProcedureContrast => "procedure_contrast",
         }
     }
 }
@@ -230,6 +243,9 @@ pub(super) fn build_distill_prompt(
             "an earlier step failed and a later path worked".to_string()
         }
         DistillTrigger::UserCorrection => "the user corrected the previous attempt".to_string(),
+        DistillTrigger::ProcedureContrast => {
+            "a procedure run was contrasted with an earlier one".to_string()
+        }
     };
     let prompt = format!(
         "DISTILL REVIEW — silent lookaside. Nothing you write here reaches the operator; only your tool calls matter.\n\
@@ -247,7 +263,11 @@ pub(super) fn build_distill_prompt(
          - If YES: call skill.register ONCE with skill_name (lowercase dotted, e.g. research.github-digest), \
          description (one sentence, when to use it), subagent_kind \"philote-worker\", goal (the procedure as a \
          template with {{{{placeholders}}}} for the parts that vary), and allowed_tools = exactly the tools used above. \
-         It lands as a Draft for the operator to review; do not assign it, do not register a second one.\n\
+         It lands as a Draft for the operator to review; do not assign it, do not register a second one. \
+         Then, if the sequence had two or more tool steps, call procedure.register ONCE with procedure_id = the \
+         skill_name, skill_name = the skill_name, one tool node per tool call in order (kind \"tool\", tool_name \
+         exact), leads_to edges between consecutive nodes with condition/guidance/pitfalls drawn from what you saw, \
+         and entry = the first node. It also lands as a Draft.\n\
          - If a durable fact about the environment or the operator was learned (a path, a preference, a \
          convention), record ONE atomic memory with memory.remember.\n\
          - If neither applies, reply exactly: DISTILL: nothing\n\
@@ -265,6 +285,92 @@ pub(super) fn build_distill_prompt(
             ))
             .unwrap_or_default(),
         reply = excerpt(reply, REPLY_EXCERPT_CHARS),
+    );
+    truncate_for_wire(&prompt, PARACRINE_WHISPER_PROMPT_MAX_CHARS)
+}
+
+/// Newest runs the contrast hook reads from the ledger.
+const CONTRAST_LEDGER_WINDOW: usize = 20;
+/// Rejected patches rendered into the contrast prompt as negative evidence.
+const CONTRAST_REJECTED_LIMIT: usize = 5;
+
+/// The paper's contrast pair over a newest-first ledger window at one graph
+/// version: the newest failed run (score 0) and the newest fully successful
+/// one (score 1). A model-reported completion (0.5) is neither.
+pub(super) fn contrast_pair(
+    runs: &[ProcedureRunRecord],
+) -> Option<(&ProcedureRunRecord, &ProcedureRunRecord)> {
+    let failed = runs.iter().find(|r| r.score <= 0.0)?;
+    let success = runs.iter().find(|r| r.score >= 1.0)?;
+    Some((failed, success))
+}
+
+fn run_line(label: &str, run: &ProcedureRunRecord) -> String {
+    format!(
+        "{label} run {}: verdict {} ({}), {}/{} steps verified, stalls {}, contradicted {}, non-atomic {}; \
+         tools in order: {}; goal: «{}»\n",
+        run.run_id,
+        run.verdict,
+        run.basis,
+        run.steps_verified,
+        run.steps_total,
+        run.stalls,
+        run.contradicted,
+        run.non_atomic,
+        if run.tool_sequence.is_empty() {
+            "(none)".to_string()
+        } else {
+            run.tool_sequence.join(" → ")
+        },
+        excerpt(&run.goal, 160)
+    )
+}
+
+/// Build the contrast review brief: the graph as triplets, the failed and
+/// successful trajectories, the rejection memory, and the two legal outputs.
+pub(super) fn build_contrast_prompt(
+    procedure: &ProcedureGraphRecord,
+    failed: &ProcedureRunRecord,
+    success: &ProcedureRunRecord,
+    rejected: &[ProcedurePatchRecord],
+) -> String {
+    let mut rejected_block = String::new();
+    for patch in rejected.iter().take(CONTRAST_REJECTED_LIMIT) {
+        rejected_block.push_str(&format!(
+            "- {} — {}\n",
+            patch.summary(),
+            patch.rejection_reason.as_deref().unwrap_or("rejected")
+        ));
+    }
+    let rejected_section = if rejected_block.is_empty() {
+        String::new()
+    } else {
+        format!("Previously rejected edits — do NOT propose these again:\n{rejected_block}\n")
+    };
+    let prompt = format!(
+        "PROCEDURE REFINE — silent lookaside. Nothing you write here reaches the operator; only your tool calls matter.\n\
+         Procedure {id} v{version}: {description}\n\
+         Graph as (from, RELATION, to) triplets with attributes:\n{triplets}\n\
+         A run of this procedure FAILED and another SUCCEEDED at this same version.\n\
+         {failed_line}{success_line}\n\
+         {rejected_section}\
+         Decide whether ONE small edit to the graph would have steered the failed run onto the successful path: \
+         a missing verification node, a missing or wrong edge, a condition/guidance/pitfalls attribute that \
+         invites the failure. Edits must be about the procedure, never about the operator's data.\n\
+         - If YES: call procedure.patch ONCE with procedure_id \"{id}\", ops (at most 4: add_node, delete_node, \
+         add_edge, delete_edge, set_edge_attrs, set_node_label), rationale (one or two sentences: what the failed \
+         run did that the successful one did not, and how the edit prevents it), evidence_run_ids \
+         [\"{failed_id}\", \"{success_id}\"]. It lands Pending for the operator; do not call it twice.\n\
+         - If no single edit is justified, reply exactly: PROCEDURE: nothing\n\
+         Do not call any other tool.",
+        id = procedure.procedure_id,
+        version = procedure.version,
+        description = excerpt(&procedure.description, 400),
+        triplets = procedure.render_triplets(),
+        failed_line = run_line("FAILED", failed),
+        success_line = run_line("SUCCEEDED", success),
+        failed_id = failed.run_id,
+        success_id = success.run_id,
     );
     truncate_for_wire(&prompt, PARACRINE_WHISPER_PROMPT_MAX_CHARS)
 }
@@ -355,46 +461,206 @@ impl AgentRuntime {
         turn: &WorkingTurn,
         reply: &str,
     ) {
-        use ansible_mesh_core::autonomy::{AutonomyLane, LANE_SKILLS_DISTILL, lane_enabled};
+        use ansible_mesh_core::autonomy::LANE_SKILLS_DISTILL;
 
         let Some(trigger) = evaluate_turn(turn) else {
             return;
         };
-        let lane = AutonomyLane::new(LANE_SKILLS_DISTILL);
-        if !lane_enabled(&lane, |k| std::env::var(k).ok()) {
-            debug!(
-                session_id = %session_id,
-                trigger = trigger.as_str(),
-                "skills.distill: predicate fired but lane kill switch is set"
-            );
-            return;
-        }
-
         let tool_names: Vec<&str> = turn
             .working_tool_history
             .iter()
             .map(|(c, _)| c.tool_name.as_str())
             .collect();
+        let prompt = build_distill_prompt(turn, trigger, reply);
+        self.emit_distill_whisper(
+            session_id,
+            &turn.turn_id,
+            &turn.chat_id,
+            LANE_SKILLS_DISTILL,
+            trigger,
+            prompt,
+            format!(
+                "distill whisper after turn {} ({})",
+                turn.turn_id,
+                trigger.as_str()
+            ),
+            format!(
+                "agent={} session={} trigger={} tool_calls={} tools=[{}]",
+                self.agent_id,
+                session_id,
+                trigger.as_str(),
+                turn.working_tool_history.len(),
+                tool_names.join(",")
+            ),
+            "if the resulting Draft skill is unwanted, `skill.set_state <name> deprecated`; an \
+             operator reversal demotes lane skills.distill",
+            "distill review",
+        )
+        .await;
+    }
+
+    /// Procedural graphs P4: after a terminal plan eval landed on the run
+    /// ledger, whisper a contrast review when that procedure now has both a
+    /// failed and a successful run at its current version, and this run is
+    /// one of the pair (so a pair fires once, not on every later run).
+    /// Never for whispers, never for a version under trial.
+    pub(super) async fn maybe_procedure_contrast_after_run(
+        &mut self,
+        session_id: &str,
+        turn: &WorkingTurn,
+        run: &ProcedureRunRecord,
+    ) {
+        use ansible_mesh_core::autonomy::LANE_PROCEDURES_REFINE;
+
+        if turn.paracrine_origin.is_some() || turn.paracrine_intent.is_some() {
+            return;
+        }
+        let runs = match self
+            .ipc_client
+            .send_request(IpcRequest::ListProcedureRuns {
+                procedure_id: run.procedure_id.clone(),
+                graph_version: Some(run.graph_version),
+                limit: Some(CONTRAST_LEDGER_WINDOW),
+            })
+            .await
+        {
+            Ok(IpcResponse::Standard {
+                ok: true,
+                data: Some(data),
+                ..
+            }) => data
+                .get("runs")
+                .cloned()
+                .and_then(|v| serde_json::from_value::<Vec<ProcedureRunRecord>>(v).ok())
+                .unwrap_or_default(),
+            other => {
+                debug!(
+                    session_id = %session_id,
+                    procedure_id = %run.procedure_id,
+                    response = ?other.as_ref().map(|_| "non-standard").unwrap_or("ipc error"),
+                    "procedures.refine: ledger unavailable, no contrast"
+                );
+                return;
+            }
+        };
+        let Some((failed, success)) = contrast_pair(&runs) else {
+            return;
+        };
+        if failed.run_id != run.run_id && success.run_id != run.run_id {
+            return;
+        }
+        let procedure = match self
+            .ipc_client
+            .send_request(IpcRequest::GetProcedure {
+                procedure_id: run.procedure_id.clone(),
+            })
+            .await
+        {
+            Ok(IpcResponse::Standard {
+                ok: true,
+                data: Some(data),
+                ..
+            }) => match serde_json::from_value::<ProcedureGraphRecord>(data) {
+                Ok(p) => p,
+                Err(_) => return,
+            },
+            _ => return,
+        };
+        if procedure.trial_of.is_some() || procedure.version != run.graph_version {
+            debug!(
+                session_id = %session_id,
+                procedure_id = %run.procedure_id,
+                "procedures.refine: procedure on trial or moved on, no contrast"
+            );
+            return;
+        }
+        let rejected: Vec<ProcedurePatchRecord> = match self
+            .ipc_client
+            .send_request(IpcRequest::ListProcedurePatches {
+                procedure_id: Some(run.procedure_id.clone()),
+                status: Some("rejected".into()),
+            })
+            .await
+        {
+            Ok(IpcResponse::Standard {
+                ok: true,
+                data: Some(data),
+                ..
+            }) => data
+                .get("patches")
+                .cloned()
+                .and_then(|v| serde_json::from_value(v).ok())
+                .unwrap_or_default(),
+            _ => Vec::new(),
+        };
+        let prompt = build_contrast_prompt(&procedure, failed, success, &rejected);
+        let trigger = DistillTrigger::ProcedureContrast;
+        self.emit_distill_whisper(
+            session_id,
+            &turn.turn_id,
+            &turn.chat_id,
+            LANE_PROCEDURES_REFINE,
+            trigger,
+            prompt,
+            format!(
+                "procedure contrast whisper for {} v{} (failed {} vs success {})",
+                run.procedure_id, run.graph_version, failed.run_id, success.run_id
+            ),
+            format!(
+                "agent={} session={} procedure={} version={} failed_run={} success_run={} rejected_patches={}",
+                self.agent_id,
+                session_id,
+                run.procedure_id,
+                run.graph_version,
+                failed.run_id,
+                success.run_id,
+                rejected.len()
+            ),
+            "reject the Pending patch with `phil procedure reject <patch_id>`; an operator reversal \
+             demotes lane procedures.refine",
+            "procedure refine",
+        )
+        .await;
+    }
+
+    /// Shared whisper plumbing for every distill-family trigger: lane kill
+    /// switch, `ConsumeAutonomyAction { filing: true }`, target role, the
+    /// paracrine thread, and `ParacrineEmit` with `Discard` routing. The
+    /// intent is `skills.distill:<trigger>` for every lane, so the allowlist
+    /// and the clean-context rules apply uniformly.
+    #[allow(clippy::too_many_arguments)]
+    async fn emit_distill_whisper(
+        &mut self,
+        session_id: &str,
+        turn_id: &str,
+        chat_id: &str,
+        lane: &str,
+        trigger: DistillTrigger,
+        prompt: String,
+        action_summary: String,
+        evidence: String,
+        reversal_hint: &str,
+        thread_kind: &str,
+    ) {
+        use ansible_mesh_core::autonomy::{AutonomyLane, lane_enabled};
+
+        let lane_handle = AutonomyLane::new(lane);
+        if !lane_enabled(&lane_handle, |k| std::env::var(k).ok()) {
+            debug!(
+                session_id = %session_id,
+                lane,
+                trigger = trigger.as_str(),
+                "distill-family predicate fired but lane kill switch is set"
+            );
+            return;
+        }
         let consume = self
             .ipc_client
             .send_request(IpcRequest::ConsumeAutonomyAction {
-                lane: LANE_SKILLS_DISTILL.into(),
-                action_summary: format!(
-                    "distill whisper after turn {} ({})",
-                    turn.turn_id,
-                    trigger.as_str()
-                ),
-                evidence: format!(
-                    "agent={} session={} trigger={} tool_calls={} tools=[{}]",
-                    self.agent_id,
-                    session_id,
-                    trigger.as_str(),
-                    turn.working_tool_history.len(),
-                    tool_names.join(",")
-                ),
-                reversal_hint: "if the resulting Draft skill is unwanted, `skill.set_state <name> \
-                                deprecated`; an operator reversal demotes lane skills.distill"
-                    .into(),
+                lane: lane.into(),
+                action_summary,
+                evidence,
+                reversal_hint: reversal_hint.into(),
                 filing: true,
             })
             .await;
@@ -418,16 +684,18 @@ impl AgentRuntime {
             Ok(other) => {
                 warn!(
                     session_id = %session_id,
+                    lane,
                     response = ?other,
-                    "skills.distill: unexpected ConsumeAutonomyAction response"
+                    "unexpected ConsumeAutonomyAction response"
                 );
                 (false, "unexpected_response".into(), None)
             }
             Err(e) => {
                 warn!(
                     session_id = %session_id,
+                    lane,
                     error = %e,
-                    "skills.distill: ConsumeAutonomyAction IPC failed"
+                    "ConsumeAutonomyAction IPC failed"
                 );
                 (false, "ipc_error".into(), None)
             }
@@ -435,9 +703,10 @@ impl AgentRuntime {
         if !allowed {
             info!(
                 session_id = %session_id,
+                lane,
                 trigger = trigger.as_str(),
                 reason = %reason,
-                "skills.distill: predicate fired; lane refused the whisper"
+                "predicate fired; lane refused the whisper"
             );
             return;
         }
@@ -445,11 +714,11 @@ impl AgentRuntime {
         let (role, role_reason) = self.distill_target_role(session_id);
         info!(
             session_id = %session_id,
+            lane,
             role = %role,
             reason = role_reason,
-            "skills.distill: target role selected"
+            "whisper target role selected"
         );
-        let prompt = build_distill_prompt(turn, trigger, reply);
         let paracrine_id = Uuid::new_v4().to_string();
         let node_id = local_node_id();
         let reply_guest_id = self
@@ -462,20 +731,21 @@ impl AgentRuntime {
             context: Some(serde_json::json!({
                 "intent": format!("{INTENT}:{}", trigger.as_str()),
                 "trigger": trigger.as_str(),
-                "source_turn_id": turn.turn_id,
+                "lane": lane,
+                "source_turn_id": turn_id,
                 "audit_id": audit_id,
             })),
             paracrine_id: Some(paracrine_id.clone()),
             response_routing: Some(ParacrineRouting::Discard),
             source_session_id: Some(session_id.to_string()),
-            source_chat_id: (!turn.chat_id.is_empty()).then(|| turn.chat_id.clone()),
+            source_chat_id: (!chat_id.is_empty()).then(|| chat_id.to_string()),
         };
 
         if let Some(state) = self.sessions.get_mut(session_id) {
             state.open_paracrine_thread(
                 paracrine_id.clone(),
                 role.clone(),
-                format!("distill review ({})", trigger.as_str()),
+                format!("{thread_kind} ({})", trigger.as_str()),
                 ParacrineRouting::Discard,
                 "advice_only".into(),
                 "distill".into(),
@@ -503,10 +773,11 @@ impl AgentRuntime {
             }) => {
                 warn!(
                     session_id = %session_id,
+                    lane,
                     role = %role,
                     code = %code,
                     message = %message,
-                    "skills.distill: hotel refused the whisper"
+                    "hotel refused the whisper"
                 );
                 if let Some(state) = self.sessions.get_mut(session_id) {
                     state.close_paracrine_thread(
@@ -520,18 +791,20 @@ impl AgentRuntime {
             Ok(_) => {
                 info!(
                     session_id = %session_id,
+                    lane,
                     role = %role,
                     trigger = trigger.as_str(),
                     paracrine_id = %paracrine_id,
                     audit_id = ?audit_id,
-                    "skills.distill: whisper emitted"
+                    "whisper emitted"
                 );
             }
             Err(e) => {
                 warn!(
                     session_id = %session_id,
+                    lane,
                     error = %e,
-                    "skills.distill: ParacrineEmit IPC failed"
+                    "ParacrineEmit IPC failed"
                 );
                 if let Some(state) = self.sessions.get_mut(session_id) {
                     state.close_paracrine_thread(
@@ -649,5 +922,86 @@ mod tests {
         assert!(tool_allowed("memory.remember"));
         assert!(!tool_allowed("skill.assign"));
         assert!(!tool_allowed("bash.exec"));
+    }
+
+    // ── Procedural graphs P4 ──────────────────────────────────────────────
+
+    fn run(id: &str, score: f32, tools: &[&str]) -> ProcedureRunRecord {
+        ProcedureRunRecord {
+            run_id: id.into(),
+            procedure_id: "outcome-reflex".into(),
+            graph_version: 1,
+            verdict: if score >= 1.0 { "complete" } else { "blocked" }.into(),
+            basis: "grounded".into(),
+            steps_total: 3,
+            steps_verified: if score >= 1.0 { 3 } else { 1 },
+            tool_sequence: tools.iter().map(|t| t.to_string()).collect(),
+            goal: "record the outcome".into(),
+            score,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn contrast_pair_needs_a_failure_and_a_full_success() {
+        let runs = vec![
+            run("r3", 0.5, &["life.observe"]),
+            run("r2", 0.0, &["life.observe"]),
+            run("r1", 1.0, &["life.recall", "life.observe", "life.commit"]),
+        ];
+        let (f, s) = contrast_pair(&runs).expect("pair");
+        assert_eq!(f.run_id, "r2");
+        assert_eq!(s.run_id, "r1");
+        assert!(contrast_pair(&[run("a", 1.0, &[]), run("b", 0.5, &[])]).is_none());
+        assert!(contrast_pair(&[run("a", 0.0, &[])]).is_none());
+    }
+
+    #[test]
+    fn contrast_prompt_is_bounded_and_carries_graph_runs_and_rejections() {
+        use ansible_mesh_core::procedure::{
+            ProcedurePatchOp, ProcedurePatchRecord, outcome_reflex_procedure,
+        };
+        let procedure = outcome_reflex_procedure();
+        let failed = run("r2", 0.0, &["life.observe"]);
+        let success = run("r1", 1.0, &["life.recall", "life.observe", "life.commit"]);
+        let rejected = vec![ProcedurePatchRecord {
+            patch_id: "p0".into(),
+            procedure_id: "outcome-reflex".into(),
+            ops: vec![ProcedurePatchOp::DeleteNode {
+                id: "recall".into(),
+            }],
+            rejection_reason: Some(
+                "trial: candidate v2 mean 0.00 over 2 run(s) < baseline v1 mean 0.50 over 2 run(s)"
+                    .into(),
+            ),
+            ..Default::default()
+        }];
+        let p = build_contrast_prompt(&procedure, &failed, &success, &rejected);
+        assert!(p.starts_with("PROCEDURE REFINE"));
+        assert!(p.contains("(observe, LEADS_TO, commit)"), "{p}");
+        assert!(p.contains("FAILED run r2"), "{p}");
+        assert!(p.contains("SUCCEEDED run r1"), "{p}");
+        assert!(
+            p.contains("life.recall → life.observe → life.commit"),
+            "{p}"
+        );
+        assert!(p.contains("do NOT propose these again"), "{p}");
+        assert!(p.contains("delete_node recall"), "{p}");
+        assert!(p.contains("PROCEDURE: nothing"), "{p}");
+        assert!(p.contains("evidence_run_ids [\"r2\", \"r1\"]"), "{p}");
+        assert!(p.chars().count() <= PARACRINE_WHISPER_PROMPT_MAX_CHARS);
+        let none = build_contrast_prompt(&procedure, &failed, &success, &[]);
+        assert!(!none.contains("do NOT propose"));
+        assert!(tool_allowed("procedure.patch"));
+        assert!(tool_allowed("procedure.get"));
+        assert!(tool_allowed("procedure.register"));
+        assert_eq!(
+            DistillTrigger::ProcedureContrast.as_str(),
+            "procedure_contrast"
+        );
+        assert_eq!(
+            origin_from_intent("skills.distill:procedure_contrast").as_deref(),
+            Some("distill:procedure_contrast")
+        );
     }
 }

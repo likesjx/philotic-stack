@@ -3813,7 +3813,13 @@ impl AgentRuntime {
         };
 
         if let Some(run) = pending_procedure_run {
-            self.record_procedure_run(&session_id, run).await;
+            let recorded = self.record_procedure_run(&session_id, run.clone()).await;
+            if recorded {
+                // P4: a ledger that now holds both a failed and a successful
+                // run of this procedure earns one contrast whisper.
+                self.maybe_procedure_contrast_after_run(&session_id, &completed_turn, &run)
+                    .await;
+            }
         }
 
         // Plan status trailer: the verdict is computed BEFORE the reply goes

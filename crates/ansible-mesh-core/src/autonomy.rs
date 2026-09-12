@@ -41,10 +41,16 @@ pub const LANE_MEMORY_HYGIENE: &str = "memory.hygiene";
 /// action is a *filing* and is permitted at `ProposalOnly`.
 pub const LANE_SKILLS_DISTILL: &str = "skills.distill";
 
+/// Procedural Graphs P4: the refiner whisper that contrasts a failed with a
+/// successful run of one procedure and files a `procedure.patch`. A patch
+/// lands `Pending` and needs operator approval before it runs a trial, so
+/// like `skills.distill` this lane's action is a *filing* at `ProposalOnly`.
+pub const LANE_PROCEDURES_REFINE: &str = "procedures.refine";
+
 /// All lanes named by the Autopoiesis proposal. Lanes are open vocabulary —
 /// this list exists for enumeration (dashboards, kill-switch sweeps), not as a
 /// closed set.
-pub const KNOWN_LANES: [&str; 7] = [
+pub const KNOWN_LANES: [&str; 8] = [
     LANE_GRAPH_BRIDGE_EDGES,
     LANE_FLEET_HEAL_SLICES,
     LANE_WORK_FILE_PROPOSALS,
@@ -52,6 +58,7 @@ pub const KNOWN_LANES: [&str; 7] = [
     LANE_WORK_EXECUTE_SLICES,
     LANE_MEMORY_HYGIENE,
     LANE_SKILLS_DISTILL,
+    LANE_PROCEDURES_REFINE,
 ];
 
 /// Per-lane default daily budget. Most lanes take [`AutonomyBudget::default`];
@@ -59,7 +66,7 @@ pub const KNOWN_LANES: [&str; 7] = [
 /// a chatty day cannot flood the Draft pool before the curator (L2) exists.
 pub fn default_budget_for_lane(lane: &str) -> AutonomyBudget {
     match lane {
-        LANE_SKILLS_DISTILL => AutonomyBudget {
+        LANE_SKILLS_DISTILL | LANE_PROCEDURES_REFINE => AutonomyBudget {
             max_actions_per_day: 3,
             ..AutonomyBudget::default()
         },
@@ -878,6 +885,10 @@ mod tests {
             (
                 LANE_SKILLS_DISTILL,
                 "PHILOTIC_AUTONOMY_DISABLE_SKILLS_DISTILL",
+            ),
+            (
+                LANE_PROCEDURES_REFINE,
+                "PHILOTIC_AUTONOMY_DISABLE_PROCEDURES_REFINE",
             ),
         ];
         assert_eq!(expected.len(), KNOWN_LANES.len());

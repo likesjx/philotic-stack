@@ -6,11 +6,18 @@
 //! - `show <id>`: the graph as the paper's triplet list plus its backbone.
 //! - `runs <id>`: the newest terminal plan evaluations attributed to it —
 //!   the refiner's evidence and the trial gate's score source.
+//! - `patches [--procedure <id>] [--status <s>]`: refiner patches and where
+//!   the gate left them (pending / trial / accepted / rejected).
+//! - `approve <patch_id>` / `reject <patch_id> [--reason ..]`: the operator
+//!   decision that opens a live trial window, or keeps the patch as negative
+//!   evidence.
 //!
 //! Everything reads the daemon's live GraphDomain over IPC, like `phil
 //! autonomy`; nothing here re-derives state from a raw DB read.
 
-use ansible_mesh_core::procedure::{ProcedureGraphRecord, ProcedureRunRecord};
+use ansible_mesh_core::procedure::{
+    ProcedureGraphRecord, ProcedurePatchRecord, ProcedureRunRecord,
+};
 use anyhow::{anyhow, Context, Result};
 use clap::Subcommand;
 use philotic_client::{GuestIdentity, IpcRequest, IpcResponse, PhiloticClient};
@@ -40,6 +47,29 @@ pub enum ProcedureAction {
         #[arg(long, default_value_t = 20)]
         limit: usize,
     },
+
+    /// Refiner patches, newest first, with their gate status.
+    Patches {
+        /// Only patches against this procedure.
+        #[arg(long)]
+        procedure: Option<String>,
+        /// One of pending | trial | accepted | rejected.
+        #[arg(long)]
+        status: Option<String>,
+    },
+
+    /// Approve a pending patch: applies it as a candidate version that runs
+    /// a live trial and is accepted only if it scores at least as well as
+    /// the version it replaces.
+    Approve { patch_id: String },
+
+    /// Reject a pending patch. It is kept as negative evidence for the
+    /// refiner, never deleted.
+    Reject {
+        patch_id: String,
+        #[arg(long)]
+        reason: Option<String>,
+    },
 }
 
 pub async fn run(action: ProcedureAction) -> Result<()> {
@@ -51,6 +81,9 @@ pub async fn run(action: ProcedureAction) -> Result<()> {
             version,
             limit,
         } => runs(procedure_id, version, limit).await,
+        ProcedureAction::Patches { procedure, status } => patches(procedure, status).await,
+        ProcedureAction::Approve { patch_id } => decide(patch_id, "approve", None).await,
+        ProcedureAction::Reject { patch_id, reason } => decide(patch_id, "reject", reason).await,
     }
 }
 
@@ -237,5 +270,99 @@ async fn runs(procedure_id: String, version: Option<u32>, limit: usize) -> Resul
     let n = runs.len() as f32;
     let mean = runs.iter().map(|r| r.score).sum::<f32>() / n;
     println!("\n{} run(s), mean score {:.2}", runs.len(), mean);
+    Ok(())
+}
+
+async fn patches(procedure: Option<String>, status: Option<String>) -> Result<()> {
+    let mut client = ipc_client().await?;
+    let data = expect_data(
+        client
+            .send_request(IpcRequest::ListProcedurePatches {
+                procedure_id: procedure,
+                status,
+            })
+            .await?,
+        "list_procedure_patches",
+    )?;
+    let patches: Vec<ProcedurePatchRecord> = data
+        .get("patches")
+        .cloned()
+        .map(serde_json::from_value)
+        .transpose()?
+        .unwrap_or_default();
+    if patches.is_empty() {
+        println!("no procedure patches");
+        return Ok(());
+    }
+    for p in &patches {
+        let trial = p
+            .trial
+            .as_ref()
+            .map(|t| {
+                format!(
+                    " trial v{}: candidate {:.2}/{} vs baseline {:.2}/{} (needs {})",
+                    t.candidate_version,
+                    t.candidate_mean,
+                    t.candidate_n,
+                    t.baseline_mean,
+                    t.baseline_n,
+                    t.required_runs
+                )
+            })
+            .unwrap_or_default();
+        println!(
+            "{}  {:<9} {} v{}→{}  by {}  {}",
+            p.patch_id,
+            p.status.as_str(),
+            p.procedure_id,
+            p.base_version,
+            p.candidate_version
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| "?".into()),
+            p.proposed_by,
+            p.created_at
+        );
+        println!("    ops: {}", p.summary());
+        if !p.rationale.is_empty() {
+            println!("    why: {}", p.rationale);
+        }
+        if let Some(reason) = &p.rejection_reason {
+            println!("    rejected: {reason}");
+        }
+        if !trial.is_empty() {
+            println!("   {trial}");
+        }
+    }
+    Ok(())
+}
+
+async fn decide(patch_id: String, decision: &str, reason: Option<String>) -> Result<()> {
+    let mut client = ipc_client().await?;
+    let data = expect_data(
+        client
+            .send_request(IpcRequest::DecideProcedurePatch {
+                patch_id: patch_id.clone(),
+                decision: decision.to_string(),
+                reason,
+            })
+            .await?,
+        "decide_procedure_patch",
+    )?;
+    let status = data.get("status").and_then(Value::as_str).unwrap_or("?");
+    match status {
+        "trial" => println!(
+            "patch {patch_id} approved: {} is now v{} on trial for {} run(s)",
+            data.get("procedure_id")
+                .and_then(Value::as_str)
+                .unwrap_or("?"),
+            data.get("candidate_version")
+                .and_then(Value::as_u64)
+                .unwrap_or(0),
+            data.get("required_runs")
+                .and_then(Value::as_u64)
+                .unwrap_or(0)
+        ),
+        other => println!("patch {patch_id}: {other}"),
+    }
     Ok(())
 }

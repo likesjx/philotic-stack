@@ -405,6 +405,9 @@ pub fn tools_for_skill(skill_name: &str) -> &'static [&'static str] {
             "skill.revoke",
             "skill.set_state",
             "skill.audit",
+            "procedure.get",
+            "procedure.register",
+            "procedure.patch",
         ],
         "context.synthesize" => &["workspace.list", "workspace.read"],
         "agent.initiate" => &["agent.graph.write", "agent.graph.recall"],
@@ -617,6 +620,8 @@ pub fn skill_is_relevant_for_turn(skill_name: &str, turn_text: &str) -> bool {
         }
         "skill.authoring" => {
             t.contains("register skill")
+                || t.contains("procedure.")
+                || t.contains("procedural graph")
                 || t.contains("skill.register")
                 || t.contains("skill.assign")
                 || t.contains("skill.set_state")
@@ -1613,6 +1618,84 @@ fn build_catalog() -> HashMap<String, ToolDefinition> {
                     }
                 },
                 "required": ["skill_name", "description", "subagent_kind", "goal"]
+            }),
+            class: Some("capability".into()),
+        },
+    );
+
+    m.insert(
+        "procedure.get".into(),
+        ToolDefinition {
+            tool_name: "procedure.get".into(),
+            description:
+                "Fetches one procedural graph from the hotel by id: its tool-bound nodes, \
+                          typed edges with condition/guidance/pitfalls, version, and state. Use it \
+                          to read a procedure before proposing a patch."
+                    .into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "procedure_id": {
+                        "type": "string",
+                        "description": "The procedure id, e.g. 'outcome-reflex'."
+                    }
+                },
+                "required": ["procedure_id"]
+            }),
+            class: Some("capability".into()),
+        },
+    );
+
+    m.insert(
+        "procedure.register".into(),
+        ToolDefinition {
+            tool_name: "procedure.register".into(),
+            description: "Registers a procedural graph — a small typed graph of tool steps with \
+                          condition/guidance/pitfalls on each edge — that philotes follow as \
+                          advice and seed plans from. Nodes: {id, label, kind: tool|reasoning|state, \
+                          tool_name}. Edges: {from, to, relation: leads_to|triggers|provides_input_for|\
+                          converges_to, condition, guidance, pitfalls}. Agent-authored procedures land \
+                          as Draft for the operator to promote. Keep it small: 3–17 nodes."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "procedure_id": { "type": "string", "description": "Lowercase dotted id, e.g. 'research.github-digest'." },
+                    "description": { "type": "string", "description": "One paragraph: when this procedure applies and what it achieves." },
+                    "skill_name": { "type": "string", "description": "Optional skill this procedure rides on; it projects when that skill is in play." },
+                    "entry": { "type": "string", "description": "Node id the backbone starts from." },
+                    "nodes": { "type": "array", "items": { "type": "object" }, "description": "Nodes: {id, label, kind, tool_name}." },
+                    "edges": { "type": "array", "items": { "type": "object" }, "description": "Edges: {from, to, relation, condition, guidance, pitfalls}." }
+                },
+                "required": ["procedure_id", "description", "entry", "nodes", "edges"]
+            }),
+            class: Some("capability".into()),
+        },
+    );
+
+    m.insert(
+        "procedure.patch".into(),
+        ToolDefinition {
+            tool_name: "procedure.patch".into(),
+            description: "Proposes an edit to a procedural graph after contrasting a failed run with \
+                          a successful one. ops is a list of {op: add_node|delete_node|add_edge|\
+                          delete_edge|set_edge_attrs|set_node_label, ...}. The patch lands Pending; \
+                          the operator approves it into a live trial, and it is accepted only if \
+                          the new version scores at least as well as the old one. Call it once."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "procedure_id": { "type": "string" },
+                    "ops": {
+                        "type": "array",
+                        "items": { "type": "object" },
+                        "description": "Edit ops. add_node {node}; delete_node {id}; add_edge {edge}; delete_edge {from, to, relation}; set_edge_attrs {from, to, relation, condition?, guidance?, pitfalls?}; set_node_label {id, label}."
+                    },
+                    "rationale": { "type": "string", "description": "One or two sentences: what the failed run did that the successful one did not, and how the edit prevents it." },
+                    "evidence_run_ids": { "type": "array", "items": { "type": "string" }, "description": "The run ids contrasted." }
+                },
+                "required": ["procedure_id", "ops", "rationale"]
             }),
             class: Some("capability".into()),
         },
