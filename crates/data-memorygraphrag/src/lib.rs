@@ -1587,6 +1587,19 @@ impl LifeObserveInput {
     }
 }
 
+impl LifeCommitInput {
+    /// Fill the packet id a model-authored commit may omit — the same
+    /// courtesy `LifeObserveInput::normalize_defaults` extends to observe.
+    /// Live 2026-09-12: every first `life.commit` attempt of the afternoon
+    /// failed "packet_id must not be empty" and cost a retry model call.
+    pub fn normalize_defaults(&mut self) {
+        if self.evidence.packet_id.trim().is_empty() {
+            self.evidence.packet_id =
+                format!("commit-{}", ulid::Ulid::new().to_string().to_lowercase());
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct LifeCommitInput {
     pub evidence: EvidencePacket,
