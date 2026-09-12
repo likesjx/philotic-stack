@@ -478,8 +478,17 @@ impl AgentRuntime {
             // operator must never be asked to approve text whose effect they
             // cannot see. (Caution is handled at the gate below: it pins the
             // call to the unconditional tier.)
-            if tool_call.tool_name == "skill.register" && !bypass_approval {
-                let fields: Vec<&str> = ["description", "goal"]
+            // Procedural graphs P4 widen the same floor to procedure text: a
+            // registration's description and a patch's rationale (the hotel
+            // scans every node label and edge attribute on its side).
+            let guard_keys: &[&str] = match tool_call.tool_name.as_str() {
+                "skill.register" => &["description", "goal"],
+                "procedure.register" => &["description"],
+                "procedure.patch" => &["rationale"],
+                _ => &[],
+            };
+            if !guard_keys.is_empty() && !bypass_approval {
+                let fields: Vec<&str> = guard_keys
                     .iter()
                     .filter_map(|k| tool_call.arguments.get(*k).and_then(|v| v.as_str()))
                     .collect();
@@ -489,7 +498,8 @@ impl AgentRuntime {
                     warn!(
                         session_id = %session_id,
                         hazard = hazard.description,
-                        "skill.register refused by prompt-guard (philote side)"
+                        tool = %tool_call.tool_name,
+                        "registration text refused by prompt-guard (philote side)"
                     );
                     return self
                         .deliver_tool_denial(
@@ -510,7 +520,13 @@ impl AgentRuntime {
             // Also skipped for a distill turn's skill.register: the hotel forces
             // that record to Draft, and a Draft grants nothing — filing is free,
             // promotion is what the operator gates.
-            let distill_draft_write = distill_turn && tool_call.tool_name == "skill.register";
+            // Procedural graphs P4: a procedure registered or patched from a
+            // lookaside lands Draft / Pending — a filing, gated at promotion.
+            let distill_draft_write = distill_turn
+                && matches!(
+                    tool_call.tool_name.as_str(),
+                    "skill.register" | "procedure.register" | "procedure.patch"
+                );
             let force_approval = if bypass_approval || distill_draft_write {
                 false
             } else {
@@ -3255,6 +3271,284 @@ impl AgentRuntime {
                     ..Default::default()
                 })
                 .await
+            }
+
+            // ── Procedural graphs (doc:procedural-graphs) ──────────────────
+            "procedure.get" => {
+                let args = &payload.arguments;
+                let Some(procedure_id) = args.get("procedure_id").and_then(|v| v.as_str()) else {
+                    return self
+                        .fail_active_turn(
+                            payload.session_id,
+                            payload.turn_id,
+                            "procedure.get: missing required argument 'procedure_id'".into(),
+                        )
+                        .await;
+                };
+                let response = self
+                    .ipc_client
+                    .send_request(IpcRequest::GetProcedure {
+                        procedure_id: procedure_id.to_string(),
+                    })
+                    .await;
+                let (content, tool_err) = match response {
+                    Ok(IpcResponse::Standard {
+                        ok: true,
+                        data: Some(data),
+                        ..
+                    }) => match serde_json::from_value::<
+                        ansible_mesh_core::procedure::ProcedureGraphRecord,
+                    >(data)
+                    {
+                        Ok(p) => {
+                            let backbone: Vec<&str> =
+                                p.linear_backbone().iter().map(|n| n.id.as_str()).collect();
+                            let nodes: Vec<String> = p
+                                .nodes
+                                .iter()
+                                .map(|n| {
+                                    format!(
+                                        "- {} [{}] {}",
+                                        n.id,
+                                        n.tool_name.as_deref().unwrap_or("-"),
+                                        n.label
+                                    )
+                                })
+                                .collect();
+                            (
+                                format!(
+                                    "{} v{} ({:?}){}\n{}\n\nnodes:\n{}\n\ntriplets:\n{}\nbackbone: {}",
+                                    p.procedure_id,
+                                    p.version,
+                                    p.validation_state,
+                                    p.trial_of
+                                        .as_deref()
+                                        .map(|id| format!(" — on trial for patch {id}"))
+                                        .unwrap_or_default(),
+                                    p.description,
+                                    nodes.join("\n"),
+                                    p.render_triplets(),
+                                    backbone.join(" → ")
+                                ),
+                                None,
+                            )
+                        }
+                        Err(e) => {
+                            let err = TaskErrorPayload::ipc_failure(
+                                "aiua",
+                                "PROCEDURE_DECODE",
+                                format!("procedure.get: malformed record — {e}"),
+                            );
+                            (err.display_message(), Some(err))
+                        }
+                    },
+                    Ok(IpcResponse::Standard {
+                        ok: false,
+                        code,
+                        message,
+                        ..
+                    }) => {
+                        let e = TaskErrorPayload::ipc_failure("aiua", &*code, message);
+                        (e.display_message(), Some(e))
+                    }
+                    Ok(IpcResponse::Error(msg)) => {
+                        let e = TaskErrorPayload::ipc_failure("aiua", "IPC_ERROR", msg);
+                        (e.display_message(), Some(e))
+                    }
+                    Ok(_) => {
+                        let e = TaskErrorPayload::ipc_failure(
+                            "aiua",
+                            "UNEXPECTED_RESPONSE",
+                            "procedure.get: unexpected hotel response",
+                        );
+                        (e.display_message(), Some(e))
+                    }
+                    Err(e) => {
+                        let err = TaskErrorPayload::transport_error(
+                            "philote",
+                            format!("procedure.get: IPC transport error — {e}"),
+                        );
+                        (err.display_message(), Some(err))
+                    }
+                };
+                self.deliver_procedure_tool_result(payload, content, tool_err)
+                    .await
+            }
+
+            "procedure.register" => {
+                // The whole argument object is the record; the hotel parses,
+                // validates, scans, and forces agent origin to Draft. Origin
+                // is derived from the turn, never from model arguments.
+                let origin = Some(
+                    self.sessions
+                        .get(&payload.session_id)
+                        .and_then(|s| s.active_turn.as_ref())
+                        .and_then(|t| t.paracrine_intent.as_deref())
+                        .and_then(super::distill::origin_from_intent)
+                        .unwrap_or_else(|| "agent".to_string()),
+                );
+                let response = self
+                    .ipc_client
+                    .send_request(IpcRequest::RegisterProcedure {
+                        procedure: payload.arguments.clone(),
+                        origin,
+                    })
+                    .await;
+                let (content, tool_err) = match response {
+                    Ok(IpcResponse::Standard {
+                        ok: true,
+                        data: Some(data),
+                        ..
+                    }) => (
+                        format!(
+                            "Procedure '{}' registered as v{} (state: {}, {} nodes, {} edges).",
+                            data.get("procedure_id")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("?"),
+                            data.get("version").and_then(|v| v.as_u64()).unwrap_or(0),
+                            data.get("validation_state")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("?"),
+                            data.get("nodes").and_then(|v| v.as_u64()).unwrap_or(0),
+                            data.get("edges").and_then(|v| v.as_u64()).unwrap_or(0),
+                        ),
+                        None,
+                    ),
+                    Ok(IpcResponse::Standard {
+                        ok: false,
+                        code,
+                        message,
+                        ..
+                    }) => {
+                        let e = TaskErrorPayload::ipc_failure("aiua", &*code, message);
+                        (e.display_message(), Some(e))
+                    }
+                    Ok(IpcResponse::Error(msg)) => {
+                        let e = TaskErrorPayload::ipc_failure("aiua", "IPC_ERROR", msg);
+                        (e.display_message(), Some(e))
+                    }
+                    Ok(_) => {
+                        let e = TaskErrorPayload::ipc_failure(
+                            "aiua",
+                            "UNEXPECTED_RESPONSE",
+                            "procedure.register: unexpected hotel response",
+                        );
+                        (e.display_message(), Some(e))
+                    }
+                    Err(e) => {
+                        let err = TaskErrorPayload::transport_error(
+                            "philote",
+                            format!("procedure.register: IPC transport error — {e}"),
+                        );
+                        (err.display_message(), Some(err))
+                    }
+                };
+                self.deliver_procedure_tool_result(payload, content, tool_err)
+                    .await
+            }
+
+            "procedure.patch" => {
+                let args = &payload.arguments;
+                let Some(procedure_id) = args.get("procedure_id").and_then(|v| v.as_str()) else {
+                    return self
+                        .fail_active_turn(
+                            payload.session_id,
+                            payload.turn_id,
+                            "procedure.patch: missing required argument 'procedure_id'".into(),
+                        )
+                        .await;
+                };
+                let Some(ops) = args.get("ops").filter(|v| v.is_array()).cloned() else {
+                    return self
+                        .fail_active_turn(
+                            payload.session_id,
+                            payload.turn_id,
+                            "procedure.patch: missing required argument 'ops' (array)".into(),
+                        )
+                        .await;
+                };
+                let rationale = args
+                    .get("rationale")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default()
+                    .to_string();
+                let evidence_run_ids: Vec<String> = args
+                    .get("evidence_run_ids")
+                    .and_then(|v| v.as_array())
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let origin = Some(
+                    self.sessions
+                        .get(&payload.session_id)
+                        .and_then(|s| s.active_turn.as_ref())
+                        .and_then(|t| t.paracrine_intent.as_deref())
+                        .and_then(super::distill::origin_from_intent)
+                        .unwrap_or_else(|| "agent".to_string()),
+                );
+                let response = self
+                    .ipc_client
+                    .send_request(IpcRequest::ProposeProcedurePatch {
+                        procedure_id: procedure_id.to_string(),
+                        ops,
+                        rationale,
+                        evidence_run_ids,
+                        origin,
+                    })
+                    .await;
+                let (content, tool_err) = match response {
+                    Ok(IpcResponse::Standard {
+                        ok: true,
+                        data: Some(data),
+                        ..
+                    }) => (
+                        format!(
+                            "Patch {} filed against {} v{} ({}): pending operator approval, then a live trial.",
+                            data.get("patch_id").and_then(|v| v.as_str()).unwrap_or("?"),
+                            data.get("procedure_id")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("?"),
+                            data.get("base_version")
+                                .and_then(|v| v.as_u64())
+                                .unwrap_or(0),
+                            data.get("summary").and_then(|v| v.as_str()).unwrap_or("-"),
+                        ),
+                        None,
+                    ),
+                    Ok(IpcResponse::Standard {
+                        ok: false,
+                        code,
+                        message,
+                        ..
+                    }) => {
+                        let e = TaskErrorPayload::ipc_failure("aiua", &*code, message);
+                        (e.display_message(), Some(e))
+                    }
+                    Ok(IpcResponse::Error(msg)) => {
+                        let e = TaskErrorPayload::ipc_failure("aiua", "IPC_ERROR", msg);
+                        (e.display_message(), Some(e))
+                    }
+                    Ok(_) => {
+                        let e = TaskErrorPayload::ipc_failure(
+                            "aiua",
+                            "UNEXPECTED_RESPONSE",
+                            "procedure.patch: unexpected hotel response",
+                        );
+                        (e.display_message(), Some(e))
+                    }
+                    Err(e) => {
+                        let err = TaskErrorPayload::transport_error(
+                            "philote",
+                            format!("procedure.patch: IPC transport error — {e}"),
+                        );
+                        (err.display_message(), Some(err))
+                    }
+                };
+                self.deliver_procedure_tool_result(payload, content, tool_err)
+                    .await
             }
 
             "skill.list" => {
@@ -8436,6 +8730,46 @@ impl AgentRuntime {
                 .await
             }
         }
+    }
+}
+
+impl AgentRuntime {
+    /// Deliver a procedure tool's result as an ordinary tool_result turn
+    /// event (doc:procedural-graphs). Mirrors the inline literal every other
+    /// hotel-backed tool arm carries.
+    async fn deliver_procedure_tool_result(
+        &mut self,
+        payload: ToolExecutionPayload,
+        content: String,
+        tool_err: Option<TaskErrorPayload>,
+    ) -> Result<()> {
+        self.handle_tool_result(InboundTaskPayload {
+            action: Some("tool_result".into()),
+            agent_action: None,
+            handoff_bundle: None,
+            source: Some("agent".into()),
+            session_id: Some(payload.session_id),
+            turn_id: Some(payload.turn_id),
+            transport: None,
+            chat_id: Some(payload.chat_id),
+            thread_id: None,
+            sender_id: None,
+            sender_username: None,
+            message_kind: None,
+            content: Some(content),
+            attachments: Vec::new(),
+            command: None,
+            callback_data: None,
+            raw_transport_event: None,
+            error: tool_err,
+            tool_name: Some(payload.tool_name),
+            arguments: None,
+            final_reply_to: Some(payload.final_reply_to),
+            final_reply_role: Some(payload.final_reply_role),
+            final_reply_guest_id: payload.final_reply_guest_id,
+            ..Default::default()
+        })
+        .await
     }
 }
 

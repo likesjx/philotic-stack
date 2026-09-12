@@ -4,6 +4,7 @@ pub mod driver;
 pub mod r#loop;
 pub mod mcp_ingress;
 pub mod plan_eval;
+pub mod procedures;
 pub mod protocol;
 pub mod reflex;
 pub mod runtime;

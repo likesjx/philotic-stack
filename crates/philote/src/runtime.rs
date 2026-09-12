@@ -60,6 +60,9 @@ use life_capture::*;
 mod mcp_handling;
 use mcp_handling::*;
 
+#[path = "procedure_runtime.rs"]
+mod procedure_runtime;
+
 #[path = "memory_explain_tool.rs"]
 mod memory_explain_tool;
 
@@ -6913,6 +6916,12 @@ impl AgentRuntime {
         let new_skill_guidance: Option<Vec<String>> = bindings
             .get("effective_skill_guidance")
             .and_then(|v| serde_json::from_value(v.clone()).ok());
+        // Procedural graphs ride the same lane as skill guidance: prompt-facing,
+        // never a tool-assembly rebuild.
+        let new_procedures: Option<Vec<ansible_mesh_core::procedure::ProcedureGraphRecord>> =
+            bindings
+                .get("effective_procedures")
+                .and_then(|v| serde_json::from_value(v.clone()).ok());
         let new_allowed_classes: Option<Vec<String>> = bindings
             .get("allowed_classes")
             .and_then(|v| serde_json::from_value(v.clone()).ok());
@@ -6939,6 +6948,11 @@ impl AgentRuntime {
             // deliberately does not set `changed` (no tool-assembly rebuild).
             if skill_guidance != state.bindings.effective_skill_guidance {
                 state.bindings.effective_skill_guidance = skill_guidance;
+            }
+        }
+        if let Some(procedures) = new_procedures {
+            if procedures != state.bindings.effective_procedures {
+                state.bindings.effective_procedures = procedures;
             }
         }
         if let Some(allowed_classes) = new_allowed_classes {
@@ -7776,6 +7790,7 @@ mod tests {
                 .collect(),
             status: "executing".into(),
             context_1_advisory: None,
+            procedure_id: None,
         });
         for tool_name in diagnostics {
             push_test_tool(&mut turn, tool_name, "ok");
@@ -7799,6 +7814,7 @@ mod tests {
             }],
             status: "executing".into(),
             context_1_advisory: None,
+            procedure_id: None,
         });
         for tool_name in ["hotel.status", "role.list", "skill.list", "session.status"] {
             push_test_tool(&mut turn, tool_name, "ok");
@@ -7823,6 +7839,7 @@ mod tests {
             }],
             status: "executing".into(),
             context_1_advisory: None,
+            procedure_id: None,
         });
         for _ in 0..4 {
             push_test_tool(
@@ -10709,6 +10726,7 @@ mod tests {
             ],
             status: "executing".into(),
             context_1_advisory: None,
+            procedure_id: None,
         });
         turn.plan_steps_verified = vec![true, false, false];
 
@@ -12945,6 +12963,7 @@ mod tests {
                 .collect(),
             status: "executing".into(),
             context_1_advisory: None,
+            procedure_id: None,
         }
     }
 

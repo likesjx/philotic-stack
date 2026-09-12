@@ -8,12 +8,14 @@
 
 use super::*;
 
+use crate::plan_eval::PlanEvalOutcome;
 use crate::plan_eval::{
     DEFAULT_PLAN_CONTINUATION_BUDGET, MAX_CONSECUTIVE_PLAN_STALLS, PLAN_CONTINUATION_LIFETIME_CAP,
     PlanEvalVerdict, PriorPlanState, evaluate_plan, interim_reply_admissible,
     plan_continuation_brief, plan_continuation_disabled, plan_stop_notice,
     scaled_continuation_budget, unix_now,
 };
+use crate::procedures::RunTerminal;
 use crate::session::CarryoverPlan;
 
 /// Current wall-clock time as epoch milliseconds. Used by the Slice 2
@@ -3766,6 +3768,7 @@ impl AgentRuntime {
             index_state,
             plan_followup,
             plan_superseded_notice,
+            pending_procedure_run,
         ) = {
             let Some(state) = self.sessions.get_mut(&session_id) else {
                 warn!("deliver_text_reply: unknown session {}", session_id);
@@ -3793,6 +3796,10 @@ impl AgentRuntime {
             // carryover BEFORE the checkpoint below is built.
             let (plan_followup, plan_superseded_notice) =
                 plan_followup_after_turn(state, &completed_turn, plan_budget);
+            // A terminal plan eval leaves its ledger row here (P1); drained
+            // below, outside the session borrow, so the IPC append never
+            // holds the sessions map.
+            let pending_procedure_run = state.pending_procedure_run.take();
 
             (
                 completed_turn,
@@ -3801,8 +3808,19 @@ impl AgentRuntime {
                 state.clone(),
                 plan_followup,
                 plan_superseded_notice,
+                pending_procedure_run,
             )
         };
+
+        if let Some(run) = pending_procedure_run {
+            let recorded = self.record_procedure_run(&session_id, run.clone()).await;
+            if recorded {
+                // P4: a ledger that now holds both a failed and a successful
+                // run of this procedure earns one contrast whisper.
+                self.maybe_procedure_contrast_after_run(&session_id, &completed_turn, &run)
+                    .await;
+            }
+        }
 
         // Plan status trailer: the verdict is computed BEFORE the reply goes
         // out, so the reply can carry it. Without this, the model's own
@@ -4399,7 +4417,17 @@ impl AgentRuntime {
                             .len()
                             .saturating_sub(carry.steps_done_count()),
                     );
-                    let brief = plan_continuation_brief(carry, budget);
+                    let mut brief = plan_continuation_brief(carry, budget);
+                    // Procedural graphs P2: localize on the carryover's
+                    // verified steps (the new turn has no history yet) and
+                    // append the active node's out-edges. Advisory only.
+                    if let Some(guidance) = crate::procedures::render_carryover_guidance(
+                        &state.bindings.effective_procedures,
+                        carry,
+                    ) {
+                        brief.push('\n');
+                        brief.push_str(&guidance);
+                    }
                     carry.continuations_used += 1;
                     // Never refunded — the absolute backstop behind the
                     // progress-refunded per-stretch budget.
@@ -4795,6 +4823,29 @@ pub(super) enum PlanFollowup {
     Continue { eval_json: Option<Value> },
 }
 
+/// Procedural graphs P1: leave a terminal plan eval's ledger row on the
+/// session for the turn loop to drain. Only a plan that matched a bound
+/// procedure (stamped id, or tool overlap) produces a row; see
+/// [`crate::procedures::build_procedure_run`].
+fn stash_procedure_run(
+    state: &mut SessionState,
+    completed_turn: &WorkingTurn,
+    plan: &ActivePlan,
+    outcome: &PlanEvalOutcome,
+    terminal: RunTerminal,
+) {
+    let run = crate::procedures::build_procedure_run(
+        &state.bindings.effective_procedures,
+        &state.agent_id,
+        &state.session_id,
+        completed_turn,
+        plan,
+        outcome,
+        terminal,
+    );
+    state.pending_procedure_run = run;
+}
+
 /// Run the plan eval for a completed turn and update the session's carryover.
 ///
 /// Mutates `state.carryover_plan` (create / update / clear) so the caller's
@@ -4915,6 +4966,7 @@ pub(super) fn plan_followup_after_turn(
         match outcome.verdict {
             PlanEvalVerdict::Complete => {
                 state.carryover_plan = None;
+                stash_procedure_run(state, completed_turn, plan, &outcome, RunTerminal::Complete);
                 (Some(PlanFollowup::Settled { eval_json }), superseded)
             }
             PlanEvalVerdict::Blocked => {
@@ -4928,6 +4980,7 @@ pub(super) fn plan_followup_after_turn(
                     created_turn_id: origin,
                 };
                 state.carryover_plan = None;
+                stash_procedure_run(state, completed_turn, plan, &outcome, RunTerminal::Blocked);
                 let notice =
                     plan_stop_notice(&carry, "a step failed or no forward progress was made");
                 (
@@ -4941,6 +4994,13 @@ pub(super) fn plan_followup_after_turn(
             PlanEvalVerdict::Continue => {
                 if disabled {
                     state.carryover_plan = None;
+                    stash_procedure_run(
+                        state,
+                        completed_turn,
+                        plan,
+                        &outcome,
+                        RunTerminal::Stopped,
+                    );
                     return (Some(PlanFollowup::Settled { eval_json }), superseded);
                 }
                 let carry = CarryoverPlan {
@@ -4962,6 +5022,13 @@ pub(super) fn plan_followup_after_turn(
                         format!("auto-continuation budget of {budget} exhausted")
                     };
                     let notice = plan_stop_notice(&carry, &reason);
+                    stash_procedure_run(
+                        state,
+                        completed_turn,
+                        plan,
+                        &outcome,
+                        RunTerminal::Stopped,
+                    );
                     return (
                         Some(PlanFollowup::Stop {
                             eval_json: Some(eval_json),

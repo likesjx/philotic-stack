@@ -27,6 +27,10 @@ use crate::graph::{
 use crate::heal_queue::{
     HealWorkItemRecord, HEAL_WORK_ITEM_STATUS_CLOSED, HEAL_WORK_ITEM_STATUS_OPEN,
 };
+use crate::procedure::{
+    ProcedureGraphRecord, ProcedurePatchRecord, ProcedurePatchStatus, ProcedureProvenance,
+    ProcedureRunRecord,
+};
 use crate::storage::{
     AgentIdentityRecord, GraphAdapter, GraphRunnerInstanceRecord, GuestRecord, HotelRecord,
     ProjectedUserIdentityRecord, SecretRecord, SessionEventRecord, SessionParticipantRecord,
@@ -1076,6 +1080,186 @@ impl GraphDomain {
         Ok(skills)
     }
 
+    // ── Procedural graph methods (doc:procedural-graphs) ──────────────────────
+
+    fn procedure_key(procedure_id: &str) -> String {
+        format!("{}:{}", NODE_KIND_PROCEDURE, procedure_id)
+    }
+
+    fn procedure_run_key(run_id: &str) -> String {
+        format!("{}:{}", NODE_KIND_PROCEDURE_RUN, run_id)
+    }
+
+    /// Upsert a procedure. Callers validate first (`ProcedureGraphRecord::validate`
+    /// + the prompt-guard scan at the IPC boundary); this is storage only.
+    pub fn upsert_procedure(&self, procedure: &ProcedureGraphRecord) -> Result<()> {
+        let data = serde_json::to_value(procedure)
+            .context("GraphDomain::upsert_procedure: serialize ProcedureGraphRecord")?;
+        self.adapter.upsert_node(&GraphNode {
+            node_key: Self::procedure_key(&procedure.procedure_id),
+            kind: NODE_KIND_PROCEDURE.to_string(),
+            label: Some(procedure.procedure_id.clone()),
+            data,
+        })
+    }
+
+    pub fn get_procedure(&self, procedure_id: &str) -> Result<Option<ProcedureGraphRecord>> {
+        match self.adapter.get_node(&Self::procedure_key(procedure_id))? {
+            None => Ok(None),
+            Some(node) => Ok(Some(serde_json::from_value(node.data).context(
+                "GraphDomain::get_procedure: deserialize ProcedureGraphRecord",
+            )?)),
+        }
+    }
+
+    pub fn list_procedures(&self) -> Result<Vec<ProcedureGraphRecord>> {
+        let mut out = Vec::new();
+        for node in self.adapter.list_nodes_by_kind(NODE_KIND_PROCEDURE)? {
+            match serde_json::from_value::<ProcedureGraphRecord>(node.data.clone()) {
+                Ok(p) => out.push(p),
+                Err(err) => warn!(
+                    node_key = %node.node_key,
+                    "Skipping incompatible procedure record during list_procedures: {}",
+                    err
+                ),
+            }
+        }
+        out.sort_by(|a, b| a.procedure_id.cmp(&b.procedure_id));
+        Ok(out)
+    }
+
+    /// Fill-only boot seed: a repo-provenance procedure is written when absent
+    /// or when the stored copy is an older repo version; a live record that
+    /// was edited by an operator, an agent, or the refiner is never clobbered.
+    pub fn seed_procedure(&self, seed: &ProcedureGraphRecord) -> Result<bool> {
+        match self.get_procedure(&seed.procedure_id)? {
+            None => {
+                self.upsert_procedure(seed)?;
+                Ok(true)
+            }
+            Some(existing)
+                if existing.provenance == ProcedureProvenance::Repo
+                    && existing.version < seed.version =>
+            {
+                self.upsert_procedure(seed)?;
+                Ok(true)
+            }
+            Some(_) => Ok(false),
+        }
+    }
+
+    /// Append one terminal plan evaluation to the procedure run ledger.
+    pub fn record_procedure_run(&self, run: &ProcedureRunRecord) -> Result<()> {
+        let data = serde_json::to_value(run)
+            .context("GraphDomain::record_procedure_run: serialize ProcedureRunRecord")?;
+        self.adapter.upsert_node(&GraphNode {
+            node_key: Self::procedure_run_key(&run.run_id),
+            kind: NODE_KIND_PROCEDURE_RUN.to_string(),
+            label: Some(run.procedure_id.clone()),
+            data,
+        })
+    }
+
+    /// Newest-first runs for a procedure, optionally pinned to one graph
+    /// version, bounded by `limit`.
+    pub fn list_procedure_runs(
+        &self,
+        procedure_id: &str,
+        graph_version: Option<u32>,
+        limit: usize,
+    ) -> Result<Vec<ProcedureRunRecord>> {
+        let mut runs: Vec<ProcedureRunRecord> = Vec::new();
+        for node in self.adapter.list_nodes_by_kind_json_eq(
+            NODE_KIND_PROCEDURE_RUN,
+            "procedure_id",
+            procedure_id,
+            "recorded_at",
+            usize::MAX,
+        )? {
+            match serde_json::from_value::<ProcedureRunRecord>(node.data.clone()) {
+                Ok(run) => {
+                    if graph_version.map_or(true, |v| run.graph_version == v) {
+                        runs.push(run);
+                    }
+                }
+                Err(err) => warn!(
+                    node_key = %node.node_key,
+                    "Skipping incompatible procedure_run record: {}",
+                    err
+                ),
+            }
+        }
+        runs.sort_by(|a, b| {
+            b.recorded_at
+                .cmp(&a.recorded_at)
+                .then(b.run_id.cmp(&a.run_id))
+        });
+        runs.truncate(limit);
+        Ok(runs)
+    }
+
+    fn procedure_patch_key(patch_id: &str) -> String {
+        format!("{}:{}", NODE_KIND_PROCEDURE_PATCH, patch_id)
+    }
+
+    /// Upsert a patch record. Patches are never deleted: a `Rejected` one is
+    /// the refiner's negative evidence.
+    pub fn upsert_procedure_patch(&self, patch: &ProcedurePatchRecord) -> Result<()> {
+        let data = serde_json::to_value(patch)
+            .context("GraphDomain::upsert_procedure_patch: serialize ProcedurePatchRecord")?;
+        self.adapter.upsert_node(&GraphNode {
+            node_key: Self::procedure_patch_key(&patch.patch_id),
+            kind: NODE_KIND_PROCEDURE_PATCH.to_string(),
+            label: Some(format!("{}:{}", patch.procedure_id, patch.status.as_str())),
+            data,
+        })
+    }
+
+    pub fn get_procedure_patch(&self, patch_id: &str) -> Result<Option<ProcedurePatchRecord>> {
+        match self
+            .adapter
+            .get_node(&Self::procedure_patch_key(patch_id))?
+        {
+            None => Ok(None),
+            Some(node) => Ok(Some(serde_json::from_value(node.data).context(
+                "GraphDomain::get_procedure_patch: deserialize ProcedurePatchRecord",
+            )?)),
+        }
+    }
+
+    /// Newest-first patches, optionally for one procedure and/or one status.
+    pub fn list_procedure_patches(
+        &self,
+        procedure_id: Option<&str>,
+        status: Option<ProcedurePatchStatus>,
+    ) -> Result<Vec<ProcedurePatchRecord>> {
+        let mut out: Vec<ProcedurePatchRecord> = Vec::new();
+        for node in self.adapter.list_nodes_by_kind(NODE_KIND_PROCEDURE_PATCH)? {
+            match serde_json::from_value::<ProcedurePatchRecord>(node.data.clone()) {
+                Ok(p) => {
+                    if procedure_id.is_some_and(|id| p.procedure_id != id) {
+                        continue;
+                    }
+                    if status.is_some_and(|s| p.status != s) {
+                        continue;
+                    }
+                    out.push(p);
+                }
+                Err(err) => warn!(
+                    node_key = %node.node_key,
+                    "Skipping incompatible procedure_patch record: {}",
+                    err
+                ),
+            }
+        }
+        out.sort_by(|a, b| {
+            b.created_at
+                .cmp(&a.created_at)
+                .then(b.patch_id.cmp(&a.patch_id))
+        });
+        Ok(out)
+    }
+
     // ── Skill registration audit methods ──────────────────────────────────────
 
     fn skill_registration_audit_key(audit_id: &str) -> String {
@@ -1991,6 +2175,142 @@ mod tests {
         let storage =
             SqliteGraphStorage::open_in_memory().expect("in-memory SqliteGraphStorage failed");
         GraphDomain::new(Arc::new(storage.adapter()))
+    }
+
+    #[test]
+    fn procedure_seed_is_fill_only_and_run_ledger_is_newest_first() {
+        use crate::procedure::{outcome_reflex_procedure, ProcedureProvenance, ProcedureRunRecord};
+        let domain = make_domain();
+        let seed = outcome_reflex_procedure();
+        assert!(domain.seed_procedure(&seed).expect("seed"));
+        // Same repo version again: no-op.
+        assert!(!domain.seed_procedure(&seed).expect("reseed"));
+        // A newer repo version replaces the stored repo copy.
+        let mut newer = seed.clone();
+        newer.version = 2;
+        newer.description = "v2".into();
+        assert!(domain.seed_procedure(&newer).expect("upgrade"));
+        assert_eq!(
+            domain
+                .get_procedure("outcome-reflex")
+                .expect("get")
+                .expect("present")
+                .version,
+            2
+        );
+        // An operator-edited record is never clobbered by a later repo seed.
+        let mut edited = newer.clone();
+        edited.provenance = ProcedureProvenance::Operator;
+        edited.description = "operator edit".into();
+        domain.upsert_procedure(&edited).expect("upsert");
+        let mut v3 = seed.clone();
+        v3.version = 3;
+        assert!(!domain.seed_procedure(&v3).expect("seed over edit"));
+        assert_eq!(
+            domain
+                .get_procedure("outcome-reflex")
+                .expect("get")
+                .expect("present")
+                .description,
+            "operator edit"
+        );
+        assert_eq!(domain.list_procedures().expect("list").len(), 1);
+
+        for (i, (verdict, basis)) in [
+            ("complete", "grounded"),
+            ("blocked", "grounded"),
+            ("complete", "model_reported"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let run = ProcedureRunRecord {
+                run_id: format!("run-{i}"),
+                procedure_id: "outcome-reflex".into(),
+                graph_version: if i == 2 { 2 } else { 1 },
+                agent_id: "agent-a".into(),
+                session_id: "s".into(),
+                turn_id: format!("t{i}"),
+                verdict: verdict.into(),
+                basis: basis.into(),
+                score: ProcedureRunRecord::score_for(verdict, basis),
+                recorded_at: 100 + i as u64,
+                ..Default::default()
+            };
+            domain.record_procedure_run(&run).expect("record");
+        }
+        let all = domain
+            .list_procedure_runs("outcome-reflex", None, 10)
+            .expect("list runs");
+        assert_eq!(
+            all.iter().map(|r| r.run_id.as_str()).collect::<Vec<_>>(),
+            vec!["run-2", "run-1", "run-0"]
+        );
+        let v1 = domain
+            .list_procedure_runs("outcome-reflex", Some(1), 10)
+            .expect("list v1");
+        assert_eq!(v1.len(), 2);
+        assert!(v1.iter().all(|r| r.graph_version == 1));
+        let limited = domain
+            .list_procedure_runs("outcome-reflex", None, 1)
+            .expect("limit");
+        assert_eq!(limited.len(), 1);
+        assert_eq!(limited[0].run_id, "run-2");
+        assert!(domain
+            .list_procedure_runs("nope", None, 10)
+            .expect("empty")
+            .is_empty());
+    }
+
+    #[test]
+    fn procedure_patch_storage_filters_and_orders_newest_first() {
+        use crate::procedure::{ProcedurePatchOp, ProcedurePatchRecord, ProcedurePatchStatus};
+        let domain = make_domain();
+        for (i, (pid, status)) in [
+            ("outcome-reflex", ProcedurePatchStatus::Pending),
+            ("outcome-reflex", ProcedurePatchStatus::Rejected),
+            ("other.proc", ProcedurePatchStatus::Trial),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            domain
+                .upsert_procedure_patch(&ProcedurePatchRecord {
+                    patch_id: format!("patch-{i}"),
+                    procedure_id: pid.into(),
+                    base_version: 1,
+                    ops: vec![ProcedurePatchOp::SetNodeLabel {
+                        id: "commit".into(),
+                        label: "x".into(),
+                    }],
+                    status,
+                    created_at: 10 + i as u64,
+                    ..Default::default()
+                })
+                .expect("upsert");
+        }
+        let all = domain.list_procedure_patches(None, None).expect("list");
+        assert_eq!(
+            all.iter().map(|p| p.patch_id.as_str()).collect::<Vec<_>>(),
+            vec!["patch-2", "patch-1", "patch-0"]
+        );
+        let rejected = domain
+            .list_procedure_patches(Some("outcome-reflex"), Some(ProcedurePatchStatus::Rejected))
+            .expect("filter");
+        assert_eq!(rejected.len(), 1);
+        assert_eq!(rejected[0].patch_id, "patch-1");
+        assert_eq!(
+            domain
+                .list_procedure_patches(Some("other.proc"), None)
+                .expect("by id")
+                .len(),
+            1
+        );
+        assert!(domain
+            .get_procedure_patch("patch-0")
+            .expect("get")
+            .is_some());
+        assert!(domain.get_procedure_patch("nope").expect("get").is_none());
     }
 
     #[test]

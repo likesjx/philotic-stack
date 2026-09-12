@@ -317,6 +317,12 @@ pub struct SessionState {
     /// this until the plan completes, blocks, or the budget is exhausted.
     /// Checkpoint-persisted with a backward-compatible default of `None`.
     pub carryover_plan: Option<CarryoverPlan>,
+    /// A terminal plan evaluation waiting to be appended to the hotel's
+    /// procedure run ledger (doc:procedural-graphs P1). Set by
+    /// `plan_followup_after_turn` for the turn loop to drain right after the
+    /// checkpoint; never checkpointed itself — a run lost to a crash between
+    /// the eval and the send is one missing ledger row, not corrupt state.
+    pub pending_procedure_run: Option<ansible_mesh_core::procedure::ProcedureRunRecord>,
     /// Consecutive successful executions per tool name within this session.
     /// Resets to 0 on any failure. Used to auto-grant standing approval once
     /// the agent has demonstrated reliability on a specific tool.
@@ -397,6 +403,7 @@ impl SessionState {
             parked_plan_turn: None,
             parked_plan_since: None,
             carryover_plan: None,
+            pending_procedure_run: None,
             tool_success_streak: std::collections::HashMap::new(),
             pending_preapproval_thresholds: std::collections::HashMap::new(),
             agent_graph_snapshot: None,
@@ -1853,6 +1860,18 @@ impl SessionState {
     /// Used when the loop re-submits to the model after receiving a tool result.
     /// The history is appended as a `[Tool call history]` section so the model
     /// has full context to decide its next action.
+    /// Procedural graphs P2: the localized guidance block for this turn's
+    /// plan, if a bound procedure resolves for it and the agent can be
+    /// located on it. See [`crate::procedures::render_procedure_guidance`].
+    pub fn procedure_guidance_for_turn(&self, turn: &WorkingTurn) -> Option<String> {
+        let plan = turn.active_plan.as_ref()?;
+        crate::procedures::render_procedure_guidance(
+            &self.bindings.effective_procedures,
+            plan,
+            &turn.working_tool_history,
+        )
+    }
+
     pub fn build_reentry_prompt(&self) -> Option<String> {
         let turn = self.active_turn.as_ref()?;
         let tools = self.project_tools_for_turn(&turn.user_content);
@@ -1883,6 +1902,10 @@ impl SessionState {
                 ));
             }
             prompt.push_str(&crate::plan_eval::reentry_hint(turn));
+            if let Some(guidance) = self.procedure_guidance_for_turn(turn) {
+                prompt.push_str("\n\n");
+                prompt.push_str(&guidance);
+            }
         }
 
         Some(prompt)
@@ -2525,6 +2548,32 @@ impl SessionState {
             .find(|m| record_is_loop_like(m))
             .and_then(|m| m.id.clone());
 
+        // Procedural graphs P3: when a procedure bound to this trigger is in
+        // play, the plan is its backbone — the branch chosen by whether the
+        // loop is already in context — with `procedure_id` stamped so the run
+        // ledger attributes the result. The literals below remain the
+        // fallback for a hotel that has not seeded a procedure.
+        if let Some(procedure) = crate::procedures::triggered_procedure(
+            &self.bindings.effective_procedures,
+            "reports_an_outcome",
+        ) {
+            let ctx = crate::procedures::SeedContext {
+                branch: Some(if recalled_target.is_some() {
+                    "target_known"
+                } else {
+                    "target_unknown"
+                }),
+                target: recalled_target.as_deref(),
+                excerpt: &excerpt,
+            };
+            if let Some(plan) = crate::procedures::seed_plan_from_procedure(procedure, &ctx) {
+                self.active_turn.as_mut()?.active_plan = Some(plan);
+                return Some(
+                    recalled_target.unwrap_or_else(|| "(loop to be recalled)".to_string()),
+                );
+            }
+        }
+
         // Two shapes. With the loop already in context, two steps bound to
         // its exact id. Without it — the prefetch cache is stale after a
         // quiet spell (live 2026-09-11 20:46 UTC: 2h23m since the last turn,
@@ -2588,6 +2637,7 @@ impl SessionState {
             status: "executing".into(),
             steps,
             context_1_advisory: None,
+            procedure_id: None,
         };
         self.active_turn.as_mut()?.active_plan = Some(plan);
         Some(recalled_target.unwrap_or_else(|| "(loop to be recalled)".to_string()))
@@ -4098,6 +4148,12 @@ impl SessionState {
             // Structured re-entry footer: grounded in verification against the
             // tool results above, not the model's own step statuses.
             lines.push(crate::plan_eval::reentry_hint(turn));
+            // Procedural graphs P2: the active node's out-edges, rendered
+            // deterministically, after the grounded hint and never instead
+            // of it. Advisory only.
+            if let Some(guidance) = self.procedure_guidance_for_turn(turn) {
+                lines.push(guidance);
+            }
         }
         if !self.paracrine_threads.is_empty() {
             lines.push("\n[Paracrine side loops]".into());
@@ -4945,6 +5001,7 @@ impl SessionState {
             .and_then(|v| serde_json::from_value::<FallbackOverride>(v.clone()).ok());
 
         Some(Self {
+            pending_procedure_run: None,
             session_id,
             agent_id,
             source,
@@ -6495,6 +6552,7 @@ mod tests {
                 ],
                 status: "executing".into(),
                 context_1_advisory: None,
+                procedure_id: None,
             },
             steps_done: vec![true, false],
             verified_step_ids: vec![1],
@@ -6985,6 +7043,7 @@ mod tests {
             steps,
             status: "executing".into(),
             context_1_advisory: None,
+            procedure_id: None,
         }
     }
 
@@ -7077,6 +7136,7 @@ mod tests {
         let mut state =
             SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
         let mut turn = test_working_turn(Some(ActivePlan {
+            procedure_id: None,
             goal: "close out the implementation slice".into(),
             steps: vec![PlanStep {
                 id: 1,
@@ -7495,6 +7555,7 @@ mod tests {
                 effective_toolset: vec!["echo".into(), "workspace.read".into()],
                 effective_skillset: vec!["planning".into()],
                 effective_skill_guidance: Vec::new(),
+                effective_procedures: Vec::new(),
                 effective_workspace_ref: Some("workspace://main".into()),
                 transport_reply_target: Some(TransportReplyTargetBinding {
                     target_node: "local-aiua-01".into(),
@@ -7612,6 +7673,7 @@ mod tests {
         let mut state =
             SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
         state.start_turn(test_working_turn(Some(ActivePlan {
+            procedure_id: None,
             goal: "close out the implementation slice".into(),
             steps: vec![PlanStep {
                 id: 1,
@@ -8117,6 +8179,7 @@ mod tests {
             effective_toolset: vec!["echo".into()],
             effective_skillset: vec!["planning".into()],
             effective_skill_guidance: Vec::new(),
+            effective_procedures: Vec::new(),
             effective_workspace_ref: Some("workspace://main".into()),
             transport_reply_target: Some(TransportReplyTargetBinding {
                 target_node: "local-aiua-01".into(),
@@ -9489,6 +9552,7 @@ mod tests {
             }],
             status: "executing".into(),
             context_1_advisory: None,
+            procedure_id: None,
         }));
         turn.plan_confirmed = true;
         state.start_turn(turn);
@@ -9658,6 +9722,97 @@ mod tests {
     /// Outcome reflex: the operator's report seeds a two-step plan bound to
     /// life.observe + life.commit on the recalled loop's exact id, and that
     /// plan makes the tools project even on a "conversational" message.
+    /// Procedural graphs P3: with the outcome-reflex procedure bound, the
+    /// seeded plan is the graph's backbone, branch by context, stamped.
+    #[test]
+    fn outcome_report_seeds_the_plan_from_the_bound_procedure() {
+        use ansible_mesh_core::procedure::outcome_reflex_procedure;
+        let msg = "I gave my icebreaker speech in toastmasters today! And i did ok.";
+
+        // Loop in context → target_known branch: observe → commit.
+        let mut state =
+            SessionState::new("sess-1".into(), "agent-beacon".into(), "telegram".into());
+        for tool in ["life.observe", "life.recall", "life.commit"] {
+            state.add_tool_binding(tool);
+        }
+        state.bindings.effective_procedures = vec![outcome_reflex_procedure()];
+        let mut turn = make_plain_turn();
+        turn.user_content = msg.into();
+        turn.recalled_memories = vec![life_record(
+            "life:open_loop:toastmasters_icebreaker_speech_20260906",
+            "Jared is starting work on his Toastmasters Icebreaker speech project.",
+        )];
+        state.start_turn(turn);
+        assert_eq!(
+            state.seed_outcome_plan().as_deref(),
+            Some("life:open_loop:toastmasters_icebreaker_speech_20260906")
+        );
+        let plan = state
+            .active_turn
+            .as_ref()
+            .and_then(|t| t.active_plan.clone())
+            .expect("plan seeded");
+        assert_eq!(plan.procedure_id.as_deref(), Some("outcome-reflex"));
+        assert_eq!(
+            plan.steps
+                .iter()
+                .map(|s| s.tool_name.as_deref())
+                .collect::<Vec<_>>(),
+            vec![Some("life.observe"), Some("life.commit")]
+        );
+        assert!(
+            plan.steps[1]
+                .description
+                .contains("life:open_loop:toastmasters_icebreaker_speech_20260906")
+        );
+        assert!(plan.steps[0].description.contains("Operator said"));
+        // Idempotent, like the literal path.
+        assert!(state.seed_outcome_plan().is_none());
+        // The seeded plan resolves to its procedure for guidance and the ledger.
+        let turn = state.active_turn.as_ref().expect("turn");
+        let guidance = state
+            .procedure_guidance_for_turn(turn)
+            .expect("guidance from the entry");
+        assert!(
+            guidance.contains("[Procedure guidance: outcome-reflex @ start]"),
+            "{guidance}"
+        );
+
+        // Nothing loop-like in context → target_unknown branch: recall first.
+        let mut state2 =
+            SessionState::new("sess-2".into(), "agent-beacon".into(), "telegram".into());
+        for tool in ["life.observe", "life.recall", "life.commit"] {
+            state2.add_tool_binding(tool);
+        }
+        state2.bindings.effective_procedures = vec![outcome_reflex_procedure()];
+        let mut turn2 = make_plain_turn();
+        turn2.user_content = msg.into();
+        state2.start_turn(turn2);
+        assert_eq!(
+            state2.seed_outcome_plan().as_deref(),
+            Some("(loop to be recalled)")
+        );
+        let plan2 = state2
+            .active_turn
+            .as_ref()
+            .and_then(|t| t.active_plan.clone())
+            .expect("recall-first plan seeded");
+        assert_eq!(plan2.procedure_id.as_deref(), Some("outcome-reflex"));
+        assert_eq!(
+            plan2
+                .steps
+                .iter()
+                .map(|s| s.tool_name.as_deref())
+                .collect::<Vec<_>>(),
+            vec![
+                Some("life.recall"),
+                Some("life.observe"),
+                Some("life.commit")
+            ]
+        );
+        assert!(plan2.steps[2].description.contains("never invent an id"));
+    }
+
     #[test]
     fn outcome_report_seeds_observe_and_commit_plan_for_recalled_loop() {
         let mut state =
@@ -11329,6 +11484,7 @@ mod tests {
             status: "active".into(),
             steps: Vec::new(),
             context_1_advisory: None,
+            procedure_id: None,
         });
         turn.active_plan = None;
         turn.user_content = "run your morning steward pass".into();
@@ -11709,6 +11865,7 @@ mod tests {
                 status: "done".into(),
             }],
             context_1_advisory: None,
+            procedure_id: None,
         };
         state.start_turn(make_turn_with_plan(plan));
         state.push_tool_history(
@@ -11755,6 +11912,7 @@ mod tests {
                 },
             ],
             context_1_advisory: None,
+            procedure_id: None,
         };
         state.start_turn(make_turn_with_plan(plan));
         state.push_tool_history(
@@ -11803,6 +11961,7 @@ mod tests {
                 status: "done".into(),
             }],
             context_1_advisory: None,
+            procedure_id: None,
         };
         state.start_turn(make_turn_with_plan(plan));
 

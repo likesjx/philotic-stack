@@ -281,6 +281,12 @@ pub struct ActivePlan {
     /// This is advisory only; approval policy still decides whether a tool may run.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_1_advisory: Option<Context1Advisory>,
+    /// The procedural graph this plan was seeded from or attributed to
+    /// (doc:procedural-graphs). Stamped by the harness when it seeds a plan
+    /// from a procedure's backbone; otherwise resolved at eval time by tool
+    /// overlap. Drives run-ledger attribution and localized guidance.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub procedure_id: Option<String>,
 }
 
 /// A plan carried across turns by the plan-eval-repeat loop.
@@ -1721,6 +1727,12 @@ pub struct SessionBindings {
     pub effective_skillset: Vec<String>,
     #[serde(default)]
     pub effective_skill_guidance: Vec<String>,
+    /// Procedural graphs projected for this session (doc:procedural-graphs):
+    /// the hotel sends the full records for the skills in play so philote
+    /// can localize the active step without an IPC round trip. Prompt-facing
+    /// only — never affects tool routing or the tool assembly.
+    #[serde(default)]
+    pub effective_procedures: Vec<ansible_mesh_core::procedure::ProcedureGraphRecord>,
     /// Skills whose tools are in the ToolAssembly but suppressed per-turn unless
     /// the turn content signals the skill is needed. Populated from the role's
     /// toolset profile `on_demand_skills` list at session snapshot time.

@@ -21,6 +21,7 @@ mod mesh;
 mod muninn;
 mod onboard;
 mod presets;
+mod procedure;
 mod reset;
 mod serve;
 mod service;
@@ -249,6 +250,13 @@ enum Command {
     Autonomy {
         #[command(subcommand)]
         action: autonomy::AutonomyAction,
+    },
+
+    /// Procedural graphs — list, inspect, and read the run ledger of the
+    /// learned execution structures philotes follow (doc:procedural-graphs)
+    Procedure {
+        #[command(subcommand)]
+        action: procedure::ProcedureAction,
     },
 
     /// Memory Transparency — merged provenance query across Muninn, the intel
@@ -598,6 +606,7 @@ async fn main() -> Result<()> {
         Command::Heal { action } => heal::run(action).await,
         Command::Config { action } => config::run(action).await,
         Command::Autonomy { action } => autonomy::run(action).await,
+        Command::Procedure { action } => procedure::run(action).await,
         Command::Memory { action } => memory_explain::run(action).await,
         Command::Graph { action } => {
             use graph_intelligence::{scanner, GraphEngine};
