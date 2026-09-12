@@ -3085,7 +3085,6 @@ impl AgentRuntime {
             }
 
             state.start_turn(WorkingTurn {
-                procedure_guidance_rendered: false,
                 task_id,
                 turn_id: turn_id.clone(),
                 chat_id: chat_id.clone(),
@@ -7613,7 +7612,6 @@ mod tests {
 
     pub(super) fn test_working_turn(phase: TurnPhase) -> WorkingTurn {
         WorkingTurn {
-            procedure_guidance_rendered: false,
             task_id: Uuid::nil(),
             turn_id: "turn-1".into(),
             chat_id: "123".into(),
@@ -8711,7 +8709,6 @@ mod tests {
         let mut state =
             SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
         state.start_turn(WorkingTurn {
-            procedure_guidance_rendered: false,
             task_id: Uuid::nil(),
             turn_id: "turn-1".into(),
             chat_id: "123".into(),

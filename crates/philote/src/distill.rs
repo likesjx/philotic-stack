@@ -105,7 +105,7 @@ pub(super) fn origin_from_intent(intent: &str) -> Option<String> {
 /// Heuristic: does a tool result read as a failure? Tool results are free
 /// text; the common shapes are a leading `Error`/`error:` line, a JSON
 /// envelope with `"success": false` / `"ok": false`, or an exit code line.
-pub(super) fn tool_result_is_error(content: &str) -> bool {
+pub(crate) fn tool_result_is_error(content: &str) -> bool {
     let head: String = content.trim_start().chars().take(64).collect();
     let head_l = head.to_ascii_lowercase();
     if head_l.starts_with("error") || head_l.starts_with("failed") || head_l.starts_with("denied") {

@@ -4411,7 +4411,17 @@ impl AgentRuntime {
                             .len()
                             .saturating_sub(carry.steps_done_count()),
                     );
-                    let brief = plan_continuation_brief(carry, budget);
+                    let mut brief = plan_continuation_brief(carry, budget);
+                    // Procedural graphs P2: localize on the carryover's
+                    // verified steps (the new turn has no history yet) and
+                    // append the active node's out-edges. Advisory only.
+                    if let Some(guidance) = crate::procedures::render_carryover_guidance(
+                        &state.bindings.effective_procedures,
+                        carry,
+                    ) {
+                        brief.push('\n');
+                        brief.push_str(&guidance);
+                    }
                     carry.continuations_used += 1;
                     // Never refunded — the absolute backstop behind the
                     // progress-refunded per-stretch budget.

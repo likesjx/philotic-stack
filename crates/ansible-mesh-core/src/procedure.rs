@@ -91,6 +91,11 @@ pub struct ProcedureEdge {
     /// What to avoid.
     #[serde(default)]
     pub pitfalls: String,
+    /// Machine-readable branch tag for an edge out of the entry node, so a
+    /// seeder can choose a branch without parsing `condition` prose (e.g.
+    /// `target_known` / `target_unknown`). Free text otherwise ignored.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
 }
 
 /// Where a procedure came from. Mirrors the provenance the self-improvement
@@ -541,30 +546,34 @@ pub fn outcome_reflex_procedure() -> ProcedureGraphRecord {
                 condition: "no recalled loop for this outcome is in context".into(),
                 guidance: "life.recall with named_strategy \"open_loops_by_context\" and query_text = the operator's message".into(),
                 pitfalls: "skipping straight to observe with the loop unknown; guessing an id".into(),
+                branch: Some("target_unknown".into()),
             },
             ProcedureEdge {
                 from: "start".into(),
                 to: "observe".into(),
                 relation: ProcedureRelation::Triggers,
                 condition: "the loop this outcome settles is already recalled in context".into(),
-                guidance: "record the Event linked to that recalled id".into(),
+                guidance: "record the Event linked to {target}".into(),
                 pitfalls: "congratulating and stopping — a reported outcome is a write, not a reply".into(),
+                branch: Some("target_known".into()),
             },
             ProcedureEdge {
                 from: "recall".into(),
                 to: "observe".into(),
                 relation: ProcedureRelation::LeadsTo,
                 condition: "recall returned, even if it found nothing".into(),
-                guidance: "record the Event linked to the loop found in the recall, or standalone when none matched".into(),
+                guidance: "record the Event linked to {target}, or standalone when the recall matched nothing".into(),
                 pitfalls: "re-running recall with a rephrased query instead of moving on".into(),
+                branch: None,
             },
             ProcedureEdge {
                 from: "observe".into(),
                 to: "commit".into(),
                 relation: ProcedureRelation::LeadsTo,
                 condition: "the outcome Event is recorded".into(),
-                guidance: "life.commit the loop by its exact id: loop_status \"resolved\", resolution_note citing the Event; with no loop, commit the Event's own node id as confirmed".into(),
+                guidance: "life.commit {target} by its exact id: loop_status \"resolved\", resolution_note citing the Event; with no loop, commit the Event's own node id as confirmed".into(),
                 pitfalls: "inventing an id; resolving a node that was not recalled; claiming the write in text without the call".into(),
+                branch: None,
             },
         ],
         version: 1,
