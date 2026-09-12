@@ -1,12 +1,17 @@
 //! Execution safety floor for the Philotic Stack: the L0 compiled-in,
 //! unrecoverable-command blocklist.
 //!
-//! This crate implements **only** L0 of the layered execution safety floor
-//! described in the Execution Safety Floor proposal
-//! (`docs/architecture/EXEC_SAFETY_FLOOR_PROPOSAL.md`, "Slice 0"). L1
-//! (operator deny globs), L2 (allowlist + approval modes), L3 (approval
-//! context binding), and L4 (`explain` diagnostics) are later slices and are
-//! deliberately not implemented here.
+//! This crate implements L0 of the layered execution safety floor — the
+//! compiled-in, non-configurable hardline blocklist ([`detect_hardline`]) — and
+//! the *detector* half of an L1 network-egress fence
+//! ([`detect_network_egress`]). Both are pure detectors that read no config;
+//! the difference is what a `Some(_)` means. An L0 hit is an unconditional
+//! block no layer above can lift. An L1 network-egress hit is a *classification*
+//! the caller turns into a policy decision (loopback/tailnet allowed, everything
+//! else redirected to the governed egress fabric) — see [`detect_network_egress`]
+//! and the `net_egress` module. The remaining L2 (allowlist + approval modes),
+//! L3 (approval context binding), and full L4 (`explain` diagnostics) layers are
+//! later slices and are deliberately not implemented here.
 //!
 //! [`detect_hardline`] must be called at the **last hop before process
 //! spawn** in every raw-shell dispatch point in the stack — currently
@@ -23,6 +28,7 @@
 //! process that already controls the guest binary. See the proposal's
 //! "Risks and Non-Goals" section.
 
+mod net_egress;
 mod normalize;
 mod patterns;
 
@@ -30,6 +36,7 @@ use std::sync::LazyLock;
 
 use regex::{RegexSet, RegexSetBuilder};
 
+pub use net_egress::NetworkEgressMatch;
 pub use normalize::normalize_command;
 
 /// A command matched against the L0 hardline blocklist.
@@ -84,6 +91,22 @@ pub fn detect_hardline(command: &str) -> Option<HardlineMatch> {
     Some(HardlineMatch {
         description: HARDLINE.descriptions[idx],
     })
+}
+
+/// Detects raw network egress (`curl`, `wget`, `nc`, `/dev/tcp`, interpreter
+/// sockets) in `command`, returning the primitive and the target host when the
+/// host is written literally.
+///
+/// This is a **detector, not a policy** — like [`detect_hardline`] it reads no
+/// config. Unlike [`detect_hardline`], a `Some(_)` result is *not* an
+/// unconditional block: the caller decides, using the returned
+/// [`NetworkEgressMatch::host`] against its egress policy (loopback/tailnet are
+/// normally allowed; everything else, and any `None` host, is denied and
+/// redirected to the governed `http:<binding>.request` fabric). See the
+/// `net_egress` module for scope and the fail-closed rationale.
+pub fn detect_network_egress(command: &str) -> Option<NetworkEgressMatch> {
+    let normalized = normalize_command(command);
+    net_egress::detect(&normalized)
 }
 
 #[cfg(test)]

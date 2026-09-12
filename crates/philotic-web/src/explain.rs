@@ -86,19 +86,55 @@ fn build_exec_decision(command: &str) -> ExecDecision {
             reason: Some(m.description),
             guidance: m.denial_message(),
         },
-        None => ExecDecision {
-            command: command.to_string(),
-            normalized,
-            layer: "L0 (compiled-in hardline floor)",
-            decision: "allow-through-floor",
-            matched_pattern: None,
-            reason: None,
-            guidance: "no L0 hardline rule matched. This is not an approval — it only means \
-                       the compiled-in floor has no opinion on this command. L1 (operator deny \
-                       globs), L2 (allowlist + approval modes), and L3 (approval context \
-                       binding) are later slices and are not implemented yet, so no higher \
-                       layer can block or approve this command either right now."
-                .to_string(),
+        None => match exec_guard::detect_network_egress(command) {
+            Some(egress) => {
+                let policy =
+                    ansible_mesh_core::mcp_upstream::McpEgressPolicy::shell_egress_from_env();
+                let permitted = egress
+                    .host
+                    .as_deref()
+                    .map(|host| policy.host_allowed(host))
+                    .unwrap_or(false);
+                let host_label = egress.host.as_deref().unwrap_or("(unresolvable)");
+                ExecDecision {
+                    command: command.to_string(),
+                    normalized,
+                    layer: "L1 (network-egress fence)",
+                    decision: if permitted {
+                        "allow-loopback-or-tailnet"
+                    } else {
+                        "block"
+                    },
+                    matched_pattern: Some(egress.tool),
+                    reason: Some(egress.tool),
+                    guidance: if permitted {
+                        format!(
+                            "raw network egress ({} to {host_label}) permitted: host is loopback \
+                             or tailnet, or matched PHILOTIC_SHELL_EGRESS_ALLOW. Any other host \
+                             would be denied and redirected to the governed http:<binding>.request \
+                             fabric.",
+                            egress.tool
+                        )
+                    } else {
+                        egress.denial_message()
+                    },
+                }
+            }
+            None => ExecDecision {
+                command: command.to_string(),
+                normalized,
+                layer: "L0 (compiled-in hardline floor)",
+                decision: "allow-through-floor",
+                matched_pattern: None,
+                reason: None,
+                guidance: "no L0 hardline rule and no L1 network-egress rule matched. This is \
+                           not an approval — it only means the compiled-in floor and the egress \
+                           fence have no opinion on this command. L2 (allowlist + approval \
+                           modes) and L3 (approval context binding) are later slices and are not \
+                           implemented yet, so no higher layer can block or approve this command \
+                           either right now."
+                    .to_string(),
+            },
         },
     }
 }
