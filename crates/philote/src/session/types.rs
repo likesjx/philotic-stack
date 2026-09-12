@@ -281,6 +281,12 @@ pub struct ActivePlan {
     /// This is advisory only; approval policy still decides whether a tool may run.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_1_advisory: Option<Context1Advisory>,
+    /// The procedural graph this plan was seeded from or attributed to
+    /// (doc:procedural-graphs). Stamped by the harness when it seeds a plan
+    /// from a procedure's backbone; otherwise resolved at eval time by tool
+    /// overlap. Drives run-ledger attribution and localized guidance.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub procedure_id: Option<String>,
 }
 
 /// A plan carried across turns by the plan-eval-repeat loop.
@@ -723,6 +729,7 @@ impl WorkingTurn {
     /// at their starting values.
     pub(crate) fn test_turn(turn_id: &str, user_content: &str) -> WorkingTurn {
         WorkingTurn {
+            procedure_guidance_rendered: false,
             task_id: Uuid::new_v4(),
             turn_id: turn_id.into(),
             chat_id: "chat-1".into(),
@@ -941,6 +948,11 @@ pub struct WorkingTurn {
     /// model's own bookkeeping — that is the entire point of it.
     #[serde(default)]
     pub plan_steps_verified: Vec<bool>,
+    /// Procedural graphs: set when localized procedure guidance was rendered
+    /// into any prompt of this turn (P2); carried onto the run ledger row so
+    /// the trial gate can tell guided runs from unguided ones.
+    #[serde(default)]
+    pub procedure_guidance_rendered: bool,
 }
 
 #[cfg(test)]
@@ -949,6 +961,7 @@ impl WorkingTurn {
     /// that plan evaluation reads is left for the caller to set.
     pub(crate) fn for_plan_tests() -> Self {
         Self {
+            procedure_guidance_rendered: false,
             task_id: Uuid::nil(),
             turn_id: "turn-test".into(),
             chat_id: String::new(),
@@ -2095,6 +2108,7 @@ mod paracrine_budget_tests {
     /// starting values (0 hops, no chain start).
     fn sample_turn() -> WorkingTurn {
         WorkingTurn {
+            procedure_guidance_rendered: false,
             task_id: Uuid::new_v4(),
             turn_id: "turn-test".into(),
             chat_id: "chat-1".into(),

@@ -1488,6 +1488,7 @@ mod tests {
                 .collect(),
             status: status.into(),
             context_1_advisory: None,
+            procedure_id: None,
         }
     }
 

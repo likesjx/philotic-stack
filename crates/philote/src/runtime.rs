@@ -60,6 +60,9 @@ use life_capture::*;
 mod mcp_handling;
 use mcp_handling::*;
 
+#[path = "procedure_runtime.rs"]
+mod procedure_runtime;
+
 #[path = "memory_explain_tool.rs"]
 mod memory_explain_tool;
 
@@ -3082,6 +3085,7 @@ impl AgentRuntime {
             }
 
             state.start_turn(WorkingTurn {
+                procedure_guidance_rendered: false,
                 task_id,
                 turn_id: turn_id.clone(),
                 chat_id: chat_id.clone(),
@@ -7609,6 +7613,7 @@ mod tests {
 
     pub(super) fn test_working_turn(phase: TurnPhase) -> WorkingTurn {
         WorkingTurn {
+            procedure_guidance_rendered: false,
             task_id: Uuid::nil(),
             turn_id: "turn-1".into(),
             chat_id: "123".into(),
@@ -7787,6 +7792,7 @@ mod tests {
                 .collect(),
             status: "executing".into(),
             context_1_advisory: None,
+            procedure_id: None,
         });
         for tool_name in diagnostics {
             push_test_tool(&mut turn, tool_name, "ok");
@@ -7810,6 +7816,7 @@ mod tests {
             }],
             status: "executing".into(),
             context_1_advisory: None,
+            procedure_id: None,
         });
         for tool_name in ["hotel.status", "role.list", "skill.list", "session.status"] {
             push_test_tool(&mut turn, tool_name, "ok");
@@ -7834,6 +7841,7 @@ mod tests {
             }],
             status: "executing".into(),
             context_1_advisory: None,
+            procedure_id: None,
         });
         for _ in 0..4 {
             push_test_tool(
@@ -8703,6 +8711,7 @@ mod tests {
         let mut state =
             SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
         state.start_turn(WorkingTurn {
+            procedure_guidance_rendered: false,
             task_id: Uuid::nil(),
             turn_id: "turn-1".into(),
             chat_id: "123".into(),
@@ -10720,6 +10729,7 @@ mod tests {
             ],
             status: "executing".into(),
             context_1_advisory: None,
+            procedure_id: None,
         });
         turn.plan_steps_verified = vec![true, false, false];
 
@@ -12956,6 +12966,7 @@ mod tests {
                 .collect(),
             status: "executing".into(),
             context_1_advisory: None,
+            procedure_id: None,
         }
     }
 

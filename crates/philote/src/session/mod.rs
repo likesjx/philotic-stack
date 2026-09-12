@@ -317,6 +317,12 @@ pub struct SessionState {
     /// this until the plan completes, blocks, or the budget is exhausted.
     /// Checkpoint-persisted with a backward-compatible default of `None`.
     pub carryover_plan: Option<CarryoverPlan>,
+    /// A terminal plan evaluation waiting to be appended to the hotel's
+    /// procedure run ledger (doc:procedural-graphs P1). Set by
+    /// `plan_followup_after_turn` for the turn loop to drain right after the
+    /// checkpoint; never checkpointed itself — a run lost to a crash between
+    /// the eval and the send is one missing ledger row, not corrupt state.
+    pub pending_procedure_run: Option<ansible_mesh_core::procedure::ProcedureRunRecord>,
     /// Consecutive successful executions per tool name within this session.
     /// Resets to 0 on any failure. Used to auto-grant standing approval once
     /// the agent has demonstrated reliability on a specific tool.
@@ -397,6 +403,7 @@ impl SessionState {
             parked_plan_turn: None,
             parked_plan_since: None,
             carryover_plan: None,
+            pending_procedure_run: None,
             tool_success_streak: std::collections::HashMap::new(),
             pending_preapproval_thresholds: std::collections::HashMap::new(),
             agent_graph_snapshot: None,
@@ -2588,6 +2595,7 @@ impl SessionState {
             status: "executing".into(),
             steps,
             context_1_advisory: None,
+            procedure_id: None,
         };
         self.active_turn.as_mut()?.active_plan = Some(plan);
         Some(recalled_target.unwrap_or_else(|| "(loop to be recalled)".to_string()))
@@ -4689,6 +4697,7 @@ impl SessionState {
                 .unwrap_or_else(Uuid::nil);
 
             Some(WorkingTurn {
+                procedure_guidance_rendered: false,
                 task_id,
                 turn_id: turn.get("turn_id")?.as_str()?.to_string(),
                 chat_id: turn
@@ -4945,6 +4954,7 @@ impl SessionState {
             .and_then(|v| serde_json::from_value::<FallbackOverride>(v.clone()).ok());
 
         Some(Self {
+            pending_procedure_run: None,
             session_id,
             agent_id,
             source,
@@ -6429,6 +6439,7 @@ mod tests {
 
     fn test_working_turn(active_plan: Option<ActivePlan>) -> WorkingTurn {
         WorkingTurn {
+            procedure_guidance_rendered: false,
             task_id: Uuid::nil(),
             turn_id: "turn-1".into(),
             chat_id: "123".into(),
@@ -6495,6 +6506,7 @@ mod tests {
                 ],
                 status: "executing".into(),
                 context_1_advisory: None,
+                procedure_id: None,
             },
             steps_done: vec![true, false],
             verified_step_ids: vec![1],
@@ -6735,6 +6747,7 @@ mod tests {
         let mut state =
             SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
         state.start_turn(WorkingTurn {
+            procedure_guidance_rendered: false,
             task_id: Uuid::nil(),
             turn_id: "turn-1".into(),
             chat_id: "123".into(),
@@ -6985,6 +6998,7 @@ mod tests {
             steps,
             status: "executing".into(),
             context_1_advisory: None,
+            procedure_id: None,
         }
     }
 
@@ -7077,6 +7091,7 @@ mod tests {
         let mut state =
             SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
         let mut turn = test_working_turn(Some(ActivePlan {
+            procedure_id: None,
             goal: "close out the implementation slice".into(),
             steps: vec![PlanStep {
                 id: 1,
@@ -7174,6 +7189,7 @@ mod tests {
         let mut state =
             SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
         state.start_turn(WorkingTurn {
+            procedure_guidance_rendered: false,
             task_id: Uuid::nil(),
             turn_id: "turn-1".into(),
             chat_id: "123".into(),
@@ -7234,6 +7250,7 @@ mod tests {
             "A".repeat(1_900_000) // ~1.9MB
         );
         state.start_turn(WorkingTurn {
+            procedure_guidance_rendered: false,
             task_id: Uuid::nil(),
             turn_id: "turn-1".into(),
             chat_id: "123".into(),
@@ -7613,6 +7630,7 @@ mod tests {
         let mut state =
             SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
         state.start_turn(test_working_turn(Some(ActivePlan {
+            procedure_id: None,
             goal: "close out the implementation slice".into(),
             steps: vec![PlanStep {
                 id: 1,
@@ -8192,6 +8210,7 @@ mod tests {
             Some("User anchor: Jared prefers direct collaboration.".into());
         state.agent_profile.memory_summary = Some("Memory seed: architecture matters.".into());
         state.start_turn(WorkingTurn {
+            procedure_guidance_rendered: false,
             task_id: Uuid::nil(),
             turn_id: "turn-ctx-1".into(),
             chat_id: "123".into(),
@@ -8304,6 +8323,7 @@ mod tests {
             SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
         state.status = "paused".into();
         state.start_turn(WorkingTurn {
+            procedure_guidance_rendered: false,
             task_id: Uuid::nil(),
             turn_id: "turn-ctx-2".into(),
             chat_id: "123".into(),
@@ -8779,6 +8799,7 @@ mod tests {
             ..Default::default()
         });
         state.start_turn(WorkingTurn {
+            procedure_guidance_rendered: false,
             task_id: Uuid::nil(),
             turn_id: "turn-handoff-1".into(),
             chat_id: "123".into(),
@@ -8866,6 +8887,7 @@ mod tests {
         state.status = "active".into();
         state.active_incarnation_id = Some("agent-beacon:orchestrator".into());
         state.start_turn(WorkingTurn {
+            procedure_guidance_rendered: false,
             task_id: Uuid::nil(),
             turn_id: "turn-handoff-2".into(),
             chat_id: "123".into(),
@@ -8945,6 +8967,7 @@ mod tests {
             ..Default::default()
         });
         state.start_turn(WorkingTurn {
+            procedure_guidance_rendered: false,
             task_id: Uuid::nil(),
             turn_id: "turn-subagent-1".into(),
             chat_id: "123".into(),
@@ -9491,6 +9514,7 @@ mod tests {
             }],
             status: "executing".into(),
             context_1_advisory: None,
+            procedure_id: None,
         }));
         turn.plan_confirmed = true;
         state.start_turn(turn);
@@ -10325,6 +10349,7 @@ mod tests {
         let mut first =
             SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
         first.start_turn(WorkingTurn {
+            procedure_guidance_rendered: false,
             task_id: Uuid::nil(),
             turn_id: "turn-1".into(),
             chat_id: "123".into(),
@@ -10392,6 +10417,7 @@ mod tests {
         let mut state =
             SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
         state.start_turn(WorkingTurn {
+            procedure_guidance_rendered: false,
             task_id: Uuid::nil(),
             turn_id: "turn-1".into(),
             chat_id: "123".into(),
@@ -10474,6 +10500,7 @@ mod tests {
         let mut state =
             SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
         state.start_turn(WorkingTurn {
+            procedure_guidance_rendered: false,
             task_id: Uuid::nil(),
             turn_id: "turn-1".into(),
             chat_id: "123".into(),
@@ -10557,6 +10584,7 @@ mod tests {
         let mut state =
             SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
         state.start_turn(WorkingTurn {
+            procedure_guidance_rendered: false,
             task_id: Uuid::nil(),
             turn_id: "turn-voice-1".into(),
             chat_id: "123".into(),
@@ -10920,6 +10948,7 @@ mod tests {
             "telegram".into(),
         );
         state.start_turn(WorkingTurn {
+            procedure_guidance_rendered: false,
             task_id: Uuid::nil(),
             turn_id: "turn-memory".into(),
             chat_id: "chat-memory".into(),
@@ -11279,6 +11308,7 @@ mod tests {
 
     fn make_turn_with_plan(plan: ActivePlan) -> WorkingTurn {
         WorkingTurn {
+            procedure_guidance_rendered: false,
             task_id: Uuid::nil(),
             turn_id: "turn-1".into(),
             chat_id: "c1".into(),
@@ -11331,6 +11361,7 @@ mod tests {
             status: "active".into(),
             steps: Vec::new(),
             context_1_advisory: None,
+            procedure_id: None,
         });
         turn.active_plan = None;
         turn.user_content = "run your morning steward pass".into();
@@ -11711,6 +11742,7 @@ mod tests {
                 status: "done".into(),
             }],
             context_1_advisory: None,
+            procedure_id: None,
         };
         state.start_turn(make_turn_with_plan(plan));
         state.push_tool_history(
@@ -11757,6 +11789,7 @@ mod tests {
                 },
             ],
             context_1_advisory: None,
+            procedure_id: None,
         };
         state.start_turn(make_turn_with_plan(plan));
         state.push_tool_history(
@@ -11805,6 +11838,7 @@ mod tests {
                 status: "done".into(),
             }],
             context_1_advisory: None,
+            procedure_id: None,
         };
         state.start_turn(make_turn_with_plan(plan));
 
@@ -11824,6 +11858,7 @@ mod tests {
         let mut state =
             SessionState::new("sess-4".into(), "agent-bjork-01".into(), "telegram".into());
         let turn = WorkingTurn {
+            procedure_guidance_rendered: false,
             task_id: Uuid::nil(),
             turn_id: "turn-x".into(),
             chat_id: "c1".into(),

@@ -1981,6 +1981,7 @@ impl AgentRuntime {
         };
         let checkpoint = if let Some(state) = self.sessions.get_mut(&session_id) {
             state.start_turn(WorkingTurn {
+                procedure_guidance_rendered: false,
                 task_id: command_task_id,
                 turn_id: turn_id.clone(),
                 chat_id: chat_id.clone(),
