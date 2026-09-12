@@ -1420,6 +1420,36 @@ impl IpcServer {
         })
     }
 
+    /// Resolve a caller-supplied hotel reference to its canonical mesh
+    /// `node_id`. Every cross-hotel placement tool (`role.set_home`,
+    /// `transport.set_home`, `hotel.materialize_request`) documents its
+    /// `target_hotel` argument with an example like `"vps-jane"` — the bare
+    /// `hotel_name` — but every routing comparison in this codebase
+    /// (`home_node != local_node_id`, `target_node_id` on an `EventEnvelope`)
+    /// is actually keyed on the full `node_id` (e.g. `"vps-jane-aiua-01"`,
+    /// `hotels.capabilities.node_id`). Passing the documented example
+    /// silently fails to route anywhere — no error, no delivery (DEF-113,
+    /// found live 2026-09-09 rehearsing the R3 watched-live gate).
+    ///
+    /// Accepts either form so both the documented example and the "correct"
+    /// internal value work: an exact `node_id` match returns as-is; an exact
+    /// `hotel_name` match resolves to that hotel's `node_id`. `None` if
+    /// neither matches any known hotel — callers should surface that as a
+    /// rejection rather than silently mis-routing.
+    pub(super) fn resolve_hotel_node_id(graph: &GraphDomain, hotel_ref: &str) -> Option<String> {
+        let hotels = graph.list_hotels().ok()?;
+        if hotels
+            .iter()
+            .any(|hotel| hotel.capabilities.node_id == hotel_ref)
+        {
+            return Some(hotel_ref.to_string());
+        }
+        hotels
+            .into_iter()
+            .find(|hotel| hotel.hotel_name == hotel_ref)
+            .map(|hotel| hotel.capabilities.node_id)
+    }
+
     fn desktop_membrane_status_view(
         graph: &GraphDomain,
         local_node_id: &str,
@@ -6674,6 +6704,29 @@ impl IpcServer {
                         format!("agent '{}' not found", agent_id),
                     );
                 }
+
+                // Resolve a bare hotel_name (documented example, e.g. "vps-jane")
+                // or an already-canonical node_id to the node_id every routing
+                // comparison actually keys on (DEF-113).
+                let Some(target_hotel) = Self::resolve_hotel_node_id(graph, &target_hotel) else {
+                    return IpcResponse::error(
+                        "set_transport_home",
+                        "SET_TRANSPORT_HOME_UNKNOWN_HOTEL",
+                        format!("no known hotel matches '{}'", target_hotel),
+                    );
+                };
+                let mut resolved_standby_hotels = Vec::with_capacity(standby_hotels.len());
+                for hotel_ref in &standby_hotels {
+                    let Some(node_id) = Self::resolve_hotel_node_id(graph, hotel_ref) else {
+                        return IpcResponse::error(
+                            "set_transport_home",
+                            "SET_TRANSPORT_HOME_UNKNOWN_HOTEL",
+                            format!("no known hotel matches standby '{}'", hotel_ref),
+                        );
+                    };
+                    resolved_standby_hotels.push(node_id);
+                }
+                let standby_hotels = resolved_standby_hotels;
 
                 let home = MembraneTransportHomeRecord {
                     agent_id: agent_id.clone(),
@@ -29525,6 +29578,28 @@ pub(crate) mod tests {
                 mesh_host: None,
             })
             .expect("seed hotel");
+        // DEF-113: resolve_hotel_node_id requires every referenced hotel —
+        // including standby_hotels — to be a seeded hotel record.
+        for peer in ["mbp-jane", "mac-jane"] {
+            graph
+                .upsert_hotel(&HotelRecord {
+                    hotel_name: peer.into(),
+                    capabilities: NodeCapabilities {
+                        node_id: peer.into(),
+                        roles: vec![],
+                        models: vec![],
+                        tools: vec![],
+                        constraints: Default::default(),
+                    },
+                    mesh_port: 9000,
+                    blob_port: 9001,
+                    execution_port: 9002,
+                    ipc_socket_path: String::new(),
+                    active_pid: None,
+                    mesh_host: None,
+                })
+                .expect("seed peer hotel");
+        }
         graph
             .upsert_agent_identity(&AgentIdentityRecord {
                 agent_id: "agent-beacon".into(),
@@ -29646,6 +29721,26 @@ pub(crate) mod tests {
                 mesh_host: None,
             })
             .expect("seed hotel");
+        // DEF-113: resolve_hotel_node_id needs mac-jane seeded too — it's
+        // the target_hotel this test moves the transport home to.
+        graph
+            .upsert_hotel(&HotelRecord {
+                hotel_name: "mac-jane".into(),
+                capabilities: NodeCapabilities {
+                    node_id: "mac-jane".into(),
+                    roles: vec![],
+                    models: vec![],
+                    tools: vec![],
+                    constraints: Default::default(),
+                },
+                mesh_port: 9010,
+                blob_port: 9011,
+                execution_port: 9012,
+                ipc_socket_path: String::new(),
+                active_pid: None,
+                mesh_host: None,
+            })
+            .expect("seed mac-jane hotel");
         graph
             .upsert_agent_identity(&AgentIdentityRecord {
                 agent_id: "agent-beacon".into(),

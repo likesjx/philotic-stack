@@ -84,9 +84,18 @@ only). Cross-hotel binary resolution (G3) turned out to already be closed by the
 Guest Binary Resolution proposal — every hotel resolves its own guest binaries
 locally via `PHILOTIC_BIN_DIR`/`PATH`, so materialization only needs to replicate
 the role/toolset *records*, not binaries, which `MaterializeRequest`'s payload
-already does (same pattern `handle_remote_role_handoff` established). Not yet
-watched-live — that is an operator-timed live-service action like R2's, not a
-solo test. R4 onward not started. The first concrete relocation
+already does (same pattern `handle_remote_role_handoff` established).
+**Watched-live 2026-09-09**: `hotel.materialize_request` mac-jane → vps-jane
+pre-warmed a real philote process end to end (confirmed by pid on vps-jane),
+replied `MaterializeReady`, and left `home_node` untouched — but only after
+finding and fixing **DEF-122**: `target_hotel` must be the hotel's real mesh
+`node_id` (e.g. `"vps-jane-aiua-01"`), not the bare `hotel_name` the tools'
+own documentation used as an example (`"vps-jane"`) — passing the documented
+example silently delivered nowhere. `codex/relocation-node-id-resolve` adds
+`resolve_hotel_node_id` (accepts either form) to `role.set_home`,
+`transport.set_home`, and `hotel.materialize_request` alike, since all three
+shared the same gap and `role.set_home` is the Ceremony's actual SWITCH
+mechanism. R4 onward not started. The first concrete relocation
 this ceremony must carry is moving every orchestrator incarnation (Bjork, Coach,
 Mac on `mac-jane`; Astrid, Ariel, Jane, Aria on `mbp-jane`) to `vps-jane`, with
 Mac-bound specialists (Architect and anything holding `bash.exec`, desktop, ONNX
