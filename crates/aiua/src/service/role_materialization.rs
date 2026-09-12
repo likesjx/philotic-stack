@@ -1636,7 +1636,24 @@ impl IpcServer {
             }
         };
 
-        record.home_node = target_hotel.clone();
+        // Resolve a bare hotel_name (the documented example, e.g. "vps-jane")
+        // or an already-canonical node_id (e.g. "vps-jane-aiua-01") to the
+        // node_id every routing comparison actually keys on (DEF-113).
+        let resolved_target = match target_hotel.as_deref() {
+            None => None,
+            Some(hotel_ref) => match Self::resolve_hotel_node_id(graph, hotel_ref) {
+                Some(node_id) => Some(node_id),
+                None => {
+                    return IpcResponse::error(
+                        "set_role_home",
+                        "SET_ROLE_HOME_UNKNOWN_HOTEL",
+                        format!("no known hotel matches '{}'", hotel_ref),
+                    );
+                }
+            },
+        };
+
+        record.home_node = resolved_target.clone();
         record.placement_updated_unix = ansible_mesh_core::graph::placement_stamp_now();
         if let Err(err) = graph.upsert_role_incarnation(&record) {
             return IpcResponse::error(
@@ -1648,11 +1665,11 @@ impl IpcServer {
 
         info!(
             "Role '{}' (agent '{}') home_node set to {:?} by '{}'",
-            role_name, agent_id, target_hotel, calling_role
+            role_name, agent_id, resolved_target, calling_role
         );
         IpcResponse::RoleHomeSet {
             role_name,
-            home_node: target_hotel,
+            home_node: resolved_target,
         }
     }
 
@@ -1704,6 +1721,17 @@ impl IpcServer {
                 ),
             );
         }
+
+        // Resolve a bare hotel_name (the documented example, e.g. "vps-jane")
+        // or an already-canonical node_id to the node_id every routing
+        // comparison and mesh envelope actually keys on (DEF-113).
+        let Some(target_hotel) = Self::resolve_hotel_node_id(graph, &target_hotel) else {
+            return IpcResponse::error(
+                "materialize_request",
+                "MATERIALIZE_REQUEST_UNKNOWN_HOTEL",
+                format!("no known hotel matches '{}'", target_hotel),
+            );
+        };
 
         if target_hotel == local_node_id {
             return IpcResponse::error(
@@ -1882,6 +1910,113 @@ mod tests {
     }
 
     #[test]
+    fn set_role_home_resolves_bare_hotel_name_to_real_node_id() {
+        let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
+        let graph = GraphDomain::new(Arc::new(graph_store.adapter()));
+        // DEF-113: hotel_name ("vps-jane", the tool's own documented example)
+        // differs from the real node_id ("vps-jane-aiua-01") that every
+        // cross-hotel routing comparison actually keys on.
+        graph
+            .upsert_hotel(&ansible_mesh_core::storage::HotelRecord {
+                hotel_name: "vps-jane".into(),
+                capabilities: NodeCapabilities {
+                    node_id: "vps-jane-aiua-01".into(),
+                    roles: vec![],
+                    models: vec![],
+                    tools: vec![],
+                    constraints: Default::default(),
+                },
+                mesh_port: 9000,
+                blob_port: 9001,
+                execution_port: 9002,
+                ipc_socket_path: String::new(),
+                active_pid: None,
+                mesh_host: None,
+            })
+            .expect("seed vps-jane hotel record");
+        graph
+            .upsert_role_incarnation(&RoleIncarnationRecord {
+                agent_id: "agent-beacon".into(),
+                role_name: "orchestrator".into(),
+                guest_id: "agent-beacon:orchestrator".into(),
+                toolset_profile: "orchestrator".into(),
+                is_admin: true,
+                readiness_state: RoleReadinessState::Routable,
+                turn_loop_config: TurnLoopConfig::default(),
+                home_node: None,
+                ..Default::default()
+            })
+            .expect("seed admin orchestrator role");
+        let identity = GuestIdentity {
+            guest_id: "agent-beacon".into(),
+            role: "agent".into(),
+            supported_tools: vec![],
+        };
+
+        let resp = IpcServer::handle_set_role_home(
+            &graph,
+            Some(&identity),
+            "agent-beacon".into(),
+            "orchestrator".into(),
+            "orchestrator".into(),
+            Some("vps-jane".into()),
+        );
+
+        match resp {
+            IpcResponse::RoleHomeSet { home_node, .. } => {
+                assert_eq!(home_node.as_deref(), Some("vps-jane-aiua-01"));
+            }
+            other => panic!("expected IpcResponse::RoleHomeSet, got {other:?}"),
+        }
+
+        let persisted = graph
+            .get_role_incarnation("agent-beacon", "orchestrator")
+            .expect("read back role")
+            .expect("role exists");
+        assert_eq!(persisted.home_node.as_deref(), Some("vps-jane-aiua-01"));
+    }
+
+    #[test]
+    fn set_role_home_rejects_target_hotel_matching_no_known_hotel() {
+        let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
+        let graph = GraphDomain::new(Arc::new(graph_store.adapter()));
+        graph
+            .upsert_role_incarnation(&RoleIncarnationRecord {
+                agent_id: "agent-beacon".into(),
+                role_name: "orchestrator".into(),
+                guest_id: "agent-beacon:orchestrator".into(),
+                toolset_profile: "orchestrator".into(),
+                is_admin: true,
+                readiness_state: RoleReadinessState::Routable,
+                turn_loop_config: TurnLoopConfig::default(),
+                home_node: None,
+                ..Default::default()
+            })
+            .expect("seed admin orchestrator role");
+        let identity = GuestIdentity {
+            guest_id: "agent-beacon".into(),
+            role: "agent".into(),
+            supported_tools: vec![],
+        };
+
+        let resp = IpcServer::handle_set_role_home(
+            &graph,
+            Some(&identity),
+            "agent-beacon".into(),
+            "orchestrator".into(),
+            "orchestrator".into(),
+            Some("nonexistent-hotel".into()),
+        );
+
+        match resp {
+            IpcResponse::Standard {
+                ok: false, code, ..
+            } => assert_eq!(code, "SET_ROLE_HOME_UNKNOWN_HOTEL"),
+            other => panic!("expected a rejecting IpcResponse::Standard, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn normalize_cron_target_role_leaves_unresolvable_role_untouched() {
         let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
         let graph = GraphDomain::new(Arc::new(graph_store.adapter()));
@@ -1956,6 +2091,28 @@ mod tests {
     async fn materialize_request_dispatches_mesh_event_carrying_role_and_toolset_records() {
         let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
         let graph = GraphDomain::new(Arc::new(graph_store.adapter()));
+        // DEF-113: seed a hotel whose hotel_name ("vps-jane", the documented
+        // target_hotel example) differs from its real node_id
+        // ("vps-jane-aiua-01", what routing actually keys on), so this test
+        // exercises the resolution, not a self-consistent coincidence.
+        graph
+            .upsert_hotel(&ansible_mesh_core::storage::HotelRecord {
+                hotel_name: "vps-jane".into(),
+                capabilities: NodeCapabilities {
+                    node_id: "vps-jane-aiua-01".into(),
+                    roles: vec![],
+                    models: vec![],
+                    tools: vec![],
+                    constraints: Default::default(),
+                },
+                mesh_port: 9000,
+                blob_port: 9001,
+                execution_port: 9002,
+                ipc_socket_path: String::new(),
+                active_pid: None,
+                mesh_host: None,
+            })
+            .expect("seed vps-jane hotel record");
         graph
             .upsert_role_incarnation(&RoleIncarnationRecord {
                 agent_id: "agent-beacon".into(),
@@ -2001,14 +2158,16 @@ mod tests {
             other => panic!("expected IpcResponse::MaterializeRequested, got {other:?}"),
         };
         assert_eq!(role_name, "orchestrator");
-        assert_eq!(target_hotel, "vps-jane");
+        // Resolved to the real node_id, not echoed back as the bare
+        // hotel_name that was passed in (DEF-113).
+        assert_eq!(target_hotel, "vps-jane-aiua-01");
 
         let cmd = rx.recv().await.expect("mesh envelope dispatched");
         let LedgerCommand::AppendLocal(event) = cmd else {
             panic!("expected LedgerCommand::AppendLocal");
         };
         assert_eq!(event.kind, EventKind::MaterializeRequest);
-        assert_eq!(event.target_node_id.as_deref(), Some("vps-jane"));
+        assert_eq!(event.target_node_id.as_deref(), Some("vps-jane-aiua-01"));
         let EventPayload::Inline { data } = &event.payload else {
             panic!("expected inline payload");
         };
@@ -2016,6 +2175,51 @@ mod tests {
         assert_eq!(v["request_id"].as_str(), Some(request_id.as_str()));
         assert_eq!(v["role_record"]["home_node"].as_str(), Some("mac-jane"));
         assert_eq!(v["role_record"]["readiness_state"], "routable");
+    }
+
+    #[tokio::test]
+    async fn materialize_request_rejects_target_hotel_matching_no_known_hotel() {
+        let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
+        let graph = GraphDomain::new(Arc::new(graph_store.adapter()));
+        graph
+            .upsert_role_incarnation(&RoleIncarnationRecord {
+                agent_id: "agent-beacon".into(),
+                role_name: "orchestrator".into(),
+                guest_id: "agent-beacon:orchestrator".into(),
+                toolset_profile: "orchestrator".into(),
+                is_admin: true,
+                readiness_state: RoleReadinessState::Routable,
+                turn_loop_config: TurnLoopConfig::default(),
+                home_node: None,
+                ..Default::default()
+            })
+            .expect("seed admin orchestrator role");
+        let (dispatcher_tx, _rx) = test_dispatcher_channel();
+        let identity = GuestIdentity {
+            guest_id: "agent-beacon".into(),
+            role: "agent".into(),
+            supported_tools: vec![],
+        };
+
+        // No hotel named or node_id'd "nonexistent-hotel" was ever seeded.
+        let resp = IpcServer::handle_materialize_request(
+            &graph,
+            &dispatcher_tx,
+            "mac-jane",
+            Some(&identity),
+            "agent-beacon".into(),
+            "orchestrator".into(),
+            "orchestrator".into(),
+            "nonexistent-hotel".into(),
+        )
+        .await;
+
+        match resp {
+            IpcResponse::Standard {
+                ok: false, code, ..
+            } => assert_eq!(code, "MATERIALIZE_REQUEST_UNKNOWN_HOTEL"),
+            other => panic!("expected a rejecting IpcResponse::Standard, got {other:?}"),
+        }
     }
 
     #[test]
