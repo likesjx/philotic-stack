@@ -4,8 +4,8 @@ doc_type: proposal
 domain: operator-control-plane
 status: active
 disposition: accepted-current-slice
-last_updated: 2026-08-07
-verification_level: test-green
+last_updated: 2026-08-12
+verification_level: watched-live-green
 tags:
 - philotic-web
 - management-plane
@@ -846,7 +846,7 @@ used by merged PRs but absent from the ledger — see §11.5):
 
 ## Current Slice
 
-**Landed (test-green, PR #418).** 190 unit + 10 integration tests, 0 failed.
+**Landed (watched-live-green, PR #418 merged to develop).** 192 unit + 10 integration tests, 0 failed, plus a watched run against the live mac-jane hotel — see below.
 
 | § | Fix | How |
 |---|---|---|
@@ -861,6 +861,41 @@ used by merged PRs but absent from the ledger — see §11.5):
 | 7.1 | Secrets written `0600` | `write_private_file` (`O_CREAT|0600`), identity dir `0700` |
 | 7.5 | `secrets.master-key-permissions` | new `doctor` check, Error severity, narrowing-only repair |
 | 4.2 | `nosniff` | shell and embedded assets |
+
+### Watched live run — mac-jane, 2026-08-12
+
+Merged to `develop` (`c7f64152`) at four-gate green, release-built, installed to
+the Cellar, and the **installed** binary verified to carry the change
+(`strings … | grep oidc_subject_allowlist`, `shared_token_not_bindable`) before
+running it against the **live mac-jane hotel** — real `context.db`, real
+`edge-devices.json`, desktop-membrane lease acquired.
+
+| Behaviour | Live result |
+|---|---|
+| `GET /health` | `200` — still open, as designed |
+| `GET /api/auth/status` **unauthenticated** | `root_user_key_refs: []`, `external_identity_links: []`, no `callback_url` |
+| same route **authenticated** | returns `vault_ref: "file://~/.philotic/vault-master-key.env/default-root-key"` and `public_fingerprint: "sha256:4bb06f8e…"` — **proving suppression, not an empty database.** The live hotel really was disclosing its vault master key's location and fingerprint pre-login |
+| `POST /api/auth/bootstrap` wrong / right token | `401` / session issued |
+| issued session token | `operator-token-` + **64 hex** (256-bit; was 16 hex) |
+| `GET /api/config/telegram` unauth / auth | `401` / `{"token_configured":true,"token_hint":"(set)"}` — a real token is configured on this hotel, and its first 8 characters are no longer returned |
+| `POST /api/auth/challenges` `bind_label: "https://evil.example/"` | `400` with the explanatory error |
+| same, `bind_label: "/desktop"` | `201` — the rejection is not over-broad |
+| security headers | `x-content-type-options: nosniff` present, CSP and `frame-ancestors 'none'` intact |
+
+Edge handshake, exercised over a real WebSocket against genuinely enrolled
+devices from the live registry:
+
+| Case | Live result |
+|---|---|
+| **shared** token, Hello as enrolled device `edge-63c782a8…` | `shared_token_not_bindable` — **the impersonation path is closed** |
+| that device's **own** token, same node | `hello_ack`, session opened — no regression for real clients |
+| device A's token, Hello as device B | `node_mismatch` — the pre-existing binding still holds |
+
+Scope of the claim: `philotic-web` is invoked per run, so running the newly
+installed binary *is* live truth for these changes. The `aiua` daemon itself was
+**not** bounced onto the new build (it started 11:15; binaries installed 11:53),
+because nothing in this slice touches it — bouncing it would roll out unrelated
+merged work and is a separate decision.
 
 ### Live-data checks before merge
 
