@@ -1178,7 +1178,7 @@ impl GraphDomain {
         )? {
             match serde_json::from_value::<ProcedureRunRecord>(node.data.clone()) {
                 Ok(run) => {
-                    if graph_version.map_or(true, |v| run.graph_version == v) {
+                    if graph_version.is_none_or(|v| run.graph_version == v) {
                         runs.push(run);
                     }
                 }

@@ -64,6 +64,11 @@ pub const LIVING_CYCLE_REL_TYPES: &[&str] = &[
     "SCOPED_TO",
 ];
 
+/// Every agenda rel type (the endpoint-validated vocabulary).
+pub fn agenda_rel_types() -> Vec<&'static str> {
+    AGENDA_EDGE_RULES.iter().map(|r| r.rel_type).collect()
+}
+
 pub fn is_living_cycle_rel_type(rel_type: &str) -> bool {
     LIVING_CYCLE_REL_TYPES.contains(&rel_type)
 }
@@ -690,6 +695,125 @@ fn numeric_node_id(id: &str) -> i64 {
         return -1;
     }
     trimmed.parse::<i64>().unwrap_or(-1)
+}
+
+/// Compiled `life.tidy` write: one parameterized statement per action.
+/// Every branch MATCHes existing nodes (never MERGE-creates), stamps
+/// `tidied_at`/`tidied_by`/`tidy_reason`, and never deletes. Retire and
+/// resolve refuse confirmed nodes unless the operator approved.
+#[derive(Debug, Clone)]
+pub struct TidyCypher {
+    pub query: String,
+    pub kind: &'static str,
+    pub a: String,
+    pub b: String,
+    pub reason: String,
+    pub now_iso: String,
+    pub actor: String,
+}
+
+pub fn compile_tidy(
+    action: &crate::audit::TidyAction,
+    operator_approved: bool,
+    actor: &str,
+    now_iso: &str,
+) -> Result<TidyCypher, String> {
+    use crate::audit::TidyAction;
+    let retirable = if operator_approved {
+        "true"
+    } else {
+        "coalesce(n.validation_state, 'inferred') IN ['proposed', 'inferred']"
+    };
+    let (query, kind, a, b, reason) = match action {
+        TidyAction::RetireDuplicate {
+            duplicate_id,
+            keeper_id,
+            reason,
+        } => (
+            format!(
+                concat!(
+                    "MATCH (n {{id: $a}}), (k {{id: $b}}) ",
+                    "WHERE {retirable} ",
+                    "SET n.validation_state = 'retired', n.retired_at = $now, n.retired_by = $actor, ",
+                    "n.resolution_note = $reason, n.tidied_at = $now, n.tidied_by = $actor, ",
+                    "n.tidy_reason = $reason ",
+                    "MERGE (k)-[r:SUPERSEDES]->(n) ",
+                    "ON CREATE SET r.tidied_at = $now, r.tidied_by = $actor ",
+                    "RETURN n.id AS id, k.id AS keeper_id, n.validation_state AS validation_state"
+                ),
+                retirable = retirable
+            ),
+            "retire_duplicate",
+            duplicate_id.clone(),
+            keeper_id.clone(),
+            reason.clone(),
+        ),
+        TidyAction::Link {
+            from_id,
+            rel_type,
+            to_id,
+            reason,
+        } => {
+            if !rel_type.chars().all(|c| c.is_ascii_uppercase() || c == '_') || rel_type.is_empty()
+            {
+                return Err(format!("rel_type '{rel_type}' is not an identifier"));
+            }
+            (
+                format!(
+                    concat!(
+                        "MATCH (n {{id: $a}}), (m {{id: $b}}) ",
+                        "MERGE (n)-[r:{rel}]->(m) ",
+                        "ON CREATE SET r.tidied_at = $now, r.tidied_by = $actor, r.tidy_reason = $reason ",
+                        "RETURN n.id AS id, m.id AS to_id, type(r) AS rel_type"
+                    ),
+                    rel = rel_type
+                ),
+                "link",
+                from_id.clone(),
+                to_id.clone(),
+                reason.clone(),
+            )
+        }
+        TidyAction::Resolve { node_id, reason } => (
+            concat!(
+                "MATCH (n {id: $a}) ",
+                "WHERE coalesce(n.validation_state, 'inferred') <> 'retired' ",
+                "SET n.status = 'resolved', n.resolved_at = $now, n.resolution_note = $reason, ",
+                "n.tidied_at = $now, n.tidied_by = $actor, n.tidy_reason = $reason ",
+                "RETURN n.id AS id, n.status AS status, n.validation_state AS validation_state"
+            )
+            .to_string(),
+            "resolve",
+            node_id.clone(),
+            String::new(),
+            reason.clone(),
+        ),
+        TidyAction::Retire { node_id, reason } => (
+            format!(
+                concat!(
+                    "MATCH (n) WHERE (n.id = $a OR toString(id(n)) = $a) AND {retirable} ",
+                    "SET n.validation_state = 'retired', n.retired_at = $now, n.retired_by = $actor, ",
+                    "n.resolution_note = $reason, n.tidied_at = $now, n.tidied_by = $actor, ",
+                    "n.tidy_reason = $reason ",
+                    "RETURN coalesce(n.id, toString(id(n))) AS id, n.validation_state AS validation_state"
+                ),
+                retirable = retirable
+            ),
+            "retire",
+            node_id.clone(),
+            String::new(),
+            reason.clone(),
+        ),
+    };
+    Ok(TidyCypher {
+        query,
+        kind,
+        a,
+        b,
+        reason,
+        now_iso: now_iso.to_string(),
+        actor: actor.to_string(),
+    })
 }
 
 pub fn compile_conflict_handoff(

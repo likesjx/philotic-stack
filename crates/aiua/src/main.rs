@@ -4230,6 +4230,42 @@ fn seed_abstract_tool_catalog(graph: &GraphDomain) -> anyhow::Result<()> {
             tool_markers: Vec::new(),
         },
         AbstractToolRecord {
+            tool_name: "life.audit".into(),
+            description: "READ-ONLY graph-science audit of the LifeGraph: components, orphans, \
+                          hubs, semantic/exact duplicates, stale loops, temporal and conformance \
+                          defects, health_score, suggested_actions (one life.tidy each) and \
+                          needs_judgment."
+                .into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "labels": { "type": "array", "items": { "type": "string" } },
+                    "max_actions": { "type": "integer", "default": 25 },
+                    "duplicate_similarity": { "type": "number", "default": 0.9 },
+                    "stale_days": { "type": "integer", "default": 45 }
+                }
+            }),
+            class: "life_graph".into(),
+            tool_markers: Vec::new(),
+        },
+        AbstractToolRecord {
+            tool_name: "life.tidy".into(),
+            description: "Apply ONE governed LifeGraph gardening action from life.audit \
+                          (retire_duplicate | link | resolve | retire). Never deletes; stamps \
+                          tidied_at/tidied_by/tidy_reason; confirmed nodes need operator_approved."
+                .into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "action": { "type": "object" },
+                    "operator_approved": { "type": "boolean", "default": false }
+                },
+                "required": ["action"]
+            }),
+            class: "life_graph".into(),
+            tool_markers: Vec::new(),
+        },
+        AbstractToolRecord {
             tool_name: "life.ontology".into(),
             description: "READ-ONLY canonical Life Graph vocabulary: labels, terminal statuses, \
                           property conventions, date fields, named queries, rules, and known \
@@ -4883,6 +4919,33 @@ fn seed_abstract_skill_catalog(graph: &GraphDomain) -> anyhow::Result<()> {
             ..Default::default()
         },
         AbstractSkillRecord {
+            skill_name: "lifegraph.gardener".into(),
+            description: "Keep the operator's LifeGraph pristine with graph science: life.audit \
+                          (components, orphans, hubs, duplicates, stale loops, conformance, \
+                          health_score) then one life.tidy step per suggested action; never \
+                          delete, never invent an id, report the delta and what needs judgment."
+                .into(),
+            implied_tools: vec![
+                "life.audit".into(),
+                "life.tidy".into(),
+                "life.list".into(),
+                "life.view.neighborhood".into(),
+                "life.recall".into(),
+                "life.commit".into(),
+                "life.resolve".into(),
+                "life.ontology".into(),
+            ],
+            validation_state: ansible_mesh_core::graph::SkillValidationState::Draft,
+            skill_markers: vec!["governed".into(), "life_graph".into(), "never_delete".into()],
+            field_sources: serde_json::json!({
+                "required_fields": [],
+                "optional_fields": ["labels", "max_actions", "duplicate_similarity", "stale_days"],
+                "repo_skill_path": "skills/lifegraph-gardener/SKILL.md",
+                "workflow": "life.audit -> one life.tidy step per suggested action -> life.audit again -> report delta"
+            }),
+            ..Default::default()
+        },
+        AbstractSkillRecord {
             skill_name: "context.synthesize".into(),
             description: "Restore session continuity at the start of a new conversation or after \
                           context compaction. Pull current state from hotel (session.status, \
@@ -5205,6 +5268,7 @@ fn seed_toolset_profiles(graph: &GraphDomain) -> anyhow::Result<()> {
             // ~47 tool schemas to ~10-15 for typical orchestrator turns.
             on_demand_skills: vec![
                 "life.steward".into(),
+                "lifegraph.gardener".into(),
                 "lifegraph.truth_summarizer".into(),
                 "cron.manage".into(),
                 "observability.pipeline".into(),
@@ -5353,6 +5417,7 @@ fn seed_toolset_profiles(graph: &GraphDomain) -> anyhow::Result<()> {
                 "session.recover".into(),
                 "cron.manage".into(),
                 "life.steward".into(),
+                "lifegraph.gardener".into(),
                 "lifegraph.truth_summarizer".into(),
             ],
             on_demand_skills: vec!["cron.manage".into()],
@@ -5461,6 +5526,7 @@ fn seed_toolset_profiles(graph: &GraphDomain) -> anyhow::Result<()> {
                 "context.synthesize".into(),
                 "profile.manage".into(),
                 "life.steward".into(),
+                "lifegraph.gardener".into(),
                 "lifegraph.truth_summarizer".into(),
                 "mesh.steward".into(),
             ],
@@ -5666,6 +5732,7 @@ fn seed_toolset_profiles(graph: &GraphDomain) -> anyhow::Result<()> {
                 "context.synthesize".into(),
                 "session.recover".into(),
                 "life.steward".into(),
+                "lifegraph.gardener".into(),
                 "lifegraph.truth_summarizer".into(),
             ],
             on_demand_skills: vec!["cron.manage".into()],
@@ -5725,7 +5792,9 @@ fn seed_toolset_profiles(graph: &GraphDomain) -> anyhow::Result<()> {
                     "life.list",
                     "life.ontology",
                     "life.patch.apply",
-                    "life.patch.list"
+                    "life.patch.list",
+                    "life.audit",
+                    "life.tidy"
                 ],
                 "execution_mode": "capability"
             });

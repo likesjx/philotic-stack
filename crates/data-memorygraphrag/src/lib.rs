@@ -5,6 +5,7 @@
 //! contracts into graph writes, context packets, or Muninn true-up requests.
 
 pub mod attention_observer;
+pub mod audit;
 pub mod cypher;
 pub mod entanglement;
 pub mod heartbeat;
@@ -993,6 +994,8 @@ pub enum LifeGraphToolName {
     LifeOntology,
     LifePatchApply,
     LifePatchList,
+    LifeAudit,
+    LifeTidy,
 }
 
 impl LifeGraphToolName {
@@ -1010,6 +1013,8 @@ impl LifeGraphToolName {
             Self::LifeOntology => "life.ontology",
             Self::LifePatchApply => "life.patch.apply",
             Self::LifePatchList => "life.patch.list",
+            Self::LifeAudit => "life.audit",
+            Self::LifeTidy => "life.tidy",
         }
     }
 
@@ -1023,6 +1028,7 @@ impl LifeGraphToolName {
                 | Self::LifeResolve
                 | Self::LifePatchPropose
                 | Self::LifePatchApply
+                | Self::LifeTidy
         )
     }
 }
@@ -2040,6 +2046,52 @@ impl LifeViewNeighborhoodInput {
     }
 }
 
+/// `life.audit` knobs. All optional; defaults match `audit::AuditOptions`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LifeAuditInput {
+    #[serde(default = "default_audit_max_actions")]
+    pub max_actions: usize,
+    #[serde(default = "default_audit_stale_days")]
+    pub stale_days: u32,
+    #[serde(default = "default_audit_similarity")]
+    pub duplicate_similarity: f32,
+    /// Restrict findings to these labels (empty = all).
+    #[serde(default)]
+    pub labels: Vec<String>,
+}
+
+fn default_audit_max_actions() -> usize {
+    25
+}
+fn default_audit_stale_days() -> u32 {
+    45
+}
+fn default_audit_similarity() -> f32 {
+    0.90
+}
+
+impl Default for LifeAuditInput {
+    fn default() -> Self {
+        Self {
+            max_actions: default_audit_max_actions(),
+            stale_days: default_audit_stale_days(),
+            duplicate_similarity: default_audit_similarity(),
+            labels: Vec::new(),
+        }
+    }
+}
+
+/// `life.tidy`: exactly one action per call, so the philote's plan evaluator
+/// can verify each step by its own tool result.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LifeTidyInput {
+    pub action: crate::audit::TidyAction,
+    /// Set when the operator explicitly asked for this action; lets a
+    /// `retire`/`resolve` touch a confirmed node.
+    #[serde(default)]
+    pub operator_approved: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "tool", content = "input", rename_all = "snake_case")]
 pub enum LifeGraphToolRequest {
@@ -2050,6 +2102,8 @@ pub enum LifeGraphToolRequest {
     LifeResolve(LifeResolveInput),
     LifePatchPropose(LifePatchProposalInput),
     LifeList(LifeListInput),
+    LifeAudit(LifeAuditInput),
+    LifeTidy(LifeTidyInput),
 }
 
 impl LifeGraphToolRequest {
@@ -2062,6 +2116,8 @@ impl LifeGraphToolRequest {
             Self::LifeResolve(_) => LifeGraphToolName::LifeResolve,
             Self::LifePatchPropose(_) => LifeGraphToolName::LifePatchPropose,
             Self::LifeList(_) => LifeGraphToolName::LifeList,
+            Self::LifeAudit(_) => LifeGraphToolName::LifeAudit,
+            Self::LifeTidy(_) => LifeGraphToolName::LifeTidy,
         }
     }
 }
@@ -2151,7 +2207,134 @@ impl MemoryGraphRagRunner {
                 self.plan_patch_propose_ext(input, ext)
             }
             LifeGraphToolRequest::LifeList(input) => self.plan_list_ext(input, ext),
+            LifeGraphToolRequest::LifeAudit(input) => self.plan_audit(input),
+            LifeGraphToolRequest::LifeTidy(input) => self.plan_tidy_ext(input, ext),
         }
+    }
+
+    /// `life.audit` is read-only: validate the knobs and the label filter.
+    fn plan_audit(&self, input: LifeAuditInput) -> Result<RunnerPlan, ContractError> {
+        let mut violations = Vec::new();
+        if !(0.5..=1.0).contains(&input.duplicate_similarity) {
+            violations.push(format!(
+                "duplicate_similarity {} must be within 0.5..=1.0",
+                input.duplicate_similarity
+            ));
+        }
+        if input.max_actions == 0 || input.max_actions > 200 {
+            violations.push(format!(
+                "max_actions {} must be within 1..=200",
+                input.max_actions
+            ));
+        }
+        for label in &input.labels {
+            if !ontology::is_known_label(label) {
+                violations.push(format!("labels contains unknown label '{label}'"));
+            }
+        }
+        if !violations.is_empty() {
+            return Err(ContractError { violations });
+        }
+        Ok(RunnerPlan {
+            tool_name: LifeGraphToolName::LifeAudit,
+            steps: vec![RunnerPlanStep {
+                target: RunnerPlanTarget::DataMemoryGraphRag,
+                action: "audit".into(),
+                payload: serde_json::json!({ "read_only": true }),
+            }],
+            requires_operator: false,
+            blocked_reasons: Vec::new(),
+        })
+    }
+
+    /// `life.tidy` is one governed write. Ids must be canonical `life:` ids
+    /// (a bare numeric id can only ever be the TARGET of a retire, where it
+    /// names the stray itself), rel types must be in the observe or
+    /// gardening vocabulary, and every action carries a reason so the node
+    /// records why it changed.
+    fn plan_tidy_ext(
+        &self,
+        input: LifeTidyInput,
+        ext: &ontology::OntologyExtensions,
+    ) -> Result<RunnerPlan, ContractError> {
+        use crate::audit::TidyAction;
+        let mut violations = Vec::new();
+        let ident_ok = |s: &str| {
+            !s.trim().is_empty()
+                && s.chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | ':' | '.'))
+        };
+        let canonical = |what: &str, id: &str, v: &mut Vec<String>| {
+            if !ident_ok(id) {
+                v.push(format!("{what} '{id}' is not a valid node id"));
+            } else if !id.contains(':') {
+                v.push(format!(
+                    "{what} '{id}' is not a canonical life:<label>:<slug> id — life.recall or \
+                     life.list first and use the exact id"
+                ));
+            }
+        };
+        let reason_ok = |r: &str, v: &mut Vec<String>| {
+            if r.trim().len() < 8 {
+                v.push("reason must say why (at least 8 characters)".into());
+            }
+        };
+        match &input.action {
+            TidyAction::RetireDuplicate {
+                duplicate_id,
+                keeper_id,
+                reason,
+            } => {
+                canonical("duplicate_id", duplicate_id, &mut violations);
+                canonical("keeper_id", keeper_id, &mut violations);
+                if duplicate_id == keeper_id {
+                    violations.push("duplicate_id and keeper_id are the same node".into());
+                }
+                reason_ok(reason, &mut violations);
+            }
+            TidyAction::Link {
+                from_id,
+                rel_type,
+                to_id,
+                reason,
+            } => {
+                canonical("from_id", from_id, &mut violations);
+                canonical("to_id", to_id, &mut violations);
+                let known = cypher::is_living_cycle_rel_type(rel_type)
+                    || cypher::agenda_rel_types().contains(&rel_type.as_str())
+                    || crate::audit::GARDENING_REL_TYPES.contains(&rel_type.as_str());
+                let _ = ext;
+                if !known || !rel_type.chars().all(|c| c.is_ascii_uppercase() || c == '_') {
+                    violations.push(format!(
+                        "rel_type '{rel_type}' is not in the edge vocabulary"
+                    ));
+                }
+                reason_ok(reason, &mut violations);
+            }
+            TidyAction::Resolve { node_id, reason } => {
+                canonical("node_id", node_id, &mut violations);
+                reason_ok(reason, &mut violations);
+            }
+            TidyAction::Retire { node_id, reason } => {
+                if !ident_ok(node_id) {
+                    violations.push(format!("node_id '{node_id}' is not a valid node id"));
+                }
+                reason_ok(reason, &mut violations);
+            }
+        }
+        if !violations.is_empty() {
+            return Err(ContractError { violations });
+        }
+        Ok(RunnerPlan {
+            tool_name: LifeGraphToolName::LifeTidy,
+            steps: vec![RunnerPlanStep {
+                target: RunnerPlanTarget::DataMemoryGraphRag,
+                action: input.action.kind().to_string(),
+                payload: serde_json::to_value(&input.action).unwrap_or_default(),
+            }],
+            requires_operator: false,
+            blocked_reasons: Vec::new(),
+        })
     }
 
     fn plan_list_ext(
