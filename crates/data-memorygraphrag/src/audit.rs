@@ -526,30 +526,28 @@ pub fn audit(nodes: &[AuditNode], edges: &[AuditEdge], opts: &AuditOptions) -> A
     for nd in nodes.iter().filter(|n| in_scope(n)) {
         let label = nd.label.as_str();
         if nd.is_live() && LOOP_LABELS.contains(&label) {
-            if let Some(d) = nd.best_date.as_deref() {
-                if let Some(days) = days_between(d, &now) {
-                    if days > 1 {
-                        stale.push(Finding {
-                            id: key_of(nd),
-                            label: nd.label.clone(),
-                            issue: "past_due".into(),
-                            detail: Some(format!("{days} days past {d}")),
-                        });
-                        continue;
-                    }
-                }
+            if let Some(d) = nd.best_date.as_deref()
+                && let Some(days) = days_between(d, &now)
+                && days > 1
+            {
+                stale.push(Finding {
+                    id: key_of(nd),
+                    label: nd.label.clone(),
+                    issue: "past_due".into(),
+                    detail: Some(format!("{days} days past {d}")),
+                });
+                continue;
             }
-            if let Some(o) = nd.observed_at.as_deref() {
-                if let Some(days) = days_between(o, &now) {
-                    if days >= i64::from(opts.stale_days) {
-                        stale.push(Finding {
-                            id: key_of(nd),
-                            label: nd.label.clone(),
-                            issue: "untouched".into(),
-                            detail: Some(format!("{days} days since observed")),
-                        });
-                    }
-                }
+            if let Some(o) = nd.observed_at.as_deref()
+                && let Some(days) = days_between(o, &now)
+                && days >= i64::from(opts.stale_days)
+            {
+                stale.push(Finding {
+                    id: key_of(nd),
+                    label: nd.label.clone(),
+                    issue: "untouched".into(),
+                    detail: Some(format!("{days} days since observed")),
+                });
             }
         }
         if DATED_LABELS.contains(&label) && nd.best_date.is_none() && nd.is_live() {
@@ -589,15 +587,15 @@ pub fn audit(nodes: &[AuditNode], edges: &[AuditEdge], opts: &AuditOptions) -> A
                 detail: nd.claim_summary.clone(),
             });
         }
-        if let Some(vs) = nd.validation_state.as_deref() {
-            if !VALIDATION_STATES.contains(&vs) {
-                conformance.push(Finding {
-                    id: key_of(nd),
-                    label: nd.label.clone(),
-                    issue: "unknown_validation_state".into(),
-                    detail: Some(vs.to_string()),
-                });
-            }
+        if let Some(vs) = nd.validation_state.as_deref()
+            && !VALIDATION_STATES.contains(&vs)
+        {
+            conformance.push(Finding {
+                id: key_of(nd),
+                label: nd.label.clone(),
+                issue: "unknown_validation_state".into(),
+                detail: Some(vs.to_string()),
+            });
         }
     }
     conformance.truncate(opts.max_actions);

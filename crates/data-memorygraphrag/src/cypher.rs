@@ -775,13 +775,14 @@ pub fn compile_tidy(
             )
         }
         TidyAction::Resolve { node_id, reason } => (
-            format!(concat!(
-                "MATCH (n {{id: $a}}) ",
+            concat!(
+                "MATCH (n {id: $a}) ",
                 "WHERE coalesce(n.validation_state, 'inferred') <> 'retired' ",
                 "SET n.status = 'resolved', n.resolved_at = $now, n.resolution_note = $reason, ",
                 "n.tidied_at = $now, n.tidied_by = $actor, n.tidy_reason = $reason ",
                 "RETURN n.id AS id, n.status AS status, n.validation_state AS validation_state"
-            )),
+            )
+            .to_string(),
             "resolve",
             node_id.clone(),
             String::new(),
