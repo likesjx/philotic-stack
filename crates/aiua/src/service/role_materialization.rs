@@ -1638,7 +1638,7 @@ impl IpcServer {
 
         // Resolve a bare hotel_name (the documented example, e.g. "vps-jane")
         // or an already-canonical node_id (e.g. "vps-jane-aiua-01") to the
-        // node_id every routing comparison actually keys on (DEF-113).
+        // node_id every routing comparison actually keys on (DEF-124).
         let resolved_target = match target_hotel.as_deref() {
             None => None,
             Some(hotel_ref) => match Self::resolve_hotel_node_id(graph, hotel_ref) {
@@ -1724,7 +1724,7 @@ impl IpcServer {
 
         // Resolve a bare hotel_name (the documented example, e.g. "vps-jane")
         // or an already-canonical node_id to the node_id every routing
-        // comparison and mesh envelope actually keys on (DEF-113).
+        // comparison and mesh envelope actually keys on (DEF-124).
         let Some(target_hotel) = Self::resolve_hotel_node_id(graph, &target_hotel) else {
             return IpcResponse::error(
                 "materialize_request",
@@ -1913,7 +1913,7 @@ mod tests {
     fn set_role_home_resolves_bare_hotel_name_to_real_node_id() {
         let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
         let graph = GraphDomain::new(Arc::new(graph_store.adapter()));
-        // DEF-113: hotel_name ("vps-jane", the tool's own documented example)
+        // DEF-124: hotel_name ("vps-jane", the tool's own documented example)
         // differs from the real node_id ("vps-jane-aiua-01") that every
         // cross-hotel routing comparison actually keys on.
         graph
@@ -2091,7 +2091,7 @@ mod tests {
     async fn materialize_request_dispatches_mesh_event_carrying_role_and_toolset_records() {
         let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
         let graph = GraphDomain::new(Arc::new(graph_store.adapter()));
-        // DEF-113: seed a hotel whose hotel_name ("vps-jane", the documented
+        // DEF-124: seed a hotel whose hotel_name ("vps-jane", the documented
         // target_hotel example) differs from its real node_id
         // ("vps-jane-aiua-01", what routing actually keys on), so this test
         // exercises the resolution, not a self-consistent coincidence.
@@ -2159,7 +2159,7 @@ mod tests {
         };
         assert_eq!(role_name, "orchestrator");
         // Resolved to the real node_id, not echoed back as the bare
-        // hotel_name that was passed in (DEF-113).
+        // hotel_name that was passed in (DEF-124).
         assert_eq!(target_hotel, "vps-jane-aiua-01");
 
         let cmd = rx.recv().await.expect("mesh envelope dispatched");
