@@ -680,6 +680,7 @@ impl IpcServer {
                     completion_route: delegation.completion_route.clone(),
                     failure_route: delegation.failure_route.clone(),
                     configured_ttl_secs: ttl,
+                    pending_delegation: Some(delegation.clone()),
                 },
             );
         }
@@ -1656,6 +1657,8 @@ impl IpcServer {
 
     pub(super) async fn handle_accept_subagent_lease(
         subagent_leases: &Arc<Mutex<RuntimeLeaseRegistry>>,
+        subagent_hooks: &SubagentHookRegistry,
+        inboxes: &InboxRegistry,
         subagent_guest_id: String,
     ) -> IpcResponse {
         // Worker calls this to acknowledge it has received and accepted the lease.
@@ -1664,9 +1667,57 @@ impl IpcServer {
         let lease = subagent_leases.lock().await.inspect(&scope);
         if lease.is_some() {
             info!("Subagent guest [{}] acknowledged lease.", subagent_guest_id);
+            // DEF-128: the worker is registered and listening now — hand it the
+            // delegation the hotel resolved at spawn time. Taken once; an
+            // explicit AssignSubagentTask from the parent still works as before.
+            let pending = {
+                let mut guard = subagent_hooks.lock().await;
+                guard.get_mut(&subagent_guest_id).and_then(|record| {
+                    record
+                        .pending_delegation
+                        .take()
+                        .map(|d| (record.persona_guest_id.clone(), d))
+                })
+            };
+            let mut delivered_task_id: Option<String> = None;
+            if let Some((persona_guest_id, delegation)) = pending {
+                match serde_json::to_string(&delegation) {
+                    Ok(task_json) => {
+                        let task_id = Uuid::new_v4();
+                        let delivered = Self::deliver_inbound_task(
+                            inboxes,
+                            &persona_guest_id,
+                            &delegation.subagent_kind,
+                            Some(&subagent_guest_id),
+                            task_id,
+                            task_json,
+                        )
+                        .await;
+                        if delivered {
+                            info!(
+                                "Subagent guest [{}] handed its delegation as task {} on lease accept.",
+                                subagent_guest_id, task_id
+                            );
+                            delivered_task_id = Some(task_id.to_string());
+                        } else {
+                            warn!(
+                                "Subagent guest [{}] accepted its lease but no inbox subscriber for role '{}' took the delegation; task {} not delivered.",
+                                subagent_guest_id, delegation.subagent_kind, task_id
+                            );
+                        }
+                    }
+                    Err(e) => warn!(
+                        "Subagent guest [{}]: could not serialise pending delegation: {}",
+                        subagent_guest_id, e
+                    ),
+                }
+            }
             IpcResponse::success(
                 "accept_subagent_lease",
-                Some(serde_json::json!({ "subagent_guest_id": subagent_guest_id })),
+                Some(serde_json::json!({
+                    "subagent_guest_id": subagent_guest_id,
+                    "delegation_task_id": delivered_task_id,
+                })),
             )
         } else {
             IpcResponse::error(
@@ -1980,6 +2031,94 @@ mod tests {
             }
             other => panic!("role incarnation must be allowed to spawn a subagent, got: {other:?}"),
         }
+
+        teardown_spawn_test_hotel(socket_path, server_task).await;
+    }
+
+    /// DEF-128: live 2026-09-14 20:51 UTC two `philote-worker` guests spawned
+    /// for `music.repertoire-gardener` registered, accepted their leases and
+    /// then idled until expiry — nothing ever sent them the delegation (the
+    /// philote's `subagent.spawn` tool stops at SpawnSubagentOk; only the
+    /// smoke driver ever called AssignSubagentTask). The hotel now hands the
+    /// worker the delegation it resolved at spawn time the moment the worker
+    /// accepts its lease.
+    #[tokio::test]
+    async fn spawned_worker_receives_its_delegation_on_lease_accept() {
+        let _env_guard = ipc_env_guard();
+        let (socket_path, _graph, server_task) = boot_spawn_test_hotel().await;
+
+        let mut parent = PhiloticClient::connect(GuestIdentity {
+            guest_id: "agent-jane-01".into(),
+            role: "agent".into(),
+            supported_tools: Vec::new(),
+        })
+        .await
+        .expect("parent connect");
+
+        let mut delegation = spawn_test_delegation();
+        delegation.subagent_kind = "philote-worker".into();
+        delegation.goal = "Link the eight MusicSection nodes to their pieces.".into();
+
+        let subagent_guest_id = match parent
+            .send_request(IpcRequest::SpawnSubagent {
+                session_id: "sess-subagent-assign".into(),
+                delegation,
+            })
+            .await
+            .expect("spawn subagent request")
+        {
+            IpcResponse::SpawnSubagentOk {
+                subagent_guest_id, ..
+            } => subagent_guest_id,
+            other => panic!("unexpected spawn response: {other:?}"),
+        };
+
+        // The worker binary's startup, in order: Register, AcceptSubagentLease,
+        // then wait for an InboundTask carrying the SubagentDelegation.
+        let mut worker = PhiloticClient::connect(GuestIdentity {
+            guest_id: subagent_guest_id.clone(),
+            role: "philote-worker".into(),
+            supported_tools: Vec::new(),
+        })
+        .await
+        .expect("worker connect");
+        let accepted = worker
+            .send_request(IpcRequest::AcceptSubagentLease {
+                subagent_guest_id: subagent_guest_id.clone(),
+            })
+            .await
+            .expect("accept lease request");
+        match accepted {
+            IpcResponse::Standard { ok, data, .. } => {
+                assert!(ok, "accept must succeed");
+                let task_id = data
+                    .as_ref()
+                    .and_then(|d| d.get("delegation_task_id"))
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string);
+                assert!(
+                    task_id.is_some(),
+                    "accept response must report the delivered delegation task id, got {data:?}"
+                );
+            }
+            other => panic!("unexpected accept response: {other:?}"),
+        }
+
+        let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
+        let goal = loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            assert!(!remaining.is_zero(), "worker never received its delegation");
+            let msg = tokio::time::timeout(remaining, worker.recv_task())
+                .await
+                .expect("worker inbox timed out")
+                .expect("worker inbox error");
+            if let IpcResponse::InboundTask { task_json, .. } = msg {
+                if let Ok(d) = serde_json::from_str::<SubagentDelegation>(&task_json) {
+                    break d.goal;
+                }
+            }
+        };
+        assert_eq!(goal, "Link the eight MusicSection nodes to their pieces.");
 
         teardown_spawn_test_hotel(socket_path, server_task).await;
     }
@@ -3330,6 +3469,7 @@ mod tests {
             completion_route: philotic_client::HookRoute::default(),
             failure_route: philotic_client::HookRoute::default(),
             configured_ttl_secs: ttl_secs,
+            pending_delegation: None,
         }
     }
 

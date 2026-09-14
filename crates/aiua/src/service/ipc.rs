@@ -87,6 +87,15 @@ pub(super) struct SubagentHookRecord {
     /// Lease TTL (seconds) the delegation skill configured at spawn time.
     /// Used to renew the subagent lease with the same terms it was acquired under.
     pub(super) configured_ttl_secs: u64,
+    /// The resolved delegation, held from SpawnSubagent until the worker
+    /// accepts its lease, then delivered to its inbox (DEF-128). The worker
+    /// registers ~30 ms after SpawnSubagentOk returns, and `deliver_inbound_task`
+    /// does not park, so a parent that assigned immediately would lose the
+    /// task — and the philote's `subagent.spawn` tool never assigned at all:
+    /// live 2026-09-14 20:51 UTC two workers spawned for
+    /// `music.repertoire-gardener` sat "Worker idle — waiting for
+    /// SubagentDelegation…" until their leases expired.
+    pub(super) pending_delegation: Option<philotic_client::SubagentDelegation>,
 }
 
 /// Maps `subagent_guest_id` → routing record.
@@ -7223,7 +7232,13 @@ impl IpcServer {
                 )
             }
             IpcRequest::AcceptSubagentLease { subagent_guest_id } => {
-                Self::handle_accept_subagent_lease(subagent_leases, subagent_guest_id).await
+                Self::handle_accept_subagent_lease(
+                    subagent_leases,
+                    subagent_hooks,
+                    inboxes,
+                    subagent_guest_id,
+                )
+                .await
             }
             IpcRequest::ConfigureRole {
                 agent_id,
