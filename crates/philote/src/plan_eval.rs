@@ -814,6 +814,7 @@ fn step_tool_is_read_only(step: &PlanStep) -> bool {
     let tool = tool.trim().to_ascii_lowercase();
     const READ_ONLY_SUFFIXES: &[&str] = &[
         ".recall",
+        ".audit",
         ".recall.feedback",
         ".list",
         ".search",
