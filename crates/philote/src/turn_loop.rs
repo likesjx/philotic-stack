@@ -3758,6 +3758,57 @@ impl AgentRuntime {
         self.maybe_autocapture_life_fact(&session_id, memory_candidate.as_ref())
             .await;
 
+        // Claim audit: a turn WITH tool calls can still over-claim. Every
+        // LifeGraph id the reply cites must either have been written by a
+        // successful write call in this turn or already been in the turn's
+        // context (recalled, returned by a read tool, or in the message).
+        // Anything else is presented as recorded and is not — live
+        // 2026-09-12 11:00 UTC, "Successfully created the proposed Trip node
+        // (`life:trip:utah_20260928_20261004`)" in a turn whose only writes
+        // were four Person observes (the trip landed two turns later).
+        let unbacked_ids = self
+            .sessions
+            .get(&session_id)
+            .and_then(|s| s.active_turn.as_ref())
+            .map(|t| unbacked_cited_ids(&content, t))
+            .unwrap_or_default();
+        let content = if unbacked_ids.is_empty() {
+            content
+        } else {
+            warn!(
+                session_id = %session_id,
+                ids = ?unbacked_ids,
+                "claim audit: reply cites LifeGraph ids no tool call in this turn wrote"
+            );
+            let _ = self
+                .emit_turn_event(
+                    &session_id,
+                    "claim_audit",
+                    Some(format!("unbacked ids: {}", unbacked_ids.join(", "))),
+                )
+                .await;
+            format!(
+                "{}\n\n⚠️ Correction: {} cited above as recorded, but no tool call in this turn \
+                 wrote {} — treat {} as not yet on the LifeGraph.",
+                content.trim_end(),
+                unbacked_ids
+                    .iter()
+                    .map(|id| format!("`{id}`"))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                if unbacked_ids.len() == 1 {
+                    "it"
+                } else {
+                    "them"
+                },
+                if unbacked_ids.len() == 1 {
+                    "it"
+                } else {
+                    "them"
+                },
+            )
+        };
+
         let plan_budget = self.plan_continuation_budget_for(&session_id);
         let (
             completed_turn,
@@ -4563,6 +4614,91 @@ pub(super) const SAY_DO_UNEXECUTED_TRAILER: &str = "⚠️ Correction: no tool c
 turn, so nothing described above as executed or logged has actually been written yet. Reply \
 \"go\" to have me do it.";
 
+/// LifeGraph tools whose successful call counts as having written the node
+/// named in its arguments.
+const LIFE_WRITE_TOOLS: &[&str] = &[
+    "life.observe",
+    "life.observe.batch",
+    "life.commit",
+    "life.resolve",
+    "life.patch.propose",
+    "life.patch.apply",
+    "graph.mutate",
+    "graph.query",
+];
+
+/// Every `life:<label>:<slug>` id mentioned in `text`, deduplicated, in
+/// order of first appearance.
+pub(super) fn cited_life_ids(text: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let bytes = text.as_bytes();
+    let mut i = 0;
+    while let Some(pos) = text[i..].find("life:") {
+        let start = i + pos;
+        // Must not be the tail of a longer token (e.g. "wildlife:").
+        if start > 0 && (bytes[start - 1] as char).is_ascii_alphanumeric() {
+            i = start + 5;
+            continue;
+        }
+        let mut end = start;
+        for (off, ch) in text[start..].char_indices() {
+            if ch.is_ascii_alphanumeric() || ch == '_' || ch == '-' || ch == ':' {
+                end = start + off + ch.len_utf8();
+            } else {
+                break;
+            }
+        }
+        let id = text[start..end].trim_end_matches(':').to_string();
+        // `life:person:nadi` — two colons past "life"; a bare `life:x` is a
+        // label mention, not a node id.
+        if id.matches(':').count() >= 2 && !out.contains(&id) {
+            out.push(id);
+        }
+        i = end.max(start + 5);
+    }
+    out
+}
+
+/// Cited LifeGraph ids that nothing in this turn backs: not written by a
+/// successful write call, and not already known to the turn (recalled
+/// record, read-tool result, or the operator's own message).
+pub(super) fn unbacked_cited_ids(reply: &str, turn: &WorkingTurn) -> Vec<String> {
+    let cited = cited_life_ids(reply);
+    if cited.is_empty() {
+        return Vec::new();
+    }
+    let mut known = String::new();
+    known.push_str(&turn.user_content);
+    for m in &turn.recalled_memories {
+        if let Some(id) = m.id.as_deref() {
+            known.push(' ');
+            known.push_str(id);
+        }
+        known.push(' ');
+        known.push_str(&m.content);
+    }
+    let mut written = String::new();
+    for (call, result) in &turn.working_tool_history {
+        let ok = crate::plan_eval::tool_result_looks_ok(result);
+        if ok && LIFE_WRITE_TOOLS.contains(&call.tool_name.as_str()) {
+            written.push(' ');
+            written.push_str(&serde_json::to_string(&call.arguments).unwrap_or_default());
+            // A write's own result names the node it landed (observe
+            // batches report per-item ids here, not in the arguments).
+            written.push(' ');
+            written.push_str(&result.content);
+        } else {
+            // Read results (recall/list/query rows) make an id known.
+            known.push(' ');
+            known.push_str(&result.content);
+        }
+    }
+    cited
+        .into_iter()
+        .filter(|id| !written.contains(id.as_str()) && !known.contains(id.as_str()))
+        .collect()
+}
+
 /// Does this reply tell the user that a write already happened?
 ///
 /// The past-tense twin of [`reply_promises_unexecuted_action`]. Only
@@ -5037,6 +5173,7 @@ pub(super) fn carryover_resume_followup(
 
 #[cfg(test)]
 mod say_do_tests {
+    use super::super::tests::test_working_turn;
     use super::*;
 
     /// Live 2026-09-11 13:26 UTC: the reply that announced a four-step
@@ -5084,6 +5221,109 @@ mod say_do_tests {
         assert!(!reply_claims_unbacked_write(
             "I logged in to the portal yesterday and it was slow."
         ));
+    }
+
+    #[test]
+    fn cited_life_ids_are_extracted_once_each() {
+        let ids = cited_life_ids(
+            "Logged **Nadi** (`life:person:nadi`) and the trip (`life:trip:utah_20260928_20261004`). \
+             See life:open-loop:9f6582d872771771, and again `life:person:nadi`. The wildlife:x label \
+             and the bare `life:person` mention are not ids.",
+        );
+        assert_eq!(
+            ids,
+            vec![
+                "life:person:nadi",
+                "life:trip:utah_20260928_20261004",
+                "life:open-loop:9f6582d872771771"
+            ]
+        );
+    }
+
+    fn turn_with(user: &str, history: Vec<(&str, serde_json::Value, &str)>) -> WorkingTurn {
+        let mut t = test_working_turn(TurnPhase::Thinking);
+        t.user_content = user.into();
+        t.working_tool_history = history
+            .into_iter()
+            .map(|(tool, args, result)| {
+                (
+                    ToolCall {
+                        tool_name: tool.into(),
+                        arguments: args,
+                    },
+                    ToolResult {
+                        tool_name: tool.into(),
+                        content: result.into(),
+                    },
+                )
+            })
+            .collect();
+        t
+    }
+
+    /// Live 2026-09-12 11:00:27 UTC: four Person observes, and a reply that
+    /// also claimed the Utah trip node — written two turns later.
+    #[test]
+    fn claim_audit_flags_ids_no_write_backed() {
+        let obs = |id: &str| serde_json::json!({"evidence": {"claim_ref": {"id": id, "label": "Person"}}});
+        let turn = turn_with(
+            "[Plan continuation 1/3] log key contacts",
+            vec![
+                (
+                    "life.observe",
+                    obs("life:person:nadi"),
+                    r#"{"status":"proposed","node_id":"life:person:nadi"}"#,
+                ),
+                (
+                    "life.observe",
+                    obs("life:person:daxton"),
+                    r#"{"status":"proposed","node_id":"life:person:daxton"}"#,
+                ),
+                (
+                    "life.recall",
+                    serde_json::json!({"query_text": "loops"}),
+                    r#"{"rows":[{"id":"life:open-loop:9f6582d872771771"}]}"#,
+                ),
+            ],
+        );
+        let reply = "Logged Nadi (`life:person:nadi`) and Daxton (`life:person:daxton`). \
+                     Successfully created the Trip node (`life:trip:utah_20260928_20261004`). \
+                     Still waiting on `life:open-loop:9f6582d872771771`.";
+        assert_eq!(
+            unbacked_cited_ids(reply, &turn),
+            vec!["life:trip:utah_20260928_20261004"]
+        );
+    }
+
+    #[test]
+    fn claim_audit_accepts_recalled_and_user_supplied_ids() {
+        let mut turn = turn_with(
+            "please resolve life:commitment:mei_due_date_update_20260909",
+            vec![],
+        );
+        turn.recalled_memories = vec![RecalledMemoryRecord {
+            id: Some("life:open_loop:toastmasters_icebreaker_speech_20260906".into()),
+            vault_id: Some("life-graph".into()),
+            concept: "OpenLoop".into(),
+            content: "Icebreaker speech project".into(),
+            ..Default::default()
+        }];
+        let reply = "Your loop `life:open_loop:toastmasters_icebreaker_speech_20260906` is still open; \
+                     I can resolve `life:commitment:mei_due_date_update_20260909` when you say go.";
+        assert!(unbacked_cited_ids(reply, &turn).is_empty());
+        // A failed write does not back a claim.
+        let failed = turn_with(
+            "x",
+            vec![(
+                "life.commit",
+                serde_json::json!({"evidence": {"claim_ref": {"id": "life:commitment:new"}}}),
+                "Error: life.commit target not found",
+            )],
+        );
+        assert_eq!(
+            unbacked_cited_ids("Resolved `life:commitment:new`.", &failed),
+            vec!["life:commitment:new"]
+        );
     }
 
     #[test]
