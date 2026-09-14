@@ -2374,6 +2374,14 @@ pub enum IpcRequest {
         role_name: String,
         calling_role: String,
         target_hotel: String,
+        /// Relocation Ceremony R4 (Feasibility and placement): when `true`,
+        /// the target only runs its feasibility checks (binary resolvable,
+        /// live primary controller, build-version match) and replies with
+        /// the outcome — it never upserts a record or spawns a process.
+        /// Defaults to `false` (R3's original STANDBY-commit behavior) so
+        /// existing callers are unaffected.
+        #[serde(default)]
+        dry_run: bool,
     },
     /// Poll the outcome of a prior [`IpcRequest::MaterializeRequest`].
     MaterializeStatus {

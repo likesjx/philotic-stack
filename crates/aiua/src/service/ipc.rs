@@ -2461,6 +2461,15 @@ impl IpcServer {
         let source_hotel = Self::local_hotel_name(graph, local_node_id).ok_or_else(|| {
             anyhow::anyhow!("local hotel record missing for node [{local_node_id}]")
         })?;
+        // R4 (G8): this hotel's own build, for the version-compatibility
+        // ranking signal below. Empty if this hotel's own record predates
+        // the `build_version` field — treated as unknown, not a mismatch.
+        let source_build_version = graph
+            .get_hotel(&source_hotel)
+            .ok()
+            .flatten()
+            .map(|hotel| hotel.capabilities.build_version)
+            .unwrap_or_default();
 
         if let (Some(agent_id), Some(role_name)) = (agent_id, role_name) {
             if let Some(role) = graph.get_role_incarnation(agent_id, role_name)? {
@@ -2527,6 +2536,28 @@ impl IpcServer {
             }
         }));
 
+        // R4 (Feasibility and placement, G8): the primary model-controller
+        // role this placement would need, so candidates missing a live
+        // controller for it can be penalized rather than silently ranked as
+        // if any candidate were equally viable. Best-effort from gossiped
+        // state (a candidate hasn't been asked yet, unlike the authoritative
+        // target-side check in `evaluate_role_relocation_feasibility`).
+        let primary_controller_tier = agent_id.zip(role_name).and_then(|(agent_id, role_name)| {
+            graph
+                .get_role_incarnation(agent_id, role_name)
+                .ok()
+                .flatten()
+                .map(|role| {
+                    role.turn_loop_config
+                        .fallback_tiers
+                        .first()
+                        .cloned()
+                        .unwrap_or_else(|| {
+                            ansible_mesh_core::model_routing::DEFAULT_FALLBACK_TIERS[0].to_string()
+                        })
+                })
+        });
+
         for status in guard.active_nodes() {
             let healthy = guard.is_node_healthy(&status.capabilities.node_id);
             let tool_match = tool_name.map_or(true, |needle| {
@@ -2564,6 +2595,71 @@ impl IpcServer {
             {
                 score -= 10;
             }
+
+            // R4 (G8): headroom. `node_health` is `None` for a peer that has
+            // never reported (older build, or not seen yet) — treated as
+            // neutral, never penalized for silence.
+            let mem_free_pct = status.node_health.as_ref().and_then(|h| h.mem_free_pct);
+            let disk_free_pct = status.node_health.as_ref().and_then(|h| h.disk_free_pct);
+            let low_headroom = mem_free_pct.is_some_and(|pct| pct < 10.0)
+                || disk_free_pct.is_some_and(|pct| pct < 10.0);
+            let ample_headroom = mem_free_pct.is_some_and(|pct| pct > 30.0)
+                && disk_free_pct.is_some_and(|pct| pct > 30.0);
+            if low_headroom {
+                score -= 20;
+            } else if ample_headroom {
+                score += 10;
+            }
+
+            // R4 (G8): max_concurrent_jobs. Only meaningful when both the
+            // candidate's declared capacity and its current guest count are
+            // known; silent otherwise rather than guessing.
+            let at_capacity = match (
+                status.capabilities.constraints.max_concurrent_jobs,
+                status.node_health.as_ref().and_then(|h| h.guest_count),
+            ) {
+                (Some(max), Some(count)) => count >= max,
+                _ => false,
+            };
+            if at_capacity {
+                score -= 25;
+            }
+
+            // R4 (G8): controller resource presence. Gossiped guest roster
+            // (`HotelStateSync`) is the same data `evaluate_role_relocation_feasibility`
+            // checks live on the target — here it's a ranking signal, not a
+            // hard gate, since a stale gossip snapshot could be wrong in
+            // either direction and this is only choosing whom to ask.
+            let controller_present = primary_controller_tier.as_deref().map(|tier| {
+                guard
+                    .remote_hotel_states()
+                    .find(|remote| remote.node_id == status.capabilities.node_id)
+                    .is_some_and(|remote| {
+                        remote
+                            .guests
+                            .iter()
+                            .any(|guest| guest.role == tier && guest.active)
+                    })
+            });
+            match controller_present {
+                Some(true) => score += 10,
+                Some(false) => score -= 30,
+                None => {}
+            }
+
+            // R4 (G8): version compatibility. Empty `build_version` means an
+            // older build (field didn't exist yet) — unknown, not a mismatch.
+            let version_compatible = if source_build_version.is_empty()
+                || status.capabilities.build_version.is_empty()
+            {
+                None
+            } else {
+                Some(status.capabilities.build_version == source_build_version)
+            };
+            if version_compatible == Some(false) {
+                score -= 40;
+            }
+
             candidates.push(serde_json::json!({
                 "node_id": status.capabilities.node_id,
                 "hotel_name": Self::target_hotel_name(graph, status, &source_hotel),
@@ -2572,6 +2668,10 @@ impl IpcServer {
                 "tool_match": tool_match,
                 "role_match": role_match,
                 "execution_reachable": status.execution_reachability.is_some(),
+                "controller_present": controller_present,
+                "at_capacity": at_capacity,
+                "low_headroom": low_headroom,
+                "version_compatible": version_compatible,
             }));
         }
         drop(guard);
@@ -6775,6 +6875,7 @@ impl IpcServer {
                 role_name,
                 calling_role,
                 target_hotel,
+                dry_run,
             } => {
                 Self::handle_materialize_request(
                     graph,
@@ -6785,6 +6886,7 @@ impl IpcServer {
                     role_name,
                     calling_role,
                     target_hotel,
+                    dry_run,
                 )
                 .await
             }
@@ -8771,6 +8873,7 @@ impl IpcServer {
                     models: vec![],
                     tools: vec![],
                     constraints: NodeConstraints::default(),
+                    build_version: String::new(),
                 };
                 let ad = CapabilityAdvertisement {
                     hotel_id,
@@ -15012,6 +15115,67 @@ impl IpcServer {
         let agent_id = role_record.agent_id.clone();
         let role_name = role_record.role_name.clone();
         let guest_id = role_record.guest_id.clone();
+        let dry_run = payload
+            .get("dry_run")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let requester_build_version = payload
+            .get("requester_build_version")
+            .and_then(|v| v.as_str());
+
+        // Relocation Ceremony R4 (Feasibility and placement): decline loudly
+        // before ever upserting or spawning anything, whether this is a
+        // dry-run probe or a real STANDBY commit. `hotel_name` falls back to
+        // `local_node_id` itself only if this hotel's own record can't be
+        // found — a state so broken the checks below would be meaningless
+        // anyway, so proceeding is no worse than declining here.
+        let hotel_name = Self::local_hotel_name(graph, local_node_id)
+            .unwrap_or_else(|| local_node_id.to_string());
+        let decline_reasons = Self::evaluate_role_relocation_feasibility(
+            graph,
+            &hotel_name,
+            &role_record,
+            requester_build_version,
+        );
+        if !decline_reasons.is_empty() {
+            info!(
+                "Materialize request [{}] declined for role '{}' (agent '{}'): {}",
+                request_id,
+                role_name,
+                agent_id,
+                decline_reasons.join("; ")
+            );
+            Self::reply_materialize_ready(
+                &dispatcher_tx,
+                local_node_id,
+                source_node_id,
+                &request_id,
+                &guest_id,
+                false,
+                None,
+                Some(decline_reasons.join("; ")),
+            )
+            .await;
+            return;
+        }
+        if dry_run {
+            info!(
+                "Materialize request [{}] feasible (dry_run) for role '{}' (agent '{}') — no changes made",
+                request_id, role_name, agent_id
+            );
+            Self::reply_materialize_ready(
+                &dispatcher_tx,
+                local_node_id,
+                source_node_id,
+                &request_id,
+                &guest_id,
+                true,
+                Some("feasible".to_string()),
+                None,
+            )
+            .await;
+            return;
+        }
 
         role_record.readiness_state = ansible_mesh_core::graph::RoleReadinessState::Configured;
         if let Err(err) = graph.upsert_role_incarnation(&role_record) {
@@ -20807,6 +20971,7 @@ pub(crate) mod tests {
                         models: vec![],
                         tools: vec![],
                         constraints: Default::default(),
+                        build_version: String::new(),
                     },
                     mesh_port: 9000,
                     blob_port: 9001,
@@ -21009,6 +21174,7 @@ pub(crate) mod tests {
                     models: vec![],
                     tools: vec![],
                     constraints: Default::default(),
+                    build_version: String::new(),
                 },
                 mesh_port: 9000,
                 blob_port: 9001,
@@ -21077,6 +21243,7 @@ pub(crate) mod tests {
                     models: vec![],
                     tools: vec![],
                     constraints: Default::default(),
+                    build_version: String::new(),
                 },
                 mesh_port: 9000,
                 blob_port: 9001,
@@ -21461,6 +21628,7 @@ pub(crate) mod tests {
                     models: vec![],
                     tools: vec![],
                     constraints: Default::default(),
+                    build_version: String::new(),
                 },
                 mesh_port: 9000,
                 blob_port: 9001,
@@ -22099,6 +22267,7 @@ pub(crate) mod tests {
                     models: vec![],
                     tools: vec![],
                     constraints: Default::default(),
+                    build_version: String::new(),
                 },
                 mesh_port: 9000,
                 blob_port: 9001,
@@ -22406,6 +22575,7 @@ pub(crate) mod tests {
                     models: vec![],
                     tools: vec![],
                     constraints: Default::default(),
+                    build_version: String::new(),
                 },
                 mesh_port: 9000,
                 blob_port: 9001,
@@ -22545,6 +22715,7 @@ pub(crate) mod tests {
                     models: vec![],
                     tools: vec![],
                     constraints: Default::default(),
+                    build_version: String::new(),
                 },
                 mesh_port: 9000,
                 blob_port: 9001,
@@ -23410,6 +23581,7 @@ pub(crate) mod tests {
                     models: vec![],
                     tools: vec![],
                     constraints: Default::default(),
+                    build_version: String::new(),
                 },
                 None,
                 None,
@@ -23753,6 +23925,7 @@ pub(crate) mod tests {
                     models: vec![],
                     tools: vec![],
                     constraints: Default::default(),
+                    build_version: String::new(),
                 },
                 mesh_port: 9000,
                 blob_port: 9001,
@@ -24308,6 +24481,7 @@ pub(crate) mod tests {
                     models: vec![],
                     tools: vec![],
                     constraints: Default::default(),
+                    build_version: String::new(),
                 },
                 mesh_port: 9000,
                 blob_port: 9001,
@@ -24460,6 +24634,7 @@ pub(crate) mod tests {
                     models: vec![],
                     tools: vec![],
                     constraints: Default::default(),
+                    build_version: String::new(),
                 },
                 mesh_port: 9000,
                 blob_port: 9001,
@@ -24598,6 +24773,7 @@ pub(crate) mod tests {
                     models: vec![],
                     tools: vec![],
                     constraints: Default::default(),
+                    build_version: String::new(),
                 },
                 mesh_port: 9000,
                 blob_port: 9001,
@@ -24740,6 +24916,7 @@ pub(crate) mod tests {
                     models: vec![],
                     tools: vec![],
                     constraints: Default::default(),
+                    build_version: String::new(),
                 },
                 mesh_port: 9000,
                 blob_port: 9001,
@@ -24892,6 +25069,7 @@ pub(crate) mod tests {
                     models: vec![],
                     tools: vec![],
                     constraints: Default::default(),
+                    build_version: String::new(),
                 },
                 mesh_port: 9000,
                 blob_port: 9001,
@@ -25046,6 +25224,7 @@ pub(crate) mod tests {
                     models: vec![],
                     tools: vec![],
                     constraints: Default::default(),
+                    build_version: String::new(),
                 },
                 mesh_port: 9000,
                 blob_port: 9001,
@@ -25279,6 +25458,7 @@ pub(crate) mod tests {
                 models: vec![],
                 tools: vec![],
                 constraints: Default::default(),
+                build_version: String::new(),
             },
             vec![],
             None,
@@ -25367,6 +25547,7 @@ pub(crate) mod tests {
                 models: vec![],
                 tools: vec![],
                 constraints: Default::default(),
+                build_version: String::new(),
             },
             vec![CapabilityAdvertisement {
                 hotel_id: "aria-architect-hotel".into(),
@@ -25930,6 +26111,7 @@ pub(crate) mod tests {
                     models: vec![],
                     tools: vec![],
                     constraints: Default::default(),
+                    build_version: String::new(),
                 },
                 mesh_port: 9000,
                 blob_port: 9001,
@@ -26030,6 +26212,7 @@ pub(crate) mod tests {
                     models: vec![],
                     tools: vec![],
                     constraints: Default::default(),
+                    build_version: String::new(),
                 },
                 mesh_port: 9000,
                 blob_port: 9001,
@@ -26292,6 +26475,7 @@ pub(crate) mod tests {
                     models: vec![],
                     tools: vec![],
                     constraints: Default::default(),
+                    build_version: String::new(),
                 },
                 mesh_port: 9000,
                 blob_port: 9001,
@@ -27415,6 +27599,7 @@ pub(crate) mod tests {
                 models: vec!["gemini".into()],
                 tools: vec![],
                 constraints: Default::default(),
+                build_version: String::new(),
             },
             vec![CapabilityAdvertisement {
                 hotel_id: "aria-architect-hotel".into(),
@@ -27541,6 +27726,7 @@ pub(crate) mod tests {
                 models: vec!["gemini".into()],
                 tools: vec![],
                 constraints: Default::default(),
+                build_version: String::new(),
             },
             vec![CapabilityAdvertisement {
                 hotel_id: "aria-architect-hotel".into(),
@@ -27679,6 +27865,7 @@ pub(crate) mod tests {
                 models: vec!["gemini".into()],
                 tools: vec![],
                 constraints: Default::default(),
+                build_version: String::new(),
             },
             vec![CapabilityAdvertisement {
                 hotel_id: "aria-architect-hotel".into(),
@@ -27818,6 +28005,7 @@ pub(crate) mod tests {
                 models: vec!["gemini".into()],
                 tools: vec![],
                 constraints: Default::default(),
+                build_version: String::new(),
             },
             vec![CapabilityAdvertisement {
                 hotel_id: "aria-architect-hotel".into(),
@@ -28391,6 +28579,7 @@ pub(crate) mod tests {
                     latency_hint_ms: Some(10),
                     trust_level: None,
                 },
+                build_version: String::new(),
             },
             vec![CapabilityAdvertisement {
                 hotel_id: "aria-architect-hotel".into(),
@@ -30840,6 +31029,7 @@ pub(crate) mod tests {
                     models: vec![],
                     tools: vec![],
                     constraints: Default::default(),
+                    build_version: String::new(),
                 },
                 mesh_port: 9000,
                 blob_port: 9001,
@@ -30861,6 +31051,7 @@ pub(crate) mod tests {
                         models: vec![],
                         tools: vec![],
                         constraints: Default::default(),
+                        build_version: String::new(),
                     },
                     mesh_port: 9000,
                     blob_port: 9001,
@@ -30983,6 +31174,7 @@ pub(crate) mod tests {
                     models: vec![],
                     tools: vec![],
                     constraints: Default::default(),
+                    build_version: String::new(),
                 },
                 mesh_port: 9000,
                 blob_port: 9001,
@@ -31003,6 +31195,7 @@ pub(crate) mod tests {
                     models: vec![],
                     tools: vec![],
                     constraints: Default::default(),
+                    build_version: String::new(),
                 },
                 mesh_port: 9010,
                 blob_port: 9011,
@@ -31129,6 +31322,7 @@ pub(crate) mod tests {
                     models: vec![],
                     tools: vec![],
                     constraints: Default::default(),
+                    build_version: String::new(),
                 },
                 mesh_port: 9000,
                 blob_port: 9001,
@@ -31191,6 +31385,7 @@ pub(crate) mod tests {
                     models: vec![],
                     tools: vec![],
                     constraints: Default::default(),
+                    build_version: String::new(),
                 },
                 mesh_port: 9000,
                 blob_port: 9001,
@@ -31283,6 +31478,7 @@ pub(crate) mod tests {
                     models: vec![],
                     tools: vec![],
                     constraints: Default::default(),
+                    build_version: String::new(),
                 },
                 mesh_port: 9000,
                 blob_port: 9001,
@@ -31373,6 +31569,7 @@ pub(crate) mod tests {
                     models: vec![],
                     tools: vec![],
                     constraints: Default::default(),
+                    build_version: String::new(),
                 },
                 mesh_port: 9000,
                 blob_port: 9001,
@@ -31390,6 +31587,7 @@ pub(crate) mod tests {
                 models: vec![],
                 tools: vec!["tool.local.status@1".into()],
                 constraints: Default::default(),
+                build_version: String::new(),
             },
             vec![CapabilityAdvertisement {
                 hotel_id: "local-hotel".into(),
@@ -31417,6 +31615,7 @@ pub(crate) mod tests {
                 models: vec!["model.gemini-2.5-pro@2026.1".into()],
                 tools: vec!["tool.remote.restart@1".into()],
                 constraints: Default::default(),
+                build_version: String::new(),
             },
             vec![CapabilityAdvertisement {
                 hotel_id: "remote-hotel".into(),
@@ -31512,6 +31711,7 @@ pub(crate) mod tests {
                     models: vec![],
                     tools: vec![],
                     constraints: Default::default(),
+                    build_version: String::new(),
                 },
                 mesh_port: 9000,
                 blob_port: 9001,
@@ -31530,6 +31730,7 @@ pub(crate) mod tests {
                     models: vec![],
                     tools: vec![],
                     constraints: Default::default(),
+                    build_version: String::new(),
                 },
                 mesh_port: 9100,
                 blob_port: 9101,
@@ -31547,6 +31748,7 @@ pub(crate) mod tests {
                 models: vec![],
                 tools: vec![],
                 constraints: Default::default(),
+                build_version: String::new(),
             },
             vec![CapabilityAdvertisement {
                 hotel_id: "remote-hotel".into(),
@@ -31645,6 +31847,7 @@ pub(crate) mod tests {
                     models: vec![],
                     tools: vec![],
                     constraints: Default::default(),
+                    build_version: String::new(),
                 },
                 mesh_port: 9000,
                 blob_port: 9001,
@@ -31677,6 +31880,7 @@ pub(crate) mod tests {
                     models: vec![],
                     tools: vec![],
                     constraints: Default::default(),
+                    build_version: String::new(),
                 },
                 mesh_port: 9100,
                 blob_port: 9101,
@@ -31694,6 +31898,7 @@ pub(crate) mod tests {
                 models: vec![],
                 tools: vec![],
                 constraints: Default::default(),
+                build_version: String::new(),
             },
             vec![CapabilityAdvertisement {
                 hotel_id: "remote-hotel".into(),
@@ -31784,6 +31989,7 @@ pub(crate) mod tests {
                     models: vec![],
                     tools: vec![],
                     constraints: Default::default(),
+                    build_version: String::new(),
                 },
                 mesh_port: 9000,
                 blob_port: 9001,
@@ -31825,6 +32031,7 @@ pub(crate) mod tests {
                 models: vec![],
                 tools: vec![],
                 constraints: Default::default(),
+                build_version: String::new(),
             },
             vec![CapabilityAdvertisement {
                 hotel_id: "local-hotel".into(),
@@ -31953,6 +32160,7 @@ pub(crate) mod tests {
                     models: vec![],
                     tools: vec![],
                     constraints: Default::default(),
+                    build_version: String::new(),
                 },
                 mesh_port: 9000,
                 blob_port: 9001,
@@ -32129,6 +32337,7 @@ pub(crate) mod tests {
                     models: vec![],
                     tools: vec![],
                     constraints: Default::default(),
+                    build_version: String::new(),
                 },
                 mesh_port: 9000,
                 blob_port: 9001,
@@ -32147,6 +32356,7 @@ pub(crate) mod tests {
                     models: vec![],
                     tools: vec![],
                     constraints: Default::default(),
+                    build_version: String::new(),
                 },
                 mesh_port: 9100,
                 blob_port: 9101,
@@ -32164,6 +32374,7 @@ pub(crate) mod tests {
                 models: vec![],
                 tools: vec![],
                 constraints: Default::default(),
+                build_version: String::new(),
             },
             vec![CapabilityAdvertisement {
                 hotel_id: "remote-hotel".into(),
@@ -32197,6 +32408,7 @@ pub(crate) mod tests {
                     models: vec![],
                     tools: vec![],
                     constraints: Default::default(),
+                    build_version: String::new(),
                 },
                 mesh_port: 9100,
                 blob_port: 9101,
@@ -32214,6 +32426,7 @@ pub(crate) mod tests {
                 models: vec![],
                 tools: vec![],
                 constraints: Default::default(),
+                build_version: String::new(),
             },
             vec![],
             Some(ExecutionReachability {
@@ -32496,6 +32709,7 @@ pub(crate) mod tests {
                     models: vec![],
                     tools: vec![],
                     constraints: Default::default(),
+                    build_version: String::new(),
                 },
                 mesh_port: 9000,
                 blob_port: 9001,
