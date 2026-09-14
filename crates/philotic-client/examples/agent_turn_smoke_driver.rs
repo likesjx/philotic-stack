@@ -55,7 +55,7 @@ async fn main() -> Result<()> {
             target_agent_id: target_agent.clone(),
             operator_session_id: operator_session_id.clone(),
             conversation_id: None,
-            content: content.into(),
+            content,
         }),
     )
     .await
