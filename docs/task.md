@@ -1942,6 +1942,20 @@ Order: P0 → P1 → P2 ∥ P3 → P4. P5 deferred.
 - [ ] P5 `procedure-generative-guidance` — deferred until P2 has a watched-live baseline
 - [ ] Deploy + watched-live: `phil procedure list` shows `outcome-reflex` v1 on mac-jane and vps-jane after the next deploy; an Icebreaker-style outcome report seeds a plan with `procedure_id` and lands one `procedure_run` row (`phil procedure runs outcome-reflex`)
 
+## New Project: Desktop Generative Surfaces
+
+Proposal: [DESKTOP_GENERATIVE_SURFACES_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/DESKTOP_GENERATIVE_SURFACES_PROPOSAL.md) (proposed 2026-09-14; outcome of the operator's A2UI/AG-UI investigation for `jaredlikes-desktop`; adopts A2UI v0.9 as the surface payload schema on the existing routed operator-chat stream, AG-UI kept as a deferred projection).
+
+Order: S0 → S1a ∥ S1b ∥ S1c → S2 → S3. S4 deferred. Precondition: commit the cookie-session Aiua work sitting uncommitted in `jaredlikes-desktop`.
+
+- [ ] S0 `surface-schema-and-types`: vendor the A2UI v0.9 JSON Schema subset for catalog `philotic.desktop.v1`; `typify` Rust types into `ansible-mesh-core::surface`; `validate()` with catalog allowlist + size ceilings; fixtures for every allowed and every excluded component — test-green.
+- [ ] S1a `surface-render-tools`: `ui.surface.create|update|delete`, `ui.data.update` in `philote/catalog.rs` + `tool_exec.rs`; `desktop.surfaces` abstract skill seeded and SkillDAG-implied; emit `turn_event{event:"ui_surface"}` with owner/hotel/session/seq attribution; tool description states the "only while a desktop turn is in flight" limit until S3 — test-green.
+- [ ] S1b `surface-stream-projection`: `philotic-web` types the frame as `operator_chat:ui_surface`; desktop `aiua-service` → `aiua:ui-surface`; Surfaces workspace app opens one window per `surface_id` — smoke-green on mac-jane (philote renders a hotel-status card).
+- [ ] S1c `surface-renderer-catalog` (`jaredlikes-desktop`): `a2ui-surface` element (adjacency list, JSON Pointer + relative binding, `ajv` validation, catalog map); new `ui-card`, `ui-list`, `ui-table` Shadow-DOM primitives; web-test-runner at the 80% gate — test-green.
+- [ ] S2 `surface-action-return`: `ui_action` on the chat adapter + `SendOperatorChatTurn`; `ui.action` observation in the philote dialogue; `context.action_id` correlation; approval card as an A2UI surface resolving the same approval record as Telegram's numbered card — watched-live-green (operator approves a real pending tool call from a desktop surface).
+- [ ] S3 `surface-persistence-rehydrate`: hotel-owned `ui_surfaces` records (`ListSurfaces`/`GetSurface` IPC, `GET /api/surfaces`); desktop rehydrate after reload; surfaces from cron/Telegram-initiated turns via the edge cursor ledger seam — smoke-green.
+- [ ] S4 `surface-agui-adapter` — deferred until an external AG-UI consumer exists (`GET /api/agents/:id/agui` SSE; `EdgeMessage::Surface` for the Apple edge client).
+
 ## New Project: MCP Endpoint Steward
 
 Skill: [skills/mcp-endpoint-steward/SKILL.md](/Users/jaredlikes/code/philotic-stack/skills/mcp-endpoint-steward/SKILL.md) (`mcp.endpoint_steward`, seeded 2026-09-05). Amends `mcp-membrane-gateway` (deterministic-first dispatch for philote targets) and closes DEF-109. Related: `mcp-membrane-hardening` (H1–H4 landed; S4 identity check already enforced at `ProvisionMcpEndpoint`).
