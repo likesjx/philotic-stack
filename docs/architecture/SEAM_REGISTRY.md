@@ -3,7 +3,7 @@ title: Philotic Seam Registry
 doc_type: workflow
 domain: workflow-docs
 status: active
-last_updated: 2026-09-12
+last_updated: 2026-09-14
 tags:
 - seams
 - ids
@@ -184,6 +184,13 @@ This registry makes the seam layer explicit without forcing every task bullet to
 | `graph-door-admin` | `operator-control-plane` | [GRAPH_DOORS_AND_LIFE_CORE_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/GRAPH_DOORS_AND_LIFE_CORE_PROPOSAL.md) | proposed | `docs/task.md` → `New Project: Graph Doors and Life Core` |
 | `life-core-layer` | `memory-context` | [GRAPH_DOORS_AND_LIFE_CORE_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/GRAPH_DOORS_AND_LIFE_CORE_PROPOSAL.md) | proposed | `docs/task.md` → `New Project: Graph Doors and Life Core` |
 | `skill-guidance-cypher` | `tooling-execution` | [GRAPH_DOORS_AND_LIFE_CORE_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/GRAPH_DOORS_AND_LIFE_CORE_PROPOSAL.md) | proposed | `docs/task.md` → `New Project: Graph Doors and Life Core` |
+| `surface-schema-and-types` | `operator-control-plane` | [DESKTOP_GENERATIVE_SURFACES_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/DESKTOP_GENERATIVE_SURFACES_PROPOSAL.md) | proposed | `docs/task.md` → `New Project: Desktop Generative Surfaces` |
+| `surface-render-tools` | `operator-control-plane` | [DESKTOP_GENERATIVE_SURFACES_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/DESKTOP_GENERATIVE_SURFACES_PROPOSAL.md) | proposed | `docs/task.md` → `New Project: Desktop Generative Surfaces` |
+| `surface-stream-projection` | `operator-control-plane` | [DESKTOP_GENERATIVE_SURFACES_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/DESKTOP_GENERATIVE_SURFACES_PROPOSAL.md) | proposed | `docs/task.md` → `New Project: Desktop Generative Surfaces` |
+| `surface-renderer-catalog` | `operator-control-plane` | [DESKTOP_GENERATIVE_SURFACES_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/DESKTOP_GENERATIVE_SURFACES_PROPOSAL.md) | proposed | `docs/task.md` → `New Project: Desktop Generative Surfaces` |
+| `surface-action-return` | `operator-control-plane` | [DESKTOP_GENERATIVE_SURFACES_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/DESKTOP_GENERATIVE_SURFACES_PROPOSAL.md) | proposed | `docs/task.md` → `New Project: Desktop Generative Surfaces` |
+| `surface-persistence-rehydrate` | `operator-control-plane` | [DESKTOP_GENERATIVE_SURFACES_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/DESKTOP_GENERATIVE_SURFACES_PROPOSAL.md) | proposed | `docs/task.md` → `New Project: Desktop Generative Surfaces` |
+| `surface-agui-adapter` | `operator-control-plane` | [DESKTOP_GENERATIVE_SURFACES_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/DESKTOP_GENERATIVE_SURFACES_PROPOSAL.md) | deferred | `docs/task.md` → `New Project: Desktop Generative Surfaces` |
 
 ## Usage Rule
 
