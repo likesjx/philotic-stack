@@ -78,7 +78,12 @@ philotic_oidc_public_base_url: ""
 # Central Cypher graph provider. When enabled, graph-datasource can target a
 # local Memgraph Bolt endpoint while agents still see the same graph.query tool.
 philotic_memgraph_enabled: false
-philotic_memgraph_image: "memgraph/memgraph:latest"
+# MAGE image, pinned to the running Memgraph version: the LifeGraph gardener
+# skill needs the graph-science procedures (weakly_connected_components,
+# pagerank, community_detection, node_similarity, degree_centrality) that the
+# plain memgraph/memgraph image does not ship. Same on-disk format as
+# memgraph/memgraph of the same version, so the bind-mounted data dir carries over.
+philotic_memgraph_image: "memgraph/memgraph-mage:3.10.1"
 philotic_memgraph_container_name: "philotic-memgraph"
 # uid/gid of the `memgraph` user inside memgraph/memgraph:*. The data dir is a
 # host bind mount, so these must match or the database cannot write to it.
