@@ -652,16 +652,39 @@ pub fn audit(nodes: &[AuditNode], edges: &[AuditEdge], opts: &AuditOptions) -> A
     }
 
     let nodes_total = nodes.len();
+    // Health: each category is capped so one noisy class (20 legacy custom
+    // edges, live 2026-09-14, scored a healthy graph 0) cannot saturate the
+    // score. Distinct unknown edge TYPES count, not every edge of that type —
+    // a consistent custom vocabulary is a registration gap, not 20 defects.
     let orphan_ratio = if live_nodes == 0 {
         0.0
     } else {
         live_orphans as f64 / live_nodes as f64
     };
-    let penalty = (orphan_ratio * 50.0)
-        + (duplicates.len() as f64 * 3.0)
-        + (stale.len() as f64 * 1.0)
-        + (conformance.len() as f64 * 2.0);
+    let unknown_types: std::collections::BTreeSet<String> = conformance
+        .iter()
+        .filter(|c| c.issue == "unknown_rel_type")
+        .filter_map(|c| c.detail.as_deref())
+        .filter_map(|d| d.split("-[").nth(1).and_then(|r| r.split("]->").next()))
+        .map(str::to_string)
+        .collect();
+    let other_conformance = conformance
+        .iter()
+        .filter(|c| c.issue != "unknown_rel_type")
+        .count();
+    let penalty = (orphan_ratio * 60.0).min(30.0)
+        + (duplicates.len() as f64 * 2.0).min(25.0)
+        + (stale.len() as f64).min(15.0)
+        + (temporal.len() as f64 * 0.5).min(10.0)
+        + (unknown_types.len() as f64 * 3.0 + other_conformance as f64 * 2.0).min(20.0);
     let health_score = (100.0 - penalty).clamp(0.0, 100.0).round() as u32;
+    if !unknown_types.is_empty() {
+        needs_judgment.push(format!(
+            "edge types outside the vocabulary: {} — register them as ontology extensions with \
+             life.patch.propose (or the operator confirms them); do not rewire existing edges",
+            unknown_types.into_iter().collect::<Vec<_>>().join(", ")
+        ));
+    }
 
     AuditReport {
         as_of: now,

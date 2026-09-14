@@ -405,6 +405,54 @@ impl AgentRuntime {
         bypass_approval: bool,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + '_>> {
         Box::pin(async move {
+            // `operator_approved` is a model-settable flag; on a life.tidy
+            // `retire` it is the only thing standing between a confirmed node
+            // and retirement. Honor it only when the operator's own message
+            // this turn reads as an approval — live 2026-09-14 20:47 UTC the
+            // model set it on its own initiative.
+            if tool_call.tool_name == "life.tidy" {
+                let is_retire = tool_call
+                    .arguments
+                    .pointer("/action/kind")
+                    .and_then(serde_json::Value::as_str)
+                    == Some("retire");
+                let claimed = tool_call
+                    .arguments
+                    .get("operator_approved")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false);
+                if is_retire && claimed {
+                    let user_text = self
+                        .sessions
+                        .get(&session_id)
+                        .and_then(|s| s.active_turn.as_ref())
+                        .map(|t| t.user_content.to_ascii_lowercase())
+                        .unwrap_or_default();
+                    let approved = [
+                        "approve",
+                        "approved",
+                        "go ahead",
+                        "yes",
+                        "retire it",
+                        "retire them",
+                        "confirm",
+                        "do it",
+                        "please retire",
+                    ]
+                    .iter()
+                    .any(|w| user_text.contains(w));
+                    if !approved {
+                        warn!(
+                            session_id = %session_id,
+                            "life.tidy retire: dropping model-set operator_approved (no approval in the operator's message)"
+                        );
+                        if let Some(args) = tool_call.arguments.as_object_mut() {
+                            args.insert("operator_approved".into(), serde_json::Value::Bool(false));
+                        }
+                    }
+                }
+            }
+
             // Per-agent provenance: life.observe writes must record WHO observed
             // (canonical agent id), not just the membrane transport. Stamp the
             // runtime's identity (and active role, if any) unless already set.
