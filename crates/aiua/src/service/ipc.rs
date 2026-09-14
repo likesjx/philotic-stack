@@ -6777,7 +6777,7 @@ impl IpcServer {
                         "guest must register before calling set_transport_home",
                     );
                 };
-                if identity.role != "agent" {
+                if !Self::is_agent_handoff_caller(graph, identity) {
                     return IpcResponse::error(
                         "set_transport_home",
                         "SET_TRANSPORT_HOME_FORBIDDEN",
@@ -7026,7 +7026,12 @@ impl IpcServer {
                         "guest must register before spawning a subagent",
                     );
                 };
-                if identity.role != "agent" {
+                // Role-incarnation philotes register as
+                // "role:{agent_id}:{role_name}", not "agent" — live 2026-09-14
+                // 18:43 UTC bjork's orchestrator incarnation was refused here
+                // (SUBAGENT_FORBIDDEN) and fell back to doing the delegated
+                // work inline. Judge agent-ness the way handoff does.
+                if !Self::is_agent_handoff_caller(graph, identity) {
                     return IpcResponse::error(
                         "spawn_subagent",
                         "SUBAGENT_FORBIDDEN",

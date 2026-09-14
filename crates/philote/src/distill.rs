@@ -124,6 +124,19 @@ pub(crate) fn tool_result_is_error(content: &str) -> bool {
     if head_l.starts_with("error") || head_l.starts_with("failed") || head_l.starts_with("denied") {
         return true;
     }
+    // Every `TaskErrorPayload::display_message` renders as
+    // "<message> | kind=<kind> | code=<code> …" — the hotel's own refusal
+    // shape. Live 2026-09-14 18:43 UTC "only agent guests may request
+    // subagent delegation | kind=ipc_failure | code=SUBAGENT_FORBIDDEN"
+    // was labelled "ok" by this heuristic because it opens with prose.
+    if content.contains(" | kind=") {
+        return true;
+    }
+    // life.observe.batch reports validation rejections inside an ok
+    // envelope: nothing written, every item rejected.
+    if content.contains("failed validation and were never written") {
+        return true;
+    }
     let compact: String = content
         .chars()
         .filter(|c| !c.is_whitespace())
@@ -1003,5 +1016,35 @@ mod tests {
             origin_from_intent("skills.distill:procedure_contrast").as_deref(),
             Some("distill:procedure_contrast")
         );
+    }
+}
+
+#[cfg(test)]
+mod tool_result_is_error_tests {
+    use super::tool_result_is_error;
+
+    #[test]
+    fn hotel_refusal_payload_text_is_an_error() {
+        assert!(tool_result_is_error(
+            "only agent guests may request subagent delegation | kind=ipc_failure | \
+             code=SUBAGENT_FORBIDDEN | component=aiua | retryable=true"
+        ));
+    }
+
+    #[test]
+    fn wholesale_batch_rejection_is_an_error() {
+        assert!(tool_result_is_error(
+            r#"{"data":{"evaluation":{"next_action":["8 item(s) failed validation and were never written — fix the payload"],"written":0}}}"#
+        ));
+    }
+
+    #[test]
+    fn successful_batch_and_plain_ok_text_are_not_errors() {
+        assert!(!tool_result_is_error(
+            r#"{"data":{"evaluation":{"next_action":["all observations landed durably"],"written":8},"failed":0}}"#
+        ));
+        assert!(!tool_result_is_error(
+            "Skill 'music.repertoire-gardener' registered (state: validated)."
+        ));
     }
 }

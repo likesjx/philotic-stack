@@ -1592,7 +1592,7 @@ impl IpcServer {
                 "guest must register before calling set_role_home",
             );
         };
-        if identity.role != "agent" {
+        if !Self::is_agent_handoff_caller(graph, identity) {
             return IpcResponse::error(
                 "set_role_home",
                 "SET_ROLE_HOME_FORBIDDEN",
@@ -1698,7 +1698,7 @@ impl IpcServer {
                 "guest must register before calling hotel.materialize_request",
             );
         };
-        if identity.role != "agent" {
+        if !Self::is_agent_handoff_caller(graph, identity) {
             return IpcResponse::error(
                 "materialize_request",
                 "MATERIALIZE_REQUEST_FORBIDDEN",

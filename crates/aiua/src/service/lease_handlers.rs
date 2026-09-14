@@ -1850,6 +1850,174 @@ mod tests {
         }
     }
 
+    /// Boot a hotel IPC server on a fresh socket with the local hotel seeded.
+    /// Returns (socket_path, graph, server_task).
+    async fn boot_spawn_test_hotel() -> (String, Arc<GraphDomain>, tokio::task::JoinHandle<()>) {
+        let socket_path = test_socket_path();
+        let (dispatcher_tx, _dispatcher_rx) = test_dispatcher_channel();
+        let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
+        let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
+        graph
+            .upsert_hotel(&HotelRecord {
+                hotel_name: "local-hotel".into(),
+                capabilities: NodeCapabilities {
+                    node_id: "local-aiua-01".into(),
+                    roles: vec![],
+                    models: vec![],
+                    tools: vec![],
+                    constraints: Default::default(),
+                    build_version: String::new(),
+                },
+                mesh_port: 9000,
+                blob_port: 9001,
+                execution_port: 9002,
+                ipc_socket_path: socket_path.clone(),
+                active_pid: None,
+                mesh_host: None,
+            })
+            .expect("seed local hotel");
+        let server = IpcServer::new(
+            socket_path.clone(),
+            "local-aiua-01",
+            dispatcher_tx,
+            graph.clone(),
+        );
+        let server_task = tokio::spawn(async move {
+            server.run().await.expect("ipc server should run");
+        });
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        // The dispatcher receiver is dropped on purpose: SpawnSubagent's
+        // ledger append is fire-and-forget for this gate check.
+        std::mem::forget(_dispatcher_rx);
+        unsafe {
+            std::env::set_var("PHILOTIC_HOTEL_SOCKET", &socket_path);
+        }
+        (socket_path, graph, server_task)
+    }
+
+    fn spawn_test_delegation() -> SubagentDelegation {
+        SubagentDelegation {
+            parent_agent_id: "agent-jane-01".into(),
+            parent_role: "agent".into(),
+            subagent_kind: "research_worker".into(),
+            goal: "Read files and report risks.".into(),
+            context_packet: SubagentContextPacket {
+                summary: "Bounded file review requested by a role incarnation.".into(),
+                ..Default::default()
+            },
+            allowed_tools: vec!["workspace.read".into()],
+            iteration_budget: Some(6),
+            ttl_seconds: Some(900),
+            completion_contract: SubagentCompletionContract {
+                summary_required: true,
+                artifact_refs_expected: false,
+                failure_summary_required: true,
+                requires_parent_ack: true,
+            },
+            ..Default::default()
+        }
+    }
+
+    async fn teardown_spawn_test_hotel(
+        socket_path: String,
+        server_task: tokio::task::JoinHandle<()>,
+    ) {
+        unsafe {
+            std::env::remove_var("PHILOTIC_HOTEL_SOCKET");
+        }
+        server_task.abort();
+        let _ = server_task.await;
+        if Path::new(&socket_path).exists() {
+            let _ = std::fs::remove_file(&socket_path);
+        }
+    }
+
+    /// Live 2026-09-14 18:43 UTC (mac-jane, bjork): the orchestrator
+    /// incarnation — registered as "role:agent-bjork-01:orchestrator", the
+    /// routing role aiua itself injects via PHILOTIC_ROLE_INBOX — called
+    /// subagent.spawn for a freshly registered skill and was refused with
+    /// SUBAGENT_FORBIDDEN, because the gate compared the raw role string to
+    /// "agent". A role incarnation is an agent caller; it must be able to
+    /// delegate.
+    #[tokio::test]
+    async fn spawn_subagent_accepts_role_incarnation_identity() {
+        let _env_guard = ipc_env_guard();
+        let (socket_path, graph, server_task) = boot_spawn_test_hotel().await;
+        graph
+            .upsert_role_incarnation(&ansible_mesh_core::graph::RoleIncarnationRecord {
+                agent_id: "agent-jane-01".into(),
+                role_name: "orchestrator".into(),
+                guest_id: "agent-jane-01:orchestrator".into(),
+                toolset_profile: "orchestrator".into(),
+                readiness_state: ansible_mesh_core::graph::RoleReadinessState::ActiveInSession,
+                ..Default::default()
+            })
+            .expect("seed role incarnation");
+
+        let mut incarnation = PhiloticClient::connect(GuestIdentity {
+            guest_id: "agent-jane-01:orchestrator".into(),
+            role: "role:agent-jane-01:orchestrator".into(),
+            supported_tools: Vec::new(),
+        })
+        .await
+        .expect("role incarnation connect");
+
+        let response = incarnation
+            .send_request(IpcRequest::SpawnSubagent {
+                session_id: "sess-subagent-incarnation".into(),
+                delegation: spawn_test_delegation(),
+            })
+            .await
+            .expect("spawn subagent request");
+
+        match response {
+            IpcResponse::SpawnSubagentOk {
+                subagent_guest_id,
+                confirmed_lease,
+            } => {
+                assert!(!subagent_guest_id.is_empty());
+                assert!(confirmed_lease.is_active());
+            }
+            other => panic!("role incarnation must be allowed to spawn a subagent, got: {other:?}"),
+        }
+
+        teardown_spawn_test_hotel(socket_path, server_task).await;
+    }
+
+    /// The gate still holds for non-agent guests: a tool runner cannot
+    /// delegate, with or without a role-incarnation record under its id.
+    #[tokio::test]
+    async fn spawn_subagent_still_refuses_non_agent_identity() {
+        let _env_guard = ipc_env_guard();
+        let (socket_path, _graph, server_task) = boot_spawn_test_hotel().await;
+
+        let mut tool_runner = PhiloticClient::connect(GuestIdentity {
+            guest_id: "local-hotel:tool-runner".into(),
+            role: "tool".into(),
+            supported_tools: Vec::new(),
+        })
+        .await
+        .expect("tool runner connect");
+
+        let response = tool_runner
+            .send_request(IpcRequest::SpawnSubagent {
+                session_id: "sess-subagent-tool".into(),
+                delegation: spawn_test_delegation(),
+            })
+            .await
+            .expect("spawn subagent request");
+
+        match response {
+            IpcResponse::Standard { ok, code, .. } => {
+                assert!(!ok);
+                assert_eq!(&*code, "SUBAGENT_FORBIDDEN");
+            }
+            other => panic!("tool runner must be refused, got: {other:?}"),
+        }
+
+        teardown_spawn_test_hotel(socket_path, server_task).await;
+    }
+
     #[tokio::test]
     async fn telegram_poll_lease_is_single_owner_and_released_on_disconnect() {
         let _env_guard = ipc_env_guard();
