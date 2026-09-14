@@ -312,6 +312,16 @@ pub fn skill_implied_tools(skill_name: &str) -> &'static [&'static str] {
             "life.patch.list",
         ],
         "lifegraph.truth_summarizer" => &["life.recall", "graph.query"],
+        "lifegraph.gardener" => &[
+            "life.audit",
+            "life.tidy",
+            "life.list",
+            "life.view.neighborhood",
+            "life.recall",
+            "life.commit",
+            "life.resolve",
+            "life.ontology",
+        ],
         "mesh.steward" => &[
             "heal.list",
             "heal.resolve",
@@ -348,6 +358,16 @@ pub fn tools_for_skill(skill_name: &str) -> &'static [&'static str] {
             "life.patch.list",
         ],
         "lifegraph.truth_summarizer" => &["life.recall", "graph.query"],
+        "lifegraph.gardener" => &[
+            "life.audit",
+            "life.tidy",
+            "life.list",
+            "life.view.neighborhood",
+            "life.recall",
+            "life.commit",
+            "life.resolve",
+            "life.ontology",
+        ],
         "mesh.steward" => &[
             "heal.list",
             "heal.resolve",
@@ -534,6 +554,31 @@ pub fn skill_is_relevant_for_turn(skill_name: &str, turn_text: &str) -> bool {
                 || t.contains("feature")
                 || t.contains("capture this")
                 || t.contains("backlog")
+        }
+        "lifegraph.gardener" => {
+            t.contains("garden")
+                || t.contains("tidy")
+                || t.contains("prune")
+                || t.contains("dedupe")
+                || t.contains("de-dupe")
+                || t.contains("duplicate")
+                || t.contains("orphan")
+                || t.contains("integrity")
+                || t.contains("connected")
+                || t.contains("component")
+                || t.contains("centrality")
+                || t.contains("pagerank")
+                || t.contains("hygiene")
+                || t.contains("audit the graph")
+                || t.contains("audit my lifegraph")
+                || t.contains("audit the lifegraph")
+                || t.contains("graph health")
+                || t.contains("lifegraph health")
+                || t.contains("clean up the graph")
+                || t.contains("clean up my lifegraph")
+                || t.contains("pristine")
+                || t.contains("life.audit")
+                || t.contains("life.tidy")
         }
         "lifegraph.truth_summarizer" => {
             t.contains("lifegraph")
@@ -4329,6 +4374,69 @@ fn build_catalog() -> HashMap<String, ToolDefinition> {
         },
     );
 
+    m.insert(
+        "life.audit".into(),
+        ToolDefinition {
+            tool_name: "life.audit".into(),
+            description: "READ-ONLY graph-science audit of the whole LifeGraph: connected \
+                          components (giant component, islands), live orphans, PageRank/degree \
+                          hubs, semantic + exact duplicates (keeper chosen: confirmed, else \
+                          newest), stale loops (past due / untouched), temporal and conformance \
+                          defects, and a health_score. Returns suggested_actions — each is ONE \
+                          life.tidy call — and needs_judgment items for the operator. Run it \
+                          before and after a gardening pass and report the delta."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "labels": {"type": "array", "items": {"type": "string"}, "description": "Restrict findings to these ontology labels (empty = all)."},
+                    "max_actions": {"type": "integer", "default": 25, "minimum": 1, "maximum": 200},
+                    "duplicate_similarity": {"type": "number", "default": 0.9, "minimum": 0.5, "maximum": 1.0, "description": "Embedding cosine threshold for a duplicate candidate."},
+                    "stale_days": {"type": "integer", "default": 45, "description": "A live loop untouched this long is stale."}
+                }
+            }),
+            class: Some("life_graph".into()),
+        },
+    );
+    m.insert(
+        "life.tidy".into(),
+        ToolDefinition {
+            tool_name: "life.tidy".into(),
+            description: "Apply ONE governed LifeGraph gardening action (pass a life.audit \
+                          suggested_actions entry verbatim as `action`): retire_duplicate \
+                          {duplicate_id, keeper_id, reason} retires the duplicate under the keeper \
+                          with a SUPERSEDES edge; link {from_id, rel_type, to_id, reason} MERGEs an \
+                          edge from the observe/gardening vocabulary; resolve {node_id, reason} \
+                          closes a loop; retire {node_id, reason} retires a stray. Nothing is ever \
+                          deleted; every touched node/edge is stamped tidied_at/tidied_by/ \
+                          tidy_reason. Confirmed nodes need operator_approved=true. Ids must be \
+                          real (from life.audit/list/recall or the operator) — never invented."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "object",
+                        "description": "One action object with a `kind` of retire_duplicate | link | resolve | retire and that kind's fields; always include a reason.",
+                        "properties": {
+                            "kind": {"type": "string", "enum": ["retire_duplicate", "link", "resolve", "retire"]},
+                            "duplicate_id": {"type": "string"},
+                            "keeper_id": {"type": "string"},
+                            "from_id": {"type": "string"},
+                            "rel_type": {"type": "string"},
+                            "to_id": {"type": "string"},
+                            "node_id": {"type": "string"},
+                            "reason": {"type": "string"}
+                        },
+                        "required": ["kind", "reason"]
+                    },
+                    "operator_approved": {"type": "boolean", "default": false}
+                },
+                "required": ["action"]
+            }),
+            class: Some("life_graph".into()),
+        },
+    );
     m.insert(
         "life.list".into(),
         ToolDefinition {

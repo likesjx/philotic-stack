@@ -681,6 +681,8 @@ impl DatasourceProvider for LifeGraphProvider {
             "life.view.node" => self.handle_view_node(task).await,
             "life.view.neighborhood" => self.handle_view_neighborhood(task).await,
             "life.list" => self.handle_list(task).await,
+            "life.audit" => self.handle_audit(task).await,
+            "life.tidy" => self.handle_tidy(task).await,
             "life.ontology" => {
                 let ext = self.load_ontology_extensions().await;
                 Ok(ProviderOutput::ResultSet(json!({
@@ -732,6 +734,7 @@ fn change_notification_for(kind: &str, data: &Value) -> Option<Value> {
     }
     let change_kind = match kind {
         "life.observe" => "observed",
+        "life.tidy" => "tidied",
         "life.commit" => "committed",
         "life.resolve" | "life.conflict.resolve" => "resolved",
         "life.conflict" | "life.conflict.handle" => "conflict_opened",
@@ -2462,6 +2465,168 @@ impl LifeGraphProvider {
     /// surface (lifegraph-steward-capability-plane seam). Named queries and
     /// typed filters both compile from the central `ontology` vocabulary;
     /// date bounds ride as Bolt params.
+    /// `life.audit`: export the graph (ids, labels, states, dates, summaries,
+    /// embeddings, edges) and run `audit::audit` over it. Read-only.
+    async fn handle_audit(&self, task: &DatasourceTask) -> Result<ProviderOutput> {
+        let input: data_memorygraphrag::LifeAuditInput = if task.parameters.is_null() {
+            Default::default()
+        } else {
+            match serde_json::from_value(task.parameters.clone()) {
+                Ok(v) => v,
+                Err(e) => {
+                    return Ok(ProviderOutput::ResultSet(json!({
+                        "status": "invalid_request",
+                        "read_only": true,
+                        "error": format!("could not parse life.audit parameters: {e}"),
+                    })));
+                }
+            }
+        };
+        if let Err(err) = self
+            .runner
+            .plan(LifeGraphToolRequest::LifeAudit(input.clone()))
+        {
+            return Ok(ProviderOutput::ResultSet(json!({
+                "status": "invalid_request",
+                "read_only": true,
+                "violations": err.violations,
+            })));
+        }
+        let graph = self.connect().await?;
+        let now_iso = chrono::Utc::now().to_rfc3339();
+
+        let node_cypher = concat!(
+            "MATCH (n) RETURN coalesce(n.id, '') AS id, id(n) AS internal_id, ",
+            "coalesce(labels(n)[0], '') AS label, n.validation_state AS validation_state, ",
+            "coalesce(n.status, n.loop_status) AS status, n.observed_at AS observed_at, ",
+            "coalesce(n.due_at, n.occurs_at, n.starts_at) AS best_date, ",
+            "n.claim_summary AS claim_summary, n.embedding AS embedding"
+        );
+        let mut rows = bounded_query("life_audit_nodes", graph.execute(query(node_cypher))).await?;
+        let mut nodes: Vec<data_memorygraphrag::audit::AuditNode> = Vec::new();
+        while let Some(row) = rows.next().await? {
+            let v = row_to_json(&row)?;
+            let embedding = v.get("embedding").and_then(Value::as_array).map(|arr| {
+                arr.iter()
+                    .filter_map(|x| x.as_f64().map(|f| f as f32))
+                    .collect::<Vec<f32>>()
+            });
+            let text = |k: &str| v.get(k).and_then(Value::as_str).map(str::to_string);
+            nodes.push(data_memorygraphrag::audit::AuditNode {
+                id: text("id").unwrap_or_default(),
+                internal_id: v.get("internal_id").and_then(Value::as_i64).unwrap_or(-1),
+                label: text("label").unwrap_or_default(),
+                validation_state: text("validation_state"),
+                status: text("status"),
+                observed_at: text("observed_at"),
+                best_date: text("best_date"),
+                claim_summary: text("claim_summary"),
+                embedding: embedding.filter(|e| !e.is_empty()),
+            });
+        }
+        let edge_cypher = concat!(
+            "MATCH (a)-[r]->(b) RETURN coalesce(a.id, '#' + toString(id(a))) AS src, ",
+            "coalesce(b.id, '#' + toString(id(b))) AS dst, type(r) AS rel_type"
+        );
+        let mut rows = bounded_query("life_audit_edges", graph.execute(query(edge_cypher))).await?;
+        let mut edges: Vec<data_memorygraphrag::audit::AuditEdge> = Vec::new();
+        while let Some(row) = rows.next().await? {
+            let v = row_to_json(&row)?;
+            let text = |k: &str| v.get(k).and_then(Value::as_str).unwrap_or("").to_string();
+            edges.push(data_memorygraphrag::audit::AuditEdge {
+                src: text("src"),
+                dst: text("dst"),
+                rel_type: text("rel_type"),
+            });
+        }
+        let opts = data_memorygraphrag::audit::AuditOptions {
+            now_iso: now_iso.clone(),
+            duplicate_similarity: input.duplicate_similarity,
+            stale_days: input.stale_days,
+            max_actions: input.max_actions,
+            labels: input.labels.clone(),
+        };
+        let report = data_memorygraphrag::audit::audit(&nodes, &edges, &opts);
+        info!(
+            nodes = report.nodes,
+            edges = report.edges,
+            live_orphans = report.live_orphans,
+            duplicates = report.duplicates.len(),
+            health = report.health_score,
+            actions = report.suggested_actions.len(),
+            "life.audit: graph-science report served"
+        );
+        let mut out = serde_json::to_value(&report)?;
+        out["status"] = json!("ok");
+        out["read_only"] = json!(true);
+        out["how_to_act"] = json!(
+            "Each suggested_actions entry is ONE life.tidy call ({\"action\": <entry>}); \
+             declare them as plan steps bound to life.tidy and execute in order. Items under \
+             needs_judgment are not actions: resolve them with evidence or ask the operator."
+        );
+        Ok(ProviderOutput::ResultSet(out))
+    }
+
+    /// `life.tidy`: one governed write per call (retire duplicate under a
+    /// keeper, link, resolve, retire). Nothing is ever deleted; every touched
+    /// node/edge is stamped with when, by whom, and why.
+    async fn handle_tidy(&self, task: &DatasourceTask) -> Result<ProviderOutput> {
+        let input: data_memorygraphrag::LifeTidyInput =
+            serde_json::from_value(task.parameters.clone())
+                .context("failed to parse life.tidy parameters as LifeTidyInput")?;
+        let ext = self.load_ontology_extensions().await;
+        let plan = self
+            .runner
+            .plan_with_extensions(LifeGraphToolRequest::LifeTidy(input.clone()), &ext)
+            .map_err(|e| anyhow::anyhow!("life.tidy plan validation failed: {e}"))?;
+        if !plan.allowed() {
+            return Ok(ProviderOutput::ResultSet(json!({
+                "status": "blocked",
+                "reasons": plan.blocked_reasons,
+            })));
+        }
+        let now = chrono::Utc::now().to_rfc3339();
+        let actor = task
+            .parameters
+            .get("observed_by")
+            .and_then(Value::as_str)
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or("lifegraph.gardener")
+            .to_string();
+        let compiled = cypher::compile_tidy(&input.action, input.operator_approved, &actor, &now)
+            .map_err(|e| anyhow::anyhow!("life.tidy Cypher compilation failed: {e}"))?;
+        let graph = self.connect().await?;
+        let mut rows = bounded_query(
+            "life_tidy",
+            graph.execute(
+                query(&compiled.query)
+                    .param("a", compiled.a.as_str())
+                    .param("b", compiled.b.as_str())
+                    .param("reason", compiled.reason.as_str())
+                    .param("now", compiled.now_iso.as_str())
+                    .param("actor", compiled.actor.as_str()),
+            ),
+        )
+        .await?;
+        let Some(row) = rows.next().await? else {
+            anyhow::bail!(
+                "life.tidy {} matched nothing: the node(s) do not exist, or the target is \
+                 confirmed and operator_approved was not set (nothing was changed)",
+                compiled.kind
+            );
+        };
+        let touched = row_to_json(&row)?;
+        info!(kind = compiled.kind, node = %compiled.a, "life.tidy: applied");
+        Ok(ProviderOutput::ResultSet(json!({
+            "status": "tidied",
+            "kind": compiled.kind,
+            "node_id": compiled.a,
+            "touched": touched,
+            "tidied_at": compiled.now_iso,
+            "tidied_by": compiled.actor,
+        })))
+    }
+
     async fn handle_list(&self, task: &DatasourceTask) -> Result<ProviderOutput> {
         let input: LifeListInput = match serde_json::from_value(task.parameters.clone()) {
             Ok(input) => input,
