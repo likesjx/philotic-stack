@@ -1205,13 +1205,11 @@ mod tests {
         assert_eq!(oc.condition, "the outcome Event is recorded");
         // The original is untouched.
         assert_eq!(p.version, 1);
-        assert_eq!(
-            p.node("observe")
-                .unwrap()
-                .label
-                .starts_with("Record the reported"),
-            true
-        );
+        assert!(p
+            .node("observe")
+            .unwrap()
+            .label
+            .starts_with("Record the reported"));
 
         // Delete a node: its edges go with it and the graph still validates.
         let next = p
