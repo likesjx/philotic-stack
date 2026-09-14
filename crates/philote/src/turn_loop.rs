@@ -3790,8 +3790,8 @@ impl AgentRuntime {
                 )
                 .await;
             format!(
-                "{}\n\n⚠️ Correction: {} cited above as recorded, but no tool call in this turn \
-                 wrote {} — treat {} as not yet on the LifeGraph.",
+                "{}\n\n⚠️ Correction: no tool call in this turn wrote {} — if {} already on the \
+                 LifeGraph, recall {} and cite the exact id; otherwise {} not recorded yet.",
                 content.trim_end(),
                 unbacked_ids
                     .iter()
@@ -3799,15 +3799,41 @@ impl AgentRuntime {
                     .collect::<Vec<_>>()
                     .join(", "),
                 if unbacked_ids.len() == 1 {
-                    "it"
+                    "it is"
                 } else {
-                    "them"
+                    "they are"
                 },
                 if unbacked_ids.len() == 1 {
                     "it"
                 } else {
                     "them"
                 },
+                if unbacked_ids.len() == 1 {
+                    "it is"
+                } else {
+                    "they are"
+                },
+            )
+        };
+
+        // Write receipt: the inverse of the claim audit. Every successful
+        // LifeGraph write this turn that the reply does not cite is listed,
+        // so a reply cannot omit real work — live 2026-09-14 20:47 UTC, four
+        // tidy actions landed and the reply was a workplan ending in "Shall
+        // we proceed?".
+        let uncited = self
+            .sessions
+            .get(&session_id)
+            .and_then(|s| s.active_turn.as_ref())
+            .map(|t| uncited_writes(&content, t))
+            .unwrap_or_default();
+        let content = if uncited.is_empty() {
+            content
+        } else {
+            format!(
+                "{}\n\n✅ Written this turn: {}",
+                content.trim_end(),
+                uncited.join("; ")
             )
         };
 
@@ -4646,6 +4672,7 @@ turn, so nothing described above as executed or logged has actually been written
 /// named in its arguments.
 const LIFE_WRITE_TOOLS: &[&str] = &[
     "life.observe",
+    "life.tidy",
     "life.observe.batch",
     "life.commit",
     "life.resolve",
@@ -4721,10 +4748,81 @@ pub(super) fn unbacked_cited_ids(reply: &str, turn: &WorkingTurn) -> Vec<String>
             known.push_str(&result.content);
         }
     }
+    let written_norm = normalize_life_id(&written);
+    let known_norm = normalize_life_id(&known);
     cited
         .into_iter()
-        .filter(|id| !written.contains(id.as_str()) && !known.contains(id.as_str()))
+        .filter(|id| {
+            let n = normalize_life_id(id);
+            !written_norm.contains(n.as_str()) && !known_norm.contains(n.as_str())
+        })
         .collect()
+}
+
+/// Ids differ only by `-`/`_` and case far too often (live 2026-09-14: the
+/// model wrote `…_blank_page` and cited `…-blank-page`); compare on a
+/// normalized form so that is a citation, not an unbacked claim.
+fn normalize_life_id(text: &str) -> String {
+    text.to_ascii_lowercase().replace('-', "_")
+}
+
+/// Successful LifeGraph writes this turn whose node id the reply does not
+/// mention, rendered as short receipts.
+pub(super) fn uncited_writes(reply: &str, turn: &WorkingTurn) -> Vec<String> {
+    let reply_norm = normalize_life_id(reply);
+    let mut out = Vec::new();
+    for (call, result) in &turn.working_tool_history {
+        if !crate::plan_eval::tool_result_looks_ok(result)
+            || !LIFE_WRITE_TOOLS.contains(&call.tool_name.as_str())
+        {
+            continue;
+        }
+        let args = &call.arguments;
+        let (verb, id, extra) = match call.tool_name.as_str() {
+            "life.tidy" => {
+                let a = args.get("action").unwrap_or(args);
+                let kind = a.get("kind").and_then(Value::as_str).unwrap_or("tidy");
+                let id = a
+                    .get("duplicate_id")
+                    .or_else(|| a.get("from_id"))
+                    .or_else(|| a.get("node_id"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                let other = a
+                    .get("keeper_id")
+                    .or_else(|| a.get("to_id"))
+                    .and_then(Value::as_str)
+                    .map(|o| match kind {
+                        "retire_duplicate" => format!(" under {o}"),
+                        "link" => format!(
+                            " -[{}]-> {o}",
+                            a.get("rel_type").and_then(Value::as_str).unwrap_or("")
+                        ),
+                        _ => String::new(),
+                    })
+                    .unwrap_or_default();
+                (kind.to_string(), id.to_string(), other)
+            }
+            _ => {
+                let id = args
+                    .pointer("/evidence/claim_ref/id")
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                let verb = match call.tool_name.as_str() {
+                    "life.observe" => "observed",
+                    "life.commit" => "committed",
+                    "life.resolve" => "resolved",
+                    other => other,
+                };
+                (verb.to_string(), id.to_string(), String::new())
+            }
+        };
+        if id.is_empty() || reply_norm.contains(normalize_life_id(&id).as_str()) {
+            continue;
+        }
+        out.push(format!("{verb} `{id}`{extra}"));
+    }
+    out
 }
 
 /// Does this reply tell the user that a write already happened?
@@ -5359,6 +5457,46 @@ mod say_do_tests {
         assert_eq!(
             unbacked_cited_ids(reply, &turn),
             vec!["life:trip:utah_20260928_20261004"]
+        );
+    }
+
+    /// Live 2026-09-14 20:48 UTC: wrote `…_blank_page`, cited `…-blank-page`
+    /// — a citation, not an unbacked claim. And 20:47 UTC: four tidy writes,
+    /// none mentioned in the reply — the receipt lists them.
+    #[test]
+    fn claim_audit_normalizes_ids_and_receipt_lists_uncited_writes() {
+        let turn = turn_with(
+            "yes - let's garden",
+            vec![
+                (
+                    "life.observe",
+                    serde_json::json!({"evidence": {"claim_ref": {"id": "life:creative_work:toastmasters_icebreaker_blank_page"}}}),
+                    r#"{"status":"proposed"}"#,
+                ),
+                (
+                    "life.tidy",
+                    serde_json::json!({"action": {"kind": "retire_duplicate", "duplicate_id": "life:next_action:dup", "keeper_id": "life:next_action:keep"}}),
+                    r#"{"status":"tidied"}"#,
+                ),
+                (
+                    "life.tidy",
+                    serde_json::json!({"action": {"kind": "link", "from_id": "life:routine:work_out_daily", "rel_type": "SUPPORTS", "to_id": "life:role:health-and-wellness"}}),
+                    r#"{"status":"tidied"}"#,
+                ),
+            ],
+        );
+        let reply = "Recorded your speech (`life:creative_work:toastmasters-icebreaker-blank-page`). Here is my workplan… Shall we proceed?";
+        assert!(
+            unbacked_cited_ids(reply, &turn).is_empty(),
+            "hyphen/underscore variants are the same id"
+        );
+        let receipt = uncited_writes(reply, &turn);
+        assert_eq!(
+            receipt,
+            vec![
+                "retire_duplicate `life:next_action:dup` under life:next_action:keep",
+                "link `life:routine:work_out_daily` -[SUPPORTS]-> life:role:health-and-wellness",
+            ]
         );
     }
 

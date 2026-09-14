@@ -63,6 +63,78 @@ fn sanitize_turn_content_for_history(content: &str) -> String {
     content.to_string()
 }
 
+/// Cap on tidy steps seeded from one audit: the continuation budget scales
+/// with outstanding steps, and the next audit re-lists what is left.
+const GARDENING_STEPS_PER_PASS: usize = 12;
+
+/// Parse the `suggested_actions` out of a `life.audit` tool result (the
+/// datasource wraps the payload in `data`; be tolerant of either shape).
+fn gardening_actions_from_audit_result(content: &str) -> Vec<Value> {
+    let Ok(v) = serde_json::from_str::<Value>(content) else {
+        return Vec::new();
+    };
+    let root = v.get("data").unwrap_or(&v);
+    root.get("suggested_actions")
+        .and_then(Value::as_array)
+        .map(|a| {
+            a.iter()
+                .filter(|x| x.get("kind").is_some())
+                .cloned()
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// One verifiable `life.tidy` step per action, then a closing `life.audit`.
+fn gardening_plan_from_actions(actions: &[Value]) -> ActivePlan {
+    let mut steps: Vec<PlanStep> = Vec::new();
+    for (i, action) in actions.iter().take(GARDENING_STEPS_PER_PASS).enumerate() {
+        let kind = action
+            .get("kind")
+            .and_then(Value::as_str)
+            .unwrap_or("action");
+        let subject = action
+            .get("duplicate_id")
+            .or_else(|| action.get("from_id"))
+            .or_else(|| action.get("node_id"))
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let object = action
+            .get("keeper_id")
+            .or_else(|| action.get("to_id"))
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let compact = serde_json::to_string(action).unwrap_or_default();
+        let compact: String = compact.chars().take(400).collect();
+        steps.push(PlanStep {
+            id: (i + 1) as u32,
+            description: format!(
+                "Apply audit action {kind} on {subject}{}: call life.tidy with {{\"action\": {compact}}}",
+                if object.is_empty() { String::new() } else { format!(" -> {object}") }
+            ),
+            tool_name: Some("life.tidy".into()),
+            status: "pending".into(),
+        });
+    }
+    let n = steps.len();
+    steps.push(PlanStep {
+        id: (n + 1) as u32,
+        description: "Re-run life.audit to measure the pass; then report the health_score delta plus what still needs judgment."
+            .into(),
+        tool_name: Some("life.audit".into()),
+        status: "pending".into(),
+    });
+    ActivePlan {
+        goal: format!(
+            "Gardening pass: apply {n} audit-suggested action(s) with life.tidy (one per step), then re-audit and report the delta"
+        ),
+        status: "executing".into(),
+        steps,
+        context_1_advisory: None,
+        procedure_id: None,
+    }
+}
+
 /// Collapse a synthesized plan-continuation brief to its headline when it
 /// is replayed as dialogue. The brief is loop-internal (remaining steps,
 /// verification notes) and several hundred chars long; replayed verbatim it
@@ -1842,6 +1914,12 @@ impl SessionState {
     /// stop being re-derivable, and a step that was genuinely done must not
     /// silently revert to unverified mid-turn.
     pub fn push_tool_history(&mut self, call: ToolCall, result: ToolResult) {
+        let audit_actions =
+            if call.tool_name == "life.audit" && crate::plan_eval::tool_result_looks_ok(&result) {
+                gardening_actions_from_audit_result(&result.content)
+            } else {
+                Vec::new()
+            };
         if let Some(turn) = self.active_turn.as_mut() {
             turn.working_tool_history.push((call, result));
             if let Some(plan) = turn.active_plan.as_ref() {
@@ -1851,6 +1929,29 @@ impl SessionState {
                     &turn.plan_steps_verified,
                 )
                 .verified_flags();
+            }
+        }
+        // Gardening reflex: a life.audit result with suggested actions seeds
+        // the plan the skill doctrine asks for — one life.tidy step per
+        // action, then a re-audit — so the evaluator drives the pass instead
+        // of the model deciding how many to apply. Live 2026-09-14 20:34 UTC
+        // the audit returned 25 actions; the model applied one and asked
+        // "if you would like…".
+        if !audit_actions.is_empty() {
+            let already_gardening = self
+                .active_turn
+                .as_ref()
+                .and_then(|t| t.active_plan.as_ref())
+                .is_some_and(|p| p.goal.starts_with("Gardening pass:"));
+            if !already_gardening {
+                let plan = gardening_plan_from_actions(&audit_actions);
+                let steps = plan.steps.len();
+                self.set_active_plan(plan);
+                tracing::info!(
+                    session_id = %self.session_id,
+                    steps,
+                    "gardening reflex: seeded a life.tidy plan from the life.audit result"
+                );
             }
         }
     }
@@ -9922,6 +10023,107 @@ mod tests {
         )];
         state3.start_turn(turn3);
         assert!(state3.seed_outcome_plan().is_none());
+    }
+
+    /// Gardening reflex: a life.audit result seeds one life.tidy step per
+    /// suggested action plus a closing re-audit, and the tidy steps verify
+    /// against their own calls.
+    #[test]
+    fn audit_result_seeds_a_tidy_plan() {
+        let mut state =
+            SessionState::new("sess-1".into(), "agent-beacon".into(), "telegram".into());
+        for tool in ["life.audit", "life.tidy"] {
+            state.add_tool_binding(tool);
+        }
+        let mut turn = make_plain_turn();
+        turn.user_content = "Audit and garden the LifeGraph.".into();
+        state.start_turn(turn);
+        let audit_result = serde_json::json!({
+            "data": {
+                "status": "ok",
+                "health_score": 12,
+                "suggested_actions": [
+                    {"kind": "retire_duplicate", "duplicate_id": "life:habit:duolingo_morning", "keeper_id": "life:habit:duolingo_morning_20260812", "reason": "duplicate"},
+                    {"kind": "link", "from_id": "life:place:home", "rel_type": "SCOPED_TO", "to_id": "life:role:chief-of-staff", "reason": "orphan"}
+                ]
+            },
+            "status": "success"
+        })
+        .to_string();
+        state.push_tool_history(
+            ToolCall {
+                tool_name: "life.audit".into(),
+                arguments: serde_json::json!({}),
+            },
+            ToolResult {
+                tool_name: "life.audit".into(),
+                content: audit_result,
+            },
+        );
+        let plan = state
+            .active_turn
+            .as_ref()
+            .and_then(|t| t.active_plan.clone())
+            .expect("gardening plan seeded");
+        assert!(plan.goal.starts_with("Gardening pass: apply 2"));
+        let tools: Vec<Option<&str>> = plan.steps.iter().map(|s| s.tool_name.as_deref()).collect();
+        assert_eq!(
+            tools,
+            vec![Some("life.tidy"), Some("life.tidy"), Some("life.audit")]
+        );
+        assert!(
+            plan.steps[0]
+                .description
+                .contains("life:habit:duolingo_morning")
+        );
+        assert!(
+            plan.steps[1]
+                .description
+                .contains("life:place:home -> life:role:chief-of-staff")
+        );
+
+        // The first tidy call verifies its own step (distinctive ids).
+        state.push_tool_history(
+            ToolCall {
+                tool_name: "life.tidy".into(),
+                arguments: serde_json::json!({"action": {"kind": "retire_duplicate", "duplicate_id": "life:habit:duolingo_morning", "keeper_id": "life:habit:duolingo_morning_20260812", "reason": "duplicate"}}),
+            },
+            ToolResult {
+                tool_name: "life.tidy".into(),
+                content: r#"{"status":"tidied"}"#.into(),
+            },
+        );
+        let flags = state
+            .active_turn
+            .as_ref()
+            .unwrap()
+            .plan_steps_verified
+            .clone();
+        assert_eq!(flags, vec![true, false, false]);
+
+        // A second audit inside the same gardening plan does not re-seed.
+        let goal_before = plan.goal.clone();
+        state.push_tool_history(
+            ToolCall {
+                tool_name: "life.audit".into(),
+                arguments: serde_json::json!({}),
+            },
+            ToolResult {
+                tool_name: "life.audit".into(),
+                content: r#"{"data":{"suggested_actions":[{"kind":"retire","node_id":"557","reason":"stray"}]}}"#.into(),
+            },
+        );
+        assert_eq!(
+            state
+                .active_turn
+                .as_ref()
+                .unwrap()
+                .active_plan
+                .as_ref()
+                .unwrap()
+                .goal,
+            goal_before
+        );
     }
 
     #[test]

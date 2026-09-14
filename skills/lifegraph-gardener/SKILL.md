@@ -77,6 +77,22 @@ Confirmed nodes are never retired or resolved without `operator_approved`.
 5. Run `life.audit` again and report the delta: score before/after, actions applied,
    what needs the operator. Keep the report to what changed.
 
+## What the harness does for you
+
+When a `life.audit` result carries `suggested_actions`, the harness seeds your `active_plan`
+with one `life.tidy` step per action (up to 12 per pass) and a closing `life.audit` step.
+Execute them in order; do not re-plan, do not skip to a summary, do not stop to ask
+whether to continue — the evaluator verifies each step by its tool result and the
+continuation loop carries the rest. Your reply reports what landed; the harness appends a
+receipt of every write this turn, so never describe future work as if it were done.
+
+## Edge types outside the vocabulary
+
+`conformance_issues` of kind `unknown_rel_type` (for example `HAS_SUB_ROLE`, `SUB_ROLE_OF`,
+`HAS_SECTION` written by another philote) are a registration gap, not a defect to rewire.
+Propose the type as an ontology extension with `life.patch.propose`, or list the distinct
+types for the operator. Never replace or remove those edges.
+
 ## Guardrails
 
 - Never delete. Never `retire` or `resolve` a confirmed node without operator approval.
