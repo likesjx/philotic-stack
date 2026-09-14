@@ -330,7 +330,7 @@ pub fn evaluate_plan(
     }
 }
 
-fn tool_result_looks_ok(result: &ToolResult) -> bool {
+pub(crate) fn tool_result_looks_ok(result: &ToolResult) -> bool {
     let trimmed = result.content.trim_start().to_lowercase();
     !(trimmed.starts_with("error")
         || trimmed.starts_with("{\"error\"")
