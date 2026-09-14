@@ -1689,6 +1689,7 @@ impl IpcServer {
         role_name: String,
         calling_role: String,
         target_hotel: String,
+        dry_run: bool,
     ) -> IpcResponse {
         let Some(identity) = current_identity else {
             return IpcResponse::error(
@@ -1785,6 +1786,8 @@ impl IpcServer {
                     "request_id": request_id.to_string(),
                     "role_record": record,
                     "toolset_record": toolset_record,
+                    "dry_run": dry_run,
+                    "requester_build_version": env!("CARGO_PKG_VERSION"),
                 })
                 .to_string(),
             },
@@ -1793,8 +1796,8 @@ impl IpcServer {
         let _ = dispatcher_tx.send(LedgerCommand::AppendLocal(event)).await;
 
         info!(
-            "Materialize request [{}] dispatched: role '{}' (agent '{}') -> hotel '{}', requested by '{}'",
-            request_id, role_name, agent_id, target_hotel, calling_role
+            "Materialize request [{}] dispatched (dry_run={}): role '{}' (agent '{}') -> hotel '{}', requested by '{}'",
+            request_id, dry_run, role_name, agent_id, target_hotel, calling_role
         );
 
         IpcResponse::MaterializeRequested {
@@ -1843,6 +1846,94 @@ impl IpcServer {
                 err.to_string(),
             ),
         }
+    }
+
+    /// Relocation Ceremony R4 (Feasibility and placement): does `command`
+    /// resolve to a real, executable file given THIS process's current
+    /// `PHILOTIC_BIN_DIR`/`PATH`? Mirrors `LocalProcessMaterializer::spawn_guest`'s
+    /// resolution rule (`guest_manager.rs`) exactly, as a side-effect-free
+    /// pre-check rather than an actual spawn attempt — a positive result is
+    /// not a guarantee (the file could still be removed or lose its execute
+    /// bit before a real spawn), but a negative result is a reliable decline.
+    fn resolve_binary_feasible(command: &str) -> bool {
+        let path = std::path::Path::new(command);
+        if path.is_absolute() {
+            return path.is_file();
+        }
+        if let Ok(bin_dir) = std::env::var("PHILOTIC_BIN_DIR") {
+            let candidate = std::path::Path::new(bin_dir.trim_end_matches('/')).join(command);
+            return candidate.is_file();
+        }
+        // Bare command relies on PATH at spawn time (dev mode) — search it
+        // the same way a shell would.
+        std::env::var_os("PATH")
+            .map(|paths| std::env::split_paths(&paths).any(|dir| dir.join(command).is_file()))
+            .unwrap_or(false)
+    }
+
+    /// Relocation Ceremony R4 (Feasibility and placement): evaluate whether
+    /// THIS hotel (`hotel_name`, the target) can actually host `role_record`
+    /// right now. Returns decline reasons — empty means feasible. Every
+    /// check runs against LOCAL truth (this hotel's own filesystem, guest
+    /// table, build version): binary presence isn't gossiped at all, and
+    /// controller liveness is more trustworthy read live than from a
+    /// possibly-stale gossiped snapshot (that snapshot is what
+    /// `best_place_to_run_view`'s ranking uses instead, for candidates that
+    /// haven't been asked yet).
+    ///
+    /// Secret-ref presence — the proposal's third feasibility check — is a
+    /// deliberate no-op here: neither `RoleIncarnationRecord` nor
+    /// `ToolsetProfileRecord` carries a structured `secret_ref`. That
+    /// concept lives on integration/OIDC credential bindings
+    /// (`ansible_mesh_core::integration`), which belong to the higher-risk
+    /// membrane/integration component classes the Ceremony proposal scopes
+    /// separately (medium/high tier) — not this low-tier role move.
+    pub(super) fn evaluate_role_relocation_feasibility(
+        graph: &GraphDomain,
+        hotel_name: &str,
+        role_record: &ansible_mesh_core::graph::RoleIncarnationRecord,
+        requester_build_version: Option<&str>,
+    ) -> Vec<String> {
+        let mut reasons = Vec::new();
+
+        if !Self::resolve_binary_feasible("philote") {
+            reasons.push(
+                "role-incarnation worker binary 'philote' does not resolve on this hotel \
+                 (PHILOTIC_BIN_DIR/PATH) — likely a stale or incomplete deploy"
+                    .to_string(),
+            );
+        }
+
+        let active_guest_roles: std::collections::BTreeSet<String> = graph
+            .list_guests(hotel_name, true)
+            .map(|guests| guests.into_iter().map(|g| g.role).collect())
+            .unwrap_or_default();
+        let tiers: Vec<String> = if role_record.turn_loop_config.fallback_tiers.is_empty() {
+            ansible_mesh_core::model_routing::DEFAULT_FALLBACK_TIERS
+                .iter()
+                .map(|t| t.to_string())
+                .collect()
+        } else {
+            role_record.turn_loop_config.fallback_tiers.clone()
+        };
+        if let Some(primary_tier) = tiers.first() {
+            if !active_guest_roles.contains(primary_tier) {
+                reasons.push(format!(
+                    "this role's primary model controller ('{primary_tier}') has no live guest on this hotel"
+                ));
+            }
+        }
+
+        if let Some(requester_version) = requester_build_version {
+            let local_version = env!("CARGO_PKG_VERSION");
+            if !requester_version.is_empty() && requester_version != local_version {
+                reasons.push(format!(
+                    "build version mismatch: requester is '{requester_version}', this hotel is '{local_version}'"
+                ));
+            }
+        }
+
+        reasons
     }
 }
 
@@ -1925,6 +2016,7 @@ mod tests {
                     models: vec![],
                     tools: vec![],
                     constraints: Default::default(),
+                    build_version: String::new(),
                 },
                 mesh_port: 9000,
                 blob_port: 9001,
@@ -2073,6 +2165,7 @@ mod tests {
             "vixen".into(),
             "vixen".into(), // calling_role: the non-admin role itself, not orchestrator
             "vps-jane".into(),
+            false,
         )
         .await;
 
@@ -2104,6 +2197,7 @@ mod tests {
                     models: vec![],
                     tools: vec![],
                     constraints: Default::default(),
+                    build_version: String::new(),
                 },
                 mesh_port: 9000,
                 blob_port: 9001,
@@ -2142,6 +2236,7 @@ mod tests {
             "orchestrator".into(),
             "orchestrator".into(),
             "vps-jane".into(),
+            false,
         )
         .await;
 
@@ -2211,6 +2306,7 @@ mod tests {
             "orchestrator".into(),
             "orchestrator".into(),
             "nonexistent-hotel".into(),
+            false,
         )
         .await;
 
@@ -2439,6 +2535,7 @@ mod tests {
                     models: vec![],
                     tools: vec![],
                     constraints: Default::default(),
+                    build_version: String::new(),
                 },
                 mesh_port: 9000,
                 blob_port: 9001,
@@ -2613,6 +2710,7 @@ mod tests {
                     models: vec![],
                     tools: vec![],
                     constraints: Default::default(),
+                    build_version: String::new(),
                 },
                 mesh_port: 9000,
                 blob_port: 9001,
@@ -2712,6 +2810,7 @@ mod tests {
                     models: vec![],
                     tools: vec![],
                     constraints: Default::default(),
+                    build_version: String::new(),
                 },
                 mesh_port: 9000,
                 blob_port: 9001,
@@ -2828,6 +2927,7 @@ mod tests {
                     models: vec![],
                     tools: vec![],
                     constraints: Default::default(),
+                    build_version: String::new(),
                 },
                 mesh_port: 9000,
                 blob_port: 9001,
@@ -2923,6 +3023,7 @@ mod tests {
                     models: vec![],
                     tools: vec![],
                     constraints: Default::default(),
+                    build_version: String::new(),
                 },
                 mesh_port: 9000,
                 blob_port: 9001,
@@ -3053,6 +3154,7 @@ mod tests {
                     models: vec![],
                     tools: vec![],
                     constraints: Default::default(),
+                    build_version: String::new(),
                 },
                 mesh_port: 9000,
                 blob_port: 9001,
@@ -3159,6 +3261,7 @@ mod tests {
                     models: vec![],
                     tools: vec![],
                     constraints: Default::default(),
+                    build_version: String::new(),
                 },
                 mesh_port: 9000,
                 blob_port: 9001,
@@ -3240,6 +3343,7 @@ mod tests {
                     models: vec![],
                     tools: vec![],
                     constraints: Default::default(),
+                    build_version: String::new(),
                 },
                 mesh_port: 9000,
                 blob_port: 9001,
@@ -3754,6 +3858,7 @@ mod tests {
                     models: vec![],
                     tools: vec![],
                     constraints: Default::default(),
+                    build_version: String::new(),
                 },
                 mesh_port: 9000,
                 blob_port: 9001,
@@ -3996,6 +4101,7 @@ mod tests {
                     models: vec![],
                     tools: vec![],
                     constraints: Default::default(),
+                    build_version: String::new(),
                 },
                 mesh_port: 9000,
                 blob_port: 9001,
@@ -4080,6 +4186,7 @@ mod tests {
                     models: vec![],
                     tools: vec![],
                     constraints: Default::default(),
+                    build_version: String::new(),
                 },
                 mesh_port: 9000,
                 blob_port: 9001,
@@ -4177,6 +4284,7 @@ mod tests {
                     models: vec![],
                     tools: vec![],
                     constraints: Default::default(),
+                    build_version: String::new(),
                 },
                 mesh_port: 9000,
                 blob_port: 9001,
@@ -4277,6 +4385,7 @@ mod tests {
                     models: vec![],
                     tools: vec![],
                     constraints: Default::default(),
+                    build_version: String::new(),
                 },
                 mesh_port: 9000,
                 blob_port: 9001,
@@ -4402,6 +4511,7 @@ mod tests {
                     models: vec![],
                     tools: vec![],
                     constraints: Default::default(),
+                    build_version: String::new(),
                 },
                 mesh_port: 9000,
                 blob_port: 9001,
@@ -4563,6 +4673,7 @@ mod tests {
                     models: vec![],
                     tools: vec![],
                     constraints: Default::default(),
+                    build_version: String::new(),
                 },
                 mesh_port: 9000,
                 blob_port: 9001,
@@ -4752,6 +4863,7 @@ mod tests {
                     models: vec![],
                     tools: vec![],
                     constraints: Default::default(),
+                    build_version: String::new(),
                 },
                 mesh_port: 9000,
                 blob_port: 9001,
@@ -4842,6 +4954,7 @@ mod tests {
                     models: vec![],
                     tools: vec![],
                     constraints: Default::default(),
+                    build_version: String::new(),
                 },
                 mesh_port: 9000,
                 blob_port: 9001,
@@ -4941,6 +5054,7 @@ mod tests {
                     models: vec![],
                     tools: vec![],
                     constraints: Default::default(),
+                    build_version: String::new(),
                 },
                 mesh_port: 9000,
                 blob_port: 9001,
@@ -5031,6 +5145,7 @@ mod tests {
                     models: vec![],
                     tools: vec![],
                     constraints: Default::default(),
+                    build_version: String::new(),
                 },
                 mesh_port: 9000,
                 blob_port: 9001,
@@ -5202,6 +5317,7 @@ mod tests {
                     models: vec![],
                     tools: vec![],
                     constraints: Default::default(),
+                    build_version: String::new(),
                 },
                 mesh_port: 9000,
                 blob_port: 9001,
@@ -5627,6 +5743,7 @@ mod tests {
                     models: vec![],
                     tools: vec![],
                     constraints: Default::default(),
+                    build_version: String::new(),
                 },
                 mesh_port: 9000,
                 blob_port: 9001,
@@ -5726,5 +5843,176 @@ mod tests {
         if Path::new(&socket_path).exists() {
             let _ = std::fs::remove_file(&socket_path);
         }
+    }
+
+    #[test]
+    fn resolve_binary_feasible_checks_absolute_paths_directly() {
+        let dir = std::env::temp_dir().join(format!("philotic-r4-abs-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let real_file = dir.join("real-binary");
+        std::fs::write(&real_file, b"#!/bin/sh\n").expect("write dummy binary");
+
+        assert!(IpcServer::resolve_binary_feasible(
+            real_file.to_str().expect("utf8 path")
+        ));
+        assert!(!IpcServer::resolve_binary_feasible(
+            dir.join("no-such-binary").to_str().expect("utf8 path")
+        ));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resolve_binary_feasible_checks_philotic_bin_dir() {
+        let _env_guard = ipc_env_guard();
+        let previous = std::env::var_os("PHILOTIC_BIN_DIR");
+        let dir = std::env::temp_dir().join(format!("philotic-r4-bindir-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        std::fs::write(dir.join("philote"), b"#!/bin/sh\n").expect("write dummy binary");
+        unsafe {
+            std::env::set_var("PHILOTIC_BIN_DIR", &dir);
+        }
+
+        assert!(IpcServer::resolve_binary_feasible("philote"));
+        assert!(!IpcServer::resolve_binary_feasible("no-such-guest-binary"));
+
+        unsafe {
+            match &previous {
+                Some(v) => std::env::set_var("PHILOTIC_BIN_DIR", v),
+                None => std::env::remove_var("PHILOTIC_BIN_DIR"),
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resolve_binary_feasible_falls_back_to_path() {
+        let _env_guard = ipc_env_guard();
+        let previous = std::env::var_os("PHILOTIC_BIN_DIR");
+        unsafe {
+            std::env::remove_var("PHILOTIC_BIN_DIR");
+        }
+
+        // `ls` is present on PATH in every dev/CI environment this test runs in.
+        assert!(IpcServer::resolve_binary_feasible("ls"));
+        assert!(!IpcServer::resolve_binary_feasible(
+            "definitely-not-a-real-guest-binary-name"
+        ));
+
+        unsafe {
+            if let Some(v) = &previous {
+                std::env::set_var("PHILOTIC_BIN_DIR", v);
+            }
+        }
+    }
+
+    fn feasibility_test_role(fallback_tiers: Vec<String>) -> RoleIncarnationRecord {
+        RoleIncarnationRecord {
+            agent_id: "agent-beacon".into(),
+            role_name: "orchestrator".into(),
+            guest_id: "agent-beacon:orchestrator".into(),
+            toolset_profile: "orchestrator".into(),
+            is_admin: true,
+            readiness_state: RoleReadinessState::Configured,
+            turn_loop_config: TurnLoopConfig {
+                fallback_tiers,
+                ..TurnLoopConfig::default()
+            },
+            home_node: None,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn evaluate_role_relocation_feasibility_reports_missing_controller_and_version_mismatch() {
+        let _env_guard = ipc_env_guard();
+        let previous = std::env::var_os("PHILOTIC_BIN_DIR");
+        let dir = std::env::temp_dir().join(format!("philotic-r4-eval-a-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        std::fs::write(dir.join("philote"), b"#!/bin/sh\n").expect("write dummy binary");
+        unsafe {
+            std::env::set_var("PHILOTIC_BIN_DIR", &dir);
+        }
+
+        let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
+        let graph = GraphDomain::new(Arc::new(graph_store.adapter()));
+        // No controller guests seeded on this hotel at all.
+        let role = feasibility_test_role(vec!["model.custom-controller".into()]);
+
+        let reasons = IpcServer::evaluate_role_relocation_feasibility(
+            &graph,
+            "test-hotel",
+            &role,
+            Some("0.0.1-not-the-real-version"),
+        );
+
+        assert!(
+            reasons
+                .iter()
+                .any(|r| r.contains("model.custom-controller")),
+            "expected a missing-controller reason, got: {reasons:?}"
+        );
+        assert!(
+            reasons.iter().any(|r| r.contains("build version mismatch")),
+            "expected a version-mismatch reason, got: {reasons:?}"
+        );
+
+        unsafe {
+            match &previous {
+                Some(v) => std::env::set_var("PHILOTIC_BIN_DIR", v),
+                None => std::env::remove_var("PHILOTIC_BIN_DIR"),
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn evaluate_role_relocation_feasibility_passes_when_everything_checks_out() {
+        let _env_guard = ipc_env_guard();
+        let previous = std::env::var_os("PHILOTIC_BIN_DIR");
+        let dir = std::env::temp_dir().join(format!("philotic-r4-eval-b-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        std::fs::write(dir.join("philote"), b"#!/bin/sh\n").expect("write dummy binary");
+        unsafe {
+            std::env::set_var("PHILOTIC_BIN_DIR", &dir);
+        }
+
+        let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
+        let graph = GraphDomain::new(Arc::new(graph_store.adapter()));
+        graph
+            .seed_guests(
+                "test-hotel",
+                &[GuestRecord {
+                    hotel_name: "test-hotel".into(),
+                    guest_id: "test-hotel:model-custom-controller".into(),
+                    role: "model.custom-controller".into(),
+                    config_json: "{}".into(),
+                    is_active: true,
+                    active_pid: None,
+                    last_active_at: None,
+                }],
+            )
+            .expect("seed controller guest");
+        let role = feasibility_test_role(vec!["model.custom-controller".into()]);
+
+        let reasons = IpcServer::evaluate_role_relocation_feasibility(
+            &graph,
+            "test-hotel",
+            &role,
+            Some(env!("CARGO_PKG_VERSION")),
+        );
+
+        assert!(
+            reasons.is_empty(),
+            "expected no decline reasons, got: {reasons:?}"
+        );
+
+        unsafe {
+            match &previous {
+                Some(v) => std::env::set_var("PHILOTIC_BIN_DIR", v),
+                None => std::env::remove_var("PHILOTIC_BIN_DIR"),
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

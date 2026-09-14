@@ -438,6 +438,7 @@ mod tests {
                 latency_hint_ms: Some(12),
                 trust_level: None,
             },
+            build_version: String::new(),
         }
     }
 

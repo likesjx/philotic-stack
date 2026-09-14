@@ -2585,6 +2585,7 @@ mod tests {
             models: vec![],
             tools: vec![],
             constraints: NodeConstraints::default(),
+            build_version: String::new(),
         }
     }
 

@@ -95,7 +95,29 @@ example silently delivered nowhere. `codex/relocation-node-id-resolve` adds
 `resolve_hotel_node_id` (accepts either form) to `role.set_home`,
 `transport.set_home`, and `hotel.materialize_request` alike, since all three
 shared the same gap and `role.set_home` is the Ceremony's actual SWITCH
-mechanism. R4 onward not started. The first concrete relocation
+mechanism.
+
+**R4 test-green** on `codex/relocation-r4-feasibility`: `hotel.materialize_request`
+gains a `dry_run` flag reusing R3's proven wire format and reply channel rather
+than a new mesh primitive — the target runs feasibility checks
+(`evaluate_role_relocation_feasibility`) and declines loudly (`ok:false,
+error: <reasons>`) before ever upserting or spawning, whether the caller asked
+for a dry run or a real STANDBY commit. Checks that must be authoritative run
+locally on the target (binary resolvable via `PHILOTIC_BIN_DIR`/`PATH`, the
+role's primary fallback-tier controller has a live guest — reusing
+`validate_fallback_ladders`' reachability logic — build-version match via a
+new `NodeCapabilities.build_version` field refreshed every boot). Secret-ref
+presence is a deliberate no-op for this component class: neither
+`RoleIncarnationRecord` nor `ToolsetProfileRecord` carries a structured
+`secret_ref` today — that belongs to the medium/high-tier
+membrane/integration classes this proposal scopes separately, not this
+low-tier role move. `best_place_to_run_view` (G8) now scores candidates on
+the same signals using data that's already gossiped (`NodeHealthSnapshot`
+headroom, `HotelStateSync` guest roster for controller presence,
+`max_concurrent_jobs` vs. current guest count, `build_version` match) — a
+soft ranking preference for whom to ask, distinct from the target-side
+check's hard gate on whoever's actually asked. R6 onward not started. The
+first concrete relocation
 this ceremony must carry is moving every orchestrator incarnation (Bjork, Coach,
 Mac on `mac-jane`; Astrid, Ariel, Jane, Aria on `mbp-jane`) to `vps-jane`, with
 Mac-bound specialists (Architect and anything holding `bash.exec`, desktop, ONNX

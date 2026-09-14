@@ -243,6 +243,7 @@ mod tests {
                     latency_hint_ms: None,
                     trust_level: None,
                 },
+                build_version: String::new(),
             },
             mesh_host: mesh_host.map(str::to_string),
             mesh_port: execution_port.saturating_sub(2),

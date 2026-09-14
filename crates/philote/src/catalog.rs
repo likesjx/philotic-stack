@@ -2130,9 +2130,12 @@ fn build_catalog() -> HashMap<String, ToolDefinition> {
                           right now, WITHOUT changing which hotel owns the role — the role keeps \
                           running wherever role.set_home last pinned it. Use this before a \
                           relocation to bring a warm standby up on the destination hotel so the \
-                          eventual role.set_home switch has nothing left to wait on. Requires \
+                          eventual role.set_home switch has nothing left to wait on. The target \
+                          runs feasibility checks first (binary present, primary model controller \
+                          live, build version compatible) and declines loudly with a reason if any \
+                          fail, instead of leaving you to guess why nothing spawned. Requires \
                           operator approval. Poll hotel.materialize_status with the returned \
-                          request_id to see when the standby is ready."
+                          request_id to see the outcome."
                 .into(),
             input_schema: json!({
                 "type": "object",
@@ -2148,6 +2151,10 @@ fn build_catalog() -> HashMap<String, ToolDefinition> {
                     "reason": {
                         "type": "string",
                         "description": "Why this standby is needed. Required for operator visibility."
+                    },
+                    "dry_run": {
+                        "type": "boolean",
+                        "description": "When true, only run the target's feasibility checks and report the result — never spawns or changes anything. Use to ask 'could this work' before committing to a real pre-warm. Defaults to false."
                     }
                 },
                 "required": ["role_name", "target_hotel", "reason"]

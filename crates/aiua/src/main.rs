@@ -1026,6 +1026,7 @@ fn default_hotel_record(hotel_name: &str) -> HotelRecord {
             models: vec![],
             tools: vec![],
             constraints: Default::default(),
+            build_version: env!("CARGO_PKG_VERSION").to_string(),
         },
         mesh_host: None,
         mesh_port: base_port,
@@ -3136,6 +3137,15 @@ fn reconcile_hotel_record(graph: &GraphDomain, hotel_name: &str) -> Result<Hotel
 
     if hotel.execution_port == 0 {
         hotel.execution_port = desired.execution_port;
+        changed = true;
+    }
+    // Refresh build_version to the binary actually running this boot — unlike
+    // the rest of `capabilities`, this field is meant to change on every
+    // upgrade, not persist as graph truth (Relocation Ceremony R4: version
+    // compatibility feasibility check needs the CURRENT build, not whichever
+    // build first seeded this hotel's record).
+    if hotel.capabilities.build_version != desired.capabilities.build_version {
+        hotel.capabilities.build_version = desired.capabilities.build_version;
         changed = true;
     }
     let explicit_socket = std::env::var("PHILOTIC_HOTEL_SOCKET")

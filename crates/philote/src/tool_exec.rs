@@ -4259,6 +4259,10 @@ impl AgentRuntime {
                     .and_then(|a| a.get("reason"))
                     .and_then(|v| v.as_str())
                     .map(str::to_string);
+                let dry_run = args
+                    .and_then(|a| a.get("dry_run"))
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
 
                 let Some(role_name) = role_name else {
                     return self
@@ -4305,6 +4309,7 @@ impl AgentRuntime {
                         role_name: role_name.clone(),
                         calling_role,
                         target_hotel: target_hotel.clone(),
+                        dry_run,
                     })
                     .await
                 {
@@ -4314,11 +4319,19 @@ impl AgentRuntime {
                         target_hotel: hotel,
                         ..
                     }) => (
-                        format!(
-                            "Materialize request dispatched: role '{name}' -> hotel '{hotel}' \
-                             (request_id: {request_id}). Poll hotel.materialize_status with this \
-                             request_id to see when the standby is ready."
-                        ),
+                        if dry_run {
+                            format!(
+                                "Feasibility check dispatched: role '{name}' -> hotel '{hotel}' \
+                                 (request_id: {request_id}). Poll hotel.materialize_status with \
+                                 this request_id to see whether the target declared it feasible."
+                            )
+                        } else {
+                            format!(
+                                "Materialize request dispatched: role '{name}' -> hotel '{hotel}' \
+                                 (request_id: {request_id}). Poll hotel.materialize_status with this \
+                                 request_id to see when the standby is ready."
+                            )
+                        },
                         None,
                     ),
                     Ok(IpcResponse::Error(msg))
