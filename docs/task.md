@@ -185,9 +185,23 @@ Seam: `device-tool-plane`; branch: `codex/ios-healthkit` (based on the location 
 - [x] Fix missing packaged ATS policy with an exact private-server exception; built-host iOS regression test passes. See [connection setup](../apps/philotic-apple/CONNECTION.md). Operator subsequently reported successful enrollment and uploads; newest server observations and agent recall still need independent verification.
 - [x] Fix LifeGraph lens decoding for the server's string-valued `fallback_used`; preserve legacy boolean support and reject unknown values. Regression reproduced the reported type mismatch; shared package suite passes (95 passed, 1 skipped), 2026-09-08.
 - [x] Build and sign iPhone build 4 with the decoder fix and new icon; verify signature, icon declaration, and exact-host ATS policy in the resulting bundle (2026-09-08).
-- [ ] Install build 4 on the physical iPhone, then confirm the Life tab renders its lists. Wireless install failed with CoreDevice error 4016 (device unavailable); build/push alone is not phone validation.
+- [x] Install and launch build 4 on the physical iPhone over private Wi-Fi (2026-09-12); operator subsequently confirmed the LifeGraph fix works.
 - [ ] Exercise selected/denied/revoked Health permissions, compare readings with Apple Health, and confirm one operator-approved live share plus agent recall.
 - [ ] Decide server-enforced health-only role/provider access, named-provider disclosure, retention/deletion, and App Store privacy requirements before widening distribution or adding passive ingestion.
+
+## Native Apple Companion
+
+Proposal: [Native Apple program](architecture/NATIVE_APPLE_APP_PROPOSAL.md).
+Design: [Apple Companion](../apps/philotic-apple/COMPANION.md).
+Branch: `codex/apple-companion`, based on the working iPhone branch `codex/ios-healthkit`.
+
+- [x] Combine the agent command center and personal dashboard in one shared Today/Agents/Life shell, with a Mac Ask/Today panel using the existing session.
+- [x] Add local read-only Reminders preview, opt-in map of the last shared location, navigation-only App Intents, and availability-gated on-device note summaries.
+- [x] Retain separate consent for Health/location sharing; no passive collection or remote Reminders actions.
+- [x] Validate hosted app tests on Mac and iOS Simulator and shared package tests; inspect Mac screens and run local inference with synthetic input.
+- [ ] Renew expired personal development signing through Xcode Accounts, then install the companion build on the reachable trusted iPhone.
+- [ ] Exercise real permission/revocation behavior, snapshot map, Siri/Shortcuts launch, and Mac display/lock transitions; independently verify approved server observation and agent recall.
+- [ ] Design governed EventKit actions and opt-in system indexing before expanding beyond local preview/navigation.
 
 ## New Project: Memory Cultivation and True-Up
 

@@ -56,7 +56,7 @@ struct ChatView: View {
                         .symbolEffect(.pulse, isActive: micActive)
                 }
                 .disabled(
-                    session.currentAgent == nil || session.isSendingVoice
+                    session.currentConversation == nil || session.isSendingVoice
                         || session.isConversationActive
                 )
                 .accessibilityLabel(micAccessibilityLabel)
@@ -69,7 +69,7 @@ struct ChatView: View {
                         .foregroundStyle(session.isConversationActive ? Color.red : Color.accentColor)
                         .symbolEffect(.pulse, isActive: session.isConversationActive)
                 }
-                .disabled(session.currentAgent == nil || micActive)
+                .disabled(session.currentConversation == nil || micActive)
                 .accessibilityLabel(session.isConversationActive ? "End conversation" : "Start conversation")
 
                 TextField(inputPlaceholder, text: fieldBinding, axis: .vertical)
@@ -87,7 +87,7 @@ struct ChatView: View {
                         Image(systemName: "arrow.up.circle.fill")
                             .font(.title2)
                     }
-                    .disabled(draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || session.currentAgent == nil)
+                    .disabled(draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || session.currentConversation == nil)
                 }
             }
             .padding(12)
@@ -149,6 +149,7 @@ struct ChatView: View {
     }
 
     private func send() {
+        guard session.currentConversation != nil else { return }
         let text = draft
         guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
         draft = ""

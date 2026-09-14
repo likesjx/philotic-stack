@@ -3,11 +3,13 @@
 // has no passive/background switch: every LifeGraph update requires a tap.
 
 import SwiftUI
+import MapKit
 
 struct LocationView: View {
     @Bindable var session: ChatSessionManager
     @Bindable var location: LocationCaptureService
     @Environment(\.dismiss) private var dismiss
+    @State private var showingMap = false
 
     var body: some View {
         Form {
@@ -70,6 +72,26 @@ struct LocationView: View {
                     Text(summary)
                         .font(.caption)
                         .textSelection(.enabled)
+                }
+            }
+
+            if let snapshot = location.lastSharedSnapshot {
+                Section("Map of the last shared snapshot") {
+                    if showingMap {
+                        Map(initialPosition: .region(MKCoordinateRegion(
+                            center: CLLocationCoordinate2D(latitude: snapshot.latitude, longitude: snapshot.longitude),
+                            latitudinalMeters: max(2_000, snapshot.horizontalAccuracyMeters * 4),
+                            longitudinalMeters: max(2_000, snapshot.horizontalAccuracyMeters * 4)))) {
+                            Marker("Shared location", coordinate: CLLocationCoordinate2D(
+                                latitude: snapshot.latitude, longitude: snapshot.longitude))
+                        }
+                        .frame(height: 220)
+                        .id(snapshot.observedAt)
+                    } else {
+                        Button("Show snapshot in Apple Maps") { showingMap = true }
+                    }
+                    Text("Uses the coordinates and precision already shared, not a live tracker. Map content is provided by Apple.")
+                        .font(.caption).foregroundStyle(.secondary)
                 }
             }
 

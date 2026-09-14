@@ -1,7 +1,7 @@
 ---
 doc_type: defect-tracker
 status: active
-last_updated: 2026-09-04
+last_updated: 2026-09-14
 ---
 
 # Defects and Technical Debt
@@ -15,6 +15,7 @@ Tracked defects and known technical debt. Each entry carries status, severity, p
 
 | ID | Title | Severity | Status | Pts | Found | Fixed by |
 |---|---|---|---|---|---|---|
+| DEF-108 | Apple agent selection could publish delayed history under a newer recipient | medium | fixed | 1 | 2026-09-14 | `codex/apple-companion`: clear old conversation synchronously, revision-gate async selection, and check recipient at send; A-B-A revision regression test. Found by code review; no claim of observed misdelivery. Seam: `device-tool-plane`. |
 | DEF-001 | Hotel-scoped capability advertisement off-by-one (inactive tool-runner counted) | low | open | 1 | 2026-03-10 | — |
 | DEF-002 | Abstract tool storage methods unwired in sqlite storage (legacy `ansible` crate Gap 3) | medium | fixed | 2 | 2026-03-10 | port to `ansible-mesh-core` (methods live in `domain/mod.rs`) |
 | DEF-003 | `aiua` binary test target could not compile/run | medium | fixed | 2 | 2026-03 | mock stubs + fallback fix (pre-04) |

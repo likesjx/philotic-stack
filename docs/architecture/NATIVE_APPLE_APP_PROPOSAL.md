@@ -3,7 +3,7 @@ title: Native Apple App — Edge Client Program
 doc_type: proposal
 domain: membrane-transport
 status: accepted-current-slice
-last_updated: 2026-09-04
+last_updated: 2026-09-14
 tags:
 - apple
 - ios
@@ -322,7 +322,23 @@ Two canonical owners, one mapping — no third source of truth:
   approximate precision, and has no passive or background upload path.
 - APNs (when built) carries wake signals only, never content.
 
-## Current Slice: Read-Only HealthKit Preview and Sharing (Transitional)
+## Current Slice: Apple Companion (Transitional)
+
+Implemented on `codex/apple-companion`, based on the working `codex/ios-healthkit`
+phone baseline: shared Today/Agents/Life shell, a Mac Ask/Today companion panel,
+local read-only Reminders preview, an opt-in map of the last shared location,
+foreground navigation App Intents, and availability-gated local note summaries.
+The existing edge chat and governed Health/location observation paths retain
+their ownership. No new remote device tools, background collection, Reminders
+sync, Spotlight indexing, or server-canonical conversation claim is introduced.
+
+See the [companion design and verification record](../../apps/philotic-apple/COMPANION.md)
+and [active work](../task.md#native-apple-companion). App tests are green on Mac
+and iOS Simulator; Mac local summarization was observed. Physical companion
+installation remains blocked by phone availability and expired signing profile.
+The larger program remains accepted for the current slice, not fully implemented.
+
+## Previous Slice: Read-Only HealthKit Preview and Sharing (Transitional)
 
 The existing Health surface now supports steps, resting/average heart rate,
 asleep minutes, and active energy through `DeviceHealthReader`. The old

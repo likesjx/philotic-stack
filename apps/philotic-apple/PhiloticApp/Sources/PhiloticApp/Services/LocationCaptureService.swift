@@ -88,6 +88,7 @@ public final class LocationCaptureService: NSObject, @preconcurrency CLLocationM
     public private(set) var isSharing = false
     public private(set) var lastSharedAt: Date?
     public private(set) var lastSharedSummary: String?
+    private(set) var lastSharedSnapshot: SharedLocationSnapshot?
     public private(set) var lastError: String?
 
     public var authorizationDescription: String {
@@ -154,6 +155,7 @@ public final class LocationCaptureService: NSObject, @preconcurrency CLLocationM
             }
 
             lastSharedAt = snapshot.observedAt
+            lastSharedSnapshot = snapshot
             lastSharedSummary = observation.evidence.claimSummary
         } catch {
             lastError = error.localizedDescription

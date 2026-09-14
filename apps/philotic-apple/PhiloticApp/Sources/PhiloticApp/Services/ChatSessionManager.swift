@@ -30,8 +30,17 @@ public final class ChatSessionManager {
     public private(set) var conversations: [Conversation] = []
     public private(set) var currentConversation: Conversation?
     public var currentAgent: AgentTarget? {
-        didSet { if currentAgent != oldValue { Task { await selectAgent(currentAgent) } } }
+        didSet {
+            guard currentAgent != oldValue else { return }
+            // Both app and companion can change selection. Never expose the old
+            // conversation underneath the new recipient while history loads.
+            currentConversation = nil
+            let target = currentAgent
+            let request = agentSelection.begin()
+            Task { await selectAgent(target, request: request) }
+        }
     }
+    private var agentSelection = AgentSelectionGate()
     public var lastError: String?
 
     /// Owns dictation capture, voice-reply playback, and fallback TTS. Views
@@ -334,7 +343,8 @@ public final class ChatSessionManager {
 
     // MARK: - Agent selection & history
 
-    private func selectAgent(_ target: AgentTarget?) async {
+    private func selectAgent(_ target: AgentTarget?, request: UUID) async {
+        guard agentSelection.isCurrent(request) else { return }
         guard let target else {
             currentConversation = nil
             return
@@ -352,8 +362,10 @@ public final class ChatSessionManager {
             }
         }
 
+        let all = await conversationStore.all()
+        guard agentSelection.isCurrent(request), currentAgent == target else { return }
         currentConversation = conversation
-        conversations = await conversationStore.all()
+        conversations = all
     }
 
     // MARK: - Sending / receiving
@@ -744,7 +756,8 @@ public final class ChatSessionManager {
         messageKind: String?,
         blobRefs: [BlobRef] = []
     ) async {
-        guard let target = currentAgent, var conversation = currentConversation else { return }
+        guard let target = currentAgent, var conversation = currentConversation,
+              conversation.agentTarget == target else { return }
         let hasContent = !content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
         guard hasContent || !blobRefs.isEmpty else { return }
 
