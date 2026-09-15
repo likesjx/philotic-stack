@@ -6908,12 +6908,54 @@ impl IpcServer {
                 let session_id = format!("{}:peer:{}", chat_id, target_agent_id);
                 let authority_hotel = lookup_agent_authority_hotel(graph, &target_agent_id);
 
+                // Resolve the peer's hotel to a mesh node BEFORE acking. The
+                // ledger writer treats an envelope without a target node as
+                // same-hotel and skips it (`AppendLocal`: `unwrap_or(true)`),
+                // so a delegation whose node was left for "the router" was
+                // never stored, never routed, never delivered — and the guest
+                // was still told "status: dispatched". Live 2026-09-15 19:35
+                // UTC (DEF-139): two delegations to agent-bjork-01 acked
+                // "dispatched"; neither reached mac-jane; Beacon told the
+                // operator Björk had received them.
+                let target_node_id = match authority_hotel.as_deref() {
+                    Some(hotel) => IpcServer::resolve_hotel_node_id(graph, hotel),
+                    None => None,
+                };
+                let Some(target_node_id) = target_node_id else {
+                    warn!(
+                        target_agent_id = %target_agent_id,
+                        authority_hotel = ?authority_hotel,
+                        "delegate_to_peer refused: no known hotel hosts the target agent"
+                    );
+                    return IpcResponse::error(
+                        "delegate_to_peer",
+                        "DELEGATION_UNROUTABLE",
+                        &format!(
+                            "no hotel on this mesh is known to host agent '{}'{}; the delegation was NOT sent — \
+                             the peer's hotel may not be syncing its roster, or the agent id is wrong",
+                            target_agent_id,
+                            authority_hotel
+                                .as_deref()
+                                .map(|h| format!(
+                                    " (its recorded authority hotel '{h}' resolves to no mesh node)"
+                                ))
+                                .unwrap_or_default()
+                        ),
+                    );
+                };
+                if target_node_id == local_node_id {
+                    warn!(
+                        target_agent_id = %target_agent_id,
+                        "delegate_to_peer: target agent is hosted on this hotel; the mesh ledger will not carry a same-hotel delegation"
+                    );
+                }
+
                 // Build the mesh envelope for TaskInvoke
                 let env = EventEnvelope {
                     event_id: delegation_id,
                     seq: 0,
                     source_node_id: local_node_id.to_string(),
-                    target_node_id: None, // Router will resolve node for agent_id
+                    target_node_id: Some(target_node_id),
                     source_agent_id: identity.guest_id.clone(),
                     target_agent_id: Some(target_agent_id.clone()),
                     kind: ansible_mesh_core::event::EventKind::TaskInvoke,
@@ -22146,6 +22188,72 @@ pub(crate) mod tests {
             _ => panic!("unexpected ledger command"),
         }
 
+        unsafe {
+            std::env::remove_var("PHILOTIC_HOTEL_SOCKET");
+        }
+        server_task.abort();
+        let _ = server_task.await;
+        if Path::new(&socket_path).exists() {
+            let _ = std::fs::remove_file(&socket_path);
+        }
+    }
+
+    /// DEF-139 (live 2026-09-15 19:35 UTC): a delegation to an agent no
+    /// hotel is known to host was acked "dispatched" and silently dropped.
+    #[tokio::test]
+    async fn delegate_to_peer_refuses_unroutable_targets_before_acking() {
+        let _env_guard = ipc_env_guard();
+        let socket_path = test_socket_path();
+        let (dispatcher_tx, mut dispatcher_rx) = test_dispatcher_channel();
+        let graph = Arc::new(GraphDomain::new(Arc::new(TestGraphAdapter)));
+        let server = IpcServer::new(
+            socket_path.clone(),
+            "vps-jane-aiua-01",
+            dispatcher_tx,
+            graph,
+        );
+        let server_task = tokio::spawn(async move {
+            server.run().await.expect("ipc server should run");
+        });
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        unsafe {
+            std::env::set_var("PHILOTIC_HOTEL_SOCKET", &socket_path);
+        }
+        let mut agent = PhiloticClient::connect(GuestIdentity {
+            guest_id: "agent-beacon:orchestrator".into(),
+            role: "agent".into(),
+            supported_tools: Vec::new(),
+        })
+        .await
+        .expect("agent connect");
+        let response = agent
+            .send_request(IpcRequest::DelegateToPeer {
+                target_agent_id: "agent-bjork-01".into(),
+                task_description: "integrate HWV 432".into(),
+                context_package: "operator confirmed the piece".into(),
+                chat_id: "7898847424".into(),
+                source: Some("peer".into()),
+                expected_artifacts: Vec::new(),
+                timeout_secs: None,
+            })
+            .await
+            .expect("delegate request");
+        let rendered = format!("{response:?}");
+        assert!(
+            rendered.contains("DELEGATION_UNROUTABLE"),
+            "unroutable delegation must be refused, got {rendered}"
+        );
+        assert!(
+            !rendered.contains("dispatched"),
+            "no dispatched ack for an unroutable delegation: {rendered}"
+        );
+        // Nothing was handed to the ledger.
+        let none = tokio::time::timeout(
+            tokio::time::Duration::from_millis(200),
+            dispatcher_rx.recv(),
+        )
+        .await;
+        assert!(none.is_err(), "no ledger command for a refused delegation");
         unsafe {
             std::env::remove_var("PHILOTIC_HOTEL_SOCKET");
         }

@@ -8913,6 +8913,17 @@ async fn main() -> Result<()> {
                             .map(|t| t == local_node_id_writer.as_str())
                             .unwrap_or(true);
                         if is_local {
+                            if evt.target_node_id.is_none() && evt.target_agent_id.is_some() {
+                                // DEF-139: an envelope addressed to an agent with no
+                                // node was being skipped here as "same-hotel" — never
+                                // stored, never routed, never delivered.
+                                warn!(
+                                    event_id = %evt.event_id,
+                                    target_agent_id = ?evt.target_agent_id,
+                                    kind = ?evt.kind,
+                                    "ledger: envelope addressed to an agent without a target node is not routable and was dropped"
+                                );
+                            }
                             continue;
                         }
                         if let Err(e) = ledger_writer.append_event(&mut evt) {

@@ -6548,7 +6548,9 @@ impl AgentRuntime {
                         status,
                     }) => (
                         format!(
-                            "Delegated task to peer '{target_agent_id}' (delegation {delegation_id}, status: {status})."
+                            "Delegation to peer '{target_agent_id}' queued on the mesh (delegation {delegation_id}, status: {status}). \
+                             Delivery is NOT confirmed: the hotel has accepted it for routing, nothing more. \
+                             Tell the user it was sent, never that it was received."
                         ),
                         None,
                     ),

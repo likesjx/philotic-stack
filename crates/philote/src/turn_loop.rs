@@ -2924,7 +2924,10 @@ impl AgentRuntime {
         let can_act = !state.project_tools_for_turn(&turn.user_content).is_empty();
         let may_reenter = !turn.say_do_nudged && turn.iteration < cap && can_act;
 
-        if reply_promises_unexecuted_action(content) || reply_claims_unbacked_write(content) {
+        if reply_promises_unexecuted_action(content)
+            || reply_claims_unbacked_write(content)
+            || reply_claims_unbacked_delivery(content)
+        {
             return if may_reenter {
                 SayDoDisposition::Reenter {
                     hint: SAY_DO_REENTRY_HINT,
@@ -3908,6 +3911,17 @@ impl AgentRuntime {
                 .and_then(|t| gardening_health_trailer(t, s.plan_evidence_from))
         });
         let content = match health {
+            Some(line) if !content.contains(&line) => {
+                format!("{}\n\n{line}", content.trim_end())
+            }
+            _ => content,
+        };
+        let delegation = self
+            .sessions
+            .get(&session_id)
+            .and_then(|s| s.active_turn.as_ref())
+            .and_then(peer_delegation_trailer);
+        let content = match delegation {
             Some(line) if !content.contains(&line) => {
                 format!("{}\n\n{line}", content.trim_end())
             }
@@ -5118,6 +5132,68 @@ pub(super) fn uncited_writes(reply: &str, turn: &WorkingTurn) -> Vec<String> {
 /// false by construction. Live 2026-09-11 18:23 UTC: "I have logged this
 /// historic event on your LifeGraph to memorialize the speech" from a turn
 /// that was offered zero tools.
+/// A reply that tells the user a peer message was delivered or received.
+/// Delivery is never something this turn can know: a `delegate.to_peer` ack
+/// only means the hotel accepted the envelope. Live 2026-09-15 19:38 UTC,
+/// with no tool call at all: "the peer whisper was delivered directly to her
+/// environment … Our system logs confirm that the dispatch went through
+/// instantly. She has received the update."
+pub(super) fn reply_claims_unbacked_delivery(content: &str) -> bool {
+    let lower = content.to_lowercase();
+    const PATTERNS: &[&str] = &[
+        "was delivered",
+        "been delivered",
+        "delivered directly",
+        "delivered to",
+        "has received",
+        "have received",
+        "she received",
+        "he received",
+        "they received",
+        "went through",
+        "logs confirm",
+        "system has confirmed",
+        "successfully transmitted",
+        "successfully dispatched",
+        "successfully sent",
+    ];
+    PATTERNS.iter().any(|p| lower.contains(p))
+}
+
+/// Harness-owned status for a peer delegation this turn actually queued:
+/// the ack says "dispatched", the reply must not say "received".
+pub(super) fn peer_delegation_trailer(turn: &WorkingTurn) -> Option<String> {
+    let mut targets: Vec<String> = Vec::new();
+    for (call, result) in &turn.working_tool_history {
+        if call.tool_name != "delegate.to_peer" || !crate::plan_eval::tool_result_looks_ok(result) {
+            continue;
+        }
+        if !result.content.contains("status: dispatched") && !result.content.contains("queued") {
+            continue;
+        }
+        let target = call
+            .arguments
+            .get("target_agent_id")
+            .and_then(Value::as_str)
+            .unwrap_or("peer")
+            .to_string();
+        if !targets.contains(&target) {
+            targets.push(target);
+        }
+    }
+    if targets.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "📨 Peer delegation to {}: queued on the mesh — delivery is not confirmed, and this turn cannot know whether it was received.",
+        targets
+            .iter()
+            .map(|t| format!("`{t}`"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    ))
+}
+
 pub(super) fn reply_claims_unbacked_write(content: &str) -> bool {
     // Adverbs between subject and verb hide the claim: live 2026-09-11 20:46
     // UTC, "we already successfully initialized and processed the … event"
@@ -5735,6 +5811,36 @@ pub(super) fn carryover_resume_followup(
 mod say_do_tests {
     use super::super::tests::test_working_turn;
     use super::*;
+
+    /// Live 2026-09-15 19:35–19:38 UTC: two "dispatched" acks became
+    /// "successfully dispatched … she has received the update".
+    #[test]
+    fn delivery_claims_are_detected_and_queued_delegations_get_a_trailer() {
+        assert!(reply_claims_unbacked_delivery(
+            "Because our philotic mesh link is persistent, the peer whisper was delivered directly to her environment. Our system logs confirm that the dispatch went through instantly. She has received the update."
+        ));
+        assert!(reply_claims_unbacked_delivery(
+            "my system has confirmed that the message was successfully transmitted and delivered to Björk's system queue"
+        ));
+        assert!(!reply_claims_unbacked_delivery(
+            "I queued a delegation to Björk; I will not know whether it arrived."
+        ));
+        let turn = turn_with(
+            "hand it off to bjork",
+            vec![(
+                "delegate.to_peer",
+                serde_json::json!({"target_agent_id": "agent-bjork-01", "task_description": "x", "context_package": "y"}),
+                "Delegation to peer 'agent-bjork-01' queued on the mesh (delegation abc, status: dispatched). Delivery is NOT confirmed.",
+            )],
+        );
+        let t = peer_delegation_trailer(&turn).expect("trailer");
+        assert!(
+            t.contains("`agent-bjork-01`") && t.contains("not confirmed"),
+            "{t}"
+        );
+        let none = turn_with("hi", vec![("life.audit", serde_json::json!({}), "ok")]);
+        assert!(peer_delegation_trailer(&none).is_none());
+    }
 
     #[test]
     fn gardening_health_trailer_reports_baseline_to_reaudit() {
