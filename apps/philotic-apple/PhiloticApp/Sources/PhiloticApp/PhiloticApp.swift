@@ -47,7 +47,7 @@ struct PhiloticApp: App {
         .commands {
             CommandGroup(after: .windowArrangement) {
                 Button("Toggle Companion") {
-                    if notch.isVisible && notch.expanded { notch.expanded = false }
+                    if notch.isEnabled && notch.expanded { notch.expanded = false }
                     else { notch.show(); notch.expanded = true }
                 }
                 .keyboardShortcut("n", modifiers: [.command, .option])
@@ -57,8 +57,8 @@ struct PhiloticApp: App {
             if let session { ConnectionSettingsView(session: session).frame(width: 520, height: 600) }
         }
         MenuBarExtra("Philotic", systemImage: "waveform") {
-            Button(notch.isVisible ? "Hide companion" : "Show companion") {
-                if notch.isVisible { notch.hide() } else { notch.show() }
+            Button(notch.isEnabled ? "Disable notch hover" : "Enable notch hover") {
+                if notch.isEnabled { notch.hide() } else { notch.show() }
             }
             OpenCompanionWindowButton(router: router)
             Divider()

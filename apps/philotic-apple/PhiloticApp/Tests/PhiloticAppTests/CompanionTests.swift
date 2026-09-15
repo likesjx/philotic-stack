@@ -91,13 +91,14 @@ final class CompanionTests: XCTestCase {
     }
 
     #if os(macOS)
-    func testPanelAvoidsNotchAndFitsOffsetExternalScreen() {
+    func testPanelGrowsFromTopEdgeOnOffsetScreen() {
         for expanded in [false, true] {
             let screen = CGRect(x: -1920, y: 300, width: 1920, height: 1080)
             let visible = CGRect(x: -1920, y: 350, width: 1920, height: 990)
             let frame = CompanionPanelLayout.frame(screen: screen, visible: visible, safeTop: 40, expanded: expanded)
-            XCTAssertTrue(visible.contains(frame))
-            XCTAssertLessThan(frame.maxY, screen.maxY - 40)
+            XCTAssertTrue(screen.contains(frame))
+            XCTAssertEqual(frame.maxY, screen.maxY)
+            XCTAssertGreaterThanOrEqual(frame.minY, visible.minY)
             XCTAssertEqual(frame.midX, screen.midX)
         }
     }
@@ -106,7 +107,36 @@ final class CompanionTests: XCTestCase {
         let screen = CGRect(x: 0, y: 0, width: 400, height: 400)
         let visible = CGRect(x: 0, y: 0, width: 400, height: 375)
         let frame = CompanionPanelLayout.frame(screen: screen, visible: visible, safeTop: 25, expanded: true)
-        XCTAssertTrue(visible.contains(frame))
+        XCTAssertTrue(screen.contains(frame))
+        XCTAssertGreaterThanOrEqual(frame.minY, visible.minY + 16)
+    }
+
+    func testRestingFrameMatchesCameraAndExpandedPanelKeepsItsAnchor() {
+        let screen = CGRect(x: -1710, y: 300, width: 1710, height: 1107)
+        let visible = CGRect(x: -1710, y: 356, width: 1710, height: 1017)
+        let camera = CGRect(x: -947.5, y: 1373.5, width: 185, height: 33.5)
+        let resting = CompanionPanelLayout.frame(screen: screen, visible: visible, safeTop: 33.5,
+                                                 expanded: false, camera: camera)
+        let open = CompanionPanelLayout.frame(screen: screen, visible: visible, safeTop: 33.5,
+                                              expanded: true, camera: camera)
+        XCTAssertEqual(resting, camera)
+        XCTAssertEqual(open.maxY, camera.maxY)
+        XCTAssertEqual(open.midX, camera.midX)
+        XCTAssertGreaterThan(open.width, resting.width)
+        XCTAssertGreaterThan(open.height, resting.height)
+        let inset = CompanionPanelLayout.contentInset(screen: screen, visible: visible, safeTop: 33.5)
+        XCTAssertLessThan(open.maxY - inset, camera.minY)
+        XCTAssertLessThan(open.maxY - inset, visible.maxY)
+    }
+
+    func testNonNotchedRestingFrameIsOnlyAnAnimationOrigin() {
+        let screen = CGRect(x: 0, y: 0, width: 1440, height: 900)
+        let visible = CGRect(x: 0, y: 50, width: 1440, height: 825)
+        let resting = CompanionPanelLayout.frame(screen: screen, visible: visible, safeTop: 0, expanded: false)
+        XCTAssertEqual(resting.height, 1)
+        XCTAssertEqual(resting.maxY, screen.maxY)
+        XCTAssertEqual(resting.midX, screen.midX)
+        XCTAssertEqual(CompanionPanelLayout.contentInset(screen: screen, visible: visible, safeTop: 0), 33)
     }
     #endif
 }

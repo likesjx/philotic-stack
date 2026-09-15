@@ -17,7 +17,6 @@ struct NotchView: View {
                     HStack(spacing: 8) {
                         Image(systemName: "waveform").foregroundStyle(.cyan)
                         Text("Philotic").font(.headline)
-                        if !controller.expanded { Text("Ask · Today").font(.caption).foregroundStyle(.secondary) }
                         Image(systemName: controller.expanded ? "chevron.up" : "chevron.down").font(.caption2)
                     }
                     .frame(maxWidth: .infinity)
@@ -63,16 +62,18 @@ struct NotchView: View {
                     Task { await session.connect() }
                 }
             }
-            // Keep chat state mounted when hover closes the panel (unsent drafts
-            // must not disappear just because the pointer moved away).
-            .frame(height: controller.expanded ? nil : 0)
-            .clipped()
-            .opacity(controller.expanded ? 1 : 0)
-            .allowsHitTesting(controller.expanded)
-            .accessibilityHidden(!controller.expanded)
         }
+        // Keep the expanded layout and chat draft mounted while the AppKit
+        // shell animates. Content is clipped, not reflowed into a tiny notch.
+        .padding(.top, controller.contentTopInset)
+        .frame(width: controller.contentSize.width, height: controller.contentSize.height, alignment: .top)
+        .opacity(controller.expanded ? 1 : 0)
+        .allowsHitTesting(controller.expanded)
+        .accessibilityHidden(!controller.expanded)
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
-        .background(Color.black.opacity(0.96), in: RoundedRectangle(cornerRadius: controller.expanded ? 24 : 19))
+        .background(Color.black)
+        .clipShape(UnevenRoundedRectangle(bottomLeadingRadius: 24, bottomTrailingRadius: 24))
+        .ignoresSafeArea()
         .preferredColorScheme(.dark)
         .onExitCommand { controller.expanded = false }
         .onChange(of: router.sheet) { _, sheet in

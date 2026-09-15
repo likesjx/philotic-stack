@@ -3,9 +3,10 @@
 ## Product direction
 
 One companion, two jobs: **Ask** is the quick agent command center; **Today**
-is the personal dashboard. The Mac keeps a quiet, top-centered pill below the
-camera/menu exclusion area, expanding when the pointer hovers over or near the
-notch (click and keyboard opening also remain available). The iPhone
+is the personal dashboard. The Mac is completely hidden at rest. Hovering over
+or near the camera notch grows a black, top-anchored panel out of the notch;
+leaving retracts it into the notch and removes the window. Keyboard opening
+also remains available. The iPhone
 uses Today, Agents, and Life tabs with the same integration boundaries.
 
 This is an original, notch-inspired SwiftUI surface in the existing app, not
@@ -28,13 +29,13 @@ it does not complete the native-app program or create a remote device tool host.
 Reminders previews are discarded on dismissal/backgrounding; stale completions
 cannot repopulate them. Native fetches have a 20-second timeout. Health retains
 its existing exact-preview consent and invalidation rules. Local AI text and
-results are discarded when its sheet closes. The collapsed Mac pill contains
-no health, location, reminder, or conversation preview.
+results are discarded when its sheet closes. The resting Mac panel is not
+onscreen and exposes no health, location, reminder, or conversation preview.
 
 ## Mac notch hover — 2026-09-15
 
 The hover target includes the physical camera gap, an 18-point horizontal
-margin, and the collapsed pill. Non-notched displays use a bounded top-center
+margin, and a 10-point approach margin. Non-notched displays use a bounded top-center
 target, not the whole menu bar. The panel prefers a notched display when present.
 A 150 ms dwell opens it; a continuous region from notch to expanded panel plus
 16 points of padding and a 450 ms exit grace prevent flicker during pointer
@@ -42,30 +43,38 @@ transfer. Manual collapse suppresses reopening until the pointer leaves and
 returns. Keyboard opening remains available until the pointer visits the panel.
 The exact top screen edge is included in hit testing. The panel's dismiss (×)
 button and keyboard toggle collapse without disabling hover; only the explicit
-menu-bar Hide companion command suspends the companion until Show is selected.
+menu-bar Disable notch hover command suspends it until Enable is selected.
+
+The controller distinguishes hover enablement from actual window visibility.
+At rest the panel is ordered out, has no shadow, and cannot intercept clicks.
+On expansion its frame animates from the actual camera bounds to the full panel
+over 280 ms; retraction takes 220 ms and orders the window out on completion.
+Both frames share the screen-top edge and camera center. Non-notched screens
+use a one-point-high origin at the top center. Stale animation completions
+cannot hide a newer presentation. The black shell extends through the menu
+band at status-bar level, while interactive content is inset below the camera
+and menu bar. Hosting size constraints are disabled so the mounted content
+cannot force the resting shell to remain window-sized.
 
 Hover never calls `makeKey` or activates the application. Editing, menu tracking,
 mouse-button drags and active voice capture keep an already-open panel from
 auto-closing. The content remains mounted while collapsed to preserve drafts.
 Frame transitions respect Reduce Motion. A controller-owned 20 Hz timer samples
 only the current `NSEvent.mouseLocation`; it stores no pointer history and
-requests no Accessibility/Input Monitoring grant. Sampling stops when hidden,
+requests no Accessibility/Input Monitoring grant. Sampling continues while
+retracted and stops only when explicitly disabled,
 the display sleeps, or the user session resigns active; observers/timer are
 released with the controller. Screen sleep and session activity are separate
 gates so one resume event cannot override the other.
 
-All 40 Mac tests pass. Timing, suppression, interaction guards, notch-to-panel
-geometry, exact top-edge hits, empty regions, offset screen coordinates and
-non-notched fallback have deterministic tests. A diagnostic live run recorded
-two pointer-dwell expansion transitions and revealed that the former × action
-stopped sampling entirely. That action now collapses instead; temporary pointer
-state logs were removed, retaining presentation and sampler lifecycle events.
-The corrected app was rebuilt and launched; UI inspection verified click
-expansion and × dismissal back to the visible pill without stopping sampling.
-Visible no-click hover behavior, focus
-retention in another app, draft retention, sleep/lock and external-display
-transitions still require operator validation; log transitions are not proof of
-visible presentation. No iPhone behavior changes in this increment.
+All 42 Mac tests pass. Timing, suppression, interaction guards, top-anchored
+camera geometry, safe content insets, exact top-edge hits, empty regions,
+offset screen coordinates and non-notched fallback have deterministic tests.
+The operator confirmed the preceding hover repair works. The new hidden-at-rest
+build was launched and UI inspection verified its expanded layout and complete
+window removal after dismissal, with sampling still enabled. The new no-click
+grow/retract animation, focus/draft retention, sleep/lock and external-display
+transitions still await operator validation. No iPhone behavior changes here.
 
 ## Authority and Philotic Web
 
@@ -135,3 +144,4 @@ current development profile and trusted, reachable phone.
 - [Apple App Intents](https://developer.apple.com/documentation/appintents/creating-your-first-app-intent)
 - [Apple MapKit](https://developer.apple.com/documentation/mapkit/map)
 - [Apple camera exclusion geometry](https://developer.apple.com/documentation/AppKit/NSScreen/auxiliaryTopLeftArea-uglc)
+- [Apple hosting size constraints](https://developer.apple.com/documentation/swiftui/nshostingsizingoptions)

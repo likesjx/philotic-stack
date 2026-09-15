@@ -326,8 +326,14 @@ Two canonical owners, one mapping — no third source of truth:
 
 The `codex/notch-hover` follow-up adds pointer-dwell expansion at the physical
 notch (top-center fallback), delayed exit collapse, and draft-preserving,
-non-focus-stealing presentation. It changes only the Mac panel; real hover,
-focus, lock and display-transition validation is tracked in the companion record.
+non-focus-stealing presentation. The operator confirmed hover activation works.
+The next presentation refinement is implemented on that branch: completely
+hidden at rest, expanding from the camera bounds into a top-anchored black
+shell with content below the camera. Retraction removes the window without
+disabling hover. All 42 Mac tests pass; the new build's layout and hidden state
+were inspected. Animation feel, focus, lock and display-transition validation
+remain tracked in the companion record; the broader program remains accepted
+for current slices, not fully implemented.
 
 Implemented on `codex/apple-companion`, based on the working `codex/ios-healthkit`
 phone baseline: shared Today/Agents/Life shell, a Mac Ask/Today companion panel,

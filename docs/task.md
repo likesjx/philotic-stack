@@ -199,13 +199,14 @@ Branch: `codex/apple-companion`, based on the working iPhone branch `codex/ios-h
 
 Hover follow-up: `codex/notch-hover` adds near-notch dwell opening, delayed
 pointer-exit collapse, focus-preserving presentation, retained drafts and
-sleep/session gating. Mac policy tests pass; fresh app launch and operator
-hover/focus validation are separate from the earlier companion merge (#513).
-September 15 hover repair: include the exact screen-top boundary and make × /
-keyboard dismissal collapse without stopping hover. All 40 Mac tests pass and
-the corrected app launches. Diagnostic logs showed pointer-driven transitions;
-visible presentation confirmation remains pending. Proposal disposition is
-unchanged; no harness trial or Muninn write was performed for this repair.
+sleep/session gating. The operator confirmed the hover repair works. The new
+September 15 presentation is completely hidden at rest and grows from the
+camera notch into a top-anchored window; × / keyboard dismissal retract without
+disabling hover. All 42 Mac tests pass, the new build runs, and UI inspection
+confirmed expanded layout and complete window removal. Operator validation of
+the new grow/retract animation and display/lock behavior remains pending.
+The broader proposal disposition is unchanged; no harness trial or Muninn write
+was performed. This branch is separate from the earlier companion merge (#513).
 
 - [x] Combine the agent command center and personal dashboard in one shared Today/Agents/Life shell, with a Mac Ask/Today panel using the existing session.
 - [x] Add local read-only Reminders preview, opt-in map of the last shared location, navigation-only App Intents, and availability-gated on-device note summaries.

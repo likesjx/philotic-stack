@@ -5,13 +5,21 @@ import OSLog
 import SwiftUI
 
 enum CompanionPanelLayout {
-    /// Sit below the camera/menu exclusion area, including on non-notched displays.
-    static func frame(screen: CGRect, visible: CGRect, safeTop: CGFloat, expanded: Bool) -> CGRect {
-        let width = min(expanded ? 500.0 : 230.0, max(1, visible.width - 16))
-        let height = min(expanded ? 540.0 : 38.0, max(1, visible.height - 16))
-        let top = min(visible.maxY, screen.maxY - safeTop) - 6
-        return CGRect(x: max(visible.minX, min(screen.midX - width / 2, visible.maxX - width)),
-                      y: max(visible.minY, top - height), width: width, height: height)
+    /// The shell grows from the camera, with its top edge pinned to the display.
+    /// Interactive content is inset below the camera/menu band separately.
+    static func frame(screen: CGRect, visible: CGRect, safeTop: CGFloat, expanded: Bool,
+                      camera: CGRect? = nil) -> CGRect {
+        if !expanded, let camera, !camera.isEmpty { return camera.intersection(screen) }
+        let width = min(expanded ? 500.0 : 180.0, max(1, visible.width - 16))
+        let height = min(expanded ? 540.0 + safeTop : max(1, safeTop),
+                         max(1, screen.maxY - visible.minY - 16))
+        let center = camera?.midX ?? screen.midX
+        return CGRect(x: max(visible.minX, min(center - width / 2, visible.maxX - width)),
+                      y: screen.maxY - height, width: width, height: height)
+    }
+
+    static func contentInset(screen: CGRect, visible: CGRect, safeTop: CGFloat) -> CGFloat {
+        max(safeTop, screen.maxY - visible.maxY) + 8
     }
 }
 
@@ -39,7 +47,10 @@ final class NotchController {
             position(animated: true)
         }
     }
-    private(set) var isVisible = false
+    /// Enabled is independent of window visibility: the resting panel is ordered out.
+    private(set) var isEnabled = false
+    private(set) var contentTopInset: CGFloat = 40
+    private(set) var contentSize = CGSize(width: 500, height: 540)
     @ObservationIgnored private var panel: NSPanel?
     @ObservationIgnored private var displayObserver: NSObjectProtocol?
     @ObservationIgnored private var lockObserver: NSObjectProtocol?
@@ -53,6 +64,7 @@ final class NotchController {
     @ObservationIgnored private var sessionActive = true
     @ObservationIgnored private var displayAwake = true
     @ObservationIgnored private var isBusy: () -> Bool = { false }
+    @ObservationIgnored private var presentationGeneration = 0
 
     func configure(session: ChatSessionManager, router: CompanionRouter, openMain: @escaping () -> Void) {
         guard panel == nil else { return }
@@ -62,12 +74,15 @@ final class NotchController {
         panel.isOpaque = false
         panel.backgroundColor = .clear
         panel.hasShadow = true
-        panel.level = .floating
+        panel.level = .statusBar
         panel.hidesOnDeactivate = false
         panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
         panel.isReleasedWhenClosed = false
-        panel.contentView = NSHostingView(rootView: NotchView(
+        let hosting = NSHostingView(rootView: NotchView(
             session: session, router: router, controller: self, openMain: openMain))
+        // The controller owns the animated frame, not the content's minimum size.
+        hosting.sizingOptions = []
+        panel.contentView = hosting
         self.panel = panel
         isBusy = { [weak session] in
             guard let session else { return false }
@@ -113,19 +128,19 @@ final class NotchController {
     }
 
     func show() {
+        isEnabled = panel != nil
         position()
-        panel?.orderFrontRegardless()
-        isVisible = panel != nil
-        Self.logger.notice("show configured=\(self.panel != nil) visible=\(self.isVisible)")
+        Self.logger.notice("companion enabled=\(self.isEnabled)")
         resumeHover()
     }
 
     func hide() {
         Self.logger.notice("hide requested")
+        isEnabled = false
         stopHover()
         expanded = false
+        presentationGeneration += 1
         panel?.orderOut(nil)
-        isVisible = false
     }
 
     private var screen: NSScreen? {
@@ -135,19 +150,45 @@ final class NotchController {
 
     private func position(animated: Bool = false) {
         guard let panel, let screen else { return }
-        let frame = CompanionPanelLayout.frame(screen: screen.frame, visible: screen.visibleFrame,
-                                                safeTop: screen.safeAreaInsets.top, expanded: expanded)
-        if animated && isVisible && !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion {
+        let camera = cameraFrame(on: screen)
+        let resting = CompanionPanelLayout.frame(screen: screen.frame, visible: screen.visibleFrame,
+                                                 safeTop: screen.safeAreaInsets.top, expanded: false, camera: camera)
+        let open = CompanionPanelLayout.frame(screen: screen.frame, visible: screen.visibleFrame,
+                                              safeTop: screen.safeAreaInsets.top, expanded: true, camera: camera)
+        contentTopInset = CompanionPanelLayout.contentInset(screen: screen.frame, visible: screen.visibleFrame,
+                                                            safeTop: screen.safeAreaInsets.top)
+        contentSize = open.size
+        presentationGeneration += 1
+        let generation = presentationGeneration
+        let presenting = isEnabled && expanded && sessionActive && displayAwake
+        let frame = presenting ? open : resting
+        panel.ignoresMouseEvents = !presenting
+        panel.hasShadow = presenting
+        if presenting && !panel.isVisible {
+            panel.setFrame(resting, display: false)
+            panel.orderFrontRegardless()
+        }
+        if animated && isEnabled && panel.isVisible && sessionActive && displayAwake
+            && !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion {
             NSAnimationContext.runAnimationGroup { context in
-                context.duration = 0.18
+                context.duration = presenting ? 0.28 : 0.22
+                context.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
                 panel.animator().setFrame(frame, display: true)
+            } completionHandler: { [weak self] in
+                MainActor.assumeIsolated {
+                    guard let self, self.presentationGeneration == generation else { return }
+                    if !presenting { self.panel?.orderOut(nil) }
+                }
             }
-        } else { panel.setFrame(frame, display: true) }
+        } else {
+            panel.setFrame(frame, display: true)
+            if !presenting { panel.orderOut(nil) }
+        }
         // Hover only changes presentation. Clicking an editor may make the panel key.
     }
 
     private func resumeHover() {
-        guard isVisible, sessionActive, displayAwake, hoverTimer == nil else { return }
+        guard isEnabled, sessionActive, displayAwake, hoverTimer == nil else { return }
         // Sampling only the current pointer also covers the camera/menu-bar area
         // while other apps are active. No event interception, key logging, or TCC grant.
         let timer = Timer(timeInterval: 0.05, repeats: true) { [weak self] _ in
@@ -169,20 +210,16 @@ final class NotchController {
     private func suspendHover() {
         stopHover()
         expanded = false
+        position()
     }
 
     private func samplePointer() {
-        guard isVisible, sessionActive, displayAwake, let panel, let screen else { return }
+        guard isEnabled, sessionActive, displayAwake, let panel, let screen else { return }
+        let camera = cameraFrame(on: screen)
         let collapsed = CompanionPanelLayout.frame(screen: screen.frame, visible: screen.visibleFrame,
-                                                   safeTop: screen.safeAreaInsets.top, expanded: false)
+                                                   safeTop: screen.safeAreaInsets.top, expanded: false, camera: camera)
         let expandedFrame = CompanionPanelLayout.frame(screen: screen.frame, visible: screen.visibleFrame,
-                                                       safeTop: screen.safeAreaInsets.top, expanded: true)
-        var camera: CGRect?
-        if let left = screen.auxiliaryTopLeftArea, let right = screen.auxiliaryTopRightArea,
-           right.minX > left.maxX {
-            camera = CGRect(x: left.maxX, y: screen.frame.maxY - screen.safeAreaInsets.top,
-                            width: right.minX - left.maxX, height: screen.safeAreaInsets.top)
-        }
+                                                       safeTop: screen.safeAreaInsets.top, expanded: true, camera: camera)
         let activation = NotchHoverRegion.activation(screen: screen.frame, collapsed: collapsed, camera: camera)
         let retention = NotchHoverRegion.retention(screen: screen.frame, activation: activation, panel: expandedFrame)
         let point = NSEvent.mouseLocation
@@ -195,6 +232,13 @@ final class NotchController {
         case .collapse: expanded = false
         case nil: break
         }
+    }
+
+    private func cameraFrame(on screen: NSScreen) -> CGRect? {
+        guard let left = screen.auxiliaryTopLeftArea, let right = screen.auxiliaryTopRightArea,
+              right.minX > left.maxX else { return nil }
+        return CGRect(x: left.maxX, y: screen.frame.maxY - screen.safeAreaInsets.top,
+                      width: right.minX - left.maxX, height: screen.safeAreaInsets.top)
     }
 
     deinit {
