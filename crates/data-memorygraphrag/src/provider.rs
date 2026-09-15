@@ -2609,10 +2609,54 @@ impl LifeGraphProvider {
         )
         .await?;
         let Some(row) = rows.next().await? else {
+            // Idempotence: a retry after the action already landed is a
+            // success, not a failure — live 2026-09-14 21:20 UTC five
+            // "matched nothing" retries on already-retired duplicates
+            // tripped the stall detector and killed the pass.
+            let probe = concat!(
+                "MATCH (n) WHERE n.id = $a OR toString(id(n)) = $a ",
+                "RETURN coalesce(n.id, toString(id(n))) AS id, n.validation_state AS validation_state, ",
+                "coalesce(n.status, n.loop_status) AS status LIMIT 1"
+            );
+            let mut probe_rows = bounded_query(
+                "life_tidy_probe",
+                graph.execute(query(probe).param("a", compiled.a.as_str())),
+            )
+            .await?;
+            if let Some(existing) = probe_rows.next().await? {
+                let existing = row_to_json(&existing)?;
+                let vs = existing
+                    .get("validation_state")
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                let st = existing.get("status").and_then(Value::as_str).unwrap_or("");
+                let already = match compiled.kind {
+                    "retire_duplicate" | "retire" => vs == "retired",
+                    "resolve" => st == "resolved" || vs == "retired",
+                    _ => false,
+                };
+                if already {
+                    info!(kind = compiled.kind, node = %compiled.a, "life.tidy: already applied (idempotent)");
+                    return Ok(ProviderOutput::ResultSet(json!({
+                        "status": "already_applied",
+                        "kind": compiled.kind,
+                        "node_id": compiled.a,
+                        "touched": existing,
+                        "note": "this action had already been applied; nothing changed",
+                    })));
+                }
+                anyhow::bail!(
+                    "life.tidy {} refused: {} is {} — confirmed nodes need operator_approved, and \
+                     a retire needs a proposed/inferred target (nothing was changed)",
+                    compiled.kind,
+                    compiled.a,
+                    if vs.is_empty() { "unstated" } else { vs }
+                );
+            }
             anyhow::bail!(
-                "life.tidy {} matched nothing: the node(s) do not exist, or the target is \
-                 confirmed and operator_approved was not set (nothing was changed)",
-                compiled.kind
+                "life.tidy {} matched nothing: no node with id '{}' exists (nothing was changed)",
+                compiled.kind,
+                compiled.a
             );
         };
         let touched = row_to_json(&row)?;

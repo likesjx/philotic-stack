@@ -1730,6 +1730,12 @@ impl AgentRuntime {
 
         match action {
             AgentAction::Respond { content } => {
+                // A provider that fails to parse its own structured envelope
+                // hands back the raw JSON (live 2026-09-14 21:23 UTC: a
+                // `{"display_text": …}` object with raw newlines inside the
+                // string reached Telegram verbatim). Unwrap it here so the
+                // gates below and the operator see the text.
+                let content = unwrap_display_text_envelope(content);
                 // Say-do gate: a text reply that tells the user work is being
                 // executed right now, from a turn that has not called a single
                 // tool, is a promise the loop will never keep — the turn ends
@@ -4676,6 +4682,45 @@ impl AgentRuntime {
     }
 }
 
+/// If `content` is a leaked structured-response envelope, return its
+/// `display_text`; otherwise return `content` unchanged. Tolerates the
+/// invalid-JSON case (raw newlines inside the string) by scanning for the
+/// key and the closing quote before the next key or the object end.
+pub(super) fn unwrap_display_text_envelope(content: String) -> String {
+    let trimmed = content.trim_start();
+    if !trimmed.starts_with('{') || !trimmed.contains("\"display_text\"") {
+        return content;
+    }
+    if let Ok(v) = serde_json::from_str::<Value>(trimmed) {
+        if let Some(t) = v.get("display_text").and_then(Value::as_str) {
+            return t.to_string();
+        }
+    }
+    let Some(key) = trimmed.find("\"display_text\"") else {
+        return content;
+    };
+    let after = &trimmed[key + "\"display_text\"".len()..];
+    let Some(q) = after.find('"') else {
+        return content;
+    };
+    let body = &after[q + 1..];
+    // Closing quote followed by a comma+newline+key, or by a newline and the
+    // object end.
+    let end = body
+        .find("\",\n")
+        .into_iter()
+        .chain(body.find("\"\n}"))
+        .chain(body.rfind('"'))
+        .min()
+        .unwrap_or(body.len());
+    let text = body[..end].replace("\\n", "\n").replace("\\\"", "\"");
+    if text.trim().is_empty() {
+        content
+    } else {
+        text
+    }
+}
+
 /// What the say-do gate decided for a text-only reply.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum SayDoDisposition {
@@ -5845,6 +5890,29 @@ mod say_do_tests {
         assert_eq!(
             unbacked_cited_ids("Resolved `life:commitment:new`.", &failed),
             vec!["life:commitment:new"]
+        );
+    }
+
+    /// Live 2026-09-14 21:23 UTC: the envelope with raw newlines in the string.
+    #[test]
+    fn leaked_display_text_envelope_is_unwrapped() {
+        let leaked = "{\n  \"display_text\": \"I have verified all 12 actions.\n\n### Summary\n- retired x\",\n  \"memory_candidate\": null\n}";
+        assert_eq!(
+            unwrap_display_text_envelope(leaked.to_string()),
+            "I have verified all 12 actions.\n\n### Summary\n- retired x"
+        );
+        let valid = r#"{"display_text": "hello\nworld", "spoken_text": null}"#;
+        assert_eq!(
+            unwrap_display_text_envelope(valid.to_string()),
+            "hello\nworld"
+        );
+        assert_eq!(
+            unwrap_display_text_envelope("plain text".into()),
+            "plain text"
+        );
+        assert_eq!(
+            unwrap_display_text_envelope("{\"other\": 1}".into()),
+            "{\"other\": 1}"
         );
     }
 

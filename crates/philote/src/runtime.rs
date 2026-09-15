@@ -1743,6 +1743,57 @@ const MODELS_PAGE_SIZE: usize = 10;
 const TELEGRAM_CALLBACK_LIMIT: usize = 64;
 
 impl AgentRuntime {
+    /// Tools the harness may call on the model's behalf: read-only, no
+    /// arguments, no approval class. A step bound to one of these is a
+    /// measurement, and a measurement should not depend on the model
+    /// remembering to take it.
+    const HARNESS_RUNNABLE_TOOLS: &'static [&'static str] = &["life.audit"];
+
+    /// On a plan-continuation turn whose remaining (not done/failed) steps
+    /// are all bound to harness-runnable tools, the first such call.
+    fn harness_runnable_step(&self, session_id: &str, content: &str) -> Option<ToolCall> {
+        if !content.trim_start().starts_with("[Plan continuation") {
+            return None;
+        }
+        let state = self.sessions.get(session_id)?;
+        let turn = state.active_turn.as_ref()?;
+        let plan = turn.active_plan.as_ref()?;
+        let remaining: Vec<&crate::session::PlanStep> = plan
+            .steps
+            .iter()
+            .enumerate()
+            .filter(|(i, s)| {
+                !turn.plan_steps_verified.get(*i).copied().unwrap_or(false)
+                    && s.status != "done"
+                    && s.status != "failed"
+            })
+            .map(|(_, s)| s)
+            .collect();
+        if remaining.is_empty() {
+            return None;
+        }
+        let all_runnable = remaining.iter().all(|s| {
+            s.tool_name
+                .as_deref()
+                .is_some_and(|t| Self::HARNESS_RUNNABLE_TOOLS.contains(&t))
+        });
+        if !all_runnable {
+            return None;
+        }
+        let tool = remaining[0].tool_name.clone()?;
+        // Never loop: one harness call per tool per turn.
+        if turn
+            .working_tool_history
+            .iter()
+            .any(|(c, _)| c.tool_name == tool)
+        {
+            return None;
+        }
+        Some(ToolCall {
+            tool_name: tool,
+            arguments: serde_json::json!({}),
+        })
+    }
     /// Live merged `/model` preset list: the hotel config key `model_presets`
     /// (JSON array of `{alias, label, tier, model, description}`) merged over
     /// the compiled-in defaults. Config edits apply on the next `/model` —
@@ -3315,6 +3366,29 @@ impl AgentRuntime {
                     "plan_seeded",
                     Some(format!("outcome reflex: observe outcome, resolve {target}")),
                 )
+                .await;
+        }
+
+        // Gardener closer: a continuation whose only remaining steps are
+        // read-only measurements (`life.audit`) is run by the harness, not
+        // asked of the model — live 2026-09-14 21:35 UTC the model replied
+        // "all 12 actions verified" three times without ever calling the
+        // closing audit, and the plan blocked at 0/1.
+        if let Some(call) = self.harness_runnable_step(&session_id, &content) {
+            info!(
+                session_id = %session_id,
+                tool = %call.tool_name,
+                "harness runs the plan's remaining read-only step itself"
+            );
+            let _ = self
+                .emit_turn_event(
+                    &session_id,
+                    "plan_step_harness_run",
+                    Some(format!("{}: only read-only step(s) remain", call.tool_name)),
+                )
+                .await;
+            return self
+                .route_tool_call_execution(session_id, turn_id, call, false)
                 .await;
         }
 
