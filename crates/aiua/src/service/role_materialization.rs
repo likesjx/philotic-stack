@@ -1205,8 +1205,16 @@ impl IpcServer {
             }
         };
 
-        // Remote role: dispatch over mesh to the role's home hotel.
-        if let Some(ref home_node) = target_role.home_node.clone() {
+        // Remote role: dispatch over mesh to the role's home hotel. A home
+        // stored as the bare hotel name (records that predate DEF-124, or any
+        // seed that still writes the name) must be resolved to its node_id
+        // first: live 2026-09-15 14:44 UTC bjork's handoff to the
+        // theoretician — home_node "mac-jane", on mac-jane-aiua-01 — was
+        // dispatched "remote" to a peer that does not exist, and the
+        // operator's thread went silent (DEF-132).
+        if let Some(home_node) = target_role.home_node.as_deref().map(|home| {
+            Self::resolve_hotel_node_id(graph, home).unwrap_or_else(|| home.to_string())
+        }) {
             if home_node != local_node_id {
                 let toolset_record = graph
                     .get_toolset_profile(&target_role.toolset_profile)
@@ -3566,6 +3574,207 @@ mod tests {
         if Path::new(&socket_path).exists() {
             let _ = std::fs::remove_file(&socket_path);
         }
+    }
+
+    /// DEF-132: the theoretician's home was stored as the bare hotel name
+    /// ("mac-jane") while every routing comparison keys on the node_id
+    /// ("mac-jane-aiua-01"); the handoff was dispatched "remote" to a peer
+    /// that does not exist and the bundle never reached the local role.
+    #[tokio::test]
+    async fn handoff_to_role_homed_by_local_hotel_name_is_delivered_locally() {
+        let _env_guard = ipc_env_guard();
+        let socket_path = test_socket_path();
+        let (dispatcher_tx, _dispatcher_rx) = test_dispatcher_channel();
+        let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
+        let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
+        graph
+            .upsert_hotel(&HotelRecord {
+                hotel_name: "local-hotel".into(),
+                capabilities: NodeCapabilities {
+                    node_id: "local-aiua-01".into(),
+                    roles: vec![],
+                    models: vec![],
+                    tools: vec![],
+                    constraints: Default::default(),
+                    build_version: String::new(),
+                },
+                mesh_port: 9000,
+                blob_port: 9001,
+                execution_port: 9002,
+                ipc_socket_path: socket_path.clone(),
+                active_pid: None,
+                mesh_host: None,
+            })
+            .expect("seed local hotel");
+        graph
+            .upsert_session(&SessionRecord {
+                session_id: "sess-handoff-home-name".into(),
+                session_kind: "conversation".into(),
+                primary_agent_id: Some("agent-jane-01".into()),
+                active_incarnation_id: Some("agent-jane:orchestrator".into()),
+                channel_kind: Some("telegram".into()),
+                channel_session_key: Some("123".into()),
+                status: "active".into(),
+                lease_owner_component_id: None,
+                lease_expires_at: None,
+                summary_json: serde_json::json!({}),
+                created_at: 1,
+                updated_at: 2,
+            })
+            .expect("session should seed");
+        graph
+            .upsert_role_incarnation(&RoleIncarnationRecord {
+                agent_id: "agent-jane-01".into(),
+                role_name: "theoretician".into(),
+                guest_id: "agent-jane:theoretician".into(),
+                toolset_profile: "codex".into(),
+                role_identity_addendum: None,
+                role_manifest: None,
+                is_admin: false,
+                readiness_state: RoleReadinessState::Configured,
+                inactive_ttl_seconds: None,
+                turn_loop_config: TurnLoopConfig::default(),
+                // The bare hotel NAME of this very hotel — not its node_id.
+                home_node: Some("local-hotel".into()),
+                ..Default::default()
+            })
+            .expect("theoretician role should seed");
+        let server = IpcServer::new(
+            socket_path.clone(),
+            "local-aiua-01",
+            dispatcher_tx,
+            graph.clone(),
+        );
+        let server_task = tokio::spawn(async move {
+            server.run().await.expect("ipc server should run");
+        });
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        unsafe {
+            std::env::set_var("PHILOTIC_HOTEL_SOCKET", &socket_path);
+        }
+
+        let mut orchestrator = PhiloticClient::connect(GuestIdentity {
+            guest_id: "agent-jane:orchestrator".into(),
+            role: "agent".into(),
+            supported_tools: Vec::new(),
+        })
+        .await
+        .expect("orchestrator connect");
+        let mut theoretician = PhiloticClient::connect(GuestIdentity {
+            guest_id: "agent-jane:theoretician".into(),
+            role: "agent".into(),
+            supported_tools: Vec::new(),
+        })
+        .await
+        .expect("theoretician connect");
+        theoretician
+            .send_request(IpcRequest::SubscribeInbox {
+                role: "role:agent-jane-01:theoretician".into(),
+            })
+            .await
+            .expect("theoretician role inbox subscribe");
+
+        let response = orchestrator
+            .send_request(IpcRequest::HandoffToRole {
+                session_id: "sess-handoff-home-name".into(),
+                role_name: "theoretician".into(),
+                handoff_bundle: HandoffBundle {
+                    goal: "map the nocturne's sections".into(),
+                    context_excerpt: "Chopin posthumous nocturne".into(),
+                    session_id: "sess-handoff-home-name".into(),
+                    initiating_turn_id: "turn-1".into(),
+                    return_to: Some("orchestrator".into()),
+                    handoff_reason: Some("manual_role_switch".into()),
+                    active_goal: Some("map the nocturne's sections".into()),
+                    active_constraints: Vec::new(),
+                    relevant_session_facts: Vec::new(),
+                    working_summary: None,
+                    from_role: Some("orchestrator".into()),
+                    to_role: Some("theoretician".into()),
+                    suggested_memory_refs: Vec::new(),
+                    expected_return_mode: Some("required".into()),
+                    cleanup_actions: Vec::new(),
+                },
+            })
+            .await
+            .expect("handoff request");
+        match response {
+            IpcResponse::HandoffAck {
+                handoff_guest_id, ..
+            } => {
+                assert_eq!(handoff_guest_id, "agent-jane:theoretician");
+            }
+            other => panic!("unexpected handoff response: {other:?}"),
+        }
+
+        // The bundle must land in the LOCAL role inbox — a remote dispatch to
+        // a peer named "local-hotel" never delivers anywhere.
+        let delivered = tokio::time::timeout(
+            tokio::time::Duration::from_secs(1),
+            theoretician.recv_task(),
+        )
+        .await
+        .expect("theoretician should receive the handoff bundle locally")
+        .expect("theoretician recv should succeed");
+        match delivered {
+            IpcResponse::InboundTask { task_json, .. } => {
+                let payload: serde_json::Value =
+                    serde_json::from_str(&task_json).expect("handoff payload should decode");
+                assert_eq!(payload["action"], "handoff_bundle");
+                assert_eq!(
+                    payload["handoff_bundle"]["goal"],
+                    "map the nocturne's sections"
+                );
+            }
+            other => panic!("unexpected theoretician inbound response: {other:?}"),
+        }
+
+        unsafe {
+            std::env::remove_var("PHILOTIC_HOTEL_SOCKET");
+        }
+        server_task.abort();
+        let _ = server_task.await;
+        if Path::new(&socket_path).exists() {
+            let _ = std::fs::remove_file(&socket_path);
+        }
+    }
+
+    /// DEF-134: a mesh-config-seeded role guest (PHILOTIC_ROLE_NAME only, no
+    /// PHILOTIC_ROLE_INBOX) built before the philote-side default registered
+    /// under the bare role name. It is still the incarnation the record
+    /// describes and must be allowed to hand back; a tool runner is not.
+    #[test]
+    fn bare_role_name_identity_is_an_agent_handoff_caller() {
+        let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
+        let graph = GraphDomain::new(Arc::new(graph_store.adapter()));
+        graph
+            .upsert_role_incarnation(&RoleIncarnationRecord {
+                agent_id: "agent-bjork-01".into(),
+                role_name: "theoretician".into(),
+                guest_id: "agent-bjork-01:theoretician".into(),
+                toolset_profile: "theoretician".into(),
+                readiness_state: RoleReadinessState::ActiveInSession,
+                ..Default::default()
+            })
+            .expect("seed role incarnation");
+        let bare = GuestIdentity {
+            guest_id: "agent-bjork-01:theoretician".into(),
+            role: "theoretician".into(),
+            supported_tools: Vec::new(),
+        };
+        assert!(IpcServer::is_agent_handoff_caller(&graph, &bare));
+        let routing = GuestIdentity {
+            guest_id: "agent-bjork-01:theoretician".into(),
+            role: "role:agent-bjork-01:theoretician".into(),
+            supported_tools: Vec::new(),
+        };
+        assert!(IpcServer::is_agent_handoff_caller(&graph, &routing));
+        let tool = GuestIdentity {
+            guest_id: "agent-bjork-01:theoretician".into(),
+            role: "tool".into(),
+            supported_tools: Vec::new(),
+        };
+        assert!(!IpcServer::is_agent_handoff_caller(&graph, &tool));
     }
 
     #[tokio::test]

@@ -888,6 +888,51 @@ pub fn verify_plan_steps(
         }
     }
 
+    // Pass C — unique READ tool: a read-only step whose bound tool no other
+    // step in the plan binds is proven by any successful call of that tool,
+    // whatever its wording. Live 2026-09-15 14:10 UTC: the closing "Re-run
+    // life.audit to measure the pass" step has distinctive words (measure,
+    // report, score) that never appear in an argument-less audit call, so
+    // Pass A could not credit it — the harness called life.audit on three
+    // continuations and the plan still blocked at 12/13.
+    //
+    // Read-only and ordered, like Pass B: a write step ("Log Zerin Maluy",
+    // `life.observe`) must still name its artifact in the call — any
+    // successful observe is exactly the wrong-thing-written false positive
+    // the token and id passes exist to catch — and a closing read only takes
+    // a call made after the calls that satisfied the steps before it (the
+    // `life.audit` that seeded a gardening plan is not its re-audit).
+    for (i, step) in plan.steps.iter().enumerate() {
+        if evidence[i] == StepEvidence::Verified
+            || !step_is_tool_bound(step)
+            || !step_tool_is_read_only(step)
+        {
+            continue;
+        }
+        let tool = step.tool_name.as_deref().unwrap_or("");
+        let shared = plan
+            .steps
+            .iter()
+            .enumerate()
+            .any(|(k, other)| k != i && other.tool_name.as_deref() == Some(tool));
+        if shared {
+            continue;
+        }
+        let floor = consumed_by_step[..i].iter().flatten().max().copied();
+        for (j, (call, result)) in tool_history.iter().enumerate() {
+            if consumed[j] || !tool_result_looks_ok(result) || call.tool_name != tool {
+                continue;
+            }
+            if floor.is_some_and(|f| j <= f) {
+                continue;
+            }
+            evidence[i] = StepEvidence::Verified;
+            consumed[j] = true;
+            consumed_by_step[i] = Some(j);
+            break;
+        }
+    }
+
     // Whatever is left: a tool-bound step is checkable and came up empty.
     // A tool-free step has no artifact to check, so the model's claim stands.
     let mut contradicted = Vec::new();
@@ -2907,6 +2952,69 @@ mod tests {
         assert_eq!(v.evidence[1], StepEvidence::Verified);
         assert_eq!(v.evidence[2], StepEvidence::Missing);
         assert_eq!(life_ids_in(&p.steps[0].description).len(), 2);
+    }
+
+    /// Live 2026-09-15 14:10 UTC: the closing audit step ran (harness-issued,
+    /// no arguments) and still could not be credited.
+    #[test]
+    fn unique_tool_step_verifies_on_any_successful_call_of_its_tool() {
+        let p = plan(
+            "executing",
+            &[
+                (
+                    "Apply audit action retire_duplicate on life:a -> life:b",
+                    Some("life.tidy"),
+                    "done",
+                ),
+                (
+                    "Re-run life.audit to measure the pass; then report the health_score delta plus what still needs judgment.",
+                    Some("life.audit"),
+                    "pending",
+                ),
+            ],
+        );
+        let h = history_args(&[
+            (
+                "life.tidy",
+                serde_json::json!({"action": {"duplicate_id": "life:a", "keeper_id": "life:b"}}),
+                "ok",
+            ),
+            (
+                "life.audit",
+                serde_json::json!({}),
+                r#"{"data":{"health_score":58}}"#,
+            ),
+        ]);
+        let v = verify_plan_steps(&p, &h, &[]);
+        assert_eq!(
+            v.evidence,
+            vec![StepEvidence::Verified, StepEvidence::Verified]
+        );
+        assert!(evaluate_whole_plan(&p, &v).complete);
+        // Two steps binding the same tool are not both credited by one call.
+        let p2 = plan(
+            "executing",
+            &[
+                (
+                    "Re-run life.audit to measure",
+                    Some("life.audit"),
+                    "pending",
+                ),
+                ("Run life.audit again later", Some("life.audit"), "pending"),
+            ],
+        );
+        let v2 = verify_plan_steps(
+            &p2,
+            &history_args(&[("life.audit", serde_json::json!({}), "ok")]),
+            &[],
+        );
+        assert!(
+            v2.evidence
+                .iter()
+                .filter(|e| **e == StepEvidence::Verified)
+                .count()
+                <= 1
+        );
     }
 
     #[test]

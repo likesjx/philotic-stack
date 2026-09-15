@@ -4341,14 +4341,20 @@ impl IpcServer {
         if let Some(node_id) = registry.find_node_id_for_guest(guest_id) {
             return Some(node_id);
         }
-        // 2. Fallback: home_node from role incarnation record. home_node stores a node_id
-        // directly (e.g. "mac-jane-aiua-01"), not a hotel name — return it as-is.
-        graph
+        // 2. Fallback: home_node from the role incarnation record. It should
+        // hold a node_id ("mac-jane-aiua-01"), but a record can still carry
+        // the bare hotel name ("mac-jane") — resolve it, or EmitTask routes
+        // the task to a mesh peer that does not exist ("target node unknown
+        // to this hotel — task may never deliver", live 2026-09-15 14:45 UTC,
+        // DEF-132).
+        let home = graph
             .list_role_incarnations_by_guest_id(guest_id)
             .unwrap_or_default()
             .into_iter()
             .next()?
-            .home_node
+            .home_node?;
+        let resolved = Self::resolve_hotel_node_id(graph, &home);
+        Some(resolved.unwrap_or(home))
     }
 
     pub(super) fn local_delivery_provenance_hint(
@@ -4443,12 +4449,15 @@ impl IpcServer {
             return true;
         }
 
+        // A role-incarnation guest registers under its routing role; a guest
+        // seeded from mesh-config by a pre-DEF-134 philote registered under
+        // the bare role name. Both are the incarnation the record describes.
         graph
             .list_role_incarnations_by_guest_id(&identity.guest_id)
             .map(|records| {
-                records
-                    .iter()
-                    .any(|record| record.routing_role() == identity.role)
+                records.iter().any(|record| {
+                    record.routing_role() == identity.role || record.role_name == identity.role
+                })
             })
             .unwrap_or(false)
     }
