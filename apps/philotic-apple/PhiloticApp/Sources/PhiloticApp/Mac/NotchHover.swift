@@ -3,6 +3,14 @@ import Foundation
 
 /// Screen-coordinate geometry; includes a bridge from the camera to the panel.
 enum NotchHoverRegion {
+    /// CGRect.contains excludes max edges, but the pointer can rest at the
+    /// screen's exact top edge. Hover targets include their boundary.
+    static func contains(_ point: CGPoint, in region: CGRect) -> Bool {
+        !region.isNull && !region.isEmpty
+            && point.x >= region.minX && point.x <= region.maxX
+            && point.y >= region.minY && point.y <= region.maxY
+    }
+
     static func activation(screen: CGRect, collapsed: CGRect, camera: CGRect?) -> CGRect {
         let top = camera ?? CGRect(x: collapsed.minX, y: screen.maxY - 24,
                                    width: collapsed.width, height: 24)

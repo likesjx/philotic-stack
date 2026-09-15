@@ -40,6 +40,9 @@ A 150 ms dwell opens it; a continuous region from notch to expanded panel plus
 16 points of padding and a 450 ms exit grace prevent flicker during pointer
 transfer. Manual collapse suppresses reopening until the pointer leaves and
 returns. Keyboard opening remains available until the pointer visits the panel.
+The exact top screen edge is included in hit testing. The panel's dismiss (×)
+button and keyboard toggle collapse without disabling hover; only the explicit
+menu-bar Hide companion command suspends the companion until Show is selected.
 
 Hover never calls `makeKey` or activates the application. Editing, menu tracking,
 mouse-button drags and active voice capture keep an already-open panel from
@@ -51,11 +54,18 @@ the display sleeps, or the user session resigns active; observers/timer are
 released with the controller. Screen sleep and session activity are separate
 gates so one resume event cannot override the other.
 
-All 38 Mac tests pass. Timing, suppression, interaction guards, notch-to-panel geometry, offset screen
-coordinates and non-notched fallback have deterministic tests. Real pointer
-hover, focus retention in another app, draft retention, sleep/lock and external
-display transitions still require operator validation; policy tests are not
-physical pointer-event proof. No iPhone behavior changes in this increment.
+All 40 Mac tests pass. Timing, suppression, interaction guards, notch-to-panel
+geometry, exact top-edge hits, empty regions, offset screen coordinates and
+non-notched fallback have deterministic tests. A diagnostic live run recorded
+two pointer-dwell expansion transitions and revealed that the former × action
+stopped sampling entirely. That action now collapses instead; temporary pointer
+state logs were removed, retaining presentation and sampler lifecycle events.
+The corrected app was rebuilt and launched; UI inspection verified click
+expansion and × dismissal back to the visible pill without stopping sampling.
+Visible no-click hover behavior, focus
+retention in another app, draft retention, sleep/lock and external-display
+transitions still require operator validation; log transitions are not proof of
+visible presentation. No iPhone behavior changes in this increment.
 
 ## Authority and Philotic Web
 

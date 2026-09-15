@@ -47,7 +47,7 @@ struct PhiloticApp: App {
         .commands {
             CommandGroup(after: .windowArrangement) {
                 Button("Toggle Companion") {
-                    if notch.isVisible && notch.expanded { notch.hide() }
+                    if notch.isVisible && notch.expanded { notch.expanded = false }
                     else { notch.show(); notch.expanded = true }
                 }
                 .keyboardShortcut("n", modifiers: [.command, .option])

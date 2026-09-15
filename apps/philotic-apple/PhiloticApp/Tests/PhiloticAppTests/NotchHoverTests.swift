@@ -3,6 +3,25 @@ import XCTest
 @testable import PhiloticApp
 
 final class NotchHoverTests: XCTestCase {
+    func testExactTopEdgeCanTriggerHoverOnOffsetDisplay() {
+        let screen = CGRect(x: -1800, y: 400, width: 1800, height: 1200)
+        let collapsed = CGRect(x: -1015, y: 1518, width: 230, height: 38)
+        let camera = CGRect(x: -1000, y: 1568, width: 200, height: 32)
+        let region = NotchHoverRegion.activation(screen: screen, collapsed: collapsed, camera: camera)
+        let atEdge = NotchHoverRegion.contains(CGPoint(x: -900, y: screen.maxY), in: region)
+        XCTAssertTrue(atEdge)
+        XCTAssertFalse(NotchHoverRegion.contains(CGPoint(x: -900, y: screen.maxY + 1), in: region))
+        XCTAssertFalse(NotchHoverRegion.contains(CGPoint(x: -1700, y: screen.maxY), in: region))
+        var state = NotchHoverState()
+        XCTAssertNil(state.update(inActivation: atEdge, inRetention: atEdge, expanded: false, interacting: false, now: 0))
+        XCTAssertEqual(state.update(inActivation: atEdge, inRetention: atEdge, expanded: false, interacting: false, now: 0.2), .expand)
+    }
+
+    func testEmptyHoverRegionsNeverHit() {
+        XCTAssertFalse(NotchHoverRegion.contains(.zero, in: .zero))
+        XCTAssertFalse(NotchHoverRegion.contains(.zero, in: .null))
+    }
+
     func testBriefPassDoesNotOpenButDwellDoes() {
         var state = NotchHoverState()
         XCTAssertNil(state.update(inActivation: true, inRetention: true, expanded: false, interacting: false, now: 0))

@@ -28,8 +28,8 @@ struct NotchView: View {
                     Button { openMain(); controller.expanded = false } label: {
                         Image(systemName: "arrow.up.right.square")
                     }.help("Open full app").accessibilityLabel("Open full app")
-                    Button { controller.hide() } label: { Image(systemName: "xmark") }
-                        .help("Hide companion; reopen from the menu bar").accessibilityLabel("Hide companion")
+                    Button { controller.expanded = false } label: { Image(systemName: "xmark") }
+                        .help("Dismiss panel; hover near the notch to reopen").accessibilityLabel("Dismiss companion")
                 }
             }
             .padding(.horizontal, 14).frame(height: 38)

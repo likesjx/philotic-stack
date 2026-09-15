@@ -1,6 +1,7 @@
 #if os(macOS)
 import AppKit
 import Observation
+import OSLog
 import SwiftUI
 
 enum CompanionPanelLayout {
@@ -23,9 +24,11 @@ private final class CompanionPanel: NSPanel {
 @MainActor
 @Observable
 final class NotchController {
+    private static let logger = Logger(subsystem: "com.philotic.apple.mac", category: "NotchHover")
     var expanded = false {
         didSet {
             guard expanded != oldValue else { return }
+            Self.logger.notice("presentation expanded=\(self.expanded)")
             if !expanded {
                 hover.suppressUntilExit()
                 // Retain the editor's draft, not keyboard ownership of an
@@ -113,10 +116,12 @@ final class NotchController {
         position()
         panel?.orderFrontRegardless()
         isVisible = panel != nil
+        Self.logger.notice("show configured=\(self.panel != nil) visible=\(self.isVisible)")
         resumeHover()
     }
 
     func hide() {
+        Self.logger.notice("hide requested")
         stopHover()
         expanded = false
         panel?.orderOut(nil)
@@ -151,11 +156,13 @@ final class NotchController {
         timer.tolerance = 0.01
         RunLoop.main.add(timer, forMode: .common)
         hoverTimer = timer
+        Self.logger.notice("pointer sampler started")
     }
 
     private func stopHover() {
         hoverTimer?.invalidate()
         hoverTimer = nil
+        Self.logger.notice("pointer sampler stopped")
         hover = NotchHoverState()
     }
 
@@ -181,7 +188,8 @@ final class NotchController {
         let point = NSEvent.mouseLocation
         let editing = panel.isKeyWindow && panel.firstResponder is NSTextView
         let interacting = editing || menuDepth > 0 || NSEvent.pressedMouseButtons != 0 || isBusy()
-        switch hover.update(inActivation: activation.contains(point), inRetention: retention.contains(point),
+        switch hover.update(inActivation: NotchHoverRegion.contains(point, in: activation),
+                            inRetention: NotchHoverRegion.contains(point, in: retention),
                             expanded: expanded, interacting: interacting, now: ProcessInfo.processInfo.systemUptime) {
         case .expand: expanded = true
         case .collapse: expanded = false
