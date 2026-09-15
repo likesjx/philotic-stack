@@ -3824,8 +3824,21 @@ impl AgentRuntime {
         let unbacked_ids = self
             .sessions
             .get(&session_id)
-            .and_then(|s| s.active_turn.as_ref())
-            .map(|t| unbacked_cited_ids(&content, t))
+            .and_then(|s| {
+                s.active_turn.as_ref().map(|t| {
+                    let dialogue = s
+                        .recent_turns
+                        .iter()
+                        .flat_map(|r| {
+                            std::iter::once(r.user_content.as_str())
+                                .chain(r.assistant_content.as_deref())
+                        })
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    (t, dialogue)
+                })
+            })
+            .map(|(t, dialogue)| unbacked_cited_ids(&content, t, &dialogue))
             .unwrap_or_default();
         let content = if unbacked_ids.is_empty() {
             content
@@ -4966,13 +4979,19 @@ pub(super) fn cited_life_ids(text: &str) -> Vec<String> {
 /// Cited LifeGraph ids that nothing in this turn backs: not written by a
 /// successful write call, and not already known to the turn (recalled
 /// record, read-tool result, or the operator's own message).
-pub(super) fn unbacked_cited_ids(reply: &str, turn: &WorkingTurn) -> Vec<String> {
+pub(super) fn unbacked_cited_ids(reply: &str, turn: &WorkingTurn, dialogue: &str) -> Vec<String> {
     let cited = cited_life_ids(reply);
     if cited.is_empty() {
         return Vec::new();
     }
     let mut known = String::new();
     known.push_str(&turn.user_content);
+    // An id already in the conversation (an earlier reply, an earlier
+    // message) is being repeated, not claimed — live 2026-09-15 14:10 UTC a
+    // continuation re-summarized the previous turn's writes and was
+    // "corrected" for citing an id its own prior reply had reported.
+    known.push(' ');
+    known.push_str(dialogue);
     for m in &turn.recalled_memories {
         if let Some(id) = m.id.as_deref() {
             known.push(' ');
@@ -5242,17 +5261,39 @@ pub(super) fn plan_status_trailer(followup: Option<&PlanFollowup>) -> Option<Str
     fn summarize(eval: &Value) -> Option<(usize, usize, String)> {
         let done = eval.get("steps_done")?.as_u64()? as usize;
         let total = eval.get("steps_total")?.as_u64()? as usize;
-        let outstanding = eval
-            .get("outstanding_steps")
+        // Prefer "<id>: <what>" briefs; fall back to bare ids for evals
+        // recorded by an older binary.
+        let briefs: Vec<String> = eval
+            .get("outstanding_briefs")
             .and_then(Value::as_array)
-            .map(|ids| {
-                ids.iter()
-                    .filter_map(Value::as_u64)
-                    .map(|id| id.to_string())
-                    .collect::<Vec<_>>()
-                    .join(", ")
+            .map(|b| {
+                b.iter()
+                    .filter_map(Value::as_str)
+                    .map(|s| s.to_string())
+                    .collect()
             })
             .unwrap_or_default();
+        let outstanding = if !briefs.is_empty() && briefs.len() <= 3 {
+            briefs
+                .iter()
+                .map(|b| match b.split_once(": ") {
+                    Some((id, what)) => format!("{id} ({what})"),
+                    None => b.clone(),
+                })
+                .collect::<Vec<_>>()
+                .join(", ")
+        } else {
+            eval.get("outstanding_steps")
+                .and_then(Value::as_array)
+                .map(|ids| {
+                    ids.iter()
+                        .filter_map(Value::as_u64)
+                        .map(|id| id.to_string())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                })
+                .unwrap_or_default()
+        };
         Some((done, total, outstanding))
     }
     match followup? {
@@ -5817,7 +5858,7 @@ mod say_do_tests {
                      Successfully created the Trip node (`life:trip:utah_20260928_20261004`). \
                      Still waiting on `life:open-loop:9f6582d872771771`.";
         assert_eq!(
-            unbacked_cited_ids(reply, &turn),
+            unbacked_cited_ids(reply, &turn, ""),
             vec!["life:trip:utah_20260928_20261004"]
         );
     }
@@ -5849,7 +5890,7 @@ mod say_do_tests {
         );
         let reply = "Recorded your speech (`life:creative_work:toastmasters-icebreaker-blank-page`). Here is my workplan… Shall we proceed?";
         assert!(
-            unbacked_cited_ids(reply, &turn).is_empty(),
+            unbacked_cited_ids(reply, &turn, "").is_empty(),
             "hyphen/underscore variants are the same id"
         );
         let receipt = uncited_writes(reply, &turn);
@@ -5877,7 +5918,7 @@ mod say_do_tests {
         }];
         let reply = "Your loop `life:open_loop:toastmasters_icebreaker_speech_20260906` is still open; \
                      I can resolve `life:commitment:mei_due_date_update_20260909` when you say go.";
-        assert!(unbacked_cited_ids(reply, &turn).is_empty());
+        assert!(unbacked_cited_ids(reply, &turn, "").is_empty());
         // A failed write does not back a claim.
         let failed = turn_with(
             "x",
@@ -5888,7 +5929,7 @@ mod say_do_tests {
             )],
         );
         assert_eq!(
-            unbacked_cited_ids("Resolved `life:commitment:new`.", &failed),
+            unbacked_cited_ids("Resolved `life:commitment:new`.", &failed, ""),
             vec!["life:commitment:new"]
         );
     }
@@ -5980,6 +6021,19 @@ mod say_do_tests {
         }))
         .expect("trailer");
         assert!(t.contains("continuation budget ran out"), "{t}");
+        // With briefs, a short outstanding list names the step (live 2026-09-15:
+        // "step(s) 13" → "there was no Step 13").
+        let mut e = eval(12, 13, &[13]);
+        e["outstanding_briefs"] = serde_json::json!(["13: Re-run life.audit to measure the pass"]);
+        let t = plan_status_trailer(Some(&PlanFollowup::Stop {
+            eval_json: Some(e),
+            notice: "stopped".into(),
+        }))
+        .expect("trailer");
+        assert!(
+            t.contains("not done: step(s) 13 (Re-run life.audit to measure the pass)"),
+            "{t}"
+        );
     }
 }
 
