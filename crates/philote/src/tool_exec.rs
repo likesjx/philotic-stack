@@ -4558,6 +4558,286 @@ impl AgentRuntime {
                 }
             }
 
+            "hotel.relocate" => {
+                let args = payload.arguments.as_object();
+                let role_name = args
+                    .and_then(|a| a.get("role_name"))
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string);
+                let target_hotel = args
+                    .and_then(|a| a.get("target_hotel"))
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string);
+                let reason = args
+                    .and_then(|a| a.get("reason"))
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string);
+                let include_transport = args
+                    .and_then(|a| a.get("include_transport"))
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                let transport = args
+                    .and_then(|a| a.get("transport"))
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string);
+                let transport_resource_ref = args
+                    .and_then(|a| a.get("transport_resource_ref"))
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string);
+
+                let Some(role_name) = role_name else {
+                    return self
+                        .fail_active_turn(
+                            payload.session_id,
+                            payload.turn_id,
+                            "hotel.relocate: missing required argument 'role_name'".into(),
+                        )
+                        .await;
+                };
+                let Some(target_hotel) = target_hotel else {
+                    return self
+                        .fail_active_turn(
+                            payload.session_id,
+                            payload.turn_id,
+                            "hotel.relocate: missing required argument 'target_hotel'".into(),
+                        )
+                        .await;
+                };
+                let Some(reason) = reason else {
+                    return self
+                        .fail_active_turn(
+                            payload.session_id,
+                            payload.turn_id,
+                            "hotel.relocate: missing required argument 'reason'".into(),
+                        )
+                        .await;
+                };
+                if include_transport && (transport.is_none() || transport_resource_ref.is_none()) {
+                    return self
+                        .fail_active_turn(
+                            payload.session_id,
+                            payload.turn_id,
+                            "hotel.relocate: include_transport requires both 'transport' and \
+                             'transport_resource_ref'"
+                                .into(),
+                        )
+                        .await;
+                }
+
+                let calling_role = self
+                    .sessions
+                    .get(&payload.session_id)
+                    .and_then(|s| s.role_activation.as_ref())
+                    .map(|r| r.role_name.clone())
+                    .unwrap_or_else(|| "orchestrator".into());
+
+                let (content, tool_err) = match self
+                    .ipc_client
+                    .send_request(IpcRequest::RelocateHotel {
+                        agent_id: self.agent_id.clone(),
+                        role_name: role_name.clone(),
+                        calling_role,
+                        target_hotel: target_hotel.clone(),
+                        include_transport,
+                        transport,
+                        transport_resource_ref,
+                        reason,
+                    })
+                    .await
+                {
+                    Ok(IpcResponse::RelocationCeremonyStarted {
+                        ceremony_id,
+                        role_name: name,
+                        target_hotel: hotel,
+                        ..
+                    }) => (
+                        format!(
+                            "Relocation ceremony started: role '{name}' -> hotel '{hotel}' \
+                             (ceremony_id: {ceremony_id}). The move runs through FEASIBILITY, \
+                             STANDBY, SWITCH, and RECONCILE in the background — poll \
+                             hotel.relocate_status with this ceremony_id for progress. A \
+                             feasibility decline or a failure before SWITCH rolls back for free; \
+                             this hotel was never touched."
+                        ),
+                        None,
+                    ),
+                    Ok(IpcResponse::Error(msg))
+                    | Ok(IpcResponse::Standard {
+                        ok: false,
+                        message: msg,
+                        ..
+                    }) => {
+                        let e = TaskErrorPayload::tool_execution(
+                            "hotel.relocate",
+                            msg,
+                            Some("RELOCATE_HOTEL_REJECTED"),
+                        );
+                        (e.display_message(), Some(e))
+                    }
+                    Ok(_) => {
+                        let e = TaskErrorPayload::ipc_failure(
+                            "aiua",
+                            "UNEXPECTED_RESPONSE",
+                            "hotel.relocate: unexpected hotel response",
+                        );
+                        (e.display_message(), Some(e))
+                    }
+                    Err(e) => {
+                        let err = TaskErrorPayload::transport_error(
+                            "philote",
+                            format!("hotel.relocate: IPC transport error — {e}"),
+                        );
+                        (err.display_message(), Some(err))
+                    }
+                };
+
+                if let Some(err) = tool_err {
+                    self.handle_tool_result(InboundTaskPayload {
+                        action: Some("tool_result".into()),
+                        agent_action: None,
+                        handoff_bundle: None,
+                        source: Some("agent".into()),
+                        session_id: Some(payload.session_id),
+                        turn_id: Some(payload.turn_id),
+                        transport: None,
+                        chat_id: Some(payload.chat_id),
+                        thread_id: None,
+                        sender_id: None,
+                        sender_username: None,
+                        message_kind: None,
+                        content: Some(content),
+                        attachments: Vec::new(),
+                        command: None,
+                        callback_data: None,
+                        raw_transport_event: None,
+                        error: Some(err),
+                        tool_name: Some(payload.tool_name),
+                        arguments: None,
+                        final_reply_to: Some(payload.final_reply_to),
+                        final_reply_role: Some(payload.final_reply_role),
+                        final_reply_guest_id: payload.final_reply_guest_id,
+                        ..Default::default()
+                    })
+                    .await
+                } else {
+                    self.complete_local_command(payload.session_id, payload.turn_id, content)
+                        .await
+                }
+            }
+
+            "hotel.relocate_status" => {
+                let args = payload.arguments.as_object();
+                let ceremony_id = args
+                    .and_then(|a| a.get("ceremony_id"))
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string);
+
+                let Some(ceremony_id) = ceremony_id else {
+                    return self
+                        .fail_active_turn(
+                            payload.session_id,
+                            payload.turn_id,
+                            "hotel.relocate_status: missing required argument 'ceremony_id'".into(),
+                        )
+                        .await;
+                };
+
+                let (content, tool_err) = match self
+                    .ipc_client
+                    .send_request(IpcRequest::RelocateHotelStatus { ceremony_id })
+                    .await
+                {
+                    Ok(IpcResponse::RelocationCeremonyStatus {
+                        ceremony_id,
+                        phase,
+                        risk_tier,
+                        origin_hotel,
+                        target_hotel,
+                        include_transport,
+                        decline_reason,
+                        needs_operator_review,
+                        ..
+                    }) => {
+                        let mut msg = format!(
+                            "Relocation ceremony {ceremony_id}: phase '{phase}' (risk tier: \
+                             {risk_tier}), {origin_hotel} -> {target_hotel}, \
+                             include_transport={include_transport}."
+                        );
+                        if let Some(reason) = decline_reason {
+                            msg.push_str(&format!(" Note: {reason}"));
+                        }
+                        if needs_operator_review {
+                            msg.push_str(
+                                " ⚠ This ceremony needs operator review — it was interrupted \
+                                 at or after SWITCH and was not auto-resumed.",
+                            );
+                        }
+                        (msg, None)
+                    }
+                    Ok(IpcResponse::Error(msg))
+                    | Ok(IpcResponse::Standard {
+                        ok: false,
+                        message: msg,
+                        ..
+                    }) => {
+                        let e = TaskErrorPayload::tool_execution(
+                            "hotel.relocate_status",
+                            msg,
+                            Some("RELOCATE_HOTEL_STATUS_REJECTED"),
+                        );
+                        (e.display_message(), Some(e))
+                    }
+                    Ok(_) => {
+                        let e = TaskErrorPayload::ipc_failure(
+                            "aiua",
+                            "UNEXPECTED_RESPONSE",
+                            "hotel.relocate_status: unexpected hotel response",
+                        );
+                        (e.display_message(), Some(e))
+                    }
+                    Err(e) => {
+                        let err = TaskErrorPayload::transport_error(
+                            "philote",
+                            format!("hotel.relocate_status: IPC transport error — {e}"),
+                        );
+                        (err.display_message(), Some(err))
+                    }
+                };
+
+                if let Some(err) = tool_err {
+                    self.handle_tool_result(InboundTaskPayload {
+                        action: Some("tool_result".into()),
+                        agent_action: None,
+                        handoff_bundle: None,
+                        source: Some("agent".into()),
+                        session_id: Some(payload.session_id),
+                        turn_id: Some(payload.turn_id),
+                        transport: None,
+                        chat_id: Some(payload.chat_id),
+                        thread_id: None,
+                        sender_id: None,
+                        sender_username: None,
+                        message_kind: None,
+                        content: Some(content),
+                        attachments: Vec::new(),
+                        command: None,
+                        callback_data: None,
+                        raw_transport_event: None,
+                        error: Some(err),
+                        tool_name: Some(payload.tool_name),
+                        arguments: None,
+                        final_reply_to: Some(payload.final_reply_to),
+                        final_reply_role: Some(payload.final_reply_role),
+                        final_reply_guest_id: payload.final_reply_guest_id,
+                        ..Default::default()
+                    })
+                    .await
+                } else {
+                    self.complete_local_command(payload.session_id, payload.turn_id, content)
+                        .await
+                }
+            }
+
             "transport.set_home" => {
                 let args = payload.arguments.as_object();
                 let transport = args

@@ -39,6 +39,7 @@ pub mod procedure;
 pub mod provenance;
 pub mod provider_keys;
 pub mod registry;
+pub mod relocation_ceremony;
 pub mod resources;
 pub mod router_trace;
 pub mod runtime;

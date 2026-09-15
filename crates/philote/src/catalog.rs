@@ -265,6 +265,8 @@ pub fn skill_implied_tools(skill_name: &str) -> &'static [&'static str] {
             "transport.set_home",
             "hotel.materialize_request",
             "hotel.materialize_status",
+            "hotel.relocate",
+            "hotel.relocate_status",
         ],
         "role.authoring" => &["session.status", "role.create_or_update", "handoff.to_role"],
         "memory" => &[
@@ -417,6 +419,8 @@ pub fn tools_for_skill(skill_name: &str) -> &'static [&'static str] {
             "hotel.best_place_to_run",
             "hotel.materialize_request",
             "hotel.materialize_status",
+            "hotel.relocate",
+            "hotel.relocate_status",
         ],
         "role.authoring" => &["role.create_or_update"],
         "skill.authoring" => &[
@@ -2180,6 +2184,81 @@ fn build_catalog() -> HashMap<String, ToolDefinition> {
                     }
                 },
                 "required": ["request_id"]
+            }),
+            class: Some("session".into()),
+        },
+    );
+
+    m.insert(
+        "hotel.relocate".into(),
+        ToolDefinition {
+            tool_name: "hotel.relocate".into(),
+            description: "Move a role incarnation — and, if requested, its paired transport — \
+                          from this hotel to target_hotel, all the way through: a feasibility \
+                          check (declines loudly with a reason if the target can't host it), a \
+                          warm STANDBY spawn on the target, then SWITCH (home_node, and transport \
+                          home if included, flip atomically) and RECONCILE (this hotel's copy \
+                          goes dormant, never resurrected on restart). Runs in the background — \
+                          returns immediately with a ceremony_id; poll hotel.relocate_status for \
+                          progress. A decline or failure before SWITCH rolls back for free — this \
+                          hotel is never touched. Moving the transport too (include_transport) is \
+                          a higher-risk move (external identity custody, e.g. a bot token) and \
+                          requires full admin authority, not just operational admin authority. \
+                          Requires operator approval."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "role_name": {
+                        "type": "string",
+                        "description": "The role to relocate. Use your current active role name to move yourself."
+                    },
+                    "target_hotel": {
+                        "type": "string",
+                        "description": "The hotel node_id (or hotel_name) to move the role to, e.g. 'vps-jane'."
+                    },
+                    "reason": {
+                        "type": "string",
+                        "description": "Why this move is needed. Required for operator visibility."
+                    },
+                    "include_transport": {
+                        "type": "boolean",
+                        "description": "If true, also move the paired transport's home atomically with the role. Requires 'transport' and 'transport_resource_ref'. Defaults to false."
+                    },
+                    "transport": {
+                        "type": "string",
+                        "description": "Transport implementation name, e.g. 'telegram'. Required when include_transport is true."
+                    },
+                    "transport_resource_ref": {
+                        "type": "string",
+                        "description": "Stable transport resource reference, such as a bot token key. Required when include_transport is true."
+                    }
+                },
+                "required": ["role_name", "target_hotel", "reason"]
+            }),
+            class: Some("config".into()),
+        },
+    );
+
+    m.insert(
+        "hotel.relocate_status".into(),
+        ToolDefinition {
+            tool_name: "hotel.relocate_status".into(),
+            description: "Check the phase/outcome of a prior hotel.relocate call: intent, \
+                          feasibility, standby, continuity, switch, reconcile, close, or \
+                          rolled_back/failed. A failed ceremony flags needs_operator_review when \
+                          it was interrupted at or after SWITCH, since that state is never \
+                          auto-resumed."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "ceremony_id": {
+                        "type": "string",
+                        "description": "The ceremony_id returned by hotel.relocate."
+                    }
+                },
+                "required": ["ceremony_id"]
             }),
             class: Some("session".into()),
         },

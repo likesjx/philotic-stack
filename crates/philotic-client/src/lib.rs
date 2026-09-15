@@ -2387,6 +2387,35 @@ pub enum IpcRequest {
     MaterializeStatus {
         request_id: String,
     },
+    /// Relocation Ceremony R6: `hotel.relocate` — move `role_name` (and, if
+    /// `include_transport`, its paired transport) from this hotel to
+    /// `target_hotel`, recorded as a `relocation_ceremony` graph record that
+    /// walks INTENT → FEASIBILITY → STANDBY → CONTINUITY → SWITCH →
+    /// RECONCILE → CLOSE. Fire-and-track like `MaterializeRequest`: answered
+    /// immediately with [`IpcResponse::RelocationCeremonyStarted`]; poll
+    /// [`IpcRequest::RelocateHotelStatus`] with `ceremony_id` for progress.
+    RelocateHotel {
+        agent_id: String,
+        role_name: String,
+        calling_role: String,
+        target_hotel: String,
+        /// If true, `transport`/`transport_resource_ref`'s home moves
+        /// atomically with the role. Bumps the ceremony's risk tier to
+        /// `High`, requiring full admin authority (`is_admin`) rather than
+        /// just operational admin authority.
+        #[serde(default)]
+        include_transport: bool,
+        #[serde(default)]
+        transport: Option<String>,
+        #[serde(default)]
+        transport_resource_ref: Option<String>,
+        #[serde(default)]
+        reason: String,
+    },
+    /// Poll the progress/outcome of a prior [`IpcRequest::RelocateHotel`].
+    RelocateHotelStatus {
+        ceremony_id: String,
+    },
 }
 
 fn default_heal_queue_limit() -> usize {
@@ -3044,6 +3073,38 @@ pub enum IpcResponse {
         readiness: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         error: Option<String>,
+    },
+    /// Response to [`IpcRequest::RelocateHotel`] — an immediate ack that the
+    /// ceremony record was created and its orchestration started, not that
+    /// the move completed. Poll [`IpcRequest::RelocateHotelStatus`] with
+    /// `ceremony_id`.
+    ///
+    /// Untagged-serde safety: the required, uniquely-named
+    /// `relocation_ceremony_started` marker field disambiguates this variant.
+    RelocationCeremonyStarted {
+        relocation_ceremony_started: bool,
+        ceremony_id: String,
+        role_name: String,
+        target_hotel: String,
+    },
+    /// Response to [`IpcRequest::RelocateHotelStatus`].
+    ///
+    /// Untagged-serde safety: the required, uniquely-named
+    /// `relocation_ceremony_status` marker field plus the required
+    /// `ceremony_id` disambiguate this variant from `Standard`/`Error` and
+    /// from `RelocationCeremonyStarted`.
+    RelocationCeremonyStatus {
+        relocation_ceremony_status: bool,
+        ceremony_id: String,
+        phase: String,
+        risk_tier: String,
+        origin_hotel: String,
+        target_hotel: String,
+        include_transport: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        decline_reason: Option<String>,
+        #[serde(default)]
+        needs_operator_review: bool,
     },
     // CRITICAL: `MemoryConfig` (all-optional payload) must remain the LAST
     // variant of this untagged enum — see `project_cron_scheduler.md` /

@@ -8557,6 +8557,8 @@ async fn main() -> Result<()> {
 
     let mut hotel = reconcile_hotel_record(&graph_domain_arc, &hotel_name)?;
 
+    crate::service::role_materialization::scan_interrupted_relocation_ceremonies(&graph_domain_arc);
+
     seed_abstract_tool_catalog(&graph_domain_arc)?;
     seed_abstract_skill_catalog(&graph_domain_arc)?;
     seed_toolset_profiles(&graph_domain_arc)?;
