@@ -3065,24 +3065,16 @@ impl AgentRuntime {
             // (completed steps marked done) so the model sees exactly what is
             // left, and enter pre-confirmed so the plan gate does not re-park.
             let is_plan_continuation = task.action.as_deref() == Some("plan_continuation");
-            let (seeded_plan, seeded_plan_confirmed) = if is_plan_continuation {
+            let (seeded_plan, seeded_verified, seeded_plan_confirmed) = if is_plan_continuation {
                 match state.carryover_plan.as_ref() {
                     Some(carry) => {
-                        let mut plan = carry.plan.clone();
-                        for (i, step) in plan.steps.iter_mut().enumerate() {
-                            if carry.steps_done.get(i).copied().unwrap_or(false) {
-                                step.status = "done".into();
-                            }
-                        }
-                        if plan.status == "planning" {
-                            plan.status = "executing".into();
-                        }
-                        (Some(plan), true)
+                        let (plan, verified) = carry.seed_turn_plan();
+                        (Some(plan), verified, true)
                     }
-                    None => (None, false),
+                    None => (None, Vec::new(), false),
                 }
             } else {
-                (None, false)
+                (None, Vec::new(), false)
             };
 
             // Cron-triggered turns get CronPrimary (the honest marker is
@@ -3177,7 +3169,7 @@ impl AgentRuntime {
                 paracrine_chain_started_at: None,
                 started_at_unix: Some(crate::plan_eval::unix_now()),
                 last_interim_at_unix: None,
-                plan_steps_verified: Vec::new(),
+                plan_steps_verified: seeded_verified,
                 selection_source,
             });
             state.set_active_turn_phase(TurnPhase::LoadingContext);
