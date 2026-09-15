@@ -812,10 +812,33 @@ pub fn verify_plan_steps(
     // to the first unproven sibling; the real steps were re-run on the
     // continuation, hit "already retired", and stalled the plan. Id-bearing
     // steps never fall through to the token passes.
-    let step_ids: Vec<Vec<String>> = plan
+    //
+    // An id that several steps share does not distinguish any of them: the
+    // twelve link steps of a gardening pass all name the anchor role
+    // `life:role:chief-of-staff`, and a step whose only other id is not a
+    // `life:` id at all ("ontology:extensions") would otherwise be proven by
+    // the first tidy call that names the anchor — which is every tidy call.
+    // Live 2026-09-15 18:30 UTC that stole the organ-practice and
+    // help_daxton calls from steps 3 and 7 (both called, both "tidied",
+    // both reported outstanding) while the in-turn latch drifted to 13/13.
+    let raw_ids: Vec<Vec<String>> = plan
         .steps
         .iter()
         .map(|s| life_ids_in(&s.description))
+        .collect();
+    let shared_ids: Vec<&String> = raw_ids
+        .iter()
+        .flatten()
+        .filter(|id| raw_ids.iter().filter(|ids| ids.contains(id)).count() >= 2)
+        .collect();
+    let step_ids: Vec<Vec<String>> = raw_ids
+        .iter()
+        .map(|ids| {
+            ids.iter()
+                .filter(|id| !shared_ids.contains(id))
+                .cloned()
+                .collect()
+        })
         .collect();
     for (i, step) in plan.steps.iter().enumerate() {
         if evidence[i] == StepEvidence::Verified || step_ids[i].is_empty() {
@@ -3104,6 +3127,77 @@ mod tests {
         assert!(brief.contains("Completed steps:\n- step 1 (tool: life.tidy): Apply audit action link on life:goal:a -> life:role:r\n"), "{brief}");
         assert!(!brief.contains("call life.tidy with"), "{brief}");
         assert!(brief.contains("Remaining steps:\n- step 2"), "{brief}");
+    }
+
+    /// Live 2026-09-15 18:30 UTC (vps, #519 build): the seeded gardening plan
+    /// had twelve link steps, all `-> life:role:chief-of-staff`; two of them
+    /// (ontology:extensions, pref-bjork-manages-musician-roles) carry no
+    /// `life:` id of their own. Ten tidies ran; plan_eval reported steps 3 and
+    /// 7 outstanding — the two whose calls had been eaten by steps 2 and 6.
+    #[test]
+    fn shared_anchor_id_does_not_prove_a_step() {
+        let subjects = [
+            "life:open_loop:escalation-duplicate_finalization-2026-08-25",
+            "ontology:extensions",
+            "life:commitment:organ-practice-2026-08-30",
+            "life:open_loop:escalation-emit_task_unserved_local_role-2026-08-26",
+            "life:open_loop:escalation-gemini-5xx-2026-08-26",
+            "pref-bjork-manages-musician-roles",
+            "life:goal:help_daxton_eagle_scout",
+            "life:person:zerin_maluy_likes",
+            "life:person:xanthos_gabriel_wagner_likes",
+            "life:person:mali_kjerstine_althoff_likes",
+            "life:goal:daxton_eagle_scout",
+            "life:routine:nightly_piano_practice",
+        ];
+        let action = |id: &str| serde_json::json!({"action": {"from_id": id, "kind": "link", "reason": "orphan: attach to the operator's anchor role so it is reachable", "rel_type": "SCOPED_TO", "to_id": "life:role:chief-of-staff"}});
+        let mut steps: Vec<(String, Option<&str>, &str)> = subjects
+            .iter()
+            .map(|id| {
+                (
+                    format!(
+                        "Apply audit action link on {id} -> life:role:chief-of-staff: call life.tidy with {}",
+                        action(id)
+                    ),
+                    Some("life.tidy"),
+                    "pending",
+                )
+            })
+            .collect();
+        steps.push((
+            "Re-run life.audit to measure the pass (health_score 61 before); then report the health_score delta plus what still needs judgment.".into(),
+            Some("life.audit"),
+            "pending",
+        ));
+        let step_refs: Vec<(&str, Option<&str>, &str)> =
+            steps.iter().map(|(d, t, s)| (d.as_str(), *t, *s)).collect();
+        let p = plan("executing", &step_refs);
+        // The ten calls the model made, in the live order (steps 2 and 6 skipped).
+        let called = [0, 2, 3, 4, 6, 7, 8, 9, 10, 11];
+        let history: Vec<(&str, serde_json::Value, &str)> = called
+            .iter()
+            .map(|i| {
+                (
+                    "life.tidy",
+                    action(subjects[*i]),
+                    r#"{"data":{"status":"tidied"}}"#,
+                )
+            })
+            .collect();
+        let h = history_args(&history);
+        let v = verify_plan_steps(&p, &h, &[]);
+        let verified: Vec<usize> = (0..13)
+            .filter(|i| v.evidence[*i] == StepEvidence::Verified)
+            .collect();
+        assert_eq!(verified, called.to_vec(), "{:?}", v.evidence);
+        // Incremental latching (one call at a time, prior flags carried) must
+        // agree with the batch verdict — the live in-turn latch said 13/13.
+        let mut flags = vec![false; 13];
+        for k in 1..=h.len() {
+            flags = verify_plan_steps(&p, &h[..k], &flags).verified_flags();
+        }
+        let latched: Vec<usize> = (0..13).filter(|i| flags[*i]).collect();
+        assert_eq!(latched, called.to_vec());
     }
 
     #[test]

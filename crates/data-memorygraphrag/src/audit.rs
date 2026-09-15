@@ -119,6 +119,7 @@ pub const SYSTEM_LABELS: &[&str] = &[
     "GrowthHypothesis",
     "GrowthExperiment",
     "ConflictHandoff",
+    "OntologyExtension",
 ];
 
 /// Labels that settle: a live one past its date, or untouched for
@@ -622,7 +623,12 @@ pub fn audit(nodes: &[AuditNode], edges: &[AuditEdge], opts: &AuditOptions) -> A
         });
     }
     if let Some(anchor) = anchor_role_id.as_deref() {
-        for o in orphans.iter().filter(|o| !o.id.starts_with('#')) {
+        // Only canonical `life:` records are anchored. A node under another
+        // scheme ("ontology:extensions", "pref-bjork-…") is a conformance
+        // problem, not a lived fact to scope — and a link step naming it
+        // carries no id of its own for the plan evaluator to prove (live
+        // 2026-09-15 18:30 UTC, DEF-137).
+        for o in orphans.iter().filter(|o| o.id.starts_with("life:")) {
             actions.push(TidyAction::Link {
                 from_id: o.id.clone(),
                 rel_type: "SCOPED_TO".into(),
@@ -634,6 +640,15 @@ pub fn audit(nodes: &[AuditNode], edges: &[AuditEdge], opts: &AuditOptions) -> A
     actions.truncate(opts.max_actions);
 
     let mut needs_judgment: Vec<String> = Vec::new();
+    for o in orphans
+        .iter()
+        .filter(|o| !o.id.starts_with("life:") && !o.id.starts_with('#'))
+    {
+        needs_judgment.push(format!(
+            "{} ({}) is an unlinked node outside the life: id scheme — register its shape via life.patch.propose, re-observe it under a canonical id, or retire it",
+            o.id, o.label
+        ));
+    }
     for s in &stale {
         needs_judgment.push(format!(
             "{} ({}) is {}: {} — resolve with the outcome, re-date it, or confirm it is still open",
@@ -774,6 +789,44 @@ mod tests {
             if from_id == "life:place:home" && rel_type == "SCOPED_TO" && to_id == "life:role:chief-of-staff")
         );
         assert!(r.needs_judgment.iter().any(|s| s.contains("island of 2")));
+    }
+
+    /// Live 2026-09-15 18:30 UTC: "ontology:extensions" and
+    /// "pref-bjork-manages-musician-roles" were proposed as SCOPED_TO links.
+    #[test]
+    fn non_life_ids_are_never_anchored_only_flagged() {
+        let nodes = vec![
+            node("life:role:chief-of-staff", "Role", "confirmed"),
+            node("life:place:home", "Place", "confirmed"),
+            node(
+                "pref-bjork-manages-musician-roles",
+                "Preference",
+                "confirmed",
+            ),
+            node("ontology:extensions", "OntologyExtension", "confirmed"),
+            node("life:goal:g", "Goal", "confirmed"),
+        ];
+        let edges = vec![edge("life:goal:g", "SCOPED_TO", "life:role:chief-of-staff")];
+        let r = audit(&nodes, &edges, &AuditOptions::default());
+        assert!(
+            r.suggested_actions.iter().all(
+                |a| !matches!(a, TidyAction::Link { from_id, .. } if !from_id.starts_with("life:"))
+            ),
+            "{:?}",
+            r.suggested_actions
+        );
+        assert!(r.suggested_actions.iter().any(
+            |a| matches!(a, TidyAction::Link { from_id, .. } if from_id == "life:place:home")
+        ));
+        assert!(
+            r.needs_judgment
+                .iter()
+                .any(|s| s.starts_with("pref-bjork-manages-musician-roles")),
+            "{:?}",
+            r.needs_judgment
+        );
+        // The ontology record is a system node: not an orphan at all.
+        assert!(r.orphans.iter().all(|o| o.id != "ontology:extensions"));
     }
 
     /// The 2026-09-12 morning-sweep duplicates: same summary text re-observed
