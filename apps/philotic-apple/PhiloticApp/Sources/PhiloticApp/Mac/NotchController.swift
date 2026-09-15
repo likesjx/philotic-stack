@@ -26,7 +26,13 @@ final class NotchController {
     var expanded = false {
         didSet {
             guard expanded != oldValue else { return }
-            if !expanded { hover.suppressUntilExit() }
+            if !expanded {
+                hover.suppressUntilExit()
+                // Retain the editor's draft, not keyboard ownership of an
+                // invisible field after Escape/manual collapse.
+                panel?.makeFirstResponder(nil)
+                panel?.resignKey()
+            }
             position(animated: true)
         }
     }
