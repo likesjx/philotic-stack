@@ -346,9 +346,18 @@ pub fn evaluate_plan(
 
 pub(crate) fn tool_result_looks_ok(result: &ToolResult) -> bool {
     let trimmed = result.content.trim_start().to_lowercase();
-    !(trimmed.starts_with("error")
+    if trimmed.starts_with("error")
         || trimmed.starts_with("{\"error\"")
-        || trimmed.starts_with("tool execution failed"))
+        || trimmed.starts_with("tool execution failed")
+    {
+        return false;
+    }
+    // The hotel's own refusals render as "<message> | kind=ipc_failure |
+    // code=…" and open with prose: live 2026-09-15 16:35 UTC "only
+    // orchestrator or management guests may registering skills |
+    // kind=ipc_failure | code=REGISTER_FORBIDDEN" verified the plan's only
+    // step and the reply promised "I will register this now" (DEF-136).
+    !crate::runtime::distill::tool_result_is_error(&result.content)
 }
 
 /// Lowercased `life:<label>:<slug>` ids named in a step description.
@@ -2688,6 +2697,30 @@ mod tests {
             "Error: runner unavailable",
         )]);
         assert_eq!(verify_plan_steps(&p, &failed, &[]).verified_count(), 0);
+    }
+
+    /// Live 2026-09-15 16:35 UTC: the hotel's refusal opens with prose, not
+    /// "error", and verified the plan's only step.
+    #[test]
+    fn hotel_refusal_payload_is_not_evidence() {
+        let p = plan(
+            "executing",
+            &[(
+                "Register the updated music.repertoire-gardener skill",
+                Some("skill.register"),
+                "done",
+            )],
+        );
+        let h = history_args(&[(
+            "skill.register",
+            serde_json::json!({"skill_name": "music.repertoire-gardener"}),
+            "only orchestrator or management guests may registering skills | kind=ipc_failure | \
+             code=REGISTER_FORBIDDEN | component=aiua | retryable=true",
+        )]);
+        let v = verify_plan_steps(&p, &h, &[]);
+        assert_eq!(v.evidence[0], StepEvidence::Missing);
+        assert_eq!(v.contradicted_step_ids, vec![1]);
+        assert!(!evaluate_whole_plan(&p, &v).complete);
     }
 
     #[test]

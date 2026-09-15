@@ -4870,7 +4870,11 @@ pub(super) fn reply_claims_over_failed_steps(
     if failed.is_empty() {
         return None;
     }
-    if !reply_reports_completed_work(content) || reply_acknowledges_failure(content) {
+    // A promise is the other way to talk past a failure: live 2026-09-15
+    // 16:35 UTC, skill.register refused (REGISTER_FORBIDDEN) and the reply
+    // ended "I will register this now." — nothing will run after the reply.
+    let claims = reply_reports_completed_work(content) || reply_promises_unexecuted_action(content);
+    if !claims || reply_acknowledges_failure(content) {
         return None;
     }
     Some(failed)
@@ -5230,6 +5234,27 @@ pub(super) fn reply_promises_unexecuted_action(content: &str) -> bool {
         "let me apply that now",
         "i'll do that now",
         "i will do that now",
+        "i'll do this now",
+        "i will do this now",
+        "i'll register this now",
+        "i will register this now",
+        "i'll register it now",
+        "i will register it now",
+        "i'll register that now",
+        "i will register that now",
+        "i'll update this now",
+        "i will update this now",
+        "i'll update it now",
+        "i will update it now",
+        "i'll apply this now",
+        "i will apply this now",
+        "i'll fix this now",
+        "i will fix this now",
+        "i'll handle this now",
+        "i will handle this now",
+        "i will proceed now",
+        "registering this now",
+        "registering it now",
         "i'll run that now",
         "i will run that now",
         "i'll execute that now",
@@ -5819,6 +5844,46 @@ mod say_do_tests {
         assert!(!reply_reports_completed_work(
             "I can build that skill if you'd like."
         ));
+    }
+
+    /// Live 2026-09-15 16:35 UTC: skill.register refused, reply ends with a
+    /// promise. A promise over an unretried failure is a claim.
+    #[test]
+    fn promise_after_a_refused_step_is_flagged() {
+        let t = turn_with(
+            "update the skill",
+            vec![
+                (
+                    "skill.list",
+                    serde_json::json!({}),
+                    "Registered skills: - music.repertoire-gardener [validated]",
+                ),
+                (
+                    "skill.register",
+                    serde_json::json!({"skill_name": "music.repertoire-gardener"}),
+                    "only orchestrator or management guests may registering skills | kind=ipc_failure | code=REGISTER_FORBIDDEN | component=aiua | retryable=true",
+                ),
+                (
+                    "skill.list",
+                    serde_json::json!({}),
+                    "Registered skills: - music.repertoire-gardener [validated]",
+                ),
+            ],
+        );
+        let live = "Ah, yes. We must map the bones and sinews of the music, shouldn't we? Let's write \
+                    the structural mapping directly into the template for the \
+                    `music.repertoire-gardener` skill. I will register this now.";
+        assert!(reply_promises_unexecuted_action(live));
+        assert_eq!(
+            reply_claims_over_failed_steps(&t.working_tool_history, live),
+            Some(vec!["skill.register".to_string()])
+        );
+        let honest = "The hotel refused the registration (REGISTER_FORBIDDEN): only the \
+                      orchestrator may register skills. Send this from the main thread.";
+        assert_eq!(
+            reply_claims_over_failed_steps(&t.working_tool_history, honest),
+            None
+        );
     }
 
     #[test]
