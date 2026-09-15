@@ -115,6 +115,17 @@ fn evidence_packet_schema() -> Value {
                 "type": "string",
                 "description": "One or two sentence summary of what was observed."
             },
+            "properties": {
+                "type": "object",
+                "additionalProperties": true,
+                "description": "Typed facts about the node, written as real node properties \
+                    (Reflexive Life Graph R1). Keys must be universal (title, status) or \
+                    declared for the claim's label in life.ontology → typed_properties; \
+                    values are scalars checked for kind, range and allowed values. Put a \
+                    number in properties.difficulty, not 'difficulty 55/100' in the summary — \
+                    prose is invisible to every query. Unknown keys are rejected with the \
+                    allowed list."
+            },
             "source_refs": {
                 "type": "array",
                 "items": source_ref_schema(),
@@ -3952,6 +3963,14 @@ fn build_catalog() -> HashMap<String, ToolDefinition> {
                             "claim_summary": {
                                 "type": "string",
                                 "description": "One or two sentence summary of what was observed."
+                            },
+                            "properties": {
+                                "type": "object",
+                                "additionalProperties": true,
+                                "description": "Typed facts written as node properties: universal \
+                                    keys (title, status) or keys declared for this label in \
+                                    life.ontology → typed_properties (kind, range, allowed values \
+                                    checked). Structured facts go here, never only in the summary."
                             },
                             "due_at": {
                                 "type": "string",

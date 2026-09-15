@@ -3,7 +3,7 @@ title: Life Graph Schema
 doc_type: specification
 domain: memory-context
 status: proposed
-last_updated: 2026-07-07
+last_updated: 2026-09-15
 tags:
 - life-graph
 - schema
@@ -82,6 +82,39 @@ Nodes that participate in semantic retrieval carry these additional properties a
 Never mix models or dimensions inside one `embedding_space`. When `embedding_model_gen` changes, schedule a re-embedding job before relying on retrieval results from that space.
 
 ---
+
+## Typed Properties (seam: `lifegraph-typed-properties`)
+
+Until 2026-09-15 the per-label property tables below were aspiration: `life.observe`
+wrote only the provenance envelope, the structured dates and `claim_summary`, so
+"Key: G minor. Difficulty: 55/100." lived in prose and no query could read it.
+They are contract now (Reflexive Life Graph R1):
+
+- `evidence.properties` on `life.observe` / `life.observe.batch` is a flat map of
+  scalars (string, number, boolean) written onto the node with `n += $properties`
+  on create **and** on match — a re-observation may correct a structured fact even
+  on a confirmed node; confirmation protects the claim text, not the numbers.
+- **Universal keys** every label accepts: `title`, `status` (strings).
+- **Declared keys** come from the ontology: a `schema_patch` carries
+  `ontology_extension.properties[]`, each `{label, name, kind, min?, max?, allowed?,
+  guidance}` with `kind ∈ string | integer | float | boolean`. `life.patch.apply`
+  validates the declaration (snake_case name, known label, no collision with
+  runner-owned fields, `min ≤ max`, `allowed` only for strings) and merges it;
+  `life.ontology` lists the result under `typed_properties`.
+- **Validation at plan time**, in the same `contract_invalid` shape as the rest of
+  the packet: an undeclared key is rejected naming the allowed keys for that label;
+  a wrong kind, an out-of-range number or a value outside `allowed` is rejected
+  naming the bound.
+- **Runner-owned fields** (`id`, `claim_summary`, `validation_state`, provenance,
+  the date fields, embeddings, tidy stamps…) can never be set through
+  `properties`.
+- `life.list` returns the universal and declared properties per row under
+  `properties` (nulls dropped); the projection names the declared columns
+  explicitly rather than shipping `properties(n)`, which would drag the embedding.
+
+The first declared set is the music repertoire: `CreativeWork{key, tempo,
+difficulty 0–100, accuracy 0–100}` and `MusicSection{measure_span, focus}`, declared
+by the repertoire skill's schema patch, not by hand.
 
 ## Node Types
 

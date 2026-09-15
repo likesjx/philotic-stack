@@ -874,7 +874,13 @@ impl LifeGraphProvider {
             .param("due_at", compiled.due_at.as_deref().unwrap_or(""))
             .param("starts_at", compiled.starts_at.as_deref().unwrap_or(""))
             .param("occurs_at", compiled.occurs_at.as_deref().unwrap_or(""))
-            .param("ends_at", compiled.ends_at.as_deref().unwrap_or(""));
+            .param("ends_at", compiled.ends_at.as_deref().unwrap_or(""))
+            // Reflexive Life Graph R1: typed properties, already validated
+            // against the ontology at plan time, merged as a map.
+            .param(
+                "properties",
+                BoltType::Map(json_scalar_map_to_bolt(&compiled.properties)),
+            );
 
         let mut rows = bounded_query("observe_node_write", graph.execute(q)).await?;
         let first_row = rows.next().await?;
@@ -2747,7 +2753,7 @@ impl LifeGraphProvider {
         let mut rows = bounded_query("life_list", graph.execute(q)).await?;
         let mut output_rows = Vec::new();
         while let Some(row) = rows.next().await? {
-            output_rows.push(row_to_json(&row)?);
+            output_rows.push(fold_property_columns(row_to_json(&row)?));
         }
         info!(
             query = query_kind.as_str(),
@@ -3755,6 +3761,7 @@ fn feedback_signal_evidence(input: &RetrievalFeedbackInput) -> EvidencePacket {
             "rating": input.rating,
             "connectivity_ratio": input.connectivity_ratio(),
         }),
+        properties: Default::default(),
     }
 }
 
@@ -3991,6 +3998,61 @@ fn row_to_json(row: &Row) -> Result<Value> {
         object.insert(key.to_string(), bolt_value_to_json(value));
     }
     Ok(Value::Object(object))
+}
+
+/// Scalar JSON map → Bolt map for the `$properties` parameter. Non-scalar
+/// values cannot reach here (the contract rejects them at plan time); they
+/// are skipped defensively rather than serialised as strings.
+fn json_scalar_map_to_bolt(map: &std::collections::BTreeMap<String, Value>) -> BoltMap {
+    let mut out = BoltMap::new();
+    for (key, value) in map {
+        let bolt = match value {
+            Value::String(s) => BoltType::String(neo4rs::BoltString::from(s.as_str())),
+            Value::Bool(b) => BoltType::Boolean(neo4rs::BoltBoolean::new(*b)),
+            Value::Number(n) => {
+                if let Some(i) = n.as_i64() {
+                    BoltType::Integer(neo4rs::BoltInteger::new(i))
+                } else if let Some(f) = n.as_f64() {
+                    BoltType::Float(neo4rs::BoltFloat::new(f))
+                } else {
+                    continue;
+                }
+            }
+            _ => continue,
+        };
+        out.put(neo4rs::BoltString::from(key.as_str()), bolt);
+    }
+    out
+}
+
+/// Fold the `prop__<name>` columns of a `life.list` row into one
+/// `properties` object, dropping nulls (a declared property the node does
+/// not carry) and the raw columns.
+pub(crate) fn fold_property_columns(mut row: Value) -> Value {
+    let Some(obj) = row.as_object_mut() else {
+        return row;
+    };
+    let prefix = data_memorygraphrag::ontology::PROPERTY_COLUMN_PREFIX;
+    let keys: Vec<String> = obj
+        .keys()
+        .filter(|k| k.starts_with(prefix))
+        .cloned()
+        .collect();
+    if keys.is_empty() {
+        return row;
+    }
+    let mut props = serde_json::Map::new();
+    for key in keys {
+        if let Some(value) = obj.remove(&key)
+            && !value.is_null()
+        {
+            props.insert(key[prefix.len()..].to_string(), value);
+        }
+    }
+    if !props.is_empty() {
+        obj.insert("properties".into(), Value::Object(props));
+    }
+    row
 }
 
 fn bolt_value_to_json(value: BoltType) -> Value {
@@ -4543,6 +4605,7 @@ mod tests {
                 conflict_ids: vec![],
                 adjudication_status: AdjudicationStatus::NotNeeded,
                 metadata: serde_json::Value::Null,
+                properties: Default::default(),
             },
             proposed_graph_refs: vec![],
             observed_by: None,
@@ -5373,5 +5436,36 @@ mod tests {
         let specs = feedback_edge_specs(&feedback, "2026-07-07T00:00:00Z");
         assert_eq!(specs.len(), 1);
         assert_eq!(specs[0].to_id, "life:goal:graph");
+    }
+}
+
+#[cfg(test)]
+mod typed_property_row_tests {
+    use super::*;
+
+    #[test]
+    fn list_rows_fold_typed_columns_and_drop_nulls() {
+        let row = json!({
+            "id": "life:creative_work:x", "label": "CreativeWork",
+            "prop__title": "Passacaglia", "prop__difficulty": 55, "prop__key": null
+        });
+        let folded = fold_property_columns(row);
+        assert_eq!(folded["properties"]["difficulty"], 55);
+        assert_eq!(folded["properties"]["title"], "Passacaglia");
+        assert!(folded.get("prop__title").is_none());
+        assert!(folded["properties"].get("key").is_none());
+        let plain = fold_property_columns(json!({"id": "x"}));
+        assert!(plain.get("properties").is_none());
+    }
+
+    #[test]
+    fn scalar_map_converts_to_bolt() {
+        let mut map = std::collections::BTreeMap::new();
+        map.insert("difficulty".to_string(), json!(55));
+        map.insert("key".to_string(), json!("G minor"));
+        map.insert("ok".to_string(), json!(true));
+        map.insert("skipped".to_string(), json!({"nested": 1}));
+        let bolt = json_scalar_map_to_bolt(&map);
+        assert_eq!(bolt.value.len(), 3);
     }
 }

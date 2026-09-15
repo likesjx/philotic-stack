@@ -6,6 +6,7 @@ use crate::{
     LifePatchProposalInput, LifeResolveInput, ObserveEdge, PatchKind, RetrievalFeedbackInput,
     RetrievalFeedbackRating, SourceKind, ValidationState,
 };
+use std::collections::BTreeMap;
 
 const KNOWN_LABELS: &[&str] = &[
     "Person",
@@ -255,6 +256,12 @@ pub struct ObserveCypher {
     /// stored as Memgraph `null`, not an empty-string sentinel, since this
     /// is a JSON blob rather than a plain scalar.
     pub provenance_envelope_json: Option<String>,
+    /// Typed properties (validated at plan time against the ontology) merged
+    /// onto the node with `n += $properties` on create and on match — a
+    /// re-observation may correct a difficulty rating even on a confirmed
+    /// node, since the claim text (not the structured facts) is what
+    /// confirmation protects.
+    pub properties: BTreeMap<String, serde_json::Value>,
 }
 
 /// One compiled living-cycle edge MERGE for a `life.observe` request.
@@ -434,7 +441,8 @@ pub fn compile_observe_with_extensions(
             "n.due_at = CASE $due_at WHEN '' THEN null ELSE $due_at END, ",
             "n.starts_at = CASE $starts_at WHEN '' THEN null ELSE $starts_at END, ",
             "n.occurs_at = CASE $occurs_at WHEN '' THEN null ELSE $occurs_at END, ",
-            "n.ends_at = CASE $ends_at WHEN '' THEN null ELSE $ends_at END ",
+            "n.ends_at = CASE $ends_at WHEN '' THEN null ELSE $ends_at END, ",
+            "n += $properties ",
             "ON MATCH SET ",
             // A fresh observation of a node that is still proposed/inferred
             // carries the newest lived fact — take it. Live 2026-09-12 16:49
@@ -458,7 +466,8 @@ pub fn compile_observe_with_extensions(
             "n.due_at = CASE $due_at WHEN '' THEN n.due_at ELSE $due_at END, ",
             "n.starts_at = CASE $starts_at WHEN '' THEN n.starts_at ELSE $starts_at END, ",
             "n.occurs_at = CASE $occurs_at WHEN '' THEN n.occurs_at ELSE $occurs_at END, ",
-            "n.ends_at = CASE $ends_at WHEN '' THEN n.ends_at ELSE $ends_at END ",
+            "n.ends_at = CASE $ends_at WHEN '' THEN n.ends_at ELSE $ends_at END, ",
+            "n += $properties ",
             "RETURN n.id AS id, n.validation_state AS validation_state, ",
             "coalesce(n.summary_updated, true) AS summary_updated",
         ),
@@ -495,6 +504,7 @@ pub fn compile_observe_with_extensions(
         origin_engram_id,
         origin_trust,
         provenance_envelope_json,
+        properties: input.evidence.properties.clone(),
     })
 }
 
@@ -1434,6 +1444,7 @@ mod tests {
                 conflict_ids: vec![],
                 adjudication_status: AdjudicationStatus::NotNeeded,
                 metadata: serde_json::Value::Null,
+                properties: Default::default(),
             },
             proposed_graph_refs: vec![],
             observed_by: None,
@@ -1486,6 +1497,20 @@ mod tests {
     /// G1 closure): dates the caller extracts land as node properties, and
     /// omitted dates preserve existing values on re-observe instead of
     /// clobbering them to null.
+    /// Reflexive Life Graph R1: typed properties ride the compiled write as a
+    /// map parameter merged on create and on match.
+    #[test]
+    fn compile_observe_merges_typed_properties_on_create_and_match() {
+        let mut input = minimal_observe_input("CreativeWork");
+        input
+            .evidence
+            .properties
+            .insert("difficulty".into(), serde_json::json!(55));
+        let compiled = compile_observe(&input, "2026-09-15T12:00:00Z").unwrap();
+        assert_eq!(compiled.properties["difficulty"], 55);
+        assert_eq!(compiled.query.matches("n += $properties").count(), 2);
+    }
+
     #[test]
     fn compile_observe_writes_structured_dates_and_preserves_on_match() {
         let mut input = minimal_observe_input("Commitment");
