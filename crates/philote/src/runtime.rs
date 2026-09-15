@@ -5515,7 +5515,16 @@ impl AgentRuntime {
         let tools_for_model = self
             .sessions
             .get(&session_id)
-            .map(|state| state.tool_assembly.tools_for_model.clone())
+            .map(|state| {
+                // A fully verified plan has nothing left but the report; a
+                // model handed its tools here re-ran twelve completed tidies
+                // (live 2026-09-15 16:33 UTC).
+                if state.plan_fully_verified() {
+                    Vec::new()
+                } else {
+                    state.tool_assembly.tools_for_model.clone()
+                }
+            })
             .unwrap_or_default();
 
         let (context, context_projection) = self
