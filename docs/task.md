@@ -2120,3 +2120,20 @@ Branch `codex/bjork-spawn-gate`. Source: bjork's Telegram session on mac-jane, 2
 - [ ] STILL OWED (operator, Telegram, orchestrator posture): "Update the hotel skill catalog entry for music.repertoire-gardener with skill.register (same skill_name): goal template must create MusicSection nodes HAS_SECTION-linked to the piece plus key/tempo/difficulty when a piece is added; then skill.list and show the record." Verify: `skill_registration_audit` action=update today, goal_template mentions HAS_SECTION.
 - [ ] Follow-ups: the gardener skill has no `allowed_tools`/procedure (a goal template only) — she should register it with the tool list and a `procedure.register` graph; typed piece properties (key, tempo, difficulty 0–100, accuracy) need an `EvidencePacket` slot the runner persists as node properties (today only `due_at`/`occurs_at` are structured) — ontology gap for the repertoire tracker the operator asked for at 14:19.
 
+## New Project: Reflexive Life Graph
+
+Proposal: [docs/architecture/REFLEXIVE_LIFE_GRAPH_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/REFLEXIVE_LIFE_GRAPH_PROPOSAL.md) (proposed 2026-09-15). Seam IDs: `lifegraph-typed-properties`, `skill-ontology-binding`, `skill-invariants`, `skill-procedure-binding`, `lifegraph-reflex-triggers`.
+
+Operator direction 2026-09-15: the LifeGraph is where life gets structured to a granular level and it must be reflexive — the philotes keep it current, and the skills carry the structure (and where useful the Cypher) that keeps it so. Evidence from 09-14/15: sections hung off open loops, a piece created twice, key/tempo/difficulty three times requested and still prose, a worker spawned to run the gardener that could not run tools.
+
+Order: R1 → R2 → R4 (declarative) → R3 → R5 → R4b. Prerequisite tracked separately: worker tool loop (DEF-129).
+
+- [ ] Index the proposal from the main checkout (`phil graph scan` / `graph_scan`) once merged — doc-backed proposals index only from there.
+- [ ] R1 `lifegraph-typed-properties`: `EvidencePacket.properties` validated per label against the ontology + applied SchemaPatches, written on the node, returned by `life.list`/`life.recall`; `CreativeWork{key,tempo,difficulty,accuracy}` + `MusicSection{measure_span,focus}` declared in the music schema patch — test-green contract + provider; watched-live: bjork records difficulty on the Handel and `life.list` returns it typed.
+- [ ] R2 `skill-ontology-binding`: `AbstractSkillRecord.ontology_scope`, `SKILL_SCOPE_UNKNOWN` at register, projection vocabulary block, out-of-scope warning on observe — watched-live: a `Project` claim from the repertoire skill is warned.
+- [ ] R4 `skill-invariants` (declarative tier): `Invariant` record, `life.invariants` runner tool, closing step of the skill's procedure, violations → gardening reflex — watched-live: a parentless section is reported and tidied in the same turn.
+- [ ] R3 `skill-procedure-binding`: `procedure_id` on the record, inline `procedure.register` at skill register, seeded plan on projection, `id_from` deterministic ids — watched-live: a piece named twice yields one node.
+- [ ] R5 `lifegraph-reflex-triggers`: trigger records + auto-recall classification hook + `trigger_fired` event — watched-live: "I'm starting the Mendelssohn" projects the repertoire skill with no prose rule.
+- [ ] R4b raw-Cypher invariants behind `cypher-guard` — after Graph Doors G1.
+- [ ] Renumber the colliding defect ids in DEFECTS.md (two `DEF-130`, two `DEF-136`) before the next id is taken.
+

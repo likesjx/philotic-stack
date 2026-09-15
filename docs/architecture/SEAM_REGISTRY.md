@@ -3,7 +3,7 @@ title: Philotic Seam Registry
 doc_type: workflow
 domain: workflow-docs
 status: active
-last_updated: 2026-09-14
+last_updated: 2026-09-15
 tags:
 - seams
 - ids
@@ -177,6 +177,11 @@ This registry makes the seam layer explicit without forcing every task bullet to
 | `procedure-refiner-gate` | `runtime-sessions` | [PROCEDURAL_GRAPHS_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/PROCEDURAL_GRAPHS_PROPOSAL.md) | proposed | `docs/task.md` → `New Project: Procedural Graphs` |
 | `procedure-generative-guidance` | `runtime-sessions` | [PROCEDURAL_GRAPHS_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/PROCEDURAL_GRAPHS_PROPOSAL.md) | deferred | `docs/task.md` → `New Project: Procedural Graphs` |
 | `cypher-classifier-wall` | `memory-context` | [GRAPH_DOORS_AND_LIFE_CORE_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/GRAPH_DOORS_AND_LIFE_CORE_PROPOSAL.md) | proposed | `docs/task.md` → `New Project: Graph Doors and Life Core` |
+| `lifegraph-typed-properties` | `memory-context` | [REFLEXIVE_LIFE_GRAPH_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/REFLEXIVE_LIFE_GRAPH_PROPOSAL.md) | proposed | `docs/task.md` → `New Project: Reflexive Life Graph` |
+| `skill-ontology-binding` | `memory-context` | [REFLEXIVE_LIFE_GRAPH_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/REFLEXIVE_LIFE_GRAPH_PROPOSAL.md) | proposed | `docs/task.md` → `New Project: Reflexive Life Graph` |
+| `skill-invariants` | `memory-context` | [REFLEXIVE_LIFE_GRAPH_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/REFLEXIVE_LIFE_GRAPH_PROPOSAL.md) | proposed | `docs/task.md` → `New Project: Reflexive Life Graph` |
+| `skill-procedure-binding` | `memory-context` | [REFLEXIVE_LIFE_GRAPH_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/REFLEXIVE_LIFE_GRAPH_PROPOSAL.md) | proposed | `docs/task.md` → `New Project: Reflexive Life Graph` |
+| `lifegraph-reflex-triggers` | `memory-context` | [REFLEXIVE_LIFE_GRAPH_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/REFLEXIVE_LIFE_GRAPH_PROPOSAL.md) | proposed | `docs/task.md` → `New Project: Reflexive Life Graph` |
 | `graph-registry-containers` | `memory-context` | [GRAPH_DOORS_AND_LIFE_CORE_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/GRAPH_DOORS_AND_LIFE_CORE_PROPOSAL.md) | proposed | `docs/task.md` → `New Project: Graph Doors and Life Core` |
 | `graph-door-query` | `memory-context` | [GRAPH_DOORS_AND_LIFE_CORE_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/GRAPH_DOORS_AND_LIFE_CORE_PROPOSAL.md) | proposed | `docs/task.md` → `New Project: Graph Doors and Life Core` |
 | `graph-door-mutate` | `memory-context` | [GRAPH_DOORS_AND_LIFE_CORE_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/GRAPH_DOORS_AND_LIFE_CORE_PROPOSAL.md) | proposed | `docs/task.md` → `New Project: Graph Doors and Life Core` |
