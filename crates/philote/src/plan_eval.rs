@@ -330,10 +330,6 @@ pub fn evaluate_plan(
     }
 }
 
-/// How much of a read-only tool's result Pass A scans for a step's
-/// distinctive tokens.
-const READ_RESULT_HAYSTACK_CHARS: usize = 16 * 1024;
-
 pub(crate) fn tool_result_looks_ok(result: &ToolResult) -> bool {
     let trimmed = result.content.trim_start().to_lowercase();
     !(trimmed.starts_with("error")
@@ -717,39 +713,34 @@ pub fn verify_plan_steps(
             .to_lowercase()
         })
         .collect();
-    // A retrieval's evidence is what it RETURNED, not what it was asked
-    // (`skill.list {}` / `life.list {"labels":[…]}` carry none of the step's
-    // words). Capped: list results run to tens of KB.
-    let result_haystacks: Vec<String> = tool_history
-        .iter()
-        .map(|(_, result)| {
-            result
-                .content
-                .chars()
-                .take(READ_RESULT_HAYSTACK_CHARS)
-                .collect::<String>()
-                .to_lowercase()
-        })
-        .collect();
+    // Which history index each step's evidence came from — a read step that
+    // follows other steps must be evidenced by a call made AFTER theirs.
+    let mut consumed_by_step: Vec<Option<usize>> = vec![None; plan.steps.len()];
 
     // Pass A — strong: a distinctive token of this step appears in the call's
-    // arguments (and the tool is compatible). For a read-only tool the
-    // returned content counts too.
+    // arguments (and the tool is compatible). A read-only step that follows
+    // other steps only takes a call made after theirs (see Pass B): "re-run
+    // life.audit" names its own tool, which is in every audit call's haystack.
     for (i, step) in plan.steps.iter().enumerate() {
         if evidence[i] == StepEvidence::Verified || distinctive[i].is_empty() {
             continue;
         }
-        let read_only = step_tool_is_read_only(step);
+        let floor = if step_tool_is_read_only(step) {
+            consumed_by_step[..i].iter().flatten().max().copied()
+        } else {
+            None
+        };
         for (j, (call, result)) in tool_history.iter().enumerate() {
             if consumed[j] || !tool_result_looks_ok(result) || !step_tool_compatible(step, call) {
                 continue;
             }
-            let hit = distinctive[i].iter().any(|t| {
-                haystacks[j].contains(t) || (read_only && result_haystacks[j].contains(t))
-            });
-            if hit {
+            if floor.is_some_and(|f| j <= f) {
+                continue;
+            }
+            if distinctive[i].iter().any(|t| haystacks[j].contains(t)) {
                 evidence[i] = StepEvidence::Verified;
                 consumed[j] = true;
+                consumed_by_step[i] = Some(j);
                 break;
             }
         }
@@ -769,20 +760,35 @@ pub fn verify_plan_steps(
     // calls each — so every such plan stalled twice, was declared `blocked`,
     // and shipped "⚠️ Plan stopped before finishing: 0/1 steps verified"
     // under a reply that (correctly) reported what the read had found.
+    //
+    // The relaxed read step must be evidenced by a call made AFTER the calls
+    // that satisfied the steps before it: a seeded gardening plan ends with
+    // "re-run life.audit to measure the pass", and the `life.audit` that
+    // seeded the plan — before any tidy ran — must not count as that re-run.
     for (i, step) in plan.steps.iter().enumerate() {
+        let relaxed_read = !distinctive[i].is_empty() && step_tool_is_read_only(step);
         if evidence[i] == StepEvidence::Verified
-            || (!distinctive[i].is_empty() && !step_tool_is_read_only(step))
+            || (!distinctive[i].is_empty() && !relaxed_read)
             || !step_is_tool_bound(step)
         {
             continue;
         }
+        let floor = if relaxed_read {
+            consumed_by_step[..i].iter().flatten().max().copied()
+        } else {
+            None
+        };
         for (j, (call, result)) in tool_history.iter().enumerate() {
             if consumed[j] || !tool_result_looks_ok(result) {
+                continue;
+            }
+            if floor.is_some_and(|f| j <= f) {
                 continue;
             }
             if step.tool_name.as_deref() == Some(call.tool_name.as_str()) {
                 evidence[i] = StepEvidence::Verified;
                 consumed[j] = true;
+                consumed_by_step[i] = Some(j);
                 break;
             }
         }
@@ -2395,9 +2401,9 @@ mod tests {
     }
 
     /// Live 2026-09-15 13:28 UTC (bjork): a single read step whose words never
-    /// appear in `skill.list {}` — but do appear in what it returned.
+    /// appear in `skill.list {}`. The successful listing is the outcome.
     #[test]
-    fn read_step_verifies_from_the_result_of_its_bound_tool() {
+    fn read_step_verifies_on_the_successful_call_of_its_bound_tool() {
         let p = plan(
             "executing",
             &[(
@@ -2441,6 +2447,63 @@ mod tests {
         let v = verify_plan_steps(&p, &h, &[]);
         assert_eq!(v.evidence[0], StepEvidence::Verified);
         assert!(evaluate_whole_plan(&p, &v).complete);
+    }
+
+    /// The `life.audit` that SEEDED a gardening plan (before any tidy ran)
+    /// must not satisfy the plan's closing "re-run life.audit" step: a read
+    /// step after other steps needs a call that follows theirs.
+    #[test]
+    fn closing_read_step_needs_a_call_after_the_earlier_steps() {
+        let p = plan(
+            "executing",
+            &[
+                (
+                    "Retire duplicate life:habit:duolingo_morning (keeper \
+                     life:habit:duolingo_morning_20260812)",
+                    Some("life.tidy"),
+                    "done",
+                ),
+                (
+                    "Link life:place:home -> life:role:chief-of-staff",
+                    Some("life.tidy"),
+                    "pending",
+                ),
+                (
+                    "Re-run life.audit to measure the pass; then report the health_score delta \
+                     plus what still needs judgment.",
+                    Some("life.audit"),
+                    "pending",
+                ),
+            ],
+        );
+        let seed_audit = (
+            "life.audit",
+            serde_json::json!({}),
+            r#"{"data":{"status":"ok","health_score":12,"suggested_actions":[]}}"#,
+        );
+        let first_tidy = (
+            "life.tidy",
+            serde_json::json!({"action": {"kind": "retire_duplicate", "duplicate_id": "life:habit:duolingo_morning"}}),
+            r#"{"status":"tidied"}"#,
+        );
+        let h = history_args(&[seed_audit.clone(), first_tidy.clone()]);
+        let v = verify_plan_steps(&p, &h, &[]);
+        assert_eq!(v.evidence[0], StepEvidence::Verified);
+        assert_eq!(v.evidence[1], StepEvidence::Missing);
+        assert_eq!(
+            v.evidence[2],
+            StepEvidence::Missing,
+            "the seeding audit predates the tidy and cannot be the re-audit"
+        );
+
+        let re_audit = (
+            "life.audit",
+            serde_json::json!({}),
+            r#"{"data":{"status":"ok","health_score":40,"suggested_actions":[]}}"#,
+        );
+        let h = history_args(&[seed_audit, first_tidy, re_audit]);
+        let v = verify_plan_steps(&p, &h, &[]);
+        assert_eq!(v.evidence[2], StepEvidence::Verified);
     }
 
     /// The relaxation is for READ tools only: a write step with distinctive
