@@ -888,15 +888,25 @@ pub fn verify_plan_steps(
         }
     }
 
-    // Pass C — unique tool: a step whose bound tool no other step in the
-    // plan binds is proven by any successful call of that tool, whatever its
-    // wording. Live 2026-09-15 14:10 UTC: the closing "Re-run life.audit to
-    // measure the pass" step has distinctive words (measure, report, score)
-    // that never appear in an argument-less audit call, so Pass A could not
-    // credit it and Pass B never ran for it — the harness called life.audit
-    // on three continuations and the plan still blocked at 12/13.
+    // Pass C — unique READ tool: a read-only step whose bound tool no other
+    // step in the plan binds is proven by any successful call of that tool,
+    // whatever its wording. Live 2026-09-15 14:10 UTC: the closing "Re-run
+    // life.audit to measure the pass" step has distinctive words (measure,
+    // report, score) that never appear in an argument-less audit call, so
+    // Pass A could not credit it — the harness called life.audit on three
+    // continuations and the plan still blocked at 12/13.
+    //
+    // Read-only and ordered, like Pass B: a write step ("Log Zerin Maluy",
+    // `life.observe`) must still name its artifact in the call — any
+    // successful observe is exactly the wrong-thing-written false positive
+    // the token and id passes exist to catch — and a closing read only takes
+    // a call made after the calls that satisfied the steps before it (the
+    // `life.audit` that seeded a gardening plan is not its re-audit).
     for (i, step) in plan.steps.iter().enumerate() {
-        if evidence[i] == StepEvidence::Verified || !step_is_tool_bound(step) {
+        if evidence[i] == StepEvidence::Verified
+            || !step_is_tool_bound(step)
+            || !step_tool_is_read_only(step)
+        {
             continue;
         }
         let tool = step.tool_name.as_deref().unwrap_or("");
@@ -908,12 +918,17 @@ pub fn verify_plan_steps(
         if shared {
             continue;
         }
+        let floor = consumed_by_step[..i].iter().flatten().max().copied();
         for (j, (call, result)) in tool_history.iter().enumerate() {
             if consumed[j] || !tool_result_looks_ok(result) || call.tool_name != tool {
                 continue;
             }
+            if floor.is_some_and(|f| j <= f) {
+                continue;
+            }
             evidence[i] = StepEvidence::Verified;
             consumed[j] = true;
+            consumed_by_step[i] = Some(j);
             break;
         }
     }
