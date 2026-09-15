@@ -15,6 +15,7 @@ pub mod projection;
 pub mod zoning;
 
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::{collections::BTreeSet, fmt};
 
 pub type PacketId = String;
@@ -174,6 +175,15 @@ pub struct EvidencePacket {
     pub adjudication_status: AdjudicationStatus,
     #[serde(default)]
     pub metadata: serde_json::Value,
+    /// Typed, per-label properties written onto the node (Reflexive Life Graph
+    /// R1, seam `lifegraph-typed-properties`). Keys must be universal
+    /// (`title`, `status`) or declared for the claim's label through the
+    /// ontology patch pipeline; values are scalars, checked for kind, range
+    /// and allowed values at plan time. Prose stays in `claim_summary` —
+    /// "difficulty 55/100" in the summary is invisible to every query;
+    /// `properties.difficulty = 55` is not.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub properties: BTreeMap<String, serde_json::Value>,
 }
 
 impl EvidencePacket {
@@ -229,6 +239,24 @@ impl EvidencePacket {
             && range.ends_at.is_none()
         {
             violations.push("valid_time_range requires starts_at, ends_at, or both".to_string());
+        }
+
+        for (key, value) in &self.properties {
+            if !ontology::valid_property_name(key) {
+                violations.push(format!(
+                    "properties.{key} is not a valid property name (snake_case, 2-40 chars)"
+                ));
+            }
+            if ontology::RESERVED_NODE_PROPERTIES.contains(&key.as_str()) {
+                violations.push(format!(
+                    "properties.{key} is runner-owned and cannot be set by an observation"
+                ));
+            }
+            if !(value.is_string() || value.is_number() || value.is_boolean()) {
+                violations.push(format!(
+                    "properties.{key} must be a scalar (string, number or boolean)"
+                ));
+            }
         }
 
         finish_validation(violations)
@@ -2000,11 +2028,15 @@ impl LifeListInput {
         if self.date_after.is_some() {
             clauses.push(format!("{best} IS NOT NULL AND {best} >= $date_after"));
         }
+        let row = format!(
+            "{}{}",
+            ontology::list_row_projection("n"),
+            ontology::property_projection("n", ext)
+        );
         format!(
             "MATCH (n) WHERE {where_clause} RETURN {row} \
              ORDER BY coalesce(n.observed_at, n.created_at, '') DESC LIMIT {limit}",
             where_clause = clauses.join(" AND "),
-            row = ontology::list_row_projection("n"),
             limit = self.effective_limit(),
         )
     }
@@ -2409,6 +2441,9 @@ impl MemoryGraphRagRunner {
         if let Err(err) = input.evidence.validate() {
             violations.extend(err.violations);
         }
+        violations.extend(
+            ext.validate_properties(&input.evidence.claim_ref.label, &input.evidence.properties),
+        );
         for (idx, edge) in input.edges.iter().enumerate() {
             let ext_rule = ext.edge(&edge.rel_type);
             if !cypher::is_living_cycle_rel_type(&edge.rel_type)
@@ -3015,6 +3050,7 @@ mod tests {
             conflict_ids: vec![],
             adjudication_status: AdjudicationStatus::Pending,
             metadata: serde_json::json!({"role": "beacon"}),
+            properties: Default::default(),
         }
     }
 
@@ -4108,5 +4144,116 @@ mod tests {
         // Wire-compatible: a bare object with no fields still deserializes.
         let parsed: LifeRecallStatsInput = serde_json::from_value(serde_json::json!({})).unwrap();
         assert_eq!(parsed, LifeRecallStatsInput::default());
+    }
+}
+
+#[cfg(test)]
+mod typed_property_contract_tests {
+    use super::*;
+
+    fn runner() -> MemoryGraphRagRunner {
+        MemoryGraphRagRunner::new(RunnerConfig::default())
+    }
+
+    fn observe_json(label: &str, properties: serde_json::Value) -> LifeObserveInput {
+        serde_json::from_value(serde_json::json!({
+            "observation_id": "obs:typed-1",
+            "evidence": {
+                "packet_id": "pkt:typed-1",
+                "claim_ref": {"id": "life:creative_work:handel-passacaglia-gminor", "label": label},
+                "claim_summary": "Handel's Passacaglia in G minor.",
+                "source_refs": [{"source_id": "membrane:telegram", "source_kind": "operator_confirmation",
+                                 "reliability": {"score": 0.9, "basis": "operator_confirmed"}}],
+                "properties": properties
+            }
+        }))
+        .expect("observe input parses")
+    }
+
+    fn music_ext() -> ontology::OntologyExtensions {
+        ontology::OntologyExtensions {
+            labels: vec![],
+            edges: vec![],
+            properties: vec![ontology::ExtensionProperty {
+                label: "CreativeWork".into(),
+                name: "difficulty".into(),
+                kind: ontology::PropertyKind::Integer,
+                min: Some(0.0),
+                max: Some(100.0),
+                allowed: vec![],
+                guidance: String::new(),
+            }],
+        }
+    }
+
+    /// Live 2026-09-14/15: "Key: G minor. Difficulty: 55/100." lived in prose
+    /// because there was nowhere else to put it.
+    #[test]
+    fn declared_typed_property_plans_and_rides_the_evidence() {
+        let input = observe_json(
+            "CreativeWork",
+            serde_json::json!({"difficulty": 55, "title": "Passacaglia (HWV 432)"}),
+        );
+        let plan = runner()
+            .plan_with_extensions(LifeGraphToolRequest::LifeObserve(input), &music_ext())
+            .expect("plan");
+        let evidence = &plan.steps[0].payload["evidence"];
+        assert_eq!(evidence["properties"]["difficulty"], 55);
+        assert_eq!(evidence["properties"]["title"], "Passacaglia (HWV 432)");
+    }
+
+    #[test]
+    fn undeclared_reserved_and_out_of_range_properties_are_contract_errors() {
+        let undeclared = observe_json("CreativeWork", serde_json::json!({"tempo": "Allegro"}));
+        let err = runner()
+            .plan_with_extensions(LifeGraphToolRequest::LifeObserve(undeclared), &music_ext())
+            .unwrap_err();
+        let text = err.to_string();
+        assert!(
+            text.contains("properties.tempo is not declared for label CreativeWork"),
+            "{text}"
+        );
+        assert!(
+            text.contains("allowed keys: title, status, difficulty"),
+            "{text}"
+        );
+
+        let reserved = observe_json("CreativeWork", serde_json::json!({"claim_summary": "x"}));
+        let text = runner()
+            .plan_with_extensions(LifeGraphToolRequest::LifeObserve(reserved), &music_ext())
+            .unwrap_err()
+            .to_string();
+        assert!(text.contains("runner-owned"), "{text}");
+
+        let out_of_range = observe_json("CreativeWork", serde_json::json!({"difficulty": 250}));
+        let text = runner()
+            .plan_with_extensions(
+                LifeGraphToolRequest::LifeObserve(out_of_range),
+                &music_ext(),
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(text.contains("above max 100"), "{text}");
+
+        let nested = observe_json("CreativeWork", serde_json::json!({"difficulty": {"v": 1}}));
+        let text = runner()
+            .plan_with_extensions(LifeGraphToolRequest::LifeObserve(nested), &music_ext())
+            .unwrap_err()
+            .to_string();
+        assert!(text.contains("must be a scalar"), "{text}");
+    }
+
+    #[test]
+    fn list_cypher_projects_typed_property_columns() {
+        let input = LifeListInput {
+            labels: vec!["CreativeWork".into()],
+            ..Default::default()
+        };
+        let cypher = input.filtered_cypher_with_extensions(&music_ext());
+        assert!(
+            cypher.contains("n.difficulty AS prop__difficulty"),
+            "{cypher}"
+        );
+        assert!(cypher.contains("n.title AS prop__title"), "{cypher}");
     }
 }
