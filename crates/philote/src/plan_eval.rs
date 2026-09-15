@@ -337,6 +337,34 @@ pub(crate) fn tool_result_looks_ok(result: &ToolResult) -> bool {
         || trimmed.starts_with("tool execution failed"))
 }
 
+/// Lowercased `life:<label>:<slug>` ids named in a step description.
+pub fn life_ids_in(text: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let bytes = text.as_bytes();
+    let mut i = 0;
+    while let Some(pos) = text[i..].find("life:") {
+        let start = i + pos;
+        if start > 0 && (bytes[start - 1] as char).is_ascii_alphanumeric() {
+            i = start + 5;
+            continue;
+        }
+        let mut end = start;
+        for (off, ch) in text[start..].char_indices() {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | ':') {
+                end = start + off + ch.len_utf8();
+            } else {
+                break;
+            }
+        }
+        let id = text[start..end].trim_end_matches(':').to_ascii_lowercase();
+        if id.matches(':').count() >= 2 && !out.contains(&id) {
+            out.push(id);
+        }
+        i = end.max(start + 5);
+    }
+    out
+}
+
 fn significant_tokens(text: &str) -> Vec<String> {
     const STOPWORDS: &[&str] = &[
         "with", "from", "then", "that", "this", "into", "step", "using", "each", "their", "them",
@@ -717,12 +745,48 @@ pub fn verify_plan_steps(
     // follows other steps must be evidenced by a call made AFTER theirs.
     let mut consumed_by_step: Vec<Option<usize>> = vec![None; plan.steps.len()];
 
+    // Pass 0 — exact: a step that names LifeGraph ids is proven only by a
+    // call whose arguments carry every one of them. Sibling steps that
+    // share all their words (twelve "retire_duplicate life:open_loop:
+    // escalation-…-08-23 under …-08-26" steps, live 2026-09-14 21:20 UTC)
+    // have no distinctive tokens, so Pass B credited each successful tidy
+    // to the first unproven sibling; the real steps were re-run on the
+    // continuation, hit "already retired", and stalled the plan. Id-bearing
+    // steps never fall through to the token passes.
+    let step_ids: Vec<Vec<String>> = plan
+        .steps
+        .iter()
+        .map(|s| life_ids_in(&s.description))
+        .collect();
+    for (i, step) in plan.steps.iter().enumerate() {
+        if evidence[i] == StepEvidence::Verified || step_ids[i].is_empty() {
+            continue;
+        }
+        for (j, (call, result)) in tool_history.iter().enumerate() {
+            if consumed[j] || !tool_result_looks_ok(result) || !step_tool_compatible(step, call) {
+                continue;
+            }
+            if step_ids[i]
+                .iter()
+                .all(|id| haystacks[j].contains(id.as_str()))
+            {
+                evidence[i] = StepEvidence::Verified;
+                consumed[j] = true;
+                consumed_by_step[i] = Some(j);
+                break;
+            }
+        }
+    }
+
     // Pass A — strong: a distinctive token of this step appears in the call's
     // arguments (and the tool is compatible). A read-only step that follows
     // other steps only takes a call made after theirs (see Pass B): "re-run
     // life.audit" names its own tool, which is in every audit call's haystack.
     for (i, step) in plan.steps.iter().enumerate() {
-        if evidence[i] == StepEvidence::Verified || distinctive[i].is_empty() {
+        if evidence[i] == StepEvidence::Verified
+            || distinctive[i].is_empty()
+            || !step_ids[i].is_empty()
+        {
             continue;
         }
         let floor = if step_tool_is_read_only(step) {
@@ -769,6 +833,7 @@ pub fn verify_plan_steps(
         let relaxed_read = !distinctive[i].is_empty() && step_tool_is_read_only(step);
         if evidence[i] == StepEvidence::Verified
             || (!distinctive[i].is_empty() && !relaxed_read)
+            || !step_ids[i].is_empty()
             || !step_is_tool_bound(step)
         {
             continue;
@@ -2483,7 +2548,7 @@ mod tests {
         );
         let first_tidy = (
             "life.tidy",
-            serde_json::json!({"action": {"kind": "retire_duplicate", "duplicate_id": "life:habit:duolingo_morning"}}),
+            serde_json::json!({"action": {"kind": "retire_duplicate", "duplicate_id": "life:habit:duolingo_morning", "keeper_id": "life:habit:duolingo_morning_20260812"}}),
             r#"{"status":"tidied"}"#,
         );
         let h = history_args(&[seed_audit.clone(), first_tidy.clone()]);
@@ -2772,6 +2837,47 @@ mod tests {
             descs,
             vec!["Propose Zerin", "Propose Mali", "Propose Daxton"]
         );
+    }
+
+    /// Live 2026-09-14 21:20 UTC: twelve retire_duplicate steps sharing every
+    /// word. Each must be credited only by the call carrying its own ids.
+    #[test]
+    fn id_bearing_steps_verify_only_against_their_own_ids() {
+        let p = plan(
+            "executing",
+            &[
+                (
+                    "Apply audit action retire_duplicate on life:open_loop:escalation-response_route_unresolved-2026-08-23 -> life:open_loop:escalation-response_route_unresolved-2026-08-26",
+                    Some("life.tidy"),
+                    "pending",
+                ),
+                (
+                    "Apply audit action retire_duplicate on life:open_loop:escalation-response_route_unresolved -> life:open_loop:escalation-response_route_unresolved-2026-08-26",
+                    Some("life.tidy"),
+                    "pending",
+                ),
+                (
+                    "Re-run life.audit to measure the pass",
+                    Some("life.audit"),
+                    "pending",
+                ),
+            ],
+        );
+        // Only the SECOND step's action ran.
+        let h = history_args(&[(
+            "life.tidy",
+            serde_json::json!({"action": {"kind": "retire_duplicate", "duplicate_id": "life:open_loop:escalation-response_route_unresolved", "keeper_id": "life:open_loop:escalation-response_route_unresolved-2026-08-26"}}),
+            "ok",
+        )]);
+        let v = verify_plan_steps(&p, &h, &[]);
+        assert_eq!(
+            v.evidence[0],
+            StepEvidence::Missing,
+            "step 1's ids are not in the call"
+        );
+        assert_eq!(v.evidence[1], StepEvidence::Verified);
+        assert_eq!(v.evidence[2], StepEvidence::Missing);
+        assert_eq!(life_ids_in(&p.steps[0].description).len(), 2);
     }
 
     #[test]
