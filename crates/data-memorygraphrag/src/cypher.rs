@@ -764,7 +764,7 @@ pub fn compile_tidy(
                         "MATCH (n {{id: $a}}), (m {{id: $b}}) ",
                         "MERGE (n)-[r:{rel}]->(m) ",
                         "ON CREATE SET r.tidied_at = $now, r.tidied_by = $actor, r.tidy_reason = $reason ",
-                        "RETURN n.id AS id, m.id AS to_id, type(r) AS rel_type"
+                        "RETURN n.id AS id, m.id AS to_id, type(r) AS rel_type, r.tidied_at = $now AS created"
                     ),
                     rel = rel_type
                 ),
@@ -1241,6 +1241,31 @@ fn feedback_rating_str(rating: &RetrievalFeedbackRating) -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    /// Live 2026-09-15 16:34 UTC: a re-link of an existing edge came back
+    /// "tidied". The query now reports whether MERGE created the edge.
+    #[test]
+    fn compile_tidy_link_reports_whether_the_edge_was_created() {
+        let action = crate::audit::TidyAction::Link {
+            from_id: "life:goal:a".into(),
+            rel_type: "SCOPED_TO".into(),
+            to_id: "life:role:chief-of-staff".into(),
+            reason: "orphan: attach to the anchor role".into(),
+        };
+        let c = super::compile_tidy(&action, false, "lifegraph.gardener", "2026-09-15T16:34:00Z")
+            .expect("link compiles");
+        assert_eq!(c.kind, "link");
+        assert!(
+            c.query.contains("MERGE (n)-[r:SCOPED_TO]->(m)"),
+            "{}",
+            c.query
+        );
+        assert!(
+            c.query.contains("r.tidied_at = $now AS created"),
+            "{}",
+            c.query
+        );
+    }
+
     /// The write-enabled edge vocabulary is duplicated in prose in
     /// `docs/architecture/life-graph/LIFE_GRAPH_SCHEMA.md`, and the two HAVE
     /// drifted: on 2026-07-27 the doc described the agenda edges as

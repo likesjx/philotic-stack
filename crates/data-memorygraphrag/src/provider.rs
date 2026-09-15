@@ -2660,6 +2660,20 @@ impl LifeGraphProvider {
             );
         };
         let touched = row_to_json(&row)?;
+        // MERGE matched an existing edge: nothing changed. Report it as such
+        // so the receipt does not list a re-link as a write (live 2026-09-15
+        // 16:34 UTC: twelve re-applied links, all "tidied").
+        if compiled.kind == "link" && touched.get("created").and_then(Value::as_bool) != Some(true)
+        {
+            info!(kind = compiled.kind, node = %compiled.a, "life.tidy: link already present (idempotent)");
+            return Ok(ProviderOutput::ResultSet(json!({
+                "status": "already_applied",
+                "kind": compiled.kind,
+                "node_id": compiled.a,
+                "touched": touched,
+                "note": "this edge already existed; nothing changed",
+            })));
+        }
         info!(kind = compiled.kind, node = %compiled.a, "life.tidy: applied");
         Ok(ProviderOutput::ResultSet(json!({
             "status": "tidied",

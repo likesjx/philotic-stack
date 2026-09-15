@@ -346,9 +346,18 @@ pub fn evaluate_plan(
 
 pub(crate) fn tool_result_looks_ok(result: &ToolResult) -> bool {
     let trimmed = result.content.trim_start().to_lowercase();
-    !(trimmed.starts_with("error")
+    if trimmed.starts_with("error")
         || trimmed.starts_with("{\"error\"")
-        || trimmed.starts_with("tool execution failed"))
+        || trimmed.starts_with("tool execution failed")
+    {
+        return false;
+    }
+    // The hotel's own refusals render as "<message> | kind=ipc_failure |
+    // code=…" and open with prose: live 2026-09-15 16:35 UTC "only
+    // orchestrator or management guests may registering skills |
+    // kind=ipc_failure | code=REGISTER_FORBIDDEN" verified the plan's only
+    // step and the reply promised "I will register this now" (DEF-136).
+    !crate::runtime::distill::tool_result_is_error(&result.content)
 }
 
 /// Lowercased `life:<label>:<slug>` ids named in a step description.
@@ -475,6 +484,13 @@ pub fn plan_stop_notice(carryover: &CarryoverPlan, reason: &str) -> String {
     )
 }
 
+/// `data.health_score` (or top-level `health_score`) of a `life.audit` result.
+pub fn audit_health_score(content: &str) -> Option<u64> {
+    let v: serde_json::Value = serde_json::from_str(content).ok()?;
+    let data = v.get("data").unwrap_or(&v);
+    data.get("health_score").and_then(serde_json::Value::as_u64)
+}
+
 /// A step description cut to its first clause, ≤ 72 chars, for status lines.
 pub fn step_brief(description: &str) -> String {
     let first = description
@@ -495,7 +511,21 @@ fn step_list(plan: &ActivePlan, flags: &[bool], done: bool) -> String {
         .iter()
         .enumerate()
         .filter(|(i, _)| flags.get(*i).copied().unwrap_or(false) == done)
-        .map(|(_, s)| format!("- step {}{}: {}", s.id, step_tool_suffix(s), s.description))
+        .map(|(_, s)| {
+            // A completed step is listed for orientation only. Its call
+            // payload ("…: call life.tidy with {…}") is an invitation to run
+            // it again — live 2026-09-15 16:33 UTC the continuation re-ran
+            // all twelve completed tidies from these lines.
+            let description = if done {
+                s.description
+                    .split_once(": call ")
+                    .map(|(head, _)| head)
+                    .unwrap_or(&s.description)
+            } else {
+                s.description.as_str()
+            };
+            format!("- step {}{}: {}", s.id, step_tool_suffix(s), description)
+        })
         .collect::<Vec<_>>()
         .join("\n")
 }
@@ -888,15 +918,25 @@ pub fn verify_plan_steps(
         }
     }
 
-    // Pass C — unique tool: a step whose bound tool no other step in the
-    // plan binds is proven by any successful call of that tool, whatever its
-    // wording. Live 2026-09-15 14:10 UTC: the closing "Re-run life.audit to
-    // measure the pass" step has distinctive words (measure, report, score)
-    // that never appear in an argument-less audit call, so Pass A could not
-    // credit it and Pass B never ran for it — the harness called life.audit
-    // on three continuations and the plan still blocked at 12/13.
+    // Pass C — unique READ tool: a read-only step whose bound tool no other
+    // step in the plan binds is proven by any successful call of that tool,
+    // whatever its wording. Live 2026-09-15 14:10 UTC: the closing "Re-run
+    // life.audit to measure the pass" step has distinctive words (measure,
+    // report, score) that never appear in an argument-less audit call, so
+    // Pass A could not credit it — the harness called life.audit on three
+    // continuations and the plan still blocked at 12/13.
+    //
+    // Read-only and ordered, like Pass B: a write step ("Log Zerin Maluy",
+    // `life.observe`) must still name its artifact in the call — any
+    // successful observe is exactly the wrong-thing-written false positive
+    // the token and id passes exist to catch — and a closing read only takes
+    // a call made after the calls that satisfied the steps before it (the
+    // `life.audit` that seeded a gardening plan is not its re-audit).
     for (i, step) in plan.steps.iter().enumerate() {
-        if evidence[i] == StepEvidence::Verified || !step_is_tool_bound(step) {
+        if evidence[i] == StepEvidence::Verified
+            || !step_is_tool_bound(step)
+            || !step_tool_is_read_only(step)
+        {
             continue;
         }
         let tool = step.tool_name.as_deref().unwrap_or("");
@@ -908,12 +948,17 @@ pub fn verify_plan_steps(
         if shared {
             continue;
         }
+        let floor = consumed_by_step[..i].iter().flatten().max().copied();
         for (j, (call, result)) in tool_history.iter().enumerate() {
             if consumed[j] || !tool_result_looks_ok(result) || call.tool_name != tool {
                 continue;
             }
+            if floor.is_some_and(|f| j <= f) {
+                continue;
+            }
             evidence[i] = StepEvidence::Verified;
             consumed[j] = true;
+            consumed_by_step[i] = Some(j);
             break;
         }
     }
@@ -2675,6 +2720,30 @@ mod tests {
         assert_eq!(verify_plan_steps(&p, &failed, &[]).verified_count(), 0);
     }
 
+    /// Live 2026-09-15 16:35 UTC: the hotel's refusal opens with prose, not
+    /// "error", and verified the plan's only step.
+    #[test]
+    fn hotel_refusal_payload_is_not_evidence() {
+        let p = plan(
+            "executing",
+            &[(
+                "Register the updated music.repertoire-gardener skill",
+                Some("skill.register"),
+                "done",
+            )],
+        );
+        let h = history_args(&[(
+            "skill.register",
+            serde_json::json!({"skill_name": "music.repertoire-gardener"}),
+            "only orchestrator or management guests may registering skills | kind=ipc_failure | \
+             code=REGISTER_FORBIDDEN | component=aiua | retryable=true",
+        )]);
+        let v = verify_plan_steps(&p, &h, &[]);
+        assert_eq!(v.evidence[0], StepEvidence::Missing);
+        assert_eq!(v.contradicted_step_ids, vec![1]);
+        assert!(!evaluate_whole_plan(&p, &v).complete);
+    }
+
     #[test]
     fn failed_tool_result_is_not_evidence() {
         let p = plan(
@@ -3000,6 +3069,41 @@ mod tests {
                 .count()
                 <= 1
         );
+    }
+
+    /// Live 2026-09-15 16:33 UTC: the continuation brief listed every
+    /// completed tidy with its full call payload and the model ran them all
+    /// again.
+    #[test]
+    fn continuation_brief_lists_completed_steps_without_their_call_payload() {
+        let plan = plan(
+            "executing",
+            &[
+                (
+                    "Apply audit action link on life:goal:a -> life:role:r: call life.tidy with {\"action\": {\"kind\":\"link\"}}",
+                    Some("life.tidy"),
+                    "done",
+                ),
+                (
+                    "Re-run life.audit to measure the pass",
+                    Some("life.audit"),
+                    "pending",
+                ),
+            ],
+        );
+        let carry = CarryoverPlan {
+            plan,
+            steps_done: vec![true, false],
+            verified_step_ids: vec![1],
+            stalled_continuations: 0,
+            continuations_used: 0,
+            lifetime_continuations: 0,
+            created_turn_id: "t0".into(),
+        };
+        let brief = plan_continuation_brief(&carry, 3);
+        assert!(brief.contains("Completed steps:\n- step 1 (tool: life.tidy): Apply audit action link on life:goal:a -> life:role:r\n"), "{brief}");
+        assert!(!brief.contains("call life.tidy with"), "{brief}");
+        assert!(brief.contains("Remaining steps:\n- step 2"), "{brief}");
     }
 
     #[test]

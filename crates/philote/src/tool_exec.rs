@@ -6269,6 +6269,19 @@ impl AgentRuntime {
                             );
                             break (e.display_message(), Some(e));
                         }
+                        Ok(IpcResponse::Standard {
+                            ok: false,
+                            code,
+                            message,
+                            ..
+                        }) => {
+                            // The hotel's own refusal (HANDOFF_FORBIDDEN,
+                            // HANDOFF_UNREGISTERED, …) — carry its code and
+                            // message instead of "unexpected hotel response"
+                            // (live 2026-09-15 16:06 UTC, DEF-135).
+                            let e = TaskErrorPayload::ipc_failure("aiua", &*code, message);
+                            break (e.display_message(), Some(e));
+                        }
                         Ok(_) => {
                             let e = TaskErrorPayload::ipc_failure(
                                 "aiua",
@@ -6384,6 +6397,19 @@ impl AgentRuntime {
                                 msg,
                                 Some("HANDOFF_BACK_REJECTED"),
                             );
+                            break (e.display_message(), Some(e));
+                        }
+                        Ok(IpcResponse::Standard {
+                            ok: false,
+                            code,
+                            message,
+                            ..
+                        }) => {
+                            // The hotel's own refusal (HANDOFF_FORBIDDEN,
+                            // HANDOFF_UNREGISTERED, …) — carry its code and
+                            // message instead of "unexpected hotel response"
+                            // (live 2026-09-15 16:06 UTC, DEF-135).
+                            let e = TaskErrorPayload::ipc_failure("aiua", &*code, message);
                             break (e.display_message(), Some(e));
                         }
                         Ok(_) => {
