@@ -15,9 +15,8 @@ use ansible_mesh_core::catalog_rights::{
 use ansible_mesh_core::domain::GraphDomain;
 use ansible_mesh_core::event::{EventEnvelope, EventKind, EventPayload};
 use ansible_mesh_core::graph::{
-    AbstractSkillRecord, MembraneTransportHomeRecord, MembraneTransportHomeStatus,
-    ModelProfileRecord, RoleIncarnationRecord, RoleReadinessState, SkillRegistrationAuditRecord,
-    SkillSourceSnapshot, SkillValidationState,
+    AbstractSkillRecord, ModelProfileRecord, RoleIncarnationRecord, RoleReadinessState,
+    SkillRegistrationAuditRecord, SkillSourceSnapshot, SkillValidationState,
 };
 use ansible_mesh_core::membership::{
     DEFAULT_INVITE_TTL_SECS, MeshInvite, MeshInvitePayload, MeshJoinRequestPayload,
@@ -6811,73 +6810,15 @@ impl IpcServer {
                     );
                 }
 
-                if graph.get_agent_identity(&agent_id).ok().flatten().is_none() {
-                    return IpcResponse::error(
-                        "set_transport_home",
-                        "SET_TRANSPORT_HOME_AGENT_UNKNOWN",
-                        format!("agent '{}' not found", agent_id),
-                    );
-                }
-
-                // Resolve a bare hotel_name (documented example, e.g. "vps-jane")
-                // or an already-canonical node_id to the node_id every routing
-                // comparison actually keys on (DEF-124).
-                let Some(target_hotel) = Self::resolve_hotel_node_id(graph, &target_hotel) else {
-                    return IpcResponse::error(
-                        "set_transport_home",
-                        "SET_TRANSPORT_HOME_UNKNOWN_HOTEL",
-                        format!("no known hotel matches '{}'", target_hotel),
-                    );
-                };
-                let mut resolved_standby_hotels = Vec::with_capacity(standby_hotels.len());
-                for hotel_ref in &standby_hotels {
-                    let Some(node_id) = Self::resolve_hotel_node_id(graph, hotel_ref) else {
-                        return IpcResponse::error(
-                            "set_transport_home",
-                            "SET_TRANSPORT_HOME_UNKNOWN_HOTEL",
-                            format!("no known hotel matches standby '{}'", hotel_ref),
-                        );
-                    };
-                    resolved_standby_hotels.push(node_id);
-                }
-                let standby_hotels = resolved_standby_hotels;
-
-                let home = MembraneTransportHomeRecord {
-                    agent_id: agent_id.clone(),
-                    transport: transport.clone(),
-                    resource_ref: resource_ref.clone(),
-                    active_home_hotel: target_hotel.clone(),
-                    standby_hotels: standby_hotels.clone(),
-                    managed_by_role: calling_role.clone(),
-                    lease_type: match transport.as_str() {
-                        "telegram" => "telegram_poll".to_string(),
-                        "discord" => "discord_gateway".to_string(),
-                        other => format!("{other}_transport"),
-                    },
-                    failover_policy: "manual-or-explicit-delegation".to_string(),
-                    status: MembraneTransportHomeStatus::Active,
-                    updated_unix: ansible_mesh_core::graph::placement_stamp_now(),
-                };
-
-                if let Err(err) = graph.upsert_membrane_transport_home(&home) {
-                    return IpcResponse::error(
-                        "set_transport_home",
-                        "SET_TRANSPORT_HOME_PERSIST_FAILED",
-                        err.to_string(),
-                    );
-                }
-
-                info!(
-                    "Transport home for agent '{}' transport '{}' resource '{}' set to '{}' by '{}'",
-                    agent_id, transport, resource_ref, target_hotel, calling_role
-                );
-                IpcResponse::TransportHomeSet {
+                Self::perform_set_transport_home(
+                    graph,
                     agent_id,
                     transport,
                     resource_ref,
-                    active_home_hotel: target_hotel,
+                    calling_role,
+                    target_hotel,
                     standby_hotels,
-                }
+                )
             }
             IpcRequest::MaterializeRequest {
                 agent_id,
@@ -6901,6 +6842,35 @@ impl IpcServer {
             }
             IpcRequest::MaterializeStatus { request_id } => {
                 Self::handle_materialize_status(graph, request_id)
+            }
+            IpcRequest::RelocateHotel {
+                agent_id,
+                role_name,
+                calling_role,
+                target_hotel,
+                include_transport,
+                transport,
+                transport_resource_ref,
+                reason,
+            } => {
+                Self::handle_relocate_hotel(
+                    graph,
+                    dispatcher_tx,
+                    local_node_id,
+                    current_identity.as_ref(),
+                    agent_id,
+                    role_name,
+                    calling_role,
+                    target_hotel,
+                    include_transport,
+                    transport,
+                    transport_resource_ref,
+                    reason,
+                )
+                .await
+            }
+            IpcRequest::RelocateHotelStatus { ceremony_id } => {
+                Self::handle_relocate_hotel_status(graph, ceremony_id)
             }
             IpcRequest::DelegateToPeer {
                 target_agent_id,

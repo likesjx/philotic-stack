@@ -31,6 +31,7 @@ use crate::procedure::{
     ProcedureGraphRecord, ProcedurePatchRecord, ProcedurePatchStatus, ProcedureProvenance,
     ProcedureRunRecord,
 };
+use crate::relocation_ceremony::{RelocationCeremonyPhase, RelocationCeremonyRecord};
 use crate::storage::{
     AgentIdentityRecord, GraphAdapter, GraphRunnerInstanceRecord, GuestRecord, HotelRecord,
     ProjectedUserIdentityRecord, SecretRecord, SessionEventRecord, SessionParticipantRecord,
@@ -52,6 +53,11 @@ pub use kinds::*;
 /// All persistence is expressed via `GraphNode` upserts and queries on the
 /// adapter. Callers hold `Arc<GraphDomain>` and never interact with the adapter
 /// directly.
+///
+/// `Clone` is cheap (an `Arc` bump) and exists so a background task (e.g. a
+/// Relocation Ceremony's spawned orchestration) can hold an owned, `'static`
+/// handle without needing the caller's own `Arc<GraphDomain>`.
+#[derive(Clone)]
 pub struct GraphDomain {
     adapter: Arc<dyn GraphAdapter>,
 }
@@ -1256,6 +1262,82 @@ impl GraphDomain {
             b.created_at
                 .cmp(&a.created_at)
                 .then(b.patch_id.cmp(&a.patch_id))
+        });
+        Ok(out)
+    }
+
+    fn relocation_ceremony_key(ceremony_id: &str) -> String {
+        format!("{}:{}", NODE_KIND_RELOCATION_CEREMONY, ceremony_id)
+    }
+
+    /// Upsert a ceremony record. Ceremonies are never deleted: a rolled-back
+    /// or failed one is its own audit trail.
+    pub fn upsert_relocation_ceremony(&self, ceremony: &RelocationCeremonyRecord) -> Result<()> {
+        let data = serde_json::to_value(ceremony).context(
+            "GraphDomain::upsert_relocation_ceremony: serialize RelocationCeremonyRecord",
+        )?;
+        self.adapter.upsert_node(&GraphNode {
+            node_key: Self::relocation_ceremony_key(&ceremony.ceremony_id),
+            kind: NODE_KIND_RELOCATION_CEREMONY.to_string(),
+            label: Some(format!(
+                "{}->{}:{}",
+                ceremony.origin_hotel,
+                ceremony.target_hotel,
+                ceremony.phase.as_str()
+            )),
+            data,
+        })
+    }
+
+    pub fn get_relocation_ceremony(
+        &self,
+        ceremony_id: &str,
+    ) -> Result<Option<RelocationCeremonyRecord>> {
+        match self
+            .adapter
+            .get_node(&Self::relocation_ceremony_key(ceremony_id))?
+        {
+            None => Ok(None),
+            Some(node) => Ok(Some(serde_json::from_value(node.data).context(
+                "GraphDomain::get_relocation_ceremony: deserialize RelocationCeremonyRecord",
+            )?)),
+        }
+    }
+
+    /// Newest-first ceremonies, optionally filtered to one agent and/or one
+    /// phase. Used by `hotel.relocate_status` and by the boot-time
+    /// interrupted-ceremony scan.
+    pub fn list_relocation_ceremonies(
+        &self,
+        agent_id: Option<&str>,
+        phase: Option<RelocationCeremonyPhase>,
+    ) -> Result<Vec<RelocationCeremonyRecord>> {
+        let mut out: Vec<RelocationCeremonyRecord> = Vec::new();
+        for node in self
+            .adapter
+            .list_nodes_by_kind(NODE_KIND_RELOCATION_CEREMONY)?
+        {
+            match serde_json::from_value::<RelocationCeremonyRecord>(node.data.clone()) {
+                Ok(c) => {
+                    if agent_id.is_some_and(|id| c.agent_id != id) {
+                        continue;
+                    }
+                    if phase.is_some_and(|p| c.phase != p) {
+                        continue;
+                    }
+                    out.push(c);
+                }
+                Err(err) => warn!(
+                    node_key = %node.node_key,
+                    "Skipping incompatible relocation_ceremony record: {}",
+                    err
+                ),
+            }
+        }
+        out.sort_by(|a, b| {
+            b.created_at
+                .cmp(&a.created_at)
+                .then(b.ceremony_id.cmp(&a.ceremony_id))
         });
         Ok(out)
     }

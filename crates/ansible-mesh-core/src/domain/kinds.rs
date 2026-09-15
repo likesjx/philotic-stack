@@ -54,3 +54,8 @@ pub const NODE_KIND_PROCEDURE: &str = "procedure";
 pub const NODE_KIND_PROCEDURE_RUN: &str = "procedure_run";
 /// Refiner-proposed edit to a procedure, with its trial outcome (P4). Never deleted.
 pub const NODE_KIND_PROCEDURE_PATCH: &str = "procedure_patch";
+
+// Relocation Ceremony (doc:relocation-ceremony, slice R6)
+/// A recorded, resumable multi-phase relocation of a role incarnation (and
+/// optionally its paired transport) from one hotel to another. Never deleted.
+pub const NODE_KIND_RELOCATION_CEREMONY: &str = "relocation_ceremony";
