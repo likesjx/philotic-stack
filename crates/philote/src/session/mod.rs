@@ -389,6 +389,12 @@ pub struct SessionState {
     /// this until the plan completes, blocks, or the budget is exhausted.
     /// Checkpoint-persisted with a backward-compatible default of `None`.
     pub carryover_plan: Option<CarryoverPlan>,
+    /// Index into the active turn's working tool history before which calls
+    /// are not evidence for the active plan. Non-zero only when a reflex
+    /// seeded the plan from a tool result mid-turn (gardening: the audit that
+    /// produced the plan must not also count as its closing audit). Not
+    /// checkpointed — it dies with the turn.
+    pub plan_evidence_from: usize,
     /// A terminal plan evaluation waiting to be appended to the hotel's
     /// procedure run ledger (doc:procedural-graphs P1). Set by
     /// `plan_followup_after_turn` for the turn loop to drain right after the
@@ -475,6 +481,7 @@ impl SessionState {
             parked_plan_turn: None,
             parked_plan_since: None,
             carryover_plan: None,
+            plan_evidence_from: 0,
             pending_procedure_run: None,
             tool_success_streak: std::collections::HashMap::new(),
             pending_preapproval_thresholds: std::collections::HashMap::new(),
@@ -519,6 +526,7 @@ impl SessionState {
 
     pub fn start_turn(&mut self, turn: WorkingTurn) {
         self.active_turn = Some(turn);
+        self.plan_evidence_from = 0;
         self.active_turn_since = Some(std::time::Instant::now());
         // The only stamp that survives an approval park/resume round-trip.
         self.active_turn_started_unix = Some(current_unix_ts());
@@ -809,6 +817,13 @@ impl SessionState {
             );
         }
         if let Some(turn) = self.active_turn.as_mut() {
+            let same_goal = turn
+                .active_plan
+                .as_ref()
+                .is_some_and(|prev| prev.goal == plan.goal);
+            if !same_goal {
+                self.plan_evidence_from = 0;
+            }
             let carried: Vec<(u32, bool)> = turn
                 .active_plan
                 .as_ref()
@@ -1920,12 +1935,14 @@ impl SessionState {
             } else {
                 Vec::new()
             };
+        let evidence_from = self.plan_evidence_from;
         if let Some(turn) = self.active_turn.as_mut() {
             turn.working_tool_history.push((call, result));
             if let Some(plan) = turn.active_plan.as_ref() {
+                let from = evidence_from.min(turn.working_tool_history.len());
                 turn.plan_steps_verified = crate::plan_eval::verify_plan_steps(
                     plan,
-                    &turn.working_tool_history,
+                    &turn.working_tool_history[from..],
                     &turn.plan_steps_verified,
                 )
                 .verified_flags();
@@ -1947,6 +1964,12 @@ impl SessionState {
                 let plan = gardening_plan_from_actions(&audit_actions);
                 let steps = plan.steps.len();
                 self.set_active_plan(plan);
+                // The audit that seeded this plan is not its closing audit.
+                self.plan_evidence_from = self
+                    .active_turn
+                    .as_ref()
+                    .map(|t| t.working_tool_history.len())
+                    .unwrap_or(0);
                 tracing::info!(
                     session_id = %self.session_id,
                     steps,
@@ -5141,6 +5164,7 @@ impl SessionState {
             parked_plan_turn,
             parked_plan_since,
             carryover_plan,
+            plan_evidence_from: 0,
             tool_success_streak,
             pending_preapproval_thresholds,
             agent_graph_snapshot: None,
@@ -10124,6 +10148,17 @@ mod tests {
                 .goal,
             goal_before
         );
+        // …but it IS the closing audit: the seeding audit never credited the
+        // last step, this one does (live 2026-09-15 14:10 UTC the plan
+        // blocked at 12/13 with the harness re-running life.audit each
+        // continuation).
+        let flags = state
+            .active_turn
+            .as_ref()
+            .unwrap()
+            .plan_steps_verified
+            .clone();
+        assert_eq!(flags, vec![true, false, true]);
     }
 
     #[test]

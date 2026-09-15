@@ -164,6 +164,11 @@ pub struct PlanEvalOutcome {
     pub non_atomic_step_ids: Vec<u32>,
     /// Ids of steps still to do.
     pub outstanding_step_ids: Vec<u32>,
+    /// `"<id>: <description>"` for each outstanding step, so a status line
+    /// can say what is left instead of a bare number (live 2026-09-15 the
+    /// reply said "not done: step(s) 13" and the model then told the operator
+    /// "there was no Step 13").
+    pub outstanding_step_briefs: Vec<String>,
     /// Consecutive continuations (including this one) that settled nothing new.
     pub stalled_continuations: u32,
     pub verdict: PlanEvalVerdict,
@@ -183,6 +188,7 @@ impl PlanEvalOutcome {
             "contradicted_steps": self.contradicted_step_ids,
             "non_atomic_steps": self.non_atomic_step_ids,
             "outstanding_steps": self.outstanding_step_ids,
+            "outstanding_briefs": self.outstanding_step_briefs,
             "stalls": self.stalled_continuations,
         })
     }
@@ -280,6 +286,13 @@ pub fn evaluate_plan(
         .filter(|(i, _)| !flags[*i])
         .map(|(_, s)| s.id)
         .collect();
+    let outstanding_step_briefs: Vec<String> = plan
+        .steps
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| !flags[*i])
+        .map(|(_, s)| format!("{}: {}", s.id, step_brief(&s.description)))
+        .collect();
 
     // A continuation that settled nothing new is a stall. One is tolerated —
     // see MAX_CONSECUTIVE_PLAN_STALLS — because under grounded evaluation a
@@ -320,6 +333,7 @@ pub fn evaluate_plan(
         contradicted_step_ids: verification.contradicted_step_ids.clone(),
         non_atomic_step_ids: verification.non_atomic_step_ids.clone(),
         outstanding_step_ids,
+        outstanding_step_briefs,
         stalled_continuations: stalls,
         verdict,
         basis: if checkable {
@@ -459,6 +473,21 @@ pub fn plan_stop_notice(carryover: &CarryoverPlan, reason: &str) -> String {
          The carryover has been cleared — the remaining steps will not run automatically.)*",
         carryover.plan.goal
     )
+}
+
+/// A step description cut to its first clause, ≤ 72 chars, for status lines.
+pub fn step_brief(description: &str) -> String {
+    let first = description
+        .split(|c| c == ';' || c == '\n')
+        .next()
+        .unwrap_or(description)
+        .trim();
+    if first.chars().count() <= 72 {
+        first.to_string()
+    } else {
+        let cut: String = first.chars().take(69).collect();
+        format!("{}…", cut.trim_end())
+    }
 }
 
 fn step_list(plan: &ActivePlan, flags: &[bool], done: bool) -> String {
@@ -815,6 +844,36 @@ pub fn verify_plan_steps(
                 consumed[j] = true;
                 break;
             }
+        }
+    }
+
+    // Pass C — unique tool: a step whose bound tool no other step in the
+    // plan binds is proven by any successful call of that tool, whatever its
+    // wording. Live 2026-09-15 14:10 UTC: the closing "Re-run life.audit to
+    // measure the pass" step has distinctive words (measure, report, score)
+    // that never appear in an argument-less audit call, so Pass A could not
+    // credit it and Pass B never ran for it — the harness called life.audit
+    // on three continuations and the plan still blocked at 12/13.
+    for (i, step) in plan.steps.iter().enumerate() {
+        if evidence[i] == StepEvidence::Verified || !step_is_tool_bound(step) {
+            continue;
+        }
+        let tool = step.tool_name.as_deref().unwrap_or("");
+        let shared = plan
+            .steps
+            .iter()
+            .enumerate()
+            .any(|(k, other)| k != i && other.tool_name.as_deref() == Some(tool));
+        if shared {
+            continue;
+        }
+        for (j, (call, result)) in tool_history.iter().enumerate() {
+            if consumed[j] || !tool_result_looks_ok(result) || call.tool_name != tool {
+                continue;
+            }
+            evidence[i] = StepEvidence::Verified;
+            consumed[j] = true;
+            break;
         }
     }
 
@@ -2686,6 +2745,69 @@ mod tests {
         assert_eq!(v.evidence[1], StepEvidence::Verified);
         assert_eq!(v.evidence[2], StepEvidence::Missing);
         assert_eq!(life_ids_in(&p.steps[0].description).len(), 2);
+    }
+
+    /// Live 2026-09-15 14:10 UTC: the closing audit step ran (harness-issued,
+    /// no arguments) and still could not be credited.
+    #[test]
+    fn unique_tool_step_verifies_on_any_successful_call_of_its_tool() {
+        let p = plan(
+            "executing",
+            &[
+                (
+                    "Apply audit action retire_duplicate on life:a -> life:b",
+                    Some("life.tidy"),
+                    "done",
+                ),
+                (
+                    "Re-run life.audit to measure the pass; then report the health_score delta plus what still needs judgment.",
+                    Some("life.audit"),
+                    "pending",
+                ),
+            ],
+        );
+        let h = history_args(&[
+            (
+                "life.tidy",
+                serde_json::json!({"action": {"duplicate_id": "life:a", "keeper_id": "life:b"}}),
+                "ok",
+            ),
+            (
+                "life.audit",
+                serde_json::json!({}),
+                r#"{"data":{"health_score":58}}"#,
+            ),
+        ]);
+        let v = verify_plan_steps(&p, &h, &[]);
+        assert_eq!(
+            v.evidence,
+            vec![StepEvidence::Verified, StepEvidence::Verified]
+        );
+        assert!(evaluate_whole_plan(&p, &v).complete);
+        // Two steps binding the same tool are not both credited by one call.
+        let p2 = plan(
+            "executing",
+            &[
+                (
+                    "Re-run life.audit to measure",
+                    Some("life.audit"),
+                    "pending",
+                ),
+                ("Run life.audit again later", Some("life.audit"), "pending"),
+            ],
+        );
+        let v2 = verify_plan_steps(
+            &p2,
+            &history_args(&[("life.audit", serde_json::json!({}), "ok")]),
+            &[],
+        );
+        assert!(
+            v2.evidence
+                .iter()
+                .filter(|e| **e == StepEvidence::Verified)
+                .count()
+                <= 1
+        );
     }
 
     #[test]

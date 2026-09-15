@@ -545,6 +545,7 @@ mod tests {
             contradicted_step_ids: vec![3],
             non_atomic_step_ids: vec![],
             outstanding_step_ids: vec![3],
+            outstanding_step_briefs: Vec::new(),
             stalled_continuations: 1,
             verdict,
             basis,
