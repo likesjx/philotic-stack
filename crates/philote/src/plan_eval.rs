@@ -330,6 +330,10 @@ pub fn evaluate_plan(
     }
 }
 
+/// How much of a read-only tool's result Pass A scans for a step's
+/// distinctive tokens.
+const READ_RESULT_HAYSTACK_CHARS: usize = 16 * 1024;
+
 pub(crate) fn tool_result_looks_ok(result: &ToolResult) -> bool {
     let trimmed = result.content.trim_start().to_lowercase();
     !(trimmed.starts_with("error")
@@ -713,18 +717,37 @@ pub fn verify_plan_steps(
             .to_lowercase()
         })
         .collect();
+    // A retrieval's evidence is what it RETURNED, not what it was asked
+    // (`skill.list {}` / `life.list {"labels":[…]}` carry none of the step's
+    // words). Capped: list results run to tens of KB.
+    let result_haystacks: Vec<String> = tool_history
+        .iter()
+        .map(|(_, result)| {
+            result
+                .content
+                .chars()
+                .take(READ_RESULT_HAYSTACK_CHARS)
+                .collect::<String>()
+                .to_lowercase()
+        })
+        .collect();
 
     // Pass A — strong: a distinctive token of this step appears in the call's
-    // arguments (and the tool is compatible).
+    // arguments (and the tool is compatible). For a read-only tool the
+    // returned content counts too.
     for (i, step) in plan.steps.iter().enumerate() {
         if evidence[i] == StepEvidence::Verified || distinctive[i].is_empty() {
             continue;
         }
+        let read_only = step_tool_is_read_only(step);
         for (j, (call, result)) in tool_history.iter().enumerate() {
             if consumed[j] || !tool_result_looks_ok(result) || !step_tool_compatible(step, call) {
                 continue;
             }
-            if distinctive[i].iter().any(|t| haystacks[j].contains(t)) {
+            let hit = distinctive[i].iter().any(|t| {
+                haystacks[j].contains(t) || (read_only && result_haystacks[j].contains(t))
+            });
+            if hit {
                 evidence[i] = StepEvidence::Verified;
                 consumed[j] = true;
                 break;
@@ -735,9 +758,20 @@ pub fn verify_plan_steps(
     // Pass B — weak: nothing distinguishes this step textually, so a
     // successful call on its bound tool is the best evidence available. Still
     // one-to-one, so N identical steps require N successful calls.
+    //
+    // A step bound to a READ-ONLY tool takes this pass even when its text is
+    // distinctive: a retrieval has no per-item artifact, so a successful call
+    // of the bound tool IS the outcome. Live 2026-09-15 09:21 and 09:28 EDT
+    // (bjork, mac-jane): "Examine local database state and confirm the batch
+    // of observations has landed" bound to `life.list`, and "Inspect
+    // registered skills … verify music.repertoire-gardener configuration"
+    // bound to `skill.list {}`, could never verify — three and two successful
+    // calls each — so every such plan stalled twice, was declared `blocked`,
+    // and shipped "⚠️ Plan stopped before finishing: 0/1 steps verified"
+    // under a reply that (correctly) reported what the read had found.
     for (i, step) in plan.steps.iter().enumerate() {
         if evidence[i] == StepEvidence::Verified
-            || !distinctive[i].is_empty()
+            || (!distinctive[i].is_empty() && !step_tool_is_read_only(step))
             || !step_is_tool_bound(step)
         {
             continue;
@@ -2358,6 +2392,100 @@ mod tests {
         let v = verify_plan_steps(&p, &[], &[true]);
         assert_eq!(v.evidence[0], StepEvidence::Verified);
         assert!(v.contradicted_step_ids.is_empty());
+    }
+
+    /// Live 2026-09-15 13:28 UTC (bjork): a single read step whose words never
+    /// appear in `skill.list {}` — but do appear in what it returned.
+    #[test]
+    fn read_step_verifies_from_the_result_of_its_bound_tool() {
+        let p = plan(
+            "executing",
+            &[(
+                "Inspect registered skills in the hotel catalog to verify \
+                 music.repertoire-gardener configuration",
+                Some("skill.list"),
+                "done",
+            )],
+        );
+        let h = history_args(&[(
+            "skill.list",
+            serde_json::json!({}),
+            "Registered skills:\n- music.repertoire-gardener [validated] — Safely updates \
+             Jared's repertoire\n- music.weekly-practice-review [validated]",
+        )]);
+        let v = verify_plan_steps(&p, &h, &[]);
+        assert_eq!(v.evidence[0], StepEvidence::Verified);
+        assert!(v.contradicted_step_ids.is_empty());
+        assert!(evaluate_whole_plan(&p, &v).complete);
+    }
+
+    /// Live 2026-09-15 13:21 UTC (bjork): the step's words are in neither the
+    /// arguments nor the returned rows, yet the retrieval itself ran fine —
+    /// a read step has no artifact beyond "the read happened".
+    #[test]
+    fn read_step_verifies_on_a_successful_call_even_with_distinctive_text() {
+        let p = plan(
+            "executing",
+            &[(
+                "Examine local database state and confirm the batch of observations has \
+                 landed successfully",
+                Some("life.list"),
+                "done",
+            )],
+        );
+        let h = history_args(&[(
+            "life.list",
+            serde_json::json!({"include_terminal": true, "labels": ["Event", "Commitment"], "limit": 10}),
+            r#"{"data":{"as_of":"2026-09-15T13:21:11Z","count":2,"query":"filtered","read_only":true,"rows":[{"id":"life:event:jared-practice-2026-09-14"}]}}"#,
+        )]);
+        let v = verify_plan_steps(&p, &h, &[]);
+        assert_eq!(v.evidence[0], StepEvidence::Verified);
+        assert!(evaluate_whole_plan(&p, &v).complete);
+    }
+
+    /// The relaxation is for READ tools only: a write step with distinctive
+    /// text still needs its words in the call, so a `life.observe` of the
+    /// wrong thing does not clear it.
+    #[test]
+    fn write_step_with_distinctive_text_still_needs_a_matching_call() {
+        let p = plan(
+            "executing",
+            &[("Log Zerin Maluy", Some("life.observe"), "done")],
+        );
+        let h = history_args(&[("life.observe", observe("Daxton Thomas"), "ok")]);
+        let v = verify_plan_steps(&p, &h, &[]);
+        assert_eq!(v.evidence[0], StepEvidence::Missing);
+        assert_eq!(v.contradicted_step_ids, vec![1]);
+    }
+
+    /// A read step is still one-to-one with calls, and a failed read is no
+    /// evidence.
+    #[test]
+    fn read_steps_stay_one_to_one_and_reject_failed_reads() {
+        let p = plan(
+            "executing",
+            &[
+                (
+                    "Verify the practice event landed",
+                    Some("life.list"),
+                    "done",
+                ),
+                (
+                    "Verify the Chopin commitment landed",
+                    Some("life.list"),
+                    "done",
+                ),
+            ],
+        );
+        let one = history_args(&[("life.list", serde_json::json!({"labels": ["Event"]}), "ok")]);
+        assert_eq!(verify_plan_steps(&p, &one, &[]).verified_count(), 1);
+
+        let failed = history_args(&[(
+            "life.list",
+            serde_json::json!({"labels": ["Event"]}),
+            "Error: runner unavailable",
+        )]);
+        assert_eq!(verify_plan_steps(&p, &failed, &[]).verified_count(), 0);
     }
 
     #[test]
