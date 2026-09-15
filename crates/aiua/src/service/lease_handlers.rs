@@ -598,6 +598,23 @@ impl IpcServer {
         let subagent_guest_id = Uuid::new_v4().to_string();
         let ttl = delegation.lease_terms.ttl_seconds;
 
+        // Guest records are keyed by hotel NAME (list_guests/get_guest build the
+        // node_key prefix from it), not by node ID — every other seed_guests call
+        // site in this codebase resolves the name first. This one didn't: it seeded
+        // under `local_node_id` (e.g. "mac-jane-aiua-01"), so `GuestManager`'s
+        // `ensure_guest_active` — which looks guests up by `hotel_name` (e.g.
+        // "mac-jane") — could never find the row and silently returned `Ok(false)`.
+        // Every subagent.spawn call granted a lease and returned success, but no
+        // worker process was ever materialized. Found live 2026-08-28 proving PR
+        // #465's spawn-by-name resolution.
+        let Some(hotel_name) = Self::local_hotel_name(graph, local_node_id) else {
+            return IpcResponse::error(
+                "spawn_subagent",
+                "SUBAGENT_HOTEL_UNKNOWN",
+                format!("current hotel authority could not be resolved for node [{local_node_id}]"),
+            );
+        };
+
         // 1. Register the subagent guest in the context graph so the materializer
         //    can spawn and supervise it.
         let config_json = serde_json::json!({
@@ -610,7 +627,7 @@ impl IpcServer {
             },
         });
         let guest_record = ansible_mesh_core::storage::GuestRecord {
-            hotel_name: local_node_id.to_string(),
+            hotel_name: hotel_name.clone(),
             guest_id: subagent_guest_id.clone(),
             role: delegation.subagent_kind.clone(),
             config_json: config_json.to_string(),
@@ -618,7 +635,7 @@ impl IpcServer {
             active_pid: None,
             last_active_at: None,
         };
-        if let Err(e) = graph.seed_guests(local_node_id, &[guest_record]) {
+        if let Err(e) = graph.seed_guests(&hotel_name, &[guest_record]) {
             return IpcResponse::error(
                 "spawn_subagent",
                 "SUBAGENT_GUEST_REGISTER_FAILED",
@@ -663,6 +680,7 @@ impl IpcServer {
                     completion_route: delegation.completion_route.clone(),
                     failure_route: delegation.failure_route.clone(),
                     configured_ttl_secs: ttl,
+                    pending_delegation: Some(delegation.clone()),
                 },
             );
         }
@@ -1639,6 +1657,8 @@ impl IpcServer {
 
     pub(super) async fn handle_accept_subagent_lease(
         subagent_leases: &Arc<Mutex<RuntimeLeaseRegistry>>,
+        subagent_hooks: &SubagentHookRegistry,
+        inboxes: &InboxRegistry,
         subagent_guest_id: String,
     ) -> IpcResponse {
         // Worker calls this to acknowledge it has received and accepted the lease.
@@ -1647,9 +1667,57 @@ impl IpcServer {
         let lease = subagent_leases.lock().await.inspect(&scope);
         if lease.is_some() {
             info!("Subagent guest [{}] acknowledged lease.", subagent_guest_id);
+            // DEF-128: the worker is registered and listening now — hand it the
+            // delegation the hotel resolved at spawn time. Taken once; an
+            // explicit AssignSubagentTask from the parent still works as before.
+            let pending = {
+                let mut guard = subagent_hooks.lock().await;
+                guard.get_mut(&subagent_guest_id).and_then(|record| {
+                    record
+                        .pending_delegation
+                        .take()
+                        .map(|d| (record.persona_guest_id.clone(), d))
+                })
+            };
+            let mut delivered_task_id: Option<String> = None;
+            if let Some((persona_guest_id, delegation)) = pending {
+                match serde_json::to_string(&delegation) {
+                    Ok(task_json) => {
+                        let task_id = Uuid::new_v4();
+                        let delivered = Self::deliver_inbound_task(
+                            inboxes,
+                            &persona_guest_id,
+                            &delegation.subagent_kind,
+                            Some(&subagent_guest_id),
+                            task_id,
+                            task_json,
+                        )
+                        .await;
+                        if delivered {
+                            info!(
+                                "Subagent guest [{}] handed its delegation as task {} on lease accept.",
+                                subagent_guest_id, task_id
+                            );
+                            delivered_task_id = Some(task_id.to_string());
+                        } else {
+                            warn!(
+                                "Subagent guest [{}] accepted its lease but no inbox subscriber for role '{}' took the delegation; task {} not delivered.",
+                                subagent_guest_id, delegation.subagent_kind, task_id
+                            );
+                        }
+                    }
+                    Err(e) => warn!(
+                        "Subagent guest [{}]: could not serialise pending delegation: {}",
+                        subagent_guest_id, e
+                    ),
+                }
+            }
             IpcResponse::success(
                 "accept_subagent_lease",
-                Some(serde_json::json!({ "subagent_guest_id": subagent_guest_id })),
+                Some(serde_json::json!({
+                    "subagent_guest_id": subagent_guest_id,
+                    "delegation_task_id": delivered_task_id,
+                })),
             )
         } else {
             IpcResponse::error(
@@ -1718,6 +1786,31 @@ mod tests {
         let (dispatcher_tx, _dispatcher_rx) = test_dispatcher_channel();
         let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
         let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
+        // A hotel record is required so `local_hotel_name` can resolve
+        // "local-aiua-01" (the node id) to "local-hotel" (the name that
+        // seed_guests/list_guests key on) — see
+        // ensure_guest_active_requires_guest_seeded_under_hotel_name_not_node_id
+        // for why that resolution is load-bearing.
+        graph
+            .upsert_hotel(&HotelRecord {
+                hotel_name: "local-hotel".into(),
+                capabilities: NodeCapabilities {
+                    node_id: "local-aiua-01".into(),
+                    roles: vec![],
+                    models: vec![],
+                    tools: vec![],
+                    constraints: Default::default(),
+                    build_version: String::new(),
+                },
+                mesh_port: 9000,
+                blob_port: 9001,
+                execution_port: 9002,
+                ipc_socket_path: socket_path.clone(),
+                active_pid: None,
+                mesh_host: None,
+            })
+            .expect("seed local hotel");
+        let graph_check = graph.clone();
         let server = IpcServer::new(socket_path.clone(), "local-aiua-01", dispatcher_tx, graph);
 
         let server_task = tokio::spawn(async move {
@@ -1785,6 +1878,15 @@ mod tests {
                     confirmed_lease.owner_component_type.as_deref(),
                     Some("philote-worker")
                 );
+                // The guest record must be discoverable under the HOTEL NAME
+                // ("local-hotel"), not the node id — that's the exact lookup
+                // GuestManager::ensure_guest_active performs to materialize it.
+                let seeded = graph_check
+                    .get_guest("local-hotel", &subagent_guest_id)
+                    .expect("query guest")
+                    .expect("subagent guest must be seeded under the hotel name");
+                assert_eq!(seeded.hotel_name, "local-hotel");
+                assert!(seeded.is_active);
             }
             other => panic!("unexpected spawn_subagent response: {other:?}"),
         }
@@ -1797,6 +1899,262 @@ mod tests {
         if Path::new(&socket_path).exists() {
             let _ = std::fs::remove_file(&socket_path);
         }
+    }
+
+    /// Boot a hotel IPC server on a fresh socket with the local hotel seeded.
+    /// Returns (socket_path, graph, server_task).
+    async fn boot_spawn_test_hotel() -> (String, Arc<GraphDomain>, tokio::task::JoinHandle<()>) {
+        let socket_path = test_socket_path();
+        let (dispatcher_tx, _dispatcher_rx) = test_dispatcher_channel();
+        let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
+        let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
+        graph
+            .upsert_hotel(&HotelRecord {
+                hotel_name: "local-hotel".into(),
+                capabilities: NodeCapabilities {
+                    node_id: "local-aiua-01".into(),
+                    roles: vec![],
+                    models: vec![],
+                    tools: vec![],
+                    constraints: Default::default(),
+                    build_version: String::new(),
+                },
+                mesh_port: 9000,
+                blob_port: 9001,
+                execution_port: 9002,
+                ipc_socket_path: socket_path.clone(),
+                active_pid: None,
+                mesh_host: None,
+            })
+            .expect("seed local hotel");
+        let server = IpcServer::new(
+            socket_path.clone(),
+            "local-aiua-01",
+            dispatcher_tx,
+            graph.clone(),
+        );
+        let server_task = tokio::spawn(async move {
+            server.run().await.expect("ipc server should run");
+        });
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        // The dispatcher receiver is dropped on purpose: SpawnSubagent's
+        // ledger append is fire-and-forget for this gate check.
+        std::mem::forget(_dispatcher_rx);
+        unsafe {
+            std::env::set_var("PHILOTIC_HOTEL_SOCKET", &socket_path);
+        }
+        (socket_path, graph, server_task)
+    }
+
+    fn spawn_test_delegation() -> SubagentDelegation {
+        SubagentDelegation {
+            parent_agent_id: "agent-jane-01".into(),
+            parent_role: "agent".into(),
+            subagent_kind: "research_worker".into(),
+            goal: "Read files and report risks.".into(),
+            context_packet: SubagentContextPacket {
+                summary: "Bounded file review requested by a role incarnation.".into(),
+                ..Default::default()
+            },
+            allowed_tools: vec!["workspace.read".into()],
+            iteration_budget: Some(6),
+            ttl_seconds: Some(900),
+            completion_contract: SubagentCompletionContract {
+                summary_required: true,
+                artifact_refs_expected: false,
+                failure_summary_required: true,
+                requires_parent_ack: true,
+            },
+            ..Default::default()
+        }
+    }
+
+    async fn teardown_spawn_test_hotel(
+        socket_path: String,
+        server_task: tokio::task::JoinHandle<()>,
+    ) {
+        unsafe {
+            std::env::remove_var("PHILOTIC_HOTEL_SOCKET");
+        }
+        server_task.abort();
+        let _ = server_task.await;
+        if Path::new(&socket_path).exists() {
+            let _ = std::fs::remove_file(&socket_path);
+        }
+    }
+
+    /// Live 2026-09-14 18:43 UTC (mac-jane, bjork): the orchestrator
+    /// incarnation — registered as "role:agent-bjork-01:orchestrator", the
+    /// routing role aiua itself injects via PHILOTIC_ROLE_INBOX — called
+    /// subagent.spawn for a freshly registered skill and was refused with
+    /// SUBAGENT_FORBIDDEN, because the gate compared the raw role string to
+    /// "agent". A role incarnation is an agent caller; it must be able to
+    /// delegate.
+    #[tokio::test]
+    async fn spawn_subagent_accepts_role_incarnation_identity() {
+        let _env_guard = ipc_env_guard();
+        let (socket_path, graph, server_task) = boot_spawn_test_hotel().await;
+        graph
+            .upsert_role_incarnation(&ansible_mesh_core::graph::RoleIncarnationRecord {
+                agent_id: "agent-jane-01".into(),
+                role_name: "orchestrator".into(),
+                guest_id: "agent-jane-01:orchestrator".into(),
+                toolset_profile: "orchestrator".into(),
+                readiness_state: ansible_mesh_core::graph::RoleReadinessState::ActiveInSession,
+                ..Default::default()
+            })
+            .expect("seed role incarnation");
+
+        let mut incarnation = PhiloticClient::connect(GuestIdentity {
+            guest_id: "agent-jane-01:orchestrator".into(),
+            role: "role:agent-jane-01:orchestrator".into(),
+            supported_tools: Vec::new(),
+        })
+        .await
+        .expect("role incarnation connect");
+
+        let response = incarnation
+            .send_request(IpcRequest::SpawnSubagent {
+                session_id: "sess-subagent-incarnation".into(),
+                delegation: spawn_test_delegation(),
+            })
+            .await
+            .expect("spawn subagent request");
+
+        match response {
+            IpcResponse::SpawnSubagentOk {
+                subagent_guest_id,
+                confirmed_lease,
+            } => {
+                assert!(!subagent_guest_id.is_empty());
+                assert!(confirmed_lease.is_active());
+            }
+            other => panic!("role incarnation must be allowed to spawn a subagent, got: {other:?}"),
+        }
+
+        teardown_spawn_test_hotel(socket_path, server_task).await;
+    }
+
+    /// DEF-128: live 2026-09-14 20:51 UTC two `philote-worker` guests spawned
+    /// for `music.repertoire-gardener` registered, accepted their leases and
+    /// then idled until expiry — nothing ever sent them the delegation (the
+    /// philote's `subagent.spawn` tool stops at SpawnSubagentOk; only the
+    /// smoke driver ever called AssignSubagentTask). The hotel now hands the
+    /// worker the delegation it resolved at spawn time the moment the worker
+    /// accepts its lease.
+    #[tokio::test]
+    async fn spawned_worker_receives_its_delegation_on_lease_accept() {
+        let _env_guard = ipc_env_guard();
+        let (socket_path, _graph, server_task) = boot_spawn_test_hotel().await;
+
+        let mut parent = PhiloticClient::connect(GuestIdentity {
+            guest_id: "agent-jane-01".into(),
+            role: "agent".into(),
+            supported_tools: Vec::new(),
+        })
+        .await
+        .expect("parent connect");
+
+        let mut delegation = spawn_test_delegation();
+        delegation.subagent_kind = "philote-worker".into();
+        delegation.goal = "Link the eight MusicSection nodes to their pieces.".into();
+
+        let subagent_guest_id = match parent
+            .send_request(IpcRequest::SpawnSubagent {
+                session_id: "sess-subagent-assign".into(),
+                delegation,
+            })
+            .await
+            .expect("spawn subagent request")
+        {
+            IpcResponse::SpawnSubagentOk {
+                subagent_guest_id, ..
+            } => subagent_guest_id,
+            other => panic!("unexpected spawn response: {other:?}"),
+        };
+
+        // The worker binary's startup, in order: Register, AcceptSubagentLease,
+        // then wait for an InboundTask carrying the SubagentDelegation.
+        let mut worker = PhiloticClient::connect(GuestIdentity {
+            guest_id: subagent_guest_id.clone(),
+            role: "philote-worker".into(),
+            supported_tools: Vec::new(),
+        })
+        .await
+        .expect("worker connect");
+        let accepted = worker
+            .send_request(IpcRequest::AcceptSubagentLease {
+                subagent_guest_id: subagent_guest_id.clone(),
+            })
+            .await
+            .expect("accept lease request");
+        match accepted {
+            IpcResponse::Standard { ok, data, .. } => {
+                assert!(ok, "accept must succeed");
+                let task_id = data
+                    .as_ref()
+                    .and_then(|d| d.get("delegation_task_id"))
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string);
+                assert!(
+                    task_id.is_some(),
+                    "accept response must report the delivered delegation task id, got {data:?}"
+                );
+            }
+            other => panic!("unexpected accept response: {other:?}"),
+        }
+
+        let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
+        let goal = loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            assert!(!remaining.is_zero(), "worker never received its delegation");
+            let msg = tokio::time::timeout(remaining, worker.recv_task())
+                .await
+                .expect("worker inbox timed out")
+                .expect("worker inbox error");
+            if let IpcResponse::InboundTask { task_json, .. } = msg {
+                if let Ok(d) = serde_json::from_str::<SubagentDelegation>(&task_json) {
+                    break d.goal;
+                }
+            }
+        };
+        assert_eq!(goal, "Link the eight MusicSection nodes to their pieces.");
+
+        teardown_spawn_test_hotel(socket_path, server_task).await;
+    }
+
+    /// The gate still holds for non-agent guests: a tool runner cannot
+    /// delegate, with or without a role-incarnation record under its id.
+    #[tokio::test]
+    async fn spawn_subagent_still_refuses_non_agent_identity() {
+        let _env_guard = ipc_env_guard();
+        let (socket_path, _graph, server_task) = boot_spawn_test_hotel().await;
+
+        let mut tool_runner = PhiloticClient::connect(GuestIdentity {
+            guest_id: "local-hotel:tool-runner".into(),
+            role: "tool".into(),
+            supported_tools: Vec::new(),
+        })
+        .await
+        .expect("tool runner connect");
+
+        let response = tool_runner
+            .send_request(IpcRequest::SpawnSubagent {
+                session_id: "sess-subagent-tool".into(),
+                delegation: spawn_test_delegation(),
+            })
+            .await
+            .expect("spawn subagent request");
+
+        match response {
+            IpcResponse::Standard { ok, code, .. } => {
+                assert!(!ok);
+                assert_eq!(&*code, "SUBAGENT_FORBIDDEN");
+            }
+            other => panic!("tool runner must be refused, got: {other:?}"),
+        }
+
+        teardown_spawn_test_hotel(socket_path, server_task).await;
     }
 
     #[tokio::test]
@@ -1815,6 +2173,7 @@ mod tests {
                     models: vec![],
                     tools: vec![],
                     constraints: Default::default(),
+                    build_version: String::new(),
                 },
                 mesh_port: 9000,
                 blob_port: 9001,
@@ -1935,6 +2294,7 @@ mod tests {
                     models: vec![],
                     tools: vec![],
                     constraints: Default::default(),
+                    build_version: String::new(),
                 },
                 mesh_port: 9000,
                 blob_port: 9001,
@@ -2018,6 +2378,7 @@ mod tests {
                     models: vec![],
                     tools: vec![],
                     constraints: Default::default(),
+                    build_version: String::new(),
                 },
                 mesh_port: 9000,
                 blob_port: 9001,
@@ -2097,6 +2458,7 @@ mod tests {
                     models: vec![],
                     tools: vec![],
                     constraints: Default::default(),
+                    build_version: String::new(),
                 },
                 mesh_port: 9000,
                 blob_port: 9001,
@@ -2125,6 +2487,7 @@ mod tests {
                 lease_type: "telegram_poll".into(),
                 failover_policy: "manual-or-explicit-delegation".into(),
                 status: MembraneTransportHomeStatus::Active,
+                updated_unix: 0,
             })
             .expect("seed transport home");
         let server = IpcServer::new(socket_path.clone(), "local-aiua-01", dispatcher_tx, graph);
@@ -2193,6 +2556,7 @@ mod tests {
                     models: vec![],
                     tools: vec![],
                     constraints: Default::default(),
+                    build_version: String::new(),
                 },
                 mesh_port: 9000,
                 blob_port: 9001,
@@ -2283,6 +2647,7 @@ mod tests {
                     models: vec![],
                     tools: vec![],
                     constraints: Default::default(),
+                    build_version: String::new(),
                 },
                 mesh_port: 9000,
                 blob_port: 9001,
@@ -2380,6 +2745,7 @@ mod tests {
                     models: vec![],
                     tools: vec![],
                     constraints: Default::default(),
+                    build_version: String::new(),
                 },
                 mesh_port: 9000,
                 blob_port: 9001,
@@ -2483,6 +2849,7 @@ mod tests {
                     models: vec![],
                     tools: vec![],
                     constraints: Default::default(),
+                    build_version: String::new(),
                 },
                 mesh_port: 9000,
                 blob_port: 9001,
@@ -2589,6 +2956,7 @@ mod tests {
                     models: vec![],
                     tools: vec![],
                     constraints: Default::default(),
+                    build_version: String::new(),
                 },
                 mesh_port: 9000,
                 blob_port: 9001,
@@ -2698,6 +3066,7 @@ mod tests {
                     models: vec![],
                     tools: vec![],
                     constraints: Default::default(),
+                    build_version: String::new(),
                 },
                 mesh_port: 9000,
                 blob_port: 9001,
@@ -2777,6 +3146,7 @@ mod tests {
                     models: vec![],
                     tools: vec![],
                     constraints: Default::default(),
+                    build_version: String::new(),
                 },
                 mesh_port: 9000,
                 blob_port: 9001,
@@ -3099,6 +3469,7 @@ mod tests {
             completion_route: philotic_client::HookRoute::default(),
             failure_route: philotic_client::HookRoute::default(),
             configured_ttl_secs: ttl_secs,
+            pending_delegation: None,
         }
     }
 

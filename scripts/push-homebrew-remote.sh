@@ -228,7 +228,7 @@ for bin_path in "${BIN_PATHS[@]}"; do
 
   if ! remote_file_exists "${AIUA_CELLAR}/${bin}"; then
     # New binary not yet in Cellar — install it and create the symlink
-    ssh -n "${SSH_OPTS[@]}" "${REMOTE}" "cp '${STAGE_DIR}/${bin}' '${AIUA_CELLAR}/${bin}'"
+    ssh -n "${SSH_OPTS[@]}" "${REMOTE}" "cp '${STAGE_DIR}/${bin}' '${AIUA_CELLAR}/${bin}.new-inode' && mv -f '${AIUA_CELLAR}/${bin}.new-inode' '${AIUA_CELLAR}/${bin}'"
     ssh -n "${SSH_OPTS[@]}" "${REMOTE}" "chmod +x '${AIUA_CELLAR}/${bin}' && xattr -d com.apple.quarantine '${AIUA_CELLAR}/${bin}' 2>/dev/null || true && codesign -s - --force '${AIUA_CELLAR}/${bin}' >/dev/null 2>&1 || true"
     ssh -n "${SSH_OPTS[@]}" "${REMOTE}" "chmod 555 '${AIUA_CELLAR}/${bin}'"
     ssh -n "${SSH_OPTS[@]}" "${REMOTE}" "ln -sf '${AIUA_CELLAR}/${bin}' '/opt/homebrew/bin/${bin}'"
@@ -237,7 +237,7 @@ for bin_path in "${BIN_PATHS[@]}"; do
   fi
 
   ssh -n "${SSH_OPTS[@]}" "${REMOTE}" "chmod u+w '${AIUA_CELLAR}/${bin}' 2>/dev/null || true"
-  ssh -n "${SSH_OPTS[@]}" "${REMOTE}" "cp '${STAGE_DIR}/${bin}' '${AIUA_CELLAR}/${bin}'"
+  ssh -n "${SSH_OPTS[@]}" "${REMOTE}" "cp '${STAGE_DIR}/${bin}' '${AIUA_CELLAR}/${bin}.new-inode' && mv -f '${AIUA_CELLAR}/${bin}.new-inode' '${AIUA_CELLAR}/${bin}'"
   ssh -n "${SSH_OPTS[@]}" "${REMOTE}" "chmod +x '${AIUA_CELLAR}/${bin}' && xattr -d com.apple.quarantine '${AIUA_CELLAR}/${bin}' 2>/dev/null || true && codesign -s - --force '${AIUA_CELLAR}/${bin}' >/dev/null 2>&1 || true"
   ssh -n "${SSH_OPTS[@]}" "${REMOTE}" "ln -sf '${AIUA_CELLAR}/${bin}' '/opt/homebrew/bin/${bin}'"
   ssh -n "${SSH_OPTS[@]}" "${REMOTE}" "chmod u-w '${AIUA_CELLAR}/${bin}' 2>/dev/null || true"
@@ -249,8 +249,11 @@ if [[ -n "${PHIL_CELLAR}" && -f "${ROOT_DIR}/target/release/philotic-web" ]]; th
   scp -q "${SSH_OPTS[@]}" "${ROOT_DIR}/target/release/philotic-web" "${REMOTE}:${STAGE_DIR}/philotic-web"
   ssh "${SSH_OPTS[@]}" "${REMOTE}" "chmod +x '${STAGE_DIR}/philotic-web'"
   ssh "${SSH_OPTS[@]}" "${REMOTE}" "chmod u+w '${PHIL_CELLAR}/philotic-web' '${PHIL_CELLAR}/phil' 2>/dev/null || true"
-  ssh "${SSH_OPTS[@]}" "${REMOTE}" "cp '${STAGE_DIR}/philotic-web' '${PHIL_CELLAR}/philotic-web'"
-  ssh "${SSH_OPTS[@]}" "${REMOTE}" "cp '${STAGE_DIR}/philotic-web' '${PHIL_CELLAR}/phil'"
+  # New-inode install (cp to temp + mv): an in-place cp reuses the inode and the
+  # kernel's cached code signature then SIGKILLs the binary at spawn
+  # (OS_REASON_CODESIGNING) — `codesign -f` alone does not clear that cache.
+  ssh "${SSH_OPTS[@]}" "${REMOTE}" "cp '${STAGE_DIR}/philotic-web' '${PHIL_CELLAR}/philotic-web.new-inode' && mv -f '${PHIL_CELLAR}/philotic-web.new-inode' '${PHIL_CELLAR}/philotic-web'"
+  ssh "${SSH_OPTS[@]}" "${REMOTE}" "cp '${STAGE_DIR}/philotic-web' '${PHIL_CELLAR}/phil.new-inode' && mv -f '${PHIL_CELLAR}/phil.new-inode' '${PHIL_CELLAR}/phil'"
   ssh "${SSH_OPTS[@]}" "${REMOTE}" "chmod +x '${PHIL_CELLAR}/philotic-web' '${PHIL_CELLAR}/phil'"
   ssh "${SSH_OPTS[@]}" "${REMOTE}" "xattr -d com.apple.quarantine '${PHIL_CELLAR}/philotic-web' '${PHIL_CELLAR}/phil' 2>/dev/null || true"
   ssh "${SSH_OPTS[@]}" "${REMOTE}" "codesign -s - --force '${PHIL_CELLAR}/philotic-web' '${PHIL_CELLAR}/phil' >/dev/null 2>&1 || true"

@@ -18,6 +18,7 @@ related_docs:
 - PERIMETER_EGRESS_CONTROL_PROPOSAL.md
 - INTER_HOTEL_ROUTING_PROPOSAL.md
 - ARCHITECTURE_STATUS.md
+- BLOB_EXECUTION_PERIMETER_HARDENING_PROPOSAL.md
 task_refs:
 - docs/task.md
 proposal_id: mesh-pki-hotel-identity

@@ -581,6 +581,13 @@ impl GuestManager {
         let _ = graph.set_guest_pid(hotel_name, guest_id, None);
     }
 
+    /// Config key marking a guest as TTL-dormant (wakeable by on-demand
+    /// materialization) rather than operator-deactivated (refused). Written
+    /// by the supervisor's role-TTL sweep, cleared on wake.
+    pub(crate) fn dormancy_marker_key(guest_id: &str) -> String {
+        format!("guest_dormancy:{guest_id}")
+    }
+
     fn supervision_state_key(hotel_name: &str, guest_id: &str) -> String {
         format!("supervision_state:{hotel_name}:{guest_id}")
     }
@@ -823,7 +830,27 @@ impl GuestManager {
             return Ok(false);
         };
         if !current_rec.is_active {
-            return Ok(false);
+            // Dormant ≠ disabled: a TTL-dormant guest (marker written by the
+            // supervisor's role-TTL sweep) is wakeable on demand — that is
+            // the whole point of lazy specialist materialization. An
+            // operator deactivation carries no marker and stays refused.
+            let marker_key = Self::dormancy_marker_key(&current_rec.guest_id);
+            let is_dormant = self
+                .graph
+                .get_config_value(&marker_key)
+                .ok()
+                .flatten()
+                .is_some();
+            if !is_dormant {
+                return Ok(false);
+            }
+            info!(
+                "On-demand materialization: waking TTL-dormant guest [{}].",
+                current_rec.guest_id
+            );
+            self.graph
+                .set_guest_active(&self.hotel_name, &current_rec.guest_id, true)?;
+            let _ = self.graph.remove_config_value(&marker_key);
         }
         if let Some(active_pid) = current_rec.active_pid.as_deref() {
             let is_live = mat.check_status(&current_rec.guest_id, active_pid).await?;
@@ -976,12 +1003,24 @@ impl GuestManager {
                 };
                 if ttl_expired {
                     info!(
-                        "Supervisor: Guest [{}] has exceeded its role TTL. Deactivating.",
+                        "Supervisor: Guest [{}] has exceeded its role TTL. Going dormant (wakeable).",
                         rec.guest_id
                     );
                     let _ = self
                         .graph
                         .set_guest_active(&self.hotel_name, &rec.guest_id, false);
+                    // Dormant ≠ disabled. TTL expiry writes the same
+                    // `is_active=0` bit an operator deactivation writes, and
+                    // `ensure_guest_active` refuses inactive guests — which
+                    // made every TTL-dormant specialist permanently
+                    // unreachable by delegation (DEF-086 family). Mark the
+                    // deactivation as dormancy so on-demand materialization
+                    // may wake it; operator deactivations never set this
+                    // marker and stay refused.
+                    let _ = self.graph.set_config_value(
+                        &Self::dormancy_marker_key(&rec.guest_id),
+                        "\"ttl_dormant\"",
+                    );
                     if let Some(_pid) = rec.active_pid.as_deref() {
                         let mut mat = self.materializer.lock().await;
                         let _ = mat.reclaim_guest(&rec.guest_id).await;
@@ -1540,6 +1579,153 @@ mod tests {
         assert_eq!(
             LocalProcessMaterializer::parse_pid_value(ValueRef::Null),
             None
+        );
+    }
+
+    /// Dormant ≠ disabled: a guest deactivated by the role-TTL sweep (marker
+    /// present) must be wakeable on demand — before this, TTL dormancy wrote
+    /// the same is_active=0 bit as an operator deactivation and every
+    /// delegation to a dormant specialist was refused forever (DEF-086
+    /// family). An operator deactivation (no marker) must STAY refused.
+    #[tokio::test]
+    async fn ensure_guest_active_wakes_ttl_dormant_but_refuses_operator_deactivation() {
+        let storage = ansible_mesh_core::sqlite_storage::SqliteGraphStorage::open(":memory:")
+            .expect("open sqlite");
+        let graph = Arc::new(GraphDomain::new(Arc::new(storage.adapter())));
+        let guests = vec![
+            GuestRecord {
+                hotel_name: "test-hotel".into(),
+                guest_id: "test-hotel:philote-Chronos".into(),
+                role: "Chronos".into(),
+                config_json: json!({ "command": "philote" }).to_string(),
+                is_active: false,
+                active_pid: None,
+                last_active_at: None,
+            },
+            GuestRecord {
+                hotel_name: "test-hotel".into(),
+                guest_id: "test-hotel:philote-Muse".into(),
+                role: "Muse".into(),
+                config_json: json!({ "command": "philote" }).to_string(),
+                is_active: false,
+                active_pid: None,
+                last_active_at: None,
+            },
+        ];
+        graph
+            .seed_guests("test-hotel", &guests)
+            .expect("seed guests");
+        // Chronos went dormant via the TTL sweep; Muse was operator-disabled.
+        graph
+            .set_config_value(
+                &GuestManager::dormancy_marker_key("test-hotel:philote-Chronos"),
+                "\"ttl_dormant\"",
+            )
+            .expect("set marker");
+
+        let mock = MockMaterializer::new(HashMap::new());
+        let spawn_count = mock.spawn_count.clone();
+        let manager = GuestManager::new("test-hotel", graph.clone(), Box::new(mock));
+
+        let woke = manager
+            .ensure_guest_active("test-hotel:philote-Chronos")
+            .await
+            .expect("ensure dormant");
+        assert!(woke, "TTL-dormant guest must wake on demand");
+        assert_eq!(spawn_count.load(Ordering::SeqCst), 1, "wake must spawn");
+        let rec = graph
+            .get_guest("test-hotel", "test-hotel:philote-Chronos")
+            .expect("get")
+            .expect("exists");
+        assert!(rec.is_active, "woken guest must be re-activated");
+        assert!(
+            graph
+                .get_config_value(&GuestManager::dormancy_marker_key(
+                    "test-hotel:philote-Chronos"
+                ))
+                .expect("get marker")
+                .is_none(),
+            "dormancy marker must clear on wake"
+        );
+
+        let refused = manager
+            .ensure_guest_active("test-hotel:philote-Muse")
+            .await
+            .expect("ensure disabled");
+        assert!(!refused, "operator-deactivated guest must stay refused");
+        assert_eq!(
+            spawn_count.load(Ordering::SeqCst),
+            1,
+            "no spawn for operator-deactivated guest"
+        );
+    }
+
+    #[tokio::test]
+    async fn ensure_guest_active_requires_guest_seeded_under_hotel_name_not_node_id() {
+        // Regression for a subagent-materialization dead-lease found live
+        // 2026-08-28: `handle_spawn_subagent` seeded the fresh subagent guest
+        // record under `local_node_id` (e.g. "mac-jane-aiua-01"), but
+        // `GuestManager` — and every other seed_guests call site — is keyed by
+        // `hotel_name` (e.g. "mac-jane", a distinct string). `list_guests`
+        // builds its lookup prefix from `hotel_name`, so the guest was
+        // invisible to `ensure_guest_active`: it silently returned `Ok(false)`,
+        // no spawn was attempted, and `subagent.spawn` returned success with a
+        // lease that no worker process ever backed.
+        let hotel_name = "mac-jane";
+        let local_node_id = "mac-jane-aiua-01"; // distinct from hotel_name, as in production
+        let storage = ansible_mesh_core::sqlite_storage::SqliteGraphStorage::open(":memory:")
+            .expect("open sqlite");
+        let graph = Arc::new(GraphDomain::new(Arc::new(storage.adapter())));
+
+        let subagent_guest = GuestRecord {
+            hotel_name: hotel_name.into(),
+            guest_id: "subagent-fixture-01".into(),
+            role: "philote-worker".into(),
+            config_json: json!({ "command": "philote-worker" }).to_string(),
+            is_active: true,
+            active_pid: None,
+            last_active_at: None,
+        };
+
+        let mock = MockMaterializer::new(HashMap::new());
+        let spawn_count = mock.spawn_count.clone();
+        let manager = GuestManager::new(hotel_name, graph.clone(), Box::new(mock));
+
+        // The fix: seeded under hotel_name — the materializer finds and spawns it.
+        graph
+            .seed_guests(hotel_name, &[subagent_guest.clone()])
+            .expect("seed under hotel_name");
+        let activated = manager
+            .ensure_guest_active("subagent-fixture-01")
+            .await
+            .expect("ensure_guest_active");
+        assert!(activated, "guest seeded under hotel_name must materialize");
+        assert_eq!(spawn_count.load(Ordering::SeqCst), 1);
+
+        // Characterizes the bug: seeded under node_id instead (the original
+        // `handle_spawn_subagent` set BOTH the seed_guests argument and the
+        // GuestRecord.hotel_name field to local_node_id) — invisible to the
+        // hotel-name-keyed lookup, so no spawn is attempted for it.
+        let orphaned = GuestRecord {
+            hotel_name: local_node_id.into(),
+            guest_id: "subagent-fixture-02".into(),
+            ..subagent_guest
+        };
+        graph
+            .seed_guests(local_node_id, std::slice::from_ref(&orphaned))
+            .expect("seed under node_id (the old bug)");
+        let activated_orphan = manager
+            .ensure_guest_active("subagent-fixture-02")
+            .await
+            .expect("ensure_guest_active");
+        assert!(
+            !activated_orphan,
+            "guest seeded under node_id must NOT be found by a hotel-name-keyed manager"
+        );
+        assert_eq!(
+            spawn_count.load(Ordering::SeqCst),
+            1,
+            "no spawn attempted for the node-id-keyed orphan"
         );
     }
 

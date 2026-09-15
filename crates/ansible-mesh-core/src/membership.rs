@@ -294,6 +294,7 @@ mod tests {
                 latency_hint_ms: Some(20),
                 trust_level: Some("trusted".into()),
             },
+            build_version: String::new(),
         }
     }
 

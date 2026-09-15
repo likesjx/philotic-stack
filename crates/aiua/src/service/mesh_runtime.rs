@@ -63,6 +63,10 @@ pub(crate) struct MeshRuntimeContext {
     /// Shared hotel roster snapshot used by BeaconDaemon for anchor handshakes.
     pub(crate) local_hotel_state:
         Arc<RwLock<Option<ansible_mesh_core::heartbeat::HotelStateSyncPayload>>>,
+    /// Newly applied gossiped placement records flow here so the hotel can
+    /// push `TransportHomeChanged` to local guests at once (DEF-107).
+    pub(crate) placement_change_tx:
+        Option<mpsc::UnboundedSender<ansible_mesh_core::placement_sync::PlacementChange>>,
 }
 
 pub(crate) async fn activate_mesh_runtime(ctx: MeshRuntimeContext) -> Result<()> {
@@ -76,7 +80,8 @@ pub(crate) async fn activate_mesh_runtime(ctx: MeshRuntimeContext) -> Result<()>
             ctx.enable_rust_auth,
             ctx.registry.clone(),
         )
-        .await?,
+        .await?
+        .with_placement_change_tx(ctx.placement_change_tx.clone()),
     );
     *daemon.local_hotel_state.write().await = ctx.local_hotel_state.read().await.clone();
     // Keep beacon's snapshot in sync: whenever the shared Arc is updated, propagate here.
@@ -410,6 +415,43 @@ pub(crate) async fn activate_mesh_runtime(ctx: MeshRuntimeContext) -> Result<()>
                                             } = &event.payload
                                             {
                                                 handle_projected_user_identity_sync(
+                                                    inbound_graph.as_ref(),
+                                                    data,
+                                                );
+                                            }
+                                        }
+                                        ansible_mesh_core::event::EventKind::MaterializeRequest => {
+                                            if let ansible_mesh_core::event::EventPayload::Inline {
+                                                data,
+                                            } = &event.payload
+                                            {
+                                                let graph = inbound_graph.clone();
+                                                let inboxes = inbound_inboxes.clone();
+                                                let mat_req = inbound_mat_req.clone();
+                                                let node_id = inbound_local_node_id.clone();
+                                                let source_node = event.source_node_id.clone();
+                                                let data = data.clone();
+                                                let dispatcher_tx = dispatcher_inbound_tx.clone();
+                                                tokio::spawn(async move {
+                                                    IpcServer::handle_remote_materialize_request(
+                                                        graph.as_ref(),
+                                                        &inboxes,
+                                                        mat_req,
+                                                        dispatcher_tx,
+                                                        &node_id,
+                                                        &source_node,
+                                                        &data,
+                                                    )
+                                                    .await;
+                                                });
+                                            }
+                                        }
+                                        ansible_mesh_core::event::EventKind::MaterializeReady => {
+                                            if let ansible_mesh_core::event::EventPayload::Inline {
+                                                data,
+                                            } = &event.payload
+                                            {
+                                                IpcServer::handle_remote_materialize_ready(
                                                     inbound_graph.as_ref(),
                                                     data,
                                                 );

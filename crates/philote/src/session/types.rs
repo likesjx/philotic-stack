@@ -281,6 +281,12 @@ pub struct ActivePlan {
     /// This is advisory only; approval policy still decides whether a tool may run.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_1_advisory: Option<Context1Advisory>,
+    /// The procedural graph this plan was seeded from or attributed to
+    /// (doc:procedural-graphs). Stamped by the harness when it seeds a plan
+    /// from a procedure's backbone; otherwise resolved at eval time by tool
+    /// overlap. Drives run-ledger attribution and localized guidance.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub procedure_id: Option<String>,
 }
 
 /// A plan carried across turns by the plan-eval-repeat loop.
@@ -322,8 +328,20 @@ pub struct CarryoverPlan {
     #[serde(default)]
     pub stalled_continuations: u32,
     /// Number of continuation turns already synthesized for this plan.
+    ///
+    /// Refunded to zero whenever a continuation settles a new step, so the
+    /// budget only ever binds stretches that are not making progress — a plan
+    /// that keeps verifiably landing steps is never cut off mid-goal. See
+    /// `PLAN_CONTINUATION_LIFETIME_CAP` for the absolute backstop.
     #[serde(default)]
     pub continuations_used: u32,
+    /// Total continuation turns synthesized over this plan's whole lifetime.
+    ///
+    /// Never refunded. Progress resets `continuations_used`, so without this a
+    /// plan that alternates one settled step with a fresh batch of self-added
+    /// steps could hold the loop forever. See `PLAN_CONTINUATION_LIFETIME_CAP`.
+    #[serde(default)]
+    pub lifetime_continuations: u32,
     /// The turn that originally produced this carryover.
     pub created_turn_id: String,
 }
@@ -704,6 +722,60 @@ pub struct FallbackOverride {
     pub notice_sent: bool,
 }
 
+#[cfg(test)]
+impl WorkingTurn {
+    /// Minimal fresh working turn for unit tests across the runtime
+    /// submodules: no tools, no plan, no paracrine state, budget counters
+    /// at their starting values.
+    pub(crate) fn test_turn(turn_id: &str, user_content: &str) -> WorkingTurn {
+        WorkingTurn {
+            task_id: Uuid::new_v4(),
+            turn_id: turn_id.into(),
+            chat_id: "chat-1".into(),
+            primary_user_id: None,
+            user_content: user_content.into(),
+            final_reply_to: "node-1".into(),
+            final_reply_role: "membrane".into(),
+            final_reply_guest_id: None,
+            phase: TurnPhase::WaitingTool,
+            iteration: 0,
+            pending_tool_call: None,
+            pending_approval: None,
+            working_tool_history: Vec::new(),
+            recalled_memories: Vec::new(),
+            active_plan: None,
+            consecutive_step_failures: 0,
+            streak_extension: 0,
+            provider_repair_note: None,
+            say_do_nudged: false,
+            provider_repair_attempts: 0,
+            pending_text_reply: None,
+            had_voice_input: false,
+            awaiting_transcription_reentry: false,
+            scripted_loop_context: None,
+            associated_paracrine_ids: Vec::new(),
+            paracrine_origin: None,
+            paracrine_reply_session_id: None,
+            paracrine_reply_chat_id: None,
+            paracrine_response_routing: None,
+            paracrine_merge_completed: false,
+            paracrine_intent: None,
+            plan_confirmed: false,
+            plan_confirm_note: None,
+            fallback_tier: 0,
+            ladder_tier0_dispatched: false,
+            streaming_retry_attempts: 0,
+            streamed_content: String::new(),
+            paracrine_hop_count: 0,
+            paracrine_chain_started_at: None,
+            selection_source: SelectionSource::default(),
+            started_at_unix: None,
+            last_interim_at_unix: None,
+            plan_steps_verified: Vec::new(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkingTurn {
     pub task_id: Uuid,
@@ -747,6 +819,14 @@ pub struct WorkingTurn {
     pub provider_repair_note: Option<String>,
     /// Number of corrective provider retries attempted for this turn.
     pub provider_repair_attempts: u32,
+    /// True once this turn has been sent back to the model for a say-do
+    /// check: the model replied with text that tells the user it is
+    /// executing work now, while the turn had made no tool call. One nudge
+    /// per turn; a second promise-only reply is delivered with an honest
+    /// trailer instead of looping. Never persisted — a turn that survives a
+    /// checkpoint restore is mid-`WaitingTool`, past this gate.
+    #[serde(default)]
+    pub say_do_nudged: bool,
     /// Stashed text content while waiting for voice synthesis to complete.
     pub pending_text_reply: Option<String>,
     pub had_voice_input: bool,
@@ -777,6 +857,12 @@ pub struct WorkingTurn {
     /// Captured from the inbound exosome and echoed back on `paracrine_response`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub paracrine_response_routing: Option<philotic_client::ParacrineRouting>,
+    /// Structured intent carried in the inbound exosome's `context.intent`
+    /// (e.g. `skills.distill:tool_count`). Lets the tool layer recognise a
+    /// lookaside turn whose legal tool surface is narrower than the role's
+    /// default — a distill whisper may only draft a skill or write memory.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub paracrine_intent: Option<String>,
     /// Set to true when the specialist explicitly calls `delegate.merge` during a turn.
     /// Suppresses the auto-emit of `paracrine_response` in deliver_text_reply so there
     /// is no duplicate delivery after the explicit merge already fired.
@@ -887,6 +973,7 @@ impl WorkingTurn {
             consecutive_step_failures: 0,
             streak_extension: 0,
             provider_repair_note: None,
+            say_do_nudged: false,
             provider_repair_attempts: 0,
             pending_text_reply: None,
             had_voice_input: false,
@@ -898,6 +985,7 @@ impl WorkingTurn {
             paracrine_reply_chat_id: None,
             paracrine_response_routing: None,
             paracrine_merge_completed: false,
+            paracrine_intent: None,
             plan_confirmed: false,
             plan_confirm_note: None,
             fallback_tier: 0,
@@ -1287,6 +1375,13 @@ pub struct InjectionBudget {
     pub reflex_snapshot_chars: usize,
     /// Cap for the Rules layer (`project_rules`).
     pub rules_chars: usize,
+    /// Cap for the dialogue window (`[Recent session context]`).
+    ///
+    /// This layer is the only one whose size the operator controls directly —
+    /// one pasted document lands in it and is then re-sent on every request for
+    /// as long as it stays inside the window. It was the one unbudgeted layer
+    /// until 2026-08-30, when coach was sending 236KB requests.
+    pub dialogue_chars: usize,
     /// Whole-envelope ceiling (sum of all rendered layer chars). Drives
     /// `ReflexEvent::ContextPressure` emission — see `BudgetLedger`.
     pub total_envelope_chars: usize,
@@ -1301,6 +1396,7 @@ impl Default for InjectionBudget {
             skills_chars: 2_500,
             reflex_snapshot_chars: 1_000,
             rules_chars: 2_000,
+            dialogue_chars: 8_000,
             total_envelope_chars: 60_000,
         }
     }
@@ -1631,6 +1727,12 @@ pub struct SessionBindings {
     pub effective_skillset: Vec<String>,
     #[serde(default)]
     pub effective_skill_guidance: Vec<String>,
+    /// Procedural graphs projected for this session (doc:procedural-graphs):
+    /// the hotel sends the full records for the skills in play so philote
+    /// can localize the active step without an IPC round trip. Prompt-facing
+    /// only — never affects tool routing or the tool assembly.
+    #[serde(default)]
+    pub effective_procedures: Vec<ansible_mesh_core::procedure::ProcedureGraphRecord>,
     /// Skills whose tools are in the ToolAssembly but suppressed per-turn unless
     /// the turn content signals the skill is needed. Populated from the role's
     /// toolset profile `on_demand_skills` list at session snapshot time.
@@ -2017,6 +2119,7 @@ mod paracrine_budget_tests {
             consecutive_step_failures: 0,
             streak_extension: 0,
             provider_repair_note: None,
+            say_do_nudged: false,
             provider_repair_attempts: 0,
             pending_text_reply: None,
             had_voice_input: false,
@@ -2028,6 +2131,7 @@ mod paracrine_budget_tests {
             paracrine_reply_chat_id: None,
             paracrine_response_routing: None,
             paracrine_merge_completed: false,
+            paracrine_intent: None,
             plan_confirmed: false,
             plan_confirm_note: None,
             fallback_tier: 0,

@@ -57,6 +57,17 @@ pub const DEFAULT_PLAN_CONTINUATION_BUDGET: u32 = 3;
 /// stage so a plan can never loop indefinitely, however many steps it declares.
 pub const PLAN_CONTINUATION_BUDGET_CEILING: u32 = 8;
 
+/// Absolute cap on continuation turns over a plan's whole lifetime.
+///
+/// The per-stretch budget is refunded whenever a continuation settles a new
+/// step (progress must never be what exhausts the loop — stalls are what the
+/// budget exists to bound, and `MAX_CONSECUTIVE_PLAN_STALLS` already blocks a
+/// spin). This cap is the backstop the refund needs: a plan that keeps growing
+/// its own step list could otherwise alternate one settled step with fresh
+/// work forever. Sized at 3× the per-stretch ceiling — far above any plan the
+/// loop legitimately runs, so hitting it is itself a signal worth surfacing.
+pub const PLAN_CONTINUATION_LIFETIME_CAP: u32 = 24;
+
 /// Consecutive stalled continuations tolerated before the plan is `Blocked`.
 ///
 /// One stall is not failure. Under grounded evaluation a turn only counts as
@@ -319,7 +330,7 @@ pub fn evaluate_plan(
     }
 }
 
-fn tool_result_looks_ok(result: &ToolResult) -> bool {
+pub(crate) fn tool_result_looks_ok(result: &ToolResult) -> bool {
     let trimmed = result.content.trim_start().to_lowercase();
     !(trimmed.starts_with("error")
         || trimmed.starts_with("{\"error\"")
@@ -416,8 +427,8 @@ pub fn plan_stop_notice(carryover: &CarryoverPlan, reason: &str) -> String {
         remaining_list
     };
     format!(
-        "*(Plan paused: {reason}. Goal: {}. {done}/{total} steps done. Remaining:\n{remaining}\n\
-         Send a message to keep going manually, or /plan drop to discard.)*",
+        "*(Plan stopped: {reason}. Goal: {}. {done}/{total} steps done. Remaining:\n{remaining}\n\
+         The carryover has been cleared — the remaining steps will not run automatically.)*",
         carryover.plan.goal
     )
 }
@@ -427,9 +438,26 @@ fn step_list(plan: &ActivePlan, flags: &[bool], done: bool) -> String {
         .iter()
         .enumerate()
         .filter(|(i, _)| flags.get(*i).copied().unwrap_or(false) == done)
-        .map(|(_, s)| format!("- step {}: {}", s.id, s.description))
+        .map(|(_, s)| format!("- step {}{}: {}", s.id, step_tool_suffix(s), s.description))
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+/// ` (tool: X)` for a tool-bound step, empty otherwise.
+///
+/// Load-bearing in continuation briefs, not decoration: the brief is the
+/// continuation turn's only tool-projection relevance text, and the keyword
+/// gates in `project_tools_for_turn` know nothing about the plan. A brief that
+/// names only step descriptions can have exactly the tools the remaining steps
+/// need stripped from the projection — worst case, a goal phrased with a `?`
+/// trips the conversational gate and the continuation runs with zero tools,
+/// stalls twice, and the plan is blocked. Naming the bound tool makes the
+/// explicit tool-name match fire first, which bypasses those gates entirely.
+fn step_tool_suffix(step: &PlanStep) -> String {
+    match step.tool_name.as_deref() {
+        Some(t) if !t.is_empty() => format!(" (tool: {t})"),
+        _ => String::new(),
+    }
 }
 
 // ── Grounded step verification ──────────────────────────────────────────────
@@ -754,22 +782,203 @@ pub fn verify_plan_steps(
 /// Mali and Daxton" was marked done after only Zerin landed, and the agent
 /// then told the operator all five children were in place when Daxton did not
 /// exist. One step must mean one verifiable outcome.
+///
+/// Two shapes are exempt, because for them "one call cleared it while the
+/// rest never happened" cannot occur (live 2026-09-11, Beacon morning brief:
+/// `Log Jared's drive with Daxton to school on Thursday morning, 2026-09-10,
+/// as a proposed event` and `Retrieve oldest active open loops, aspirations,
+/// and roles` were both flagged, could never settle, and the plan burned its
+/// whole continuation budget re-observing the same two facts — four Telegram
+/// messages, two duplicate LifeGraph events, and a final "fully executed and
+/// verified" over a `blocked` verdict):
+/// - a step bound to a read-only tool (`life.recall`, `life.list`, …) produces
+///   no artifact per list item — one retrieval covers every topic it names;
+/// - a description whose commas are not a list (dates, appositives) — a real
+///   enumeration of artifacts reads `A, B and C` / `A and B and C`, never
+///   `on Thursday morning, 2026-09-10, as a proposed event`.
 pub fn atomicity_violations(plan: &ActivePlan) -> Vec<u32> {
     plan.steps
         .iter()
+        .filter(|s| !step_tool_is_read_only(s))
         .filter(|s| description_enumerates_artifacts(&s.description))
         .map(|s| s.id)
         .collect()
 }
 
+/// Tools that retrieve rather than create. A step bound to one of these
+/// cannot bundle *artifacts*, however many topics its description lists.
+fn step_tool_is_read_only(step: &PlanStep) -> bool {
+    let Some(tool) = step.tool_name.as_deref() else {
+        return false;
+    };
+    let tool = tool.trim().to_ascii_lowercase();
+    const READ_ONLY_SUFFIXES: &[&str] = &[
+        ".recall",
+        ".audit",
+        ".recall.feedback",
+        ".list",
+        ".search",
+        ".get",
+        ".status",
+        ".read",
+        ".inspect",
+        ".describe",
+        ".feedback",
+    ];
+    READ_ONLY_SUFFIXES.iter().any(|s| tool.ends_with(s))
+}
+
+/// Split every bundled, tool-bound step of a model-declared plan into one
+/// step per enumerated item, in place. Returns `(original_id, new_ids)` for
+/// each split so callers can log it.
+///
+/// The evaluator refuses to settle a bundled step ("Log Nadi, Daxton, Gabby,
+/// and Brandon as Person nodes") because one call cannot prove four
+/// artifacts — and it tells the model to split. Live 2026-09-12 11:00 UTC
+/// the model instead re-ran all four observes on every continuation, the
+/// step stayed outstanding, and the plan burned three continuations (four
+/// Telegram messages) to a `blocked` verdict with all four people actually
+/// written. The harness now splits for it: each item becomes its own step
+/// with the same tool, so the distinctive-token pass in
+/// [`verify_plan_steps`] can credit each observe to its own person.
+///
+/// Read-only tool steps and non-enumerating steps are left alone (see
+/// [`atomicity_violations`]). Items are the comma/`and`-separated pieces of
+/// the description; the lead-in before a colon is kept on every piece so
+/// the steps still read as instructions.
+pub fn split_bundled_steps(plan: &mut ActivePlan) -> Vec<(u32, Vec<u32>)> {
+    let bundled = atomicity_violations(plan);
+    if bundled.is_empty() {
+        return Vec::new();
+    }
+    let mut next_id = plan.steps.iter().map(|s| s.id).max().unwrap_or(0) + 1;
+    let mut out = Vec::new();
+    let mut new_steps: Vec<PlanStep> = Vec::with_capacity(plan.steps.len() + 4);
+    for step in plan.steps.drain(..) {
+        if !bundled.contains(&step.id) {
+            new_steps.push(step);
+            continue;
+        }
+        let mut items = enumerated_items(&step.description);
+        if items.len() < 2 {
+            new_steps.push(step);
+            continue;
+        }
+        let (mut lead, _) = split_lead_in(&step.description);
+        // No colon: "Propose Zerin, Mali and Daxton" — the first item carries
+        // the verb. Lift a leading imperative onto every item so the steps
+        // read "Propose Zerin" / "Propose Mali" instead of "Mali".
+        if lead.is_none() {
+            const VERBS: &[&str] = &[
+                "propose", "log", "record", "create", "add", "register", "observe", "capture",
+                "update", "resolve", "commit", "mark", "retire", "confirm", "write", "store",
+                "save", "set", "schedule", "send", "note",
+            ];
+            if let Some((first, rest)) = items[0].split_once(' ') {
+                if VERBS.contains(&first.to_lowercase().as_str()) {
+                    lead = Some(first.to_string());
+                    items[0] = rest.trim().to_string();
+                }
+            }
+        }
+        let mut ids = Vec::with_capacity(items.len());
+        for item in items {
+            let description = match lead.as_deref() {
+                Some(lead) => format!("{lead} {item}"),
+                None => item,
+            };
+            new_steps.push(PlanStep {
+                id: next_id,
+                description,
+                tool_name: step.tool_name.clone(),
+                // A split step is never inherited as done: each item must be
+                // proven by its own call.
+                status: if step.status == "done" || step.status == "in_progress" {
+                    "pending".to_string()
+                } else {
+                    step.status.clone()
+                },
+            });
+            ids.push(next_id);
+            next_id += 1;
+        }
+        out.push((step.id, ids));
+    }
+    plan.steps = new_steps;
+    out
+}
+
+/// "Log key contacts: Nadi, Daxton, Gabby, and Brandon as Person nodes" →
+/// lead-in "Log key contacts:" and body "Nadi, Daxton, Gabby, and Brandon as
+/// Person nodes". Without a colon the whole description is the body.
+fn split_lead_in(description: &str) -> (Option<String>, String) {
+    match description.find(':') {
+        Some(idx) if idx + 1 < description.len() => (
+            Some(description[..=idx].trim().to_string()),
+            description[idx + 1..].trim().to_string(),
+        ),
+        _ => (None, description.trim().to_string()),
+    }
+}
+
+/// The enumerated pieces of a bundled description, split on `, `, `; `,
+/// ` and `, ` & ` and newlines, with bullet markers and the Oxford comma's
+/// leading "and" stripped. A trailing clause after the last item ("as
+/// Person nodes") stays attached to that item — it is harmless to the
+/// distinctive-token match and keeps the step readable.
+fn enumerated_items(description: &str) -> Vec<String> {
+    let (_, body) = split_lead_in(description);
+    let mut pieces: Vec<String> = Vec::new();
+    for line in body.split('\n') {
+        let line = line
+            .trim()
+            .trim_start_matches(['-', '*', '•'])
+            .trim_start_matches(|c: char| c.is_ascii_digit() || c == '.' || c == ')')
+            .trim();
+        if line.is_empty() {
+            continue;
+        }
+        let mut buf = line.replace(" & ", ", ").replace("; ", ", ");
+        buf = buf.replace(", and ", ", ").replace(" and ", ", ");
+        for piece in buf.split(", ") {
+            let piece = piece.trim().trim_start_matches("and ").trim();
+            if !piece.is_empty() {
+                pieces.push(piece.to_string());
+            }
+        }
+    }
+    // The last item usually drags the shared trailing clause with it
+    // ("Brandon as Person nodes scoped to the Chief of Staff role"). Cut it
+    // at the first clause marker so the item is just the item: otherwise
+    // its words ("person", "scoped", "staff") become distinctive tokens that
+    // let a sibling's call be credited to it.
+    if let Some(last) = pieces.last_mut() {
+        const CLAUSE_MARKERS: &[&str] = &[
+            " as ", " to ", " into ", " with ", " for ", " under ", " scoped", " linked", " via ",
+            " so ", " on the ", " in the ",
+        ];
+        let lower = last.to_lowercase();
+        let cut = CLAUSE_MARKERS
+            .iter()
+            .filter_map(|m| lower.find(m))
+            .filter(|&i| i > 0)
+            .min();
+        if let Some(i) = cut {
+            *last = last[..i].trim().to_string();
+        }
+    }
+    pieces
+}
+
 fn description_enumerates_artifacts(description: &str) -> bool {
     let lower = description.to_lowercase();
-    let separators = lower.matches(", ").count()
-        + lower.matches("; ").count()
-        + lower.matches(" and ").count()
-        + lower.matches(" & ").count()
-        + lower.matches('\n').count();
-    separators >= 2
+    let conjunctions = lower.matches(" and ").count() + lower.matches(" & ").count();
+    let list_separators = lower.matches(", ").count() + lower.matches("; ").count();
+    let newlines = lower.matches('\n').count();
+    // `A, B and C` (Oxford or not), `A and B and C`, or a multi-line bullet
+    // list. Commas alone are not a list: `on Thursday morning, 2026-09-10, as
+    // a proposed event` names one artifact.
+    (conjunctions >= 1 && list_separators >= 1) || conjunctions >= 2 || newlines >= 2
 }
 
 /// Whole-plan verdict for the turn, grounded in [`verify_plan_steps`].
@@ -888,6 +1097,45 @@ pub fn plan_integrity_note(
 ///
 /// The skip branch is not a nicety. A four-step plan attached to "Going for a
 /// run tonight." is a worse experience than the bug being fixed here.
+/// Word-boundary request markers that make a message plan-worthy.
+const REQUEST_MARKERS: &[&str] = &[
+    "can you",
+    "could you",
+    "would you",
+    "please",
+    "i need",
+    "i want",
+    "lets",
+    "let s",
+    "add",
+    "create",
+    "set",
+    "update",
+    "change",
+    "get",
+    "find",
+    "make",
+    "show",
+    "list",
+    "record",
+    "track",
+    "plan",
+    "fix",
+    "check",
+    "remove",
+    "delete",
+    "schedule",
+    "remind",
+    "write",
+    "build",
+    "send",
+    "look up",
+    "figure out",
+    "help me",
+    "map",
+    "propose",
+];
+
 pub fn should_plan(user_content: &str) -> bool {
     let trimmed = user_content.trim();
     if trimmed.is_empty() {
@@ -902,58 +1150,8 @@ pub fn should_plan(user_content: &str) -> bool {
     // "get", "forget it" contains "get", and "planning to relax" contains
     // "plan". A false positive only costs a one-step plan, but it costs it on
     // exactly the chit-chat the skip branch exists to protect.
-    const REQUEST_MARKERS: &[&str] = &[
-        "can you",
-        "could you",
-        "would you",
-        "please",
-        "i need",
-        "i want",
-        "lets",
-        "let s",
-        "add",
-        "create",
-        "set",
-        "update",
-        "change",
-        "get",
-        "find",
-        "make",
-        "show",
-        "list",
-        "record",
-        "track",
-        "plan",
-        "fix",
-        "check",
-        "remove",
-        "delete",
-        "schedule",
-        "remind",
-        "write",
-        "build",
-        "send",
-        "look up",
-        "figure out",
-        "help me",
-        "map",
-        "propose",
-    ];
-    let words_padded = format!(
-        " {} ",
-        lower
-            .chars()
-            .map(|c| if c.is_alphanumeric() { c } else { ' ' })
-            .collect::<String>()
-            .split_whitespace()
-            .collect::<Vec<_>>()
-            .join(" ")
-    );
-    if trimmed.contains('?')
-        || REQUEST_MARKERS
-            .iter()
-            .any(|m| words_padded.contains(&format!(" {m} ")))
-    {
+    let words_padded = words_padded(&lower);
+    if trimmed.contains('?') || request_marker_present(&words_padded) {
         return true;
     }
 
@@ -969,7 +1167,172 @@ pub fn should_plan(user_content: &str) -> bool {
         return true;
     }
 
-    false
+    // An enumeration is work even when it is one short sentence with no
+    // request verb: "more habits that i am building: duolingo morning and
+    // evening, morning supplements and evening, reading before bed" carries
+    // five artifacts, no marker word, no `?`, and only 17 words — live
+    // 2026-08-27 it got no plan, and only the first item was captured. Same
+    // separator threshold as `description_enumerates_artifacts`: two or more
+    // separators means several distinct items.
+    enumeration_present(&lower)
+}
+
+fn request_marker_present(words_padded: &str) -> bool {
+    REQUEST_MARKERS
+        .iter()
+        .any(|m| words_padded.contains(&format!(" {m} ")))
+}
+
+fn enumeration_present(lower: &str) -> bool {
+    let separators = lower.matches(", ").count()
+        + lower.matches("; ").count()
+        + lower.matches(" and ").count()
+        + lower.matches(" & ").count();
+    separators >= 2
+}
+
+fn words_padded(lower: &str) -> String {
+    format!(
+        " {} ",
+        lower
+            .chars()
+            .map(|c| if c.is_alphanumeric() { c } else { ' ' })
+            .collect::<String>()
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+    )
+}
+
+/// A plan-worthy message that is a statement rather than a question and
+/// carries an explicit signal of work: a request marker, an enumeration, or
+/// a reported outcome. Deliberately narrower than [`should_plan`], which
+/// also treats any two-sentence message as plan-worthy — that rule is right
+/// for prompting a plan but wrong for handing tools to, or re-entering, a
+/// two-sentence thank-you. Questions are answered from context.
+pub fn is_plan_worthy_statement(user_content: &str) -> bool {
+    if user_content.contains('?') {
+        return false;
+    }
+    let lower = user_content.trim().to_lowercase();
+    request_marker_present(&words_padded(&lower))
+        || enumeration_present(&lower)
+        || reports_an_outcome(&lower)
+}
+
+/// Does this message report that something HAPPENED — an outcome the
+/// operator lived, rather than a request or a question? Past-tense
+/// completion language on word boundaries. Drives the outcome reflex.
+pub fn reports_an_outcome(normalized: &str) -> bool {
+    if normalized.contains('?') {
+        return false;
+    }
+    let padded = words_padded(normalized);
+    // "haven't received", "didn't finish", "never sent": not an outcome.
+    if [
+        "not",
+        "haven t",
+        "havent",
+        "hasn t",
+        "hasnt",
+        "didn t",
+        "didnt",
+        "never",
+        "still need",
+    ]
+    .iter()
+    .any(|n| padded.contains(&format!(" {n} ")))
+    {
+        return false;
+    }
+    // Bare past participles that only ever report completion.
+    if [
+        "renewed",
+        "purchased",
+        "submitted",
+        "delivered",
+        "completed",
+        "finished",
+        "booked",
+        "reinstated",
+    ]
+    .iter()
+    .any(|w| padded.contains(&format!(" {w} ")))
+    {
+        return true;
+    }
+    const OUTCOME_PHRASES: &[&str] = &[
+        "i gave",
+        "gave my",
+        "gave the",
+        "i finished",
+        "finished my",
+        "finished the",
+        "i completed",
+        "completed my",
+        "completed the",
+        "i delivered",
+        "delivered my",
+        "delivered the",
+        "i submitted",
+        "submitted my",
+        "submitted the",
+        "i sent",
+        "sent the",
+        "i booked",
+        "booked the",
+        "tickets purchased",
+        "tickets are booked",
+        "i purchased",
+        "i bought",
+        "i paid",
+        "paid the",
+        "i passed",
+        "passed my",
+        "passed the",
+        "i attended",
+        "i went to",
+        "we went to",
+        "i did it",
+        "got it done",
+        "is done",
+        "are done",
+        "all done",
+        "done with",
+        "wrapped up",
+        "i closed",
+        "closed the",
+        "i resolved",
+        "resolved the",
+        "took care of",
+        "i handled",
+        "i signed",
+        "i renewed",
+        "renewed my",
+        "renewed the",
+        "i received",
+        "received my",
+        "received the",
+        "picked up",
+        "dropped off",
+        "i fixed",
+        "fixed the",
+        "i installed",
+        "i shipped",
+        "i mailed",
+        "i called",
+        "met with",
+        "i talked to",
+        "i spoke with",
+        "got him back",
+        "got her back",
+        "got back into",
+        "is back in",
+        "reinstated",
+    ];
+    OUTCOME_PHRASES
+        .iter()
+        .any(|p| padded.contains(&format!(" {p} ")))
 }
 
 /// Instruction injected when a plan-worthy turn has not declared a plan yet.
@@ -1007,7 +1370,12 @@ fn outstanding_lines(
                 }
                 _ => "",
             };
-            Some(format!("- step {}: {}{marker}", step.id, step.description))
+            Some(format!(
+                "- step {}{}: {}{marker}",
+                step.id,
+                step_tool_suffix(step),
+                step.description
+            ))
         })
         .collect();
 
@@ -1121,6 +1489,7 @@ mod tests {
                 .collect(),
             status: status.into(),
             context_1_advisory: None,
+            procedure_id: None,
         }
     }
 
@@ -1149,6 +1518,7 @@ mod tests {
             verified_step_ids: Vec::new(),
             stalled_continuations: 0,
             continuations_used: used,
+            lifetime_continuations: 0,
             created_turn_id: "turn-0".into(),
         }
     }
@@ -1767,7 +2137,33 @@ mod tests {
         assert!(notice.contains("1/2 steps done"));
         assert!(notice.contains("continuation budget exhausted"));
         assert!(notice.contains("- step 2: apply fix"));
-        assert!(notice.contains("/plan drop"));
+        // The notice must tell the truth about what the loop did: the
+        // carryover is gone, so it must not advertise resumption paths
+        // ("send a message", "/plan drop") that no longer exist.
+        assert!(notice.contains("will not run automatically"));
+        assert!(!notice.contains("/plan drop"));
+    }
+
+    #[test]
+    fn step_lists_name_bound_tools_for_projection() {
+        // The brief is the continuation turn's only tool-projection relevance
+        // text: a bound tool must be named so the explicit tool-name match
+        // fires before any keyword gate can strip it (or zero-tool the turn).
+        let carry = carryover(
+            plan(
+                "executing",
+                &[
+                    ("read config", None, "done"),
+                    ("apply fix", Some("bash.exec"), "pending"),
+                ],
+            ),
+            vec![true, false],
+            0,
+        );
+        let brief = plan_continuation_brief(&carry, 3);
+        assert!(brief.contains("(tool: bash.exec)"), "{brief}");
+        let notice = plan_stop_notice(&carry, "whatever");
+        assert!(notice.contains("(tool: bash.exec)"), "{notice}");
     }
 
     // ── Grounded verification ───────────────────────────────────────────
@@ -2028,7 +2424,240 @@ mod tests {
         assert!(atomicity_violations(&p).is_empty());
     }
 
+    /// Live 2026-09-11 (Beacon morning brief): these two steps were flagged
+    /// non-atomic, could never settle, and drove four continuation turns that
+    /// re-observed the same facts. Commas that are not a list, and read-only
+    /// retrieval steps, are not bundles.
+    #[test]
+    fn date_commas_and_read_only_steps_are_not_bundles() {
+        let p = plan(
+            "executing",
+            &[
+                (
+                    "Log Jared's drive with Daxton to school on Thursday morning, 2026-09-10, as a proposed event.",
+                    Some("life.observe"),
+                    "pending",
+                ),
+                (
+                    "Retrieve oldest active open loops, aspirations, and roles to anchor the brief.",
+                    Some("life.recall"),
+                    "pending",
+                ),
+                (
+                    "List open loops, commitments, and next actions",
+                    Some("life.list"),
+                    "pending",
+                ),
+            ],
+        );
+        assert!(
+            atomicity_violations(&p).is_empty(),
+            "got {:?}",
+            atomicity_violations(&p)
+        );
+
+        // A one-step plan that verifies must then settle, so the brief does
+        // not loop on a step that cannot be split any further.
+        let single = plan(
+            "executing",
+            &[(
+                "Log Jared's drive with Daxton to school on Thursday morning, 2026-09-10, as a proposed event.",
+                Some("life.observe"),
+                "done",
+            )],
+        );
+        let h = history_args(&[("life.observe", observe("drive Daxton school"), "ok")]);
+        let v = verify_plan_steps(&single, &h, &[]);
+        assert!(evaluate_whole_plan(&single, &v).complete);
+    }
+
+    /// Live 2026-09-12 11:00 UTC: the bundled Person step that burned three
+    /// continuations. After the split, each observe settles its own item and
+    /// the plan completes on the same tool history.
+    #[test]
+    fn bundled_step_is_split_per_item_and_settles_on_per_item_evidence() {
+        let mut p = plan(
+            "executing",
+            &[
+                (
+                    "Log key contacts: Nadi, Daxton, Gabby, and Brandon as Person nodes scoped to the Chief of Staff role",
+                    Some("life.observe"),
+                    "done",
+                ),
+                (
+                    "Retrieve oldest open loops, aspirations, and roles to anchor the brief",
+                    Some("life.recall"),
+                    "pending",
+                ),
+            ],
+        );
+        let splits = split_bundled_steps(&mut p);
+        assert_eq!(
+            splits.len(),
+            1,
+            "only the observe step is bundled: {splits:?}"
+        );
+        assert_eq!(splits[0].0, 1);
+        assert_eq!(splits[0].1, vec![3, 4, 5, 6]);
+        assert_eq!(p.steps.len(), 5);
+        let descs: Vec<&str> = p.steps.iter().map(|s| s.description.as_str()).collect();
+        assert_eq!(descs[0], "Log key contacts: Nadi");
+        assert_eq!(descs[1], "Log key contacts: Daxton");
+        assert_eq!(descs[2], "Log key contacts: Gabby");
+        assert!(descs[3] == "Log key contacts: Brandon", "{}", descs[3]);
+        assert!(
+            p.steps[..4]
+                .iter()
+                .all(|s| s.status == "pending" && s.tool_name.as_deref() == Some("life.observe"))
+        );
+        assert_eq!(p.steps[4].id, 2, "unsplit steps keep their ids");
+        assert!(
+            atomicity_violations(&p).is_empty(),
+            "nothing bundled remains"
+        );
+
+        // Idempotent.
+        assert!(split_bundled_steps(&mut p).is_empty());
+
+        // Four observes, one per person, plus the recall: complete.
+        let h = history_args(&[
+            ("life.observe", observe("Nadi"), "ok"),
+            ("life.observe", observe("Daxton"), "ok"),
+            ("life.observe", observe("Gabby"), "ok"),
+            ("life.observe", observe("Brandon"), "ok"),
+            (
+                "life.recall",
+                serde_json::json!({"query_text": "open loops"}),
+                "ok",
+            ),
+        ]);
+        let v = verify_plan_steps(&p, &h, &[]);
+        let c = evaluate_whole_plan(&p, &v);
+        assert!(c.complete, "outstanding: {:?}", c.outstanding);
+
+        // Three observes only: Brandon stays outstanding, nothing else.
+        let h3 = history_args(&[
+            ("life.observe", observe("Nadi"), "ok"),
+            ("life.observe", observe("Daxton"), "ok"),
+            ("life.observe", observe("Gabby"), "ok"),
+            (
+                "life.recall",
+                serde_json::json!({"query_text": "open loops"}),
+                "ok",
+            ),
+        ]);
+        let v3 = verify_plan_steps(&p, &h3, &[]);
+        let c3 = evaluate_whole_plan(&p, &v3);
+        assert_eq!(c3.outstanding, vec![3]);
+    }
+
+    #[test]
+    fn enumerated_items_handles_bullets_and_oxford_commas() {
+        assert_eq!(
+            enumerated_items("Propose Zerin, Mali and Daxton as Person nodes"),
+            vec!["Propose Zerin", "Mali", "Daxton"]
+        );
+        assert_eq!(
+            enumerated_items("Log:\n- the run\n- the ride\n- the swim"),
+            vec!["the run", "the ride", "the swim"]
+        );
+        assert_eq!(
+            enumerated_items("Record the run and the bike ride and the swim"),
+            vec!["Record the run", "the bike ride", "the swim"]
+        );
+
+        // No colon: the verb is lifted onto every item.
+        let mut p = plan(
+            "executing",
+            &[(
+                "Propose Zerin, Mali and Daxton as Person nodes",
+                Some("life.observe"),
+                "pending",
+            )],
+        );
+        split_bundled_steps(&mut p);
+        let descs: Vec<&str> = p.steps.iter().map(|s| s.description.as_str()).collect();
+        assert_eq!(
+            descs,
+            vec!["Propose Zerin", "Propose Mali", "Propose Daxton"]
+        );
+    }
+
+    #[test]
+    fn real_enumerations_are_still_bundles() {
+        let p = plan(
+            "executing",
+            &[
+                (
+                    "Propose Zerin, Mali and Daxton as Person nodes",
+                    Some("life.observe"),
+                    "pending",
+                ),
+                (
+                    "Record the run and the bike ride and the swim",
+                    Some("life.observe"),
+                    "pending",
+                ),
+                (
+                    "Log:\n- the run\n- the ride\n- the swim",
+                    Some("life.observe"),
+                    "pending",
+                ),
+                // Same enumeration on a read-only tool is fine: one recall
+                // covers every topic it names.
+                (
+                    "Recall Zerin, Mali and Daxton",
+                    Some("life.recall"),
+                    "pending",
+                ),
+            ],
+        );
+        assert_eq!(atomicity_violations(&p), vec![1, 2, 3]);
+    }
+
     // ── Plan-by-default gate ────────────────────────────────────────────
+
+    /// Live 2026-09-11 18:23 UTC: the outcome report that got congratulations
+    /// instead of a plan.
+    #[test]
+    fn outcome_reports_are_detected() {
+        for msg in [
+            "i gave my icebreaker speech in toastmasters today! and i did ok. nadi came in support.",
+            "finished the expense reports",
+            "delta tickets purchased for utah trip: 28 sept - 4 october",
+            "daxton's teacher got him back into the gsu class",
+            "passport renewed and received",
+        ] {
+            assert!(reports_an_outcome(msg), "should read as an outcome: {msg}");
+        }
+        for msg in [
+            "can you remind me to finish the report tomorrow?",
+            "going for a run tonight.",
+            "did i finish the report?",
+            "i will give my speech on friday",
+            "thanks!",
+            "i haven't received the passport yet",
+            "thanks bjork, i really appreciate it. looks like you're working pretty well now.",
+        ] {
+            assert!(
+                !reports_an_outcome(msg),
+                "should NOT read as an outcome: {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn plan_worthy_statements_exclude_questions() {
+        assert!(is_plan_worthy_statement(
+            "please update the MRI commitment and confirm it"
+        ));
+        assert!(is_plan_worthy_statement(
+            "On the open loops:\n1 - I am still working on the icebreaker speech\n2 - Daxton's teacher got him back into the GSU class"
+        ));
+        assert!(!is_plan_worthy_statement("what's on my plate today?"));
+        assert!(!is_plan_worthy_statement("can you show me my open loops?"));
+        assert!(!is_plan_worthy_statement("ok"));
+    }
 
     #[test]
     fn trivial_chat_does_not_get_a_plan() {
@@ -2061,6 +2690,25 @@ mod tests {
         ] {
             assert!(should_plan(msg), "should plan: {msg}");
         }
+    }
+
+    /// The live 2026-08-27 habit incident: a short single-sentence message
+    /// with no request-marker word and no `?` enumerated five habits — it got
+    /// no plan, only the first item was captured, and the operator had to ask
+    /// six times. Two or more separators means several distinct items.
+    #[test]
+    fn short_enumerations_get_a_plan() {
+        for msg in [
+            "more habits that i am building: duolingo morning and evening, \
+             morning supplements and evening, reading before bed.",
+            "my current systems: morning pages, duolingo, evening reading",
+        ] {
+            assert!(should_plan(msg), "should plan: {msg}");
+        }
+        // A single "and"/comma is still conversation, not an enumeration.
+        assert!(!should_plan(
+            "Kelley and I are watching The Bear - fourth season 😉"
+        ));
     }
 
     // ── Re-entry hint ───────────────────────────────────────────────────

@@ -50,6 +50,8 @@ async fn main() -> anyhow::Result<()> {
             validation_state: ValidationState::Proposed,
             observed_at: Some("2026-06-04T00:00:00Z".to_string()),
             valid_time_range: None,
+            due_at: None,
+            occurs_at: None,
             source_reliability: 0.9,
             conflict_ids: vec![],
             adjudication_status: AdjudicationStatus::NotNeeded,

@@ -448,15 +448,29 @@ Embedding space: `skill_tool_semantic`
 | `REDUCES_FRICTION_FOR` | `System`, `Habit`, `Routine` | `Role`, `Goal`, `Habit` | Explicitly reduces barrier |
 | `SUGGESTS_PATCH` | `DriftFinding`, `GrowthExperiment` | `*Patch` | Leads to a patch proposal |
 | `APPLIES_TO_ROLE` | `Preference`, `Value`, `Concern`, `*Patch` | `Role` | Scoped to a specific role |
+| `INVOLVES` | `Event`, `Trip`, `Appointment`, `Moment`, `Commitment` | `Person` | Who takes part |
+| `OCCURS_AT` | `Event`, `Trip`, `Appointment`, `Moment`, `Routine` | `Place` | Where it happens |
+| `PART_OF` | `Event`, `Appointment`, `Moment`, `NextAction` | `Trip`, `Project` | Itinerary / rollup membership |
+| `ABOUT` | `OpenLoop`, `NextAction`, `Commitment`, `Decision`, `Concern`, `Signal` | `Person`, `Place`, `Asset`, `Subscription`, `CreativeWork`, `Trip` | What the item concerns |
+| `MAINTAINS` | `Routine`, `Habit`, `NextAction` | `Asset`, `CreativeWork`, `Subscription` | Upkeep of a durable thing |
+| `RENEWS` | `NextAction`, `OpenLoop`, `Commitment` | `Subscription`, `Asset` | Renewal-cycle work |
 
-**Write-enabled on `life.observe`** (LIFE_GRAPH_ACTIVE proposal, S2): the living-cycle six
-(`OWNS`, `SHAPES`, `SETS`, `SPAWNS`, `RELATES_TO`, plus server-injected `SCOPED_TO`) and the
-agenda six (`ADVANCES`, `BLOCKED_BY`, `NEEDS_FOLLOWUP`, `PROMISED_TO`, `CONTAINS`,
-`SUPPORTS`). Agenda edges are endpoint-validated against this table — wrong source label is
-rejected at compile time; a wrong-label target matches nothing and reports `target_missing`
-(see `cypher::AGENDA_EDGE_RULES`). The remaining rows (`RECURS`, `SUPERSEDES`,
-`CONTRADICTS`, `EVIDENCED_BY`, `REDUCES_FRICTION_FOR`, `SUGGESTS_PATCH`, `APPLIES_TO_ROLE`)
-are not yet writable via `life.observe`.
+**Write-enabled on `life.observe`** (LIFE_GRAPH_ACTIVE proposal, S2 + nouns-verbs expansion
+2026-08-25): the living-cycle six (`OWNS`, `SHAPES`, `SETS`, `SPAWNS`, `RELATES_TO`, plus
+server-injected `SCOPED_TO`) and the twelve endpoint-validated types (`ADVANCES`,
+`BLOCKED_BY`, `NEEDS_FOLLOWUP`, `PROMISED_TO`, `CONTAINS`, `SUPPORTS`, `INVOLVES`,
+`OCCURS_AT`, `PART_OF`, `ABOUT`, `MAINTAINS`, `RENEWS`). Endpoint-validated edges are checked
+against this table — wrong source label is rejected at compile time; a wrong-label target
+matches nothing and reports `target_missing` (see `cypher::AGENDA_EDGE_RULES`). The remaining
+rows (`RECURS`, `SUPERSEDES`, `CONTRADICTS`, `EVIDENCED_BY`, `REDUCES_FRICTION_FOR`,
+`SUGGESTS_PATCH`, `APPLIES_TO_ROLE`) are not yet writable via `life.observe`.
+
+**Lived-world nouns (V006, 2026-08-25):** `Place`, `Trip`, `Appointment`, `Subscription`,
+`Asset`, `CreativeWork`, `Moment`. `Moment` is KEPT history — a confirmed past `Event` worth
+remembering becomes a `Moment` (same `INVOLVES`/`OCCURS_AT` edges); gardening retires stale
+proposed `Event`s but never retires `Moment`s. Spaces: Trip/Appointment/Moment/Place →
+`life_event_semantic`; Subscription/Asset/CreativeWork → `goal_system_semantic` (indexes in
+`migrations/V006__nouns_verbs_expansion.cypher`).
 
 Edge provenance: the full provenance envelope applies to agent-inferred edges. Operator-asserted edges may carry only `source_membrane` and `observed_at`.
 

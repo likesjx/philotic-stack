@@ -354,6 +354,7 @@ fn graph_storage_node_capabilities_round_trip() {
         models: vec!["gemini-2.0-flash@2026.1".into()],
         tools: vec!["mcp.search@1".into()],
         constraints: Default::default(),
+        build_version: String::new(),
     };
 
     // Initially empty
@@ -380,6 +381,7 @@ fn graph_storage_node_capabilities_upsert() {
         models: vec![],
         tools: vec![],
         constraints: Default::default(),
+        build_version: String::new(),
     };
     let mut caps_v2 = caps_v1.clone();
     caps_v2.models = vec!["new-model@1".into()];
@@ -405,6 +407,7 @@ fn graph_storage_get_config_value_round_trip() {
         models: vec![],
         tools: vec![],
         constraints: Default::default(),
+        build_version: String::new(),
     };
 
     store.save_node_capabilities(&caps).unwrap();
@@ -474,6 +477,7 @@ fn graph_storage_hotel_round_trip_and_pid_update() {
             models: vec![],
             tools: vec![],
             constraints: Default::default(),
+            build_version: String::new(),
         },
         mesh_host: Some("127.0.0.1".into()),
         mesh_port: 9101,
@@ -510,6 +514,7 @@ fn graph_storage_lists_hotels() {
             models: vec![],
             tools: vec![],
             constraints: Default::default(),
+            build_version: String::new(),
         },
         mesh_host: Some("127.0.0.1".into()),
         mesh_port: 9101,
@@ -526,6 +531,7 @@ fn graph_storage_lists_hotels() {
             models: vec![],
             tools: vec![],
             constraints: Default::default(),
+            build_version: String::new(),
         },
         mesh_host: Some("127.0.0.1".into()),
         mesh_port: 9102,

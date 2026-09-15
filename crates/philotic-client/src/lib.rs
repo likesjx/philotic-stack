@@ -771,6 +771,16 @@ pub struct SubagentDelegation {
     pub allowed_tools: Vec<String>,
     #[serde(default)]
     pub allowed_skills: Vec<String>,
+    /// Spawn by registered skill: the hotel resolves this skill's stored goal
+    /// template, subagent kind, tool bounds, and SkillDAG dependencies into
+    /// the delegation before granting the lease. Suspended/deprecated or
+    /// unknown skills are refused. When set, `goal` may be empty — a non-empty
+    /// `goal` is appended to the rendered template as delegating-agent context.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skill_name: Option<String>,
+    /// Values substituted into the skill goal template's `{{placeholder}}`s.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub skill_inputs: std::collections::BTreeMap<String, String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub memory_allowance: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -872,6 +882,12 @@ pub enum ParacrineRouting {
     /// the parked turn and applies the resolution (approve or deny) without re-entering
     /// the model loop. Carries `decision` ("approved"/"denied") and optional `note`.
     ApprovalResolution,
+    /// Fire-and-forget. The emitter logs the specialist's reply, closes the
+    /// paracrine thread, and does nothing else: no model invocation, nothing
+    /// surfaces to the operator. Used by lookaside work whose *side effects*
+    /// are the point (a distill whisper that registers a Draft skill) and
+    /// whose final text is noise.
+    Discard,
 }
 
 /// Paracrine message envelope — the vesicle a philote secretes when performing a
@@ -1252,6 +1268,13 @@ pub enum IpcRequest {
         /// SkillDAG edges: skills this skill transitively activates.
         #[serde(default)]
         allowed_skills: Vec<String>,
+        /// Where this registration came from. `None` = an ordinary
+        /// operator-approved `skill.register`. `Some("distill:<trigger>")` =
+        /// the Self-Improvement Loop's L1 distill whisper; the hotel forces
+        /// such records to `Draft` and marks them `agent_authored`/`distilled`
+        /// so nothing distilled ever projects without an operator promotion.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        origin: Option<String>,
         #[serde(default)]
         hook_subscriptions: Vec<HookSubscription>,
         #[serde(default)]
@@ -1332,6 +1355,66 @@ pub enum IpcRequest {
     },
     /// List all registered skills with their validation states.
     ListSkills {},
+    /// Register a procedural graph, or a new version of one
+    /// (doc:procedural-graphs). `procedure` is a serialized
+    /// `ProcedureGraphRecord`. Gated like [`IpcRequest::RegisterSkill`]; an
+    /// `origin` of `distill:*` / `agent` forces the record to `Draft`.
+    RegisterProcedure {
+        procedure: serde_json::Value,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        origin: Option<String>,
+    },
+    /// Fetch one procedural graph by id.
+    GetProcedure {
+        procedure_id: String,
+    },
+    /// List every procedural graph with its version and validation state.
+    ListProcedures {},
+    /// Append one terminal plan evaluation to a procedure's run ledger.
+    /// `run` is a serialized `ProcedureRunRecord`; the hotel stamps
+    /// `recorded_at` and the caller's `agent_id` when absent.
+    RecordProcedureRun {
+        run: serde_json::Value,
+    },
+    /// Newest-first runs for a procedure, optionally pinned to a graph version.
+    ListProcedureRuns {
+        procedure_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        graph_version: Option<u32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        limit: Option<usize>,
+    },
+    /// File a refiner patch against a procedure (doc:procedural-graphs P4).
+    /// `ops` is a serialized `Vec<ProcedurePatchOp>`. The hotel dry-runs the
+    /// ops against the current version, scans the text with prompt-guard,
+    /// and stores the patch `Pending` for an operator decision.
+    ProposeProcedurePatch {
+        procedure_id: String,
+        ops: serde_json::Value,
+        #[serde(default)]
+        rationale: String,
+        #[serde(default)]
+        evidence_run_ids: Vec<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        origin: Option<String>,
+    },
+    /// Newest-first patches, optionally for one procedure and/or one status
+    /// (`pending` | `trial` | `accepted` | `rejected`).
+    ListProcedurePatches {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        procedure_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        status: Option<String>,
+    },
+    /// Operator decision on a `Pending` patch: `approve` applies the ops into
+    /// a candidate version on trial; `reject` retains the patch as negative
+    /// evidence. Skill-admin gated.
+    DecideProcedurePatch {
+        patch_id: String,
+        decision: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
+    },
     /// Get a single toolset profile by name.
     GetToolsetProfile {
         profile_name: String,
@@ -2177,6 +2260,12 @@ pub enum IpcRequest {
         action_summary: String,
         evidence: String,
         reversal_hint: String,
+        /// When true the action *is* a filing (a Draft skill, a proposal
+        /// record) rather than an effect on the world, so it is permitted —
+        /// budgeted and audited — at `ProposalOnly`. Default false keeps
+        /// every existing caller's semantics.
+        #[serde(default)]
+        filing: bool,
     },
     /// Operator/steward → hotel: report the reviewed outcome of an audited
     /// autonomous action so the lane earns (or loses) trust (Autopoiesis
@@ -2271,6 +2360,32 @@ pub enum IpcRequest {
     /// variants append after this one.
     CloseHealWorkItem {
         work_item_id: String,
+    },
+    /// Relocation Ceremony R3 (STANDBY phase): ask a `target_hotel` to
+    /// pre-warm `role_name`'s process ahead of any traffic switch, without
+    /// changing `home_node` — that stays a separate act via
+    /// [`IpcRequest::SetRoleHome`]. Gated identically to `SetRoleHome`
+    /// (`calling_role` must carry operational admin authority). Fire-and-track:
+    /// answered immediately with [`IpcResponse::MaterializeRequested`]; actual
+    /// readiness arrives asynchronously over the mesh and is polled with
+    /// [`IpcRequest::MaterializeStatus`].
+    MaterializeRequest {
+        agent_id: String,
+        role_name: String,
+        calling_role: String,
+        target_hotel: String,
+        /// Relocation Ceremony R4 (Feasibility and placement): when `true`,
+        /// the target only runs its feasibility checks (binary resolvable,
+        /// live primary controller, build-version match) and replies with
+        /// the outcome — it never upserts a record or spawns a process.
+        /// Defaults to `false` (R3's original STANDBY-commit behavior) so
+        /// existing callers are unaffected.
+        #[serde(default)]
+        dry_run: bool,
+    },
+    /// Poll the outcome of a prior [`IpcRequest::MaterializeRequest`].
+    MaterializeStatus {
+        request_id: String,
     },
 }
 
@@ -2616,6 +2731,29 @@ pub enum IpcResponse {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         home_node: Option<String>,
     },
+    /// Hotel push: a membrane transport home changed — a local
+    /// `transport.set_home`, or a newer record applied from mesh gossip
+    /// (`placement_sync`). Seats for this agent/transport/resource act at
+    /// once instead of waiting for a lease denial plus the 180 s re-probe
+    /// (DEF-107): the seat on the new home probes on its next lease tick,
+    /// the seat on the old home stops polling now and stands by.
+    ///
+    /// Untagged-enum note: `transport_home_changed` is a required marker so
+    /// this decodes to its own variant and never as [`Self::TransportHomeSet`],
+    /// which shares the other field names; it must stay declared BEFORE it.
+    TransportHomeChanged {
+        transport_home_changed: bool,
+        agent_id: String,
+        transport: String,
+        resource_ref: String,
+        active_home_hotel: String,
+        #[serde(default)]
+        standby_hotels: Vec<String>,
+        #[serde(default)]
+        updated_unix: u64,
+        /// Whether the pushing hotel is the new active home.
+        hotel_is_home: bool,
+    },
     /// Response to [`IpcRequest::SetTransportHome`].
     TransportHomeSet {
         agent_id: String,
@@ -2877,6 +3015,35 @@ pub enum IpcResponse {
     /// makes this variant structurally unambiguous.
     MeshRosterView {
         mesh_roster: Vec<MeshRosterEntryView>,
+    },
+    /// Response to [`IpcRequest::MaterializeRequest`] — an immediate ack that
+    /// the request was dispatched, not that the guest is warm yet. Poll
+    /// [`IpcRequest::MaterializeStatus`] with `request_id` for the outcome.
+    ///
+    /// Untagged-serde safety: the required, uniquely-named
+    /// `materialize_requested` marker field disambiguates this variant.
+    MaterializeRequested {
+        materialize_requested: bool,
+        request_id: String,
+        role_name: String,
+        target_hotel: String,
+    },
+    /// Response to [`IpcRequest::MaterializeStatus`]. `ok`/`readiness`/`error`
+    /// are all `None` until the target hotel's [`EventKind::MaterializeReady`]
+    /// mesh reply lands — a still-pending request is not an error.
+    ///
+    /// Untagged-serde safety: the required, uniquely-named `materialize_status`
+    /// marker field plus the required `request_id` disambiguate this variant
+    /// from `MaterializeRequested` and from `Standard`/`Error`.
+    MaterializeStatus {
+        materialize_status: bool,
+        request_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ok: Option<bool>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        readiness: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
     },
     // CRITICAL: `MemoryConfig` (all-optional payload) must remain the LAST
     // variant of this untagged enum — see `project_cron_scheduler.md` /
@@ -3513,6 +3680,48 @@ mod tests {
             }
             other => panic!("unexpected decoded response: {other:?}"),
         }
+    }
+
+    #[test]
+    fn transport_home_changed_and_set_roundtrip_to_their_own_variants() {
+        // The push shares every field name with TransportHomeSet except its
+        // required marker; both must survive the untagged round trip.
+        let changed = IpcResponse::TransportHomeChanged {
+            transport_home_changed: true,
+            agent_id: "agent-bjork-01".into(),
+            transport: "telegram".into(),
+            resource_ref: "telegram_bot_token_bjork".into(),
+            active_home_hotel: "vps-jane".into(),
+            standby_hotels: vec!["mac-jane".into()],
+            updated_unix: 1_757_000_000,
+            hotel_is_home: false,
+        };
+        let bytes = serde_json::to_vec(&changed).expect("serialize");
+        match serde_json::from_slice::<IpcResponse>(&bytes).expect("deserialize") {
+            IpcResponse::TransportHomeChanged {
+                active_home_hotel,
+                hotel_is_home,
+                updated_unix,
+                ..
+            } => {
+                assert_eq!(active_home_hotel, "vps-jane");
+                assert!(!hotel_is_home);
+                assert_eq!(updated_unix, 1_757_000_000);
+            }
+            other => panic!("TransportHomeChanged decoded as wrong variant: {other:?}"),
+        }
+        let set = IpcResponse::TransportHomeSet {
+            agent_id: "agent-bjork-01".into(),
+            transport: "telegram".into(),
+            resource_ref: "telegram_bot_token_bjork".into(),
+            active_home_hotel: "vps-jane".into(),
+            standby_hotels: vec![],
+        };
+        let bytes = serde_json::to_vec(&set).expect("serialize");
+        assert!(matches!(
+            serde_json::from_slice::<IpcResponse>(&bytes).expect("deserialize"),
+            IpcResponse::TransportHomeSet { .. }
+        ));
     }
 
     #[test]
@@ -4905,6 +5114,7 @@ mod tests {
             action_summary: "bridge 2 RELATES_TO edge(s)".into(),
             evidence: "feedback_id=feedback:recall:1 rating=Disconnected".into(),
             reversal_hint: "MATCH ()-[r:RELATES_TO {feedback_signal_id: 'f1'}]-() DELETE r".into(),
+            filing: false,
         };
         let wire = serde_json::to_string(&req).expect("serialize");
         assert!(wire.contains("\"consume_autonomy_action\""), "wire: {wire}");
@@ -4915,6 +5125,7 @@ mod tests {
                 action_summary,
                 evidence,
                 reversal_hint,
+                filing: false,
             } => {
                 assert_eq!(lane, "graph.bridge_edges");
                 assert!(action_summary.contains("RELATES_TO"));

@@ -45,6 +45,9 @@ mod paracrine;
 #[path = "tool_exec.rs"]
 mod tool_exec;
 
+#[path = "distill.rs"]
+pub(crate) mod distill;
+
 #[path = "memory_integration.rs"]
 mod memory_integration;
 use memory_integration::*;
@@ -52,6 +55,13 @@ use memory_integration::*;
 #[path = "life_capture.rs"]
 mod life_capture;
 use life_capture::*;
+
+#[path = "mcp_handling.rs"]
+mod mcp_handling;
+use mcp_handling::*;
+
+#[path = "procedure_runtime.rs"]
+mod procedure_runtime;
 
 #[path = "memory_explain_tool.rs"]
 mod memory_explain_tool;
@@ -1544,7 +1554,7 @@ fn build_capability_request(
 fn command_bypasses_turn_start(command: &SlashCommand) -> bool {
     matches!(
         command,
-        SlashCommand::Ping | SlashCommand::Status | SlashCommand::Context
+        SlashCommand::Ping | SlashCommand::Status | SlashCommand::Context | SlashCommand::Hotel
     )
 }
 
@@ -2528,7 +2538,7 @@ impl AgentRuntime {
                             )
                             .await
                         }
-                        SlashCommand::Status | SlashCommand::Context => {
+                        SlashCommand::Status | SlashCommand::Context | SlashCommand::Hotel => {
                             self.handle_read_only_session_command(
                                 task_id,
                                 session_id,
@@ -2544,7 +2554,10 @@ impl AgentRuntime {
                         _ => unreachable!("command_bypasses_turn_start gate should be exhaustive"),
                     };
                 }
-                SlashCommand::Ping | SlashCommand::Status | SlashCommand::Context => {
+                SlashCommand::Ping
+                | SlashCommand::Status
+                | SlashCommand::Context
+                | SlashCommand::Hotel => {
                     unreachable!("read-only commands should bypass turn start")
                 }
                 SlashCommand::Pause | SlashCommand::Resume => {}
@@ -2976,6 +2989,7 @@ impl AgentRuntime {
                 paracrine_reply_session_id,
                 paracrine_reply_chat_id,
                 paracrine_response_routing,
+                paracrine_intent,
             ) = {
                 let exosome = task
                     .exosome
@@ -2986,6 +3000,13 @@ impl AgentRuntime {
                     exosome.as_ref().and_then(|e| e.source_session_id.clone()),
                     exosome.as_ref().and_then(|e| e.source_chat_id.clone()),
                     exosome.as_ref().and_then(|e| e.response_routing.clone()),
+                    exosome.as_ref().and_then(|e| {
+                        e.context
+                            .as_ref()
+                            .and_then(|c| c.get("intent"))
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.to_string())
+                    }),
                 )
             };
 
@@ -3046,6 +3067,23 @@ impl AgentRuntime {
                 SelectionSource::ConfiguredDefault
             };
 
+            // Self-Improvement Loop L1: a distill review starts from a clean
+            // slate — the lookaside session's earlier verdicts must not steer
+            // this one. See `SessionState::forget_dialogue_for_lookaside`.
+            if paracrine_intent
+                .as_deref()
+                .is_some_and(|i| i == distill::INTENT || i.starts_with("skills.distill:"))
+            {
+                let forgotten = state.forget_dialogue_for_lookaside();
+                if forgotten > 0 {
+                    info!(
+                        session_id = %session_id,
+                        forgotten_turns = forgotten,
+                        "skills.distill: lookaside session dialogue forgotten before review"
+                    );
+                }
+            }
+
             state.start_turn(WorkingTurn {
                 task_id,
                 turn_id: turn_id.clone(),
@@ -3065,6 +3103,7 @@ impl AgentRuntime {
                 consecutive_step_failures: 0,
                 streak_extension: 0,
                 provider_repair_note: None,
+                say_do_nudged: false,
                 provider_repair_attempts: 0,
                 pending_text_reply: None,
                 had_voice_input,
@@ -3076,6 +3115,7 @@ impl AgentRuntime {
                 paracrine_reply_chat_id,
                 paracrine_response_routing,
                 paracrine_merge_completed: false,
+                paracrine_intent,
                 plan_confirmed: seeded_plan_confirmed,
                 plan_confirm_note: None,
                 fallback_tier: if self.network_offline { 1 } else { 0 },
@@ -3224,11 +3264,17 @@ impl AgentRuntime {
             model_context,
             context_projection,
             tools_for_model,
+            seeded_outcome_target,
         ) = {
             let state = self
                 .sessions
                 .get_mut(&session_id)
                 .expect("session should exist after ensuring and binding transport target");
+            // Outcome reflex: an operator report that settles a recalled loop
+            // gets a harness-seeded observe+commit plan BEFORE tools are
+            // projected, so the plan binds its tools and the evaluator has
+            // something to check. See SessionState::seed_outcome_plan.
+            let seeded_outcome_target = state.seed_outcome_plan();
             let tools_for_model = state.project_tools_for_turn(&content);
             let (model_prompt, model_context, context_projection) =
                 state.model_request_payloads(&content, &tools_for_model);
@@ -3248,6 +3294,7 @@ impl AgentRuntime {
                 model_context,
                 context_projection,
                 tools_for_model,
+                seeded_outcome_target,
             )
         };
 
@@ -3255,6 +3302,21 @@ impl AgentRuntime {
             .sync_apartment(&self.agent_id, &checkpoint_memory_type, checkpoint_json)
             .await?;
         self.sync_session_index(&index_state).await?;
+
+        if let Some(target) = seeded_outcome_target.as_deref() {
+            info!(
+                session_id = %session_id,
+                target,
+                "outcome reflex seeded an observe+commit plan for a recalled loop"
+            );
+            let _ = self
+                .emit_turn_event(
+                    &session_id,
+                    "plan_seeded",
+                    Some(format!("outcome reflex: observe outcome, resolve {target}")),
+                )
+                .await;
+        }
 
         if let Some(command) = parse_slash_command(&content) {
             return match command {
@@ -3264,6 +3326,7 @@ impl AgentRuntime {
                 }
                 SlashCommand::Status
                 | SlashCommand::Context
+                | SlashCommand::Hotel
                 | SlashCommand::Pause
                 | SlashCommand::Resume
                 | SlashCommand::ToolsAdd { .. }
@@ -5242,8 +5305,8 @@ impl AgentRuntime {
                 task_id: original_task_id,
                 error_code: "APPROVAL_CANCELLED".into(),
                 reason: cancel_reason.to_string(),
-                session_id: None,
-                turn_id: None,
+                session_id: Some(session_id.clone()),
+                turn_id: Some(original_turn_id.clone()),
             })
             .await?;
 
@@ -6016,6 +6079,28 @@ impl AgentRuntime {
                         "chat_id": command_chat_id,
                     }),
                 ),
+                SlashCommand::Hotel => (
+                    {
+                        let hotel = local_hotel_name().unwrap_or_else(|| "unknown".into());
+                        let node = local_node_id();
+                        hotel_location_text(
+                            &hotel,
+                            &node,
+                            &self.agent_id,
+                            self.role_name.as_deref(),
+                        )
+                    },
+                    "hotel_location_reported",
+                    serde_json::json!({
+                        "session_id": session_id,
+                        "turn_id": command_turn_id,
+                        "chat_id": command_chat_id,
+                        "hotel_name": local_hotel_name(),
+                        "node_id": local_node_id(),
+                        "agent_id": self.agent_id,
+                        "role_name": self.role_name,
+                    }),
+                ),
                 SlashCommand::Pause => {
                     state.set_status("paused");
                     (
@@ -6306,6 +6391,23 @@ impl AgentRuntime {
                     "session_id": session_id,
                     "turn_id": command_turn_id,
                     "chat_id": command_chat_id,
+                })),
+            ),
+            SlashCommand::Hotel => (
+                {
+                    let hotel = local_hotel_name().unwrap_or_else(|| "unknown".into());
+                    let node = local_node_id();
+                    hotel_location_text(&hotel, &node, &self.agent_id, self.role_name.as_deref())
+                },
+                Some("hotel_location_reported"),
+                Some(serde_json::json!({
+                    "session_id": session_id,
+                    "turn_id": command_turn_id,
+                    "chat_id": command_chat_id,
+                    "hotel_name": local_hotel_name(),
+                    "node_id": local_node_id(),
+                    "agent_id": self.agent_id,
+                    "role_name": self.role_name,
                 })),
             ),
             _ => {
@@ -6814,6 +6916,12 @@ impl AgentRuntime {
         let new_skill_guidance: Option<Vec<String>> = bindings
             .get("effective_skill_guidance")
             .and_then(|v| serde_json::from_value(v.clone()).ok());
+        // Procedural graphs ride the same lane as skill guidance: prompt-facing,
+        // never a tool-assembly rebuild.
+        let new_procedures: Option<Vec<ansible_mesh_core::procedure::ProcedureGraphRecord>> =
+            bindings
+                .get("effective_procedures")
+                .and_then(|v| serde_json::from_value(v.clone()).ok());
         let new_allowed_classes: Option<Vec<String>> = bindings
             .get("allowed_classes")
             .and_then(|v| serde_json::from_value(v.clone()).ok());
@@ -6840,6 +6948,11 @@ impl AgentRuntime {
             // deliberately does not set `changed` (no tool-assembly rebuild).
             if skill_guidance != state.bindings.effective_skill_guidance {
                 state.bindings.effective_skill_guidance = skill_guidance;
+            }
+        }
+        if let Some(procedures) = new_procedures {
+            if procedures != state.bindings.effective_procedures {
+                state.bindings.effective_procedures = procedures;
             }
         }
         if let Some(allowed_classes) = new_allowed_classes {
@@ -7003,6 +7116,20 @@ impl AgentRuntime {
                             }
                         }
 
+                        // Checkpoint-restored sessions carry the agent
+                        // profile as of when the checkpoint was written —
+                        // fields configured SINCE then (user_timezone from the
+                        // hotel user profile) never reach long-lived sessions
+                        // otherwise. Overlay missing fields from the current
+                        // default profile; never override what the session
+                        // already has. Same bug class as the voice-routing
+                        // loss on restore (restore must apply
+                        // default_agent_profile).
+                        if state.agent_profile.user_timezone.is_none() {
+                            state.agent_profile.user_timezone =
+                                self.default_agent_profile.user_timezone.clone();
+                        }
+
                         self.sessions.insert(session_id.to_string(), state);
                         self.apply_mcp_upstream_projection(session_id);
                         self.apply_http_integration_projection(session_id);
@@ -7025,11 +7152,23 @@ impl AgentRuntime {
         // Auto-activate the agent's default role incarnation on fresh sessions so the
         // correct manifest, toolset, and skill guidance are present from turn zero
         // without requiring an explicit handoff.to_role call.
+        //
+        // A role-incarnation process (PHILOTIC_ROLE_NAME set) exists to serve
+        // exactly that role: its fresh sessions activate ITS role, not the
+        // agent's default. Before this, a whisper to Chronos materialized a
+        // Chronos philote whose paracrine session then auto-activated
+        // `orchestrator` — the specialist answered without the specialist's
+        // lens, manifest, or toolset (found live 2026-08-25).
         let default_role = self
-            .default_agent_profile
-            .default_role_name
+            .role_name
             .clone()
             .filter(|role| !role.trim().is_empty())
+            .or_else(|| {
+                self.default_agent_profile
+                    .default_role_name
+                    .clone()
+                    .filter(|role| !role.trim().is_empty())
+            })
             .unwrap_or_else(|| "orchestrator".into());
         {
             if let Some(activation) = self.fetch_role_activation(&default_role).await {
@@ -7152,6 +7291,19 @@ fn local_hotel_name() -> Option<String> {
         .ok()
         .map(|name| name.trim().to_string())
         .filter(|name| !name.is_empty())
+}
+
+/// Builds the `/hotel` reply: a quick "where am I running" readout — which
+/// hotel (node) materialized this philote, and under which role, if any.
+/// Takes resolved values rather than reading env vars itself, so callers
+/// (and tests) control the source and formatting stays independent of the
+/// process environment.
+fn hotel_location_text(hotel: &str, node: &str, agent_id: &str, role_name: Option<&str>) -> String {
+    let role = role_name.unwrap_or("orchestrator");
+    let guest_identity = compose_guest_identity(agent_id, role_name);
+    format!(
+        "Hotel: {hotel}. Node: {node}. Agent: {agent_id}. Role: {role}. Guest identity: {guest_identity}."
+    )
 }
 
 fn projected_user_context_from_profile(profile: &UserProfileDataPayload) -> Option<String> {
@@ -7478,6 +7630,7 @@ mod tests {
             consecutive_step_failures: 0,
             streak_extension: 0,
             provider_repair_note: None,
+            say_do_nudged: false,
             provider_repair_attempts: 0,
             pending_text_reply: None,
             had_voice_input: false,
@@ -7489,6 +7642,7 @@ mod tests {
             paracrine_reply_chat_id: None,
             paracrine_response_routing: None,
             paracrine_merge_completed: false,
+            paracrine_intent: None,
             plan_confirmed: false,
             plan_confirm_note: None,
             fallback_tier: 0,
@@ -7636,6 +7790,7 @@ mod tests {
                 .collect(),
             status: "executing".into(),
             context_1_advisory: None,
+            procedure_id: None,
         });
         for tool_name in diagnostics {
             push_test_tool(&mut turn, tool_name, "ok");
@@ -7659,6 +7814,7 @@ mod tests {
             }],
             status: "executing".into(),
             context_1_advisory: None,
+            procedure_id: None,
         });
         for tool_name in ["hotel.status", "role.list", "skill.list", "session.status"] {
             push_test_tool(&mut turn, tool_name, "ok");
@@ -7683,6 +7839,7 @@ mod tests {
             }],
             status: "executing".into(),
             context_1_advisory: None,
+            procedure_id: None,
         });
         for _ in 0..4 {
             push_test_tool(
@@ -8570,6 +8727,7 @@ mod tests {
             consecutive_step_failures: 0,
             streak_extension: 0,
             provider_repair_note: None,
+            say_do_nudged: false,
             provider_repair_attempts: 0,
             pending_text_reply: None,
             had_voice_input: false,
@@ -8581,6 +8739,7 @@ mod tests {
             paracrine_reply_chat_id: None,
             paracrine_response_routing: None,
             paracrine_merge_completed: false,
+            paracrine_intent: None,
             plan_confirmed: false,
             plan_confirm_note: None,
             fallback_tier: 0,
@@ -9173,10 +9332,23 @@ mod tests {
         assert!(super::command_bypasses_turn_start(&SlashCommand::Ping));
         assert!(super::command_bypasses_turn_start(&SlashCommand::Status));
         assert!(super::command_bypasses_turn_start(&SlashCommand::Context));
+        assert!(super::command_bypasses_turn_start(&SlashCommand::Hotel));
         assert!(!super::command_bypasses_turn_start(&SlashCommand::Pause));
         assert!(!super::command_bypasses_turn_start(
             &SlashCommand::Approve { note: None }
         ));
+    }
+
+    #[test]
+    fn hotel_location_text_reports_agent_and_role() {
+        assert_eq!(
+            super::hotel_location_text("mac-jane", "local-aiua-01", "astrid", None),
+            "Hotel: mac-jane. Node: local-aiua-01. Agent: astrid. Role: orchestrator. Guest identity: astrid."
+        );
+        assert_eq!(
+            super::hotel_location_text("vps-jane", "vps-01", "astrid", Some("chronos")),
+            "Hotel: vps-jane. Node: vps-01. Agent: astrid. Role: chronos. Guest identity: astrid:chronos."
+        );
     }
 
     #[test]
@@ -10224,26 +10396,179 @@ mod tests {
         let _ = std::fs::remove_file(&socket_path);
 
         let emitted = emitted.lock().unwrap();
+        // A MODEL-invoked life.observe transport failure flows through the
+        // normal loop re-entry: the model sees the error in its tool history
+        // and decides what to do (try differently, continue other work, or
+        // tell the user itself). It must NOT be short-circuited with a canned
+        // apology that ends the turn — that short-circuit is reserved for the
+        // operator's direct text command, which has no model in the loop.
         assert!(
             emitted
                 .iter()
-                .all(|e| e["task"]["action"] != "generate_text"),
-            "a non-contract error must never trigger the life.observe retry: {:#?}",
+                .any(|e| e["task"]["action"] == "generate_text"),
+            "a model-invoked failure must re-enter the model loop: {:#?}",
             *emitted
         );
         assert!(
             emitted.iter().all(|e| e.get("heal_event").is_none()),
-            "a non-contract error must not use the new life.observe heal path: {:#?}",
+            "a non-contract error must not use the life.observe heal path: {:#?}",
             *emitted
         );
-        let send_replies: Vec<_> = emitted
+        assert!(
+            emitted.iter().all(|e| e["task"]["action"] != "send_reply"),
+            "no canned apology may end a model-invoked turn: {:#?}",
+            *emitted
+        );
+    }
+
+    /// The live 2026-08-27 habit incident: the model called life.observe as
+    /// the first of several captures, and the turn was force-completed with a
+    /// canned "Recorded this …" receipt — one artifact per turn, the operator
+    /// asked six times. A model-invoked SUCCESS must re-enter the loop so the
+    /// model can execute the remaining items and write its own final reply.
+    #[tokio::test]
+    async fn life_observe_model_invoked_success_reenters_loop() {
+        let socket_path = format!(
+            "/tmp/philote-lifeobs-modelok-{}.sock",
+            Uuid::new_v4().simple()
+        );
+        let listener = tokio::net::UnixListener::bind(&socket_path).expect("bind");
+        let emitted = std::sync::Arc::new(std::sync::Mutex::new(Vec::<serde_json::Value>::new()));
+        let server = tokio::spawn(run_recording_hotel(listener, emitted.clone()));
+
+        let identity = philotic_client::GuestIdentity {
+            guest_id: "agent-lifeobs-modelok".into(),
+            role: "agent".into(),
+            supported_tools: Vec::new(),
+        };
+        let client = philotic_client::PhiloticClient::connect_at(&socket_path, identity)
+            .await
+            .expect("connect to stub hotel");
+        let mut runtime = AgentRuntime::new(client, "agent-lifeobs-modelok");
+
+        let session_id = "sess-lifeobs-modelok";
+        let turn_id = "turn-lifeobs-modelok";
+        runtime
+            .ensure_session_loaded(session_id, "telegram")
+            .await
+            .expect("session load");
+        runtime
+            .sessions
+            .get_mut(session_id)
+            .expect("session exists")
+            .start_turn(life_observe_working_turn(turn_id, false));
+
+        runtime
+            .handle_tool_result(InboundTaskPayload {
+                action: Some("tool_result".into()),
+                session_id: Some(session_id.into()),
+                turn_id: Some(turn_id.into()),
+                tool_name: Some("life.observe".into()),
+                content: Some(
+                    r#"{"status":"proposed","node_id":"life:habit:duolingo_morning"}"#.into(),
+                ),
+                ..Default::default()
+            })
+            .await
+            .expect("tool result handled");
+
+        {
+            let state = runtime.session(session_id).expect("session");
+            assert!(
+                state.active_turn.is_some(),
+                "the turn must still be alive after a model-invoked life.observe"
+            );
+        }
+
+        drop(runtime);
+        let _ = server.await;
+        let _ = std::fs::remove_file(&socket_path);
+
+        let emitted = emitted.lock().unwrap();
+        assert!(
+            emitted
+                .iter()
+                .any(|e| e["task"]["action"] == "generate_text"),
+            "a model-invoked life.observe success must re-enter the model loop: {:#?}",
+            *emitted
+        );
+        assert!(
+            emitted.iter().all(|e| !(e["task"]["action"] == "send_reply"
+                && e["task"]["content"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("Recorded this"))),
+            "the canned receipt must never end a model-invoked turn: {:#?}",
+            *emitted
+        );
+    }
+
+    /// The operator's direct text command ("record this …") has no model in
+    /// the loop — its success must still complete the turn with the canned
+    /// receipt exactly as before.
+    #[tokio::test]
+    async fn life_observe_direct_origin_success_still_receipts() {
+        let socket_path = format!(
+            "/tmp/philote-lifeobs-directok-{}.sock",
+            Uuid::new_v4().simple()
+        );
+        let listener = tokio::net::UnixListener::bind(&socket_path).expect("bind");
+        let emitted = std::sync::Arc::new(std::sync::Mutex::new(Vec::<serde_json::Value>::new()));
+        let server = tokio::spawn(run_recording_hotel(listener, emitted.clone()));
+
+        let identity = philotic_client::GuestIdentity {
+            guest_id: "agent-lifeobs-directok".into(),
+            role: "agent".into(),
+            supported_tools: Vec::new(),
+        };
+        let client = philotic_client::PhiloticClient::connect_at(&socket_path, identity)
+            .await
+            .expect("connect to stub hotel");
+        let mut runtime = AgentRuntime::new(client, "agent-lifeobs-directok");
+
+        let session_id = "sess-lifeobs-directok";
+        let turn_id = "turn-lifeobs-directok";
+        runtime
+            .ensure_session_loaded(session_id, "telegram")
+            .await
+            .expect("session load");
+        runtime
+            .sessions
+            .get_mut(session_id)
+            .expect("session exists")
+            .start_turn(life_observe_working_turn(turn_id, true));
+
+        runtime
+            .handle_tool_result(InboundTaskPayload {
+                action: Some("tool_result".into()),
+                session_id: Some(session_id.into()),
+                turn_id: Some(turn_id.into()),
+                tool_name: Some("life.observe".into()),
+                content: Some(r#"{"status":"proposed","node_id":"life:openloop:1"}"#.into()),
+                ..Default::default()
+            })
+            .await
+            .expect("tool result handled");
+
+        drop(runtime);
+        let _ = server.await;
+        let _ = std::fs::remove_file(&socket_path);
+
+        let emitted = emitted.lock().unwrap();
+        let receipts: Vec<_> = emitted
             .iter()
-            .filter(|e| e["task"]["action"] == "send_reply")
+            .filter(|e| {
+                e["task"]["action"] == "send_reply"
+                    && e["task"]["content"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .contains("Recorded this")
+            })
             .collect();
         assert_eq!(
-            send_replies.len(),
+            receipts.len(),
             1,
-            "existing apology-to-user behavior must be unchanged: {:#?}",
+            "the direct-command path must keep its canned receipt: {:#?}",
             *emitted
         );
     }
@@ -10341,6 +10666,141 @@ mod tests {
     }
 
     // ── Turn-failure heal intake (self-heal) ─────────────────────────────────
+
+    /// An approval that times out mid-plan must leave the plan resumable —
+    /// not discarded. Before this fix, eviction cleared `parked_approval_turn`
+    /// (and everything it carried) with no carryover set, so the NEXT user
+    /// message restarted the whole goal from step 1 instead of continuing at
+    /// the step whose approval actually timed out. Live 2026-08-27: a
+    /// 4-step `skill.register` plan restarted from scratch three separate
+    /// times and never registered anything.
+    #[tokio::test]
+    async fn approval_timeout_eviction_stashes_plan_into_carryover() {
+        let socket_path = format!(
+            "/tmp/philote-approvalcarry-{}.sock",
+            Uuid::new_v4().simple()
+        );
+        let listener = tokio::net::UnixListener::bind(&socket_path).expect("bind");
+        let emitted = std::sync::Arc::new(std::sync::Mutex::new(Vec::<serde_json::Value>::new()));
+        let server = tokio::spawn(run_recording_hotel(listener, emitted.clone()));
+
+        let identity = philotic_client::GuestIdentity {
+            guest_id: "agent-approval-carry".into(),
+            role: "agent".into(),
+            supported_tools: Vec::new(),
+        };
+        let client = philotic_client::PhiloticClient::connect_at(&socket_path, identity)
+            .await
+            .expect("connect to stub hotel");
+        let mut runtime = AgentRuntime::new(client, "agent-approval-carry");
+
+        let session_id = "sess-approval-carry";
+        runtime
+            .ensure_session_loaded(session_id, "telegram")
+            .await
+            .expect("session load");
+
+        let mut turn = def004_working_turn("turn-approval-carry", "skill.register");
+        turn.phase = TurnPhase::WaitingApproval;
+        turn.active_plan = Some(ActivePlan {
+            goal: "Register four music stewardship skills".into(),
+            steps: vec![
+                PlanStep {
+                    id: 1,
+                    description: "register practice-tracker".into(),
+                    tool_name: Some("skill.register".into()),
+                    status: "done".into(),
+                },
+                PlanStep {
+                    id: 2,
+                    description: "register fatigue-monitor".into(),
+                    tool_name: Some("skill.register".into()),
+                    status: "pending".into(),
+                },
+                PlanStep {
+                    id: 3,
+                    description: "register tempo-log".into(),
+                    tool_name: Some("skill.register".into()),
+                    status: "pending".into(),
+                },
+            ],
+            status: "executing".into(),
+            context_1_advisory: None,
+            procedure_id: None,
+        });
+        turn.plan_steps_verified = vec![true, false, false];
+
+        {
+            let state = runtime
+                .sessions
+                .get_mut(session_id)
+                .expect("session exists");
+            state.start_turn(turn);
+            state.park_active_turn_for_approval();
+        }
+
+        let past = std::time::Instant::now()
+            .checked_sub(std::time::Duration::from_secs(400))
+            .expect("backdate instant");
+        {
+            let state = runtime
+                .sessions
+                .get_mut(session_id)
+                .expect("session exists");
+            state.parked_approval_since = Some(past);
+        }
+        runtime
+            .stuck_turn_first_seen
+            .insert(session_id.to_string(), past);
+        runtime.stuck_turn_signature.insert(
+            session_id.to_string(),
+            "parked_approval:turn-approval-carry".to_string(),
+        );
+
+        runtime.evict_timed_out_turns().await;
+
+        let state = runtime
+            .sessions
+            .get(session_id)
+            .expect("session survives eviction");
+        assert!(
+            state.parked_approval_turn.is_none(),
+            "eviction must still clear the parked turn"
+        );
+        let carry = state
+            .carryover_plan
+            .as_ref()
+            .expect("the plan must survive as a carryover, not vanish");
+        assert_eq!(carry.plan.goal, "Register four music stewardship skills");
+        assert_eq!(
+            carry.steps_done,
+            vec![true, false, false],
+            "steps_done must mirror each step's own status"
+        );
+        assert_eq!(
+            carry.verified_step_ids,
+            vec![1],
+            "only the step actually backed by a verified tool result carries forward"
+        );
+
+        drop(runtime);
+        let _ = server.await;
+        let _ = std::fs::remove_file(&socket_path);
+
+        // The unblock notice must name it as an approval timeout, distinct
+        // from a generic tool/model hang, and hint that the next message
+        // resumes rather than restarts.
+        let emitted = emitted.lock().unwrap();
+        let reply = emitted
+            .iter()
+            .find(|e| e["task"]["action"] == "send_reply")
+            .expect("unblock notice must be sent");
+        let content = reply["task"]["content"].as_str().unwrap_or_default();
+        assert!(
+            content.contains("timed out") && content.contains("resumes"),
+            "approval-timeout unblock message must name the timeout and resumability: {content}"
+        );
+    }
 
     /// A watchdog eviction must push a `stuck_turn_evicted:{phase}` heal
     /// event to the hotel (turn-failure heal intake) in addition to failing
@@ -10445,6 +10905,104 @@ mod tests {
         assert!(
             emitted.iter().any(|e| e["task"]["action"] == "send_reply"),
             "eviction must still emit the unblock send_reply: {:#?}",
+            *emitted
+        );
+    }
+
+    /// A whisper past its deadline must DEGRADE, not die: the specialist's
+    /// silence is converted into a tool_result the model can react to, the
+    /// turn continues (re-enters the model), no eviction fires, and the heal
+    /// queue gets `paracrine_whisper_timeout` instead of a stuck-turn event.
+    #[tokio::test]
+    async fn whisper_deadline_converts_to_tool_result_not_eviction() {
+        let socket_path = format!("/tmp/philote-wdl-{}.sock", Uuid::new_v4().simple());
+        let listener = tokio::net::UnixListener::bind(&socket_path).expect("bind");
+        let emitted = std::sync::Arc::new(std::sync::Mutex::new(Vec::<serde_json::Value>::new()));
+        let server = tokio::spawn(run_recording_hotel(listener, emitted.clone()));
+
+        let identity = philotic_client::GuestIdentity {
+            guest_id: "agent-wdl".into(),
+            role: "agent".into(),
+            supported_tools: Vec::new(),
+        };
+        let client = philotic_client::PhiloticClient::connect_at(&socket_path, identity)
+            .await
+            .expect("connect to stub hotel");
+        let mut runtime = AgentRuntime::new(client, "agent-wdl");
+
+        let session_id = "sess-wdl";
+        runtime
+            .ensure_session_loaded(session_id, "telegram")
+            .await
+            .expect("session load");
+
+        let turn = def004_working_turn("turn-wdl", "delegate.whisper");
+        runtime
+            .sessions
+            .get_mut(session_id)
+            .expect("session exists")
+            .start_turn(turn);
+
+        // Backdate past PARACRINE_WHISPER_WAIT_SECS (660s).
+        let past = std::time::Instant::now()
+            .checked_sub(std::time::Duration::from_secs(700))
+            .expect("backdate instant");
+        {
+            let state = runtime
+                .sessions
+                .get_mut(session_id)
+                .expect("session exists");
+            state.turn_waiting_since = Some(past);
+            state.active_turn_since = Some(past);
+        }
+        runtime
+            .total_active_since
+            .insert(session_id.to_string(), past);
+
+        runtime.evict_timed_out_turns().await;
+
+        let state = runtime.sessions.get(session_id).expect("session");
+        let turn = state
+            .active_turn
+            .as_ref()
+            .expect("whisper deadline must NOT evict the turn");
+        assert!(
+            !matches!(turn.phase, TurnPhase::WaitingTool),
+            "turn must have moved on from WaitingTool, got {:?}",
+            turn.phase
+        );
+
+        drop(runtime);
+        let _ = server.await;
+        let _ = std::fs::remove_file(&socket_path);
+
+        let emitted = emitted.lock().unwrap();
+        assert!(
+            emitted
+                .iter()
+                .any(|e| e["heal_event"]["pattern_tag"] == "paracrine_whisper_timeout"),
+            "must push the whisper-timeout heal event: {:#?}",
+            *emitted
+        );
+        assert!(
+            !emitted.iter().any(|e| {
+                e["heal_event"]["pattern_tag"]
+                    .as_str()
+                    .map(|t| t.starts_with("stuck_turn_evicted"))
+                    .unwrap_or(false)
+            }),
+            "no eviction heal event may fire for a whisper deadline: {:#?}",
+            *emitted
+        );
+        assert!(
+            emitted.iter().any(|e| {
+                e["task"]["action"] == "generate_text"
+                    && e["task"]["prompt"]
+                        .as_str()
+                        .map(|p| p.contains("did not respond"))
+                        .unwrap_or(false)
+            }),
+            "specialist silence must re-enter the model as a visible tool failure: {:#?}",
             *emitted
         );
     }
@@ -12319,6 +12877,67 @@ mod tests {
         let _ = std::fs::remove_file(&socket_path);
     }
 
+    /// Live incident 2026-08-30: a handoff bundle whose `active_goal` is a
+    /// slash command (e.g. "/role chronos") — because it was built while the
+    /// sender's active_turn.user_content WAS that very command — must never
+    /// be auto-executed. The receiving role's local session state hasn't yet
+    /// recorded the new incarnation as active, so re-parsing that goal as a
+    /// fresh command and re-dispatching it re-triggers the same same-identity
+    /// handoff from the specialist's own process, evading
+    /// handle_role_command's self-handoff guard and looping until the
+    /// ROLE_SWITCH_MAX throttle intervenes. `build_same_identity_handoff_bundle`
+    /// is fixed to never construct such a bundle in the first place; this is
+    /// the defense-in-depth check on the receiving side.
+    #[tokio::test]
+    async fn handoff_bundle_never_auto_executes_a_slash_command_active_goal() {
+        let socket_path = format!("/tmp/philote-selfloop-{}.sock", Uuid::new_v4().simple());
+        let listener = tokio::net::UnixListener::bind(&socket_path).expect("bind");
+        let emitted = std::sync::Arc::new(std::sync::Mutex::new(Vec::<serde_json::Value>::new()));
+        let server = tokio::spawn(run_recording_hotel(listener, emitted.clone()));
+
+        let identity = philotic_client::GuestIdentity {
+            guest_id: "agent-beacon:Chronos".into(),
+            role: "role:agent-beacon:Chronos".into(),
+            supported_tools: Vec::new(),
+        };
+        let client = philotic_client::PhiloticClient::connect_at(&socket_path, identity)
+            .await
+            .expect("connect to stub hotel");
+        let mut runtime = AgentRuntime::new(client, "agent-beacon");
+
+        let session_id = "sess-selfloop";
+        let bundle = philotic_client::HandoffBundle {
+            to_role: Some("chronos".into()),
+            from_role: Some("orchestrator".into()),
+            handoff_reason: Some("manual_role_switch".into()),
+            active_goal: Some("/role chronos".into()),
+            ..Default::default()
+        };
+        runtime
+            .handle_handoff_bundle(
+                InboundTaskPayload {
+                    action: Some("handoff_bundle".into()),
+                    session_id: Some(session_id.into()),
+                    turn_id: Some("turn-selfloop".into()),
+                    handoff_bundle: Some(bundle),
+                    ..Default::default()
+                },
+                Uuid::new_v4(),
+            )
+            .await
+            .expect("handoff bundle");
+
+        assert!(
+            runtime.pending_drains.is_empty(),
+            "a slash-command active_goal must never be queued for auto-execution: {:?}",
+            runtime.pending_drains
+        );
+
+        drop(runtime);
+        let _ = server.await;
+        let _ = std::fs::remove_file(&socket_path);
+    }
+
     // ── Plan-eval-repeat loop ───────────────────────────────────────────────
 
     /// Serializes tests that read or mutate PHILOTIC_DISABLE_PLAN_CONTINUATION,
@@ -12344,6 +12963,7 @@ mod tests {
                 .collect(),
             status: "executing".into(),
             context_1_advisory: None,
+            procedure_id: None,
         }
     }
 
@@ -12515,12 +13135,17 @@ mod tests {
                 verified_step_ids: vec![1],
                 stalled_continuations: 0,
                 continuations_used: 3,
+                lifetime_continuations: 3,
                 created_turn_id: "turn-origin".into(),
             });
-            // This continuation made progress (step 2 done) but one step remains.
+            // This continuation settled nothing new (first stall — not yet
+            // Blocked), so the spent budget is NOT refunded and must bind.
             let mut turn = test_working_turn(TurnPhase::WaitingModel);
             turn.turn_id = "turn-plan-4".into();
-            turn.active_plan = Some(plan_with_statuses("ship it", &["done", "done", "pending"]));
+            turn.active_plan = Some(plan_with_statuses(
+                "ship it",
+                &["done", "pending", "pending"],
+            ));
             state.start_turn(turn);
         }
 
@@ -12570,8 +13195,282 @@ mod tests {
             .collect();
         assert_eq!(stopped.len(), 1, "one plan_stopped event: {:#?}", *emitted);
         let notice = stopped[0]["task"]["partial_content"].as_str().unwrap();
-        assert!(notice.contains("2/3 steps done"), "{notice}");
+        assert!(notice.contains("1/3 steps done"), "{notice}");
         assert!(notice.contains("work item 3"), "{notice}");
+    }
+
+    /// Progress refunds the per-stretch budget: a continuation that settles a
+    /// new step must keep the loop going even with `continuations_used` at the
+    /// configured budget. The stall ceiling — not the budget — is what stops a
+    /// plan; the budget only binds stretches that settle nothing.
+    #[tokio::test]
+    async fn plan_continuation_progress_refunds_budget() {
+        let _guard = plan_env_guard();
+        unsafe {
+            std::env::remove_var("PHILOTIC_DISABLE_PLAN_CONTINUATION");
+        }
+        let (mut runtime, _emitted, server, socket_path) = plan_test_runtime("planrefund").await;
+        let session_id = "sess-planrefund";
+        runtime
+            .ensure_session_loaded(session_id, "telegram")
+            .await
+            .expect("session load");
+
+        {
+            let state = runtime.sessions.get_mut(session_id).expect("session");
+            // Budget fully spent — but this continuation lands step 2.
+            state.carryover_plan = Some(CarryoverPlan {
+                plan: plan_with_statuses("ship it", &["done", "pending", "pending"]),
+                steps_done: vec![true, false, false],
+                verified_step_ids: vec![1],
+                stalled_continuations: 0,
+                continuations_used: 3,
+                lifetime_continuations: 3,
+                created_turn_id: "turn-origin".into(),
+            });
+            let mut turn = test_working_turn(TurnPhase::WaitingModel);
+            turn.turn_id = "turn-plan-4".into();
+            turn.active_plan = Some(plan_with_statuses("ship it", &["done", "done", "pending"]));
+            state.start_turn(turn);
+        }
+
+        runtime
+            .handle_model_response(respond_payload(session_id, "turn-plan-4", "more progress"))
+            .await
+            .expect("respond");
+
+        let state = runtime.session(session_id).expect("session");
+        let carry = state
+            .carryover_plan
+            .as_ref()
+            .expect("carryover must survive — progress refunds the budget");
+        assert_eq!(
+            carry.continuations_used, 1,
+            "refund resets the stretch, then the synthesized continuation charges 1"
+        );
+        assert_eq!(
+            carry.lifetime_continuations, 4,
+            "the lifetime counter is never refunded"
+        );
+        assert!(
+            !runtime.pending_drains.is_empty(),
+            "a continuation must be synthesized for the remaining step"
+        );
+
+        drop(runtime);
+        let _ = server.await;
+        let _ = std::fs::remove_file(&socket_path);
+    }
+
+    /// The lifetime cap is the absolute backstop behind the refund: a plan at
+    /// the cap stops even when its latest continuation made progress.
+    #[tokio::test]
+    async fn plan_continuation_lifetime_cap_stops_even_with_progress() {
+        let _guard = plan_env_guard();
+        unsafe {
+            std::env::remove_var("PHILOTIC_DISABLE_PLAN_CONTINUATION");
+        }
+        let (mut runtime, emitted, server, socket_path) = plan_test_runtime("planlifetime").await;
+        let session_id = "sess-planlifetime";
+        runtime
+            .ensure_session_loaded(session_id, "telegram")
+            .await
+            .expect("session load");
+
+        {
+            let state = runtime.sessions.get_mut(session_id).expect("session");
+            state.carryover_plan = Some(CarryoverPlan {
+                plan: plan_with_statuses("ship it", &["done", "pending", "pending"]),
+                steps_done: vec![true, false, false],
+                verified_step_ids: vec![1],
+                stalled_continuations: 0,
+                continuations_used: 0,
+                lifetime_continuations: crate::plan_eval::PLAN_CONTINUATION_LIFETIME_CAP,
+                created_turn_id: "turn-origin".into(),
+            });
+            let mut turn = test_working_turn(TurnPhase::WaitingModel);
+            turn.turn_id = "turn-plan-cap".into();
+            turn.active_plan = Some(plan_with_statuses("ship it", &["done", "done", "pending"]));
+            state.start_turn(turn);
+        }
+
+        runtime
+            .handle_model_response(respond_payload(session_id, "turn-plan-cap", "progress"))
+            .await
+            .expect("respond");
+
+        let state = runtime.session(session_id).expect("session");
+        assert!(
+            state.carryover_plan.is_none(),
+            "lifetime cap must clear the carryover"
+        );
+        assert!(runtime.pending_drains.is_empty());
+
+        drop(runtime);
+        let _ = server.await;
+        let _ = std::fs::remove_file(&socket_path);
+
+        let emitted = emitted.lock().unwrap();
+        let stopped: Vec<_> = emitted
+            .iter()
+            .filter(|e| e["task"]["action"] == "turn_event" && e["task"]["event"] == "plan_stopped")
+            .collect();
+        assert_eq!(stopped.len(), 1, "one plan_stopped event: {:#?}", *emitted);
+        assert!(
+            stopped[0]["task"]["partial_content"]
+                .as_str()
+                .unwrap()
+                .contains("lifetime continuation cap"),
+        );
+    }
+
+    /// A failed turn must resume — not strand — the session's carryover.
+    /// The first dead turn charges a stall and synthesizes a continuation;
+    /// a second consecutive dead turn stops the plan with a plan_stopped
+    /// event instead of retrying forever.
+    #[tokio::test]
+    async fn failed_turn_resumes_carryover_then_stops_on_repeat() {
+        let _guard = plan_env_guard();
+        unsafe {
+            std::env::remove_var("PHILOTIC_DISABLE_PLAN_CONTINUATION");
+        }
+        let (mut runtime, emitted, server, socket_path) = plan_test_runtime("planfail").await;
+        let session_id = "sess-planfail";
+        runtime
+            .ensure_session_loaded(session_id, "telegram")
+            .await
+            .expect("session load");
+
+        {
+            let state = runtime.sessions.get_mut(session_id).expect("session");
+            state.carryover_plan = Some(CarryoverPlan {
+                plan: plan_with_statuses("ship it", &["done", "pending", "pending"]),
+                steps_done: vec![true, false, false],
+                verified_step_ids: vec![1],
+                stalled_continuations: 0,
+                continuations_used: 1,
+                lifetime_continuations: 1,
+                created_turn_id: "turn-origin".into(),
+            });
+            let mut turn = test_working_turn(TurnPhase::WaitingModel);
+            turn.turn_id = "turn-plan-dead".into();
+            state.start_turn(turn);
+        }
+
+        runtime
+            .fail_active_turn(
+                session_id.to_string(),
+                "turn-plan-dead".to_string(),
+                "model died".to_string(),
+            )
+            .await
+            .expect("fail turn");
+
+        {
+            let state = runtime.session(session_id).expect("session");
+            let carry = state
+                .carryover_plan
+                .as_ref()
+                .expect("first failure must keep the carryover and resume it");
+            assert_eq!(carry.stalled_continuations, 1, "failure charged as a stall");
+            assert!(
+                !runtime.pending_drains.is_empty(),
+                "a continuation must be synthesized after the failed turn"
+            );
+            runtime.pending_drains.clear();
+        }
+
+        // Second consecutive dead turn: the plan stops instead of spinning.
+        {
+            let state = runtime.sessions.get_mut(session_id).expect("session");
+            let mut turn = test_working_turn(TurnPhase::WaitingModel);
+            turn.turn_id = "turn-plan-dead-2".into();
+            state.start_turn(turn);
+        }
+        runtime
+            .fail_active_turn(
+                session_id.to_string(),
+                "turn-plan-dead-2".to_string(),
+                "model died again".to_string(),
+            )
+            .await
+            .expect("fail turn 2");
+
+        let state = runtime.session(session_id).expect("session");
+        assert!(
+            state.carryover_plan.is_none(),
+            "second consecutive failure must stop the plan"
+        );
+        assert!(runtime.pending_drains.is_empty());
+
+        drop(runtime);
+        let _ = server.await;
+        let _ = std::fs::remove_file(&socket_path);
+
+        let emitted = emitted.lock().unwrap();
+        let stopped: Vec<_> = emitted
+            .iter()
+            .filter(|e| e["task"]["action"] == "turn_event" && e["task"]["event"] == "plan_stopped")
+            .collect();
+        assert_eq!(stopped.len(), 1, "one plan_stopped event: {:#?}", *emitted);
+        assert!(
+            stopped[0]["task"]["partial_content"]
+                .as_str()
+                .unwrap()
+                .contains("failed repeatedly"),
+        );
+    }
+
+    /// A new plan with a different goal replacing an unfinished carryover must
+    /// leave an auditable plan_stopped record, not vanish the old goal.
+    #[tokio::test]
+    async fn superseded_carryover_emits_plan_stopped() {
+        let _guard = plan_env_guard();
+        unsafe {
+            std::env::remove_var("PHILOTIC_DISABLE_PLAN_CONTINUATION");
+        }
+        let (mut runtime, emitted, server, socket_path) = plan_test_runtime("plansuper").await;
+        let session_id = "sess-plansuper";
+        runtime
+            .ensure_session_loaded(session_id, "telegram")
+            .await
+            .expect("session load");
+
+        {
+            let state = runtime.sessions.get_mut(session_id).expect("session");
+            state.carryover_plan = Some(CarryoverPlan {
+                plan: plan_with_statuses("old goal", &["done", "pending"]),
+                steps_done: vec![true, false],
+                verified_step_ids: vec![1],
+                stalled_continuations: 0,
+                continuations_used: 1,
+                lifetime_continuations: 1,
+                created_turn_id: "turn-origin".into(),
+            });
+            let mut turn = test_working_turn(TurnPhase::WaitingModel);
+            turn.turn_id = "turn-new-goal".into();
+            turn.active_plan = Some(plan_with_statuses("new goal", &["done"]));
+            state.start_turn(turn);
+        }
+
+        runtime
+            .handle_model_response(respond_payload(session_id, "turn-new-goal", "done"))
+            .await
+            .expect("respond");
+
+        drop(runtime);
+        let _ = server.await;
+        let _ = std::fs::remove_file(&socket_path);
+
+        let emitted = emitted.lock().unwrap();
+        let stopped: Vec<_> = emitted
+            .iter()
+            .filter(|e| e["task"]["action"] == "turn_event" && e["task"]["event"] == "plan_stopped")
+            .collect();
+        assert_eq!(stopped.len(), 1, "one plan_stopped event: {:#?}", *emitted);
+        let notice = stopped[0]["task"]["partial_content"].as_str().unwrap();
+        assert!(notice.contains("superseded by a new plan"), "{notice}");
+        assert!(notice.contains("old goal"), "{notice}");
     }
 
     #[tokio::test]
@@ -12651,6 +13550,7 @@ mod tests {
                 verified_step_ids: vec![1],
                 stalled_continuations: 0,
                 continuations_used: 1,
+                lifetime_continuations: 0,
                 created_turn_id: "turn-old".into(),
             });
             let mut turn = test_working_turn(TurnPhase::Thinking);
@@ -12788,6 +13688,7 @@ mod tests {
             verified_step_ids: vec![1],
             stalled_continuations: 0,
             continuations_used: 1,
+            lifetime_continuations: 0,
             created_turn_id: "turn-origin".into(),
         });
 

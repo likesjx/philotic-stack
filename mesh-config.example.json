@@ -9,24 +9,30 @@
     "elevenlabs_api_key": "",
     "default_model": "gemini-2.0-flash-exp"
   },
+  "operator_timezone": "America/New_York",
   "hotels": {
     "default": {
       "agents": {
         "jane": {
           "agent_id": "agent-jane",
           "persona_name": "Jane",
-          "system_prompt": "You are Jane, a warm and capable conversational assistant — attentive, thoughtful, and direct. You are the operator's primary point of contact and handle a wide range of requests. You have access to bash for running commands when needed.",
+          "system_prompt": "You are Jane, a warm and capable conversational assistant \u2014 attentive, thoughtful, and direct. You are the operator's primary point of contact and handle a wide range of requests. You have access to bash for running commands when needed.",
           "import_workspace": "",
           "telegram": {
             "bot_token": "REPLACE_WITH_JANE_BOT_TOKEN",
-            "allowed_users": ["REPLACE_WITH_YOUR_TELEGRAM_USERNAME"]
+            "allowed_users": [
+              "REPLACE_WITH_YOUR_TELEGRAM_USERNAME"
+            ]
           },
           "model": {
             "default_model": "gemini-2.0-flash-exp"
           },
           "approval_policy": {
             "require_approval": true,
-            "preapproved_classes": ["utility", "session"]
+            "preapproved_classes": [
+              "utility",
+              "session"
+            ]
           },
           "media_routing_policy": {
             "forward_media_to_model": true,
@@ -39,19 +45,27 @@
         "aria": {
           "agent_id": "agent-aria",
           "persona_name": "Aria",
-          "system_prompt": "You are Aria the Architect, a development specialist and technical lead. You track all active work, monitor documentation quality, and guide architectural decisions. You have an admin role — you can inspect and manage the Philotic Stack itself. You are precise, systematic, and think in systems. Use bash for development tasks.",
+          "system_prompt": "You are Aria the Architect, a development specialist and technical lead. You track all active work, monitor documentation quality, and guide architectural decisions. You have an admin role \u2014 you can inspect and manage the Philotic Stack itself. You are precise, systematic, and think in systems. Use bash for development tasks.",
           "import_workspace": "",
           "telegram": {
             "bot_token": "REPLACE_WITH_ARIA_BOT_TOKEN",
-            "allowed_users": ["REPLACE_WITH_YOUR_TELEGRAM_USERNAME"]
+            "allowed_users": [
+              "REPLACE_WITH_YOUR_TELEGRAM_USERNAME"
+            ]
           },
           "model": {
             "default_model": "gemini-2.0-flash-exp"
           },
-          "toolset_tags": ["admin-required"],
+          "toolset_tags": [
+            "admin-required"
+          ],
           "approval_policy": {
             "require_approval": true,
-            "preapproved_classes": ["utility", "session", "workspace"]
+            "preapproved_classes": [
+              "utility",
+              "session",
+              "workspace"
+            ]
           },
           "media_routing_policy": {
             "forward_media_to_model": true,
@@ -68,14 +82,19 @@
           "import_workspace": "",
           "telegram": {
             "bot_token": "REPLACE_WITH_BEACON_BOT_TOKEN",
-            "allowed_users": ["REPLACE_WITH_YOUR_TELEGRAM_USERNAME"]
+            "allowed_users": [
+              "REPLACE_WITH_YOUR_TELEGRAM_USERNAME"
+            ]
           },
           "model": {
             "default_model": "gemini-2.0-flash-exp"
           },
           "approval_policy": {
             "require_approval": true,
-            "preapproved_classes": ["utility", "session"]
+            "preapproved_classes": [
+              "utility",
+              "session"
+            ]
           },
           "media_routing_policy": {
             "forward_media_to_model": true,
@@ -88,18 +107,23 @@
         "hermes": {
           "agent_id": "agent-hermes",
           "persona_name": "Hermes",
-          "system_prompt": "You are Hermes, Communications Specialist. You manage all outbound and inbound communications — email drafts, message routing, notification summaries, and correspondence. You are concise, clear, and know when something needs immediate attention versus when it can wait. Use bash to interact with mail and messaging tools.",
+          "system_prompt": "You are Hermes, Communications Specialist. You manage all outbound and inbound communications \u2014 email drafts, message routing, notification summaries, and correspondence. You are concise, clear, and know when something needs immediate attention versus when it can wait. Use bash to interact with mail and messaging tools.",
           "import_workspace": "",
           "telegram": {
             "bot_token": "REPLACE_WITH_HERMES_BOT_TOKEN",
-            "allowed_users": ["REPLACE_WITH_YOUR_TELEGRAM_USERNAME"]
+            "allowed_users": [
+              "REPLACE_WITH_YOUR_TELEGRAM_USERNAME"
+            ]
           },
           "model": {
             "default_model": "gemini-2.0-flash-exp"
           },
           "approval_policy": {
             "require_approval": true,
-            "preapproved_classes": ["utility", "session"]
+            "preapproved_classes": [
+              "utility",
+              "session"
+            ]
           },
           "media_routing_policy": {
             "forward_media_to_model": true,
@@ -116,14 +140,20 @@
           "import_workspace": "",
           "telegram": {
             "bot_token": "REPLACE_WITH_ASTRID_BOT_TOKEN",
-            "allowed_users": ["REPLACE_WITH_YOUR_TELEGRAM_USERNAME"]
+            "allowed_users": [
+              "REPLACE_WITH_YOUR_TELEGRAM_USERNAME"
+            ]
           },
           "model": {
             "default_model": "gemini-2.0-flash-exp"
           },
           "approval_policy": {
             "require_approval": true,
-            "preapproved_classes": ["utility", "session", "workspace"]
+            "preapproved_classes": [
+              "utility",
+              "session",
+              "workspace"
+            ]
           },
           "media_routing_policy": {
             "forward_media_to_model": true,

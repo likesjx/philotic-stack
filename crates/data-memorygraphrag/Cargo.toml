@@ -18,6 +18,7 @@ anyhow = "1"
 ansible-mesh-core = { path = "../ansible-mesh-core" }
 async-trait = "0.1"
 chrono = { version = "0.4", features = ["clock", "serde"] }
+chrono-tz = "0.10"
 datasource = { path = "../datasource" }
 futures = "0.3"
 philotic-client = { path = "../philotic-client" }

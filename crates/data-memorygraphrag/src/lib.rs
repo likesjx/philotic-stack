@@ -5,9 +5,12 @@
 //! contracts into graph writes, context packets, or Muninn true-up requests.
 
 pub mod attention_observer;
+pub mod audit;
 pub mod cypher;
 pub mod entanglement;
+pub mod heartbeat;
 pub mod hygiene;
+pub mod ontology;
 pub mod projection;
 pub mod zoning;
 
@@ -154,6 +157,15 @@ pub struct EvidencePacket {
     pub observed_at: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub valid_time_range: Option<TimeRange>,
+    /// ISO 8601 deadline for the claimed item (commitments, next actions).
+    /// Structured dates are what deterministic maintenance queries see —
+    /// a date left in `claim_summary` prose is invisible to `life.list`
+    /// (ontology gap G1).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub due_at: Option<String>,
+    /// ISO 8601 point-in-time the claimed event happens (events).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub occurs_at: Option<String>,
     #[serde(default = "default_evidence_score")]
     pub source_reliability: f32,
     #[serde(default)]
@@ -978,6 +990,12 @@ pub enum LifeGraphToolName {
     LifeResolve,
     LifeConflict,
     LifePatchPropose,
+    LifeList,
+    LifeOntology,
+    LifePatchApply,
+    LifePatchList,
+    LifeAudit,
+    LifeTidy,
 }
 
 impl LifeGraphToolName {
@@ -991,6 +1009,12 @@ impl LifeGraphToolName {
             Self::LifeResolve => "life.resolve",
             Self::LifeConflict => "life.conflict",
             Self::LifePatchPropose => "life.patch.propose",
+            Self::LifeList => "life.list",
+            Self::LifeOntology => "life.ontology",
+            Self::LifePatchApply => "life.patch.apply",
+            Self::LifePatchList => "life.patch.list",
+            Self::LifeAudit => "life.audit",
+            Self::LifeTidy => "life.tidy",
         }
     }
 
@@ -1003,6 +1027,8 @@ impl LifeGraphToolName {
                 | Self::LifeCommit
                 | Self::LifeResolve
                 | Self::LifePatchPropose
+                | Self::LifePatchApply
+                | Self::LifeTidy
         )
     }
 }
@@ -1075,6 +1101,30 @@ pub fn life_graph_tool_catalog() -> Vec<LifeGraphToolSpec> {
             LifeGraphToolName::LifePatchPropose,
             "Propose a governed Life Graph schema, skill, tool, or policy patch.",
             true,
+        ),
+        LifeGraphToolSpec::new(
+            LifeGraphToolName::LifeList,
+            "Deterministically list Life Graph nodes by exact label/status/date \
+             predicates or a named maintenance query (read-only).",
+            false,
+        ),
+        LifeGraphToolSpec::new(
+            LifeGraphToolName::LifeOntology,
+            "Serve the canonical Life Graph vocabulary: labels, lifecycle states, \
+             property conventions, named queries, rules, and known gaps (read-only).",
+            false,
+        ),
+        LifeGraphToolSpec::new(
+            LifeGraphToolName::LifePatchApply,
+            "Confirm or reject an awaiting_confirmation Life Graph patch. Confirming a \
+             schema_patch with an ontology_extension makes the new vocabulary live \
+             (indexes created automatically). Call ONLY after the operator approves.",
+            true,
+        ),
+        LifeGraphToolSpec::new(
+            LifeGraphToolName::LifePatchList,
+            "List Life Graph patches and their statuses (read-only).",
+            false,
         ),
     ]
 }
@@ -1543,6 +1593,19 @@ impl LifeObserveInput {
     }
 }
 
+impl LifeCommitInput {
+    /// Fill the packet id a model-authored commit may omit — the same
+    /// courtesy `LifeObserveInput::normalize_defaults` extends to observe.
+    /// Live 2026-09-12: every first `life.commit` attempt of the afternoon
+    /// failed "packet_id must not be empty" and cost a retry model call.
+    pub fn normalize_defaults(&mut self) {
+        if self.evidence.packet_id.trim().is_empty() {
+            self.evidence.packet_id =
+                format!("commit-{}", ulid::Ulid::new().to_string().to_lowercase());
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct LifeCommitInput {
     pub evidence: EvidencePacket,
@@ -1589,6 +1652,13 @@ pub struct LifePatchProposalInput {
     /// trust.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub autonomy_audit_id: Option<String>,
+    /// Governed ontology self-serve (nouns-verbs automation): a schema_patch
+    /// may carry new vocabulary — labels and endpoint-validated edges. On
+    /// operator confirm, `life.patch.apply` validates the spec, creates the
+    /// vector index for each new label, and persists the merged extension
+    /// set; the vocabulary is live immediately, no code change or deploy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ontology_extension: Option<ontology::OntologyExtensions>,
 }
 
 /// Operator decision on an `awaiting_confirmation` patch.
@@ -1805,6 +1875,141 @@ pub struct LifeViewNodeInput {
     pub edge_limit: Option<usize>,
 }
 
+/// Input for `life.list` — the READ-ONLY deterministic maintenance query
+/// surface (lifegraph-steward-capability-plane seam). Either name a query
+/// from [`ontology::NamedMaintenanceQuery`] or compose typed filters; the
+/// two modes are mutually exclusive so a named query's semantics can never
+/// be silently narrowed by leftover filters.
+///
+/// Unlike `life.recall` (embedding similarity), every field here maps to an
+/// exact predicate built from the central [`ontology`] vocabulary, so the
+/// same call always returns the same rows for the same graph state.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct LifeListInput {
+    /// Named maintenance query (`past_dated_events`, `aging_loops_oldest_first`,
+    /// `duplicate_candidates`, `recently_retired`, `past_due_commitments`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub named_query: Option<String>,
+    /// Node labels to include. Empty = every ontology label.
+    #[serde(default)]
+    pub labels: Vec<String>,
+    /// Lifecycle statuses to require (matched on any status property).
+    #[serde(default)]
+    pub statuses: Vec<String>,
+    /// Validation states to require.
+    #[serde(default)]
+    pub validation_states: Vec<String>,
+    /// Include terminal (retired/resolved/done/…) nodes. Default false.
+    #[serde(default)]
+    pub include_terminal: bool,
+    /// ISO 8601 lower bound on `observed_at`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_after: Option<String>,
+    /// ISO 8601 upper bound on `observed_at`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_before: Option<String>,
+    /// ISO 8601 upper bound on the node's best structured date.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub date_before: Option<String>,
+    /// ISO 8601 lower bound on the node's best structured date.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub date_after: Option<String>,
+    /// Maximum rows. Default 50, clamped to `1..=200`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<usize>,
+}
+
+impl LifeListInput {
+    pub fn effective_limit(&self) -> usize {
+        self.limit.unwrap_or(50).clamp(1, 200)
+    }
+
+    fn has_filters(&self) -> bool {
+        !self.labels.is_empty()
+            || !self.statuses.is_empty()
+            || !self.validation_states.is_empty()
+            || self.observed_after.is_some()
+            || self.observed_before.is_some()
+            || self.date_before.is_some()
+            || self.date_after.is_some()
+            || self.include_terminal
+    }
+
+    /// Build the filtered-mode cypher. Date/observed bounds ride as Bolt
+    /// params (`$observed_after` etc.) — caller binds exactly the ones set.
+    /// Statuses and labels are validated against the ontology vocabulary by
+    /// `plan_list` before they are interpolated.
+    pub fn filtered_cypher(&self) -> String {
+        self.filtered_cypher_with_extensions(&ontology::OntologyExtensions::default())
+    }
+
+    /// Extension-aware variant: the all-labels default includes runtime
+    /// extension labels.
+    pub fn filtered_cypher_with_extensions(&self, ext: &ontology::OntologyExtensions) -> String {
+        let ext_names: Vec<&str> = ext.labels.iter().map(|l| l.name.as_str()).collect();
+        let labels: Vec<&str> = if self.labels.is_empty() {
+            let mut all = ontology::NODE_LABELS.to_vec();
+            all.extend(ext_names);
+            all
+        } else {
+            self.labels.iter().map(String::as_str).collect()
+        };
+        let label_list = labels
+            .iter()
+            .map(|l| format!("'{l}'"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let mut clauses = vec![format!(
+            "any(label IN labels(n) WHERE label IN [{label_list}])"
+        )];
+        if !self.include_terminal {
+            clauses.push(ontology::liveness_predicate("n"));
+        }
+        if !self.statuses.is_empty() {
+            let statuses = self
+                .statuses
+                .iter()
+                .map(|s| format!("'{s}'"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            clauses.push(format!(
+                "coalesce(n.status, n.loop_status, '') IN [{statuses}]"
+            ));
+        }
+        if !self.validation_states.is_empty() {
+            let states = self
+                .validation_states
+                .iter()
+                .map(|s| format!("'{s}'"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            clauses.push(format!(
+                "coalesce(n.validation_state, 'inferred') IN [{states}]"
+            ));
+        }
+        if self.observed_after.is_some() {
+            clauses.push("n.observed_at >= $observed_after".into());
+        }
+        if self.observed_before.is_some() {
+            clauses.push("n.observed_at <= $observed_before".into());
+        }
+        let best = ontology::best_date_expr("n");
+        if self.date_before.is_some() {
+            clauses.push(format!("{best} IS NOT NULL AND {best} < $date_before"));
+        }
+        if self.date_after.is_some() {
+            clauses.push(format!("{best} IS NOT NULL AND {best} >= $date_after"));
+        }
+        format!(
+            "MATCH (n) WHERE {where_clause} RETURN {row} \
+             ORDER BY coalesce(n.observed_at, n.created_at, '') DESC LIMIT {limit}",
+            where_clause = clauses.join(" AND "),
+            row = ontology::list_row_projection("n"),
+            limit = self.effective_limit(),
+        )
+    }
+}
+
 impl LifeViewNodeInput {
     pub fn effective_edge_limit(&self) -> usize {
         self.edge_limit.unwrap_or(50).clamp(1, 200)
@@ -1841,6 +2046,52 @@ impl LifeViewNeighborhoodInput {
     }
 }
 
+/// `life.audit` knobs. All optional; defaults match `audit::AuditOptions`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LifeAuditInput {
+    #[serde(default = "default_audit_max_actions")]
+    pub max_actions: usize,
+    #[serde(default = "default_audit_stale_days")]
+    pub stale_days: u32,
+    #[serde(default = "default_audit_similarity")]
+    pub duplicate_similarity: f32,
+    /// Restrict findings to these labels (empty = all).
+    #[serde(default)]
+    pub labels: Vec<String>,
+}
+
+fn default_audit_max_actions() -> usize {
+    25
+}
+fn default_audit_stale_days() -> u32 {
+    45
+}
+fn default_audit_similarity() -> f32 {
+    0.90
+}
+
+impl Default for LifeAuditInput {
+    fn default() -> Self {
+        Self {
+            max_actions: default_audit_max_actions(),
+            stale_days: default_audit_stale_days(),
+            duplicate_similarity: default_audit_similarity(),
+            labels: Vec::new(),
+        }
+    }
+}
+
+/// `life.tidy`: exactly one action per call, so the philote's plan evaluator
+/// can verify each step by its own tool result.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LifeTidyInput {
+    pub action: crate::audit::TidyAction,
+    /// Set when the operator explicitly asked for this action; lets a
+    /// `retire`/`resolve` touch a confirmed node.
+    #[serde(default)]
+    pub operator_approved: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "tool", content = "input", rename_all = "snake_case")]
 pub enum LifeGraphToolRequest {
@@ -1850,6 +2101,9 @@ pub enum LifeGraphToolRequest {
     LifeCommit(LifeCommitInput),
     LifeResolve(LifeResolveInput),
     LifePatchPropose(LifePatchProposalInput),
+    LifeList(LifeListInput),
+    LifeAudit(LifeAuditInput),
+    LifeTidy(LifeTidyInput),
 }
 
 impl LifeGraphToolRequest {
@@ -1861,6 +2115,9 @@ impl LifeGraphToolRequest {
             Self::LifeCommit(_) => LifeGraphToolName::LifeCommit,
             Self::LifeResolve(_) => LifeGraphToolName::LifeResolve,
             Self::LifePatchPropose(_) => LifeGraphToolName::LifePatchPropose,
+            Self::LifeList(_) => LifeGraphToolName::LifeList,
+            Self::LifeAudit(_) => LifeGraphToolName::LifeAudit,
+            Self::LifeTidy(_) => LifeGraphToolName::LifeTidy,
         }
     }
 }
@@ -1928,27 +2185,235 @@ impl MemoryGraphRagRunner {
     }
 
     pub fn plan(&self, request: LifeGraphToolRequest) -> Result<RunnerPlan, ContractError> {
+        self.plan_with_extensions(request, &ontology::OntologyExtensions::default())
+    }
+
+    /// Extension-aware planning: runtime ontology extensions (governed
+    /// self-serve vocabulary) are accepted everywhere the compiled core is.
+    pub fn plan_with_extensions(
+        &self,
+        request: LifeGraphToolRequest,
+        ext: &ontology::OntologyExtensions,
+    ) -> Result<RunnerPlan, ContractError> {
         match request {
-            LifeGraphToolRequest::LifeObserve(input) => self.plan_observe(input),
+            LifeGraphToolRequest::LifeObserve(input) => self.plan_observe_ext(input, ext),
             LifeGraphToolRequest::LifeRecall(query) => self.plan_recall(query),
             LifeGraphToolRequest::LifeRecallFeedback(feedback) => {
                 self.plan_recall_feedback(feedback)
             }
             LifeGraphToolRequest::LifeCommit(input) => self.plan_commit(input),
             LifeGraphToolRequest::LifeResolve(input) => self.plan_resolve(input),
-            LifeGraphToolRequest::LifePatchPropose(input) => self.plan_patch_propose(input),
+            LifeGraphToolRequest::LifePatchPropose(input) => {
+                self.plan_patch_propose_ext(input, ext)
+            }
+            LifeGraphToolRequest::LifeList(input) => self.plan_list_ext(input, ext),
+            LifeGraphToolRequest::LifeAudit(input) => self.plan_audit(input),
+            LifeGraphToolRequest::LifeTidy(input) => self.plan_tidy_ext(input, ext),
         }
     }
 
-    fn plan_observe(&self, input: LifeObserveInput) -> Result<RunnerPlan, ContractError> {
+    /// `life.audit` is read-only: validate the knobs and the label filter.
+    fn plan_audit(&self, input: LifeAuditInput) -> Result<RunnerPlan, ContractError> {
+        let mut violations = Vec::new();
+        if !(0.5..=1.0).contains(&input.duplicate_similarity) {
+            violations.push(format!(
+                "duplicate_similarity {} must be within 0.5..=1.0",
+                input.duplicate_similarity
+            ));
+        }
+        if input.max_actions == 0 || input.max_actions > 200 {
+            violations.push(format!(
+                "max_actions {} must be within 1..=200",
+                input.max_actions
+            ));
+        }
+        for label in &input.labels {
+            if !ontology::is_known_label(label) {
+                violations.push(format!("labels contains unknown label '{label}'"));
+            }
+        }
+        if !violations.is_empty() {
+            return Err(ContractError { violations });
+        }
+        Ok(RunnerPlan {
+            tool_name: LifeGraphToolName::LifeAudit,
+            steps: vec![RunnerPlanStep {
+                target: RunnerPlanTarget::DataMemoryGraphRag,
+                action: "audit".into(),
+                payload: serde_json::json!({ "read_only": true }),
+            }],
+            requires_operator: false,
+            blocked_reasons: Vec::new(),
+        })
+    }
+
+    /// `life.tidy` is one governed write. Ids must be canonical `life:` ids
+    /// (a bare numeric id can only ever be the TARGET of a retire, where it
+    /// names the stray itself), rel types must be in the observe or
+    /// gardening vocabulary, and every action carries a reason so the node
+    /// records why it changed.
+    fn plan_tidy_ext(
+        &self,
+        input: LifeTidyInput,
+        ext: &ontology::OntologyExtensions,
+    ) -> Result<RunnerPlan, ContractError> {
+        use crate::audit::TidyAction;
+        let mut violations = Vec::new();
+        let ident_ok = |s: &str| {
+            !s.trim().is_empty()
+                && s.chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | ':' | '.'))
+        };
+        let canonical = |what: &str, id: &str, v: &mut Vec<String>| {
+            if !ident_ok(id) {
+                v.push(format!("{what} '{id}' is not a valid node id"));
+            } else if !id.contains(':') {
+                v.push(format!(
+                    "{what} '{id}' is not a canonical life:<label>:<slug> id — life.recall or \
+                     life.list first and use the exact id"
+                ));
+            }
+        };
+        let reason_ok = |r: &str, v: &mut Vec<String>| {
+            if r.trim().len() < 8 {
+                v.push("reason must say why (at least 8 characters)".into());
+            }
+        };
+        match &input.action {
+            TidyAction::RetireDuplicate {
+                duplicate_id,
+                keeper_id,
+                reason,
+            } => {
+                canonical("duplicate_id", duplicate_id, &mut violations);
+                canonical("keeper_id", keeper_id, &mut violations);
+                if duplicate_id == keeper_id {
+                    violations.push("duplicate_id and keeper_id are the same node".into());
+                }
+                reason_ok(reason, &mut violations);
+            }
+            TidyAction::Link {
+                from_id,
+                rel_type,
+                to_id,
+                reason,
+            } => {
+                canonical("from_id", from_id, &mut violations);
+                canonical("to_id", to_id, &mut violations);
+                let known = cypher::is_living_cycle_rel_type(rel_type)
+                    || cypher::agenda_rel_types().contains(&rel_type.as_str())
+                    || crate::audit::GARDENING_REL_TYPES.contains(&rel_type.as_str());
+                let _ = ext;
+                if !known || !rel_type.chars().all(|c| c.is_ascii_uppercase() || c == '_') {
+                    violations.push(format!(
+                        "rel_type '{rel_type}' is not in the edge vocabulary"
+                    ));
+                }
+                reason_ok(reason, &mut violations);
+            }
+            TidyAction::Resolve { node_id, reason } => {
+                canonical("node_id", node_id, &mut violations);
+                reason_ok(reason, &mut violations);
+            }
+            TidyAction::Retire { node_id, reason } => {
+                if !ident_ok(node_id) {
+                    violations.push(format!("node_id '{node_id}' is not a valid node id"));
+                }
+                reason_ok(reason, &mut violations);
+            }
+        }
+        if !violations.is_empty() {
+            return Err(ContractError { violations });
+        }
+        Ok(RunnerPlan {
+            tool_name: LifeGraphToolName::LifeTidy,
+            steps: vec![RunnerPlanStep {
+                target: RunnerPlanTarget::DataMemoryGraphRag,
+                action: input.action.kind().to_string(),
+                payload: serde_json::to_value(&input.action).unwrap_or_default(),
+            }],
+            requires_operator: false,
+            blocked_reasons: Vec::new(),
+        })
+    }
+
+    fn plan_list_ext(
+        &self,
+        input: LifeListInput,
+        ext: &ontology::OntologyExtensions,
+    ) -> Result<RunnerPlan, ContractError> {
+        let mut violations = Vec::new();
+        if let Some(name) = input.named_query.as_deref() {
+            if ontology::NamedMaintenanceQuery::parse(name).is_none() {
+                violations.push(format!(
+                    "named_query '{name}' is unknown (expected one of: {})",
+                    ontology::NamedMaintenanceQuery::ALL
+                        .iter()
+                        .map(|q| q.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ));
+            }
+            if input.has_filters() {
+                violations.push(
+                    "named_query cannot be combined with filters — a named query's \
+                     semantics must not be silently narrowed"
+                        .into(),
+                );
+            }
+        }
+        for label in &input.labels {
+            if !ontology::is_known_label(label) && !ext.is_extension_label(label) {
+                violations.push(format!("labels contains unknown label '{label}'"));
+            }
+            // Extension label names pass valid_extension_label_name at apply
+            // time, so interpolating them into filtered_cypher stays safe.
+        }
+        // Statuses and validation states are interpolated into cypher, so
+        // they must be plain identifiers — never quoted or spaced text.
+        let ident_ok =
+            |s: &str| !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+        for status in &input.statuses {
+            if !ident_ok(status) {
+                violations.push(format!("statuses contains invalid value '{status}'"));
+            }
+        }
+        for state in &input.validation_states {
+            if !ontology::VALIDATION_STATES.contains(&state.as_str()) {
+                violations.push(format!(
+                    "validation_states contains unknown state '{state}'"
+                ));
+            }
+        }
+        finish_validation(violations)?;
+
+        Ok(RunnerPlan {
+            tool_name: LifeGraphToolName::LifeList,
+            steps: vec![RunnerPlanStep {
+                target: RunnerPlanTarget::GraphDatasource,
+                action: "read".into(),
+                payload: serde_json::json!({ "read_only": true }),
+            }],
+            requires_operator: false,
+            blocked_reasons: Vec::new(),
+        })
+    }
+
+    fn plan_observe_ext(
+        &self,
+        input: LifeObserveInput,
+        ext: &ontology::OntologyExtensions,
+    ) -> Result<RunnerPlan, ContractError> {
         let mut violations = Vec::new();
         require_non_empty(&mut violations, "observation_id", &input.observation_id);
         if let Err(err) = input.evidence.validate() {
             violations.extend(err.violations);
         }
         for (idx, edge) in input.edges.iter().enumerate() {
+            let ext_rule = ext.edge(&edge.rel_type);
             if !cypher::is_living_cycle_rel_type(&edge.rel_type)
                 && !cypher::is_agenda_rel_type(&edge.rel_type)
+                && ext_rule.is_none()
             {
                 violations.push(format!(
                     "edges[{idx}].rel_type '{}' is not an allowed relation (expected one of {})",
@@ -1956,8 +2421,8 @@ impl MemoryGraphRagRunner {
                     cypher::observe_rel_type_vocabulary()
                 ));
             }
+            let source_label = &input.evidence.claim_ref.label;
             if let Some(rule) = cypher::agenda_edge_rule(&edge.rel_type) {
-                let source_label = &input.evidence.claim_ref.label;
                 if !rule.source_labels.contains(&source_label.as_str()) {
                     violations.push(format!(
                         "edges[{idx}].rel_type {} not allowed from {source_label} (allowed sources: {})",
@@ -1965,6 +2430,14 @@ impl MemoryGraphRagRunner {
                         rule.source_labels.join(", ")
                     ));
                 }
+            } else if let Some(rule) = ext_rule
+                && !rule.source_labels.iter().any(|l| l == source_label)
+            {
+                violations.push(format!(
+                    "edges[{idx}].rel_type {} not allowed from {source_label} (allowed sources: {})",
+                    rule.rel_type,
+                    rule.source_labels.join(", ")
+                ));
             }
             require_non_empty(
                 &mut violations,
@@ -2151,10 +2624,24 @@ impl MemoryGraphRagRunner {
         })
     }
 
-    fn plan_patch_propose(
+    fn plan_patch_propose_ext(
         &self,
         input: LifePatchProposalInput,
+        ext: &ontology::OntologyExtensions,
     ) -> Result<RunnerPlan, ContractError> {
+        // Ontology self-serve: reject a malformed extension spec at PROPOSE
+        // time — endpoints may reference core vocabulary, already-applied
+        // extensions, or labels introduced in this same spec.
+        if let Some(extension) = &input.ontology_extension {
+            if input.patch_kind != PatchKind::SchemaPatch {
+                return Err(ContractError {
+                    violations: vec!["ontology_extension requires patch_kind schema_patch".into()],
+                });
+            }
+            if let Err(violations) = extension.validate_against(ext) {
+                return Err(ContractError { violations });
+            }
+        }
         let evaluation = GrowthLoopPolicy::default().evaluate_patch(&input)?;
 
         let requires_operator = evaluation.requires_operator;
@@ -2237,6 +2724,95 @@ fn finish_validation(violations: Vec<String>) -> Result<(), ContractError> {
 
 #[cfg(test)]
 mod tests {
+    mod life_list {
+        use crate::ontology::NamedMaintenanceQuery;
+        use crate::{LifeGraphToolRequest, LifeListInput, MemoryGraphRagRunner};
+
+        fn plan(input: LifeListInput) -> Result<crate::RunnerPlan, crate::ContractError> {
+            MemoryGraphRagRunner::default().plan(LifeGraphToolRequest::LifeList(input))
+        }
+
+        #[test]
+        fn named_query_plans_read_only() {
+            let p = plan(LifeListInput {
+                named_query: Some("past_dated_events".into()),
+                ..Default::default()
+            })
+            .expect("valid named query must plan");
+            assert!(p.allowed());
+            assert!(!p.tool_name.mutates_graph());
+        }
+
+        #[test]
+        fn unknown_named_query_is_rejected_with_catalog() {
+            let err = plan(LifeListInput {
+                named_query: Some("everything_stale".into()),
+                ..Default::default()
+            })
+            .expect_err("unknown named query must fail validation");
+            assert!(err.violations[0].contains("aging_loops_oldest_first"));
+        }
+
+        #[test]
+        fn named_query_plus_filters_is_rejected() {
+            let err = plan(LifeListInput {
+                named_query: Some("recently_retired".into()),
+                labels: vec!["Event".into()],
+                ..Default::default()
+            })
+            .expect_err("named query with filters must fail");
+            assert!(err.violations[0].contains("cannot be combined"));
+        }
+
+        #[test]
+        fn unknown_label_and_quote_injection_are_rejected() {
+            let err = plan(LifeListInput {
+                labels: vec!["Widget".into()],
+                statuses: vec!["open'] OR true //".into()],
+                validation_states: vec!["maybe".into()],
+                ..Default::default()
+            })
+            .expect_err("unknown label, bad status, bad state must all fail");
+            assert_eq!(err.violations.len(), 3);
+        }
+
+        #[test]
+        fn filtered_cypher_excludes_terminal_by_default_and_binds_dates() {
+            let input = LifeListInput {
+                labels: vec!["OpenLoop".into()],
+                date_before: Some("2026-08-22T00:00:00Z".into()),
+                ..Default::default()
+            };
+            let c = input.filtered_cypher();
+            assert!(c.contains("'OpenLoop'"));
+            assert!(c.contains("'resolved'"), "terminal filter must apply: {c}");
+            assert!(c.contains("$date_before"));
+            assert!(
+                !c.contains("2026-08-22"),
+                "date values must ride as params, never interpolated"
+            );
+            assert!(c.contains("LIMIT 50"));
+        }
+
+        #[test]
+        fn include_terminal_drops_the_liveness_predicate() {
+            let input = LifeListInput {
+                include_terminal: true,
+                ..Default::default()
+            };
+            assert!(!input.filtered_cypher().contains("'abandoned'"));
+        }
+
+        #[test]
+        fn every_named_query_compiles_with_projection() {
+            for q in NamedMaintenanceQuery::ALL {
+                let c = q.cypher(5);
+                assert!(c.contains("LIMIT 5"), "{c}");
+                assert!(c.contains("MATCH"), "{c}");
+            }
+        }
+    }
+
     /// The EXACT payload shape recorded failing on the operator's live graph
     /// (hotel session_event, 2026-07-28). Guards against "fixed it in principle
     /// but not for the case that actually happened".
@@ -2433,6 +3009,8 @@ mod tests {
                 starts_at: Some("2026-06-04T00:00:00Z".into()),
                 ends_at: None,
             }),
+            due_at: None,
+            occurs_at: None,
             source_reliability: 0.82,
             conflict_ids: vec![],
             adjudication_status: AdjudicationStatus::Pending,
@@ -2863,7 +3441,11 @@ mod tests {
                 "life.commit",
                 "life.resolve",
                 "life.conflict",
-                "life.patch.propose"
+                "life.patch.propose",
+                "life.list",
+                "life.ontology",
+                "life.patch.apply",
+                "life.patch.list"
             ]
         );
         assert!(
@@ -3190,6 +3772,7 @@ mod tests {
                     operator_approved: false,
                     edge_specs: vec![],
                     autonomy_audit_id: None,
+                    ontology_extension: None,
                 },
             ))
             .expect("patch proposal should plan");
@@ -3243,6 +3826,7 @@ mod tests {
                 operator_approved: false,
                 edge_specs: vec![],
                 autonomy_audit_id: None,
+                ontology_extension: None,
             })
             .expect("low-risk patch should evaluate");
 
@@ -3270,6 +3854,7 @@ mod tests {
                 operator_approved: false,
                 edge_specs: vec![],
                 autonomy_audit_id: None,
+                ontology_extension: None,
             })
             .expect("medium-risk patch should evaluate");
 

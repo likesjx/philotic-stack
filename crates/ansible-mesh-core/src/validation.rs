@@ -354,9 +354,12 @@ fn validate_skill_name(name: &str, errors: &mut Vec<ValidationError>) {
     if name.len() > 64 {
         errors.push(ValidationError::SkillNameTooLong { len: name.len() });
     }
+    // Dots are the house naming style (`skill.crafting`, `life.steward`,
+    // `role.governance`) — the catalog seeds use them, so orchestrator-authored
+    // names must be allowed to as well.
     let invalid_chars = !name
         .chars()
-        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-');
+        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-' || c == '.');
     if invalid_chars {
         errors.push(ValidationError::InvalidSkillNameChars {
             skill_name: name.to_string(),
@@ -563,6 +566,19 @@ mod tests {
         assert!(errs
             .iter()
             .any(|e| matches!(e, ValidationError::InvalidSkillNameChars { .. })));
+    }
+
+    #[test]
+    fn dotted_skill_name_is_valid() {
+        // House style: seeded skills are dotted (skill.crafting, life.steward);
+        // orchestrator-authored names must not be flagged for the same shape.
+        let mut d = valid_draft();
+        d.skill_name = "smoke.skill-admin_live2".to_string();
+        let result = validate_skill_layer1(&d);
+        assert!(
+            !matches!(&result, Err(errs) if errs.iter().any(|e| matches!(e, ValidationError::InvalidSkillNameChars { .. }))),
+            "dotted names are valid: {result:?}"
+        );
     }
 
     #[test]

@@ -60,19 +60,34 @@ if [ -n "${AVAIL_GB:-}" ] && [ "$AVAIL_GB" -lt 5 ]; then
   echo "⚠ only ${AVAIL_GB}GB free — a wedged hotel is the usual symptom of a full disk" >&2
 fi
 
-echo "==> installing fresh binaries"
+# Install via a NEW inode (cp to a temp name, then mv over the target). An
+# in-place cp reuses the inode, and the kernel's per-inode code-signature
+# cache then kills the binary at spawn with OS_REASON_CODESIGNING — and the
+# ad-hoc `codesign -f` below does NOT reliably clear that cache (mac-jane was
+# down 14 launchd spawns in a row on 2026-08-13 until every binary was
+# re-installed through a fresh inode). Homebrew leaves the bin DIRECTORY
+# read-only, so it must be unlocked for the temp file to be created.
+install_new_inode() {
+  local src="$1" dst="$2" dir
+  dir="$(dirname "$dst")"
+  chmod u+w "$dir" 2>/dev/null || true
+  chmod u+w "$dst" 2>/dev/null || true
+  cp "$src" "$dst.new-inode"
+  mv -f "$dst.new-inode" "$dst"
+  chmod u-w "$dir" 2>/dev/null || true
+}
+
+echo "==> installing fresh binaries (new inodes)"
 installed=0
 for b in $(ls "$CBIN"); do
   if [ -f "$REL/$b" ]; then
-    chmod u+w "$CBIN/$b" 2>/dev/null || true
-    cp "$REL/$b" "$CBIN/$b"
+    install_new_inode "$REL/$b" "$CBIN/$b"
     installed=$((installed+1))
   else
     echo "    (leaving legacy binary untouched: $b)"
   fi
 done
-chmod u+w "$CWEB" 2>/dev/null || true
-cp "$REL/philotic-web" "$CWEB"
+install_new_inode "$REL/philotic-web" "$CWEB"
 echo "    $installed guest binaries + philotic-web installed"
 
 # Hash verification must run BEFORE the re-sign step: `codesign -f -s -`

@@ -970,9 +970,25 @@ impl GeminiProvider {
         Option<Value>,
     ) {
         let raw = Self::parse_response_text(status, body);
-        if let Ok(parsed) =
-            serde_json::from_str::<serde_json::Value>(Self::strip_json_code_fences(&raw))
-        {
+        let stripped = Self::strip_json_code_fences(&raw);
+        // Tolerate trailing text after the JSON object (models routinely
+        // append handles like "@agent:orchestrator" after the envelope):
+        // strict from_str rejects the WHOLE envelope for a suffix, silently
+        // dropping active_plan and every other structured field (live
+        // incident 2026-08-23: a plan-only gardening response fell back to
+        // raw text, the plan machinery never engaged, and the cron turn
+        // delivered nothing).
+        let parsed_value: Option<serde_json::Value> =
+            serde_json::from_str::<serde_json::Value>(stripped)
+                .ok()
+                .or_else(|| {
+                    serde_json::Deserializer::from_str(stripped)
+                        .into_iter::<serde_json::Value>()
+                        .next()
+                        .and_then(Result::ok)
+                        .filter(serde_json::Value::is_object)
+                });
+        if let Some(parsed) = parsed_value {
             let display = parsed
                 .get("display_text")
                 .and_then(Value::as_str)
@@ -1000,6 +1016,20 @@ impl GeminiProvider {
             let active_plan = parsed.get("active_plan").cloned();
             if let Some(display) = display {
                 return (display, spoken, concept, memory_candidate, active_plan);
+            }
+            // Plan-only response: a real plan but no display_text. Surface a
+            // minimal progress line instead of the raw JSON so the turn
+            // completes cleanly and the plan-eval/continuation loop drives
+            // step execution — previously this fell through to the raw-text
+            // fallback and the plan was lost.
+            if let Some(plan) = active_plan {
+                let goal = plan
+                    .get("goal")
+                    .and_then(Value::as_str)
+                    .filter(|s| !s.trim().is_empty())
+                    .unwrap_or("multi-step task");
+                let display = format!("Working on it: {goal}");
+                return (display, spoken, concept, memory_candidate, Some(plan));
             }
         }
         (raw, None, None, None, None)
@@ -3402,6 +3432,56 @@ mod tests {
             GeminiProvider::parse_structured_response(reqwest::StatusCode::OK, body);
         assert_eq!(display, "Hello there");
         assert_eq!(spoken.as_deref(), Some("Hello"));
+    }
+
+    /// Live regression (2026-08-23, gardening cron): the model emitted a
+    /// valid envelope followed by trailing text ("@agent:orchestrator").
+    /// Strict from_str rejected the whole thing, active_plan was silently
+    /// dropped, and the plan machinery never engaged.
+    #[test]
+    fn parse_structured_response_tolerates_trailing_text_after_envelope() {
+        let body = serde_json::json!({
+            "candidates": [{
+                "content": {
+                    "parts": [{
+                        "text": "{\"display_text\": \"On it\", \"active_plan\": {\"goal\": \"garden\", \"status\": \"executing\", \"steps\": []}}\n\n@agent:orchestrator"
+                    }]
+                }
+            }]
+        });
+        let (display, _, _, _, plan) =
+            GeminiProvider::parse_structured_response(reqwest::StatusCode::OK, body);
+        assert_eq!(display, "On it");
+        assert_eq!(
+            plan.as_ref()
+                .and_then(|p| p.get("goal"))
+                .and_then(|g| g.as_str()),
+            Some("garden")
+        );
+    }
+
+    /// A plan-only envelope (no display_text) must keep the plan and
+    /// synthesize a minimal progress line — previously it fell through to
+    /// the raw-text fallback, losing the plan AND showing the user raw JSON.
+    #[test]
+    fn parse_structured_response_plan_only_keeps_plan_and_synthesizes_display() {
+        let body = serde_json::json!({
+            "candidates": [{
+                "content": {
+                    "parts": [{
+                        "text": "{\"active_plan\": {\"goal\": \"Daily LifeGraph gardening\", \"status\": \"starting\", \"steps\": [{\"id\": 1, \"description\": \"ontology\", \"tool_name\": \"life.ontology\", \"status\": \"pending\"}]}}\n\n@agent:orchestrator"
+                    }]
+                }
+            }]
+        });
+        let (display, _, _, _, plan) =
+            GeminiProvider::parse_structured_response(reqwest::StatusCode::OK, body);
+        assert!(
+            display.contains("Daily LifeGraph gardening"),
+            "synthesized display should carry the goal: {display}"
+        );
+        assert!(!display.contains("active_plan"), "raw JSON must not leak");
+        assert!(plan.is_some(), "the plan must survive");
     }
 
     /// Invariant: a Gemini request payload must NEVER combine controlled

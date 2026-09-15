@@ -48,3 +48,33 @@ const _: () = assert!(
     "the hotel's zombie reaper must outlast the guest's own turn ceiling, \
      otherwise the guest can never report its own timeout"
 );
+
+/// Hard ceiling on a turn's TOTAL wall-clock age, measured from the moment the
+/// turn was created and including every second it spent parked waiting on the
+/// operator.
+///
+/// Every other budget here bounds one *phase* or one *park*, and each of them
+/// is re-stamped when the phase changes: `park_active_turn_for_approval` resets
+/// the approval clock, and `restore_parked_approval_turn` resets the aggregate
+/// active clock. That is correct for a single approval — operator deliberation
+/// should not be charged against agent work — but it means a turn that parks,
+/// is approved, and parks again resets *both* clocks on every round-trip, so
+/// nothing measured its true age. Live 2026-08-30: an `agent-bjork-01` turn
+/// looped park→approve→park for **2h58m48s** and was finally evicted reporting
+/// `elapsed_secs=302`, the age of the last park alone.
+///
+/// This is the one clock that is never re-stamped. It sits *above*
+/// [`TURN_ZOMBIE_REAP_SECS`] on purpose: the hotel's reaper only sees turns it
+/// still considers `running`, so a parked turn is invisible to it and the
+/// guest must bound itself. It is deliberately generous — a multi-step plan
+/// may legitimately need several operator approvals — but it is finite.
+pub const TURN_TOTAL_AGE_CEILING_SECS: u64 = 1800;
+
+/// A total-age ceiling at or below the hotel's reaper would make this clock
+/// redundant for ordinary turns and would cut short the operator deliberation
+/// it exists to permit.
+const _: () = assert!(
+    TURN_TOTAL_AGE_CEILING_SECS > TURN_ZOMBIE_REAP_SECS,
+    "the total-age ceiling must outlast the hotel reaper; it exists to bound \
+     the parked turns the reaper cannot see"
+);

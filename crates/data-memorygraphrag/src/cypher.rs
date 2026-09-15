@@ -35,6 +35,16 @@ const KNOWN_LABELS: &[&str] = &[
     "AttentionPatch",
     "SystemPatch",
     "StewardshipInstruction",
+    // Lived-world nouns (nouns-verbs expansion, 2026-08-25): concrete things
+    // an operator's life is made of, so loops/actions can be ABOUT something
+    // instead of restating it in prose.
+    "Place",
+    "Trip",
+    "Appointment",
+    "Subscription",
+    "Asset",
+    "CreativeWork",
+    "Moment",
 ];
 
 /// Living-cycle relationship types allowed on `life.observe` edge writes.
@@ -53,6 +63,11 @@ pub const LIVING_CYCLE_REL_TYPES: &[&str] = &[
     "RELATES_TO",
     "SCOPED_TO",
 ];
+
+/// Every agenda rel type (the endpoint-validated vocabulary).
+pub fn agenda_rel_types() -> Vec<&'static str> {
+    AGENDA_EDGE_RULES.iter().map(|r| r.rel_type).collect()
+}
 
 pub fn is_living_cycle_rel_type(rel_type: &str) -> bool {
     LIVING_CYCLE_REL_TYPES.contains(&rel_type)
@@ -104,6 +119,52 @@ pub const AGENDA_EDGE_RULES: &[AgendaEdgeRule] = &[
         rel_type: "SUPPORTS",
         source_labels: &["System", "Habit", "Routine"],
         target_labels: &["Goal", "Habit"],
+    },
+    // Lived-world verbs (nouns-verbs expansion, 2026-08-25). Same closed,
+    // endpoint-validated contract as the agenda six.
+    AgendaEdgeRule {
+        rel_type: "INVOLVES",
+        source_labels: &["Event", "Trip", "Appointment", "Moment", "Commitment"],
+        target_labels: &["Person"],
+    },
+    AgendaEdgeRule {
+        rel_type: "OCCURS_AT",
+        source_labels: &["Event", "Trip", "Appointment", "Moment", "Routine"],
+        target_labels: &["Place"],
+    },
+    AgendaEdgeRule {
+        rel_type: "PART_OF",
+        source_labels: &["Event", "Appointment", "Moment", "NextAction"],
+        target_labels: &["Trip", "Project"],
+    },
+    AgendaEdgeRule {
+        rel_type: "ABOUT",
+        source_labels: &[
+            "OpenLoop",
+            "NextAction",
+            "Commitment",
+            "Decision",
+            "Concern",
+            "Signal",
+        ],
+        target_labels: &[
+            "Person",
+            "Place",
+            "Asset",
+            "Subscription",
+            "CreativeWork",
+            "Trip",
+        ],
+    },
+    AgendaEdgeRule {
+        rel_type: "MAINTAINS",
+        source_labels: &["Routine", "Habit", "NextAction"],
+        target_labels: &["Asset", "CreativeWork", "Subscription"],
+    },
+    AgendaEdgeRule {
+        rel_type: "RENEWS",
+        source_labels: &["NextAction", "OpenLoop", "Commitment"],
+        target_labels: &["Subscription", "Asset"],
     },
 ];
 
@@ -174,6 +235,13 @@ pub struct ObserveCypher {
     pub claim_summary: String,
     pub observation_id: String,
     pub packet_id: String,
+    /// Structured temporal fields (ontology `DATE_PROPERTIES`). Empty-string
+    /// sentinel in params; the compiled CASE clauses preserve any existing
+    /// value on re-observe when the caller omits them.
+    pub due_at: Option<String>,
+    pub starts_at: Option<String>,
+    pub occurs_at: Option<String>,
+    pub ends_at: Option<String>,
     /// Muninn origin: engram ID of the first `MuninnEngram` source ref, if any.
     /// Preserved on the node so promotion (lifegraph-muninn-promotion seam)
     /// can trace a Life Graph fact back to its Muninn continuity source.
@@ -207,6 +275,9 @@ pub struct ObserveEdgeCypher {
 pub struct CommitCypher {
     pub query: String,
     pub node_id: String,
+    /// `node_id` parsed as a Memgraph internal id when it is all digits,
+    /// else -1 (the query's `$id_numeric >= 0` guard makes it inert).
+    pub node_id_numeric: i64,
     pub label: String,
     pub packet_id: String,
     pub confidence: f64,
@@ -261,8 +332,23 @@ pub struct RecallFeedbackCypher {
 }
 
 pub fn compile_observe(input: &LifeObserveInput, now_iso: &str) -> Result<ObserveCypher, String> {
+    compile_observe_with_extensions(
+        input,
+        now_iso,
+        &crate::ontology::OntologyExtensions::default(),
+    )
+}
+
+/// Extension-aware compile: runtime ontology extension labels are writable.
+/// Extension label names pass [`crate::ontology::valid_extension_label_name`]
+/// at apply time, so interpolation stays safe.
+pub fn compile_observe_with_extensions(
+    input: &LifeObserveInput,
+    now_iso: &str,
+    ext: &crate::ontology::OntologyExtensions,
+) -> Result<ObserveCypher, String> {
     let label = &input.evidence.claim_ref.label;
-    if !is_known_label(label) {
+    if !is_known_label(label) && !ext.is_extension_label(label) {
         return Err(format!("unknown Life Graph label: {label}"));
     }
 
@@ -344,15 +430,37 @@ pub fn compile_observe(input: &LifeObserveInput, now_iso: &str) -> Result<Observ
             "n.observed_role = CASE $observed_role WHEN '' THEN null ELSE $observed_role END, ",
             "n.origin_engram_id = CASE $origin_engram_id WHEN '' THEN null ELSE $origin_engram_id END, ",
             "n.origin_trust = CASE WHEN $origin_trust < 0.0 THEN null ELSE $origin_trust END, ",
-            "n.provenance_envelope = CASE $provenance_envelope WHEN '' THEN null ELSE $provenance_envelope END ",
+            "n.provenance_envelope = CASE $provenance_envelope WHEN '' THEN null ELSE $provenance_envelope END, ",
+            "n.due_at = CASE $due_at WHEN '' THEN null ELSE $due_at END, ",
+            "n.starts_at = CASE $starts_at WHEN '' THEN null ELSE $starts_at END, ",
+            "n.occurs_at = CASE $occurs_at WHEN '' THEN null ELSE $occurs_at END, ",
+            "n.ends_at = CASE $ends_at WHEN '' THEN null ELSE $ends_at END ",
             "ON MATCH SET ",
+            // A fresh observation of a node that is still proposed/inferred
+            // carries the newest lived fact — take it. Live 2026-09-12 16:49
+            // UTC: "My home address is 137 Harmony Grove Rd" re-observed
+            // `life:place:home`, the runner answered "observed", the model
+            // told the operator it was recorded, and the node kept its
+            // generic summary. Confirmed and retired nodes keep their
+            // summary (only life.commit may rewrite confirmed truth); the
+            // latest observation is still kept beside it so nothing is lost,
+            // and `summary_updated` tells the caller which happened.
+            "n.summary_updated = NOT coalesce(n.validation_state, '') IN ['confirmed', 'retired'], ",
+            "n.claim_summary = CASE WHEN coalesce(n.validation_state, '') IN ['confirmed', 'retired'] THEN n.claim_summary ELSE $claim_summary END, ",
+            "n.last_observed_summary = $claim_summary, ",
+            "n.observed_at = $observed_at, ",
             "n.confidence = $confidence, ",
             "n.observation_id = $observation_id, ",
             "n.packet_id = $packet_id, ",
             "n.observed_by = $observed_by, ",
             "n.observed_role = CASE $observed_role WHEN '' THEN null ELSE $observed_role END, ",
-            "n.provenance_envelope = CASE $provenance_envelope WHEN '' THEN n.provenance_envelope ELSE $provenance_envelope END ",
-            "RETURN n.id AS id, n.validation_state AS validation_state",
+            "n.provenance_envelope = CASE $provenance_envelope WHEN '' THEN n.provenance_envelope ELSE $provenance_envelope END, ",
+            "n.due_at = CASE $due_at WHEN '' THEN n.due_at ELSE $due_at END, ",
+            "n.starts_at = CASE $starts_at WHEN '' THEN n.starts_at ELSE $starts_at END, ",
+            "n.occurs_at = CASE $occurs_at WHEN '' THEN n.occurs_at ELSE $occurs_at END, ",
+            "n.ends_at = CASE $ends_at WHEN '' THEN n.ends_at ELSE $ends_at END ",
+            "RETURN n.id AS id, n.validation_state AS validation_state, ",
+            "coalesce(n.summary_updated, true) AS summary_updated",
         ),
         label = label
     );
@@ -372,6 +480,18 @@ pub fn compile_observe(input: &LifeObserveInput, now_iso: &str) -> Result<Observ
         claim_summary: input.evidence.claim_summary.clone(),
         observation_id: input.observation_id.clone(),
         packet_id: input.evidence.packet_id.clone(),
+        due_at: input.evidence.due_at.clone(),
+        starts_at: input
+            .evidence
+            .valid_time_range
+            .as_ref()
+            .and_then(|r| r.starts_at.clone()),
+        occurs_at: input.evidence.occurs_at.clone(),
+        ends_at: input
+            .evidence
+            .valid_time_range
+            .as_ref()
+            .and_then(|r| r.ends_at.clone()),
         origin_engram_id,
         origin_trust,
         provenance_envelope_json,
@@ -387,14 +507,41 @@ pub fn compile_observe(input: &LifeObserveInput, now_iso: &str) -> Result<Observ
 /// `upsert_target: true` (structural anchors, e.g. SCOPED_TO) instead `MERGE`
 /// the target so it always resolves.
 pub fn compile_observe_edges(input: &LifeObserveInput) -> Result<Vec<ObserveEdgeCypher>, String> {
+    compile_observe_edges_with_extensions(input, &crate::ontology::OntologyExtensions::default())
+}
+
+/// Endpoint rule resolved from either the compiled agenda table or a runtime
+/// ontology extension — one shape for the validation + query emission below.
+struct ResolvedEdgeRule<'a> {
+    rel_type: &'a str,
+    source_labels: Vec<&'a str>,
+    target_labels: Vec<&'a str>,
+}
+
+pub fn compile_observe_edges_with_extensions(
+    input: &LifeObserveInput,
+    ext: &crate::ontology::OntologyExtensions,
+) -> Result<Vec<ObserveEdgeCypher>, String> {
     let label = &input.evidence.claim_ref.label;
-    if !is_known_label(label) {
+    if !is_known_label(label) && !ext.is_extension_label(label) {
         return Err(format!("unknown Life Graph label: {label}"));
     }
 
     let mut compiled = Vec::with_capacity(input.edges.len());
     for edge in &input.edges {
-        let agenda_rule = agenda_edge_rule(&edge.rel_type);
+        let agenda_rule = agenda_edge_rule(&edge.rel_type)
+            .map(|rule| ResolvedEdgeRule {
+                rel_type: rule.rel_type,
+                source_labels: rule.source_labels.to_vec(),
+                target_labels: rule.target_labels.to_vec(),
+            })
+            .or_else(|| {
+                ext.edge(&edge.rel_type).map(|rule| ResolvedEdgeRule {
+                    rel_type: rule.rel_type.as_str(),
+                    source_labels: rule.source_labels.iter().map(String::as_str).collect(),
+                    target_labels: rule.target_labels.iter().map(String::as_str).collect(),
+                })
+            });
         if !is_living_cycle_rel_type(&edge.rel_type) && agenda_rule.is_none() {
             return Err(format!(
                 "unknown rel_type: {} (expected one of {})",
@@ -405,11 +552,11 @@ pub fn compile_observe_edges(input: &LifeObserveInput) -> Result<Vec<ObserveEdge
         if edge.target_id.trim().is_empty() {
             return Err("edge target_id must not be empty".to_string());
         }
-        // Agenda edges are endpoint-validated (living-cycle edges are not):
-        // wrong source label is a compile-time rejection; the target label
-        // constraint is baked into the MATCH below, so a wrong-label target
-        // writes nothing and surfaces as target_missing.
-        if let Some(rule) = agenda_rule
+        // Agenda and extension edges are endpoint-validated (living-cycle
+        // edges are not): wrong source label is a compile-time rejection; the
+        // target label constraint is baked into the MATCH below, so a
+        // wrong-label target writes nothing and surfaces as target_missing.
+        if let Some(rule) = &agenda_rule
             && !rule.source_labels.contains(&label.as_str())
         {
             return Err(format!(
@@ -499,9 +646,19 @@ pub fn compile_commit(input: &LifeCommitInput, now_iso: &str) -> Result<CommitCy
     // pattern as observed_role/origin_engram_id in compile_observe: an empty
     // string parameter means "leave the existing property untouched" rather
     // than overwriting it with null.
+    //
+    // MATCH, never MERGE: a commit promotes an EXISTING node to confirmed
+    // truth. MERGE on an unknown id manufactured a brand-new node — live
+    // 2026-09-11, Beacon committed `claim_ref.id = "557"` (the Memgraph
+    // internal id it had just read via graph.query) and the graph gained a
+    // stray `Commitment {id: "557"}` marked confirmed while the real node
+    // `life:commitment:mei_due_date_update_20260909` stayed proposed. The
+    // provider reports a miss when no row comes back. As a courtesy to that
+    // exact mistake, an all-digit id also matches the internal `id(n)`.
     let query = format!(
         concat!(
-            "MERGE (n:{label} {{id: $id}}) ",
+            "MATCH (n:{label}) ",
+            "WHERE n.id = $id OR ($id_numeric >= 0 AND id(n) = $id_numeric) ",
             "SET n.validation_state = 'confirmed', ",
             "n.last_confirmed_at = $confirmed_at, ",
             "n.confidence = $confidence, ",
@@ -518,6 +675,7 @@ pub fn compile_commit(input: &LifeCommitInput, now_iso: &str) -> Result<CommitCy
     Ok(CommitCypher {
         query,
         node_id: input.evidence.claim_ref.id.clone(),
+        node_id_numeric: numeric_node_id(&input.evidence.claim_ref.id),
         label: label.clone(),
         packet_id: input.evidence.packet_id.clone(),
         confidence: input.evidence.confidence as f64,
@@ -525,6 +683,136 @@ pub fn compile_commit(input: &LifeCommitInput, now_iso: &str) -> Result<CommitCy
         confirmed_at: now_iso.to_string(),
         loop_status: input.loop_status.clone().unwrap_or_default(),
         resolution_note: input.resolution_note.clone().unwrap_or_default(),
+    })
+}
+
+/// An all-digit claim id is (almost certainly) a Memgraph internal `id(n)`
+/// the model copied out of a `graph.query` row. Returns it as an integer so
+/// the commit can match on `id(n)`; -1 for anything else.
+fn numeric_node_id(id: &str) -> i64 {
+    let trimmed = id.trim();
+    if trimmed.is_empty() || !trimmed.bytes().all(|b| b.is_ascii_digit()) {
+        return -1;
+    }
+    trimmed.parse::<i64>().unwrap_or(-1)
+}
+
+/// Compiled `life.tidy` write: one parameterized statement per action.
+/// Every branch MATCHes existing nodes (never MERGE-creates), stamps
+/// `tidied_at`/`tidied_by`/`tidy_reason`, and never deletes. Retire and
+/// resolve refuse confirmed nodes unless the operator approved.
+#[derive(Debug, Clone)]
+pub struct TidyCypher {
+    pub query: String,
+    pub kind: &'static str,
+    pub a: String,
+    pub b: String,
+    pub reason: String,
+    pub now_iso: String,
+    pub actor: String,
+}
+
+pub fn compile_tidy(
+    action: &crate::audit::TidyAction,
+    operator_approved: bool,
+    actor: &str,
+    now_iso: &str,
+) -> Result<TidyCypher, String> {
+    use crate::audit::TidyAction;
+    let retirable = if operator_approved {
+        "true"
+    } else {
+        "coalesce(n.validation_state, 'inferred') IN ['proposed', 'inferred']"
+    };
+    let (query, kind, a, b, reason) = match action {
+        TidyAction::RetireDuplicate {
+            duplicate_id,
+            keeper_id,
+            reason,
+        } => (
+            format!(
+                concat!(
+                    "MATCH (n {{id: $a}}), (k {{id: $b}}) ",
+                    "WHERE {retirable} ",
+                    "SET n.validation_state = 'retired', n.retired_at = $now, n.retired_by = $actor, ",
+                    "n.resolution_note = $reason, n.tidied_at = $now, n.tidied_by = $actor, ",
+                    "n.tidy_reason = $reason ",
+                    "MERGE (k)-[r:SUPERSEDES]->(n) ",
+                    "ON CREATE SET r.tidied_at = $now, r.tidied_by = $actor ",
+                    "RETURN n.id AS id, k.id AS keeper_id, n.validation_state AS validation_state"
+                ),
+                retirable = retirable
+            ),
+            "retire_duplicate",
+            duplicate_id.clone(),
+            keeper_id.clone(),
+            reason.clone(),
+        ),
+        TidyAction::Link {
+            from_id,
+            rel_type,
+            to_id,
+            reason,
+        } => {
+            if !rel_type.chars().all(|c| c.is_ascii_uppercase() || c == '_') || rel_type.is_empty()
+            {
+                return Err(format!("rel_type '{rel_type}' is not an identifier"));
+            }
+            (
+                format!(
+                    concat!(
+                        "MATCH (n {{id: $a}}), (m {{id: $b}}) ",
+                        "MERGE (n)-[r:{rel}]->(m) ",
+                        "ON CREATE SET r.tidied_at = $now, r.tidied_by = $actor, r.tidy_reason = $reason ",
+                        "RETURN n.id AS id, m.id AS to_id, type(r) AS rel_type"
+                    ),
+                    rel = rel_type
+                ),
+                "link",
+                from_id.clone(),
+                to_id.clone(),
+                reason.clone(),
+            )
+        }
+        TidyAction::Resolve { node_id, reason } => (
+            concat!(
+                "MATCH (n {id: $a}) ",
+                "WHERE coalesce(n.validation_state, 'inferred') <> 'retired' ",
+                "SET n.status = 'resolved', n.resolved_at = $now, n.resolution_note = $reason, ",
+                "n.tidied_at = $now, n.tidied_by = $actor, n.tidy_reason = $reason ",
+                "RETURN n.id AS id, n.status AS status, n.validation_state AS validation_state"
+            )
+            .to_string(),
+            "resolve",
+            node_id.clone(),
+            String::new(),
+            reason.clone(),
+        ),
+        TidyAction::Retire { node_id, reason } => (
+            format!(
+                concat!(
+                    "MATCH (n) WHERE (n.id = $a OR toString(id(n)) = $a) AND {retirable} ",
+                    "SET n.validation_state = 'retired', n.retired_at = $now, n.retired_by = $actor, ",
+                    "n.resolution_note = $reason, n.tidied_at = $now, n.tidied_by = $actor, ",
+                    "n.tidy_reason = $reason ",
+                    "RETURN coalesce(n.id, toString(id(n))) AS id, n.validation_state AS validation_state"
+                ),
+                retirable = retirable
+            ),
+            "retire",
+            node_id.clone(),
+            String::new(),
+            reason.clone(),
+        ),
+    };
+    Ok(TidyCypher {
+        query,
+        kind,
+        a,
+        b,
+        reason,
+        now_iso: now_iso.to_string(),
+        actor: actor.to_string(),
     })
 }
 
@@ -1022,6 +1310,50 @@ mod tests {
                     vec!["System", "Habit", "Routine"],
                     vec!["Goal", "Habit"]
                 ),
+                (
+                    "INVOLVES",
+                    vec!["Event", "Trip", "Appointment", "Moment", "Commitment"],
+                    vec!["Person"]
+                ),
+                (
+                    "OCCURS_AT",
+                    vec!["Event", "Trip", "Appointment", "Moment", "Routine"],
+                    vec!["Place"]
+                ),
+                (
+                    "PART_OF",
+                    vec!["Event", "Appointment", "Moment", "NextAction"],
+                    vec!["Trip", "Project"]
+                ),
+                (
+                    "ABOUT",
+                    vec![
+                        "OpenLoop",
+                        "NextAction",
+                        "Commitment",
+                        "Decision",
+                        "Concern",
+                        "Signal"
+                    ],
+                    vec![
+                        "Person",
+                        "Place",
+                        "Asset",
+                        "Subscription",
+                        "CreativeWork",
+                        "Trip"
+                    ]
+                ),
+                (
+                    "MAINTAINS",
+                    vec!["Routine", "Habit", "NextAction"],
+                    vec!["Asset", "CreativeWork", "Subscription"]
+                ),
+                (
+                    "RENEWS",
+                    vec!["NextAction", "OpenLoop", "Commitment"],
+                    vec!["Subscription", "Asset"]
+                ),
             ],
             "agenda edge vocabulary changed — update LIFE_GRAPH_SCHEMA.md too"
         );
@@ -1042,7 +1374,7 @@ mod tests {
     use crate::{
         AdjudicationStatus, EvidencePacket, GraphRecordRef, LifeObserveInput, ReliabilityBasis,
         RetrievalFeedbackInput, RetrievalFeedbackRating, SourceKind, SourceRef, SourceReliability,
-        ValidationState,
+        TimeRange, ValidationState,
     };
 
     fn minimal_observe_input(label: &str) -> LifeObserveInput {
@@ -1071,6 +1403,8 @@ mod tests {
                 validation_state: ValidationState::Proposed,
                 observed_at: Some("2026-06-04T00:00:00Z".to_string()),
                 valid_time_range: None,
+                due_at: None,
+                occurs_at: None,
                 source_reliability: 0.9,
                 conflict_ids: vec![],
                 adjudication_status: AdjudicationStatus::NotNeeded,
@@ -1082,6 +1416,83 @@ mod tests {
             edges: vec![],
             provenance: None,
         }
+    }
+
+    /// Live 2026-09-12 16:49 UTC: re-observing `life:place:home` with the
+    /// operator's address kept the generic summary — ON MATCH never touched
+    /// `claim_summary`. A still-proposed node now takes the newest
+    /// observation; confirmed/retired nodes keep theirs; the caller learns
+    /// which via `summary_updated`.
+    #[test]
+    fn compile_observe_on_match_updates_summary_unless_confirmed() {
+        let compiled =
+            compile_observe(&minimal_observe_input("Place"), "2026-09-12T16:49:00Z").unwrap();
+        let q = &compiled.query;
+        let on_match = &q[q.find("ON MATCH SET").expect("on match clause")..];
+        assert!(on_match.contains(
+            "n.claim_summary = CASE WHEN coalesce(n.validation_state, '') IN ['confirmed', 'retired'] THEN n.claim_summary ELSE $claim_summary END"
+        ));
+        assert!(on_match.contains("n.last_observed_summary = $claim_summary"));
+        assert!(on_match.contains("n.observed_at = $observed_at"));
+        assert!(q.contains("coalesce(n.summary_updated, true) AS summary_updated"));
+    }
+
+    #[test]
+    fn commit_normalize_defaults_fills_packet_id() {
+        let mut evidence = minimal_observe_input("Commitment").evidence;
+        evidence.packet_id = String::new();
+        let mut input = crate::LifeCommitInput {
+            evidence,
+            operator_approved: true,
+            loop_status: None,
+            resolution_note: None,
+        };
+        input.normalize_defaults();
+        assert!(input.evidence.packet_id.starts_with("commit-"));
+        // Validation would have rejected the empty id before.
+        assert!(input.evidence.validate().is_ok());
+        // A caller-supplied id is left alone.
+        input.evidence.packet_id = "pkt:mine".into();
+        input.normalize_defaults();
+        assert_eq!(input.evidence.packet_id, "pkt:mine");
+    }
+
+    /// Structured temporal fields must ride the observe write (ontology gap
+    /// G1 closure): dates the caller extracts land as node properties, and
+    /// omitted dates preserve existing values on re-observe instead of
+    /// clobbering them to null.
+    #[test]
+    fn compile_observe_writes_structured_dates_and_preserves_on_match() {
+        let mut input = minimal_observe_input("Commitment");
+        input.evidence.due_at = Some("2026-09-01T00:00:00Z".to_string());
+        input.evidence.occurs_at = Some("2026-09-02T00:00:00Z".to_string());
+        input.evidence.valid_time_range = Some(TimeRange {
+            starts_at: Some("2026-08-30T00:00:00Z".to_string()),
+            ends_at: Some("2026-09-03T00:00:00Z".to_string()),
+        });
+        let compiled = compile_observe(&input, "2026-08-22T12:00:00Z").unwrap();
+
+        assert_eq!(compiled.due_at.as_deref(), Some("2026-09-01T00:00:00Z"));
+        assert_eq!(compiled.starts_at.as_deref(), Some("2026-08-30T00:00:00Z"));
+        assert_eq!(compiled.occurs_at.as_deref(), Some("2026-09-02T00:00:00Z"));
+        assert_eq!(compiled.ends_at.as_deref(), Some("2026-09-03T00:00:00Z"));
+        // ON CREATE nulls the sentinel; ON MATCH preserves the prior value.
+        assert!(
+            compiled
+                .query
+                .contains("n.due_at = CASE $due_at WHEN '' THEN null")
+        );
+        assert!(
+            compiled
+                .query
+                .contains("n.due_at = CASE $due_at WHEN '' THEN n.due_at")
+        );
+
+        // Omitted dates compile to None → empty-sentinel params.
+        let bare =
+            compile_observe(&minimal_observe_input("Signal"), "2026-08-22T12:00:00Z").unwrap();
+        assert!(bare.due_at.is_none());
+        assert!(bare.starts_at.is_none());
     }
 
     #[test]
@@ -1596,7 +2007,16 @@ mod tests {
 
         assert_eq!(compiled.label, "OpenLoop");
         assert_eq!(compiled.confirmed_at, "2026-06-05T09:00:00Z");
-        assert!(compiled.query.contains("MERGE (n:OpenLoop {id: $id})"));
+        // MATCH, not MERGE: a commit promotes an existing node and must never
+        // manufacture one from an unknown id (live 2026-09-11: stray
+        // `Commitment {id: "557"}`).
+        assert!(
+            compiled
+                .query
+                .contains("MATCH (n:OpenLoop) WHERE n.id = $id")
+        );
+        assert!(!compiled.query.contains("MERGE"));
+        assert_eq!(compiled.node_id_numeric, -1, "life: ids are not numeric");
         assert!(compiled.query.contains("n.validation_state = 'confirmed'"));
         // No loop_status supplied — the sentinel is empty, so the query must
         // preserve the existing n.status rather than clobbering it with null.
@@ -1640,6 +2060,31 @@ mod tests {
                 .query
                 .contains("n.resolution_note = CASE $resolution_note")
         );
+    }
+
+    #[test]
+    fn compile_commit_numeric_id_matches_internal_id() {
+        // The model copied Memgraph's internal id out of a graph.query row.
+        // Match it on id(n) rather than creating `Commitment {id: "557"}`.
+        let mut evidence = minimal_observe_input("Commitment").evidence;
+        evidence.validation_state = ValidationState::Confirmed;
+        evidence.claim_ref.id = "557".to_string();
+        let compiled = compile_commit(
+            &crate::LifeCommitInput {
+                evidence,
+                operator_approved: true,
+                loop_status: None,
+                resolution_note: None,
+            },
+            "2026-09-11T13:28:11Z",
+        )
+        .unwrap();
+        assert_eq!(compiled.node_id_numeric, 557);
+        assert!(compiled.query.contains("id(n) = $id_numeric"));
+        assert_eq!(numeric_node_id(" 12 "), 12);
+        assert_eq!(numeric_node_id("life:open_loop:x"), -1);
+        assert_eq!(numeric_node_id(""), -1);
+        assert_eq!(numeric_node_id("12a"), -1);
     }
 
     #[test]
@@ -1724,6 +2169,7 @@ mod tests {
                 operator_approved: false,
                 edge_specs: vec![],
                 autonomy_audit_id: None,
+                ontology_extension: None,
             },
             "2026-06-05T09:00:00Z",
         )
@@ -1845,6 +2291,7 @@ mod tests {
             operator_approved: false,
             edge_specs: vec![bridge_spec()],
             autonomy_audit_id: Some("autonomy:graph.bridge_edges:abc".into()),
+            ontology_extension: None,
         };
 
         let compiled = compile_patch_proposal_with_status(

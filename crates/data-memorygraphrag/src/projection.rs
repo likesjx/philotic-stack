@@ -23,14 +23,19 @@ use serde_json::Value;
 ///
 /// Must stay in sync with the index names created by V001 migration.
 pub fn index_name(space: &SemanticSpace, label: &str) -> String {
-    let prefix = match space {
+    format!("{}__{}", space_prefix(space), label)
+}
+
+/// The index-name prefix for a semantic space (matches
+/// `ontology::SEMANTIC_SPACE_PREFIXES` and the V00x migrations).
+pub fn space_prefix(space: &SemanticSpace) -> &'static str {
+    match space {
         SemanticSpace::LifeEventSemantic => "life_event_semantic",
         SemanticSpace::GoalSystemSemantic => "goal_system_semantic",
         SemanticSpace::SkillToolSemantic => "skill_tool_semantic",
         SemanticSpace::RolePersonSemantic => "role_person_semantic",
         SemanticSpace::MemoryBridgeSemantic => "memory_bridge_semantic",
-    };
-    format!("{}__{}", prefix, label)
+    }
 }
 
 /// All node labels that participate in a given semantic space.
@@ -39,7 +44,15 @@ pub fn index_name(space: &SemanticSpace, label: &str) -> String {
 /// V001 migration index names.
 pub fn labels_for_space(space: &SemanticSpace) -> &'static [&'static str] {
     match space {
-        SemanticSpace::LifeEventSemantic => &["Event", "Signal", "OpenLoop"],
+        SemanticSpace::LifeEventSemantic => &[
+            "Event",
+            "Signal",
+            "OpenLoop",
+            "Trip",
+            "Appointment",
+            "Moment",
+            "Place",
+        ],
         SemanticSpace::GoalSystemSemantic => &[
             "Goal",
             "System",
@@ -47,6 +60,9 @@ pub fn labels_for_space(space: &SemanticSpace) -> &'static [&'static str] {
             "Project",
             "Routine",
             "NextAction",
+            "Subscription",
+            "Asset",
+            "CreativeWork",
         ],
         SemanticSpace::SkillToolSemantic => &[
             "GrowthHypothesis",
@@ -77,10 +93,11 @@ pub fn labels_for_space(space: &SemanticSpace) -> &'static [&'static str] {
 /// or `None` if the label has no vector index.
 pub fn embedding_space_for_label(label: &str) -> Option<&'static str> {
     match label {
-        "Event" | "Signal" | "OpenLoop" => Some("life_event_semantic"),
-        "Goal" | "System" | "Habit" | "Project" | "Routine" | "NextAction" => {
-            Some("goal_system_semantic")
+        "Event" | "Signal" | "OpenLoop" | "Trip" | "Appointment" | "Moment" | "Place" => {
+            Some("life_event_semantic")
         }
+        "Goal" | "System" | "Habit" | "Project" | "Routine" | "NextAction" | "Subscription"
+        | "Asset" | "CreativeWork" => Some("goal_system_semantic"),
         "GrowthHypothesis" | "GrowthExperiment" | "DriftFinding" | "CapabilityPatch"
         | "SkillPatch" | "ToolPatch" | "SchemaPatch" | "AttentionPatch" | "SystemPatch" => {
             Some("skill_tool_semantic")
@@ -177,20 +194,14 @@ impl VectorHit {
     }
 
     pub fn is_retired(&self) -> bool {
-        // "resolved" is what life.commit/life.resolve write on loop closure
-        // (cypher.rs `loop_status` commit path), so it must terminate recall
-        // the same way retired/done do. `loop_status` is checked as a
-        // fallback because production nodes exist where the closure landed
-        // on that property instead of `status`.
+        // The terminal vocabulary lives in `ontology` (single source):
+        // `resolved` is what life.commit/life.resolve write on loop closure
+        // (PR #434 regression), and the legacy `loop_status` alias is read
+        // because production nodes exist where the closure landed there.
         matches!(self.validation_state(), ValidationState::Retired)
-            || matches!(
-                self.prop_str("status").unwrap_or(""),
-                "retired" | "done" | "fulfilled" | "abandoned" | "resolved"
-            )
-            || matches!(
-                self.prop_str("loop_status").unwrap_or(""),
-                "retired" | "done" | "fulfilled" | "abandoned" | "resolved"
-            )
+            || crate::ontology::STATUS_PROPERTIES
+                .iter()
+                .any(|prop| crate::ontology::is_terminal_status(self.prop_str(prop).unwrap_or("")))
     }
 }
 
@@ -603,6 +614,8 @@ pub fn project_hit_to_evidence_packet(hit: &VectorHit, generated_at: &str) -> Ev
         validation_state: hit.validation_state(),
         observed_at: hit.prop_str("observed_at").map(str::to_string),
         valid_time_range: None,
+        due_at: None,
+        occurs_at: None,
         source_reliability: hit.confidence(),
         conflict_ids: Vec::new(),
         adjudication_status: AdjudicationStatus::NotNeeded,
@@ -1247,7 +1260,7 @@ mod tests {
         // relations (LIFE_GRAPH_ACTIVE S2) so recall expansion traverses
         // goal/commitment topology too.
         assert!(cypher.contains(
-            "MATCH (n)-[r:OWNS|SHAPES|SETS|SPAWNS|RELATES_TO|SCOPED_TO|ADVANCES|BLOCKED_BY|NEEDS_FOLLOWUP|PROMISED_TO|CONTAINS|SUPPORTS]-(related)"
+            "MATCH (n)-[r:OWNS|SHAPES|SETS|SPAWNS|RELATES_TO|SCOPED_TO|ADVANCES|BLOCKED_BY|NEEDS_FOLLOWUP|PROMISED_TO|CONTAINS|SUPPORTS|INVOLVES|OCCURS_AT|PART_OF|ABOUT|MAINTAINS|RENEWS]-(related)"
         ));
         assert!(cypher.contains("n.id IN ['l:ol:a', 'l:ol:b\\'quote']"));
         assert!(cypher.contains("coalesce(related.validation_state, 'inferred') <> 'retired'"));
@@ -1271,7 +1284,13 @@ mod tests {
                 "NEEDS_FOLLOWUP",
                 "PROMISED_TO",
                 "CONTAINS",
-                "SUPPORTS"
+                "SUPPORTS",
+                "INVOLVES",
+                "OCCURS_AT",
+                "PART_OF",
+                "ABOUT",
+                "MAINTAINS",
+                "RENEWS"
             ]
         );
         assert_eq!(

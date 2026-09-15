@@ -404,3 +404,26 @@
     state: started
     daemon_reload: true
   when: muninn_enabled | default(true) | bool
+
+# ── Philotic heartbeat cleanup ───────────────────────────────────────────────
+# The heartbeat now ticks inside the life-graph-runner (data-memorygraphrag),
+# shipping with every build. Remove the retired systemd timer + script so a
+# host deployed before the port doesn't keep a second sensor running.
+
+- name: Stop and disable retired philotic heartbeat timer
+  systemd:
+    name: philotic-heartbeat.timer
+    enabled: false
+    state: stopped
+  failed_when: false
+
+- name: Remove retired philotic heartbeat files
+  file:
+    path: "{{ item }}"
+    state: absent
+  loop:
+    - /etc/systemd/system/philotic-heartbeat.timer
+    - /etc/systemd/system/philotic-heartbeat.service
+    - /usr/local/bin/philotic-heartbeat.py
+  notify:
+    - Reload systemd

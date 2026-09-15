@@ -7,13 +7,13 @@ use data_memorygraphrag::projection;
 use data_memorygraphrag::zoning;
 use data_memorygraphrag::{
     AdjudicationStatus, ConflictHandoff, ContextPacket, EvidencePacket, FeedbackEdgeSpec,
-    GraphRecordRef, LifeCommitInput, LifeGraphToolRequest, LifeObserveBatchInput, LifeObserveInput,
-    LifePatchApplyInput, LifePatchListInput, LifePatchProposalInput, LifeRecallStatsInput,
-    LifeResolveInput, LifeViewNeighborhoodInput, LifeViewNodeInput, MAX_OBSERVE_BATCH,
-    MemoryGraphRagRunner, PatchApplyDecision, PatchGate, PatchKind, PatchRisk, PolicyFilter,
-    RankingWeights, ReliabilityBasis, RetrievalFeedbackInput, RetrievalFeedbackRating,
-    RetrievalQuery, RetrievalStrategy, RunnerConfig, RunnerPlanTarget, SemanticSpace, SourceKind,
-    SourceRef, SourceReliability, ValidationState, feedback_edge_specs,
+    GraphRecordRef, LifeCommitInput, LifeGraphToolRequest, LifeListInput, LifeObserveBatchInput,
+    LifeObserveInput, LifePatchApplyInput, LifePatchListInput, LifePatchProposalInput,
+    LifeRecallStatsInput, LifeResolveInput, LifeViewNeighborhoodInput, LifeViewNodeInput,
+    MAX_OBSERVE_BATCH, MemoryGraphRagRunner, PatchApplyDecision, PatchGate, PatchKind, PatchRisk,
+    PolicyFilter, RankingWeights, ReliabilityBasis, RetrievalFeedbackInput,
+    RetrievalFeedbackRating, RetrievalQuery, RetrievalStrategy, RunnerConfig, RunnerPlanTarget,
+    SemanticSpace, SourceKind, SourceRef, SourceReliability, ValidationState, feedback_edge_specs,
 };
 use datasource::controller::{
     CONTRACT_ERROR_MARKER, DatasourceProvider, DatasourceTask, ProviderOutput, TaskKind,
@@ -309,6 +309,7 @@ impl AutonomyGate for HotelAutonomyGate {
             action_summary: action_summary.to_string(),
             evidence: evidence.to_string(),
             reversal_hint: reversal_hint.to_string(),
+            filing: false,
         })
         .await?;
         Ok(AutonomyDecision::from_response_data(&data))
@@ -513,6 +514,141 @@ impl LifeGraphProvider {
     /// `data_memorygraphrag::hygiene` for the pure planning logic; this just
     /// wires it to the shared connection pool. Called from the runner's
     /// internal timer (`main.rs`) — never on the request path.
+    /// Load the runtime ontology extensions (governed self-serve vocabulary).
+    /// Single-node read; absence or parse failure degrades to empty — the
+    /// compiled core vocabulary always works.
+    pub async fn load_ontology_extensions(
+        &self,
+    ) -> data_memorygraphrag::ontology::OntologyExtensions {
+        let Ok(graph) = self.connect().await else {
+            return Default::default();
+        };
+        let Ok(mut rows) = graph
+            .execute(query(
+                "MATCH (n:OntologyExtension {id: 'ontology:extensions'}) \
+                 RETURN n.extensions_json AS extensions_json",
+            ))
+            .await
+        else {
+            return Default::default();
+        };
+        match rows.next().await {
+            Ok(Some(row)) => {
+                let raw: String = row.get("extensions_json").unwrap_or_default();
+                serde_json::from_str(&raw).unwrap_or_default()
+            }
+            _ => Default::default(),
+        }
+    }
+
+    /// Persist the merged extension set (bumps version, stamps updated_at).
+    async fn persist_ontology_extensions(
+        &self,
+        ext: &data_memorygraphrag::ontology::OntologyExtensions,
+    ) -> Result<()> {
+        let graph = self.connect().await?;
+        let json = serde_json::to_string(ext)?;
+        let now = chrono::Utc::now().to_rfc3339();
+        let mut rows = graph
+            .execute(
+                query(
+                    "MERGE (n:OntologyExtension {id: 'ontology:extensions'}) \
+                     SET n.extensions_json = $json, \
+                     n.version = coalesce(n.version, 0) + 1, \
+                     n.updated_at = $now \
+                     RETURN n.version AS version",
+                )
+                .param("json", json.as_str())
+                .param("now", now.as_str()),
+            )
+            .await?;
+        let _ = rows.next().await?;
+        Ok(())
+    }
+
+    /// Create the vector index for each extension label. Labels passed here
+    /// have already passed `valid_extension_label_name`, and spaces are from
+    /// the closed prefix set — safe to interpolate. An already-existing
+    /// index is tolerated (re-apply / re-merge).
+    async fn create_extension_indexes(
+        &self,
+        labels: &[data_memorygraphrag::ontology::ExtensionLabel],
+    ) -> Vec<String> {
+        let mut created = Vec::new();
+        let Ok(graph) = self.connect().await else {
+            return created;
+        };
+        for label in labels {
+            let index_name = format!("{}__{}", label.space, label.name);
+            let cypher = format!(
+                "CREATE VECTOR INDEX {index_name} ON :{name}(embedding) WITH CONFIG \
+                 {{\"dimension\": {dims}, \"capacity\": 10000, \"metric\": \"cos\"}}",
+                name = label.name,
+                dims = LIFE_GRAPH_EMBEDDING_DIMS,
+            );
+            match graph.execute(query(&cypher)).await {
+                Ok(mut rows) => {
+                    let _ = rows.next().await;
+                    created.push(index_name);
+                }
+                Err(e) => {
+                    let msg = e.to_string();
+                    if msg.contains("already exists") {
+                        created.push(index_name);
+                    } else {
+                        warn!(index = index_name.as_str(), error = %msg,
+                              "extension index creation failed");
+                    }
+                }
+            }
+        }
+        created
+    }
+
+    /// One heartbeat tick of the reminders sensor (hotel-managed, see
+    /// `data_memorygraphrag::heartbeat`): select due un-dispatched nodes,
+    /// stamp them, return the pre-formatted delivery message — or None on a
+    /// quiet tick. Stamp-then-emit: at-most-once by construction; a lost
+    /// emit is caught by the daily-brief safety net, never duplicated.
+    pub async fn heartbeat_reminders_tick(&self, window_secs: u64) -> Result<Option<String>> {
+        use data_memorygraphrag::heartbeat;
+        let now = chrono::Utc::now();
+        let result = self
+            .execute_cypher(&heartbeat::due_reminders_cypher(now, window_secs))
+            .await?;
+        let rows = result
+            .get("rows")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        if rows.is_empty() {
+            return Ok(None);
+        }
+        let tz = heartbeat::operator_tz();
+        let mut ids = Vec::new();
+        let mut lines = Vec::new();
+        for row in &rows {
+            let id = row.get("id").and_then(Value::as_str).unwrap_or("");
+            if id.is_empty() {
+                continue;
+            }
+            let due = row.get("due_at").and_then(Value::as_str).unwrap_or("");
+            let claim = row.get("claim").and_then(Value::as_str).unwrap_or("");
+            ids.push(id.to_string());
+            lines.push(heartbeat::format_reminder_line(claim, due, id, &tz));
+        }
+        if ids.is_empty() {
+            return Ok(None);
+        }
+        self.execute_cypher(&heartbeat::stamp_cypher(&ids, now))
+            .await?;
+        info!(
+            reminders = ids.len(),
+            "heartbeat: reminders selected, stamped, handing to delivery"
+        );
+        Ok(Some(heartbeat::dispatch_message(&lines)))
+    }
+
     pub async fn hygiene_sweep(&self) -> Result<data_memorygraphrag::hygiene::SweepSummary> {
         let graph = self.connect().await?;
         data_memorygraphrag::hygiene::sweep(&graph).await
@@ -544,6 +680,17 @@ impl DatasourceProvider for LifeGraphProvider {
             "life.recall.stats" => self.handle_recall_stats(task).await,
             "life.view.node" => self.handle_view_node(task).await,
             "life.view.neighborhood" => self.handle_view_neighborhood(task).await,
+            "life.list" => self.handle_list(task).await,
+            "life.audit" => self.handle_audit(task).await,
+            "life.tidy" => self.handle_tidy(task).await,
+            "life.ontology" => {
+                let ext = self.load_ontology_extensions().await;
+                Ok(ProviderOutput::ResultSet(json!({
+                    "status": "ok",
+                    "read_only": true,
+                    "ontology": data_memorygraphrag::ontology::ontology_document_with(&ext),
+                })))
+            }
             other => {
                 warn!(tool = other, "life.* tool not yet implemented in runner");
                 Ok(ProviderOutput::ResultSet(json!({
@@ -587,6 +734,7 @@ fn change_notification_for(kind: &str, data: &Value) -> Option<Value> {
     }
     let change_kind = match kind {
         "life.observe" => "observed",
+        "life.tidy" => "tidied",
         "life.commit" => "committed",
         "life.resolve" | "life.conflict.resolve" => "resolved",
         "life.conflict" | "life.conflict.handle" => "conflict_opened",
@@ -662,9 +810,11 @@ impl LifeGraphProvider {
         // before plan/validate, which require non-empty ids.
         input.normalize_defaults();
 
+        // Runtime ontology extensions are full vocabulary on the write path.
+        let ext = self.load_ontology_extensions().await;
         let plan = self
             .runner
-            .plan(LifeGraphToolRequest::LifeObserve(input.clone()))
+            .plan_with_extensions(LifeGraphToolRequest::LifeObserve(input.clone()), &ext)
             .map_err(|e| {
                 anyhow::anyhow!("{CONTRACT_ERROR_MARKER} life.observe plan validation failed: {e}")
             })?;
@@ -677,14 +827,16 @@ impl LifeGraphProvider {
         }
 
         let now = chrono::Utc::now().to_rfc3339();
-        let compiled = cypher::compile_observe(&input, &now).map_err(|e| {
-            anyhow::anyhow!("{CONTRACT_ERROR_MARKER} Cypher compilation failed: {e}")
-        })?;
+        let compiled =
+            cypher::compile_observe_with_extensions(&input, &now, &ext).map_err(|e| {
+                anyhow::anyhow!("{CONTRACT_ERROR_MARKER} Cypher compilation failed: {e}")
+            })?;
         // Compile edges up-front so an unknown rel_type rejects the request
         // before any node write happens.
-        let compiled_edges = cypher::compile_observe_edges(&input).map_err(|e| {
-            anyhow::anyhow!("{CONTRACT_ERROR_MARKER} edge Cypher compilation failed: {e}")
-        })?;
+        let compiled_edges =
+            cypher::compile_observe_edges_with_extensions(&input, &ext).map_err(|e| {
+                anyhow::anyhow!("{CONTRACT_ERROR_MARKER} edge Cypher compilation failed: {e}")
+            })?;
 
         let graph = self.connect().await?;
 
@@ -716,7 +868,13 @@ impl LifeGraphProvider {
             .param(
                 "provenance_envelope",
                 compiled.provenance_envelope_json.as_deref().unwrap_or(""),
-            );
+            )
+            // Structured temporal fields (ontology DATE_PROPERTIES); empty
+            // sentinel preserves any existing value on re-observe.
+            .param("due_at", compiled.due_at.as_deref().unwrap_or(""))
+            .param("starts_at", compiled.starts_at.as_deref().unwrap_or(""))
+            .param("occurs_at", compiled.occurs_at.as_deref().unwrap_or(""))
+            .param("ends_at", compiled.ends_at.as_deref().unwrap_or(""));
 
         let mut rows = bounded_query("observe_node_write", graph.execute(q)).await?;
         let first_row = rows.next().await?;
@@ -725,6 +883,14 @@ impl LifeGraphProvider {
             .as_ref()
             .and_then(|r| r.get::<String>("id").ok())
             .unwrap_or_else(|| compiled.node_id.clone());
+        // False only when the node already existed as confirmed/retired and
+        // kept its summary (the observation is retained as
+        // `last_observed_summary`); the caller must not report the new text
+        // as recorded in that case.
+        let summary_updated = first_row
+            .as_ref()
+            .and_then(|r| r.get::<bool>("summary_updated").ok())
+            .unwrap_or(true);
 
         info!(
             node_id = %node_id,
@@ -732,6 +898,7 @@ impl LifeGraphProvider {
             observation_id = %compiled.observation_id,
             packet_id = %compiled.packet_id,
             observed_by = %compiled.observed_by,
+            summary_updated,
             "life.observe: proposed evidence node written to Memgraph"
         );
 
@@ -833,6 +1000,10 @@ impl LifeGraphProvider {
             "origin_engram_id": compiled.origin_engram_id,
             "origin_trust": compiled.origin_trust,
             "embed_status": embed_status,
+            "summary_updated": summary_updated,
+            "summary_note": if summary_updated { Value::Null } else {
+                Value::String("node is confirmed/retired: claim_summary kept, this observation stored as last_observed_summary — use life.commit to rewrite confirmed truth".into())
+            },
             "edges": edge_reports,
         })))
     }
@@ -988,10 +1159,11 @@ impl LifeGraphProvider {
         // batch here would contradict the instructions the model is acting on.
         let mut rejected: Vec<Value> = Vec::new();
         let mut planned_ok: Vec<(usize, LifeObserveInput)> = Vec::with_capacity(requested);
+        let ext = self.load_ontology_extensions().await;
         for (index, observation) in input.observations.into_iter().enumerate() {
             match self
                 .runner
-                .plan(LifeGraphToolRequest::LifeObserve(observation.clone()))
+                .plan_with_extensions(LifeGraphToolRequest::LifeObserve(observation.clone()), &ext)
             {
                 Ok(plan) if !plan.allowed() => rejected.push(json!({
                     "index": index,
@@ -1178,7 +1350,25 @@ impl LifeGraphProvider {
     async fn handle_recall(&self, task: &DatasourceTask) -> Result<ProviderOutput> {
         let query_val: RetrievalQuery = serde_json::from_value(task.parameters.clone())
             .context("failed to parse life.recall parameters as RetrievalQuery")?;
-        let named_strategy = NamedRecallStrategy::from_task(task);
+        let mut named_strategy = NamedRecallStrategy::from_task(task);
+        // A bare call — `{query_id, query_text}` and nothing else — lands on
+        // SemanticPivot with no pivots, whose dispatch loop then runs zero
+        // queries and whose fallback labels come from the same empty list.
+        // The result was a well-formed, "ok", EMPTY packet on every explicit
+        // life.recall Beacon made on 2026-09-11, so the model re-observed
+        // facts already in the graph and fell back to raw Cypher to find a
+        // node. There is a query_text and an embedding: sweep the core
+        // spaces with it instead of silently returning nothing.
+        if matches!(named_strategy, NamedRecallStrategy::SemanticPivot)
+            && query_val.semantic_pivots.is_empty()
+        {
+            info!(
+                query_id = %query_val.query_id,
+                "life.recall: no named_strategy/operator_intent and no semantic_pivots; \
+                 dispatching as current_prompt_semantic instead of an empty pivot sweep"
+            );
+            named_strategy = NamedRecallStrategy::CurrentPromptSemantic;
+        }
         if !named_strategy.agrees_with(&query_val.strategy) {
             warn!(
                 named_strategy = named_strategy.as_str(),
@@ -1357,12 +1547,19 @@ impl LifeGraphProvider {
                 .await?;
             }
             NamedRecallStrategy::SemanticPivot => {
+                // Full-space sweeps include runtime ontology extension labels
+                // (their vector indexes were created at patch apply).
+                let ext = self.load_ontology_extensions().await;
                 for pivot in &query_val.semantic_pivots {
-                    for label in projection::labels_for_space(&pivot.space) {
+                    let core = projection::labels_for_space(&pivot.space).iter().copied();
+                    let extension =
+                        ext.labels_for_space_prefix(projection::space_prefix(&pivot.space));
+                    let labels: Vec<&str> = core.chain(extension).collect();
+                    for label in labels {
                         self.extend_vector_hits(
                             &mut all_hits,
                             pivot.space.clone(),
-                            &[*label],
+                            &[label],
                             top_k,
                             min_similarity,
                             &embedding,
@@ -1515,8 +1712,9 @@ impl LifeGraphProvider {
     }
 
     async fn handle_commit(&self, task: &DatasourceTask) -> Result<ProviderOutput> {
-        let input: LifeCommitInput = serde_json::from_value(task.parameters.clone())
+        let mut input: LifeCommitInput = serde_json::from_value(task.parameters.clone())
             .context("failed to parse life.commit parameters as LifeCommitInput")?;
+        input.normalize_defaults();
         let plan = self
             .runner
             .plan(LifeGraphToolRequest::LifeCommit(input.clone()))
@@ -1536,6 +1734,7 @@ impl LifeGraphProvider {
             .execute(
                 query(&compiled.query)
                     .param("id", compiled.node_id.as_str())
+                    .param("id_numeric", compiled.node_id_numeric)
                     .param("confirmed_at", compiled.confirmed_at.as_str())
                     .param("confidence", compiled.confidence)
                     .param("claim_summary", compiled.claim_summary.as_str())
@@ -1545,6 +1744,18 @@ impl LifeGraphProvider {
             )
             .await?;
         let first_row = rows.next().await?;
+        // MATCH semantics: no row means no such node. Say so instead of
+        // reporting "committed" for a write that touched nothing (or, under
+        // the old MERGE, manufactured a stray node).
+        let Some(first_row) = first_row else {
+            anyhow::bail!(
+                "life.commit target not found: no {} node with id '{}'. Call life.recall or \
+                 life.list first and commit the exact `id` it returns (e.g. life:open_loop:…).",
+                compiled.label,
+                compiled.node_id
+            );
+        };
+        let first_row = Some(first_row);
         let node_id = first_row
             .as_ref()
             .and_then(|r| r.get::<String>("id").ok())
@@ -1620,12 +1831,22 @@ impl LifeGraphProvider {
     async fn handle_patch_propose(&self, task: &DatasourceTask) -> Result<ProviderOutput> {
         let input: LifePatchProposalInput = serde_json::from_value(task.parameters.clone())
             .context("failed to parse life.patch.propose parameters as LifePatchProposalInput")?;
+        let ext = self.load_ontology_extensions().await;
         let plan = self
             .runner
-            .plan(LifeGraphToolRequest::LifePatchPropose(input.clone()))
+            .plan_with_extensions(LifeGraphToolRequest::LifePatchPropose(input.clone()), &ext)
             .map_err(|e| anyhow::anyhow!("life.patch.propose plan validation failed: {e}"))?;
         let now = chrono::Utc::now().to_rfc3339();
-        let compiled = cypher::compile_patch_proposal(&input, &now)
+        // An ontology_extension is by definition a confirm-gated change:
+        // park it as awaiting_confirmation so `life.patch.apply` (called
+        // after explicit operator approval) can actually act on it — the
+        // default `proposed` status is invisible to apply.
+        let status = if input.ontology_extension.is_some() {
+            cypher::PATCH_STATUS_AWAITING_CONFIRMATION
+        } else {
+            cypher::PATCH_STATUS_PROPOSED
+        };
+        let compiled = cypher::compile_patch_proposal_with_status(&input, &now, status)
             .map_err(|e| anyhow::anyhow!("life.patch.propose Cypher compilation failed: {e}"))?;
 
         let graph = self.connect().await?;
@@ -2003,20 +2224,63 @@ impl LifeGraphProvider {
         let current_status: String = row.get("status").unwrap_or_default();
         let patch_json: String = row.get("patch_json").unwrap_or_default();
         if current_status != cypher::PATCH_STATUS_AWAITING_CONFIRMATION {
+            let stored_patch = serde_json::from_str::<LifePatchProposalInput>(&patch_json).ok();
+            let patch_kind = stored_patch
+                .as_ref()
+                .and_then(|patch| serde_json::to_value(&patch.patch_kind).ok())
+                .and_then(|kind| kind.as_str().map(str::to_string));
+            let next_action = patch_apply_next_action(stored_patch.as_ref());
             return Ok(ProviderOutput::ResultSet(json!({
                 "status": "not_applicable",
                 "patch_id": input.patch_id,
                 "current_status": current_status,
+                "patch_kind": patch_kind,
+                "reason": "patch is not awaiting_confirmation",
+                "next_action": next_action,
             })));
         }
         let patch: LifePatchProposalInput = serde_json::from_str(&patch_json)
             .context("life.patch.apply: stored patch_json failed to parse")?;
 
         let now = chrono::Utc::now().to_rfc3339();
+        let mut ontology_applied: Option<Value> = None;
         let (new_status, edges_written, missing_targets, outcome) = match input.decision {
             PatchApplyDecision::Confirm => {
                 let (written, missing) =
                     Self::execute_bridge_edges(&graph, &patch.edge_specs).await?;
+                // Ontology self-serve: a confirmed schema_patch carrying an
+                // ontology_extension becomes live vocabulary — validate
+                // against core + current extensions, create the vector index
+                // for each new label, then persist the merged set.
+                if let Some(extension) = &patch.ontology_extension {
+                    let mut current = self.load_ontology_extensions().await;
+                    match extension.validate_against(&current) {
+                        Err(violations) => {
+                            ontology_applied = Some(json!({
+                                "status": "rejected",
+                                "violations": violations,
+                            }));
+                        }
+                        Ok(()) => {
+                            let indexes = self.create_extension_indexes(&extension.labels).await;
+                            current.merge(extension.clone());
+                            self.persist_ontology_extensions(&current).await?;
+                            info!(
+                                labels = extension.labels.len(),
+                                edges = extension.edges.len(),
+                                "life.patch.apply: ontology extension applied"
+                            );
+                            ontology_applied = Some(json!({
+                                "status": "applied",
+                                "labels_added": extension.labels.iter()
+                                    .map(|l| l.name.clone()).collect::<Vec<_>>(),
+                                "edges_added": extension.edges.iter()
+                                    .map(|e| e.rel_type.clone()).collect::<Vec<_>>(),
+                                "indexes_created": indexes,
+                            }));
+                        }
+                    }
+                }
                 (
                     cypher::PATCH_STATUS_APPLIED,
                     written,
@@ -2073,7 +2337,7 @@ impl LifeGraphProvider {
             }
         }
 
-        Ok(ProviderOutput::ResultSet(json!({
+        let mut result = json!({
             "status": new_status,
             "patch_id": input.patch_id,
             "edges_written": edges_written,
@@ -2081,7 +2345,11 @@ impl LifeGraphProvider {
             "audit_id": patch.autonomy_audit_id,
             "outcome": outcome,
             "outcome_reported": outcome_reported,
-        })))
+        });
+        if let Some(ontology) = ontology_applied {
+            result["ontology_extension"] = ontology;
+        }
+        Ok(ProviderOutput::ResultSet(result))
     }
 
     /// Handle `life.patch.list` — the READ-ONLY patch review surface.
@@ -2193,6 +2461,251 @@ impl LifeGraphProvider {
     /// gating, two bounded read queries, never a write. The provenance
     /// envelope (validation_state, confidence, source_membrane, observed_at,
     /// …) rides in the returned node's `properties`.
+    /// Handle `life.list` — the READ-ONLY deterministic maintenance query
+    /// surface (lifegraph-steward-capability-plane seam). Named queries and
+    /// typed filters both compile from the central `ontology` vocabulary;
+    /// date bounds ride as Bolt params.
+    /// `life.audit`: export the graph (ids, labels, states, dates, summaries,
+    /// embeddings, edges) and run `audit::audit` over it. Read-only.
+    async fn handle_audit(&self, task: &DatasourceTask) -> Result<ProviderOutput> {
+        let input: data_memorygraphrag::LifeAuditInput = if task.parameters.is_null() {
+            Default::default()
+        } else {
+            match serde_json::from_value(task.parameters.clone()) {
+                Ok(v) => v,
+                Err(e) => {
+                    return Ok(ProviderOutput::ResultSet(json!({
+                        "status": "invalid_request",
+                        "read_only": true,
+                        "error": format!("could not parse life.audit parameters: {e}"),
+                    })));
+                }
+            }
+        };
+        if let Err(err) = self
+            .runner
+            .plan(LifeGraphToolRequest::LifeAudit(input.clone()))
+        {
+            return Ok(ProviderOutput::ResultSet(json!({
+                "status": "invalid_request",
+                "read_only": true,
+                "violations": err.violations,
+            })));
+        }
+        let graph = self.connect().await?;
+        let now_iso = chrono::Utc::now().to_rfc3339();
+
+        let node_cypher = concat!(
+            "MATCH (n) RETURN coalesce(n.id, '') AS id, id(n) AS internal_id, ",
+            "coalesce(labels(n)[0], '') AS label, n.validation_state AS validation_state, ",
+            "coalesce(n.status, n.loop_status) AS status, n.observed_at AS observed_at, ",
+            "coalesce(n.due_at, n.occurs_at, n.starts_at) AS best_date, ",
+            "n.claim_summary AS claim_summary, n.embedding AS embedding"
+        );
+        let mut rows = bounded_query("life_audit_nodes", graph.execute(query(node_cypher))).await?;
+        let mut nodes: Vec<data_memorygraphrag::audit::AuditNode> = Vec::new();
+        while let Some(row) = rows.next().await? {
+            let v = row_to_json(&row)?;
+            let embedding = v.get("embedding").and_then(Value::as_array).map(|arr| {
+                arr.iter()
+                    .filter_map(|x| x.as_f64().map(|f| f as f32))
+                    .collect::<Vec<f32>>()
+            });
+            let text = |k: &str| v.get(k).and_then(Value::as_str).map(str::to_string);
+            nodes.push(data_memorygraphrag::audit::AuditNode {
+                id: text("id").unwrap_or_default(),
+                internal_id: v.get("internal_id").and_then(Value::as_i64).unwrap_or(-1),
+                label: text("label").unwrap_or_default(),
+                validation_state: text("validation_state"),
+                status: text("status"),
+                observed_at: text("observed_at"),
+                best_date: text("best_date"),
+                claim_summary: text("claim_summary"),
+                embedding: embedding.filter(|e| !e.is_empty()),
+            });
+        }
+        let edge_cypher = concat!(
+            "MATCH (a)-[r]->(b) RETURN coalesce(a.id, '#' + toString(id(a))) AS src, ",
+            "coalesce(b.id, '#' + toString(id(b))) AS dst, type(r) AS rel_type"
+        );
+        let mut rows = bounded_query("life_audit_edges", graph.execute(query(edge_cypher))).await?;
+        let mut edges: Vec<data_memorygraphrag::audit::AuditEdge> = Vec::new();
+        while let Some(row) = rows.next().await? {
+            let v = row_to_json(&row)?;
+            let text = |k: &str| v.get(k).and_then(Value::as_str).unwrap_or("").to_string();
+            edges.push(data_memorygraphrag::audit::AuditEdge {
+                src: text("src"),
+                dst: text("dst"),
+                rel_type: text("rel_type"),
+            });
+        }
+        let opts = data_memorygraphrag::audit::AuditOptions {
+            now_iso: now_iso.clone(),
+            duplicate_similarity: input.duplicate_similarity,
+            stale_days: input.stale_days,
+            max_actions: input.max_actions,
+            labels: input.labels.clone(),
+        };
+        let report = data_memorygraphrag::audit::audit(&nodes, &edges, &opts);
+        info!(
+            nodes = report.nodes,
+            edges = report.edges,
+            live_orphans = report.live_orphans,
+            duplicates = report.duplicates.len(),
+            health = report.health_score,
+            actions = report.suggested_actions.len(),
+            "life.audit: graph-science report served"
+        );
+        let mut out = serde_json::to_value(&report)?;
+        out["status"] = json!("ok");
+        out["read_only"] = json!(true);
+        out["how_to_act"] = json!(
+            "Each suggested_actions entry is ONE life.tidy call ({\"action\": <entry>}); \
+             declare them as plan steps bound to life.tidy and execute in order. Items under \
+             needs_judgment are not actions: resolve them with evidence or ask the operator."
+        );
+        Ok(ProviderOutput::ResultSet(out))
+    }
+
+    /// `life.tidy`: one governed write per call (retire duplicate under a
+    /// keeper, link, resolve, retire). Nothing is ever deleted; every touched
+    /// node/edge is stamped with when, by whom, and why.
+    async fn handle_tidy(&self, task: &DatasourceTask) -> Result<ProviderOutput> {
+        let input: data_memorygraphrag::LifeTidyInput =
+            serde_json::from_value(task.parameters.clone())
+                .context("failed to parse life.tidy parameters as LifeTidyInput")?;
+        let ext = self.load_ontology_extensions().await;
+        let plan = self
+            .runner
+            .plan_with_extensions(LifeGraphToolRequest::LifeTidy(input.clone()), &ext)
+            .map_err(|e| anyhow::anyhow!("life.tidy plan validation failed: {e}"))?;
+        if !plan.allowed() {
+            return Ok(ProviderOutput::ResultSet(json!({
+                "status": "blocked",
+                "reasons": plan.blocked_reasons,
+            })));
+        }
+        let now = chrono::Utc::now().to_rfc3339();
+        let actor = task
+            .parameters
+            .get("observed_by")
+            .and_then(Value::as_str)
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or("lifegraph.gardener")
+            .to_string();
+        let compiled = cypher::compile_tidy(&input.action, input.operator_approved, &actor, &now)
+            .map_err(|e| anyhow::anyhow!("life.tidy Cypher compilation failed: {e}"))?;
+        let graph = self.connect().await?;
+        let mut rows = bounded_query(
+            "life_tidy",
+            graph.execute(
+                query(&compiled.query)
+                    .param("a", compiled.a.as_str())
+                    .param("b", compiled.b.as_str())
+                    .param("reason", compiled.reason.as_str())
+                    .param("now", compiled.now_iso.as_str())
+                    .param("actor", compiled.actor.as_str()),
+            ),
+        )
+        .await?;
+        let Some(row) = rows.next().await? else {
+            anyhow::bail!(
+                "life.tidy {} matched nothing: the node(s) do not exist, or the target is \
+                 confirmed and operator_approved was not set (nothing was changed)",
+                compiled.kind
+            );
+        };
+        let touched = row_to_json(&row)?;
+        info!(kind = compiled.kind, node = %compiled.a, "life.tidy: applied");
+        Ok(ProviderOutput::ResultSet(json!({
+            "status": "tidied",
+            "kind": compiled.kind,
+            "node_id": compiled.a,
+            "touched": touched,
+            "tidied_at": compiled.now_iso,
+            "tidied_by": compiled.actor,
+        })))
+    }
+
+    async fn handle_list(&self, task: &DatasourceTask) -> Result<ProviderOutput> {
+        let input: LifeListInput = match serde_json::from_value(task.parameters.clone()) {
+            Ok(input) => input,
+            Err(e) => {
+                return Ok(ProviderOutput::ResultSet(json!({
+                    "status": "invalid_request",
+                    "read_only": true,
+                    "error": format!("could not parse life.list parameters: {e}"),
+                })));
+            }
+        };
+        let ext = self.load_ontology_extensions().await;
+        let plan = self.runner.plan_with_extensions(
+            data_memorygraphrag::LifeGraphToolRequest::LifeList(input.clone()),
+            &ext,
+        );
+        if let Err(err) = plan {
+            return Ok(ProviderOutput::ResultSet(json!({
+                "status": "invalid_request",
+                "read_only": true,
+                "violations": err.violations,
+            })));
+        }
+
+        let limit = input.effective_limit();
+        let now_iso = chrono::Utc::now().to_rfc3339();
+        let (query_kind, cypher) = match input.named_query.as_deref() {
+            Some(name) => {
+                // plan_list validated the name parses.
+                let named = data_memorygraphrag::ontology::NamedMaintenanceQuery::parse(name)
+                    .expect("plan_list validated named_query");
+                (
+                    named.as_str().to_string(),
+                    named.cypher_with_extensions(limit, &ext),
+                )
+            }
+            None => (
+                "filtered".to_string(),
+                input.filtered_cypher_with_extensions(&ext),
+            ),
+        };
+
+        let graph = self.connect().await?;
+        let mut q = query(&cypher);
+        if cypher.contains("$now") {
+            q = q.param("now", now_iso.as_str());
+        }
+        if let Some(v) = input.observed_after.as_deref() {
+            q = q.param("observed_after", v);
+        }
+        if let Some(v) = input.observed_before.as_deref() {
+            q = q.param("observed_before", v);
+        }
+        if let Some(v) = input.date_before.as_deref() {
+            q = q.param("date_before", v);
+        }
+        if let Some(v) = input.date_after.as_deref() {
+            q = q.param("date_after", v);
+        }
+        let mut rows = bounded_query("life_list", graph.execute(q)).await?;
+        let mut output_rows = Vec::new();
+        while let Some(row) = rows.next().await? {
+            output_rows.push(row_to_json(&row)?);
+        }
+        info!(
+            query = query_kind.as_str(),
+            rows = output_rows.len(),
+            "life.list: deterministic list served"
+        );
+        Ok(ProviderOutput::ResultSet(json!({
+            "status": "ok",
+            "read_only": true,
+            "query": query_kind,
+            "as_of": now_iso,
+            "count": output_rows.len(),
+            "rows": output_rows,
+        })))
+    }
+
     async fn handle_view_node(&self, task: &DatasourceTask) -> Result<ProviderOutput> {
         let input: LifeViewNodeInput =
             serde_json::from_value(task.parameters.clone()).unwrap_or_default();
@@ -2919,18 +3432,13 @@ fn raw_recall_fallback_cypher(labels: &[&str], limit: usize) -> String {
         .collect::<Vec<_>>()
         .join(", ");
     format!(
-        concat!(
-            "MATCH (n) ",
-            "WHERE any(label IN labels(n) WHERE label IN [{labels}]) ",
-            "AND coalesce(n.validation_state, 'inferred') <> 'retired' ",
-            "AND NOT coalesce(n.status, '') IN ['retired', 'done', 'fulfilled', 'abandoned', 'resolved'] ",
-            "AND NOT coalesce(n.loop_status, '') IN ['retired', 'done', 'fulfilled', 'abandoned', 'resolved'] ",
-            "RETURN n AS node, 0.25 AS similarity ",
-            "ORDER BY coalesce(n.observed_at, n.created_at, '') DESC ",
-            "LIMIT {limit}"
-        ),
-        labels = labels,
-        limit = limit
+        "MATCH (n) \
+         WHERE any(label IN labels(n) WHERE label IN [{labels}]) \
+         AND {live} \
+         RETURN n AS node, 0.25 AS similarity \
+         ORDER BY coalesce(n.observed_at, n.created_at, '') DESC \
+         LIMIT {limit}",
+        live = data_memorygraphrag::ontology::liveness_predicate("n"),
     )
 }
 
@@ -3147,6 +3655,7 @@ fn recall_feedback_patch_proposal(
         operator_approved: false,
         edge_specs: Vec::new(),
         autonomy_audit_id: None,
+        ontology_extension: None,
     })
 }
 
@@ -3177,6 +3686,8 @@ fn feedback_signal_evidence(input: &RetrievalFeedbackInput) -> EvidencePacket {
         validation_state: ValidationState::Confirmed,
         observed_at: None,
         valid_time_range: None,
+        due_at: None,
+        occurs_at: None,
         source_reliability: 1.0,
         conflict_ids: vec![],
         adjudication_status: AdjudicationStatus::NotNeeded,
@@ -3483,6 +3994,22 @@ fn bolt_unbounded_relation_to_json(v: BoltUnboundedRelation) -> Value {
     })
 }
 
+fn patch_apply_next_action(patch: Option<&LifePatchProposalInput>) -> &'static str {
+    match patch.map(|patch| &patch.patch_kind) {
+        Some(PatchKind::SkillPatch) => {
+            "SkillPatch is a review artifact. Author an executable skill definition, then use skill.register and skill.assign."
+        }
+        Some(PatchKind::SchemaPatch)
+            if patch.is_some_and(|patch| patch.ontology_extension.is_none()) =>
+        {
+            "This prose-only SchemaPatch has no executable ontology_extension. Propose a new schema_patch with labels/edges in ontology_extension; property or core-label changes require a code change."
+        }
+        _ => {
+            "Only patches parked in awaiting_confirmation with an executable payload can be applied. Review or replace this proposal with the correct actuator payload."
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3499,6 +4026,35 @@ mod tests {
             parameters,
             identity: json!({}),
         }
+    }
+
+    #[test]
+    fn not_applicable_patch_guidance_routes_to_the_real_actuator() {
+        let skill_patch: LifePatchProposalInput = serde_json::from_value(json!({
+            "patch_id": "patch:music-skills",
+            "patch_kind": "skill_patch",
+            "summary": "Register music skills",
+            "rationale": "Operator requested them",
+            "evidence_packets": [],
+            "risk": "medium"
+        }))
+        .unwrap();
+        let schema_patch: LifePatchProposalInput = serde_json::from_value(json!({
+            "patch_id": "patch:music-schema",
+            "patch_kind": "schema_patch",
+            "summary": "Add music fields",
+            "rationale": "Track repertoire",
+            "evidence_packets": [],
+            "risk": "medium"
+        }))
+        .unwrap();
+
+        assert!(patch_apply_next_action(Some(&skill_patch)).contains("skill.register"));
+        assert!(patch_apply_next_action(Some(&skill_patch)).contains("skill.assign"));
+        assert!(
+            patch_apply_next_action(Some(&schema_patch))
+                .contains("property or core-label changes require a code change")
+        );
     }
 
     #[tokio::test]
@@ -3923,6 +4479,8 @@ mod tests {
                 validation_state: ValidationState::Proposed,
                 observed_at: Some("2026-07-10T00:00:00Z".to_string()),
                 valid_time_range: None,
+                due_at: None,
+                occurs_at: None,
                 source_reliability: 0.9,
                 conflict_ids: vec![],
                 adjudication_status: AdjudicationStatus::NotNeeded,
