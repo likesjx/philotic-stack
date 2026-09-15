@@ -6997,6 +6997,10 @@ impl AgentRuntime {
             bindings
                 .get("effective_procedures")
                 .and_then(|v| serde_json::from_value(v.clone()).ok());
+        let new_skill_records: Option<Vec<ansible_mesh_core::graph::AbstractSkillRecord>> =
+            bindings
+                .get("effective_skill_records")
+                .and_then(|v| serde_json::from_value(v.clone()).ok());
         let new_allowed_classes: Option<Vec<String>> = bindings
             .get("allowed_classes")
             .and_then(|v| serde_json::from_value(v.clone()).ok());
@@ -7028,6 +7032,12 @@ impl AgentRuntime {
         if let Some(procedures) = new_procedures {
             if procedures != state.bindings.effective_procedures {
                 state.bindings.effective_procedures = procedures;
+            }
+        }
+        if let Some(records) = new_skill_records {
+            // Projection-facing only, like guidance: no tool-assembly rebuild.
+            if records != state.bindings.effective_skill_records {
+                state.bindings.effective_skill_records = records;
             }
         }
         if let Some(allowed_classes) = new_allowed_classes {
