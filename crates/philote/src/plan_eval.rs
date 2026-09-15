@@ -475,6 +475,13 @@ pub fn plan_stop_notice(carryover: &CarryoverPlan, reason: &str) -> String {
     )
 }
 
+/// `data.health_score` (or top-level `health_score`) of a `life.audit` result.
+pub fn audit_health_score(content: &str) -> Option<u64> {
+    let v: serde_json::Value = serde_json::from_str(content).ok()?;
+    let data = v.get("data").unwrap_or(&v);
+    data.get("health_score").and_then(serde_json::Value::as_u64)
+}
+
 /// A step description cut to its first clause, ≤ 72 chars, for status lines.
 pub fn step_brief(description: &str) -> String {
     let first = description
@@ -495,7 +502,21 @@ fn step_list(plan: &ActivePlan, flags: &[bool], done: bool) -> String {
         .iter()
         .enumerate()
         .filter(|(i, _)| flags.get(*i).copied().unwrap_or(false) == done)
-        .map(|(_, s)| format!("- step {}{}: {}", s.id, step_tool_suffix(s), s.description))
+        .map(|(_, s)| {
+            // A completed step is listed for orientation only. Its call
+            // payload ("…: call life.tidy with {…}") is an invitation to run
+            // it again — live 2026-09-15 16:33 UTC the continuation re-ran
+            // all twelve completed tidies from these lines.
+            let description = if done {
+                s.description
+                    .split_once(": call ")
+                    .map(|(head, _)| head)
+                    .unwrap_or(&s.description)
+            } else {
+                s.description.as_str()
+            };
+            format!("- step {}{}: {}", s.id, step_tool_suffix(s), description)
+        })
         .collect::<Vec<_>>()
         .join("\n")
 }
@@ -3015,6 +3036,41 @@ mod tests {
                 .count()
                 <= 1
         );
+    }
+
+    /// Live 2026-09-15 16:33 UTC: the continuation brief listed every
+    /// completed tidy with its full call payload and the model ran them all
+    /// again.
+    #[test]
+    fn continuation_brief_lists_completed_steps_without_their_call_payload() {
+        let plan = plan(
+            "executing",
+            &[
+                (
+                    "Apply audit action link on life:goal:a -> life:role:r: call life.tidy with {\"action\": {\"kind\":\"link\"}}",
+                    Some("life.tidy"),
+                    "done",
+                ),
+                (
+                    "Re-run life.audit to measure the pass",
+                    Some("life.audit"),
+                    "pending",
+                ),
+            ],
+        );
+        let carry = CarryoverPlan {
+            plan,
+            steps_done: vec![true, false],
+            verified_step_ids: vec![1],
+            stalled_continuations: 0,
+            continuations_used: 0,
+            lifetime_continuations: 0,
+            created_turn_id: "t0".into(),
+        };
+        let brief = plan_continuation_brief(&carry, 3);
+        assert!(brief.contains("Completed steps:\n- step 1 (tool: life.tidy): Apply audit action link on life:goal:a -> life:role:r\n"), "{brief}");
+        assert!(!brief.contains("call life.tidy with"), "{brief}");
+        assert!(brief.contains("Remaining steps:\n- step 2"), "{brief}");
     }
 
     #[test]

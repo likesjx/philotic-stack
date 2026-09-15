@@ -86,7 +86,7 @@ fn gardening_actions_from_audit_result(content: &str) -> Vec<Value> {
 }
 
 /// One verifiable `life.tidy` step per action, then a closing `life.audit`.
-fn gardening_plan_from_actions(actions: &[Value]) -> ActivePlan {
+fn gardening_plan_from_actions(actions: &[Value], baseline_health: Option<u64>) -> ActivePlan {
     let mut steps: Vec<PlanStep> = Vec::new();
     for (i, action) in actions.iter().take(GARDENING_STEPS_PER_PASS).enumerate() {
         let kind = action
@@ -117,16 +117,20 @@ fn gardening_plan_from_actions(actions: &[Value]) -> ActivePlan {
         });
     }
     let n = steps.len();
+    let baseline = baseline_health
+        .map(|b| format!(" (health_score {b} before)"))
+        .unwrap_or_default();
     steps.push(PlanStep {
         id: (n + 1) as u32,
-        description: "Re-run life.audit to measure the pass; then report the health_score delta plus what still needs judgment."
-            .into(),
+        description: format!(
+            "Re-run life.audit to measure the pass{baseline}; then report the health_score delta plus what still needs judgment."
+        ),
         tool_name: Some("life.audit".into()),
         status: "pending".into(),
     });
     ActivePlan {
         goal: format!(
-            "Gardening pass: apply {n} audit-suggested action(s) with life.tidy (one per step), then re-audit and report the delta"
+            "Gardening pass: apply {n} audit-suggested action(s) with life.tidy (one per step), then re-audit and report the delta{baseline}"
         ),
         status: "executing".into(),
         steps,
@@ -854,6 +858,19 @@ impl SessionState {
                 .collect();
             turn.active_plan = Some(plan);
         }
+    }
+
+    /// Every step of the active plan is backed by a tool result (evidence
+    /// carried from earlier turns included). The remaining work is the
+    /// report, so the re-entry projects no tools and says so.
+    pub fn plan_fully_verified(&self) -> bool {
+        self.active_turn.as_ref().is_some_and(|t| {
+            t.active_plan.as_ref().is_some_and(|p| {
+                !p.steps.is_empty()
+                    && t.plan_steps_verified.len() == p.steps.len()
+                    && t.plan_steps_verified.iter().all(|v| *v)
+            })
+        })
     }
 
     /// Increment consecutive step failure counter and return the new count.
@@ -1935,6 +1952,11 @@ impl SessionState {
             } else {
                 Vec::new()
             };
+        let audit_baseline = if audit_actions.is_empty() {
+            None
+        } else {
+            crate::plan_eval::audit_health_score(&result.content)
+        };
         let evidence_from = self.plan_evidence_from;
         if let Some(turn) = self.active_turn.as_mut() {
             turn.working_tool_history.push((call, result));
@@ -1961,7 +1983,7 @@ impl SessionState {
                 .and_then(|t| t.active_plan.as_ref())
                 .is_some_and(|p| p.goal.starts_with("Gardening pass:"));
             if !already_gardening {
-                let plan = gardening_plan_from_actions(&audit_actions);
+                let plan = gardening_plan_from_actions(&audit_actions, audit_baseline);
                 let steps = plan.steps.len();
                 self.set_active_plan(plan);
                 // The audit that seeded this plan is not its closing audit.
@@ -4210,6 +4232,22 @@ impl SessionState {
                 {
                     lines.push(note);
                 }
+            } else if self.plan_fully_verified() {
+                // Live 2026-09-15 16:33 UTC: the harness ran the closing
+                // audit, every step was verified, and the model — handed its
+                // tools and a brief whose "Remaining steps" was empty — re-ran
+                // all twelve completed tidies and never reported the score.
+                let closing = plan
+                    .steps
+                    .last()
+                    .map(|s| s.description.as_str())
+                    .unwrap_or("");
+                lines.push(format!(
+                    "[Plan complete] Every step of the active plan is verified by tool results \
+                     (steps the harness ran for you included). No tools are offered on this \
+                     step: do not repeat completed work. Reply now with the final report of the \
+                     whole plan, answering what the closing step asked for: {closing}"
+                ));
             }
             if let Some(advisory) = plan.context_1_advisory.as_ref() {
                 lines.push(format!(
@@ -10090,6 +10128,18 @@ mod tests {
             .and_then(|t| t.active_plan.clone())
             .expect("gardening plan seeded");
         assert!(plan.goal.starts_with("Gardening pass: apply 2"));
+        assert!(
+            plan.goal.ends_with("(health_score 12 before)"),
+            "{}",
+            plan.goal
+        );
+        assert!(
+            plan.steps[2]
+                .description
+                .starts_with("Re-run life.audit to measure the pass (health_score 12 before);"),
+            "{}",
+            plan.steps[2].description
+        );
         let tools: Vec<Option<&str>> = plan.steps.iter().map(|s| s.tool_name.as_deref()).collect();
         assert_eq!(
             tools,

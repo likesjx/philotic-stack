@@ -3902,6 +3902,17 @@ impl AgentRuntime {
                 uncited.join("; ")
             )
         };
+        let health = self.sessions.get(&session_id).and_then(|s| {
+            s.active_turn
+                .as_ref()
+                .and_then(|t| gardening_health_trailer(t, s.plan_evidence_from))
+        });
+        let content = match health {
+            Some(line) if !content.contains(&line) => {
+                format!("{}\n\n{line}", content.trim_end())
+            }
+            _ => content,
+        };
 
         let plan_budget = self.plan_continuation_budget_for(&session_id);
         let (
@@ -5042,6 +5053,9 @@ pub(super) fn uncited_writes(reply: &str, turn: &WorkingTurn) -> Vec<String> {
     for (call, result) in &turn.working_tool_history {
         if !crate::plan_eval::tool_result_looks_ok(result)
             || !LIFE_WRITE_TOOLS.contains(&call.tool_name.as_str())
+            // A no-op retry is not a write (live 2026-09-15 16:34 UTC: twelve
+            // re-applied links listed as "Written this turn").
+            || result.content.contains("\"already_applied\"")
         {
             continue;
         }
@@ -5254,6 +5268,53 @@ pub(super) fn reply_promises_unexecuted_action(content: &str) -> bool {
     PATTERNS.iter().any(|p| lower.contains(p))
 }
 
+/// Harness-owned measurement for a gardening pass: the plan goal carries the
+/// audit score the pass started from, this turn's re-audit carries the score
+/// it ended at. The model never reported the delta on its own (live
+/// 2026-09-15 16:34 UTC: "No further structural tool calls are required" over
+/// a 59 → 61 audit it had just been handed). Calls before `evidence_from`
+/// (the seeding audit) are not the re-audit.
+pub(super) fn gardening_health_trailer(turn: &WorkingTurn, evidence_from: usize) -> Option<String> {
+    let goal = &turn.active_plan.as_ref()?.goal;
+    if !goal.starts_with("Gardening pass") {
+        return None;
+    }
+    let baseline: u64 = goal
+        .rsplit_once("health_score ")
+        .and_then(|(_, tail)| tail.split_whitespace().next())
+        .and_then(|n| n.parse().ok())?;
+    let from = evidence_from.min(turn.working_tool_history.len());
+    for (call, result) in turn.working_tool_history[from..].iter().rev() {
+        if call.tool_name != "life.audit" || !crate::plan_eval::tool_result_looks_ok(result) {
+            continue;
+        }
+        let score = crate::plan_eval::audit_health_score(&result.content)?;
+        let v: Value = serde_json::from_str(&result.content).ok()?;
+        let data = v.get("data").unwrap_or(&v);
+        let orphans = data
+            .get("live_orphans")
+            .and_then(Value::as_u64)
+            .map(|n| format!(", live orphans {n}"))
+            .unwrap_or_default();
+        let dups = data
+            .get("duplicates")
+            .and_then(Value::as_array)
+            .map(|d| format!(", duplicates {}", d.len()))
+            .unwrap_or_default();
+        let arrow = if score > baseline {
+            "↑"
+        } else if score < baseline {
+            "↓"
+        } else {
+            "→"
+        };
+        return Some(format!(
+            "📊 LifeGraph health: {baseline} {arrow} {score}{orphans}{dups}"
+        ));
+    }
+    None
+}
+
 /// One user-facing line describing an unsettled plan, from the eval that
 /// was computed for this turn before the reply went out. `None` when the
 /// plan is settled or there is nothing to say.
@@ -5450,7 +5511,18 @@ pub(super) fn plan_followup_after_turn(
             stalls: c.stalled_continuations,
         });
 
-        let outcome = evaluate_plan(plan, prior_state, &completed_turn.working_tool_history);
+        // Calls made before the plan was seeded are not evidence for it:
+        // the audit that seeded a gardening plan must not be credited as its
+        // closing audit (live 2026-09-15 16:15 UTC: 13/13 "complete" with no
+        // second audit — push_tool_history honoured the fence, this did not).
+        let evidence_from = state
+            .plan_evidence_from
+            .min(completed_turn.working_tool_history.len());
+        let outcome = evaluate_plan(
+            plan,
+            prior_state,
+            &completed_turn.working_tool_history[evidence_from..],
+        );
         // Evidence is sticky across the whole plan lifetime: a step proven in
         // turn 1 must stay proven in turn 3, long after its tool result has
         // scrolled out of the working history.
@@ -5630,6 +5702,98 @@ pub(super) fn carryover_resume_followup(
 mod say_do_tests {
     use super::super::tests::test_working_turn;
     use super::*;
+
+    #[test]
+    fn gardening_health_trailer_reports_baseline_to_reaudit() {
+        let audit = |score: u64| {
+            format!(
+                r#"{{"data":{{"status":"ok","health_score":{score},"live_orphans":76,"duplicates":[],"suggested_actions":[]}}}}"#
+            )
+        };
+        let mut turn = turn_with(
+            "[Plan continuation 1/3]",
+            vec![("life.audit", serde_json::json!({}), "")],
+        );
+        turn.working_tool_history[0].1.content = audit(61);
+        turn.active_plan = Some(ActivePlan {
+            goal: "Gardening pass: apply 12 audit-suggested action(s) with life.tidy (one per step), then re-audit and report the delta (health_score 59 before)".into(),
+            steps: vec![],
+            status: "executing".into(),
+            context_1_advisory: None,
+            procedure_id: None,
+        });
+        assert_eq!(
+            gardening_health_trailer(&turn, 0).as_deref(),
+            Some("📊 LifeGraph health: 59 ↑ 61, live orphans 76, duplicates 0")
+        );
+        // The seeding audit (before the fence) is not the re-audit.
+        assert!(gardening_health_trailer(&turn, 1).is_none());
+        // No baseline in the goal → nothing to compare against.
+        turn.active_plan.as_mut().unwrap().goal = "Gardening pass: apply 3".into();
+        assert!(gardening_health_trailer(&turn, 0).is_none());
+    }
+
+    /// Live 2026-09-15 16:14–16:15 UTC (#516 build): the audit seeded a
+    /// 13-step gardening plan, twelve tidies ran, no second audit ran, and the
+    /// turn-end evaluator still said 13/13 complete because it re-verified
+    /// from the full history and credited the seeding audit as the closer.
+    #[test]
+    fn seeding_audit_is_not_the_closing_audit_at_turn_end() {
+        let mut state = crate::session::SessionState::new(
+            "sess-garden".into(),
+            "agent-beacon".into(),
+            "telegram".into(),
+        );
+        for tool in ["life.audit", "life.tidy"] {
+            state.add_tool_binding(tool);
+        }
+        let mut turn = test_working_turn(TurnPhase::WaitingTool);
+        turn.user_content = "Garden the LifeGraph".into();
+        state.start_turn(turn);
+        let audit = serde_json::json!({
+            "data": {
+                "status": "ok",
+                "health_score": 58,
+                "suggested_actions": [
+                    {"kind": "link", "from_id": "life:open_loop:work-item-76bacc98", "rel_type": "SCOPED_TO", "to_id": "life:role:chief-of-staff", "reason": "orphan"}
+                ]
+            },
+            "status": "success"
+        })
+        .to_string();
+        state.push_tool_history(
+            ToolCall {
+                tool_name: "life.audit".into(),
+                arguments: serde_json::json!({}),
+            },
+            ToolResult {
+                tool_name: "life.audit".into(),
+                content: audit,
+            },
+        );
+        state.push_tool_history(
+            ToolCall {
+                tool_name: "life.tidy".into(),
+                arguments: serde_json::json!({"action": {"kind": "link", "from_id": "life:open_loop:work-item-76bacc98", "rel_type": "SCOPED_TO", "to_id": "life:role:chief-of-staff", "reason": "orphan"}}),
+            },
+            ToolResult { tool_name: "life.tidy".into(), content: r#"{"data":{"status":"tidied"}}"#.into() },
+        );
+        let completed = state.active_turn.take().expect("turn");
+        let plan = completed.active_plan.as_ref().expect("seeded plan");
+        assert_eq!(plan.steps.len(), 2);
+        let (followup, _) = plan_followup_after_turn(&mut state, &completed, 3);
+        match followup {
+            Some(PlanFollowup::Continue {
+                eval_json: Some(eval),
+            }) => {
+                assert_eq!(eval["steps_done"], 1, "{eval}");
+                assert_eq!(eval["verdict"], "continue", "{eval}");
+                let briefs = eval["outstanding_briefs"].as_array().expect("briefs");
+                assert!(briefs[0].as_str().unwrap().contains("life.audit"), "{eval}");
+            }
+            other => panic!("expected a continuation, got {other:?}"),
+        }
+    }
 
     /// Live 2026-09-11 13:26 UTC: the reply that announced a four-step
     /// "battle plan" and ended the turn with zero tool calls.
@@ -5888,6 +6052,18 @@ mod say_do_tests {
                 ),
             ],
         );
+        // A no-op retry is not a write.
+        let mut turn = turn;
+        turn.working_tool_history.push((
+            ToolCall {
+                tool_name: "life.tidy".into(),
+                arguments: serde_json::json!({"action": {"kind": "link", "from_id": "life:goal:x", "rel_type": "SCOPED_TO", "to_id": "life:role:r"}}),
+            },
+            ToolResult {
+                tool_name: "life.tidy".into(),
+                content: r#"{"data":{"status":"already_applied","kind":"link","node_id":"life:goal:x"}}"#.into(),
+            },
+        ));
         let reply = "Recorded your speech (`life:creative_work:toastmasters-icebreaker-blank-page`). Here is my workplan… Shall we proceed?";
         assert!(
             unbacked_cited_ids(reply, &turn, "").is_empty(),
