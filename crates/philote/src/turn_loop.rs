@@ -5450,7 +5450,18 @@ pub(super) fn plan_followup_after_turn(
             stalls: c.stalled_continuations,
         });
 
-        let outcome = evaluate_plan(plan, prior_state, &completed_turn.working_tool_history);
+        // Calls made before the plan was seeded are not evidence for it:
+        // the audit that seeded a gardening plan must not be credited as its
+        // closing audit (live 2026-09-15 16:15 UTC: 13/13 "complete" with no
+        // second audit — push_tool_history honoured the fence, this did not).
+        let evidence_from = state
+            .plan_evidence_from
+            .min(completed_turn.working_tool_history.len());
+        let outcome = evaluate_plan(
+            plan,
+            prior_state,
+            &completed_turn.working_tool_history[evidence_from..],
+        );
         // Evidence is sticky across the whole plan lifetime: a step proven in
         // turn 1 must stay proven in turn 3, long after its tool result has
         // scrolled out of the working history.
@@ -5630,6 +5641,68 @@ pub(super) fn carryover_resume_followup(
 mod say_do_tests {
     use super::super::tests::test_working_turn;
     use super::*;
+
+    /// Live 2026-09-15 16:14–16:15 UTC (#516 build): the audit seeded a
+    /// 13-step gardening plan, twelve tidies ran, no second audit ran, and the
+    /// turn-end evaluator still said 13/13 complete because it re-verified
+    /// from the full history and credited the seeding audit as the closer.
+    #[test]
+    fn seeding_audit_is_not_the_closing_audit_at_turn_end() {
+        let mut state = crate::session::SessionState::new(
+            "sess-garden".into(),
+            "agent-beacon".into(),
+            "telegram".into(),
+        );
+        for tool in ["life.audit", "life.tidy"] {
+            state.add_tool_binding(tool);
+        }
+        let mut turn = test_working_turn(TurnPhase::WaitingTool);
+        turn.user_content = "Garden the LifeGraph".into();
+        state.start_turn(turn);
+        let audit = serde_json::json!({
+            "data": {
+                "status": "ok",
+                "health_score": 58,
+                "suggested_actions": [
+                    {"kind": "link", "from_id": "life:open_loop:work-item-76bacc98", "rel_type": "SCOPED_TO", "to_id": "life:role:chief-of-staff", "reason": "orphan"}
+                ]
+            },
+            "status": "success"
+        })
+        .to_string();
+        state.push_tool_history(
+            ToolCall {
+                tool_name: "life.audit".into(),
+                arguments: serde_json::json!({}),
+            },
+            ToolResult {
+                tool_name: "life.audit".into(),
+                content: audit,
+            },
+        );
+        state.push_tool_history(
+            ToolCall {
+                tool_name: "life.tidy".into(),
+                arguments: serde_json::json!({"action": {"kind": "link", "from_id": "life:open_loop:work-item-76bacc98", "rel_type": "SCOPED_TO", "to_id": "life:role:chief-of-staff", "reason": "orphan"}}),
+            },
+            ToolResult { tool_name: "life.tidy".into(), content: r#"{"data":{"status":"tidied"}}"#.into() },
+        );
+        let completed = state.active_turn.take().expect("turn");
+        let plan = completed.active_plan.as_ref().expect("seeded plan");
+        assert_eq!(plan.steps.len(), 2);
+        let (followup, _) = plan_followup_after_turn(&mut state, &completed, 3);
+        match followup {
+            Some(PlanFollowup::Continue {
+                eval_json: Some(eval),
+            }) => {
+                assert_eq!(eval["steps_done"], 1, "{eval}");
+                assert_eq!(eval["verdict"], "continue", "{eval}");
+                let briefs = eval["outstanding_briefs"].as_array().expect("briefs");
+                assert!(briefs[0].as_str().unwrap().contains("life.audit"), "{eval}");
+            }
+            other => panic!("expected a continuation, got {other:?}"),
+        }
+    }
 
     /// Live 2026-09-11 13:26 UTC: the reply that announced a four-step
     /// "battle plan" and ended the turn with zero tool calls.

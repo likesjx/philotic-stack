@@ -888,36 +888,6 @@ pub fn verify_plan_steps(
         }
     }
 
-    // Pass C — unique tool: a step whose bound tool no other step in the
-    // plan binds is proven by any successful call of that tool, whatever its
-    // wording. Live 2026-09-15 14:10 UTC: the closing "Re-run life.audit to
-    // measure the pass" step has distinctive words (measure, report, score)
-    // that never appear in an argument-less audit call, so Pass A could not
-    // credit it and Pass B never ran for it — the harness called life.audit
-    // on three continuations and the plan still blocked at 12/13.
-    for (i, step) in plan.steps.iter().enumerate() {
-        if evidence[i] == StepEvidence::Verified || !step_is_tool_bound(step) {
-            continue;
-        }
-        let tool = step.tool_name.as_deref().unwrap_or("");
-        let shared = plan
-            .steps
-            .iter()
-            .enumerate()
-            .any(|(k, other)| k != i && other.tool_name.as_deref() == Some(tool));
-        if shared {
-            continue;
-        }
-        for (j, (call, result)) in tool_history.iter().enumerate() {
-            if consumed[j] || !tool_result_looks_ok(result) || call.tool_name != tool {
-                continue;
-            }
-            evidence[i] = StepEvidence::Verified;
-            consumed[j] = true;
-            break;
-        }
-    }
-
     // Whatever is left: a tool-bound step is checkable and came up empty.
     // A tool-free step has no artifact to check, so the model's claim stands.
     let mut contradicted = Vec::new();
@@ -2937,69 +2907,6 @@ mod tests {
         assert_eq!(v.evidence[1], StepEvidence::Verified);
         assert_eq!(v.evidence[2], StepEvidence::Missing);
         assert_eq!(life_ids_in(&p.steps[0].description).len(), 2);
-    }
-
-    /// Live 2026-09-15 14:10 UTC: the closing audit step ran (harness-issued,
-    /// no arguments) and still could not be credited.
-    #[test]
-    fn unique_tool_step_verifies_on_any_successful_call_of_its_tool() {
-        let p = plan(
-            "executing",
-            &[
-                (
-                    "Apply audit action retire_duplicate on life:a -> life:b",
-                    Some("life.tidy"),
-                    "done",
-                ),
-                (
-                    "Re-run life.audit to measure the pass; then report the health_score delta plus what still needs judgment.",
-                    Some("life.audit"),
-                    "pending",
-                ),
-            ],
-        );
-        let h = history_args(&[
-            (
-                "life.tidy",
-                serde_json::json!({"action": {"duplicate_id": "life:a", "keeper_id": "life:b"}}),
-                "ok",
-            ),
-            (
-                "life.audit",
-                serde_json::json!({}),
-                r#"{"data":{"health_score":58}}"#,
-            ),
-        ]);
-        let v = verify_plan_steps(&p, &h, &[]);
-        assert_eq!(
-            v.evidence,
-            vec![StepEvidence::Verified, StepEvidence::Verified]
-        );
-        assert!(evaluate_whole_plan(&p, &v).complete);
-        // Two steps binding the same tool are not both credited by one call.
-        let p2 = plan(
-            "executing",
-            &[
-                (
-                    "Re-run life.audit to measure",
-                    Some("life.audit"),
-                    "pending",
-                ),
-                ("Run life.audit again later", Some("life.audit"), "pending"),
-            ],
-        );
-        let v2 = verify_plan_steps(
-            &p2,
-            &history_args(&[("life.audit", serde_json::json!({}), "ok")]),
-            &[],
-        );
-        assert!(
-            v2.evidence
-                .iter()
-                .filter(|e| **e == StepEvidence::Verified)
-                .count()
-                <= 1
-        );
     }
 
     #[test]
