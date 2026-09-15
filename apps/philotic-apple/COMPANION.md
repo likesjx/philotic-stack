@@ -17,7 +17,7 @@ it does not complete the native-app program or create a remote device tool host.
 
 | Surface | Implemented behavior | Boundary |
 |---|---|---|
-| Mac companion | Collapsed pill; expandable Ask/Today; hide and full-app handoff; menu-bar controls; Option-Command-N while app is active | One owned NSPanel, one existing chat session; no global keyboard monitoring |
+| Mac companion | Invisible at rest; notch-grown Ask/Today; retract and full-app handoff; menu-bar enable/disable; Option-Command-N while app is active | One owned NSPanel, one existing chat session; no global keyboard monitoring |
 | Today | Connection status, current LifeGraph lens with explicit load/retry/empty states, Apple connection cards | Reads the existing LifeGraph store, not a parallel personal database |
 | Agents | Existing typed/voice chat in full app and Mac companion | Existing Philotic Web edge transport and credentials; selection revisions reject stale history handoffs |
 | Health | Existing selected-metric, read-only preview and separately confirmed sharing | No new background access or Health writes |
