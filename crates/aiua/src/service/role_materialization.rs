@@ -3739,6 +3739,44 @@ mod tests {
         }
     }
 
+    /// DEF-134: a mesh-config-seeded role guest (PHILOTIC_ROLE_NAME only, no
+    /// PHILOTIC_ROLE_INBOX) built before the philote-side default registered
+    /// under the bare role name. It is still the incarnation the record
+    /// describes and must be allowed to hand back; a tool runner is not.
+    #[test]
+    fn bare_role_name_identity_is_an_agent_handoff_caller() {
+        let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
+        let graph = GraphDomain::new(Arc::new(graph_store.adapter()));
+        graph
+            .upsert_role_incarnation(&RoleIncarnationRecord {
+                agent_id: "agent-bjork-01".into(),
+                role_name: "theoretician".into(),
+                guest_id: "agent-bjork-01:theoretician".into(),
+                toolset_profile: "theoretician".into(),
+                readiness_state: RoleReadinessState::ActiveInSession,
+                ..Default::default()
+            })
+            .expect("seed role incarnation");
+        let bare = GuestIdentity {
+            guest_id: "agent-bjork-01:theoretician".into(),
+            role: "theoretician".into(),
+            supported_tools: Vec::new(),
+        };
+        assert!(IpcServer::is_agent_handoff_caller(&graph, &bare));
+        let routing = GuestIdentity {
+            guest_id: "agent-bjork-01:theoretician".into(),
+            role: "role:agent-bjork-01:theoretician".into(),
+            supported_tools: Vec::new(),
+        };
+        assert!(IpcServer::is_agent_handoff_caller(&graph, &routing));
+        let tool = GuestIdentity {
+            guest_id: "agent-bjork-01:theoretician".into(),
+            role: "tool".into(),
+            supported_tools: Vec::new(),
+        };
+        assert!(!IpcServer::is_agent_handoff_caller(&graph, &tool));
+    }
+
     #[tokio::test]
     async fn role_incarnation_can_initiate_manual_handoff_to_role() {
         let _env_guard = ipc_env_guard();

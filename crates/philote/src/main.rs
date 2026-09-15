@@ -40,13 +40,8 @@ async fn main() -> Result<()> {
         .map(|v| v.trim().to_string())
         .filter(|v| !v.is_empty());
 
-    let (role, guest_id) = match role_name {
-        Some(ref rn) => {
-            let role = role_inbox.unwrap_or_else(|| rn.clone());
-            (role, format!("{}:{}", agent_id, rn))
-        }
-        None => ("agent".to_string(), agent_id.clone()),
-    };
+    let (role, guest_id) =
+        role_registration(&agent_id, role_name.as_deref(), role_inbox.as_deref());
 
     let identity = GuestIdentity {
         guest_id: guest_id.clone(),
@@ -79,4 +74,72 @@ async fn main() -> Result<()> {
         runtime.set_role_name(rn.clone());
     }
     runtime.run().await
+}
+
+/// The IPC identity a philote registers under.
+///
+/// A role-incarnation philote (`PHILOTIC_ROLE_NAME` set) must register under
+/// the hotel's routing key `role:{agent_id}:{role_name}` — the same string
+/// `RoleIncarnationRecord::routing_role()` produces and the only role string
+/// (besides `agent`) that `is_agent_handoff_caller` accepts. aiua injects it
+/// as `PHILOTIC_ROLE_INBOX` when it materialises a role, but a guest seeded
+/// from mesh-config carries only `PHILOTIC_ROLE_NAME`; falling back to the
+/// bare role name left it able to receive a handoff but never hand back
+/// (live 2026-09-15 16:06 UTC: bjork's theoretician, registered as role
+/// "theoretician", got HANDOFF_FORBIDDEN on `handoff.back`, DEF-134).
+fn role_registration(
+    agent_id: &str,
+    role_name: Option<&str>,
+    role_inbox: Option<&str>,
+) -> (String, String) {
+    match role_name {
+        Some(rn) => {
+            let role = role_inbox
+                .map(str::to_string)
+                .unwrap_or_else(|| format!("role:{agent_id}:{rn}"));
+            (role, format!("{agent_id}:{rn}"))
+        }
+        None => ("agent".to_string(), agent_id.to_string()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::role_registration;
+
+    #[test]
+    fn base_philote_registers_as_agent() {
+        assert_eq!(
+            role_registration("agent-bjork-01", None, None),
+            ("agent".to_string(), "agent-bjork-01".to_string())
+        );
+    }
+
+    #[test]
+    fn injected_role_inbox_wins() {
+        assert_eq!(
+            role_registration(
+                "agent-bjork-01",
+                Some("theoretician"),
+                Some("role:agent-bjork-01:theoretician")
+            ),
+            (
+                "role:agent-bjork-01:theoretician".to_string(),
+                "agent-bjork-01:theoretician".to_string()
+            )
+        );
+    }
+
+    /// The mesh-config-seeded guest: role name only. It must still register
+    /// under the routing key, not the bare name.
+    #[test]
+    fn missing_role_inbox_defaults_to_the_routing_role() {
+        assert_eq!(
+            role_registration("agent-bjork-01", Some("theoretician"), None),
+            (
+                "role:agent-bjork-01:theoretician".to_string(),
+                "agent-bjork-01:theoretician".to_string()
+            )
+        );
+    }
 }

@@ -4449,12 +4449,15 @@ impl IpcServer {
             return true;
         }
 
+        // A role-incarnation guest registers under its routing role; a guest
+        // seeded from mesh-config by a pre-DEF-134 philote registered under
+        // the bare role name. Both are the incarnation the record describes.
         graph
             .list_role_incarnations_by_guest_id(&identity.guest_id)
             .map(|records| {
-                records
-                    .iter()
-                    .any(|record| record.routing_role() == identity.role)
+                records.iter().any(|record| {
+                    record.routing_role() == identity.role || record.role_name == identity.role
+                })
             })
             .unwrap_or(false)
     }
