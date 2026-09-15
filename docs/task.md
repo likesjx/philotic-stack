@@ -197,6 +197,11 @@ Proposal: [Native Apple program](architecture/NATIVE_APPLE_APP_PROPOSAL.md).
 Design: [Apple Companion](../apps/philotic-apple/COMPANION.md).
 Branch: `codex/apple-companion`, based on the working iPhone branch `codex/ios-healthkit`.
 
+Hover follow-up: `codex/notch-hover` adds near-notch dwell opening, delayed
+pointer-exit collapse, focus-preserving presentation, retained drafts and
+sleep/session gating. Mac policy tests pass; fresh app launch and operator
+hover/focus validation are separate from the earlier companion merge (#513).
+
 - [x] Combine the agent command center and personal dashboard in one shared Today/Agents/Life shell, with a Mac Ask/Today panel using the existing session.
 - [x] Add local read-only Reminders preview, opt-in map of the last shared location, navigation-only App Intents, and availability-gated on-device note summaries.
 - [x] Retain separate consent for Health/location sharing; no passive collection or remote Reminders actions.
@@ -2102,4 +2107,3 @@ Branch `codex/bjork-spawn-gate`. Source: bjork's Telegram session on mac-jane, 2
 - [x] DEF-128 fixed on `codex/subagent-auto-assign`: hotel delivers the resolved delegation on lease accept; IPC test. **Watched-live 21:09 UTC mac-jane:** operator-chat turn → `subagent.spawn` → worker registered, accepted, `handed its delegation as task …` 7 ms later, `Executing subagent delegation` with the gardener goal. Worker's model leg then timed out (DEF-129 evidence).
 - [ ] DEF-129: worker turn loop with `allowed_tools` projection — proposal/seam, not a patch. Until then a philote that delegates writes gets prose back.
 - [ ] Follow-ups: the gardener skill has no `allowed_tools`/procedure (a goal template only) — she should register it with the tool list and a `procedure.register` graph; typed piece properties (key, tempo, difficulty 0–100, accuracy) need an `EvidencePacket` slot the runner persists as node properties (today only `due_at`/`occurs_at` are structured) — ontology gap for the repertoire tracker the operator asked for at 14:19.
-

@@ -3,7 +3,7 @@ title: Philotic Architecture Status
 doc_type: status
 domain: runtime-sessions
 status: active
-last_updated: 2026-09-14
+last_updated: 2026-09-15
 tags:
 - source-of-truth
 - current-state
@@ -97,6 +97,8 @@ Philotic currently operates as a hotel-centered runtime:
 - The `codex/apple-companion` branch adds a shared Today/Agents/Life shell and Mac Ask/Today panel, local read-only Reminders preview, an opt-in map of the last acknowledged location snapshot, navigation-only App Intents, and availability-gated Foundation Models note summaries. Mac and simulator tests pass; local summarization was observed on Mac. This is not remote Apple-tool execution or passive data synchronization. Physical companion install is pending renewal of the expired development profile and phone availability. See [companion design and validation](../../apps/philotic-apple/COMPANION.md) and [native Apple program](NATIVE_APPLE_APP_PROPOSAL.md).
 
 - The native Apple Health surface now separates selected-type, read-only HealthKit capture from explicit LifeGraph sharing: local ephemeral preview, completed local-day windows, no synthetic unavailable-store fallback, no background delivery, and no Health writes. Sleep intervals are clipped/unioned, observations use unique proposed Signals, and upload acknowledgment is checked per observation instead of treating failed/unknown batches as success. App logic and transport contracts are test-green; real-device permissions/capture, live sharing/agent recall, and server health-specific access/retention policy remain unproven or deferred. See [NATIVE_APPLE_APP_PROPOSAL.md](NATIVE_APPLE_APP_PROPOSAL.md).
+
+- The `codex/notch-hover` follow-up adds near-notch hover opening and delayed pointer-exit collapse to the Mac companion, without application activation. The content stays mounted to retain drafts; pointer sampling stops on hide, display sleep or inactive user session. All 38 Mac tests pass and the updated app launches; physical hover/focus and display/lock behavior still await operator validation. See the [hover contract](../../apps/philotic-apple/COMPANION.md#mac-notch-hover--2026-09-15).
 
 ## Implemented Foundations
 

@@ -3,7 +3,7 @@ title: Native Apple App — Edge Client Program
 doc_type: proposal
 domain: membrane-transport
 status: accepted-current-slice
-last_updated: 2026-09-14
+last_updated: 2026-09-15
 tags:
 - apple
 - ios
@@ -323,6 +323,11 @@ Two canonical owners, one mapping — no third source of truth:
 - APNs (when built) carries wake signals only, never content.
 
 ## Current Slice: Apple Companion (Transitional)
+
+The `codex/notch-hover` follow-up adds pointer-dwell expansion at the physical
+notch (top-center fallback), delayed exit collapse, and draft-preserving,
+non-focus-stealing presentation. It changes only the Mac panel; real hover,
+focus, lock and display-transition validation is tracked in the companion record.
 
 Implemented on `codex/apple-companion`, based on the working `codex/ios-healthkit`
 phone baseline: shared Today/Agents/Life shell, a Mac Ask/Today companion panel,

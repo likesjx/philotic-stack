@@ -4,7 +4,8 @@
 
 One companion, two jobs: **Ask** is the quick agent command center; **Today**
 is the personal dashboard. The Mac keeps a quiet, top-centered pill below the
-camera/menu exclusion area, expanding on click into either mode. The iPhone
+camera/menu exclusion area, expanding when the pointer hovers over or near the
+notch (click and keyboard opening also remain available). The iPhone
 uses Today, Agents, and Life tabs with the same integration boundaries.
 
 This is an original, notch-inspired SwiftUI surface in the existing app, not
@@ -29,6 +30,32 @@ cannot repopulate them. Native fetches have a 20-second timeout. Health retains
 its existing exact-preview consent and invalidation rules. Local AI text and
 results are discarded when its sheet closes. The collapsed Mac pill contains
 no health, location, reminder, or conversation preview.
+
+## Mac notch hover — 2026-09-15
+
+The hover target includes the physical camera gap, an 18-point horizontal
+margin, and the collapsed pill. Non-notched displays use a bounded top-center
+target, not the whole menu bar. The panel prefers a notched display when present.
+A 150 ms dwell opens it; a continuous region from notch to expanded panel plus
+16 points of padding and a 450 ms exit grace prevent flicker during pointer
+transfer. Manual collapse suppresses reopening until the pointer leaves and
+returns. Keyboard opening remains available until the pointer visits the panel.
+
+Hover never calls `makeKey` or activates the application. Editing, menu tracking,
+mouse-button drags and active voice capture keep an already-open panel from
+auto-closing. The content remains mounted while collapsed to preserve drafts.
+Frame transitions respect Reduce Motion. A controller-owned 20 Hz timer samples
+only the current `NSEvent.mouseLocation`; it stores no pointer history and
+requests no Accessibility/Input Monitoring grant. Sampling stops when hidden,
+the display sleeps, or the user session resigns active; observers/timer are
+released with the controller. Screen sleep and session activity are separate
+gates so one resume event cannot override the other.
+
+All 38 Mac tests pass. Timing, suppression, interaction guards, notch-to-panel geometry, offset screen
+coordinates and non-notched fallback have deterministic tests. Real pointer
+hover, focus retention in another app, draft retention, sleep/lock and external
+display transitions still require operator validation; policy tests are not
+physical pointer-event proof. No iPhone behavior changes in this increment.
 
 ## Authority and Philotic Web
 
@@ -97,3 +124,4 @@ current development profile and trusted, reachable phone.
 - [Apple Foundation Models availability](https://developer.apple.com/documentation/foundationmodels/systemlanguagemodel)
 - [Apple App Intents](https://developer.apple.com/documentation/appintents/creating-your-first-app-intent)
 - [Apple MapKit](https://developer.apple.com/documentation/mapkit/map)
+- [Apple camera exclusion geometry](https://developer.apple.com/documentation/AppKit/NSScreen/auxiliaryTopLeftArea-uglc)

@@ -33,7 +33,7 @@ struct NotchView: View {
                 }
             }
             .padding(.horizontal, 14).frame(height: 38)
-            if controller.expanded {
+            VStack(spacing: 0) {
                 Picker("Companion view", selection: $pane) {
                     Text("Ask").tag(0)
                     Text("Today").tag(1)
@@ -63,6 +63,13 @@ struct NotchView: View {
                     Task { await session.connect() }
                 }
             }
+            // Keep chat state mounted when hover closes the panel (unsent drafts
+            // must not disappear just because the pointer moved away).
+            .frame(height: controller.expanded ? nil : 0)
+            .clipped()
+            .opacity(controller.expanded ? 1 : 0)
+            .allowsHitTesting(controller.expanded)
+            .accessibilityHidden(!controller.expanded)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
         .background(Color.black.opacity(0.96), in: RoundedRectangle(cornerRadius: controller.expanded ? 24 : 19))
