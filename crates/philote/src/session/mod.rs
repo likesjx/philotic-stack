@@ -2339,6 +2339,13 @@ impl SessionState {
     }
 
     pub fn project_tools_for_turn(&self, user_content: &str) -> Vec<ToolDefinition> {
+        // A fully verified plan has nothing left but the report. Every
+        // re-entry path (initial call, tool-result envelope, harness-run
+        // step) projects through here — live 2026-09-15 19:23 UTC the
+        // "[Plan complete]" note went out with 26 tools beside it.
+        if self.plan_fully_verified() {
+            return Vec::new();
+        }
         // Self-Improvement Loop L1: a distill lookaside turn sees exactly the
         // allowlisted tools the role actually holds — no keyword gates, no
         // on-demand suppression. Live 2026-09-04: the brief named
@@ -10209,6 +10216,117 @@ mod tests {
             .plan_steps_verified
             .clone();
         assert_eq!(flags, vec![true, false, true]);
+    }
+
+    /// Live 2026-09-15 19:23 UTC: the "[Plan complete]" note and 26 tools in
+    /// the same request — the tool-result re-entry envelope projects tools
+    /// through `project_tools_for_turn`, not the initial-call path.
+    #[test]
+    fn fully_verified_plan_projects_no_tools_on_any_path() {
+        let mut state =
+            SessionState::new("sess-1".into(), "agent-beacon".into(), "telegram".into());
+        for tool in ["life.audit", "life.tidy"] {
+            state.add_tool_binding(tool);
+        }
+        let mut turn = make_plain_turn();
+        turn.user_content = "Garden the LifeGraph.".into();
+        turn.active_plan = Some(ActivePlan {
+            goal: "Gardening pass: apply 1 audit-suggested action(s)".into(),
+            steps: vec![PlanStep {
+                id: 1,
+                description: "Re-run life.audit".into(),
+                tool_name: Some("life.audit".into()),
+                status: "pending".into(),
+            }],
+            status: "executing".into(),
+            context_1_advisory: None,
+            procedure_id: None,
+        });
+        turn.plan_steps_verified = vec![false];
+        state.start_turn(turn);
+        assert!(
+            !state
+                .project_tools_for_turn("Garden the LifeGraph.")
+                .is_empty()
+        );
+        let (_, _, _, tools) = state.build_reentry_context_envelope().expect("envelope");
+        assert!(!tools.is_empty());
+        state.active_turn.as_mut().unwrap().plan_steps_verified = vec![true];
+        assert!(state.plan_fully_verified());
+        assert!(
+            state
+                .project_tools_for_turn("Garden the LifeGraph.")
+                .is_empty()
+        );
+        let (_, _, _, tools) = state.build_reentry_context_envelope().expect("envelope");
+        assert!(tools.is_empty());
+    }
+
+    /// Live 2026-09-15 19:22 UTC: a continuation opened with the carried
+    /// plan's statuses but none of its evidence, so the in-turn hint listed
+    /// all twelve landed tidies as outstanding.
+    #[test]
+    fn continuation_turn_opens_with_carried_evidence() {
+        let plan = ActivePlan {
+            goal: "Gardening pass: apply 2 audit-suggested action(s)".into(),
+            steps: vec![
+                PlanStep {
+                    id: 1,
+                    description: "Apply audit action link on life:a -> life:role:r".into(),
+                    tool_name: Some("life.tidy".into()),
+                    status: "pending".into(),
+                },
+                PlanStep {
+                    id: 2,
+                    description: "Apply audit action link on life:b -> life:role:r".into(),
+                    tool_name: Some("life.tidy".into()),
+                    status: "done".into(),
+                },
+                PlanStep {
+                    id: 3,
+                    description: "Re-run life.audit".into(),
+                    tool_name: Some("life.audit".into()),
+                    status: "pending".into(),
+                },
+            ],
+            status: "planning".into(),
+            context_1_advisory: None,
+            procedure_id: None,
+        };
+        let carry = CarryoverPlan {
+            plan,
+            steps_done: vec![true, true, false],
+            // Step 2 was settled on the model's word only; step 1 by a call.
+            verified_step_ids: vec![1],
+            stalled_continuations: 0,
+            continuations_used: 1,
+            lifetime_continuations: 1,
+            created_turn_id: "t0".into(),
+        };
+        let (plan, verified) = carry.seed_turn_plan();
+        assert_eq!(plan.status, "executing");
+        let statuses: Vec<&str> = plan.steps.iter().map(|s| s.status.as_str()).collect();
+        assert_eq!(statuses, vec!["done", "done", "pending"]);
+        assert_eq!(verified, vec![true, false, false]);
+        // Installed on a turn, the hint no longer lists step 1 as outstanding.
+        let mut state =
+            SessionState::new("sess-1".into(), "agent-beacon".into(), "telegram".into());
+        let mut turn = make_plain_turn();
+        turn.active_plan = Some(plan);
+        turn.plan_steps_verified = verified;
+        turn.working_tool_history.push((
+            ToolCall {
+                tool_name: "life.audit".into(),
+                arguments: serde_json::json!({}),
+            },
+            ToolResult {
+                tool_name: "life.audit".into(),
+                content: r#"{"data":{"health_score":61}}"#.into(),
+            },
+        ));
+        state.start_turn(turn);
+        let hint = crate::plan_eval::reentry_hint(state.active_turn.as_ref().unwrap());
+        assert!(!hint.contains("step 1 (tool: life.tidy)"), "{hint}");
     }
 
     #[test]

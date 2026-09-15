@@ -5313,8 +5313,16 @@ pub(super) fn gardening_health_trailer(turn: &WorkingTurn, evidence_from: usize)
         if call.tool_name != "life.audit" || !crate::plan_eval::tool_result_looks_ok(result) {
             continue;
         }
-        let score = crate::plan_eval::audit_health_score(&result.content)?;
-        let v: Value = serde_json::from_str(&result.content).ok()?;
+        // A "[Duplicate call skipped]" or otherwise non-JSON audit entry is
+        // not a measurement — keep looking for the real one (live 2026-09-15
+        // 19:23 UTC the last audit entry was a skipped duplicate and the
+        // trailer never appeared).
+        let Some(score) = crate::plan_eval::audit_health_score(&result.content) else {
+            continue;
+        };
+        let Ok(v) = serde_json::from_str::<Value>(&result.content) else {
+            continue;
+        };
         let data = v.get("data").unwrap_or(&v);
         let orphans = data
             .get("live_orphans")
@@ -5753,6 +5761,22 @@ mod say_do_tests {
         );
         // The seeding audit (before the fence) is not the re-audit.
         assert!(gardening_health_trailer(&turn, 1).is_none());
+        // A skipped-duplicate audit entry after the real one is not a
+        // measurement; the real one still reports.
+        turn.working_tool_history.push((
+            ToolCall {
+                tool_name: "life.audit".into(),
+                arguments: serde_json::json!({}),
+            },
+            ToolResult {
+                tool_name: "life.audit".into(),
+                content: "[Duplicate call skipped] `life.audit` already ran".into(),
+            },
+        ));
+        assert_eq!(
+            gardening_health_trailer(&turn, 0).as_deref(),
+            Some("📊 LifeGraph health: 59 ↑ 61, live orphans 76, duplicates 0")
+        );
         // No baseline in the goal → nothing to compare against.
         turn.active_plan.as_mut().unwrap().goal = "Gardening pass: apply 3".into();
         assert!(gardening_health_trailer(&turn, 0).is_none());

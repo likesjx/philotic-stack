@@ -358,6 +358,28 @@ impl CarryoverPlan {
             .map(|s| self.verified_step_ids.contains(&s.id))
             .collect()
     }
+
+    /// The plan a continuation turn opens with, and the evidence it opens
+    /// with. Settled steps are marked done for the model; evidence-backed
+    /// steps are latched as verified for the harness — the in-turn hint,
+    /// the integrity note and the duplicate-call guard all read
+    /// `plan_steps_verified`, and a continuation that opened with none
+    /// told the model "1/13 verified, still outstanding: steps 1–12" right
+    /// after the harness ran the closing audit (live 2026-09-15 19:22 UTC),
+    /// so it re-ran all twelve landed tidies.
+    pub fn seed_turn_plan(&self) -> (ActivePlan, Vec<bool>) {
+        let mut plan = self.plan.clone();
+        for (i, step) in plan.steps.iter_mut().enumerate() {
+            if self.steps_done.get(i).copied().unwrap_or(false) {
+                step.status = "done".into();
+            }
+        }
+        if plan.status == "planning" {
+            plan.status = "executing".into();
+        }
+        let verified = self.verified_flags_for(&plan);
+        (plan, verified)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
