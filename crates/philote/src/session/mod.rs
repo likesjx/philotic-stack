@@ -3406,7 +3406,59 @@ impl SessionState {
             }
         }
 
+        // Record-driven projection: the compiled tables above only know the
+        // skills a developer typed into this binary. Every skill registered at
+        // runtime lives only in its hotel record, which the hotel now ships in
+        // `effective_skill_records`. A record projects when the skill is in
+        // play (assigned closure or on-demand) AND:
+        //   - it declares `implied_tools` and one of them is projected this
+        //     turn (assigned skills: that is enough; on-demand: must also be
+        //     relevant), or
+        //   - it declares no tools, is relevant to the turn (skill-name part,
+        //     description/goal tokens, or an active [Rules] entry naming it),
+        //     and either mentions a tool that is projected this turn or is
+        //     named by a rule (the operator said "always").
+        for record in &self.bindings.effective_skill_records {
+            let name = &record.skill_name;
+            if projected_skills.contains(name) || !record.validation_state.is_projectable() {
+                continue;
+            }
+            let assigned = self.bindings.effective_skillset.iter().any(|s| s == name);
+            let on_demand = self.bindings.on_demand_skills.iter().any(|s| s == name);
+            if !assigned && !on_demand {
+                continue;
+            }
+            let named_by_rule = self.rules_name_skill(name);
+            let relevant = named_by_rule
+                || record_relevant_for_turn(record, &normalized)
+                || self.skill_relevant_for_turn_with_session_signal(name, &normalized);
+            let projects = if !record.implied_tools.is_empty() {
+                let present = record
+                    .implied_tools
+                    .iter()
+                    .any(|tool| projected_tool_names.contains(tool.as_str()));
+                present && (assigned || relevant)
+            } else {
+                relevant
+                    && (named_by_rule
+                        || record_mentions_projected_tool(record, &projected_tool_names))
+            };
+            if projects {
+                projected_skills.insert(name.clone());
+            }
+        }
+
         projected_skills.into_iter().collect()
+    }
+
+    /// True when an active behavioral rule names this skill: the operator
+    /// said "always use X", so X is in front of the model on every turn.
+    fn rules_name_skill(&self, skill_name: &str) -> bool {
+        self.rules.iter().any(|rule| {
+            rule.get("description")
+                .and_then(|v| v.as_str())
+                .is_some_and(|d| d.contains(skill_name))
+        })
     }
 
     fn projected_role_activation_for_turn(
@@ -5628,6 +5680,67 @@ fn looks_like_multi_tool_workflow(normalized: &str) -> bool {
     .any(|phrase| normalized.contains(phrase))
 }
 
+/// Words too common to count as relevance evidence from a skill record.
+const RECORD_RELEVANCE_STOPWORDS: &[&str] = &[
+    "whenever", "always", "should", "would", "could", "which", "their", "there", "about", "these",
+    "those", "using", "through", "before", "after", "every", "other", "while", "where", "being",
+    "jared", "operator", "agent", "skill", "skills", "tools", "safely", "never", "first", "then",
+];
+
+/// Relevance from the record itself: a distinctive part of the skill name
+/// (`repertoire` in `music.repertoire-gardener`) or at least two significant
+/// words of its description/goal appear in the turn.
+fn record_relevant_for_turn(
+    record: &ansible_mesh_core::graph::AbstractSkillRecord,
+    normalized: &str,
+) -> bool {
+    if record
+        .skill_name
+        .split(['.', '-', '_'])
+        .filter(|part| part.len() >= 5)
+        .any(|part| normalized.contains(part))
+    {
+        return true;
+    }
+    let text = format!(
+        "{} {}",
+        record.description,
+        record.goal_template.as_deref().unwrap_or("")
+    )
+    .to_ascii_lowercase();
+    let mut seen = std::collections::BTreeSet::new();
+    let mut hits = 0usize;
+    for token in text.split(|c: char| !c.is_alphanumeric()) {
+        if token.len() < 5 || RECORD_RELEVANCE_STOPWORDS.contains(&token) || !seen.insert(token) {
+            continue;
+        }
+        if normalized.contains(token) {
+            hits += 1;
+            if hits >= 2 {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Does the record's description or goal name a tool that is projected this
+/// turn? Stands in for `implied_tools` when the author declared none.
+fn record_mentions_projected_tool(
+    record: &ansible_mesh_core::graph::AbstractSkillRecord,
+    projected_tool_names: &std::collections::BTreeSet<&str>,
+) -> bool {
+    let text = format!(
+        "{} {}",
+        record.description,
+        record.goal_template.as_deref().unwrap_or("")
+    )
+    .to_ascii_lowercase();
+    projected_tool_names
+        .iter()
+        .any(|tool| tool.contains('.') && text.contains(&tool.to_ascii_lowercase()))
+}
+
 fn normalized_turn_text(user_content: &str) -> String {
     user_content
         .trim()
@@ -7726,6 +7839,7 @@ mod tests {
                 effective_skillset: vec!["planning".into()],
                 effective_skill_guidance: Vec::new(),
                 effective_procedures: Vec::new(),
+                effective_skill_records: Vec::new(),
                 effective_workspace_ref: Some("workspace://main".into()),
                 transport_reply_target: Some(TransportReplyTargetBinding {
                     target_node: "local-aiua-01".into(),
@@ -8350,6 +8464,7 @@ mod tests {
             effective_skillset: vec!["planning".into()],
             effective_skill_guidance: Vec::new(),
             effective_procedures: Vec::new(),
+            effective_skill_records: Vec::new(),
             effective_workspace_ref: Some("workspace://main".into()),
             transport_reply_target: Some(TransportReplyTargetBinding {
                 target_node: "local-aiua-01".into(),
@@ -10711,6 +10826,124 @@ mod tests {
 
         assert!(projected_names.contains("skill.register"));
         assert!(projected_names.contains("skill.assign"));
+    }
+
+    fn gardener_record() -> ansible_mesh_core::graph::AbstractSkillRecord {
+        ansible_mesh_core::graph::AbstractSkillRecord {
+            skill_name: "music.repertoire-gardener".into(),
+            description: "Safely and deterministically updates, audits, and maintains Jared's \
+                          active music repertoire in the LifeGraph."
+                .into(),
+            goal_template: Some(
+                "Whenever a new piece is added to the repertoire, use life.list to check for \
+                 it, then life.observe.batch to create MusicSection nodes linked HAS_SECTION."
+                    .into(),
+            ),
+            ..Default::default()
+        }
+    }
+
+    fn state_with_gardener() -> SessionState {
+        let mut state =
+            SessionState::new("sess-1".into(), "agent-bjork-01".into(), "telegram".into());
+        state.clear_tool_bindings();
+        for tool in ["life.list", "life.observe", "life.observe.batch", "echo"] {
+            state.add_tool_binding(tool);
+        }
+        state.bindings.effective_skillset = vec!["music.repertoire-gardener".into()];
+        state.bindings.effective_skill_records = vec![gardener_record()];
+        state
+    }
+
+    fn projected_skills(state: &SessionState, text: &str) -> Vec<String> {
+        let tools = state.project_tools_for_turn(text);
+        state.projected_skill_names_for_turn(&super::normalized_turn_text(text), &tools)
+    }
+
+    /// Live 2026-09-15 14:24 EDT: `music.repertoire-gardener` is registered,
+    /// assigned to the orchestrator, named by a rule — and absent from every
+    /// turn, because projection only knew compiled skills.
+    #[test]
+    fn runtime_registered_skill_projects_from_its_record() {
+        let state = state_with_gardener();
+        let on_topic = projected_skills(
+            &state,
+            "Check whether the Chopin nocturne is in my repertoire",
+        );
+        assert!(
+            on_topic.iter().any(|s| s == "music.repertoire-gardener"),
+            "{on_topic:?}"
+        );
+        let off_topic = projected_skills(&state, "what's the weather like tomorrow");
+        assert!(
+            !off_topic.iter().any(|s| s == "music.repertoire-gardener"),
+            "{off_topic:?}"
+        );
+    }
+
+    /// "Always use the music.repertoire-gardener skill whenever Jared mentions
+    /// a piece" — a rule that names a skill keeps it projected even when the
+    /// turn text carries none of the skill's words.
+    #[test]
+    fn rule_naming_a_skill_projects_it_every_turn() {
+        let mut state = state_with_gardener();
+        state.rules.push(serde_json::json!({
+            "rule_id": "r1",
+            "description": "Always use the music.repertoire-gardener skill to initialize, map, and cultivate the structural sections of a piece whenever Jared mentions playing a new composition."
+        }));
+        let projected = projected_skills(&state, "I am starting to look at Mendelssohn's 67/2");
+        assert!(
+            projected.iter().any(|s| s == "music.repertoire-gardener"),
+            "{projected:?}"
+        );
+    }
+
+    /// Declared implied tools behave like compiled skills: an assigned record
+    /// projects on tool intersection alone; an on-demand one also needs
+    /// relevance; a retired record never projects.
+    #[test]
+    fn record_declared_tools_follow_assignment_and_relevance_rules() {
+        let mut state = state_with_gardener();
+        let mut record = gardener_record();
+        record.skill_name = "music.practice-log".into();
+        record.description = "Log practice sessions".into();
+        record.goal_template = None;
+        record.implied_tools = vec!["life.observe".into()];
+        state.bindings.effective_skill_records.push(record.clone());
+
+        // On-demand + no relevance → no.
+        state.bindings.on_demand_skills = vec!["music.practice-log".into()];
+        let projected = projected_skills(&state, "what's the weather like tomorrow");
+        assert!(
+            !projected.iter().any(|s| s == "music.practice-log"),
+            "{projected:?}"
+        );
+        // On-demand + relevant (name part "practice") → yes.
+        let projected = projected_skills(&state, "log tonight's practice");
+        assert!(
+            projected.iter().any(|s| s == "music.practice-log"),
+            "{projected:?}"
+        );
+        // Assigned → tool intersection is enough (no relevance needed once the tool is projected).
+        state.bindings.on_demand_skills.clear();
+        state
+            .bindings
+            .effective_skillset
+            .push("music.practice-log".into());
+        let projected = projected_skills(&state, "use life.observe to record tonight's session");
+        assert!(
+            projected.iter().any(|s| s == "music.practice-log"),
+            "{projected:?}"
+        );
+        // Retired → never.
+        let mut retired = record.clone();
+        retired.validation_state = ansible_mesh_core::graph::SkillValidationState::Deprecated;
+        state.bindings.effective_skill_records = vec![retired];
+        let projected = projected_skills(&state, "log tonight's practice");
+        assert!(
+            !projected.iter().any(|s| s == "music.practice-log"),
+            "{projected:?}"
+        );
     }
 
     #[test]

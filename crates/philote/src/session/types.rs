@@ -1755,6 +1755,18 @@ pub struct SessionBindings {
     /// only — never affects tool routing or the tool assembly.
     #[serde(default)]
     pub effective_procedures: Vec<ansible_mesh_core::procedure::ProcedureGraphRecord>,
+    /// Hotel skill records for every skill in play (the role-assigned SkillDAG
+    /// closure plus on-demand skills), so per-turn projection reads implied
+    /// tools, description and goal text from the RECORD. Until 2026-09-15 the
+    /// philote decided projection from compiled tables keyed by skill name, so
+    /// every skill registered at runtime — every skill a philote or the distill
+    /// lane authors — returned no tools, was never relevant, and never
+    /// projected: the rule "always use music.repertoire-gardener" fired on a
+    /// turn where the skill was absent and the model reached for
+    /// `subagent.spawn`. Projection-facing only; never a tool grant (grants
+    /// are expanded by the hotel into `effective_toolset`).
+    #[serde(default)]
+    pub effective_skill_records: Vec<ansible_mesh_core::graph::AbstractSkillRecord>,
     /// Skills whose tools are in the ToolAssembly but suppressed per-turn unless
     /// the turn content signals the skill is needed. Populated from the role's
     /// toolset profile `on_demand_skills` list at session snapshot time.
