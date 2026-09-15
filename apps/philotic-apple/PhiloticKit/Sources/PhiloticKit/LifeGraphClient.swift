@@ -131,6 +131,30 @@ public struct LifeLensData: Codable, Equatable, Sendable {
         case fallbackUsed = "fallback_used"
         case contextPacket = "context_packet"
     }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        status = try container.decode(String.self, forKey: .status)
+        namedStrategy = try container.decodeIfPresent(String.self, forKey: .namedStrategy)
+        contextPacket = try container.decodeIfPresent(LifeContextPacket.self, forKey: .contextPacket)
+
+        if try !container.contains(.fallbackUsed) || container.decodeNil(forKey: .fallbackUsed) {
+            fallbackUsed = nil
+        } else if let legacyValue = try? container.decode(Bool.self, forKey: .fallbackUsed) {
+            fallbackUsed = legacyValue
+        } else {
+            // data-memorygraphrag's FallbackUsage emits strings, not JSON booleans.
+            // Keep the existing boolean projection while accepting both wire formats.
+            switch try container.decode(String.self, forKey: .fallbackUsed) {
+            case "false": fallbackUsed = false
+            case "topped_up", "full_fallback": fallbackUsed = true
+            default:
+                throw DecodingError.dataCorruptedError(
+                    forKey: .fallbackUsed, in: container,
+                    debugDescription: "Unknown LifeGraph fallback usage")
+            }
+        }
+    }
 }
 
 /// `GET /api/edge/lifegraph/lens/:lens` response.
@@ -346,9 +370,11 @@ public struct LifeGraphClient: Sendable {
             )
             merged.append(contentsOf: result.results)
             switch result.status {
-            case "error": sawError = true
+            case "ok": break
             case "partial": sawPartial = true
-            default: break
+            // Failed, invalid_request, unknown, and future statuses must not
+            // become a successful health/location upload by default.
+            default: sawError = true
             }
         }
 

@@ -161,6 +161,50 @@ Seam IDs: `life-graph-schema`, `life-graph-memorygraphrag-runner`, `life-graph-a
 - [ ] Wire Beacon as the first Life Graph steward / chief-of-staff role once schema and retrieval are test-green.
 - [ ] Let specialized roles such as Coach consume and contribute to Life Graph OS through governed tools without owning the canonical cross-domain graph posture.
 
+## New Project: Native Apple Location Context
+
+Proposal: [NATIVE_APPLE_APP_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/NATIVE_APPLE_APP_PROPOSAL.md)
+
+- [x] Add a manual Core Location snapshot surface to the Swift app with approximate sharing as the default, precise sharing as an explicit choice, and no background tracking.
+- [x] Encode each share as a unique, timestamped LifeGraph `Signal` so agents can prefer recent evidence without a second current-location authority.
+- [x] Add macOS-hosted unit coverage for coordinate precision and the outbound observation contract; keep it in `just app-test`.
+- [x] Build macOS and iOS Simulator targets and watch the Location sheet render on an iOS 27 Simulator.
+- [x] Connect, unlock, trust, sign, and install the app on Jared's iPhone; wireless install and launch confirmed 2026-09-05 (Personal Team, iOS 27).
+- [ ] Share one real snapshot to the configured hotel, query the LifeGraph, and verify an agent recalls the newest snapshot with its observation time and accuracy.
+- [ ] Persist structured `EvidencePacket.metadata` in the `life.observe` compiler, then decide whether a governed derived `current location` projection is warranted; the immutable snapshot stream remains canonical meanwhile.
+
+## New Project: Native Apple HealthKit Context
+
+Proposal: [NATIVE_APPLE_APP_PROPOSAL.md](architecture/NATIVE_APPLE_APP_PROPOSAL.md)
+Seam: `device-tool-plane`; branch: `codex/ios-healthkit` (based on the location branch).
+
+- [x] Replace synthetic health uploads with selected-type read-only capture and an ephemeral local preview; metrics start unselected.
+- [x] Separate Apple read permission from exact-preview and destination-bound external-sharing confirmation; no background sync or Health writes.
+- [x] Bound reads to yesterday or seven completed local days; preserve missing/error states, clip and union sleep overlaps, and emit unique timestamped proposed Signals with durable metric/window text.
+- [x] Decode nested observe acknowledgments and prevent failed/unknown/partial uploads from being reported as complete; no automatic retries after uncertain writes.
+- [x] Cover service consent/invalidation/error/time-window contracts and transport responses; run app tests on macOS and iOS Simulator and inspect the Health UI.
+- [x] Sign and install on the trusted physical iPhone over Wi-Fi; build 2 installed and launched 2026-09-05.
+- [x] Fix missing packaged ATS policy with an exact private-server exception; built-host iOS regression test passes. See [connection setup](../apps/philotic-apple/CONNECTION.md). Operator subsequently reported successful enrollment and uploads; newest server observations and agent recall still need independent verification.
+- [x] Fix LifeGraph lens decoding for the server's string-valued `fallback_used`; preserve legacy boolean support and reject unknown values. Regression reproduced the reported type mismatch; shared package suite passes (95 passed, 1 skipped), 2026-09-08.
+- [x] Build and sign iPhone build 4 with the decoder fix and new icon; verify signature, icon declaration, and exact-host ATS policy in the resulting bundle (2026-09-08).
+- [x] Install and launch build 4 on the physical iPhone over private Wi-Fi (2026-09-12); operator subsequently confirmed the LifeGraph fix works.
+- [ ] Exercise selected/denied/revoked Health permissions, compare readings with Apple Health, and confirm one operator-approved live share plus agent recall.
+- [ ] Decide server-enforced health-only role/provider access, named-provider disclosure, retention/deletion, and App Store privacy requirements before widening distribution or adding passive ingestion.
+
+## Native Apple Companion
+
+Proposal: [Native Apple program](architecture/NATIVE_APPLE_APP_PROPOSAL.md).
+Design: [Apple Companion](../apps/philotic-apple/COMPANION.md).
+Branch: `codex/apple-companion`, based on the working iPhone branch `codex/ios-healthkit`.
+
+- [x] Combine the agent command center and personal dashboard in one shared Today/Agents/Life shell, with a Mac Ask/Today panel using the existing session.
+- [x] Add local read-only Reminders preview, opt-in map of the last shared location, navigation-only App Intents, and availability-gated on-device note summaries.
+- [x] Retain separate consent for Health/location sharing; no passive collection or remote Reminders actions.
+- [x] Validate hosted app tests on Mac and iOS Simulator and shared package tests; inspect Mac screens and run local inference with synthetic input.
+- [ ] Renew expired personal development signing through Xcode Accounts, then install the companion build on the reachable trusted iPhone.
+- [ ] Exercise real permission/revocation behavior, snapshot map, Siri/Shortcuts launch, and Mac display/lock transitions; independently verify approved server observation and agent recall.
+- [ ] Design governed EventKit actions and opt-in system indexing before expanding beyond local preview/navigation.
+
 ## New Project: Memory Cultivation and True-Up
 
 Proposal: [MEMORY_CULTIVATION_TRUE_UP_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/MEMORY_CULTIVATION_TRUE_UP_PROPOSAL.md)

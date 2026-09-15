@@ -15,6 +15,7 @@ Tracked defects and known technical debt. Each entry carries status, severity, p
 
 | ID | Title | Severity | Status | Pts | Found | Fixed by |
 |---|---|---|---|---|---|---|
+| DEF-130 | Apple agent selection could publish delayed history under a newer recipient | medium | fixed | 1 | 2026-09-14 | `codex/apple-companion`: clear old conversation synchronously, revision-gate async selection, and check recipient at send; A-B-A revision regression test. Found by code review; no claim of observed misdelivery. Seam: `device-tool-plane`. Initial local commit c3728c37 referenced DEF-108 before discovering that develop already used that ID; DEF-130 is the canonical ID for this fix. |
 | DEF-001 | Hotel-scoped capability advertisement off-by-one (inactive tool-runner counted) | low | open | 1 | 2026-03-10 | — |
 | DEF-002 | Abstract tool storage methods unwired in sqlite storage (legacy `ansible` crate Gap 3) | medium | fixed | 2 | 2026-03-10 | port to `ansible-mesh-core` (methods live in `domain/mod.rs`) |
 | DEF-003 | `aiua` binary test target could not compile/run | medium | fixed | 2 | 2026-03 | mock stubs + fallback fix (pre-04) |
@@ -146,6 +147,16 @@ Tracked defects and known technical debt. Each entry carries status, severity, p
 | DEF-129 | `philote-worker` cannot execute a skill: `execute_delegation` is a single model call with the goal as prompt ("Multi-turn model loops and tool execution will be wired in subsequent blocks"), `allowed_tools` resolved from the skill catalog are ignored, and the model reply is fired back as the completion summary. Spawn-by-name therefore cannot run any tool-bearing skill (the gardener, the steward, research digests) — the parent gets prose. Live 2026-09-14 21:09 UTC (mac-jane, DEF-128 build): worker `14ce429a` received the gardener delegation 7 ms after lease accept and started executing, then its single model leg (`EmitTask` to role `model`, session `worker-…`) got no reply and failed with `Model response timeout` at 120 s; `Failure hook fired` on the worker side but no hotel-side hook delivery to the parent is logged, and bjork's session shows no follow-up turn | high | open | 8 | 2026-09-14 | needs a seam: give the worker the philote turn loop (tool projection bounded by `allowed_tools`, iteration budget, completion hook carrying the tool ledger) or route skill delegations to a role incarnation instead of a worker; until then a philote that delegates a write to a subagent must be told the result is text-only |
 
 ---
+
+## HealthKit slice fixes (2026-09-04)
+
+IDs allocated after checking `origin/develop` (through DEF-104); this stacked branch predates DEF-081 through DEF-104.
+
+| ID | Title | Severity | Status | Pts | Found | Fixed by |
+|---|---|---|---|---|---|---|
+| DEF-105 | Unavailable HealthKit generated plausible sample values and uploaded them with real-health provenance; metrics defaulted on and missing data was reported as no metrics enabled | high | fixed | 2 | 2026-09-04 | `codex/ios-healthkit` — real-data-only reader, selected-type consent, local preview and separate confirmation; service regression tests. Seam: device-tool-plane. |
+| DEF-106 | Swift observe client normalized `failed`/unknown server statuses to `ok`, and ignored nested batch result acknowledgments | high | fixed | 1 | 2026-09-04 | `codex/ios-healthkit` — fail-closed status mapping, nested result decoding, exact per-observation acknowledgment check; transport/service tests. Seam: lifegraph-read-plane (adjacent write adapter). |
+| DEF-107 | macOS hosted app tests initialized real connection settings and blocked in `SecItemCopyMatching` before XCTest started | medium | fixed | 1 | 2026-09-04 | `codex/ios-healthkit` — DEBUG XCTest host renders without a ChatSessionManager; macOS app tests pass without Keychain interaction. Seam: device-tool-plane validation. |
 
 ## Open defects — detail
 

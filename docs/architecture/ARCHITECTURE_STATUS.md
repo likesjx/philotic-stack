@@ -31,6 +31,7 @@ related_docs:
 - DOC_TAGGING_FRONTMATTER_PROPOSAL.md
 - MCP_CLIENT_FABRIC_PROPOSAL.md
 - OUTBOUND_INTEGRATION_FABRIC_PROPOSAL.md
+- NATIVE_APPLE_APP_PROPOSAL.md
 task_refs:
 - docs/task.md
 tracks_domains:
@@ -46,7 +47,7 @@ tracks_domains:
 
 # Philotic Architecture Status
 
-> **Status:** Transitional Snapshot | **Last Updated:** 2026-07-28
+> **Status:** Transitional Snapshot | **Last Updated:** 2026-09-04
 
 This document is a legacy human-readable projection of current architecture state.
 The SQLite graph is the canonical source of truth; this file exists for review,
@@ -91,6 +92,11 @@ Philotic currently operates as a hotel-centered runtime:
 - LifeGraph now has a live read+write loop rather than write-only ingestion: `philote` auto-recalls cached LifeGraph context into turn prefetch (PR #152), auto-captures turn outcomes back into the graph (PR #168), retrieval carries Muninn-sourced provenance edges (PR #149) and cross-domain/role-ranked/read-expanded retrieval (PRs #153, #154, #157, #159) with a calibrated recall-confidence threshold (PR #160).
 - Model routing gained a health-aware oracle beneath the static fallback ladders (`model_oracle`, PR #167) and the model-controller fleet now includes a native `model-controller-anthropic` guest and `AnthropicProvider` (PR #166, "full model suite") alongside the existing gemini/elevenlabs/openai/openrouter/mlx/ollama/onnx/parakeet/vision controllers; provider key configuration for Anthropic is wired through the same vault-backed `provider_keys` path as the others but is not yet populated on any deployed hotel.
 - Turn-level failures (provider errors, watchdog evictions, fallback-ladder exhaustion) now flow into the self-heal queue instead of terminating silently (PR #173), and repeated 4xx responses from a provider now escalate to the next fallback tier instead of retrying the same dead provider (PR #176).
+- The native Apple app has a transitional, operator-triggered Core Location surface: each tap sends one timestamped `Signal` observation through the existing LifeGraph write plane, approximate precision is the default, and there is no background tracking path. Physical build 4 was installed and launched September 12, and the operator reported uploads and the LifeGraph fix working; independently observed server persistence and agent recall remain unproven.
+
+- The `codex/apple-companion` branch adds a shared Today/Agents/Life shell and Mac Ask/Today panel, local read-only Reminders preview, an opt-in map of the last acknowledged location snapshot, navigation-only App Intents, and availability-gated Foundation Models note summaries. Mac and simulator tests pass; local summarization was observed on Mac. This is not remote Apple-tool execution or passive data synchronization. Physical companion install is pending renewal of the expired development profile and phone availability. See [companion design and validation](../../apps/philotic-apple/COMPANION.md) and [native Apple program](NATIVE_APPLE_APP_PROPOSAL.md).
+
+- The native Apple Health surface now separates selected-type, read-only HealthKit capture from explicit LifeGraph sharing: local ephemeral preview, completed local-day windows, no synthetic unavailable-store fallback, no background delivery, and no Health writes. Sleep intervals are clipped/unioned, observations use unique proposed Signals, and upload acknowledgment is checked per observation instead of treating failed/unknown batches as success. App logic and transport contracts are test-green; real-device permissions/capture, live sharing/agent recall, and server health-specific access/retention policy remain unproven or deferred. See [NATIVE_APPLE_APP_PROPOSAL.md](NATIVE_APPLE_APP_PROPOSAL.md).
 
 ## Implemented Foundations
 
