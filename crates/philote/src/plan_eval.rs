@@ -741,6 +741,9 @@ pub fn verify_plan_steps(
             .to_lowercase()
         })
         .collect();
+    // Which history index each step's evidence came from — a read step that
+    // follows other steps must be evidenced by a call made AFTER theirs.
+    let mut consumed_by_step: Vec<Option<usize>> = vec![None; plan.steps.len()];
 
     // Pass 0 — exact: a step that names LifeGraph ids is proven only by a
     // call whose arguments carry every one of them. Sibling steps that
@@ -769,13 +772,16 @@ pub fn verify_plan_steps(
             {
                 evidence[i] = StepEvidence::Verified;
                 consumed[j] = true;
+                consumed_by_step[i] = Some(j);
                 break;
             }
         }
     }
 
     // Pass A — strong: a distinctive token of this step appears in the call's
-    // arguments (and the tool is compatible).
+    // arguments (and the tool is compatible). A read-only step that follows
+    // other steps only takes a call made after theirs (see Pass B): "re-run
+    // life.audit" names its own tool, which is in every audit call's haystack.
     for (i, step) in plan.steps.iter().enumerate() {
         if evidence[i] == StepEvidence::Verified
             || distinctive[i].is_empty()
@@ -783,13 +789,22 @@ pub fn verify_plan_steps(
         {
             continue;
         }
+        let floor = if step_tool_is_read_only(step) {
+            consumed_by_step[..i].iter().flatten().max().copied()
+        } else {
+            None
+        };
         for (j, (call, result)) in tool_history.iter().enumerate() {
             if consumed[j] || !tool_result_looks_ok(result) || !step_tool_compatible(step, call) {
+                continue;
+            }
+            if floor.is_some_and(|f| j <= f) {
                 continue;
             }
             if distinctive[i].iter().any(|t| haystacks[j].contains(t)) {
                 evidence[i] = StepEvidence::Verified;
                 consumed[j] = true;
+                consumed_by_step[i] = Some(j);
                 break;
             }
         }
@@ -798,21 +813,47 @@ pub fn verify_plan_steps(
     // Pass B — weak: nothing distinguishes this step textually, so a
     // successful call on its bound tool is the best evidence available. Still
     // one-to-one, so N identical steps require N successful calls.
+    //
+    // A step bound to a READ-ONLY tool takes this pass even when its text is
+    // distinctive: a retrieval has no per-item artifact, so a successful call
+    // of the bound tool IS the outcome. Live 2026-09-15 09:21 and 09:28 EDT
+    // (bjork, mac-jane): "Examine local database state and confirm the batch
+    // of observations has landed" bound to `life.list`, and "Inspect
+    // registered skills … verify music.repertoire-gardener configuration"
+    // bound to `skill.list {}`, could never verify — three and two successful
+    // calls each — so every such plan stalled twice, was declared `blocked`,
+    // and shipped "⚠️ Plan stopped before finishing: 0/1 steps verified"
+    // under a reply that (correctly) reported what the read had found.
+    //
+    // The relaxed read step must be evidenced by a call made AFTER the calls
+    // that satisfied the steps before it: a seeded gardening plan ends with
+    // "re-run life.audit to measure the pass", and the `life.audit` that
+    // seeded the plan — before any tidy ran — must not count as that re-run.
     for (i, step) in plan.steps.iter().enumerate() {
+        let relaxed_read = !distinctive[i].is_empty() && step_tool_is_read_only(step);
         if evidence[i] == StepEvidence::Verified
-            || !distinctive[i].is_empty()
+            || (!distinctive[i].is_empty() && !relaxed_read)
             || !step_ids[i].is_empty()
             || !step_is_tool_bound(step)
         {
             continue;
         }
+        let floor = if relaxed_read {
+            consumed_by_step[..i].iter().flatten().max().copied()
+        } else {
+            None
+        };
         for (j, (call, result)) in tool_history.iter().enumerate() {
             if consumed[j] || !tool_result_looks_ok(result) {
+                continue;
+            }
+            if floor.is_some_and(|f| j <= f) {
                 continue;
             }
             if step.tool_name.as_deref() == Some(call.tool_name.as_str()) {
                 evidence[i] = StepEvidence::Verified;
                 consumed[j] = true;
+                consumed_by_step[i] = Some(j);
                 break;
             }
         }
@@ -2422,6 +2463,157 @@ mod tests {
         let v = verify_plan_steps(&p, &[], &[true]);
         assert_eq!(v.evidence[0], StepEvidence::Verified);
         assert!(v.contradicted_step_ids.is_empty());
+    }
+
+    /// Live 2026-09-15 13:28 UTC (bjork): a single read step whose words never
+    /// appear in `skill.list {}`. The successful listing is the outcome.
+    #[test]
+    fn read_step_verifies_on_the_successful_call_of_its_bound_tool() {
+        let p = plan(
+            "executing",
+            &[(
+                "Inspect registered skills in the hotel catalog to verify \
+                 music.repertoire-gardener configuration",
+                Some("skill.list"),
+                "done",
+            )],
+        );
+        let h = history_args(&[(
+            "skill.list",
+            serde_json::json!({}),
+            "Registered skills:\n- music.repertoire-gardener [validated] — Safely updates \
+             Jared's repertoire\n- music.weekly-practice-review [validated]",
+        )]);
+        let v = verify_plan_steps(&p, &h, &[]);
+        assert_eq!(v.evidence[0], StepEvidence::Verified);
+        assert!(v.contradicted_step_ids.is_empty());
+        assert!(evaluate_whole_plan(&p, &v).complete);
+    }
+
+    /// Live 2026-09-15 13:21 UTC (bjork): the step's words are in neither the
+    /// arguments nor the returned rows, yet the retrieval itself ran fine —
+    /// a read step has no artifact beyond "the read happened".
+    #[test]
+    fn read_step_verifies_on_a_successful_call_even_with_distinctive_text() {
+        let p = plan(
+            "executing",
+            &[(
+                "Examine local database state and confirm the batch of observations has \
+                 landed successfully",
+                Some("life.list"),
+                "done",
+            )],
+        );
+        let h = history_args(&[(
+            "life.list",
+            serde_json::json!({"include_terminal": true, "labels": ["Event", "Commitment"], "limit": 10}),
+            r#"{"data":{"as_of":"2026-09-15T13:21:11Z","count":2,"query":"filtered","read_only":true,"rows":[{"id":"life:event:jared-practice-2026-09-14"}]}}"#,
+        )]);
+        let v = verify_plan_steps(&p, &h, &[]);
+        assert_eq!(v.evidence[0], StepEvidence::Verified);
+        assert!(evaluate_whole_plan(&p, &v).complete);
+    }
+
+    /// The `life.audit` that SEEDED a gardening plan (before any tidy ran)
+    /// must not satisfy the plan's closing "re-run life.audit" step: a read
+    /// step after other steps needs a call that follows theirs.
+    #[test]
+    fn closing_read_step_needs_a_call_after_the_earlier_steps() {
+        let p = plan(
+            "executing",
+            &[
+                (
+                    "Retire duplicate life:habit:duolingo_morning (keeper \
+                     life:habit:duolingo_morning_20260812)",
+                    Some("life.tidy"),
+                    "done",
+                ),
+                (
+                    "Link life:place:home -> life:role:chief-of-staff",
+                    Some("life.tidy"),
+                    "pending",
+                ),
+                (
+                    "Re-run life.audit to measure the pass; then report the health_score delta \
+                     plus what still needs judgment.",
+                    Some("life.audit"),
+                    "pending",
+                ),
+            ],
+        );
+        let seed_audit = (
+            "life.audit",
+            serde_json::json!({}),
+            r#"{"data":{"status":"ok","health_score":12,"suggested_actions":[]}}"#,
+        );
+        let first_tidy = (
+            "life.tidy",
+            serde_json::json!({"action": {"kind": "retire_duplicate", "duplicate_id": "life:habit:duolingo_morning", "keeper_id": "life:habit:duolingo_morning_20260812"}}),
+            r#"{"status":"tidied"}"#,
+        );
+        let h = history_args(&[seed_audit.clone(), first_tidy.clone()]);
+        let v = verify_plan_steps(&p, &h, &[]);
+        assert_eq!(v.evidence[0], StepEvidence::Verified);
+        assert_eq!(v.evidence[1], StepEvidence::Missing);
+        assert_eq!(
+            v.evidence[2],
+            StepEvidence::Missing,
+            "the seeding audit predates the tidy and cannot be the re-audit"
+        );
+
+        let re_audit = (
+            "life.audit",
+            serde_json::json!({}),
+            r#"{"data":{"status":"ok","health_score":40,"suggested_actions":[]}}"#,
+        );
+        let h = history_args(&[seed_audit, first_tidy, re_audit]);
+        let v = verify_plan_steps(&p, &h, &[]);
+        assert_eq!(v.evidence[2], StepEvidence::Verified);
+    }
+
+    /// The relaxation is for READ tools only: a write step with distinctive
+    /// text still needs its words in the call, so a `life.observe` of the
+    /// wrong thing does not clear it.
+    #[test]
+    fn write_step_with_distinctive_text_still_needs_a_matching_call() {
+        let p = plan(
+            "executing",
+            &[("Log Zerin Maluy", Some("life.observe"), "done")],
+        );
+        let h = history_args(&[("life.observe", observe("Daxton Thomas"), "ok")]);
+        let v = verify_plan_steps(&p, &h, &[]);
+        assert_eq!(v.evidence[0], StepEvidence::Missing);
+        assert_eq!(v.contradicted_step_ids, vec![1]);
+    }
+
+    /// A read step is still one-to-one with calls, and a failed read is no
+    /// evidence.
+    #[test]
+    fn read_steps_stay_one_to_one_and_reject_failed_reads() {
+        let p = plan(
+            "executing",
+            &[
+                (
+                    "Verify the practice event landed",
+                    Some("life.list"),
+                    "done",
+                ),
+                (
+                    "Verify the Chopin commitment landed",
+                    Some("life.list"),
+                    "done",
+                ),
+            ],
+        );
+        let one = history_args(&[("life.list", serde_json::json!({"labels": ["Event"]}), "ok")]);
+        assert_eq!(verify_plan_steps(&p, &one, &[]).verified_count(), 1);
+
+        let failed = history_args(&[(
+            "life.list",
+            serde_json::json!({"labels": ["Event"]}),
+            "Error: runner unavailable",
+        )]);
+        assert_eq!(verify_plan_steps(&p, &failed, &[]).verified_count(), 0);
     }
 
     #[test]
