@@ -1,0 +1,3687 @@
+# Philotic tool catalog — the single source of truth for tool definitions.
+#
+# Loaded by the hotel (aiua) into the context graph as `abstract_tool` records
+# on every boot and `aiua load`; the philote reads those records through its
+# session bindings. The copy compiled into the aiua binary is the floor; a
+# `tool-catalog.yaml` in the hotel profile directory (~/.philotic/<profile>/)
+# or the file named by PHILOTIC_TOOL_CATALOG overrides entries by tool_name.
+# Edit, then restart the hotel (or run `aiua load`) to apply.
+#
+# Fields per tool:
+#   tool_name     unique name the model calls
+#   class         approval/projection class (life_graph, config, session, …)
+#   description   what the model reads — say what the tool does AND its limits
+#   tool_markers  optional shared ligands (high_agency, local_only, …)
+#   batch_of      optional {tool, items_pointer}: this tool writes a list of
+#                 `tool` inputs found at the JSON pointer; plan verification
+#                 and argument repair treat each item as a call to `tool`
+#   input_schema  JSON Schema for the arguments; `{"$ref": "#/defs/<name>"}`
+#                 pulls in a shared fragment from `defs` below
+#
+# Generated 2026-09-16 from the philote's compiled catalog (108 tools; its
+# descriptions, schemas and classes win where the two compiled catalogs
+# disagreed) plus the 13 tools only the hotel seed defined, keeping the hotel
+# seed's tool_markers.
+version: 1
+defs:
+  conflict_handoff:
+    description: ConflictHandoff. Include graph_fact_refs, evidence_packets, or muninn_engram_ids so the
+      conflict is grounded.
+    properties:
+      conflict_id:
+        type: string
+      evidence_packets:
+        default: []
+        items:
+          $ref: '#/defs/evidence_packet'
+        type: array
+      finding_type:
+        enum:
+        - direct_contradiction
+        - temporal_conflict
+        - granularity_conflict
+        - identity_ambiguity
+        - staleness
+        - policy_risk
+        type: string
+      graph_fact_refs:
+        default: []
+        items:
+          $ref: '#/defs/graph_record_ref'
+        type: array
+      handoff_id:
+        type: string
+      metadata:
+        default: {}
+        type: object
+      muninn_engram_ids:
+        default: []
+        items:
+          type: string
+        type: array
+      recommended_owner:
+        enum:
+        - muninn
+        - data_memory_graph_rag
+        - shared_gate
+        - operator
+        type: string
+      requested_muninn_action:
+        enum:
+        - none
+        - true_up
+        - contradiction_review
+        - trust_update
+        - cultivate
+        type: string
+      requires_operator:
+        type: boolean
+      risk:
+        enum:
+        - low
+        - medium
+        - high
+        type: string
+      status:
+        enum:
+        - open
+        - sent_to_muninn
+        - awaiting_operator
+        - resolved
+        - closed_no_action
+        type: string
+      summary:
+        type: string
+    required:
+    - handoff_id
+    - conflict_id
+    - finding_type
+    - summary
+    - recommended_owner
+    - requested_muninn_action
+    - risk
+    - requires_operator
+    - status
+    type: object
+  evidence_packet:
+    description: EvidencePacket. Provide at least one source_ref or passage_ref; ungrounded evidence is
+      rejected by the runner.
+    properties:
+      adjudication_status:
+        default: not_needed
+        enum:
+        - not_needed
+        - pending
+        - muninn_first
+        - graph_review
+        - operator_required
+        - resolved
+        - rejected
+        type: string
+      claim_ref:
+        $ref: '#/defs/graph_record_ref'
+      claim_summary:
+        description: One or two sentence summary of what was observed.
+        type: string
+      confidence:
+        default: 0.6
+        description: How confident the observer is in the claim. Optional — defaults to 0.6 (agent-inferred
+          tier).
+        maximum: 1
+        minimum: 0
+        type: number
+      conflict_ids:
+        default: []
+        items:
+          type: string
+        type: array
+      metadata:
+        default: {}
+        type: object
+      observed_at:
+        description: ISO 8601 timestamp when this was observed.
+        type: string
+      packet_id:
+        description: Unique ID for this evidence packet. Optional — auto-generated when omitted.
+        type: string
+      passage_refs:
+        default: []
+        items:
+          $ref: '#/defs/passage_ref'
+        type: array
+      properties:
+        additionalProperties: true
+        description: Typed facts about the node, written as real node properties (Reflexive Life Graph
+          R1). Keys must be universal (title, status) or declared for the claim's label in life.ontology
+          → typed_properties; values are scalars checked for kind, range and allowed values. Put a number
+          in properties.difficulty, not 'difficulty 55/100' in the summary — prose is invisible to every
+          query. Unknown keys are rejected with the allowed list.
+        type: object
+      source_refs:
+        default: []
+        items:
+          $ref: '#/defs/source_ref'
+        type: array
+      source_reliability:
+        default: 0.6
+        description: How reliable the underlying source is. Optional — defaults to 0.6 (agent-inferred
+          tier).
+        maximum: 1
+        minimum: 0
+        type: number
+      valid_time_range:
+        properties:
+          ends_at:
+            type: string
+          starts_at:
+            type: string
+        type: object
+      validation_state:
+        default: proposed
+        enum:
+        - inferred
+        - proposed
+        - confirmed
+        - retired
+        - conflicted
+        type: string
+    required:
+    - claim_ref
+    - claim_summary
+    type: object
+  graph_record_ref:
+    properties:
+      datasource:
+        default: life-graph
+        description: Usually 'life-graph'.
+        type: string
+      id:
+        description: Life Graph node ID (e.g. 'life:open_loop:rowing').
+        type: string
+      label:
+        description: 'Life Graph node type. Examples: Person, Role, Goal, System, Habit, Project, Commitment,
+          OpenLoop, NextAction, Routine, Decision, Preference, Value, Concern, Event, Signal, GrowthHypothesis,
+          GrowthExperiment, DriftFinding, CapabilityPatch, SkillPatch, ToolPatch, SchemaPatch, AttentionPatch,
+          SystemPatch, StewardshipInstruction.'
+        type: string
+    required:
+    - id
+    - label
+    type: object
+  passage_ref:
+    properties:
+      excerpt_hash:
+        type: string
+      graph_node_id:
+        type: string
+      muninn_engram_id:
+        type: string
+      passage_id:
+        type: string
+      source_ref_id:
+        type: string
+    required:
+    - passage_id
+    type: object
+  source_ref:
+    properties:
+      captured_at:
+        description: ISO 8601 timestamp when this source was captured.
+        type: string
+      reliability:
+        properties:
+          basis:
+            enum:
+            - operator_confirmed
+            - direct_observation
+            - muninn_trust
+            - imported_authority
+            - agent_inferred
+            - unknown
+            type: string
+          score:
+            maximum: 1
+            minimum: 0
+            type: number
+        required:
+        - score
+        - basis
+        type: object
+      source_id:
+        description: Source membrane, agent, or memory ID (e.g. 'membrane:telegram').
+        type: string
+      source_kind:
+        enum:
+        - operator_confirmation
+        - membrane_event
+        - muninn_engram
+        - graph_passage
+        - imported_record
+        - agent_inference
+        - runtime_observation
+        type: string
+      uri:
+        type: string
+    required:
+    - source_id
+    - source_kind
+    - reliability
+    type: object
+tools:
+- tool_name: agent.configure
+  class: config
+  description: Update an agent configuration field. Supports approval_policy, profile, bindings, settings,
+    media_routing_policy, and voice_response_policy sections. Changes to sensitive fields (soul, identity,
+    approval policy) require operator approval unless preapproved. Use operation 'set' to replace, 'append'
+    to add to arrays, or 'remove' to delete from arrays.
+  input_schema:
+    properties:
+      config_path:
+        description: 'Dot-separated path to the config field. Examples: ''approval_policy.preapproved_tools'',
+          ''approval_policy.preapproved_classes'', ''approval_policy.auto_approve_all'', ''profile.soul_text'',
+          ''profile.identity_text'', ''profile.user_context_text'', ''profile.memory_summary'', ''bindings.effective_toolset'',
+          ''bindings.effective_skillset'', ''media_routing_policy.voice_action'', ''media_routing_policy.image_action'',
+          ''media_routing_policy.document_action'', ''media_routing_policy.forward_media_to_model'', ''media_routing_policy.strip_tools_on_media'',
+          ''voice_response_policy.mode'', ''voice_response_policy.provider'', ''voice_response_policy.voice_id'',
+          ''voice_response_policy.send_text_caption'', ''voice_response_policy.fallback_to_text'''
+        type: string
+      operation:
+        description: How to apply the change. Defaults to 'set'.
+        enum:
+        - set
+        - append
+        - remove
+        type: string
+      value:
+        description: The new value. For array fields with 'append'/'remove', provide a single string item.
+    required:
+    - config_path
+    - value
+    type: object
+- tool_name: agent.graph.declare
+  class: capability
+  description: Declare an agent-local resource shape in the agent graph. Use this for durable cognitive
+    posture about resources the agent expects to use; it does not grant hotel authority by itself.
+  input_schema:
+    properties:
+      config_hint:
+        description: Optional configuration hint to store with the declaration.
+        type: string
+      resource_type:
+        description: Resource type to declare, matching the shared resource enum.
+        type: string
+    required:
+    - resource_type
+    type: object
+- tool_name: agent.graph.read
+  class: capability
+  description: Read agent-local operating preferences and declarations from the agent graph. This is not
+    the operator LifeGraph and not the repo intel graph. Use only for agent policy such as tool_preferences,
+    routing, resource grants, or reflex preferences.
+  input_schema:
+    properties:
+      entity:
+        description: The agent-graph entity collection to read.
+        enum:
+        - resource_grants
+        - tool_preferences
+        - routing_preferences
+        - reflex_preferences
+        - resource_declarations
+        type: string
+    required:
+    - entity
+    type: object
+- tool_name: agent.graph.recall
+  class: capability
+  description: Recall recent agent-graph experience traces. Use this to inspect prior tool calls, resource
+    requests, model invocations, or approval outcomes recorded for this agent.
+  input_schema:
+    properties:
+      event_type:
+        description: Optional event type filter, such as tool_call.
+        type: string
+      limit:
+        description: Maximum number of traces to return.
+        maximum: 100
+        minimum: 1
+        type: integer
+    type: object
+- tool_name: agent.graph.sync
+  class: capability
+  description: Apply an inbound agent-graph snapshot using last-writer-wins merge semantics. This is normally
+    used by mesh synchronization rather than casual model turns.
+  input_schema:
+    properties:
+      agent_id:
+        type: string
+      declarations:
+        items:
+          type: object
+        type: array
+      exported_at:
+        type: integer
+      preferences:
+        items:
+          type: object
+        type: array
+      reflex_preferences:
+        items:
+          type: object
+        type: array
+      routing_preferences:
+        items:
+          type: object
+        type: array
+      source_node_id:
+        type: string
+    required:
+    - agent_id
+    - source_node_id
+    - exported_at
+    - preferences
+    - declarations
+    type: object
+- tool_name: agent.graph.write
+  class: capability
+  description: Write an agent-local graph preference or configuration record. Use for governed self-configuration
+    inside the agent graph, such as tool or routing preferences. This does not mutate hotel authority
+    or the shared model graph directly.
+  input_schema:
+    properties:
+      capability:
+        type: string
+      config: {}
+      entity:
+        enum:
+        - tool_preference
+        - routing_preference
+        - reflex_preference
+        type: string
+      model_ref:
+        type: string
+      precedence:
+        type: integer
+      preference_key:
+        type: string
+      preference_level:
+        type: integer
+      provider_hint:
+        type: string
+      reflexes:
+        type: object
+      stage_kind:
+        type: string
+      tool_name:
+        type: string
+      weight:
+        type: integer
+    required:
+    - entity
+    type: object
+- tool_name: agent.migrate_to
+  class: admin
+  description: Migrate this agent to a different hotel. All context, memory, role incarnations, vault
+    secrets (Telegram tokens, etc.), and guest processes travel to the destination. The source hotel remains
+    active as a fallback. Requires operator approval.
+  input_schema:
+    properties:
+      dest_hotel:
+        description: Name of the destination hotel (e.g. 'vps-jane').
+        type: string
+    required:
+    - dest_hotel
+    type: object
+- tool_name: approval.request_standing
+  class: approval
+  description: Request standing (pre-approved) permission for a specific tool based on a demonstrated
+    track record. Once the tool has succeeded the required number of times consecutively, operator approval
+    will no longer be required for that tool. Use this when you have already proven reliability on a tool
+    and the repeated approval gate is slowing down legitimate work. Does not require operator approval
+    to register the threshold.
+  input_schema:
+    properties:
+      required_successes:
+        description: Number of consecutive successful executions required before standing approval is
+          auto-granted. Defaults to 3 if not specified. Min 1, max 10.
+        type: integer
+      tool_name:
+        description: The exact tool name to request standing approval for (e.g. 'role.create_or_update').
+        type: string
+    required:
+    - tool_name
+    type: object
+- tool_name: asr.setup
+  class: asr
+  description: 'Set up the Parakeet ASR provider on this node: verifies Python + nemo-toolkit, optionally
+    installs nemo-toolkit[asr] via pip, writes the component config, and registers the model-controller-parakeet
+    guest for automatic materialization. python_path defaults to ''python3''; auto_install defaults to
+    true.'
+  tool_markers:
+  - high_agency
+  input_schema:
+    properties:
+      auto_install:
+        description: 'Attempt pip install if nemo import fails (default: true).'
+        type: boolean
+      model_name:
+        description: 'NeMo model name (default: nvidia/parakeet-tdt-0.6b-v2).'
+        type: string
+      python_path:
+        description: Python interpreter path (must have or will get nemo-toolkit).
+        type: string
+    type: object
+- tool_name: asr.status
+  class: asr
+  description: 'Return the current status of the Parakeet ASR provider: whether the guest is registered
+    and active, its PID if running, and whether nemo-toolkit is importable on this node.'
+  input_schema:
+    properties: {}
+    type: object
+- tool_name: bash.exec
+  class: shell
+  description: Last-resort shell execution. Runs a shell command and returns stdout, stderr, and exit
+    code. Use ONLY when no Philotic-native tool (workspace.read, agent.graph.read, session.status, etc.)
+    can accomplish the task. Do not call speculatively or for diagnostic purposes. Requires explicit operator
+    approval before execution. Commands run under the agent's effective working directory unless overridden
+    by working_dir. A timeout (default 30 s) is enforced.
+  tool_markers:
+  - high_agency
+  input_schema:
+    properties:
+      command:
+        description: The shell command to execute (passed to `sh -c`).
+        type: string
+      timeout_secs:
+        description: Maximum seconds to wait before killing the process. Defaults to 30.
+        type: integer
+      working_dir:
+        description: Optional absolute path to use as the working directory. Defaults to the agent session
+          workspace path if set.
+        type: string
+    required:
+    - command
+    type: object
+- tool_name: component.restart
+  class: heal
+  description: 'Restart a wedged materialized guest: the hotel terminates the process and immediately
+    re-spawns it. HIGH AGENCY and respawn-budget-gated server-side — if the budget is exhausted the restart
+    is refused; escalate to the operator instead of retrying. Use hotel.status first to confirm the guest_id
+    and that a restart is actually warranted. Requires operational admin authority; non-admin agents are
+    refused server-side.'
+  tool_markers:
+  - high_agency
+  input_schema:
+    properties:
+      guest_id:
+        description: The materialized guest id to restart (from hotel.status).
+        type: string
+      reason_note:
+        description: Short note explaining why the restart is needed (echoed in the result for the audit
+          trail).
+        type: string
+    required:
+    - guest_id
+    type: object
+- tool_name: cron.disable
+  class: cron
+  description: Disable a cron job by id.
+  input_schema:
+    properties:
+      job_id:
+        description: The cron job UUID.
+        type: string
+    required:
+    - job_id
+    type: object
+- tool_name: cron.enable
+  class: cron
+  description: Re-enable a cron job by id.
+  input_schema:
+    properties:
+      job_id:
+        description: The cron job UUID.
+        type: string
+    required:
+    - job_id
+    type: object
+- tool_name: cron.list
+  class: cron
+  description: List the cron jobs in YOUR crontab on the hotel's native scheduler, including schedule,
+    target role, enabled state, and next fire time. This is the only cron a philote consults — system
+    crontab and launchd are out of scope. You see jobs owned by your agent; the orchestrator sees the
+    whole hotel.
+  input_schema:
+    properties: {}
+    type: object
+- tool_name: cron.register
+  class: cron
+  description: Register a cron job in your crontab on the hotel's native scheduler (never system cron
+    or launchd). Use cron.list first to avoid duplicates. The schedule is a 7-field cron expression and
+    the payload is a JSON string delivered to the target role. The job is owned by your agent; only your
+    agent or the orchestrator can change it later.
+  tool_markers:
+  - high_agency
+  input_schema:
+    properties:
+      guaranteed:
+        description: Mesh-coordinated delivery flag. Optional; defaults to false.
+        type: boolean
+      payload:
+        description: JSON payload string delivered to the role. Include enough context for the recipient
+          to act without extra lookup.
+        type: string
+      schedule:
+        description: '7-field cron expression: <sec> <min> <hour> <dom> <month> <dow> <year>. Example:
+          "0 0 7 * * * *" for 7:00 AM daily.'
+        type: string
+      silent_ok:
+        description: When true, a fire's reply is suppressed (never delivered to the operator channel)
+          if it matches the Hermes [SILENT]/NO_REPLY convention (whole response, or standing alone on
+          the first/last line). Optional; defaults to false.
+        type: boolean
+      target_role:
+        description: Role name whose inbox receives the trigger payload, such as orchestrator.
+        type: string
+    required:
+    - schedule
+    - target_role
+    - payload
+    type: object
+- tool_name: cron.remove
+  class: cron
+  description: Remove a cron job by id.
+  tool_markers:
+  - high_agency
+  input_schema:
+    properties:
+      job_id:
+        description: The cron job UUID.
+        type: string
+    required:
+    - job_id
+    type: object
+- tool_name: delegate.to_external_cognitive_peer
+  class: delegate
+  description: Delegates a bounded task to an external cognitive peer (e.g., Claude Code, Codex) that
+    operates outside the Philotic mesh. Crosses both identity and runtime trust boundaries. Requires explicit
+    packaging, bounds, and a clear return expectation. Requires operator approval.
+  input_schema:
+    properties:
+      context_package:
+        description: Explicit context snapshot necessary for the peer to execute the task.
+        type: string
+      expected_artifacts:
+        description: List of artifacts or outcomes expected back
+        items:
+          type: string
+        type: array
+      target_peer_type:
+        description: The type or identifier of the external peer (e.g., 'claude_code', 'codex_worktree').
+        type: string
+      task_description:
+        description: Natural language description of the delegated task.
+        type: string
+    required:
+    - target_peer_type
+    - task_description
+    - context_package
+    type: object
+- tool_name: delegate.to_peer
+  class: delegate
+  description: Delegates a bounded task to a peer Philotic agent on the mesh. Crosses an identity boundary.
+    Requires explicitly packaging a bounded context, goal, and clear return contract expectations. Used
+    when a different agent's expertise or trust domain is needed, rather than your own active roles. Requires
+    operator approval.
+  input_schema:
+    properties:
+      context_package:
+        description: Explicit context snapshot necessary for the peer to execute the task.
+        type: string
+      expected_artifacts:
+        description: List of artifacts or outcomes expected back
+        items:
+          type: string
+        type: array
+      target_agent_id:
+        description: The unique ID of the peer agent to delegate to (e.g., 'jane').
+        type: string
+      task_description:
+        description: Natural language description of the delegated task.
+        type: string
+      timeout_secs:
+        description: Implicit contract SLA before the delegation is considered stalled.
+        type: integer
+    required:
+    - target_agent_id
+    - task_description
+    - context_package
+    type: object
+- tool_name: delegate.whisper
+  class: delegate
+  description: Paracrine dispatch — silently consults a specialist role. By default the specialist's response
+    arrives back asynchronously as a paracrine_response. Use routing='enriched_tool_result' or wait_for_response=true
+    when the main loop should pause until the aside completes and then continue with the specialist result
+    as this tool's result. Use other routing modes for quiet delegation, mid-turn enrichment, or specialist
+    consultation where the user does not need to see the handoff. Set reply_to='membrane' to route the
+    specialist's response directly to the user with an inline role-switch button.
+  input_schema:
+    properties:
+      approval_scope:
+        description: Where approval requests from the side loop should resolve. Defaults to originating_session.
+        enum:
+        - originating_session
+        - specialist_session
+        type: string
+      authority:
+        description: Authority granted to the paracrine side loop. Defaults to advice_only.
+        enum:
+        - advice_only
+        - context_patch
+        - execute_with_approval
+        type: string
+      prompt:
+        description: 'A succinct structured brief for the specialist — state the goal, the minimum essential
+          context, any constraints, and the expected return format. Do NOT paste conversation transcripts,
+          tool output, or your full working context; the specialist keeps its own session context per
+          conversation. Budget: ~4000 characters — anything longer is truncated before dispatch.'
+        type: string
+      reply_to:
+        description: Where the specialist's response should go. 'self' = back to this philote as paracrine_response
+          (default). 'membrane' = directly to the user with a role-switch button. '<node>/<role>' = explicit
+          routing.
+        type: string
+      role:
+        description: The target specialist role name to dispatch the exosome to.
+        type: string
+      routing:
+        description: 'How to handle the specialist''s response when it arrives. Defaults to reflective_re_entry:
+          the specialist''s reply comes back into your own loop as a fresh turn — reason about it, then
+          reply with the text you want the user to see (that reply is surfaced automatically) or call
+          delegate.merge. Complete with NO text only if the user should see nothing.'
+        enum:
+        - reflective_re_entry
+        - cognitive_re_entry
+        - enriched_tool_result
+        - datasource_injection
+        - memory_enrichment
+        - progress_update
+        - heartbeat
+        - raw_forward
+        - priority_re_entry
+        - approval_resolution
+        type: string
+      tool_policy:
+        description: Tool policy for the specialist side loop. Defaults to role_default.
+        enum:
+        - role_default
+        - read_only
+        - no_tools
+        type: string
+      wait_for_response:
+        description: When true, keep the current turn in waiting_tool until the specialist completes.
+          If routing is omitted, this implies routing='enriched_tool_result'.
+        type: boolean
+    required:
+    - role
+    - prompt
+    type: object
+- tool_name: desktop.observe
+  class: desktop
+  description: Returns low-agency metadata about the bound desktop automation runner and desktop session.
+    This observe-only CUA scaffold does not take a screenshot and cannot click, type, press keys, or scroll.
+  tool_markers:
+  - desktop_bound
+  - local_only
+  - low_agency
+  input_schema:
+    properties:
+      detail:
+        description: Observation detail level. Only summary metadata is supported in the first scaffold.
+        enum:
+        - summary
+        type: string
+    type: object
+- tool_name: echo
+  class: utility
+  description: Echoes a string back unchanged. Only use when explicitly asked to test tool connectivity.
+    Do not call during normal conversation or reasoning — this tool exists for diagnostics only.
+  input_schema:
+    properties:
+      text:
+        description: The text to echo back.
+        type: string
+    required:
+    - text
+    type: object
+- tool_name: graph.create
+  class: graph
+  description: Create a new named graph partition in the agent graph store. Omit graph_id to create your
+    own personal partition (keyed to your agent_id). Each partition is an isolated SQLite-backed Cypher
+    graph you own and can query.
+  input_schema:
+    properties:
+      graph_id:
+        description: Partition name (defaults to your agent_id if omitted).
+        type: string
+    type: object
+- tool_name: graph.drop
+  class: graph
+  description: Permanently drop a graph partition and all its data. Only drop partitions you own.
+  input_schema:
+    properties:
+      graph_id:
+        description: Partition to drop.
+        type: string
+    required:
+    - graph_id
+    type: object
+- tool_name: graph.grant_access
+  class: graph
+  description: Grant another agent read or write access to one of your graph partitions.
+  input_schema:
+    properties:
+      access:
+        description: Access level to grant.
+        enum:
+        - read
+        - write
+        type: string
+      agent_id:
+        description: Agent to grant access to.
+        type: string
+      graph_id:
+        description: Partition to share.
+        type: string
+    required:
+    - graph_id
+    - agent_id
+    - access
+    type: object
+- tool_name: graph.list
+  class: graph
+  description: List all graph partitions accessible to you in the agent graph store.
+  input_schema:
+    properties: {}
+    type: object
+- tool_name: graph.query
+  class: graph
+  description: 'Run a Cypher query against a graph partition. Use this to read or write structured knowledge
+    — entities, relationships, and typed records — in the agent graph store. Omit graph_id to query your
+    own partition. Supported patterns: MATCH (n) RETURN n [all nodes], MATCH (n:Label) RETURN n [by label],
+    MATCH (n:Label {id:''X''}) RETURN n [by label+id], CREATE (n:Label {id:''...'', ...}) [create node],
+    CREATE (a:L {id:''A''})-[:REL]->(b:L {id:''B''}) [create edge], MATCH (n {id:''X''}) DELETE n [delete
+    node], MATCH (n:Label {id:''X''}) DETACH DELETE n [delete node with label], MATCH ()-[r {id:''X''}]-()
+    DELETE r [delete edge].'
+  input_schema:
+    properties:
+      graph_id:
+        description: Partition to query (defaults to your agent_id).
+        type: string
+      parameters:
+        default: {}
+        description: Optional query parameters.
+        type: object
+      query:
+        description: Cypher query string.
+        type: string
+    required:
+    - query
+    type: object
+- tool_name: graph.schema
+  class: graph
+  description: Inspect the labels and relationship types visible in the active graph datasource provider.
+  input_schema:
+    properties:
+      graph_id:
+        description: Optional graph partition identifier.
+        type: string
+    type: object
+- tool_name: handoff.back
+  class: handoff
+  description: Return context and work custody back to the orchestrator or a specified prior role. Packages
+    a completion summary and signals the hotel to restore the previous session route. Use when the current
+    role's mission is complete or blocked. Requires operator approval.
+  input_schema:
+    properties:
+      return_to:
+        description: Optional role name to return to. Defaults to the orchestrator.
+        type: string
+      summary:
+        description: Summary of what was accomplished or why control is being returned.
+        type: string
+    required:
+    - summary
+    type: object
+- tool_name: handoff.to_role
+  class: handoff
+  description: Transfer active context and work custody to a configured role. Packages the current working
+    state into a handoff bundle and signals the hotel to route the session to the named role. The current
+    turn ends and the target role receives the bundle as its activation context. Requires operator approval.
+  input_schema:
+    properties:
+      active_goal:
+        description: The current goal being transferred. The target role inherits this.
+        type: string
+      cleanup_actions:
+        description: Actions completed before yielding (e.g. 'committed changes', 'closed open files').
+        items:
+          type: string
+        type: array
+      context_summary:
+        description: Compact summary of relevant working context for the target role.
+        type: string
+      expected_return_mode:
+        description: Whether the role is expected to hand back on completion.
+        enum:
+        - required
+        - optional
+        - none
+        type: string
+      reason:
+        description: Why this handoff is warranted. Required for operator visibility.
+        type: string
+      role_name:
+        description: The target role name to hand off to (e.g. 'developer', 'researcher').
+        type: string
+      target_focus_framing:
+        description: Specific natural language instructions framing what the target role should focus
+          on upon waking.
+        type: string
+    required:
+    - role_name
+    - reason
+    - target_focus_framing
+    type: object
+- tool_name: heal.close_work_item
+  class: heal
+  description: Close a filed heal work item once its underlying recurring fault is repaired. Mutating
+    and idempotent — closing an already-closed item succeeds; a missing id reports closed=false. Record
+    why in `reason`. Requires operational admin authority; non-admin agents are refused server-side.
+  input_schema:
+    properties:
+      reason:
+        description: Short note explaining why the item is being closed.
+        type: string
+      work_item_id:
+        description: The heal work item id to close (from heal.list work_items).
+        type: string
+    required:
+    - work_item_id
+    type: object
+- tool_name: heal.list
+  class: heal
+  description: 'Diagnostic only. Returns the hotel''s self-heal state: pending (unresolved) heal_queue
+    entries and open heal work items filed by the heal circuit. Use this to review outstanding maintenance
+    before resolving entries or closing work items. Never use bash.exec with `phil heal list` when this
+    tool is available.'
+  input_schema:
+    properties:
+      limit:
+        description: Maximum pending heal_queue entries to return (default 20).
+        type: integer
+      scope:
+        description: 'Which surface to list: the pending heal queue, filed work items, or both (default
+          both).'
+        enum:
+        - queue
+        - work_items
+        - both
+        type: string
+    type: object
+- tool_name: heal.resolve
+  class: heal
+  description: Mark a heal_queue entry resolved with an observed outcome. Mutating — use only after the
+    underlying fault has actually been attended to, and always record what happened in `outcome`. Requires
+    operational admin authority; non-admin agents are refused server-side.
+  input_schema:
+    properties:
+      entry_id:
+        description: The heal_queue entry id to resolve (from heal.list).
+        type: string
+      outcome:
+        description: Short note describing the observed outcome (e.g. 'guest restarted, healthy'). Defaults
+          to 'resolved_by_agent'.
+        type: string
+    required:
+    - entry_id
+    type: object
+- tool_name: host.vitals
+  class: heal
+  description: 'Diagnostic only. Returns the latest host health scan snapshot: disk headroom, memory pressure,
+    and load. Statuses are pre-graded against the hotel''s thresholds — trust the reported status over
+    raw percentages. Returns {"status":"no_scan_yet"} if no scan has run on this hotel.'
+  input_schema:
+    properties: {}
+    type: object
+- tool_name: hotel.egress.check
+  class: session
+  description: Check whether an outbound HTTP request is permitted by the hotel's egress policy. Returns
+    `allowed`, `credential_binding_configured`, and `deny_reason` if blocked. Credential values are never
+    returned; they remain inside the hotel-owned executor that performs the request. Call this before
+    privileged outbound requests at Mesh or Internet exposure.
+  input_schema:
+    properties:
+      agent_id:
+        description: Calling agent's ID for vault access decisions.
+        type: string
+      method:
+        description: 'HTTP method (default: GET).'
+        type: string
+      target_url:
+        description: Full URL of the outbound request (e.g. https://api.perplexity.ai/chat/completions).
+        type: string
+    required:
+    - target_url
+    type: object
+- tool_name: hotel.logs
+  class: session
+  description: Returns the last N lines from the hotel's log file (aiua.log). Use this to tail recent
+    log output, diagnose guest failures, or inspect hotel activity. Defaults to 50 lines. Never use bash.exec
+    to tail logs when this tool is available.
+  input_schema:
+    properties:
+      lines:
+        description: Number of log lines to return (default 50, max 500).
+        type: integer
+    type: object
+- tool_name: hotel.materialize_request
+  class: config
+  description: Ask a target hotel to pre-warm (spawn and register) a role's process right now, WITHOUT
+    changing which hotel owns the role — the role keeps running wherever role.set_home last pinned it.
+    Use this before a relocation to bring a warm standby up on the destination hotel so the eventual role.set_home
+    switch has nothing left to wait on. The target runs feasibility checks first (binary present, primary
+    model controller live, build version compatible) and declines loudly with a reason if any fail, instead
+    of leaving you to guess why nothing spawned. Requires operator approval. Poll hotel.materialize_status
+    with the returned request_id to see the outcome.
+  input_schema:
+    properties:
+      dry_run:
+        description: When true, only run the target's feasibility checks and report the result — never
+          spawns or changes anything. Use to ask 'could this work' before committing to a real pre-warm.
+          Defaults to false.
+        type: boolean
+      reason:
+        description: Why this standby is needed. Required for operator visibility.
+        type: string
+      role_name:
+        description: The role to pre-warm. Use your current active role name to pre-warm yourself elsewhere.
+        type: string
+      target_hotel:
+        description: The hotel node_id to materialize the role's process on (e.g. 'vps-jane').
+        type: string
+    required:
+    - role_name
+    - target_hotel
+    - reason
+    type: object
+- tool_name: hotel.materialize_status
+  class: session
+  description: Check the outcome of a prior hotel.materialize_request call. Returns pending (no reply
+    yet), ready (the target hotel's standby process is spawned and routable), or failed with an error.
+  input_schema:
+    properties:
+      request_id:
+        description: The request_id returned by hotel.materialize_request.
+        type: string
+    required:
+    - request_id
+    type: object
+- tool_name: hotel.perimeter.refresh
+  class: session
+  description: Forces the hotel to re-derive its network security perimeter from live OS interfaces and
+    returns the updated snapshot. Use this after a network change (e.g. joining a VPN, gaining a public
+    IP) to ensure the fence tiers reflect current topology.
+  input_schema:
+    properties: {}
+    type: object
+- tool_name: hotel.perimeter.status
+  class: session
+  description: 'Returns the hotel''s current network security perimeter snapshot: exposure ceiling tier
+    (Local/Lan/Mesh/Internet), per-listener profiles, Tailscale presence, and detected public/private
+    IP addresses. Use this to understand what auth is required on ingress and what egress policies apply.'
+  input_schema:
+    properties: {}
+    type: object
+- tool_name: hotel.relocate
+  class: config
+  description: 'Move a role incarnation — and, if requested, its paired transport — from this hotel to
+    target_hotel, all the way through: a feasibility check (declines loudly with a reason if the target
+    can''t host it), a warm STANDBY spawn on the target, then SWITCH (home_node, and transport home if
+    included, flip atomically) and RECONCILE (this hotel''s copy goes dormant, never resurrected on restart).
+    Runs in the background — returns immediately with a ceremony_id; poll hotel.relocate_status for progress.
+    A decline or failure before SWITCH rolls back for free — this hotel is never touched. Moving the transport
+    too (include_transport) is a higher-risk move (external identity custody, e.g. a bot token) and requires
+    full admin authority, not just operational admin authority. Requires operator approval.'
+  input_schema:
+    properties:
+      include_transport:
+        description: If true, also move the paired transport's home atomically with the role. Requires
+          'transport' and 'transport_resource_ref'. Defaults to false.
+        type: boolean
+      reason:
+        description: Why this move is needed. Required for operator visibility.
+        type: string
+      role_name:
+        description: The role to relocate. Use your current active role name to move yourself.
+        type: string
+      target_hotel:
+        description: The hotel node_id (or hotel_name) to move the role to, e.g. 'vps-jane'.
+        type: string
+      transport:
+        description: Transport implementation name, e.g. 'telegram'. Required when include_transport is
+          true.
+        type: string
+      transport_resource_ref:
+        description: Stable transport resource reference, such as a bot token key. Required when include_transport
+          is true.
+        type: string
+    required:
+    - role_name
+    - target_hotel
+    - reason
+    type: object
+- tool_name: hotel.relocate_status
+  class: session
+  description: 'Check the phase/outcome of a prior hotel.relocate call: intent, feasibility, standby,
+    continuity, switch, reconcile, close, or rolled_back/failed. A failed ceremony flags needs_operator_review
+    when it was interrupted at or after SWITCH, since that state is never auto-resumed.'
+  input_schema:
+    properties:
+      ceremony_id:
+        description: The ceremony_id returned by hotel.relocate.
+        type: string
+    required:
+    - ceremony_id
+    type: object
+- tool_name: hotel.status
+  class: session
+  description: 'Diagnostic only. Returns a safe view of the hotel''s current state: hotel name, node ID,
+    active/inactive guests, and registered agent identities. Use when the operator asks about hotel health,
+    guest placement, or runtime debugging. Do not use for ordinary memory, LifeGraph, or planning questions.'
+  input_schema:
+    properties: {}
+    type: object
+- tool_name: image.ground
+  class: vision
+  description: Locate objects or regions in an image (visual grounding). Provide image_url or image_base64
+    and a query describing what to find. Returns bounding boxes and labels.
+  input_schema:
+    properties:
+      image_base64:
+        description: Base64-encoded PNG or JPEG image data.
+        type: string
+      image_url:
+        description: HTTP or file URL of the image to process.
+        type: string
+      query:
+        description: Natural language description of what to locate in the image.
+        type: string
+    required:
+    - query
+    type: object
+- tool_name: image.ocr
+  class: vision
+  description: Extract text from an image using the local vision provider. Provide image_url (HTTP/file
+    URL) or image_base64 (base64-encoded PNG/JPEG). Returns the extracted text.
+  input_schema:
+    properties:
+      hint:
+        description: Optional text prompt to guide OCR (e.g. 'extract only the table').
+        type: string
+      image_base64:
+        description: Base64-encoded PNG or JPEG image data.
+        type: string
+      image_url:
+        description: HTTP or file URL of the image to process.
+        type: string
+    type: object
+- tool_name: integration.bind_http
+  class: config
+  description: 'Create or update a governed outbound HTTP integration. The binding grants a named API
+    capability, never arbitrary network access: base URL, methods, path prefixes, headers, address scope,
+    byte/time limits, agent grants, and hotel exit placement are all explicit. A successful bind is a
+    PERMISSION GRANT, not a connection — the integration is live only after one http:<binding_id>.request
+    returns 2xx. Before binding: run integration.list (re-use an existing binding for the same host),
+    and take paths and the auth header from the vendor''s documented contract (a 404 on the smoke means
+    YOUR path is wrong; 401 means the credential is missing). Declare credential_header + credential_format
+    when the API needs a key — the operator provisions the value with `phil integration set-credential`;
+    never ask for it in chat. Use placement {mode:''local''} unless the operator named an exit hotel that
+    integration.list reports reachable (an unreachable exit hotel makes every call hang ~30s and time
+    out). Webhooks need an inbound ingress the stack does not have; bind for polling instead. This is
+    a high-agency configuration action.'
+  input_schema:
+    additionalProperties: false
+    properties:
+      allowed_methods:
+        items:
+          enum:
+          - GET
+          - HEAD
+          - POST
+          - PUT
+          - PATCH
+          - DELETE
+          - OPTIONS
+          type: string
+        type: array
+      allowed_path_prefixes:
+        items:
+          type: string
+        type: array
+      allowed_redirect_hosts:
+        items:
+          type: string
+        type: array
+      allowed_request_headers:
+        items:
+          type: string
+        type: array
+      base_url:
+        type: string
+      binding_id:
+        type: string
+      credential_format:
+        description: Format containing exactly one {}, e.g. 'Bearer {}'.
+        type: string
+      credential_header:
+        description: Optional runner-owned injection header, e.g. Authorization. Pair with credential_format;
+          an operator must provision the value outside the model path with phil integration set-credential.
+        type: string
+      default_headers:
+        additionalProperties:
+          type: string
+        type: object
+      display_name:
+        type: string
+      grant_agents:
+        items:
+          type: string
+        type: array
+      grant_skills:
+        description: Optional SkillDAG dependencies. When non-empty, the projected tool appears only in
+          sessions whose effective skill set contains at least one named skill.
+        items:
+          type: string
+        type: array
+      max_redirects:
+        maximum: 10
+        minimum: 0
+        type: integer
+      max_request_bytes:
+        minimum: 1
+        type: integer
+      max_response_bytes:
+        minimum: 1
+        type: integer
+      network_scope:
+        default: public
+        enum:
+        - public
+        - loopback
+        - tailnet
+        - private
+        type: string
+      placement:
+        description: 'Tagged placement policy: {mode:''local''}, {mode:''prefer_hotel'',hotel_id:''vps-jane'',fallback:''deny''|''local_with_audit''},
+          {mode:''require_hotel'',hotel_id:''vps-jane''}, or {mode:''deny''}.'
+        type: object
+      requires_approval:
+        default: true
+        type: boolean
+      response_header_allowlist:
+        items:
+          type: string
+        type: array
+      timeout_secs:
+        maximum: 300
+        minimum: 1
+        type: integer
+      traffic_class:
+        default: general_api
+        enum:
+        - communication
+        - general_api
+        - mcp
+        - model_provider
+        - mesh_peer
+        - local_resource
+        - artifact
+        type: string
+    required:
+    - binding_id
+    - base_url
+    - allowed_methods
+    - allowed_path_prefixes
+    type: object
+- tool_name: integration.list
+  class: session
+  description: List governed outbound integration bindings with their current placement decision, execution
+    node, reachability, grants, and projected tool name. Secret values are never included.
+  input_schema:
+    properties: {}
+    type: object
+- tool_name: integration.unbind
+  class: config
+  description: Revoke a governed outbound integration owned by this agent. The projected http:<binding>.request
+    tool disappears immediately.
+  input_schema:
+    additionalProperties: false
+    properties:
+      binding_id:
+        type: string
+    required:
+    - binding_id
+    type: object
+- tool_name: life.audit
+  class: life_graph
+  description: 'READ-ONLY graph-science audit of the whole LifeGraph: connected components (giant component,
+    islands), live orphans, PageRank/degree hubs, semantic + exact duplicates (keeper chosen: confirmed,
+    else newest), stale loops (past due / untouched), temporal and conformance defects, and a health_score.
+    Returns suggested_actions — each is ONE life.tidy call — and needs_judgment items for the operator.
+    Run it before and after a gardening pass and report the delta.'
+  input_schema:
+    properties:
+      duplicate_similarity:
+        default: 0.9
+        description: Embedding cosine threshold for a duplicate candidate.
+        maximum: 1.0
+        minimum: 0.5
+        type: number
+      labels:
+        description: Restrict findings to these ontology labels (empty = all).
+        items:
+          type: string
+        type: array
+      max_actions:
+        default: 25
+        maximum: 200
+        minimum: 1
+        type: integer
+      stale_days:
+        default: 45
+        description: A live loop untouched this long is stale.
+        type: integer
+    type: object
+- tool_name: life.commit
+  class: life_graph
+  description: 'Promote a validated Life Graph evidence node to confirmed truth. Requires either confirmed
+    evidence or explicit operator approval. This is also the tool for closing a loop: when the operator
+    says a previously-observed OpenLoop/Commitment/Goal is done, life.recall it first to get its exact
+    node id, then call life.commit on that id with loop_status set to "resolved" and an up-to-date claim_summary
+    — do NOT leave stale recalled content (e.g. yesterday''s "paused/halfway" note) standing as the record
+    once the operator has reported it done. life.resolve is a SEPARATE tool for governed conflict handoffs
+    only — it cannot close an ordinary loop.'
+  input_schema:
+    properties:
+      evidence:
+        $ref: '#/defs/evidence_packet'
+      loop_status:
+        description: Optional. Set to "resolved" when the operator has reported this node's underlying
+          loop/commitment/goal as done — marks it closed (distinct from validation_state, which tracks
+          evidence trust, not lifecycle). Omit to leave lifecycle status unchanged.
+        type: string
+      operator_approved:
+        description: True if operator has explicitly approved this commit.
+        type: boolean
+      resolution_note:
+        description: Optional. Short note on how/why this closed, in the operator's own words where possible
+          (e.g. "operator reported complete 2026-07-09"). Only meaningful alongside loop_status.
+        type: string
+    required:
+    - evidence
+    - operator_approved
+    type: object
+- tool_name: life.conflict
+  class: life_graph
+  description: Open a governed Life Graph conflict handoff when graph evidence, Muninn memory, or operator
+    context disagrees. Use this to record the conflict and route it toward Muninn, graph review, shared
+    gate, or operator resolution; do not use it for ordinary observations.
+  input_schema:
+    properties:
+      handoff:
+        $ref: '#/defs/conflict_handoff'
+    required:
+    - handoff
+    type: object
+- tool_name: life.list
+  class: life_graph
+  description: 'READ-ONLY deterministic Life Graph listing — exact predicates, not similarity. Preferred
+    for maintenance/gardening: pass a named_query (''past_dated_events'', ''aging_loops_oldest_first'',
+    ''duplicate_candidates'', ''recently_retired'', ''past_due_commitments'') OR typed filters (labels/statuses/validation_states/date
+    bounds), never both. Terminal (resolved/retired/done) nodes are excluded unless include_terminal=true.
+    Same call, same graph state → same rows; every returned id is a real node id safe to cite.'
+  input_schema:
+    properties:
+      date_after:
+        description: ISO 8601 lower bound on the node's best structured date.
+        type: string
+      date_before:
+        description: ISO 8601 upper bound on the node's best structured date (due/starts/occurs/ends).
+        type: string
+      include_terminal:
+        default: false
+        description: Include resolved/retired/done nodes (self-audit).
+        type: boolean
+      labels:
+        description: Node labels to include (ontology labels, e.g. OpenLoop, Event). Empty = all.
+        items:
+          type: string
+        type: array
+      limit:
+        default: 50
+        description: Max rows, clamped 1..=200.
+        type: integer
+      named_query:
+        description: Named maintenance query. Mutually exclusive with the filter fields.
+        enum:
+        - past_dated_events
+        - aging_loops_oldest_first
+        - duplicate_candidates
+        - recently_retired
+        - past_due_commitments
+        type: string
+      observed_after:
+        description: ISO 8601 lower bound on observed_at.
+        type: string
+      observed_before:
+        description: ISO 8601 upper bound on observed_at.
+        type: string
+      statuses:
+        description: Lifecycle statuses to require, matched on any status property.
+        items:
+          type: string
+        type: array
+      validation_states:
+        items:
+          enum:
+          - proposed
+          - inferred
+          - confirmed
+          - conflicted
+          - retired
+          type: string
+        type: array
+    type: object
+- tool_name: life.observe
+  class: life_graph
+  description: Propose a grounded observation as a new Life Graph evidence node. Use this to record commitments,
+    open loops, goals, habits, events, and other lived-reality facts with provenance. The node is written
+    to the Life Graph with validation_state=proposed and must be confirmed before becoming durable truth.
+  input_schema:
+    properties:
+      edges:
+        default: []
+        description: 'Typed edges from this node to existing nodes. Living-cycle: OWNS, SHAPES, SETS,
+          SPAWNS, RELATES_TO. Agenda (endpoint-validated): ADVANCES (NextAction/Habit/Project→Goal), BLOCKED_BY
+          (Goal/NextAction/Project→Concern/OpenLoop/Commitment), NEEDS_FOLLOWUP (Event/Commitment/OpenLoop→NextAction/Commitment),
+          PROMISED_TO (Commitment→Person), CONTAINS (Project/System/Routine→NextAction/Habit/OpenLoop),
+          SUPPORTS (System/Habit/Routine→Goal/Habit). ALWAYS wire new Goals, NextActions, Commitments
+          and OpenLoops into the agenda: a NextAction should ADVANCES its Goal; a Commitment should be
+          PROMISED_TO its Person. A target_id that matches no node (or the wrong node type) writes nothing
+          and is reported as target_missing.'
+        items:
+          properties:
+            rel_type:
+              enum:
+              - OWNS
+              - SHAPES
+              - SETS
+              - SPAWNS
+              - RELATES_TO
+              - ADVANCES
+              - BLOCKED_BY
+              - NEEDS_FOLLOWUP
+              - PROMISED_TO
+              - CONTAINS
+              - SUPPORTS
+              type: string
+            target_id:
+              description: Existing Life Graph node ID the edge points to.
+              type: string
+          required:
+          - rel_type
+          - target_id
+          type: object
+        type: array
+      evidence:
+        properties:
+          adjudication_status:
+            default: not_needed
+            enum:
+            - not_needed
+            - pending
+            - muninn_first
+            - graph_review
+            - operator_required
+            - resolved
+            - rejected
+            type: string
+          claim_ref:
+            properties:
+              datasource:
+                default: life-graph
+                description: Always 'life-graph'.
+                type: string
+              id:
+                description: Life Graph node ID (e.g. 'life:open_loop:rowing').
+                type: string
+              label:
+                description: 'Life Graph node type. Must be one of: Person, Role, Goal, System, Habit,
+                  Project, Commitment, OpenLoop, NextAction, Routine, Decision, Preference, Value, Concern,
+                  Event, Signal, Place, Trip, Appointment, Subscription, Asset, CreativeWork, Moment,
+                  GrowthHypothesis, GrowthExperiment, DriftFinding, CapabilityPatch, SkillPatch, ToolPatch,
+                  SchemaPatch, AttentionPatch, SystemPatch, StewardshipInstruction. Prefer the concrete
+                  lived-world nouns (Place, Trip, Appointment, Subscription, Asset, CreativeWork, Moment)
+                  over generic Events/Signals when one fits, and wire them with edges (INVOLVES→Person,
+                  OCCURS_AT→Place, PART_OF→Trip/Project, ABOUT→the thing a loop concerns, MAINTAINS/RENEWS→Asset/Subscription/CreativeWork).
+                  Consult life.ontology for the full vocabulary.'
+                type: string
+            required:
+            - id
+            - label
+            type: object
+          claim_summary:
+            description: One or two sentence summary of what was observed.
+            type: string
+          confidence:
+            description: Confidence in this claim (0.0–1.0).
+            maximum: 1
+            minimum: 0
+            type: number
+          conflict_ids:
+            default: []
+            items:
+              type: string
+            type: array
+          due_at:
+            description: ISO 8601 deadline for the claimed item (commitments, next actions). ALWAYS extract
+              a concrete date mentioned in the claim into this field — dates left only in prose are invisible
+              to deterministic maintenance queries.
+            type: string
+          metadata:
+            default: {}
+            type: object
+          observed_at:
+            description: ISO 8601 timestamp when this was observed.
+            type: string
+          occurs_at:
+            description: ISO 8601 point-in-time the claimed event happens. Extract from the claim whenever
+              a concrete date is known.
+            type: string
+          packet_id:
+            description: Unique ID for this evidence packet.
+            type: string
+          passage_refs:
+            default: []
+            items:
+              type: object
+            type: array
+          properties:
+            additionalProperties: true
+            description: 'Typed facts written as node properties: universal keys (title, status) or keys
+              declared for this label in life.ontology → typed_properties (kind, range, allowed values
+              checked). Structured facts go here, never only in the summary. Pass a JSON object, never
+              a JSON-encoded string.'
+            type: object
+          source_refs:
+            items:
+              properties:
+                reliability:
+                  properties:
+                    basis:
+                      enum:
+                      - operator_confirmed
+                      - direct_observation
+                      - muninn_trust
+                      - imported_authority
+                      - agent_inferred
+                      - unknown
+                      type: string
+                    score:
+                      maximum: 1
+                      minimum: 0
+                      type: number
+                  required:
+                  - score
+                  - basis
+                  type: object
+                source_id:
+                  description: Source membrane or agent ID (e.g. 'membrane:telegram').
+                  type: string
+                source_kind:
+                  enum:
+                  - operator_confirmation
+                  - membrane_event
+                  - muninn_engram
+                  - graph_passage
+                  - imported_record
+                  - agent_inference
+                  - runtime_observation
+                  type: string
+              required:
+              - source_id
+              - source_kind
+              - reliability
+              type: object
+            minItems: 1
+            type: array
+          source_reliability:
+            maximum: 1
+            minimum: 0
+            type: number
+          valid_time_range:
+            description: Time window the claim spans (trips, multi-day events).
+            properties:
+              ends_at:
+                description: ISO 8601 end.
+                type: string
+              starts_at:
+                description: ISO 8601 start.
+                type: string
+            type: object
+          validation_state:
+            default: proposed
+            enum:
+            - inferred
+            - proposed
+            - confirmed
+            - retired
+            - conflicted
+            type: string
+        required:
+        - claim_ref
+        - claim_summary
+        type: object
+      observation_id:
+        description: Unique ID for this observation (e.g. 'obs:rowing-2026-06-05').
+        type: string
+      proposed_graph_refs:
+        default: []
+        items:
+          type: object
+        type: array
+    required:
+    - evidence
+    type: object
+- tool_name: life.observe.batch
+  class: life_graph
+  description: 'Propose UP TO 25 Life Graph observations in ONE tool call. Use this instead of repeated
+    life.observe calls whenever recording more than ~3 related nodes (e.g. seeding goals + systems + open
+    loops): one batch call costs one model round-trip regardless of item count, so large structures never
+    exhaust the turn''s iteration budget. Each item is a complete life.observe input (observation_id +
+    evidence, same provenance requirements) and is gated and written INDIVIDUALLY — results report per-item
+    success/failure and completed writes are durable; there is NO rollback on partial failure. For structures
+    larger than 25 nodes, declare a plan and split into multiple batch calls.'
+  batch_of:
+    tool: life.observe
+    items_pointer: /observations
+  input_schema:
+    properties:
+      observations:
+        description: 'Each item is a full life.observe input: {observation_id, evidence:{packet_id, claim_ref:{id,label},
+          claim_summary, source_refs, confidence, validation_state, source_reliability, adjudication_status},
+          edges?}. See the life.observe schema for field details.'
+        items:
+          type: object
+        maxItems: 25
+        minItems: 1
+        type: array
+    required:
+    - observations
+    type: object
+- tool_name: life.ontology
+  class: life_graph
+  description: 'READ-ONLY canonical Life Graph vocabulary: node labels, terminal lifecycle statuses, status
+    property conventions, structured date fields, named maintenance queries, stewardship rules, and known
+    schema gaps. Consult this before composing life.list filters or reasoning about node lifecycle — never
+    restate vocabulary from memory.'
+  input_schema:
+    properties: {}
+    type: object
+- tool_name: life.patch.apply
+  class: life_graph
+  description: Confirm or reject an awaiting_confirmation Life Graph patch — call ONLY after the operator
+    has explicitly approved or rejected it in conversation. Confirming a schema_patch that carries an
+    ontology_extension makes the new nouns/verbs live vocabulary immediately (vector indexes are created
+    automatically). It does NOT register SkillPatch records; use skill.register followed by skill.assign
+    for those. Prose-only patches remain review artifacts and are not executable. Verify schema changes
+    with life.ontology afterwards.
+  input_schema:
+    properties:
+      decision:
+        enum:
+        - confirm
+        - reject
+        type: string
+      operator_approved:
+        description: MUST be true, and only after the operator explicitly approved or rejected this patch
+          in conversation — this call IS the operator-confirmation step. Omitting it blocks the apply.
+        type: boolean
+      patch_id:
+        description: The patch to decide.
+        type: string
+    required:
+    - patch_id
+    - decision
+    - operator_approved
+    type: object
+- tool_name: life.patch.list
+  class: life_graph
+  description: READ-ONLY list of Life Graph patch proposals and their statuses (pending by default). Use
+    before proposing (avoid duplicates) and when the operator asks what is awaiting their approval.
+  input_schema:
+    properties:
+      status:
+        description: 'Filter by patch status (default: pending set).'
+        type: string
+    type: object
+- tool_name: life.patch.propose
+  class: life_graph
+  description: 'Propose a governed Life Graph improvement: schema change, skill update, tool addition,
+    attention policy change, or system-level change. A schema_patch is executable only when it carries
+    an ontology_extension (new labels and/or edges; not properties or core-label edits). A SkillPatch
+    is a review artifact, not a skill-catalog write: after approval, register it with skill.register and
+    activate it with skill.assign. High-risk patches remain proposal-only.'
+  input_schema:
+    properties:
+      evidence_packets:
+        items:
+          $ref: '#/defs/evidence_packet'
+        minItems: 1
+        type: array
+      ontology_extension:
+        description: Executable schema_patch payload for NEW Life Graph labels and endpoint-validated
+          edges only. Cannot add properties or modify a compiled core label.
+        properties:
+          edges:
+            items:
+              properties:
+                rel_type:
+                  description: New SCREAMING_SNAKE relationship name.
+                  type: string
+                source_labels:
+                  items:
+                    type: string
+                  type: array
+                target_labels:
+                  items:
+                    type: string
+                  type: array
+              required:
+              - rel_type
+              - source_labels
+              - target_labels
+              type: object
+            type: array
+          labels:
+            items:
+              properties:
+                guidance:
+                  type: string
+                name:
+                  description: New PascalCase label name.
+                  type: string
+                space:
+                  description: Existing semantic-space prefix.
+                  type: string
+              required:
+              - name
+              - space
+              type: object
+            type: array
+        type: object
+      operator_approved:
+        default: false
+        type: boolean
+      patch_id:
+        type: string
+      patch_kind:
+        enum:
+        - schema_patch
+        - skill_patch
+        - tool_patch
+        - attention_patch
+        - system_patch
+        type: string
+      rationale:
+        type: string
+      risk:
+        enum:
+        - low
+        - medium
+        - high
+        type: string
+      summary:
+        type: string
+    required:
+    - patch_id
+    - patch_kind
+    - summary
+    - rationale
+    - evidence_packets
+    - risk
+    type: object
+- tool_name: life.recall
+  class: life_graph
+  description: 'Retrieve context from the operator''s LifeGraph: roles, goals, habits, systems, open loops,
+    commitments, and next actions. Use this whenever the operator asks what is in the LifeGraph or asks
+    about life structure. Provide query_text and, when useful, operator_intent; the runner can use text/fallback
+    recall when an embedding is not available. Named intents: open_loops_by_context, goals_and_next_actions,
+    commitments_approaching, re_entry_context.'
+  input_schema:
+    properties:
+      active_role:
+        type: string
+      expansion_policy:
+        properties:
+          allowed_edge_types:
+            default: []
+            items:
+              type: string
+            type: array
+          max_hops:
+            default: 2
+            type: integer
+          max_nodes:
+            default: 24
+            type: integer
+        type: object
+      max_context_packets:
+        default: 6
+        type: integer
+      operator_intent:
+        description: 'Named strategy hint: open_loops_by_context, goals_and_next_actions, commitments_approaching,
+          re_entry_context.'
+        type: string
+      policy_filters:
+        default:
+        - exclude_retired
+        - require_evidence
+        items:
+          enum:
+          - exclude_retired
+          - exclude_conflicted_unless_requested
+          - require_evidence
+          - role_appropriate
+          - low_agency_only
+          type: string
+        type: array
+      query_id:
+        type: string
+      query_text:
+        description: Human-language query.
+        type: string
+      ranking_weights:
+        properties:
+          active_commitment:
+            default: 0.1
+            type: number
+          confirmation:
+            default: 0.15
+            type: number
+          graph_specificity:
+            default: 0.2
+            type: number
+          recency:
+            default: 0.1
+            type: number
+          role_relevance:
+            default: 0.15
+            type: number
+          semantic_similarity:
+            default: 0.45
+            type: number
+        type: object
+      semantic_pivots:
+        description: Optional. The runner can auto-embed query_text when this is omitted.
+        items:
+          properties:
+            embedding_dims:
+              default: 768
+              type: integer
+            embedding_model:
+              default: Xenova/all-mpnet-base-v2
+              type: string
+            query_text_hash:
+              type: string
+            space:
+              enum:
+              - life_event_semantic
+              - goal_system_semantic
+              - skill_tool_semantic
+              - role_person_semantic
+              - memory_bridge_semantic
+              type: string
+          required:
+          - space
+          - embedding_model
+          - embedding_dims
+          - query_text_hash
+          type: object
+        type: array
+      strategy:
+        default: memory_aware_graph_rank
+        description: Defaults to memory_aware_graph_rank when omitted.
+        enum:
+        - semantic_pivot
+        - vector_then_expand
+        - memory_aware_graph_rank
+        type: string
+    required:
+    - query_id
+    - query_text
+    type: object
+- tool_name: life.recall.feedback
+  class: life_graph
+  description: Record whether a LifeGraph recall packet was useful, stale, missing context, noisy, overconfident,
+    or disconnected. Use this after a LifeGraph recall result influences or fails to influence the turn
+    so the graph can improve bridge/ranking/attention behavior without silently confirming new life truth.
+  tool_markers:
+  - feedback
+  - self_improving
+  input_schema:
+    properties:
+      candidate_count:
+        default: 0
+        minimum: 0
+        type: integer
+      connected_candidate_count:
+        default: 0
+        minimum: 0
+        type: integer
+      evidence_packets:
+        default: []
+        items:
+          type: object
+        type: array
+      feedback_id:
+        description: Unique ID for this retrieval feedback event.
+        type: string
+      missing_context_refs:
+        default: []
+        items:
+          type: string
+        type: array
+      noisy_node_refs:
+        default: []
+        items:
+          type: object
+        type: array
+      note:
+        description: Brief reason for the rating.
+        type: string
+      packet_id:
+        description: The RetrievalContextPacket or recall packet ID being evaluated.
+        type: string
+      query_summary:
+        description: Short summary of the original recall query.
+        type: string
+      rating:
+        enum:
+        - useful
+        - stale
+        - missing
+        - noisy
+        - overconfident
+        - disconnected
+        type: string
+      stale_node_refs:
+        default: []
+        items:
+          type: object
+        type: array
+    required:
+    - feedback_id
+    - packet_id
+    - rating
+    type: object
+- tool_name: life.resolve
+  class: life_graph
+  description: 'Resolve a Life Graph CONFLICT HANDOFF after review — operates only on ConflictHandoff
+    nodes opened via life.conflict. This is a governance tool: high-risk or operator-required handoffs
+    need explicit operator approval before resolution. It does NOT close an ordinary OpenLoop/Commitment/Goal
+    — for "the operator says this is done", use life.commit with loop_status="resolved" instead.'
+  input_schema:
+    properties:
+      handoff:
+        $ref: '#/defs/conflict_handoff'
+      operator_approved:
+        description: True only when the operator explicitly approved this resolution.
+        type: boolean
+      resolution_summary:
+        description: Concise explanation of how the conflict should be resolved.
+        type: string
+    required:
+    - handoff
+    - resolution_summary
+    - operator_approved
+    type: object
+- tool_name: life.tidy
+  class: life_graph
+  description: 'Apply ONE governed LifeGraph gardening action (pass a life.audit suggested_actions entry
+    verbatim as `action`): retire_duplicate {duplicate_id, keeper_id, reason} retires the duplicate under
+    the keeper with a SUPERSEDES edge; link {from_id, rel_type, to_id, reason} MERGEs an edge from the
+    observe/gardening vocabulary; resolve {node_id, reason} closes a loop; retire {node_id, reason} retires
+    a stray. Nothing is ever deleted; every touched node/edge is stamped tidied_at/tidied_by/ tidy_reason.
+    Confirmed nodes need operator_approved=true. Ids must be real (from life.audit/list/recall or the
+    operator) — never invented.'
+  input_schema:
+    properties:
+      action:
+        description: One action object with a `kind` of retire_duplicate | link | resolve | retire and
+          that kind's fields; always include a reason.
+        properties:
+          duplicate_id:
+            type: string
+          from_id:
+            type: string
+          keeper_id:
+            type: string
+          kind:
+            enum:
+            - retire_duplicate
+            - link
+            - resolve
+            - retire
+            type: string
+          node_id:
+            type: string
+          reason:
+            type: string
+          rel_type:
+            type: string
+          to_id:
+            type: string
+        required:
+        - kind
+        - reason
+        type: object
+      operator_approved:
+        default: false
+        type: boolean
+    required:
+    - action
+    type: object
+- tool_name: mcp.connect
+  class: config
+  description: Register an upstream MCP server whose tools this agent consumes. The hotel checks the egress
+    policy (loopback + tailnet by default), persists the registration, and the mcp-client guest connects,
+    lists the server's tools, and projects the allowlisted ones into this agent's catalog as mcp:<upstream_id>.<tool>
+    (approval-gated). Each remote tool must be explicitly allowlisted — nothing is projected by default.
+    Connection happens asynchronously; run mcp.upstreams afterwards to see the projected tools.
+  input_schema:
+    properties:
+      credential_ref:
+        description: Optional vault secret ref holding the bearer token for this upstream (operator-provisioned).
+        type: string
+      grant_agents:
+        description: Additional agent IDs allowed to call the projected tools. Absent = owner only.
+        items:
+          type: string
+        type: array
+      network_scope:
+        description: Optional resolved-address scope. Literal loopback/tailnet/private IPs are inferred;
+          DNS names default to public.
+        enum:
+        - public
+        - loopback
+        - tailnet
+        - private
+        type: string
+      placement:
+        description: Optional HTTP exit placement using the same tagged policy as integration.bind_http.
+          MCP protocol ownership stays local; only HTTP transport runs at the selected hotel.
+        type: object
+      refresh_interval_secs:
+        description: Optionally re-list the server's tools every N seconds (min 30). Tools whose description
+          or schema changed since approval are dropped as stale until mcp.connect is re-run. Absent =
+          refresh only on connect.
+        type: integer
+      tools:
+        description: Remote tools to allowlist for projection. Each item is a name string, or an object
+          {name, allotment, max_response_bytes} to set a per-tool hourly call budget and response-size
+          cap.
+        items:
+          anyOf:
+          - type: string
+          - properties:
+              allotment:
+                description: Max calls per sliding hour.
+                type: integer
+              max_response_bytes:
+                description: Response size cap (default 262144).
+                type: integer
+              name:
+                type: string
+            required:
+            - name
+            type: object
+        type: array
+      upstream_id:
+        description: Stable ID for this upstream (e.g. 'intel-graph').
+        type: string
+      url:
+        description: HTTP(S) URL of the MCP server's JSON-RPC endpoint (e.g. 'http://127.0.0.1:8901/mcp').
+          Must be loopback, tailnet, or operator-allowlisted.
+        type: string
+    required:
+    - upstream_id
+    - url
+    - tools
+    type: object
+- tool_name: mcp.disconnect
+  class: config
+  description: Remove an upstream MCP server registration this agent owns. Projected mcp:<upstream>.<tool>
+    entries disappear from the catalog and the mcp-client guest drops the connection.
+  input_schema:
+    properties:
+      upstream_id:
+        description: The upstream ID to remove (must be owned by this agent).
+        type: string
+    required:
+    - upstream_id
+    type: object
+- tool_name: mcp.grant_token
+  class: config
+  description: Mint a bearer-token credential for an MCP endpoint this agent owns. The hotel generates
+    the token, stores only its BLAKE3 hash in the vault, attaches the grant to the named tool (or the
+    endpoint's default auth), and pushes the updated config to the membrane. The raw token is returned
+    ONCE in the tool result — relay it to the operator immediately with a storage warning; it cannot be
+    shown again.
+  input_schema:
+    properties:
+      allotment:
+        description: Optional per-token call budget.
+        properties:
+          max_per_window:
+            type: integer
+          window_secs:
+            type: integer
+        required:
+        - max_per_window
+        - window_secs
+        type: object
+      endpoint_id:
+        description: The MCP endpoint to attach the grant to (must be owned by this agent).
+        type: string
+      expires_at:
+        description: Optional unix epoch expiry. Absent = no expiry.
+        type: integer
+      scopes:
+        description: Optional capability scopes granted to this token.
+        items:
+          type: string
+        type: array
+      token_id:
+        description: Stable opaque label for this credential (e.g. 'claude-desktop', 'n8n-prod').
+        type: string
+      tool_name:
+        description: Attach to this specific tool's auth. Omit to attach to the endpoint's default_auth
+          (covers every tool without its own auth).
+        type: string
+    required:
+    - endpoint_id
+    - token_id
+    type: object
+- tool_name: mcp.provision
+  class: config
+  description: Declare or update an MCP endpoint this agent exposes to external callers. Specifies the
+    port, tool listing with inbound/outbound transforms, and pre-approval rules. The hotel materializes
+    a membrane-mcp guest for this endpoint. The provisioning turn is the authorization event — pre-approval
+    rules carry that authority forward so future requests matching the declared envelope shapes are not
+    re-blocked for approval.
+  input_schema:
+    properties:
+      allow_unauthenticated:
+        description: Explicit acknowledgment that this endpoint intentionally serves unauthenticated tools
+          beyond loopback. Without it, provisioning a lan/mesh/internet endpoint with any no-auth tool
+          is REJECTED. Surfaced in the operator approval prompt.
+        type: boolean
+      default_auth:
+        description: Endpoint-wide default auth for tools without their own 'auth'. Use {scheme:'bearer_token',grants:[]}
+          and mint credentials with mcp.grant_token. Absent = none (loopback-only callers).
+        properties:
+          grants:
+            items:
+              type: object
+            type: array
+          scheme:
+            enum:
+            - bearer_token
+            - none
+            type: string
+        required:
+        - scheme
+        type: object
+      endpoint_id:
+        description: Stable ID for this endpoint (e.g. 'bjork-mcp-01'). Must be unique within the hotel.
+        type: string
+      exposure:
+        description: Minimum tier at which this endpoint is intentionally served. The hotel validates
+          that exposure <= its current perimeter ceiling and rejects the provision if it does not. Defaults
+          to 'local'. Set to 'mesh' for Tailscale-reachable endpoints or 'internet' for public endpoints.
+        enum:
+        - local
+        - lan
+        - mesh
+        - internet
+        type: string
+      port:
+        description: Port the membrane-mcp guest should bind on (e.g. 8910).
+        type: integer
+      preapproval_rules:
+        description: Envelope actions pre-approved by this provisioning turn.
+        items:
+          properties:
+            action_pattern:
+              description: Exact action string or '*' to match all.
+              type: string
+            expires_at:
+              description: Optional unix epoch expiry. Absent = permanent.
+              type: integer
+          required:
+          - action_pattern
+          type: object
+        type: array
+      tools:
+        description: Tools to advertise to MCP clients.
+        items:
+          properties:
+            auth:
+              description: Per-tool auth override. Usually {scheme:'bearer_token',grants:[]} then mint
+                credentials with mcp.grant_token. Omit to inherit default_auth; {scheme:'none'} = loopback-only
+                callers.
+              properties:
+                grants:
+                  items:
+                    type: object
+                  type: array
+                scheme:
+                  enum:
+                  - bearer_token
+                  - none
+                  type: string
+              required:
+              - scheme
+              type: object
+            description:
+              type: string
+            handler:
+              description: 'How THIS agent answers calls to a philote-targeted tool: a deterministic ladder
+                runs BEFORE any model turn, then the declared fallback. validate_input (default true)
+                rejects args that violate input_schema. steps run in order: {kind:''static'',result:{...}}
+                answers with a fixed value; {kind:''reflex'',reflex:''echo''|''memory.recall''|''memory.capture'',
+                args:{...},escalate_on_empty:bool} runs a built-in reflex with args templated from the
+                payload (''${payload.query}''). fallback: {kind:''model'',instructions:''...''} hands
+                the call to your cognitive loop with those instructions; {kind:''error'',message:''...''}
+                refuses deterministically. Omit for datasource/tool targets (they never reach you).'
+              properties:
+                fallback:
+                  properties:
+                    instructions:
+                      type: string
+                    kind:
+                      enum:
+                      - model
+                      - error
+                      type: string
+                    message:
+                      type: string
+                  required:
+                  - kind
+                  type: object
+                steps:
+                  items:
+                    properties:
+                      args:
+                        type: object
+                      escalate_on_empty:
+                        type: boolean
+                      kind:
+                        enum:
+                        - static
+                        - reflex
+                        type: string
+                      reflex:
+                        enum:
+                        - echo
+                        - memory.recall
+                        - memory.capture
+                        type: string
+                      result:
+                        type: object
+                    required:
+                    - kind
+                    type: object
+                  type: array
+                validate_input:
+                  type: boolean
+              type: object
+            inbound_transform:
+              description: Always use kind='field_map'. Do NOT pass a string or template.
+              properties:
+                action:
+                  description: Envelope action string, e.g. 'echo' or 'datasource.query'.
+                  type: string
+                kind:
+                  enum:
+                  - field_map
+                  type: string
+                mappings:
+                  items:
+                    properties:
+                      from:
+                        description: Arg key from MCP call, e.g. 'query'.
+                        type: string
+                      to:
+                        description: Destination key in envelope payload, e.g. 'query'.
+                        type: string
+                    required:
+                    - from
+                    - to
+                    type: object
+                  type: array
+                target:
+                  description: 'philote: {kind:''philote'',agent_id:''...''}  datasource: {kind:''datasource'',datasource_id:''...''}  tool:
+                    {kind:''tool'',tool_ref:''...''}'
+                  properties:
+                    agent_id:
+                      type: string
+                    datasource_id:
+                      type: string
+                    kind:
+                      enum:
+                      - philote
+                      - datasource
+                      - tool
+                      type: string
+                    tool_ref:
+                      type: string
+                  required:
+                  - kind
+                  type: object
+              required:
+              - kind
+              - action
+              - target
+              type: object
+            input_schema:
+              type: object
+            name:
+              type: string
+            outbound_transform:
+              description: 'pass_through: {kind:''pass_through''}  extract: {kind:''extract'',path:''dot.path''}'
+              properties:
+                kind:
+                  enum:
+                  - pass_through
+                  - extract
+                  type: string
+                path:
+                  type: string
+              required:
+              - kind
+              type: object
+          required:
+          - name
+          - description
+          - input_schema
+          - inbound_transform
+          - outbound_transform
+          type: object
+        type: array
+    required:
+    - endpoint_id
+    - port
+    - tools
+    type: object
+- tool_name: mcp.revoke
+  class: config
+  description: Tear down an MCP endpoint and remove its configuration. The hotel signals the membrane-mcp
+    guest to shut down and clears all stored config and pre-approval rules.
+  input_schema:
+    properties:
+      endpoint_id:
+        description: The endpoint ID to revoke (must be owned by this agent).
+        type: string
+    required:
+    - endpoint_id
+    type: object
+- tool_name: mcp.revoke_token
+  class: config
+  description: Revoke an MCP token grant by token_id. Removes the grant from every tool auth and the endpoint
+    default; callers holding the token lose access (the membrane's vault cache may honor it for up to
+    60s). An emptied bearer grant list stays bearer — it does not degrade to unauthenticated.
+  input_schema:
+    properties:
+      endpoint_id:
+        description: The MCP endpoint holding the grant (must be owned by this agent).
+        type: string
+      token_id:
+        description: The grant label to revoke.
+        type: string
+    required:
+    - endpoint_id
+    - token_id
+    type: object
+- tool_name: mcp.rotate_token
+  class: config
+  description: 'Rotate the credential behind an existing MCP token grant in place: same token_id and grant
+    scope, new secret. The old token stops working (the membrane''s vault cache may honor it for up to
+    60s). The new raw token is returned ONCE — relay it to the operator immediately.'
+  input_schema:
+    properties:
+      endpoint_id:
+        description: The MCP endpoint holding the grant (must be owned by this agent).
+        type: string
+      token_id:
+        description: The existing grant label to rotate.
+        type: string
+      tool_name:
+        description: Tool whose auth holds the grant. Omit if the grant lives on default_auth.
+        type: string
+    required:
+    - endpoint_id
+    - token_id
+    type: object
+- tool_name: mcp.set_credential
+  class: config
+  description: Store or rotate the outbound credential (bearer token) for an upstream MCP server this
+    agent owns. The value passes through to the hotel vault (kind mcp_upstream_credential, readable only
+    by the mcp-client guest) and is never stored in the graph, logged, or echoed back. The guest reconnects
+    authenticated immediately. Ask the operator for the token value — never invent one.
+  input_schema:
+    properties:
+      credential:
+        description: The raw bearer token/credential value, exactly as provided by the operator.
+        type: string
+      upstream_id:
+        description: The upstream this credential is for (must be owned by this agent).
+        type: string
+    required:
+    - upstream_id
+    - credential
+    type: object
+- tool_name: mcp.status
+  class: session
+  description: Return the current configuration and exposure status of an MCP endpoint. Shows the stored
+    McpEndpointConfig (tools, preapproval rules, port), the hotel's current perimeter ceiling, and whether
+    the endpoint is active. Use this to verify a provision succeeded, check whether an endpoint's exposure
+    tier is within the hotel's perimeter ceiling, or inspect the live configuration.
+  input_schema:
+    properties:
+      endpoint_id:
+        description: The endpoint ID to inspect.
+        type: string
+    required:
+    - endpoint_id
+    type: object
+- tool_name: mcp.upstreams
+  class: session
+  description: 'List registered upstream MCP servers: connection state, owner, allowlisted and projected
+    tools, and any stale grants. Also refreshes this agent''s projected mcp:<upstream>.<tool> catalog
+    entries from the latest reported state.'
+  input_schema:
+    properties: {}
+    type: object
+- tool_name: memory.cultivate
+  class: memory
+  description: Inspect recalled memories for cultivation needs without mutating memory. Use during closeout,
+    reflection, or explicit memory-maintenance turns to find missing spacetime frames, entity overlays,
+    or stale candidates.
+  input_schema:
+    properties:
+      limit:
+        description: Maximum candidate count. Defaults to 8. Range 1-20.
+        type: integer
+      mode:
+        description: Cultivation intent. Current implementation reports candidates and performs no mutation.
+        enum:
+        - report
+        - closeout
+        - true_up
+        type: string
+      query:
+        description: Natural-language scope for candidate memories to inspect.
+        type: string
+      scope:
+        description: Optional memory scope to inspect.
+        enum:
+        - self
+        - shared_user
+        - session
+        - cross
+        type: string
+    required:
+    - query
+    type: object
+- tool_name: memory.delta_digest
+  class: memory
+  description: 'Memory Transparency Slice M3: return a digest of what the fleet''s Muninn vaults remembered,
+    forgot, and found contradictory in a trailing window (default 24h), each notable line carrying its
+    provenance (author/trust) when known and a textual revert hint (e.g. ''muninn_restore <id>''). Also
+    reports the most recent memory.hygiene sweep''s findings. ''Evolved'' memories are always 0 today
+    — MuninnDB has no queryable evolution history yet; this is a named gap in the digest itself, not a
+    missing feature of this tool. Use this before composing an operator morning brief, or whenever the
+    operator asks what the system''s memory has changed recently.'
+  input_schema:
+    properties:
+      window_hours:
+        description: Trailing window size in hours. Defaults to 24 if omitted.
+        type: integer
+    type: object
+- tool_name: memory.explain
+  class: memory
+  description: Answer 'why do you believe X?' by fanning a claim out across all three memory planes —
+    Muninn (MuninnDB engrams), the intel graph (decision trail), and LifeGraph (the session's cached life.recall
+    evidence) — and merging the result into confirmed / inferred / told-or-seeded / pre-provenance bands.
+    Any plane that could not be reached is reported as a labeled gap, never silently omitted. Use when
+    asked to justify a belief, decision, or remembered fact.
+  input_schema:
+    properties:
+      claim:
+        description: The belief/fact/decision to explain, in natural language (e.g. 'the vps deploy key
+          rotates monthly').
+        type: string
+      entity:
+        description: Optional intel-graph target id hint (e.g. 'seam:role-handoff-seam', 'doc:memory-transparency-proposal')
+          to scope the intel-graph plane precisely instead of an untargeted recent-decisions scan. Use
+          when you already know the seam/proposal/doc the claim concerns.
+        type: string
+      limit:
+        description: Maximum Muninn engrams to consider. Defaults to 8. Range 1–20.
+        type: integer
+    required:
+    - claim
+    type: object
+- tool_name: memory.fix
+  class: memory
+  description: Diagnose and recover MuninnDB memory connectivity. Triggers an immediate hotel-side reachability
+    probe and returns the result. If the probe succeeds, memory tools are re-enabled. If it fails, the
+    outage is recorded in the heal queue for dispatcher action. Use when memory.recall or memory.remember
+    report errors or when memory.status shows unreachable.
+  input_schema:
+    properties: {}
+    type: object
+- tool_name: memory.promote_candidate
+  class: memory
+  description: 'Evaluate whether a memory candidate is allowed to become durable shared memory. This is
+    a gate: it reports missing authority, validation, or evidence and does not promote unverified inferred
+    claims.'
+  input_schema:
+    properties:
+      authority:
+        description: Evidence authority behind the candidate.
+        enum:
+        - observed_runtime
+        - observed_repo
+        - graph_structured
+        - user_stated
+        - verified_memory
+        - inferred_memory
+        - external
+        - untrusted
+        type: string
+      candidate:
+        description: Candidate memory or claim being considered for promotion.
+        type: string
+      evidence_refs:
+        description: Evidence references such as files, test runs, graph ids, or Muninn ids.
+        items:
+          type: string
+        type: array
+      operator_approved:
+        description: Set only when the operator explicitly approves promotion despite missing gates.
+        type: boolean
+      validation_level:
+        description: Validation level backing the candidate.
+        enum:
+        - unverified
+        - check-green
+        - test-green
+        - smoke-green
+        - watched-live-green
+        type: string
+    required:
+    - candidate
+    type: object
+- tool_name: memory.recall
+  class: memory
+  description: Retrieve memories relevant to a query from the agent's long-term autobiographical store
+    (MuninnDB). Returns the most salient engrams based on semantic + graph activation. Use for prior conversation,
+    operator preferences, and agent continuity. For roles, goals, habits, systems, open loops, or commitments
+    in the operator's LifeGraph, prefer life.recall.
+  input_schema:
+    properties:
+      limit:
+        description: Maximum number of engrams to return. Defaults to the session recall_limit setting
+          (default 5). Range 1–20.
+        type: integer
+      query:
+        description: Natural-language query describing what to recall. Be specific — the activation pipeline
+          uses this as the primary context signal.
+        type: string
+      scope:
+        description: Optional memory scope. 'cross' searches agent self, shared user, and active session
+          memories.
+        enum:
+        - self
+        - shared_user
+        - session
+        - cross
+        type: string
+    required:
+    - query
+    type: object
+- tool_name: memory.remember
+  class: memory
+  description: Store a new memory in the agent's long-term autobiographical store (MuninnDB). Use for
+    facts, decisions, user preferences, or observations that should persist across sessions. Keep concept
+    slugs short and content atomic (1–3 sentences).
+  input_schema:
+    properties:
+      affected_nodes:
+        description: Optional graph/code node ids this memory affects.
+        items:
+          type: string
+        type: array
+      authority:
+        description: Optional evidence authority. Runtime/repo observations should be used only when actually
+          observed.
+        enum:
+        - observed_runtime
+        - observed_repo
+        - graph_structured
+        - user_stated
+        - verified_memory
+        - inferred_memory
+        - external
+        - untrusted
+        type: string
+      branch:
+        description: Optional git branch this memory applies to.
+        type: string
+      concept:
+        description: 'Short slug identifying the memory (e.g. ''user preference: dark mode'', ''decision:
+          use postgres''). Max 128 characters.'
+        type: string
+      content:
+        description: The memory content. Keep atomic — one fact or decision. 1–3 sentences max.
+        type: string
+      hotel_id:
+        description: Optional hotel this memory applies to.
+        type: string
+      last_verified_at:
+        description: Optional Unix timestamp in milliseconds when this memory was last verified.
+        type: integer
+      node_id:
+        description: Optional node this memory applies to.
+        type: string
+      observed_at:
+        description: Optional Unix timestamp in milliseconds for when this was observed. Defaults to write
+          time.
+        type: integer
+      proposal_id:
+        description: Optional AgentGraph proposal anchor.
+        type: string
+      scope:
+        description: Optional write scope. Use 'shared_user' for operator preferences, 'session' for active
+          workstream context, and 'self' for the agent's own habits or observations.
+        enum:
+        - self
+        - shared_user
+        - session
+        type: string
+      seam_id:
+        description: Optional AgentGraph seam anchor.
+        type: string
+      spatial_scope:
+        description: Optional spatial scope for where this memory applies.
+        enum:
+        - self
+        - agent
+        - user
+        - session
+        - workspace
+        - hotel
+        - mesh
+        - global
+        type: string
+      tags:
+        description: Optional tags for recall filtering (e.g. ['preference', 'user', 'decision']).
+        items:
+          type: string
+        type: array
+      task_id:
+        description: Optional AgentGraph task anchor.
+        type: string
+      temporal_kind:
+        description: Optional temporal behavior for the memory.
+        enum:
+        - event
+        - state
+        - preference
+        - rule
+        - decision
+        - hypothesis
+        - gap
+        - checkpoint
+        type: string
+      valid_from:
+        description: Optional Unix timestamp in milliseconds when this memory starts being valid.
+        type: integer
+      valid_until:
+        description: Optional Unix timestamp in milliseconds when this memory stops being valid.
+        type: integer
+      validation_level:
+        description: Optional validation level backing the memory.
+        enum:
+        - unverified
+        - check-green
+        - test-green
+        - smoke-green
+        - watched-live-green
+        type: string
+      workspace_path:
+        description: Optional workspace path this memory applies to.
+        type: string
+    required:
+    - concept
+    - content
+    type: object
+- tool_name: memory.status
+  class: memory
+  description: 'Report the current MuninnDB connection status: whether the hotel has the endpoint configured,
+    whether it was reachable on the last probe, and how many vaults are registered. Use before memory.recall/remember
+    if you suspect a connection issue.'
+  input_schema:
+    properties: {}
+    type: object
+- tool_name: memory.true_up
+  class: memory
+  description: Compare a memory claim with observed repo/runtime truth or AgentGraph truth and return
+    a structured true-up finding. Use when memory and graph may have holes, contradictions, or stale assumptions.
+  input_schema:
+    properties:
+      evidence_refs:
+        description: Evidence references such as file paths, test names, or smoke runs.
+        items:
+          type: string
+        type: array
+      graph_ids:
+        description: AgentGraph node ids involved in this finding.
+        items:
+          type: string
+        type: array
+      graph_truth:
+        description: AgentGraph structured truth, if available.
+        type: string
+      memory_claim:
+        description: Claim currently held in memory.
+        type: string
+      muninn_ids:
+        description: Muninn engram ids involved in this finding.
+        items:
+          type: string
+        type: array
+      observed_truth:
+        description: Observed repo/runtime truth, if directly checked.
+        type: string
+      resolution:
+        description: Optional proposed resolution or operator note.
+        type: string
+    required: []
+    type: object
+- tool_name: procedure.get
+  class: capability
+  description: 'Fetches one procedural graph from the hotel by id: its tool-bound nodes, typed edges with
+    condition/guidance/pitfalls, version, and state. Use it to read a procedure before proposing a patch.'
+  input_schema:
+    properties:
+      procedure_id:
+        description: The procedure id, e.g. 'outcome-reflex'.
+        type: string
+    required:
+    - procedure_id
+    type: object
+- tool_name: procedure.patch
+  class: capability
+  description: 'Proposes an edit to a procedural graph after contrasting a failed run with a successful
+    one. ops is a list of {op: add_node|delete_node|add_edge|delete_edge|set_edge_attrs|set_node_label,
+    ...}. The patch lands Pending; the operator approves it into a live trial, and it is accepted only
+    if the new version scores at least as well as the old one. Call it once.'
+  input_schema:
+    properties:
+      evidence_run_ids:
+        description: The run ids contrasted.
+        items:
+          type: string
+        type: array
+      ops:
+        description: Edit ops. add_node {node}; delete_node {id}; add_edge {edge}; delete_edge {from,
+          to, relation}; set_edge_attrs {from, to, relation, condition?, guidance?, pitfalls?}; set_node_label
+          {id, label}.
+        items:
+          type: object
+        type: array
+      procedure_id:
+        type: string
+      rationale:
+        description: 'One or two sentences: what the failed run did that the successful one did not, and
+          how the edit prevents it.'
+        type: string
+    required:
+    - procedure_id
+    - ops
+    - rationale
+    type: object
+- tool_name: procedure.register
+  class: capability
+  description: 'Registers a procedural graph — a small typed graph of tool steps with condition/guidance/pitfalls
+    on each edge — that philotes follow as advice and seed plans from. Nodes: {id, label, kind: tool|reasoning|state,
+    tool_name}. Edges: {from, to, relation: leads_to|triggers|provides_input_for|converges_to, condition,
+    guidance, pitfalls}. Agent-authored procedures land as Draft for the operator to promote. Keep it
+    small: 3–17 nodes.'
+  input_schema:
+    properties:
+      description:
+        description: 'One paragraph: when this procedure applies and what it achieves.'
+        type: string
+      edges:
+        description: 'Edges: {from, to, relation, condition, guidance, pitfalls}.'
+        items:
+          type: object
+        type: array
+      entry:
+        description: Node id the backbone starts from.
+        type: string
+      nodes:
+        description: 'Nodes: {id, label, kind, tool_name}.'
+        items:
+          type: object
+        type: array
+      procedure_id:
+        description: Lowercase dotted id, e.g. 'research.github-digest'.
+        type: string
+      skill_name:
+        description: Optional skill this procedure rides on; it projects when that skill is in play.
+        type: string
+    required:
+    - procedure_id
+    - description
+    - entry
+    - nodes
+    - edges
+    type: object
+- tool_name: role.configure
+  class: config
+  description: Low-level compatibility surface for mutating a role incarnation for the current agent identity.
+    Prefer the governed role.create_or_update workflow surface for prompt-facing role authoring. This
+    tool still executes the underlying hotel mutation path and requires the same role_name, toolset_profile,
+    and reasoning object.
+  input_schema:
+    properties:
+      approval_policy:
+        description: Stringified JSON describing the approval policy structure.
+        type: string
+      content_policy:
+        description: Content-filtering posture for this role. 'standard' (the default) preserves current
+          provider defaults. 'unrestricted' disables provider-level safety filtering where the provider
+          exposes a toggle (Gemini safetySettings at BLOCK_NONE) — only set this when the operator has
+          explicitly asked for it for a specific role/agent. 'strict' tightens filtering. OMIT this field
+          to leave the role's existing policy untouched — omitting it never resets a previously configured
+          policy back to 'standard'.
+        enum:
+        - unrestricted
+        - standard
+        - strict
+        type: string
+      context_window_policy:
+        description: Stringified JSON describing context packaging rules.
+        type: string
+      fallback_tiers:
+        description: Ordered model-role fallback ladder for this role (e.g. ['model', 'model.openrouter',
+          'model.ollama']). OMIT this field to leave the role's existing ladder untouched — omitting it
+          never clears a previously configured ladder. Pass an explicit non-empty list only when you intend
+          to replace it.
+        items:
+          type: string
+        type: array
+      inactive_ttl_seconds:
+        description: Seconds of inactivity before the role is suspended/terminated.
+        type: integer
+      is_admin:
+        description: If true, this role has admin authority — it may update operator-owned records such
+          as the orchestrator manifest. Only existing admin roles may create other admin roles. Setting
+          this to true always triggers a live operator approval interrupt that cannot be preapproved or
+          bypassed.
+        type: boolean
+      iteration_cap:
+        description: Maximum model-turn iterations allowed for this role before it must return or stop.
+        type: integer
+      model_bindings:
+        additionalProperties:
+          type: string
+        description: 'Per-agent model NAME binding, keyed by provider role from fallback_tiers (e.g. {"model.openrouter":
+          "z-ai/glm-5.2", "model": "gemini-flash-latest"}). Consumed at dispatch: whichever provider role
+          resolve_model_execution_target picks (primary or a fallback tier) uses this role''s bound model
+          name instead of that provider''s global default. OMIT this field to leave the role''s existing
+          bindings untouched — omitting it never clears previously configured bindings. Pass an explicit
+          object only when you intend to replace it.'
+        type: object
+      model_profile:
+        description: Stringified JSON describing model preferences (provider, temperature).
+        type: string
+      reasoning:
+        description: Required reasoning for this role's existence, purpose, and capability posture.
+        properties:
+          handoff_posture_and_limits:
+            type: string
+          purpose:
+            type: string
+          toolset_rationale:
+            type: string
+        required:
+        - purpose
+        - toolset_rationale
+        - handoff_posture_and_limits
+        type: object
+      role_identity_addendum:
+        description: Additive persona/identity instructions for this specific role.
+        type: string
+      role_manifest:
+        description: 'Governance document for this role — focus, rules, delegation posture, and approval
+          constraints. Written in natural language. The agent sees this as its [Governance] context block
+          when the role is active. Should describe: what this role does, what tools are available and
+          when to use them, what requires approval, and when to hand off.'
+        type: string
+      role_name:
+        description: The name of the role (e.g. 'developer', 'researcher').
+        type: string
+      toolset_profile:
+        description: The profile name determining default tools/skills (e.g. 'codex', 'research', 'utility').
+        type: string
+    required:
+    - role_name
+    - toolset_profile
+    - reasoning
+    type: object
+- tool_name: role.create_or_update
+  class: config
+  description: 'Creates or modifies a role DEFINITION in the hotel database — it writes a role''s manifest,
+    toolset profile, and identity addendum. This is a configuration-only operation: it does NOT activate,
+    switch to, or hand off to the role. Do NOT call this before handoff.to_role or delegate.whisper. If
+    a role already exists and you want to switch to it, use handoff.to_role directly without calling this
+    first. Only call this when the operator explicitly asks you to create a new role or change an existing
+    role''s definition. Always include role_name, toolset_profile, and the full reasoning object with
+    purpose, toolset_rationale, and handoff_posture_and_limits.'
+  input_schema:
+    properties:
+      approval_policy:
+        description: Stringified JSON describing the approval policy structure.
+        type: string
+      content_policy:
+        description: Content-filtering posture for this role. 'standard' (the default) preserves current
+          provider defaults. 'unrestricted' disables provider-level safety filtering where the provider
+          exposes a toggle (Gemini safetySettings at BLOCK_NONE) — only set this when the operator has
+          explicitly asked for it for a specific role/agent. 'strict' tightens filtering. OMIT this field
+          to leave the role's existing policy untouched — omitting it never resets a previously configured
+          policy back to 'standard'.
+        enum:
+        - unrestricted
+        - standard
+        - strict
+        type: string
+      context_window_policy:
+        description: Stringified JSON describing context packaging rules.
+        type: string
+      fallback_tiers:
+        description: Ordered model-role fallback ladder for this role (e.g. ['model', 'model.openrouter',
+          'model.ollama']). OMIT this field to leave the role's existing ladder untouched — omitting it
+          never clears a previously configured ladder. Pass an explicit non-empty list only when you intend
+          to replace it.
+        items:
+          type: string
+        type: array
+      inactive_ttl_seconds:
+        description: Seconds of inactivity before the role is suspended/terminated.
+        type: integer
+      is_admin:
+        description: If true, this role has admin authority — it may update operator-owned records such
+          as the orchestrator manifest. Only existing admin roles may create other admin roles. Setting
+          this to true always triggers a live operator approval interrupt that cannot be preapproved or
+          bypassed.
+        type: boolean
+      iteration_cap:
+        description: Maximum model-turn iterations allowed for this role before it must return or stop.
+        type: integer
+      model_bindings:
+        additionalProperties:
+          type: string
+        description: 'Per-agent model NAME binding, keyed by provider role from fallback_tiers (e.g. {"model.openrouter":
+          "z-ai/glm-5.2", "model": "gemini-flash-latest"}). Consumed at dispatch: whichever provider role
+          resolve_model_execution_target picks (primary or a fallback tier) uses this role''s bound model
+          name instead of that provider''s global default. OMIT this field to leave the role''s existing
+          bindings untouched — omitting it never clears previously configured bindings. Pass an explicit
+          object only when you intend to replace it.'
+        type: object
+      model_profile:
+        description: Stringified JSON describing model preferences (provider, temperature).
+        type: string
+      reasoning:
+        description: Required reasoning for this role's existence, purpose, and capability posture.
+        properties:
+          handoff_posture_and_limits:
+            type: string
+          purpose:
+            type: string
+          toolset_rationale:
+            type: string
+        required:
+        - purpose
+        - toolset_rationale
+        - handoff_posture_and_limits
+        type: object
+      role_identity_addendum:
+        description: Additive persona/identity instructions for this specific role.
+        type: string
+      role_manifest:
+        description: 'Governance document for this role — focus, rules, delegation posture, and approval
+          constraints. Written in natural language. The agent sees this as its [Governance] context block
+          when the role is active. Should describe: what this role does, what tools are available and
+          when to use them, what requires approval, and when to hand off.'
+        type: string
+      role_name:
+        description: The name of the role (e.g. 'developer', 'researcher').
+        type: string
+      toolset_profile:
+        description: The profile name determining default tools/skills (e.g. 'codex', 'research', 'utility').
+        type: string
+    required:
+    - role_name
+    - toolset_profile
+    - reasoning
+    type: object
+- tool_name: role.list
+  class: capability
+  description: Configuration inspection only. Lists configured roles and active role incarnations for
+    this agent/hotel. Use when the operator asks which roles exist, which role is active, or when debugging
+    role routing. Do not use as a generic discovery step before answering domain questions.
+  input_schema:
+    properties: {}
+    type: object
+- tool_name: role.set_home
+  class: config
+  description: Pin a role to a specific hotel so its philote process runs there, or clear an existing
+    pin to return it to the authority hotel. Use this to place specialised roles on the machines where
+    they have the right tool access — for example, pin an obsidian-keeper role to the machine where the
+    Obsidian vault lives, or move yourself to a more capable host. Requires operator approval. After pinning,
+    the next handoff.to_role call for that role will automatically route across the mesh.
+  input_schema:
+    properties:
+      reason:
+        description: Why this placement is needed. Required for operator visibility.
+        type: string
+      role_name:
+        description: The role to move. Use your current active role name to move yourself.
+        type: string
+      target_hotel:
+        description: The hotel node_id to run the role on (e.g. 'mac-jane'). Omit or pass null to clear
+          the pin and run on the authority hotel.
+        type: string
+    required:
+    - role_name
+    - reason
+    type: object
+- tool_name: router.stats
+  class: session
+  description: 'Returns aggregated routing performance statistics from the model-router trace store: per-provider
+    success rate, average latency, p90 latency, and failure counts broken down by task_kind. Use this
+    to inspect which providers are performing well or poorly, diagnose routing failures, or reason about
+    model selection. Pass `window_hours` to limit to recent history (e.g. 24 for last day); omit for all-time
+    stats.'
+  input_schema:
+    properties:
+      window_hours:
+        description: If set, only include traces from the last N hours. Omit for all-time stats.
+        type: number
+    type: object
+- tool_name: routing.pipeline.get
+  class: utility
+  description: Read the agent's declared routing pipeline rules from the agent graph. Returns all stored
+    rules or a specific rule by rule_id. Use to inspect which pipeline transforms are currently active.
+  input_schema:
+    properties:
+      rule_id:
+        description: Optional — if provided, returns only the rule with this id. If omitted, returns all
+          rules.
+        type: string
+    required: []
+    type: object
+- tool_name: routing.pipeline.remove
+  class: utility
+  description: Remove a routing pipeline rule from the agent graph. After removal, inbound envelopes that
+    previously matched this rule will be delivered to the agent without transformation.
+  input_schema:
+    properties:
+      rule_id:
+        description: The rule_id of the rule to remove.
+        type: string
+    required:
+    - rule_id
+    type: object
+- tool_name: routing.pipeline.set
+  class: utility
+  description: Declare or replace a routing pipeline rule in the agent graph. Pipeline rules define how
+    the hotel pre-processes inbound envelopes before delivering them to this agent — for example, transcribing
+    a voice memo before the agent sees it. Setting a rule with the same rule_id replaces the previous
+    definition. Takes effect on the next inbound turn.
+  input_schema:
+    properties:
+      deliver_as:
+        description: 'How to deliver the transformed envelope to the agent. One of: ''user_message'' (default),
+          ''tool_result''.'
+        type: string
+      match:
+        description: 'Envelope match criteria. Supported fields: frame_kind (array of strings), channel_kind
+          (array of strings), has_text (bool).'
+        type: object
+      rule_id:
+        description: Stable identifier for this rule (e.g. 'voice-transcribe'). Used as the primary key
+          — re-set with the same rule_id to update.
+        type: string
+      stages:
+        description: 'Ordered list of transform stages. Each stage has: capability (string), mode (''blob''|''stream''),
+          collect (''full''|''incremental''), output_as (''replace_content''|''append_content''), on_failure
+          (''passthrough''|''drop''|''error'').'
+        items:
+          type: object
+        type: array
+    required:
+    - rule_id
+    - match
+    - stages
+    type: object
+- tool_name: routing.policy.propose
+  class: config
+  description: Propose a durable routing or cognition policy refinement for the agent. Use when repeated
+    evidence suggests a turn stage, provider preference, context envelope, or affordance posture should
+    be adjusted. Always requires live operator approval and is stored as a first-class routing policy
+    artifact with disposition and evaluation history.
+  input_schema:
+    properties:
+      affected_capability:
+        description: Optional capability hint such as voice.transcribe, text.generate, or voice.synthesize.
+        type: string
+      affected_stage:
+        description: Optional stage hint such as ingress, cognition, or egress.
+        type: string
+      evidence:
+        description: 'Concrete evidence motivating the change: failed turn shapes, repeated user corrections,
+          latency/cost mismatch, or provider misfit. Max 1024 characters.'
+        type: string
+      learned_reflex:
+        description: Optional approved reflex write-back to store in the agent graph if this proposal
+          should immediately update durable adaptive posture.
+        properties:
+          precedence:
+            description: Optional precedence for the learned reflex layer. Defaults to 70.
+            type: integer
+          preference_key:
+            description: Stable key for the learned reflex preference in the agent graph.
+            type: string
+          reflexes:
+            description: Reflex fields to write, such as remote_tool_reflex, remote_component_reflex,
+              or credential_scope_reflex.
+            type: object
+        required:
+        - preference_key
+        - reflexes
+        type: object
+      problem:
+        description: Short description of the recurring routing or cognition problem being observed. Max
+          512 characters.
+        type: string
+      proposed_change:
+        description: The durable routing or cognition policy update being proposed in the imperative.
+          Max 512 characters.
+        type: string
+    required:
+    - problem
+    - proposed_change
+    - evidence
+    type: object
+- tool_name: routing.reflex.get
+  class: utility
+  description: Read the agent's current routing reflexes from the agent graph. Returns all stored reflex
+    preference rows including their keys, precedences, and current reflex values. Use to inspect what
+    generation capability or routing posture is active before deciding whether to change it.
+  input_schema:
+    properties:
+      preference_key:
+        description: Optional — if provided, returns only the row with this key. If omitted, returns all
+          rows.
+        type: string
+    required: []
+    type: object
+- tool_name: routing.reflex.set
+  class: utility
+  description: 'Set a durable routing reflex that takes effect immediately on the next turn. Use to self-administer
+    low-level dispatch preferences without operator approval. Currently supports `preferred_generation_capability`
+    (values: `text.generate` for standard Gemini, `response.generate` for Gemini Live native audio). Setting
+    a reflex overrides any prior value for the same key.'
+  input_schema:
+    properties:
+      preference_key:
+        description: Stable identifier for this reflex, e.g. 'generation_capability_preference'. Used
+          to update or clear the reflex later.
+        type: string
+      reason:
+        description: Brief reason for the change — stored in the config alongside the reflex for observability.
+        type: string
+      reflexes:
+        description: 'Reflex fields to set. Supported keys: ''preferred_generation_capability'' (''text.generate''
+          or ''response.generate'').'
+        properties:
+          preferred_generation_capability:
+            description: Which generation capability to dispatch cognitive turns to.
+            enum:
+            - text.generate
+            - response.generate
+            type: string
+        type: object
+    required:
+    - preference_key
+    - reflexes
+    type: object
+- tool_name: rule.propose
+  class: config
+  description: Propose a durable behavioral rule to be stored permanently in the agent's context graph.
+    Rules survive dialogue window compaction and are injected into every cognitive call. A rule captures
+    a constraint, pattern, or standing preference that should govern all future behavior. Always requires
+    live operator approval — cannot be preapproved or bypassed by policy.
+  input_schema:
+    properties:
+      description:
+        description: The behavioral rule in the imperative. E.g. 'Always ask for clarification before
+          deleting files.' Max 512 characters.
+        type: string
+      rationale:
+        description: The observation or reasoning that motivates this rule. Reference the specific turn,
+          pattern, or user correction that led here. Max 1024 characters.
+        type: string
+    required:
+    - description
+    - rationale
+    type: object
+- tool_name: session.repair_stale
+  class: heal
+  description: 'Repair session turns stuck in ''running'' longer than min_age_secs (default 300) — the
+    zombie-turn sweep the heal dispatcher runs periodically, on demand. Mutating but bounded: it only
+    fails-out already-dead turns; it never touches healthy sessions. Requires operational admin authority;
+    non-admin agents are refused server-side.'
+  input_schema:
+    properties:
+      min_age_secs:
+        description: Only repair turns older than this many seconds (default 300).
+        type: integer
+    type: object
+- tool_name: session.status
+  class: session
+  description: 'Diagnostic only. Returns a summary of this conversation session: active session ID, turn
+    state, approval policy, and active tool runners. Use only when the operator asks about session/tool
+    availability or when debugging routing. Do not use as a default first step for domain work.'
+  input_schema:
+    properties: {}
+    type: object
+- tool_name: skill.assign
+  class: config
+  description: Assigns a registered skill to a role's toolset profile. Once assigned, the skill's implied
+    tools become available to the role on its next session. The skill must exist in the catalog. Idempotent.
+  input_schema:
+    properties:
+      role_name:
+        description: The role to assign the skill to (e.g. 'developer').
+        type: string
+      skill_name:
+        description: The name of the skill to assign.
+        type: string
+    required:
+    - role_name
+    - skill_name
+    type: object
+- tool_name: skill.audit
+  class: capability
+  description: 'Reads the append-only skill administration audit trail: every register, update, assign,
+    revoke, and state change, with who did it and when. Orchestrator/management only. Use to review how
+    the skill catalog reached its current shape.'
+  input_schema:
+    properties:
+      limit:
+        description: Maximum entries to return, newest first. Defaults to 100.
+        type: integer
+      skill_name:
+        description: 'Optional: only entries for this skill.'
+        type: string
+    type: object
+- tool_name: skill.list
+  class: capability
+  description: Configuration inspection only. Lists registered skills in the hotel's skill catalog, including
+    validation states and implied tools. Use when the operator asks to inspect or assign skills. Do not
+    call just to decide how to answer a normal user request.
+  input_schema:
+    properties: {}
+    type: object
+- tool_name: skill.register
+  class: capability
+  description: Registers a new delegation skill in the hotel's shared skill catalog. A delegation skill
+    defines a reusable subagent role with a goal template, allowed tools, and lifecycle configuration.
+    The hotel validates the skill structurally and returns the validation outcome. Once registered, the
+    skill can be referenced by name when spawning subagents. Always include skill_name, description, subagent_kind,
+    and goal.
+  input_schema:
+    properties:
+      allowed_classes:
+        description: Optional list of tool class names the subagent may use (e.g., 'utility', 'workspace').
+        items:
+          type: string
+        type: array
+      allowed_skills:
+        description: 'Optional SkillDAG edges: names of already-registered skills this skill depends on.
+          Activating this skill transitively activates its dependencies.'
+        items:
+          type: string
+        type: array
+      allowed_tools:
+        description: Optional list of tool IDs the subagent is permitted to use.
+        items:
+          type: string
+        type: array
+      description:
+        description: Human-readable description of what the skill does. Max 2048 characters.
+        type: string
+      goal:
+        description: Goal template injected into the subagent context when this skill is invoked. May
+          include placeholders.
+        type: string
+      skill_name:
+        description: Stable identifier for the skill. Lowercase alphanumeric, dots, hyphens, and underscores
+          only. Max 64 characters; dotted names are the Philotic house style.
+        type: string
+      subagent_kind:
+        description: The role name of the subagent worker this skill delegates to (e.g., 'philote-worker').
+        type: string
+    required:
+    - skill_name
+    - description
+    - subagent_kind
+    - goal
+    type: object
+- tool_name: skill.revoke
+  class: config
+  description: Removes a skill from a role's toolset profile. The skill's implied tools will no longer
+    be available to the role after the next session reset. Idempotent.
+  input_schema:
+    properties:
+      role_name:
+        description: The role to revoke the skill from.
+        type: string
+      skill_name:
+        description: The name of the skill to revoke.
+        type: string
+    required:
+    - role_name
+    - skill_name
+    type: object
+- tool_name: skill.set_state
+  class: config
+  description: 'Administratively changes a registered skill''s lifecycle state. ''suspended'' and ''deprecated''
+    retire the skill: it stops contributing tools and guidance to sessions on their next snapshot. ''active''
+    reinstates it. Orchestrator/management only; every change is audited.'
+  input_schema:
+    properties:
+      reason:
+        description: Why the state is changing (recorded in the audit trail; required in spirit for suspended/deprecated).
+        type: string
+      skill_name:
+        description: The registered skill to change.
+        type: string
+      state:
+        description: Target lifecycle state.
+        enum:
+        - active
+        - suspended
+        - deprecated
+        type: string
+    required:
+    - skill_name
+    - state
+    type: object
+- tool_name: subagent.spawn
+  class: capability
+  description: Spawns a new subagent worker in the hotel. The subagent runs independently with its own
+    lease and model turn budget. Use this to delegate a discrete, self-contained task to a worker process.
+    Either pass 'goal' directly, OR pass 'skill_name' to spawn a registered delegation skill from the
+    catalog — the skill's stored goal template (with {{placeholder}}s filled from 'inputs'), worker kind,
+    and tool bounds are used automatically. The hotel responds with the subagent's guest ID and confirmed
+    lease details.
+  input_schema:
+    properties:
+      allowed_tools:
+        description: Optional list of tool IDs the subagent may use (merged with the skill's implied tools
+          when spawning by name).
+        items:
+          type: string
+        type: array
+      context_summary:
+        description: Optional context summary paragraph handed to the subagent as background knowledge.
+        type: string
+      goal:
+        description: The mission goal text delivered to the subagent. Required unless 'skill_name' is
+          given; with 'skill_name' it is appended to the skill's template as extra context.
+        type: string
+      inputs:
+        additionalProperties:
+          type: string
+        description: 'Values substituted into the skill goal template''s {{placeholder}}s, e.g. {"topic":
+          "..."}.'
+        type: object
+      iteration_budget:
+        description: Maximum model-turn iterations for the subagent. Defaults to 5.
+        type: integer
+      skill_name:
+        description: Name of a registered delegation skill (see skill.list). The skill's goal template,
+          subagent kind, tool bounds, and dependencies are resolved by the hotel. Suspended or deprecated
+          skills are refused.
+        type: string
+      subagent_kind:
+        description: The worker role to spawn. Defaults to 'philote-worker'; overridden by the skill's
+          stored kind when 'skill_name' is given.
+        type: string
+    required: []
+    type: object
+- tool_name: table.add_listener
+  class: table
+  description: Register a router-listener handler that writes matching inbound events into a local table.
+    Merges into the hotel's router_listener.config so the router-listener starts routing the specified
+    event_kind to the named table on its next reconnect. After calling this, run graph.query to store
+    a TableConfig node in your partition so the table appears in your cognitive envelope on future sessions.
+  input_schema:
+    properties:
+      adapter_script:
+        description: Path to a Python adapter script. Receives raw event JSON on stdin, emits transformed
+          row JSON on stdout.
+        type: string
+      event_kind:
+        description: The 'kind' field value on inbound envelopes to match (e.g. 'transcription_capture',
+          'routing_signal').
+        type: string
+      filter_keys:
+        description: Only process events where these envelope fields match these values.
+        type: object
+      schema_map:
+        description: Maps event envelope field names to table column names. Omit to pass through the full
+          envelope.
+        type: object
+      table_name:
+        description: Target table name in the local table store.
+        type: string
+      target_role:
+        description: 'Role to route table.insert tasks to (default: ''table-datasource'').'
+        type: string
+    required:
+    - event_kind
+    - table_name
+    type: object
+- tool_name: table.configure
+  class: table
+  description: Create a new table in the local table store using a CREATE TABLE SQL statement. Use this
+    to set up observability tables, event logs, or any flat structured data that your agent-graph neighborhood
+    should track.
+  input_schema:
+    properties:
+      query:
+        description: CREATE TABLE IF NOT EXISTS ... SQL DDL statement.
+        type: string
+    required:
+    - query
+    type: object
+- tool_name: table.insert
+  class: table
+  description: Insert a row into a table in the local table store. Pass the table name as graph_id and
+    the row as parameters.
+  input_schema:
+    properties:
+      graph_id:
+        description: Table name.
+        type: string
+      parameters:
+        description: Row data as column→value pairs.
+        type: object
+    required:
+    - graph_id
+    - parameters
+    type: object
+- tool_name: table.query
+  class: table
+  description: Run a SELECT query against a table in the local table store. Returns rows as JSON objects.
+    Use graph_id to specify the table name and query for the SQL. Pass limit in parameters to cap results.
+  input_schema:
+    properties:
+      graph_id:
+        description: Table name (also set as the target table for the query context).
+        type: string
+      parameters:
+        default: {}
+        description: Optional query parameters. Include 'limit' to cap result count.
+        type: object
+      query:
+        description: SELECT SQL query.
+        type: string
+    required:
+    - query
+    type: object
+- tool_name: table.rolloff
+  class: table
+  description: Apply data retention rules to a table — delete rows older than max_age_secs or keep only
+    the newest max_rows rows. Pass the table name as graph_id.
+  input_schema:
+    properties:
+      graph_id:
+        description: Table name.
+        type: string
+      parameters:
+        description: 'Rolloff options: max_rows (integer), max_age_secs (integer), ts_column (string,
+          default ''timestamp'').'
+        properties:
+          max_age_secs:
+            type: integer
+          max_rows:
+            type: integer
+          ts_column:
+            type: string
+        type: object
+    required:
+    - graph_id
+    type: object
+- tool_name: table.schema
+  class: table
+  description: Return the CREATE TABLE DDL for a table in the local table store.
+  input_schema:
+    properties:
+      graph_id:
+        description: Table name.
+        type: string
+    required:
+    - graph_id
+    type: object
+- tool_name: table.stats
+  class: table
+  description: Return row count and latest timestamp for a table in the local table store.
+  input_schema:
+    properties:
+      graph_id:
+        description: Table name.
+        type: string
+      parameters:
+        default: {}
+        description: 'Options: ts_column (string, default ''timestamp'').'
+        type: object
+    required:
+    - graph_id
+    type: object
+- tool_name: training.correct
+  class: training
+  description: Apply an operator correction to a captured voice training sample. Sets the ground-truth
+    transcript and marks the sample training_eligible.
+  tool_markers:
+  - high_agency
+  input_schema:
+    properties:
+      corrected_transcript:
+        description: The ground-truth transcript.
+        type: string
+      turn_id:
+        description: The turn to correct.
+        type: string
+    required:
+    - turn_id
+    - corrected_transcript
+    type: object
+- tool_name: training.export
+  class: training
+  description: Export training-eligible samples to a file for the fine-tuning pipeline. Supports huggingface
+    (JSON array) and nemo (one-JSON-per-line manifest) formats. Marks exported samples so they are not
+    re-exported.
+  tool_markers:
+  - high_agency
+  input_schema:
+    properties:
+      format:
+        description: Output format.
+        enum:
+        - huggingface
+        - nemo
+        type: string
+      limit:
+        description: 'Max samples to export (default: all eligible).'
+        type: integer
+      output_path:
+        description: Absolute path for the export file.
+        type: string
+    required:
+    - format
+    - output_path
+    type: object
+- tool_name: training.list
+  class: training
+  description: 'List captured voice training samples. Filter by state: all (default), uncorrected, eligible,
+    or exported. Optionally narrow by agent_id.'
+  input_schema:
+    properties:
+      agent_id:
+        description: Restrict to samples from a specific agent.
+        type: string
+      filter:
+        description: Filter samples by correction/export state.
+        enum:
+        - all
+        - uncorrected
+        - eligible
+        - exported
+        type: string
+      limit:
+        description: Number of samples to return (default 20, max 200).
+        type: integer
+    type: object
+- tool_name: training.status
+  class: training
+  description: 'Return a summary of voice training sample counts: total captured, uncorrected, eligible
+    for export, and already exported. Optionally filtered by agent_id.'
+  input_schema:
+    properties:
+      agent_id:
+        description: Restrict counts to a specific agent.
+        type: string
+    type: object
+- tool_name: transport.set_home
+  class: config
+  description: 'Pin an external membrane transport resource to the one hotel that may own its inbound
+    poller or gateway. Use this for scarce ingress like Telegram long polling, Discord gateway sessions,
+    or desktop chat surfaces. This is separate from role.set_home: roles may run elsewhere while a single
+    stable hotel owns the transport. Requires operator approval.'
+  input_schema:
+    properties:
+      reason:
+        description: Why this transport belongs on this hotel. Required for operator visibility.
+        type: string
+      resource_ref:
+        description: Stable transport resource reference, such as a bot token key.
+        type: string
+      standby_hotels:
+        description: Optional standby hotels allowed for explicit future failover.
+        items:
+          type: string
+        type: array
+      target_hotel:
+        description: Hotel node_id/name that should own the active poller or gateway.
+        type: string
+      transport:
+        description: Transport implementation name, e.g. 'telegram', 'discord', or 'desktop'.
+        type: string
+    required:
+    - transport
+    - resource_ref
+    - target_hotel
+    - reason
+    type: object
+- tool_name: vision.setup
+  class: vision
+  description: 'Set up the local ONNX vision provider (Florence-2): writes the component config, upserts
+    a ModelProfileRecord so health-aware routing picks it up, and registers the model-controller-vision
+    guest for automatic materialization. The model is downloaded from HuggingFace Hub on first start.
+    repo_id defaults to ''onnx-community/Florence-2-base-ft''.'
+  tool_markers:
+  - high_agency
+  input_schema:
+    properties:
+      repo_id:
+        description: HuggingFace repo ID for the Florence-2 ONNX model (optional).
+        type: string
+    type: object
+- tool_name: vision.status
+  class: vision
+  description: 'Return the current status of the ONNX vision provider: whether the guest is registered
+    and active, its PID if running, the configured model repo, and the ModelProfileRecord health status.'
+  input_schema:
+    properties: {}
+    type: object
+- tool_name: workspace.list
+  class: workspace
+  description: Lists files and directories at the given path within the workspace. Defaults to the workspace
+    root if no path is provided.
+  input_schema:
+    properties:
+      path:
+        description: Relative path within the workspace to list. Omit to list the root.
+        type: string
+    type: object
+- tool_name: workspace.read
+  class: workspace
+  description: Reads the contents of a file in the workspace. Supports optional byte-range limiting via
+    offset and limit.
+  input_schema:
+    properties:
+      limit:
+        description: Maximum number of bytes to read.
+        type: integer
+      offset:
+        description: Byte offset to start reading from.
+        type: integer
+      path:
+        description: Relative path to the file within the workspace.
+        type: string
+    required:
+    - path
+    type: object

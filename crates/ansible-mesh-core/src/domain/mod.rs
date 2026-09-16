@@ -2691,6 +2691,7 @@ mod tests {
             input_schema: serde_json::json!({"type": "object"}),
             class: "utility".to_string(),
             tool_markers: Vec::new(),
+            batch_of: None,
         }
     }
 

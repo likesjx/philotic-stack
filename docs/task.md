@@ -1577,6 +1577,8 @@ Seam IDs: `desktop-membrane-boundary`, `desktop-membrane-lease`, `desktop-membra
 
 ## Next Project: Tool Assembly and Routed Execution
 
+- [ ] **T1 tool catalog file (2026-09-16, `codex/tool-catalog-file`)** — operator: "i don't like hard-coding the tool stubs - we should have an external json/yml that we can update, that should get loaded into the hotel graph". `catalog/tools.yaml` (121 tools, `defs` + `$ref`) → hotel loader (embedded floor + `~/.philotic/<profile>/tool-catalog.yaml` + `PHILOTIC_TOOL_CATALOG`) → `abstract_tool` records → philote `GetToolCatalog` registry → tool definitions, argument repair and plan verification. First data relationship: `batch_of` (DEF-147). Watched-live gate: edited override description appears in bjork's prompt after a hotel restart; a `life.observe`-bound plan verifies from one `life.observe.batch` call. Follow-ons in TOOL_MANAGEMENT_PLANE_PROPOSAL.md § Tool Catalog File.
+
 - [ ] Review [TOOL_ASSEMBLY_EXECUTION_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/TOOL_ASSEMBLY_EXECUTION_PROPOSAL.md).
 - [ ] Review [TOOL_MANAGEMENT_PLANE_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/TOOL_MANAGEMENT_PLANE_PROPOSAL.md).
 - [ ] Review [RUNNER_ARTIFACT_BUILD_DISTRIBUTION_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/RUNNER_ARTIFACT_BUILD_DISTRIBUTION_PROPOSAL.md).

@@ -1026,6 +1026,11 @@ impl AgentRuntime {
         // membrane-mcp guest picks them up immediately on restart.
         self.register_mcp_routes().await;
 
+        // Tool definitions are data: load the hotel's catalog records before the
+        // first turn so descriptions, schemas and batch relationships come from
+        // catalog/tools.yaml rather than the compiled fallback.
+        self.refresh_tool_catalog().await;
+
         // Load projected upstream MCP tools (mcp:<upstream>.<tool>) so granted
         // remote tools are in the catalog from the first turn.
         self.refresh_mcp_upstream_projection().await;

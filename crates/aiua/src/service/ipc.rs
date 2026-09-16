@@ -11387,6 +11387,17 @@ impl IpcServer {
                 }
             }
 
+            IpcRequest::GetToolCatalog {} => match graph.list_abstract_tools() {
+                Ok(tool_catalog) => IpcResponse::ToolCatalogState { tool_catalog },
+                Err(err) => IpcResponse::Standard {
+                    ok: false,
+                    code: "tool_catalog_read_failed".into(),
+                    message: format!("tool catalog read failed: {err}"),
+                    corr_id: String::new(),
+                    data: None,
+                },
+            },
+
             IpcRequest::GetMcpUpstreams {} => {
                 use ansible_mesh_core::mcp_upstream::{McpUpstreamCatalog, McpUpstreamConfig};
                 let registry: std::collections::HashMap<String, McpUpstreamConfig> = graph
@@ -29634,6 +29645,7 @@ pub(crate) mod tests {
                 input_schema: serde_json::json!({ "type": "object" }),
                 class: "config".into(),
                 tool_markers: vec!["high_agency".into(), "local_only".into()],
+                batch_of: None,
             })
             .expect("seed abstract tool");
         graph
