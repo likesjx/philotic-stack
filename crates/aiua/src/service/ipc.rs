@@ -1449,7 +1449,7 @@ impl IpcServer {
     /// `hotel_name` match resolves to that hotel's `node_id`. `None` if
     /// neither matches any known hotel — callers should surface that as a
     /// rejection rather than silently mis-routing.
-    pub(super) fn resolve_hotel_node_id(graph: &GraphDomain, hotel_ref: &str) -> Option<String> {
+    pub(crate) fn resolve_hotel_node_id(graph: &GraphDomain, hotel_ref: &str) -> Option<String> {
         let hotels = graph.list_hotels().ok()?;
         if hotels
             .iter()
@@ -3495,9 +3495,15 @@ impl IpcServer {
                             standby_hotels,
                         } = &response
                         {
+                            // DEF-143: `active_home_hotel` is canonicalized to
+                            // node_id by transport.set_home (DEF-124) — resolve
+                            // before comparing rather than comparing against the
+                            // bare local hotel name, which only matched records
+                            // never rewritten since before that fix.
                             let hotel_is_home =
-                                Self::local_hotel_name(graph.as_ref(), &local_node_id)
-                                    .is_some_and(|name| name == *active_home_hotel);
+                                Self::resolve_hotel_node_id(graph.as_ref(), active_home_hotel)
+                                    .as_deref()
+                                    == Some(local_node_id.as_str());
                             let updated_unix = graph
                                 .get_membrane_transport_home(agent_id, transport, resource_ref)
                                 .ok()
