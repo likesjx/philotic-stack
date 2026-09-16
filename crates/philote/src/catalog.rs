@@ -3970,7 +3970,8 @@ fn build_catalog() -> HashMap<String, ToolDefinition> {
                                 "description": "Typed facts written as node properties: universal \
                                     keys (title, status) or keys declared for this label in \
                                     life.ontology → typed_properties (kind, range, allowed values \
-                                    checked). Structured facts go here, never only in the summary."
+                                    checked). Structured facts go here, never only in the summary. \
+                                    Pass a JSON object, never a JSON-encoded string."
                             },
                             "due_at": {
                                 "type": "string",

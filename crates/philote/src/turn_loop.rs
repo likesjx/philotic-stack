@@ -2900,11 +2900,16 @@ impl AgentRuntime {
             return SayDoDisposition::FailedStepTrailer { failed };
         }
         // Only a turn that has done nothing can be promising in vain. A turn
-        // with tool results behind it is judged by plan_eval, not by phrasing.
-        if !turn.working_tool_history.is_empty()
-            || turn.scripted_loop_context.is_some()
-            || turn.paracrine_origin.is_some()
-        {
+        // with a successful WRITE behind it is judged by plan_eval, not by
+        // phrasing; a turn whose only calls were reads (memory.recall,
+        // life.recall) or failures has done nothing yet — live 2026-09-16
+        // 12:44 UTC, "I will make sure this is tracked and followed up" after
+        // a lone memory.recall, and the subscription was never recorded.
+        let did_work = turn.working_tool_history.iter().any(|(call, result)| {
+            !crate::plan_eval::tool_name_is_read_only(&call.tool_name)
+                && crate::plan_eval::tool_result_looks_ok(result)
+        });
+        if did_work || turn.scripted_loop_context.is_some() || turn.paracrine_origin.is_some() {
             return SayDoDisposition::Deliver;
         }
         // A declared plan with pending steps is the honest form of "working on
@@ -5279,6 +5284,21 @@ pub(super) fn reply_claims_unbacked_write(content: &str) -> bool {
 pub(super) fn reply_promises_unexecuted_action(content: &str) -> bool {
     let lower = content.to_lowercase();
     const PATTERNS: &[&str] = &[
+        "i will make sure this is tracked",
+        "i'll make sure this is tracked",
+        "i will make sure it is tracked",
+        "i'll make sure it is tracked",
+        "i will make sure this is recorded",
+        "i'll make sure this is recorded",
+        "i will make sure this is logged",
+        "i'll make sure this is logged",
+        "will be tracked and followed up",
+        "i will track this",
+        "i'll track this",
+        "i will log this",
+        "i'll log this",
+        "i will record this",
+        "i'll record this",
         "executing step",
         "executing now",
         "executing this now",
@@ -5811,6 +5831,21 @@ pub(super) fn carryover_resume_followup(
 mod say_do_tests {
     use super::super::tests::test_working_turn;
     use super::*;
+
+    /// Live 2026-09-16 12:44 UTC: a lone memory.recall, then a promise.
+    #[test]
+    fn read_only_turns_still_count_as_doing_nothing() {
+        assert!(reply_promises_unexecuted_action(
+            "I've noted your instruction to cancel your Bronze David Bars subscription. I will make sure this is tracked and followed up as part of our ongoing cleanups."
+        ));
+        assert!(crate::plan_eval::tool_name_is_read_only("memory.recall"));
+        assert!(crate::plan_eval::tool_name_is_read_only("life.recall"));
+        assert!(crate::plan_eval::tool_name_is_read_only("hotel.status"));
+        assert!(!crate::plan_eval::tool_name_is_read_only("life.observe"));
+        assert!(!crate::plan_eval::tool_name_is_read_only(
+            "delegate.to_peer"
+        ));
+    }
 
     /// Live 2026-09-15 19:35–19:38 UTC: two "dispatched" acks became
     /// "successfully dispatched … she has received the update".

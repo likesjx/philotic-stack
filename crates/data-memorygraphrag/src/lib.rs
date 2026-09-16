@@ -182,7 +182,11 @@ pub struct EvidencePacket {
     /// and allowed values at plan time. Prose stays in `claim_summary` —
     /// "difficulty 55/100" in the summary is invisible to every query;
     /// `properties.difficulty = 55` is not.
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    #[serde(
+        default,
+        skip_serializing_if = "BTreeMap::is_empty",
+        deserialize_with = "deserialize_properties_leniently"
+    )]
     pub properties: BTreeMap<String, serde_json::Value>,
 }
 
@@ -1869,6 +1873,52 @@ pub struct LifeObserveBatchInput {
 /// provenance requirement or plan gate is relaxed. A malformed inner payload
 /// still fails, and now says so per item rather than as an opaque type error
 /// about the whole array.
+/// `evidence.properties` as an object, or as a JSON-encoded string of one.
+/// Gemini function calling serializes a free-form object (`"type": "object",
+/// "additionalProperties": true`, no declared keys) as a string: live
+/// 2026-09-16 11:17–11:49 UTC every `life.observe` from Beacon carried
+/// `"properties":"{\"title\":\"Pay bills\",\"status\":\"open\"}"` and the runner
+/// refused all ten with "invalid type: string … expected a map" (DEF-144), so
+/// four operator items were never recorded. The inner value must still be an
+/// object; a string that is not one fails with a message that says so.
+fn deserialize_properties_leniently<'de, D>(
+    deserializer: D,
+) -> std::result::Result<BTreeMap<String, serde_json::Value>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::Error as _;
+    let raw = serde_json::Value::deserialize(deserializer)?;
+    let value = match raw {
+        serde_json::Value::String(encoded) => {
+            let trimmed = encoded.trim();
+            if trimmed.is_empty() {
+                return Ok(BTreeMap::new());
+            }
+            serde_json::from_str::<serde_json::Value>(trimmed).map_err(|err| {
+                D::Error::custom(format!(
+                    "evidence.properties is a string that is not a JSON object ({err}); pass an object"
+                ))
+            })?
+        }
+        other => other,
+    };
+    match value {
+        serde_json::Value::Null => Ok(BTreeMap::new()),
+        serde_json::Value::Object(map) => Ok(map.into_iter().collect()),
+        other => Err(D::Error::custom(format!(
+            "evidence.properties must be a JSON object, got {}",
+            match other {
+                serde_json::Value::Array(_) => "an array",
+                serde_json::Value::String(_) => "a string",
+                serde_json::Value::Number(_) => "a number",
+                serde_json::Value::Bool(_) => "a boolean",
+                _ => "an unexpected value",
+            }
+        ))),
+    }
+}
+
 fn deserialize_observations_leniently<'de, D>(
     deserializer: D,
 ) -> std::result::Result<Vec<LifeObserveInput>, D::Error>
@@ -4149,6 +4199,44 @@ mod tests {
 
 #[cfg(test)]
 mod typed_property_contract_tests {
+    /// DEF-144, live 2026-09-16 11:17 UTC: the model sent `properties` as
+    /// a JSON string and every observe was refused.
+    #[test]
+    fn observe_accepts_properties_as_a_json_encoded_string() {
+        let raw = serde_json::json!({
+            "evidence": {
+                "claim_ref": {"id": "life:open_loop:pay_bills_20260916", "label": "OpenLoop"},
+                "claim_summary": "Jared needs to pay bills.",
+                "properties": "{\"title\":\"Pay bills\",\"status\":\"open\"}"
+            }
+        });
+        let input: super::LifeObserveInput = serde_json::from_value(raw).expect("lenient parse");
+        assert_eq!(
+            input
+                .evidence
+                .properties
+                .get("title")
+                .and_then(|v| v.as_str()),
+            Some("Pay bills")
+        );
+        assert_eq!(
+            input
+                .evidence
+                .properties
+                .get("status")
+                .and_then(|v| v.as_str()),
+            Some("open")
+        );
+        let obj = serde_json::json!({"evidence": {"claim_ref": {"id": "life:x:y", "label": "Event"}, "claim_summary": "s", "properties": {"title": "T"}}});
+        let input: super::LifeObserveInput = serde_json::from_value(obj).expect("object parse");
+        assert_eq!(input.evidence.properties.len(), 1);
+        let bad = serde_json::json!({"evidence": {"claim_ref": {"id": "life:x:y", "label": "Event"}, "claim_summary": "s", "properties": "just words"}});
+        let err = serde_json::from_value::<super::LifeObserveInput>(bad)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("evidence.properties"), "{err}");
+    }
+
     use super::*;
 
     fn runner() -> MemoryGraphRagRunner {
