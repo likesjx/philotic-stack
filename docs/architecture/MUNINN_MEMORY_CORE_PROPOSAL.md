@@ -4,7 +4,7 @@ doc_type: proposal
 domain: memory-context
 status: proposed
 disposition: proposed
-last_updated: 2026-08-28
+last_updated: 2026-09-16
 tags:
   - muninn
   - memory
@@ -222,6 +222,202 @@ per-agent context — promotion is opt-in by policy, not automatic for all).
   Cortex write lands on the observer.
 - **Pre-req:** reconcile the 179 historical mac-only memories up to the Cortex
   before any observer reseed (data-loss guard).
+
+## Phase 2 — Philote Memory Efficiency, Sleep, and Repair (2026-09-16 audit)
+
+Phase 1 (S1–S6a) built pieces; a live audit of all three hotels on 2026-09-16 shows
+the philotes' **automatic** memory loop is still the weak link. Evidence came from
+the session-event ledger (7-day retention), hotel logs (mac-jane 08-20 to 09-16),
+prompt budget ledgers in `generate_text` payloads, read-only recall replays, and a
+code audit of `origin/develop` (3ed106cd, the deployed truth; this branch is 72
+commits behind). Slices are ordered by operator priority: **recall/remember
+efficiency first**, then sleep/maintenance, then the missing-memory repair.
+
+### Audit findings (measured)
+
+**Recall** runs once per inbound task and on every plan continuation
+(`maybe_auto_recall_turn_memory`), fans out one `/api/activate` per tokened vault,
+merges, and keeps 5.
+
+| Finding | Evidence | Code |
+|---|---|---|
+| `role: <name> \|` query prefix drags role-themed memories to the top | one memory in Beacon's top-3 on 165/178 recalls; A/B replay without the prefix moves the relevant memory from #7 to #2 | `memory-core/src/recall.rs` `build_query` |
+| No relevance gate; always 5 items | score parsed then dropped; replayed queries: 0 strong, 24% moderate, 76% weak; a query Muninn answers with nothing still injects 5 | `rest_client.rs` merge; `recall.rs` limit 5 |
+| Projection mostly wasted | 3,000-char cap truncates 97–99.5% of blocks; ~965-char fixed preamble; ~650 chars/item for ~150 chars of content, so 2–3 items survive; block re-sent on 73–89% of the turn's later model calls (~8% of every prompt) | `session/mod.rs` `project_recalled_memory` |
+| LifeGraph starved by ordering | Muninn items render first and the cap cuts from the end | `session/mod.rs` layer assembly |
+| Nanosecond timestamps unconverted | model sees `unix_ms=1779888583525039000`; recency tie-break is always 1.0 | `rest_client.rs` `ActivationItem` to `Engram` |
+| No timeout; engine rebuilt per call | `reqwest::Client::new()`; the 45s `RecallCache` can never hit; p90 up to 543 ms, max 4–12 s, inline on the turn | `rest_client.rs`; `memory_integration.rs` `memory_engine_for` |
+| Failing/empty vaults queried every turn | `user_likesjx` HTTP 401 on 207 mac-jane recalls since 08-22 (token heal must mint on the Cortex; a partial 401 never triggers heal); empty session/ariel/lyra vaults | `rest_client.rs` partial-failure path |
+| Failed recalls invisible | 33/391 mac-jane recalls failed with no event, so `memory.report` hit rate reads ~100% against a real 91.6% | `memory_integration.rs` failure path; `memory_report.rs` |
+| Recall never feeds back | `last_access` equals `created_at` on 166/167 Beacon and 56/56 Jane memories | no feedback/access path |
+
+**Remembering**:
+
+| Finding | Evidence | Code |
+|---|---|---|
+| Mac-hotel writes are rejected | Attend-hook `self_` writes POST to the local observer and get **421 Misdirected Request** (13×); token mint 421 (27×); no `memory.write_forward` activity fleet-wide | Attend hook hard-codes local `SelfOnly`; `is_fleet_shared_vault` excludes `self_*` |
+| Writes nearly stopped | last new memory: Björk 07-11, Coach 08-03, Aria 07-28, Jane 08-05; only Beacon (vps, local Cortex) still gains (~4% of turns) | — |
+| `memory.remember` rarely offered | keyword gate `looks_like_memory_write_goal`; offered in ≤2.5% of model calls, called 0× in 7 days | tool gating |
+| `memory_candidate` rarely produced | 1–2% of responses | `MEMORY_CANDIDATE_POLICY` |
+| Concept slug is the upsert key | `idempotent_id = "{vault}:{concept}"`; Muninn (v0.11.0+, #556) **evolves** the pinned memory on changed content, so corrections work, but two different facts under one slug clobber each other | `rest_client.rs` write paths |
+| Noise in self vaults | test probes (`perplexity.note…`) recalled into unrelated turns ~150×; self-heal escalations stored as Beacon's own memories; months-old dated events rendered as current | capture paths |
+
+**Content quality is otherwise good**: short, atomic, no pasted model responses, and
+no near-duplicates among recent memories.
+
+**Sleep/maintenance today**: `memory.hygiene` (03:00, opt-in, live on mac-jane) only
+flags. The hotel dream sweep (`aiua/src/dream.rs`, opt-in, not enabled) consolidates
+through REST `/api/consolidate`, a path that replicates and keeps lineage, but its
+vault discovery matches no real guests and on Macs its writes would 421. Muninn
+itself has no scheduled consolidation (the 6h worker is never started), no
+soft-delete hard purge, and no enrich plugin on any node. **The `muninn dream` CLI
+must never run on a cluster node**: it opens Pebble without the replication log, so
+its archives never replicate and nodes diverge silently.
+
+**Replication**: in both v0.11.0 and rc1 no node ever receives a snapshot on join
+(`coordinator.go` builds `NewJoinHandler`/`NewJoinClient` without a DB). When an
+observer falls more than `max_log_backlog` (5000) entries behind, or the Cortex
+restarts while it is away, the leader prunes past it, the observer restarts from the
+first retained entry, and the applier (no contiguity check) silently skips the gap.
+That is the mbp-jane Aug 22–29 hole: 49 `default` memories plus every other mutation
+in the window. Both observers also hold a few philote memories the Cortex never got,
+written locally before they became observers: mbp 5 (`self_agent-jane` 2,
+`self_agent-aria` 3) and mac-jane 2 (`self_agent-coach`), plus mac-jane's known ~179
+in `default`.
+
+### M1 — Recall query + relevance gate (quality): implement first
+
+- Drop the `role:` prefix from `build_query`; reintroduce role only as a tag boost if
+  an A/B replay shows it helps.
+- For short or referential turns ("what about the second one?"), seed with the
+  previous user turn. For plan continuations, reuse the turn's existing recall
+  instead of querying on the boilerplate continuation brief.
+- Request and parse `relevance_band`; inject `strong`/`moderate` only; allow 0–5
+  items. Carry score/band onto `Engram` so projection and telemetry can see it.
+- Stop querying vaults that are empty or failing: cache per-vault emptiness for the
+  session, and on a partial 401 trigger token heal for that vault (minting on the
+  Cortex, see M4).
+- **Acceptance**: replaying the six audit queries puts the relevant memory in the top
+  3 where one exists and injects nothing where none does; no single memory appears in
+  more than 25% of an agent's recalls over a day.
+
+### M2 — Projection budget (tokens)
+
+- Slim item format: `concept — content (age, origin)`; keep ids, tags and validation
+  metadata in the turn record rather than the prompt.
+- Cut the fixed preamble to the rules that change behaviour (~300 chars).
+- Fix the nanosecond conversion and render age as "3 days ago".
+- Render the ⚠ contradiction/staleness lines once (drop the duplicate raw
+  `annotations` JSON) and drop superseded items outright.
+- Give LifeGraph its own lane budget instead of sharing the cut; budget the
+  `MuninnEntity` overlay.
+- On re-entry model calls within a turn, keep the block byte-identical and in a
+  stable prefix position so provider prompt caching applies.
+- **Acceptance**: under 10% of blocks truncated; recall share of prompt at most 4%;
+  every injected item fully visible.
+
+### M3 — Recall engine hygiene + honest telemetry (latency)
+
+- One long-lived `MuninnRestEngine` per philote, so the connection pool and the
+  existing recall cache are actually used.
+- Recall timeout (target 1.5 s): proceed without memory and emit
+  `memory_auto_recall_failed` with the reason; emit it on every failure path.
+- Put per-item band/score and latency in `memory_auto_recall_completed`; make
+  `memory.report` recall effectiveness count failures; populate
+  `router_traces.token_count`.
+- When the model cites or acts on a recalled item, record access/feedback in Muninn
+  so ACT-R activation stops being inert.
+
+### M4 — Write routing to the Cortex (memory creation): critical
+
+- **All** philote writes (Attend hook, `memory.remember` at any scope,
+  `context.capture`, MCP `memory.capture`) and vault token minting target the Cortex.
+  Recommended: extend the existing `memory.write_forward` path from shared vaults to
+  every vault on non-Cortex hotels, reusing aiua's authz and `apply_forwarded_write`.
+  Every philote self vault already exists on the Cortex (verified 2026-09-16).
+- Land the S2 remainder: a durable retry queue for forwards that fail while the
+  Cortex is unreachable, surfaced in `memory.report`; never fall back to a local
+  write on an observer.
+- Read-after-write: Mac recall reads the local observer, so a new memory becomes
+  recallable once replication lands (seconds on a healthy observer).
+- **Acceptance**: zero 421s in Mac hotel logs over 24 h; new Björk/Coach/Jane memories
+  appear on the Cortex and on the hotel's observer.
+
+### M5 — Remember volume and quality
+
+- Replace the keyword gate on `memory.remember` with a durable-fact heuristic, or
+  always offer it to persona agents.
+- Wire S3 deterministic operator-fact capture after M4 (so captures land), with a
+  daily cap per agent.
+- Make concept slugs collision-safe: include a distinguishing subject in the slug, or
+  recall by concept before writing and evolve deliberately.
+- Keep test probes and self-heal escalations out of persona self vaults (dedicated
+  diagnostics vault); cap Attend-hook content length as the LifeGraph fork does.
+- **Acceptance**: each active persona gains durable memories weekly; zero probe
+  memories recalled into persona turns.
+
+### M6 — Sleep: Cortex-side maintenance cycle
+
+Runs **only on the Cortex hotel** (vps-jane), over REST/MCP so every mutation
+replicates. Built on the existing `memory.hygiene` cron and autonomy grants, moving
+each lane from `proposal_only` to `auto_with_audit` as confidence is earned:
+
+1. Contradictions: resolve via evolve, `forget(not_true_since)` or `link supersedes`.
+2. Near-duplicate clusters: `/api/consolidate` (lineage kept). Fix `dream.rs` vault
+   discovery to the real `self_agent-*` / `user_*` naming and gate it to the Cortex.
+3. Dated events past their date: set `valid_until` or archive, so they stop rendering
+   as current.
+4. Enrichment backfill: agent-driven `get_enrichment_candidates` +
+   `apply_enrichment`, or `MUNINN_ENRICH_URL` on the Cortex only (never on observers).
+5. Tombstones older than 30 days: `forget hard=true`.
+6. Divergence check: scheduled cross-node ID+state diff per vault; alert on the Cortex
+   log lines `dropping lobe left behind`, `forced_by_backlog=true` and `from_seq=0`.
+7. Enable `--metrics-addr` on all three nodes and feed
+   `muninndb_recall_embed_fallback_total` and `muninndb_activate_duration_seconds`
+   into `memory.report`.
+
+Never run the `muninn dream` CLI on any cluster node.
+
+### M7 — Repair the missing memories (live-ops, operator-driven)
+
+Supersedes the S5 reconcile note. Order matters because a restore erases
+observer-only data:
+
+1. **Enumerate observer-only memories** in every vault on both observers with the
+   two-way ID diff, `default` included (mac-jane ~179; mbp to be measured).
+2. **Re-write them to the Cortex** (content copy, new ULIDs, tagged
+   `reconciled-from:<node>`). Duplicates are not a problem here because step 4
+   replaces the observer's store.
+3. Stop the observer daemon.
+4. Take a fresh online checkpoint on the Cortex (`POST /api/admin/backup`), copy its
+   `pebble/` to the observer, move the observer's `data/pebble` aside and install the
+   checkpoint. Keep `node-identity`, `cluster.yaml`, `auth_secret`, `wal/`,
+   `audit.log` and `~/.muninn/mcp.token`. Schemas match (migrations 1–6 on both
+   v0.11.0 and rc1).
+5. Start the observer; confirm `cluster: joined` and the Cortex's
+   `starting replication stream … from_seq` line; re-run the ID+state diff.
+6. Rollback: stop the daemon and move the old `pebble` back.
+
+Run steps 3–5 back to back, so fewer than 5000 log entries land between checkpoint
+and rejoin. Never wipe-and-rejoin (no snapshot path exists, so the observer would end
+up far emptier) and never `vault import` (observers reject it, and it cannot merge
+into a live vault).
+
+**Prevent recurrence**: raise `max_log_backlog` to cover the longest laptop offline
+window (size it from the `log_seq` rate); upstream to muninndb an applier contiguity
+guard (fail loud with a `needs_resync` marker), a per-vault digest endpoint and real
+snapshot wiring; build rc1 for linux so the self-knowledge surface works on the node
+every write goes through.
+
+### Phase 2 sequence
+
+**M1 → M2 → M3** (one PR rebased on develop; test-green, then watched-live on one
+persona per hotel) → **M4** (with the S2 queue) → **M5** → **M6** → **M7** (operator
+window). M7's prevention items and the linux rc1 build can run in parallel.
+
+**Security note from the audit**: mac-jane's `config:muninn` graph node holds Muninn
+admin credentials in plaintext with a default-looking password. Rotate them and move
+them to the vault store; tracked separately from this proposal.
 
 ## Admin plane authz (S6a / S6b / S4 verbs)
 
