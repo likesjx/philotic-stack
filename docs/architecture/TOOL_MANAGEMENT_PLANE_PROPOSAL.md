@@ -405,6 +405,13 @@ field:
   own tool list reads the same file.
 - Merge policy for runtime tool edits (`ToolsetProfileRecord::reconcile_seed_with_existing`
   precedent) once a `tool.*` admin operation exists.
+- Uncatalogued records: the loader leaves records the file does not name. On
+  mac-jane 2026-09-16 that is four: `hotel.best_place_to_run` (a real local tool,
+  implied by skills, never defined in any catalog — it needs a catalog entry) and
+  `life.capture`, `life.flywheel.brief`, `life.flywheel.review` (orphans from older
+  binaries; no current code defines them). The philote registry now serves their
+  stale descriptions. Next: add the real one to the file and have the loader mark
+  unnamed records stale instead of silently keeping them.
 
 ## Implementation Phasing
 
