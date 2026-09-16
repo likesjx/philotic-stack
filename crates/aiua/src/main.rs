@@ -44,6 +44,8 @@ mod lyra_charter;
 mod memory;
 mod memory_delta_digest;
 mod memory_hygiene;
+mod memory_promotion;
+mod memory_report;
 mod mesh;
 mod muninn_provision;
 mod vault;
@@ -4098,6 +4100,8 @@ fn seed_toolset_profiles(graph: &GraphDomain) -> anyhow::Result<()> {
                 "session.status".into(),
                 "hotel.status".into(),
                 "hotel.logs".into(),
+                // S6a: admin memory-health report (read-only, honest-sourcing).
+                "memory.report".into(),
                 "hotel.best_place_to_run".into(),
                 "echo".into(),
                 "agent.configure".into(),
@@ -4331,6 +4335,8 @@ fn seed_toolset_profiles(graph: &GraphDomain) -> anyhow::Result<()> {
                 "session.status".into(),
                 "hotel.status".into(),
                 "hotel.logs".into(),
+                // S6a: admin memory-health report (read-only, honest-sourcing).
+                "memory.report".into(),
                 "echo".into(),
                 "agent.configure".into(),
                 "skill.register".into(),
@@ -8554,12 +8560,10 @@ async fn main() -> Result<()> {
     }
     info!("All guest subscribers drained (or drain window elapsed). Shutting down hotel.");
 
-    // DreamsPhase: semantic consolidation + Hebbian sweep across all agent vaults.
-    // Runs after guests drain, before the internal shutdown broadcast.
-    // Uses direct HTTP to ONNX sidecar (:11435) and Ollama (:11434) — no IPC needed.
-    if let Some(ref cfg) = muninn_config_arc {
-        dream::dream_sweep(cfg, &graph_domain_arc, &hotel_name).await;
-    }
+    // Memory sleep no longer runs at shutdown (Phase 2 M6): it lists and
+    // maintains every memory vault through the Cortex, which would stall
+    // hotel restarts and deploys. It runs on its nightly cron instead
+    // (`PHILOTIC_DREAM_SWEEP_ENABLED`, Cortex hotel only).
 
     let _ = shutdown_tx.send(());
     tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;

@@ -313,6 +313,7 @@ pub(super) fn memory_spatial_scope_from_arg(
         _ => match scope {
             MemoryScope::SharedUser => MemorySpatialScope::User,
             MemoryScope::Session(_) => MemorySpatialScope::Session,
+            MemoryScope::SharedFleet => MemorySpatialScope::Mesh,
             MemoryScope::CrossScope(_) => MemorySpatialScope::Mesh,
             MemoryScope::SelfOnly => MemorySpatialScope::SelfScope,
         },
@@ -729,6 +730,11 @@ pub(super) fn default_turn_recall_scope(session_id: &str) -> MemoryScope {
         MemoryScope::SelfOnly,
         MemoryScope::SharedUser,
         MemoryScope::Session(session_id.to_string()),
+        // Fleet knowledge: every philote recalls the shared, curated
+        // `fleet_knowledge` vault so cross-agent/cross-hotel knowledge actually
+        // reaches turns (proposal S1). Curated at write time, so this stays
+        // high-signal; the per-turn relevance gate + char budget bound it.
+        MemoryScope::SharedFleet,
     ])
 }
 
@@ -736,10 +742,33 @@ pub(super) fn memory_scope_from_tool_arg(scope: Option<&str>, session_id: &str) 
     match scope.unwrap_or("self") {
         "shared_user" | "user" => MemoryScope::SharedUser,
         "session" | "working" => MemoryScope::Session(session_id.to_string()),
+        "fleet" | "shared_fleet" | "knowledge" => MemoryScope::SharedFleet,
         "cross" | "all" => default_turn_recall_scope(session_id),
         _ => MemoryScope::SelfOnly,
     }
 }
+
+/// Result of attempting to route a memory write to the cluster primary.
+#[derive(Debug, Clone, PartialEq)]
+pub(super) enum ForwardOutcome {
+    /// Forwarded to the primary; carries the operator-facing confirmation text.
+    Forwarded(String),
+    /// This write does not need forwarding (no route configured, this host IS
+    /// the primary, or the vault is per-session) — a local write is correct.
+    NotApplicable,
+    /// A routable write whose forward could not be enqueued right now. It is
+    /// held in the runtime's retry queue and re-sent on the next memory write
+    /// or turn — never written to the local observer, which rejects writes
+    /// (HTTP 421) and would lose it. Callers must say "queued", not "stored".
+    Queued { vault: String, cortex: String },
+}
+
+/// Upper bound on forwards held for retry while the local hotel cannot accept
+/// them. Oldest are dropped (with a warning) past this bound.
+pub(super) const PENDING_MEMORY_FORWARDS_MAX: usize = 200;
+
+/// Per-agent daily cap on deterministic operator-fact captures (Phase 2 M5).
+pub(super) const DETERMINISTIC_CAPTURE_DAILY_CAP: usize = 10;
 
 #[derive(Debug, Clone, PartialEq)]
 pub(super) struct DirectLifeObserveCommand {
@@ -1639,15 +1668,50 @@ impl AgentRuntime {
             .collect();
         let concept = format!("perplexity.{}: {}", category, first_line);
 
-        let result_text = match self.memory_engine_for(&self.agent_id, &self.agent_id) {
-            None => "Captured (Muninn not configured on this node).".to_string(),
-            Some(engine) => {
-                match engine
-                    .remember(MemoryScope::SelfOnly, &concept, &capture_text, tags)
-                    .await
-                {
-                    Ok(engram_ref) => format!("Captured to memory (id: {}).", engram_ref.id),
-                    Err(e) => format!("context.capture: memory error — {e}"),
+        let capture_session = task.session_id_or_default(&self.agent_id);
+        let agent_user = self.agent_id.clone();
+        // Phase 2 M5: smoke tests and routing probes were landing in persona
+        // self vaults and being recalled into unrelated operator turns.
+        let diagnostic =
+            memory_core::write_hygiene::is_diagnostic_capture(&concept, &capture_text, &tags);
+        let result_text = if diagnostic {
+            info!(concept = %concept, "context.capture: diagnostic capture acknowledged, not stored");
+            "Diagnostic capture acknowledged (not stored in memory).".to_string()
+        } else {
+            match self
+                .forward_shared_memory_write(
+                    &MemoryScope::SelfOnly,
+                    &agent_user,
+                    &concept,
+                    &capture_text,
+                    &tags,
+                    &serde_json::Value::Null,
+                    &capture_session,
+                )
+                .await
+            {
+                ForwardOutcome::Forwarded(_) => {
+                    "Captured to memory (routed to the cluster primary).".to_string()
+                }
+                ForwardOutcome::Queued { .. } => {
+                    "Capture queued for the cluster primary; it will be stored on retry."
+                        .to_string()
+                }
+                ForwardOutcome::NotApplicable => {
+                    match self.memory_engine_for(&self.agent_id, &self.agent_id) {
+                        None => "Captured (Muninn not configured on this node).".to_string(),
+                        Some(engine) => {
+                            match engine
+                                .remember(MemoryScope::SelfOnly, &concept, &capture_text, tags)
+                                .await
+                            {
+                                Ok(engram_ref) => {
+                                    format!("Captured to memory (id: {}).", engram_ref.id)
+                                }
+                                Err(e) => format!("context.capture: memory error — {e}"),
+                            }
+                        }
+                    }
                 }
             }
         };
@@ -1690,8 +1754,35 @@ impl AgentRuntime {
         Ok(())
     }
 
+    /// Record an automatic recall that did not produce a result. Failed
+    /// recalls used to leave no ledger trace, so recall effectiveness read
+    /// ~100% while ~8% of recalls were failing (2026-09-16 audit).
+    async fn emit_auto_recall_failed(
+        &mut self,
+        session_id: &str,
+        reason: &str,
+        elapsed: std::time::Duration,
+    ) {
+        let _ = self
+            .emit_turn_event(
+                session_id,
+                "memory_auto_recall_failed",
+                Some(format!(
+                    "Auto recall failed after {}ms: {reason}",
+                    elapsed.as_millis()
+                )),
+            )
+            .await;
+    }
+
     pub(super) async fn maybe_auto_recall_turn_memory(&mut self, session_id: &str) -> Result<()> {
         use memory_core::MemoryEngine as _;
+
+        // Every turn is a chance to deliver memory writes queued while the
+        // local hotel could not accept them (Phase 2 M4).
+        if !self.pending_memory_forwards.is_empty() {
+            self.flush_pending_memory_forwards().await;
+        }
 
         let Some(state) = self.sessions.get(session_id) else {
             return Ok(());
@@ -1798,6 +1889,7 @@ impl AgentRuntime {
             "Running auto recall for turn."
         );
 
+        let recall_started = std::time::Instant::now();
         let result = match engine.recall_for_turn(&recall_context).await {
             Ok(r) => r,
             Err(err) => {
@@ -1822,16 +1914,57 @@ impl AgentRuntime {
                     Some(Ok(r)) => r,
                     Some(Err(retry_err)) => {
                         warn!(session_id = %session_id, error = %retry_err, "Auto recall failed after token heal — giving up for this turn.");
+                        self.emit_auto_recall_failed(
+                            session_id,
+                            "token_rejected_after_heal",
+                            recall_started.elapsed(),
+                        )
+                        .await;
                         return Ok(());
                     }
                     None => {
                         warn!(session_id = %session_id, error = %err, "Auto recall failed: memory engine error.");
+                        let reason = if memory_core::token_rejected_vault(&err).is_some() {
+                            "token_rejected"
+                        } else {
+                            "engine_error"
+                        };
+                        self.emit_auto_recall_failed(session_id, reason, recall_started.elapsed())
+                            .await;
                         return Ok(());
                     }
                 }
             }
         };
+        let recall_latency_ms = recall_started.elapsed().as_millis();
+
+        // Partial token rejection: other vaults answered, so the call did not
+        // error and the all-vaults heal above never fired. Heal the rejected
+        // vault for the next turn (the engine skips it meanwhile).
+        if let Some(vault) = result.rejected_vaults.first().cloned()
+            && !self.heal_memory_token(&vault).await
+        {
+            warn!(session_id = %session_id, vault = %vault, "Auto recall: partial token rejection could not be healed.");
+        }
+
         let recall_reason = result.decision.reason.clone();
+        let mut band_counts: std::collections::BTreeMap<String, usize> = Default::default();
+        for engram in &result.engrams {
+            *band_counts
+                .entry(
+                    memory_core::engram_relevance_band(engram)
+                        .unwrap_or("unknown")
+                        .to_string(),
+                )
+                .or_default() += 1;
+        }
+        let dropped_by_gate = result.dropped_by_gate;
+        let degraded_vaults: Vec<String> = result
+            .rejected_vaults
+            .iter()
+            .chain(result.failed_vaults.iter())
+            .cloned()
+            .collect();
         let recalled_memories = result
             .engrams
             .into_iter()
@@ -1851,26 +1984,42 @@ impl AgentRuntime {
             }
         }
 
+        let bands = band_counts
+            .iter()
+            .map(|(band, n)| format!("{band}={n}"))
+            .collect::<Vec<_>>()
+            .join(" ");
         info!(
             session_id = %session_id,
             total = recalled_count,
+            dropped_by_gate,
+            latency_ms = recall_latency_ms,
+            bands = %bands,
+            degraded_vaults = ?degraded_vaults,
             concepts = %concept_summary,
             "Auto recall completed for turn."
         );
+        let mut detail = format!(
+            "Recalled {} memory item(s) in {}ms (dropped {} below relevance{}{})",
+            recalled_count,
+            recall_latency_ms,
+            dropped_by_gate,
+            if bands.is_empty() {
+                String::new()
+            } else {
+                format!("; bands {bands}")
+            },
+            if degraded_vaults.is_empty() {
+                String::new()
+            } else {
+                format!("; degraded vaults {}", degraded_vaults.join(","))
+            },
+        );
+        if !concept_summary.is_empty() {
+            detail.push_str(&format!(": {concept_summary}"));
+        }
         let _ = self
-            .emit_turn_event(
-                session_id,
-                "memory_auto_recall_completed",
-                Some(format!(
-                    "Recalled {} memory item(s){}",
-                    recalled_count,
-                    if concept_summary.is_empty() {
-                        String::new()
-                    } else {
-                        format!(": {concept_summary}")
-                    }
-                )),
-            )
+            .emit_turn_event(session_id, "memory_auto_recall_completed", Some(detail))
             .await;
 
         Ok(())
@@ -2198,14 +2347,18 @@ impl AgentRuntime {
 
     /// Muninn-cluster single-writer routing (see `MuninnConfig::shared_write_route`).
     ///
-    /// Returns `Some(status_text)` when the write was forwarded to the Cortex
-    /// hotel over the mesh — the caller must NOT also write locally (the
-    /// canonical engram arrives back on this host via cluster replication; a
-    /// local write would strand a divergent duplicate on the replica).
-    /// Returns `None` when the write should proceed locally: no route
-    /// configured, the route names this hotel, the vault is not fleet-shared,
-    /// or the forward could not be enqueued (falling back to a local write
-    /// strands the memory on the replica, but never loses it).
+    /// Returns `Forwarded` when the write was handed to the Cortex hotel over
+    /// the mesh — the caller must NOT also write locally (the canonical engram
+    /// arrives back via replication). Returns `NotApplicable` when the write
+    /// should proceed locally: no route configured, the route names this hotel,
+    /// or the vault is per-session. Returns `Queued` when a routable write could
+    /// not be enqueued right now; it is retried, never written to the local
+    /// observer (which rejects writes with 421).
+    ///
+    /// Phase 2 M4: agent `self_*` vaults are routed too (see
+    /// `memory_core::is_cortex_routable_vault`). The old shared-vault-only rule
+    /// left every automatic memory write on the Mac hotels hitting the local
+    /// observer and failing (last new Björk memory 2026-07-11).
     #[allow(clippy::too_many_arguments)]
     pub(super) async fn forward_shared_memory_write(
         &mut self,
@@ -2216,14 +2369,17 @@ impl AgentRuntime {
         tags: &[String],
         metadata: &serde_json::Value,
         session_id: &str,
-    ) -> Option<String> {
-        let route = self
+    ) -> ForwardOutcome {
+        let Some(route) = self
             .muninn_config
             .as_ref()
-            .and_then(|cfg| cfg.shared_write_route.clone())?;
+            .and_then(|cfg| cfg.shared_write_route.clone())
+        else {
+            return ForwardOutcome::NotApplicable;
+        };
         let local_node = local_node_id();
         if route == local_node {
-            return None;
+            return ForwardOutcome::NotApplicable;
         }
         let vault = memory_core::VaultResolver {
             agent_id: self.agent_id.clone(),
@@ -2241,8 +2397,8 @@ impl AgentRuntime {
         } else {
             vault
         };
-        if !memory_core::is_fleet_shared_vault(&vault) {
-            return None;
+        if !memory_core::is_cortex_routable_vault(&vault) {
+            return ForwardOutcome::NotApplicable;
         }
 
         let task_json = serde_json::json!({
@@ -2259,39 +2415,96 @@ impl AgentRuntime {
         })
         .to_string();
 
-        match self
-            .ipc_client
-            .send_request(IpcRequest::EmitTask {
-                target_node: route.clone(),
-                target_role: philotic_client::MEMORY_WRITE_FORWARD_ROLE.into(),
-                target_guest_id: None,
-                task_json,
-            })
-            .await
+        // Older queued writes go first so ordering is preserved.
+        self.flush_pending_memory_forwards().await;
+
+        if self.pending_memory_forwards.is_empty()
+            && self.send_memory_forward(&route, task_json.clone()).await
         {
-            Ok(IpcResponse::Standard { ok: true, .. }) => {
-                info!(
-                    vault = %vault,
-                    concept = %concept,
-                    cortex = %route,
-                    "memory.remember: shared-vault write forwarded to cluster primary"
-                );
-                Some(format!(
-                    "Stored memory '{}' (vault: {}, routed to cluster primary {}; \
-                     it will appear in local recall after replication).",
-                    concept, vault, route
-                ))
+            info!(
+                vault = %vault,
+                concept = %concept,
+                cortex = %route,
+                "memory write forwarded to cluster primary"
+            );
+            return ForwardOutcome::Forwarded(format!(
+                "Stored memory '{}' (vault: {}, routed to cluster primary {}; \
+                 it will appear in local recall after replication).",
+                concept, vault, route
+            ));
+        }
+
+        warn!(
+            vault = %vault,
+            cortex = %route,
+            queued = self.pending_memory_forwards.len() + 1,
+            "memory write forward could not be enqueued — held for retry (not written to the local replica)"
+        );
+        self.enqueue_pending_memory_forward(route.clone(), task_json);
+        ForwardOutcome::Queued {
+            vault,
+            cortex: route,
+        }
+    }
+
+    /// Spend one deterministic operator-fact capture from today's budget.
+    /// False when the per-agent daily cap is reached: the classifier is a
+    /// high-precision floor, and a runaway pattern must not flood the store.
+    pub(super) fn take_deterministic_capture_budget(&mut self) -> bool {
+        let today = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() / 86_400)
+            .unwrap_or(0);
+        if self.deterministic_capture_budget.0 != today {
+            self.deterministic_capture_budget = (today, 0);
+        }
+        if self.deterministic_capture_budget.1 >= DETERMINISTIC_CAPTURE_DAILY_CAP {
+            return false;
+        }
+        self.deterministic_capture_budget.1 += 1;
+        true
+    }
+
+    /// Send one `memory.write_forward` EmitTask. True when the local hotel
+    /// accepted it (the mesh ledger then owns delivery).
+    async fn send_memory_forward(&mut self, route: &str, task_json: String) -> bool {
+        matches!(
+            self.ipc_client
+                .send_request(IpcRequest::EmitTask {
+                    target_node: route.to_string(),
+                    target_role: philotic_client::MEMORY_WRITE_FORWARD_ROLE.into(),
+                    target_guest_id: None,
+                    task_json,
+                })
+                .await,
+            Ok(IpcResponse::Standard { ok: true, .. })
+        )
+    }
+
+    fn enqueue_pending_memory_forward(&mut self, route: String, task_json: String) {
+        if self.pending_memory_forwards.len() >= PENDING_MEMORY_FORWARDS_MAX {
+            let dropped = self.pending_memory_forwards.pop_front();
+            warn!(
+                dropped = ?dropped.map(|(route, _)| route),
+                "pending memory forward queue full — dropping the oldest queued write"
+            );
+        }
+        self.pending_memory_forwards.push_back((route, task_json));
+    }
+
+    /// Re-send queued forwards in order, stopping at the first that still
+    /// cannot be enqueued.
+    pub(super) async fn flush_pending_memory_forwards(&mut self) {
+        while let Some((route, task_json)) = self.pending_memory_forwards.pop_front() {
+            if !self.send_memory_forward(&route, task_json.clone()).await {
+                self.pending_memory_forwards.push_front((route, task_json));
+                break;
             }
-            other => {
-                warn!(
-                    vault = %vault,
-                    cortex = %route,
-                    ?other,
-                    "memory.remember: shared-write forward failed — falling back to local write \
-                     (memory will strand on this replica until reconciled)"
-                );
-                None
-            }
+            info!(
+                cortex = %route,
+                remaining = self.pending_memory_forwards.len(),
+                "queued memory write forwarded to cluster primary"
+            );
         }
     }
 
@@ -2378,53 +2591,59 @@ impl AgentRuntime {
             )
             .await;
 
-        let result_text = if let Some(routed) = routed_result {
-            routed
-        } else {
-            match self.memory_engine_for(&self.agent_id, &memory_user_id) {
-                None => "Memory unavailable: MuninnDB not configured.".to_string(),
-                Some(engine) => {
-                    let mut engine = engine;
-                    let mut write = engine
-                        .remember_with_metadata(
-                            scope.clone(),
-                            &concept,
-                            &content_str,
-                            tags.clone(),
-                            metadata.clone(),
-                        )
-                        .await;
-                    // Token-401 → hotel re-mint → retry once with a fresh engine.
-                    if let Err(err) = &write {
-                        if let Some(vault) = memory_core::token_rejected_vault(err) {
-                            let vault = vault.to_string();
-                            if self.heal_memory_token(&vault).await {
-                                if let Some(fresh) =
-                                    self.memory_engine_for(&self.agent_id, &memory_user_id)
-                                {
-                                    engine = fresh;
-                                    write = engine
-                                        .remember_with_metadata(
-                                            scope,
-                                            &concept,
-                                            &content_str,
-                                            tags,
-                                            metadata,
-                                        )
-                                        .await;
+        let result_text = match routed_result {
+            ForwardOutcome::Forwarded(routed) => routed,
+            ForwardOutcome::Queued { vault, cortex } => format!(
+                "Memory '{concept}' is QUEUED, not yet stored: this hotel could not hand the \
+                 write for vault '{vault}' to the cluster primary {cortex} right now. It will be \
+                 retried automatically; do not tell the user it is saved yet."
+            ),
+            ForwardOutcome::NotApplicable => {
+                match self.memory_engine_for(&self.agent_id, &memory_user_id) {
+                    None => "Memory unavailable: MuninnDB not configured.".to_string(),
+                    Some(engine) => {
+                        let mut engine = engine;
+                        let mut write = engine
+                            .remember_with_metadata(
+                                scope.clone(),
+                                &concept,
+                                &content_str,
+                                tags.clone(),
+                                metadata.clone(),
+                            )
+                            .await;
+                        // Token-401 → hotel re-mint → retry once with a fresh engine.
+                        if let Err(err) = &write {
+                            if let Some(vault) = memory_core::token_rejected_vault(err) {
+                                let vault = vault.to_string();
+                                if self.heal_memory_token(&vault).await {
+                                    if let Some(fresh) =
+                                        self.memory_engine_for(&self.agent_id, &memory_user_id)
+                                    {
+                                        engine = fresh;
+                                        write = engine
+                                            .remember_with_metadata(
+                                                scope,
+                                                &concept,
+                                                &content_str,
+                                                tags,
+                                                metadata,
+                                            )
+                                            .await;
+                                    }
                                 }
                             }
                         }
-                    }
-                    match write {
-                        Ok(engram_ref) => {
-                            let _ = engine.retry_enrich(&engram_ref.id).await;
-                            format!(
-                                "Stored memory '{}' (id: {}, vault: {}).",
-                                concept, engram_ref.id, engram_ref.vault_id
-                            )
+                        match write {
+                            Ok(engram_ref) => {
+                                let _ = engine.retry_enrich(&engram_ref.id).await;
+                                format!(
+                                    "Stored memory '{}' (id: {}, vault: {}).",
+                                    concept, engram_ref.id, engram_ref.vault_id
+                                )
+                            }
+                            Err(e) => format!("memory.remember error: {e}"),
                         }
-                        Err(e) => format!("memory.remember error: {e}"),
                     }
                 }
             }
@@ -2822,6 +3041,37 @@ impl AgentRuntime {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn default_turn_recall_scope_includes_fleet_knowledge() {
+        // Regression guard for proposal S1: every philote turn must recall the
+        // shared fleet_knowledge vault, or cross-agent knowledge never reaches
+        // the model.
+        let MemoryScope::CrossScope(scopes) = default_turn_recall_scope("session_x") else {
+            panic!("default recall scope must be a cross-scope");
+        };
+        assert!(
+            scopes.iter().any(|s| matches!(s, MemoryScope::SharedFleet)),
+            "default recall scope must include SharedFleet"
+        );
+    }
+
+    #[test]
+    fn fleet_scope_arg_maps_to_shared_fleet() {
+        assert!(matches!(
+            memory_scope_from_tool_arg(Some("fleet"), "s"),
+            MemoryScope::SharedFleet
+        ));
+        assert!(matches!(
+            memory_scope_from_tool_arg(Some("knowledge"), "s"),
+            MemoryScope::SharedFleet
+        ));
+        // Unknown/absent still defaults to the private self scope.
+        assert!(matches!(
+            memory_scope_from_tool_arg(None, "s"),
+            MemoryScope::SelfOnly
+        ));
+    }
 
     #[test]
     fn inbound_primary_user_id_prefers_lowercased_username_over_numeric_id() {

@@ -3420,6 +3420,7 @@ dependencies = [
  "memory-core",
  "philotic-client",
  "prompt-guard",
+ "regex",
  "reqwest",
  "serde",
  "serde_json",

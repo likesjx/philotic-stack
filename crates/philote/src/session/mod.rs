@@ -3951,6 +3951,21 @@ impl SessionState {
         )
     }
 
+    /// Render the turn's recalled memories for the model.
+    ///
+    /// Phase 2 M2 (2026-09-16 audit): the previous renderer spent ~965 chars on
+    /// a fixed preamble and ~650 chars per item on ids, tags, vault, a constant
+    /// `confidence=1.00` and inferred frame lines, for ~150 chars of content —
+    /// the 3,000-char cap then truncated 97–99.5% of blocks mid-item and cut
+    /// LifeGraph records (appended last) first. This renderer:
+    /// - keeps a short precedence preamble;
+    /// - renders one compact line per memory: concept, content (capped), date
+    ///   + age, origin, and an id only where a tool can act on it
+    ///   (LifeGraph items, which life.commit/life.resolve close);
+    /// - shows stored (not inferred) spacetime frame facts compactly;
+    /// - maps contradiction ids onto item numbers and renders each ⚠ once;
+    /// - budgets whole items per origin lane so the outer cap never cuts an
+    ///   item and neither lane starves the other.
     fn project_recalled_memory(&self) -> String {
         let Some(turn) = self.active_turn.as_ref() else {
             return String::new();
@@ -3959,144 +3974,186 @@ impl SessionState {
             return String::new();
         }
 
-        let mut out = String::from(
-            "[Recalled memory]\n\
-             Precedence: everything below describes PAST state and is advisory context, not \
-             current fact. The CURRENT TURN is ground truth for current state. If this turn \
-             contradicts a recalled item — e.g. a LifeGraph loop recalled as \"paused\" or \
-             \"in progress\" when the operator now reports it done — trust the turn, not the \
-             recall, and update the store instead of repeating the stale version: call \
-             life.commit with loop_status=\"resolved\" for a LifeGraph loop/commitment/goal, or \
-             memory.remember for a Muninn fact that changed.\n\
-             Origin: each item below is tagged origin=life-graph (structured LifeGraph node, \
-             provenance-tracked) or origin=muninn (continuity engram) — weight trust \
-             accordingly; life-graph items are the ones life.commit/life.resolve can close.\n\
-             Note: if a memory describes an event (something that happened), \
-             it must include a timestamp in its content. \
-             When writing new memories of this kind, always include an ISO 8601 timestamp \
-             (date and time).\n",
-        );
-        for (i, memory) in turn.recalled_memories.iter().enumerate() {
-            let mut provenance = Vec::new();
-            if let Some(id) = memory.id.as_deref() {
-                provenance.push(format!("id={id}"));
-            }
-            provenance.push(format!("origin={}", recalled_memory_origin(memory)));
-            if let Some(vault) = memory.vault_id.as_deref() {
-                provenance.push(format!("vault={vault}"));
-            }
-            if let Some(confidence) = memory.confidence {
-                provenance.push(format!("confidence={confidence:.2}"));
-            }
-            if let Some(trust) = memory.trust.as_deref() {
-                provenance.push(format!("trust={trust}"));
-            }
-            if let Some(reason) = memory.recall_reason.as_deref() {
-                provenance.push(format!("reason={reason}"));
-            }
+        const PREAMBLE: &str = "[Recalled memory]\n\
+             Past context, not current fact — the CURRENT TURN is ground truth. If it \
+             contradicts an item, trust the turn and update the store: life.commit with \
+             loop_status=\"resolved\" for a life-graph item, memory.remember for a muninn item. \
+             Memories you write about events must include an ISO 8601 date.\n";
+        const ITEM_CONTENT_MAX_CHARS: usize = 500;
 
-            out.push_str(&format!(
-                "{}. [{}] {}",
-                i + 1,
-                memory.concept,
-                memory.content
+        let now_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let total_budget = self
+            .settings
+            .injection_budget
+            .recalled_memory_chars
+            .saturating_sub(PREAMBLE.chars().count());
+        // Split the budget between lanes; a lane with nothing to show donates
+        // its share to the other.
+        let has_life = turn
+            .recalled_memories
+            .iter()
+            .any(|m| recalled_memory_origin(m) == "life-graph");
+        let has_muninn = turn
+            .recalled_memories
+            .iter()
+            .any(|m| recalled_memory_origin(m) == "muninn");
+        let lane_budget = |origin: &str| -> usize {
+            match (has_life, has_muninn) {
+                (true, true) => total_budget / 2,
+                _ if origin == "life-graph" && has_life => total_budget,
+                _ if origin == "muninn" && has_muninn => total_budget,
+                _ => 0,
+            }
+        };
+
+        // Item numbers are assigned in render order so ⚠ lines can refer to
+        // "item 3" instead of opaque ids.
+        let rendered_ids: Vec<Option<&str>> = turn
+            .recalled_memories
+            .iter()
+            .map(|m| m.id.as_deref())
+            .collect();
+
+        let mut lines: Vec<(usize, String)> = Vec::new(); // (source index, line)
+        let mut used: std::collections::HashMap<&'static str, usize> = Default::default();
+        let mut omitted = 0usize;
+        for (idx, memory) in turn.recalled_memories.iter().enumerate() {
+            let origin = recalled_memory_origin(memory);
+            let line =
+                self.render_recalled_memory_line(memory, origin, now_secs, ITEM_CONTENT_MAX_CHARS);
+            let cost = line.chars().count() + 4; // "NN. " prefix
+            let lane_used = used.entry(origin).or_default();
+            if *lane_used + cost > lane_budget(origin) {
+                omitted += 1;
+                continue;
+            }
+            *lane_used += cost;
+            lines.push((idx, line));
+        }
+        if lines.is_empty() {
+            // Nothing fits the configured budget: render the best item anyway
+            // so the outer injection cap truncates it visibly and records the
+            // overflow in the budget ledger, instead of silently showing nothing.
+            let first = &turn.recalled_memories[0];
+            let origin = recalled_memory_origin(first);
+            lines.push((
+                0,
+                self.render_recalled_memory_line(first, origin, now_secs, ITEM_CONTENT_MAX_CHARS),
             ));
-            if !provenance.is_empty() {
-                out.push_str(&format!(" {{{}}}", provenance.join("; ")));
-            }
-            if !memory.tags.is_empty() {
-                out.push_str(&format!(" ({})", memory.tags.join(", ")));
-            }
-            if let Some(summary) = memory.summary.as_deref().filter(|text| !text.is_empty()) {
-                out.push_str(&format!("\n   summary: {summary}"));
-            }
-            let frame = self.memory_spacetime_frame_for(memory);
-            if let Some(temporal_kind) = frame.temporal_kind {
-                out.push_str(&format!("\n   temporal_kind: {}", temporal_kind.as_str()));
-            }
-            if let Some(observed_at) = frame.observed_at {
-                out.push_str(&format!(
-                    "\n   observed_at: {}",
-                    format_memory_timestamp(observed_at)
-                ));
-            }
-            if let Some(last_verified_at) = frame.last_verified_at {
-                out.push_str(&format!(
-                    "\n   last_verified_at: {}",
-                    format_memory_timestamp(last_verified_at)
-                ));
-            }
-            if let Some(valid_from) = frame.valid_from {
-                out.push_str(&format!(
-                    "\n   valid_from: {}",
-                    format_memory_timestamp(valid_from)
-                ));
-            }
-            if let Some(valid_until) = frame.valid_until {
-                out.push_str(&format!(
-                    "\n   valid_until: {}",
-                    format_memory_timestamp(valid_until)
-                ));
-            }
-            if let Some(spatial_scope) = frame.spatial_scope {
-                out.push_str(&format!("\n   spatial_scope: {}", spatial_scope.as_str()));
-            }
-            if let Some(space) = memory_space_summary(&frame) {
-                out.push_str(&format!("\n   space: {space}"));
-            }
-            if let Some(authority) = frame.authority {
-                out.push_str(&format!("\n   authority: {}", authority.as_str()));
-            }
-            if let Some(validation_level) = frame.validation_level {
-                out.push_str(&format!("\n   validation: {}", validation_level.as_str()));
-            }
-            if !memory.entities.is_empty() {
-                out.push_str(&format!("\n   entities: {}", memory.entities.len()));
-            }
-            if !memory.relationships.is_empty() {
-                out.push_str(&format!(
-                    "\n   relationships: {}",
-                    memory.relationships.len()
-                ));
-            }
-            if let Some(annotations) = memory.annotations.as_ref().filter(|v| !v.is_null()) {
-                out.push_str(&format!("\n   annotations: {annotations}"));
+            omitted = omitted.saturating_sub(1);
+        }
+
+        let number_of = |id: &str| -> Option<usize> {
+            lines
+                .iter()
+                .position(|(idx, _)| rendered_ids.get(*idx).copied().flatten() == Some(id))
+                .map(|pos| pos + 1)
+        };
+
+        let mut out = String::from(PREAMBLE);
+        for (pos, (idx, line)) in lines.iter().enumerate() {
+            let memory = &turn.recalled_memories[*idx];
+            out.push_str(&format!("{}. {}", pos + 1, line));
+            if let Some(ann) = memory.annotations.as_ref().filter(|v| v.is_object()) {
+                if let Some(ids) = ann.get("contradicts_ids").and_then(|v| v.as_array()) {
+                    let refs: Vec<String> = ids
+                        .iter()
+                        .filter_map(|v| v.as_str())
+                        .map(|id| match number_of(id) {
+                            Some(n) => format!("item {n}"),
+                            None => "an unshown memory".to_string(),
+                        })
+                        .collect();
+                    if !refs.is_empty() {
+                        out.push_str(&format!(
+                            "\n   ⚠ CONTRADICTS {}: do not present either as settled; prefer the newer/verified one or resolve via memory.remember.",
+                            refs.join(", ")
+                        ));
+                    }
+                }
+                if ann
+                    .get("superseded_by")
+                    .and_then(|v| v.as_str())
+                    .is_some_and(|v| !v.is_empty())
+                {
+                    out.push_str(
+                        "\n   ⚠ STALE — superseded by a newer version: treat this as history, not current fact.",
+                    );
+                } else if ann
+                    .get("possibly_superseded_by")
+                    .and_then(|v| v.as_str())
+                    .is_some_and(|v| !v.is_empty())
+                {
+                    out.push_str("\n   possibly stale — a newer, similar memory exists.");
+                }
             }
             out.push('\n');
+        }
+        if omitted > 0 {
+            out.push_str(&format!(
+                "({omitted} more recalled item(s) omitted for space; use memory.recall or life.recall for more.)\n"
+            ));
         }
         out.trim_end().to_string()
     }
 
-    fn memory_spacetime_frame_for(&self, memory: &RecalledMemoryRecord) -> MemorySpacetimeFrame {
-        let mut frame = memory.spacetime_frame.clone().unwrap_or_default();
-        if frame.observed_at.is_none() {
-            frame.observed_at = memory.created_at;
+    /// One compact line for a recalled memory (without the item number).
+    fn render_recalled_memory_line(
+        &self,
+        memory: &RecalledMemoryRecord,
+        origin: &str,
+        now_secs: u64,
+        content_max_chars: usize,
+    ) -> String {
+        let content = normalize_projection_whitespace(&memory.content);
+        let content = if content.chars().count() > content_max_chars {
+            let mut cut: String = content.chars().take(content_max_chars).collect();
+            cut.push('…');
+            cut
+        } else {
+            content
+        };
+
+        let mut facts: Vec<String> = Vec::new();
+        let frame = memory.spacetime_frame.clone().unwrap_or_default();
+        let when = frame
+            .observed_at
+            .or(memory.created_at)
+            .and_then(|ts| memory_date_and_age(ts, now_secs));
+        if let Some(when) = when {
+            facts.push(when);
         }
-        if frame.last_verified_at.is_none() {
-            frame.last_verified_at = memory.updated_at;
+        facts.push(origin.to_string());
+        // Stored frame facts only — inferred kinds/scopes/authority added
+        // tokens without adding information.
+        if let Some(kind) = frame.temporal_kind {
+            facts.push(kind.as_str().to_string());
         }
-        if frame.temporal_kind.is_none() {
-            frame.temporal_kind = Some(infer_memory_temporal_kind(memory));
+        if let Some(valid_until) = frame
+            .valid_until
+            .and_then(|ts| memory_date_and_age(ts, now_secs))
+        {
+            facts.push(format!("valid until {valid_until}"));
         }
-        if frame.spatial_scope.is_none() {
-            frame.spatial_scope = Some(infer_memory_spatial_scope(memory));
+        if let Some(authority) = frame.authority {
+            facts.push(format!("authority: {}", authority.as_str()));
         }
-        if frame.session_id.is_none() {
-            frame.session_id = Some(self.session_id.clone());
+        if let Some(level) = frame.validation_level {
+            facts.push(format!("validation: {}", level.as_str()));
         }
-        if frame.agent_id.is_none() {
-            frame.agent_id = Some(self.agent_id.clone());
+        if let Some(space) = memory_space_summary(&frame) {
+            facts.push(format!("space: {space}"));
         }
-        if frame.primary_user_id.is_none() {
-            frame.primary_user_id = self
-                .active_turn
-                .as_ref()
-                .and_then(|turn| turn.primary_user_id.clone());
+        if origin == "life-graph" {
+            if let Some(id) = memory.id.as_deref() {
+                facts.push(format!("id={id}"));
+            }
         }
-        if frame.authority.is_none() {
-            frame.authority = Some(infer_memory_authority(memory));
-        }
-        frame
+
+        format!("[{}] {} ({})", memory.concept, content, facts.join("; "))
     }
 
     fn project_agent_graph_with_memory_overlay(&self) -> String {
@@ -4111,8 +4168,15 @@ impl SessionState {
                 .unwrap_or_default();
         };
 
+        // Phase 2 M2: this overlay had no budget — every entity and relationship
+        // of every recalled memory became a line, re-sent on every model call.
+        // Dedupe entities by name and cap both lists.
+        const OVERLAY_MAX_LINES: usize = 12;
+        let mut seen_entity_names = std::collections::HashSet::new();
+        let mut seen_relations = std::collections::HashSet::new();
         let mut entity_lines = Vec::new();
         let mut relation_lines = Vec::new();
+        let mut omitted_overlay_lines = 0usize;
         for memory in &turn.recalled_memories {
             let memory_id = memory.id.as_deref().unwrap_or("unknown");
             let concept = memory.concept.as_str();
@@ -4120,6 +4184,13 @@ impl SessionState {
                 let Some(name) = entity.get("name").and_then(Value::as_str) else {
                     continue;
                 };
+                if !seen_entity_names.insert(name.to_ascii_lowercase()) {
+                    continue;
+                }
+                if entity_lines.len() >= OVERLAY_MAX_LINES {
+                    omitted_overlay_lines += 1;
+                    continue;
+                }
                 let entity_type = entity
                     .get("type")
                     .and_then(Value::as_str)
@@ -4152,6 +4223,17 @@ impl SessionState {
                     .or_else(|| relationship.get("type"))
                     .and_then(Value::as_str)
                     .unwrap_or("relates_to");
+                if !seen_relations.insert((
+                    from.to_ascii_lowercase(),
+                    rel_type.to_ascii_lowercase(),
+                    to.to_ascii_lowercase(),
+                )) {
+                    continue;
+                }
+                if relation_lines.len() >= OVERLAY_MAX_LINES {
+                    omitted_overlay_lines += 1;
+                    continue;
+                }
                 relation_lines.push(format!(
                     "MuninnRelation: {{\"from\":\"{}\",\"rel_type\":\"{}\",\"to\":\"{}\",\"memory_id\":\"{}\"}}",
                     json_escape_for_projection(from),
@@ -4169,20 +4251,20 @@ impl SessionState {
         if !entity_lines.is_empty() || !relation_lines.is_empty() {
             let mut overlay = String::from("[Muninn entity overlay]\n");
             overlay.push_str(
-                "Advisory entity/relationship hints extracted from recalled memories (Muninn \
-                 and LifeGraph alike) — supplementary structure, not standalone fact. \"Graph/code \
-                 truth\" here means this agent's own graph partition above (`[Agent graph]`) and \
-                 the live codebase/config, which take precedence over these extracted hints on \
-                 structural conflicts. It does NOT mean a recalled node outranks the current \
-                 turn: for anything the operator states directly in this turn, the turn is ground \
-                 truth over any recalled memory or entity/relationship hint, per [Recalled \
-                 memory] precedence above.\n",
+                "Advisory entity/relationship hints from recalled memories — structure, not \
+                 standalone fact. [Agent graph] and live code/config win on structural \
+                 conflicts; the current turn wins over any recalled hint.\n",
             );
             overlay.push_str(&entity_lines.join("\n"));
             if !entity_lines.is_empty() && !relation_lines.is_empty() {
                 overlay.push('\n');
             }
             overlay.push_str(&relation_lines.join("\n"));
+            if omitted_overlay_lines > 0 {
+                overlay.push_str(&format!(
+                    "\n({omitted_overlay_lines} more entity/relationship hint(s) omitted for space.)"
+                ));
+            }
             sections.push(overlay.trim_end().to_string());
         }
         sections.join("\n\n")
@@ -5647,22 +5729,65 @@ fn looks_like_execution_goal(normalized: &str) -> bool {
     .any(|keyword| normalized.contains(keyword))
 }
 
+/// Whether to offer `memory.remember` for this turn.
+///
+/// Phase 2 M5 (2026-09-16 audit): the gate matched only explicit "remember" /
+/// "note this" phrasing, so the tool was offered on ≤2.5% of model calls and
+/// never called in 7 days. It now also opens on durable first-person facts,
+/// standing preferences and decisions — the statements a person expects to be
+/// remembered without saying "remember".
 fn looks_like_memory_write_goal(normalized: &str) -> bool {
-    [
+    const EXPLICIT: &[&str] = &[
         "remember",
         "write this down",
         "store memory",
         "save memory",
         "note this",
+        "note that",
+        "make a note",
+        "keep in mind",
+        "don't forget",
+        "dont forget",
+        "for future reference",
+        "going forward",
+        "from now on",
         "memory delta",
         "decision:",
         "operator preference",
         "reality gap",
         "next seam",
         "closeout",
-    ]
-    .iter()
-    .any(|phrase| normalized.contains(phrase))
+    ];
+    const DURABLE_FIRST_PERSON: &[&str] = &[
+        "i prefer",
+        "i always",
+        "i never",
+        "i usually",
+        "i don't like",
+        "i dont like",
+        "i hate",
+        "i love",
+        "i decided",
+        "we decided",
+        "my birthday",
+        "my wife",
+        "my husband",
+        "my kids",
+        "my son",
+        "my daughter",
+        "my doctor",
+        "my address",
+        "my email",
+        "my phone",
+        "my schedule",
+        "call me",
+        "i'm allergic",
+        "i am allergic",
+    ];
+    EXPLICIT
+        .iter()
+        .chain(DURABLE_FIRST_PERSON.iter())
+        .any(|phrase| normalized.contains(phrase))
 }
 
 fn looks_like_memory_cultivation_goal(normalized: &str) -> bool {
@@ -6533,95 +6658,46 @@ fn recalled_memory_origin(memory: &RecalledMemoryRecord) -> &'static str {
     }
 }
 
-fn format_memory_timestamp(value: u64) -> String {
-    if value >= 1_000_000_000_000 {
-        format!("unix_ms={value}")
-    } else {
-        format!("unix_s={value}")
-    }
+fn normalize_projection_whitespace(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-fn infer_memory_temporal_kind(memory: &RecalledMemoryRecord) -> MemoryTemporalKind {
-    let haystack = format!(
-        "{} {} {}",
-        memory.memory_type.as_deref().unwrap_or_default(),
-        memory.concept,
-        memory.tags.join(" ")
-    )
-    .to_ascii_lowercase();
-
-    if haystack.contains("decision") {
-        MemoryTemporalKind::Decision
-    } else if haystack.contains("preference") || haystack.contains("operator-preference") {
-        MemoryTemporalKind::Preference
-    } else if haystack.contains("rule") || haystack.contains("protocol") {
-        MemoryTemporalKind::Rule
-    } else if haystack.contains("hypothesis") || haystack.contains("inferred") {
-        MemoryTemporalKind::Hypothesis
-    } else if haystack.contains("gap") || haystack.contains("reality-gap") {
-        MemoryTemporalKind::Gap
-    } else if haystack.contains("checkpoint") || haystack.contains("where-left-off") {
-        MemoryTemporalKind::Checkpoint
-    } else if haystack.contains("event") {
-        MemoryTemporalKind::Event
+/// Render a memory timestamp (seconds or milliseconds) as a UTC date plus a
+/// coarse age, e.g. `2026-05-12, 4mo ago`. Returns `None` for zero/invalid.
+fn memory_date_and_age(value: u64, now_secs: u64) -> Option<String> {
+    if value == 0 {
+        return None;
+    }
+    let secs = if value >= 100_000_000_000_000_000 {
+        value / 1_000_000_000
+    } else if value >= 100_000_000_000_000 {
+        value / 1_000_000
+    } else if value >= 100_000_000_000 {
+        value / 1_000
     } else {
-        MemoryTemporalKind::State
-    }
-}
-
-fn infer_memory_spatial_scope(memory: &RecalledMemoryRecord) -> MemorySpatialScope {
-    if let Some(vault) = memory.vault_id.as_deref() {
-        if vault.starts_with("user_") {
-            return MemorySpatialScope::User;
+        value
+    };
+    let date = chrono::DateTime::from_timestamp(secs as i64, 0)?
+        .format("%Y-%m-%d")
+        .to_string();
+    let age = if secs > now_secs {
+        let days = (secs - now_secs) / 86_400;
+        if days == 0 {
+            "today".to_string()
+        } else {
+            format!("in {days}d")
         }
-        if vault.starts_with("session_") {
-            return MemorySpatialScope::Session;
-        }
-        if vault.starts_with("agent_") {
-            return MemorySpatialScope::Agent;
-        }
-    }
-    if memory
-        .tags
-        .iter()
-        .any(|tag| tag == "mesh" || tag == "multi-hotel")
-    {
-        MemorySpatialScope::Mesh
-    } else if memory
-        .tags
-        .iter()
-        .any(|tag| tag == "workspace" || tag == "repo")
-    {
-        MemorySpatialScope::Workspace
     } else {
-        MemorySpatialScope::Session
-    }
-}
-
-fn infer_memory_authority(memory: &RecalledMemoryRecord) -> MemoryAuthority {
-    match memory.trust.as_deref() {
-        Some("verified") => return MemoryAuthority::VerifiedMemory,
-        Some("external") => return MemoryAuthority::External,
-        Some("untrusted") => return MemoryAuthority::Untrusted,
-        _ => {}
-    }
-
-    let source = memory
-        .source
-        .as_deref()
-        .unwrap_or_default()
-        .to_ascii_lowercase();
-    if source.contains("runtime") || source.contains("watched") {
-        MemoryAuthority::ObservedRuntime
-    } else if source.contains("repo") || source.contains("code") {
-        MemoryAuthority::ObservedRepo
-    } else if source.contains("graph") {
-        MemoryAuthority::GraphStructured
-    } else if source.contains("user") || source.contains("operator") {
-        MemoryAuthority::UserStated
-    } else {
-        MemoryAuthority::InferredMemory
-    }
+        let days = (now_secs - secs) / 86_400;
+        match days {
+            0 => "today".to_string(),
+            1..=13 => format!("{days}d ago"),
+            14..=59 => format!("{}w ago", days / 7),
+            60..=729 => format!("{}mo ago", days / 30),
+            _ => format!("{}y ago", days / 365),
+        }
+    };
+    Some(format!("{date}, {age}"))
 }
 
 fn memory_space_summary(frame: &MemorySpacetimeFrame) -> Option<String> {
@@ -11778,6 +11854,12 @@ mod tests {
                 trust: Some("verified".into()),
                 entities: vec![serde_json::json!({"name": "Muninn", "type": "memory_system"})],
                 recall_reason: Some("meaningful_user_turn".into()),
+                // Self-knowledge surface as folded by memory-core from Muninn's
+                // `contradicts_ids` / `superseded_by` (self_knowledge recall).
+                annotations: Some(serde_json::json!({
+                    "contradicts_ids": ["01OTHER"],
+                    "superseded_by": "01NEWER"
+                })),
                 ..Default::default()
             }],
             active_plan: None,
@@ -11822,18 +11904,39 @@ mod tests {
             .as_str()
             .expect("recalled memory entry should render text");
         assert!(text.contains("[Recalled memory]"));
-        assert!(text.contains("memory-architecture"));
-        assert!(text.contains("id=01MEMORY"));
-        assert!(text.contains("vault=user_chat-memory"));
-        assert!(text.contains("origin=muninn"));
-        assert!(text.contains("confidence=0.91"));
-        assert!(text.contains("trust=verified"));
-        assert!(text.contains("entities: 1"));
+        assert!(text.contains(
+            "1. [memory-architecture] User prefers deterministic bounded recall over broad automatic dumps. (muninn)"
+        ), "{text}");
+        // Phase 2 M2: per-item metadata that carried no decision value for the
+        // model (vault, a constant confidence, trust, reason, entity counts,
+        // muninn ids, raw annotations JSON) stays out of the prompt.
+        for noise in [
+            "vault=",
+            "confidence=",
+            "trust=",
+            "reason=",
+            "entities:",
+            "id=01MEMORY",
+            "annotations:",
+        ] {
+            assert!(
+                !text.contains(noise),
+                "{noise} must not be rendered: {text}"
+            );
+        }
         // Reconciliation instruction: turn is ground truth, recall is advisory.
-        assert!(text.contains("Precedence"));
         assert!(text.contains("CURRENT TURN is ground truth"));
         assert!(text.contains("life.commit"));
         assert!(text.contains("memory.remember"));
+        // Self-knowledge signals must be rendered as explicit, unmissable lines
+        // so the model never presents a contradicted or superseded item as the
+        // answer — once each, referring to item numbers where the other side is
+        // shown.
+        assert!(
+            text.contains("⚠ CONTRADICTS an unshown memory"),
+            "contradiction signal must be rendered: {text}"
+        );
+        assert_eq!(text.matches("⚠ STALE").count(), 1, "{text}");
     }
 
     #[test]
@@ -11878,9 +11981,21 @@ mod tests {
             .expect("recalled_memory layer present");
 
         assert_eq!(layer.authority, ContextAuthority::Advisory);
-        assert!(layer.rendered_content.contains("origin=muninn"));
-        assert!(layer.rendered_content.contains("origin=life-graph"));
-        assert!(layer.rendered_content.contains("Precedence"));
+        assert!(
+            layer
+                .rendered_content
+                .contains("[preference] Muninn continuity engram. (muninn)"),
+            "{}",
+            layer.rendered_content
+        );
+        // LifeGraph items keep their id: life.commit/life.resolve need it.
+        assert!(
+            layer
+                .rendered_content
+                .contains("[OpenLoop] YPT halfway, paused. (life-graph; id=life:ypt)"),
+            "{}",
+            layer.rendered_content
+        );
         assert!(layer.rendered_content.contains("loop_status=\"resolved\""));
 
         // The reconciliation instruction must reach the model through both the
@@ -11930,13 +12045,93 @@ mod tests {
             .as_str()
             .expect("recalled memory should render text");
 
-        assert!(recalled_text.contains("temporal_kind: gap"));
-        assert!(recalled_text.contains("observed_at: unix_ms=1768922400000"));
-        assert!(recalled_text.contains("last_verified_at: unix_ms=1768922430000"));
-        assert!(recalled_text.contains("spatial_scope: hotel"));
-        assert!(recalled_text.contains("space: branch=develop; hotel=vps-jane; session=sess-frame; agent=agent-jane-01; user=jared"));
+        // Stored frame facts render compactly on the item line: an absolute UTC
+        // date with a coarse age (never a raw epoch), the temporal kind,
+        // authority, validation level and the stored space anchors.
+        assert!(recalled_text.contains("(2026-01-20, "), "{recalled_text}");
+        assert!(!recalled_text.contains("unix_ms="), "{recalled_text}");
+        assert!(recalled_text.contains("; muninn; gap;"), "{recalled_text}");
         assert!(recalled_text.contains("authority: observed_runtime"));
         assert!(recalled_text.contains("validation: watched-live-green"));
+        assert!(
+            recalled_text.contains("space: branch=develop; hotel=vps-jane"),
+            "{recalled_text}"
+        );
+    }
+
+    #[test]
+    fn recalled_memory_budgets_whole_items_per_lane() {
+        let mut state = SessionState::new(
+            "sess-lanes".into(),
+            "agent-beacon-01".into(),
+            "telegram".into(),
+        );
+        state.settings.injection_budget.recalled_memory_chars = 1_200;
+        let muninn = |i: usize| RecalledMemoryRecord {
+            id: Some(format!("01M{i}")),
+            concept: format!("muninn-{i}"),
+            content: "m".repeat(300),
+            ..Default::default()
+        };
+        let life = |i: usize| RecalledMemoryRecord {
+            id: Some(format!("life:{i}")),
+            vault_id: Some("life-graph".into()),
+            source: Some("life-graph".into()),
+            concept: format!("life-{i}"),
+            content: "l".repeat(120),
+            ..Default::default()
+        };
+        let mut turn = test_working_turn(None);
+        // Muninn items first, as the auto-recall lane appends them before the
+        // LifeGraph cache injection.
+        turn.recalled_memories = vec![muninn(1), muninn(2), muninn(3), muninn(4), life(1), life(2)];
+        state.start_turn(turn);
+
+        let text = state.project_recalled_memory();
+        // LifeGraph records are no longer starved by Muninn items rendered first.
+        assert!(text.contains("[life-1]"), "{text}");
+        assert!(text.contains("[life-2]"), "{text}");
+        assert!(text.contains("omitted for space"), "{text}");
+        // Whole items only: nothing is cut mid-content by the outer cap.
+        assert!(!text.contains("truncated at"), "{text}");
+        assert!(text.chars().count() <= 1_200, "{}", text.chars().count());
+    }
+
+    #[test]
+    fn memory_remember_is_offered_on_durable_personal_statements() {
+        for offered in [
+            "please remember my train leaves at 7",
+            "i prefer aisle seats on long flights",
+            "we decided to move rehearsal to thursdays",
+            "going forward, send the weekly review on sundays",
+            "i'm allergic to penicillin",
+        ] {
+            assert!(super::looks_like_memory_write_goal(offered), "{offered}");
+        }
+        for not_offered in [
+            "what time is it in london",
+            "thanks, that works",
+            "draft an email to the choir about sunday",
+        ] {
+            assert!(
+                !super::looks_like_memory_write_goal(not_offered),
+                "{not_offered}"
+            );
+        }
+    }
+
+    #[test]
+    fn memory_date_and_age_renders_dates_not_epochs() {
+        let now = 1_779_900_000; // 2026-05-27
+        assert_eq!(
+            super::memory_date_and_age(now - 3 * 86_400, now).as_deref(),
+            Some("2026-05-24, 3d ago")
+        );
+        assert_eq!(
+            super::memory_date_and_age((now - 120 * 86_400) * 1_000, now).as_deref(),
+            Some("2026-01-27, 4mo ago")
+        );
+        assert_eq!(super::memory_date_and_age(0, now), None);
     }
 
     #[test]

@@ -224,6 +224,42 @@ impl AgentRuntime {
                     .take(50)
                     .collect();
                 let concept = format!("mcp.{category}: {first_line}");
+                if memory_core::write_hygiene::is_diagnostic_capture(&concept, &content, &tags) {
+                    return Ok((
+                        json!({ "captured": false, "diagnostic": true, "concept": concept }),
+                        false,
+                    ));
+                }
+                let agent_user = self.agent_id.clone();
+                // Self-scope writes do not use the session for vault
+                // resolution; label the origin for the forward envelope.
+                let capture_session = format!("mcp-capture:{}", self.agent_id);
+                match self
+                    .forward_shared_memory_write(
+                        &MemoryScope::SelfOnly,
+                        &agent_user,
+                        &concept,
+                        &content,
+                        &tags,
+                        &serde_json::Value::Null,
+                        &capture_session,
+                    )
+                    .await
+                {
+                    super::memory_integration::ForwardOutcome::Forwarded(_) => {
+                        return Ok((
+                            json!({ "captured": true, "routed": "cluster_primary", "concept": concept }),
+                            false,
+                        ));
+                    }
+                    super::memory_integration::ForwardOutcome::Queued { .. } => {
+                        return Ok((
+                            json!({ "captured": false, "queued": true, "concept": concept }),
+                            false,
+                        ));
+                    }
+                    super::memory_integration::ForwardOutcome::NotApplicable => {}
+                }
                 let Some(engine) = self.memory_engine_for(&self.agent_id, &self.agent_id) else {
                     anyhow::bail!("memory backend not configured on this node");
                 };
