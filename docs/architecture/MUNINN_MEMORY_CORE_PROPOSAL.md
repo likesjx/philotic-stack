@@ -409,6 +409,26 @@ guard (fail loud with a `needs_resync` marker), a per-vault digest endpoint and 
 snapshot wiring; build rc1 for linux so the self-knowledge surface works on the node
 every write goes through.
 
+### Phase 2 status (2026-09-16)
+
+**M1–M6 implemented and test-green on `codex/muninn-memory-core` (PR #466)**, merged
+with develop first. Not yet deployed or watched-live. Corrections found while
+building:
+
+- `memory.report` recall effectiveness counted session events by record kind, but
+  philote turn events are stored as `emit_task` records with the event name in the
+  payload — it always read zero. Fixed with a windowed payload counter.
+- The dream sweep could not have run: its recall route does not exist on Muninn, and
+  its "evolve" call would have replaced content. Rebuilt as a deterministic,
+  Cortex-only sleep cycle (M6).
+- Muninn keys writes on `{vault}:{concept}` and evolves on changed content (v0.11.0+),
+  so the audit's "corrections silently dropped" was wrong; the real risk was generic
+  concept labels colliding, addressed in M5.
+- The Cortex hotel held tokens only for its own agents' vaults; M4 provisions a token
+  when a forwarded self-vault write first arrives, refusing non-memory names.
+- Muninn's REST API has no access-feedback route and no hard delete; M3 feedback and
+  M6 tombstone purge are reported as not done rather than faked.
+
 ### Phase 2 sequence
 
 **M1 → M2 → M3** (one PR rebased on develop; test-green, then watched-live on one
