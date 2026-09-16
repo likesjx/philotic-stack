@@ -1040,9 +1040,16 @@ pub fn atomicity_violations(plan: &ActivePlan) -> Vec<u32> {
 /// Tools that retrieve rather than create. A step bound to one of these
 /// cannot bundle *artifacts*, however many topics its description lists.
 fn step_tool_is_read_only(step: &PlanStep) -> bool {
-    let Some(tool) = step.tool_name.as_deref() else {
-        return false;
-    };
+    step.tool_name
+        .as_deref()
+        .is_some_and(tool_name_is_read_only)
+}
+
+/// A tool whose successful call changes nothing: a retrieval or a status
+/// read. Such a call is not "work done" for the say-do gate (live 2026-09-16
+/// 12:44 UTC: `memory.recall` alone, then "I will make sure this is tracked
+/// and followed up" — and nothing was).
+pub fn tool_name_is_read_only(tool: &str) -> bool {
     let tool = tool.trim().to_ascii_lowercase();
     const READ_ONLY_SUFFIXES: &[&str] = &[
         ".recall",
