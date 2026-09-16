@@ -9371,14 +9371,25 @@ async fn main() -> Result<()> {
     {
         use ansible_mesh_core::placement_sync::PlacementChange;
         let push_tx = placement_push_tx;
-        let push_hotel_name = hotel_name.clone();
+        let push_graph = graph_domain_arc.clone();
+        let push_local_node_id = caps.node_id.clone();
         let mut push_shutdown = shutdown_tx.subscribe();
         tokio::spawn(async move {
             loop {
                 tokio::select! {
                     Some(change) = placement_change_rx.recv() => {
                         if let PlacementChange::TransportHome(home) = change {
-                            let hotel_is_home = home.is_active_home(&push_hotel_name);
+                            // DEF-143: `home.active_home_hotel` may be a bare
+                            // hotel_name (legacy) or a node_id (any record
+                            // touched by transport.set_home since DEF-124) —
+                            // resolve before comparing, mirroring the fix in
+                            // lease_handlers.rs's hotel_may_poll_transport_home.
+                            let hotel_is_home = crate::service::ipc::IpcServer::resolve_hotel_node_id(
+                                &push_graph,
+                                &home.active_home_hotel,
+                            )
+                            .as_deref()
+                                == Some(push_local_node_id.as_str());
                             info!(
                                 agent_id = %home.agent_id,
                                 transport = %home.transport,

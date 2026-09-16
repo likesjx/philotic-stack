@@ -333,18 +333,30 @@ impl IpcServer {
     /// - `Ok(Some(false))` — transport home registered but points elsewhere → MISMATCH
     /// - `Ok(None)`        — no transport home registered; caller should apply authority check
     /// - `Err(e)`          — DB lookup error
+    ///
+    /// DEF-143: `home.active_home_hotel` may be stored as either the bare
+    /// `hotel_name` (records never rewritten since before DEF-124) or the
+    /// canonical `node_id` (any record `transport.set_home` has touched
+    /// since DEF-124 added `resolve_hotel_node_id` canonicalization to its
+    /// write path). Comparing it directly against a bare `local_hotel_name`
+    /// only matches the legacy form — resolve `active_home_hotel` to its
+    /// canonical `node_id` first and compare against `local_node_id`
+    /// (already canonical), so both forms match correctly.
     fn hotel_may_poll_transport_home(
         graph: &GraphDomain,
         agent_id: &str,
         transport: &str,
         resource_ref: &str,
-        local_hotel_name: &str,
+        local_node_id: &str,
     ) -> Result<Option<bool>, String> {
         match graph.resolve_membrane_transport_home(agent_id, transport, resource_ref) {
-            Ok(Some(home)) => Ok(Some(
-                home.status == MembraneTransportHomeStatus::Active
-                    && home.active_home_hotel == local_hotel_name,
-            )),
+            Ok(Some(home)) => {
+                let resolved_home = Self::resolve_hotel_node_id(graph, &home.active_home_hotel);
+                Ok(Some(
+                    home.status == MembraneTransportHomeStatus::Active
+                        && resolved_home.as_deref() == Some(local_node_id),
+                ))
+            }
             Ok(None) => Ok(None),
             Err(err) => Err(err.to_string()),
         }
@@ -789,7 +801,7 @@ impl IpcServer {
             &agent_id,
             "telegram",
             transport_resource_ref,
-            &local_hotel_name,
+            local_node_id,
         ) {
             Ok(Some(true)) => {}
             Ok(Some(false)) => {
@@ -933,7 +945,7 @@ impl IpcServer {
             &agent_id,
             "telegram",
             transport_resource_ref,
-            &local_hotel_name,
+            local_node_id,
         ) {
             Ok(Some(true)) => {}
             Ok(Some(false)) => {
@@ -2529,6 +2541,107 @@ mod tests {
             }
             other => panic!("unexpected response: {other:?}"),
         }
+
+        unsafe {
+            std::env::remove_var("PHILOTIC_HOTEL_SOCKET");
+        }
+        server_task.abort();
+        let _ = server_task.await;
+        if Path::new(&socket_path).exists() {
+            let _ = std::fs::remove_file(&socket_path);
+        }
+    }
+
+    #[tokio::test]
+    async fn telegram_poll_lease_allows_acquisition_when_home_stored_as_node_id() {
+        // DEF-143 regression: transport.set_home (since DEF-124) canonicalizes
+        // active_home_hotel to the hotel's node_id before storing. Any record
+        // that has gone through it — like this one — must still let its own
+        // hotel acquire the lease, not just records still in the legacy bare
+        // hotel_name form (telegram_poll_lease_can_be_renewed_by_owner and
+        // friends cover that case).
+        let _env_guard = ipc_env_guard();
+        let socket_path = test_socket_path();
+        let (dispatcher_tx, _dispatcher_rx) = test_dispatcher_channel();
+        let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
+        let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
+        graph
+            .upsert_hotel(&HotelRecord {
+                hotel_name: "local-hotel".into(),
+                capabilities: NodeCapabilities {
+                    node_id: "local-aiua-01".into(),
+                    roles: vec![],
+                    models: vec![],
+                    tools: vec![],
+                    constraints: Default::default(),
+                    build_version: String::new(),
+                },
+                mesh_port: 9000,
+                blob_port: 9001,
+                execution_port: 9002,
+                ipc_socket_path: socket_path.clone(),
+                active_pid: None,
+                mesh_host: None,
+            })
+            .expect("seed local hotel");
+        graph
+            .upsert_agent_identity(&AgentIdentityRecord {
+                agent_id: "agent-beacon".into(),
+                persona_name: "Beacon".into(),
+                authority_hotel: "local-hotel".into(),
+                bundle_json: serde_json::json!({}),
+            })
+            .expect("seed agent identity");
+        graph
+            .upsert_membrane_transport_home(&MembraneTransportHomeRecord {
+                agent_id: "agent-beacon".into(),
+                transport: "telegram".into(),
+                resource_ref: "telegram_bot_token_beacon".into(),
+                // The canonical node_id form, not the bare hotel_name.
+                active_home_hotel: "local-aiua-01".into(),
+                standby_hotels: vec![],
+                managed_by_role: "orchestrator".into(),
+                lease_type: "telegram_poll".into(),
+                failover_policy: "manual-or-explicit-delegation".into(),
+                status: MembraneTransportHomeStatus::Active,
+                updated_unix: 0,
+            })
+            .expect("seed transport home stored as node_id");
+        let server = IpcServer::new(socket_path.clone(), "local-aiua-01", dispatcher_tx, graph);
+
+        let server_task = tokio::spawn(async move {
+            server.run().await.expect("ipc server should run");
+        });
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        unsafe {
+            std::env::set_var("PHILOTIC_HOTEL_SOCKET", &socket_path);
+        }
+
+        let mut poller = PhiloticClient::connect(GuestIdentity {
+            guest_id: "membrane-telegram-01".into(),
+            role: "membrane".into(),
+            supported_tools: Vec::new(),
+        })
+        .await
+        .expect("poller connect");
+
+        let response = poller
+            .send_request(IpcRequest::AcquireTelegramPollLease {
+                lease_key: "telegram:telegram_bot_token_beacon:deadbeefcafebabe".into(),
+                agent_id: "agent-beacon".into(),
+                resource_ref: Some("telegram_bot_token_beacon".into()),
+            })
+            .await
+            .expect("node-id-stored home request");
+
+        let (granted, lease) = expect_telegram_poll_lease(response);
+        assert!(
+            granted,
+            "hotel should acquire the lease for its own node_id-stored transport home"
+        );
+        let lease = lease.expect("lease envelope");
+        assert_eq!(lease.owner_guest_id, "membrane-telegram-01");
 
         unsafe {
             std::env::remove_var("PHILOTIC_HOTEL_SOCKET");
