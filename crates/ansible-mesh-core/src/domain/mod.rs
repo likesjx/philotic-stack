@@ -726,6 +726,42 @@ impl GraphDomain {
     /// so this never loads the whole event ledger; a return equal to `window`
     /// means the true count is `>= window` (saturated), which the caller should
     /// surface rather than treat as exact.
+    /// Count philote turn events by name among the most recent `window`
+    /// `emit_task` session events.
+    ///
+    /// Philote turn events (e.g. `memory_auto_recall_completed`) are persisted
+    /// as session events whose record `kind` is `emit_task`, with the event name
+    /// at `payload_json.event` (and `payload_json.action == "turn_event"`) — so
+    /// [`Self::count_recent_session_events_by_kind`] with the event name always
+    /// counted zero (found live 2026-09-16). Windowed: one bounded fetch, then
+    /// an in-memory tally (DEF-080 guard).
+    pub fn count_recent_turn_events_by_name(
+        &self,
+        names: &[&str],
+        window: usize,
+    ) -> Result<std::collections::BTreeMap<String, usize>> {
+        let nodes = self.adapter.list_nodes_by_kind_json_eq(
+            NODE_KIND_SESSION_EVENT,
+            "kind",
+            "emit_task",
+            "created_at",
+            window,
+        )?;
+        let mut counts: std::collections::BTreeMap<String, usize> =
+            names.iter().map(|n| (n.to_string(), 0)).collect();
+        for node in nodes {
+            let payload = &node.data["payload_json"];
+            if payload.get("action").and_then(|v| v.as_str()) != Some("turn_event") {
+                continue;
+            }
+            let event = payload.get("event").and_then(|v| v.as_str());
+            if let Some(count) = event.and_then(|event| counts.get_mut(event)) {
+                *count += 1;
+            }
+        }
+        Ok(counts)
+    }
+
     pub fn count_recent_session_events_by_kind(&self, kind: &str, window: usize) -> Result<usize> {
         let nodes = self.adapter.list_nodes_by_kind_json_eq(
             NODE_KIND_SESSION_EVENT,
@@ -2325,6 +2361,68 @@ mod tests {
                 .unwrap(),
             1,
             "a window of 1 must cap the returned count at 1"
+        );
+    }
+
+    #[test]
+    fn count_recent_turn_events_by_name_reads_the_emit_task_payload() {
+        use crate::storage::SessionEventRecord;
+        let domain = make_domain();
+        // The shape philote turn events are actually persisted with (live
+        // mac-jane 2026-09-16): kind=emit_task, payload_json.action=turn_event,
+        // payload_json.event=<name>.
+        let turn_event = |id: &str, event: &str, at: u64| SessionEventRecord {
+            event_id: id.into(),
+            session_id: "s1".into(),
+            turn_id: None,
+            component_id: "philote".into(),
+            kind: "emit_task".into(),
+            payload_json: serde_json::json!({"action": "turn_event", "event": event}),
+            created_at: at,
+        };
+        for (i, event) in [
+            "memory_auto_recall_completed",
+            "memory_auto_recall_completed",
+            "memory_auto_recall_failed",
+            "plan_ready",
+        ]
+        .iter()
+        .enumerate()
+        {
+            domain
+                .append_session_event(&turn_event(&format!("e{i}"), event, i as u64 + 1))
+                .unwrap();
+        }
+        // A non-turn emit_task with the same event-like field must not count.
+        domain
+            .append_session_event(&SessionEventRecord {
+                event_id: "x".into(),
+                session_id: "s1".into(),
+                turn_id: None,
+                component_id: "philote".into(),
+                kind: "emit_task".into(),
+                payload_json: serde_json::json!({"action": "execute_tool", "event": "memory_auto_recall_completed"}),
+                created_at: 9,
+            })
+            .unwrap();
+
+        let names = [
+            "memory_auto_recall_completed",
+            "memory_auto_recall_skipped",
+            "memory_auto_recall_failed",
+        ];
+        let counts = domain
+            .count_recent_turn_events_by_name(&names, 5000)
+            .unwrap();
+        assert_eq!(counts["memory_auto_recall_completed"], 2);
+        assert_eq!(counts["memory_auto_recall_skipped"], 0);
+        assert_eq!(counts["memory_auto_recall_failed"], 1);
+        // The old kind-based counter could never see these.
+        assert_eq!(
+            domain
+                .count_recent_session_events_by_kind("memory_auto_recall_completed", 5000)
+                .unwrap(),
+            0
         );
     }
 

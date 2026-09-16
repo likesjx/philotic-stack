@@ -1714,6 +1714,27 @@ impl AgentRuntime {
         Ok(())
     }
 
+    /// Record an automatic recall that did not produce a result. Failed
+    /// recalls used to leave no ledger trace, so recall effectiveness read
+    /// ~100% while ~8% of recalls were failing (2026-09-16 audit).
+    async fn emit_auto_recall_failed(
+        &mut self,
+        session_id: &str,
+        reason: &str,
+        elapsed: std::time::Duration,
+    ) {
+        let _ = self
+            .emit_turn_event(
+                session_id,
+                "memory_auto_recall_failed",
+                Some(format!(
+                    "Auto recall failed after {}ms: {reason}",
+                    elapsed.as_millis()
+                )),
+            )
+            .await;
+    }
+
     pub(super) async fn maybe_auto_recall_turn_memory(&mut self, session_id: &str) -> Result<()> {
         use memory_core::MemoryEngine as _;
 
@@ -1822,6 +1843,7 @@ impl AgentRuntime {
             "Running auto recall for turn."
         );
 
+        let recall_started = std::time::Instant::now();
         let result = match engine.recall_for_turn(&recall_context).await {
             Ok(r) => r,
             Err(err) => {
@@ -1846,16 +1868,57 @@ impl AgentRuntime {
                     Some(Ok(r)) => r,
                     Some(Err(retry_err)) => {
                         warn!(session_id = %session_id, error = %retry_err, "Auto recall failed after token heal — giving up for this turn.");
+                        self.emit_auto_recall_failed(
+                            session_id,
+                            "token_rejected_after_heal",
+                            recall_started.elapsed(),
+                        )
+                        .await;
                         return Ok(());
                     }
                     None => {
                         warn!(session_id = %session_id, error = %err, "Auto recall failed: memory engine error.");
+                        let reason = if memory_core::token_rejected_vault(&err).is_some() {
+                            "token_rejected"
+                        } else {
+                            "engine_error"
+                        };
+                        self.emit_auto_recall_failed(session_id, reason, recall_started.elapsed())
+                            .await;
                         return Ok(());
                     }
                 }
             }
         };
+        let recall_latency_ms = recall_started.elapsed().as_millis();
+
+        // Partial token rejection: other vaults answered, so the call did not
+        // error and the all-vaults heal above never fired. Heal the rejected
+        // vault for the next turn (the engine skips it meanwhile).
+        if let Some(vault) = result.rejected_vaults.first().cloned()
+            && !self.heal_memory_token(&vault).await
+        {
+            warn!(session_id = %session_id, vault = %vault, "Auto recall: partial token rejection could not be healed.");
+        }
+
         let recall_reason = result.decision.reason.clone();
+        let mut band_counts: std::collections::BTreeMap<String, usize> = Default::default();
+        for engram in &result.engrams {
+            *band_counts
+                .entry(
+                    memory_core::engram_relevance_band(engram)
+                        .unwrap_or("unknown")
+                        .to_string(),
+                )
+                .or_default() += 1;
+        }
+        let dropped_by_gate = result.dropped_by_gate;
+        let degraded_vaults: Vec<String> = result
+            .rejected_vaults
+            .iter()
+            .chain(result.failed_vaults.iter())
+            .cloned()
+            .collect();
         let recalled_memories = result
             .engrams
             .into_iter()
@@ -1875,26 +1938,42 @@ impl AgentRuntime {
             }
         }
 
+        let bands = band_counts
+            .iter()
+            .map(|(band, n)| format!("{band}={n}"))
+            .collect::<Vec<_>>()
+            .join(" ");
         info!(
             session_id = %session_id,
             total = recalled_count,
+            dropped_by_gate,
+            latency_ms = recall_latency_ms,
+            bands = %bands,
+            degraded_vaults = ?degraded_vaults,
             concepts = %concept_summary,
             "Auto recall completed for turn."
         );
+        let mut detail = format!(
+            "Recalled {} memory item(s) in {}ms (dropped {} below relevance{}{})",
+            recalled_count,
+            recall_latency_ms,
+            dropped_by_gate,
+            if bands.is_empty() {
+                String::new()
+            } else {
+                format!("; bands {bands}")
+            },
+            if degraded_vaults.is_empty() {
+                String::new()
+            } else {
+                format!("; degraded vaults {}", degraded_vaults.join(","))
+            },
+        );
+        if !concept_summary.is_empty() {
+            detail.push_str(&format!(": {concept_summary}"));
+        }
         let _ = self
-            .emit_turn_event(
-                session_id,
-                "memory_auto_recall_completed",
-                Some(format!(
-                    "Recalled {} memory item(s){}",
-                    recalled_count,
-                    if concept_summary.is_empty() {
-                        String::new()
-                    } else {
-                        format!(": {concept_summary}")
-                    }
-                )),
-            )
+            .emit_turn_event(session_id, "memory_auto_recall_completed", Some(detail))
             .await;
 
         Ok(())

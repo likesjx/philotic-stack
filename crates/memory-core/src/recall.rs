@@ -54,6 +54,15 @@ pub struct TurnRecallResult {
     pub decision: RecallDecision,
     pub engrams: Vec<Engram>,
     pub total: usize,
+    /// Engrams the relevance gate removed (weak or superseded).
+    #[serde(default)]
+    pub dropped_by_gate: usize,
+    /// See [`crate::ActivationResult::rejected_vaults`].
+    #[serde(default)]
+    pub rejected_vaults: Vec<String>,
+    /// See [`crate::ActivationResult::failed_vaults`].
+    #[serde(default)]
+    pub failed_vaults: Vec<String>,
 }
 
 impl RecallContext {
@@ -152,15 +161,14 @@ fn build_query(context: &RecallContext, normalized_turn: &str) -> Option<String>
         plan_continuation_goal(normalized_turn).unwrap_or_else(|| normalized_turn.to_string());
     let mut parts = vec![seed.clone()];
 
-    if is_referential_follow_up(&seed) {
-        if let Some(previous) = context
+    if is_referential_follow_up(&seed)
+        && let Some(previous) = context
             .recent_turns
             .iter()
             .map(|turn| normalize_whitespace(turn))
             .find(|turn| !turn.is_empty() && !turn.starts_with(PLAN_CONTINUATION_PREFIX))
-        {
-            parts.push(truncate_chars(&previous, 200));
-        }
+    {
+        parts.push(truncate_chars(&previous, 200));
     }
 
     if let Some(goal) = context

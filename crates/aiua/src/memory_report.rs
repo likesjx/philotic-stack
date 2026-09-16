@@ -34,20 +34,23 @@ const RECALL_EVENT_WINDOW: usize = 5000;
 /// multi-node Muninn status calls (S6a-wire follow-up), and replication
 /// lag/peer/backlog need a muninndb API (S6b). Nothing is guessed.
 pub fn assemble_live_memory_report(graph: &GraphDomain) -> MemoryReport {
-    let recall = match (
-        graph.count_recent_session_events_by_kind(
-            "memory_auto_recall_completed",
+    // Turn events are persisted as `emit_task` session events with the event
+    // name in the payload; the earlier kind-based count always read zero.
+    let recall = graph
+        .count_recent_turn_events_by_name(
+            &[
+                "memory_auto_recall_completed",
+                "memory_auto_recall_skipped",
+                "memory_auto_recall_failed",
+            ],
             RECALL_EVENT_WINDOW,
-        ),
-        graph
-            .count_recent_session_events_by_kind("memory_auto_recall_skipped", RECALL_EVENT_WINDOW),
-    ) {
-        (Ok(completed), Ok(skipped)) => Some(RecallEffectiveness {
-            completed: completed as u64,
-            skipped: skipped as u64,
-        }),
-        _ => None,
-    };
+        )
+        .ok()
+        .map(|counts| RecallEffectiveness {
+            completed: counts["memory_auto_recall_completed"] as u64,
+            skipped: counts["memory_auto_recall_skipped"] as u64,
+            failed: counts["memory_auto_recall_failed"] as u64,
+        });
 
     assemble_memory_report(MemoryReportInputs {
         recall,
@@ -141,14 +144,25 @@ pub struct VaultDivergence {
 pub struct RecallEffectiveness {
     pub completed: u64,
     pub skipped: u64,
+    /// Recalls that ran and produced no result (engine error, timeout, token
+    /// rejection). Before Phase 2 M3 these left no ledger trace.
+    #[serde(default)]
+    pub failed: u64,
 }
 
 impl RecallEffectiveness {
-    /// Fraction of eligible turns where auto-recall actually ran. `None` when no
-    /// turns were observed (avoid a fabricated 0/0 = 0 rate).
+    /// Fraction of recall attempts where auto-recall actually delivered.
+    /// Failures count against it. `None` when nothing was observed (avoid a
+    /// fabricated 0/0 = 0 rate).
     pub fn hit_rate(&self) -> Option<f64> {
-        let total = self.completed + self.skipped;
+        let total = self.completed + self.skipped + self.failed;
         (total > 0).then(|| self.completed as f64 / total as f64)
+    }
+
+    /// Of the recalls that actually ran, the fraction that succeeded.
+    pub fn success_rate(&self) -> Option<f64> {
+        let ran = self.completed + self.failed;
+        (ran > 0).then(|| self.completed as f64 / ran as f64)
     }
 }
 
@@ -350,12 +364,27 @@ mod tests {
     }
 
     #[test]
+    fn recall_failures_count_against_the_rates() {
+        // 2026-09-16 audit, mac-jane: 358 completed, 33 failed with no event.
+        let r = RecallEffectiveness {
+            completed: 358,
+            skipped: 0,
+            failed: 33,
+        };
+        let success = r.success_rate().expect("ran");
+        assert!((success - 358.0 / 391.0).abs() < 1e-9, "{success}");
+        assert!(r.hit_rate().expect("observed") < 0.92);
+    }
+
+    #[test]
     fn recall_hit_rate_is_none_on_zero_turns_not_fabricated() {
         let r = RecallEffectiveness {
             completed: 0,
             skipped: 0,
+            failed: 0,
         };
         assert_eq!(r.hit_rate(), None, "0/0 must not fabricate a 0.0 rate");
+        assert_eq!(r.success_rate(), None);
         let report = assemble_memory_report(MemoryReportInputs {
             recall: Some(r),
             ..Default::default()
@@ -371,6 +400,7 @@ mod tests {
             recall: Some(RecallEffectiveness {
                 completed: 3,
                 skipped: 1,
+                failed: 0,
             }),
             ..Default::default()
         });
@@ -441,6 +471,7 @@ mod tests {
             recall: Some(RecallEffectiveness {
                 completed: 2,
                 skipped: 2,
+                failed: 0,
             }),
             ..Default::default()
         });
