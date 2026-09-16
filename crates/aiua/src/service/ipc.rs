@@ -14707,7 +14707,28 @@ impl IpcServer {
                     }
                 };
 
+                // Skill RECORDS for every skill in play (projected closure +
+                // on-demand), so philote's per-turn projection can read implied
+                // tools, description and goal text instead of a compiled table
+                // keyed by name (2026-09-15: runtime-registered skills could
+                // never project). Retired states are already filtered above.
+                let effective_skill_records: Vec<serde_json::Value> = projected_skillset
+                    .iter()
+                    .chain(
+                        on_demand_skills
+                            .iter()
+                            .filter(|s| !projected_skillset.contains(s)),
+                    )
+                    .filter_map(|name| graph.get_abstract_skill(name).ok().flatten())
+                    .filter(|record| record.validation_state.is_projectable())
+                    .filter_map(|record| serde_json::to_value(record).ok())
+                    .collect();
+
                 if let Some(obj) = bindings.as_object_mut() {
+                    obj.insert(
+                        "effective_skill_records".to_string(),
+                        serde_json::json!(effective_skill_records),
+                    );
                     obj.insert(
                         "effective_procedures".to_string(),
                         serde_json::json!(effective_procedures),
