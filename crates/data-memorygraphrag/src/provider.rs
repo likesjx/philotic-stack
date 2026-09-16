@@ -2760,14 +2760,23 @@ impl LifeGraphProvider {
             rows = output_rows.len(),
             "life.list: deterministic list served"
         );
-        Ok(ProviderOutput::ResultSet(json!({
+        let mut out = json!({
             "status": "ok",
             "read_only": true,
             "query": query_kind,
             "as_of": now_iso,
             "count": output_rows.len(),
+            "limit": limit,
+            "truncated": list_page_is_full(output_rows.len(), limit),
             "rows": output_rows,
-        })))
+        });
+        if list_page_is_full(out["count"].as_u64().unwrap_or(0) as usize, limit) {
+            out["note"] = json!(format!(
+                "This page is FULL ({limit} rows): more matching nodes exist. Do not present these \
+                 rows as all of them — narrow by labels, or raise limit (max 200)."
+            ));
+        }
+        Ok(ProviderOutput::ResultSet(out))
     }
 
     async fn handle_view_node(&self, task: &DatasourceTask) -> Result<ProviderOutput> {
@@ -5439,9 +5448,23 @@ mod tests {
     }
 }
 
+/// A `life.list` page that came back at its limit is presumed truncated:
+/// live 2026-09-16 19:38 UTC Beacon rendered "all proposed items" from a
+/// 50-row page while 197 proposed nodes existed (DEF-153).
+fn list_page_is_full(rows: usize, limit: usize) -> bool {
+    limit > 0 && rows >= limit
+}
+
 #[cfg(test)]
 mod typed_property_row_tests {
     use super::*;
+
+    #[test]
+    fn a_full_list_page_is_flagged_truncated() {
+        assert!(list_page_is_full(50, 50));
+        assert!(!list_page_is_full(26, 50));
+        assert!(!list_page_is_full(0, 50));
+    }
 
     #[test]
     fn list_rows_fold_typed_columns_and_drop_nulls() {

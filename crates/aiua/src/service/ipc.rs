@@ -8969,6 +8969,22 @@ impl IpcServer {
             // ── Cron scheduler ──────────────────────────────────────────────
             IpcRequest::RegisterCronJob { mut job } => {
                 Self::normalize_cron_target_role(graph, &mut job);
+                if job.target_role.starts_with("role:")
+                    && !crate::service::cron_ticker::cron_payload_reaches_an_agent(&job.payload)
+                {
+                    return IpcResponse::error(
+                        "register_cron_job",
+                        "CRON_PAYLOAD_UNDELIVERABLE",
+                        format!(
+                            "cron job NOT registered: a job for {} must carry its instruction in a \
+                             `message` string, e.g. {{\"message\": \"Run the LifeGraph gardening review \
+                             now: …\"}}. A payload with no `message`/`content` (got: {}) is dropped \
+                             by the agent every time it fires.",
+                            job.target_role,
+                            job.payload.chars().take(160).collect::<String>()
+                        ),
+                    );
+                }
                 // Ownership is stamped from the connection identity, never
                 // trusted from the wire: a guest's jobs belong to its agent.
                 if let Some(identity) = current_identity.as_ref() {

@@ -568,8 +568,10 @@ tools:
         description: Mesh-coordinated delivery flag. Optional; defaults to false.
         type: boolean
       payload:
-        description: JSON payload string delivered to the role. Include enough context for the recipient
-          to act without extra lookup.
+        description: 'JSON object string delivered to the role. For an agent role it MUST carry the
+          full instruction in a "message" string, e.g. {"message": "Run the LifeGraph gardening review
+          now: ..."}. A payload without "message" is dropped when it fires and is refused at registration.
+          Include enough context for the recipient to act without extra lookup.'
         type: string
       schedule:
         description: '7-field cron expression: <sec> <min> <hour> <dom> <month> <dow> <year>. Example:
@@ -1377,7 +1379,9 @@ tools:
     for maintenance/gardening: pass a named_query (''past_dated_events'', ''aging_loops_oldest_first'',
     ''duplicate_candidates'', ''recently_retired'', ''past_due_commitments'') OR typed filters (labels/statuses/validation_states/date
     bounds), never both. Terminal (resolved/retired/done) nodes are excluded unless include_terminal=true.
-    Same call, same graph state → same rows; every returned id is a real node id safe to cite.'
+    Same call, same graph state → same rows; every returned id is a real node id safe to cite. Default
+    limit 50, max 200: when the result says truncated=true the page is full and more nodes exist, so
+    never present it as the complete set.'
   input_schema:
     properties:
       date_after:

@@ -808,6 +808,14 @@ impl SessionState {
     /// `true`). Re-key by step id so a step keeps its own evidence and a
     /// genuinely new step starts unverified.
     pub fn set_active_plan(&mut self, mut plan: ActivePlan) {
+        let unbound = crate::plan_eval::unbind_reply_pseudo_tools(&mut plan);
+        if !unbound.is_empty() {
+            tracing::info!(
+                session_id = %self.session_id,
+                steps = ?unbound,
+                "plan normalization: unbound step(s) tied to the reply instead of a callable tool"
+            );
+        }
         // Normalize before anything else: a bundled step is split into one
         // step per item so each can be proven by its own call (live
         // 2026-09-12 11:00 UTC: four people in one step, four observes, plan
