@@ -886,6 +886,18 @@ fn apply_embedded_agent_graph_snapshot(task_json: &str) -> anyhow::Result<Option
     Ok(Some(snapshot.agent_id))
 }
 
+/// The mesh node hosting `agent_id` according to gossiped peer rosters
+/// (`HotelStateSync`), for agents this hotel's graph has no identity for.
+pub(super) fn peer_agent_node_from_roster<'a>(
+    states: impl Iterator<Item = &'a ansible_mesh_core::registry::RemoteHotelState>,
+    agent_id: &str,
+) -> Option<String> {
+    states
+        .filter(|state| state.agents.iter().any(|a| a.agent_id == agent_id))
+        .map(|state| state.node_id.clone())
+        .next()
+}
+
 pub(super) fn lookup_agent_authority_hotel(graph: &GraphDomain, agent_id: &str) -> Option<String> {
     graph
         .get_agent_identity(agent_id)
@@ -6917,10 +6929,21 @@ impl IpcServer {
                 // UTC (DEF-139): two delegations to agent-bjork-01 acked
                 // "dispatched"; neither reached mac-jane; Beacon told the
                 // operator Björk had received them.
-                let target_node_id = match authority_hotel.as_deref() {
+                let mut target_node_id = match authority_hotel.as_deref() {
                     Some(hotel) => IpcServer::resolve_hotel_node_id(graph, hotel),
                     None => None,
                 };
+                // The graph only holds identities for agents this hotel has
+                // materialized; a peer's agents are known from its roster
+                // gossip (HotelStateSync → NodeRegistry). Live 2026-09-16
+                // 02:10 UTC the vps received mac-jane's roster ("45 guests,
+                // 4 agents") every 30 s and still had no graph identity for
+                // agent-bjork-01.
+                if target_node_id.is_none() {
+                    let reg = registry.read().await;
+                    target_node_id =
+                        peer_agent_node_from_roster(reg.remote_hotel_states(), &target_agent_id);
+                }
                 let Some(target_node_id) = target_node_id else {
                     warn!(
                         target_agent_id = %target_agent_id,
@@ -22217,6 +22240,44 @@ pub(crate) mod tests {
         if Path::new(&socket_path).exists() {
             let _ = std::fs::remove_file(&socket_path);
         }
+    }
+
+    /// A peer's agents are known from roster gossip, not the local graph.
+    #[test]
+    fn peer_agent_node_resolves_from_gossiped_rosters() {
+        use ansible_mesh_core::heartbeat::{HotelStateSyncAgent, HotelStateSyncGuest};
+        use ansible_mesh_core::registry::RemoteHotelState;
+        let states = vec![
+            RemoteHotelState {
+                hotel_name: "mbp-jane".into(),
+                node_id: "mbp-jane-aiua-01".into(),
+                guests: vec![],
+                agents: vec![HotelStateSyncAgent {
+                    agent_id: "agent-astrid".into(),
+                    persona_name: "Astrid".into(),
+                }],
+                last_seen: std::time::Instant::now(),
+            },
+            RemoteHotelState {
+                hotel_name: "mac-jane".into(),
+                node_id: "mac-jane-aiua-01".into(),
+                guests: vec![HotelStateSyncGuest {
+                    guest_id: "agent-bjork-01:orchestrator".into(),
+                    role: "agent".into(),
+                    active: true,
+                }],
+                agents: vec![HotelStateSyncAgent {
+                    agent_id: "agent-bjork-01".into(),
+                    persona_name: "Björk".into(),
+                }],
+                last_seen: std::time::Instant::now(),
+            },
+        ];
+        assert_eq!(
+            peer_agent_node_from_roster(states.iter(), "agent-bjork-01").as_deref(),
+            Some("mac-jane-aiua-01")
+        );
+        assert!(peer_agent_node_from_roster(states.iter(), "agent-nobody").is_none());
     }
 
     /// DEF-139 (live 2026-09-15 19:35 UTC): a delegation to an agent no
