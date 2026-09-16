@@ -5,6 +5,9 @@ struct RootView: View {
     @Bindable var router: CompanionRouter
     @State private var health = HealthKitCaptureService()
     @State private var location = LocationCaptureService()
+    #if os(macOS)
+    @State private var desktop = HotelDesktopSession()
+    #endif
 
     var body: some View {
         VStack(spacing: 0) {
@@ -31,6 +34,10 @@ struct RootView: View {
                 LifeView(session: session).toolbar { settingsButton }
             }
             .tabItem { Label("Life", systemImage: "brain") }.tag(CompanionTab.life)
+            #if os(macOS)
+            HotelDesktopView(desktop: desktop, suggestedAddress: session.settings.anchorURLString)
+                .tabItem { Label("Desktop", systemImage: "desktopcomputer") }.tag(CompanionTab.desktop)
+            #endif
         }
             #if os(macOS)
             connectionStatus
@@ -53,6 +60,9 @@ struct RootView: View {
             if CommandLine.arguments.contains("--show-location") { router.sheet = .location }
             if CommandLine.arguments.contains("--show-health") { router.sheet = .health }
             if CommandLine.arguments.contains("--show-today") { router.open(.today) }
+            #if os(macOS)
+            if CommandLine.arguments.contains("--show-desktop") { router.open(.desktop) }
+            #endif
             #endif
         }
     }
