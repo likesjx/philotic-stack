@@ -954,6 +954,33 @@ tools:
   input_schema:
     properties: {}
     type: object
+- tool_name: hotel.best_place_to_run
+  class: session
+  description: 'READ-ONLY placement recommendation: which hotel on the mesh should run a role or a tool
+    need. Ranks role home pins first, then live registry health, reachability, tool affinity, required
+    tool markers, build-version compatibility and locality. It only recommends; it moves nothing. To act
+    on the answer use role.set_home or hotel.relocate. Pass role_name for a role, tool_name for a tool,
+    required_markers to demand capabilities (e.g. local_only), prefer_locality to favour this hotel on a tie.'
+  input_schema:
+    type: object
+    properties:
+      agent_id:
+        type: string
+        description: Agent whose role or tool need is being placed. Defaults to the caller.
+      role_name:
+        type: string
+        description: Role to place (e.g. theoretician).
+      tool_name:
+        type: string
+        description: Tool whose best host is wanted.
+      required_markers:
+        type: array
+        items:
+          type: string
+        description: Tool markers the chosen hotel must satisfy.
+      prefer_locality:
+        type: boolean
+        description: Prefer this hotel when candidates tie.
 - tool_name: hotel.egress.check
   class: session
   description: Check whether an outbound HTTP request is permitted by the hotel's egress policy. Returns
