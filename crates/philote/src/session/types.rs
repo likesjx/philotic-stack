@@ -1379,7 +1379,8 @@ impl ContextWindowPolicy {
 ///
 /// Slice 0 applies `persona_chars`, `rules_chars`, and `recalled_memory_chars`
 /// to the layers that exist today (`project_agent_self`, `project_rules`,
-/// `project_recalled_memory`). `memory_snapshot_chars`, `skills_chars`, and
+/// `project_recalled_memory`); `skills_chars` caps the `[Skill guidance]`
+/// section (DEF-145). `memory_snapshot_chars` and
 /// `reflex_snapshot_chars` are reserved for the frozen `MemorySnapshot` and
 /// tiered skill/reflex projections landing in later slices — no renderer
 /// consumes them yet.
@@ -1391,7 +1392,8 @@ pub struct InjectionBudget {
     pub memory_snapshot_chars: usize,
     /// Cap for the per-turn RecalledMemory layer (`project_recalled_memory`).
     pub recalled_memory_chars: usize,
-    /// Reserved for a future skills/role-manifest index projection. Unused today.
+    /// Cap for the per-turn `[Skill guidance]` section (DEF-145: it used to
+    /// live under `persona_chars` and was the part the persona overflow cut).
     pub skills_chars: usize,
     /// Reserved for a future reflex-state projection. Unused today.
     pub reflex_snapshot_chars: usize,

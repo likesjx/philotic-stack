@@ -45,6 +45,9 @@ mod paracrine;
 #[path = "tool_exec.rs"]
 mod tool_exec;
 
+#[path = "tool_args.rs"]
+pub(crate) mod tool_args;
+
 #[path = "distill.rs"]
 pub(crate) mod distill;
 

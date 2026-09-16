@@ -2880,9 +2880,23 @@ impl SessionState {
         let identity = apply_injection_budget(
             &mut budget_ledger,
             "identity",
-            self.project_agent_self(&projected_skill_names),
+            self.project_agent_self_core(),
             injection_budget.persona_chars,
         );
+        // DEF-145: [Skill guidance] carries its own budget so a long persona
+        // can no longer truncate the doctrine of the skills projected this
+        // turn. It still renders inside the Identity layer, after the core.
+        let skill_guidance = apply_injection_budget(
+            &mut budget_ledger,
+            "skill_guidance",
+            self.project_skill_guidance_section(&projected_skill_names),
+            injection_budget.skills_chars,
+        );
+        let identity = if skill_guidance.is_empty() {
+            identity
+        } else {
+            format!("{identity}\n{skill_guidance}")
+        };
         let relationship = self.project_user(user_content);
         let knowledge = self.project_knowledge(user_content, projected_tools);
         let recalled_memory = apply_injection_budget(
@@ -3600,6 +3614,45 @@ impl SessionState {
     /// turn-agnostic contexts (size estimates, policy checks); guidance for
     /// non-projected skills is never rendered.
     pub fn project_agent_self(&self, projected_skills: &[String]) -> String {
+        self.project_agent_self_inner(Some(projected_skills))
+    }
+
+    /// The Identity layer WITHOUT the per-turn [Skill guidance] section —
+    /// identity, soul, governance, content policy. Budgeted by `persona_chars`.
+    pub fn project_agent_self_core(&self) -> String {
+        self.project_agent_self_inner(None)
+    }
+
+    /// Doctrine text for the skills projected THIS turn — the hotel composes
+    /// "name — description" guidance from the skill catalog
+    /// (effective_skill_guidance), and before this section existed nothing on
+    /// the philote side ever rendered it: the model saw bare skill ids with
+    /// the charter text (outcome-note discipline, respawn-budget escalation,
+    /// …) silently dropped. Capped in skill_guidance_for_turn; budgeted by
+    /// `skills_chars` (DEF-145). Self-Improvement Loop L1: the distill brief
+    /// IS the doctrine for a distill turn, so a distill turn renders none.
+    pub fn project_skill_guidance_section(&self, projected_skills: &[String]) -> String {
+        let skill_guidance = if self
+            .active_turn
+            .as_ref()
+            .is_some_and(crate::runtime::distill::turn_is_distill)
+        {
+            Vec::new()
+        } else {
+            self.skill_guidance_for_turn(projected_skills)
+        };
+        if skill_guidance.is_empty() {
+            return String::new();
+        }
+        let mut section = String::from("\n[Skill guidance]");
+        for entry in &skill_guidance {
+            section.push_str("\n- ");
+            section.push_str(entry);
+        }
+        section
+    }
+
+    fn project_agent_self_inner(&self, projected_skills: Option<&[String]>) -> String {
         let mut lines = Vec::new();
 
         if let Some(identity) = self
@@ -3651,31 +3704,21 @@ impl SessionState {
             }
         }
 
-        // Doctrine text for the skills projected THIS turn — the hotel
-        // composes "name — description" guidance from the skill catalog
-        // (effective_skill_guidance), and before this section existed nothing
-        // on the philote side ever rendered it: the model saw bare skill ids
-        // with the charter text (outcome-note discipline, respawn-budget
-        // escalation, …) silently dropped. Capped in skill_guidance_for_turn.
-        // Self-Improvement Loop L1: the distill brief IS the doctrine for a
-        // distill turn. The projected skill.authoring guidance ("3 or more
-        // times", "not for one-off tasks") would argue against the brief.
-        let skill_guidance = if self
-            .active_turn
-            .as_ref()
-            .is_some_and(crate::runtime::distill::turn_is_distill)
-        {
-            Vec::new()
-        } else {
-            self.skill_guidance_for_turn(projected_skills)
-        };
-        if !skill_guidance.is_empty() {
-            let mut section = String::from("\n[Skill guidance]");
-            for entry in &skill_guidance {
-                section.push_str("\n- ");
-                section.push_str(entry);
+        // [Skill guidance] used to be composed here, inside the Identity
+        // layer, and so lived under `persona_chars`. Live 2026-09-15 22:54 EDT
+        // (bjork): identity + soul + governance already used ~5.3 KB of the
+        // 6 KB persona budget, so the guidance for 9 of the 12 projected
+        // skills — the repertoire gardener the operator's rule says to
+        // "always use" among them — was cut by the layer truncation with no
+        // notice from the guidance cap (DEF-145). The section is now rendered
+        // by `project_skill_guidance_section` and budgeted on its own
+        // (`skills_chars`) in `build_context_projection`; this method keeps
+        // appending it for callers that want the whole self-projection.
+        if let Some(projected_skills) = projected_skills {
+            let section = self.project_skill_guidance_section(projected_skills);
+            if !section.is_empty() {
+                lines.push(section);
             }
-            lines.push(section);
         }
 
         // Providers with no API-level safety toggle (Anthropic/OpenAI/Ollama/
@@ -12751,6 +12794,49 @@ mod tests {
     }
 
     // ── InjectionBudget / BudgetLedger (slice 0) ─────────────────────────────
+
+    /// DEF-145 (live 2026-09-15 22:54 EDT): the persona overflow must not cut
+    /// the [Skill guidance] of the skills projected this turn.
+    #[test]
+    fn skill_guidance_survives_a_persona_overflow() {
+        let mut state =
+            SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
+        state.clear_tool_bindings();
+        state.add_tool_binding("echo");
+        state.agent_profile.identity_text = Some("x".repeat(9_000));
+        state.bindings.effective_skillset = vec!["mesh.steward".into()];
+        state.bindings.on_demand_skills = vec!["mesh.steward".into()];
+        state.bindings.effective_skill_guidance =
+            vec!["mesh.steward — Mesh steward duties: keep the fleet high-functioning.".into()];
+
+        let projection = state.build_context_projection("check the heal queue");
+        let identity = projection
+            .layers
+            .iter()
+            .find(|l| l.layer_id == ContextLayerId::Identity)
+            .expect("identity layer present");
+        assert!(
+            identity
+                .rendered_content
+                .contains("truncated at 6000 chars"),
+            "persona overflow should still be reported"
+        );
+        assert!(
+            identity
+                .rendered_content
+                .contains("[Skill guidance]\n- mesh.steward — Mesh steward duties"),
+            "guidance must render after the truncated persona:\n{}",
+            identity.rendered_content
+        );
+        let entry = projection
+            .budget_ledger
+            .entries
+            .iter()
+            .find(|e| e.source == "skill_guidance")
+            .expect("skill_guidance ledger entry present");
+        assert!(!entry.truncated);
+        assert_eq!(entry.cap_chars, 2_500);
+    }
 
     #[test]
     fn injection_budget_truncates_persona_and_records_ledger_entry() {
