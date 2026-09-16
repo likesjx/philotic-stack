@@ -20,8 +20,6 @@
 //! classifier does not over-capture in practice — the classifier is exercised
 //! by unit tests until then.
 
-#![allow(dead_code)]
-
 use std::sync::LazyLock;
 
 use regex::Regex;

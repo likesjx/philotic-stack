@@ -1630,6 +1630,8 @@ pub struct AgentRuntime {
     /// forward and at turn start. In-memory only (bounded) — the mesh ledger is
     /// the durable queue once the local hotel accepts the task.
     pending_memory_forwards: std::collections::VecDeque<(String, String)>,
+    /// Deterministic operator-fact captures spent today: `(utc_day, count)`.
+    deterministic_capture_budget: (u64, usize),
     /// Role configurations registered via `role.configure`, keyed by role_name.
     configured_roles: HashMap<String, CachedRoleConfig>,
     /// Cached hotel-owned OpenRouter catalog snapshot for `/model` display:
@@ -2007,6 +2009,7 @@ impl AgentRuntime {
             muninn_config: None,
             muninn_available: true,
             pending_memory_forwards: std::collections::VecDeque::new(),
+            deterministic_capture_budget: (0, 0),
             configured_roles: HashMap::new(),
             openrouter_tools_catalog: None,
             default_agent_profile: AgentProfile::default(),
@@ -14137,6 +14140,27 @@ mod tests {
 
     /// No route configured (the default, and the Cortex hotel itself):
     /// every write proceeds locally.
+    #[tokio::test]
+    async fn deterministic_capture_budget_caps_per_day() {
+        let (mut runtime, _emitted, server, socket_path) = plan_test_runtime("capbudget").await;
+        let cap = super::memory_integration::DETERMINISTIC_CAPTURE_DAILY_CAP;
+        for _ in 0..cap {
+            assert!(runtime.take_deterministic_capture_budget());
+        }
+        assert!(
+            !runtime.take_deterministic_capture_budget(),
+            "the cap must hold within a day"
+        );
+        // A new UTC day resets the budget.
+        runtime.deterministic_capture_budget.0 =
+            runtime.deterministic_capture_budget.0.saturating_sub(1);
+        assert!(runtime.take_deterministic_capture_budget());
+
+        drop(runtime);
+        let _ = server.await;
+        let _ = std::fs::remove_file(&socket_path);
+    }
+
     #[tokio::test]
     async fn shared_scope_write_stays_local_without_route() {
         let (mut runtime, emitted, server, socket_path) = plan_test_runtime("memnoroute").await;

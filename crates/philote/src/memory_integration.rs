@@ -767,6 +767,9 @@ pub(super) enum ForwardOutcome {
 /// them. Oldest are dropped (with a warning) past this bound.
 pub(super) const PENDING_MEMORY_FORWARDS_MAX: usize = 200;
 
+/// Per-agent daily cap on deterministic operator-fact captures (Phase 2 M5).
+pub(super) const DETERMINISTIC_CAPTURE_DAILY_CAP: usize = 10;
+
 #[derive(Debug, Clone, PartialEq)]
 pub(super) struct DirectLifeObserveCommand {
     pub(super) label: String,
@@ -1667,36 +1670,46 @@ impl AgentRuntime {
 
         let capture_session = task.session_id_or_default(&self.agent_id);
         let agent_user = self.agent_id.clone();
-        let result_text = match self
-            .forward_shared_memory_write(
-                &MemoryScope::SelfOnly,
-                &agent_user,
-                &concept,
-                &capture_text,
-                &tags,
-                &serde_json::Value::Null,
-                &capture_session,
-            )
-            .await
-        {
-            ForwardOutcome::Forwarded(_) => {
-                "Captured to memory (routed to the cluster primary).".to_string()
-            }
-            ForwardOutcome::Queued { .. } => {
-                "Capture queued for the cluster primary; it will be stored on retry.".to_string()
-            }
-            ForwardOutcome::NotApplicable => {
-                match self.memory_engine_for(&self.agent_id, &self.agent_id) {
-                    None => "Captured (Muninn not configured on this node).".to_string(),
-                    Some(engine) => {
-                        match engine
-                            .remember(MemoryScope::SelfOnly, &concept, &capture_text, tags)
-                            .await
-                        {
-                            Ok(engram_ref) => {
-                                format!("Captured to memory (id: {}).", engram_ref.id)
+        // Phase 2 M5: smoke tests and routing probes were landing in persona
+        // self vaults and being recalled into unrelated operator turns.
+        let diagnostic =
+            memory_core::write_hygiene::is_diagnostic_capture(&concept, &capture_text, &tags);
+        let result_text = if diagnostic {
+            info!(concept = %concept, "context.capture: diagnostic capture acknowledged, not stored");
+            "Diagnostic capture acknowledged (not stored in memory).".to_string()
+        } else {
+            match self
+                .forward_shared_memory_write(
+                    &MemoryScope::SelfOnly,
+                    &agent_user,
+                    &concept,
+                    &capture_text,
+                    &tags,
+                    &serde_json::Value::Null,
+                    &capture_session,
+                )
+                .await
+            {
+                ForwardOutcome::Forwarded(_) => {
+                    "Captured to memory (routed to the cluster primary).".to_string()
+                }
+                ForwardOutcome::Queued { .. } => {
+                    "Capture queued for the cluster primary; it will be stored on retry."
+                        .to_string()
+                }
+                ForwardOutcome::NotApplicable => {
+                    match self.memory_engine_for(&self.agent_id, &self.agent_id) {
+                        None => "Captured (Muninn not configured on this node).".to_string(),
+                        Some(engine) => {
+                            match engine
+                                .remember(MemoryScope::SelfOnly, &concept, &capture_text, tags)
+                                .await
+                            {
+                                Ok(engram_ref) => {
+                                    format!("Captured to memory (id: {}).", engram_ref.id)
+                                }
+                                Err(e) => format!("context.capture: memory error — {e}"),
                             }
-                            Err(e) => format!("context.capture: memory error — {e}"),
                         }
                     }
                 }
@@ -2432,6 +2445,24 @@ impl AgentRuntime {
             vault,
             cortex: route,
         }
+    }
+
+    /// Spend one deterministic operator-fact capture from today's budget.
+    /// False when the per-agent daily cap is reached: the classifier is a
+    /// high-precision floor, and a runaway pattern must not flood the store.
+    pub(super) fn take_deterministic_capture_budget(&mut self) -> bool {
+        let today = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() / 86_400)
+            .unwrap_or(0);
+        if self.deterministic_capture_budget.0 != today {
+            self.deterministic_capture_budget = (today, 0);
+        }
+        if self.deterministic_capture_budget.1 >= DETERMINISTIC_CAPTURE_DAILY_CAP {
+            return false;
+        }
+        self.deterministic_capture_budget.1 += 1;
+        true
     }
 
     /// Send one `memory.write_forward` EmitTask. True when the local hotel

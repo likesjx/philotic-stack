@@ -4,6 +4,7 @@ pub mod null;
 pub mod recall;
 pub mod rest_client;
 pub mod types;
+pub mod write_hygiene;
 
 // ──── Re-exports ──────────────────────────────────────────────────────────────
 

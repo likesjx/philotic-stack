@@ -4270,32 +4270,109 @@ impl AgentRuntime {
             }
         }
 
-        // Attend hook (Slice E): fire-and-forget autobiographical memory write.
-        // Only saves when the model provided an explicit memory_candidate — raw turn
-        // content is never written as a fallback so the vault stays signal-only.
-        if let (Some(engine), Some(candidate)) = (
-            self.memory_engine_for(&self.agent_id, &self.agent_id),
-            memory_candidate,
-        ) {
+        // Attend hook (Slice E): autobiographical memory write.
+        // Saves the model's explicit `memory_candidate` when it gave one. When it
+        // did not, a conservative deterministic classifier (S3) may capture an
+        // explicit operator fact ("remember that …", "my X is Y", "I prefer …")
+        // into the operator's user vault. Raw turn content is never written.
+        let attend_turn_is_operator = !crate::runtime::distill::turn_is_distill(&distill_snapshot)
+            && !distill_snapshot
+                .user_content
+                .trim_start()
+                .starts_with("[Plan continuation");
+        let attend_operator_id = distill_snapshot
+            .primary_user_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|id| !id.is_empty())
+            .map(str::to_string);
+
+        let attend_write: Option<(
+            MemoryScope,
+            String,
+            String,
+            String,
+            Vec<String>,
+            serde_json::Value,
+        )> = match memory_candidate {
+            Some(candidate) => {
+                let concept = memory_concept.unwrap_or(candidate.concept);
+                let content = candidate.content;
+                let mut tags = vec![
+                    format!("agent:{}", self.agent_id),
+                    format!("session:{}", attend_session_id),
+                ];
+                tags.extend(candidate.tags);
+                if memory_core::write_hygiene::is_diagnostic_capture(&concept, &content, &tags) {
+                    info!(agent = %self.agent_id, concept = %concept, "Attend: skipping diagnostic memory candidate");
+                    None
+                } else if memory_core::write_hygiene::exceeds_auto_capture_limit(&content) {
+                    warn!(agent = %self.agent_id, concept = %concept, chars = content.chars().count(), "Attend: skipping non-atomic memory candidate (too long)");
+                    None
+                } else {
+                    let concept = memory_core::write_hygiene::distinct_concept(&concept, &content);
+                    Some((
+                        MemoryScope::SelfOnly,
+                        self.agent_id.clone(),
+                        concept,
+                        content,
+                        tags,
+                        serde_json::Value::Null,
+                    ))
+                }
+            }
+            None => match (attend_turn_is_operator, attend_operator_id.as_deref()) {
+                (true, Some(operator_id)) => {
+                    match super::deterministic_capture::classify_operator_fact(
+                        &distill_snapshot.user_content,
+                    ) {
+                        Some(fact) if self.take_deterministic_capture_budget() => {
+                            let tags = vec![
+                                format!("agent:{}", self.agent_id),
+                                format!("session:{}", attend_session_id),
+                                "deterministic-capture".to_string(),
+                                fact.kind.to_string(),
+                            ];
+                            let concept = memory_core::write_hygiene::distinct_concept(
+                                &fact.concept,
+                                &fact.content,
+                            );
+                            info!(agent = %self.agent_id, concept = %concept, "Attend: deterministic operator-fact capture");
+                            Some((
+                                MemoryScope::SharedUser,
+                                operator_id.to_string(),
+                                concept,
+                                fact.content,
+                                tags,
+                                serde_json::json!({
+                                    "importance": super::deterministic_capture::DETERMINISTIC_CAPTURE_IMPORTANCE,
+                                    "capture": "deterministic",
+                                }),
+                            ))
+                        }
+                        Some(_) => {
+                            info!(agent = %self.agent_id, "Attend: deterministic capture daily budget spent — skipping");
+                            None
+                        }
+                        None => None,
+                    }
+                }
+                _ => None,
+            },
+        };
+
+        if let Some((scope, memory_user_id, concept, content, tags, metadata)) = attend_write {
             let agent_id = self.agent_id.clone();
-            let mut tags = vec![
-                format!("agent:{}", agent_id),
-                format!("session:{}", attend_session_id),
-            ];
-            tags.extend(candidate.tags);
-            let concept = memory_concept.unwrap_or(candidate.concept);
-            let content_snapshot = candidate.content;
-            // Phase 2 M4: on an observer hotel the self vault lives on the
-            // Cortex; a local write here was rejected with 421 and lost.
-            let agent_user = agent_id.clone();
+            // Phase 2 M4: on an observer hotel the vault lives on the Cortex; a
+            // local write here was rejected with 421 and lost.
             match self
                 .forward_shared_memory_write(
-                    &MemoryScope::SelfOnly,
-                    &agent_user,
+                    &scope,
+                    &memory_user_id,
                     &concept,
-                    &content_snapshot,
+                    &content,
                     &tags,
-                    &serde_json::Value::Null,
+                    &metadata,
                     &attend_session_id,
                 )
                 .await
@@ -4307,20 +4384,22 @@ impl AgentRuntime {
                     warn!(agent = %agent_id, concept = %concept, "Attend: memory write queued for the cluster primary");
                 }
                 super::memory_integration::ForwardOutcome::NotApplicable => {
-                    tokio::spawn(async move {
-                        use memory_core::MemoryEngine as _;
-                        match engine
-                            .remember(MemoryScope::SelfOnly, &concept, &content_snapshot, tags)
-                            .await
-                        {
-                            Ok(engram) => {
-                                info!(agent = %agent_id, id = %engram.id, "Attend: memory written")
+                    if let Some(engine) = self.memory_engine_for(&agent_id, &memory_user_id) {
+                        tokio::spawn(async move {
+                            use memory_core::MemoryEngine as _;
+                            match engine
+                                .remember_with_metadata(scope, &concept, &content, tags, metadata)
+                                .await
+                            {
+                                Ok(engram) => {
+                                    info!(agent = %agent_id, id = %engram.id, "Attend: memory written")
+                                }
+                                Err(e) => {
+                                    warn!(agent = %agent_id, error = %e, "Attend: memory write failed (non-fatal)")
+                                }
                             }
-                            Err(e) => {
-                                warn!(agent = %agent_id, error = %e, "Attend: memory write failed (non-fatal)")
-                            }
-                        }
-                    });
+                        });
+                    }
                 }
             }
         }
