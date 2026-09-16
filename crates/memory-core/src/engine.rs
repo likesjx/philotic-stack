@@ -154,10 +154,16 @@ pub trait MemoryEngine: Send + Sync {
         let activation = self
             .activate(&query, context.scope.clone(), decision.limit)
             .await?;
+        let mut engrams = activation.engrams;
+        // Automatic recall is gated; an explicit recall shows what the caller
+        // asked for (the projection labels bands).
+        if !matches!(context.trigger, crate::RecallTrigger::ExplicitToolCall) {
+            crate::retain_turn_relevant(&mut engrams);
+        }
 
         Ok(TurnRecallResult {
             decision,
-            engrams: activation.engrams,
+            engrams,
             total: activation.total,
         })
     }

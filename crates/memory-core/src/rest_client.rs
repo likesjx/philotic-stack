@@ -274,10 +274,48 @@ struct ActivationItem {
     /// which case cross-scope ranking degrades to recency + confidence.
     #[serde(default)]
     score: f64,
+    /// Absolute relevance band (Muninn #773, v0.11.0+): `strong` | `moderate`
+    /// | `weak` | `filter_match` | `uncalibrated`. Derived from the vault's own
+    /// calibration, so unlike `score` (renormalized per query per vault, top
+    /// row ~1.0 in every vault) it is comparable across vaults.
+    #[serde(default)]
+    relevance_band: Option<String>,
+    /// Activation rows carry nanoseconds; see [`epoch_to_secs`].
+    #[serde(default)]
     created_at: i64,
     updated_at: Option<i64>,
     #[serde(default)]
     metadata: serde_json::Value,
+}
+
+/// Normalize a Muninn epoch timestamp to seconds. Muninn's activation rows
+/// carry `UnixNano` while engram reads carry `Unix` seconds; treating the
+/// nanosecond value as seconds froze the recency tiebreak and showed the model
+/// a 19-digit "unix_ms". Detect the unit by magnitude.
+pub(crate) fn epoch_to_secs(value: i64) -> u64 {
+    let v = value.max(0) as u64;
+    if v >= 100_000_000_000_000_000 {
+        v / 1_000_000_000 // nanoseconds
+    } else if v >= 100_000_000_000_000 {
+        v / 1_000_000 // microseconds
+    } else if v >= 100_000_000_000 {
+        v / 1_000 // milliseconds
+    } else {
+        v
+    }
+}
+
+/// Rank of a relevance band for cross-vault merging; higher is better.
+/// Missing (older server) and non-judging bands sit between moderate and weak
+/// so that an unknown never outranks a calibrated strong/moderate match, and a
+/// calibrated weak match never outranks an unknown.
+pub(crate) fn relevance_band_rank(band: Option<&str>) -> u8 {
+    match band {
+        Some("strong") => 4,
+        Some("moderate") | Some("filter_match") => 3,
+        Some("weak") => 1,
+        _ => 2,
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -341,6 +379,22 @@ impl From<ActivationItem> for Engram {
                 ann.insert("possibly_superseded_by".into(), serde_json::json!(psb));
             }
         }
+        // Retrieval statistics for this activation (not stored truth): the
+        // turn-recall gate and telemetry read `metadata.recall`.
+        if !metadata.is_object() {
+            metadata = serde_json::json!({});
+        }
+        metadata
+            .as_object_mut()
+            .expect("metadata is an object")
+            .insert(
+                crate::RECALL_METADATA_KEY.into(),
+                serde_json::json!({
+                    "band": item.relevance_band,
+                    "score": item.score,
+                }),
+            );
+        let created_at = epoch_to_secs(item.created_at);
         Engram {
             id: item.id.clone(),
             vault_id: String::new(), // not returned by activate; filled by context
@@ -348,8 +402,8 @@ impl From<ActivationItem> for Engram {
             content: item.content,
             tags: item.tags,
             confidence: item.confidence,
-            created_at: item.created_at as u64,
-            updated_at: item.updated_at.unwrap_or(item.created_at) as u64,
+            created_at,
+            updated_at: item.updated_at.map(epoch_to_secs).unwrap_or(created_at),
             metadata,
         }
     }
@@ -364,8 +418,8 @@ impl From<ReadResponse> for Engram {
             content: r.content,
             tags: r.tags,
             confidence: r.confidence,
-            created_at: r.created_at as u64,
-            updated_at: r.updated_at.unwrap_or(r.created_at) as u64,
+            created_at: epoch_to_secs(r.created_at),
+            updated_at: epoch_to_secs(r.updated_at.unwrap_or(r.created_at)),
             metadata: r.metadata,
         }
     }
@@ -1117,10 +1171,21 @@ impl MemoryEngine for MuninnRestEngine {
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_secs())
                 .unwrap_or(0);
+            // Band first: `score` is renormalized per query per vault (every
+            // vault's top row is ~1.0), so it is only comparable inside one
+            // vault. The absolute band is calibrated and comparable across.
             all_engrams.sort_by(|(score_a, a), (score_b, b)| {
-                cross_scope_rank_score(*score_b, b.confidence, b.updated_at, now_secs).total_cmp(
-                    &cross_scope_rank_score(*score_a, a.confidence, a.updated_at, now_secs),
-                )
+                let band_a = relevance_band_rank(crate::engram_relevance_band(a));
+                let band_b = relevance_band_rank(crate::engram_relevance_band(b));
+                band_b.cmp(&band_a).then_with(|| {
+                    cross_scope_rank_score(*score_b, b.confidence, b.updated_at, now_secs)
+                        .total_cmp(&cross_scope_rank_score(
+                            *score_a,
+                            a.confidence,
+                            a.updated_at,
+                            now_secs,
+                        ))
+                })
             });
             if let Some(m) = max {
                 all_engrams.truncate(m);
@@ -1424,6 +1489,108 @@ mod tests {
             .await
             .expect_err("all-401 cross-scope must error");
         assert!(token_rejected_vault(&err).is_some());
+    }
+
+    #[test]
+    fn epoch_to_secs_detects_unit_by_magnitude() {
+        let secs = 1_779_888_583_i64;
+        assert_eq!(epoch_to_secs(secs), secs as u64);
+        assert_eq!(epoch_to_secs(secs * 1_000), secs as u64);
+        assert_eq!(epoch_to_secs(secs * 1_000_000), secs as u64);
+        assert_eq!(epoch_to_secs(secs * 1_000_000_000), secs as u64);
+        assert_eq!(epoch_to_secs(-5), 0);
+    }
+
+    #[test]
+    fn relevance_band_rank_orders_calibrated_bands() {
+        assert!(relevance_band_rank(Some("strong")) > relevance_band_rank(Some("moderate")));
+        assert!(relevance_band_rank(Some("moderate")) > relevance_band_rank(None));
+        assert!(relevance_band_rank(None) > relevance_band_rank(Some("weak")));
+        assert_eq!(
+            relevance_band_rank(Some("uncalibrated")),
+            relevance_band_rank(None)
+        );
+    }
+
+    /// One vault's response: a high-score WEAK row first (the per-vault score
+    /// is renormalized, so a weak best-row still scores ~1.0) and a lower-score
+    /// STRONG row, both with nanosecond timestamps as activation rows carry.
+    const MIXED_BAND_ACTIVATION: &str = r#"{"total_found":2,"activations":[
+        {"id":"01WEAK","concept":"weak","content":"off-topic","confidence":1.0,
+         "score":0.99,"relevance_band":"weak","created_at":1779888583525039000},
+        {"id":"01STRONG","concept":"strong","content":"on-topic","confidence":0.6,
+         "score":0.31,"relevance_band":"strong","created_at":1779888583525039000}
+    ]}"#;
+
+    #[tokio::test]
+    async fn cross_scope_merge_ranks_by_band_before_score_and_turn_gate_drops_weak() {
+        let engine = engine_against(spawn_canned_server(200, MIXED_BAND_ACTIVATION));
+        let scope = MemoryScope::CrossScope(vec![MemoryScope::SelfOnly, MemoryScope::SharedUser]);
+
+        let merged = engine
+            .activate("organ practice", scope.clone(), Some(5))
+            .await
+            .expect("activate");
+        let order: Vec<&str> = merged.engrams.iter().map(|e| e.id.as_str()).collect();
+        assert_eq!(order, vec!["01STRONG", "01STRONG", "01WEAK", "01WEAK"]);
+        assert_eq!(merged.engrams[0].created_at, 1_779_888_583);
+        assert_eq!(
+            crate::engram_relevance_band(&merged.engrams[0]),
+            Some("strong")
+        );
+        assert_eq!(crate::engram_recall_score(&merged.engrams[0]), Some(0.31));
+
+        let turn = engine
+            .recall_for_turn(&crate::RecallContext {
+                trigger: crate::RecallTrigger::UserTurnStart,
+                scope,
+                recall_seed_text: "practising organ tonight".into(),
+                active_goal: None,
+                role_name: Some("orchestrator".into()),
+                recent_turns: vec![],
+                local_memory_summaries: vec![],
+                tool_history_summary: vec![],
+                lens: None,
+            })
+            .await
+            .expect("recall_for_turn");
+        assert!(
+            turn.engrams
+                .iter()
+                .all(|e| crate::engram_relevance_band(e) != Some("weak")),
+            "turn recall must not inject weak matches"
+        );
+        assert_eq!(turn.engrams.len(), 2);
+    }
+
+    #[test]
+    fn turn_gate_drops_superseded_and_keeps_unknown_bands() {
+        let mk = |id: &str, metadata: serde_json::Value| Engram {
+            id: id.into(),
+            vault_id: "v".into(),
+            concept: id.into(),
+            content: "x".into(),
+            tags: vec![],
+            confidence: 1.0,
+            created_at: 0,
+            updated_at: 0,
+            metadata,
+        };
+        let mut engrams = vec![
+            mk(
+                "old",
+                serde_json::json!({"annotations": {"superseded_by": "new"}}),
+            ),
+            mk("legacy", serde_json::json!({})),
+            mk(
+                "uncal",
+                serde_json::json!({"recall": {"band": "uncalibrated"}}),
+            ),
+            mk("weak", serde_json::json!({"recall": {"band": "weak"}})),
+        ];
+        assert_eq!(crate::retain_turn_relevant(&mut engrams), 2);
+        let kept: Vec<&str> = engrams.iter().map(|e| e.id.as_str()).collect();
+        assert_eq!(kept, vec!["legacy", "uncal"]);
     }
 
     #[tokio::test]

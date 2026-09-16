@@ -14,7 +14,9 @@ pub use cognitive::{
 pub use engine::MemoryEngine;
 pub use null::NullMemoryEngine;
 pub use recall::{
-    RecallContext, RecallDecision, RecallMode, RecallTrigger, TurnRecallResult, evaluate_recall,
+    RECALL_METADATA_KEY, RecallContext, RecallDecision, RecallMode, RecallTrigger,
+    TurnRecallResult, engram_recall_score, engram_relevance_band, evaluate_recall,
+    retain_turn_relevant,
 };
 pub use rest_client::{
     MuninnConfig, MuninnRestEngine, TokenRejected, VaultResolver, is_fleet_shared_vault,
