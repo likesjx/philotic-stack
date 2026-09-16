@@ -397,7 +397,9 @@ field:
   `turn_loop::LIFE_WRITE_TOOLS` disagree with each other and with the runner
   (`.feedback` listed read-only though `life.recall.feedback` writes;
   `graph.query`, a read, and `graph.mutate`, defined nowhere, listed as
-  writes). The record field must pick one truth.
+  writes). The record field must pick one truth: the runner's own
+  `LifeGraphToolName::mutates_graph()` is the source, because it is the only
+  one of the three the write path actually obeys; seed `mutates` from it.
 - Artifact-id argument pointers for write receipts (`uncited_writes`).
 - Skill ownership / relevance (`tools_for_skill`, `skill_implied_tools`,
   `skill_is_relevant_for_turn`) from records.
@@ -409,9 +411,10 @@ field:
   mac-jane 2026-09-16 that is four: `hotel.best_place_to_run` (a real local tool,
   implied by skills, never defined in any catalog — it needs a catalog entry) and
   `life.capture`, `life.flywheel.brief`, `life.flywheel.review` (orphans from older
-  binaries; no current code defines them). The philote registry now serves their
-  stale descriptions. Next: add the real one to the file and have the loader mark
-  unnamed records stale instead of silently keeping them.
+  binaries; no current code defines them). `hotel.best_place_to_run` is now in the
+  file (class `session`: a read-only recommendation must not inherit `config`
+  approval once class moves to records). Next: have the loader mark unnamed
+  records stale instead of silently keeping them.
 
 ## Implementation Phasing
 

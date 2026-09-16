@@ -2747,6 +2747,50 @@ mod tests {
         assert_eq!(v.verified_count(), 0);
     }
 
+    /// Replay of the LIVE payload (captured from the hotel DB): the plan that
+    /// reported "stopped, 0/2 verified" now verifies both steps when the
+    /// catalog declares life.observe.batch as a batch of life.observe.
+    #[test]
+    fn live_2026_09_16_batch_turn_replays_to_two_verified_steps() {
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../tests/fixtures/live_observe_batch_2026_09_16.json"
+        ))
+        .expect("fixture parses");
+        let steps: Vec<(String, String)> = fixture["plan_steps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|s| {
+                (
+                    s["description"].as_str().unwrap().to_string(),
+                    s["tool_name"].as_str().unwrap().to_string(),
+                )
+            })
+            .collect();
+        let step_refs: Vec<(&str, Option<&str>, &str)> = steps
+            .iter()
+            .map(|(d, t)| (d.as_str(), Some(t.as_str()), "done"))
+            .collect();
+        let p = plan("executing", &step_refs);
+        let history = vec![(
+            ToolCall {
+                tool_name: "life.observe.batch".into(),
+                arguments: fixture["call_arguments"].clone(),
+            },
+            ToolResult {
+                tool_name: "life.observe.batch".into(),
+                content: fixture["result_content"].as_str().unwrap().to_string(),
+            },
+        )];
+
+        let before = verify_plan_steps_with_batches(&p, &history, &[], &|_| None);
+        assert_eq!(before.verified_count(), 0, "reproduces the live 0/2");
+
+        let after = verify_plan_steps_with_batches(&p, &history, &[], &observe_batch_of);
+        assert_eq!(after.verified_count(), 2, "{:?}", after.evidence);
+        assert!(evaluate_whole_plan(&p, &after).complete);
+    }
+
     #[test]
     fn rejected_or_unattempted_batch_items_do_not_verify_their_steps() {
         let p = plan(
