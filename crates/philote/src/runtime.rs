@@ -1625,6 +1625,11 @@ pub struct AgentRuntime {
     /// Tracks hotel-broadcast MuninnDB reachability. False = hotel reported endpoint down.
     /// When false, `memory_engine_for` returns None even if `muninn_config` is set.
     muninn_available: bool,
+    /// Memory writes routed to the Cortex whose EmitTask could not be enqueued
+    /// yet: `(target_node, task_json)`, oldest first. Re-sent before every new
+    /// forward and at turn start. In-memory only (bounded) — the mesh ledger is
+    /// the durable queue once the local hotel accepts the task.
+    pending_memory_forwards: std::collections::VecDeque<(String, String)>,
     /// Role configurations registered via `role.configure`, keyed by role_name.
     configured_roles: HashMap<String, CachedRoleConfig>,
     /// Cached hotel-owned OpenRouter catalog snapshot for `/model` display:
@@ -2001,6 +2006,7 @@ impl AgentRuntime {
             sessions: HashMap::new(),
             muninn_config: None,
             muninn_available: true,
+            pending_memory_forwards: std::collections::VecDeque::new(),
             configured_roles: HashMap::new(),
             openrouter_tools_catalog: None,
             default_agent_profile: AgentProfile::default(),
@@ -14071,9 +14077,10 @@ mod tests {
             );
         }
 
-        // Self-scope writes stay local even with a route configured — agent
-        // vaults are per-host by design (the vault registry never replicates).
-        let not_routed = runtime
+        // Phase 2 M4: self-scope writes are routed too. Observer replicas
+        // reject writes (HTTP 421), so a local self-vault write on a Mac hotel
+        // was lost; the agent's self vault exists on the Cortex.
+        let self_routed = runtime
             .forward_shared_memory_write(
                 &memory_core::MemoryScope::SelfOnly,
                 "likesjx",
@@ -14086,10 +14093,41 @@ mod tests {
             .await;
         assert!(
             matches!(
-                not_routed,
+                self_routed,
+                super::memory_integration::ForwardOutcome::Forwarded(_)
+            ),
+            "SelfOnly write must be forwarded when a route is configured"
+        );
+        {
+            let emitted = emitted.lock().unwrap();
+            let fwd = emitted
+                .iter()
+                .filter(|e| e["target_role"] == philotic_client::MEMORY_WRITE_FORWARD_ROLE)
+                .last()
+                .expect("self-scope forward present");
+            let vault = fwd["task"]["vault"].as_str().unwrap_or_default();
+            assert!(vault.starts_with("self_"), "{vault}");
+        }
+
+        // Session-scope writes stay local: per-session scratch vaults would
+        // mint throwaway tokens on the primary.
+        let session_local = runtime
+            .forward_shared_memory_write(
+                &memory_core::MemoryScope::Session("sess-memroute".into()),
+                "likesjx",
+                "session concept",
+                "session content",
+                &[],
+                &serde_json::Value::Null,
+                "sess-memroute",
+            )
+            .await;
+        assert!(
+            matches!(
+                session_local,
                 super::memory_integration::ForwardOutcome::NotApplicable
             ),
-            "SelfOnly write must stay local"
+            "Session write must stay local"
         );
 
         drop(runtime);

@@ -19,8 +19,8 @@ pub use recall::{
     retain_turn_relevant,
 };
 pub use rest_client::{
-    MuninnConfig, MuninnRestEngine, TokenRejected, VaultResolver, is_fleet_shared_vault,
-    token_rejected_vault,
+    MuninnConfig, MuninnRestEngine, TokenRejected, VaultResolver, is_cortex_routable_vault,
+    is_fleet_shared_vault, token_rejected_vault,
 };
 pub use types::{
     ActivationResult, AgentId, AttentionalLens, CognitiveOutcome, Engram, EngramId, EngramRef,

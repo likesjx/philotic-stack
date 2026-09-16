@@ -57,6 +57,25 @@ pub fn is_fleet_shared_vault(vault: &str) -> bool {
     vault == "default" || vault == "fleet_knowledge" || vault.starts_with("user_")
 }
 
+/// Whether a write to `vault` must be routed to the cluster primary when the
+/// hotel runs an observer replica.
+///
+/// Phase 2 M4 (2026-09-16 audit): Muninn observers reject every write with
+/// 421, so agent `self_*` vaults — which exist on the Cortex (the vault set and
+/// auth store replicate; only the hotel's token registry is per-host) — must be
+/// forwarded too. On Mac hotels the old shared-only rule silently dropped every
+/// automatic memory write. `session_*` vaults stay local: they are per-session
+/// scratch and would mint throwaway tokens on the primary. Names are also
+/// validated so a forwarded op can never address a non-memory registry entry.
+pub fn is_cortex_routable_vault(vault: &str) -> bool {
+    let well_formed = !vault.is_empty()
+        && vault.len() <= 128
+        && vault
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'));
+    well_formed && (is_fleet_shared_vault(vault) || (vault.starts_with("self_") && vault.len() > 5))
+}
+
 impl MuninnConfig {
     pub fn local(default_vault: impl Into<String>) -> Self {
         Self {
@@ -2180,6 +2199,32 @@ mod shared_write_route_tests {
         assert!(!is_fleet_shared_vault("self_agent-aria"));
         assert!(!is_fleet_shared_vault("session_01abc"));
         assert!(!is_fleet_shared_vault("user")); // no underscore suffix — not a user vault
+    }
+
+    #[test]
+    fn cortex_routable_vault_predicate() {
+        for routable in [
+            "default",
+            "fleet_knowledge",
+            "user_likesjx",
+            "self_agent-bjork-01",
+            "self_agent-coach",
+        ] {
+            assert!(is_cortex_routable_vault(routable), "{routable}");
+        }
+        for local_or_refused in [
+            "session_01abc",
+            "self_",
+            "openai_api_key",
+            "integration/integration-smoke",
+            "self_agent bjork",
+            "",
+        ] {
+            assert!(
+                !is_cortex_routable_vault(local_or_refused),
+                "{local_or_refused:?}"
+            );
+        }
     }
 
     /// Wire compat: configs serialized before `shared_write_route` existed

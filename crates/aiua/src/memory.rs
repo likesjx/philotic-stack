@@ -222,6 +222,71 @@ pub fn parse_forwarded_write_op(payload: &serde_json::Value) -> Result<Forwarded
     }
 }
 
+/// The vault a forwarded op writes into, when the op names one (`evolve` and
+/// `forget` address an engram id instead).
+pub fn forwarded_target_vault(op: &ForwardedWriteOp) -> Option<&str> {
+    match op {
+        ForwardedWriteOp::Remember { vault, .. }
+        | ForwardedWriteOp::RememberBatch { vault, .. } => Some(vault.as_str()),
+        ForwardedWriteOp::Evolve { .. } | ForwardedWriteOp::Forget { .. } => None,
+    }
+}
+
+/// Why a forwarded write's vault may not be provisioned here. Pure, so the
+/// safety rules are unit-testable without MuninnDB.
+pub fn forwarded_vault_provision_refusal(
+    vault: &str,
+    registered_vault_names: &[String],
+) -> Option<String> {
+    if !memory_core::is_cortex_routable_vault(vault) {
+        return Some(format!(
+            "vault {vault:?} is not a routable memory vault (default, fleet_knowledge, user_*, self_*)"
+        ));
+    }
+    if registered_vault_names.iter().any(|name| name == vault) {
+        // Registered but the config carries no token: the entry is not a
+        // Muninn vault token (e.g. an API-key secret sharing the name) or its
+        // secret is unreadable. Never overwrite it from a mesh request.
+        return Some(format!(
+            "vault {vault:?} is registered here without a usable Muninn token — refusing to re-provision it from a forwarded write"
+        ));
+    }
+    None
+}
+
+/// Provision a Muninn token for a vault first seen in a forwarded write.
+async fn ensure_forwarded_vault_provisioned(
+    graph: &GraphDomain,
+    endpoint: &str,
+    vault: &str,
+) -> Result<()> {
+    let registered: Vec<String> = graph
+        .get_vault_registry()?
+        .into_iter()
+        .map(|entry| entry.vault_name)
+        .collect();
+    if let Some(reason) = forwarded_vault_provision_refusal(vault, &registered) {
+        anyhow::bail!("memory.write_forward: {reason}");
+    }
+    let credential = crate::muninn_provision::resolve_admin_credential(graph)?.ok_or_else(|| {
+        anyhow::anyhow!(
+            "memory.write_forward: no MuninnDB admin credential on this hotel — cannot provision vault {vault}"
+        )
+    })?;
+    tracing::info!(
+        vault = %vault,
+        "memory.write_forward: provisioning a token for a vault first seen in a forwarded write"
+    );
+    crate::muninn_provision::provision_muninn_vaults(
+        graph,
+        endpoint,
+        &credential.username,
+        &credential.password,
+        vec![vault.to_string()],
+    )
+    .await
+}
+
 /// Apply a mesh-forwarded shared-vault memory write to THIS hotel's muninn —
 /// the Cortex-side of `MuninnConfig::shared_write_route` (single-writer
 /// routing). The payload is the `memory.write_forward` task JSON emitted by a
@@ -234,8 +299,20 @@ pub async fn apply_forwarded_write(graph: &GraphDomain, task_json: &str) -> Resu
     let payload: serde_json::Value = serde_json::from_str(task_json)?;
     let parsed = parse_forwarded_write_op(&payload)?;
 
-    let config = load_muninn_config(graph)?
+    let mut config = load_muninn_config(graph)?
         .ok_or_else(|| anyhow::anyhow!("memory.write_forward: MuninnDB not configured here"))?;
+
+    // Phase 2 M4: observer hotels now forward agent `self_*` writes as well.
+    // This hotel's token registry only holds its own agents' vaults, so
+    // provision a token for a forwarded vault the first time it arrives.
+    if let Some(vault) = forwarded_target_vault(&parsed)
+        && !config.vault_tokens.contains_key(vault)
+    {
+        ensure_forwarded_vault_provisioned(graph, &config.base_url, vault).await?;
+        config = load_muninn_config(graph)?.ok_or_else(|| {
+            anyhow::anyhow!("memory.write_forward: MuninnDB config vanished after provisioning")
+        })?;
+    }
     let engine = engine_for_agent(config, "hotel", "hotel");
 
     match parsed {
@@ -351,6 +428,42 @@ mod tests {
         assert!(
             parse_forwarded_write_op(&serde_json::json!({"op":"remember","concept":"c"})).is_err()
         );
+    }
+
+    #[test]
+    fn forwarded_vault_provisioning_is_limited_to_unregistered_memory_vaults() {
+        let registered = vec![
+            "self_agent-beacon".to_string(),
+            "openai_api_key".to_string(),
+        ];
+        // Mac agents' self vaults arriving at the Cortex hotel: allowed.
+        assert_eq!(
+            forwarded_vault_provision_refusal("self_agent-bjork-01", &registered),
+            None
+        );
+        assert_eq!(
+            forwarded_vault_provision_refusal("fleet_knowledge", &registered),
+            None
+        );
+        // Non-memory registry names and malformed names: refused.
+        assert!(forwarded_vault_provision_refusal("openai_api_key", &registered).is_some());
+        assert!(forwarded_vault_provision_refusal("integration/x", &registered).is_some());
+        assert!(forwarded_vault_provision_refusal("session_01abc", &registered).is_some());
+        // Registered but tokenless: never overwritten from a mesh request.
+        let tokenless = vec!["user_likesjx".to_string()];
+        assert!(forwarded_vault_provision_refusal("user_likesjx", &tokenless).is_some());
+    }
+
+    #[test]
+    fn forwarded_target_vault_only_for_vault_addressed_ops() {
+        let remember = parse_forwarded_write_op(&serde_json::json!({
+            "op": "remember", "vault": "self_agent-coach", "concept": "c", "content": "x"
+        }))
+        .unwrap();
+        assert_eq!(forwarded_target_vault(&remember), Some("self_agent-coach"));
+        let forget =
+            parse_forwarded_write_op(&serde_json::json!({"op": "forget", "id": "01X"})).unwrap();
+        assert_eq!(forwarded_target_vault(&forget), None);
     }
 
     #[tokio::test]

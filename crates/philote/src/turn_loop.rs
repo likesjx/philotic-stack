@@ -4285,15 +4285,44 @@ impl AgentRuntime {
             tags.extend(candidate.tags);
             let concept = memory_concept.unwrap_or(candidate.concept);
             let content_snapshot = candidate.content;
-            tokio::spawn(async move {
-                use memory_core::MemoryEngine as _;
-                if let Err(e) = engine
-                    .remember(MemoryScope::SelfOnly, &concept, &content_snapshot, tags)
-                    .await
-                {
-                    warn!(agent = %agent_id, error = %e, "Attend: memory write failed (non-fatal)");
+            // Phase 2 M4: on an observer hotel the self vault lives on the
+            // Cortex; a local write here was rejected with 421 and lost.
+            let agent_user = agent_id.clone();
+            match self
+                .forward_shared_memory_write(
+                    &MemoryScope::SelfOnly,
+                    &agent_user,
+                    &concept,
+                    &content_snapshot,
+                    &tags,
+                    &serde_json::Value::Null,
+                    &attend_session_id,
+                )
+                .await
+            {
+                super::memory_integration::ForwardOutcome::Forwarded(_) => {
+                    info!(agent = %agent_id, concept = %concept, "Attend: memory write forwarded to cluster primary");
                 }
-            });
+                super::memory_integration::ForwardOutcome::Queued { .. } => {
+                    warn!(agent = %agent_id, concept = %concept, "Attend: memory write queued for the cluster primary");
+                }
+                super::memory_integration::ForwardOutcome::NotApplicable => {
+                    tokio::spawn(async move {
+                        use memory_core::MemoryEngine as _;
+                        match engine
+                            .remember(MemoryScope::SelfOnly, &concept, &content_snapshot, tags)
+                            .await
+                        {
+                            Ok(engram) => {
+                                info!(agent = %agent_id, id = %engram.id, "Attend: memory written")
+                            }
+                            Err(e) => {
+                                warn!(agent = %agent_id, error = %e, "Attend: memory write failed (non-fatal)")
+                            }
+                        }
+                    });
+                }
+            }
         }
 
         Ok(())
