@@ -3418,6 +3418,7 @@ dependencies = [
  "media-prep",
  "memory-core",
  "philotic-client",
+ "regex",
  "reqwest",
  "serde",
  "serde_json",
