@@ -5,7 +5,7 @@
 //! map arrived with that map serialized as a JSON *string* —
 //! `"properties": "{\"title\":\"…\",\"status\":\"confirmed\"}"` — so the runner
 //! answered `invalid type: string …, expected a map`, the automatic retry sent
-//! the identical string, and nothing was written (DEF-144). The tool schema
+//! the identical string, and nothing was written (DEF-146). The tool schema
 //! declares the field as an object; the model simply stringified the nested
 //! value, which some providers do for any nested object or array.
 //!

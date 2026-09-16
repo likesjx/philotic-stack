@@ -405,6 +405,15 @@ impl AgentRuntime {
         bypass_approval: bool,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + '_>> {
         Box::pin(async move {
+            // DEF-146: repair stringified object/array arguments against the
+            // tool's own schema FIRST — live, every `life.observe` with
+            // `evidence.properties` arrived with the map as a JSON string and
+            // the runner refused it twice. Running before the gates below
+            // means the approval card, the duplicate-call loop guard (which
+            // compares against the repaired history) and dispatch all see
+            // the same arguments.
+            super::tool_args::coerce_tool_call_arguments(&mut tool_call);
+
             // `operator_approved` is a model-settable flag; on a life.tidy
             // `retire` it is the only thing standing between a confirmed node
             // and retirement. Honor it only when the operator's own message
@@ -838,12 +847,6 @@ impl AgentRuntime {
                     })
                     .await;
             }
-
-            // DEF-144: repair stringified object/array arguments against the
-            // tool's own schema before the call is stored, routed or run —
-            // live, every `life.observe` with `evidence.properties` arrived
-            // with the map as a JSON string and the runner refused it twice.
-            super::tool_args::coerce_tool_call_arguments(&mut tool_call);
 
             // Emit step_started if streaming is enabled.
             let stream_events = self
