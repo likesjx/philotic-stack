@@ -839,6 +839,12 @@ impl AgentRuntime {
                     .await;
             }
 
+            // DEF-144: repair stringified object/array arguments against the
+            // tool's own schema before the call is stored, routed or run —
+            // live, every `life.observe` with `evidence.properties` arrived
+            // with the map as a JSON string and the runner refused it twice.
+            super::tool_args::coerce_tool_call_arguments(&mut tool_call);
+
             // Emit step_started if streaming is enabled.
             let stream_events = self
                 .sessions

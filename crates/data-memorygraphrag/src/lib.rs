@@ -190,6 +190,44 @@ pub struct EvidencePacket {
     pub properties: BTreeMap<String, serde_json::Value>,
 }
 
+/// Accept `properties` as a map OR as a JSON string that encodes a map.
+/// Live 2026-09-15/16 (bjork, Gemini): every observe carrying typed
+/// properties arrived with the map stringified — `"properties":
+/// "{\"title\":…}"` — and the strict map parse refused the whole call
+/// (DEF-144). The philote repairs this against the tool schema before
+/// dispatch; this is the runner-side belt for callers that bypass it.
+fn deserialize_properties_leniently<'de, D>(
+    deserializer: D,
+) -> std::result::Result<BTreeMap<String, serde_json::Value>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::Error as _;
+
+    match serde_json::Value::deserialize(deserializer)? {
+        serde_json::Value::Null => Ok(BTreeMap::new()),
+        serde_json::Value::Object(map) => Ok(map.into_iter().collect()),
+        serde_json::Value::String(encoded) => {
+            let trimmed = encoded.trim();
+            if trimmed.is_empty() {
+                return Ok(BTreeMap::new());
+            }
+            match serde_json::from_str::<serde_json::Value>(trimmed) {
+                Ok(serde_json::Value::Object(map)) => Ok(map.into_iter().collect()),
+                Ok(other) => Err(D::Error::custom(format!(
+                    "properties: expected a map, got a JSON string encoding {other}"
+                ))),
+                Err(err) => Err(D::Error::custom(format!(
+                    "properties: expected a map, got a string that is not JSON ({err})"
+                ))),
+            }
+        }
+        other => Err(D::Error::custom(format!(
+            "properties: expected a map, got {other}"
+        ))),
+    }
+}
+
 impl EvidencePacket {
     pub fn validate(&self) -> Result<(), ContractError> {
         let mut violations = Vec::new();
@@ -4343,5 +4381,37 @@ mod typed_property_contract_tests {
             "{cypher}"
         );
         assert!(cypher.contains("n.title AS prop__title"), "{cypher}");
+    }
+}
+
+#[cfg(test)]
+mod lenient_properties_tests {
+    use super::LifeObserveInput;
+
+    #[test]
+    fn stringified_properties_map_parses_as_a_map() {
+        // Live 2026-09-16 09:50 EDT (DEF-144), verbatim shape.
+        let raw = r#"{"observation_id":"obs:x","evidence":{"claim_ref":{"id":"life:event:organ_warmup_20260920","label":"Event"},"claim_summary":"warm up","confidence":1,"observed_at":"2026-09-16T13:50:00Z","properties":"{\"title\":\"Sunday Organ Warmup\",\"status\":\"proposed\"}","source_refs":[{"source_id":"membrane:telegram","source_kind":"membrane_event","reliability":{"basis":"direct_observation","score":1}}]}}"#;
+        let input: LifeObserveInput = serde_json::from_str(raw).expect("stringified map parses");
+        assert_eq!(
+            input
+                .evidence
+                .properties
+                .get("status")
+                .and_then(|v| v.as_str()),
+            Some("proposed")
+        );
+        assert_eq!(input.evidence.properties.len(), 2);
+    }
+
+    #[test]
+    fn non_map_strings_are_still_refused() {
+        let raw = r#"{"evidence":{"claim_ref":{"id":"life:x","label":"Event"},"claim_summary":"s","properties":"[1,2]"}}"#;
+        let err = serde_json::from_str::<LifeObserveInput>(raw)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("expected a map"), "{err}");
+        let raw = r#"{"evidence":{"claim_ref":{"id":"life:x","label":"Event"},"claim_summary":"s","properties":"{not json"}}"#;
+        assert!(serde_json::from_str::<LifeObserveInput>(raw).is_err());
     }
 }

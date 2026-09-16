@@ -124,6 +124,19 @@ pub(crate) fn tool_result_is_error(content: &str) -> bool {
     if head_l.starts_with("error") || head_l.starts_with("failed") || head_l.starts_with("denied") {
         return true;
     }
+    // The philote's own failure renderings (tool_exec / runtime): "Tool call
+    // failed: <message> (provider: …, capability: …)", "Capability call
+    // failed: …", "Tool execution failed: …", "Unexpected hotel response …".
+    // Live 2026-09-15 22:55 EDT: a runner contract_error rendered this way
+    // read as ok, so the write receipt listed the failed observe as
+    // "Written this turn" and the plan step verified (DEF-144).
+    if head_l.starts_with("tool call failed")
+        || head_l.starts_with("capability call failed")
+        || head_l.starts_with("tool execution failed")
+        || head_l.starts_with("unexpected hotel response")
+    {
+        return true;
+    }
     // Every `TaskErrorPayload::display_message` renders as
     // "<message> | kind=<kind> | code=<code> …" — the hotel's own refusal
     // shape. Live 2026-09-14 18:43 UTC "only agent guests may request
@@ -1028,6 +1041,22 @@ mod tool_result_is_error_tests {
         assert!(tool_result_is_error(
             "only agent guests may request subagent delegation | kind=ipc_failure | \
              code=SUBAGENT_FORBIDDEN | component=aiua | retryable=true"
+        ));
+    }
+
+    #[test]
+    fn philote_rendered_tool_failure_is_an_error() {
+        // Live 2026-09-16 09:50 EDT shape (DEF-144).
+        assert!(tool_result_is_error(
+            "Tool call failed: provider failed: contract_error: failed to parse life.observe \
+             parameters as LifeObserveInput: invalid type: string \"{}\", expected a map \
+             (provider: life-graph-memorygraphrag, capability: life.observe)"
+        ));
+        assert!(tool_result_is_error(
+            "Capability call failed: image.generate refused"
+        ));
+        assert!(tool_result_is_error(
+            "Unexpected hotel response for capability 'x': Standard { ok: true, data: None }"
         ));
     }
 
