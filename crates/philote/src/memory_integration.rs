@@ -1439,6 +1439,17 @@ impl AgentRuntime {
         if query_text.is_empty() || query_text.starts_with('/') {
             return;
         }
+        // Self-Improvement Loop L1: never prefetch life context for a distill
+        // review — it reads only its brief, and the prefetch is four
+        // life.recall round-trips of 20–34 KB each.
+        if self
+            .sessions
+            .get(session_id)
+            .and_then(|s| s.active_turn.as_ref())
+            .is_some_and(crate::runtime::distill::turn_is_distill)
+        {
+            return;
+        }
         let Some((target_node, target_role)) = self.sessions.get(session_id).and_then(|state| {
             state.resolve_tool_route("life.recall").map(|route| {
                 let node = if route.target_node.trim().is_empty() {
@@ -1561,6 +1572,16 @@ impl AgentRuntime {
             let Some(state) = self.sessions.get_mut(session_id) else {
                 return;
             };
+            // Self-Improvement Loop L1: a distill review needs no life
+            // context (live trace: four 20–34 KB payloads injected into a
+            // review that reads only its brief).
+            if state
+                .active_turn
+                .as_ref()
+                .is_some_and(crate::runtime::distill::turn_is_distill)
+            {
+                return;
+            }
             if state.resolve_tool_route("life.recall").is_none() {
                 return;
             }
@@ -1601,13 +1622,11 @@ impl AgentRuntime {
     ) -> Result<()> {
         use memory_core::MemoryEngine as _;
 
-        // Content is JSON: {"tool": "context.capture", "args": {...}}
-        let args: serde_json::Value = task
-            .content
-            .as_deref()
-            .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
-            .and_then(|v| v.get("args").cloned())
-            .unwrap_or_default();
+        // Legacy route-table endpoints send {"tool": "context.capture",
+        // "args": {...}}; config-driven endpoints send {"action":
+        // "context.capture", "payload": {...}} plus the raw args in
+        // raw_transport_event. Accept both (DEF-109).
+        let args: serde_json::Value = crate::mcp_ingress::extract_args(&task);
 
         let capture_text = args
             .get("content")
@@ -1705,6 +1724,12 @@ impl AgentRuntime {
             return Ok(());
         };
         if active_turn.user_content.trim_start().starts_with('/') {
+            return Ok(());
+        }
+        // Self-Improvement Loop L1: a distill review reads only its brief —
+        // no Muninn auto-recall, so the lookaside stays cheap and its own
+        // earlier verdicts cannot leak back in as "memory".
+        if crate::runtime::distill::turn_is_distill(active_turn) {
             return Ok(());
         }
 
@@ -1998,6 +2023,7 @@ impl AgentRuntime {
                 consecutive_step_failures: 0,
                 streak_extension: 0,
                 provider_repair_note: None,
+                say_do_nudged: false,
                 provider_repair_attempts: 0,
                 pending_text_reply: None,
                 had_voice_input: false,
@@ -2009,6 +2035,7 @@ impl AgentRuntime {
                 paracrine_reply_chat_id: None,
                 paracrine_response_routing: None,
                 paracrine_merge_completed: false,
+                paracrine_intent: None,
                 plan_confirmed: false,
                 plan_confirm_note: None,
                 fallback_tier: if self.network_offline { 1 } else { 0 },
@@ -2623,7 +2650,30 @@ impl AgentRuntime {
         &mut self,
         payload: ToolExecutionPayload,
     ) -> Result<()> {
-        let report = promotion_gate_report(&payload.arguments);
+        let mut report = promotion_gate_report(&payload.arguments);
+        // Self-Improvement Loop L5: a candidate that would be rendered back
+        // into prompts as durable shared memory passes the prompt safety
+        // floor first. Dangerous text is refused regardless of authority,
+        // validation level, evidence, or operator_approved.
+        if let Some(hazard) = payload
+            .arguments
+            .get("candidate")
+            .and_then(|v| v.as_str())
+            .and_then(prompt_guard::detect_prompt_hazard)
+            .filter(|h| h.is_dangerous())
+        {
+            if let Some(obj) = report.as_object_mut() {
+                obj.insert("allowed".into(), serde_json::Value::Bool(false));
+                obj.insert(
+                    "prompt_guard".into(),
+                    serde_json::Value::String(hazard.description.to_string()),
+                );
+                obj.insert(
+                    "denial".into(),
+                    serde_json::Value::String(hazard.denial_message()),
+                );
+            }
+        }
 
         self.handle_tool_result(InboundTaskPayload {
             action: Some("tool_result".into()),

@@ -1,19 +1,76 @@
-//! Static tool catalog for philote.
+//! Tool catalog for philote.
 //!
-//! Defines the canonical set of built-in tool definitions with real descriptions
-//! and input schemas. Used by `default_tool_assembly_for_bindings` instead of
-//! generating generic stubs, and mirrored into the context graph as `abstract_tool`
-//! nodes at hotel startup.
+//! The source of truth is `catalog/tools.yaml`, loaded by the hotel into
+//! `abstract_tool` records and fetched here at startup (`set_hotel_tool_records`).
+//! `tool_definition` / `tool_batch_of` read those records first. The compiled
+//! `build_catalog` below is only the FALLBACK until the hotel answers; it is
+//! scheduled for deletion once every consumer reads records (proposal
+//! tool-management-plane § Tool Catalog File).
 //!
 //! Tools not present in the catalog fall back to stubs — this keeps the catalog
 //! forward-compatible with dynamically registered tools from tool-runner guests.
 
 use crate::session::ToolDefinition;
+use ansible_mesh_core::graph::{AbstractToolRecord, ToolBatchOf};
 use serde_json::{Value, json};
 use std::collections::HashMap;
-use std::sync::OnceLock;
+use std::sync::{OnceLock, RwLock};
 
 static TOOL_CATALOG: OnceLock<HashMap<String, ToolDefinition>> = OnceLock::new();
+
+/// The hotel's `abstract_tool` records (loaded there from `catalog/tools.yaml`),
+/// fetched with `GetToolCatalog` at startup. Records win over the compiled
+/// catalog below, which is only the fallback until the hotel answers.
+static HOTEL_TOOL_RECORDS: OnceLock<RwLock<HashMap<String, AbstractToolRecord>>> = OnceLock::new();
+
+fn hotel_tool_records() -> &'static RwLock<HashMap<String, AbstractToolRecord>> {
+    HOTEL_TOOL_RECORDS.get_or_init(|| RwLock::new(HashMap::new()))
+}
+
+/// Replace the hotel tool records. Returns `true` when anything changed, so
+/// callers rebuild session tool assemblies only when they must.
+pub fn set_hotel_tool_records(records: Vec<AbstractToolRecord>) -> bool {
+    let next: HashMap<String, AbstractToolRecord> = records
+        .into_iter()
+        .map(|record| (record.tool_name.clone(), record))
+        .collect();
+    let mut guard = hotel_tool_records()
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if *guard == next {
+        return false;
+    }
+    *guard = next;
+    true
+}
+
+/// The hotel record for a tool, when the hotel has one.
+pub fn hotel_tool_record(tool_name: &str) -> Option<AbstractToolRecord> {
+    hotel_tool_records()
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(tool_name)
+        .cloned()
+}
+
+/// The model-facing definition of a tool: the hotel record's description,
+/// schema and class when it exists, else the compiled catalog entry.
+pub fn tool_definition(tool_name: &str) -> Option<ToolDefinition> {
+    if let Some(record) = hotel_tool_record(tool_name) {
+        return Some(ToolDefinition {
+            tool_name: record.tool_name,
+            description: record.description,
+            input_schema: record.input_schema,
+            class: Some(record.class),
+        });
+    }
+    tool_catalog().get(tool_name).cloned()
+}
+
+/// The batch relationship a tool declares in the catalog file, if any.
+pub fn tool_batch_of(tool_name: &str) -> Option<ToolBatchOf> {
+    hotel_tool_record(tool_name).and_then(|record| record.batch_of)
+}
 
 fn graph_record_ref_schema() -> Value {
     json!({
@@ -114,6 +171,17 @@ fn evidence_packet_schema() -> Value {
             "claim_summary": {
                 "type": "string",
                 "description": "One or two sentence summary of what was observed."
+            },
+            "properties": {
+                "type": "object",
+                "additionalProperties": true,
+                "description": "Typed facts about the node, written as real node properties \
+                    (Reflexive Life Graph R1). Keys must be universal (title, status) or \
+                    declared for the claim's label in life.ontology → typed_properties; \
+                    values are scalars checked for kind, range and allowed values. Put a \
+                    number in properties.difficulty, not 'difficulty 55/100' in the summary — \
+                    prose is invisible to every query. Unknown keys are rejected with the \
+                    allowed list."
             },
             "source_refs": {
                 "type": "array",
@@ -263,6 +331,10 @@ pub fn skill_implied_tools(skill_name: &str) -> &'static [&'static str] {
             "role.create_or_update",
             "role.set_home",
             "transport.set_home",
+            "hotel.materialize_request",
+            "hotel.materialize_status",
+            "hotel.relocate",
+            "hotel.relocate_status",
         ],
         "role.authoring" => &["session.status", "role.create_or_update", "handoff.to_role"],
         "memory" => &[
@@ -310,6 +382,16 @@ pub fn skill_implied_tools(skill_name: &str) -> &'static [&'static str] {
             "life.patch.list",
         ],
         "lifegraph.truth_summarizer" => &["life.recall", "graph.query"],
+        "lifegraph.gardener" => &[
+            "life.audit",
+            "life.tidy",
+            "life.list",
+            "life.view.neighborhood",
+            "life.recall",
+            "life.commit",
+            "life.resolve",
+            "life.ontology",
+        ],
         "mesh.steward" => &[
             "heal.list",
             "heal.resolve",
@@ -346,6 +428,16 @@ pub fn tools_for_skill(skill_name: &str) -> &'static [&'static str] {
             "life.patch.list",
         ],
         "lifegraph.truth_summarizer" => &["life.recall", "graph.query"],
+        "lifegraph.gardener" => &[
+            "life.audit",
+            "life.tidy",
+            "life.list",
+            "life.view.neighborhood",
+            "life.recall",
+            "life.commit",
+            "life.resolve",
+            "life.ontology",
+        ],
         "mesh.steward" => &[
             "heal.list",
             "heal.resolve",
@@ -393,6 +485,10 @@ pub fn tools_for_skill(skill_name: &str) -> &'static [&'static str] {
             "role.set_home",
             "transport.set_home",
             "hotel.best_place_to_run",
+            "hotel.materialize_request",
+            "hotel.materialize_status",
+            "hotel.relocate",
+            "hotel.relocate_status",
         ],
         "role.authoring" => &["role.create_or_update"],
         "skill.authoring" => &[
@@ -401,6 +497,9 @@ pub fn tools_for_skill(skill_name: &str) -> &'static [&'static str] {
             "skill.revoke",
             "skill.set_state",
             "skill.audit",
+            "procedure.get",
+            "procedure.register",
+            "procedure.patch",
         ],
         "context.synthesize" => &["workspace.list", "workspace.read"],
         "agent.initiate" => &["agent.graph.write", "agent.graph.recall"],
@@ -416,10 +515,34 @@ pub fn tools_for_skill(skill_name: &str) -> &'static [&'static str] {
             "mcp.upstreams",
             "mcp.set_credential",
         ],
+        // The full-lifecycle endpoint skill: audit → design the tool surface
+        // and handler policies → provision → mint credentials → smoke → keep
+        // the surface clean. Endpoint-side only; upstream (client) tools stay
+        // under mcp.manage.
+        "mcp.endpoint_steward" => &[
+            "mcp.status",
+            "mcp.provision",
+            "mcp.grant_token",
+            "mcp.rotate_token",
+            "mcp.revoke_token",
+            "mcp.revoke",
+            "session.status",
+        ],
         "integration.manage" => &[
             "integration.bind_http",
             "integration.unbind",
             "integration.list",
+        ],
+        // Full-lifecycle external-API skill: audit → contract → narrow bind →
+        // operator-provisioned credential → smoke → poll. See
+        // skills/integration-steward/SKILL.md.
+        "integration.steward" => &[
+            "integration.list",
+            "integration.bind_http",
+            "integration.unbind",
+            "session.status",
+            "cron.list",
+            "cron.register",
         ],
         _ => &[],
     }
@@ -503,6 +626,31 @@ pub fn skill_is_relevant_for_turn(skill_name: &str, turn_text: &str) -> bool {
                 || t.contains("feature")
                 || t.contains("capture this")
                 || t.contains("backlog")
+        }
+        "lifegraph.gardener" => {
+            t.contains("garden")
+                || t.contains("tidy")
+                || t.contains("prune")
+                || t.contains("dedupe")
+                || t.contains("de-dupe")
+                || t.contains("duplicate")
+                || t.contains("orphan")
+                || t.contains("integrity")
+                || t.contains("connected")
+                || t.contains("component")
+                || t.contains("centrality")
+                || t.contains("pagerank")
+                || t.contains("hygiene")
+                || t.contains("audit the graph")
+                || t.contains("audit my lifegraph")
+                || t.contains("audit the lifegraph")
+                || t.contains("graph health")
+                || t.contains("lifegraph health")
+                || t.contains("clean up the graph")
+                || t.contains("clean up my lifegraph")
+                || t.contains("pristine")
+                || t.contains("life.audit")
+                || t.contains("life.tidy")
         }
         "lifegraph.truth_summarizer" => {
             t.contains("lifegraph")
@@ -589,6 +737,8 @@ pub fn skill_is_relevant_for_turn(skill_name: &str, turn_text: &str) -> bool {
         }
         "skill.authoring" => {
             t.contains("register skill")
+                || t.contains("procedure.")
+                || t.contains("procedural graph")
                 || t.contains("skill.register")
                 || t.contains("skill.assign")
                 || t.contains("skill.set_state")
@@ -643,6 +793,21 @@ pub fn skill_is_relevant_for_turn(skill_name: &str, turn_text: &str) -> bool {
                 || t.contains("upstream")
                 || t.contains("connect mcp")
         }
+        "mcp.endpoint_steward" => {
+            // Endpoint-exposure language. Shares the mcp.manage vocabulary and
+            // adds the words an operator uses when asking an agent to expose
+            // itself to an external client (Perplexity, Claude, Codex, n8n).
+            t.contains("mcp")
+                || t.contains("endpoint")
+                || t.contains("provision")
+                || t.contains("expose")
+                || t.contains("external client")
+                || t.contains("bearer")
+                || t.contains("token grant")
+                || t.contains("tools/list")
+                || t.contains("perplexity")
+                || t.contains("claude desktop")
+        }
         "integration.manage" => {
             t.contains("integration")
                 || t.contains("http api")
@@ -650,6 +815,33 @@ pub fn skill_is_relevant_for_turn(skill_name: &str, turn_text: &str) -> bool {
                 || t.contains("outbound api")
                 || t.contains("egress")
                 || t.contains("exit hotel")
+        }
+        "integration.steward" => {
+            // Operator language for "hook me up to <service>": the vendor
+            // words, the mechanism words, and the failure words. Without the
+            // failure vocabulary the triage rules never project on the turn
+            // where the agent is about to blame the network (2026-09-05 Hevy).
+            t.contains("integration")
+                || t.contains("api key")
+                || t.contains("api ")
+                || t.contains("webhook")
+                || t.contains("web hook")
+                || t.contains("connect to")
+                || t.contains("hook up")
+                || t.contains("sync from")
+                || t.contains("pull my")
+                || t.contains("binding")
+                || t.contains("egress")
+                || t.contains("hevy")
+                || t.contains("strava")
+                || t.contains("garmin")
+                || t.contains("oura")
+                || t.contains("whoop")
+                || t.contains("fitbit")
+                || t.contains("blocked")
+                || t.contains("timed out")
+                || t.contains("401")
+                || t.contains("404")
         }
         "mesh.steward" => {
             // Fleet maintenance language: the heal queue, host pressure,
@@ -1410,9 +1602,11 @@ fn build_catalog() -> HashMap<String, ToolDefinition> {
         "cron.register".into(),
         ToolDefinition {
             tool_name: "cron.register".into(),
-            description: "Register a cron job on the hotel. Use cron.list first to avoid \
+            description: "Register a cron job in your crontab on the hotel's native scheduler \
+                          (never system cron or launchd). Use cron.list first to avoid \
                           duplicates. The schedule is a 7-field cron expression and the payload \
-                          is a JSON string delivered to the target role."
+                          is a JSON string delivered to the target role. The job is owned by \
+                          your agent; only your agent or the orchestrator can change it later."
                 .into(),
             input_schema: json!({
                 "type": "object",
@@ -1448,8 +1642,11 @@ fn build_catalog() -> HashMap<String, ToolDefinition> {
         "cron.list".into(),
         ToolDefinition {
             tool_name: "cron.list".into(),
-            description: "List cron jobs registered on this hotel, including schedule, target \
-                          role, enabled state, and next fire time."
+            description: "List the cron jobs in YOUR crontab on the hotel's native scheduler, \
+                          including schedule, target role, enabled state, and next fire time. \
+                          This is the only cron a philote consults — system crontab and \
+                          launchd are out of scope. You see jobs owned by your agent; the \
+                          orchestrator sees the whole hotel."
                 .into(),
             input_schema: json!({
                 "type": "object",
@@ -1538,6 +1735,84 @@ fn build_catalog() -> HashMap<String, ToolDefinition> {
                     }
                 },
                 "required": ["skill_name", "description", "subagent_kind", "goal"]
+            }),
+            class: Some("capability".into()),
+        },
+    );
+
+    m.insert(
+        "procedure.get".into(),
+        ToolDefinition {
+            tool_name: "procedure.get".into(),
+            description:
+                "Fetches one procedural graph from the hotel by id: its tool-bound nodes, \
+                          typed edges with condition/guidance/pitfalls, version, and state. Use it \
+                          to read a procedure before proposing a patch."
+                    .into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "procedure_id": {
+                        "type": "string",
+                        "description": "The procedure id, e.g. 'outcome-reflex'."
+                    }
+                },
+                "required": ["procedure_id"]
+            }),
+            class: Some("capability".into()),
+        },
+    );
+
+    m.insert(
+        "procedure.register".into(),
+        ToolDefinition {
+            tool_name: "procedure.register".into(),
+            description: "Registers a procedural graph — a small typed graph of tool steps with \
+                          condition/guidance/pitfalls on each edge — that philotes follow as \
+                          advice and seed plans from. Nodes: {id, label, kind: tool|reasoning|state, \
+                          tool_name}. Edges: {from, to, relation: leads_to|triggers|provides_input_for|\
+                          converges_to, condition, guidance, pitfalls}. Agent-authored procedures land \
+                          as Draft for the operator to promote. Keep it small: 3–17 nodes."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "procedure_id": { "type": "string", "description": "Lowercase dotted id, e.g. 'research.github-digest'." },
+                    "description": { "type": "string", "description": "One paragraph: when this procedure applies and what it achieves." },
+                    "skill_name": { "type": "string", "description": "Optional skill this procedure rides on; it projects when that skill is in play." },
+                    "entry": { "type": "string", "description": "Node id the backbone starts from." },
+                    "nodes": { "type": "array", "items": { "type": "object" }, "description": "Nodes: {id, label, kind, tool_name}." },
+                    "edges": { "type": "array", "items": { "type": "object" }, "description": "Edges: {from, to, relation, condition, guidance, pitfalls}." }
+                },
+                "required": ["procedure_id", "description", "entry", "nodes", "edges"]
+            }),
+            class: Some("capability".into()),
+        },
+    );
+
+    m.insert(
+        "procedure.patch".into(),
+        ToolDefinition {
+            tool_name: "procedure.patch".into(),
+            description: "Proposes an edit to a procedural graph after contrasting a failed run with \
+                          a successful one. ops is a list of {op: add_node|delete_node|add_edge|\
+                          delete_edge|set_edge_attrs|set_node_label, ...}. The patch lands Pending; \
+                          the operator approves it into a live trial, and it is accepted only if \
+                          the new version scores at least as well as the old one. Call it once."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "procedure_id": { "type": "string" },
+                    "ops": {
+                        "type": "array",
+                        "items": { "type": "object" },
+                        "description": "Edit ops. add_node {node}; delete_node {id}; add_edge {edge}; delete_edge {from, to, relation}; set_edge_attrs {from, to, relation, condition?, guidance?, pitfalls?}; set_node_label {id, label}."
+                    },
+                    "rationale": { "type": "string", "description": "One or two sentences: what the failed run did that the successful one did not, and how the edit prevents it." },
+                    "evidence_run_ids": { "type": "array", "items": { "type": "string" }, "description": "The run ids contrasted." }
+                },
+                "required": ["procedure_id", "ops", "rationale"]
             }),
             class: Some("capability".into()),
         },
@@ -1695,19 +1970,40 @@ fn build_catalog() -> HashMap<String, ToolDefinition> {
             tool_name: "subagent.spawn".into(),
             description: "Spawns a new subagent worker in the hotel. The subagent runs \
                           independently with its own lease and model turn budget. Use this to \
-                          delegate a discrete, self-contained task to a worker process. The hotel \
-                          responds with the subagent's guest ID and confirmed lease details."
+                          delegate a discrete, self-contained task to a worker process. Either \
+                          pass 'goal' directly, OR pass 'skill_name' to spawn a registered \
+                          delegation skill from the catalog — the skill's stored goal template \
+                          (with {{placeholder}}s filled from 'inputs'), worker kind, and tool \
+                          bounds are used automatically. The hotel responds with the subagent's \
+                          guest ID and confirmed lease details."
                 .into(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
                     "goal": {
                         "type": "string",
-                        "description": "The mission goal text delivered to the subagent."
+                        "description": "The mission goal text delivered to the subagent. \
+                                        Required unless 'skill_name' is given; with 'skill_name' \
+                                        it is appended to the skill's template as extra context."
+                    },
+                    "skill_name": {
+                        "type": "string",
+                        "description": "Name of a registered delegation skill (see skill.list). \
+                                        The skill's goal template, subagent kind, tool bounds, \
+                                        and dependencies are resolved by the hotel. Suspended or \
+                                        deprecated skills are refused."
+                    },
+                    "inputs": {
+                        "type": "object",
+                        "additionalProperties": { "type": "string" },
+                        "description": "Values substituted into the skill goal template's \
+                                        {{placeholder}}s, e.g. {\"topic\": \"...\"}."
                     },
                     "subagent_kind": {
                         "type": "string",
-                        "description": "The worker role to spawn. Defaults to 'philote-worker'."
+                        "description": "The worker role to spawn. Defaults to 'philote-worker'; \
+                                        overridden by the skill's stored kind when 'skill_name' \
+                                        is given."
                     },
                     "context_summary": {
                         "type": "string",
@@ -1717,14 +2013,15 @@ fn build_catalog() -> HashMap<String, ToolDefinition> {
                     "allowed_tools": {
                         "type": "array",
                         "items": { "type": "string" },
-                        "description": "Optional list of tool IDs the subagent may use."
+                        "description": "Optional list of tool IDs the subagent may use \
+                                        (merged with the skill's implied tools when spawning by name)."
                     },
                     "iteration_budget": {
                         "type": "integer",
                         "description": "Maximum model-turn iterations for the subagent. Defaults to 5."
                     }
                 },
-                "required": ["goal"]
+                "required": []
             }),
             class: Some("capability".into()),
         },
@@ -1894,6 +2191,144 @@ fn build_catalog() -> HashMap<String, ToolDefinition> {
                 "required": ["role_name", "reason"]
             }),
             class: Some("config".into()),
+        },
+    );
+
+    m.insert(
+        "hotel.materialize_request".into(),
+        ToolDefinition {
+            tool_name: "hotel.materialize_request".into(),
+            description: "Ask a target hotel to pre-warm (spawn and register) a role's process \
+                          right now, WITHOUT changing which hotel owns the role — the role keeps \
+                          running wherever role.set_home last pinned it. Use this before a \
+                          relocation to bring a warm standby up on the destination hotel so the \
+                          eventual role.set_home switch has nothing left to wait on. The target \
+                          runs feasibility checks first (binary present, primary model controller \
+                          live, build version compatible) and declines loudly with a reason if any \
+                          fail, instead of leaving you to guess why nothing spawned. Requires \
+                          operator approval. Poll hotel.materialize_status with the returned \
+                          request_id to see the outcome."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "role_name": {
+                        "type": "string",
+                        "description": "The role to pre-warm. Use your current active role name to pre-warm yourself elsewhere."
+                    },
+                    "target_hotel": {
+                        "type": "string",
+                        "description": "The hotel node_id to materialize the role's process on (e.g. 'vps-jane')."
+                    },
+                    "reason": {
+                        "type": "string",
+                        "description": "Why this standby is needed. Required for operator visibility."
+                    },
+                    "dry_run": {
+                        "type": "boolean",
+                        "description": "When true, only run the target's feasibility checks and report the result — never spawns or changes anything. Use to ask 'could this work' before committing to a real pre-warm. Defaults to false."
+                    }
+                },
+                "required": ["role_name", "target_hotel", "reason"]
+            }),
+            class: Some("config".into()),
+        },
+    );
+
+    m.insert(
+        "hotel.materialize_status".into(),
+        ToolDefinition {
+            tool_name: "hotel.materialize_status".into(),
+            description: "Check the outcome of a prior hotel.materialize_request call. Returns \
+                          pending (no reply yet), ready (the target hotel's standby process is \
+                          spawned and routable), or failed with an error."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "request_id": {
+                        "type": "string",
+                        "description": "The request_id returned by hotel.materialize_request."
+                    }
+                },
+                "required": ["request_id"]
+            }),
+            class: Some("session".into()),
+        },
+    );
+
+    m.insert(
+        "hotel.relocate".into(),
+        ToolDefinition {
+            tool_name: "hotel.relocate".into(),
+            description: "Move a role incarnation — and, if requested, its paired transport — \
+                          from this hotel to target_hotel, all the way through: a feasibility \
+                          check (declines loudly with a reason if the target can't host it), a \
+                          warm STANDBY spawn on the target, then SWITCH (home_node, and transport \
+                          home if included, flip atomically) and RECONCILE (this hotel's copy \
+                          goes dormant, never resurrected on restart). Runs in the background — \
+                          returns immediately with a ceremony_id; poll hotel.relocate_status for \
+                          progress. A decline or failure before SWITCH rolls back for free — this \
+                          hotel is never touched. Moving the transport too (include_transport) is \
+                          a higher-risk move (external identity custody, e.g. a bot token) and \
+                          requires full admin authority, not just operational admin authority. \
+                          Requires operator approval."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "role_name": {
+                        "type": "string",
+                        "description": "The role to relocate. Use your current active role name to move yourself."
+                    },
+                    "target_hotel": {
+                        "type": "string",
+                        "description": "The hotel node_id (or hotel_name) to move the role to, e.g. 'vps-jane'."
+                    },
+                    "reason": {
+                        "type": "string",
+                        "description": "Why this move is needed. Required for operator visibility."
+                    },
+                    "include_transport": {
+                        "type": "boolean",
+                        "description": "If true, also move the paired transport's home atomically with the role. Requires 'transport' and 'transport_resource_ref'. Defaults to false."
+                    },
+                    "transport": {
+                        "type": "string",
+                        "description": "Transport implementation name, e.g. 'telegram'. Required when include_transport is true."
+                    },
+                    "transport_resource_ref": {
+                        "type": "string",
+                        "description": "Stable transport resource reference, such as a bot token key. Required when include_transport is true."
+                    }
+                },
+                "required": ["role_name", "target_hotel", "reason"]
+            }),
+            class: Some("config".into()),
+        },
+    );
+
+    m.insert(
+        "hotel.relocate_status".into(),
+        ToolDefinition {
+            tool_name: "hotel.relocate_status".into(),
+            description: "Check the phase/outcome of a prior hotel.relocate call: intent, \
+                          feasibility, standby, continuity, switch, reconcile, close, or \
+                          rolled_back/failed. A failed ceremony flags needs_operator_review when \
+                          it was interrupted at or after SWITCH, since that state is never \
+                          auto-resumed."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "ceremony_id": {
+                        "type": "string",
+                        "description": "The ceremony_id returned by hotel.relocate."
+                    }
+                },
+                "required": ["ceremony_id"]
+            }),
+            class: Some("session".into()),
         },
     );
 
@@ -3008,6 +3443,47 @@ fn build_catalog() -> HashMap<String, ToolDefinition> {
                                         "grants": { "type": "array", "items": { "type": "object" } }
                                     },
                                     "required": ["scheme"]
+                                },
+                                "handler": {
+                                    "type": "object",
+                                    "description": "How THIS agent answers calls to a philote-targeted tool: a \
+                                                    deterministic ladder runs BEFORE any model turn, then the \
+                                                    declared fallback. validate_input (default true) rejects \
+                                                    args that violate input_schema. steps run in order: \
+                                                    {kind:'static',result:{...}} answers with a fixed value; \
+                                                    {kind:'reflex',reflex:'echo'|'memory.recall'|'memory.capture', \
+                                                    args:{...},escalate_on_empty:bool} runs a built-in reflex \
+                                                    with args templated from the payload ('${payload.query}'). \
+                                                    fallback: {kind:'model',instructions:'...'} hands the call to \
+                                                    your cognitive loop with those instructions; \
+                                                    {kind:'error',message:'...'} refuses deterministically. \
+                                                    Omit for datasource/tool targets (they never reach you).",
+                                    "properties": {
+                                        "validate_input": { "type": "boolean" },
+                                        "steps": {
+                                            "type": "array",
+                                            "items": {
+                                                "type": "object",
+                                                "properties": {
+                                                    "kind": { "type": "string", "enum": ["static", "reflex"] },
+                                                    "result": { "type": "object" },
+                                                    "reflex": { "type": "string", "enum": ["echo", "memory.recall", "memory.capture"] },
+                                                    "args": { "type": "object" },
+                                                    "escalate_on_empty": { "type": "boolean" }
+                                                },
+                                                "required": ["kind"]
+                                            }
+                                        },
+                                        "fallback": {
+                                            "type": "object",
+                                            "properties": {
+                                                "kind": { "type": "string", "enum": ["model", "error"] },
+                                                "instructions": { "type": "string" },
+                                                "message": { "type": "string" }
+                                            },
+                                            "required": ["kind"]
+                                        }
+                                    }
                                 }
                             },
                             "required": ["name", "description", "input_schema",
@@ -3312,10 +3788,20 @@ fn build_catalog() -> HashMap<String, ToolDefinition> {
             description: "Create or update a governed outbound HTTP integration. The binding \
                           grants a named API capability, never arbitrary network access: base URL, \
                           methods, path prefixes, headers, address scope, byte/time limits, agent \
-                          grants, and hotel exit placement are all explicit. Prefer \
-                          {mode:'prefer_hotel',hotel_id:'vps-jane',fallback:'deny'} for public APIs \
-                          that should normally exit through vps-jane; use local for device-bound \
-                          resources. This is a high-agency configuration action."
+                          grants, and hotel exit placement are all explicit. A successful bind is a \
+                          PERMISSION GRANT, not a connection — the integration is live only after \
+                          one http:<binding_id>.request returns 2xx. Before binding: run \
+                          integration.list (re-use an existing binding for the same host), and \
+                          take paths and the auth header from the vendor's documented contract \
+                          (a 404 on the smoke means YOUR path is wrong; 401 means the credential \
+                          is missing). Declare credential_header + credential_format when the API \
+                          needs a key — the operator provisions the value with \
+                          `phil integration set-credential`; never ask for it in chat. Use \
+                          placement {mode:'local'} unless the operator named an exit hotel that \
+                          integration.list reports reachable (an unreachable exit hotel makes \
+                          every call hang ~30s and time out). Webhooks need an inbound ingress \
+                          the stack does not have; bind for polling instead. This is a \
+                          high-agency configuration action."
                 .into(),
             input_schema: json!({
                 "type": "object",
@@ -3558,6 +4044,15 @@ fn build_catalog() -> HashMap<String, ToolDefinition> {
                             "claim_summary": {
                                 "type": "string",
                                 "description": "One or two sentence summary of what was observed."
+                            },
+                            "properties": {
+                                "type": "object",
+                                "additionalProperties": true,
+                                "description": "Typed facts written as node properties: universal \
+                                    keys (title, status) or keys declared for this label in \
+                                    life.ontology → typed_properties (kind, range, allowed values \
+                                    checked). Structured facts go here, never only in the summary. \
+                                    Pass a JSON object, never a JSON-encoded string."
                             },
                             "due_at": {
                                 "type": "string",
@@ -4067,6 +4562,69 @@ fn build_catalog() -> HashMap<String, ToolDefinition> {
     );
 
     m.insert(
+        "life.audit".into(),
+        ToolDefinition {
+            tool_name: "life.audit".into(),
+            description: "READ-ONLY graph-science audit of the whole LifeGraph: connected \
+                          components (giant component, islands), live orphans, PageRank/degree \
+                          hubs, semantic + exact duplicates (keeper chosen: confirmed, else \
+                          newest), stale loops (past due / untouched), temporal and conformance \
+                          defects, and a health_score. Returns suggested_actions — each is ONE \
+                          life.tidy call — and needs_judgment items for the operator. Run it \
+                          before and after a gardening pass and report the delta."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "labels": {"type": "array", "items": {"type": "string"}, "description": "Restrict findings to these ontology labels (empty = all)."},
+                    "max_actions": {"type": "integer", "default": 25, "minimum": 1, "maximum": 200},
+                    "duplicate_similarity": {"type": "number", "default": 0.9, "minimum": 0.5, "maximum": 1.0, "description": "Embedding cosine threshold for a duplicate candidate."},
+                    "stale_days": {"type": "integer", "default": 45, "description": "A live loop untouched this long is stale."}
+                }
+            }),
+            class: Some("life_graph".into()),
+        },
+    );
+    m.insert(
+        "life.tidy".into(),
+        ToolDefinition {
+            tool_name: "life.tidy".into(),
+            description: "Apply ONE governed LifeGraph gardening action (pass a life.audit \
+                          suggested_actions entry verbatim as `action`): retire_duplicate \
+                          {duplicate_id, keeper_id, reason} retires the duplicate under the keeper \
+                          with a SUPERSEDES edge; link {from_id, rel_type, to_id, reason} MERGEs an \
+                          edge from the observe/gardening vocabulary; resolve {node_id, reason} \
+                          closes a loop; retire {node_id, reason} retires a stray. Nothing is ever \
+                          deleted; every touched node/edge is stamped tidied_at/tidied_by/ \
+                          tidy_reason. Confirmed nodes need operator_approved=true. Ids must be \
+                          real (from life.audit/list/recall or the operator) — never invented."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "object",
+                        "description": "One action object with a `kind` of retire_duplicate | link | resolve | retire and that kind's fields; always include a reason.",
+                        "properties": {
+                            "kind": {"type": "string", "enum": ["retire_duplicate", "link", "resolve", "retire"]},
+                            "duplicate_id": {"type": "string"},
+                            "keeper_id": {"type": "string"},
+                            "from_id": {"type": "string"},
+                            "rel_type": {"type": "string"},
+                            "to_id": {"type": "string"},
+                            "node_id": {"type": "string"},
+                            "reason": {"type": "string"}
+                        },
+                        "required": ["kind", "reason"]
+                    },
+                    "operator_approved": {"type": "boolean", "default": false}
+                },
+                "required": ["action"]
+            }),
+            class: Some("life_graph".into()),
+        },
+    );
+    m.insert(
         "life.list".into(),
         ToolDefinition {
             tool_name: "life.list".into(),
@@ -4346,6 +4904,7 @@ fn build_catalog() -> HashMap<String, ToolDefinition> {
 
 #[cfg(test)]
 mod tests {
+
     use super::{skill_implied_tools, skill_is_relevant_for_turn, tool_catalog};
     use serde_json::json;
 

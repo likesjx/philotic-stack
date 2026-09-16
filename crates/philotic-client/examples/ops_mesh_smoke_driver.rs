@@ -45,6 +45,7 @@ async fn main() -> Result<()> {
                     allowed_tools: vec!["session.status".into()],
                     allowed_classes: Vec::new(),
                     allowed_skills: Vec::new(),
+                    origin: None,
                     hook_subscriptions: Vec::new(),
                     completion_route: HookRoute::PersonaAgent,
                     failure_route: HookRoute::PersonaAgent,

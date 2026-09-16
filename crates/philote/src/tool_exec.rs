@@ -9,6 +9,7 @@
 //! behavior change.
 
 use super::*;
+use crate::session::SessionBindings;
 
 /// Parse the optional `fallback_tiers` tool argument (a JSON array of tier
 /// role-name strings) into the `Option<Vec<String>>` the hotel's ConfigureRole
@@ -122,6 +123,53 @@ impl AgentRuntime {
             "skill.register" => Some("skill_register"),
             _ => None,
         }
+    }
+
+    /// Whether a `skill.register` call's declared grant (`allowed_tools` +
+    /// `allowed_classes`) is already fully covered by the registering
+    /// session's OWN current bindings — i.e. the skill cannot hand the
+    /// registrant anything it doesn't already have. When true, the call is
+    /// SAFE TO DOWNGRADE from the unconditional gate to the normal
+    /// policy-governed approval path (`auto_approve_all`, preapproved
+    /// classes, session trust all then apply normally).
+    ///
+    /// Deliberately conservative: any declared `allowed_skills` (SkillDAG
+    /// edges to other skills) keeps the call unconditional — resolving
+    /// those transitively needs the hotel's graph, which philote does not
+    /// hold locally, and silently treating unresolved edges as "grants
+    /// nothing" would be a false-negative risk assessment. A skill with no
+    /// DAG edges that only wraps tools/classes the registrant can already
+    /// reach is the common, low-risk case this exists for — e.g. a
+    /// practice-tracking skill built entirely on `life.observe`, which the
+    /// registrant already holds.
+    pub(super) fn skill_register_call_within_bindings(
+        arguments: &serde_json::Value,
+        bindings: &SessionBindings,
+    ) -> bool {
+        let has_skill_edges = arguments
+            .get("allowed_skills")
+            .and_then(|v| v.as_array())
+            .is_some_and(|arr| !arr.is_empty());
+        if has_skill_edges {
+            return false;
+        }
+        let declared_tools = arguments
+            .get("allowed_tools")
+            .and_then(|v| v.as_array())
+            .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>())
+            .unwrap_or_default();
+        let declared_classes = arguments
+            .get("allowed_classes")
+            .and_then(|v| v.as_array())
+            .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>())
+            .unwrap_or_default();
+        let class_covered = |class: &str| bindings.allowed_classes.iter().any(|c| c == class);
+        let tool_covered = |tool: &str| {
+            bindings.effective_toolset.iter().any(|t| t == tool)
+                || crate::catalog::tool_class(tool).is_some_and(class_covered)
+        };
+        declared_tools.iter().all(|t| tool_covered(t))
+            && declared_classes.iter().all(|c| class_covered(c))
     }
 
     pub(super) async fn handle_approval_request(
@@ -357,6 +405,63 @@ impl AgentRuntime {
         bypass_approval: bool,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + '_>> {
         Box::pin(async move {
+            // DEF-146: repair stringified object/array arguments against the
+            // tool's own schema FIRST — live, every `life.observe` with
+            // `evidence.properties` arrived with the map as a JSON string and
+            // the runner refused it twice. Running before the gates below
+            // means the approval card, the duplicate-call loop guard (which
+            // compares against the repaired history) and dispatch all see
+            // the same arguments.
+            super::tool_args::coerce_tool_call_arguments(&mut tool_call);
+
+            // `operator_approved` is a model-settable flag; on a life.tidy
+            // `retire` it is the only thing standing between a confirmed node
+            // and retirement. Honor it only when the operator's own message
+            // this turn reads as an approval — live 2026-09-14 20:47 UTC the
+            // model set it on its own initiative.
+            if tool_call.tool_name == "life.tidy" {
+                let is_retire = tool_call
+                    .arguments
+                    .pointer("/action/kind")
+                    .and_then(serde_json::Value::as_str)
+                    == Some("retire");
+                let claimed = tool_call
+                    .arguments
+                    .get("operator_approved")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false);
+                if is_retire && claimed {
+                    let user_text = self
+                        .sessions
+                        .get(&session_id)
+                        .and_then(|s| s.active_turn.as_ref())
+                        .map(|t| t.user_content.to_ascii_lowercase())
+                        .unwrap_or_default();
+                    let approved = [
+                        "approve",
+                        "approved",
+                        "go ahead",
+                        "yes",
+                        "retire it",
+                        "retire them",
+                        "confirm",
+                        "do it",
+                        "please retire",
+                    ]
+                    .iter()
+                    .any(|w| user_text.contains(w));
+                    if !approved {
+                        warn!(
+                            session_id = %session_id,
+                            "life.tidy retire: dropping model-set operator_approved (no approval in the operator's message)"
+                        );
+                        if let Some(args) = tool_call.arguments.as_object_mut() {
+                            args.insert("operator_approved".into(), serde_json::Value::Bool(false));
+                        }
+                    }
+                }
+            }
+
             // Per-agent provenance: life.observe writes must record WHO observed
             // (canonical agent id), not just the membrane transport. Stamp the
             // runtime's identity (and active role, if any) unless already set.
@@ -398,12 +503,88 @@ impl AgentRuntime {
                     inject_scoped_to_anchor(args);
                 }
             }
+            // Self-Improvement Loop L1: a distill lookaside turn runs on a
+            // fixed minimal tool surface regardless of the role's default
+            // toolset — it may draft a skill or write memory, nothing else.
+            // Enforced here, at dispatch, so no prompt wording can widen it.
+            let distill_turn = self
+                .sessions
+                .get(&session_id)
+                .and_then(|s| s.active_turn.as_ref())
+                .is_some_and(super::distill::turn_is_distill);
+            if distill_turn && !super::distill::tool_allowed(&tool_call.tool_name) {
+                warn!(
+                    session_id = %session_id,
+                    tool = %tool_call.tool_name,
+                    "skills.distill: tool outside the distill allowlist refused"
+                );
+                let denial = format!(
+                    "'{}' is not available in a distill review turn — only {} may be used here. \
+                     Either call skill.register / memory.remember, or reply exactly: DISTILL: nothing",
+                    tool_call.tool_name,
+                    super::distill::TOOL_ALLOWLIST.join(", ")
+                );
+                return self
+                    .deliver_tool_denial(session_id, turn_id, tool_call.tool_name, denial)
+                    .await;
+            }
+
+            // Self-Improvement Loop L5: the prompt safety floor on text that
+            // will be rendered into future worker prompts. A Dangerous verdict
+            // is a tool-result denial BEFORE any approval is requested — the
+            // operator must never be asked to approve text whose effect they
+            // cannot see. (Caution is handled at the gate below: it pins the
+            // call to the unconditional tier.)
+            // Procedural graphs P4 widen the same floor to procedure text: a
+            // registration's description and a patch's rationale (the hotel
+            // scans every node label and edge attribute on its side).
+            let guard_keys: &[&str] = match tool_call.tool_name.as_str() {
+                "skill.register" => &["description", "goal"],
+                "procedure.register" => &["description"],
+                "procedure.patch" => &["rationale"],
+                _ => &[],
+            };
+            if !guard_keys.is_empty() && !bypass_approval {
+                let fields: Vec<&str> = guard_keys
+                    .iter()
+                    .filter_map(|k| tool_call.arguments.get(*k).and_then(|v| v.as_str()))
+                    .collect();
+                if let Some(hazard) = prompt_guard::detect_prompt_hazard_in(fields.iter().copied())
+                    .filter(|h| h.is_dangerous())
+                {
+                    warn!(
+                        session_id = %session_id,
+                        hazard = hazard.description,
+                        tool = %tool_call.tool_name,
+                        "registration text refused by prompt-guard (philote side)"
+                    );
+                    return self
+                        .deliver_tool_denial(
+                            session_id,
+                            turn_id,
+                            tool_call.tool_name,
+                            hazard.denial_message(),
+                        )
+                        .await;
+                }
+            }
+
             // Agent-level approval enforcement: if the tool's policy annotation marks it as
             // requiring approval, and the current approval policy does not preapprove it,
             // synthesize an ApprovalRequest before executing. This runs independently of
             // whether the model itself requested approval — it is the agent's safety gate.
             // Skipped when bypass_approval is true (i.e. we are resuming after a resolution).
-            let force_approval = if bypass_approval {
+            // Also skipped for a distill turn's skill.register: the hotel forces
+            // that record to Draft, and a Draft grants nothing — filing is free,
+            // promotion is what the operator gates.
+            // Procedural graphs P4: a procedure registered or patched from a
+            // lookaside lands Draft / Pending — a filing, gated at promotion.
+            let distill_draft_write = distill_turn
+                && matches!(
+                    tool_call.tool_name.as_str(),
+                    "skill.register" | "procedure.register" | "procedure.patch"
+                );
+            let force_approval = if bypass_approval || distill_draft_write {
                 false
             } else {
                 self.sessions
@@ -440,7 +621,44 @@ impl AgentRuntime {
             let unconditional_gate = if bypass_approval {
                 None
             } else {
-                Self::unconditional_approval_gate(&tool_call.tool_name, &tool_call.arguments)
+                let gate =
+                    Self::unconditional_approval_gate(&tool_call.tool_name, &tool_call.arguments);
+                // Risk-tiered downgrade: a skill.register call that cannot
+                // grant the registrant anything beyond its own current
+                // bindings falls through to the normal policy-governed
+                // approval path (still gated if the session has no
+                // auto-approve/preapproval policy — this only removes the
+                // UNCONDITIONAL floor, it does not itself grant silence).
+                // Live 2026-08-27: four narrow, no-new-capability skill
+                // registrations each demanded their own live approval with
+                // no way to batch or preapprove them, and a plan that never
+                // gets past step 1 of 4 never registers anything.
+                if gate == Some("skill_register") {
+                    if distill_draft_write {
+                        // L1: Draft-only write, see `distill_draft_write` above.
+                        None
+                    } else {
+                        // L5 Caution pins the call to the unconditional tier
+                        // even when the subset check would downgrade it.
+                        let caution = ["description", "goal"]
+                            .iter()
+                            .filter_map(|k| tool_call.arguments.get(*k).and_then(|v| v.as_str()))
+                            .any(|f| prompt_guard::detect_prompt_hazard(f).is_some());
+                        let within_bindings = self.sessions.get(&session_id).is_some_and(|state| {
+                            Self::skill_register_call_within_bindings(
+                                &tool_call.arguments,
+                                &state.bindings,
+                            )
+                        });
+                        if within_bindings && !caution {
+                            None
+                        } else {
+                            gate
+                        }
+                    }
+                } else {
+                    gate
+                }
             };
             let is_admin_role_creation = unconditional_gate == Some("admin_role_creation");
             let is_rule_propose = unconditional_gate == Some("rule_propose");
@@ -462,30 +680,67 @@ impl AgentRuntime {
                 } else {
                     String::new()
                 };
+                // How many OTHER not-yet-done steps in the current plan will hit
+                // this exact same unconditional gate. A repeated identical-looking
+                // approval card reads as a duplicate of one already answered —
+                // live 2026-08-27: a 4-step skill.register plan fired this card
+                // three separate times and the operator, having just approved
+                // one, let each next one time out assuming it was already
+                // resolved. Naming the count up front makes a repeat legible
+                // instead of confusing.
+                let pending_siblings = self
+                    .sessions
+                    .get(&session_id)
+                    .and_then(|state| state.active_turn.as_ref())
+                    .and_then(|turn| turn.active_plan.as_ref())
+                    .map(|plan| {
+                        plan.steps
+                            .iter()
+                            .filter(|s| {
+                                s.tool_name.as_deref() == Some(tool_call.tool_name.as_str())
+                                    && s.status != "done"
+                            })
+                            .count()
+                    })
+                    .unwrap_or(0);
+                let sibling_note = if pending_siblings > 1 {
+                    format!(
+                        " (this plan has {pending_siblings} steps that each need this same \
+                         live approval — expect this card to repeat; each one is a DIFFERENT \
+                         step, not a duplicate of one you already answered.)"
+                    )
+                } else {
+                    String::new()
+                };
                 let (reason, approved_response) = if is_admin_role_creation {
                     (
                         format!(
                             "Admin role '{}' creation requires your explicit live approval. \
-                         This cannot be preapproved or bypassed by policy.",
+                         This cannot be preapproved or bypassed by policy.{sibling_note}",
                             role_name_hint
                         ),
                         format!("Admin role '{}' approved.", role_name_hint),
                     )
                 } else if is_rule_propose {
                     (
-                        "Rule proposal requires your explicit live approval.".to_string(),
+                        format!(
+                            "Rule proposal requires your explicit live approval.{sibling_note}"
+                        ),
                         "Rule proposal approved.".to_string(),
                     )
                 } else if is_routing_policy_propose {
                     (
-                        "Routing policy proposal requires your explicit live approval.".to_string(),
+                        format!(
+                            "Routing policy proposal requires your explicit live approval.{sibling_note}"
+                        ),
                         "Routing policy proposal approved.".to_string(),
                     )
                 } else if is_skill_register {
                     (
-                        "Skill registration requires your explicit live approval. \
-                         This cannot be preapproved or bypassed by policy."
-                            .to_string(),
+                        format!(
+                            "Skill registration requires your explicit live approval. \
+                         This cannot be preapproved or bypassed by policy.{sibling_note}"
+                        ),
                         "Skill registration approved.".to_string(),
                     )
                 } else {
@@ -1008,6 +1263,7 @@ impl AgentRuntime {
                 SlashCommand::Ping
                 | SlashCommand::Status
                 | SlashCommand::Context
+                | SlashCommand::Hotel
                 | SlashCommand::Pause
                 | SlashCommand::Resume
                 | SlashCommand::Role { .. }
@@ -1029,7 +1285,6 @@ impl AgentRuntime {
                 | SlashCommand::Voice { .. }
                 | SlashCommand::Model { .. }
                 | SlashCommand::ModelPreset { .. }
-                | SlashCommand::Models { .. }
                 | SlashCommand::Models { .. }
                 | SlashCommand::Dirty
                 | SlashCommand::Sfw
@@ -1240,6 +1495,7 @@ impl AgentRuntime {
             SlashCommand::Ping
             | SlashCommand::Status
             | SlashCommand::Context
+            | SlashCommand::Hotel
             | SlashCommand::Pause
             | SlashCommand::Resume
             | SlashCommand::Role { .. }
@@ -3014,6 +3270,16 @@ impl AgentRuntime {
                 let allowed_tools = str_vec("allowed_tools");
                 let allowed_classes = str_vec("allowed_classes");
                 let allowed_skills = str_vec("allowed_skills");
+                // Self-Improvement Loop L1: a registration made inside a
+                // distill lookaside turn is stamped with its origin so the
+                // hotel forces it to Draft. Derived from the turn, never
+                // from model-supplied arguments.
+                let origin = self
+                    .sessions
+                    .get(&payload.session_id)
+                    .and_then(|s| s.active_turn.as_ref())
+                    .and_then(|t| t.paracrine_intent.as_deref())
+                    .and_then(super::distill::origin_from_intent);
 
                 let response = self
                     .ipc_client
@@ -3025,6 +3291,7 @@ impl AgentRuntime {
                         allowed_tools,
                         allowed_classes,
                         allowed_skills,
+                        origin,
                         hook_subscriptions: vec![],
                         completion_route: Default::default(),
                         failure_route: Default::default(),
@@ -3112,6 +3379,284 @@ impl AgentRuntime {
                     ..Default::default()
                 })
                 .await
+            }
+
+            // ── Procedural graphs (doc:procedural-graphs) ──────────────────
+            "procedure.get" => {
+                let args = &payload.arguments;
+                let Some(procedure_id) = args.get("procedure_id").and_then(|v| v.as_str()) else {
+                    return self
+                        .fail_active_turn(
+                            payload.session_id,
+                            payload.turn_id,
+                            "procedure.get: missing required argument 'procedure_id'".into(),
+                        )
+                        .await;
+                };
+                let response = self
+                    .ipc_client
+                    .send_request(IpcRequest::GetProcedure {
+                        procedure_id: procedure_id.to_string(),
+                    })
+                    .await;
+                let (content, tool_err) = match response {
+                    Ok(IpcResponse::Standard {
+                        ok: true,
+                        data: Some(data),
+                        ..
+                    }) => match serde_json::from_value::<
+                        ansible_mesh_core::procedure::ProcedureGraphRecord,
+                    >(data)
+                    {
+                        Ok(p) => {
+                            let backbone: Vec<&str> =
+                                p.linear_backbone().iter().map(|n| n.id.as_str()).collect();
+                            let nodes: Vec<String> = p
+                                .nodes
+                                .iter()
+                                .map(|n| {
+                                    format!(
+                                        "- {} [{}] {}",
+                                        n.id,
+                                        n.tool_name.as_deref().unwrap_or("-"),
+                                        n.label
+                                    )
+                                })
+                                .collect();
+                            (
+                                format!(
+                                    "{} v{} ({:?}){}\n{}\n\nnodes:\n{}\n\ntriplets:\n{}\nbackbone: {}",
+                                    p.procedure_id,
+                                    p.version,
+                                    p.validation_state,
+                                    p.trial_of
+                                        .as_deref()
+                                        .map(|id| format!(" — on trial for patch {id}"))
+                                        .unwrap_or_default(),
+                                    p.description,
+                                    nodes.join("\n"),
+                                    p.render_triplets(),
+                                    backbone.join(" → ")
+                                ),
+                                None,
+                            )
+                        }
+                        Err(e) => {
+                            let err = TaskErrorPayload::ipc_failure(
+                                "aiua",
+                                "PROCEDURE_DECODE",
+                                format!("procedure.get: malformed record — {e}"),
+                            );
+                            (err.display_message(), Some(err))
+                        }
+                    },
+                    Ok(IpcResponse::Standard {
+                        ok: false,
+                        code,
+                        message,
+                        ..
+                    }) => {
+                        let e = TaskErrorPayload::ipc_failure("aiua", &*code, message);
+                        (e.display_message(), Some(e))
+                    }
+                    Ok(IpcResponse::Error(msg)) => {
+                        let e = TaskErrorPayload::ipc_failure("aiua", "IPC_ERROR", msg);
+                        (e.display_message(), Some(e))
+                    }
+                    Ok(_) => {
+                        let e = TaskErrorPayload::ipc_failure(
+                            "aiua",
+                            "UNEXPECTED_RESPONSE",
+                            "procedure.get: unexpected hotel response",
+                        );
+                        (e.display_message(), Some(e))
+                    }
+                    Err(e) => {
+                        let err = TaskErrorPayload::transport_error(
+                            "philote",
+                            format!("procedure.get: IPC transport error — {e}"),
+                        );
+                        (err.display_message(), Some(err))
+                    }
+                };
+                self.deliver_procedure_tool_result(payload, content, tool_err)
+                    .await
+            }
+
+            "procedure.register" => {
+                // The whole argument object is the record; the hotel parses,
+                // validates, scans, and forces agent origin to Draft. Origin
+                // is derived from the turn, never from model arguments.
+                let origin = Some(
+                    self.sessions
+                        .get(&payload.session_id)
+                        .and_then(|s| s.active_turn.as_ref())
+                        .and_then(|t| t.paracrine_intent.as_deref())
+                        .and_then(super::distill::origin_from_intent)
+                        .unwrap_or_else(|| "agent".to_string()),
+                );
+                let response = self
+                    .ipc_client
+                    .send_request(IpcRequest::RegisterProcedure {
+                        procedure: payload.arguments.clone(),
+                        origin,
+                    })
+                    .await;
+                let (content, tool_err) = match response {
+                    Ok(IpcResponse::Standard {
+                        ok: true,
+                        data: Some(data),
+                        ..
+                    }) => (
+                        format!(
+                            "Procedure '{}' registered as v{} (state: {}, {} nodes, {} edges).",
+                            data.get("procedure_id")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("?"),
+                            data.get("version").and_then(|v| v.as_u64()).unwrap_or(0),
+                            data.get("validation_state")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("?"),
+                            data.get("nodes").and_then(|v| v.as_u64()).unwrap_or(0),
+                            data.get("edges").and_then(|v| v.as_u64()).unwrap_or(0),
+                        ),
+                        None,
+                    ),
+                    Ok(IpcResponse::Standard {
+                        ok: false,
+                        code,
+                        message,
+                        ..
+                    }) => {
+                        let e = TaskErrorPayload::ipc_failure("aiua", &*code, message);
+                        (e.display_message(), Some(e))
+                    }
+                    Ok(IpcResponse::Error(msg)) => {
+                        let e = TaskErrorPayload::ipc_failure("aiua", "IPC_ERROR", msg);
+                        (e.display_message(), Some(e))
+                    }
+                    Ok(_) => {
+                        let e = TaskErrorPayload::ipc_failure(
+                            "aiua",
+                            "UNEXPECTED_RESPONSE",
+                            "procedure.register: unexpected hotel response",
+                        );
+                        (e.display_message(), Some(e))
+                    }
+                    Err(e) => {
+                        let err = TaskErrorPayload::transport_error(
+                            "philote",
+                            format!("procedure.register: IPC transport error — {e}"),
+                        );
+                        (err.display_message(), Some(err))
+                    }
+                };
+                self.deliver_procedure_tool_result(payload, content, tool_err)
+                    .await
+            }
+
+            "procedure.patch" => {
+                let args = &payload.arguments;
+                let Some(procedure_id) = args.get("procedure_id").and_then(|v| v.as_str()) else {
+                    return self
+                        .fail_active_turn(
+                            payload.session_id,
+                            payload.turn_id,
+                            "procedure.patch: missing required argument 'procedure_id'".into(),
+                        )
+                        .await;
+                };
+                let Some(ops) = args.get("ops").filter(|v| v.is_array()).cloned() else {
+                    return self
+                        .fail_active_turn(
+                            payload.session_id,
+                            payload.turn_id,
+                            "procedure.patch: missing required argument 'ops' (array)".into(),
+                        )
+                        .await;
+                };
+                let rationale = args
+                    .get("rationale")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default()
+                    .to_string();
+                let evidence_run_ids: Vec<String> = args
+                    .get("evidence_run_ids")
+                    .and_then(|v| v.as_array())
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let origin = Some(
+                    self.sessions
+                        .get(&payload.session_id)
+                        .and_then(|s| s.active_turn.as_ref())
+                        .and_then(|t| t.paracrine_intent.as_deref())
+                        .and_then(super::distill::origin_from_intent)
+                        .unwrap_or_else(|| "agent".to_string()),
+                );
+                let response = self
+                    .ipc_client
+                    .send_request(IpcRequest::ProposeProcedurePatch {
+                        procedure_id: procedure_id.to_string(),
+                        ops,
+                        rationale,
+                        evidence_run_ids,
+                        origin,
+                    })
+                    .await;
+                let (content, tool_err) = match response {
+                    Ok(IpcResponse::Standard {
+                        ok: true,
+                        data: Some(data),
+                        ..
+                    }) => (
+                        format!(
+                            "Patch {} filed against {} v{} ({}): pending operator approval, then a live trial.",
+                            data.get("patch_id").and_then(|v| v.as_str()).unwrap_or("?"),
+                            data.get("procedure_id")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("?"),
+                            data.get("base_version")
+                                .and_then(|v| v.as_u64())
+                                .unwrap_or(0),
+                            data.get("summary").and_then(|v| v.as_str()).unwrap_or("-"),
+                        ),
+                        None,
+                    ),
+                    Ok(IpcResponse::Standard {
+                        ok: false,
+                        code,
+                        message,
+                        ..
+                    }) => {
+                        let e = TaskErrorPayload::ipc_failure("aiua", &*code, message);
+                        (e.display_message(), Some(e))
+                    }
+                    Ok(IpcResponse::Error(msg)) => {
+                        let e = TaskErrorPayload::ipc_failure("aiua", "IPC_ERROR", msg);
+                        (e.display_message(), Some(e))
+                    }
+                    Ok(_) => {
+                        let e = TaskErrorPayload::ipc_failure(
+                            "aiua",
+                            "UNEXPECTED_RESPONSE",
+                            "procedure.patch: unexpected hotel response",
+                        );
+                        (e.display_message(), Some(e))
+                    }
+                    Err(e) => {
+                        let err = TaskErrorPayload::transport_error(
+                            "philote",
+                            format!("procedure.patch: IPC transport error — {e}"),
+                        );
+                        (err.display_message(), Some(err))
+                    }
+                };
+                self.deliver_procedure_tool_result(payload, content, tool_err)
+                    .await
             }
 
             "skill.list" => {
@@ -3518,18 +4063,35 @@ impl AgentRuntime {
             "subagent.spawn" => {
                 let args = &payload.arguments;
 
+                let skill_name = args
+                    .get("skill_name")
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.trim().is_empty())
+                    .map(str::to_string);
+                // Spawn-by-name: the registered skill supplies the goal
+                // template, so an explicit goal is only required without one.
                 let goal = match args.get("goal").and_then(|v| v.as_str()) {
                     Some(s) => s.to_string(),
+                    None if skill_name.is_some() => String::new(),
                     None => {
                         return self
                             .fail_active_turn(
                                 payload.session_id,
                                 payload.turn_id,
-                                "subagent.spawn: missing required argument 'goal'".into(),
+                                "subagent.spawn: missing required argument 'goal' (or pass 'skill_name' to spawn a registered skill)".into(),
                             )
                             .await;
                     }
                 };
+                let skill_inputs: std::collections::BTreeMap<String, String> = args
+                    .get("inputs")
+                    .and_then(|v| v.as_object())
+                    .map(|obj| {
+                        obj.iter()
+                            .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+                            .collect()
+                    })
+                    .unwrap_or_default();
                 let subagent_kind = args
                     .get("subagent_kind")
                     .and_then(|v| v.as_str())
@@ -3565,6 +4127,8 @@ impl AgentRuntime {
                     },
                     allowed_tools,
                     iteration_budget,
+                    skill_name,
+                    skill_inputs,
                     ..Default::default()
                 };
 
@@ -3750,6 +4314,551 @@ impl AgentRuntime {
                         let err = TaskErrorPayload::transport_error(
                             "philote",
                             format!("role.set_home: IPC transport error — {e}"),
+                        );
+                        (err.display_message(), Some(err))
+                    }
+                };
+
+                if let Some(err) = tool_err {
+                    self.handle_tool_result(InboundTaskPayload {
+                        action: Some("tool_result".into()),
+                        agent_action: None,
+                        handoff_bundle: None,
+                        source: Some("agent".into()),
+                        session_id: Some(payload.session_id),
+                        turn_id: Some(payload.turn_id),
+                        transport: None,
+                        chat_id: Some(payload.chat_id),
+                        thread_id: None,
+                        sender_id: None,
+                        sender_username: None,
+                        message_kind: None,
+                        content: Some(content),
+                        attachments: Vec::new(),
+                        command: None,
+                        callback_data: None,
+                        raw_transport_event: None,
+                        error: Some(err),
+                        tool_name: Some(payload.tool_name),
+                        arguments: None,
+                        final_reply_to: Some(payload.final_reply_to),
+                        final_reply_role: Some(payload.final_reply_role),
+                        final_reply_guest_id: payload.final_reply_guest_id,
+                        ..Default::default()
+                    })
+                    .await
+                } else {
+                    self.complete_local_command(payload.session_id, payload.turn_id, content)
+                        .await
+                }
+            }
+
+            "hotel.materialize_request" => {
+                let args = payload.arguments.as_object();
+                let role_name = args
+                    .and_then(|a| a.get("role_name"))
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string);
+                let target_hotel = args
+                    .and_then(|a| a.get("target_hotel"))
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string);
+                let reason = args
+                    .and_then(|a| a.get("reason"))
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string);
+                let dry_run = args
+                    .and_then(|a| a.get("dry_run"))
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+
+                let Some(role_name) = role_name else {
+                    return self
+                        .fail_active_turn(
+                            payload.session_id,
+                            payload.turn_id,
+                            "hotel.materialize_request: missing required argument 'role_name'"
+                                .into(),
+                        )
+                        .await;
+                };
+                let Some(target_hotel) = target_hotel else {
+                    return self
+                        .fail_active_turn(
+                            payload.session_id,
+                            payload.turn_id,
+                            "hotel.materialize_request: missing required argument 'target_hotel'"
+                                .into(),
+                        )
+                        .await;
+                };
+                let Some(reason) = reason else {
+                    return self
+                        .fail_active_turn(
+                            payload.session_id,
+                            payload.turn_id,
+                            "hotel.materialize_request: missing required argument 'reason'".into(),
+                        )
+                        .await;
+                };
+
+                let calling_role = self
+                    .sessions
+                    .get(&payload.session_id)
+                    .and_then(|s| s.role_activation.as_ref())
+                    .map(|r| r.role_name.clone())
+                    .unwrap_or_else(|| "orchestrator".into());
+
+                let _ = reason; // recorded for operator visibility in approval surface
+                let (content, tool_err) = match self
+                    .ipc_client
+                    .send_request(IpcRequest::MaterializeRequest {
+                        agent_id: self.agent_id.clone(),
+                        role_name: role_name.clone(),
+                        calling_role,
+                        target_hotel: target_hotel.clone(),
+                        dry_run,
+                    })
+                    .await
+                {
+                    Ok(IpcResponse::MaterializeRequested {
+                        request_id,
+                        role_name: name,
+                        target_hotel: hotel,
+                        ..
+                    }) => (
+                        if dry_run {
+                            format!(
+                                "Feasibility check dispatched: role '{name}' -> hotel '{hotel}' \
+                                 (request_id: {request_id}). Poll hotel.materialize_status with \
+                                 this request_id to see whether the target declared it feasible."
+                            )
+                        } else {
+                            format!(
+                                "Materialize request dispatched: role '{name}' -> hotel '{hotel}' \
+                                 (request_id: {request_id}). Poll hotel.materialize_status with this \
+                                 request_id to see when the standby is ready."
+                            )
+                        },
+                        None,
+                    ),
+                    Ok(IpcResponse::Error(msg))
+                    | Ok(IpcResponse::Standard {
+                        ok: false,
+                        message: msg,
+                        ..
+                    }) => {
+                        let e = TaskErrorPayload::tool_execution(
+                            "hotel.materialize_request",
+                            msg,
+                            Some("MATERIALIZE_REQUEST_REJECTED"),
+                        );
+                        (e.display_message(), Some(e))
+                    }
+                    Ok(_) => {
+                        let e = TaskErrorPayload::ipc_failure(
+                            "aiua",
+                            "UNEXPECTED_RESPONSE",
+                            "hotel.materialize_request: unexpected hotel response",
+                        );
+                        (e.display_message(), Some(e))
+                    }
+                    Err(e) => {
+                        let err = TaskErrorPayload::transport_error(
+                            "philote",
+                            format!("hotel.materialize_request: IPC transport error — {e}"),
+                        );
+                        (err.display_message(), Some(err))
+                    }
+                };
+
+                if let Some(err) = tool_err {
+                    self.handle_tool_result(InboundTaskPayload {
+                        action: Some("tool_result".into()),
+                        agent_action: None,
+                        handoff_bundle: None,
+                        source: Some("agent".into()),
+                        session_id: Some(payload.session_id),
+                        turn_id: Some(payload.turn_id),
+                        transport: None,
+                        chat_id: Some(payload.chat_id),
+                        thread_id: None,
+                        sender_id: None,
+                        sender_username: None,
+                        message_kind: None,
+                        content: Some(content),
+                        attachments: Vec::new(),
+                        command: None,
+                        callback_data: None,
+                        raw_transport_event: None,
+                        error: Some(err),
+                        tool_name: Some(payload.tool_name),
+                        arguments: None,
+                        final_reply_to: Some(payload.final_reply_to),
+                        final_reply_role: Some(payload.final_reply_role),
+                        final_reply_guest_id: payload.final_reply_guest_id,
+                        ..Default::default()
+                    })
+                    .await
+                } else {
+                    self.complete_local_command(payload.session_id, payload.turn_id, content)
+                        .await
+                }
+            }
+
+            "hotel.materialize_status" => {
+                let args = payload.arguments.as_object();
+                let request_id = args
+                    .and_then(|a| a.get("request_id"))
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string);
+
+                let Some(request_id) = request_id else {
+                    return self
+                        .fail_active_turn(
+                            payload.session_id,
+                            payload.turn_id,
+                            "hotel.materialize_status: missing required argument 'request_id'"
+                                .into(),
+                        )
+                        .await;
+                };
+
+                let (content, tool_err) = match self
+                    .ipc_client
+                    .send_request(IpcRequest::MaterializeStatus { request_id })
+                    .await
+                {
+                    Ok(IpcResponse::MaterializeStatus {
+                        request_id,
+                        ok,
+                        readiness,
+                        error,
+                        ..
+                    }) => {
+                        let msg = match (ok, readiness, error) {
+                            (Some(true), readiness, _) => format!(
+                                "Materialize request {request_id}: ready (readiness: {}).",
+                                readiness.unwrap_or_else(|| "unknown".into())
+                            ),
+                            (Some(false), _, Some(err)) => {
+                                format!("Materialize request {request_id}: failed — {err}")
+                            }
+                            (Some(false), _, None) => {
+                                format!("Materialize request {request_id}: failed.")
+                            }
+                            (None, _, _) => format!(
+                                "Materialize request {request_id}: pending — no reply from the \
+                                 target hotel yet."
+                            ),
+                        };
+                        (msg, None)
+                    }
+                    Ok(IpcResponse::Error(msg))
+                    | Ok(IpcResponse::Standard {
+                        ok: false,
+                        message: msg,
+                        ..
+                    }) => {
+                        let e = TaskErrorPayload::tool_execution(
+                            "hotel.materialize_status",
+                            msg,
+                            Some("MATERIALIZE_STATUS_REJECTED"),
+                        );
+                        (e.display_message(), Some(e))
+                    }
+                    Ok(_) => {
+                        let e = TaskErrorPayload::ipc_failure(
+                            "aiua",
+                            "UNEXPECTED_RESPONSE",
+                            "hotel.materialize_status: unexpected hotel response",
+                        );
+                        (e.display_message(), Some(e))
+                    }
+                    Err(e) => {
+                        let err = TaskErrorPayload::transport_error(
+                            "philote",
+                            format!("hotel.materialize_status: IPC transport error — {e}"),
+                        );
+                        (err.display_message(), Some(err))
+                    }
+                };
+
+                if let Some(err) = tool_err {
+                    self.handle_tool_result(InboundTaskPayload {
+                        action: Some("tool_result".into()),
+                        agent_action: None,
+                        handoff_bundle: None,
+                        source: Some("agent".into()),
+                        session_id: Some(payload.session_id),
+                        turn_id: Some(payload.turn_id),
+                        transport: None,
+                        chat_id: Some(payload.chat_id),
+                        thread_id: None,
+                        sender_id: None,
+                        sender_username: None,
+                        message_kind: None,
+                        content: Some(content),
+                        attachments: Vec::new(),
+                        command: None,
+                        callback_data: None,
+                        raw_transport_event: None,
+                        error: Some(err),
+                        tool_name: Some(payload.tool_name),
+                        arguments: None,
+                        final_reply_to: Some(payload.final_reply_to),
+                        final_reply_role: Some(payload.final_reply_role),
+                        final_reply_guest_id: payload.final_reply_guest_id,
+                        ..Default::default()
+                    })
+                    .await
+                } else {
+                    self.complete_local_command(payload.session_id, payload.turn_id, content)
+                        .await
+                }
+            }
+
+            "hotel.relocate" => {
+                let args = payload.arguments.as_object();
+                let role_name = args
+                    .and_then(|a| a.get("role_name"))
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string);
+                let target_hotel = args
+                    .and_then(|a| a.get("target_hotel"))
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string);
+                let reason = args
+                    .and_then(|a| a.get("reason"))
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string);
+                let include_transport = args
+                    .and_then(|a| a.get("include_transport"))
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                let transport = args
+                    .and_then(|a| a.get("transport"))
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string);
+                let transport_resource_ref = args
+                    .and_then(|a| a.get("transport_resource_ref"))
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string);
+
+                let Some(role_name) = role_name else {
+                    return self
+                        .fail_active_turn(
+                            payload.session_id,
+                            payload.turn_id,
+                            "hotel.relocate: missing required argument 'role_name'".into(),
+                        )
+                        .await;
+                };
+                let Some(target_hotel) = target_hotel else {
+                    return self
+                        .fail_active_turn(
+                            payload.session_id,
+                            payload.turn_id,
+                            "hotel.relocate: missing required argument 'target_hotel'".into(),
+                        )
+                        .await;
+                };
+                let Some(reason) = reason else {
+                    return self
+                        .fail_active_turn(
+                            payload.session_id,
+                            payload.turn_id,
+                            "hotel.relocate: missing required argument 'reason'".into(),
+                        )
+                        .await;
+                };
+                if include_transport && (transport.is_none() || transport_resource_ref.is_none()) {
+                    return self
+                        .fail_active_turn(
+                            payload.session_id,
+                            payload.turn_id,
+                            "hotel.relocate: include_transport requires both 'transport' and \
+                             'transport_resource_ref'"
+                                .into(),
+                        )
+                        .await;
+                }
+
+                let calling_role = self
+                    .sessions
+                    .get(&payload.session_id)
+                    .and_then(|s| s.role_activation.as_ref())
+                    .map(|r| r.role_name.clone())
+                    .unwrap_or_else(|| "orchestrator".into());
+
+                let (content, tool_err) = match self
+                    .ipc_client
+                    .send_request(IpcRequest::RelocateHotel {
+                        agent_id: self.agent_id.clone(),
+                        role_name: role_name.clone(),
+                        calling_role,
+                        target_hotel: target_hotel.clone(),
+                        include_transport,
+                        transport,
+                        transport_resource_ref,
+                        reason,
+                    })
+                    .await
+                {
+                    Ok(IpcResponse::RelocationCeremonyStarted {
+                        ceremony_id,
+                        role_name: name,
+                        target_hotel: hotel,
+                        ..
+                    }) => (
+                        format!(
+                            "Relocation ceremony started: role '{name}' -> hotel '{hotel}' \
+                             (ceremony_id: {ceremony_id}). The move runs through FEASIBILITY, \
+                             STANDBY, SWITCH, and RECONCILE in the background — poll \
+                             hotel.relocate_status with this ceremony_id for progress. A \
+                             feasibility decline or a failure before SWITCH rolls back for free; \
+                             this hotel was never touched."
+                        ),
+                        None,
+                    ),
+                    Ok(IpcResponse::Error(msg))
+                    | Ok(IpcResponse::Standard {
+                        ok: false,
+                        message: msg,
+                        ..
+                    }) => {
+                        let e = TaskErrorPayload::tool_execution(
+                            "hotel.relocate",
+                            msg,
+                            Some("RELOCATE_HOTEL_REJECTED"),
+                        );
+                        (e.display_message(), Some(e))
+                    }
+                    Ok(_) => {
+                        let e = TaskErrorPayload::ipc_failure(
+                            "aiua",
+                            "UNEXPECTED_RESPONSE",
+                            "hotel.relocate: unexpected hotel response",
+                        );
+                        (e.display_message(), Some(e))
+                    }
+                    Err(e) => {
+                        let err = TaskErrorPayload::transport_error(
+                            "philote",
+                            format!("hotel.relocate: IPC transport error — {e}"),
+                        );
+                        (err.display_message(), Some(err))
+                    }
+                };
+
+                if let Some(err) = tool_err {
+                    self.handle_tool_result(InboundTaskPayload {
+                        action: Some("tool_result".into()),
+                        agent_action: None,
+                        handoff_bundle: None,
+                        source: Some("agent".into()),
+                        session_id: Some(payload.session_id),
+                        turn_id: Some(payload.turn_id),
+                        transport: None,
+                        chat_id: Some(payload.chat_id),
+                        thread_id: None,
+                        sender_id: None,
+                        sender_username: None,
+                        message_kind: None,
+                        content: Some(content),
+                        attachments: Vec::new(),
+                        command: None,
+                        callback_data: None,
+                        raw_transport_event: None,
+                        error: Some(err),
+                        tool_name: Some(payload.tool_name),
+                        arguments: None,
+                        final_reply_to: Some(payload.final_reply_to),
+                        final_reply_role: Some(payload.final_reply_role),
+                        final_reply_guest_id: payload.final_reply_guest_id,
+                        ..Default::default()
+                    })
+                    .await
+                } else {
+                    self.complete_local_command(payload.session_id, payload.turn_id, content)
+                        .await
+                }
+            }
+
+            "hotel.relocate_status" => {
+                let args = payload.arguments.as_object();
+                let ceremony_id = args
+                    .and_then(|a| a.get("ceremony_id"))
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string);
+
+                let Some(ceremony_id) = ceremony_id else {
+                    return self
+                        .fail_active_turn(
+                            payload.session_id,
+                            payload.turn_id,
+                            "hotel.relocate_status: missing required argument 'ceremony_id'".into(),
+                        )
+                        .await;
+                };
+
+                let (content, tool_err) = match self
+                    .ipc_client
+                    .send_request(IpcRequest::RelocateHotelStatus { ceremony_id })
+                    .await
+                {
+                    Ok(IpcResponse::RelocationCeremonyStatus {
+                        ceremony_id,
+                        phase,
+                        risk_tier,
+                        origin_hotel,
+                        target_hotel,
+                        include_transport,
+                        decline_reason,
+                        needs_operator_review,
+                        ..
+                    }) => {
+                        let mut msg = format!(
+                            "Relocation ceremony {ceremony_id}: phase '{phase}' (risk tier: \
+                             {risk_tier}), {origin_hotel} -> {target_hotel}, \
+                             include_transport={include_transport}."
+                        );
+                        if let Some(reason) = decline_reason {
+                            msg.push_str(&format!(" Note: {reason}"));
+                        }
+                        if needs_operator_review {
+                            msg.push_str(
+                                " ⚠ This ceremony needs operator review — it was interrupted \
+                                 at or after SWITCH and was not auto-resumed.",
+                            );
+                        }
+                        (msg, None)
+                    }
+                    Ok(IpcResponse::Error(msg))
+                    | Ok(IpcResponse::Standard {
+                        ok: false,
+                        message: msg,
+                        ..
+                    }) => {
+                        let e = TaskErrorPayload::tool_execution(
+                            "hotel.relocate_status",
+                            msg,
+                            Some("RELOCATE_HOTEL_STATUS_REJECTED"),
+                        );
+                        (e.display_message(), Some(e))
+                    }
+                    Ok(_) => {
+                        let e = TaskErrorPayload::ipc_failure(
+                            "aiua",
+                            "UNEXPECTED_RESPONSE",
+                            "hotel.relocate_status: unexpected hotel response",
+                        );
+                        (e.display_message(), Some(e))
+                    }
+                    Err(e) => {
+                        let err = TaskErrorPayload::transport_error(
+                            "philote",
+                            format!("hotel.relocate_status: IPC transport error — {e}"),
                         );
                         (err.display_message(), Some(err))
                     }
@@ -5220,6 +6329,19 @@ impl AgentRuntime {
                             );
                             break (e.display_message(), Some(e));
                         }
+                        Ok(IpcResponse::Standard {
+                            ok: false,
+                            code,
+                            message,
+                            ..
+                        }) => {
+                            // The hotel's own refusal (HANDOFF_FORBIDDEN,
+                            // HANDOFF_UNREGISTERED, …) — carry its code and
+                            // message instead of "unexpected hotel response"
+                            // (live 2026-09-15 16:06 UTC, DEF-135).
+                            let e = TaskErrorPayload::ipc_failure("aiua", &*code, message);
+                            break (e.display_message(), Some(e));
+                        }
                         Ok(_) => {
                             let e = TaskErrorPayload::ipc_failure(
                                 "aiua",
@@ -5335,6 +6457,19 @@ impl AgentRuntime {
                                 msg,
                                 Some("HANDOFF_BACK_REJECTED"),
                             );
+                            break (e.display_message(), Some(e));
+                        }
+                        Ok(IpcResponse::Standard {
+                            ok: false,
+                            code,
+                            message,
+                            ..
+                        }) => {
+                            // The hotel's own refusal (HANDOFF_FORBIDDEN,
+                            // HANDOFF_UNREGISTERED, …) — carry its code and
+                            // message instead of "unexpected hotel response"
+                            // (live 2026-09-15 16:06 UTC, DEF-135).
+                            let e = TaskErrorPayload::ipc_failure("aiua", &*code, message);
                             break (e.display_message(), Some(e));
                         }
                         Ok(_) => {
@@ -5473,7 +6608,9 @@ impl AgentRuntime {
                         status,
                     }) => (
                         format!(
-                            "Delegated task to peer '{target_agent_id}' (delegation {delegation_id}, status: {status})."
+                            "Delegation to peer '{target_agent_id}' queued on the mesh (delegation {delegation_id}, status: {status}). \
+                             Delivery is NOT confirmed: the hotel has accepted it for routing, nothing more. \
+                             Tell the user it was sent, never that it was received."
                         ),
                         None,
                     ),
@@ -5957,6 +7094,15 @@ impl AgentRuntime {
                                 .await;
                         }
                     };
+
+                // A handler policy that names an unknown reflex (or an empty
+                // error message) must fail here, in the approved provisioning
+                // turn, not on the first external call.
+                if let Err(e) = validate_handler_policies(&tools) {
+                    return self
+                        .fail_active_turn(session_id, turn_id, format!("mcp.provision: {e}"))
+                        .await;
+                }
 
                 let preapproval_rules: Vec<ansible_mesh_core::mcp_endpoint::McpPreapprovalRule> =
                     args.get("preapproval_rules")
@@ -8016,11 +9162,109 @@ impl AgentRuntime {
     }
 }
 
+impl AgentRuntime {
+    /// Deliver a procedure tool's result as an ordinary tool_result turn
+    /// event (doc:procedural-graphs). Mirrors the inline literal every other
+    /// hotel-backed tool arm carries.
+    async fn deliver_procedure_tool_result(
+        &mut self,
+        payload: ToolExecutionPayload,
+        content: String,
+        tool_err: Option<TaskErrorPayload>,
+    ) -> Result<()> {
+        self.handle_tool_result(InboundTaskPayload {
+            action: Some("tool_result".into()),
+            agent_action: None,
+            handoff_bundle: None,
+            source: Some("agent".into()),
+            session_id: Some(payload.session_id),
+            turn_id: Some(payload.turn_id),
+            transport: None,
+            chat_id: Some(payload.chat_id),
+            thread_id: None,
+            sender_id: None,
+            sender_username: None,
+            message_kind: None,
+            content: Some(content),
+            attachments: Vec::new(),
+            command: None,
+            callback_data: None,
+            raw_transport_event: None,
+            error: tool_err,
+            tool_name: Some(payload.tool_name),
+            arguments: None,
+            final_reply_to: Some(payload.final_reply_to),
+            final_reply_role: Some(payload.final_reply_role),
+            final_reply_guest_id: payload.final_reply_guest_id,
+            ..Default::default()
+        })
+        .await
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::tests::test_working_turn;
     use super::*;
     use crate::r#loop::{ToolCall, TurnPhase};
+
+    /// A skill.register call that only wraps tools/classes the registrant
+    /// already has must be recognized as within-bindings so the gate can
+    /// downgrade from unconditional. Any `allowed_skills` DAG edge keeps it
+    /// conservative (philote cannot resolve DAG edges locally), and a tool
+    /// or class NOT already held keeps it conservative too.
+    #[test]
+    fn skill_register_within_bindings_subset_check() {
+        let bindings = SessionBindings {
+            effective_toolset: vec!["life.observe".into(), "life.list".into()],
+            allowed_classes: vec!["memory".into()],
+            ..Default::default()
+        };
+
+        // Fully covered: both declared tools already held.
+        let covered = serde_json::json!({
+            "allowed_tools": ["life.observe", "life.list"],
+        });
+        assert!(AgentRuntime::skill_register_call_within_bindings(
+            &covered, &bindings
+        ));
+
+        // A tool not already held keeps it unconditional.
+        let uncovered_tool = serde_json::json!({
+            "allowed_tools": ["life.observe", "bash.exec"],
+        });
+        assert!(!AgentRuntime::skill_register_call_within_bindings(
+            &uncovered_tool,
+            &bindings
+        ));
+
+        // A class not already held keeps it unconditional.
+        let uncovered_class = serde_json::json!({
+            "allowed_classes": ["shell"],
+        });
+        assert!(!AgentRuntime::skill_register_call_within_bindings(
+            &uncovered_class,
+            &bindings
+        ));
+
+        // ANY declared allowed_skills edge is conservative-unconditional,
+        // even if the flat tools/classes would otherwise be covered —
+        // philote cannot resolve the DAG locally.
+        let with_dag_edge = serde_json::json!({
+            "allowed_tools": ["life.observe"],
+            "allowed_skills": ["some.other.skill"],
+        });
+        assert!(!AgentRuntime::skill_register_call_within_bindings(
+            &with_dag_edge,
+            &bindings
+        ));
+
+        // No declared grant at all is trivially within-bindings.
+        let empty = serde_json::json!({});
+        assert!(AgentRuntime::skill_register_call_within_bindings(
+            &empty, &bindings
+        ));
+    }
 
     #[test]
     fn inject_scoped_to_anchor_appends_edge_when_agent_resolves_and_no_edges() {

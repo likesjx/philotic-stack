@@ -2093,6 +2093,9 @@ struct TelegramLeaseBackend<'a> {
     /// This seat's IPC guest_id — used to recognise our own stale lease
     /// binding in a renew denial (conn-id fencing after IPC reconnect).
     seat_guest_id: &'a str,
+    /// Records the hotel's denial code on a refused acquire (see
+    /// `TelegramSeatGuest::last_denial_code`).
+    last_denial_code: &'a StdMutex<Option<String>>,
 }
 
 #[async_trait]
@@ -2126,8 +2129,15 @@ impl LeaseBackend for TelegramLeaseBackend<'_> {
             // driver goes terminal and the seat stands down instead of
             // hammering acquire forever.
             IpcResponse::Standard {
-                ok: false, message, ..
+                ok: false,
+                code,
+                message,
+                ..
             } => {
+                *self
+                    .last_denial_code
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(code);
                 warn!(
                     "Telegram poll lease [{}] acquire refused by hotel: {}",
                     self.lease_key, message
@@ -2697,6 +2707,17 @@ struct TelegramSeatGuest {
     /// [`LEASE_REPROBE_SECS`] on the renew tick and un-yields when the lease
     /// is free.
     stand_down: Option<StandDownReason>,
+    /// Denial code from the last refused lease acquire (`IpcResponse::Standard`
+    /// with `ok: false`), so `setup` can tell "this hotel is not the transport
+    /// home" (→ `Standby`) from every other deterministic refusal.
+    last_denial_code: StdMutex<Option<String>>,
+    /// Set by a `TransportHomeChanged` push that moved the home away while this
+    /// seat was polling; the next `renew` tick (the only point with a live
+    /// client) releases the lease.
+    pending_lease_release: bool,
+    /// True while `renew` re-runs `setup` for a standby re-probe, so a repeat
+    /// "still not home" answer stays quiet instead of filing a heal event again.
+    reprobing_standby: bool,
 }
 
 /// Why a seat stopped polling. See the `stand_down` field docs.
@@ -2707,6 +2728,13 @@ enum StandDownReason {
     /// Lease held by another live seat when we last tried. Re-probed
     /// periodically; `next_probe_at` gates the probe cadence.
     LeaseHeld { next_probe_at: Instant },
+    /// This hotel is not the active transport home for the token
+    /// (`LEASE_TRANSPORT_HOME_MISMATCH`, or a `TransportHomeChanged` push
+    /// that moved the home away). The seat exists, is registered, and is
+    /// ready to take over — it just may not act. Re-probed every
+    /// [`LEASE_REPROBE_SECS`], or immediately when a `TransportHomeChanged`
+    /// push names this hotel as home (R2, DEF-107).
+    Standby { next_probe_at: Instant },
 }
 
 /// How often a lease-held stood-down seat re-probes the lease owner. Twice
@@ -2754,11 +2782,70 @@ impl TelegramSeatGuest {
             tg_base: None,
             poll_task: None,
             stand_down: None,
+            last_denial_code: StdMutex::new(None),
+            pending_lease_release: false,
+            reprobing_standby: false,
         }
     }
 
     /// Abort the poll task (if running) and cancel all in-flight turn UX.
     /// Called on IPC reconnect (before re-setup) and on teardown.
+    /// React to a hotel `TransportHomeChanged` push for this seat's token
+    /// (R2, DEF-107). Home moved HERE: a stood-down seat re-probes on the next
+    /// lease tick instead of the 180 s cadence. Home moved AWAY: stop the poll
+    /// loop now (one getUpdates loop per token, mesh-wide), release the lease
+    /// on the next tick, and stand by.
+    fn apply_transport_home_change(&mut self, active_home_hotel: &str, hotel_is_home: bool) {
+        if hotel_is_home {
+            match &mut self.stand_down {
+                Some(StandDownReason::LeaseHeld { next_probe_at })
+                | Some(StandDownReason::Standby { next_probe_at }) => {
+                    info!(
+                        "Transport home for [{}] moved to this hotel ({}); seat [{}] re-probes on the next lease tick.",
+                        self.telegram_token_key, active_home_hotel, self.seat_guest_id
+                    );
+                    *next_probe_at = Instant::now();
+                }
+                Some(StandDownReason::TokenMissing) => warn!(
+                    "Transport home for [{}] moved to this hotel but seat [{}] has no valid bot token; staying down.",
+                    self.telegram_token_key, self.seat_guest_id
+                ),
+                None => debug!(
+                    "Transport home for [{}] confirmed on this hotel; seat [{}] already active or mid-setup.",
+                    self.telegram_token_key, self.seat_guest_id
+                ),
+            }
+            return;
+        }
+        if matches!(self.stand_down, Some(StandDownReason::TokenMissing)) {
+            return;
+        }
+        let was_polling = self.poll_task.is_some();
+        self.stop_poll_task();
+        if was_polling || self.lease_driver.epoch().is_some() {
+            self.pending_lease_release = true;
+        }
+        let was_standby = matches!(self.stand_down, Some(StandDownReason::Standby { .. }));
+        self.stand_down = Some(StandDownReason::Standby {
+            next_probe_at: Instant::now() + Duration::from_secs(LEASE_REPROBE_SECS),
+        });
+        if !was_standby {
+            info!(
+                "Transport home for [{}] moved to [{}]; seat [{}] stops polling now and stands by.",
+                self.telegram_token_key, active_home_hotel, self.seat_guest_id
+            );
+            self.queue_heal_event(
+                self.seat_guest_id.clone(),
+                "low",
+                "seat_standby:transport_home_moved",
+                format!(
+                    "Telegram seat [{}] stood by: transport home for [{}] moved to [{}].",
+                    self.seat_guest_id, self.telegram_token_key, active_home_hotel
+                ),
+            );
+        }
+    }
+
     fn stop_poll_task(&mut self) {
         if let Some(handle) = self.poll_task.take() {
             handle.abort();
@@ -2963,6 +3050,7 @@ impl MembraneGuest for TelegramSeatGuest {
                 agent_id: &self.target_agent_id,
                 resource_ref: &self.telegram_token_key,
                 seat_guest_id: &self.seat_guest_id,
+                last_denial_code: &self.last_denial_code,
             };
             match self.lease_driver.tick(&mut backend).await {
                 LeaseEvent::Acquired { epoch }
@@ -2975,6 +3063,39 @@ impl MembraneGuest for TelegramSeatGuest {
                     break;
                 }
                 LeaseEvent::Lost { owner } => {
+                    let denial_code = self
+                        .last_denial_code
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .take();
+                    let was_reprobing_standby = std::mem::take(&mut self.reprobing_standby);
+                    if owner.is_none()
+                        && denial_code.as_deref() == Some("LEASE_TRANSPORT_HOME_MISMATCH")
+                    {
+                        // R2 (DEF-107): this hotel is not the transport home. The
+                        // seat is STANDBY — registered, token in hand, not acting —
+                        // and re-probes on the cadence or on a TransportHomeChanged
+                        // push naming this hotel as home. Quiet on re-confirmation.
+                        info!(
+                            "This hotel is not the active transport home for [{}]; seat [{}] is STANDBY (re-probe every {LEASE_REPROBE_SECS}s or on TransportHomeChanged).",
+                            lease_key, self.seat_guest_id
+                        );
+                        self.stand_down = Some(StandDownReason::Standby {
+                            next_probe_at: Instant::now() + Duration::from_secs(LEASE_REPROBE_SECS),
+                        });
+                        if !was_reprobing_standby {
+                            self.queue_heal_event(
+                                self.seat_guest_id.clone(),
+                                "low",
+                                "seat_standby:not_transport_home",
+                                format!(
+                                    "Telegram seat [{}] is standby: this hotel is not the active transport home for [{}].",
+                                    self.seat_guest_id, lease_key
+                                ),
+                            );
+                        }
+                        return Ok(());
+                    }
                     warn!(
                         "Telegram poll lease [{}] is held by {:?}. Seat [{}] stands down; will re-probe the lease every {LEASE_REPROBE_SECS}s.",
                         lease_key, owner, self.seat_guest_id
@@ -3059,9 +3180,57 @@ impl MembraneGuest for TelegramSeatGuest {
         // with no lease key yet, so nothing queued during setup is lost.
         self.flush_pending_heal_events(client).await;
 
+        // R2 (DEF-107): a TransportHomeChanged push moved the home away while we
+        // were polling; the poll task is already stopped — release the lease now
+        // that a live client is in hand so the new home's seat need not wait for
+        // the TTL to lapse.
+        if std::mem::take(&mut self.pending_lease_release) {
+            if let Some(lease_key) = self.lease_key.clone() {
+                info!(
+                    "Releasing Telegram poll lease [{}]: transport home moved away from this hotel.",
+                    lease_key
+                );
+                let mut backend = TelegramLeaseBackend {
+                    client,
+                    lease_key: &lease_key,
+                    agent_id: &self.target_agent_id,
+                    resource_ref: &self.telegram_token_key,
+                    seat_guest_id: &self.seat_guest_id,
+                    last_denial_code: &self.last_denial_code,
+                };
+                if let Err(err) = backend.release().await {
+                    warn!(
+                        "Telegram poll lease [{}] release after transport-home move failed: {}",
+                        lease_key, err
+                    );
+                }
+            }
+            self.lease_driver = LeaseDriver::new(LeaseDriverConfig::default());
+        }
+
         match &self.stand_down {
             Some(StandDownReason::TokenMissing) => {
                 return Ok(LeaseRenewResult::Ok { epoch: 0 });
+            }
+            Some(StandDownReason::Standby { next_probe_at }) => {
+                if Instant::now() < *next_probe_at {
+                    return Ok(LeaseRenewResult::Ok { epoch: 0 });
+                }
+                // Re-probe: is this hotel the transport home now? `setup`
+                // re-runs the acquire; a repeat MISMATCH re-enters Standby
+                // quietly (see `reprobing_standby`).
+                info!(
+                    "Standby seat [{}] re-probing whether this hotel is now the transport home.",
+                    self.seat_guest_id
+                );
+                self.stand_down = None;
+                self.reprobing_standby = true;
+                self.lease_driver = LeaseDriver::new(LeaseDriverConfig::default());
+                self.setup(client).await?;
+                self.reprobing_standby = false;
+                return Ok(LeaseRenewResult::Ok {
+                    epoch: self.lease_driver.epoch().unwrap_or(0),
+                });
             }
             Some(StandDownReason::LeaseHeld { next_probe_at }) => {
                 if Instant::now() < *next_probe_at {
@@ -3122,6 +3291,7 @@ impl MembraneGuest for TelegramSeatGuest {
             agent_id: &self.target_agent_id,
             resource_ref: &self.telegram_token_key,
             seat_guest_id: &self.seat_guest_id,
+            last_denial_code: &self.last_denial_code,
         };
         match self.lease_driver.tick(&mut backend).await {
             LeaseEvent::Renewed { epoch } | LeaseEvent::Acquired { epoch } => {
@@ -3177,6 +3347,7 @@ impl MembraneGuest for TelegramSeatGuest {
                 agent_id: &self.target_agent_id,
                 resource_ref: &self.telegram_token_key,
                 seat_guest_id: &self.seat_guest_id,
+                last_denial_code: &self.last_denial_code,
             };
             if let Err(err) = self.lease_driver.release(&mut backend).await {
                 warn!(
@@ -3210,6 +3381,22 @@ impl MembraneGuest for TelegramSeatGuest {
                     task_id, source_node
                 );
                 self.handle_inbound_task(task_json).await;
+                Ok(true)
+            }
+            IpcResponse::TransportHomeChanged {
+                agent_id,
+                transport,
+                resource_ref,
+                active_home_hotel,
+                hotel_is_home,
+                ..
+            } => {
+                if transport == "telegram"
+                    && *agent_id == self.target_agent_id
+                    && *resource_ref == self.telegram_token_key
+                {
+                    self.apply_transport_home_change(active_home_hotel, *hotel_is_home);
+                }
                 Ok(true)
             }
             IpcResponse::NetworkState { online } => {
@@ -3899,7 +4086,9 @@ mod tests {
         normalize_telegram_menu_command_name, session_owned_by_agent, telegram_command,
         telegram_format_text, telegram_help_text, telegram_inbound_envelope,
     };
+    use super::{MembraneGuest, StandDownReason};
     use philotic_client::CommandManifestEntry;
+    use philotic_client::IpcResponse;
     use serde_json::{Value, json};
     use std::time::Duration;
     use tokio::sync::{mpsc, oneshot};
@@ -5223,6 +5412,119 @@ mod tests {
             "http://127.0.0.1:0".into(),
             inbound_tx,
         )
+    }
+
+    fn transport_home_changed_push(
+        agent_id: &str,
+        resource_ref: &str,
+        active_home_hotel: &str,
+        hotel_is_home: bool,
+    ) -> IpcResponse {
+        IpcResponse::TransportHomeChanged {
+            transport_home_changed: true,
+            agent_id: agent_id.into(),
+            transport: "telegram".into(),
+            resource_ref: resource_ref.into(),
+            active_home_hotel: active_home_hotel.into(),
+            standby_hotels: vec![],
+            updated_unix: 1,
+            hotel_is_home,
+        }
+    }
+
+    // R2 (DEF-107): a stood-down seat learns the home moved HERE and re-probes
+    // on the next lease tick instead of the 180 s cadence.
+    #[tokio::test]
+    async fn transport_home_changed_to_this_hotel_arms_immediate_reprobe() {
+        let mut guest = new_test_seat_guest();
+        guest.stand_down = Some(StandDownReason::Standby {
+            next_probe_at: std::time::Instant::now() + Duration::from_secs(180),
+        });
+        MembraneGuest::handle_push(
+            &mut guest,
+            &transport_home_changed_push("agent-jane", "telegram_bot_token_test", "mac-jane", true),
+        )
+        .await
+        .expect("push handled");
+        match &guest.stand_down {
+            Some(StandDownReason::Standby { next_probe_at }) => {
+                assert!(
+                    *next_probe_at <= std::time::Instant::now(),
+                    "probe must be armed for now"
+                );
+            }
+            other => panic!("expected Standby with an immediate probe, got {other:?}"),
+        }
+        assert!(!guest.pending_lease_release);
+    }
+
+    // R2 (DEF-107): a polling seat learns the home moved AWAY, stops its poll
+    // loop at once, queues a lease release for the next tick, and stands by.
+    #[tokio::test]
+    async fn transport_home_changed_away_stops_polling_and_enters_standby() {
+        let mut guest = new_test_seat_guest();
+        guest.lease_key = Some("telegram-poll:telegram_bot_token_test".into());
+        guest.poll_task = Some(tokio::spawn(async { std::future::pending::<()>().await }));
+        MembraneGuest::handle_push(
+            &mut guest,
+            &transport_home_changed_push(
+                "agent-jane",
+                "telegram_bot_token_test",
+                "vps-jane",
+                false,
+            ),
+        )
+        .await
+        .expect("push handled");
+        assert!(guest.poll_task.is_none(), "poll loop must stop immediately");
+        assert!(matches!(
+            guest.stand_down,
+            Some(StandDownReason::Standby { .. })
+        ));
+        assert!(
+            guest.pending_lease_release,
+            "lease release must be queued for the next tick"
+        );
+        // A repeat push is idempotent and quiet.
+        MembraneGuest::handle_push(
+            &mut guest,
+            &transport_home_changed_push(
+                "agent-jane",
+                "telegram_bot_token_test",
+                "vps-jane",
+                false,
+            ),
+        )
+        .await
+        .expect("push handled");
+        assert!(matches!(
+            guest.stand_down,
+            Some(StandDownReason::Standby { .. })
+        ));
+    }
+
+    // A push for another agent or token never touches this seat.
+    #[tokio::test]
+    async fn transport_home_changed_for_another_seat_is_ignored() {
+        let mut guest = new_test_seat_guest();
+        guest.poll_task = Some(tokio::spawn(async { std::future::pending::<()>().await }));
+        MembraneGuest::handle_push(
+            &mut guest,
+            &transport_home_changed_push(
+                "agent-beacon",
+                "telegram_bot_token_beacon",
+                "mac-jane",
+                false,
+            ),
+        )
+        .await
+        .expect("push handled");
+        assert!(
+            guest.poll_task.is_some(),
+            "another seat's token must not stop this poll loop"
+        );
+        assert!(guest.stand_down.is_none());
+        guest.stop_poll_task();
     }
 
     // RC-3 regression (2026-07-09 stuck-turn forensic): reproduces the harder

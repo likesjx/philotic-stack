@@ -9,6 +9,7 @@ async-trait = "0.1"
 chrono = { version = "0.4", features = ["clock"] }
 chrono-tz = "0.10"
 ansible-mesh-core = { path = "../ansible-mesh-core" }
+prompt-guard = { path = "../prompt-guard" }
 perimeter-core = { path = "../perimeter-core" }
 memory-core = { path = "../memory-core" }
 anyhow = "1.0"

@@ -107,7 +107,7 @@ Before opening a PR from a worktree:
 just workstream-overlap <slug>
 ```
 
-Hot files include `crates/aiua/src/main.rs`, `crates/aiua/src/service/ipc.rs`, `crates/philote/src/runtime.rs`, `crates/membrane-telegram/src/main.rs`, `crates/model-router/*`, `crates/philotic-client/src/lib.rs`, `crates/aiua/README.md`, `docs/task.md`.
+Hot files include `crates/aiua/src/main.rs`, `crates/aiua/src/service/ipc.rs`, `crates/philote/src/runtime.rs`, `crates/philote/src/turn_loop.rs`, `crates/philote/src/memory_integration.rs`, `crates/membrane-telegram/src/main.rs`, `crates/model-router/*`, `crates/philotic-client/src/lib.rs`, `crates/aiua/README.md`, `docs/task.md`.
 
 ## Architecture
 

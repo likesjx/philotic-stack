@@ -5,6 +5,7 @@
 //! contracts into graph writes, context packets, or Muninn true-up requests.
 
 pub mod attention_observer;
+pub mod audit;
 pub mod cypher;
 pub mod entanglement;
 pub mod heartbeat;
@@ -14,6 +15,7 @@ pub mod projection;
 pub mod zoning;
 
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::{collections::BTreeSet, fmt};
 
 pub type PacketId = String;
@@ -173,6 +175,19 @@ pub struct EvidencePacket {
     pub adjudication_status: AdjudicationStatus,
     #[serde(default)]
     pub metadata: serde_json::Value,
+    /// Typed, per-label properties written onto the node (Reflexive Life Graph
+    /// R1, seam `lifegraph-typed-properties`). Keys must be universal
+    /// (`title`, `status`) or declared for the claim's label through the
+    /// ontology patch pipeline; values are scalars, checked for kind, range
+    /// and allowed values at plan time. Prose stays in `claim_summary` —
+    /// "difficulty 55/100" in the summary is invisible to every query;
+    /// `properties.difficulty = 55` is not.
+    #[serde(
+        default,
+        skip_serializing_if = "BTreeMap::is_empty",
+        deserialize_with = "deserialize_properties_leniently"
+    )]
+    pub properties: BTreeMap<String, serde_json::Value>,
 }
 
 impl EvidencePacket {
@@ -228,6 +243,24 @@ impl EvidencePacket {
             && range.ends_at.is_none()
         {
             violations.push("valid_time_range requires starts_at, ends_at, or both".to_string());
+        }
+
+        for (key, value) in &self.properties {
+            if !ontology::valid_property_name(key) {
+                violations.push(format!(
+                    "properties.{key} is not a valid property name (snake_case, 2-40 chars)"
+                ));
+            }
+            if ontology::RESERVED_NODE_PROPERTIES.contains(&key.as_str()) {
+                violations.push(format!(
+                    "properties.{key} is runner-owned and cannot be set by an observation"
+                ));
+            }
+            if !(value.is_string() || value.is_number() || value.is_boolean()) {
+                violations.push(format!(
+                    "properties.{key} must be a scalar (string, number or boolean)"
+                ));
+            }
         }
 
         finish_validation(violations)
@@ -993,6 +1026,8 @@ pub enum LifeGraphToolName {
     LifeOntology,
     LifePatchApply,
     LifePatchList,
+    LifeAudit,
+    LifeTidy,
 }
 
 impl LifeGraphToolName {
@@ -1010,6 +1045,8 @@ impl LifeGraphToolName {
             Self::LifeOntology => "life.ontology",
             Self::LifePatchApply => "life.patch.apply",
             Self::LifePatchList => "life.patch.list",
+            Self::LifeAudit => "life.audit",
+            Self::LifeTidy => "life.tidy",
         }
     }
 
@@ -1023,6 +1060,7 @@ impl LifeGraphToolName {
                 | Self::LifeResolve
                 | Self::LifePatchPropose
                 | Self::LifePatchApply
+                | Self::LifeTidy
         )
     }
 }
@@ -1587,6 +1625,19 @@ impl LifeObserveInput {
     }
 }
 
+impl LifeCommitInput {
+    /// Fill the packet id a model-authored commit may omit — the same
+    /// courtesy `LifeObserveInput::normalize_defaults` extends to observe.
+    /// Live 2026-09-12: every first `life.commit` attempt of the afternoon
+    /// failed "packet_id must not be empty" and cost a retry model call.
+    pub fn normalize_defaults(&mut self) {
+        if self.evidence.packet_id.trim().is_empty() {
+            self.evidence.packet_id =
+                format!("commit-{}", ulid::Ulid::new().to_string().to_lowercase());
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct LifeCommitInput {
     pub evidence: EvidencePacket,
@@ -1822,6 +1873,52 @@ pub struct LifeObserveBatchInput {
 /// provenance requirement or plan gate is relaxed. A malformed inner payload
 /// still fails, and now says so per item rather than as an opaque type error
 /// about the whole array.
+/// `evidence.properties` as an object, or as a JSON-encoded string of one.
+/// Gemini function calling serializes a free-form object (`"type": "object",
+/// "additionalProperties": true`, no declared keys) as a string: live
+/// 2026-09-16 11:17–11:49 UTC every `life.observe` from Beacon carried
+/// `"properties":"{\"title\":\"Pay bills\",\"status\":\"open\"}"` and the runner
+/// refused all ten with "invalid type: string … expected a map" (DEF-144), so
+/// four operator items were never recorded. The inner value must still be an
+/// object; a string that is not one fails with a message that says so.
+fn deserialize_properties_leniently<'de, D>(
+    deserializer: D,
+) -> std::result::Result<BTreeMap<String, serde_json::Value>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::Error as _;
+    let raw = serde_json::Value::deserialize(deserializer)?;
+    let value = match raw {
+        serde_json::Value::String(encoded) => {
+            let trimmed = encoded.trim();
+            if trimmed.is_empty() {
+                return Ok(BTreeMap::new());
+            }
+            serde_json::from_str::<serde_json::Value>(trimmed).map_err(|err| {
+                D::Error::custom(format!(
+                    "evidence.properties is a string that is not a JSON object ({err}); pass an object"
+                ))
+            })?
+        }
+        other => other,
+    };
+    match value {
+        serde_json::Value::Null => Ok(BTreeMap::new()),
+        serde_json::Value::Object(map) => Ok(map.into_iter().collect()),
+        other => Err(D::Error::custom(format!(
+            "evidence.properties must be a JSON object, got {}",
+            match other {
+                serde_json::Value::Array(_) => "an array",
+                serde_json::Value::String(_) => "a string",
+                serde_json::Value::Number(_) => "a number",
+                serde_json::Value::Bool(_) => "a boolean",
+                _ => "an unexpected value",
+            }
+        ))),
+    }
+}
+
 fn deserialize_observations_leniently<'de, D>(
     deserializer: D,
 ) -> std::result::Result<Vec<LifeObserveInput>, D::Error>
@@ -1981,11 +2078,15 @@ impl LifeListInput {
         if self.date_after.is_some() {
             clauses.push(format!("{best} IS NOT NULL AND {best} >= $date_after"));
         }
+        let row = format!(
+            "{}{}",
+            ontology::list_row_projection("n"),
+            ontology::property_projection("n", ext)
+        );
         format!(
             "MATCH (n) WHERE {where_clause} RETURN {row} \
              ORDER BY coalesce(n.observed_at, n.created_at, '') DESC LIMIT {limit}",
             where_clause = clauses.join(" AND "),
-            row = ontology::list_row_projection("n"),
             limit = self.effective_limit(),
         )
     }
@@ -2027,6 +2128,52 @@ impl LifeViewNeighborhoodInput {
     }
 }
 
+/// `life.audit` knobs. All optional; defaults match `audit::AuditOptions`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LifeAuditInput {
+    #[serde(default = "default_audit_max_actions")]
+    pub max_actions: usize,
+    #[serde(default = "default_audit_stale_days")]
+    pub stale_days: u32,
+    #[serde(default = "default_audit_similarity")]
+    pub duplicate_similarity: f32,
+    /// Restrict findings to these labels (empty = all).
+    #[serde(default)]
+    pub labels: Vec<String>,
+}
+
+fn default_audit_max_actions() -> usize {
+    25
+}
+fn default_audit_stale_days() -> u32 {
+    45
+}
+fn default_audit_similarity() -> f32 {
+    0.90
+}
+
+impl Default for LifeAuditInput {
+    fn default() -> Self {
+        Self {
+            max_actions: default_audit_max_actions(),
+            stale_days: default_audit_stale_days(),
+            duplicate_similarity: default_audit_similarity(),
+            labels: Vec::new(),
+        }
+    }
+}
+
+/// `life.tidy`: exactly one action per call, so the philote's plan evaluator
+/// can verify each step by its own tool result.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LifeTidyInput {
+    pub action: crate::audit::TidyAction,
+    /// Set when the operator explicitly asked for this action; lets a
+    /// `retire`/`resolve` touch a confirmed node.
+    #[serde(default)]
+    pub operator_approved: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "tool", content = "input", rename_all = "snake_case")]
 pub enum LifeGraphToolRequest {
@@ -2037,6 +2184,8 @@ pub enum LifeGraphToolRequest {
     LifeResolve(LifeResolveInput),
     LifePatchPropose(LifePatchProposalInput),
     LifeList(LifeListInput),
+    LifeAudit(LifeAuditInput),
+    LifeTidy(LifeTidyInput),
 }
 
 impl LifeGraphToolRequest {
@@ -2049,6 +2198,8 @@ impl LifeGraphToolRequest {
             Self::LifeResolve(_) => LifeGraphToolName::LifeResolve,
             Self::LifePatchPropose(_) => LifeGraphToolName::LifePatchPropose,
             Self::LifeList(_) => LifeGraphToolName::LifeList,
+            Self::LifeAudit(_) => LifeGraphToolName::LifeAudit,
+            Self::LifeTidy(_) => LifeGraphToolName::LifeTidy,
         }
     }
 }
@@ -2138,7 +2289,134 @@ impl MemoryGraphRagRunner {
                 self.plan_patch_propose_ext(input, ext)
             }
             LifeGraphToolRequest::LifeList(input) => self.plan_list_ext(input, ext),
+            LifeGraphToolRequest::LifeAudit(input) => self.plan_audit(input),
+            LifeGraphToolRequest::LifeTidy(input) => self.plan_tidy_ext(input, ext),
         }
+    }
+
+    /// `life.audit` is read-only: validate the knobs and the label filter.
+    fn plan_audit(&self, input: LifeAuditInput) -> Result<RunnerPlan, ContractError> {
+        let mut violations = Vec::new();
+        if !(0.5..=1.0).contains(&input.duplicate_similarity) {
+            violations.push(format!(
+                "duplicate_similarity {} must be within 0.5..=1.0",
+                input.duplicate_similarity
+            ));
+        }
+        if input.max_actions == 0 || input.max_actions > 200 {
+            violations.push(format!(
+                "max_actions {} must be within 1..=200",
+                input.max_actions
+            ));
+        }
+        for label in &input.labels {
+            if !ontology::is_known_label(label) {
+                violations.push(format!("labels contains unknown label '{label}'"));
+            }
+        }
+        if !violations.is_empty() {
+            return Err(ContractError { violations });
+        }
+        Ok(RunnerPlan {
+            tool_name: LifeGraphToolName::LifeAudit,
+            steps: vec![RunnerPlanStep {
+                target: RunnerPlanTarget::DataMemoryGraphRag,
+                action: "audit".into(),
+                payload: serde_json::json!({ "read_only": true }),
+            }],
+            requires_operator: false,
+            blocked_reasons: Vec::new(),
+        })
+    }
+
+    /// `life.tidy` is one governed write. Ids must be canonical `life:` ids
+    /// (a bare numeric id can only ever be the TARGET of a retire, where it
+    /// names the stray itself), rel types must be in the observe or
+    /// gardening vocabulary, and every action carries a reason so the node
+    /// records why it changed.
+    fn plan_tidy_ext(
+        &self,
+        input: LifeTidyInput,
+        ext: &ontology::OntologyExtensions,
+    ) -> Result<RunnerPlan, ContractError> {
+        use crate::audit::TidyAction;
+        let mut violations = Vec::new();
+        let ident_ok = |s: &str| {
+            !s.trim().is_empty()
+                && s.chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | ':' | '.'))
+        };
+        let canonical = |what: &str, id: &str, v: &mut Vec<String>| {
+            if !ident_ok(id) {
+                v.push(format!("{what} '{id}' is not a valid node id"));
+            } else if !id.contains(':') {
+                v.push(format!(
+                    "{what} '{id}' is not a canonical life:<label>:<slug> id — life.recall or \
+                     life.list first and use the exact id"
+                ));
+            }
+        };
+        let reason_ok = |r: &str, v: &mut Vec<String>| {
+            if r.trim().len() < 8 {
+                v.push("reason must say why (at least 8 characters)".into());
+            }
+        };
+        match &input.action {
+            TidyAction::RetireDuplicate {
+                duplicate_id,
+                keeper_id,
+                reason,
+            } => {
+                canonical("duplicate_id", duplicate_id, &mut violations);
+                canonical("keeper_id", keeper_id, &mut violations);
+                if duplicate_id == keeper_id {
+                    violations.push("duplicate_id and keeper_id are the same node".into());
+                }
+                reason_ok(reason, &mut violations);
+            }
+            TidyAction::Link {
+                from_id,
+                rel_type,
+                to_id,
+                reason,
+            } => {
+                canonical("from_id", from_id, &mut violations);
+                canonical("to_id", to_id, &mut violations);
+                let known = cypher::is_living_cycle_rel_type(rel_type)
+                    || cypher::agenda_rel_types().contains(&rel_type.as_str())
+                    || crate::audit::GARDENING_REL_TYPES.contains(&rel_type.as_str());
+                let _ = ext;
+                if !known || !rel_type.chars().all(|c| c.is_ascii_uppercase() || c == '_') {
+                    violations.push(format!(
+                        "rel_type '{rel_type}' is not in the edge vocabulary"
+                    ));
+                }
+                reason_ok(reason, &mut violations);
+            }
+            TidyAction::Resolve { node_id, reason } => {
+                canonical("node_id", node_id, &mut violations);
+                reason_ok(reason, &mut violations);
+            }
+            TidyAction::Retire { node_id, reason } => {
+                if !ident_ok(node_id) {
+                    violations.push(format!("node_id '{node_id}' is not a valid node id"));
+                }
+                reason_ok(reason, &mut violations);
+            }
+        }
+        if !violations.is_empty() {
+            return Err(ContractError { violations });
+        }
+        Ok(RunnerPlan {
+            tool_name: LifeGraphToolName::LifeTidy,
+            steps: vec![RunnerPlanStep {
+                target: RunnerPlanTarget::DataMemoryGraphRag,
+                action: input.action.kind().to_string(),
+                payload: serde_json::to_value(&input.action).unwrap_or_default(),
+            }],
+            requires_operator: false,
+            blocked_reasons: Vec::new(),
+        })
     }
 
     fn plan_list_ext(
@@ -2213,6 +2491,9 @@ impl MemoryGraphRagRunner {
         if let Err(err) = input.evidence.validate() {
             violations.extend(err.violations);
         }
+        violations.extend(
+            ext.validate_properties(&input.evidence.claim_ref.label, &input.evidence.properties),
+        );
         for (idx, edge) in input.edges.iter().enumerate() {
             let ext_rule = ext.edge(&edge.rel_type);
             if !cypher::is_living_cycle_rel_type(&edge.rel_type)
@@ -2819,6 +3100,7 @@ mod tests {
             conflict_ids: vec![],
             adjudication_status: AdjudicationStatus::Pending,
             metadata: serde_json::json!({"role": "beacon"}),
+            properties: Default::default(),
         }
     }
 
@@ -3912,5 +4194,186 @@ mod tests {
         // Wire-compatible: a bare object with no fields still deserializes.
         let parsed: LifeRecallStatsInput = serde_json::from_value(serde_json::json!({})).unwrap();
         assert_eq!(parsed, LifeRecallStatsInput::default());
+    }
+}
+
+#[cfg(test)]
+mod typed_property_contract_tests {
+    /// DEF-144, live 2026-09-16 11:17 UTC: the model sent `properties` as
+    /// a JSON string and every observe was refused.
+    #[test]
+    fn observe_accepts_properties_as_a_json_encoded_string() {
+        let raw = serde_json::json!({
+            "evidence": {
+                "claim_ref": {"id": "life:open_loop:pay_bills_20260916", "label": "OpenLoop"},
+                "claim_summary": "Jared needs to pay bills.",
+                "properties": "{\"title\":\"Pay bills\",\"status\":\"open\"}"
+            }
+        });
+        let input: super::LifeObserveInput = serde_json::from_value(raw).expect("lenient parse");
+        assert_eq!(
+            input
+                .evidence
+                .properties
+                .get("title")
+                .and_then(|v| v.as_str()),
+            Some("Pay bills")
+        );
+        assert_eq!(
+            input
+                .evidence
+                .properties
+                .get("status")
+                .and_then(|v| v.as_str()),
+            Some("open")
+        );
+        let obj = serde_json::json!({"evidence": {"claim_ref": {"id": "life:x:y", "label": "Event"}, "claim_summary": "s", "properties": {"title": "T"}}});
+        let input: super::LifeObserveInput = serde_json::from_value(obj).expect("object parse");
+        assert_eq!(input.evidence.properties.len(), 1);
+        let bad = serde_json::json!({"evidence": {"claim_ref": {"id": "life:x:y", "label": "Event"}, "claim_summary": "s", "properties": "just words"}});
+        let err = serde_json::from_value::<super::LifeObserveInput>(bad)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("evidence.properties"), "{err}");
+    }
+
+    use super::*;
+
+    fn runner() -> MemoryGraphRagRunner {
+        MemoryGraphRagRunner::new(RunnerConfig::default())
+    }
+
+    fn observe_json(label: &str, properties: serde_json::Value) -> LifeObserveInput {
+        serde_json::from_value(serde_json::json!({
+            "observation_id": "obs:typed-1",
+            "evidence": {
+                "packet_id": "pkt:typed-1",
+                "claim_ref": {"id": "life:creative_work:handel-passacaglia-gminor", "label": label},
+                "claim_summary": "Handel's Passacaglia in G minor.",
+                "source_refs": [{"source_id": "membrane:telegram", "source_kind": "operator_confirmation",
+                                 "reliability": {"score": 0.9, "basis": "operator_confirmed"}}],
+                "properties": properties
+            }
+        }))
+        .expect("observe input parses")
+    }
+
+    fn music_ext() -> ontology::OntologyExtensions {
+        ontology::OntologyExtensions {
+            labels: vec![],
+            edges: vec![],
+            properties: vec![ontology::ExtensionProperty {
+                label: "CreativeWork".into(),
+                name: "difficulty".into(),
+                kind: ontology::PropertyKind::Integer,
+                min: Some(0.0),
+                max: Some(100.0),
+                allowed: vec![],
+                guidance: String::new(),
+            }],
+        }
+    }
+
+    /// Live 2026-09-14/15: "Key: G minor. Difficulty: 55/100." lived in prose
+    /// because there was nowhere else to put it.
+    #[test]
+    fn declared_typed_property_plans_and_rides_the_evidence() {
+        let input = observe_json(
+            "CreativeWork",
+            serde_json::json!({"difficulty": 55, "title": "Passacaglia (HWV 432)"}),
+        );
+        let plan = runner()
+            .plan_with_extensions(LifeGraphToolRequest::LifeObserve(input), &music_ext())
+            .expect("plan");
+        let evidence = &plan.steps[0].payload["evidence"];
+        assert_eq!(evidence["properties"]["difficulty"], 55);
+        assert_eq!(evidence["properties"]["title"], "Passacaglia (HWV 432)");
+    }
+
+    #[test]
+    fn undeclared_reserved_and_out_of_range_properties_are_contract_errors() {
+        let undeclared = observe_json("CreativeWork", serde_json::json!({"tempo": "Allegro"}));
+        let err = runner()
+            .plan_with_extensions(LifeGraphToolRequest::LifeObserve(undeclared), &music_ext())
+            .unwrap_err();
+        let text = err.to_string();
+        assert!(
+            text.contains("properties.tempo is not declared for label CreativeWork"),
+            "{text}"
+        );
+        assert!(
+            text.contains("allowed keys: title, status, difficulty"),
+            "{text}"
+        );
+
+        let reserved = observe_json("CreativeWork", serde_json::json!({"claim_summary": "x"}));
+        let text = runner()
+            .plan_with_extensions(LifeGraphToolRequest::LifeObserve(reserved), &music_ext())
+            .unwrap_err()
+            .to_string();
+        assert!(text.contains("runner-owned"), "{text}");
+
+        let out_of_range = observe_json("CreativeWork", serde_json::json!({"difficulty": 250}));
+        let text = runner()
+            .plan_with_extensions(
+                LifeGraphToolRequest::LifeObserve(out_of_range),
+                &music_ext(),
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(text.contains("above max 100"), "{text}");
+
+        let nested = observe_json("CreativeWork", serde_json::json!({"difficulty": {"v": 1}}));
+        let text = runner()
+            .plan_with_extensions(LifeGraphToolRequest::LifeObserve(nested), &music_ext())
+            .unwrap_err()
+            .to_string();
+        assert!(text.contains("must be a scalar"), "{text}");
+    }
+
+    #[test]
+    fn list_cypher_projects_typed_property_columns() {
+        let input = LifeListInput {
+            labels: vec!["CreativeWork".into()],
+            ..Default::default()
+        };
+        let cypher = input.filtered_cypher_with_extensions(&music_ext());
+        assert!(
+            cypher.contains("n.difficulty AS prop__difficulty"),
+            "{cypher}"
+        );
+        assert!(cypher.contains("n.title AS prop__title"), "{cypher}");
+    }
+}
+
+#[cfg(test)]
+mod lenient_properties_tests {
+    use super::LifeObserveInput;
+
+    #[test]
+    fn stringified_properties_map_parses_as_a_map() {
+        // Live 2026-09-16 09:50 EDT (DEF-144), verbatim shape.
+        let raw = r#"{"observation_id":"obs:x","evidence":{"claim_ref":{"id":"life:event:organ_warmup_20260920","label":"Event"},"claim_summary":"warm up","confidence":1,"observed_at":"2026-09-16T13:50:00Z","properties":"{\"title\":\"Sunday Organ Warmup\",\"status\":\"proposed\"}","source_refs":[{"source_id":"membrane:telegram","source_kind":"membrane_event","reliability":{"basis":"direct_observation","score":1}}]}}"#;
+        let input: LifeObserveInput = serde_json::from_str(raw).expect("stringified map parses");
+        assert_eq!(
+            input
+                .evidence
+                .properties
+                .get("status")
+                .and_then(|v| v.as_str()),
+            Some("proposed")
+        );
+        assert_eq!(input.evidence.properties.len(), 2);
+    }
+
+    #[test]
+    fn non_map_strings_are_still_refused() {
+        let raw = r#"{"evidence":{"claim_ref":{"id":"life:x","label":"Event"},"claim_summary":"s","properties":"[1,2]"}}"#;
+        let err = serde_json::from_str::<LifeObserveInput>(raw)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("must be a JSON object"), "{err}");
+        let raw = r#"{"evidence":{"claim_ref":{"id":"life:x","label":"Event"},"claim_summary":"s","properties":"{not json"}}"#;
+        assert!(serde_json::from_str::<LifeObserveInput>(raw).is_err());
     }
 }

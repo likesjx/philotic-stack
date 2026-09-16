@@ -18,7 +18,10 @@ use crate::LedgerCommand;
 use crate::service::guest_manager::GuestMaterializationRequester;
 use ansible_mesh_core::domain::GraphDomain;
 use ansible_mesh_core::event::{EventEnvelope, EventKind, EventPayload};
-use ansible_mesh_core::graph::RoleReadinessState;
+use ansible_mesh_core::graph::{
+    MembraneTransportHomeRecord, MembraneTransportHomeStatus, RoleReadinessState,
+};
+use ansible_mesh_core::relocation_ceremony::{RelocationCeremonyPhase, RelocationCeremonyRecord};
 use philotic_client::{GuestIdentity, HandoffBundle, IpcResponse};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -148,13 +151,23 @@ impl IpcServer {
                     .flatten()
                     .is_none()
                 {
+                    // Mirror role_worker_manifest's env exactly (ipc.rs, Self::role_worker_manifest):
+                    // PHILOTIC_ROLE_INBOX/PHILOTIC_GUEST_ID/PHILOTIC_HOTEL_NAME are what let the
+                    // spawned philote self-report the canonical role_incarnation identity
+                    // ("role:{agent_id}:{role_name}" / "{agent_id}:{role_name}") instead of
+                    // falling back to a bare role name that can never pass
+                    // Self::is_agent_handoff_caller — omitting them here previously produced a
+                    // process that could materialize into a role but never hand back out of it.
                     let config_json = serde_json::json!({
                         "command": "philote",
                         "args": [],
                         "env": {
                             "PHILOTIC_AGENT_ID": inc.agent_id,
+                            "PHILOTIC_GUEST_ID": inc.guest_id,
                             "PHILOTIC_ROLE_NAME": inc.role_name,
+                            "PHILOTIC_ROLE_INBOX": inc.routing_role(),
                             "PHILOTIC_HOTEL_SOCKET": socket_path,
+                            "PHILOTIC_HOTEL_NAME": hotel_name,
                             "PHILOTIC_NODE_ID": local_node_id,
                         }
                     });
@@ -858,6 +871,7 @@ impl IpcServer {
                 },
             },
             home_node: preserved.and_then(|p| p.home_node.clone()),
+            placement_updated_unix: preserved.map(|p| p.placement_updated_unix).unwrap_or(0),
         };
 
         if let Err(e) = graph.upsert_role_incarnation(&record) {
@@ -1075,6 +1089,38 @@ impl IpcServer {
                     }
                 };
 
+                // A task addressed to an AGENT id rather than a role
+                // (`delegate.to_peer` sets `target_agent_id` to the peer agent,
+                // e.g. "agent-bjork-01"). No guest subscribes a role by that
+                // name; the agent's orchestrator incarnation subscribes `agent`
+                // (and `role:<agent>:orchestrator`) and handles `peer.delegate`.
+                // Live 2026-09-16 18:40 UTC (DEF-151): Beacon's delegation
+                // crossed the mesh in one second and was dropped here with "no
+                // subscriber for role 'agent-bjork-01'".
+                if !is_subscribed && target_guest_id.is_none() {
+                    if let Some((role, guest)) =
+                        agent_addressed_subscriber(inboxes, target_role.as_str()).await
+                    {
+                        info!(
+                            event_id = %event.event_id,
+                            agent_id = target_role.as_str(),
+                            role = %role,
+                            guest_id = %guest,
+                            "Cross-hotel task addressed to an agent id: delivering to its orchestrator"
+                        );
+                        Self::deliver_inbound_task(
+                            inboxes,
+                            &event.source_node_id,
+                            &role,
+                            Some(guest.as_str()),
+                            event.event_id,
+                            data.clone(),
+                        )
+                        .await;
+                        return true;
+                    }
+                }
+
                 if is_subscribed {
                     // Register the active incarnation so that model_responses for this
                     // session route back to the correct specialist philote rather than
@@ -1194,8 +1240,16 @@ impl IpcServer {
             }
         };
 
-        // Remote role: dispatch over mesh to the role's home hotel.
-        if let Some(ref home_node) = target_role.home_node.clone() {
+        // Remote role: dispatch over mesh to the role's home hotel. A home
+        // stored as the bare hotel name (records that predate DEF-124, or any
+        // seed that still writes the name) must be resolved to its node_id
+        // first: live 2026-09-15 14:44 UTC bjork's handoff to the
+        // theoretician — home_node "mac-jane", on mac-jane-aiua-01 — was
+        // dispatched "remote" to a peer that does not exist, and the
+        // operator's thread went silent (DEF-132).
+        if let Some(home_node) = target_role.home_node.as_deref().map(|home| {
+            Self::resolve_hotel_node_id(graph, home).unwrap_or_else(|| home.to_string())
+        }) {
             if home_node != local_node_id {
                 let toolset_record = graph
                     .get_toolset_profile(&target_role.toolset_profile)
@@ -1256,7 +1310,12 @@ impl IpcServer {
             materialization_requester,
             local_node_id,
             &target_role.agent_id,
-            &role_name,
+            // Use the resolved record's canonical role_name, not the raw
+            // caller-supplied `role_name` — resolve_role_incarnation above
+            // may have matched it case-insensitively (e.g. "chronos" against
+            // a role stored as "Chronos"), and ensure_role_materialized does
+            // its own exact-match lookup that would otherwise re-fail here.
+            &target_role.role_name,
         )
         .await
         {
@@ -1576,7 +1635,7 @@ impl IpcServer {
                 "guest must register before calling set_role_home",
             );
         };
-        if identity.role != "agent" {
+        if !Self::is_agent_handoff_caller(graph, identity) {
             return IpcResponse::error(
                 "set_role_home",
                 "SET_ROLE_HOME_FORBIDDEN",
@@ -1602,6 +1661,22 @@ impl IpcServer {
             );
         }
 
+        Self::perform_set_role_home(graph, agent_id, role_name, calling_role, target_hotel)
+    }
+
+    /// Core "move a role incarnation's `home_node` to `target_hotel`" logic,
+    /// shared by `role.set_home`'s direct IPC dispatch (which gates caller
+    /// identity/authority itself before calling this) and the Relocation
+    /// Ceremony's SWITCH phase (which gates once at INTENT for the whole
+    /// ceremony — see [`Self::handle_relocate_hotel`]). Does NOT check
+    /// caller authority; callers must gate before invoking it.
+    pub(super) fn perform_set_role_home(
+        graph: &GraphDomain,
+        agent_id: String,
+        role_name: String,
+        calling_role: String,
+        target_hotel: Option<String>,
+    ) -> IpcResponse {
         let mut record = match graph.get_role_incarnation(&agent_id, &role_name) {
             Ok(Some(r)) => r,
             Ok(None) => {
@@ -1620,7 +1695,25 @@ impl IpcServer {
             }
         };
 
-        record.home_node = target_hotel.clone();
+        // Resolve a bare hotel_name (the documented example, e.g. "vps-jane")
+        // or an already-canonical node_id (e.g. "vps-jane-aiua-01") to the
+        // node_id every routing comparison actually keys on (DEF-124).
+        let resolved_target = match target_hotel.as_deref() {
+            None => None,
+            Some(hotel_ref) => match Self::resolve_hotel_node_id(graph, hotel_ref) {
+                Some(node_id) => Some(node_id),
+                None => {
+                    return IpcResponse::error(
+                        "set_role_home",
+                        "SET_ROLE_HOME_UNKNOWN_HOTEL",
+                        format!("no known hotel matches '{}'", hotel_ref),
+                    );
+                }
+            },
+        };
+
+        record.home_node = resolved_target.clone();
+        record.placement_updated_unix = ansible_mesh_core::graph::placement_stamp_now();
         if let Err(err) = graph.upsert_role_incarnation(&record) {
             return IpcResponse::error(
                 "set_role_home",
@@ -1631,13 +1724,1024 @@ impl IpcServer {
 
         info!(
             "Role '{}' (agent '{}') home_node set to {:?} by '{}'",
-            role_name, agent_id, target_hotel, calling_role
+            role_name, agent_id, resolved_target, calling_role
         );
         IpcResponse::RoleHomeSet {
             role_name,
-            home_node: target_hotel,
+            home_node: resolved_target,
         }
     }
+
+    /// Core "move a transport's active home to `target_hotel`" logic, shared
+    /// by `transport.set_home`'s direct IPC dispatch (which gates caller
+    /// identity/authority itself before calling this) and the Relocation
+    /// Ceremony's SWITCH phase (which gates once at INTENT for the whole
+    /// ceremony — see [`Self::handle_relocate_hotel`]). Does NOT check
+    /// caller authority; callers must gate before invoking it.
+    pub(super) fn perform_set_transport_home(
+        graph: &GraphDomain,
+        agent_id: String,
+        transport: String,
+        resource_ref: String,
+        calling_role: String,
+        target_hotel: String,
+        standby_hotels: Vec<String>,
+    ) -> IpcResponse {
+        if graph.get_agent_identity(&agent_id).ok().flatten().is_none() {
+            return IpcResponse::error(
+                "set_transport_home",
+                "SET_TRANSPORT_HOME_AGENT_UNKNOWN",
+                format!("agent '{}' not found", agent_id),
+            );
+        }
+
+        // Resolve a bare hotel_name (documented example, e.g. "vps-jane")
+        // or an already-canonical node_id to the node_id every routing
+        // comparison actually keys on (DEF-124).
+        let Some(target_hotel) = Self::resolve_hotel_node_id(graph, &target_hotel) else {
+            return IpcResponse::error(
+                "set_transport_home",
+                "SET_TRANSPORT_HOME_UNKNOWN_HOTEL",
+                format!("no known hotel matches '{}'", target_hotel),
+            );
+        };
+        let mut resolved_standby_hotels = Vec::with_capacity(standby_hotels.len());
+        for hotel_ref in &standby_hotels {
+            let Some(node_id) = Self::resolve_hotel_node_id(graph, hotel_ref) else {
+                return IpcResponse::error(
+                    "set_transport_home",
+                    "SET_TRANSPORT_HOME_UNKNOWN_HOTEL",
+                    format!("no known hotel matches standby '{}'", hotel_ref),
+                );
+            };
+            resolved_standby_hotels.push(node_id);
+        }
+        let standby_hotels = resolved_standby_hotels;
+
+        let home = MembraneTransportHomeRecord {
+            agent_id: agent_id.clone(),
+            transport: transport.clone(),
+            resource_ref: resource_ref.clone(),
+            active_home_hotel: target_hotel.clone(),
+            standby_hotels: standby_hotels.clone(),
+            managed_by_role: calling_role.clone(),
+            lease_type: match transport.as_str() {
+                "telegram" => "telegram_poll".to_string(),
+                "discord" => "discord_gateway".to_string(),
+                other => format!("{other}_transport"),
+            },
+            failover_policy: "manual-or-explicit-delegation".to_string(),
+            status: MembraneTransportHomeStatus::Active,
+            updated_unix: ansible_mesh_core::graph::placement_stamp_now(),
+        };
+
+        if let Err(err) = graph.upsert_membrane_transport_home(&home) {
+            return IpcResponse::error(
+                "set_transport_home",
+                "SET_TRANSPORT_HOME_PERSIST_FAILED",
+                err.to_string(),
+            );
+        }
+
+        info!(
+            "Transport home for agent '{}' transport '{}' resource '{}' set to '{}' by '{}'",
+            agent_id, transport, resource_ref, target_hotel, calling_role
+        );
+        IpcResponse::TransportHomeSet {
+            agent_id,
+            transport,
+            resource_ref,
+            active_home_hotel: target_hotel,
+            standby_hotels,
+        }
+    }
+
+    /// Relocation Ceremony R3 (STANDBY phase): dispatch a `MaterializeRequest`
+    /// mesh event asking `target_hotel` to pre-warm `role_name`'s process,
+    /// without touching `home_node` — that stays [`Self::handle_set_role_home`]'s
+    /// job alone, so STANDBY can complete well before SWITCH. Gated identically
+    /// to `set_role_home`/`set_transport_home` (G9): only operational-admin
+    /// roles may request cross-hotel materialization.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) async fn handle_materialize_request(
+        graph: &GraphDomain,
+        dispatcher_tx: &mpsc::Sender<LedgerCommand>,
+        local_node_id: &str,
+        current_identity: Option<&GuestIdentity>,
+        agent_id: String,
+        role_name: String,
+        calling_role: String,
+        target_hotel: String,
+        dry_run: bool,
+    ) -> IpcResponse {
+        let Some(identity) = current_identity else {
+            return IpcResponse::error(
+                "materialize_request",
+                "MATERIALIZE_REQUEST_UNREGISTERED",
+                "guest must register before calling hotel.materialize_request",
+            );
+        };
+        if !Self::is_agent_handoff_caller(graph, identity) {
+            return IpcResponse::error(
+                "materialize_request",
+                "MATERIALIZE_REQUEST_FORBIDDEN",
+                "only agent guests may call hotel.materialize_request",
+            );
+        }
+
+        let calling_role_record = graph.get_role_incarnation(&agent_id, &calling_role);
+        let is_admin = calling_role_record
+            .ok()
+            .flatten()
+            .map(|r| r.has_operational_admin_authority())
+            .unwrap_or(false);
+        if !is_admin {
+            return IpcResponse::error(
+                "materialize_request",
+                "MATERIALIZE_REQUEST_FORBIDDEN",
+                format!(
+                    "role '{}' does not have authority to request cross-hotel materialization",
+                    calling_role
+                ),
+            );
+        }
+
+        Self::dispatch_materialize_request_core(
+            graph,
+            dispatcher_tx,
+            local_node_id,
+            identity.guest_id.clone(),
+            agent_id,
+            role_name,
+            calling_role,
+            target_hotel,
+            dry_run,
+        )
+        .await
+    }
+
+    /// Core STANDBY dispatch: resolve `target_hotel`, load the role/toolset
+    /// records, and send the `MaterializeRequest` mesh event. Shared by
+    /// [`Self::handle_materialize_request`] (which gates the caller before
+    /// calling this) and the Relocation Ceremony's FEASIBILITY/STANDBY
+    /// phases (gated once at ceremony INTENT — see
+    /// [`Self::handle_relocate_hotel`]). Does NOT check caller authority.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) async fn dispatch_materialize_request_core(
+        graph: &GraphDomain,
+        dispatcher_tx: &mpsc::Sender<LedgerCommand>,
+        local_node_id: &str,
+        requester_guest_id: String,
+        agent_id: String,
+        role_name: String,
+        calling_role: String,
+        target_hotel: String,
+        dry_run: bool,
+    ) -> IpcResponse {
+        // Resolve a bare hotel_name (the documented example, e.g. "vps-jane")
+        // or an already-canonical node_id to the node_id every routing
+        // comparison and mesh envelope actually keys on (DEF-124).
+        let Some(target_hotel) = Self::resolve_hotel_node_id(graph, &target_hotel) else {
+            return IpcResponse::error(
+                "materialize_request",
+                "MATERIALIZE_REQUEST_UNKNOWN_HOTEL",
+                format!("no known hotel matches '{}'", target_hotel),
+            );
+        };
+
+        if target_hotel == local_node_id {
+            return IpcResponse::error(
+                "materialize_request",
+                "MATERIALIZE_REQUEST_LOCAL_TARGET",
+                "target_hotel is this hotel — the role is already local; nothing to pre-warm remotely",
+            );
+        }
+
+        let record = match graph.get_role_incarnation(&agent_id, &role_name) {
+            Ok(Some(r)) => r,
+            Ok(None) => {
+                return IpcResponse::error(
+                    "materialize_request",
+                    "MATERIALIZE_REQUEST_ROLE_UNKNOWN",
+                    format!("role '{}' not found for agent '{}'", role_name, agent_id),
+                );
+            }
+            Err(err) => {
+                return IpcResponse::error(
+                    "materialize_request",
+                    "MATERIALIZE_REQUEST_DB_ERROR",
+                    err.to_string(),
+                );
+            }
+        };
+        let toolset_record = graph
+            .get_toolset_profile(&record.toolset_profile)
+            .ok()
+            .flatten();
+
+        let request_id = Uuid::new_v4();
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let event = EventEnvelope {
+            event_id: request_id,
+            seq: 0,
+            source_node_id: local_node_id.to_string(),
+            target_node_id: Some(target_hotel.clone()),
+            source_agent_id: requester_guest_id,
+            target_agent_id: None,
+            kind: EventKind::MaterializeRequest,
+            corr_id: request_id.to_string(),
+            attempt: 0,
+            created_at: ts,
+            expires_at: None,
+            payload: EventPayload::Inline {
+                data: serde_json::json!({
+                    "request_id": request_id.to_string(),
+                    "role_record": record,
+                    "toolset_record": toolset_record,
+                    "dry_run": dry_run,
+                    "requester_build_version": env!("CARGO_PKG_VERSION"),
+                })
+                .to_string(),
+            },
+            trace: vec![],
+        };
+        let _ = dispatcher_tx.send(LedgerCommand::AppendLocal(event)).await;
+
+        info!(
+            "Materialize request [{}] dispatched (dry_run={}): role '{}' (agent '{}') -> hotel '{}', requested by '{}'",
+            request_id, dry_run, role_name, agent_id, target_hotel, calling_role
+        );
+
+        IpcResponse::MaterializeRequested {
+            materialize_requested: true,
+            request_id: request_id.to_string(),
+            role_name,
+            target_hotel,
+        }
+    }
+
+    /// Poll the outcome of a prior [`Self::handle_materialize_request`]. `None`
+    /// fields mean the target hotel's `MaterializeReady` reply has not landed
+    /// yet — a pending request, not an error.
+    pub(super) fn handle_materialize_status(
+        graph: &GraphDomain,
+        request_id: String,
+    ) -> IpcResponse {
+        let key = format!("materialize_ready:{request_id}");
+        match graph.get_config_value(&key) {
+            Ok(Some(raw)) => {
+                let parsed: serde_json::Value = serde_json::from_str(&raw).unwrap_or_default();
+                IpcResponse::MaterializeStatus {
+                    materialize_status: true,
+                    request_id,
+                    ok: parsed.get("ok").and_then(|v| v.as_bool()),
+                    readiness: parsed
+                        .get("readiness")
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string),
+                    error: parsed
+                        .get("error")
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string),
+                }
+            }
+            Ok(None) => IpcResponse::MaterializeStatus {
+                materialize_status: true,
+                request_id,
+                ok: None,
+                readiness: None,
+                error: None,
+            },
+            Err(err) => IpcResponse::error(
+                "materialize_status",
+                "MATERIALIZE_STATUS_DB_ERROR",
+                err.to_string(),
+            ),
+        }
+    }
+
+    /// Relocation Ceremony R4 (Feasibility and placement): does `command`
+    /// resolve to a real, executable file given THIS process's current
+    /// `PHILOTIC_BIN_DIR`/`PATH`? Mirrors `LocalProcessMaterializer::spawn_guest`'s
+    /// resolution rule (`guest_manager.rs`) exactly, as a side-effect-free
+    /// pre-check rather than an actual spawn attempt — a positive result is
+    /// not a guarantee (the file could still be removed or lose its execute
+    /// bit before a real spawn), but a negative result is a reliable decline.
+    fn resolve_binary_feasible(command: &str) -> bool {
+        let path = std::path::Path::new(command);
+        if path.is_absolute() {
+            return path.is_file();
+        }
+        if let Ok(bin_dir) = std::env::var("PHILOTIC_BIN_DIR") {
+            let candidate = std::path::Path::new(bin_dir.trim_end_matches('/')).join(command);
+            return candidate.is_file();
+        }
+        // Bare command relies on PATH at spawn time (dev mode) — search it
+        // the same way a shell would.
+        std::env::var_os("PATH")
+            .map(|paths| std::env::split_paths(&paths).any(|dir| dir.join(command).is_file()))
+            .unwrap_or(false)
+    }
+
+    /// Relocation Ceremony R4 (Feasibility and placement): evaluate whether
+    /// THIS hotel (`hotel_name`, the target) can actually host `role_record`
+    /// right now. Returns decline reasons — empty means feasible. Every
+    /// check runs against LOCAL truth (this hotel's own filesystem, guest
+    /// table, build version): binary presence isn't gossiped at all, and
+    /// controller liveness is more trustworthy read live than from a
+    /// possibly-stale gossiped snapshot (that snapshot is what
+    /// `best_place_to_run_view`'s ranking uses instead, for candidates that
+    /// haven't been asked yet).
+    ///
+    /// Secret-ref presence — the proposal's third feasibility check — is a
+    /// deliberate no-op here: neither `RoleIncarnationRecord` nor
+    /// `ToolsetProfileRecord` carries a structured `secret_ref`. That
+    /// concept lives on integration/OIDC credential bindings
+    /// (`ansible_mesh_core::integration`), which belong to the higher-risk
+    /// membrane/integration component classes the Ceremony proposal scopes
+    /// separately (medium/high tier) — not this low-tier role move.
+    pub(super) fn evaluate_role_relocation_feasibility(
+        graph: &GraphDomain,
+        hotel_name: &str,
+        role_record: &ansible_mesh_core::graph::RoleIncarnationRecord,
+        requester_build_version: Option<&str>,
+    ) -> Vec<String> {
+        let mut reasons = Vec::new();
+
+        if !Self::resolve_binary_feasible("philote") {
+            reasons.push(
+                "role-incarnation worker binary 'philote' does not resolve on this hotel \
+                 (PHILOTIC_BIN_DIR/PATH) — likely a stale or incomplete deploy"
+                    .to_string(),
+            );
+        }
+
+        let active_guest_roles: std::collections::BTreeSet<String> = graph
+            .list_guests(hotel_name, true)
+            .map(|guests| guests.into_iter().map(|g| g.role).collect())
+            .unwrap_or_default();
+        let tiers: Vec<String> = if role_record.turn_loop_config.fallback_tiers.is_empty() {
+            ansible_mesh_core::model_routing::DEFAULT_FALLBACK_TIERS
+                .iter()
+                .map(|t| t.to_string())
+                .collect()
+        } else {
+            role_record.turn_loop_config.fallback_tiers.clone()
+        };
+        if let Some(primary_tier) = tiers.first() {
+            if !active_guest_roles.contains(primary_tier) {
+                reasons.push(format!(
+                    "this role's primary model controller ('{primary_tier}') has no live guest on this hotel"
+                ));
+            }
+        }
+
+        if let Some(requester_version) = requester_build_version {
+            let local_version = env!("CARGO_PKG_VERSION");
+            if !requester_version.is_empty() && requester_version != local_version {
+                reasons.push(format!(
+                    "build version mismatch: requester is '{requester_version}', this hotel is '{local_version}'"
+                ));
+            }
+        }
+
+        reasons
+    }
+
+    /// Relocation Ceremony R6: `hotel.relocate` — the philote-facing entry
+    /// point. Validates the caller, creates a [`RelocationCeremonyRecord`]
+    /// at phase INTENT, and spawns a background task
+    /// ([`Self::run_relocation_ceremony`]) that walks FEASIBILITY → STANDBY
+    /// → CONTINUITY → SWITCH → RECONCILE → CLOSE, recording every
+    /// transition so an interrupted ceremony can be found and classified on
+    /// the next boot (see
+    /// [`crate::service::role_materialization::scan_interrupted_relocation_ceremonies`]).
+    ///
+    /// Gated identically to `role.set_home`/`hotel.materialize_request` for
+    /// the low tier (role incarnation alone: operational admin authority).
+    /// If `include_transport` is set, the ceremony's risk tier is `High`
+    /// and the gate additionally requires full admin authority (`is_admin`)
+    /// — see [`ansible_mesh_core::relocation_ceremony::RelocationRiskTier::High`]'s
+    /// doc comment for the scope trim this represents.
+    ///
+    /// Fire-and-track like `MaterializeRequest`: returns
+    /// [`IpcResponse::RelocationCeremonyStarted`] as soon as the ceremony
+    /// record exists and its orchestration task is spawned, not when the
+    /// move completes. Poll [`Self::handle_relocate_hotel_status`] with
+    /// `ceremony_id` for progress.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) async fn handle_relocate_hotel(
+        graph: &GraphDomain,
+        dispatcher_tx: &mpsc::Sender<LedgerCommand>,
+        local_node_id: &str,
+        current_identity: Option<&GuestIdentity>,
+        agent_id: String,
+        role_name: String,
+        calling_role: String,
+        target_hotel: String,
+        include_transport: bool,
+        transport: Option<String>,
+        transport_resource_ref: Option<String>,
+        reason: String,
+    ) -> IpcResponse {
+        let Some(identity) = current_identity else {
+            return IpcResponse::error(
+                "relocate_hotel",
+                "RELOCATE_HOTEL_UNREGISTERED",
+                "guest must register before calling hotel.relocate",
+            );
+        };
+        if !Self::is_agent_handoff_caller(graph, identity) {
+            return IpcResponse::error(
+                "relocate_hotel",
+                "RELOCATE_HOTEL_FORBIDDEN",
+                "only agent guests may call hotel.relocate",
+            );
+        }
+
+        let calling_record = match graph.get_role_incarnation(&agent_id, &calling_role) {
+            Ok(Some(r)) => r,
+            _ => {
+                return IpcResponse::error(
+                    "relocate_hotel",
+                    "RELOCATE_HOTEL_UNKNOWN_CALLER",
+                    format!(
+                        "calling role '{}' not found for agent '{}'",
+                        calling_role, agent_id
+                    ),
+                );
+            }
+        };
+        if !calling_record.has_operational_admin_authority() {
+            return IpcResponse::error(
+                "relocate_hotel",
+                "RELOCATE_HOTEL_FORBIDDEN",
+                format!(
+                    "role '{}' does not have authority to relocate hotels",
+                    calling_role
+                ),
+            );
+        }
+        if include_transport && !calling_record.has_full_admin_authority() {
+            return IpcResponse::error(
+                "relocate_hotel",
+                "RELOCATE_HOTEL_FORBIDDEN_HIGH_TIER",
+                format!(
+                    "role '{}' has operational admin authority but moving a transport atomically \
+                     is a High-tier ceremony requiring full admin authority (is_admin)",
+                    calling_role
+                ),
+            );
+        }
+        if include_transport && (transport.is_none() || transport_resource_ref.is_none()) {
+            return IpcResponse::error(
+                "relocate_hotel",
+                "RELOCATE_HOTEL_TRANSPORT_ARGS_MISSING",
+                "include_transport requires both transport and transport_resource_ref",
+            );
+        }
+
+        let Some(target_node_id) = Self::resolve_hotel_node_id(graph, &target_hotel) else {
+            return IpcResponse::error(
+                "relocate_hotel",
+                "RELOCATE_HOTEL_UNKNOWN_HOTEL",
+                format!("no known hotel matches '{}'", target_hotel),
+            );
+        };
+        if target_node_id == local_node_id {
+            return IpcResponse::error(
+                "relocate_hotel",
+                "RELOCATE_HOTEL_LOCAL_TARGET",
+                "target_hotel is this hotel; nothing to relocate",
+            );
+        }
+
+        if graph
+            .get_role_incarnation(&agent_id, &role_name)
+            .ok()
+            .flatten()
+            .is_none()
+        {
+            return IpcResponse::error(
+                "relocate_hotel",
+                "RELOCATE_HOTEL_UNKNOWN_ROLE",
+                format!("role '{}' not found for agent '{}'", role_name, agent_id),
+            );
+        }
+
+        let ceremony_id = format!("relocate-{}", Uuid::new_v4());
+        let now = unix_ts();
+        let ceremony = RelocationCeremonyRecord::new(
+            ceremony_id.clone(),
+            agent_id.clone(),
+            role_name.clone(),
+            local_node_id.to_string(),
+            target_node_id.clone(),
+            include_transport,
+            transport,
+            transport_resource_ref,
+            calling_role.clone(),
+            reason,
+            now,
+        );
+        if let Err(err) = graph.upsert_relocation_ceremony(&ceremony) {
+            return IpcResponse::error(
+                "relocate_hotel",
+                "RELOCATE_HOTEL_PERSIST_FAILED",
+                err.to_string(),
+            );
+        }
+
+        info!(
+            "Relocation ceremony [{}] started: role '{}' (agent '{}') {} -> {}, include_transport={}, requested by '{}'",
+            ceremony_id,
+            role_name,
+            agent_id,
+            local_node_id,
+            target_node_id,
+            include_transport,
+            calling_role
+        );
+
+        let graph_bg = graph.clone();
+        let dispatcher_bg = dispatcher_tx.clone();
+        let local_node_bg = local_node_id.to_string();
+        let ceremony_id_bg = ceremony_id.clone();
+        tokio::spawn(async move {
+            Self::run_relocation_ceremony(
+                &graph_bg,
+                &dispatcher_bg,
+                &local_node_bg,
+                ceremony_id_bg,
+            )
+            .await;
+        });
+
+        IpcResponse::RelocationCeremonyStarted {
+            relocation_ceremony_started: true,
+            ceremony_id,
+            role_name,
+            target_hotel: target_node_id,
+        }
+    }
+
+    /// Bounded poll of the `materialize_ready:{request_id}` config blob
+    /// [`Self::dispatch_materialize_request_core`] writes into. 250ms ×
+    /// `max_attempts`, mirroring the cadence
+    /// `handle_remote_materialize_request` already uses target-side for the
+    /// same wait shape. Returns `None` on timeout (still pending).
+    async fn poll_materialize_ready(
+        graph: &GraphDomain,
+        request_id: &str,
+        max_attempts: u32,
+    ) -> Option<serde_json::Value> {
+        let key = format!("materialize_ready:{request_id}");
+        for _ in 0..max_attempts {
+            if let Ok(Some(raw)) = graph.get_config_value(&key) {
+                return Some(serde_json::from_str(&raw).unwrap_or_default());
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        }
+        None
+    }
+
+    /// Roll a still-pre-commitment ceremony back (free — nothing on the
+    /// origin was ever touched) and persist the terminal state.
+    fn roll_back_ceremony(
+        graph: &GraphDomain,
+        ceremony: &mut RelocationCeremonyRecord,
+        reason: impl Into<String>,
+    ) {
+        let reason = reason.into();
+        ceremony.decline_reason = Some(reason.clone());
+        let now = unix_ts();
+        ceremony.advance(RelocationCeremonyPhase::RolledBack, reason.clone(), now);
+        let _ = graph.upsert_relocation_ceremony(ceremony);
+        warn!(
+            "Relocation ceremony [{}] rolled back: {}",
+            ceremony.ceremony_id, reason
+        );
+    }
+
+    /// Mark a ceremony interrupted at or after SWITCH as `Failed` and flag
+    /// it for operator review — origin state may be inconsistent, so this
+    /// is never auto-resumed (invariant 7).
+    fn fail_ceremony_needs_review(
+        graph: &GraphDomain,
+        ceremony: &mut RelocationCeremonyRecord,
+        reason: impl Into<String>,
+    ) {
+        let reason = reason.into();
+        ceremony.decline_reason = Some(reason.clone());
+        ceremony.needs_operator_review = true;
+        let now = unix_ts();
+        ceremony.advance(RelocationCeremonyPhase::Failed, reason.clone(), now);
+        let _ = graph.upsert_relocation_ceremony(ceremony);
+        warn!(
+            "Relocation ceremony [{}] FAILED and needs operator review: {}",
+            ceremony.ceremony_id, reason
+        );
+    }
+
+    /// Drive one ceremony through FEASIBILITY → STANDBY → CONTINUITY →
+    /// SWITCH → RECONCILE → CLOSE, recording every transition. Runs as a
+    /// spawned background task from [`Self::handle_relocate_hotel`].
+    ///
+    /// Degraded continuity (R5 not built): CONTINUITY does not transfer a
+    /// session/checkpoint/dialogue-window blob — STANDBY's
+    /// `MaterializeRequest` payload already carries the role/toolset
+    /// records, which is all this ceremony moves in its current form.
+    ///
+    /// SWITCH does not reach into the philote guest's live in-process turn
+    /// state to force a park (that state is private to the guest process,
+    /// not something the hotel can see or mutate) — it only flips
+    /// `home_node`/transport-home routing truth. Any turn already in flight
+    /// on the origin process finishes naturally there since no *new* turn
+    /// will route to it after SWITCH; RECONCILE then deactivates the origin
+    /// guest in the graph (not a forced kill) so the existing
+    /// supervisor/TTL path reclaims the process once it is actually idle.
+    async fn run_relocation_ceremony(
+        graph: &GraphDomain,
+        dispatcher_tx: &mpsc::Sender<LedgerCommand>,
+        local_node_id: &str,
+        ceremony_id: String,
+    ) {
+        let Ok(Some(mut ceremony)) = graph.get_relocation_ceremony(&ceremony_id) else {
+            warn!(
+                "run_relocation_ceremony: ceremony [{}] vanished before orchestration could run",
+                ceremony_id
+            );
+            return;
+        };
+
+        let Ok(Some(role_record)) =
+            graph.get_role_incarnation(&ceremony.agent_id, &ceremony.role_name)
+        else {
+            Self::roll_back_ceremony(
+                graph,
+                &mut ceremony,
+                "role record disappeared before FEASIBILITY could run",
+            );
+            return;
+        };
+
+        // ── FEASIBILITY ──────────────────────────────────────────────────
+        let now = unix_ts();
+        ceremony.advance(
+            RelocationCeremonyPhase::Feasibility,
+            "dispatching dry-run feasibility check",
+            now,
+        );
+        let _ = graph.upsert_relocation_ceremony(&ceremony);
+
+        let requester_guest_id = role_record.guest_id.clone();
+        let feasibility_reply = Self::dispatch_materialize_request_core(
+            graph,
+            dispatcher_tx,
+            local_node_id,
+            requester_guest_id.clone(),
+            ceremony.agent_id.clone(),
+            ceremony.role_name.clone(),
+            ceremony.requested_by_role.clone(),
+            ceremony.target_hotel.clone(),
+            true,
+        )
+        .await;
+        let IpcResponse::MaterializeRequested { request_id, .. } = feasibility_reply else {
+            Self::roll_back_ceremony(
+                graph,
+                &mut ceremony,
+                "FEASIBILITY dispatch failed before any mesh round trip".to_string(),
+            );
+            return;
+        };
+        ceremony.materialize_request_id = Some(request_id.clone());
+        let _ = graph.upsert_relocation_ceremony(&ceremony);
+
+        match Self::poll_materialize_ready(graph, &request_id, 20).await {
+            None => {
+                Self::roll_back_ceremony(
+                    graph,
+                    &mut ceremony,
+                    "FEASIBILITY check timed out waiting for the target's reply",
+                );
+                return;
+            }
+            Some(reply) if reply.get("ok").and_then(|v| v.as_bool()) != Some(true) => {
+                let decline = reply
+                    .get("error")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("target declined without a reason")
+                    .to_string();
+                Self::roll_back_ceremony(
+                    graph,
+                    &mut ceremony,
+                    format!("target declined FEASIBILITY: {decline}"),
+                );
+                return;
+            }
+            Some(_) => {}
+        }
+
+        // ── STANDBY ───────────────────────────────────────────────────────
+        let now = unix_ts();
+        ceremony.advance(
+            RelocationCeremonyPhase::Standby,
+            "target feasible; committing STANDBY (materialize + spawn)",
+            now,
+        );
+        let _ = graph.upsert_relocation_ceremony(&ceremony);
+
+        let standby_reply = Self::dispatch_materialize_request_core(
+            graph,
+            dispatcher_tx,
+            local_node_id,
+            requester_guest_id,
+            ceremony.agent_id.clone(),
+            ceremony.role_name.clone(),
+            ceremony.requested_by_role.clone(),
+            ceremony.target_hotel.clone(),
+            false,
+        )
+        .await;
+        let IpcResponse::MaterializeRequested { request_id, .. } = standby_reply else {
+            Self::roll_back_ceremony(
+                graph,
+                &mut ceremony,
+                "STANDBY dispatch failed before any mesh round trip".to_string(),
+            );
+            return;
+        };
+        ceremony.materialize_request_id = Some(request_id.clone());
+        let _ = graph.upsert_relocation_ceremony(&ceremony);
+
+        match Self::poll_materialize_ready(graph, &request_id, 40).await {
+            None => {
+                Self::roll_back_ceremony(
+                    graph,
+                    &mut ceremony,
+                    "STANDBY timed out waiting for the target to report ready",
+                );
+                return;
+            }
+            Some(reply) if reply.get("ok").and_then(|v| v.as_bool()) != Some(true) => {
+                let decline = reply
+                    .get("error")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("target failed STANDBY without a reason")
+                    .to_string();
+                Self::roll_back_ceremony(
+                    graph,
+                    &mut ceremony,
+                    format!("target failed STANDBY: {decline}"),
+                );
+                return;
+            }
+            Some(_) => {}
+        }
+
+        // ── CONTINUITY (degraded — R5 not built) ────────────────────────
+        let now = unix_ts();
+        ceremony.advance(
+            RelocationCeremonyPhase::Continuity,
+            "degraded: no continuity blob transfer (R5 not built); STANDBY's role/toolset \
+             records are the only state this ceremony carries",
+            now,
+        );
+        let _ = graph.upsert_relocation_ceremony(&ceremony);
+
+        // ── SWITCH ───────────────────────────────────────────────────────
+        let now = unix_ts();
+        ceremony.advance(
+            RelocationCeremonyPhase::Switch,
+            "flipping home_node (and transport home, if included)",
+            now,
+        );
+        let _ = graph.upsert_relocation_ceremony(&ceremony);
+
+        let role_home_reply = Self::perform_set_role_home(
+            graph,
+            ceremony.agent_id.clone(),
+            ceremony.role_name.clone(),
+            ceremony.requested_by_role.clone(),
+            Some(ceremony.target_hotel.clone()),
+        );
+        if !matches!(role_home_reply, IpcResponse::RoleHomeSet { .. }) {
+            // Nothing committed yet at this exact call (perform_set_role_home
+            // is a single atomic upsert) — safe to roll back.
+            Self::roll_back_ceremony(
+                graph,
+                &mut ceremony,
+                "SWITCH failed setting home_node; origin was not touched",
+            );
+            return;
+        }
+
+        if ceremony.include_transport {
+            let (Some(transport), Some(resource_ref)) = (
+                ceremony.transport.clone(),
+                ceremony.transport_resource_ref.clone(),
+            ) else {
+                Self::fail_ceremony_needs_review(
+                    graph,
+                    &mut ceremony,
+                    "SWITCH committed home_node but transport/resource_ref were missing for the \
+                     include_transport leg — role already moved, transport did not",
+                );
+                return;
+            };
+            let transport_reply = Self::perform_set_transport_home(
+                graph,
+                ceremony.agent_id.clone(),
+                transport,
+                resource_ref,
+                ceremony.requested_by_role.clone(),
+                ceremony.target_hotel.clone(),
+                Vec::new(),
+            );
+            if !matches!(transport_reply, IpcResponse::TransportHomeSet { .. }) {
+                // Partial commitment: home_node already moved, transport
+                // didn't. Never auto-rolled-back post-SWITCH (invariant 7) —
+                // surface loudly instead.
+                Self::fail_ceremony_needs_review(
+                    graph,
+                    &mut ceremony,
+                    format!(
+                        "SWITCH committed home_node but transport move failed: {transport_reply:?} \
+                         — role already moved, transport did not"
+                    ),
+                );
+                return;
+            }
+        }
+
+        // ── RECONCILE ────────────────────────────────────────────────────
+        let now = unix_ts();
+        ceremony.advance(
+            RelocationCeremonyPhase::Reconcile,
+            "deactivating origin guest (dormant, not deleted — never resurrected from seed)",
+            now,
+        );
+        let _ = graph.upsert_relocation_ceremony(&ceremony);
+
+        if let Some(origin_hotel_name) = IpcServer::local_hotel_name(graph, local_node_id) {
+            if let Err(err) =
+                graph.set_guest_active(&origin_hotel_name, &role_record.guest_id, false)
+            {
+                warn!(
+                    "Relocation ceremony [{}] RECONCILE: failed to deactivate origin guest '{}': {} \
+                     (non-fatal — the move itself already committed)",
+                    ceremony.ceremony_id, role_record.guest_id, err
+                );
+            }
+        } else {
+            warn!(
+                "Relocation ceremony [{}] RECONCILE: could not resolve local hotel_name for '{}' \
+                 — origin guest left active (non-fatal, the move itself already committed)",
+                ceremony.ceremony_id, local_node_id
+            );
+        }
+
+        // ── CLOSE ────────────────────────────────────────────────────────
+        let now = unix_ts();
+        ceremony.advance(RelocationCeremonyPhase::Close, "ceremony complete", now);
+        let _ = graph.upsert_relocation_ceremony(&ceremony);
+
+        info!(
+            "Relocation ceremony [{}] CLOSED: role '{}' (agent '{}') now home at '{}'",
+            ceremony.ceremony_id, ceremony.role_name, ceremony.agent_id, ceremony.target_hotel
+        );
+    }
+
+    /// Poll the progress/outcome of a prior [`Self::handle_relocate_hotel`].
+    pub(super) fn handle_relocate_hotel_status(
+        graph: &GraphDomain,
+        ceremony_id: String,
+    ) -> IpcResponse {
+        match graph.get_relocation_ceremony(&ceremony_id) {
+            Ok(Some(ceremony)) => IpcResponse::RelocationCeremonyStatus {
+                relocation_ceremony_status: true,
+                ceremony_id,
+                phase: ceremony.phase.as_str().to_string(),
+                risk_tier: ceremony.risk_tier.as_str().to_string(),
+                origin_hotel: ceremony.origin_hotel,
+                target_hotel: ceremony.target_hotel,
+                include_transport: ceremony.include_transport,
+                decline_reason: ceremony.decline_reason,
+                needs_operator_review: ceremony.needs_operator_review,
+            },
+            Ok(None) => IpcResponse::error(
+                "relocate_hotel_status",
+                "RELOCATE_HOTEL_STATUS_UNKNOWN",
+                format!("no relocation ceremony found for id '{}'", ceremony_id),
+            ),
+            Err(err) => IpcResponse::error(
+                "relocate_hotel_status",
+                "RELOCATE_HOTEL_STATUS_DB_ERROR",
+                err.to_string(),
+            ),
+        }
+    }
+}
+
+/// Relocation Ceremony R6: boot-time scan for a ceremony an unclean restart
+/// interrupted mid-flight (invariant 7 — "a crashed ceremony resumes from
+/// its last recorded phase or rolls back to the origin"). Called once from
+/// hotel startup, after the graph is open.
+///
+/// A ceremony interrupted while still pre-commitment (INTENT through
+/// CONTINUITY — SWITCH never ran) is rolled back for free: nothing on the
+/// origin was ever touched, so there is nothing to undo. A ceremony
+/// interrupted at or after SWITCH is never auto-resumed — blindly re-driving
+/// SWITCH/RECONCILE after an unknown crash point risks a double-action, so
+/// it is instead flagged `needs_operator_review` and left exactly where it
+/// stopped for a human (or a deliberate follow-up ceremony) to resolve.
+pub fn scan_interrupted_relocation_ceremonies(graph: &GraphDomain) {
+    let ceremonies = match graph.list_relocation_ceremonies(None, None) {
+        Ok(c) => c,
+        Err(err) => {
+            warn!(
+                "scan_interrupted_relocation_ceremonies: failed to list ceremonies: {}",
+                err
+            );
+            return;
+        }
+    };
+    let now = unix_ts();
+    for mut ceremony in ceremonies {
+        if ceremony.phase.is_terminal() {
+            continue;
+        }
+        let interrupted_phase = ceremony.phase;
+        if interrupted_phase.is_pre_commitment() {
+            ceremony.decline_reason = Some(format!(
+                "interrupted by hotel restart at phase '{}', before SWITCH — no committed \
+                 changes, safe rollback",
+                interrupted_phase.as_str()
+            ));
+            ceremony.advance(
+                RelocationCeremonyPhase::RolledBack,
+                format!(
+                    "boot-time scan: rolled back from interrupted phase '{}'",
+                    interrupted_phase.as_str()
+                ),
+                now,
+            );
+            let _ = graph.upsert_relocation_ceremony(&ceremony);
+            warn!(
+                "Relocation ceremony [{}] rolled back on boot: interrupted at '{}' before SWITCH",
+                ceremony.ceremony_id,
+                interrupted_phase.as_str()
+            );
+        } else {
+            ceremony.needs_operator_review = true;
+            ceremony.updated_at = now;
+            let _ = graph.upsert_relocation_ceremony(&ceremony);
+            warn!(
+                "Relocation ceremony [{}] interrupted by hotel restart AFTER SWITCH (phase '{}') \
+                 — origin state may be inconsistent, flagged needs_operator_review",
+                ceremony.ceremony_id,
+                interrupted_phase.as_str()
+            );
+        }
+    }
+}
+
+/// The live subscriber that should receive a task addressed to an agent id:
+/// the agent's orchestrator incarnation on the `agent` role, else its
+/// `role:<agent>:orchestrator` inbox, else any `agent` guest of that agent.
+/// `None` when the name is not an agent id this hotel is serving right now.
+pub(crate) async fn agent_addressed_subscriber(
+    inboxes: &InboxRegistry,
+    agent_id: &str,
+) -> Option<(String, String)> {
+    if agent_id.is_empty() || agent_id.contains(':') {
+        return None;
+    }
+    let orchestrator_guest = format!("{agent_id}:orchestrator");
+    let guest_prefix = format!("{agent_id}:");
+    let guard = inboxes.lock().await;
+    if let Some(subs) = guard.get("agent") {
+        if let Some(sub) = subs.iter().find(|s| s.guest_id == orchestrator_guest) {
+            return Some(("agent".to_string(), sub.guest_id.clone()));
+        }
+    }
+    let incarnation_role = format!("role:{agent_id}:orchestrator");
+    if let Some(sub) = guard.get(&incarnation_role).and_then(|subs| subs.first()) {
+        return Some((incarnation_role, sub.guest_id.clone()));
+    }
+    if let Some(subs) = guard.get("agent") {
+        if let Some(sub) = subs
+            .iter()
+            .find(|s| s.guest_id == agent_id || s.guest_id.starts_with(&guest_prefix))
+        {
+            return Some(("agent".to_string(), sub.guest_id.clone()));
+        }
+    }
+    None
 }
 
 #[cfg(test)]
@@ -1704,6 +2808,114 @@ mod tests {
     }
 
     #[test]
+    fn set_role_home_resolves_bare_hotel_name_to_real_node_id() {
+        let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
+        let graph = GraphDomain::new(Arc::new(graph_store.adapter()));
+        // DEF-124: hotel_name ("vps-jane", the tool's own documented example)
+        // differs from the real node_id ("vps-jane-aiua-01") that every
+        // cross-hotel routing comparison actually keys on.
+        graph
+            .upsert_hotel(&ansible_mesh_core::storage::HotelRecord {
+                hotel_name: "vps-jane".into(),
+                capabilities: NodeCapabilities {
+                    node_id: "vps-jane-aiua-01".into(),
+                    roles: vec![],
+                    models: vec![],
+                    tools: vec![],
+                    constraints: Default::default(),
+                    build_version: String::new(),
+                },
+                mesh_port: 9000,
+                blob_port: 9001,
+                execution_port: 9002,
+                ipc_socket_path: String::new(),
+                active_pid: None,
+                mesh_host: None,
+            })
+            .expect("seed vps-jane hotel record");
+        graph
+            .upsert_role_incarnation(&RoleIncarnationRecord {
+                agent_id: "agent-beacon".into(),
+                role_name: "orchestrator".into(),
+                guest_id: "agent-beacon:orchestrator".into(),
+                toolset_profile: "orchestrator".into(),
+                is_admin: true,
+                readiness_state: RoleReadinessState::Routable,
+                turn_loop_config: TurnLoopConfig::default(),
+                home_node: None,
+                ..Default::default()
+            })
+            .expect("seed admin orchestrator role");
+        let identity = GuestIdentity {
+            guest_id: "agent-beacon".into(),
+            role: "agent".into(),
+            supported_tools: vec![],
+        };
+
+        let resp = IpcServer::handle_set_role_home(
+            &graph,
+            Some(&identity),
+            "agent-beacon".into(),
+            "orchestrator".into(),
+            "orchestrator".into(),
+            Some("vps-jane".into()),
+        );
+
+        match resp {
+            IpcResponse::RoleHomeSet { home_node, .. } => {
+                assert_eq!(home_node.as_deref(), Some("vps-jane-aiua-01"));
+            }
+            other => panic!("expected IpcResponse::RoleHomeSet, got {other:?}"),
+        }
+
+        let persisted = graph
+            .get_role_incarnation("agent-beacon", "orchestrator")
+            .expect("read back role")
+            .expect("role exists");
+        assert_eq!(persisted.home_node.as_deref(), Some("vps-jane-aiua-01"));
+    }
+
+    #[test]
+    fn set_role_home_rejects_target_hotel_matching_no_known_hotel() {
+        let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
+        let graph = GraphDomain::new(Arc::new(graph_store.adapter()));
+        graph
+            .upsert_role_incarnation(&RoleIncarnationRecord {
+                agent_id: "agent-beacon".into(),
+                role_name: "orchestrator".into(),
+                guest_id: "agent-beacon:orchestrator".into(),
+                toolset_profile: "orchestrator".into(),
+                is_admin: true,
+                readiness_state: RoleReadinessState::Routable,
+                turn_loop_config: TurnLoopConfig::default(),
+                home_node: None,
+                ..Default::default()
+            })
+            .expect("seed admin orchestrator role");
+        let identity = GuestIdentity {
+            guest_id: "agent-beacon".into(),
+            role: "agent".into(),
+            supported_tools: vec![],
+        };
+
+        let resp = IpcServer::handle_set_role_home(
+            &graph,
+            Some(&identity),
+            "agent-beacon".into(),
+            "orchestrator".into(),
+            "orchestrator".into(),
+            Some("nonexistent-hotel".into()),
+        );
+
+        match resp {
+            IpcResponse::Standard {
+                ok: false, code, ..
+            } => assert_eq!(code, "SET_ROLE_HOME_UNKNOWN_HOTEL"),
+            other => panic!("expected a rejecting IpcResponse::Standard, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn normalize_cron_target_role_leaves_unresolvable_role_untouched() {
         let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
         let graph = GraphDomain::new(Arc::new(graph_store.adapter()));
@@ -1725,6 +2937,725 @@ mod tests {
         IpcServer::normalize_cron_target_role(&graph, &mut job);
 
         assert_eq!(job.target_role, "role:agent-beacon:orchestrator");
+    }
+
+    #[tokio::test]
+    async fn materialize_request_rejects_caller_without_operational_admin_authority() {
+        let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
+        let graph = GraphDomain::new(Arc::new(graph_store.adapter()));
+        graph
+            .upsert_role_incarnation(&RoleIncarnationRecord {
+                agent_id: "agent-beacon".into(),
+                role_name: "vixen".into(),
+                guest_id: "agent-beacon:vixen".into(),
+                toolset_profile: "vixen".into(),
+                is_admin: false,
+                readiness_state: RoleReadinessState::Routable,
+                turn_loop_config: TurnLoopConfig::default(),
+                home_node: None,
+                ..Default::default()
+            })
+            .expect("seed non-admin calling role");
+        let (dispatcher_tx, _rx) = test_dispatcher_channel();
+        let identity = GuestIdentity {
+            guest_id: "agent-beacon".into(),
+            role: "agent".into(),
+            supported_tools: vec![],
+        };
+
+        let resp = IpcServer::handle_materialize_request(
+            &graph,
+            &dispatcher_tx,
+            "mac-jane",
+            Some(&identity),
+            "agent-beacon".into(),
+            "vixen".into(),
+            "vixen".into(), // calling_role: the non-admin role itself, not orchestrator
+            "vps-jane".into(),
+            false,
+        )
+        .await;
+
+        match resp {
+            IpcResponse::Standard {
+                ok: false, message, ..
+            } => assert!(
+                message.contains("does not have authority"),
+                "expected authority-denial message, got: {message}"
+            ),
+            other => panic!("expected a rejecting IpcResponse::Standard, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn materialize_request_dispatches_mesh_event_carrying_role_and_toolset_records() {
+        let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
+        let graph = GraphDomain::new(Arc::new(graph_store.adapter()));
+        // DEF-124: seed a hotel whose hotel_name ("vps-jane", the documented
+        // target_hotel example) differs from its real node_id
+        // ("vps-jane-aiua-01", what routing actually keys on), so this test
+        // exercises the resolution, not a self-consistent coincidence.
+        graph
+            .upsert_hotel(&ansible_mesh_core::storage::HotelRecord {
+                hotel_name: "vps-jane".into(),
+                capabilities: NodeCapabilities {
+                    node_id: "vps-jane-aiua-01".into(),
+                    roles: vec![],
+                    models: vec![],
+                    tools: vec![],
+                    constraints: Default::default(),
+                    build_version: String::new(),
+                },
+                mesh_port: 9000,
+                blob_port: 9001,
+                execution_port: 9002,
+                ipc_socket_path: String::new(),
+                active_pid: None,
+                mesh_host: None,
+            })
+            .expect("seed vps-jane hotel record");
+        graph
+            .upsert_role_incarnation(&RoleIncarnationRecord {
+                agent_id: "agent-beacon".into(),
+                role_name: "orchestrator".into(),
+                guest_id: "agent-beacon:orchestrator".into(),
+                toolset_profile: "orchestrator".into(),
+                is_admin: true,
+                readiness_state: RoleReadinessState::Routable,
+                turn_loop_config: TurnLoopConfig::default(),
+                home_node: Some("mac-jane".into()),
+                ..Default::default()
+            })
+            .expect("seed admin orchestrator role");
+        let (dispatcher_tx, mut rx) = test_dispatcher_channel();
+        let identity = GuestIdentity {
+            guest_id: "agent-beacon".into(),
+            role: "agent".into(),
+            supported_tools: vec![],
+        };
+
+        let resp = IpcServer::handle_materialize_request(
+            &graph,
+            &dispatcher_tx,
+            "mac-jane",
+            Some(&identity),
+            "agent-beacon".into(),
+            "orchestrator".into(),
+            "orchestrator".into(),
+            "vps-jane".into(),
+            false,
+        )
+        .await;
+
+        let (request_id, role_name, target_hotel) = match resp {
+            IpcResponse::MaterializeRequested {
+                materialize_requested,
+                request_id,
+                role_name,
+                target_hotel,
+            } => {
+                assert!(materialize_requested);
+                (request_id, role_name, target_hotel)
+            }
+            other => panic!("expected IpcResponse::MaterializeRequested, got {other:?}"),
+        };
+        assert_eq!(role_name, "orchestrator");
+        // Resolved to the real node_id, not echoed back as the bare
+        // hotel_name that was passed in (DEF-124).
+        assert_eq!(target_hotel, "vps-jane-aiua-01");
+
+        let cmd = rx.recv().await.expect("mesh envelope dispatched");
+        let LedgerCommand::AppendLocal(event) = cmd else {
+            panic!("expected LedgerCommand::AppendLocal");
+        };
+        assert_eq!(event.kind, EventKind::MaterializeRequest);
+        assert_eq!(event.target_node_id.as_deref(), Some("vps-jane-aiua-01"));
+        let EventPayload::Inline { data } = &event.payload else {
+            panic!("expected inline payload");
+        };
+        let v: serde_json::Value = serde_json::from_str(data).expect("valid json payload");
+        assert_eq!(v["request_id"].as_str(), Some(request_id.as_str()));
+        assert_eq!(v["role_record"]["home_node"].as_str(), Some("mac-jane"));
+        assert_eq!(v["role_record"]["readiness_state"], "routable");
+    }
+
+    #[tokio::test]
+    async fn materialize_request_rejects_target_hotel_matching_no_known_hotel() {
+        let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
+        let graph = GraphDomain::new(Arc::new(graph_store.adapter()));
+        graph
+            .upsert_role_incarnation(&RoleIncarnationRecord {
+                agent_id: "agent-beacon".into(),
+                role_name: "orchestrator".into(),
+                guest_id: "agent-beacon:orchestrator".into(),
+                toolset_profile: "orchestrator".into(),
+                is_admin: true,
+                readiness_state: RoleReadinessState::Routable,
+                turn_loop_config: TurnLoopConfig::default(),
+                home_node: None,
+                ..Default::default()
+            })
+            .expect("seed admin orchestrator role");
+        let (dispatcher_tx, _rx) = test_dispatcher_channel();
+        let identity = GuestIdentity {
+            guest_id: "agent-beacon".into(),
+            role: "agent".into(),
+            supported_tools: vec![],
+        };
+
+        // No hotel named or node_id'd "nonexistent-hotel" was ever seeded.
+        let resp = IpcServer::handle_materialize_request(
+            &graph,
+            &dispatcher_tx,
+            "mac-jane",
+            Some(&identity),
+            "agent-beacon".into(),
+            "orchestrator".into(),
+            "orchestrator".into(),
+            "nonexistent-hotel".into(),
+            false,
+        )
+        .await;
+
+        match resp {
+            IpcResponse::Standard {
+                ok: false, code, ..
+            } => assert_eq!(code, "MATERIALIZE_REQUEST_UNKNOWN_HOTEL"),
+            other => panic!("expected a rejecting IpcResponse::Standard, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn materialize_status_reports_pending_when_no_reply_has_landed() {
+        let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
+        let graph = GraphDomain::new(Arc::new(graph_store.adapter()));
+
+        let resp = IpcServer::handle_materialize_status(&graph, "no-such-request".into());
+
+        match resp {
+            IpcResponse::MaterializeStatus {
+                materialize_status,
+                request_id,
+                ok,
+                readiness,
+                error,
+            } => {
+                assert!(materialize_status);
+                assert_eq!(request_id, "no-such-request");
+                assert_eq!(ok, None);
+                assert_eq!(readiness, None);
+                assert_eq!(error, None);
+            }
+            other => panic!("expected IpcResponse::MaterializeStatus, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn materialize_status_surfaces_a_landed_ready_reply() {
+        let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
+        let graph = GraphDomain::new(Arc::new(graph_store.adapter()));
+        graph
+            .set_config_value(
+                "materialize_ready:req-123",
+                &serde_json::json!({
+                    "request_id": "req-123",
+                    "guest_id": "agent-beacon:orchestrator",
+                    "ok": true,
+                    "readiness": "routable",
+                    "error": null,
+                })
+                .to_string(),
+            )
+            .expect("seed materialize_ready reply");
+
+        let resp = IpcServer::handle_materialize_status(&graph, "req-123".into());
+
+        match resp {
+            IpcResponse::MaterializeStatus {
+                ok,
+                readiness,
+                error,
+                ..
+            } => {
+                assert_eq!(ok, Some(true));
+                assert_eq!(readiness.as_deref(), Some("routable"));
+                assert_eq!(error, None);
+            }
+            other => panic!("expected IpcResponse::MaterializeStatus, got {other:?}"),
+        }
+    }
+
+    fn seed_relocatable_orchestrator(graph: &GraphDomain) {
+        graph
+            .upsert_hotel(&HotelRecord {
+                hotel_name: "vps-jane".into(),
+                capabilities: NodeCapabilities {
+                    node_id: "vps-jane-aiua-01".into(),
+                    roles: vec![],
+                    models: vec![],
+                    tools: vec![],
+                    constraints: Default::default(),
+                    build_version: String::new(),
+                },
+                mesh_port: 9000,
+                blob_port: 9001,
+                execution_port: 9002,
+                ipc_socket_path: String::new(),
+                active_pid: None,
+                mesh_host: None,
+            })
+            .expect("seed vps-jane hotel record");
+        graph
+            .upsert_role_incarnation(&RoleIncarnationRecord {
+                agent_id: "agent-beacon".into(),
+                role_name: "orchestrator".into(),
+                guest_id: "agent-beacon:orchestrator".into(),
+                toolset_profile: "orchestrator".into(),
+                is_admin: true,
+                readiness_state: RoleReadinessState::Routable,
+                turn_loop_config: TurnLoopConfig::default(),
+                home_node: Some("mac-jane".into()),
+                ..Default::default()
+            })
+            .expect("seed admin orchestrator role");
+        graph
+            .upsert_hotel(&HotelRecord {
+                hotel_name: "mac-jane".into(),
+                capabilities: NodeCapabilities {
+                    node_id: "mac-jane-aiua-01".into(),
+                    roles: vec![],
+                    models: vec![],
+                    tools: vec![],
+                    constraints: Default::default(),
+                    build_version: String::new(),
+                },
+                mesh_port: 9000,
+                blob_port: 9001,
+                execution_port: 9002,
+                ipc_socket_path: String::new(),
+                active_pid: None,
+                mesh_host: None,
+            })
+            .expect("seed mac-jane hotel record");
+        graph
+            .upsert_guest(&GuestRecord {
+                hotel_name: "mac-jane".into(),
+                guest_id: "agent-beacon:orchestrator".into(),
+                role: "agent".into(),
+                config_json: "{}".into(),
+                is_active: true,
+                active_pid: None,
+                last_active_at: None,
+            })
+            .expect("seed orchestrator guest record on mac-jane");
+    }
+
+    #[tokio::test]
+    async fn relocate_hotel_rejects_caller_without_operational_admin_authority() {
+        let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
+        let graph = GraphDomain::new(Arc::new(graph_store.adapter()));
+        graph
+            .upsert_role_incarnation(&RoleIncarnationRecord {
+                agent_id: "agent-beacon".into(),
+                role_name: "vixen".into(),
+                guest_id: "agent-beacon:vixen".into(),
+                toolset_profile: "vixen".into(),
+                is_admin: false,
+                readiness_state: RoleReadinessState::Routable,
+                turn_loop_config: TurnLoopConfig::default(),
+                home_node: None,
+                ..Default::default()
+            })
+            .expect("seed non-admin calling role");
+        let (dispatcher_tx, _rx) = test_dispatcher_channel();
+        let identity = GuestIdentity {
+            guest_id: "agent-beacon".into(),
+            role: "agent".into(),
+            supported_tools: vec![],
+        };
+
+        let resp = IpcServer::handle_relocate_hotel(
+            &graph,
+            &dispatcher_tx,
+            "mac-jane-aiua-01",
+            Some(&identity),
+            "agent-beacon".into(),
+            "vixen".into(),
+            "vixen".into(),
+            "vps-jane".into(),
+            false,
+            None,
+            None,
+            "test move".into(),
+        )
+        .await;
+
+        match resp {
+            IpcResponse::Standard {
+                ok: false, message, ..
+            } => assert!(
+                message.contains("does not have authority"),
+                "expected authority-denial message, got: {message}"
+            ),
+            other => panic!("expected a rejecting IpcResponse::Standard, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn relocate_hotel_rejects_transport_move_without_full_admin_authority() {
+        let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
+        let graph = GraphDomain::new(Arc::new(graph_store.adapter()));
+        graph
+            .upsert_role_incarnation(&RoleIncarnationRecord {
+                agent_id: "agent-beacon".into(),
+                role_name: "orchestrator".into(),
+                guest_id: "agent-beacon:orchestrator".into(),
+                toolset_profile: "orchestrator".into(),
+                // operational admin authority via role_name=="orchestrator",
+                // but NOT is_admin — insufficient for the High tier.
+                is_admin: false,
+                readiness_state: RoleReadinessState::Routable,
+                turn_loop_config: TurnLoopConfig::default(),
+                home_node: Some("mac-jane".into()),
+                ..Default::default()
+            })
+            .expect("seed non-full-admin orchestrator role");
+        let (dispatcher_tx, _rx) = test_dispatcher_channel();
+        let identity = GuestIdentity {
+            guest_id: "agent-beacon".into(),
+            role: "agent".into(),
+            supported_tools: vec![],
+        };
+
+        let resp = IpcServer::handle_relocate_hotel(
+            &graph,
+            &dispatcher_tx,
+            "mac-jane-aiua-01",
+            Some(&identity),
+            "agent-beacon".into(),
+            "orchestrator".into(),
+            "orchestrator".into(),
+            "vps-jane".into(),
+            true,
+            Some("telegram".into()),
+            Some("bjork-bot".into()),
+            "test move with transport".into(),
+        )
+        .await;
+
+        match resp {
+            IpcResponse::Standard {
+                ok: false, message, ..
+            } => assert!(
+                message.contains("High-tier"),
+                "expected High-tier-denial message, got: {message}"
+            ),
+            other => panic!("expected a rejecting IpcResponse::Standard, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn relocate_hotel_full_ceremony_reaches_close_and_flips_home_node() {
+        let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
+        let graph = GraphDomain::new(Arc::new(graph_store.adapter()));
+        seed_relocatable_orchestrator(&graph);
+        let (dispatcher_tx, mut rx) = test_dispatcher_channel();
+        let identity = GuestIdentity {
+            guest_id: "agent-beacon".into(),
+            role: "agent".into(),
+            supported_tools: vec![],
+        };
+
+        let resp = IpcServer::handle_relocate_hotel(
+            &graph,
+            &dispatcher_tx,
+            "mac-jane-aiua-01",
+            Some(&identity),
+            "agent-beacon".into(),
+            "orchestrator".into(),
+            "orchestrator".into(),
+            "vps-jane".into(),
+            false,
+            None,
+            None,
+            "test move".into(),
+        )
+        .await;
+        let ceremony_id = match resp {
+            IpcResponse::RelocationCeremonyStarted {
+                relocation_ceremony_started,
+                ceremony_id,
+                ..
+            } => {
+                assert!(relocation_ceremony_started);
+                ceremony_id
+            }
+            other => panic!("expected IpcResponse::RelocationCeremonyStarted, got {other:?}"),
+        };
+
+        // FEASIBILITY's dry-run MaterializeRequest.
+        let cmd = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+            .await
+            .expect("feasibility dispatch within timeout")
+            .expect("feasibility mesh envelope dispatched");
+        let LedgerCommand::AppendLocal(event) = cmd else {
+            panic!("expected LedgerCommand::AppendLocal");
+        };
+        let EventPayload::Inline { data } = &event.payload else {
+            panic!("expected inline payload");
+        };
+        let v: serde_json::Value = serde_json::from_str(data).expect("valid json payload");
+        assert_eq!(v["dry_run"], serde_json::Value::Bool(true));
+        let feasibility_request_id = v["request_id"].as_str().expect("request_id").to_string();
+        graph
+            .set_config_value(
+                &format!("materialize_ready:{feasibility_request_id}"),
+                &serde_json::json!({"ok": true, "readiness": "feasible"}).to_string(),
+            )
+            .expect("seed feasibility reply");
+
+        // STANDBY's real MaterializeRequest.
+        let cmd = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+            .await
+            .expect("standby dispatch within timeout")
+            .expect("standby mesh envelope dispatched");
+        let LedgerCommand::AppendLocal(event) = cmd else {
+            panic!("expected LedgerCommand::AppendLocal");
+        };
+        let EventPayload::Inline { data } = &event.payload else {
+            panic!("expected inline payload");
+        };
+        let v: serde_json::Value = serde_json::from_str(data).expect("valid json payload");
+        assert_eq!(v["dry_run"], serde_json::Value::Bool(false));
+        let standby_request_id = v["request_id"].as_str().expect("request_id").to_string();
+        graph
+            .set_config_value(
+                &format!("materialize_ready:{standby_request_id}"),
+                &serde_json::json!({"ok": true, "readiness": "routable"}).to_string(),
+            )
+            .expect("seed standby reply");
+
+        // Poll until the ceremony reaches a terminal phase.
+        let mut final_ceremony = None;
+        for _ in 0..40 {
+            let ceremony = graph
+                .get_relocation_ceremony(&ceremony_id)
+                .expect("query ceremony")
+                .expect("ceremony exists");
+            if ceremony.phase.is_terminal() {
+                final_ceremony = Some(ceremony);
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        let ceremony = final_ceremony.expect("ceremony reached a terminal phase within bound");
+        assert_eq!(ceremony.phase, RelocationCeremonyPhase::Close);
+        assert!(!ceremony.needs_operator_review);
+
+        let moved_role = graph
+            .get_role_incarnation("agent-beacon", "orchestrator")
+            .expect("query role")
+            .expect("role exists");
+        assert_eq!(moved_role.home_node.as_deref(), Some("vps-jane-aiua-01"));
+
+        let origin_guest = graph
+            .list_guests("mac-jane", false)
+            .expect("list mac-jane guests")
+            .into_iter()
+            .find(|g| g.guest_id == "agent-beacon:orchestrator")
+            .expect("origin guest record still present (dormant, not deleted)");
+        assert!(
+            !origin_guest.is_active,
+            "RECONCILE should have deactivated the origin guest"
+        );
+    }
+
+    #[tokio::test]
+    async fn relocate_hotel_rolls_back_for_free_when_target_declines_feasibility() {
+        let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
+        let graph = GraphDomain::new(Arc::new(graph_store.adapter()));
+        seed_relocatable_orchestrator(&graph);
+        let (dispatcher_tx, mut rx) = test_dispatcher_channel();
+        let identity = GuestIdentity {
+            guest_id: "agent-beacon".into(),
+            role: "agent".into(),
+            supported_tools: vec![],
+        };
+
+        let resp = IpcServer::handle_relocate_hotel(
+            &graph,
+            &dispatcher_tx,
+            "mac-jane-aiua-01",
+            Some(&identity),
+            "agent-beacon".into(),
+            "orchestrator".into(),
+            "orchestrator".into(),
+            "vps-jane".into(),
+            false,
+            None,
+            None,
+            "test move".into(),
+        )
+        .await;
+        let ceremony_id = match resp {
+            IpcResponse::RelocationCeremonyStarted { ceremony_id, .. } => ceremony_id,
+            other => panic!("expected IpcResponse::RelocationCeremonyStarted, got {other:?}"),
+        };
+
+        let cmd = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+            .await
+            .expect("feasibility dispatch within timeout")
+            .expect("feasibility mesh envelope dispatched");
+        let LedgerCommand::AppendLocal(event) = cmd else {
+            panic!("expected LedgerCommand::AppendLocal");
+        };
+        let EventPayload::Inline { data } = &event.payload else {
+            panic!("expected inline payload");
+        };
+        let v: serde_json::Value = serde_json::from_str(data).expect("valid json payload");
+        let feasibility_request_id = v["request_id"].as_str().expect("request_id").to_string();
+        graph
+            .set_config_value(
+                &format!("materialize_ready:{feasibility_request_id}"),
+                &serde_json::json!({"ok": false, "error": "no live controller"}).to_string(),
+            )
+            .expect("seed feasibility decline");
+
+        let mut final_ceremony = None;
+        for _ in 0..40 {
+            let ceremony = graph
+                .get_relocation_ceremony(&ceremony_id)
+                .expect("query ceremony")
+                .expect("ceremony exists");
+            if ceremony.phase.is_terminal() {
+                final_ceremony = Some(ceremony);
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        let ceremony = final_ceremony.expect("ceremony reached a terminal phase within bound");
+        assert_eq!(ceremony.phase, RelocationCeremonyPhase::RolledBack);
+        assert!(
+            ceremony
+                .decline_reason
+                .as_deref()
+                .unwrap_or_default()
+                .contains("no live controller"),
+            "expected the target's decline reason to surface, got: {:?}",
+            ceremony.decline_reason
+        );
+
+        // The role was never touched — free rollback.
+        let role = graph
+            .get_role_incarnation("agent-beacon", "orchestrator")
+            .expect("query role")
+            .expect("role exists");
+        assert_eq!(role.home_node.as_deref(), Some("mac-jane"));
+
+        // No STANDBY dispatch should have followed the decline.
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(200), rx.recv())
+                .await
+                .is_err(),
+            "expected no further mesh dispatch after a FEASIBILITY decline"
+        );
+    }
+
+    #[test]
+    fn boot_scan_rolls_back_a_ceremony_interrupted_before_switch() {
+        let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
+        let graph = GraphDomain::new(Arc::new(graph_store.adapter()));
+        let ceremony = RelocationCeremonyRecord::new(
+            "cer-interrupted-pre".into(),
+            "agent-beacon".into(),
+            "orchestrator".into(),
+            "mac-jane-aiua-01".into(),
+            "vps-jane-aiua-01".into(),
+            false,
+            None,
+            None,
+            "orchestrator".into(),
+            "test".into(),
+            1000,
+        );
+        graph
+            .upsert_relocation_ceremony(&ceremony)
+            .expect("seed ceremony at INTENT");
+
+        scan_interrupted_relocation_ceremonies(&graph);
+
+        let after = graph
+            .get_relocation_ceremony("cer-interrupted-pre")
+            .expect("query ceremony")
+            .expect("ceremony exists");
+        assert_eq!(after.phase, RelocationCeremonyPhase::RolledBack);
+        assert!(!after.needs_operator_review);
+    }
+
+    #[test]
+    fn boot_scan_flags_a_ceremony_interrupted_after_switch_for_operator_review() {
+        let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
+        let graph = GraphDomain::new(Arc::new(graph_store.adapter()));
+        let mut ceremony = RelocationCeremonyRecord::new(
+            "cer-interrupted-post".into(),
+            "agent-beacon".into(),
+            "orchestrator".into(),
+            "mac-jane-aiua-01".into(),
+            "vps-jane-aiua-01".into(),
+            false,
+            None,
+            None,
+            "orchestrator".into(),
+            "test".into(),
+            1000,
+        );
+        ceremony.advance(RelocationCeremonyPhase::Switch, "home_node flipped", 1010);
+        graph
+            .upsert_relocation_ceremony(&ceremony)
+            .expect("seed ceremony interrupted at SWITCH");
+
+        scan_interrupted_relocation_ceremonies(&graph);
+
+        let after = graph
+            .get_relocation_ceremony("cer-interrupted-post")
+            .expect("query ceremony")
+            .expect("ceremony exists");
+        // Left exactly where it stopped — never auto-resumed past SWITCH.
+        assert_eq!(after.phase, RelocationCeremonyPhase::Switch);
+        assert!(after.needs_operator_review);
+    }
+
+    #[test]
+    fn boot_scan_ignores_terminal_ceremonies() {
+        let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
+        let graph = GraphDomain::new(Arc::new(graph_store.adapter()));
+        let mut ceremony = RelocationCeremonyRecord::new(
+            "cer-already-closed".into(),
+            "agent-beacon".into(),
+            "orchestrator".into(),
+            "mac-jane-aiua-01".into(),
+            "vps-jane-aiua-01".into(),
+            false,
+            None,
+            None,
+            "orchestrator".into(),
+            "test".into(),
+            1000,
+        );
+        ceremony.advance(RelocationCeremonyPhase::Close, "done", 1010);
+        graph
+            .upsert_relocation_ceremony(&ceremony)
+            .expect("seed closed ceremony");
+
+        scan_interrupted_relocation_ceremonies(&graph);
+
+        let after = graph
+            .get_relocation_ceremony("cer-already-closed")
+            .expect("query ceremony")
+            .expect("ceremony exists");
+        assert_eq!(after.phase, RelocationCeremonyPhase::Close);
+        assert!(!after.needs_operator_review);
+        assert_eq!(after.updated_at, 1010, "untouched by the scan");
     }
 
     #[tokio::test]
@@ -1786,6 +3717,102 @@ mod tests {
         assert!(
             parked_inbound.lock().await.is_empty(),
             "must not park a task that belongs to a different node"
+        );
+    }
+
+    /// DEF-151, live 2026-09-16 18:40 UTC: a `delegate.to_peer` envelope
+    /// addressed to "agent-bjork-01" was dropped on arrival.
+    #[tokio::test]
+    async fn peer_delegation_addressed_to_an_agent_id_reaches_its_orchestrator() {
+        let inboxes: InboxRegistry = Arc::new(Mutex::new(HashMap::new()));
+        let graph = Arc::new(GraphDomain::new(Arc::new(TestGraphAdapter)));
+        let parked_inbound: Arc<Mutex<HashMap<String, Vec<ParkedInboundTask>>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+        let mat_req = MockMaterializationRequester::default();
+
+        let (theoretician_tx, mut theoretician_rx) = mpsc::unbounded_channel::<IpcResponse>();
+        let (orchestrator_tx, mut orchestrator_rx) = mpsc::unbounded_channel::<IpcResponse>();
+        let mut roles = Vec::new();
+        IpcServer::add_subscription(
+            &inboxes,
+            "agent",
+            Uuid::new_v4(),
+            "agent-bjork-01:theoretician",
+            &[],
+            &crate::service::ipc::CountedSender::detached(&theoretician_tx),
+            &mut roles,
+        )
+        .await;
+        IpcServer::add_subscription(
+            &inboxes,
+            "agent",
+            Uuid::new_v4(),
+            "agent-bjork-01:orchestrator",
+            &[],
+            &crate::service::ipc::CountedSender::detached(&orchestrator_tx),
+            &mut roles,
+        )
+        .await;
+
+        let event = EventEnvelope {
+            event_id: Uuid::new_v4(),
+            seq: 1,
+            source_node_id: "vps-jane-aiua-01".into(),
+            target_node_id: Some("mac-jane-aiua-01".into()),
+            source_agent_id: "agent-beacon:orchestrator".into(),
+            target_agent_id: Some("agent-bjork-01".into()),
+            kind: EventKind::TaskInvoke,
+            corr_id: "delegation".into(),
+            attempt: 0,
+            created_at: 0,
+            expires_at: None,
+            payload: EventPayload::Inline {
+                data: serde_json::json!({
+                    "action": "peer.delegate",
+                    "agent_id": "agent-bjork-01",
+                    "session_id": "7898847424:peer:agent-bjork-01",
+                    "chat_id": "7898847424",
+                    "content": "Handoff from peer agent-beacon:orchestrator: organ practice tonight",
+                })
+                .to_string(),
+            },
+            trace: vec![],
+        };
+        let handled = IpcServer::deliver_event_envelope_or_park(
+            &inboxes,
+            &event,
+            None,
+            &graph,
+            "mac-jane-aiua-01",
+            &parked_inbound,
+            Some(&mat_req),
+            &new_delivery_claim_registry(),
+        )
+        .await;
+        assert!(handled);
+        assert!(
+            matches!(
+                orchestrator_rx.try_recv(),
+                Ok(IpcResponse::InboundTask { .. })
+            ),
+            "the agent's orchestrator must receive the peer delegation"
+        );
+        assert!(
+            theoretician_rx.try_recv().is_err(),
+            "a sibling incarnation must not receive it"
+        );
+        assert_eq!(mat_req.calls.load(Ordering::SeqCst), 0);
+
+        // Role names and unknown agents are not rerouted.
+        assert!(
+            agent_addressed_subscriber(&inboxes, "role:agent-bjork-01:orchestrator")
+                .await
+                .is_none()
+        );
+        assert!(
+            agent_addressed_subscriber(&inboxes, "agent-nobody")
+                .await
+                .is_none()
         );
     }
 
@@ -1884,6 +3911,7 @@ mod tests {
                     models: vec![],
                     tools: vec![],
                     constraints: Default::default(),
+                    build_version: String::new(),
                 },
                 mesh_port: 9000,
                 blob_port: 9001,
@@ -2029,6 +4057,17 @@ mod tests {
             .expect("cross-hotel arm must seed the philote hotel guest record");
         assert!(guest.is_active);
         assert_eq!(guest.role, "orchestrator");
+
+        let config: serde_json::Value =
+            serde_json::from_str(&guest.config_json).expect("config_json must be valid JSON");
+        let env = config["env"].clone();
+        assert_eq!(
+            env["PHILOTIC_ROLE_INBOX"], "role:agent-test:orchestrator",
+            "spawned philote must self-report the canonical routing role, or it can never \
+             pass Self::is_agent_handoff_caller and hand back out of the role"
+        );
+        assert_eq!(env["PHILOTIC_GUEST_ID"], "agent-test:orchestrator");
+        assert_eq!(env["PHILOTIC_HOTEL_NAME"], "local-hotel");
     }
 
     #[tokio::test]
@@ -2047,6 +4086,7 @@ mod tests {
                     models: vec![],
                     tools: vec![],
                     constraints: Default::default(),
+                    build_version: String::new(),
                 },
                 mesh_port: 9000,
                 blob_port: 9001,
@@ -2146,6 +4186,7 @@ mod tests {
                     models: vec![],
                     tools: vec![],
                     constraints: Default::default(),
+                    build_version: String::new(),
                 },
                 mesh_port: 9000,
                 blob_port: 9001,
@@ -2262,6 +4303,7 @@ mod tests {
                     models: vec![],
                     tools: vec![],
                     constraints: Default::default(),
+                    build_version: String::new(),
                 },
                 mesh_port: 9000,
                 blob_port: 9001,
@@ -2357,6 +4399,7 @@ mod tests {
                     models: vec![],
                     tools: vec![],
                     constraints: Default::default(),
+                    build_version: String::new(),
                 },
                 mesh_port: 9000,
                 blob_port: 9001,
@@ -2487,6 +4530,7 @@ mod tests {
                     models: vec![],
                     tools: vec![],
                     constraints: Default::default(),
+                    build_version: String::new(),
                 },
                 mesh_port: 9000,
                 blob_port: 9001,
@@ -2593,6 +4637,7 @@ mod tests {
                     models: vec![],
                     tools: vec![],
                     constraints: Default::default(),
+                    build_version: String::new(),
                 },
                 mesh_port: 9000,
                 blob_port: 9001,
@@ -2674,6 +4719,7 @@ mod tests {
                     models: vec![],
                     tools: vec![],
                     constraints: Default::default(),
+                    build_version: String::new(),
                 },
                 mesh_port: 9000,
                 blob_port: 9001,
@@ -2898,6 +4944,207 @@ mod tests {
         }
     }
 
+    /// DEF-132: the theoretician's home was stored as the bare hotel name
+    /// ("mac-jane") while every routing comparison keys on the node_id
+    /// ("mac-jane-aiua-01"); the handoff was dispatched "remote" to a peer
+    /// that does not exist and the bundle never reached the local role.
+    #[tokio::test]
+    async fn handoff_to_role_homed_by_local_hotel_name_is_delivered_locally() {
+        let _env_guard = ipc_env_guard();
+        let socket_path = test_socket_path();
+        let (dispatcher_tx, _dispatcher_rx) = test_dispatcher_channel();
+        let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
+        let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
+        graph
+            .upsert_hotel(&HotelRecord {
+                hotel_name: "local-hotel".into(),
+                capabilities: NodeCapabilities {
+                    node_id: "local-aiua-01".into(),
+                    roles: vec![],
+                    models: vec![],
+                    tools: vec![],
+                    constraints: Default::default(),
+                    build_version: String::new(),
+                },
+                mesh_port: 9000,
+                blob_port: 9001,
+                execution_port: 9002,
+                ipc_socket_path: socket_path.clone(),
+                active_pid: None,
+                mesh_host: None,
+            })
+            .expect("seed local hotel");
+        graph
+            .upsert_session(&SessionRecord {
+                session_id: "sess-handoff-home-name".into(),
+                session_kind: "conversation".into(),
+                primary_agent_id: Some("agent-jane-01".into()),
+                active_incarnation_id: Some("agent-jane:orchestrator".into()),
+                channel_kind: Some("telegram".into()),
+                channel_session_key: Some("123".into()),
+                status: "active".into(),
+                lease_owner_component_id: None,
+                lease_expires_at: None,
+                summary_json: serde_json::json!({}),
+                created_at: 1,
+                updated_at: 2,
+            })
+            .expect("session should seed");
+        graph
+            .upsert_role_incarnation(&RoleIncarnationRecord {
+                agent_id: "agent-jane-01".into(),
+                role_name: "theoretician".into(),
+                guest_id: "agent-jane:theoretician".into(),
+                toolset_profile: "codex".into(),
+                role_identity_addendum: None,
+                role_manifest: None,
+                is_admin: false,
+                readiness_state: RoleReadinessState::Configured,
+                inactive_ttl_seconds: None,
+                turn_loop_config: TurnLoopConfig::default(),
+                // The bare hotel NAME of this very hotel — not its node_id.
+                home_node: Some("local-hotel".into()),
+                ..Default::default()
+            })
+            .expect("theoretician role should seed");
+        let server = IpcServer::new(
+            socket_path.clone(),
+            "local-aiua-01",
+            dispatcher_tx,
+            graph.clone(),
+        );
+        let server_task = tokio::spawn(async move {
+            server.run().await.expect("ipc server should run");
+        });
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        unsafe {
+            std::env::set_var("PHILOTIC_HOTEL_SOCKET", &socket_path);
+        }
+
+        let mut orchestrator = PhiloticClient::connect(GuestIdentity {
+            guest_id: "agent-jane:orchestrator".into(),
+            role: "agent".into(),
+            supported_tools: Vec::new(),
+        })
+        .await
+        .expect("orchestrator connect");
+        let mut theoretician = PhiloticClient::connect(GuestIdentity {
+            guest_id: "agent-jane:theoretician".into(),
+            role: "agent".into(),
+            supported_tools: Vec::new(),
+        })
+        .await
+        .expect("theoretician connect");
+        theoretician
+            .send_request(IpcRequest::SubscribeInbox {
+                role: "role:agent-jane-01:theoretician".into(),
+            })
+            .await
+            .expect("theoretician role inbox subscribe");
+
+        let response = orchestrator
+            .send_request(IpcRequest::HandoffToRole {
+                session_id: "sess-handoff-home-name".into(),
+                role_name: "theoretician".into(),
+                handoff_bundle: HandoffBundle {
+                    goal: "map the nocturne's sections".into(),
+                    context_excerpt: "Chopin posthumous nocturne".into(),
+                    session_id: "sess-handoff-home-name".into(),
+                    initiating_turn_id: "turn-1".into(),
+                    return_to: Some("orchestrator".into()),
+                    handoff_reason: Some("manual_role_switch".into()),
+                    active_goal: Some("map the nocturne's sections".into()),
+                    active_constraints: Vec::new(),
+                    relevant_session_facts: Vec::new(),
+                    working_summary: None,
+                    from_role: Some("orchestrator".into()),
+                    to_role: Some("theoretician".into()),
+                    suggested_memory_refs: Vec::new(),
+                    expected_return_mode: Some("required".into()),
+                    cleanup_actions: Vec::new(),
+                },
+            })
+            .await
+            .expect("handoff request");
+        match response {
+            IpcResponse::HandoffAck {
+                handoff_guest_id, ..
+            } => {
+                assert_eq!(handoff_guest_id, "agent-jane:theoretician");
+            }
+            other => panic!("unexpected handoff response: {other:?}"),
+        }
+
+        // The bundle must land in the LOCAL role inbox — a remote dispatch to
+        // a peer named "local-hotel" never delivers anywhere.
+        let delivered = tokio::time::timeout(
+            tokio::time::Duration::from_secs(1),
+            theoretician.recv_task(),
+        )
+        .await
+        .expect("theoretician should receive the handoff bundle locally")
+        .expect("theoretician recv should succeed");
+        match delivered {
+            IpcResponse::InboundTask { task_json, .. } => {
+                let payload: serde_json::Value =
+                    serde_json::from_str(&task_json).expect("handoff payload should decode");
+                assert_eq!(payload["action"], "handoff_bundle");
+                assert_eq!(
+                    payload["handoff_bundle"]["goal"],
+                    "map the nocturne's sections"
+                );
+            }
+            other => panic!("unexpected theoretician inbound response: {other:?}"),
+        }
+
+        unsafe {
+            std::env::remove_var("PHILOTIC_HOTEL_SOCKET");
+        }
+        server_task.abort();
+        let _ = server_task.await;
+        if Path::new(&socket_path).exists() {
+            let _ = std::fs::remove_file(&socket_path);
+        }
+    }
+
+    /// DEF-134: a mesh-config-seeded role guest (PHILOTIC_ROLE_NAME only, no
+    /// PHILOTIC_ROLE_INBOX) built before the philote-side default registered
+    /// under the bare role name. It is still the incarnation the record
+    /// describes and must be allowed to hand back; a tool runner is not.
+    #[test]
+    fn bare_role_name_identity_is_an_agent_handoff_caller() {
+        let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
+        let graph = GraphDomain::new(Arc::new(graph_store.adapter()));
+        graph
+            .upsert_role_incarnation(&RoleIncarnationRecord {
+                agent_id: "agent-bjork-01".into(),
+                role_name: "theoretician".into(),
+                guest_id: "agent-bjork-01:theoretician".into(),
+                toolset_profile: "theoretician".into(),
+                readiness_state: RoleReadinessState::ActiveInSession,
+                ..Default::default()
+            })
+            .expect("seed role incarnation");
+        let bare = GuestIdentity {
+            guest_id: "agent-bjork-01:theoretician".into(),
+            role: "theoretician".into(),
+            supported_tools: Vec::new(),
+        };
+        assert!(IpcServer::is_agent_handoff_caller(&graph, &bare));
+        let routing = GuestIdentity {
+            guest_id: "agent-bjork-01:theoretician".into(),
+            role: "role:agent-bjork-01:theoretician".into(),
+            supported_tools: Vec::new(),
+        };
+        assert!(IpcServer::is_agent_handoff_caller(&graph, &routing));
+        let tool = GuestIdentity {
+            guest_id: "agent-bjork-01:theoretician".into(),
+            role: "tool".into(),
+            supported_tools: Vec::new(),
+        };
+        assert!(!IpcServer::is_agent_handoff_caller(&graph, &tool));
+    }
+
     #[tokio::test]
     async fn role_incarnation_can_initiate_manual_handoff_to_role() {
         let _env_guard = ipc_env_guard();
@@ -3046,6 +5293,133 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn handoff_to_role_resolves_role_name_case_insensitively() {
+        // Role names are stored with whatever casing they were configured with
+        // (e.g. "Chronos"), but an operator typing `/role chronos` from memory,
+        // or a model emitting a lowercased argument, must still resolve —
+        // live-observed: HANDOFF_ROLE_UNKNOWN for `/role chronos` against a
+        // role stored as "Chronos".
+        let _env_guard = ipc_env_guard();
+        let socket_path = test_socket_path();
+        let (dispatcher_tx, _dispatcher_rx) = test_dispatcher_channel();
+        let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
+        let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
+        graph
+            .upsert_session(&SessionRecord {
+                session_id: "sess-role-case-insensitive".into(),
+                session_kind: "conversation".into(),
+                primary_agent_id: Some("agent-beacon".into()),
+                active_incarnation_id: Some("agent-beacon".into()),
+                channel_kind: Some("telegram".into()),
+                channel_session_key: Some("456".into()),
+                status: "active".into(),
+                lease_owner_component_id: None,
+                lease_expires_at: None,
+                summary_json: serde_json::json!({}),
+                created_at: 1,
+                updated_at: 2,
+            })
+            .expect("session should seed");
+        graph
+            .upsert_role_incarnation(&RoleIncarnationRecord {
+                agent_id: "agent-beacon".into(),
+                role_name: "Chronos".into(),
+                guest_id: "agent-beacon:Chronos".into(),
+                toolset_profile: "scheduler".into(),
+                role_identity_addendum: None,
+                role_manifest: None,
+                is_admin: false,
+                readiness_state: RoleReadinessState::Configured,
+                inactive_ttl_seconds: None,
+                turn_loop_config: TurnLoopConfig::default(),
+                home_node: None,
+                ..Default::default()
+            })
+            .expect("Chronos role should seed");
+        let server = IpcServer::new(
+            socket_path.clone(),
+            "local-aiua-01",
+            dispatcher_tx,
+            graph.clone(),
+        );
+
+        let server_task = tokio::spawn(async move {
+            server.run().await.expect("ipc server should run");
+        });
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        unsafe {
+            std::env::set_var("PHILOTIC_HOTEL_SOCKET", &socket_path);
+        }
+
+        let mut base_agent = PhiloticClient::connect(GuestIdentity {
+            guest_id: "agent-beacon".into(),
+            role: "agent".into(),
+            supported_tools: Vec::new(),
+        })
+        .await
+        .expect("base agent connect");
+        let mut chronos = PhiloticClient::connect(GuestIdentity {
+            guest_id: "agent-beacon:Chronos".into(),
+            role: "role:agent-beacon:Chronos".into(),
+            supported_tools: Vec::new(),
+        })
+        .await
+        .expect("chronos connect");
+        chronos
+            .send_request(IpcRequest::SubscribeInbox {
+                role: "agent".into(),
+            })
+            .await
+            .expect("chronos agent inbox subscribe");
+
+        let response = base_agent
+            .send_request(IpcRequest::HandoffToRole {
+                session_id: "sess-role-case-insensitive".into(),
+                role_name: "chronos".into(),
+                handoff_bundle: HandoffBundle {
+                    goal: "switch role".into(),
+                    context_excerpt: "manual slash command".into(),
+                    session_id: "sess-role-case-insensitive".into(),
+                    initiating_turn_id: "turn-1".into(),
+                    return_to: Some("orchestrator".into()),
+                    handoff_reason: Some("manual_role_switch".into()),
+                    active_goal: None,
+                    active_constraints: Vec::new(),
+                    relevant_session_facts: Vec::new(),
+                    working_summary: None,
+                    from_role: Some("orchestrator".into()),
+                    to_role: Some("chronos".into()),
+                    suggested_memory_refs: Vec::new(),
+                    expected_return_mode: Some("required".into()),
+                    cleanup_actions: Vec::new(),
+                },
+            })
+            .await
+            .expect("handoff request");
+
+        match response {
+            IpcResponse::HandoffAck {
+                handoff_guest_id,
+                became_active,
+            } => {
+                assert_eq!(handoff_guest_id, "agent-beacon:Chronos");
+                assert!(became_active);
+            }
+            other => panic!("lowercase role name must still resolve, got: {other:?}"),
+        }
+
+        unsafe {
+            std::env::remove_var("PHILOTIC_HOTEL_SOCKET");
+        }
+        server_task.abort();
+        let _ = server_task.await;
+        if Path::new(&socket_path).exists() {
+            let _ = std::fs::remove_file(&socket_path);
+        }
+    }
+
+    #[tokio::test]
     async fn handoff_to_missing_role_returns_pending_until_role_inbox_is_routable() {
         let _env_guard = ipc_env_guard();
         let socket_path = test_socket_path();
@@ -3061,6 +5435,7 @@ mod tests {
                     models: vec![],
                     tools: vec![],
                     constraints: Default::default(),
+                    build_version: String::new(),
                 },
                 mesh_port: 9000,
                 blob_port: 9001,
@@ -3303,6 +5678,7 @@ mod tests {
                     models: vec![],
                     tools: vec![],
                     constraints: Default::default(),
+                    build_version: String::new(),
                 },
                 mesh_port: 9000,
                 blob_port: 9001,
@@ -3387,6 +5763,7 @@ mod tests {
                     models: vec![],
                     tools: vec![],
                     constraints: Default::default(),
+                    build_version: String::new(),
                 },
                 mesh_port: 9000,
                 blob_port: 9001,
@@ -3484,6 +5861,7 @@ mod tests {
                     models: vec![],
                     tools: vec![],
                     constraints: Default::default(),
+                    build_version: String::new(),
                 },
                 mesh_port: 9000,
                 blob_port: 9001,
@@ -3584,6 +5962,7 @@ mod tests {
                     models: vec![],
                     tools: vec![],
                     constraints: Default::default(),
+                    build_version: String::new(),
                 },
                 mesh_port: 9000,
                 blob_port: 9001,
@@ -3709,6 +6088,7 @@ mod tests {
                     models: vec![],
                     tools: vec![],
                     constraints: Default::default(),
+                    build_version: String::new(),
                 },
                 mesh_port: 9000,
                 blob_port: 9001,
@@ -3870,6 +6250,7 @@ mod tests {
                     models: vec![],
                     tools: vec![],
                     constraints: Default::default(),
+                    build_version: String::new(),
                 },
                 mesh_port: 9000,
                 blob_port: 9001,
@@ -4059,6 +6440,7 @@ mod tests {
                     models: vec![],
                     tools: vec![],
                     constraints: Default::default(),
+                    build_version: String::new(),
                 },
                 mesh_port: 9000,
                 blob_port: 9001,
@@ -4149,6 +6531,7 @@ mod tests {
                     models: vec![],
                     tools: vec![],
                     constraints: Default::default(),
+                    build_version: String::new(),
                 },
                 mesh_port: 9000,
                 blob_port: 9001,
@@ -4248,6 +6631,7 @@ mod tests {
                     models: vec![],
                     tools: vec![],
                     constraints: Default::default(),
+                    build_version: String::new(),
                 },
                 mesh_port: 9000,
                 blob_port: 9001,
@@ -4338,6 +6722,7 @@ mod tests {
                     models: vec![],
                     tools: vec![],
                     constraints: Default::default(),
+                    build_version: String::new(),
                 },
                 mesh_port: 9000,
                 blob_port: 9001,
@@ -4509,6 +6894,7 @@ mod tests {
                     models: vec![],
                     tools: vec![],
                     constraints: Default::default(),
+                    build_version: String::new(),
                 },
                 mesh_port: 9000,
                 blob_port: 9001,
@@ -4934,6 +7320,7 @@ mod tests {
                     models: vec![],
                     tools: vec![],
                     constraints: Default::default(),
+                    build_version: String::new(),
                 },
                 mesh_port: 9000,
                 blob_port: 9001,
@@ -5033,5 +7420,176 @@ mod tests {
         if Path::new(&socket_path).exists() {
             let _ = std::fs::remove_file(&socket_path);
         }
+    }
+
+    #[test]
+    fn resolve_binary_feasible_checks_absolute_paths_directly() {
+        let dir = std::env::temp_dir().join(format!("philotic-r4-abs-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let real_file = dir.join("real-binary");
+        std::fs::write(&real_file, b"#!/bin/sh\n").expect("write dummy binary");
+
+        assert!(IpcServer::resolve_binary_feasible(
+            real_file.to_str().expect("utf8 path")
+        ));
+        assert!(!IpcServer::resolve_binary_feasible(
+            dir.join("no-such-binary").to_str().expect("utf8 path")
+        ));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resolve_binary_feasible_checks_philotic_bin_dir() {
+        let _env_guard = ipc_env_guard();
+        let previous = std::env::var_os("PHILOTIC_BIN_DIR");
+        let dir = std::env::temp_dir().join(format!("philotic-r4-bindir-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        std::fs::write(dir.join("philote"), b"#!/bin/sh\n").expect("write dummy binary");
+        unsafe {
+            std::env::set_var("PHILOTIC_BIN_DIR", &dir);
+        }
+
+        assert!(IpcServer::resolve_binary_feasible("philote"));
+        assert!(!IpcServer::resolve_binary_feasible("no-such-guest-binary"));
+
+        unsafe {
+            match &previous {
+                Some(v) => std::env::set_var("PHILOTIC_BIN_DIR", v),
+                None => std::env::remove_var("PHILOTIC_BIN_DIR"),
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resolve_binary_feasible_falls_back_to_path() {
+        let _env_guard = ipc_env_guard();
+        let previous = std::env::var_os("PHILOTIC_BIN_DIR");
+        unsafe {
+            std::env::remove_var("PHILOTIC_BIN_DIR");
+        }
+
+        // `ls` is present on PATH in every dev/CI environment this test runs in.
+        assert!(IpcServer::resolve_binary_feasible("ls"));
+        assert!(!IpcServer::resolve_binary_feasible(
+            "definitely-not-a-real-guest-binary-name"
+        ));
+
+        unsafe {
+            if let Some(v) = &previous {
+                std::env::set_var("PHILOTIC_BIN_DIR", v);
+            }
+        }
+    }
+
+    fn feasibility_test_role(fallback_tiers: Vec<String>) -> RoleIncarnationRecord {
+        RoleIncarnationRecord {
+            agent_id: "agent-beacon".into(),
+            role_name: "orchestrator".into(),
+            guest_id: "agent-beacon:orchestrator".into(),
+            toolset_profile: "orchestrator".into(),
+            is_admin: true,
+            readiness_state: RoleReadinessState::Configured,
+            turn_loop_config: TurnLoopConfig {
+                fallback_tiers,
+                ..TurnLoopConfig::default()
+            },
+            home_node: None,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn evaluate_role_relocation_feasibility_reports_missing_controller_and_version_mismatch() {
+        let _env_guard = ipc_env_guard();
+        let previous = std::env::var_os("PHILOTIC_BIN_DIR");
+        let dir = std::env::temp_dir().join(format!("philotic-r4-eval-a-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        std::fs::write(dir.join("philote"), b"#!/bin/sh\n").expect("write dummy binary");
+        unsafe {
+            std::env::set_var("PHILOTIC_BIN_DIR", &dir);
+        }
+
+        let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
+        let graph = GraphDomain::new(Arc::new(graph_store.adapter()));
+        // No controller guests seeded on this hotel at all.
+        let role = feasibility_test_role(vec!["model.custom-controller".into()]);
+
+        let reasons = IpcServer::evaluate_role_relocation_feasibility(
+            &graph,
+            "test-hotel",
+            &role,
+            Some("0.0.1-not-the-real-version"),
+        );
+
+        assert!(
+            reasons
+                .iter()
+                .any(|r| r.contains("model.custom-controller")),
+            "expected a missing-controller reason, got: {reasons:?}"
+        );
+        assert!(
+            reasons.iter().any(|r| r.contains("build version mismatch")),
+            "expected a version-mismatch reason, got: {reasons:?}"
+        );
+
+        unsafe {
+            match &previous {
+                Some(v) => std::env::set_var("PHILOTIC_BIN_DIR", v),
+                None => std::env::remove_var("PHILOTIC_BIN_DIR"),
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn evaluate_role_relocation_feasibility_passes_when_everything_checks_out() {
+        let _env_guard = ipc_env_guard();
+        let previous = std::env::var_os("PHILOTIC_BIN_DIR");
+        let dir = std::env::temp_dir().join(format!("philotic-r4-eval-b-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        std::fs::write(dir.join("philote"), b"#!/bin/sh\n").expect("write dummy binary");
+        unsafe {
+            std::env::set_var("PHILOTIC_BIN_DIR", &dir);
+        }
+
+        let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
+        let graph = GraphDomain::new(Arc::new(graph_store.adapter()));
+        graph
+            .seed_guests(
+                "test-hotel",
+                &[GuestRecord {
+                    hotel_name: "test-hotel".into(),
+                    guest_id: "test-hotel:model-custom-controller".into(),
+                    role: "model.custom-controller".into(),
+                    config_json: "{}".into(),
+                    is_active: true,
+                    active_pid: None,
+                    last_active_at: None,
+                }],
+            )
+            .expect("seed controller guest");
+        let role = feasibility_test_role(vec!["model.custom-controller".into()]);
+
+        let reasons = IpcServer::evaluate_role_relocation_feasibility(
+            &graph,
+            "test-hotel",
+            &role,
+            Some(env!("CARGO_PKG_VERSION")),
+        );
+
+        assert!(
+            reasons.is_empty(),
+            "expected no decline reasons, got: {reasons:?}"
+        );
+
+        unsafe {
+            match &previous {
+                Some(v) => std::env::set_var("PHILOTIC_BIN_DIR", v),
+                None => std::env::remove_var("PHILOTIC_BIN_DIR"),
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

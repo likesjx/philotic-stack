@@ -48,6 +48,12 @@ mod tool_exec;
 #[path = "deterministic_capture.rs"]
 mod deterministic_capture;
 
+#[path = "tool_args.rs"]
+pub(crate) mod tool_args;
+
+#[path = "distill.rs"]
+pub(crate) mod distill;
+
 #[path = "memory_integration.rs"]
 mod memory_integration;
 use memory_integration::*;
@@ -55,6 +61,13 @@ use memory_integration::*;
 #[path = "life_capture.rs"]
 mod life_capture;
 use life_capture::*;
+
+#[path = "mcp_handling.rs"]
+mod mcp_handling;
+use mcp_handling::*;
+
+#[path = "procedure_runtime.rs"]
+mod procedure_runtime;
 
 #[path = "memory_explain_tool.rs"]
 mod memory_explain_tool;
@@ -1548,7 +1561,7 @@ fn build_capability_request(
 fn command_bypasses_turn_start(command: &SlashCommand) -> bool {
     matches!(
         command,
-        SlashCommand::Ping | SlashCommand::Status | SlashCommand::Context
+        SlashCommand::Ping | SlashCommand::Status | SlashCommand::Context | SlashCommand::Hotel
     )
 }
 
@@ -1737,6 +1750,57 @@ const MODELS_PAGE_SIZE: usize = 10;
 const TELEGRAM_CALLBACK_LIMIT: usize = 64;
 
 impl AgentRuntime {
+    /// Tools the harness may call on the model's behalf: read-only, no
+    /// arguments, no approval class. A step bound to one of these is a
+    /// measurement, and a measurement should not depend on the model
+    /// remembering to take it.
+    const HARNESS_RUNNABLE_TOOLS: &'static [&'static str] = &["life.audit"];
+
+    /// On a plan-continuation turn whose remaining (not done/failed) steps
+    /// are all bound to harness-runnable tools, the first such call.
+    fn harness_runnable_step(&self, session_id: &str, content: &str) -> Option<ToolCall> {
+        if !content.trim_start().starts_with("[Plan continuation") {
+            return None;
+        }
+        let state = self.sessions.get(session_id)?;
+        let turn = state.active_turn.as_ref()?;
+        let plan = turn.active_plan.as_ref()?;
+        let remaining: Vec<&crate::session::PlanStep> = plan
+            .steps
+            .iter()
+            .enumerate()
+            .filter(|(i, s)| {
+                !turn.plan_steps_verified.get(*i).copied().unwrap_or(false)
+                    && s.status != "done"
+                    && s.status != "failed"
+            })
+            .map(|(_, s)| s)
+            .collect();
+        if remaining.is_empty() {
+            return None;
+        }
+        let all_runnable = remaining.iter().all(|s| {
+            s.tool_name
+                .as_deref()
+                .is_some_and(|t| Self::HARNESS_RUNNABLE_TOOLS.contains(&t))
+        });
+        if !all_runnable {
+            return None;
+        }
+        let tool = remaining[0].tool_name.clone()?;
+        // Never loop: one harness call per tool per turn.
+        if turn
+            .working_tool_history
+            .iter()
+            .any(|(c, _)| c.tool_name == tool)
+        {
+            return None;
+        }
+        Some(ToolCall {
+            tool_name: tool,
+            arguments: serde_json::json!({}),
+        })
+    }
     /// Live merged `/model` preset list: the hotel config key `model_presets`
     /// (JSON array of `{alias, label, tier, model, description}`) merged over
     /// the compiled-in defaults. Config edits apply on the next `/model` —
@@ -2532,7 +2596,7 @@ impl AgentRuntime {
                             )
                             .await
                         }
-                        SlashCommand::Status | SlashCommand::Context => {
+                        SlashCommand::Status | SlashCommand::Context | SlashCommand::Hotel => {
                             self.handle_read_only_session_command(
                                 task_id,
                                 session_id,
@@ -2548,7 +2612,10 @@ impl AgentRuntime {
                         _ => unreachable!("command_bypasses_turn_start gate should be exhaustive"),
                     };
                 }
-                SlashCommand::Ping | SlashCommand::Status | SlashCommand::Context => {
+                SlashCommand::Ping
+                | SlashCommand::Status
+                | SlashCommand::Context
+                | SlashCommand::Hotel => {
                     unreachable!("read-only commands should bypass turn start")
                 }
                 SlashCommand::Pause | SlashCommand::Resume => {}
@@ -2980,6 +3047,7 @@ impl AgentRuntime {
                 paracrine_reply_session_id,
                 paracrine_reply_chat_id,
                 paracrine_response_routing,
+                paracrine_intent,
             ) = {
                 let exosome = task
                     .exosome
@@ -2990,6 +3058,13 @@ impl AgentRuntime {
                     exosome.as_ref().and_then(|e| e.source_session_id.clone()),
                     exosome.as_ref().and_then(|e| e.source_chat_id.clone()),
                     exosome.as_ref().and_then(|e| e.response_routing.clone()),
+                    exosome.as_ref().and_then(|e| {
+                        e.context
+                            .as_ref()
+                            .and_then(|c| c.get("intent"))
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.to_string())
+                    }),
                 )
             };
 
@@ -2997,24 +3072,16 @@ impl AgentRuntime {
             // (completed steps marked done) so the model sees exactly what is
             // left, and enter pre-confirmed so the plan gate does not re-park.
             let is_plan_continuation = task.action.as_deref() == Some("plan_continuation");
-            let (seeded_plan, seeded_plan_confirmed) = if is_plan_continuation {
+            let (seeded_plan, seeded_verified, seeded_plan_confirmed) = if is_plan_continuation {
                 match state.carryover_plan.as_ref() {
                     Some(carry) => {
-                        let mut plan = carry.plan.clone();
-                        for (i, step) in plan.steps.iter_mut().enumerate() {
-                            if carry.steps_done.get(i).copied().unwrap_or(false) {
-                                step.status = "done".into();
-                            }
-                        }
-                        if plan.status == "planning" {
-                            plan.status = "executing".into();
-                        }
-                        (Some(plan), true)
+                        let (plan, verified) = carry.seed_turn_plan();
+                        (Some(plan), verified, true)
                     }
-                    None => (None, false),
+                    None => (None, Vec::new(), false),
                 }
             } else {
-                (None, false)
+                (None, Vec::new(), false)
             };
 
             // Cron-triggered turns get CronPrimary (the honest marker is
@@ -3050,6 +3117,23 @@ impl AgentRuntime {
                 SelectionSource::ConfiguredDefault
             };
 
+            // Self-Improvement Loop L1: a distill review starts from a clean
+            // slate — the lookaside session's earlier verdicts must not steer
+            // this one. See `SessionState::forget_dialogue_for_lookaside`.
+            if paracrine_intent
+                .as_deref()
+                .is_some_and(|i| i == distill::INTENT || i.starts_with("skills.distill:"))
+            {
+                let forgotten = state.forget_dialogue_for_lookaside();
+                if forgotten > 0 {
+                    info!(
+                        session_id = %session_id,
+                        forgotten_turns = forgotten,
+                        "skills.distill: lookaside session dialogue forgotten before review"
+                    );
+                }
+            }
+
             state.start_turn(WorkingTurn {
                 task_id,
                 turn_id: turn_id.clone(),
@@ -3069,6 +3153,7 @@ impl AgentRuntime {
                 consecutive_step_failures: 0,
                 streak_extension: 0,
                 provider_repair_note: None,
+                say_do_nudged: false,
                 provider_repair_attempts: 0,
                 pending_text_reply: None,
                 had_voice_input,
@@ -3080,6 +3165,7 @@ impl AgentRuntime {
                 paracrine_reply_chat_id,
                 paracrine_response_routing,
                 paracrine_merge_completed: false,
+                paracrine_intent,
                 plan_confirmed: seeded_plan_confirmed,
                 plan_confirm_note: None,
                 fallback_tier: if self.network_offline { 1 } else { 0 },
@@ -3090,7 +3176,7 @@ impl AgentRuntime {
                 paracrine_chain_started_at: None,
                 started_at_unix: Some(crate::plan_eval::unix_now()),
                 last_interim_at_unix: None,
-                plan_steps_verified: Vec::new(),
+                plan_steps_verified: seeded_verified,
                 selection_source,
             });
             state.set_active_turn_phase(TurnPhase::LoadingContext);
@@ -3228,11 +3314,17 @@ impl AgentRuntime {
             model_context,
             context_projection,
             tools_for_model,
+            seeded_outcome_target,
         ) = {
             let state = self
                 .sessions
                 .get_mut(&session_id)
                 .expect("session should exist after ensuring and binding transport target");
+            // Outcome reflex: an operator report that settles a recalled loop
+            // gets a harness-seeded observe+commit plan BEFORE tools are
+            // projected, so the plan binds its tools and the evaluator has
+            // something to check. See SessionState::seed_outcome_plan.
+            let seeded_outcome_target = state.seed_outcome_plan();
             let tools_for_model = state.project_tools_for_turn(&content);
             let (model_prompt, model_context, context_projection) =
                 state.model_request_payloads(&content, &tools_for_model);
@@ -3252,6 +3344,7 @@ impl AgentRuntime {
                 model_context,
                 context_projection,
                 tools_for_model,
+                seeded_outcome_target,
             )
         };
 
@@ -3259,6 +3352,44 @@ impl AgentRuntime {
             .sync_apartment(&self.agent_id, &checkpoint_memory_type, checkpoint_json)
             .await?;
         self.sync_session_index(&index_state).await?;
+
+        if let Some(target) = seeded_outcome_target.as_deref() {
+            info!(
+                session_id = %session_id,
+                target,
+                "outcome reflex seeded an observe+commit plan for a recalled loop"
+            );
+            let _ = self
+                .emit_turn_event(
+                    &session_id,
+                    "plan_seeded",
+                    Some(format!("outcome reflex: observe outcome, resolve {target}")),
+                )
+                .await;
+        }
+
+        // Gardener closer: a continuation whose only remaining steps are
+        // read-only measurements (`life.audit`) is run by the harness, not
+        // asked of the model — live 2026-09-14 21:35 UTC the model replied
+        // "all 12 actions verified" three times without ever calling the
+        // closing audit, and the plan blocked at 0/1.
+        if let Some(call) = self.harness_runnable_step(&session_id, &content) {
+            info!(
+                session_id = %session_id,
+                tool = %call.tool_name,
+                "harness runs the plan's remaining read-only step itself"
+            );
+            let _ = self
+                .emit_turn_event(
+                    &session_id,
+                    "plan_step_harness_run",
+                    Some(format!("{}: only read-only step(s) remain", call.tool_name)),
+                )
+                .await;
+            return self
+                .route_tool_call_execution(session_id, turn_id, call, false)
+                .await;
+        }
 
         if let Some(command) = parse_slash_command(&content) {
             return match command {
@@ -3268,6 +3399,7 @@ impl AgentRuntime {
                 }
                 SlashCommand::Status
                 | SlashCommand::Context
+                | SlashCommand::Hotel
                 | SlashCommand::Pause
                 | SlashCommand::Resume
                 | SlashCommand::ToolsAdd { .. }
@@ -5382,7 +5514,16 @@ impl AgentRuntime {
         let tools_for_model = self
             .sessions
             .get(&session_id)
-            .map(|state| state.tool_assembly.tools_for_model.clone())
+            .map(|state| {
+                // A fully verified plan has nothing left but the report; a
+                // model handed its tools here re-ran twelve completed tidies
+                // (live 2026-09-15 16:33 UTC).
+                if state.plan_fully_verified() {
+                    Vec::new()
+                } else {
+                    state.tool_assembly.tools_for_model.clone()
+                }
+            })
             .unwrap_or_default();
 
         let (context, context_projection) = self
@@ -6020,6 +6161,28 @@ impl AgentRuntime {
                         "chat_id": command_chat_id,
                     }),
                 ),
+                SlashCommand::Hotel => (
+                    {
+                        let hotel = local_hotel_name().unwrap_or_else(|| "unknown".into());
+                        let node = local_node_id();
+                        hotel_location_text(
+                            &hotel,
+                            &node,
+                            &self.agent_id,
+                            self.role_name.as_deref(),
+                        )
+                    },
+                    "hotel_location_reported",
+                    serde_json::json!({
+                        "session_id": session_id,
+                        "turn_id": command_turn_id,
+                        "chat_id": command_chat_id,
+                        "hotel_name": local_hotel_name(),
+                        "node_id": local_node_id(),
+                        "agent_id": self.agent_id,
+                        "role_name": self.role_name,
+                    }),
+                ),
                 SlashCommand::Pause => {
                     state.set_status("paused");
                     (
@@ -6310,6 +6473,23 @@ impl AgentRuntime {
                     "session_id": session_id,
                     "turn_id": command_turn_id,
                     "chat_id": command_chat_id,
+                })),
+            ),
+            SlashCommand::Hotel => (
+                {
+                    let hotel = local_hotel_name().unwrap_or_else(|| "unknown".into());
+                    let node = local_node_id();
+                    hotel_location_text(&hotel, &node, &self.agent_id, self.role_name.as_deref())
+                },
+                Some("hotel_location_reported"),
+                Some(serde_json::json!({
+                    "session_id": session_id,
+                    "turn_id": command_turn_id,
+                    "chat_id": command_chat_id,
+                    "hotel_name": local_hotel_name(),
+                    "node_id": local_node_id(),
+                    "agent_id": self.agent_id,
+                    "role_name": self.role_name,
                 })),
             ),
             _ => {
@@ -6632,6 +6812,33 @@ impl AgentRuntime {
     /// it to every live session (proposal mcp-client-fabric). Sessions whose
     /// projection changed get their tool assembly rebuilt, so revoked
     /// upstreams disappear and newly reported catalogs appear.
+    /// Fetch the hotel's tool catalog records (`catalog/tools.yaml` as loaded
+    /// into the hotel graph) and rebuild every session's tool assembly when
+    /// they changed. On failure the compiled catalog stays in effect.
+    pub(crate) async fn refresh_tool_catalog(&mut self) {
+        match self
+            .ipc_client
+            .send_request_with_timeout(IpcRequest::GetToolCatalog {}, Duration::from_secs(5))
+            .await
+        {
+            Ok(IpcResponse::ToolCatalogState { tool_catalog }) => {
+                let count = tool_catalog.len();
+                if crate::catalog::set_hotel_tool_records(tool_catalog) {
+                    info!(tools = count, "tool catalog loaded from hotel records");
+                    for state in self.sessions.values_mut() {
+                        state.rebuild_default_tool_assembly();
+                    }
+                }
+            }
+            Ok(_) => warn!(
+                "refresh_tool_catalog: hotel did not return a tool catalog; compiled catalog stays"
+            ),
+            Err(e) => {
+                warn!("refresh_tool_catalog: GetToolCatalog failed: {e}; compiled catalog stays")
+            }
+        }
+    }
+
     pub(crate) async fn refresh_mcp_upstream_projection(&mut self) {
         let entries = match self
             .ipc_client
@@ -6818,6 +7025,16 @@ impl AgentRuntime {
         let new_skill_guidance: Option<Vec<String>> = bindings
             .get("effective_skill_guidance")
             .and_then(|v| serde_json::from_value(v.clone()).ok());
+        // Procedural graphs ride the same lane as skill guidance: prompt-facing,
+        // never a tool-assembly rebuild.
+        let new_procedures: Option<Vec<ansible_mesh_core::procedure::ProcedureGraphRecord>> =
+            bindings
+                .get("effective_procedures")
+                .and_then(|v| serde_json::from_value(v.clone()).ok());
+        let new_skill_records: Option<Vec<ansible_mesh_core::graph::AbstractSkillRecord>> =
+            bindings
+                .get("effective_skill_records")
+                .and_then(|v| serde_json::from_value(v.clone()).ok());
         let new_allowed_classes: Option<Vec<String>> = bindings
             .get("allowed_classes")
             .and_then(|v| serde_json::from_value(v.clone()).ok());
@@ -6844,6 +7061,17 @@ impl AgentRuntime {
             // deliberately does not set `changed` (no tool-assembly rebuild).
             if skill_guidance != state.bindings.effective_skill_guidance {
                 state.bindings.effective_skill_guidance = skill_guidance;
+            }
+        }
+        if let Some(procedures) = new_procedures {
+            if procedures != state.bindings.effective_procedures {
+                state.bindings.effective_procedures = procedures;
+            }
+        }
+        if let Some(records) = new_skill_records {
+            // Projection-facing only, like guidance: no tool-assembly rebuild.
+            if records != state.bindings.effective_skill_records {
+                state.bindings.effective_skill_records = records;
             }
         }
         if let Some(allowed_classes) = new_allowed_classes {
@@ -7184,6 +7412,19 @@ fn local_hotel_name() -> Option<String> {
         .filter(|name| !name.is_empty())
 }
 
+/// Builds the `/hotel` reply: a quick "where am I running" readout — which
+/// hotel (node) materialized this philote, and under which role, if any.
+/// Takes resolved values rather than reading env vars itself, so callers
+/// (and tests) control the source and formatting stays independent of the
+/// process environment.
+fn hotel_location_text(hotel: &str, node: &str, agent_id: &str, role_name: Option<&str>) -> String {
+    let role = role_name.unwrap_or("orchestrator");
+    let guest_identity = compose_guest_identity(agent_id, role_name);
+    format!(
+        "Hotel: {hotel}. Node: {node}. Agent: {agent_id}. Role: {role}. Guest identity: {guest_identity}."
+    )
+}
+
 fn projected_user_context_from_profile(profile: &UserProfileDataPayload) -> Option<String> {
     let display_name = profile
         .preferred_name
@@ -7508,6 +7749,7 @@ mod tests {
             consecutive_step_failures: 0,
             streak_extension: 0,
             provider_repair_note: None,
+            say_do_nudged: false,
             provider_repair_attempts: 0,
             pending_text_reply: None,
             had_voice_input: false,
@@ -7519,6 +7761,7 @@ mod tests {
             paracrine_reply_chat_id: None,
             paracrine_response_routing: None,
             paracrine_merge_completed: false,
+            paracrine_intent: None,
             plan_confirmed: false,
             plan_confirm_note: None,
             fallback_tier: 0,
@@ -7666,6 +7909,7 @@ mod tests {
                 .collect(),
             status: "executing".into(),
             context_1_advisory: None,
+            procedure_id: None,
         });
         for tool_name in diagnostics {
             push_test_tool(&mut turn, tool_name, "ok");
@@ -7689,6 +7933,7 @@ mod tests {
             }],
             status: "executing".into(),
             context_1_advisory: None,
+            procedure_id: None,
         });
         for tool_name in ["hotel.status", "role.list", "skill.list", "session.status"] {
             push_test_tool(&mut turn, tool_name, "ok");
@@ -7713,6 +7958,7 @@ mod tests {
             }],
             status: "executing".into(),
             context_1_advisory: None,
+            procedure_id: None,
         });
         for _ in 0..4 {
             push_test_tool(
@@ -8600,6 +8846,7 @@ mod tests {
             consecutive_step_failures: 0,
             streak_extension: 0,
             provider_repair_note: None,
+            say_do_nudged: false,
             provider_repair_attempts: 0,
             pending_text_reply: None,
             had_voice_input: false,
@@ -8611,6 +8858,7 @@ mod tests {
             paracrine_reply_chat_id: None,
             paracrine_response_routing: None,
             paracrine_merge_completed: false,
+            paracrine_intent: None,
             plan_confirmed: false,
             plan_confirm_note: None,
             fallback_tier: 0,
@@ -9203,10 +9451,23 @@ mod tests {
         assert!(super::command_bypasses_turn_start(&SlashCommand::Ping));
         assert!(super::command_bypasses_turn_start(&SlashCommand::Status));
         assert!(super::command_bypasses_turn_start(&SlashCommand::Context));
+        assert!(super::command_bypasses_turn_start(&SlashCommand::Hotel));
         assert!(!super::command_bypasses_turn_start(&SlashCommand::Pause));
         assert!(!super::command_bypasses_turn_start(
             &SlashCommand::Approve { note: None }
         ));
+    }
+
+    #[test]
+    fn hotel_location_text_reports_agent_and_role() {
+        assert_eq!(
+            super::hotel_location_text("mac-jane", "local-aiua-01", "astrid", None),
+            "Hotel: mac-jane. Node: local-aiua-01. Agent: astrid. Role: orchestrator. Guest identity: astrid."
+        );
+        assert_eq!(
+            super::hotel_location_text("vps-jane", "vps-01", "astrid", Some("chronos")),
+            "Hotel: vps-jane. Node: vps-01. Agent: astrid. Role: chronos. Guest identity: astrid:chronos."
+        );
     }
 
     #[test]
@@ -10524,6 +10785,141 @@ mod tests {
     }
 
     // ── Turn-failure heal intake (self-heal) ─────────────────────────────────
+
+    /// An approval that times out mid-plan must leave the plan resumable —
+    /// not discarded. Before this fix, eviction cleared `parked_approval_turn`
+    /// (and everything it carried) with no carryover set, so the NEXT user
+    /// message restarted the whole goal from step 1 instead of continuing at
+    /// the step whose approval actually timed out. Live 2026-08-27: a
+    /// 4-step `skill.register` plan restarted from scratch three separate
+    /// times and never registered anything.
+    #[tokio::test]
+    async fn approval_timeout_eviction_stashes_plan_into_carryover() {
+        let socket_path = format!(
+            "/tmp/philote-approvalcarry-{}.sock",
+            Uuid::new_v4().simple()
+        );
+        let listener = tokio::net::UnixListener::bind(&socket_path).expect("bind");
+        let emitted = std::sync::Arc::new(std::sync::Mutex::new(Vec::<serde_json::Value>::new()));
+        let server = tokio::spawn(run_recording_hotel(listener, emitted.clone()));
+
+        let identity = philotic_client::GuestIdentity {
+            guest_id: "agent-approval-carry".into(),
+            role: "agent".into(),
+            supported_tools: Vec::new(),
+        };
+        let client = philotic_client::PhiloticClient::connect_at(&socket_path, identity)
+            .await
+            .expect("connect to stub hotel");
+        let mut runtime = AgentRuntime::new(client, "agent-approval-carry");
+
+        let session_id = "sess-approval-carry";
+        runtime
+            .ensure_session_loaded(session_id, "telegram")
+            .await
+            .expect("session load");
+
+        let mut turn = def004_working_turn("turn-approval-carry", "skill.register");
+        turn.phase = TurnPhase::WaitingApproval;
+        turn.active_plan = Some(ActivePlan {
+            goal: "Register four music stewardship skills".into(),
+            steps: vec![
+                PlanStep {
+                    id: 1,
+                    description: "register practice-tracker".into(),
+                    tool_name: Some("skill.register".into()),
+                    status: "done".into(),
+                },
+                PlanStep {
+                    id: 2,
+                    description: "register fatigue-monitor".into(),
+                    tool_name: Some("skill.register".into()),
+                    status: "pending".into(),
+                },
+                PlanStep {
+                    id: 3,
+                    description: "register tempo-log".into(),
+                    tool_name: Some("skill.register".into()),
+                    status: "pending".into(),
+                },
+            ],
+            status: "executing".into(),
+            context_1_advisory: None,
+            procedure_id: None,
+        });
+        turn.plan_steps_verified = vec![true, false, false];
+
+        {
+            let state = runtime
+                .sessions
+                .get_mut(session_id)
+                .expect("session exists");
+            state.start_turn(turn);
+            state.park_active_turn_for_approval();
+        }
+
+        let past = std::time::Instant::now()
+            .checked_sub(std::time::Duration::from_secs(400))
+            .expect("backdate instant");
+        {
+            let state = runtime
+                .sessions
+                .get_mut(session_id)
+                .expect("session exists");
+            state.parked_approval_since = Some(past);
+        }
+        runtime
+            .stuck_turn_first_seen
+            .insert(session_id.to_string(), past);
+        runtime.stuck_turn_signature.insert(
+            session_id.to_string(),
+            "parked_approval:turn-approval-carry".to_string(),
+        );
+
+        runtime.evict_timed_out_turns().await;
+
+        let state = runtime
+            .sessions
+            .get(session_id)
+            .expect("session survives eviction");
+        assert!(
+            state.parked_approval_turn.is_none(),
+            "eviction must still clear the parked turn"
+        );
+        let carry = state
+            .carryover_plan
+            .as_ref()
+            .expect("the plan must survive as a carryover, not vanish");
+        assert_eq!(carry.plan.goal, "Register four music stewardship skills");
+        assert_eq!(
+            carry.steps_done,
+            vec![true, false, false],
+            "steps_done must mirror each step's own status"
+        );
+        assert_eq!(
+            carry.verified_step_ids,
+            vec![1],
+            "only the step actually backed by a verified tool result carries forward"
+        );
+
+        drop(runtime);
+        let _ = server.await;
+        let _ = std::fs::remove_file(&socket_path);
+
+        // The unblock notice must name it as an approval timeout, distinct
+        // from a generic tool/model hang, and hint that the next message
+        // resumes rather than restarts.
+        let emitted = emitted.lock().unwrap();
+        let reply = emitted
+            .iter()
+            .find(|e| e["task"]["action"] == "send_reply")
+            .expect("unblock notice must be sent");
+        let content = reply["task"]["content"].as_str().unwrap_or_default();
+        assert!(
+            content.contains("timed out") && content.contains("resumes"),
+            "approval-timeout unblock message must name the timeout and resumability: {content}"
+        );
+    }
 
     /// A watchdog eviction must push a `stuck_turn_evicted:{phase}` heal
     /// event to the hotel (turn-failure heal intake) in addition to failing
@@ -12600,6 +12996,67 @@ mod tests {
         let _ = std::fs::remove_file(&socket_path);
     }
 
+    /// Live incident 2026-08-30: a handoff bundle whose `active_goal` is a
+    /// slash command (e.g. "/role chronos") — because it was built while the
+    /// sender's active_turn.user_content WAS that very command — must never
+    /// be auto-executed. The receiving role's local session state hasn't yet
+    /// recorded the new incarnation as active, so re-parsing that goal as a
+    /// fresh command and re-dispatching it re-triggers the same same-identity
+    /// handoff from the specialist's own process, evading
+    /// handle_role_command's self-handoff guard and looping until the
+    /// ROLE_SWITCH_MAX throttle intervenes. `build_same_identity_handoff_bundle`
+    /// is fixed to never construct such a bundle in the first place; this is
+    /// the defense-in-depth check on the receiving side.
+    #[tokio::test]
+    async fn handoff_bundle_never_auto_executes_a_slash_command_active_goal() {
+        let socket_path = format!("/tmp/philote-selfloop-{}.sock", Uuid::new_v4().simple());
+        let listener = tokio::net::UnixListener::bind(&socket_path).expect("bind");
+        let emitted = std::sync::Arc::new(std::sync::Mutex::new(Vec::<serde_json::Value>::new()));
+        let server = tokio::spawn(run_recording_hotel(listener, emitted.clone()));
+
+        let identity = philotic_client::GuestIdentity {
+            guest_id: "agent-beacon:Chronos".into(),
+            role: "role:agent-beacon:Chronos".into(),
+            supported_tools: Vec::new(),
+        };
+        let client = philotic_client::PhiloticClient::connect_at(&socket_path, identity)
+            .await
+            .expect("connect to stub hotel");
+        let mut runtime = AgentRuntime::new(client, "agent-beacon");
+
+        let session_id = "sess-selfloop";
+        let bundle = philotic_client::HandoffBundle {
+            to_role: Some("chronos".into()),
+            from_role: Some("orchestrator".into()),
+            handoff_reason: Some("manual_role_switch".into()),
+            active_goal: Some("/role chronos".into()),
+            ..Default::default()
+        };
+        runtime
+            .handle_handoff_bundle(
+                InboundTaskPayload {
+                    action: Some("handoff_bundle".into()),
+                    session_id: Some(session_id.into()),
+                    turn_id: Some("turn-selfloop".into()),
+                    handoff_bundle: Some(bundle),
+                    ..Default::default()
+                },
+                Uuid::new_v4(),
+            )
+            .await
+            .expect("handoff bundle");
+
+        assert!(
+            runtime.pending_drains.is_empty(),
+            "a slash-command active_goal must never be queued for auto-execution: {:?}",
+            runtime.pending_drains
+        );
+
+        drop(runtime);
+        let _ = server.await;
+        let _ = std::fs::remove_file(&socket_path);
+    }
+
     // ── Plan-eval-repeat loop ───────────────────────────────────────────────
 
     /// Serializes tests that read or mutate PHILOTIC_DISABLE_PLAN_CONTINUATION,
@@ -12625,6 +13082,7 @@ mod tests {
                 .collect(),
             status: "executing".into(),
             context_1_advisory: None,
+            procedure_id: None,
         }
     }
 

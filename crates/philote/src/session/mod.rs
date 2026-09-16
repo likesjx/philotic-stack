@@ -1,7 +1,7 @@
 mod types;
 pub use types::*;
 
-use crate::catalog::{tool_catalog, tool_class, tool_requires_approval};
+use crate::catalog::{tool_class, tool_requires_approval};
 use crate::r#loop::{ApprovalRequest, ToolCall, ToolResult, TurnPhase};
 use crate::protocol::InboundTaskPayload;
 use crate::reflex::{IngressAction, PolicyAssertion, ReflexEngine, ReflexEvent};
@@ -61,6 +61,105 @@ fn sanitize_turn_content_for_history(content: &str) -> String {
         }
     }
     content.to_string()
+}
+
+/// Cap on tidy steps seeded from one audit: the continuation budget scales
+/// with outstanding steps, and the next audit re-lists what is left.
+const GARDENING_STEPS_PER_PASS: usize = 12;
+
+/// Parse the `suggested_actions` out of a `life.audit` tool result (the
+/// datasource wraps the payload in `data`; be tolerant of either shape).
+fn gardening_actions_from_audit_result(content: &str) -> Vec<Value> {
+    let Ok(v) = serde_json::from_str::<Value>(content) else {
+        return Vec::new();
+    };
+    let root = v.get("data").unwrap_or(&v);
+    root.get("suggested_actions")
+        .and_then(Value::as_array)
+        .map(|a| {
+            a.iter()
+                .filter(|x| x.get("kind").is_some())
+                .cloned()
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// One verifiable `life.tidy` step per action, then a closing `life.audit`.
+fn gardening_plan_from_actions(actions: &[Value], baseline_health: Option<u64>) -> ActivePlan {
+    let mut steps: Vec<PlanStep> = Vec::new();
+    for (i, action) in actions.iter().take(GARDENING_STEPS_PER_PASS).enumerate() {
+        let kind = action
+            .get("kind")
+            .and_then(Value::as_str)
+            .unwrap_or("action");
+        let subject = action
+            .get("duplicate_id")
+            .or_else(|| action.get("from_id"))
+            .or_else(|| action.get("node_id"))
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let object = action
+            .get("keeper_id")
+            .or_else(|| action.get("to_id"))
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let compact = serde_json::to_string(action).unwrap_or_default();
+        let compact: String = compact.chars().take(400).collect();
+        steps.push(PlanStep {
+            id: (i + 1) as u32,
+            description: format!(
+                "Apply audit action {kind} on {subject}{}: call life.tidy with {{\"action\": {compact}}}",
+                if object.is_empty() { String::new() } else { format!(" -> {object}") }
+            ),
+            tool_name: Some("life.tidy".into()),
+            status: "pending".into(),
+        });
+    }
+    let n = steps.len();
+    let baseline = baseline_health
+        .map(|b| format!(" (health_score {b} before)"))
+        .unwrap_or_default();
+    steps.push(PlanStep {
+        id: (n + 1) as u32,
+        description: format!(
+            "Re-run life.audit to measure the pass{baseline}; then report the health_score delta plus what still needs judgment."
+        ),
+        tool_name: Some("life.audit".into()),
+        status: "pending".into(),
+    });
+    ActivePlan {
+        goal: format!(
+            "Gardening pass: apply {n} audit-suggested action(s) with life.tidy (one per step), then re-audit and report the delta{baseline}"
+        ),
+        status: "executing".into(),
+        steps,
+        context_1_advisory: None,
+        procedure_id: None,
+    }
+}
+
+/// Collapse a synthesized plan-continuation brief to its headline when it
+/// is replayed as dialogue. The brief is loop-internal (remaining steps,
+/// verification notes) and several hundred chars long; replayed verbatim it
+/// crowded the 8000-char dialogue budget until the human exchange was elided
+/// — live 2026-09-11 13:26 UTC, the operator's own morning conversation was
+/// gone and "[7 earlier turn(s) elided]" led into three copies of "[Plan
+/// continuation 1/3] Continue executing your existing plan…". The full text
+/// stays in the hotel's `session_turn` ledger.
+fn collapse_internal_turn_content(content: &str) -> String {
+    let trimmed = content.trim_start();
+    if !trimmed.starts_with("[Plan continuation") {
+        return content.to_string();
+    }
+    let headline: String = trimmed
+        .lines()
+        .next()
+        .unwrap_or(trimmed)
+        .chars()
+        .take(200)
+        .collect();
+    format!("{headline} (internal continuation brief; step list elided)")
 }
 
 fn dropped_active_turn_record(checkpoint: &serde_json::Value) -> Option<TurnRecord> {
@@ -266,6 +365,16 @@ pub struct SessionState {
     /// stamp silently restarts the budget whenever ticks are missed, which is exactly
     /// how turns escaped the ceiling for hours (see `evict_timed_out_turns`).
     pub active_turn_since: Option<std::time::Instant>,
+    /// Wall-clock unix seconds when the current turn was first created.
+    ///
+    /// Unlike every other clock on this struct, this one is **never re-stamped**
+    /// while the turn lives — not on an approval park, not on the resume that
+    /// follows it. It is the only measure of a turn's true total age, and it is
+    /// what bounds a turn that loops park -> approve -> park (see
+    /// [`ansible_mesh_core::turn_budget::TURN_TOTAL_AGE_CEILING_SECS`]). Cleared
+    /// only when the turn genuinely ends. Persisted as unix seconds because an
+    /// `Instant` has no fixed epoch and cannot survive a checkpoint.
+    pub active_turn_started_unix: Option<u64>,
     /// A turn that entered WaitingApproval and was parked so the session stays free
     /// for new work while the operator decides. Restored when the operator approves
     /// or denies via `/approve`, `/deny`, or a paracrine ApprovalResolution response.
@@ -284,6 +393,18 @@ pub struct SessionState {
     /// this until the plan completes, blocks, or the budget is exhausted.
     /// Checkpoint-persisted with a backward-compatible default of `None`.
     pub carryover_plan: Option<CarryoverPlan>,
+    /// Index into the active turn's working tool history before which calls
+    /// are not evidence for the active plan. Non-zero only when a reflex
+    /// seeded the plan from a tool result mid-turn (gardening: the audit that
+    /// produced the plan must not also count as its closing audit). Not
+    /// checkpointed — it dies with the turn.
+    pub plan_evidence_from: usize,
+    /// A terminal plan evaluation waiting to be appended to the hotel's
+    /// procedure run ledger (doc:procedural-graphs P1). Set by
+    /// `plan_followup_after_turn` for the turn loop to drain right after the
+    /// checkpoint; never checkpointed itself — a run lost to a crash between
+    /// the eval and the send is one missing ledger row, not corrupt state.
+    pub pending_procedure_run: Option<ansible_mesh_core::procedure::ProcedureRunRecord>,
     /// Consecutive successful executions per tool name within this session.
     /// Resets to 0 on any failure. Used to auto-grant standing approval once
     /// the agent has demonstrated reliability on a specific tool.
@@ -358,11 +479,14 @@ impl SessionState {
             queue_arbiter_role: None,
             turn_waiting_since: None,
             active_turn_since: None,
+            active_turn_started_unix: None,
             parked_approval_turn: None,
             parked_approval_since: None,
             parked_plan_turn: None,
             parked_plan_since: None,
             carryover_plan: None,
+            plan_evidence_from: 0,
+            pending_procedure_run: None,
             tool_success_streak: std::collections::HashMap::new(),
             pending_preapproval_thresholds: std::collections::HashMap::new(),
             agent_graph_snapshot: None,
@@ -406,7 +530,10 @@ impl SessionState {
 
     pub fn start_turn(&mut self, turn: WorkingTurn) {
         self.active_turn = Some(turn);
+        self.plan_evidence_from = 0;
         self.active_turn_since = Some(std::time::Instant::now());
+        // The only stamp that survives an approval park/resume round-trip.
+        self.active_turn_started_unix = Some(current_unix_ts());
     }
 
     /// Returns true if a turn is currently active (any phase except Completed/Failed).
@@ -618,9 +745,15 @@ impl SessionState {
         if let Some(turn) = self.parked_approval_turn.take() {
             self.parked_approval_since = None;
             self.active_turn = Some(turn);
-            // Fresh total budget on resume: the ceiling bounds agent work, and the
-            // operator's deliberation time (already bounded by WAITING_APPROVAL_SECS)
-            // must not be charged against it.
+            // Fresh *active* budget on resume: the ceiling bounds agent work, and the
+            // operator's deliberation time must not be charged against it.
+            //
+            // `active_turn_started_unix` is deliberately left alone. Resetting both
+            // clocks here is what let a turn live forever: each approval round-trip
+            // re-armed the aggregate ceiling *and* the park clock, so a turn that
+            // parked repeatedly was never measured end to end. The premise that
+            // deliberation is "already bounded by WAITING_APPROVAL_SECS" holds for a
+            // single park and fails for a loop of them.
             self.active_turn_since = Some(std::time::Instant::now());
             true
         } else {
@@ -650,7 +783,8 @@ impl SessionState {
             turn.plan_confirmed = true;
             turn.plan_confirm_note = operator_note;
             self.active_turn = Some(turn);
-            // Fresh total budget on resume — see `restore_parked_approval_turn`.
+            // Fresh active budget on resume; `active_turn_started_unix` untouched —
+            // see `restore_parked_approval_turn`.
             self.active_turn_since = Some(std::time::Instant::now());
             true
         } else {
@@ -673,8 +807,27 @@ impl SessionState {
     /// unverified (or, worse, a fresh unverified step inherits a stale
     /// `true`). Re-key by step id so a step keeps its own evidence and a
     /// genuinely new step starts unverified.
-    pub fn set_active_plan(&mut self, plan: ActivePlan) {
+    pub fn set_active_plan(&mut self, mut plan: ActivePlan) {
+        // Normalize before anything else: a bundled step is split into one
+        // step per item so each can be proven by its own call (live
+        // 2026-09-12 11:00 UTC: four people in one step, four observes, plan
+        // still "outstanding" through three continuations).
+        let splits = crate::plan_eval::split_bundled_steps(&mut plan);
+        if !splits.is_empty() {
+            tracing::info!(
+                session_id = %self.session_id,
+                splits = ?splits,
+                "plan normalization: split bundled step(s) into one step per item"
+            );
+        }
         if let Some(turn) = self.active_turn.as_mut() {
+            let same_goal = turn
+                .active_plan
+                .as_ref()
+                .is_some_and(|prev| prev.goal == plan.goal);
+            if !same_goal {
+                self.plan_evidence_from = 0;
+            }
             let carried: Vec<(u32, bool)> = turn
                 .active_plan
                 .as_ref()
@@ -705,6 +858,19 @@ impl SessionState {
                 .collect();
             turn.active_plan = Some(plan);
         }
+    }
+
+    /// Every step of the active plan is backed by a tool result (evidence
+    /// carried from earlier turns included). The remaining work is the
+    /// report, so the re-entry projects no tools and says so.
+    pub fn plan_fully_verified(&self) -> bool {
+        self.active_turn.as_ref().is_some_and(|t| {
+            t.active_plan.as_ref().is_some_and(|p| {
+                !p.steps.is_empty()
+                    && t.plan_steps_verified.len() == p.steps.len()
+                    && t.plan_steps_verified.iter().all(|v| *v)
+            })
+        })
     }
 
     /// Increment consecutive step failure counter and return the new count.
@@ -844,6 +1010,20 @@ impl SessionState {
             final_reply_guest_id,
             tools_for_model,
         })
+    }
+
+    /// Self-Improvement Loop L1: a distill lookaside session is reused for
+    /// every whisper to the same role, so before a distill turn starts the
+    /// session forgets its dialogue. Every consumer of `recent_turns` — the
+    /// rendered window, the structured `dialogue_window`, the session
+    /// envelope, the previous-turn hint — then sees an empty history, and the
+    /// review reads only its brief. Live 2026-09-04 18:36: with the renderer
+    /// alone blanked, the request still carried 32 copies of the session's
+    /// own earlier "DISTILL: nothing".
+    pub fn forget_dialogue_for_lookaside(&mut self) -> usize {
+        let forgotten = self.recent_turns.len();
+        self.recent_turns.clear();
+        forgotten
     }
 
     pub fn complete_active_turn(&mut self, assistant_content: String) -> Option<WorkingTurn> {
@@ -1766,15 +1946,57 @@ impl SessionState {
     /// stop being re-derivable, and a step that was genuinely done must not
     /// silently revert to unverified mid-turn.
     pub fn push_tool_history(&mut self, call: ToolCall, result: ToolResult) {
+        let audit_actions =
+            if call.tool_name == "life.audit" && crate::plan_eval::tool_result_looks_ok(&result) {
+                gardening_actions_from_audit_result(&result.content)
+            } else {
+                Vec::new()
+            };
+        let audit_baseline = if audit_actions.is_empty() {
+            None
+        } else {
+            crate::plan_eval::audit_health_score(&result.content)
+        };
+        let evidence_from = self.plan_evidence_from;
         if let Some(turn) = self.active_turn.as_mut() {
             turn.working_tool_history.push((call, result));
             if let Some(plan) = turn.active_plan.as_ref() {
+                let from = evidence_from.min(turn.working_tool_history.len());
                 turn.plan_steps_verified = crate::plan_eval::verify_plan_steps(
                     plan,
-                    &turn.working_tool_history,
+                    &turn.working_tool_history[from..],
                     &turn.plan_steps_verified,
                 )
                 .verified_flags();
+            }
+        }
+        // Gardening reflex: a life.audit result with suggested actions seeds
+        // the plan the skill doctrine asks for — one life.tidy step per
+        // action, then a re-audit — so the evaluator drives the pass instead
+        // of the model deciding how many to apply. Live 2026-09-14 20:34 UTC
+        // the audit returned 25 actions; the model applied one and asked
+        // "if you would like…".
+        if !audit_actions.is_empty() {
+            let already_gardening = self
+                .active_turn
+                .as_ref()
+                .and_then(|t| t.active_plan.as_ref())
+                .is_some_and(|p| p.goal.starts_with("Gardening pass:"));
+            if !already_gardening {
+                let plan = gardening_plan_from_actions(&audit_actions, audit_baseline);
+                let steps = plan.steps.len();
+                self.set_active_plan(plan);
+                // The audit that seeded this plan is not its closing audit.
+                self.plan_evidence_from = self
+                    .active_turn
+                    .as_ref()
+                    .map(|t| t.working_tool_history.len())
+                    .unwrap_or(0);
+                tracing::info!(
+                    session_id = %self.session_id,
+                    steps,
+                    "gardening reflex: seeded a life.tidy plan from the life.audit result"
+                );
             }
         }
     }
@@ -1784,6 +2006,18 @@ impl SessionState {
     /// Used when the loop re-submits to the model after receiving a tool result.
     /// The history is appended as a `[Tool call history]` section so the model
     /// has full context to decide its next action.
+    /// Procedural graphs P2: the localized guidance block for this turn's
+    /// plan, if a bound procedure resolves for it and the agent can be
+    /// located on it. See [`crate::procedures::render_procedure_guidance`].
+    pub fn procedure_guidance_for_turn(&self, turn: &WorkingTurn) -> Option<String> {
+        let plan = turn.active_plan.as_ref()?;
+        crate::procedures::render_procedure_guidance(
+            &self.bindings.effective_procedures,
+            plan,
+            &turn.working_tool_history,
+        )
+    }
+
     pub fn build_reentry_prompt(&self) -> Option<String> {
         let turn = self.active_turn.as_ref()?;
         let tools = self.project_tools_for_turn(&turn.user_content);
@@ -1814,6 +2048,10 @@ impl SessionState {
                 ));
             }
             prompt.push_str(&crate::plan_eval::reentry_hint(turn));
+            if let Some(guidance) = self.procedure_guidance_for_turn(turn) {
+                prompt.push_str("\n\n");
+                prompt.push_str(&guidance);
+            }
         }
 
         Some(prompt)
@@ -2101,6 +2339,33 @@ impl SessionState {
     }
 
     pub fn project_tools_for_turn(&self, user_content: &str) -> Vec<ToolDefinition> {
+        // A fully verified plan has nothing left but the report. Every
+        // re-entry path (initial call, tool-result envelope, harness-run
+        // step) projects through here — live 2026-09-15 19:23 UTC the
+        // "[Plan complete]" note went out with 26 tools beside it.
+        if self.plan_fully_verified() {
+            return Vec::new();
+        }
+        // Self-Improvement Loop L1: a distill lookaside turn sees exactly the
+        // allowlisted tools the role actually holds — no keyword gates, no
+        // on-demand suppression. Live 2026-09-04: the brief named
+        // `skill.register`, the orchestrator profile keeps it behind the
+        // on-demand `skill.authoring` skill, and the relevance heuristics
+        // hid it, so the distiller could only answer "DISTILL: nothing".
+        if self
+            .active_turn
+            .as_ref()
+            .is_some_and(crate::runtime::distill::turn_is_distill)
+        {
+            return self
+                .tool_assembly
+                .tools_for_model
+                .iter()
+                .filter(|t| crate::runtime::distill::tool_allowed(&t.tool_name))
+                .cloned()
+                .collect();
+        }
+
         let mut tools = self.project_tools_for_turn_by_relevance(user_content);
 
         // A turn that carries an active plan must always be able to execute
@@ -2262,9 +2527,24 @@ impl SessionState {
             // conversational zero-tools gate — a gratitude/filler turn stays
             // tool-free even mid-stewardship (tool projection is policy).
             .any(|skill| crate::catalog::skill_is_relevant_for_turn(skill, &normalized));
+        // …unless the turn is plainly ABOUT something the harness just
+        // recalled from the LifeGraph. Live 2026-09-11 18:23 UTC: "I gave my
+        // icebreaker speech in toastmasters today! And i did ok." tripped the
+        // gate on "ok" while auto-recall had injected the very open loop it
+        // resolves; the model got a [Plan first] directive and ZERO tools,
+        // replied "I have logged this historic event on your LifeGraph", and
+        // nothing was written. A lived-fact report that names a recalled
+        // node is stewardship, not filler — the life tools stay projected
+        // (the on-demand filter below keeps them via the session signal).
+        // A plan-worthy statement (a request, a multi-fact report, an
+        // enumeration) keeps its tools too: the plan directive asks for
+        // tool-bound steps, and a plan cannot bind tools it was not given.
+        // Questions are still answered from context without tools.
         if looks_like_conversational_goal(&normalized)
             && !looks_like_retry_goal(&normalized_current)
             && !on_demand_relevant
+            && !self.turn_reports_on_recalled_life_context(&normalized)
+            && !crate::plan_eval::is_plan_worthy_statement(user_content)
         {
             return Vec::new();
         }
@@ -2329,6 +2609,191 @@ impl SessionState {
                     .any(|memory| memory.vault_id.as_deref() == Some("life-graph"))
             })
             .unwrap_or(false)
+    }
+
+    /// True when the current message shares at least two distinctive words
+    /// with a LifeGraph record the auto-recall lane injected for this turn —
+    /// the operator is reporting on a known loop, event, or commitment, and
+    /// the model must be able to act on it (observe the outcome, commit or
+    /// resolve the node). Gratitude and filler share no such words with a
+    /// recalled node, so the conversational gate still holds for them.
+    pub(crate) fn turn_reports_on_recalled_life_context(&self, normalized: &str) -> bool {
+        !self.recalled_life_records_named_by(normalized).is_empty()
+    }
+
+    /// The injected LifeGraph records this message is about, best match
+    /// first (most distinctive words in common; ties broken by loop-like
+    /// labels so an open loop outranks the event that mentions it).
+    fn recalled_life_records_named_by(&self, normalized: &str) -> Vec<&RecalledMemoryRecord> {
+        let Some(turn) = self.active_turn.as_ref() else {
+            return Vec::new();
+        };
+        let message_words: std::collections::HashSet<&str> = normalized
+            .split(|c: char| !c.is_alphanumeric())
+            .filter(|w| w.len() >= 5)
+            .collect();
+        if message_words.is_empty() {
+            return Vec::new();
+        }
+        let mut scored: Vec<(usize, &RecalledMemoryRecord)> = turn
+            .recalled_memories
+            .iter()
+            .filter(|memory| memory.vault_id.as_deref() == Some("life-graph"))
+            .filter_map(|memory| {
+                let text = format!(
+                    "{} {} {}",
+                    memory.concept,
+                    memory.content,
+                    memory.summary.as_deref().unwrap_or_default()
+                )
+                .to_lowercase();
+                let overlap: std::collections::HashSet<&str> = text
+                    .split(|c: char| !c.is_alphanumeric())
+                    .filter(|w| w.len() >= 5 && !LIFE_CONTEXT_STOPWORDS.contains(w))
+                    .filter(|w| message_words.contains(w))
+                    .collect();
+                (overlap.len() >= 2).then_some((overlap.len(), memory))
+            })
+            .collect();
+        scored.sort_by(|a, b| {
+            b.0.cmp(&a.0)
+                .then_with(|| record_is_loop_like(b.1).cmp(&record_is_loop_like(a.1)))
+        });
+        scored.into_iter().map(|(_, m)| m).collect()
+    }
+
+    /// Outcome reflex: when the operator reports that something happened
+    /// ("I gave my speech", "finished the report", "tickets are booked") and
+    /// the harness has already recalled the open loop / commitment it
+    /// settles, seed the turn with a two-step plan — record the outcome as
+    /// an Event, then resolve that exact node — so the model executes and
+    /// the evaluator checks, instead of the model deciding whether to act.
+    /// Returns the resolved node id when a plan was seeded.
+    ///
+    /// Live 2026-09-11 18:23 UTC: "I gave my icebreaker speech in toastmasters
+    /// today! And i did ok." got congratulations and a false "I have logged
+    /// this" — no plan, no tool call, loop left open.
+    pub fn seed_outcome_plan(&mut self) -> Option<String> {
+        let user_content = self.active_turn.as_ref()?.user_content.clone();
+        if self.active_turn.as_ref()?.active_plan.is_some()
+            || self.active_turn.as_ref()?.paracrine_origin.is_some()
+            || user_content.trim_start().starts_with("[Plan continuation")
+        {
+            return None;
+        }
+        let normalized = normalized_turn_text(&user_content);
+        if !crate::plan_eval::reports_an_outcome(&normalized) {
+            return None;
+        }
+        let has_tool = |name: &str| {
+            self.tool_assembly
+                .tools_for_model
+                .iter()
+                .any(|t| t.tool_name == name)
+        };
+        if !(has_tool("life.observe") && has_tool("life.commit") && has_tool("life.recall")) {
+            return None;
+        }
+        let excerpt: String = user_content.trim().chars().take(160).collect();
+        let recalled_target = self
+            .recalled_life_records_named_by(&normalized)
+            .into_iter()
+            .find(|m| record_is_loop_like(m))
+            .and_then(|m| m.id.clone());
+
+        // Procedural graphs P3: when a procedure bound to this trigger is in
+        // play, the plan is its backbone — the branch chosen by whether the
+        // loop is already in context — with `procedure_id` stamped so the run
+        // ledger attributes the result. The literals below remain the
+        // fallback for a hotel that has not seeded a procedure.
+        if let Some(procedure) = crate::procedures::triggered_procedure(
+            &self.bindings.effective_procedures,
+            "reports_an_outcome",
+        ) {
+            let ctx = crate::procedures::SeedContext {
+                branch: Some(if recalled_target.is_some() {
+                    "target_known"
+                } else {
+                    "target_unknown"
+                }),
+                target: recalled_target.as_deref(),
+                excerpt: &excerpt,
+            };
+            if let Some(plan) = crate::procedures::seed_plan_from_procedure(procedure, &ctx) {
+                self.active_turn.as_mut()?.active_plan = Some(plan);
+                return Some(
+                    recalled_target.unwrap_or_else(|| "(loop to be recalled)".to_string()),
+                );
+            }
+        }
+
+        // Two shapes. With the loop already in context, two steps bound to
+        // its exact id. Without it — the prefetch cache is stale after a
+        // quiet spell (live 2026-09-11 20:46 UTC: 2h23m since the last turn,
+        // cache max age 30 min, nothing injected, nothing seeded) — a recall
+        // step comes first and the commit resolves whatever it finds, or
+        // confirms the outcome Event itself so the step is still a real
+        // write. Either way the model executes and the evaluator checks.
+        let (goal, steps) = match recalled_target.as_deref() {
+            Some(target) => (
+                format!(
+                    "Outcome reflex: record the outcome the operator just reported and resolve {target}"
+                ),
+                vec![
+                    PlanStep {
+                        id: 1,
+                        description: format!(
+                            "Record the reported outcome as a confirmed Event with life.observe — what happened, when, who was involved — linked to {target}. Operator said: \"{excerpt}\""
+                        ),
+                        tool_name: Some("life.observe".into()),
+                        status: "pending".into(),
+                    },
+                    PlanStep {
+                        id: 2,
+                        description: format!(
+                            "Resolve {target} with life.commit using that exact id: loop_status \"resolved\", resolution_note citing the outcome event."
+                        ),
+                        tool_name: Some("life.commit".into()),
+                        status: "pending".into(),
+                    },
+                ],
+            ),
+            None => (
+                "Outcome reflex: record the outcome the operator just reported and resolve the LifeGraph loop it settles"
+                    .to_string(),
+                vec![
+                    PlanStep {
+                        id: 1,
+                        description: format!(
+                            "Find the open loop / commitment / next action this outcome settles with life.recall (named_strategy \"open_loops_by_context\", query_text = the operator's message). Operator said: \"{excerpt}\""
+                        ),
+                        tool_name: Some("life.recall".into()),
+                        status: "pending".into(),
+                    },
+                    PlanStep {
+                        id: 2,
+                        description: "Record the reported outcome as a confirmed Event with life.observe — what happened, when, who was involved — linked to the loop found in step 1 if any.".into(),
+                        tool_name: Some("life.observe".into()),
+                        status: "pending".into(),
+                    },
+                    PlanStep {
+                        id: 3,
+                        description: "life.commit: if step 1 found the matching loop, resolve it by its exact id (loop_status \"resolved\", resolution_note citing the outcome event); if it found none, commit the step-2 Event's node id as confirmed instead. Never invent an id.".into(),
+                        tool_name: Some("life.commit".into()),
+                        status: "pending".into(),
+                    },
+                ],
+            ),
+        };
+        let plan = ActivePlan {
+            goal,
+            status: "executing".into(),
+            steps,
+            context_1_advisory: None,
+            procedure_id: None,
+        };
+        self.active_turn.as_mut()?.active_plan = Some(plan);
+        Some(recalled_target.unwrap_or_else(|| "(loop to be recalled)".to_string()))
     }
 
     /// Skill relevance with a session-state fallback for `life.steward`.
@@ -2415,9 +2880,23 @@ impl SessionState {
         let identity = apply_injection_budget(
             &mut budget_ledger,
             "identity",
-            self.project_agent_self(&projected_skill_names),
+            self.project_agent_self_core(),
             injection_budget.persona_chars,
         );
+        // DEF-145: [Skill guidance] carries its own budget so a long persona
+        // can no longer truncate the doctrine of the skills projected this
+        // turn. It still renders inside the Identity layer, after the core.
+        let skill_guidance = apply_injection_budget(
+            &mut budget_ledger,
+            "skill_guidance",
+            self.project_skill_guidance_section(&projected_skill_names),
+            injection_budget.skills_chars,
+        );
+        let identity = if skill_guidance.is_empty() {
+            identity
+        } else {
+            format!("{identity}\n{skill_guidance}")
+        };
         let relationship = self.project_user(user_content);
         let knowledge = self.project_knowledge(user_content, projected_tools);
         let recalled_memory = apply_injection_budget(
@@ -2766,14 +3245,19 @@ impl SessionState {
 
         let mut dialogue_window = Vec::new();
         for turn in windowed_turns {
+            // `at`: the turn's own absolute clock, so a consumer can anchor
+            // relative words ("tomorrow") to when they were said.
+            let at = self.turn_stamp(turn.created_at);
             dialogue_window.push(json!({
                 "role": "user",
-                "text": turn.user_content,
+                "text": collapse_internal_turn_content(&turn.user_content),
+                "at": at,
             }));
             if let Some(reply) = turn.assistant_content.as_deref() {
                 dialogue_window.push(json!({
                     "role": "assistant",
                     "text": reply,
+                    "at": at,
                 }));
             }
         }
@@ -2936,7 +3420,59 @@ impl SessionState {
             }
         }
 
+        // Record-driven projection: the compiled tables above only know the
+        // skills a developer typed into this binary. Every skill registered at
+        // runtime lives only in its hotel record, which the hotel now ships in
+        // `effective_skill_records`. A record projects when the skill is in
+        // play (assigned closure or on-demand) AND:
+        //   - it declares `implied_tools` and one of them is projected this
+        //     turn (assigned skills: that is enough; on-demand: must also be
+        //     relevant), or
+        //   - it declares no tools, is relevant to the turn (skill-name part,
+        //     description/goal tokens, or an active [Rules] entry naming it),
+        //     and either mentions a tool that is projected this turn or is
+        //     named by a rule (the operator said "always").
+        for record in &self.bindings.effective_skill_records {
+            let name = &record.skill_name;
+            if projected_skills.contains(name) || !record.validation_state.is_projectable() {
+                continue;
+            }
+            let assigned = self.bindings.effective_skillset.iter().any(|s| s == name);
+            let on_demand = self.bindings.on_demand_skills.iter().any(|s| s == name);
+            if !assigned && !on_demand {
+                continue;
+            }
+            let named_by_rule = self.rules_name_skill(name);
+            let relevant = named_by_rule
+                || record_relevant_for_turn(record, &normalized)
+                || self.skill_relevant_for_turn_with_session_signal(name, &normalized);
+            let projects = if !record.implied_tools.is_empty() {
+                let present = record
+                    .implied_tools
+                    .iter()
+                    .any(|tool| projected_tool_names.contains(tool.as_str()));
+                present && (assigned || relevant)
+            } else {
+                relevant
+                    && (named_by_rule
+                        || record_mentions_projected_tool(record, &projected_tool_names))
+            };
+            if projects {
+                projected_skills.insert(name.clone());
+            }
+        }
+
         projected_skills.into_iter().collect()
+    }
+
+    /// True when an active behavioral rule names this skill: the operator
+    /// said "always use X", so X is in front of the model on every turn.
+    fn rules_name_skill(&self, skill_name: &str) -> bool {
+        self.rules.iter().any(|rule| {
+            rule.get("description")
+                .and_then(|v| v.as_str())
+                .is_some_and(|d| d.contains(skill_name))
+        })
     }
 
     fn projected_role_activation_for_turn(
@@ -3078,6 +3614,45 @@ impl SessionState {
     /// turn-agnostic contexts (size estimates, policy checks); guidance for
     /// non-projected skills is never rendered.
     pub fn project_agent_self(&self, projected_skills: &[String]) -> String {
+        self.project_agent_self_inner(Some(projected_skills))
+    }
+
+    /// The Identity layer WITHOUT the per-turn [Skill guidance] section —
+    /// identity, soul, governance, content policy. Budgeted by `persona_chars`.
+    pub fn project_agent_self_core(&self) -> String {
+        self.project_agent_self_inner(None)
+    }
+
+    /// Doctrine text for the skills projected THIS turn — the hotel composes
+    /// "name — description" guidance from the skill catalog
+    /// (effective_skill_guidance), and before this section existed nothing on
+    /// the philote side ever rendered it: the model saw bare skill ids with
+    /// the charter text (outcome-note discipline, respawn-budget escalation,
+    /// …) silently dropped. Capped in skill_guidance_for_turn; budgeted by
+    /// `skills_chars` (DEF-145). Self-Improvement Loop L1: the distill brief
+    /// IS the doctrine for a distill turn, so a distill turn renders none.
+    pub fn project_skill_guidance_section(&self, projected_skills: &[String]) -> String {
+        let skill_guidance = if self
+            .active_turn
+            .as_ref()
+            .is_some_and(crate::runtime::distill::turn_is_distill)
+        {
+            Vec::new()
+        } else {
+            self.skill_guidance_for_turn(projected_skills)
+        };
+        if skill_guidance.is_empty() {
+            return String::new();
+        }
+        let mut section = String::from("\n[Skill guidance]");
+        for entry in &skill_guidance {
+            section.push_str("\n- ");
+            section.push_str(entry);
+        }
+        section
+    }
+
+    fn project_agent_self_inner(&self, projected_skills: Option<&[String]>) -> String {
         let mut lines = Vec::new();
 
         if let Some(identity) = self
@@ -3129,20 +3704,21 @@ impl SessionState {
             }
         }
 
-        // Doctrine text for the skills projected THIS turn — the hotel
-        // composes "name — description" guidance from the skill catalog
-        // (effective_skill_guidance), and before this section existed nothing
-        // on the philote side ever rendered it: the model saw bare skill ids
-        // with the charter text (outcome-note discipline, respawn-budget
-        // escalation, …) silently dropped. Capped in skill_guidance_for_turn.
-        let skill_guidance = self.skill_guidance_for_turn(projected_skills);
-        if !skill_guidance.is_empty() {
-            let mut section = String::from("\n[Skill guidance]");
-            for entry in &skill_guidance {
-                section.push_str("\n- ");
-                section.push_str(entry);
+        // [Skill guidance] used to be composed here, inside the Identity
+        // layer, and so lived under `persona_chars`. Live 2026-09-15 22:54 EDT
+        // (bjork): identity + soul + governance already used ~5.3 KB of the
+        // 6 KB persona budget, so the guidance for 9 of the 12 projected
+        // skills — the repertoire gardener the operator's rule says to
+        // "always use" among them — was cut by the layer truncation with no
+        // notice from the guidance cap (DEF-145). The section is now rendered
+        // by `project_skill_guidance_section` and budgeted on its own
+        // (`skills_chars`) in `build_context_projection`; this method keeps
+        // appending it for callers that want the whole self-projection.
+        if let Some(projected_skills) = projected_skills {
+            let section = self.project_skill_guidance_section(projected_skills);
+            if !section.is_empty() {
+                lines.push(section);
             }
-            lines.push(section);
         }
 
         // Providers with no API-level safety toggle (Anthropic/OpenAI/Ollama/
@@ -3276,16 +3852,9 @@ impl SessionState {
     ) -> String {
         let mut sections = Vec::new();
 
-        if !self.recent_turns.is_empty() {
-            let mut recent = String::from("[Recent session context]\n");
-            for turn in &self.recent_turns {
-                let display_content = sanitize_turn_content_for_history(&turn.user_content);
-                recent.push_str(&format!("User: {}\n", display_content));
-                if let Some(reply) = &turn.assistant_content {
-                    recent.push_str(&format!("Assistant: {}\n", reply));
-                }
-            }
-            sections.push(recent.trim_end().to_string());
+        let dialogue = self.render_dialogue_window(self.settings.injection_budget.dialogue_chars);
+        if !dialogue.is_empty() {
+            sections.push(dialogue);
         }
 
         let mut policy = String::from("[Approval policy]\n");
@@ -3315,9 +3884,11 @@ impl SessionState {
             );
         }
         sections.push(policy.trim_end().to_string());
-        if !self.summary_text().is_empty() {
-            sections.push(format!("[Recent summary]\n{}.", self.summary_text()));
-        }
+        // [Recent summary] used to be emitted here as well. It is the last three
+        // turns, which `[Recent session context]` above already carries in full — in
+        // this same layer — so it was a verbatim second copy in every request. The
+        // Session layer keeps its own one-line recap; that one is a different layer
+        // with a different authority, and stays.
 
         if let Some(memory_summary) = self
             .agent_profile
@@ -3376,7 +3947,7 @@ impl SessionState {
         let Some(turn) = self.active_turn.as_ref() else {
             return String::new();
         };
-        if turn.recalled_memories.is_empty() {
+        if turn.recalled_memories.is_empty() || crate::runtime::distill::turn_is_distill(turn) {
             return String::new();
         }
 
@@ -3759,6 +4330,15 @@ impl SessionState {
                 plan.status,
                 plan.steps.len()
             ));
+            if plan.goal.starts_with("Outcome reflex:") {
+                lines.push(
+                    "[Outcome reflex] The harness seeded this plan from the operator's message. \
+                     Execute both steps NOW with the bound tools (life.observe the outcome, then \
+                     life.commit the exact node id with loop_status \"resolved\"), then reply with \
+                     what you wrote. Do not answer with congratulations or acknowledgment alone."
+                        .into(),
+                );
+            }
             // A continuation turn opens with its plan already seeded and an
             // empty tool history, so the re-entry footer below (which is gated
             // on that history) has not fired yet. Without a guard here the
@@ -3778,6 +4358,22 @@ impl SessionState {
                 {
                     lines.push(note);
                 }
+            } else if self.plan_fully_verified() {
+                // Live 2026-09-15 16:33 UTC: the harness ran the closing
+                // audit, every step was verified, and the model — handed its
+                // tools and a brief whose "Remaining steps" was empty — re-ran
+                // all twelve completed tidies and never reported the score.
+                let closing = plan
+                    .steps
+                    .last()
+                    .map(|s| s.description.as_str())
+                    .unwrap_or("");
+                lines.push(format!(
+                    "[Plan complete] Every step of the active plan is verified by tool results \
+                     (steps the harness ran for you included). No tools are offered on this \
+                     step: do not repeat completed work. Reply now with the final report of the \
+                     whole plan, answering what the closing step asked for: {closing}"
+                ));
             }
             if let Some(advisory) = plan.context_1_advisory.as_ref() {
                 lines.push(format!(
@@ -3840,6 +4436,12 @@ impl SessionState {
             // Structured re-entry footer: grounded in verification against the
             // tool results above, not the model's own step statuses.
             lines.push(crate::plan_eval::reentry_hint(turn));
+            // Procedural graphs P2: the active node's out-edges, rendered
+            // deterministically, after the grounded hint and never instead
+            // of it. Advisory only.
+            if let Some(guidance) = self.procedure_guidance_for_turn(turn) {
+                lines.push(guidance);
+            }
         }
         if !self.paracrine_threads.is_empty() {
             lines.push("\n[Paracrine side loops]".into());
@@ -3885,11 +4487,24 @@ impl SessionState {
         handoff_reason: &str,
         return_to: Option<String>,
     ) -> HandoffBundle {
+        // Live incident 2026-08-30: when this bundle is built WHILE handling a
+        // manual `/role <name>` (or `/back`) command, `active_turn.user_content`
+        // IS that very command — carrying it over as `active_goal` makes the
+        // receiving role auto-execute "/role chronos" as its first inbound
+        // task (see handle_handoff_bundle's auto_execute_goal), which
+        // re-triggers the SAME same-identity handoff from the specialist's own
+        // process. Its local session state hasn't yet recorded the new
+        // incarnation as active, so the self-handoff guard in
+        // handle_role_command never catches it, and the cycle repeats until
+        // the ROLE_SWITCH_MAX throttle intervenes. A slash command is a
+        // control-flow instruction, never a task to auto-execute in the new
+        // role, so it can never be a valid `active_goal`.
         let active_goal = self
             .active_turn
             .as_ref()
             .map(|turn| turn.user_content.clone())
             .filter(|text| !text.trim().is_empty())
+            .filter(|text| crate::commands::parse_slash_command(text).is_none())
             .or_else(|| {
                 let summary = self.summary_text();
                 (!summary.is_empty()).then_some(summary)
@@ -4070,6 +4685,7 @@ impl SessionState {
                 "paracrine_reply_session_id": turn.paracrine_reply_session_id,
                 "paracrine_reply_chat_id": turn.paracrine_reply_chat_id,
                 "paracrine_response_routing": turn.paracrine_response_routing,
+                "paracrine_intent": turn.paracrine_intent,
                 "paracrine_merge_completed": turn.paracrine_merge_completed,
             })
         });
@@ -4102,8 +4718,24 @@ impl SessionState {
             "pending_preapproval_thresholds": self.pending_preapproval_thresholds,
             "paracrine_threads": self.paracrine_threads,
             "active_turn": active_turn,
+            // Wait-clock stamps as wall-clock unix seconds (Instant has no
+            // fixed epoch and cannot round-trip through JSON). Without this,
+            // a session reload (idle eviction, guest restart) silently reset
+            // every in-flight watchdog deadline to "now" — an approval or
+            // tool wait that had already run long could then sit for a
+            // SECOND full deadline before eviction, and the eventual
+            // "elapsed_secs" in the eviction log under-reported the true
+            // wait by however long the session was unloaded (DEF-100; live
+            // 2026-08-29: architect-charter's approval sat 84 minutes,
+            // logged as a 304s eviction).
+            "turn_waiting_since_unix": self.turn_waiting_since.map(instant_to_unix_ts),
+            // Already wall-clock; stored verbatim so a guest restart cannot rewind
+            // the turn's true age the way it once rewound every phase deadline.
+            "active_turn_started_unix": self.active_turn_started_unix,
             "parked_approval_turn": parked_approval_turn,
+            "parked_approval_since_unix": self.parked_approval_since.map(instant_to_unix_ts),
             "parked_plan_turn": parked_plan_turn,
+            "parked_plan_since_unix": self.parked_plan_since.map(instant_to_unix_ts),
             "carryover_plan": self.carryover_plan,
             "active_user_task_id": self.active_user_task_id,
             "pinned_tier_role": self.pinned_tier_role,
@@ -4137,20 +4769,141 @@ impl SessionState {
         })
     }
 
+    /// Render `[Recent session context]` under a character budget.
+    ///
+    /// The rolling window bounds how many turns are kept (`memory_window_size`)
+    /// and how old they may be, but until 2026-08-30 nothing bounded their SIZE.
+    /// A single pasted document therefore entered the window and was re-sent on
+    /// every request until it aged out — coach was shipping 236KB requests, and
+    /// the model-router's 55s dispatch budget is not generous with those.
+    ///
+    /// Turns are admitted newest-first so the budget is spent on what is most
+    /// relevant, then rendered oldest-first so the dialogue still reads in order.
+    /// Dropped turns are named rather than silently vanished: the full text is
+    /// still in the hotel's `session_turn` ledger, and anything that must outlive
+    /// the window belongs in Muninn, which is the memory of record.
+    fn render_dialogue_window(&self, budget_chars: usize) -> String {
+        if self.recent_turns.is_empty() {
+            return String::new();
+        }
+        // Self-Improvement Loop L1: a distill review reads the brief and
+        // nothing else. The lookaside session persists across whispers, so
+        // its own earlier "DISTILL: nothing" completions (and a refused
+        // register) would otherwise sit in the window and be echoed back —
+        // live 2026-09-04 18:25: two clean-tooled reviews declined in 3 s.
+        if self
+            .active_turn
+            .as_ref()
+            .is_some_and(crate::runtime::distill::turn_is_distill)
+        {
+            return String::new();
+        }
+
+        // Every turn carries its own absolute clock. Without one, "tomorrow"
+        // from last night's check-in reads as tomorrow again this morning —
+        // live 2026-09-11 07:00 EDT, Beacon's brief for "Friday, September
+        // 11" announced the speech as "scheduled for tomorrow (Friday,
+        // September 11)" because the evening turn saying "tomorrow" was
+        // replayed with no date on it.
+        let mut any_stamped = false;
+        let rendered: Vec<String> = self
+            .recent_turns
+            .iter()
+            .map(|turn| {
+                let user = collapse_internal_turn_content(&sanitize_turn_content_for_history(
+                    &turn.user_content,
+                ));
+                let stamp = match self.turn_stamp(turn.created_at) {
+                    Some(s) => {
+                        any_stamped = true;
+                        format!("[{s}] ")
+                    }
+                    None => String::new(),
+                };
+                match &turn.assistant_content {
+                    Some(reply) => format!("{stamp}User: {user}\n{stamp}Assistant: {reply}\n"),
+                    None => format!("{stamp}User: {user}\n"),
+                }
+            })
+            .collect();
+
+        let mut kept: Vec<&String> = Vec::new();
+        let mut used = 0usize;
+        for entry in rendered.iter().rev() {
+            let cost = entry.chars().count();
+            // Always admit the newest turn, even if it alone exceeds the budget:
+            // dropping the turn being replied to would be worse than overrunning.
+            if !kept.is_empty() && used + cost > budget_chars {
+                break;
+            }
+            used += cost;
+            kept.push(entry);
+        }
+        let dropped = rendered.len() - kept.len();
+
+        let mut out = String::from("[Recent session context]\n");
+        if any_stamped {
+            out.push_str(
+                "Each line is stamped with that turn's own clock. Relative words inside a turn \
+                 (today, tomorrow, tonight, this morning) are relative to THAT stamp, not to the \
+                 current time in the [System] header — re-derive them against the current date \
+                 before repeating them.\n",
+            );
+        }
+        if dropped > 0 {
+            out.push_str(&format!(
+                "[{dropped} earlier turn(s) elided to stay inside the {budget_chars}-char \
+                 dialogue budget — recall from memory if they matter]\n"
+            ));
+        }
+        for entry in kept.iter().rev() {
+            out.push_str(entry);
+        }
+        out.trim_end().to_string()
+    }
+
     fn summary_text(&self) -> String {
         self.recent_turns
             .iter()
             .rev()
             .take(3)
             .map(|turn| {
-                let uc = sanitize_turn_content_for_history(&turn.user_content);
+                let uc = collapse_internal_turn_content(&sanitize_turn_content_for_history(
+                    &turn.user_content,
+                ));
+                let stamp = self
+                    .turn_stamp(turn.created_at)
+                    .map(|s| format!("[{s}] "))
+                    .unwrap_or_default();
                 match &turn.assistant_content {
-                    Some(reply) => format!("{} -> {}", uc, reply),
-                    None => uc,
+                    Some(reply) => format!("{stamp}{} -> {}", uc, reply),
+                    None => format!("{stamp}{uc}"),
                 }
             })
             .collect::<Vec<_>>()
             .join(" | ")
+    }
+
+    /// Absolute stamp for a dialogue turn — the operator's zone when one is
+    /// configured, else UTC. `None` for legacy records without a timestamp.
+    fn turn_stamp(&self, created_at: u64) -> Option<String> {
+        if created_at == 0 {
+            return None;
+        }
+        let utc = chrono::DateTime::<chrono::Utc>::from_timestamp(created_at as i64, 0)?;
+        let zone = self
+            .agent_profile
+            .user_timezone
+            .as_deref()
+            .and_then(sanitize_timezone_for_prompt)
+            .and_then(|tz| tz.parse::<chrono_tz::Tz>().ok());
+        Some(match zone {
+            Some(zone) => utc
+                .with_timezone(&zone)
+                .format("%Y-%m-%d %H:%M %Z")
+                .to_string(),
+            None => utc.format("%Y-%m-%d %H:%M UTC").to_string(),
+        })
     }
 
     pub fn from_checkpoint(checkpoint: &serde_json::Value) -> Option<Self> {
@@ -4371,6 +5124,7 @@ impl SessionState {
                     .get("provider_repair_attempts")
                     .and_then(serde_json::Value::as_u64)
                     .unwrap_or(0) as u32,
+                say_do_nudged: false,
                 pending_text_reply: turn
                     .get("pending_text_reply")
                     .and_then(serde_json::Value::as_str)
@@ -4412,6 +5166,10 @@ impl SessionState {
                     .get("paracrine_response_routing")
                     .cloned()
                     .and_then(|v| serde_json::from_value(v).ok()),
+                paracrine_intent: turn
+                    .get("paracrine_intent")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string),
                 paracrine_merge_completed: turn
                     .get("paracrine_merge_completed")
                     .and_then(serde_json::Value::as_bool)
@@ -4475,6 +5233,19 @@ impl SessionState {
         // Everything else (WaitingModel, WaitingVoice, Thinking, Queued, Failed,
         // unknown phase strings) is dropped so the queue can drain cleanly.
         let active_turn = active_turn.filter(|t| matches!(t.phase, TurnPhase::WaitingTool));
+        // Reconstruct the wait-clock from its persisted wall-clock stamp,
+        // gated on the corresponding state actually surviving restore above.
+        // See the checkpoint_json comment (DEF-100): without this, every
+        // reload reset the deadline to "now", silently extending how long a
+        // stuck approval or tool call could sit past the watchdog's
+        // intended grace window (live 2026-08-29: an approval sat 84
+        // minutes, logged by the watchdog as a 304s eviction).
+        let turn_waiting_since = active_turn.as_ref().and_then(|_| {
+            checkpoint
+                .get("turn_waiting_since_unix")
+                .and_then(serde_json::Value::as_u64)
+                .map(unix_ts_to_instant)
+        });
 
         // Restore parked approval turn if one was checkpointed.
         let parked_approval_turn = checkpoint
@@ -4482,6 +5253,12 @@ impl SessionState {
             .and_then(|v| if v.is_null() { None } else { Some(v) })
             .and_then(|v| serde_json::from_value::<WorkingTurn>(v.clone()).ok())
             .filter(|t| t.phase == TurnPhase::WaitingApproval);
+        let parked_approval_since = parked_approval_turn.as_ref().and_then(|_| {
+            checkpoint
+                .get("parked_approval_since_unix")
+                .and_then(serde_json::Value::as_u64)
+                .map(unix_ts_to_instant)
+        });
 
         // Restore parked plan turn if one was checkpointed.
         let parked_plan_turn = checkpoint
@@ -4489,6 +5266,12 @@ impl SessionState {
             .and_then(|v| if v.is_null() { None } else { Some(v) })
             .and_then(|v| serde_json::from_value::<WorkingTurn>(v.clone()).ok())
             .filter(|t| t.phase == TurnPhase::PlanningDiscussion);
+        let parked_plan_since = parked_plan_turn.as_ref().and_then(|_| {
+            checkpoint
+                .get("parked_plan_since_unix")
+                .and_then(serde_json::Value::as_u64)
+                .map(unix_ts_to_instant)
+        });
 
         // Restore the plan carryover if one was checkpointed. Missing key
         // (older checkpoints) or unparseable value degrades to None.
@@ -4506,6 +5289,7 @@ impl SessionState {
             .and_then(|v| serde_json::from_value::<FallbackOverride>(v.clone()).ok());
 
         Some(Self {
+            pending_procedure_run: None,
             session_id,
             agent_id,
             source,
@@ -4534,13 +5318,17 @@ impl SessionState {
                 .get("queue_arbiter_role")
                 .and_then(serde_json::Value::as_str)
                 .map(str::to_string),
-            turn_waiting_since: None,
+            turn_waiting_since,
             active_turn_since: None,
+            active_turn_started_unix: checkpoint
+                .get("active_turn_started_unix")
+                .and_then(serde_json::Value::as_u64),
             parked_approval_turn,
-            parked_approval_since: None,
+            parked_approval_since,
             parked_plan_turn,
-            parked_plan_since: None,
+            parked_plan_since,
             carryover_plan,
+            plan_evidence_from: 0,
             tool_success_streak,
             pending_preapproval_thresholds,
             agent_graph_snapshot: None,
@@ -4656,6 +5444,115 @@ fn contains_word_boundary(text: &str, phrase: &str) -> bool {
     }
     false
 }
+
+/// A recalled record that an outcome can settle: open loops, commitments,
+/// next actions, goals — by id prefix or by the label the recall lane put
+/// in `concept`.
+fn record_is_loop_like(memory: &RecalledMemoryRecord) -> bool {
+    let id = memory
+        .id
+        .as_deref()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let concept = memory.concept.to_ascii_lowercase();
+    [
+        "life:open_loop",
+        "life:open-loop",
+        "life:openloop",
+        "life:commitment",
+        "life:next_action",
+        "life:next-action",
+        "life:goal",
+    ]
+    .iter()
+    .any(|p| id.starts_with(p))
+        || [
+            "openloop",
+            "open_loop",
+            "open loop",
+            "commitment",
+            "nextaction",
+            "next_action",
+            "goal",
+        ]
+        .iter()
+        .any(|p| concept.contains(p))
+}
+
+/// Words too common in LifeGraph records to count as "about the same thing"
+/// (five letters or longer, since shorter words are already ignored).
+const LIFE_CONTEXT_STOPWORDS: &[&str] = &[
+    "about",
+    "after",
+    "again",
+    "before",
+    "being",
+    "could",
+    "doing",
+    "every",
+    "first",
+    "going",
+    "having",
+    "jared",
+    "later",
+    "might",
+    "needs",
+    "operator",
+    "other",
+    "should",
+    "since",
+    "still",
+    "their",
+    "there",
+    "these",
+    "thing",
+    "things",
+    "think",
+    "those",
+    "today",
+    "tomorrow",
+    "tonight",
+    "under",
+    "until",
+    "watch",
+    "where",
+    "which",
+    "while",
+    "would",
+    "week",
+    "weeks",
+    "month",
+    "morning",
+    "evening",
+    "night",
+    "afternoon",
+    "friday",
+    "monday",
+    "tuesday",
+    "wednesday",
+    "thursday",
+    "saturday",
+    "sunday",
+    "project",
+    "proposed",
+    "confirmed",
+    "resolved",
+    "status",
+    "update",
+    "updated",
+    "check",
+    "loop",
+    "loops",
+    "commitment",
+    "event",
+    "events",
+    "goal",
+    "goals",
+    "habit",
+    "habits",
+    "routine",
+    "reminder",
+];
 
 fn looks_like_conversational_goal(normalized: &str) -> bool {
     normalized.contains('?')
@@ -4850,6 +5747,67 @@ fn looks_like_multi_tool_workflow(normalized: &str) -> bool {
     .any(|phrase| normalized.contains(phrase))
 }
 
+/// Words too common to count as relevance evidence from a skill record.
+const RECORD_RELEVANCE_STOPWORDS: &[&str] = &[
+    "whenever", "always", "should", "would", "could", "which", "their", "there", "about", "these",
+    "those", "using", "through", "before", "after", "every", "other", "while", "where", "being",
+    "jared", "operator", "agent", "skill", "skills", "tools", "safely", "never", "first", "then",
+];
+
+/// Relevance from the record itself: a distinctive part of the skill name
+/// (`repertoire` in `music.repertoire-gardener`) or at least two significant
+/// words of its description/goal appear in the turn.
+fn record_relevant_for_turn(
+    record: &ansible_mesh_core::graph::AbstractSkillRecord,
+    normalized: &str,
+) -> bool {
+    if record
+        .skill_name
+        .split(['.', '-', '_'])
+        .filter(|part| part.len() >= 5)
+        .any(|part| normalized.contains(part))
+    {
+        return true;
+    }
+    let text = format!(
+        "{} {}",
+        record.description,
+        record.goal_template.as_deref().unwrap_or("")
+    )
+    .to_ascii_lowercase();
+    let mut seen = std::collections::BTreeSet::new();
+    let mut hits = 0usize;
+    for token in text.split(|c: char| !c.is_alphanumeric()) {
+        if token.len() < 5 || RECORD_RELEVANCE_STOPWORDS.contains(&token) || !seen.insert(token) {
+            continue;
+        }
+        if normalized.contains(token) {
+            hits += 1;
+            if hits >= 2 {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Does the record's description or goal name a tool that is projected this
+/// turn? Stands in for `implied_tools` when the author declared none.
+fn record_mentions_projected_tool(
+    record: &ansible_mesh_core::graph::AbstractSkillRecord,
+    projected_tool_names: &std::collections::BTreeSet<&str>,
+) -> bool {
+    let text = format!(
+        "{} {}",
+        record.description,
+        record.goal_template.as_deref().unwrap_or("")
+    )
+    .to_ascii_lowercase();
+    projected_tool_names
+        .iter()
+        .any(|tool| tool.contains('.') && text.contains(&tool.to_ascii_lowercase()))
+}
+
 fn normalized_turn_text(user_content: &str) -> String {
     user_content
         .trim()
@@ -4926,19 +5884,15 @@ pub fn default_tool_assembly_for_bindings(bindings: &SessionBindings) -> ToolAss
 
     let toolset = default_visible_toolset(bindings);
 
-    let catalog = tool_catalog();
     let tools_for_model = toolset
         .iter()
         .map(|tool_name| {
-            catalog
-                .get(tool_name.as_str())
-                .cloned()
-                .unwrap_or_else(|| ToolDefinition {
-                    tool_name: tool_name.clone(),
-                    description: format!("Execute the {} tool.", tool_name),
-                    input_schema: json!({ "type": "object" }),
-                    class: None,
-                })
+            crate::catalog::tool_definition(tool_name.as_str()).unwrap_or_else(|| ToolDefinition {
+                tool_name: tool_name.clone(),
+                description: format!("Execute the {} tool.", tool_name),
+                input_schema: json!({ "type": "object" }),
+                class: None,
+            })
         })
         .collect::<Vec<_>>();
 
@@ -5318,19 +6272,15 @@ fn tool_assembly_from_allowed_incarnations(bindings: &SessionBindings) -> ToolAs
         default_visible_toolset(bindings)
     };
 
-    let catalog = tool_catalog();
     let tools_for_model = visible_tools
         .iter()
         .map(|tool_name| {
-            catalog
-                .get(tool_name.as_str())
-                .cloned()
-                .unwrap_or_else(|| ToolDefinition {
-                    tool_name: tool_name.clone(),
-                    description: format!("Execute the {} tool.", tool_name),
-                    input_schema: json!({ "type": "object" }),
-                    class: None,
-                })
+            crate::catalog::tool_definition(tool_name.as_str()).unwrap_or_else(|| ToolDefinition {
+                tool_name: tool_name.clone(),
+                description: format!("Execute the {} tool.", tool_name),
+                input_schema: json!({ "type": "object" }),
+                class: None,
+            })
         })
         .collect::<Vec<_>>();
 
@@ -5726,11 +6676,29 @@ fn memory_space_summary(frame: &MemorySpacetimeFrame) -> Option<String> {
     }
 }
 
-fn current_unix_ts() -> u64 {
+pub(crate) fn current_unix_ts() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
+}
+
+/// Convert a monotonic wait-clock stamp to a wall-clock unix timestamp so it
+/// can survive a checkpoint round-trip. `Instant` has no fixed epoch and
+/// cannot be serialized directly.
+fn instant_to_unix_ts(instant: std::time::Instant) -> u64 {
+    current_unix_ts().saturating_sub(instant.elapsed().as_secs())
+}
+
+/// Reconstruct an approximate `Instant` for a wait-clock stamp that was
+/// persisted as a wall-clock unix timestamp. Used only on checkpoint
+/// restore — see the module note on why restore-time clock loss silently
+/// extended the watchdog's effective deadline (DEF-100).
+fn unix_ts_to_instant(unix_ts: u64) -> std::time::Instant {
+    let elapsed = current_unix_ts().saturating_sub(unix_ts);
+    std::time::Instant::now()
+        .checked_sub(std::time::Duration::from_secs(elapsed))
+        .unwrap_or_else(std::time::Instant::now)
 }
 
 /// Format current UTC time as "YYYY-MM-DD HH:MM:SS UTC" using only std.
@@ -5878,6 +6846,7 @@ mod tests {
             consecutive_step_failures: 0,
             streak_extension: 0,
             provider_repair_note: None,
+            say_do_nudged: false,
             provider_repair_attempts: 0,
             pending_text_reply: Some("hello back".into()),
             had_voice_input: true,
@@ -5889,6 +6858,7 @@ mod tests {
             paracrine_reply_chat_id: None,
             paracrine_response_routing: None,
             paracrine_merge_completed: false,
+            paracrine_intent: None,
             plan_confirmed: false,
             plan_confirm_note: None,
             fallback_tier: 0,
@@ -5924,6 +6894,7 @@ mod tests {
                 ],
                 status: "executing".into(),
                 context_1_advisory: None,
+                procedure_id: None,
             },
             steps_done: vec![true, false],
             verified_step_ids: vec![1],
@@ -6000,6 +6971,58 @@ mod tests {
         let restored = SessionState::from_checkpoint(&checkpoint).expect("rehydrate state");
 
         assert_eq!(restored.pinned_tier_role.as_deref(), Some("model.ollama"));
+    }
+
+    /// DEF-100: without a persisted wall-clock stamp, restoring a parked
+    /// approval reset its wait-clock to "now" — a session reload (idle
+    /// eviction, guest restart) silently extended an already-long wait by a
+    /// full extra watchdog deadline, and the eventual eviction's
+    /// `elapsed_secs` under-reported the true wait. Live 2026-08-29:
+    /// architect-charter's approval sat 84 minutes, logged as 304s.
+    #[test]
+    fn parked_approval_wait_clock_survives_checkpoint_round_trip() {
+        let mut state =
+            SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
+        let mut turn = test_working_turn(None);
+        turn.phase = TurnPhase::WaitingApproval;
+        state.start_turn(turn);
+        state.park_active_turn_for_approval();
+
+        // Backdate the park stamp by 84 minutes, mirroring the live incident.
+        let long_ago = std::time::Instant::now()
+            .checked_sub(std::time::Duration::from_secs(84 * 60))
+            .expect("backdate instant");
+        state.parked_approval_since = Some(long_ago);
+
+        let checkpoint = state.checkpoint_json();
+        let restored = SessionState::from_checkpoint(&checkpoint).expect("rehydrate state");
+
+        assert!(
+            restored.parked_approval_turn.is_some(),
+            "parked approval turn must survive restore"
+        );
+        let restored_since = restored
+            .parked_approval_since
+            .expect("wait-clock must be reconstructed, not reset to None");
+        let elapsed = restored_since.elapsed().as_secs();
+        assert!(
+            elapsed >= 84 * 60 - 5,
+            "restore must preserve the ORIGINAL wait duration (~{}s), got {elapsed}s — \
+             a value near 0 means the clock was reset to \"now\" on reload",
+            84 * 60
+        );
+    }
+
+    /// A session with no parked approval must restore with no wait-clock
+    /// stamp either — the reconstruction is gated on the turn surviving,
+    /// not unconditional.
+    #[test]
+    fn no_parked_approval_means_no_reconstructed_wait_clock() {
+        let state = SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
+        let checkpoint = state.checkpoint_json();
+        let restored = SessionState::from_checkpoint(&checkpoint).expect("rehydrate state");
+        assert!(restored.parked_approval_turn.is_none());
+        assert!(restored.parked_approval_since.is_none());
     }
 
     #[test]
@@ -6130,6 +7153,7 @@ mod tests {
             consecutive_step_failures: 0,
             streak_extension: 0,
             provider_repair_note: None,
+            say_do_nudged: false,
             provider_repair_attempts: 0,
             pending_text_reply: Some("hello back".into()),
             had_voice_input: true,
@@ -6141,6 +7165,7 @@ mod tests {
             paracrine_reply_chat_id: None,
             paracrine_response_routing: None,
             paracrine_merge_completed: false,
+            paracrine_intent: None,
             plan_confirmed: false,
             plan_confirm_note: None,
             fallback_tier: 0,
@@ -6360,6 +7385,7 @@ mod tests {
             steps,
             status: "executing".into(),
             context_1_advisory: None,
+            procedure_id: None,
         }
     }
 
@@ -6452,6 +7478,7 @@ mod tests {
         let mut state =
             SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
         let mut turn = test_working_turn(Some(ActivePlan {
+            procedure_id: None,
             goal: "close out the implementation slice".into(),
             steps: vec![PlanStep {
                 id: 1,
@@ -6567,6 +7594,7 @@ mod tests {
             consecutive_step_failures: 0,
             streak_extension: 0,
             provider_repair_note: None,
+            say_do_nudged: false,
             provider_repair_attempts: 0,
             pending_text_reply: None,
             had_voice_input: false,
@@ -6578,6 +7606,7 @@ mod tests {
             paracrine_reply_chat_id: None,
             paracrine_response_routing: None,
             paracrine_merge_completed: false,
+            paracrine_intent: None,
             plan_confirmed: false,
             plan_confirm_note: None,
             fallback_tier: 0,
@@ -6625,6 +7654,7 @@ mod tests {
             consecutive_step_failures: 0,
             streak_extension: 0,
             provider_repair_note: None,
+            say_do_nudged: false,
             provider_repair_attempts: 0,
             pending_text_reply: None,
             had_voice_input: false,
@@ -6636,6 +7666,7 @@ mod tests {
             paracrine_reply_chat_id: None,
             paracrine_response_routing: None,
             paracrine_merge_completed: false,
+            paracrine_intent: None,
             plan_confirmed: false,
             plan_confirm_note: None,
             fallback_tier: 0,
@@ -6686,6 +7717,89 @@ mod tests {
         assert!(
             knowledge.contains("[voice message]"),
             "placeholder must appear in context"
+        );
+    }
+
+    /// Builds a checkpoint with `n` turns whose user content is `chars` long each.
+    fn checkpoint_with_bulky_turns(n: usize, chars: usize) -> serde_json::Value {
+        let turns: Vec<serde_json::Value> = (0..n)
+            .map(|i| {
+                serde_json::json!({
+                    "turn_id": format!("t{i}"),
+                    "user_content": format!("TURN{i}-{}", "x".repeat(chars)),
+                    "assistant_content": format!("reply{i}"),
+                    "created_at": 0u64
+                })
+            })
+            .collect();
+        serde_json::json!({
+            "session_id": "sess-1",
+            "agent_id": "agent-coach",
+            "source": "telegram",
+            "recent_turns": turns,
+        })
+    }
+
+    /// The rolling window bounded turn COUNT but never turn SIZE, so one pasted
+    /// document rode along in every request until it aged out. Live 2026-08-30:
+    /// coach was sending 236KB requests and OpenRouter timed out at 55s.
+    #[test]
+    fn dialogue_window_is_bounded_by_the_injection_budget() {
+        let state = SessionState::from_checkpoint(&checkpoint_with_bulky_turns(5, 4_000))
+            .expect("from_checkpoint must succeed");
+        let budget = state.settings.injection_budget.dialogue_chars;
+        let knowledge = state.project_knowledge("", &[]);
+
+        assert!(
+            knowledge.chars().count() < budget * 2,
+            "dialogue window must stay near its {budget}-char budget, got {}",
+            knowledge.chars().count()
+        );
+        assert!(
+            knowledge.contains("elided to stay inside"),
+            "elided turns must be announced, not silently dropped"
+        );
+        // Newest turn survives; the oldest is the one dropped.
+        assert!(
+            knowledge.contains("TURN4"),
+            "the most recent turn must always be kept"
+        );
+        assert!(
+            !knowledge.contains("TURN0"),
+            "the oldest turn must be the first evicted under budget pressure"
+        );
+    }
+
+    /// Dropping the turn currently being replied to would be worse than
+    /// overrunning the budget, so the newest turn is admitted unconditionally.
+    #[test]
+    fn dialogue_window_keeps_the_newest_turn_even_if_it_alone_exceeds_budget() {
+        let state = SessionState::from_checkpoint(&checkpoint_with_bulky_turns(1, 40_000))
+            .expect("from_checkpoint must succeed");
+        let knowledge = state.project_knowledge("", &[]);
+        assert!(
+            knowledge.contains("TURN0"),
+            "a single oversized turn must still be projected — it is the one being answered"
+        );
+    }
+
+    /// `project_knowledge` used to emit `[Recent session context]` (the whole
+    /// window) AND `[Recent summary]` (its last three turns) into the same layer,
+    /// so those turns were sent twice in every request.
+    #[test]
+    fn knowledge_layer_does_not_duplicate_recent_turns() {
+        let state = SessionState::from_checkpoint(&checkpoint_with_bulky_turns(2, 10))
+            .expect("from_checkpoint must succeed");
+        let knowledge = state.project_knowledge("", &[]);
+
+        assert!(
+            !knowledge.contains("[Recent summary]"),
+            "the in-layer duplicate of the dialogue window must be gone"
+        );
+        assert_eq!(
+            knowledge.matches("TURN1").count(),
+            1,
+            "the newest turn must appear exactly once in the knowledge layer"
         );
     }
 
@@ -6783,6 +7897,8 @@ mod tests {
                 effective_toolset: vec!["echo".into(), "workspace.read".into()],
                 effective_skillset: vec!["planning".into()],
                 effective_skill_guidance: Vec::new(),
+                effective_procedures: Vec::new(),
+                effective_skill_records: Vec::new(),
                 effective_workspace_ref: Some("workspace://main".into()),
                 transport_reply_target: Some(TransportReplyTargetBinding {
                     target_node: "local-aiua-01".into(),
@@ -6900,6 +8016,7 @@ mod tests {
         let mut state =
             SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
         state.start_turn(test_working_turn(Some(ActivePlan {
+            procedure_id: None,
             goal: "close out the implementation slice".into(),
             steps: vec![PlanStep {
                 id: 1,
@@ -7405,6 +8522,8 @@ mod tests {
             effective_toolset: vec!["echo".into()],
             effective_skillset: vec!["planning".into()],
             effective_skill_guidance: Vec::new(),
+            effective_procedures: Vec::new(),
+            effective_skill_records: Vec::new(),
             effective_workspace_ref: Some("workspace://main".into()),
             transport_reply_target: Some(TransportReplyTargetBinding {
                 target_node: "local-aiua-01".into(),
@@ -7505,6 +8624,7 @@ mod tests {
             consecutive_step_failures: 0,
             streak_extension: 0,
             provider_repair_note: None,
+            say_do_nudged: false,
             provider_repair_attempts: 0,
             pending_text_reply: None,
             had_voice_input: false,
@@ -7516,6 +8636,7 @@ mod tests {
             paracrine_reply_chat_id: None,
             paracrine_response_routing: None,
             paracrine_merge_completed: false,
+            paracrine_intent: None,
             plan_confirmed: false,
             plan_confirm_note: None,
             fallback_tier: 0,
@@ -7606,6 +8727,7 @@ mod tests {
             consecutive_step_failures: 0,
             streak_extension: 0,
             provider_repair_note: None,
+            say_do_nudged: false,
             provider_repair_attempts: 0,
             pending_text_reply: None,
             had_voice_input: false,
@@ -7617,6 +8739,7 @@ mod tests {
             paracrine_reply_chat_id: None,
             paracrine_response_routing: None,
             paracrine_merge_completed: false,
+            paracrine_intent: None,
             plan_confirmed: false,
             plan_confirm_note: None,
             fallback_tier: 0,
@@ -7635,6 +8758,88 @@ mod tests {
         assert!(prompt.contains("[Session projection]"));
         assert!(prompt.contains("[Working projection]"));
         assert!(prompt.contains("Active conversation turn: turn-ctx-2."));
+    }
+
+    /// Live 2026-09-11: the evening turn saying "tomorrow" was replayed the
+    /// next morning with no date on it, and the internal
+    /// "[Plan continuation n/N]" briefs crowded the human exchange out of
+    /// the dialogue budget. Every replayed turn now carries its own
+    /// operator-local stamp and continuation briefs collapse to a headline.
+    #[test]
+    fn dialogue_window_stamps_turns_and_collapses_continuation_briefs() {
+        let mut state =
+            SessionState::new("sess-1".into(), "agent-beacon".into(), "telegram".into());
+        state.agent_profile.user_timezone = Some("America/New_York".into());
+        // 2026-09-11 02:00:05 UTC == 2026-09-10 22:00 EDT
+        state.recent_turns.push(TurnRecord {
+            turn_id: "t1".into(),
+            user_content: "Trigger the daily Evening Check-In prompt for Jared.".into(),
+            assistant_content: Some(
+                "Your Toastmasters Icebreaker Speech is scheduled for tomorrow!".into(),
+            ),
+            created_at: 1_789_092_005,
+        });
+        state.recent_turns.push(TurnRecord {
+            turn_id: "t2".into(),
+            user_content: "[Plan continuation 1/3] Continue executing your existing plan. Goal: \
+                           deliver a clean morning brief.\nRemaining steps:\n- step 1 (tool: \
+                           life.observe): Log Jared's drive with Daxton\n- step 2 …"
+                .into(),
+            assistant_content: Some("Good morning, Jared! Here is your brief.".into()),
+            created_at: 1_789_124_424,
+        });
+        // Legacy record without a timestamp: rendered, but unstamped.
+        state.recent_turns.push(TurnRecord {
+            turn_id: "t0".into(),
+            user_content: "ok".into(),
+            assistant_content: Some("👍".into()),
+            created_at: 0,
+        });
+
+        let window = state.render_dialogue_window(8000);
+        assert!(
+            window.contains("[2026-09-10 22:00 EDT] User: Trigger the daily Evening Check-In"),
+            "{window}"
+        );
+        assert!(
+            window.contains("[2026-09-10 22:00 EDT] Assistant: Your Toastmasters"),
+            "{window}"
+        );
+        assert!(window.contains("[2026-09-11 07:00 EDT] User: [Plan continuation 1/3]"));
+        assert!(window.contains("(internal continuation brief; step list elided)"));
+        assert!(
+            !window.contains("Remaining steps:"),
+            "brief body must be elided: {window}"
+        );
+        assert!(
+            window.contains("relative to THAT stamp"),
+            "legend: {window}"
+        );
+        assert!(window.contains("\nUser: ok\nAssistant: 👍"), "{window}");
+
+        // Structured window carries the same stamp as `at`.
+        let (_, context, _) = state.model_request_payloads("next", &[]);
+        let dw = context["dialogue_window"]
+            .as_array()
+            .expect("dialogue_window");
+        let first = dw
+            .iter()
+            .find(|m| m["role"] == "user")
+            .expect("a user entry");
+        assert!(first.get("at").is_some(), "{first}");
+
+        // Recent summary collapses the brief too.
+        let summary = state.summary_text();
+        assert!(!summary.contains("Remaining steps:"), "{summary}");
+        assert!(summary.contains("[Plan continuation 1/3]"), "{summary}");
+
+        // No zone configured: stamps fall back to UTC.
+        state.agent_profile.user_timezone = None;
+        let window = state.render_dialogue_window(8000);
+        assert!(
+            window.contains("[2026-09-11 02:00 UTC] User: Trigger"),
+            "{window}"
+        );
     }
 
     #[test]
@@ -7669,6 +8874,80 @@ mod tests {
     /// for skills projected on this turn. Before this existed the strings were
     /// discarded (`.clear()` + vec![] resets) and no skill doctrine ever
     /// reached the model.
+    /// Self-Improvement Loop L1: a distill lookaside turn projects exactly the
+    /// allowlisted tools the role holds — keyword gates and on-demand
+    /// suppression do not apply. Live 2026-09-04 the distiller was offered
+    /// 33 tools without `skill.register` and could only decline.
+    /// Self-Improvement Loop L1: a distill review carries no dialogue window
+    /// and no recalled memory — the lookaside session persists across
+    /// whispers and its own earlier declines must not steer the next one.
+    #[test]
+    fn distill_turn_renders_no_dialogue_window_or_recall() {
+        let mut state =
+            SessionState::new("sess-1".into(), "agent-bjork-01".into(), "telegram".into());
+        state.recent_turns.push(TurnRecord {
+            turn_id: "t-0".into(),
+            user_content: "DISTILL REVIEW — earlier brief".into(),
+            assistant_content: Some("DISTILL: nothing".into()),
+            created_at: 1,
+        });
+        let mut turn = WorkingTurn::test_turn("t-1", "DISTILL REVIEW — new brief");
+        turn.paracrine_origin = Some("pid-1".into());
+        turn.paracrine_intent = Some("skills.distill:tool_count".into());
+        state.start_turn(turn);
+
+        assert_eq!(state.render_dialogue_window(8_000), "");
+        assert_eq!(state.project_recalled_memory(), "");
+
+        // An ordinary turn in the same session still sees the window.
+        state.active_turn = None;
+        state.start_turn(WorkingTurn::test_turn("t-2", "hello"));
+        assert!(
+            state
+                .render_dialogue_window(8_000)
+                .contains("DISTILL: nothing")
+        );
+    }
+
+    #[test]
+    fn distill_turn_projects_only_the_allowlist() {
+        let mut state =
+            SessionState::new("sess-1".into(), "agent-bjork-01".into(), "telegram".into());
+        state.clear_tool_bindings();
+        for tool in [
+            "skill.register",
+            "skill.list",
+            "memory.remember",
+            "bash.exec",
+            "hotel.status",
+        ] {
+            state.add_tool_binding(tool);
+        }
+        // Even with skill.register hidden behind an on-demand skill.
+        state.bindings.on_demand_skills = vec!["skill.authoring".into()];
+
+        let mut turn = WorkingTurn::test_turn("t-distill", "DISTILL REVIEW — silent lookaside.");
+        turn.paracrine_origin = Some("pid-1".into());
+        turn.paracrine_intent = Some("skills.distill:tool_count".into());
+        state.start_turn(turn);
+
+        let mut names: Vec<String> = state
+            .project_tools_for_turn("DISTILL REVIEW — silent lookaside.")
+            .into_iter()
+            .map(|t| t.tool_name)
+            .collect();
+        names.sort();
+        assert_eq!(
+            names,
+            vec![
+                "memory.remember".to_string(),
+                "skill.list".to_string(),
+                "skill.register".to_string()
+            ],
+            "distill turn must see the allowlisted tools it holds and nothing else"
+        );
+    }
+
     #[test]
     fn skill_guidance_renders_for_projected_skills_only() {
         let mut state =
@@ -7923,6 +9202,7 @@ mod tests {
             consecutive_step_failures: 0,
             streak_extension: 0,
             provider_repair_note: None,
+            say_do_nudged: false,
             provider_repair_attempts: 0,
             pending_text_reply: None,
             had_voice_input: false,
@@ -7934,6 +9214,7 @@ mod tests {
             paracrine_reply_chat_id: None,
             paracrine_response_routing: None,
             paracrine_merge_completed: false,
+            paracrine_intent: None,
             plan_confirmed: false,
             plan_confirm_note: None,
             fallback_tier: 0,
@@ -7978,6 +9259,78 @@ mod tests {
     }
 
     #[test]
+    fn same_identity_handoff_bundle_never_carries_a_slash_command_as_active_goal() {
+        // Live incident 2026-08-30: a manual `/role chronos` command IS the
+        // session's active_turn.user_content while it's being handled. If that
+        // text were carried over as active_goal, the receiving role would
+        // auto-execute "/role chronos" as its first inbound task and
+        // re-trigger the same handoff from its own process — a
+        // self-perpetuating loop only bounded by the ROLE_SWITCH_MAX throttle.
+        let mut state =
+            SessionState::new("sess-1".into(), "agent-beacon-01".into(), "telegram".into());
+        state.status = "active".into();
+        state.active_incarnation_id = Some("agent-beacon:orchestrator".into());
+        state.start_turn(WorkingTurn {
+            task_id: Uuid::nil(),
+            turn_id: "turn-handoff-2".into(),
+            chat_id: "123".into(),
+            primary_user_id: None,
+            user_content: "/role chronos".into(),
+            final_reply_to: "local-aiua-01".into(),
+            final_reply_role: "membrane".into(),
+            final_reply_guest_id: None,
+            phase: TurnPhase::WaitingModel,
+            iteration: 0,
+            pending_tool_call: None,
+            pending_approval: None,
+            working_tool_history: Vec::new(),
+            recalled_memories: Vec::new(),
+            active_plan: None,
+            consecutive_step_failures: 0,
+            streak_extension: 0,
+            provider_repair_note: None,
+            say_do_nudged: false,
+            provider_repair_attempts: 0,
+            pending_text_reply: None,
+            had_voice_input: false,
+            awaiting_transcription_reentry: false,
+            scripted_loop_context: None,
+            associated_paracrine_ids: Vec::new(),
+            paracrine_origin: None,
+            paracrine_reply_session_id: None,
+            paracrine_reply_chat_id: None,
+            paracrine_response_routing: None,
+            paracrine_merge_completed: false,
+            paracrine_intent: None,
+            plan_confirmed: false,
+            plan_confirm_note: None,
+            fallback_tier: 0,
+            ladder_tier0_dispatched: false,
+            streaming_retry_attempts: 0,
+            streamed_content: String::new(),
+            paracrine_hop_count: 0,
+            paracrine_chain_started_at: None,
+            started_at_unix: None,
+            last_interim_at_unix: None,
+            plan_steps_verified: Vec::new(),
+            selection_source: SelectionSource::default(),
+        });
+
+        let bundle = state.build_same_identity_handoff_bundle(
+            "chronos",
+            "turn-handoff-2",
+            "manual_role_switch",
+            Some("orchestrator".into()),
+        );
+
+        assert_eq!(
+            bundle.active_goal, None,
+            "a slash command must never become an auto-executed active_goal: {:?}",
+            bundle.active_goal
+        );
+    }
+
+    #[test]
     fn subagent_delegation_builder_is_lightweight_and_role_scoped() {
         let mut state =
             SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
@@ -8015,6 +9368,7 @@ mod tests {
             consecutive_step_failures: 0,
             streak_extension: 0,
             provider_repair_note: None,
+            say_do_nudged: false,
             provider_repair_attempts: 0,
             pending_text_reply: None,
             had_voice_input: false,
@@ -8026,6 +9380,7 @@ mod tests {
             paracrine_reply_chat_id: None,
             paracrine_response_routing: None,
             paracrine_merge_completed: false,
+            paracrine_intent: None,
             plan_confirmed: false,
             plan_confirm_note: None,
             fallback_tier: 0,
@@ -8541,6 +9896,7 @@ mod tests {
             }],
             status: "executing".into(),
             context_1_advisory: None,
+            procedure_id: None,
         }));
         turn.plan_confirmed = true;
         state.start_turn(turn);
@@ -8640,6 +9996,511 @@ mod tests {
                 .map(|t| t.tool_name.as_str())
                 .collect::<Vec<_>>()
         );
+    }
+
+    /// Live 2026-09-11 18:23 UTC: the operator reported the outcome of a
+    /// recalled open loop, the "ok" in the message tripped the conversational
+    /// gate, and the model — with zero tools — told him it had logged the
+    /// event. A report that names a recalled node keeps the life tools.
+    #[test]
+    fn lived_fact_report_about_recalled_loop_keeps_life_tools() {
+        let mut state =
+            SessionState::new("sess-1".into(), "agent-beacon".into(), "telegram".into());
+        for tool in [
+            "life.observe",
+            "life.recall",
+            "life.commit",
+            "cron.register",
+        ] {
+            state.add_tool_binding(tool);
+        }
+        state.bindings.on_demand_skills = vec!["life.steward".into(), "cron.manage".into()];
+
+        let msg = "I gave my icebreaker speech in toastmasters today! And i did ok. Nadi came in support.";
+        let mut turn = make_plain_turn();
+        turn.user_content = msg.into();
+        let mut life_memory = life_record(
+            "life:open_loop:toastmasters_icebreaker_speech_20260906",
+            "Jared is starting work on his Toastmasters Icebreaker speech project.",
+        );
+        life_memory.vault_id = Some("life-graph".into());
+        turn.recalled_memories = vec![life_memory];
+        state.start_turn(turn);
+
+        let names: Vec<String> = state
+            .project_tools_for_turn(msg)
+            .into_iter()
+            .map(|t| t.tool_name)
+            .collect();
+        for expected in ["life.observe", "life.commit", "life.recall"] {
+            assert!(
+                names.contains(&expected.to_string()),
+                "missing {expected}: {names:?}"
+            );
+        }
+        assert!(
+            !names.contains(&"cron.register".to_string()),
+            "unrelated on-demand tools stay stripped: {names:?}"
+        );
+
+        // The same message with unrelated recalled context is still filler.
+        let mut state2 =
+            SessionState::new("sess-2".into(), "agent-beacon".into(), "telegram".into());
+        for tool in ["life.observe", "life.recall", "life.commit"] {
+            state2.add_tool_binding(tool);
+        }
+        state2.bindings.on_demand_skills = vec!["life.steward".into()];
+        let mut turn2 = make_plain_turn();
+        turn2.user_content = "ok, that looks great today!".into();
+        let mut other = life_record("life:openloop:ypt", "YPT training due this week");
+        other.vault_id = Some("life-graph".into());
+        turn2.recalled_memories = vec![other];
+        state2.start_turn(turn2);
+        assert!(
+            state2
+                .project_tools_for_turn("ok, that looks great today!")
+                .is_empty()
+        );
+    }
+
+    /// Outcome reflex: the operator's report seeds a two-step plan bound to
+    /// life.observe + life.commit on the recalled loop's exact id, and that
+    /// plan makes the tools project even on a "conversational" message.
+    /// Procedural graphs P3: with the outcome-reflex procedure bound, the
+    /// seeded plan is the graph's backbone, branch by context, stamped.
+    #[test]
+    fn outcome_report_seeds_the_plan_from_the_bound_procedure() {
+        use ansible_mesh_core::procedure::outcome_reflex_procedure;
+        let msg = "I gave my icebreaker speech in toastmasters today! And i did ok.";
+
+        // Loop in context → target_known branch: observe → commit.
+        let mut state =
+            SessionState::new("sess-1".into(), "agent-beacon".into(), "telegram".into());
+        for tool in ["life.observe", "life.recall", "life.commit"] {
+            state.add_tool_binding(tool);
+        }
+        state.bindings.effective_procedures = vec![outcome_reflex_procedure()];
+        let mut turn = make_plain_turn();
+        turn.user_content = msg.into();
+        turn.recalled_memories = vec![life_record(
+            "life:open_loop:toastmasters_icebreaker_speech_20260906",
+            "Jared is starting work on his Toastmasters Icebreaker speech project.",
+        )];
+        state.start_turn(turn);
+        assert_eq!(
+            state.seed_outcome_plan().as_deref(),
+            Some("life:open_loop:toastmasters_icebreaker_speech_20260906")
+        );
+        let plan = state
+            .active_turn
+            .as_ref()
+            .and_then(|t| t.active_plan.clone())
+            .expect("plan seeded");
+        assert_eq!(plan.procedure_id.as_deref(), Some("outcome-reflex"));
+        assert_eq!(
+            plan.steps
+                .iter()
+                .map(|s| s.tool_name.as_deref())
+                .collect::<Vec<_>>(),
+            vec![Some("life.observe"), Some("life.commit")]
+        );
+        assert!(
+            plan.steps[1]
+                .description
+                .contains("life:open_loop:toastmasters_icebreaker_speech_20260906")
+        );
+        assert!(plan.steps[0].description.contains("Operator said"));
+        // Idempotent, like the literal path.
+        assert!(state.seed_outcome_plan().is_none());
+        // The seeded plan resolves to its procedure for guidance and the ledger.
+        let turn = state.active_turn.as_ref().expect("turn");
+        let guidance = state
+            .procedure_guidance_for_turn(turn)
+            .expect("guidance from the entry");
+        assert!(
+            guidance.contains("[Procedure guidance: outcome-reflex @ start]"),
+            "{guidance}"
+        );
+
+        // Nothing loop-like in context → target_unknown branch: recall first.
+        let mut state2 =
+            SessionState::new("sess-2".into(), "agent-beacon".into(), "telegram".into());
+        for tool in ["life.observe", "life.recall", "life.commit"] {
+            state2.add_tool_binding(tool);
+        }
+        state2.bindings.effective_procedures = vec![outcome_reflex_procedure()];
+        let mut turn2 = make_plain_turn();
+        turn2.user_content = msg.into();
+        state2.start_turn(turn2);
+        assert_eq!(
+            state2.seed_outcome_plan().as_deref(),
+            Some("(loop to be recalled)")
+        );
+        let plan2 = state2
+            .active_turn
+            .as_ref()
+            .and_then(|t| t.active_plan.clone())
+            .expect("recall-first plan seeded");
+        assert_eq!(plan2.procedure_id.as_deref(), Some("outcome-reflex"));
+        assert_eq!(
+            plan2
+                .steps
+                .iter()
+                .map(|s| s.tool_name.as_deref())
+                .collect::<Vec<_>>(),
+            vec![
+                Some("life.recall"),
+                Some("life.observe"),
+                Some("life.commit")
+            ]
+        );
+        assert!(plan2.steps[2].description.contains("never invent an id"));
+    }
+
+    #[test]
+    fn outcome_report_seeds_observe_and_commit_plan_for_recalled_loop() {
+        let mut state =
+            SessionState::new("sess-1".into(), "agent-beacon".into(), "telegram".into());
+        for tool in ["life.observe", "life.recall", "life.commit"] {
+            state.add_tool_binding(tool);
+        }
+        state.bindings.on_demand_skills = vec!["life.steward".into()];
+        let msg = "I gave my icebreaker speech in toastmasters today! And i did ok. Nadi came in support.";
+        let mut turn = make_plain_turn();
+        turn.user_content = msg.into();
+        // An event that also mentions the speech must not outrank the loop.
+        let mut event = life_record(
+            "life:event:toastmasters_meeting_20260911",
+            "Toastmasters meeting on Friday, September 11 where Jared delivers his Icebreaker speech.",
+        );
+        event.concept = "Event".into();
+        let loop_rec = life_record(
+            "life:open_loop:toastmasters_icebreaker_speech_20260906",
+            "Jared is starting work on his Toastmasters Icebreaker speech project.",
+        );
+        turn.recalled_memories = vec![event, loop_rec];
+        state.start_turn(turn);
+
+        let seeded = state.seed_outcome_plan();
+        assert_eq!(
+            seeded.as_deref(),
+            Some("life:open_loop:toastmasters_icebreaker_speech_20260906")
+        );
+        let plan = state
+            .active_turn
+            .as_ref()
+            .and_then(|t| t.active_plan.clone())
+            .expect("plan seeded");
+        assert!(plan.goal.starts_with("Outcome reflex:"));
+        assert_eq!(plan.steps.len(), 2);
+        assert_eq!(plan.steps[0].tool_name.as_deref(), Some("life.observe"));
+        assert_eq!(plan.steps[1].tool_name.as_deref(), Some("life.commit"));
+        assert!(
+            plan.steps[1]
+                .description
+                .contains("life:open_loop:toastmasters_icebreaker_speech_20260906")
+        );
+        // Seeding is idempotent: a second call leaves the plan alone.
+        assert!(state.seed_outcome_plan().is_none());
+
+        let names: Vec<String> = state
+            .project_tools_for_turn(msg)
+            .into_iter()
+            .map(|t| t.tool_name)
+            .collect();
+        assert!(names.contains(&"life.observe".to_string()), "{names:?}");
+        assert!(names.contains(&"life.commit".to_string()), "{names:?}");
+        let prompt = state.build_prompt(msg);
+        assert!(prompt.contains("[Outcome reflex]"), "{prompt}");
+
+        // No loop-like record recalled (stale prefetch cache, or only an
+        // event) → the plan opens with a life.recall step and the commit
+        // resolves whatever it finds. Live 2026-09-11 20:46 UTC: nothing was
+        // injected after a 2h23m quiet spell and nothing was seeded.
+        let mut state2 =
+            SessionState::new("sess-2".into(), "agent-beacon".into(), "telegram".into());
+        for tool in ["life.observe", "life.commit", "life.recall"] {
+            state2.add_tool_binding(tool);
+        }
+        let mut turn2 = make_plain_turn();
+        turn2.user_content = msg.into();
+        let mut only_event = life_record(
+            "life:event:toastmasters_meeting_20260911",
+            "Toastmasters meeting where Jared delivers his Icebreaker speech.",
+        );
+        only_event.concept = "Event".into();
+        turn2.recalled_memories = vec![only_event];
+        state2.start_turn(turn2);
+        assert_eq!(
+            state2.seed_outcome_plan().as_deref(),
+            Some("(loop to be recalled)")
+        );
+        let plan2 = state2
+            .active_turn
+            .as_ref()
+            .and_then(|t| t.active_plan.clone())
+            .expect("recall-first plan seeded");
+        let tools2: Vec<Option<&str>> =
+            plan2.steps.iter().map(|s| s.tool_name.as_deref()).collect();
+        assert_eq!(
+            tools2,
+            vec![
+                Some("life.recall"),
+                Some("life.observe"),
+                Some("life.commit")
+            ]
+        );
+        assert!(plan2.steps[2].description.contains("Never invent an id"));
+
+        // A request (not an outcome) never seeds.
+        let mut state3 =
+            SessionState::new("sess-3".into(), "agent-beacon".into(), "telegram".into());
+        for tool in ["life.observe", "life.commit", "life.recall"] {
+            state3.add_tool_binding(tool);
+        }
+        let mut turn3 = make_plain_turn();
+        turn3.user_content = "please remind me about my icebreaker speech tomorrow".into();
+        turn3.recalled_memories = vec![life_record(
+            "life:open_loop:toastmasters_icebreaker_speech_20260906",
+            "Jared is starting work on his Toastmasters Icebreaker speech project.",
+        )];
+        state3.start_turn(turn3);
+        assert!(state3.seed_outcome_plan().is_none());
+    }
+
+    /// Gardening reflex: a life.audit result seeds one life.tidy step per
+    /// suggested action plus a closing re-audit, and the tidy steps verify
+    /// against their own calls.
+    #[test]
+    fn audit_result_seeds_a_tidy_plan() {
+        let mut state =
+            SessionState::new("sess-1".into(), "agent-beacon".into(), "telegram".into());
+        for tool in ["life.audit", "life.tidy"] {
+            state.add_tool_binding(tool);
+        }
+        let mut turn = make_plain_turn();
+        turn.user_content = "Audit and garden the LifeGraph.".into();
+        state.start_turn(turn);
+        let audit_result = serde_json::json!({
+            "data": {
+                "status": "ok",
+                "health_score": 12,
+                "suggested_actions": [
+                    {"kind": "retire_duplicate", "duplicate_id": "life:habit:duolingo_morning", "keeper_id": "life:habit:duolingo_morning_20260812", "reason": "duplicate"},
+                    {"kind": "link", "from_id": "life:place:home", "rel_type": "SCOPED_TO", "to_id": "life:role:chief-of-staff", "reason": "orphan"}
+                ]
+            },
+            "status": "success"
+        })
+        .to_string();
+        state.push_tool_history(
+            ToolCall {
+                tool_name: "life.audit".into(),
+                arguments: serde_json::json!({}),
+            },
+            ToolResult {
+                tool_name: "life.audit".into(),
+                content: audit_result,
+            },
+        );
+        let plan = state
+            .active_turn
+            .as_ref()
+            .and_then(|t| t.active_plan.clone())
+            .expect("gardening plan seeded");
+        assert!(plan.goal.starts_with("Gardening pass: apply 2"));
+        assert!(
+            plan.goal.ends_with("(health_score 12 before)"),
+            "{}",
+            plan.goal
+        );
+        assert!(
+            plan.steps[2]
+                .description
+                .starts_with("Re-run life.audit to measure the pass (health_score 12 before);"),
+            "{}",
+            plan.steps[2].description
+        );
+        let tools: Vec<Option<&str>> = plan.steps.iter().map(|s| s.tool_name.as_deref()).collect();
+        assert_eq!(
+            tools,
+            vec![Some("life.tidy"), Some("life.tidy"), Some("life.audit")]
+        );
+        assert!(
+            plan.steps[0]
+                .description
+                .contains("life:habit:duolingo_morning")
+        );
+        assert!(
+            plan.steps[1]
+                .description
+                .contains("life:place:home -> life:role:chief-of-staff")
+        );
+
+        // The first tidy call verifies its own step (distinctive ids).
+        state.push_tool_history(
+            ToolCall {
+                tool_name: "life.tidy".into(),
+                arguments: serde_json::json!({"action": {"kind": "retire_duplicate", "duplicate_id": "life:habit:duolingo_morning", "keeper_id": "life:habit:duolingo_morning_20260812", "reason": "duplicate"}}),
+            },
+            ToolResult {
+                tool_name: "life.tidy".into(),
+                content: r#"{"status":"tidied"}"#.into(),
+            },
+        );
+        let flags = state
+            .active_turn
+            .as_ref()
+            .unwrap()
+            .plan_steps_verified
+            .clone();
+        assert_eq!(flags, vec![true, false, false]);
+
+        // A second audit inside the same gardening plan does not re-seed.
+        let goal_before = plan.goal.clone();
+        state.push_tool_history(
+            ToolCall {
+                tool_name: "life.audit".into(),
+                arguments: serde_json::json!({}),
+            },
+            ToolResult {
+                tool_name: "life.audit".into(),
+                content: r#"{"data":{"suggested_actions":[{"kind":"retire","node_id":"557","reason":"stray"}]}}"#.into(),
+            },
+        );
+        assert_eq!(
+            state
+                .active_turn
+                .as_ref()
+                .unwrap()
+                .active_plan
+                .as_ref()
+                .unwrap()
+                .goal,
+            goal_before
+        );
+        // …but it IS the closing audit: the seeding audit never credited the
+        // last step, this one does (live 2026-09-15 14:10 UTC the plan
+        // blocked at 12/13 with the harness re-running life.audit each
+        // continuation).
+        let flags = state
+            .active_turn
+            .as_ref()
+            .unwrap()
+            .plan_steps_verified
+            .clone();
+        assert_eq!(flags, vec![true, false, true]);
+    }
+
+    /// Live 2026-09-15 19:23 UTC: the "[Plan complete]" note and 26 tools in
+    /// the same request — the tool-result re-entry envelope projects tools
+    /// through `project_tools_for_turn`, not the initial-call path.
+    #[test]
+    fn fully_verified_plan_projects_no_tools_on_any_path() {
+        let mut state =
+            SessionState::new("sess-1".into(), "agent-beacon".into(), "telegram".into());
+        for tool in ["life.audit", "life.tidy"] {
+            state.add_tool_binding(tool);
+        }
+        let mut turn = make_plain_turn();
+        turn.user_content = "Garden the LifeGraph.".into();
+        turn.active_plan = Some(ActivePlan {
+            goal: "Gardening pass: apply 1 audit-suggested action(s)".into(),
+            steps: vec![PlanStep {
+                id: 1,
+                description: "Re-run life.audit".into(),
+                tool_name: Some("life.audit".into()),
+                status: "pending".into(),
+            }],
+            status: "executing".into(),
+            context_1_advisory: None,
+            procedure_id: None,
+        });
+        turn.plan_steps_verified = vec![false];
+        state.start_turn(turn);
+        assert!(
+            !state
+                .project_tools_for_turn("Garden the LifeGraph.")
+                .is_empty()
+        );
+        let (_, _, _, tools) = state.build_reentry_context_envelope().expect("envelope");
+        assert!(!tools.is_empty());
+        state.active_turn.as_mut().unwrap().plan_steps_verified = vec![true];
+        assert!(state.plan_fully_verified());
+        assert!(
+            state
+                .project_tools_for_turn("Garden the LifeGraph.")
+                .is_empty()
+        );
+        let (_, _, _, tools) = state.build_reentry_context_envelope().expect("envelope");
+        assert!(tools.is_empty());
+    }
+
+    /// Live 2026-09-15 19:22 UTC: a continuation opened with the carried
+    /// plan's statuses but none of its evidence, so the in-turn hint listed
+    /// all twelve landed tidies as outstanding.
+    #[test]
+    fn continuation_turn_opens_with_carried_evidence() {
+        let plan = ActivePlan {
+            goal: "Gardening pass: apply 2 audit-suggested action(s)".into(),
+            steps: vec![
+                PlanStep {
+                    id: 1,
+                    description: "Apply audit action link on life:a -> life:role:r".into(),
+                    tool_name: Some("life.tidy".into()),
+                    status: "pending".into(),
+                },
+                PlanStep {
+                    id: 2,
+                    description: "Apply audit action link on life:b -> life:role:r".into(),
+                    tool_name: Some("life.tidy".into()),
+                    status: "done".into(),
+                },
+                PlanStep {
+                    id: 3,
+                    description: "Re-run life.audit".into(),
+                    tool_name: Some("life.audit".into()),
+                    status: "pending".into(),
+                },
+            ],
+            status: "planning".into(),
+            context_1_advisory: None,
+            procedure_id: None,
+        };
+        let carry = CarryoverPlan {
+            plan,
+            steps_done: vec![true, true, false],
+            // Step 2 was settled on the model's word only; step 1 by a call.
+            verified_step_ids: vec![1],
+            stalled_continuations: 0,
+            continuations_used: 1,
+            lifetime_continuations: 1,
+            created_turn_id: "t0".into(),
+        };
+        let (plan, verified) = carry.seed_turn_plan();
+        assert_eq!(plan.status, "executing");
+        let statuses: Vec<&str> = plan.steps.iter().map(|s| s.status.as_str()).collect();
+        assert_eq!(statuses, vec!["done", "done", "pending"]);
+        assert_eq!(verified, vec![true, false, false]);
+        // Installed on a turn, the hint no longer lists step 1 as outstanding.
+        let mut state =
+            SessionState::new("sess-1".into(), "agent-beacon".into(), "telegram".into());
+        let mut turn = make_plain_turn();
+        turn.active_plan = Some(plan);
+        turn.plan_steps_verified = verified;
+        turn.working_tool_history.push((
+            ToolCall {
+                tool_name: "life.audit".into(),
+                arguments: serde_json::json!({}),
+            },
+            ToolResult {
+                tool_name: "life.audit".into(),
+                content: r#"{"data":{"health_score":61}}"#.into(),
+            },
+        ));
+        state.start_turn(turn);
+        let hint = crate::plan_eval::reentry_hint(state.active_turn.as_ref().unwrap());
+        assert!(!hint.contains("step 1 (tool: life.tidy)"), "{hint}");
     }
 
     #[test]
@@ -9026,6 +10887,124 @@ mod tests {
         assert!(projected_names.contains("skill.assign"));
     }
 
+    fn gardener_record() -> ansible_mesh_core::graph::AbstractSkillRecord {
+        ansible_mesh_core::graph::AbstractSkillRecord {
+            skill_name: "music.repertoire-gardener".into(),
+            description: "Safely and deterministically updates, audits, and maintains Jared's \
+                          active music repertoire in the LifeGraph."
+                .into(),
+            goal_template: Some(
+                "Whenever a new piece is added to the repertoire, use life.list to check for \
+                 it, then life.observe.batch to create MusicSection nodes linked HAS_SECTION."
+                    .into(),
+            ),
+            ..Default::default()
+        }
+    }
+
+    fn state_with_gardener() -> SessionState {
+        let mut state =
+            SessionState::new("sess-1".into(), "agent-bjork-01".into(), "telegram".into());
+        state.clear_tool_bindings();
+        for tool in ["life.list", "life.observe", "life.observe.batch", "echo"] {
+            state.add_tool_binding(tool);
+        }
+        state.bindings.effective_skillset = vec!["music.repertoire-gardener".into()];
+        state.bindings.effective_skill_records = vec![gardener_record()];
+        state
+    }
+
+    fn projected_skills(state: &SessionState, text: &str) -> Vec<String> {
+        let tools = state.project_tools_for_turn(text);
+        state.projected_skill_names_for_turn(&super::normalized_turn_text(text), &tools)
+    }
+
+    /// Live 2026-09-15 14:24 EDT: `music.repertoire-gardener` is registered,
+    /// assigned to the orchestrator, named by a rule — and absent from every
+    /// turn, because projection only knew compiled skills.
+    #[test]
+    fn runtime_registered_skill_projects_from_its_record() {
+        let state = state_with_gardener();
+        let on_topic = projected_skills(
+            &state,
+            "Check whether the Chopin nocturne is in my repertoire",
+        );
+        assert!(
+            on_topic.iter().any(|s| s == "music.repertoire-gardener"),
+            "{on_topic:?}"
+        );
+        let off_topic = projected_skills(&state, "what's the weather like tomorrow");
+        assert!(
+            !off_topic.iter().any(|s| s == "music.repertoire-gardener"),
+            "{off_topic:?}"
+        );
+    }
+
+    /// "Always use the music.repertoire-gardener skill whenever Jared mentions
+    /// a piece" — a rule that names a skill keeps it projected even when the
+    /// turn text carries none of the skill's words.
+    #[test]
+    fn rule_naming_a_skill_projects_it_every_turn() {
+        let mut state = state_with_gardener();
+        state.rules.push(serde_json::json!({
+            "rule_id": "r1",
+            "description": "Always use the music.repertoire-gardener skill to initialize, map, and cultivate the structural sections of a piece whenever Jared mentions playing a new composition."
+        }));
+        let projected = projected_skills(&state, "I am starting to look at Mendelssohn's 67/2");
+        assert!(
+            projected.iter().any(|s| s == "music.repertoire-gardener"),
+            "{projected:?}"
+        );
+    }
+
+    /// Declared implied tools behave like compiled skills: an assigned record
+    /// projects on tool intersection alone; an on-demand one also needs
+    /// relevance; a retired record never projects.
+    #[test]
+    fn record_declared_tools_follow_assignment_and_relevance_rules() {
+        let mut state = state_with_gardener();
+        let mut record = gardener_record();
+        record.skill_name = "music.practice-log".into();
+        record.description = "Log practice sessions".into();
+        record.goal_template = None;
+        record.implied_tools = vec!["life.observe".into()];
+        state.bindings.effective_skill_records.push(record.clone());
+
+        // On-demand + no relevance → no.
+        state.bindings.on_demand_skills = vec!["music.practice-log".into()];
+        let projected = projected_skills(&state, "what's the weather like tomorrow");
+        assert!(
+            !projected.iter().any(|s| s == "music.practice-log"),
+            "{projected:?}"
+        );
+        // On-demand + relevant (name part "practice") → yes.
+        let projected = projected_skills(&state, "log tonight's practice");
+        assert!(
+            projected.iter().any(|s| s == "music.practice-log"),
+            "{projected:?}"
+        );
+        // Assigned → tool intersection is enough (no relevance needed once the tool is projected).
+        state.bindings.on_demand_skills.clear();
+        state
+            .bindings
+            .effective_skillset
+            .push("music.practice-log".into());
+        let projected = projected_skills(&state, "use life.observe to record tonight's session");
+        assert!(
+            projected.iter().any(|s| s == "music.practice-log"),
+            "{projected:?}"
+        );
+        // Retired → never.
+        let mut retired = record.clone();
+        retired.validation_state = ansible_mesh_core::graph::SkillValidationState::Deprecated;
+        state.bindings.effective_skill_records = vec![retired];
+        let projected = projected_skills(&state, "log tonight's practice");
+        assert!(
+            !projected.iter().any(|s| s == "music.practice-log"),
+            "{projected:?}"
+        );
+    }
+
     #[test]
     fn explicit_tool_mentions_project_matching_tools() {
         let mut state =
@@ -9214,6 +11193,7 @@ mod tests {
             consecutive_step_failures: 0,
             streak_extension: 0,
             provider_repair_note: None,
+            say_do_nudged: false,
             provider_repair_attempts: 0,
             pending_text_reply: None,
             had_voice_input: false,
@@ -9225,6 +11205,7 @@ mod tests {
             paracrine_reply_chat_id: None,
             paracrine_response_routing: None,
             paracrine_merge_completed: false,
+            paracrine_intent: None,
             plan_confirmed: false,
             plan_confirm_note: None,
             fallback_tier: 0,
@@ -9279,6 +11260,7 @@ mod tests {
             consecutive_step_failures: 0,
             streak_extension: 0,
             provider_repair_note: None,
+            say_do_nudged: false,
             provider_repair_attempts: 0,
             pending_text_reply: None,
             had_voice_input: false,
@@ -9290,6 +11272,7 @@ mod tests {
             paracrine_reply_chat_id: None,
             paracrine_response_routing: None,
             paracrine_merge_completed: false,
+            paracrine_intent: None,
             plan_confirmed: false,
             plan_confirm_note: None,
             fallback_tier: 0,
@@ -9359,6 +11342,7 @@ mod tests {
             consecutive_step_failures: 0,
             streak_extension: 0,
             provider_repair_note: None,
+            say_do_nudged: false,
             provider_repair_attempts: 0,
             pending_text_reply: None,
             had_voice_input: false,
@@ -9370,6 +11354,7 @@ mod tests {
             paracrine_reply_chat_id: None,
             paracrine_response_routing: None,
             paracrine_merge_completed: false,
+            paracrine_intent: None,
             plan_confirmed: false,
             plan_confirm_note: None,
             fallback_tier: 0,
@@ -9440,6 +11425,7 @@ mod tests {
             consecutive_step_failures: 0,
             streak_extension: 0,
             provider_repair_note: None,
+            say_do_nudged: false,
             provider_repair_attempts: 0,
             pending_text_reply: None,
             had_voice_input: true,
@@ -9451,6 +11437,7 @@ mod tests {
             paracrine_reply_chat_id: None,
             paracrine_response_routing: None,
             paracrine_merge_completed: false,
+            paracrine_intent: None,
             plan_confirmed: false,
             plan_confirm_note: None,
             fallback_tier: 0,
@@ -9819,6 +11806,7 @@ mod tests {
             consecutive_step_failures: 0,
             streak_extension: 0,
             provider_repair_note: None,
+            say_do_nudged: false,
             provider_repair_attempts: 0,
             pending_text_reply: None,
             had_voice_input: false,
@@ -9830,6 +11818,7 @@ mod tests {
             paracrine_reply_chat_id: None,
             paracrine_response_routing: None,
             paracrine_merge_completed: false,
+            paracrine_intent: None,
             plan_confirmed: false,
             plan_confirm_note: None,
             fallback_tier: 0,
@@ -10175,6 +12164,7 @@ mod tests {
             consecutive_step_failures: 0,
             streak_extension: 0,
             provider_repair_note: None,
+            say_do_nudged: false,
             provider_repair_attempts: 0,
             pending_text_reply: None,
             had_voice_input: false,
@@ -10186,6 +12176,7 @@ mod tests {
             paracrine_reply_chat_id: None,
             paracrine_response_routing: None,
             paracrine_merge_completed: false,
+            paracrine_intent: None,
             plan_confirmed: false,
             plan_confirm_note: None,
             fallback_tier: 0,
@@ -10207,6 +12198,7 @@ mod tests {
             status: "active".into(),
             steps: Vec::new(),
             context_1_advisory: None,
+            procedure_id: None,
         });
         turn.active_plan = None;
         turn.user_content = "run your morning steward pass".into();
@@ -10587,6 +12579,7 @@ mod tests {
                 status: "done".into(),
             }],
             context_1_advisory: None,
+            procedure_id: None,
         };
         state.start_turn(make_turn_with_plan(plan));
         state.push_tool_history(
@@ -10633,6 +12626,7 @@ mod tests {
                 },
             ],
             context_1_advisory: None,
+            procedure_id: None,
         };
         state.start_turn(make_turn_with_plan(plan));
         state.push_tool_history(
@@ -10681,6 +12675,7 @@ mod tests {
                 status: "done".into(),
             }],
             context_1_advisory: None,
+            procedure_id: None,
         };
         state.start_turn(make_turn_with_plan(plan));
 
@@ -10718,6 +12713,7 @@ mod tests {
             consecutive_step_failures: 0,
             streak_extension: 0,
             provider_repair_note: None,
+            say_do_nudged: false,
             provider_repair_attempts: 0,
             pending_text_reply: None,
             had_voice_input: false,
@@ -10729,6 +12725,7 @@ mod tests {
             paracrine_reply_chat_id: None,
             paracrine_response_routing: None,
             paracrine_merge_completed: false,
+            paracrine_intent: None,
             plan_confirmed: false,
             plan_confirm_note: None,
             fallback_tier: 0,
@@ -10830,6 +12827,49 @@ mod tests {
     }
 
     // ── InjectionBudget / BudgetLedger (slice 0) ─────────────────────────────
+
+    /// DEF-145 (live 2026-09-15 22:54 EDT): the persona overflow must not cut
+    /// the [Skill guidance] of the skills projected this turn.
+    #[test]
+    fn skill_guidance_survives_a_persona_overflow() {
+        let mut state =
+            SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
+        state.clear_tool_bindings();
+        state.add_tool_binding("echo");
+        state.agent_profile.identity_text = Some("x".repeat(9_000));
+        state.bindings.effective_skillset = vec!["mesh.steward".into()];
+        state.bindings.on_demand_skills = vec!["mesh.steward".into()];
+        state.bindings.effective_skill_guidance =
+            vec!["mesh.steward — Mesh steward duties: keep the fleet high-functioning.".into()];
+
+        let projection = state.build_context_projection("check the heal queue");
+        let identity = projection
+            .layers
+            .iter()
+            .find(|l| l.layer_id == ContextLayerId::Identity)
+            .expect("identity layer present");
+        assert!(
+            identity
+                .rendered_content
+                .contains("truncated at 6000 chars"),
+            "persona overflow should still be reported"
+        );
+        assert!(
+            identity
+                .rendered_content
+                .contains("[Skill guidance]\n- mesh.steward — Mesh steward duties"),
+            "guidance must render after the truncated persona:\n{}",
+            identity.rendered_content
+        );
+        let entry = projection
+            .budget_ledger
+            .entries
+            .iter()
+            .find(|e| e.source == "skill_guidance")
+            .expect("skill_guidance ledger entry present");
+        assert!(!entry.truncated);
+        assert_eq!(entry.cap_chars, 2_500);
+    }
 
     #[test]
     fn injection_budget_truncates_persona_and_records_ledger_entry() {

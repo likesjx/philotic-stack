@@ -135,6 +135,7 @@ fn echo_tool(name: &str, auth: Option<McpAuthScheme>) -> McpToolSpec {
         },
         outbound_transform: McpOutboundTransform::PassThrough,
         auth,
+        handler: None,
     }
 }
 
@@ -371,6 +372,49 @@ async fn tools_call_dispatches_and_returns_result() {
     let text = body["result"]["content"][0]["text"].as_str().unwrap();
     assert!(text.contains("42"), "unexpected result text: {text}");
     assert!(body["result"]["isError"].is_null());
+}
+
+#[tokio::test]
+async fn tools_call_forwards_handler_policy_schema_and_args_to_philote() {
+    use ansible_mesh_core::mcp_endpoint::{McpHandlerFallback, McpHandlerPolicy, McpHandlerStep};
+
+    let mut tool = echo_tool("echo", None);
+    tool.handler = Some(McpHandlerPolicy {
+        validate_input: true,
+        steps: vec![McpHandlerStep::Static {
+            result: json!({"pong": true}),
+        }],
+        fallback: McpHandlerFallback::Error {
+            message: "deterministic only".into(),
+        },
+    });
+    let mut h = harness(false, ExposureTier::Local, HashMap::new());
+    h.set_endpoint(endpoint_with(vec![tool], None)).await;
+    h.spawn_stub(|env| {
+        // The philote-side ladder needs the policy, the advertised schema, and
+        // the raw args exactly as the caller sent them.
+        let policy = &env.raw_transport["handler"];
+        assert_eq!(policy["steps"][0]["kind"], "static");
+        assert_eq!(policy["fallback"]["kind"], "error");
+        assert_eq!(
+            env.raw_transport["input_schema"]["properties"]["q"]["type"],
+            "string"
+        );
+        assert_eq!(env.raw_transport["args"]["q"], "hi");
+        DispatchOutcome::Ok(json!({"pong": true}).to_string())
+    });
+
+    let (_, body) = call(
+        &h.state,
+        rpc(
+            "tools/call",
+            json!({"name": "echo", "arguments": {"q": "hi"}}),
+        ),
+        None,
+        true,
+    )
+    .await;
+    assert!(body["result"]["isError"].is_null(), "{body}");
 }
 
 #[tokio::test]

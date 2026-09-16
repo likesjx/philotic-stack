@@ -52,13 +52,31 @@ Do not create a skill for a one-off task. Skills are for patterns.
 
 | Field | Required | Notes |
 |---|---|---|
-| `skill_name` | Yes | Lowercase, hyphens/underscores only, max 64 chars. Stable identifier. |
+| `skill_name` | Yes | Lowercase, dots, hyphens, underscores; max 64 chars. Stable identifier (house style is dotted, e.g. `research.deep-dive`). |
 | `description` | Yes | What the skill does and when to use it. 1-3 sentences. |
 | `subagent_kind` | Yes | The worker role that executes this skill (almost always `philote-worker`). |
 | `goal` | Yes | The goal template injected into the subagent at invocation. May include `{{placeholder}}` variables. |
 | `allowed_tools` | No | Explicit tool IDs the subagent may use. If omitted, falls back to class allowances. |
 | `allowed_classes` | No | Tool class names allowed (e.g. `workspace`, `utility`, `shell`). |
 | `allowed_skills` | No | SkillDAG edges: names of already-registered skills this skill depends on. Activating the skill transitively activates its dependencies. |
+
+## Invoking a registered skill
+
+Spawn a registered delegation skill by name — the hotel resolves the stored
+goal template, worker kind, tool bounds, and SkillDAG dependencies:
+
+```json
+{
+  "tool": "subagent.spawn",
+  "skill_name": "research.deep-dive",
+  "inputs": { "topic": "hotel supervision" },
+  "goal": "optional extra context appended to the template"
+}
+```
+
+`inputs` fills the template's `{{placeholder}}`s. Suspended/deprecated skills
+are refused at spawn. An explicit `goal` is only required when no `skill_name`
+is given.
 
 ## Lifecycle and audit
 

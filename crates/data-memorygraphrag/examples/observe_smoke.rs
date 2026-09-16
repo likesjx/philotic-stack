@@ -56,6 +56,7 @@ async fn main() -> anyhow::Result<()> {
             conflict_ids: vec![],
             adjudication_status: AdjudicationStatus::NotNeeded,
             metadata: serde_json::Value::Null,
+            properties: Default::default(),
         },
         proposed_graph_refs: vec![],
         observed_by: None,

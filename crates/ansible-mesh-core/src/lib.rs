@@ -34,9 +34,12 @@ pub mod model_catalog_discovery;
 pub mod model_manager;
 pub mod model_oracle;
 pub mod model_routing;
+pub mod placement_sync;
+pub mod procedure;
 pub mod provenance;
 pub mod provider_keys;
 pub mod registry;
+pub mod relocation_ceremony;
 pub mod resources;
 pub mod router_trace;
 pub mod runtime;
@@ -89,6 +92,14 @@ pub struct NodeCapabilities {
     pub tools: Vec<ToolRef>,
     #[serde(default)]
     pub constraints: NodeConstraints,
+    /// This hotel's `aiua` build version (`CARGO_PKG_VERSION`), refreshed on
+    /// every boot in `reconcile_hotel_record`. Empty string for a peer still
+    /// running a build from before this field existed — callers must treat
+    /// that as "unknown", not "incompatible". Used by the Relocation
+    /// Ceremony's R4 feasibility checks (version-compatibility) and by
+    /// `best_place_to_run_view`'s ranking.
+    #[serde(default)]
+    pub build_version: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
