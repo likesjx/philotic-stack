@@ -1,19 +1,76 @@
-//! Static tool catalog for philote.
+//! Tool catalog for philote.
 //!
-//! Defines the canonical set of built-in tool definitions with real descriptions
-//! and input schemas. Used by `default_tool_assembly_for_bindings` instead of
-//! generating generic stubs, and mirrored into the context graph as `abstract_tool`
-//! nodes at hotel startup.
+//! The source of truth is `catalog/tools.yaml`, loaded by the hotel into
+//! `abstract_tool` records and fetched here at startup (`set_hotel_tool_records`).
+//! `tool_definition` / `tool_batch_of` read those records first. The compiled
+//! `build_catalog` below is only the FALLBACK until the hotel answers; it is
+//! scheduled for deletion once every consumer reads records (proposal
+//! tool-management-plane § Tool Catalog File).
 //!
 //! Tools not present in the catalog fall back to stubs — this keeps the catalog
 //! forward-compatible with dynamically registered tools from tool-runner guests.
 
 use crate::session::ToolDefinition;
+use ansible_mesh_core::graph::{AbstractToolRecord, ToolBatchOf};
 use serde_json::{Value, json};
 use std::collections::HashMap;
-use std::sync::OnceLock;
+use std::sync::{OnceLock, RwLock};
 
 static TOOL_CATALOG: OnceLock<HashMap<String, ToolDefinition>> = OnceLock::new();
+
+/// The hotel's `abstract_tool` records (loaded there from `catalog/tools.yaml`),
+/// fetched with `GetToolCatalog` at startup. Records win over the compiled
+/// catalog below, which is only the fallback until the hotel answers.
+static HOTEL_TOOL_RECORDS: OnceLock<RwLock<HashMap<String, AbstractToolRecord>>> = OnceLock::new();
+
+fn hotel_tool_records() -> &'static RwLock<HashMap<String, AbstractToolRecord>> {
+    HOTEL_TOOL_RECORDS.get_or_init(|| RwLock::new(HashMap::new()))
+}
+
+/// Replace the hotel tool records. Returns `true` when anything changed, so
+/// callers rebuild session tool assemblies only when they must.
+pub fn set_hotel_tool_records(records: Vec<AbstractToolRecord>) -> bool {
+    let next: HashMap<String, AbstractToolRecord> = records
+        .into_iter()
+        .map(|record| (record.tool_name.clone(), record))
+        .collect();
+    let mut guard = hotel_tool_records()
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if *guard == next {
+        return false;
+    }
+    *guard = next;
+    true
+}
+
+/// The hotel record for a tool, when the hotel has one.
+pub fn hotel_tool_record(tool_name: &str) -> Option<AbstractToolRecord> {
+    hotel_tool_records()
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(tool_name)
+        .cloned()
+}
+
+/// The model-facing definition of a tool: the hotel record's description,
+/// schema and class when it exists, else the compiled catalog entry.
+pub fn tool_definition(tool_name: &str) -> Option<ToolDefinition> {
+    if let Some(record) = hotel_tool_record(tool_name) {
+        return Some(ToolDefinition {
+            tool_name: record.tool_name,
+            description: record.description,
+            input_schema: record.input_schema,
+            class: Some(record.class),
+        });
+    }
+    tool_catalog().get(tool_name).cloned()
+}
+
+/// The batch relationship a tool declares in the catalog file, if any.
+pub fn tool_batch_of(tool_name: &str) -> Option<ToolBatchOf> {
+    hotel_tool_record(tool_name).and_then(|record| record.batch_of)
+}
 
 fn graph_record_ref_schema() -> Value {
     json!({
@@ -4823,6 +4880,7 @@ fn build_catalog() -> HashMap<String, ToolDefinition> {
 
 #[cfg(test)]
 mod tests {
+
     use super::{skill_implied_tools, skill_is_relevant_for_turn, tool_catalog};
     use serde_json::json;
 

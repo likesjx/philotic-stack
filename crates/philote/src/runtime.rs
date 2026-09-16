@@ -6808,6 +6808,33 @@ impl AgentRuntime {
     /// it to every live session (proposal mcp-client-fabric). Sessions whose
     /// projection changed get their tool assembly rebuilt, so revoked
     /// upstreams disappear and newly reported catalogs appear.
+    /// Fetch the hotel's tool catalog records (`catalog/tools.yaml` as loaded
+    /// into the hotel graph) and rebuild every session's tool assembly when
+    /// they changed. On failure the compiled catalog stays in effect.
+    pub(crate) async fn refresh_tool_catalog(&mut self) {
+        match self
+            .ipc_client
+            .send_request_with_timeout(IpcRequest::GetToolCatalog {}, Duration::from_secs(5))
+            .await
+        {
+            Ok(IpcResponse::ToolCatalogState { tool_catalog }) => {
+                let count = tool_catalog.len();
+                if crate::catalog::set_hotel_tool_records(tool_catalog) {
+                    info!(tools = count, "tool catalog loaded from hotel records");
+                    for state in self.sessions.values_mut() {
+                        state.rebuild_default_tool_assembly();
+                    }
+                }
+            }
+            Ok(_) => warn!(
+                "refresh_tool_catalog: hotel did not return a tool catalog; compiled catalog stays"
+            ),
+            Err(e) => {
+                warn!("refresh_tool_catalog: GetToolCatalog failed: {e}; compiled catalog stays")
+            }
+        }
+    }
+
     pub(crate) async fn refresh_mcp_upstream_projection(&mut self) {
         let entries = match self
             .ipc_client

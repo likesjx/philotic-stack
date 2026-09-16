@@ -455,6 +455,7 @@ mod tests {
                 input_schema: serde_json::json!({"type": "object"}),
                 class: "config".into(),
                 tool_markers: vec![],
+                batch_of: None,
             }],
             abstract_skills: vec![AbstractSkillRecord {
                 skill_name: "role.governance".into(),

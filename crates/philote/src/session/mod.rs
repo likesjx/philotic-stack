@@ -1,7 +1,7 @@
 mod types;
 pub use types::*;
 
-use crate::catalog::{tool_catalog, tool_class, tool_requires_approval};
+use crate::catalog::{tool_class, tool_requires_approval};
 use crate::r#loop::{ApprovalRequest, ToolCall, ToolResult, TurnPhase};
 use crate::protocol::InboundTaskPayload;
 use crate::reflex::{IngressAction, PolicyAssertion, ReflexEngine, ReflexEvent};
@@ -5860,19 +5860,15 @@ pub fn default_tool_assembly_for_bindings(bindings: &SessionBindings) -> ToolAss
 
     let toolset = default_visible_toolset(bindings);
 
-    let catalog = tool_catalog();
     let tools_for_model = toolset
         .iter()
         .map(|tool_name| {
-            catalog
-                .get(tool_name.as_str())
-                .cloned()
-                .unwrap_or_else(|| ToolDefinition {
-                    tool_name: tool_name.clone(),
-                    description: format!("Execute the {} tool.", tool_name),
-                    input_schema: json!({ "type": "object" }),
-                    class: None,
-                })
+            crate::catalog::tool_definition(tool_name.as_str()).unwrap_or_else(|| ToolDefinition {
+                tool_name: tool_name.clone(),
+                description: format!("Execute the {} tool.", tool_name),
+                input_schema: json!({ "type": "object" }),
+                class: None,
+            })
         })
         .collect::<Vec<_>>();
 
@@ -6252,19 +6248,15 @@ fn tool_assembly_from_allowed_incarnations(bindings: &SessionBindings) -> ToolAs
         default_visible_toolset(bindings)
     };
 
-    let catalog = tool_catalog();
     let tools_for_model = visible_tools
         .iter()
         .map(|tool_name| {
-            catalog
-                .get(tool_name.as_str())
-                .cloned()
-                .unwrap_or_else(|| ToolDefinition {
-                    tool_name: tool_name.clone(),
-                    description: format!("Execute the {} tool.", tool_name),
-                    input_schema: json!({ "type": "object" }),
-                    class: None,
-                })
+            crate::catalog::tool_definition(tool_name.as_str()).unwrap_or_else(|| ToolDefinition {
+                tool_name: tool_name.clone(),
+                description: format!("Execute the {} tool.", tool_name),
+                input_schema: json!({ "type": "object" }),
+                class: None,
+            })
         })
         .collect::<Vec<_>>();
 
