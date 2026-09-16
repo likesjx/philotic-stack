@@ -8560,12 +8560,10 @@ async fn main() -> Result<()> {
     }
     info!("All guest subscribers drained (or drain window elapsed). Shutting down hotel.");
 
-    // DreamsPhase: semantic consolidation + Hebbian sweep across all agent vaults.
-    // Runs after guests drain, before the internal shutdown broadcast.
-    // Uses direct HTTP to ONNX sidecar (:11435) and Ollama (:11434) — no IPC needed.
-    if let Some(ref cfg) = muninn_config_arc {
-        dream::dream_sweep(cfg, &graph_domain_arc, &hotel_name).await;
-    }
+    // Memory sleep no longer runs at shutdown (Phase 2 M6): it lists and
+    // maintains every memory vault through the Cortex, which would stall
+    // hotel restarts and deploys. It runs on its nightly cron instead
+    // (`PHILOTIC_DREAM_SWEEP_ENABLED`, Cortex hotel only).
 
     let _ = shutdown_tx.send(());
     tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
