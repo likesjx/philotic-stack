@@ -190,44 +190,6 @@ pub struct EvidencePacket {
     pub properties: BTreeMap<String, serde_json::Value>,
 }
 
-/// Accept `properties` as a map OR as a JSON string that encodes a map.
-/// Live 2026-09-15/16 (bjork, Gemini): every observe carrying typed
-/// properties arrived with the map stringified — `"properties":
-/// "{\"title\":…}"` — and the strict map parse refused the whole call
-/// (DEF-144). The philote repairs this against the tool schema before
-/// dispatch; this is the runner-side belt for callers that bypass it.
-fn deserialize_properties_leniently<'de, D>(
-    deserializer: D,
-) -> std::result::Result<BTreeMap<String, serde_json::Value>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    use serde::de::Error as _;
-
-    match serde_json::Value::deserialize(deserializer)? {
-        serde_json::Value::Null => Ok(BTreeMap::new()),
-        serde_json::Value::Object(map) => Ok(map.into_iter().collect()),
-        serde_json::Value::String(encoded) => {
-            let trimmed = encoded.trim();
-            if trimmed.is_empty() {
-                return Ok(BTreeMap::new());
-            }
-            match serde_json::from_str::<serde_json::Value>(trimmed) {
-                Ok(serde_json::Value::Object(map)) => Ok(map.into_iter().collect()),
-                Ok(other) => Err(D::Error::custom(format!(
-                    "properties: expected a map, got a JSON string encoding {other}"
-                ))),
-                Err(err) => Err(D::Error::custom(format!(
-                    "properties: expected a map, got a string that is not JSON ({err})"
-                ))),
-            }
-        }
-        other => Err(D::Error::custom(format!(
-            "properties: expected a map, got {other}"
-        ))),
-    }
-}
-
 impl EvidencePacket {
     pub fn validate(&self) -> Result<(), ContractError> {
         let mut violations = Vec::new();
@@ -4410,7 +4372,7 @@ mod lenient_properties_tests {
         let err = serde_json::from_str::<LifeObserveInput>(raw)
             .unwrap_err()
             .to_string();
-        assert!(err.contains("expected a map"), "{err}");
+        assert!(err.contains("must be a JSON object"), "{err}");
         let raw = r#"{"evidence":{"claim_ref":{"id":"life:x","label":"Event"},"claim_summary":"s","properties":"{not json"}}"#;
         assert!(serde_json::from_str::<LifeObserveInput>(raw).is_err());
     }
