@@ -1192,6 +1192,12 @@ pub fn verify_plan_steps_with_batches(
 pub fn atomicity_violations(plan: &ActivePlan) -> Vec<u32> {
     plan.steps
         .iter()
+        // Only a step bound to a tool produces artifacts that can be proven
+        // one call per item. A prose step ("Render a clean, structured review
+        // grouped by type with individual and batch validation mechanisms")
+        // was split into "Render a clean" / "structured review … individual"
+        // / "batch validation mechanisms." (live 2026-09-16 19:38 UTC, DEF-154).
+        .filter(|s| step_is_tool_bound(s))
         .filter(|s| !step_tool_is_read_only(s))
         .filter(|s| description_enumerates_artifacts(&s.description))
         .map(|s| s.id)
@@ -1246,6 +1252,40 @@ pub fn tool_name_is_read_only(tool: &str) -> bool {
 /// [`atomicity_violations`]). Items are the comma/`and`-separated pieces of
 /// the description; the lead-in before a colon is kept on every piece so
 /// the steps still read as instructions.
+/// Unbind steps the model tied to its own reply rather than to a callable
+/// tool (`text.generate`, `respond`, …). No tool call can ever prove such a
+/// step, so it was reported "contradicted" on every continuation: live
+/// 2026-09-16 19:38–19:39 UTC Beacon re-sent the same review four times and
+/// the plan stopped "before finishing" under a reply that contained it
+/// (DEF-154). Unbound, the step settles on the model's word like any other
+/// reasoning step. Returns the ids that were unbound.
+pub fn unbind_reply_pseudo_tools(plan: &mut ActivePlan) -> Vec<u32> {
+    const PSEUDO: &[&str] = &[
+        "respond",
+        "reply",
+        "response",
+        "model",
+        "llm",
+        "generate_text",
+        "render",
+        "compose",
+        "none",
+        "n/a",
+    ];
+    let mut unbound = Vec::new();
+    for step in plan.steps.iter_mut() {
+        let Some(tool) = step.tool_name.as_deref() else {
+            continue;
+        };
+        let t = tool.trim().to_ascii_lowercase();
+        if t.is_empty() || t.starts_with("text.") || PSEUDO.contains(&t.as_str()) {
+            step.tool_name = None;
+            unbound.push(step.id);
+        }
+    }
+    unbound
+}
+
 pub fn split_bundled_steps(plan: &mut ActivePlan) -> Vec<(u32, Vec<u32>)> {
     let bundled = atomicity_violations(plan);
     if bundled.is_empty() {
@@ -3511,6 +3551,50 @@ mod tests {
         }
         let latched: Vec<usize> = (0..13).filter(|i| flags[*i]).collect();
         assert_eq!(latched, called.to_vec());
+    }
+
+    /// DEF-154 replay, live 2026-09-16 19:38 UTC.
+    #[test]
+    fn prose_steps_are_not_split_and_reply_bound_steps_are_unbound() {
+        let mut p = plan(
+            "executing",
+            &[
+                (
+                    "Fetch all proposed nodes from the LifeGraph.",
+                    Some("life.list"),
+                    "done",
+                ),
+                (
+                    "Render a clean, structured review grouped by type with individual and batch validation mechanisms.",
+                    None,
+                    "pending",
+                ),
+                (
+                    "Render a clean review interface.",
+                    Some("text.generate"),
+                    "done",
+                ),
+            ],
+        );
+        assert!(
+            atomicity_violations(&p).is_empty(),
+            "{:?}",
+            atomicity_violations(&p)
+        );
+        assert!(split_bundled_steps(&mut p).is_empty());
+        assert_eq!(p.steps.len(), 3);
+        assert_eq!(unbind_reply_pseudo_tools(&mut p), vec![3]);
+        assert!(p.steps[2].tool_name.is_none());
+        assert_eq!(p.steps[0].tool_name.as_deref(), Some("life.list"));
+        // Unbound and claimed done, the reply step settles; the plan completes.
+        let h = history_args(&[(
+            "life.list",
+            serde_json::json!({"validation_states": ["proposed"]}),
+            r#"{"data":{"count":50}}"#,
+        )]);
+        p.steps[1].status = "done".into();
+        let v = verify_plan_steps(&p, &h, &[]);
+        assert!(evaluate_whole_plan(&p, &v).complete, "{:?}", v.evidence);
     }
 
     #[test]
