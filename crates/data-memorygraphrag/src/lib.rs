@@ -215,15 +215,15 @@ where
             match serde_json::from_str::<serde_json::Value>(trimmed) {
                 Ok(serde_json::Value::Object(map)) => Ok(map.into_iter().collect()),
                 Ok(other) => Err(D::Error::custom(format!(
-                    "properties: expected a map, got a JSON string encoding {other}"
+                    "evidence.properties: expected a map, got a JSON string encoding {other}"
                 ))),
                 Err(err) => Err(D::Error::custom(format!(
-                    "properties: expected a map, got a string that is not JSON ({err})"
+                    "evidence.properties: expected a map, got a string that is not JSON ({err})"
                 ))),
             }
         }
         other => Err(D::Error::custom(format!(
-            "properties: expected a map, got {other}"
+            "evidence.properties: expected a map, got {other}"
         ))),
     }
 }
@@ -1911,52 +1911,6 @@ pub struct LifeObserveBatchInput {
 /// provenance requirement or plan gate is relaxed. A malformed inner payload
 /// still fails, and now says so per item rather than as an opaque type error
 /// about the whole array.
-/// `evidence.properties` as an object, or as a JSON-encoded string of one.
-/// Gemini function calling serializes a free-form object (`"type": "object",
-/// "additionalProperties": true`, no declared keys) as a string: live
-/// 2026-09-16 11:17–11:49 UTC every `life.observe` from Beacon carried
-/// `"properties":"{\"title\":\"Pay bills\",\"status\":\"open\"}"` and the runner
-/// refused all ten with "invalid type: string … expected a map" (DEF-144), so
-/// four operator items were never recorded. The inner value must still be an
-/// object; a string that is not one fails with a message that says so.
-fn deserialize_properties_leniently<'de, D>(
-    deserializer: D,
-) -> std::result::Result<BTreeMap<String, serde_json::Value>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    use serde::de::Error as _;
-    let raw = serde_json::Value::deserialize(deserializer)?;
-    let value = match raw {
-        serde_json::Value::String(encoded) => {
-            let trimmed = encoded.trim();
-            if trimmed.is_empty() {
-                return Ok(BTreeMap::new());
-            }
-            serde_json::from_str::<serde_json::Value>(trimmed).map_err(|err| {
-                D::Error::custom(format!(
-                    "evidence.properties is a string that is not a JSON object ({err}); pass an object"
-                ))
-            })?
-        }
-        other => other,
-    };
-    match value {
-        serde_json::Value::Null => Ok(BTreeMap::new()),
-        serde_json::Value::Object(map) => Ok(map.into_iter().collect()),
-        other => Err(D::Error::custom(format!(
-            "evidence.properties must be a JSON object, got {}",
-            match other {
-                serde_json::Value::Array(_) => "an array",
-                serde_json::Value::String(_) => "a string",
-                serde_json::Value::Number(_) => "a number",
-                serde_json::Value::Bool(_) => "a boolean",
-                _ => "an unexpected value",
-            }
-        ))),
-    }
-}
-
 fn deserialize_observations_leniently<'de, D>(
     deserializer: D,
 ) -> std::result::Result<Vec<LifeObserveInput>, D::Error>
