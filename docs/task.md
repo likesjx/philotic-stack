@@ -22,6 +22,19 @@
 
 ## Current Work Item Split
 
+### Native LifeGraph editor
+
+Branch: `codex/lifegraph-editor`; seam: `lifegraph-lens-ui`.
+Spec: [LifeGraph editor and relationships](../apps/philotic-apple/LIFEGRAPH.md).
+
+- [x] Add a direct text editor with server-derived device audit identity, bounded fields, stale-write checks, atomic before/after audit, and a verified receipt.
+- [x] Add a bounded one-hop relationship diagram with labeled directed edges and neighbor navigation.
+- [x] Verify shared Swift contracts, Mac app build/tests, Rust contracts, and gateway authorization.
+- [x] Prove real Cypher saves, stale-write rejection, and audit persistence against isolated Memgraph.
+- [ ] Deploy both server boundaries and validate from the installed app with a disposable node.
+- [ ] Follow-ups: ontology-driven typed property editing, audit-history/undo, embedding refresh, graph-wide browsing, and granular device edit grants.
+
+
 Stable seam refs live in [SEAM_REGISTRY.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/SEAM_REGISTRY.md).
 
 ### Primitives Refactor

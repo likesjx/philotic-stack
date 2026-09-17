@@ -928,6 +928,81 @@ pub(crate) struct EdgeLifegraphNeighborhoodQuery {
     max_nodes: Option<u32>,
 }
 
+/// A deliberately narrow operator correction surface. Shared bearers cannot
+/// edit: audit identity must resolve to a currently enrolled device. Transport
+/// identity is authoritative; no client-provided actor or approval is accepted.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct EdgeNodeEditBody {
+    before: std::collections::BTreeMap<String, Option<String>>,
+    changes: std::collections::BTreeMap<String, String>,
+}
+
+fn node_edit_actor(identity: Option<EdgeBearerIdentity>) -> Option<String> {
+    match identity {
+        Some(EdgeBearerIdentity::Device(id)) if !id.trim().is_empty() => Some(format!("edge:{id}")),
+        _ => None,
+    }
+}
+
+pub(crate) async fn handle_edge_lifegraph_edit(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Path(node_id): Path<String>,
+    Json(body): Json<EdgeNodeEditBody>,
+) -> Response {
+    let Some(actor) = node_edit_actor(edge_bearer_identity(&headers, &state)) else {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({"error": "An enrolled device is required to edit nodes"})),
+        )
+            .into_response();
+    };
+    let args = json!({"id": node_id, "actor": actor,
+        "before": body.before, "changes": body.changes});
+    match super::ipc_life_graph_datasource_call(&state.socket, "life.node.edit", args).await {
+        Ok(data) => {
+            let status = match data.get("status").and_then(serde_json::Value::as_str) {
+                Some("saved") => StatusCode::OK,
+                Some("conflict") => StatusCode::CONFLICT,
+                Some("invalid_request") => StatusCode::BAD_REQUEST,
+                _ => StatusCode::BAD_GATEWAY,
+            };
+            (status, Json(data)).into_response()
+        }
+        Err(err) => life_graph_unavailable(err),
+    }
+}
+
+#[cfg(test)]
+mod node_edit_authority_tests {
+    use super::*;
+    #[test]
+    fn only_identified_enrolled_devices_can_edit() {
+        assert_eq!(node_edit_actor(None), None);
+        assert_eq!(node_edit_actor(Some(EdgeBearerIdentity::Shared)), None);
+        assert_eq!(
+            node_edit_actor(Some(EdgeBearerIdentity::Device(String::new()))),
+            None
+        );
+        assert_eq!(
+            node_edit_actor(Some(EdgeBearerIdentity::Device("mac-1".into()))),
+            Some("edge:mac-1".into())
+        );
+    }
+    #[test]
+    fn client_cannot_supply_audit_identity() {
+        assert!(serde_json::from_value::<EdgeNodeEditBody>(json!({
+            "before": {"title": "Old"}, "changes": {"title": "New"}, "actor": "operator"
+        }))
+        .is_err());
+        assert!(serde_json::from_value::<EdgeNodeEditBody>(json!({
+            "before": {"title": null}, "changes": {"title": "New"}
+        }))
+        .is_ok());
+    }
+}
+
 /// `GET /api/edge/lifegraph/neighborhood/:node_id` — edge-bearer bounded
 /// living-cycle expansion via the read-only `life.view.neighborhood`
 /// datasource tool, for the canvas view (depth ≤ 2, node budget ≤ 150 —

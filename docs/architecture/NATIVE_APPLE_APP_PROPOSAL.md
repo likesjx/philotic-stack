@@ -3,7 +3,7 @@ title: Native Apple App — Edge Client Program
 doc_type: proposal
 domain: membrane-transport
 status: accepted-current-slice
-last_updated: 2026-09-14
+last_updated: 2026-09-17
 tags:
 - apple
 - ios
@@ -323,6 +323,15 @@ Two canonical owners, one mapping — no third source of truth:
 - APNs (when built) carries wake signals only, never content.
 
 ## Current Slice: Apple Companion (Transitional)
+
+The `codex/lifegraph-editor` follow-on implements a direct, audited editor for
+node title/summary/description and a bounded directed-neighbor diagram. The
+enrolled device identity is stamped by the hotel, and a compare-and-set graph
+write creates the before/after audit atomically. This is test-green source, not
+an installed-runtime claim; server/app rollout and watched verification remain.
+See [contract and limitations](../../apps/philotic-apple/LIFEGRAPH.md) and
+[active work](../task.md#native-lifegraph-editor). The broader program disposition
+remains accepted for the current slice.
 
 Implemented on `codex/apple-companion`, based on the working `codex/ios-healthkit`
 phone baseline: shared Today/Agents/Life shell, a Mac Ask/Today companion panel,

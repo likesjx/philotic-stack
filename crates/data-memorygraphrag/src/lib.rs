@@ -10,6 +10,7 @@ pub mod cypher;
 pub mod entanglement;
 pub mod heartbeat;
 pub mod hygiene;
+pub mod node_edit;
 pub mod ontology;
 pub mod projection;
 pub mod zoning;
