@@ -6,6 +6,7 @@
 
 pub mod attention_observer;
 pub mod audit;
+pub mod bridging;
 pub mod cypher;
 pub mod entanglement;
 pub mod heartbeat;
