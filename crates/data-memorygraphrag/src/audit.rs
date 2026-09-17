@@ -568,26 +568,25 @@ pub fn audit(nodes: &[AuditNode], edges: &[AuditEdge], opts: &AuditOptions) -> A
         }
         if LOOP_LABELS.contains(&label)
             && let Some(summary) = nd.claim_summary.as_deref()
-        {
-            if let Some(done) = completions.iter().find(|c| {
+            && let Some(done) = completions.iter().find(|c| {
                 key_of(c) != key_of(nd)
                     && (c.claim_summary.as_deref().is_some_and(|other| {
                         crate::hygiene::summary_overlap(summary, other) >= 0.5
                     }) || crate::hygiene::id_slug_overlap(&key_of(nd), &key_of(c)) >= 0.6)
-            }) {
-                closable.push(Finding {
-                    id: key_of(nd),
-                    label: nd.label.clone(),
-                    issue: "contradicted_by_completion".into(),
-                    detail: Some(format!(
-                        "{} ({}) says this work is {}",
-                        key_of(done),
-                        done.label,
-                        done.status.as_deref().unwrap_or("done")
-                    )),
-                });
-                continue;
-            }
+            })
+        {
+            closable.push(Finding {
+                id: key_of(nd),
+                label: nd.label.clone(),
+                issue: "contradicted_by_completion".into(),
+                detail: Some(format!(
+                    "{} ({}) says this work is {}",
+                    key_of(done),
+                    done.label,
+                    done.status.as_deref().unwrap_or("done")
+                )),
+            });
+            continue;
         }
         if DATED_LABELS.contains(&label)
             && !LOOP_LABELS.contains(&label)

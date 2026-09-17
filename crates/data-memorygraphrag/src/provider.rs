@@ -1095,10 +1095,10 @@ impl LifeGraphProvider {
             ),
         )
         .await?;
-        if let Some(row) = existing.next().await? {
-            if row.get::<i64>("c").unwrap_or(0) > 0 {
-                return Ok(Vec::new());
-            }
+        if let Some(row) = existing.next().await?
+            && row.get::<i64>("c").unwrap_or(0) > 0
+        {
+            return Ok(Vec::new());
         }
         let cypher = format!(
             "MATCH (n:{label}) WHERE n.id <> $id AND n.claim_summary IS NOT NULL              AND coalesce(n.validation_state, 'proposed') <> 'retired'              RETURN n.id AS id, n.claim_summary AS claim_summary,              coalesce(n.validation_state, 'proposed') AS validation_state,              n.observed_at AS observed_at LIMIT 500"
