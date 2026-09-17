@@ -3491,7 +3491,7 @@ impl AgentRuntime {
             .map(|routing| routing.action == "transcribe")
             .unwrap_or(false);
         // A vision/document analysis turn: its reply is the only text form of
-        // the attachment, so the reply path must not discard it (DEF-160/161).
+        // the attachment, so the reply path must not discard it (DEF-163/164).
         let media_analysis_dispatch = media_routing
             .as_ref()
             .map(|routing| routing.action != "transcribe")

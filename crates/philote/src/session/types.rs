@@ -853,7 +853,7 @@ pub struct WorkingTurn {
     /// This turn was dispatched to the media-analysis capability (a photo
     /// or document went to the vision model). The analysis reply is the
     /// ONLY place the attachment's content exists in text, so the reply
-    /// path must carry it forward rather than drop it (DEF-160/161).
+    /// path must carry it forward rather than drop it (DEF-163/164).
     #[serde(default)]
     pub media_analysis: bool,
     /// Stashed text content while waiting for voice synthesis to complete.

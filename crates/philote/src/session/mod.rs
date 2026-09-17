@@ -962,7 +962,7 @@ impl SessionState {
     /// True when the operator's last exchange left a request open — the last
     /// assistant reply asked them for something, or a plan still has steps to
     /// run. An attachment that arrives with no caption is then INPUT for that
-    /// request, not a thing to describe (DEF-161).
+    /// request, not a thing to describe (DEF-164).
     pub fn operator_request_open(&self) -> bool {
         if self
             .carryover_plan
@@ -9004,7 +9004,7 @@ mod tests {
         );
     }
 
-    /// DEF-161, live 2026-09-17 09:15 EDT: bjork had just asked "Could you
+    /// DEF-164, live 2026-09-17 09:15 EDT: bjork had just asked "Could you
     /// send the new hymn numbers again?"; the operator's caption-less photo
     /// came back as a description instead of the update they asked for.
     #[test]

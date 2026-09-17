@@ -1371,7 +1371,7 @@ impl LifeGraphProvider {
         // the single call gets: synthesize the ids a model-authored payload
         // omits, before plan/validate demand them. Live 2026-09-17 09:16 and
         // 09:18 EDT both batches were rejected wholesale for an empty
-        // packet_id and cost a retry model call each (DEF-162).
+        // packet_id and cost a retry model call each (DEF-165).
         for observation in input.observations.iter_mut() {
             observation.normalize_defaults();
         }
@@ -4568,7 +4568,7 @@ mod tests {
     /// which passed only because the fixture's `OpenLoop` source label failed
     /// *endpoint* validation — so the test would have silently stopped
     /// exercising vocabulary rejection as the agenda vocabulary grew.
-    /// DEF-162, live 2026-09-17 09:16 and 09:18 EDT: both batches were
+    /// DEF-165, live 2026-09-17 09:16 and 09:18 EDT: both batches were
     /// rejected wholesale for "packet_id must not be empty" and each cost a
     /// retry model call, while a single life.observe fills the same ids.
     #[tokio::test]

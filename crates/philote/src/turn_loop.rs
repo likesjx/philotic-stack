@@ -1751,7 +1751,7 @@ impl AgentRuntime {
                 // attachment. When the operator sent it with no caption while a
                 // request of theirs was still open, that reading is INPUT for
                 // the request, not an answer: go back into the cognitive loop
-                // with the reading carried as evidence (DEF-161). Live
+                // with the reading carried as evidence (DEF-164). Live
                 // 2026-09-17 09:15 EDT: the hymn program came back as a
                 // description while "send me the new hymns" stayed unanswered.
                 if self.media_analysis_needs_reentry(&session_id) {
@@ -3005,7 +3005,7 @@ impl AgentRuntime {
     /// hint appended. Mirrors the provider-failure retry re-entry.
     /// True when this turn was a media analysis whose reply should feed the
     /// operator's open request instead of being delivered as the answer: the
-    /// attachment arrived with no caption of its own (DEF-161).
+    /// attachment arrived with no caption of its own (DEF-164).
     pub(super) fn media_analysis_needs_reentry(&mut self, session_id: &str) -> bool {
         let Some(state) = self.sessions.get_mut(session_id) else {
             return false;
@@ -3031,7 +3031,7 @@ impl AgentRuntime {
         // The reply the gate refused. It is NOT sent to the operator, but any
         // fact the model derived in it — above all what an attachment shows —
         // is evidence this turn already paid for. Carrying it stops the retry
-        // from rebuilding those facts from memory (DEF-160): live 2026-09-17
+        // from rebuilding those facts from memory (DEF-163): live 2026-09-17
         // 09:09 EDT the vision model read the right hymns off a photo, the
         // gate refused the reply for claiming a write, and the text-only
         // retry wrote LAST WEEK's hymns from recall.
@@ -6119,7 +6119,7 @@ pub(super) fn carryover_resume_followup(
 mod media_evidence_tests {
     use super::*;
 
-    /// DEF-160, live 2026-09-17 09:09 EDT: the vision model read the hymn
+    /// DEF-163, live 2026-09-17 09:09 EDT: the vision model read the hymn
     /// numbers off a photo, the say-do gate refused the reply for claiming a
     /// write, and the text-only retry wrote LAST WEEK's hymns from recall.
     /// The retry must carry what the refused reply established.
