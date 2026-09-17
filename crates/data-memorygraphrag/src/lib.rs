@@ -1908,7 +1908,7 @@ where
         serde_json::Value::Null => Ok(BTreeMap::new()),
         serde_json::Value::Object(map) => Ok(map.into_iter().collect()),
         other => Err(D::Error::custom(format!(
-            "evidence.properties: expected a map (JSON object), got {}",
+            "evidence.properties must be a JSON object, got {}",
             match other {
                 serde_json::Value::Array(_) => "an array",
                 serde_json::Value::String(_) => "a string",
