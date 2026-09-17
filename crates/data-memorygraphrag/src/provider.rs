@@ -1049,6 +1049,28 @@ impl LifeGraphProvider {
             },
             "edges": edge_reports,
         });
+        // Bridge the new claim to what it names: the ontology's validated
+        // pairs are written now (Event INVOLVES Person, OpenLoop ABOUT
+        // Subscription, Routine OCCURS_AT Place), anything else is reported
+        // for the turn or the sweep to decide. Live 2026-09-17 a drop-off
+        // Event sat with no edge to Daxton until the operator asked for one
+        // by hand (DEF-160).
+        let (bridged, suggested) = self
+            .bridge_new_node(&graph, &compiled, &input, &now)
+            .await
+            .unwrap_or_default();
+        if !bridged.is_empty() {
+            out["bridged_edges"] = json!(bridged);
+        }
+        if !suggested.is_empty() {
+            out["suggested_edges"] = json!(suggested);
+            out["suggested_edges_note"] = json!(
+                "These live nodes are named in the claim but the ontology has no validated edge for \
+                 the pair. Add the right one with life.observe edges (or life.tidy link) if the \
+                 connection is real."
+            );
+        }
+
         // Not a block, but close enough that leaving both is how the graph
         // grew five records for one evening: name them so the turn can
         // consolidate now (life.tidy retire_duplicate) instead of the sweep
@@ -1072,6 +1094,106 @@ impl LifeGraphProvider {
             );
         }
         Ok(ProviderOutput::ResultSet(out))
+    }
+
+    /// Labels a claim can name: the nouns of the operator's life. Loops and
+    /// events are deliberately absent — they are the claims, not the things
+    /// claims are about.
+    const BRIDGE_TARGET_LABELS: &'static [&'static str] = &[
+        "Person",
+        "Place",
+        "CreativeWork",
+        "Asset",
+        "Subscription",
+        "Trip",
+        "Project",
+        "Goal",
+    ];
+
+    /// Write the validated edges a new claim earns and report the rest.
+    /// Returns `(written, suggested)` for the observe result.
+    async fn bridge_new_node(
+        &self,
+        graph: &Graph,
+        compiled: &cypher::ObserveCypher,
+        input: &LifeObserveInput,
+        now: &str,
+    ) -> Result<(Vec<Value>, Vec<Value>)> {
+        if compiled.claim_summary.trim().is_empty() {
+            return Ok((Vec::new(), Vec::new()));
+        }
+        let labels = Self::BRIDGE_TARGET_LABELS
+            .iter()
+            .map(|l| format!("'{l}'"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let cypher = format!(
+            "MATCH (n) WHERE n.id IS NOT NULL AND head(labels(n)) IN [{labels}]              AND coalesce(n.validation_state, 'proposed') <> 'retired'              RETURN n.id AS id, head(labels(n)) AS label, n.title AS title LIMIT 800"
+        );
+        let mut rows =
+            bounded_query("observe_bridge_targets", graph.execute(query(&cypher))).await?;
+        let mut targets: Vec<data_memorygraphrag::bridging::BridgeTarget> = Vec::new();
+        while let Some(row) = rows.next().await? {
+            let (Ok(id), Ok(label)) = (row.get::<String>("id"), row.get::<String>("label")) else {
+                continue;
+            };
+            targets.push(data_memorygraphrag::bridging::BridgeTarget {
+                id,
+                label,
+                title: row.get::<String>("title").ok(),
+            });
+        }
+        let already: Vec<&str> = input.edges.iter().map(|e| e.target_id.as_str()).collect();
+        let edges = data_memorygraphrag::bridging::bridges_for(
+            &compiled.label,
+            &compiled.node_id,
+            &compiled.claim_summary,
+            &targets,
+            6,
+        );
+        let mut written = Vec::new();
+        let mut suggested = Vec::new();
+        for edge in edges {
+            if already.contains(&edge.target_id.as_str()) {
+                continue;
+            }
+            let entry = json!({
+                "target_id": edge.target_id,
+                "target_label": edge.target_label,
+                "rel_type": edge.rel_type,
+                "matched": edge.matched,
+            });
+            if !edge.validated {
+                suggested.push(entry);
+                continue;
+            }
+            let merge = format!(
+                "MATCH (n {{id: $id}}), (m {{id: $target}}) MERGE (n)-[r:{}]->(m)                  ON CREATE SET r.bridged_at = $now, r.bridged_by = 'lifegraph.bridging',                  r.bridge_match = $matched RETURN type(r) AS rel_type",
+                edge.rel_type
+            );
+            match bounded_query(
+                "observe_bridge_write",
+                graph.execute(
+                    query(&merge)
+                        .param("id", compiled.node_id.as_str())
+                        .param("target", edge.target_id.as_str())
+                        .param("now", now)
+                        .param("matched", edge.matched.as_str()),
+                ),
+            )
+            .await
+            {
+                Ok(mut r) => match r.next().await {
+                    Ok(Some(_)) => written.push(entry),
+                    _ => suggested.push(entry),
+                },
+                Err(e) => {
+                    warn!(target_id = %edge.target_id, "bridge edge MERGE failed: {e}");
+                    suggested.push(entry);
+                }
+            }
+        }
+        Ok((written, suggested))
     }
 
     /// Live nodes of the same label whose claim already covers `summary`,
