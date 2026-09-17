@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - cron-continuity
+
+rectangle "cron-continuity" as cron_continuity #Orange {
+}
+
+
+@enduml

@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - mcp-catalog-projection
+
+rectangle "mcp-catalog-projection" as mcp_catalog_projection #Orange {
+}
+
+
+@enduml

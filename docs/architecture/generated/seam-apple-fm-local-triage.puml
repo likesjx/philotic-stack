@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - apple-fm-local-triage
+
+rectangle "apple-fm-local-triage" as apple_fm_local_triage #Orange {
+}
+
+
+@enduml

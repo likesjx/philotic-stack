@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - standing-notes-budget
+
+rectangle "standing-notes-budget" as standing_notes_budget #Orange {
+}
+
+
+@enduml

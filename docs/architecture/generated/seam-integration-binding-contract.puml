@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - integration-binding-contract
+
+rectangle "integration-binding-contract" as integration_binding_contract #Orange {
+}
+
+
+@enduml

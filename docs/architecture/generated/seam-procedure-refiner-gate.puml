@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - procedure-refiner-gate
+
+rectangle "procedure-refiner-gate" as procedure_refiner_gate #Orange {
+}
+
+
+@enduml

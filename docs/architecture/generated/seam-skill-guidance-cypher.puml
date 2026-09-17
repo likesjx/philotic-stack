@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - skill-guidance-cypher
+
+rectangle "skill-guidance-cypher" as skill_guidance_cypher #Orange {
+}
+
+
+@enduml

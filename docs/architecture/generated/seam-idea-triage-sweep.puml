@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - idea-triage-sweep
+
+rectangle "idea-triage-sweep" as idea_triage_sweep #Orange {
+}
+
+
+@enduml

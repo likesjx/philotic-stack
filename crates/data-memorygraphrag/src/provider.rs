@@ -679,6 +679,7 @@ impl DatasourceProvider for LifeGraphProvider {
             "life.patch.list" => self.handle_patch_list(task).await,
             "life.recall.stats" => self.handle_recall_stats(task).await,
             "life.view.node" => self.handle_view_node(task).await,
+            "life.node.edit" => self.handle_node_edit(task).await,
             "life.view.neighborhood" => self.handle_view_neighborhood(task).await,
             "life.list" => self.handle_list(task).await,
             "life.audit" => self.handle_audit(task).await,
@@ -736,6 +737,7 @@ fn change_notification_for(kind: &str, data: &Value) -> Option<Value> {
         "life.observe" => "observed",
         "life.tidy" => "tidied",
         "life.commit" => "committed",
+        "life.node.edit" => "edited",
         "life.resolve" | "life.conflict.resolve" => "resolved",
         "life.conflict" | "life.conflict.handle" => "conflict_opened",
         "life.patch.propose" => "patch_proposed",
@@ -748,7 +750,7 @@ fn change_notification_for(kind: &str, data: &Value) -> Option<Value> {
         .unwrap_or_default();
     let succeeded = matches!(
         status,
-        "proposed" | "committed" | "resolved" | "applied" | "awaiting_operator"
+        "proposed" | "committed" | "resolved" | "applied" | "awaiting_operator" | "saved"
     ) || (change_kind == "conflict_opened" && status == "open");
     if !succeeded {
         return None;
@@ -2760,14 +2762,66 @@ impl LifeGraphProvider {
             rows = output_rows.len(),
             "life.list: deterministic list served"
         );
-        Ok(ProviderOutput::ResultSet(json!({
+        let mut out = json!({
             "status": "ok",
             "read_only": true,
             "query": query_kind,
             "as_of": now_iso,
             "count": output_rows.len(),
+            "limit": limit,
+            "truncated": list_page_is_full(output_rows.len(), limit),
             "rows": output_rows,
-        })))
+        });
+        if list_page_is_full(out["count"].as_u64().unwrap_or(0) as usize, limit) {
+            out["note"] = json!(format!(
+                "This page is FULL ({limit} rows): more matching nodes exist. Do not present these \
+                 rows as all of them — narrow by labels, or raise limit (max 200)."
+            ));
+        }
+        Ok(ProviderOutput::ResultSet(out))
+    }
+
+    async fn handle_node_edit(&self, task: &DatasourceTask) -> Result<ProviderOutput> {
+        use data_memorygraphrag::node_edit::{EDIT_QUERY, NodeEdit};
+        let input: NodeEdit = serde_json::from_value(task.parameters.clone())?;
+        if let Err(error) = input.validate() {
+            return Ok(ProviderOutput::ResultSet(
+                json!({"status": "invalid_request", "error": error}),
+            ));
+        }
+        let before = input
+            .before
+            .iter()
+            .map(|(k, v)| (k.clone(), json!(v)))
+            .collect();
+        let changes = input
+            .changes
+            .iter()
+            .map(|(k, v)| (k.clone(), json!(v)))
+            .collect();
+        let audit_id = format!("node-edit:{}", ulid::Ulid::new());
+        let graph = self.connect().await?;
+        let mut rows = graph
+            .execute(
+                query(EDIT_QUERY)
+                    .param("id", input.id.as_str())
+                    .param("actor", input.actor.as_str())
+                    .param("before", BoltType::Map(json_scalar_map_to_bolt(&before)))
+                    .param("changes", BoltType::Map(json_scalar_map_to_bolt(&changes)))
+                    .param("audit_id", audit_id.as_str())
+                    .param("edited_at", chrono::Utc::now().to_rfc3339())
+                    .param("before_json", serde_json::to_string(&input.before)?)
+                    .param("after_json", serde_json::to_string(&input.changes)?),
+            )
+            .await?;
+        let saved = rows.next().await?.is_some();
+        // Consume completion before returning a receipt (surface commit errors).
+        while rows.next().await?.is_some() {}
+        Ok(ProviderOutput::ResultSet(if saved {
+            json!({"status": "saved", "node_id": input.id, "audit_id": audit_id})
+        } else {
+            json!({"status": "conflict", "error": "Node missing, ambiguous, or changed. Reload before saving."})
+        }))
     }
 
     async fn handle_view_node(&self, task: &DatasourceTask) -> Result<ProviderOutput> {
@@ -5439,9 +5493,23 @@ mod tests {
     }
 }
 
+/// A `life.list` page that came back at its limit is presumed truncated:
+/// live 2026-09-16 19:38 UTC Beacon rendered "all proposed items" from a
+/// 50-row page while 197 proposed nodes existed (DEF-153).
+fn list_page_is_full(rows: usize, limit: usize) -> bool {
+    limit > 0 && rows >= limit
+}
+
 #[cfg(test)]
 mod typed_property_row_tests {
     use super::*;
+
+    #[test]
+    fn a_full_list_page_is_flagged_truncated() {
+        assert!(list_page_is_full(50, 50));
+        assert!(!list_page_is_full(26, 50));
+        assert!(!list_page_is_full(0, 50));
+    }
 
     #[test]
     fn list_rows_fold_typed_columns_and_drop_nulls() {

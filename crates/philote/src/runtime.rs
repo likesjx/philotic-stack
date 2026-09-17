@@ -45,6 +45,9 @@ mod paracrine;
 #[path = "tool_exec.rs"]
 mod tool_exec;
 
+#[path = "deterministic_capture.rs"]
+mod deterministic_capture;
+
 #[path = "tool_args.rs"]
 pub(crate) mod tool_args;
 
@@ -499,6 +502,7 @@ fn low_progress_tool_name(tool_name: &str) -> bool {
             | "hotel.logs"
             | "hotel.status"
             | "mcp.status"
+            | "memory.report"
             | "memory.status"
             | "role.list"
             | "session.status"
@@ -1621,6 +1625,13 @@ pub struct AgentRuntime {
     /// Tracks hotel-broadcast MuninnDB reachability. False = hotel reported endpoint down.
     /// When false, `memory_engine_for` returns None even if `muninn_config` is set.
     muninn_available: bool,
+    /// Memory writes routed to the Cortex whose EmitTask could not be enqueued
+    /// yet: `(target_node, task_json)`, oldest first. Re-sent before every new
+    /// forward and at turn start. In-memory only (bounded) — the mesh ledger is
+    /// the durable queue once the local hotel accepts the task.
+    pending_memory_forwards: std::collections::VecDeque<(String, String)>,
+    /// Deterministic operator-fact captures spent today: `(utc_day, count)`.
+    deterministic_capture_budget: (u64, usize),
     /// Role configurations registered via `role.configure`, keyed by role_name.
     configured_roles: HashMap<String, CachedRoleConfig>,
     /// Cached hotel-owned OpenRouter catalog snapshot for `/model` display:
@@ -1997,6 +2008,8 @@ impl AgentRuntime {
             sessions: HashMap::new(),
             muninn_config: None,
             muninn_available: true,
+            pending_memory_forwards: std::collections::VecDeque::new(),
+            deterministic_capture_budget: (0, 0),
             configured_roles: HashMap::new(),
             openrouter_tools_catalog: None,
             default_agent_profile: AgentProfile::default(),
@@ -6808,6 +6821,33 @@ impl AgentRuntime {
     /// it to every live session (proposal mcp-client-fabric). Sessions whose
     /// projection changed get their tool assembly rebuilt, so revoked
     /// upstreams disappear and newly reported catalogs appear.
+    /// Fetch the hotel's tool catalog records (`catalog/tools.yaml` as loaded
+    /// into the hotel graph) and rebuild every session's tool assembly when
+    /// they changed. On failure the compiled catalog stays in effect.
+    pub(crate) async fn refresh_tool_catalog(&mut self) {
+        match self
+            .ipc_client
+            .send_request_with_timeout(IpcRequest::GetToolCatalog {}, Duration::from_secs(5))
+            .await
+        {
+            Ok(IpcResponse::ToolCatalogState { tool_catalog }) => {
+                let count = tool_catalog.len();
+                if crate::catalog::set_hotel_tool_records(tool_catalog) {
+                    info!(tools = count, "tool catalog loaded from hotel records");
+                    for state in self.sessions.values_mut() {
+                        state.rebuild_default_tool_assembly();
+                    }
+                }
+            }
+            Ok(_) => warn!(
+                "refresh_tool_catalog: hotel did not return a tool catalog; compiled catalog stays"
+            ),
+            Err(e) => {
+                warn!("refresh_tool_catalog: GetToolCatalog failed: {e}; compiled catalog stays")
+            }
+        }
+    }
+
     pub(crate) async fn refresh_mcp_upstream_projection(&mut self) {
         let entries = match self
             .ipc_client
@@ -7218,6 +7258,23 @@ impl AgentRuntime {
                                 self.default_agent_profile.user_timezone.clone();
                         }
 
+                        // A session created by a task that carried no agent id
+                        // (smoke drivers, MCP loopback, shadow control) is
+                        // snapshotted before this philote's first checkpoint, so it
+                        // comes back with no role and an empty toolset. Treat it
+                        // like a fresh session instead of running the whole first
+                        // turn on the always-on minimum (found live 2026-09-16:
+                        // Björk had no memory tools and claimed a save it never made).
+                        if state.role_activation.is_none()
+                            && state.bindings.effective_toolset.is_empty()
+                        {
+                            info!(
+                                session_id = %session_id,
+                                "Restored session has no role or toolset — activating the default role."
+                            );
+                            self.activate_default_role(&mut state, session_id).await;
+                        }
+
                         self.sessions.insert(session_id.to_string(), state);
                         self.apply_mcp_upstream_projection(session_id);
                         self.apply_http_integration_projection(session_id);
@@ -7247,6 +7304,17 @@ impl AgentRuntime {
         // Chronos philote whose paracrine session then auto-activated
         // `orchestrator` — the specialist answered without the specialist's
         // lens, manifest, or toolset (found live 2026-08-25).
+        self.activate_default_role(&mut state, session_id).await;
+
+        self.sessions.insert(session_id.to_string(), state);
+        self.apply_mcp_upstream_projection(session_id);
+        self.apply_http_integration_projection(session_id);
+        Ok(())
+    }
+
+    /// Activate this philote's default role on a session with no role yet:
+    /// manifest, turn-loop settings and the role's toolset profile bindings.
+    async fn activate_default_role(&mut self, state: &mut SessionState, session_id: &str) {
         let default_role = self
             .role_name
             .clone()
@@ -7283,7 +7351,7 @@ impl AgentRuntime {
                 }
                 state.role_activation = Some(activation);
                 if let Some(profile_name) = toolset_profile_ref.as_deref() {
-                    self.hydrate_bindings_from_toolset_profile(&mut state, profile_name)
+                    self.hydrate_bindings_from_toolset_profile(state, profile_name)
                         .await;
                 }
                 info!(
@@ -7293,11 +7361,6 @@ impl AgentRuntime {
                 );
             }
         }
-
-        self.sessions.insert(session_id.to_string(), state);
-        self.apply_mcp_upstream_projection(session_id);
-        self.apply_http_integration_projection(session_id);
-        Ok(())
     }
 
     /// Fetches durable rules from the hotel and injects them into the session state.
@@ -13988,7 +14051,13 @@ mod tests {
                 "sess-memroute",
             )
             .await;
-        assert!(routed.is_some(), "SharedUser write must be forwarded");
+        assert!(
+            matches!(
+                routed,
+                super::memory_integration::ForwardOutcome::Forwarded(_)
+            ),
+            "SharedUser write must be forwarded"
+        );
 
         {
             let emitted = emitted.lock().unwrap();
@@ -14017,7 +14086,10 @@ mod tests {
                 "sess-memroute-fallback",
             )
             .await;
-        assert!(routed_fallback.is_some());
+        assert!(matches!(
+            routed_fallback,
+            super::memory_integration::ForwardOutcome::Forwarded(_)
+        ));
         {
             let emitted = emitted.lock().unwrap();
             let fwd = emitted
@@ -14031,9 +14103,10 @@ mod tests {
             );
         }
 
-        // Self-scope writes stay local even with a route configured — agent
-        // vaults are per-host by design (the vault registry never replicates).
-        let not_routed = runtime
+        // Phase 2 M4: self-scope writes are routed too. Observer replicas
+        // reject writes (HTTP 421), so a local self-vault write on a Mac hotel
+        // was lost; the agent's self vault exists on the Cortex.
+        let self_routed = runtime
             .forward_shared_memory_write(
                 &memory_core::MemoryScope::SelfOnly,
                 "likesjx",
@@ -14044,7 +14117,44 @@ mod tests {
                 "sess-memroute",
             )
             .await;
-        assert!(not_routed.is_none(), "SelfOnly write must stay local");
+        assert!(
+            matches!(
+                self_routed,
+                super::memory_integration::ForwardOutcome::Forwarded(_)
+            ),
+            "SelfOnly write must be forwarded when a route is configured"
+        );
+        {
+            let emitted = emitted.lock().unwrap();
+            let fwd = emitted
+                .iter()
+                .filter(|e| e["target_role"] == philotic_client::MEMORY_WRITE_FORWARD_ROLE)
+                .last()
+                .expect("self-scope forward present");
+            let vault = fwd["task"]["vault"].as_str().unwrap_or_default();
+            assert!(vault.starts_with("self_"), "{vault}");
+        }
+
+        // Session-scope writes stay local: per-session scratch vaults would
+        // mint throwaway tokens on the primary.
+        let session_local = runtime
+            .forward_shared_memory_write(
+                &memory_core::MemoryScope::Session("sess-memroute".into()),
+                "likesjx",
+                "session concept",
+                "session content",
+                &[],
+                &serde_json::Value::Null,
+                "sess-memroute",
+            )
+            .await;
+        assert!(
+            matches!(
+                session_local,
+                super::memory_integration::ForwardOutcome::NotApplicable
+            ),
+            "Session write must stay local"
+        );
 
         drop(runtime);
         let _ = server.await;
@@ -14053,6 +14163,27 @@ mod tests {
 
     /// No route configured (the default, and the Cortex hotel itself):
     /// every write proceeds locally.
+    #[tokio::test]
+    async fn deterministic_capture_budget_caps_per_day() {
+        let (mut runtime, _emitted, server, socket_path) = plan_test_runtime("capbudget").await;
+        let cap = super::memory_integration::DETERMINISTIC_CAPTURE_DAILY_CAP;
+        for _ in 0..cap {
+            assert!(runtime.take_deterministic_capture_budget());
+        }
+        assert!(
+            !runtime.take_deterministic_capture_budget(),
+            "the cap must hold within a day"
+        );
+        // A new UTC day resets the budget.
+        runtime.deterministic_capture_budget.0 =
+            runtime.deterministic_capture_budget.0.saturating_sub(1);
+        assert!(runtime.take_deterministic_capture_budget());
+
+        drop(runtime);
+        let _ = server.await;
+        let _ = std::fs::remove_file(&socket_path);
+    }
+
     #[tokio::test]
     async fn shared_scope_write_stays_local_without_route() {
         let (mut runtime, emitted, server, socket_path) = plan_test_runtime("memnoroute").await;
@@ -14069,7 +14200,10 @@ mod tests {
                 "sess-memnoroute",
             )
             .await;
-        assert!(routed.is_none());
+        assert!(matches!(
+            routed,
+            super::memory_integration::ForwardOutcome::NotApplicable
+        ));
         assert!(
             emitted
                 .lock()

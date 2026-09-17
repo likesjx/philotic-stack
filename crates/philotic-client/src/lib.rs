@@ -1909,6 +1909,10 @@ pub enum IpcRequest {
     /// Return all registered upstreams with their last reported catalogs.
     /// Responds with [`IpcResponse::McpUpstreamsState`].
     GetMcpUpstreams {},
+    /// Return every `abstract_tool` record in the hotel graph — the tool
+    /// catalog loaded from `catalog/tools.yaml` and its overrides.
+    /// Responds with [`IpcResponse::ToolCatalogState`].
+    GetToolCatalog {},
     /// Guest → hotel: report an upstream's connection state and projected
     /// tool catalog after connect/refresh. Responds with [`IpcResponse::Standard`].
     ReportMcpUpstreamCatalog {
@@ -2064,6 +2068,10 @@ pub enum IpcRequest {
     /// Return a safe view of hotel state: hotel name, active guests, agent identities.
     /// No secret or credential values are included.
     GetHotelStatus,
+    /// Return the Muninn admin observability report (proposal S6a): recall
+    /// effectiveness and other memory-health fields, each honest about whether
+    /// it could be sourced. Read-only; no memory content or secrets included.
+    GetMemoryReport,
     /// Return the hotel's current network security perimeter snapshot.
     GetPerimeterStatus,
     /// Force the hotel's PerimeterService to re-derive the snapshot from live interfaces.
@@ -2901,6 +2909,11 @@ pub enum IpcResponse {
     /// Response to [`IpcRequest::GetMcpUpstreams`].
     McpUpstreamsState {
         mcp_upstreams: Vec<McpUpstreamEntry>,
+    },
+    /// Response to [`IpcRequest::GetToolCatalog`]. The field name is unique
+    /// on purpose: this enum is untagged and matches by required fields.
+    ToolCatalogState {
+        tool_catalog: Vec<ansible_mesh_core::graph::AbstractToolRecord>,
     },
     /// Response to integration binding mutations.
     IntegrationBindingRegistered {

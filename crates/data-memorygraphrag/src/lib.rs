@@ -10,6 +10,7 @@ pub mod cypher;
 pub mod entanglement;
 pub mod heartbeat;
 pub mod hygiene;
+pub mod node_edit;
 pub mod ontology;
 pub mod projection;
 pub mod zoning;
@@ -215,7 +216,8 @@ where
             match serde_json::from_str::<serde_json::Value>(trimmed) {
                 Ok(serde_json::Value::Object(map)) => Ok(map.into_iter().collect()),
                 Ok(other) => Err(D::Error::custom(format!(
-                    "evidence.properties: expected a map, got a JSON string encoding {other}"
+                    "evidence.properties: expected a map (must be a JSON object), got a JSON \
+                     string encoding {other}"
                 ))),
                 Err(err) => Err(D::Error::custom(format!(
                     "evidence.properties: expected a map, got a string that is not JSON ({err})"
@@ -4364,7 +4366,7 @@ mod lenient_properties_tests {
         let err = serde_json::from_str::<LifeObserveInput>(raw)
             .unwrap_err()
             .to_string();
-        assert!(err.contains("expected a map"), "{err}");
+        assert!(err.contains("must be a JSON object"), "{err}");
         let raw = r#"{"evidence":{"claim_ref":{"id":"life:x","label":"Event"},"claim_summary":"s","properties":"{not json"}}"#;
         assert!(serde_json::from_str::<LifeObserveInput>(raw).is_err());
     }

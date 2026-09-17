@@ -779,6 +779,167 @@ pub fn verify_plan_steps(
     tool_history: &[(ToolCall, ToolResult)],
     prior_verified: &[bool],
 ) -> PlanVerification {
+    verify_plan_steps_with_batches(
+        plan,
+        tool_history,
+        prior_verified,
+        &crate::catalog::tool_batch_of,
+    )
+}
+
+/// Expand every batch call (a tool whose catalog record declares `batch_of`)
+/// into one `(member call, item result)` entry per item, placed right after
+/// the batch call, which is kept so a step bound to the batch tool itself
+/// still verifies. Live 2026-09-16 11:18 EDT: steps bound to `life.observe`
+/// were written by ONE `life.observe.batch` call and the plan reported
+/// "stopped, 0/2 verified" under two real writes.
+///
+/// Per-item results come from the batch payload: `results[].{index,result}`
+/// for attempted items, `evaluation.rejected[].{index,reason,detail}` and
+/// `evaluation.not_attempted[].{index}` for the rest. A batch whose result is
+/// an error fails every item; a result that cannot be attributed per item is
+/// left unexpanded rather than guessed.
+pub fn expand_batch_calls(
+    tool_history: &[(ToolCall, ToolResult)],
+    batch_of_for: &dyn Fn(&str) -> Option<ansible_mesh_core::graph::ToolBatchOf>,
+) -> Vec<(ToolCall, ToolResult)> {
+    let mut out = Vec::with_capacity(tool_history.len());
+    for (call, result) in tool_history {
+        out.push((call.clone(), result.clone()));
+        let Some(batch) = batch_of_for(&call.tool_name) else {
+            continue;
+        };
+        let Some(serde_json::Value::Array(items)) = call.arguments.pointer(&batch.items_pointer)
+        else {
+            continue;
+        };
+        let batch_failed = crate::runtime::distill::tool_result_is_error(&result.content);
+        let per_item = if batch_failed {
+            None
+        } else {
+            match batch_item_outcomes(&result.content) {
+                Some(outcomes) => Some(outcomes),
+                None => continue,
+            }
+        };
+        for (index, item) in items.iter().enumerate() {
+            let arguments = match item {
+                serde_json::Value::String(text) => {
+                    serde_json::from_str(text.trim()).unwrap_or_else(|_| item.clone())
+                }
+                other => other.clone(),
+            };
+            let content = match &per_item {
+                None => result.content.clone(),
+                Some(outcomes) => outcomes.get(&index).cloned().unwrap_or_else(|| {
+                    format!("Error: batch item {index} has no reported outcome")
+                }),
+            };
+            out.push((
+                ToolCall {
+                    tool_name: batch.tool.clone(),
+                    arguments,
+                },
+                ToolResult {
+                    tool_name: batch.tool.clone(),
+                    content,
+                },
+            ));
+        }
+    }
+    out
+}
+
+/// Per-item outcome text keyed by item index, or `None` when the payload
+/// carries no per-item attribution.
+fn batch_item_outcomes(content: &str) -> Option<BTreeMap<usize, String>> {
+    let parsed = parse_json_payload(content)?;
+    let body = find_object_with_key(&parsed, "results")?;
+    let mut outcomes = BTreeMap::new();
+    for entry in body.get("results")?.as_array()? {
+        let index = entry.get("index")?.as_u64()? as usize;
+        let item = entry
+            .get("result")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null);
+        outcomes.insert(index, item.to_string());
+    }
+    if let Some(evaluation) = body.get("evaluation") {
+        for entry in evaluation
+            .get("rejected")
+            .and_then(serde_json::Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            if let Some(index) = entry.get("index").and_then(serde_json::Value::as_u64) {
+                outcomes.insert(
+                    index as usize,
+                    format!(
+                        "Error: batch item {index} rejected ({}): {}",
+                        entry
+                            .get("reason")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or("invalid"),
+                        entry
+                            .get("detail")
+                            .map(|d| d.to_string())
+                            .unwrap_or_default()
+                    ),
+                );
+            }
+        }
+        for entry in evaluation
+            .get("not_attempted")
+            .and_then(serde_json::Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            if let Some(index) = entry.get("index").and_then(serde_json::Value::as_u64) {
+                outcomes.insert(
+                    index as usize,
+                    format!("Error: batch item {index} was not attempted (batch budget exhausted)"),
+                );
+            }
+        }
+    }
+    Some(outcomes)
+}
+
+fn parse_json_payload(content: &str) -> Option<serde_json::Value> {
+    let trimmed = content.trim();
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed) {
+        return Some(value);
+    }
+    let start = trimmed.find('{')?;
+    let end = trimmed.rfind('}')?;
+    serde_json::from_str(&trimmed[start..=end]).ok()
+}
+
+fn find_object_with_key<'a>(
+    value: &'a serde_json::Value,
+    key: &str,
+) -> Option<&'a serde_json::Value> {
+    match value {
+        serde_json::Value::Object(map) => {
+            if map.get(key).is_some_and(serde_json::Value::is_array) {
+                return Some(value);
+            }
+            map.values().find_map(|v| find_object_with_key(v, key))
+        }
+        serde_json::Value::Array(items) => items.iter().find_map(|v| find_object_with_key(v, key)),
+        _ => None,
+    }
+}
+
+/// [`verify_plan_steps`] with an explicit batch lookup (tests inject it).
+pub fn verify_plan_steps_with_batches(
+    plan: &ActivePlan,
+    tool_history: &[(ToolCall, ToolResult)],
+    prior_verified: &[bool],
+    batch_of_for: &dyn Fn(&str) -> Option<ansible_mesh_core::graph::ToolBatchOf>,
+) -> PlanVerification {
+    let expanded = expand_batch_calls(tool_history, batch_of_for);
+    let tool_history: &[(ToolCall, ToolResult)] = &expanded;
     let distinctive = distinctive_tokens(plan);
     let mut consumed = vec![false; tool_history.len()];
     let mut evidence = vec![StepEvidence::NotCheckable; plan.steps.len()];
@@ -1031,6 +1192,12 @@ pub fn verify_plan_steps(
 pub fn atomicity_violations(plan: &ActivePlan) -> Vec<u32> {
     plan.steps
         .iter()
+        // Only a step bound to a tool produces artifacts that can be proven
+        // one call per item. A prose step ("Render a clean, structured review
+        // grouped by type with individual and batch validation mechanisms")
+        // was split into "Render a clean" / "structured review … individual"
+        // / "batch validation mechanisms." (live 2026-09-16 19:38 UTC, DEF-154).
+        .filter(|s| step_is_tool_bound(s))
         .filter(|s| !step_tool_is_read_only(s))
         .filter(|s| description_enumerates_artifacts(&s.description))
         .map(|s| s.id)
@@ -1085,6 +1252,40 @@ pub fn tool_name_is_read_only(tool: &str) -> bool {
 /// [`atomicity_violations`]). Items are the comma/`and`-separated pieces of
 /// the description; the lead-in before a colon is kept on every piece so
 /// the steps still read as instructions.
+/// Unbind steps the model tied to its own reply rather than to a callable
+/// tool (`text.generate`, `respond`, …). No tool call can ever prove such a
+/// step, so it was reported "contradicted" on every continuation: live
+/// 2026-09-16 19:38–19:39 UTC Beacon re-sent the same review four times and
+/// the plan stopped "before finishing" under a reply that contained it
+/// (DEF-154). Unbound, the step settles on the model's word like any other
+/// reasoning step. Returns the ids that were unbound.
+pub fn unbind_reply_pseudo_tools(plan: &mut ActivePlan) -> Vec<u32> {
+    const PSEUDO: &[&str] = &[
+        "respond",
+        "reply",
+        "response",
+        "model",
+        "llm",
+        "generate_text",
+        "render",
+        "compose",
+        "none",
+        "n/a",
+    ];
+    let mut unbound = Vec::new();
+    for step in plan.steps.iter_mut() {
+        let Some(tool) = step.tool_name.as_deref() else {
+            continue;
+        };
+        let t = tool.trim().to_ascii_lowercase();
+        if t.is_empty() || t.starts_with("text.") || PSEUDO.contains(&t.as_str()) {
+            step.tool_name = None;
+            unbound.push(step.id);
+        }
+    }
+    unbound
+}
+
 pub fn split_bundled_steps(plan: &mut ActivePlan) -> Vec<(u32, Vec<u32>)> {
     let bundled = atomicity_violations(plan);
     if bundled.is_empty() {
@@ -2529,6 +2730,151 @@ mod tests {
         assert_eq!(v.evidence[1], StepEvidence::Missing);
     }
 
+    fn observe_batch_of(name: &str) -> Option<ansible_mesh_core::graph::ToolBatchOf> {
+        (name == "life.observe.batch").then(|| ansible_mesh_core::graph::ToolBatchOf {
+            tool: "life.observe".into(),
+            items_pointer: "/observations".into(),
+        })
+    }
+
+    fn two_item_batch(content: &str) -> Vec<(ToolCall, ToolResult)> {
+        vec![(
+            ToolCall {
+                tool_name: "life.observe.batch".into(),
+                arguments: serde_json::json!({"observations": [
+                    {"evidence": {"claim_ref": {"id": "life:appointment:organ_practice_20260916", "label": "Appointment"},
+                                  "claim_summary": "Organ practice tonight with Rachel Hammond"}},
+                    {"evidence": {"claim_ref": {"id": "life:appointment:choir_warmup_20260920", "label": "Appointment"},
+                                  "claim_summary": "Sunday choir warmup in the chapel"}}
+                ]}),
+            },
+            ToolResult {
+                tool_name: "life.observe.batch".into(),
+                content: content.into(),
+            },
+        )]
+    }
+
+    /// Live 2026-09-16 11:18 EDT: two steps bound to `life.observe`, both
+    /// written by ONE `life.observe.batch` call → "Plan stopped, 0/2".
+    #[test]
+    fn one_batch_call_verifies_one_member_step_per_written_item() {
+        let p = plan(
+            "executing",
+            &[
+                (
+                    "Propose tonight's organ practice session with Rachel Hammond in LifeGraph",
+                    Some("life.observe"),
+                    "done",
+                ),
+                (
+                    "Propose Sunday's choir warmup session in LifeGraph",
+                    Some("life.observe"),
+                    "done",
+                ),
+            ],
+        );
+        let ok = r#"{"data":{"status":"ok","requested":2,"succeeded":2,"failed":0,
+            "results":[{"index":0,"result":{"node_id":"life:appointment:organ_practice_20260916"}},
+                       {"index":1,"result":{"node_id":"life:appointment:choir_warmup_20260920"}}],
+            "evaluation":{"written":2,"rejected":[],"not_attempted":[]}}}"#;
+        let v = verify_plan_steps_with_batches(&p, &two_item_batch(ok), &[], &observe_batch_of);
+        assert_eq!(v.verified_count(), 2, "{:?}", v.evidence);
+        assert!(evaluate_whole_plan(&p, &v).complete);
+
+        // Without the catalog relationship the old behaviour stands.
+        let v = verify_plan_steps_with_batches(&p, &two_item_batch(ok), &[], &|_| None);
+        assert_eq!(v.verified_count(), 0);
+    }
+
+    /// Replay of the LIVE payload (captured from the hotel DB): the plan that
+    /// reported "stopped, 0/2 verified" now verifies both steps when the
+    /// catalog declares life.observe.batch as a batch of life.observe.
+    #[test]
+    fn live_2026_09_16_batch_turn_replays_to_two_verified_steps() {
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../tests/fixtures/live_observe_batch_2026_09_16.json"
+        ))
+        .expect("fixture parses");
+        let steps: Vec<(String, String)> = fixture["plan_steps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|s| {
+                (
+                    s["description"].as_str().unwrap().to_string(),
+                    s["tool_name"].as_str().unwrap().to_string(),
+                )
+            })
+            .collect();
+        let step_refs: Vec<(&str, Option<&str>, &str)> = steps
+            .iter()
+            .map(|(d, t)| (d.as_str(), Some(t.as_str()), "done"))
+            .collect();
+        let p = plan("executing", &step_refs);
+        let history = vec![(
+            ToolCall {
+                tool_name: "life.observe.batch".into(),
+                arguments: fixture["call_arguments"].clone(),
+            },
+            ToolResult {
+                tool_name: "life.observe.batch".into(),
+                content: fixture["result_content"].as_str().unwrap().to_string(),
+            },
+        )];
+
+        let before = verify_plan_steps_with_batches(&p, &history, &[], &|_| None);
+        assert_eq!(before.verified_count(), 0, "reproduces the live 0/2");
+
+        let after = verify_plan_steps_with_batches(&p, &history, &[], &observe_batch_of);
+        assert_eq!(after.verified_count(), 2, "{:?}", after.evidence);
+        assert!(evaluate_whole_plan(&p, &after).complete);
+    }
+
+    #[test]
+    fn rejected_or_unattempted_batch_items_do_not_verify_their_steps() {
+        let p = plan(
+            "executing",
+            &[
+                (
+                    "Propose tonight's organ practice session with Rachel Hammond in LifeGraph",
+                    Some("life.observe"),
+                    "done",
+                ),
+                (
+                    "Propose Sunday's choir warmup session in LifeGraph",
+                    Some("life.observe"),
+                    "done",
+                ),
+            ],
+        );
+        let partial = r#"{"data":{"status":"partial","succeeded":1,"failed":1,
+            "results":[{"index":0,"result":{"node_id":"life:appointment:organ_practice_20260916"}}],
+            "evaluation":{"written":1,"rejected":[{"index":1,"reason":"contract_invalid","detail":"expected a map"}],"not_attempted":[]}}}"#;
+        let v =
+            verify_plan_steps_with_batches(&p, &two_item_batch(partial), &[], &observe_batch_of);
+        assert_eq!(v.verified_count(), 1, "{:?}", v.evidence);
+
+        let failed = "Tool call failed: provider failed: contract_error: boom (provider: life-graph-runner, capability: life.observe.batch)";
+        let v = verify_plan_steps_with_batches(&p, &two_item_batch(failed), &[], &observe_batch_of);
+        assert_eq!(v.verified_count(), 0);
+    }
+
+    #[test]
+    fn a_step_bound_to_the_batch_tool_itself_still_verifies() {
+        let p = plan(
+            "executing",
+            &[(
+                "Record the organ practice with Rachel Hammond",
+                Some("life.observe.batch"),
+                "done",
+            )],
+        );
+        let ok = r#"{"results":[{"index":0,"result":{}},{"index":1,"result":{}}],"evaluation":{"rejected":[],"not_attempted":[]}}"#;
+        let v = verify_plan_steps_with_batches(&p, &two_item_batch(ok), &[], &observe_batch_of);
+        assert_eq!(v.verified_count(), 1);
+    }
+
     /// Steps with no distinguishing text still consume one call each, so two
     /// identical steps need two successful calls.
     #[test]
@@ -3205,6 +3551,50 @@ mod tests {
         }
         let latched: Vec<usize> = (0..13).filter(|i| flags[*i]).collect();
         assert_eq!(latched, called.to_vec());
+    }
+
+    /// DEF-154 replay, live 2026-09-16 19:38 UTC.
+    #[test]
+    fn prose_steps_are_not_split_and_reply_bound_steps_are_unbound() {
+        let mut p = plan(
+            "executing",
+            &[
+                (
+                    "Fetch all proposed nodes from the LifeGraph.",
+                    Some("life.list"),
+                    "done",
+                ),
+                (
+                    "Render a clean, structured review grouped by type with individual and batch validation mechanisms.",
+                    None,
+                    "pending",
+                ),
+                (
+                    "Render a clean review interface.",
+                    Some("text.generate"),
+                    "done",
+                ),
+            ],
+        );
+        assert!(
+            atomicity_violations(&p).is_empty(),
+            "{:?}",
+            atomicity_violations(&p)
+        );
+        assert!(split_bundled_steps(&mut p).is_empty());
+        assert_eq!(p.steps.len(), 3);
+        assert_eq!(unbind_reply_pseudo_tools(&mut p), vec![3]);
+        assert!(p.steps[2].tool_name.is_none());
+        assert_eq!(p.steps[0].tool_name.as_deref(), Some("life.list"));
+        // Unbound and claimed done, the reply step settles; the plan completes.
+        let h = history_args(&[(
+            "life.list",
+            serde_json::json!({"validation_states": ["proposed"]}),
+            r#"{"data":{"count":50}}"#,
+        )]);
+        p.steps[1].status = "done".into();
+        let v = verify_plan_steps(&p, &h, &[]);
+        assert!(evaluate_whole_plan(&p, &v).complete, "{:?}", v.evidence);
     }
 
     #[test]

@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - life-core-layer
+
+rectangle "life-core-layer" as life_core_layer #Orange {
+}
+
+
+@enduml

@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - dormancy-vs-operator-intent
+
+rectangle "dormancy-vs-operator-intent" as dormancy_vs_operator_intent #Orange {
+}
+
+
+@enduml

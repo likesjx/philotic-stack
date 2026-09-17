@@ -841,6 +841,27 @@ fn apply_cron_session_routing(mut task: serde_json::Value, job: &CronJob) -> ser
     task
 }
 
+/// Would a philote act on this cron payload? An agent incarnation reads the
+/// instruction from `message`/`content` (promoted into the task's `content`
+/// by [`build_cron_task_json`]) or runs a `paracrine_signal`; with neither,
+/// `normalized_user_content` returns None and the task is dropped without a
+/// trace. Live 2026-09-16 (DEF-152): Beacon registered
+/// `{"action": "lifegraph_gardening_review"}`, and two older enabled jobs
+/// (`workout_reminder`, `whisper_practice_update`) had been firing into
+/// nothing since August/September.
+pub(crate) fn cron_payload_reaches_an_agent(payload: &str) -> bool {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(payload) else {
+        return false;
+    };
+    let has_text = |key: &str| {
+        value
+            .get(key)
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|s| !s.trim().is_empty())
+    };
+    has_text("message") || has_text("content") || value.get("paracrine_signal").is_some()
+}
+
 fn build_cron_task_json(
     job: &CronJob,
     fire_epoch: u64,
@@ -856,6 +877,14 @@ fn build_cron_task_json(
         });
         return apply_cron_session_routing(task, job).to_string();
     };
+
+    if job.target_role.starts_with("role:") && !cron_payload_reaches_an_agent(&payload_data) {
+        warn!(
+            job_id = %job.id,
+            target_role = %job.target_role,
+            "cron job fired with no `message`/`content`/`paracrine_signal`; the agent will drop this task (DEF-152)"
+        );
+    }
 
     let Some(signal_seed) = payload_json.get("paracrine_signal") else {
         // Promote routing fields so the receiving agent has content and can
@@ -963,6 +992,27 @@ fn build_cron_task_json(
 mod tests {
     use super::*;
     use ansible_mesh_core::cron::CronJobSource;
+
+    #[test]
+    fn only_payloads_with_an_instruction_reach_an_agent() {
+        assert!(!cron_payload_reaches_an_agent(
+            r#"{"action": "lifegraph_gardening_review"}"#
+        ));
+        assert!(!cron_payload_reaches_an_agent(
+            r#"{"action": "workout_reminder"}"#
+        ));
+        assert!(!cron_payload_reaches_an_agent(r#"{"message": "   "}"#));
+        assert!(!cron_payload_reaches_an_agent("run the review"));
+        assert!(cron_payload_reaches_an_agent(
+            r#"{"message": "Run the gardening review now."}"#
+        ));
+        assert!(cron_payload_reaches_an_agent(
+            r#"{"content": "Evening check-in"}"#
+        ));
+        assert!(cron_payload_reaches_an_agent(
+            r#"{"paracrine_signal": {"intent": "x"}}"#
+        ));
+    }
 
     fn test_job() -> CronJob {
         CronJob {

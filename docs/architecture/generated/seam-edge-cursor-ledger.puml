@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - edge-cursor-ledger
+
+rectangle "edge-cursor-ledger" as edge_cursor_ledger #Orange {
+}
+
+
+@enduml

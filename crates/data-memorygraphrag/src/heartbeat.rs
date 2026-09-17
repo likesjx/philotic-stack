@@ -141,7 +141,10 @@ pub fn format_reminder_line(claim: &str, due_iso: &str, id: &str, tz: &Tz) -> St
     format!("⏰ Reminder: {claim} (due {due_local}) — {id}")
 }
 
-/// The full message handed to the delivery turn.
+/// The full message handed to the delivery turn. The opening words are
+/// matched by the philote (`turn_loop::is_heartbeat_reminder_dispatch`) to
+/// exempt this delivery-only turn from the plan gate — change them in both
+/// places (DEF-156).
 pub fn dispatch_message(lines: &[String]) -> String {
     format!(
         "Heartbeat reminder dispatch (deterministic pre-selection — do NOT \
@@ -190,6 +193,12 @@ mod tests {
         assert!(line.contains("2:00 PM EDT"), "{line}");
         assert!(line.starts_with("⏰ Reminder: Call the nephrologist"));
         assert!(line.ends_with("life:next_action:x"));
+    }
+
+    #[test]
+    fn dispatch_message_keeps_the_opening_the_philote_matches() {
+        let m = dispatch_message(&["⏰ Reminder: x".to_string()]);
+        assert!(m.starts_with("Heartbeat reminder dispatch (deterministic pre-selection"));
     }
 
     #[test]

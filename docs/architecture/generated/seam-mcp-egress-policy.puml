@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - mcp-egress-policy
+
+rectangle "mcp-egress-policy" as mcp_egress_policy #Orange {
+}
+
+
+@enduml

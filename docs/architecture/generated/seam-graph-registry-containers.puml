@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - graph-registry-containers
+
+rectangle "graph-registry-containers" as graph_registry_containers #Orange {
+}
+
+
+@enduml

@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - procedure-localized-guidance
+
+rectangle "procedure-localized-guidance" as procedure_localized_guidance #Orange {
+}
+
+
+@enduml

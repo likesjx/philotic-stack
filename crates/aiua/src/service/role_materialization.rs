@@ -1089,6 +1089,38 @@ impl IpcServer {
                     }
                 };
 
+                // A task addressed to an AGENT id rather than a role
+                // (`delegate.to_peer` sets `target_agent_id` to the peer agent,
+                // e.g. "agent-bjork-01"). No guest subscribes a role by that
+                // name; the agent's orchestrator incarnation subscribes `agent`
+                // (and `role:<agent>:orchestrator`) and handles `peer.delegate`.
+                // Live 2026-09-16 18:40 UTC (DEF-151): Beacon's delegation
+                // crossed the mesh in one second and was dropped here with "no
+                // subscriber for role 'agent-bjork-01'".
+                if !is_subscribed && target_guest_id.is_none() {
+                    if let Some((role, guest)) =
+                        agent_addressed_subscriber(inboxes, target_role.as_str()).await
+                    {
+                        info!(
+                            event_id = %event.event_id,
+                            agent_id = target_role.as_str(),
+                            role = %role,
+                            guest_id = %guest,
+                            "Cross-hotel task addressed to an agent id: delivering to its orchestrator"
+                        );
+                        Self::deliver_inbound_task(
+                            inboxes,
+                            &event.source_node_id,
+                            &role,
+                            Some(guest.as_str()),
+                            event.event_id,
+                            data.clone(),
+                        )
+                        .await;
+                        return true;
+                    }
+                }
+
                 if is_subscribed {
                     // Register the active incarnation so that model_responses for this
                     // session route back to the correct specialist philote rather than
@@ -2678,6 +2710,40 @@ pub fn scan_interrupted_relocation_ceremonies(graph: &GraphDomain) {
     }
 }
 
+/// The live subscriber that should receive a task addressed to an agent id:
+/// the agent's orchestrator incarnation on the `agent` role, else its
+/// `role:<agent>:orchestrator` inbox, else any `agent` guest of that agent.
+/// `None` when the name is not an agent id this hotel is serving right now.
+pub(crate) async fn agent_addressed_subscriber(
+    inboxes: &InboxRegistry,
+    agent_id: &str,
+) -> Option<(String, String)> {
+    if agent_id.is_empty() || agent_id.contains(':') {
+        return None;
+    }
+    let orchestrator_guest = format!("{agent_id}:orchestrator");
+    let guest_prefix = format!("{agent_id}:");
+    let guard = inboxes.lock().await;
+    if let Some(subs) = guard.get("agent") {
+        if let Some(sub) = subs.iter().find(|s| s.guest_id == orchestrator_guest) {
+            return Some(("agent".to_string(), sub.guest_id.clone()));
+        }
+    }
+    let incarnation_role = format!("role:{agent_id}:orchestrator");
+    if let Some(sub) = guard.get(&incarnation_role).and_then(|subs| subs.first()) {
+        return Some((incarnation_role, sub.guest_id.clone()));
+    }
+    if let Some(subs) = guard.get("agent") {
+        if let Some(sub) = subs
+            .iter()
+            .find(|s| s.guest_id == agent_id || s.guest_id.starts_with(&guest_prefix))
+        {
+            return Some(("agent".to_string(), sub.guest_id.clone()));
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3651,6 +3717,102 @@ mod tests {
         assert!(
             parked_inbound.lock().await.is_empty(),
             "must not park a task that belongs to a different node"
+        );
+    }
+
+    /// DEF-151, live 2026-09-16 18:40 UTC: a `delegate.to_peer` envelope
+    /// addressed to "agent-bjork-01" was dropped on arrival.
+    #[tokio::test]
+    async fn peer_delegation_addressed_to_an_agent_id_reaches_its_orchestrator() {
+        let inboxes: InboxRegistry = Arc::new(Mutex::new(HashMap::new()));
+        let graph = Arc::new(GraphDomain::new(Arc::new(TestGraphAdapter)));
+        let parked_inbound: Arc<Mutex<HashMap<String, Vec<ParkedInboundTask>>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+        let mat_req = MockMaterializationRequester::default();
+
+        let (theoretician_tx, mut theoretician_rx) = mpsc::unbounded_channel::<IpcResponse>();
+        let (orchestrator_tx, mut orchestrator_rx) = mpsc::unbounded_channel::<IpcResponse>();
+        let mut roles = Vec::new();
+        IpcServer::add_subscription(
+            &inboxes,
+            "agent",
+            Uuid::new_v4(),
+            "agent-bjork-01:theoretician",
+            &[],
+            &crate::service::ipc::CountedSender::detached(&theoretician_tx),
+            &mut roles,
+        )
+        .await;
+        IpcServer::add_subscription(
+            &inboxes,
+            "agent",
+            Uuid::new_v4(),
+            "agent-bjork-01:orchestrator",
+            &[],
+            &crate::service::ipc::CountedSender::detached(&orchestrator_tx),
+            &mut roles,
+        )
+        .await;
+
+        let event = EventEnvelope {
+            event_id: Uuid::new_v4(),
+            seq: 1,
+            source_node_id: "vps-jane-aiua-01".into(),
+            target_node_id: Some("mac-jane-aiua-01".into()),
+            source_agent_id: "agent-beacon:orchestrator".into(),
+            target_agent_id: Some("agent-bjork-01".into()),
+            kind: EventKind::TaskInvoke,
+            corr_id: "delegation".into(),
+            attempt: 0,
+            created_at: 0,
+            expires_at: None,
+            payload: EventPayload::Inline {
+                data: serde_json::json!({
+                    "action": "peer.delegate",
+                    "agent_id": "agent-bjork-01",
+                    "session_id": "7898847424:peer:agent-bjork-01",
+                    "chat_id": "7898847424",
+                    "content": "Handoff from peer agent-beacon:orchestrator: organ practice tonight",
+                })
+                .to_string(),
+            },
+            trace: vec![],
+        };
+        let handled = IpcServer::deliver_event_envelope_or_park(
+            &inboxes,
+            &event,
+            None,
+            &graph,
+            "mac-jane-aiua-01",
+            &parked_inbound,
+            Some(&mat_req),
+            &new_delivery_claim_registry(),
+        )
+        .await;
+        assert!(handled);
+        assert!(
+            matches!(
+                orchestrator_rx.try_recv(),
+                Ok(IpcResponse::InboundTask { .. })
+            ),
+            "the agent's orchestrator must receive the peer delegation"
+        );
+        assert!(
+            theoretician_rx.try_recv().is_err(),
+            "a sibling incarnation must not receive it"
+        );
+        assert_eq!(mat_req.calls.load(Ordering::SeqCst), 0);
+
+        // Role names and unknown agents are not rerouted.
+        assert!(
+            agent_addressed_subscriber(&inboxes, "role:agent-bjork-01:orchestrator")
+                .await
+                .is_none()
+        );
+        assert!(
+            agent_addressed_subscriber(&inboxes, "agent-nobody")
+                .await
+                .is_none()
         );
     }
 

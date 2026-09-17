@@ -68,6 +68,22 @@ pub struct AbstractToolRecord {
     pub class: String,
     #[serde(default)]
     pub tool_markers: Vec<String>,
+    /// This tool writes a LIST of `batch_of.tool` inputs found at
+    /// `batch_of.items_pointer` in its arguments (e.g. `life.observe.batch`
+    /// → `life.observe` at `/observations`). Plan verification credits each
+    /// item as a call to the member tool; argument repair walks each item
+    /// against the member's schema. Declared in `catalog/tools.yaml`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub batch_of: Option<ToolBatchOf>,
+}
+
+/// A batch tool's member relationship (see [`AbstractToolRecord::batch_of`]).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ToolBatchOf {
+    /// The member tool each item is an input for.
+    pub tool: String,
+    /// RFC 6901 JSON pointer to the item array inside the batch arguments.
+    pub items_pointer: String,
 }
 
 /// A system-wide shared model definition stored in the context graph.
