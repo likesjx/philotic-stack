@@ -129,6 +129,7 @@ fn record_observation_input(
     let (observed_by, observed_role_owned, edges) = anchor_fields(agent_id, observed_role);
 
     LifeObserveInput {
+        force_new: false,
         observation_id,
         evidence: EvidencePacket {
             packet_id,
@@ -191,6 +192,7 @@ fn propose_sil_input(
     let (observed_by, observed_role_owned, edges) = anchor_fields(agent_id, observed_role);
 
     LifeObserveInput {
+        force_new: false,
         observation_id,
         evidence: EvidencePacket {
             packet_id,
@@ -263,6 +265,7 @@ fn active_checkin_awaiting_posture_input(
     }
 
     LifeObserveInput {
+        force_new: false,
         observation_id,
         evidence: EvidencePacket {
             packet_id,

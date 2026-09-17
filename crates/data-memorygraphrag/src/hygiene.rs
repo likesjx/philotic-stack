@@ -115,6 +115,114 @@ pub fn normalize_claim_summary(raw: &str) -> String {
         .join(" ")
 }
 
+/// How strongly a pending claim matches a node that already exists.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DuplicateGuardHit {
+    pub id: String,
+    pub similarity: f32,
+    /// `exact_summary` or `token_overlap`.
+    pub basis: &'static str,
+    pub validation_state: String,
+}
+
+/// Refuse the write at or above this token overlap: the claim is the same
+/// thing said twice.
+pub const GUARD_BLOCK_OVERLAP: f32 = 0.80;
+/// Report as a candidate to consolidate at or above this overlap.
+pub const GUARD_ADVISORY_OVERLAP: f32 = 0.55;
+
+/// Token set for overlap comparison: normalized, singular-ish (a trailing
+/// "s" is dropped so "Tuesdays" and "Tuesday" agree), one-character tokens
+/// dropped.
+fn overlap_tokens(summary: &str) -> std::collections::BTreeSet<String> {
+    normalize_claim_summary(summary)
+        .split(' ')
+        .filter(|t| t.len() > 1)
+        .map(|t| {
+            t.strip_suffix('s')
+                .filter(|s| s.len() > 2)
+                .unwrap_or(t)
+                .to_string()
+        })
+        .collect()
+}
+
+/// Jaccard overlap of two claim summaries, 0.0–1.0.
+pub fn summary_overlap(a: &str, b: &str) -> f32 {
+    let (ta, tb) = (overlap_tokens(a), overlap_tokens(b));
+    if ta.is_empty() || tb.is_empty() {
+        return 0.0;
+    }
+    let inter = ta.intersection(&tb).count() as f32;
+    let union = ta.union(&tb).count() as f32;
+    inter / union
+}
+
+/// Overlap of two canonical ids' subject slugs, 0.0–1.0: the last segment
+/// split on `_`/`-`, with dates and bare numbers dropped. Wording-independent
+/// where summaries are not: `life:open_loop:pay_bills_20260916` and
+/// `life:open_loop:pay_bills_event_20260916` share their subject even though
+/// "needs to pay" and "paid" do not (DEF-159).
+pub fn id_slug_overlap(a: &str, b: &str) -> f32 {
+    fn slug(id: &str) -> std::collections::BTreeSet<String> {
+        id.rsplit(':')
+            .next()
+            .unwrap_or(id)
+            .split(['_', '-'])
+            .map(str::to_ascii_lowercase)
+            .filter(|t| t.len() > 1 && !t.chars().all(|c| c.is_ascii_digit()))
+            .collect()
+    }
+    let (sa, sb) = (slug(a), slug(b));
+    if sa.is_empty() || sb.is_empty() {
+        return 0.0;
+    }
+    sa.intersection(&sb).count() as f32 / sa.union(&sb).count() as f32
+}
+
+/// Does a live node already carry this claim? Returns every candidate at or
+/// above [`GUARD_ADVISORY_OVERLAP`], strongest first; the caller refuses the
+/// write when the strongest is at or above [`GUARD_BLOCK_OVERLAP`].
+///
+/// Live 2026-09-17: one evening of practice became five confirmed Events, a
+/// misheard "Jackson's Drop-off Routine" sat beside the corrected "Daxton's",
+/// and a second bills item was written while the operator was saying "I
+/// already have that as an open loop" (DEF-158).
+pub fn duplicate_guard_candidates(
+    summary: &str,
+    candidates: &[DuplicateCandidate],
+) -> Vec<DuplicateGuardHit> {
+    let norm = normalize_claim_summary(summary);
+    let mut hits: Vec<DuplicateGuardHit> = candidates
+        .iter()
+        .filter_map(|c| {
+            let exact = !norm.is_empty() && normalize_claim_summary(&c.claim_summary) == norm;
+            let overlap = summary_overlap(summary, &c.claim_summary);
+            if !exact && overlap < GUARD_ADVISORY_OVERLAP {
+                return None;
+            }
+            Some(DuplicateGuardHit {
+                id: c.id.clone(),
+                similarity: if exact { 1.0 } else { overlap },
+                basis: if exact {
+                    "exact_summary"
+                } else {
+                    "token_overlap"
+                },
+                validation_state: c.validation_state.clone(),
+            })
+        })
+        .collect();
+    hits.sort_by(|a, b| {
+        b.similarity
+            .partial_cmp(&a.similarity)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.id.cmp(&b.id))
+    });
+    hits.truncate(5);
+    hits
+}
+
 /// A duplicate-collapse candidate node, as read from Memgraph.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DuplicateCandidate {
@@ -392,6 +500,84 @@ pub async fn sweep(graph: &Graph) -> Result<SweepSummary> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn id_slug_overlap_sees_the_subject_through_wording() {
+        assert!(
+            super::id_slug_overlap(
+                "life:open_loop:pay_bills_20260916",
+                "life:open_loop:pay_bills_event_20260916"
+            ) >= 0.6
+        );
+        assert!(
+            super::id_slug_overlap("life:person:daxton", "life:person:zerin_maluy_likes") < 0.3
+        );
+        assert_eq!(
+            super::id_slug_overlap("life:x:20260916", "life:y:20260917"),
+            0.0
+        );
+    }
+
+    /// DEF-158 live shapes: the same claim twice blocks; a corrected name
+    /// beside the old one is a candidate; two different sessions are not.
+    #[test]
+    fn duplicate_guard_separates_same_claim_from_merely_similar() {
+        let node = |id: &str, summary: &str, state: &str| super::DuplicateCandidate {
+            id: id.into(),
+            claim_summary: summary.into(),
+            observed_at: None,
+            validation_state: state.into(),
+        };
+        let candidates = vec![
+            node(
+                "life:routine:jackson_dropoff_20260917",
+                "Jackson's Drop-off Routine: Tuesday and Thursday mornings at 8:30 AM class start time.",
+                "proposed",
+            ),
+            node(
+                "life:event:music_practice_20260916_tonight",
+                "Jared practiced organ (two hymns) and piano (Moonlight III, nocturnes, Waltz 64/2) on 2026-09-16.",
+                "confirmed",
+            ),
+            node(
+                "life:open_loop:pay_bills_20260916",
+                "Jared needs to pay his bills.",
+                "confirmed",
+            ),
+        ];
+        // Same claim, different wording of the same sentence → blocked.
+        let hits = super::duplicate_guard_candidates("Jared needs to pay his bills!", &candidates);
+        assert_eq!(hits[0].id, "life:open_loop:pay_bills_20260916");
+        assert_eq!(hits[0].basis, "exact_summary");
+        assert!(hits[0].similarity >= super::GUARD_BLOCK_OVERLAP);
+        // The corrected routine beside the misheard one → a candidate to
+        // consolidate, not a block (the names genuinely differ).
+        let hits = super::duplicate_guard_candidates(
+            "Daxton's Drop-off Routine (Tuesdays and Thursdays, class starts at 8:30 AM).",
+            &candidates,
+        );
+        assert_eq!(hits[0].id, "life:routine:jackson_dropoff_20260917");
+        assert!(
+            hits[0].similarity >= super::GUARD_ADVISORY_OVERLAP
+                && hits[0].similarity < super::GUARD_BLOCK_OVERLAP,
+            "{}",
+            hits[0].similarity
+        );
+        // A different evening is not a duplicate of this one.
+        assert!(
+            super::duplicate_guard_candidates(
+                "Jared practiced the organ on 2026-09-20 for sacrament meeting.",
+                &candidates
+            )
+            .iter()
+            .all(|h| h.similarity < super::GUARD_BLOCK_OVERLAP)
+        );
+        // Nothing similar at all → no candidates.
+        assert!(
+            super::duplicate_guard_candidates("Zerin visits Atlanta in August.", &candidates)
+                .is_empty()
+        );
+    }
+
     use super::*;
 
     fn candidate(

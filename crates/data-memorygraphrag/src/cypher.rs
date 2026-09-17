@@ -1414,6 +1414,7 @@ mod tests {
 
     fn minimal_observe_input(label: &str) -> LifeObserveInput {
         LifeObserveInput {
+            force_new: false,
             observation_id: "obs-001".to_string(),
             evidence: EvidencePacket {
                 packet_id: "pkt-001".to_string(),

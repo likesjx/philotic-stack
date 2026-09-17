@@ -1624,6 +1624,11 @@ tools:
         - claim_ref
         - claim_summary
         type: object
+      force_new:
+        description: Write this claim even though a live node of the same label already carries it.
+          The write is refused when an existing node says the same thing (the refusal names that id);
+          set this true ONLY when the thing is genuinely different. Default false.
+        type: boolean
       observation_id:
         description: Unique ID for this observation (e.g. 'obs:rowing-2026-06-05').
         type: string

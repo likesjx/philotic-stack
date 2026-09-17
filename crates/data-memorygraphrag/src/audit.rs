@@ -245,6 +245,11 @@ pub struct AuditReport {
     pub duplicates: Vec<DuplicateFinding>,
     pub stale_loops: Vec<Finding>,
     pub temporal_issues: Vec<Finding>,
+    /// A live loop-like node whose work another record says is finished, and
+    /// a dated record whose date has passed while it is still live. Both are
+    /// closable by the sweep with `life.tidy resolve` (DEF-159).
+    #[serde(default)]
+    pub closable: Vec<Finding>,
     pub conformance_issues: Vec<Finding>,
     /// Atomic actions, one `life.tidy` call each, in priority order.
     pub suggested_actions: Vec<TidyAction>,
@@ -480,6 +485,7 @@ pub fn audit(nodes: &[AuditNode], edges: &[AuditEdge], opts: &AuditOptions) -> A
         }
     }
     let mut already_dup: Vec<String> = Vec::new();
+    let mut confirmed_twins: Vec<String> = Vec::new();
     for (label, members) in &by_label_live {
         for (x, &i) in members.iter().enumerate() {
             for &j in &members[x + 1..] {
@@ -496,7 +502,23 @@ pub fn audit(nodes: &[AuditNode], edges: &[AuditEdge], opts: &AuditOptions) -> A
                 }
                 let (keeper, dup) = prefer_keeper(a, b);
                 let dup_key = key_of(dup);
-                if already_dup.contains(&dup_key) || !dup.is_retirable() {
+                if already_dup.contains(&dup_key) {
+                    continue;
+                }
+                if !dup.is_retirable() {
+                    // A confirmed twin is the operator's to settle — the sweep
+                    // may not retire it. Silently skipping is how five
+                    // confirmed Events for one evening of practice stayed
+                    // invisible to every pass (DEF-159).
+                    already_dup.push(dup_key.clone());
+                    confirmed_twins.push(format!(
+                        "{dup_key} ({}) duplicates {} and is {} — the sweep cannot retire it: \
+                         confirm which one is true, then life.tidy retire_duplicate with \
+                         operator_approved",
+                        label,
+                        key_of(keeper),
+                        dup.validation_state.as_deref().unwrap_or("confirmed")
+                    ));
                     continue;
                 }
                 already_dup.push(dup_key.clone());
@@ -520,6 +542,66 @@ pub fn audit(nodes: &[AuditNode], edges: &[AuditEdge], opts: &AuditOptions) -> A
             .unwrap_or(std::cmp::Ordering::Equal)
     });
     duplicates.truncate(opts.max_actions);
+
+    // Closable: a live loop contradicted by a completion record for the same
+    // claim, and a dated record whose date has passed. The operator's
+    // standing rule is that a past-dated Event is swept without asking; a
+    // contradicted loop is closed on the evidence of the record that says the
+    // work is done. Live 2026-09-17: `life:open_loop:pay_bills_20260916`
+    // (confirmed, open) sat beside `life:open_loop:pay_bills_event_20260916`
+    // (Event, done) and a third bills Commitment (DEF-159).
+    let completions: Vec<&AuditNode> = nodes
+        .iter()
+        .filter(|n| {
+            in_scope(n)
+                && n.validation_state.as_deref() != Some("retired")
+                && n.status
+                    .as_deref()
+                    .is_some_and(|s| matches!(s, "done" | "completed" | "resolved"))
+        })
+        .collect();
+    let mut closable: Vec<Finding> = Vec::new();
+    for nd in nodes.iter().filter(|n| in_scope(n)) {
+        let label = nd.label.as_str();
+        if SYSTEM_LABELS.contains(&label) || !nd.is_live() {
+            continue;
+        }
+        if LOOP_LABELS.contains(&label)
+            && let Some(summary) = nd.claim_summary.as_deref()
+            && let Some(done) = completions.iter().find(|c| {
+                key_of(c) != key_of(nd)
+                    && (c.claim_summary.as_deref().is_some_and(|other| {
+                        crate::hygiene::summary_overlap(summary, other) >= 0.5
+                    }) || crate::hygiene::id_slug_overlap(&key_of(nd), &key_of(c)) >= 0.6)
+            })
+        {
+            closable.push(Finding {
+                id: key_of(nd),
+                label: nd.label.clone(),
+                issue: "contradicted_by_completion".into(),
+                detail: Some(format!(
+                    "{} ({}) says this work is {}",
+                    key_of(done),
+                    done.label,
+                    done.status.as_deref().unwrap_or("done")
+                )),
+            });
+            continue;
+        }
+        if DATED_LABELS.contains(&label)
+            && !LOOP_LABELS.contains(&label)
+            && let Some(d) = nd.best_date.as_deref()
+            && let Some(days) = days_between(d, &now)
+            && days > 0
+        {
+            closable.push(Finding {
+                id: key_of(nd),
+                label: nd.label.clone(),
+                issue: "past_dated".into(),
+                detail: Some(format!("{days} days past {d}, still live")),
+            });
+        }
+    }
 
     // Stale loops and temporal issues.
     let mut stale: Vec<Finding> = Vec::new();
@@ -615,6 +697,23 @@ pub fn audit(nodes: &[AuditNode], edges: &[AuditEdge], opts: &AuditOptions) -> A
             ),
         });
     }
+    for c in &closable {
+        actions.push(TidyAction::Resolve {
+            node_id: c.id.clone(),
+            reason: match c.issue.as_str() {
+                "contradicted_by_completion" => format!(
+                    "closed by evidence: {}",
+                    c.detail
+                        .as_deref()
+                        .unwrap_or("a completion record covers this claim")
+                ),
+                _ => format!(
+                    "past-dated: {}",
+                    c.detail.as_deref().unwrap_or("the date has passed")
+                ),
+            },
+        });
+    }
     for c in conformance.iter().filter(|c| c.issue == "bare_numeric_id") {
         actions.push(TidyAction::Retire {
             node_id: c.id.clone(),
@@ -639,7 +738,7 @@ pub fn audit(nodes: &[AuditNode], edges: &[AuditEdge], opts: &AuditOptions) -> A
     }
     actions.truncate(opts.max_actions);
 
-    let mut needs_judgment: Vec<String> = Vec::new();
+    let mut needs_judgment: Vec<String> = confirmed_twins;
     for o in orphans
         .iter()
         .filter(|o| !o.id.starts_with("life:") && !o.id.starts_with('#'))
@@ -720,6 +819,7 @@ pub fn audit(nodes: &[AuditNode], edges: &[AuditEdge], opts: &AuditOptions) -> A
         duplicates,
         stale_loops: stale,
         temporal_issues: temporal,
+        closable,
         conformance_issues: conformance,
         suggested_actions: actions,
         needs_judgment,
@@ -890,6 +990,82 @@ mod tests {
             r.suggested_actions
                 .iter()
                 .all(|a| matches!(a, TidyAction::RetireDuplicate { .. }))
+        );
+    }
+
+    /// DEF-159, the live 2026-09-17 bills tangle: a confirmed OpenLoop still
+    /// open beside an Event that says the same work is done, plus a past-dated
+    /// Event nobody closed.
+    #[test]
+    fn closable_finds_contradicted_loops_and_past_dated_records() {
+        let mut loop_node = node("life:open_loop:pay_bills_20260916", "OpenLoop", "confirmed");
+        loop_node.claim_summary = Some("Jared needs to pay his bills.".into());
+        let mut done = node(
+            "life:open_loop:pay_bills_event_20260916",
+            "Event",
+            "confirmed",
+        );
+        done.claim_summary = Some("Jared paid his bills.".into());
+        done.status = Some("done".into());
+        let mut past = node("life:event:organ_warmup_20260910", "Event", "confirmed");
+        past.claim_summary = Some("Organ warmup before sacrament meeting.".into());
+        past.best_date = Some("2026-09-10".into());
+        let mut future = node("life:event:trip_kickoff_20991231", "Event", "confirmed");
+        future.claim_summary = Some("A trip that has not happened yet.".into());
+        future.best_date = Some("2099-12-31".into());
+        let mut unrelated = node("life:open_loop:buy_deodorant", "OpenLoop", "proposed");
+        unrelated.claim_summary = Some("Buy deodorant from Dr. Squatch.".into());
+
+        let opts = AuditOptions {
+            now_iso: "2026-09-17T12:00:00Z".into(),
+            ..AuditOptions::default()
+        };
+        let r = audit(&[loop_node, done, past, future, unrelated], &[], &opts);
+        let closable: Vec<(&str, &str)> = r
+            .closable
+            .iter()
+            .map(|f| (f.id.as_str(), f.issue.as_str()))
+            .collect();
+        assert!(
+            closable.contains(&(
+                "life:open_loop:pay_bills_20260916",
+                "contradicted_by_completion"
+            )),
+            "{closable:?}"
+        );
+        assert!(
+            closable.contains(&("life:event:organ_warmup_20260910", "past_dated")),
+            "{closable:?}"
+        );
+        // A future date and an unrelated loop are left alone.
+        assert!(
+            closable
+                .iter()
+                .all(|(id, _)| *id != "life:event:trip_kickoff_20991231")
+        );
+        assert!(
+            closable
+                .iter()
+                .all(|(id, _)| *id != "life:open_loop:buy_deodorant")
+        );
+        // Each closable becomes a resolve the sweep can apply.
+        let resolves: Vec<&String> = r
+            .suggested_actions
+            .iter()
+            .filter_map(|a| match a {
+                TidyAction::Resolve { node_id, .. } => Some(node_id),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            resolves
+                .iter()
+                .any(|id| *id == "life:open_loop:pay_bills_20260916")
+        );
+        assert!(
+            resolves
+                .iter()
+                .any(|id| *id == "life:event:organ_warmup_20260910")
         );
     }
 
