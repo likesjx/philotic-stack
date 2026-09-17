@@ -2149,6 +2149,7 @@ impl AgentRuntime {
                 streak_extension: 0,
                 provider_repair_note: None,
                 say_do_nudged: false,
+                media_analysis: false,
                 provider_repair_attempts: 0,
                 pending_text_reply: None,
                 had_voice_input: false,

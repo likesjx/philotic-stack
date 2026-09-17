@@ -770,6 +770,7 @@ impl WorkingTurn {
             streak_extension: 0,
             provider_repair_note: None,
             say_do_nudged: false,
+            media_analysis: false,
             provider_repair_attempts: 0,
             pending_text_reply: None,
             had_voice_input: false,
@@ -849,6 +850,12 @@ pub struct WorkingTurn {
     /// checkpoint restore is mid-`WaitingTool`, past this gate.
     #[serde(default)]
     pub say_do_nudged: bool,
+    /// This turn was dispatched to the media-analysis capability (a photo
+    /// or document went to the vision model). The analysis reply is the
+    /// ONLY place the attachment's content exists in text, so the reply
+    /// path must carry it forward rather than drop it (DEF-163/164).
+    #[serde(default)]
+    pub media_analysis: bool,
     /// Stashed text content while waiting for voice synthesis to complete.
     pub pending_text_reply: Option<String>,
     pub had_voice_input: bool,
@@ -996,6 +1003,7 @@ impl WorkingTurn {
             streak_extension: 0,
             provider_repair_note: None,
             say_do_nudged: false,
+            media_analysis: false,
             provider_repair_attempts: 0,
             pending_text_reply: None,
             had_voice_input: false,
@@ -2156,6 +2164,7 @@ mod paracrine_budget_tests {
             streak_extension: 0,
             provider_repair_note: None,
             say_do_nudged: false,
+            media_analysis: false,
             provider_repair_attempts: 0,
             pending_text_reply: None,
             had_voice_input: false,

@@ -952,6 +952,54 @@ impl SessionState {
         }
     }
 
+    /// Mark this turn as dispatched to the media-analysis capability.
+    pub fn set_active_turn_media_analysis(&mut self, media: bool) {
+        if let Some(turn) = self.active_turn.as_mut() {
+            turn.media_analysis = media;
+        }
+    }
+
+    /// True when the operator's last exchange left a request open — the last
+    /// assistant reply asked them for something, or a plan still has steps to
+    /// run. An attachment that arrives with no caption is then INPUT for that
+    /// request, not a thing to describe (DEF-164).
+    pub fn operator_request_open(&self) -> bool {
+        if self
+            .carryover_plan
+            .as_ref()
+            .is_some_and(|carry| carry.steps_done.iter().any(|done| !done))
+        {
+            return true;
+        }
+        let Some(last) = self
+            .recent_turns
+            .iter()
+            .rev()
+            .find_map(|turn| turn.assistant_content.as_deref())
+        else {
+            return false;
+        };
+        // Trailers the loop appends ("⏳ Plan status: …", "@agent:orchestrator")
+        // sit after the model's own sentence; look at the whole reply for a
+        // question addressed to the operator rather than only its last char.
+        let lowered = last.to_ascii_lowercase();
+        last.contains('?')
+            && [
+                "send",
+                "share",
+                "again",
+                "which",
+                "what",
+                "could you",
+                "can you",
+                "ready to receive",
+                "paste",
+                "attach",
+            ]
+            .iter()
+            .any(|cue| lowered.contains(cue))
+    }
+
     pub fn active_turn_awaiting_transcription_reentry(&self) -> bool {
         self.active_turn
             .as_ref()
@@ -5193,6 +5241,7 @@ impl SessionState {
                     .and_then(serde_json::Value::as_u64)
                     .unwrap_or(0) as u32,
                 say_do_nudged: false,
+                media_analysis: false,
                 pending_text_reply: turn
                     .get("pending_text_reply")
                     .and_then(serde_json::Value::as_str)
@@ -6848,6 +6897,7 @@ mod tests {
             streak_extension: 0,
             provider_repair_note: None,
             say_do_nudged: false,
+            media_analysis: false,
             provider_repair_attempts: 0,
             pending_text_reply: Some("hello back".into()),
             had_voice_input: true,
@@ -7155,6 +7205,7 @@ mod tests {
             streak_extension: 0,
             provider_repair_note: None,
             say_do_nudged: false,
+            media_analysis: false,
             provider_repair_attempts: 0,
             pending_text_reply: Some("hello back".into()),
             had_voice_input: true,
@@ -7596,6 +7647,7 @@ mod tests {
             streak_extension: 0,
             provider_repair_note: None,
             say_do_nudged: false,
+            media_analysis: false,
             provider_repair_attempts: 0,
             pending_text_reply: None,
             had_voice_input: false,
@@ -7656,6 +7708,7 @@ mod tests {
             streak_extension: 0,
             provider_repair_note: None,
             say_do_nudged: false,
+            media_analysis: false,
             provider_repair_attempts: 0,
             pending_text_reply: None,
             had_voice_input: false,
@@ -8626,6 +8679,7 @@ mod tests {
             streak_extension: 0,
             provider_repair_note: None,
             say_do_nudged: false,
+            media_analysis: false,
             provider_repair_attempts: 0,
             pending_text_reply: None,
             had_voice_input: false,
@@ -8729,6 +8783,7 @@ mod tests {
             streak_extension: 0,
             provider_repair_note: None,
             say_do_nudged: false,
+            media_analysis: false,
             provider_repair_attempts: 0,
             pending_text_reply: None,
             had_voice_input: false,
@@ -8947,6 +9002,61 @@ mod tests {
             ],
             "distill turn must see the allowlisted tools it holds and nothing else"
         );
+    }
+
+    /// DEF-164, live 2026-09-17 09:15 EDT: bjork had just asked "Could you
+    /// send the new hymn numbers again?"; the operator's caption-less photo
+    /// came back as a description instead of the update they asked for.
+    #[test]
+    fn an_open_operator_request_is_recognized_from_the_last_reply() {
+        let mut state =
+            SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
+        assert!(!state.operator_request_open(), "no dialogue yet");
+
+        state.recent_turns.push(TurnRecord {
+            turn_id: "t1".into(),
+            user_content: "did you not see the updated list?".into(),
+            assistant_content: Some(
+                "Oh! Forgive me. Could you send the new hymn numbers or details again? I am \
+                 holding my hands completely still and ready to receive them. @agent:orchestrator"
+                    .into(),
+            ),
+            created_at: 1_789_000_000,
+        });
+        assert!(state.operator_request_open());
+
+        // A reply that asks nothing of the operator leaves no request open.
+        state.recent_turns.clear();
+        state.recent_turns.push(TurnRecord {
+            turn_id: "t2".into(),
+            user_content: "thanks".into(),
+            assistant_content: Some("Anchored in the graph. It is yours.".into()),
+            created_at: 1_789_000_100,
+        });
+        assert!(!state.operator_request_open());
+
+        // A plan with steps left to run is also an open request.
+        state.carryover_plan = Some(CarryoverPlan {
+            plan: ActivePlan {
+                goal: "record the hymns".into(),
+                steps: vec![PlanStep {
+                    id: 1,
+                    description: "write the hymn list".into(),
+                    tool_name: Some("life.observe".into()),
+                    status: "pending".into(),
+                }],
+                status: "executing".into(),
+                context_1_advisory: None,
+                procedure_id: None,
+            },
+            steps_done: vec![false],
+            verified_step_ids: Vec::new(),
+            stalled_continuations: 0,
+            continuations_used: 0,
+            lifetime_continuations: 0,
+            created_turn_id: "t2".into(),
+        });
+        assert!(state.operator_request_open());
     }
 
     #[test]
@@ -9204,6 +9314,7 @@ mod tests {
             streak_extension: 0,
             provider_repair_note: None,
             say_do_nudged: false,
+            media_analysis: false,
             provider_repair_attempts: 0,
             pending_text_reply: None,
             had_voice_input: false,
@@ -9291,6 +9402,7 @@ mod tests {
             streak_extension: 0,
             provider_repair_note: None,
             say_do_nudged: false,
+            media_analysis: false,
             provider_repair_attempts: 0,
             pending_text_reply: None,
             had_voice_input: false,
@@ -9370,6 +9482,7 @@ mod tests {
             streak_extension: 0,
             provider_repair_note: None,
             say_do_nudged: false,
+            media_analysis: false,
             provider_repair_attempts: 0,
             pending_text_reply: None,
             had_voice_input: false,
@@ -11196,6 +11309,7 @@ mod tests {
             streak_extension: 0,
             provider_repair_note: None,
             say_do_nudged: false,
+            media_analysis: false,
             provider_repair_attempts: 0,
             pending_text_reply: None,
             had_voice_input: false,
@@ -11263,6 +11377,7 @@ mod tests {
             streak_extension: 0,
             provider_repair_note: None,
             say_do_nudged: false,
+            media_analysis: false,
             provider_repair_attempts: 0,
             pending_text_reply: None,
             had_voice_input: false,
@@ -11345,6 +11460,7 @@ mod tests {
             streak_extension: 0,
             provider_repair_note: None,
             say_do_nudged: false,
+            media_analysis: false,
             provider_repair_attempts: 0,
             pending_text_reply: None,
             had_voice_input: false,
@@ -11428,6 +11544,7 @@ mod tests {
             streak_extension: 0,
             provider_repair_note: None,
             say_do_nudged: false,
+            media_analysis: false,
             provider_repair_attempts: 0,
             pending_text_reply: None,
             had_voice_input: true,
@@ -11809,6 +11926,7 @@ mod tests {
             streak_extension: 0,
             provider_repair_note: None,
             say_do_nudged: false,
+            media_analysis: false,
             provider_repair_attempts: 0,
             pending_text_reply: None,
             had_voice_input: false,
@@ -12246,6 +12364,7 @@ mod tests {
             streak_extension: 0,
             provider_repair_note: None,
             say_do_nudged: false,
+            media_analysis: false,
             provider_repair_attempts: 0,
             pending_text_reply: None,
             had_voice_input: false,
@@ -12795,6 +12914,7 @@ mod tests {
             streak_extension: 0,
             provider_repair_note: None,
             say_do_nudged: false,
+            media_analysis: false,
             provider_repair_attempts: 0,
             pending_text_reply: None,
             had_voice_input: false,
