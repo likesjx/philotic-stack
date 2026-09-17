@@ -158,6 +158,28 @@ pub fn summary_overlap(a: &str, b: &str) -> f32 {
     inter / union
 }
 
+/// Overlap of two canonical ids' subject slugs, 0.0–1.0: the last segment
+/// split on `_`/`-`, with dates and bare numbers dropped. Wording-independent
+/// where summaries are not: `life:open_loop:pay_bills_20260916` and
+/// `life:open_loop:pay_bills_event_20260916` share their subject even though
+/// "needs to pay" and "paid" do not (DEF-159).
+pub fn id_slug_overlap(a: &str, b: &str) -> f32 {
+    fn slug(id: &str) -> std::collections::BTreeSet<String> {
+        id.rsplit(':')
+            .next()
+            .unwrap_or(id)
+            .split(['_', '-'])
+            .map(str::to_ascii_lowercase)
+            .filter(|t| t.len() > 1 && !t.chars().all(|c| c.is_ascii_digit()))
+            .collect()
+    }
+    let (sa, sb) = (slug(a), slug(b));
+    if sa.is_empty() || sb.is_empty() {
+        return 0.0;
+    }
+    sa.intersection(&sb).count() as f32 / sa.union(&sb).count() as f32
+}
+
 /// Does a live node already carry this claim? Returns every candidate at or
 /// above [`GUARD_ADVISORY_OVERLAP`], strongest first; the caller refuses the
 /// write when the strongest is at or above [`GUARD_BLOCK_OVERLAP`].
@@ -478,6 +500,23 @@ pub async fn sweep(graph: &Graph) -> Result<SweepSummary> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn id_slug_overlap_sees_the_subject_through_wording() {
+        assert!(
+            super::id_slug_overlap(
+                "life:open_loop:pay_bills_20260916",
+                "life:open_loop:pay_bills_event_20260916"
+            ) >= 0.6
+        );
+        assert!(
+            super::id_slug_overlap("life:person:daxton", "life:person:zerin_maluy_likes") < 0.3
+        );
+        assert_eq!(
+            super::id_slug_overlap("life:x:20260916", "life:y:20260917"),
+            0.0
+        );
+    }
+
     /// DEF-158 live shapes: the same claim twice blocks; a corrected name
     /// beside the old one is a candidate; two different sessions are not.
     #[test]
