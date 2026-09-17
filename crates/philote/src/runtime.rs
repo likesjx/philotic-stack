@@ -7258,6 +7258,23 @@ impl AgentRuntime {
                                 self.default_agent_profile.user_timezone.clone();
                         }
 
+                        // A session created by a task that carried no agent id
+                        // (smoke drivers, MCP loopback, shadow control) is
+                        // snapshotted before this philote's first checkpoint, so it
+                        // comes back with no role and an empty toolset. Treat it
+                        // like a fresh session instead of running the whole first
+                        // turn on the always-on minimum (found live 2026-09-16:
+                        // Björk had no memory tools and claimed a save it never made).
+                        if state.role_activation.is_none()
+                            && state.bindings.effective_toolset.is_empty()
+                        {
+                            info!(
+                                session_id = %session_id,
+                                "Restored session has no role or toolset — activating the default role."
+                            );
+                            self.activate_default_role(&mut state, session_id).await;
+                        }
+
                         self.sessions.insert(session_id.to_string(), state);
                         self.apply_mcp_upstream_projection(session_id);
                         self.apply_http_integration_projection(session_id);
@@ -7287,6 +7304,17 @@ impl AgentRuntime {
         // Chronos philote whose paracrine session then auto-activated
         // `orchestrator` — the specialist answered without the specialist's
         // lens, manifest, or toolset (found live 2026-08-25).
+        self.activate_default_role(&mut state, session_id).await;
+
+        self.sessions.insert(session_id.to_string(), state);
+        self.apply_mcp_upstream_projection(session_id);
+        self.apply_http_integration_projection(session_id);
+        Ok(())
+    }
+
+    /// Activate this philote's default role on a session with no role yet:
+    /// manifest, turn-loop settings and the role's toolset profile bindings.
+    async fn activate_default_role(&mut self, state: &mut SessionState, session_id: &str) {
         let default_role = self
             .role_name
             .clone()
@@ -7323,7 +7351,7 @@ impl AgentRuntime {
                 }
                 state.role_activation = Some(activation);
                 if let Some(profile_name) = toolset_profile_ref.as_deref() {
-                    self.hydrate_bindings_from_toolset_profile(&mut state, profile_name)
+                    self.hydrate_bindings_from_toolset_profile(state, profile_name)
                         .await;
                 }
                 info!(
@@ -7333,11 +7361,6 @@ impl AgentRuntime {
                 );
             }
         }
-
-        self.sessions.insert(session_id.to_string(), state);
-        self.apply_mcp_upstream_projection(session_id);
-        self.apply_http_integration_projection(session_id);
-        Ok(())
     }
 
     /// Fetches durable rules from the hotel and injects them into the session state.

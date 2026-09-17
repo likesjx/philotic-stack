@@ -4200,6 +4200,10 @@ fn seed_toolset_profiles(graph: &GraphDomain) -> anyhow::Result<()> {
                 "echo".into(),
                 "skill.list".into(),
                 "role.list".into(),
+                // Operator decision 2026-09-16: every philote role can recall and
+                // remember (writes route to the Cortex; see Phase 2 M4).
+                "memory.recall".into(),
+                "memory.remember".into(),
                 "workspace.list".into(),
                 "workspace.read".into(),
                 "graph.query".into(),
@@ -4235,6 +4239,10 @@ fn seed_toolset_profiles(graph: &GraphDomain) -> anyhow::Result<()> {
                 "echo".into(),
                 "skill.list".into(),
                 "role.list".into(),
+                // Operator decision 2026-09-16: every philote role can recall and
+                // remember (writes route to the Cortex; see Phase 2 M4).
+                "memory.recall".into(),
+                "memory.remember".into(),
                 "graph.query".into(),
                 "graph.create".into(),
                 "graph.list".into(),
@@ -4268,6 +4276,10 @@ fn seed_toolset_profiles(graph: &GraphDomain) -> anyhow::Result<()> {
                 "echo".into(),
                 "skill.list".into(),
                 "role.list".into(),
+                // Operator decision 2026-09-16: every philote role can recall and
+                // remember (writes route to the Cortex; see Phase 2 M4).
+                "memory.recall".into(),
+                "memory.remember".into(),
                 "graph.query".into(),
                 "graph.create".into(),
                 "graph.list".into(),
@@ -4299,6 +4311,10 @@ fn seed_toolset_profiles(graph: &GraphDomain) -> anyhow::Result<()> {
                 "echo".into(),
                 "skill.list".into(),
                 "role.list".into(),
+                // Operator decision 2026-09-16: every philote role can recall and
+                // remember (writes route to the Cortex; see Phase 2 M4).
+                "memory.recall".into(),
+                "memory.remember".into(),
                 "cron.register".into(),
                 "cron.list".into(),
                 "cron.enable".into(),
@@ -4568,6 +4584,10 @@ fn seed_toolset_profiles(graph: &GraphDomain) -> anyhow::Result<()> {
                 "echo".into(),
                 "skill.list".into(),
                 "role.list".into(),
+                // Operator decision 2026-09-16: every philote role can recall and
+                // remember (writes route to the Cortex; see Phase 2 M4).
+                "memory.recall".into(),
+                "memory.remember".into(),
                 "graph.query".into(),
                 "graph.create".into(),
                 "graph.list".into(),
@@ -9016,6 +9036,34 @@ mod tests {
     /// be granted by the profile (directly or via an allowed_classes
     /// expansion), otherwise the incarnation has instructions it cannot
     /// follow (the same invisible-tool defect the architect test above pins).
+    /// Operator decision 2026-09-16: every philote role can recall and remember.
+    /// Every seeded profile must grant both memory tools, directly or through a
+    /// class expansion (the thin utility/scheduler/virtuoso/codex/research
+    /// profiles previously left theoretician, virtuosa, Chronos and echo
+    /// without memory).
+    #[test]
+    fn every_seeded_profile_grants_memory_recall_and_remember() {
+        let storage = SqliteGraphStorage::open(":memory:").expect("open sqlite");
+        let graph = GraphDomain::new(Arc::new(storage.adapter()));
+        seed_toolset_profiles(&graph).expect("seed toolset profiles");
+
+        let profiles = graph.list_toolset_profiles().expect("list profiles");
+        assert!(!profiles.is_empty());
+        for profile in profiles {
+            for tool in ["memory.recall", "memory.remember"] {
+                let granted = profile.allowed_tools.iter().any(|t| t == tool)
+                    || profile.allowed_classes.iter().any(|class| {
+                        ansible_mesh_core::graph::tools_for_tool_class(class).contains(&tool)
+                    });
+                assert!(
+                    granted,
+                    "profile {:?} must grant {tool}",
+                    profile.profile_name
+                );
+            }
+        }
+    }
+
     #[test]
     fn travel_profile_grants_every_tool_the_lyra_charters_name() {
         use crate::lyra_charter::{

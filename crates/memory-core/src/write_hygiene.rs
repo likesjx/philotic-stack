@@ -73,40 +73,62 @@ pub fn distinct_concept(concept: &str, content: &str) -> String {
 /// Markers of diagnostic traffic (smoke tests, canaries, routing probes) that
 /// must not land in a persona's own memory, where they were being recalled into
 /// unrelated operator turns (~150 times for four probe memories, 2026-09-16).
-const DIAGNOSTIC_TAGS: &[&str] = &[
+///
+/// Tags split in two: `STRONG` tags only ever mark throwaway traffic; `WEAK`
+/// tags are also ordinary topic labels ("smoke" on a real procedure memory
+/// about smoke testing was a false positive, 2026-09-16), so they only count on
+/// automatic-capture traffic.
+const STRONG_DIAGNOSTIC_TAGS: &[&str] = &["delete-me", "disposable"];
+const WEAK_DIAGNOSTIC_TAGS: &[&str] = &[
     "test",
     "smoke",
     "smoke-test",
     "canary",
     "probe",
     "diagnostic",
-    "delete-me",
-    "disposable",
 ];
 const DIAGNOSTIC_PHRASES: &[&str] = &[
     "smoke test",
     "smoke-test",
     "routing test",
     "test probe",
-    "canary",
+    "canary probe",
     "this is a test",
     "test capture",
     "probe engram",
     "ignore this",
 ];
+/// Concept prefixes of the external capture reflexes (`context.capture`,
+/// MCP `memory.capture`), where test traffic arrived from.
+const AUTO_CAPTURE_PREFIXES: &[&str] = &["perplexity.", "mcp."];
 
 /// Whether an automatic capture is diagnostic traffic rather than a memory.
 pub fn is_diagnostic_capture(concept: &str, content: &str, tags: &[String]) -> bool {
-    if tags
+    let tag_in = |set: &[&str]| {
+        tags.iter()
+            .any(|t| set.contains(&t.trim().to_ascii_lowercase().as_str()))
+    };
+    if tag_in(STRONG_DIAGNOSTIC_TAGS) {
+        return true;
+    }
+    let concept_lower = concept.trim().to_ascii_lowercase();
+    if DIAGNOSTIC_PHRASES
         .iter()
-        .any(|t| DIAGNOSTIC_TAGS.contains(&t.trim().to_ascii_lowercase().as_str()))
+        .any(|phrase| concept_lower.contains(phrase))
     {
         return true;
     }
-    let haystack = format!("{concept} {content}").to_ascii_lowercase();
-    DIAGNOSTIC_PHRASES
+    let is_auto_capture = AUTO_CAPTURE_PREFIXES
         .iter()
-        .any(|phrase| haystack.contains(phrase))
+        .any(|prefix| concept_lower.starts_with(prefix));
+    if !is_auto_capture {
+        return false;
+    }
+    let content_lower = content.to_ascii_lowercase();
+    tag_in(WEAK_DIAGNOSTIC_TAGS)
+        || DIAGNOSTIC_PHRASES
+            .iter()
+            .any(|phrase| content_lower.contains(phrase))
 }
 
 /// Whether an automatic capture's content is too long to be one atomic memory.
@@ -158,7 +180,30 @@ mod tests {
             "Cross-hotel routing test from mac-jane",
             &[]
         ));
-        assert!(is_diagnostic_capture("x", "y", &["canary".into()]));
+        // The real probes in Björk's vault: capture-prefixed and tagged "test".
+        assert!(is_diagnostic_capture(
+            "perplexity.note: Fresh auth-fix verification test",
+            "auth fix verified",
+            &["test".into()]
+        ));
+        assert!(is_diagnostic_capture("x", "y", &["delete-me".into()]));
+        // A real procedure memory tagged "smoke" is not diagnostic (false
+        // positive found while rescuing mac-jane's memories, 2026-09-16).
+        assert!(!is_diagnostic_capture(
+            "ephemeral-hotel smoke pattern for live verification",
+            "To prove runtime behavior live without touching the fleet: boot an ephemeral aiua…",
+            &[
+                "philotic-stack".into(),
+                "smoke".into(),
+                "verification".into(),
+                "procedure".into()
+            ]
+        ));
+        assert!(!is_diagnostic_capture(
+            "canary-deploy-results",
+            "The canary deploy succeeded.",
+            &["canary".into()]
+        ));
         assert!(!is_diagnostic_capture(
             "choir-rehearsal",
             "Choir rehearsal moved to Thursday; test the new anthem first.",
