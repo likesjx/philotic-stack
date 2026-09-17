@@ -2961,6 +2961,7 @@ impl AgentRuntime {
         let normalized = turn.user_content.trim().to_ascii_lowercase();
         let plan_worthy = turn.active_plan.is_none()
             && !normalized.starts_with("[plan continuation")
+            && !is_heartbeat_reminder_dispatch(&turn.user_content)
             && (crate::plan_eval::is_plan_worthy_statement(&turn.user_content)
                 || (!normalized.contains('?')
                     && state.turn_reports_on_recalled_life_context(&normalized)));
@@ -5368,6 +5369,20 @@ pub(super) fn peer_delegation_trailer(turn: &WorkingTurn) -> Option<String> {
     ))
 }
 
+/// A delivery-only turn authored by the LifeGraph runner's reminder
+/// heartbeat (`data_memorygraphrag::heartbeat::dispatch_message`): the
+/// instruction is "send this text verbatim", and a plain-text reply IS the
+/// work. It arrives with `source: telegram`, indistinguishable from an
+/// operator message except by this fixed machine-written opening. Live
+/// 2026-09-17 12:31 UTC the plan gate sent it back for a plan, the model
+/// declared one it could never settle, and the reminder reached the operator
+/// three times followed by "Plan stopped before finishing" (DEF-156).
+pub(super) fn is_heartbeat_reminder_dispatch(content: &str) -> bool {
+    content
+        .trim_start()
+        .starts_with("Heartbeat reminder dispatch (deterministic pre-selection")
+}
+
 pub(super) fn reply_claims_unbacked_write(content: &str) -> bool {
     // Adverbs between subject and verb hide the claim: live 2026-09-11 20:46
     // UTC, "we already successfully initialized and processed the … event"
@@ -5453,6 +5468,19 @@ pub(super) fn reply_claims_unbacked_write(content: &str) -> bool {
 pub(super) fn reply_promises_unexecuted_action(content: &str) -> bool {
     let lower = content.to_lowercase();
     const PATTERNS: &[&str] = &[
+        // Live 2026-09-17 12:57 UTC, a zero-tool turn: "I am taking care of
+        // those links in the background right now." Nothing runs in the
+        // background after a reply (DEF-156).
+        "taking care of those",
+        "taking care of that",
+        "taking care of this",
+        "taking care of it",
+        "i'll take care of",
+        "i will take care of",
+        "in the background right now",
+        "in the background now",
+        "i am handling",
+        "i'm handling",
         "i will make sure this is tracked",
         "i'll make sure this is tracked",
         "i will make sure it is tracked",
@@ -6000,6 +6028,23 @@ pub(super) fn carryover_resume_followup(
 mod say_do_tests {
     use super::super::tests::test_working_turn;
     use super::*;
+
+    /// DEF-156, live 2026-09-17: a background-work promise with no tool
+    /// call, and the reminder heartbeat's delivery turn.
+    #[test]
+    fn background_promises_and_heartbeat_dispatch_turns() {
+        assert!(reply_promises_unexecuted_action(
+            "You don't have to worry about the mechanics of how it gets done—that is exactly what I am here for! I am taking care of those links in the background right now."
+        ));
+        assert!(!reply_promises_unexecuted_action(
+            "I linked the routine to Daxton; nothing else is pending."
+        ));
+        let dispatch = "Heartbeat reminder dispatch (deterministic pre-selection — do NOT re-query). Send the operator this reminder text as one Telegram message, verbatim:\n⏰ Reminder: Jared committed to paying his bills today.";
+        assert!(is_heartbeat_reminder_dispatch(dispatch));
+        assert!(!is_heartbeat_reminder_dispatch(
+            "Send the operator a heartbeat reminder about bills"
+        ));
+    }
 
     /// Live 2026-09-16 12:44 UTC: a lone memory.recall, then a promise.
     #[test]
