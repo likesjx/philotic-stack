@@ -3163,6 +3163,7 @@ impl AgentRuntime {
                 streak_extension: 0,
                 provider_repair_note: None,
                 say_do_nudged: false,
+                media_analysis: false,
                 provider_repair_attempts: 0,
                 pending_text_reply: None,
                 had_voice_input,
@@ -3489,6 +3490,12 @@ impl AgentRuntime {
             .as_ref()
             .map(|routing| routing.action == "transcribe")
             .unwrap_or(false);
+        // A vision/document analysis turn: its reply is the only text form of
+        // the attachment, so the reply path must not discard it (DEF-160/161).
+        let media_analysis_dispatch = media_routing
+            .as_ref()
+            .map(|routing| routing.action != "transcribe")
+            .unwrap_or(false);
 
         let _ = self
             .ipc_client
@@ -3512,6 +3519,7 @@ impl AgentRuntime {
             state.bump_active_turn_iteration();
             state.set_active_turn_phase(TurnPhase::WaitingModel);
             state.set_active_turn_awaiting_transcription_reentry(awaiting_transcription_reentry);
+            state.set_active_turn_media_analysis(media_analysis_dispatch);
             (
                 state.checkpoint_memory_type(),
                 state.checkpoint_json(),
@@ -7782,6 +7790,7 @@ mod tests {
             streak_extension: 0,
             provider_repair_note: None,
             say_do_nudged: false,
+            media_analysis: false,
             provider_repair_attempts: 0,
             pending_text_reply: None,
             had_voice_input: false,
@@ -8879,6 +8888,7 @@ mod tests {
             streak_extension: 0,
             provider_repair_note: None,
             say_do_nudged: false,
+            media_analysis: false,
             provider_repair_attempts: 0,
             pending_text_reply: None,
             had_voice_input: false,

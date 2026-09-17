@@ -1747,10 +1747,37 @@ impl AgentRuntime {
                 // with this reply. Send the model back once with the tools
                 // still available; if it cannot or will not act, deliver the
                 // reply with an honest trailer instead of the bare promise.
+                // A media-analysis reply is the only text form of the
+                // attachment. When the operator sent it with no caption while a
+                // request of theirs was still open, that reading is INPUT for
+                // the request, not an answer: go back into the cognitive loop
+                // with the reading carried as evidence (DEF-161). Live
+                // 2026-09-17 09:15 EDT: the hymn program came back as a
+                // description while "send me the new hymns" stayed unanswered.
+                if self.media_analysis_needs_reentry(&session_id) {
+                    let _ = self
+                        .emit_turn_event(&session_id, "media_evidence_reentry", None)
+                        .await;
+                    return self
+                        .reenter_for_say_do_check(
+                            session_id,
+                            turn_id,
+                            MEDIA_EVIDENCE_REENTRY_HINT,
+                            "media_evidence_reentry",
+                            Some(&content),
+                        )
+                        .await;
+                }
                 match self.say_do_disposition(&session_id, &content) {
                     SayDoDisposition::Reenter { hint, event } => {
                         return self
-                            .reenter_for_say_do_check(session_id, turn_id, hint, event)
+                            .reenter_for_say_do_check(
+                                session_id,
+                                turn_id,
+                                hint,
+                                event,
+                                Some(&content),
+                            )
                             .await;
                     }
                     SayDoDisposition::Trailer => {
@@ -2976,12 +3003,39 @@ impl AgentRuntime {
 
     /// Send the turn back to the model once, tools intact, with the say-do
     /// hint appended. Mirrors the provider-failure retry re-entry.
+    /// True when this turn was a media analysis whose reply should feed the
+    /// operator's open request instead of being delivered as the answer: the
+    /// attachment arrived with no caption of its own (DEF-161).
+    pub(super) fn media_analysis_needs_reentry(&mut self, session_id: &str) -> bool {
+        let Some(state) = self.sessions.get_mut(session_id) else {
+            return false;
+        };
+        let Some(turn) = state.active_turn.as_mut() else {
+            return false;
+        };
+        if !turn.media_analysis || turn.say_do_nudged {
+            return false;
+        }
+        // One re-entry per turn, whatever the outcome.
+        turn.media_analysis = false;
+        let caption_is_placeholder = attachment_placeholder_caption(&turn.user_content);
+        caption_is_placeholder && state.operator_request_open()
+    }
+
     pub(super) async fn reenter_for_say_do_check(
         &mut self,
         session_id: String,
         turn_id: String,
         hint: &'static str,
         event: &'static str,
+        // The reply the gate refused. It is NOT sent to the operator, but any
+        // fact the model derived in it — above all what an attachment shows —
+        // is evidence this turn already paid for. Carrying it stops the retry
+        // from rebuilding those facts from memory (DEF-160): live 2026-09-17
+        // 09:09 EDT the vision model read the right hymns off a photo, the
+        // gate refused the reply for claiming a write, and the text-only
+        // retry wrote LAST WEEK's hymns from recall.
+        refused_draft: Option<&str>,
     ) -> Result<()> {
         let retry_plan = {
             let Some(state) = self.sessions.get_mut(&session_id) else {
@@ -2989,6 +3043,9 @@ impl AgentRuntime {
             };
             match state.build_reentry_context_envelope() {
                 Some((mut prompt, context, context_projection, tools_for_model)) => {
+                    if let Some(draft) = refused_draft {
+                        prompt.push_str(&refused_draft_block(draft));
+                    }
                     prompt.push_str(hint);
                     if let Some(turn) = state.active_turn.as_mut() {
                         turn.say_do_nudged = true;
@@ -5383,6 +5440,40 @@ pub(super) fn is_heartbeat_reminder_dispatch(content: &str) -> bool {
         .starts_with("Heartbeat reminder dispatch (deterministic pre-selection")
 }
 
+/// Hint for a media-analysis turn whose reading is input, not an answer.
+const MEDIA_EVIDENCE_REENTRY_HINT: &str = "\n\n[Attachment is input]\nThe operator sent this \
+attachment with no message of its own while a request of theirs was still open. Your reading of \
+it above is the INPUT for that request, not the answer to it. Do not describe the attachment back \
+to them. Use what it says to carry out what they already asked for: declare an active_plan and \
+call the tools now. If the attachment does not answer the open request, say so plainly and name \
+what is still missing.";
+
+/// Render the refused draft so the retry keeps the facts it derived.
+fn refused_draft_block(draft: &str) -> String {
+    const MAX_DRAFT_CHARS: usize = 4_000;
+    let trimmed = draft.trim();
+    let body: String = if trimmed.chars().count() > MAX_DRAFT_CHARS {
+        let kept: String = trimmed.chars().take(MAX_DRAFT_CHARS).collect();
+        format!("{kept}\n[…draft truncated]")
+    } else {
+        trimmed.to_string()
+    };
+    format!(
+        "\n\n[Your previous reply — NOT sent to the operator]\n{body}\n\nFacts you established \
+         there stand: anything you read off an attachment, or worked out from the operator's \
+         message, is evidence this turn already has. Reuse it verbatim — do not re-derive it from \
+         memory or recall, which may hold older values."
+    )
+}
+
+/// The membrane's stand-in caption for an attachment the operator sent with no
+/// text of their own ("User sent a Telegram photo.").
+pub(super) fn attachment_placeholder_caption(content: &str) -> bool {
+    let trimmed = content.trim();
+    let lowered = trimmed.to_ascii_lowercase();
+    lowered.starts_with("user sent a telegram ") && trimmed.chars().count() <= 120
+}
+
 pub(super) fn reply_claims_unbacked_write(content: &str) -> bool {
     // Adverbs between subject and verb hide the claim: live 2026-09-11 20:46
     // UTC, "we already successfully initialized and processed the … event"
@@ -6022,6 +6113,56 @@ pub(super) fn carryover_resume_followup(
         });
     }
     Some(PlanFollowup::Continue { eval_json: None })
+}
+
+#[cfg(test)]
+mod media_evidence_tests {
+    use super::*;
+
+    /// DEF-160, live 2026-09-17 09:09 EDT: the vision model read the hymn
+    /// numbers off a photo, the say-do gate refused the reply for claiming a
+    /// write, and the text-only retry wrote LAST WEEK's hymns from recall.
+    /// The retry must carry what the refused reply established.
+    #[test]
+    fn refused_draft_is_carried_into_the_retry() {
+        let draft = "I have updated the hymn list for Sunday, September 20, 2026: \
+                     Opening #26 Joseph Smith's First Prayer; Sacrament #136; \
+                     #1069 Speak to Us, Lord (choir); Closing #85 How Firm a Foundation.";
+        let block = refused_draft_block(draft);
+        assert!(block.contains("NOT sent to the operator"));
+        assert!(block.contains("#26"), "the facts must survive: {block}");
+        assert!(block.contains("#85"));
+        assert!(
+            block.contains("do not re-derive it from memory"),
+            "the retry must be told not to rebuild from recall: {block}"
+        );
+    }
+
+    #[test]
+    fn a_long_draft_is_truncated_but_keeps_its_head() {
+        let draft = format!("HEAD FACTS #26 #136{}", "x".repeat(9_000));
+        let block = refused_draft_block(&draft);
+        assert!(block.contains("HEAD FACTS #26 #136"));
+        assert!(block.contains("draft truncated"));
+        assert!(block.chars().count() < 4_600, "{}", block.chars().count());
+    }
+
+    /// The membrane's stand-in caption for an attachment sent with no text.
+    #[test]
+    fn placeholder_captions_are_recognized_but_real_ones_are_not() {
+        assert!(attachment_placeholder_caption(
+            "User sent a Telegram photo."
+        ));
+        assert!(attachment_placeholder_caption(
+            "User sent a Telegram document: program.pdf."
+        ));
+        assert!(!attachment_placeholder_caption(
+            "Here are the updated hymns for Sunday. Please update them. 1069 is not on the organ, it's the choir"
+        ));
+        assert!(!attachment_placeholder_caption(
+            "user sent a telegram photo of the program, please read the hymn numbers off it and update the LifeGraph event accordingly"
+        ));
+    }
 }
 
 #[cfg(test)]

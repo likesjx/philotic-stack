@@ -1238,13 +1238,21 @@ impl LifeGraphProvider {
     /// durably; a failing item is reported in its result row and never rolls
     /// back or aborts the rest of the batch.
     async fn handle_observe_batch(&self, task: &DatasourceTask) -> Result<ProviderOutput> {
-        let input: LifeObserveBatchInput = serde_json::from_value(task.parameters.clone())
+        let mut input: LifeObserveBatchInput = serde_json::from_value(task.parameters.clone())
             .map_err(|e| {
                 anyhow::anyhow!(
                     "{CONTRACT_ERROR_MARKER} failed to parse life.observe.batch parameters \
                      as LifeObserveBatchInput: {e}"
                 )
             })?;
+        // Every item is a full life.observe input, so it gets the same courtesy
+        // the single call gets: synthesize the ids a model-authored payload
+        // omits, before plan/validate demand them. Live 2026-09-17 09:16 and
+        // 09:18 EDT both batches were rejected wholesale for an empty
+        // packet_id and cost a retry model call each (DEF-162).
+        for observation in input.observations.iter_mut() {
+            observation.normalize_defaults();
+        }
         if input.observations.is_empty() {
             return Ok(ProviderOutput::ResultSet(json!({
                 "status": "invalid_request",
@@ -4438,6 +4446,66 @@ mod tests {
     /// which passed only because the fixture's `OpenLoop` source label failed
     /// *endpoint* validation — so the test would have silently stopped
     /// exercising vocabulary rejection as the agenda vocabulary grew.
+    /// DEF-162, live 2026-09-17 09:16 and 09:18 EDT: both batches were
+    /// rejected wholesale for "packet_id must not be empty" and each cost a
+    /// retry model call, while a single life.observe fills the same ids.
+    #[tokio::test]
+    async fn observe_batch_fills_the_ids_a_model_omits() {
+        let provider = LifeGraphProvider::from_env();
+        let mut first = minimal_observe_input_for_provider_tests("");
+        first.evidence.packet_id = String::new();
+        let mut second = minimal_observe_input_for_provider_tests("obs-supplied");
+        second.evidence.packet_id = "pkt-supplied".into();
+        // Force both items to fail PLANNING, so the outcome reports the
+        // contract state of each item without touching the graph.
+        for observation in [&mut first, &mut second] {
+            observation.edges = vec![ObserveEdge {
+                rel_type: "NOT_A_REAL_RELATION".into(),
+                target_id: "some-target".into(),
+                upsert_target: false,
+            }];
+        }
+        let parameters = serde_json::to_value(LifeObserveBatchInput {
+            observations: vec![first, second],
+        })
+        .expect("serialize batch input");
+        let out = provider
+            .handle_observe_batch(&DatasourceTask {
+                kind: TaskKind::Custom("life.observe.batch".into()),
+                provider: None,
+                db: None,
+                graph_id: None,
+                query: None,
+                parameters,
+                identity: json!({}),
+            })
+            .await
+            .expect("batch reports outcomes");
+        let ProviderOutput::ResultSet(value) = out else {
+            panic!("expected ResultSet");
+        };
+        let rejected = value["evaluation"]["rejected"]
+            .as_array()
+            .expect("rejected array");
+        assert_eq!(rejected.len(), 2, "{}", value["evaluation"]);
+        let detail = serde_json::to_string(rejected).unwrap();
+        assert!(
+            !detail.contains("packet_id must not be empty"),
+            "ids must be synthesized before validation: {detail}"
+        );
+        // The supplied id is never overwritten, and the omitted one is filled.
+        let ids: Vec<&str> = rejected
+            .iter()
+            .filter_map(|r| r["observation_id"].as_str())
+            .collect();
+        assert!(ids.contains(&"obs-supplied"), "{ids:?}");
+        assert!(
+            ids.iter()
+                .any(|id| id.starts_with("obs-") && *id != "obs-supplied"),
+            "the omitted observation_id should be synthesized: {ids:?}"
+        );
+    }
+
     #[tokio::test]
     async fn observe_batch_plans_every_item_before_writing_any() {
         let provider = LifeGraphProvider::from_env();
