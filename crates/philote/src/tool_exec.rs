@@ -6622,6 +6622,31 @@ impl AgentRuntime {
                         );
                         (e.display_message(), Some(e))
                     }
+                    // The hotel's own refusal envelope. Without this arm it
+                    // fell to `Ok(_)` and the reason was replaced by
+                    // "unexpected hotel response": live 2026-09-17 03:00 UTC
+                    // Beacon addressed the peer as "bjork" (the agent id is
+                    // `agent-bjork-01`), the hotel refused with
+                    // DELEGATION_UNROUTABLE naming the problem, and she told
+                    // the operator it was "a transient IPC connectivity
+                    // failure" that she had "queued" (DEF-155).
+                    Ok(IpcResponse::Standard {
+                        ok: false,
+                        code,
+                        message,
+                        ..
+                    }) => {
+                        let e = TaskErrorPayload::tool_execution(
+                            "delegate.to_peer",
+                            message,
+                            Some(if code.is_empty() {
+                                "DELEGATION_REJECTED"
+                            } else {
+                                code.as_str()
+                            }),
+                        );
+                        (e.display_message(), Some(e))
+                    }
                     Ok(_) => {
                         let e = TaskErrorPayload::ipc_failure(
                             "aiua",

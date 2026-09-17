@@ -2179,4 +2179,4 @@ Order: R1 → R2 → R4 (declarative) → R3 → R5 → R4b. Prerequisite tracke
 - [ ] R5 `lifegraph-reflex-triggers`: trigger records + auto-recall classification hook + `trigger_fired` event — watched-live: "I'm starting the Mendelssohn" projects the repertoire skill with no prose rule.
 - [ ] R4b raw-Cypher invariants behind `cypher-guard` — after Graph Doors G1.
 - [ ] Renumber the colliding defect ids in DEFECTS.md (two `DEF-130`, two `DEF-136`) before the next id is taken.
-
+- [x] Operator cleanup 2026-09-17: removed the two dead vps cron jobs (`069f52a1` workout_reminder, `1a0c3dea` Chronos whisper_practice_update) plus the superseded `ddc5ce66` gardening payload, via a management IPC client on the vps (no `phil` CLI there). Beacon re-registered `ac6e8d5f` (10:30 UTC, full message) and also REMOVED the older named `lifegraph-gardening:vps-jane`. DEF-155 filed for the swallowed delegation refusal.
