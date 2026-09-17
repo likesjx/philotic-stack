@@ -2645,6 +2645,40 @@ impl IpcServer {
             ),
         }
     }
+
+    /// List `membrane_transport_home` records, optionally filtered to one
+    /// agent and/or one transport. Read-only, no authority gate beyond
+    /// registration — used by a membrane guest to discover which agents it
+    /// should seat, from graph truth rather than only the static
+    /// `PHILOTIC_AGENT_ROSTER` a hotel was booted with (see
+    /// `membrane-telegram`'s `discover_graph_roster_entries` and
+    /// `run_roster_watcher`).
+    pub(super) fn handle_list_membrane_transport_homes(
+        graph: &GraphDomain,
+        agent_id: Option<String>,
+        transport: Option<String>,
+    ) -> IpcResponse {
+        match graph.list_membrane_transport_homes(agent_id.as_deref()) {
+            Ok(homes) => {
+                let homes = match transport {
+                    Some(transport) => homes
+                        .into_iter()
+                        .filter(|h| h.transport == transport)
+                        .collect(),
+                    None => homes,
+                };
+                IpcResponse::MembraneTransportHomeList {
+                    membrane_transport_home_list: true,
+                    homes,
+                }
+            }
+            Err(err) => IpcResponse::error(
+                "list_membrane_transport_homes",
+                "LIST_MEMBRANE_TRANSPORT_HOMES_DB_ERROR",
+                err.to_string(),
+            ),
+        }
+    }
 }
 
 /// Relocation Ceremony R6: boot-time scan for a ceremony an unclean restart
@@ -3656,6 +3690,74 @@ mod tests {
         assert_eq!(after.phase, RelocationCeremonyPhase::Close);
         assert!(!after.needs_operator_review);
         assert_eq!(after.updated_at, 1010, "untouched by the scan");
+    }
+
+    #[test]
+    fn list_membrane_transport_homes_filters_by_agent_and_transport() {
+        let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
+        let graph = GraphDomain::new(Arc::new(graph_store.adapter()));
+        graph
+            .upsert_membrane_transport_home(&MembraneTransportHomeRecord {
+                agent_id: "agent-beacon".into(),
+                transport: "telegram".into(),
+                resource_ref: "telegram_bot_token_beacon".into(),
+                active_home_hotel: "vps-jane-aiua-01".into(),
+                standby_hotels: vec!["mac-jane-aiua-01".into()],
+                managed_by_role: "orchestrator".into(),
+                lease_type: "telegram_poll".into(),
+                failover_policy: "manual-or-explicit-delegation".into(),
+                status: MembraneTransportHomeStatus::Active,
+                updated_unix: 0,
+            })
+            .expect("seed beacon telegram home");
+        graph
+            .upsert_membrane_transport_home(&MembraneTransportHomeRecord {
+                agent_id: "agent-coach".into(),
+                transport: "discord".into(),
+                resource_ref: "discord_bot_token_coach".into(),
+                active_home_hotel: "vps-jane-aiua-01".into(),
+                standby_hotels: vec![],
+                managed_by_role: "orchestrator".into(),
+                lease_type: "discord_gateway".into(),
+                failover_policy: "manual-or-explicit-delegation".into(),
+                status: MembraneTransportHomeStatus::Active,
+                updated_unix: 0,
+            })
+            .expect("seed coach discord home");
+
+        // No filters: both records.
+        match IpcServer::handle_list_membrane_transport_homes(&graph, None, None) {
+            IpcResponse::MembraneTransportHomeList { homes, .. } => {
+                assert_eq!(homes.len(), 2);
+            }
+            other => panic!("expected IpcResponse::MembraneTransportHomeList, got {other:?}"),
+        }
+
+        // Filtered to telegram: only Beacon's.
+        match IpcServer::handle_list_membrane_transport_homes(&graph, None, Some("telegram".into()))
+        {
+            IpcResponse::MembraneTransportHomeList { homes, .. } => {
+                assert_eq!(homes.len(), 1);
+                assert_eq!(homes[0].agent_id, "agent-beacon");
+                assert_eq!(
+                    homes[0].standby_hotels,
+                    vec!["mac-jane-aiua-01".to_string()]
+                );
+            }
+            other => panic!("expected IpcResponse::MembraneTransportHomeList, got {other:?}"),
+        }
+
+        // Filtered to an agent with no records: empty, not an error.
+        match IpcServer::handle_list_membrane_transport_homes(
+            &graph,
+            Some("agent-nobody".into()),
+            None,
+        ) {
+            IpcResponse::MembraneTransportHomeList { homes, .. } => {
+                assert!(homes.is_empty());
+            }
+            other => panic!("expected IpcResponse::MembraneTransportHomeList, got {other:?}"),
+        }
     }
 
     #[tokio::test]

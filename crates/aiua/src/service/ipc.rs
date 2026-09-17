@@ -6899,6 +6899,10 @@ impl IpcServer {
             IpcRequest::RelocateHotelStatus { ceremony_id } => {
                 Self::handle_relocate_hotel_status(graph, ceremony_id)
             }
+            IpcRequest::ListMembraneTransportHomes {
+                agent_id,
+                transport,
+            } => Self::handle_list_membrane_transport_homes(graph, agent_id, transport),
             IpcRequest::DelegateToPeer {
                 target_agent_id,
                 task_description,

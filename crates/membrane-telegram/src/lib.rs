@@ -9,7 +9,9 @@ use membrane::{
     InboundEnvelope, LeaseAcquireOutcome, LeaseBackend, LeaseDriver, LeaseDriverConfig, LeaseEvent,
     LeaseRenewResult, MembraneGuest, MembraneRuntime, OutboundReply, SenderInfo,
 };
-use philotic_client::{CommandManifestEntry, IpcRequest, IpcResponse, PhiloticClient};
+use philotic_client::{
+    CommandManifestEntry, GuestIdentity, IpcRequest, IpcResponse, PhiloticClient,
+};
 use pulldown_cmark::{
     CodeBlockKind, Event, LinkType, Options, Parser as MarkdownParser, Tag, TagEnd,
 };
@@ -19,7 +21,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, oneshot, watch};
-use tokio::task::JoinHandle;
+use tokio::task::{JoinHandle, JoinSet};
 use tracing::{debug, error, info, warn};
 
 pub mod webhook_secret;
@@ -59,6 +61,18 @@ fn local_node_id() -> String {
 
 fn local_guest_id() -> String {
     std::env::var("PHILOTIC_GUEST_ID").unwrap_or_else(|_| "membrane-telegram-01".to_string())
+}
+
+/// The bare `hotel_name` this membrane process is running on (e.g.
+/// `"vps-jane"`), derived from `PHILOTIC_GUEST_ID`
+/// (`"{hotel_name}:membrane-gateway"`). A `membrane_transport_home` record
+/// may name a hotel by this bare form (legacy — never rewritten since before
+/// DEF-124) or by its canonical `node_id` (`local_node_id()`) — callers that
+/// compare against this hotel's identity must check both forms.
+fn local_hotel_name() -> Option<String> {
+    local_guest_id()
+        .strip_suffix(":membrane-gateway")
+        .map(str::to_string)
 }
 
 fn hotel_socket_path() -> String {
@@ -3967,6 +3981,195 @@ impl TelegramSeatGuest {
     }
 }
 
+/// Spawn one Telegram seat task for `agent_key`/`agent_id` into `seats`, and
+/// return once it's added (the task itself runs indefinitely until IPC
+/// disconnect or ctrl-c). Shared by the static-roster loop and dynamic
+/// on-the-fly seat provisioning — both need the exact same spawn shape.
+#[allow(clippy::too_many_arguments)]
+fn spawn_seat(
+    seats: &mut JoinSet<()>,
+    hotel_guest_id: &str,
+    agent_key: &str,
+    agent_id: &str,
+    http_client: &reqwest::Client,
+    telegram_api_base: &str,
+    telegram_file_api_base: &str,
+    blob_base: &str,
+) {
+    // Each seat registers under the per-agent guest_id so that philote reply
+    // routing (final_reply_guest_id) lands in the correct seat's inbox.
+    let seat_guest_id = format!("{hotel_guest_id}-{agent_key}");
+    let token_key = format!("telegram_bot_token_{agent_key}");
+
+    info!(
+        "Spawning seat for agent [{}] (guest_id: {})",
+        agent_id, seat_guest_id
+    );
+    let (inbound_tx, inbound_rx) = mpsc::channel::<InboundEnvelope>(64);
+    let guest = TelegramSeatGuest::new(
+        seat_guest_id.clone(),
+        token_key,
+        agent_id.to_string(),
+        http_client.clone(),
+        telegram_api_base.to_string(),
+        telegram_file_api_base.to_string(),
+        blob_base.to_string(),
+        inbound_tx,
+    );
+    let runtime = MembraneRuntime::new(hotel_socket_path(), &seat_guest_id, local_node_id())
+        .with_inbound_rx(inbound_rx);
+
+    seats.spawn(async move {
+        if let Err(e) = runtime.run(guest).await {
+            error!("Seat [{}] exited with error: {}", seat_guest_id, e);
+        }
+    });
+}
+
+/// Whether `home` names this hotel — as the active home OR as a standby —
+/// checking both the legacy bare `hotel_name` form and the canonical
+/// `node_id` form a record may be stored in (DEF-124/DEF-143).
+fn transport_home_names_this_hotel(
+    active_home_hotel: &str,
+    standby_hotels: &[String],
+    local_node: &str,
+    local_hotel: Option<&str>,
+) -> bool {
+    let names = |hotel_ref: &str| hotel_ref == local_node || Some(hotel_ref) == local_hotel;
+    names(active_home_hotel) || standby_hotels.iter().any(|h| names(h))
+}
+
+/// Query graph truth for any Telegram transport home naming this hotel as
+/// active or standby, so a hotel that was never listed for this agent in the
+/// static `PHILOTIC_AGENT_ROSTER` (mesh-config.json never named it) still
+/// gets a seat if `transport.set_home` has since declared this hotel a
+/// standby or active home. `mesh-config.json` is a fill-only seed, not the
+/// source of truth (Relocation Ceremony invariant 1) — this is the boot-time
+/// half of that; [`run_roster_watcher`] is the live half.
+async fn discover_graph_roster_entries(hotel_guest_id: &str) -> Vec<(String, String)> {
+    let identity = GuestIdentity {
+        guest_id: format!("{hotel_guest_id}-roster-discovery"),
+        role: "membrane".into(),
+        supported_tools: vec![],
+    };
+    let mut client = match PhiloticClient::connect(identity).await {
+        Ok(c) => c,
+        Err(e) => {
+            warn!(
+                "roster discovery: failed to connect to hotel, using the static roster only: {}",
+                e
+            );
+            return Vec::new();
+        }
+    };
+    let homes = match client
+        .send_request(IpcRequest::ListMembraneTransportHomes {
+            agent_id: None,
+            transport: Some("telegram".to_string()),
+        })
+        .await
+    {
+        Ok(IpcResponse::MembraneTransportHomeList { homes, .. }) => homes,
+        Ok(other) => {
+            warn!(
+                "roster discovery: unexpected response listing transport homes: {:?}",
+                other
+            );
+            return Vec::new();
+        }
+        Err(e) => {
+            warn!("roster discovery: failed to list transport homes: {}", e);
+            return Vec::new();
+        }
+    };
+
+    let local_node = local_node_id();
+    let local_hotel = local_hotel_name();
+    homes
+        .into_iter()
+        .filter(|home| {
+            transport_home_names_this_hotel(
+                &home.active_home_hotel,
+                &home.standby_hotels,
+                &local_node,
+                local_hotel.as_deref(),
+            )
+        })
+        .filter_map(|home| {
+            home.resource_ref
+                .strip_prefix("telegram_bot_token_")
+                .map(|agent_key| (agent_key.to_string(), home.agent_id))
+        })
+        .collect()
+}
+
+/// Watches for a `TransportHomeChanged` push naming an agent this hotel
+/// doesn't have a seat for yet, and reports it over `new_agent_tx` so the
+/// caller can spawn a seat on the fly — no process restart, so it doesn't
+/// disturb any other agent's already-running seat. Reconnects on disconnect.
+async fn run_roster_watcher(hotel_guest_id: String, new_agent_tx: mpsc::Sender<(String, String)>) {
+    let local_node = local_node_id();
+    let local_hotel = local_hotel_name();
+    loop {
+        let identity = GuestIdentity {
+            guest_id: format!("{hotel_guest_id}-roster-watcher"),
+            role: "membrane".into(),
+            supported_tools: vec![],
+        };
+        let mut client = match PhiloticClient::connect(identity).await {
+            Ok(c) => c,
+            Err(e) => {
+                warn!("roster watcher: failed to connect, retrying in 5s: {}", e);
+                tokio::time::sleep(Duration::from_secs(5)).await;
+                continue;
+            }
+        };
+        loop {
+            match client.recv_task().await {
+                Ok(IpcResponse::TransportHomeChanged {
+                    agent_id,
+                    transport,
+                    resource_ref,
+                    active_home_hotel,
+                    standby_hotels,
+                    hotel_is_home,
+                    ..
+                }) => {
+                    if transport != "telegram" {
+                        continue;
+                    }
+                    let Some(agent_key) = resource_ref.strip_prefix("telegram_bot_token_") else {
+                        continue;
+                    };
+                    let is_relevant = hotel_is_home
+                        || transport_home_names_this_hotel(
+                            &active_home_hotel,
+                            &standby_hotels,
+                            &local_node,
+                            local_hotel.as_deref(),
+                        );
+                    if is_relevant
+                        && new_agent_tx
+                            .send((agent_key.to_string(), agent_id))
+                            .await
+                            .is_err()
+                    {
+                        return; // receiver dropped — main loop is gone, nothing left to do
+                    }
+                }
+                Ok(_) => continue,
+                Err(e) => {
+                    if philotic_client::is_ipc_disconnect(&e) {
+                        warn!("roster watcher: IPC disconnected, reconnecting");
+                        break;
+                    }
+                    warn!("roster watcher: recv error: {}", e);
+                }
+            }
+        }
+    }
+}
+
 pub async fn run() -> Result<()> {
     tracing_subscriber::fmt::init();
     let args = Args::parse();
@@ -3992,16 +4195,22 @@ pub async fn run() -> Result<()> {
 
     // ── Multi-seat mode ────────────────────────────────────────────────────────
     // PHILOTIC_AGENT_ROSTER is set by aiua when running a multi-agent hotel.
-    // It's a JSON array of {agent_key, agent_id} objects — one entry per agent.
-    // One seat task is spawned per entry, each with its own IPC connection.
+    // It's a JSON array of {agent_key, agent_id} objects — one entry per agent
+    // seeded from mesh-config.json at boot. Union it with graph truth
+    // (discover_graph_roster_entries) so a hotel that was never named for
+    // this agent in the static config still gets a seat if transport.set_home
+    // has since declared it a standby or active home — mesh-config.json is a
+    // fill-only seed, not the source of truth.
     if let Ok(roster_json) = std::env::var("PHILOTIC_AGENT_ROSTER")
         && !roster_json.trim().is_empty()
     {
-        let roster: Vec<Value> = serde_json::from_str(&roster_json).unwrap_or_default();
+        let static_roster: Vec<Value> = serde_json::from_str(&roster_json).unwrap_or_default();
         let hotel_guest_id = local_guest_id(); // e.g. "default:membrane-gateway"
 
-        let mut tasks = Vec::new();
-        for entry in &roster {
+        // agent_key -> agent_id, first entry wins (static roster takes
+        // priority over graph discovery for any agent_key both name).
+        let mut seated: HashMap<String, String> = HashMap::new();
+        for entry in &static_roster {
             let agent_key = entry.get("agent_key").and_then(Value::as_str).unwrap_or("");
             let agent_id = entry.get("agent_id").and_then(Value::as_str).unwrap_or("");
             if agent_key.is_empty() || agent_id.is_empty() {
@@ -4011,45 +4220,71 @@ pub async fn run() -> Result<()> {
                 );
                 continue;
             }
-            // Each seat registers under the per-agent guest_id so that philote reply
-            // routing (final_reply_guest_id) lands in the correct seat's inbox.
-            let seat_guest_id = format!("{}-{}", hotel_guest_id, agent_key);
-            let token_key = format!("telegram_bot_token_{}", agent_key);
-
-            info!(
-                "Spawning seat for agent [{}] (guest_id: {})",
-                agent_id, seat_guest_id
-            );
-            let (inbound_tx, inbound_rx) = mpsc::channel::<InboundEnvelope>(64);
-            let guest = TelegramSeatGuest::new(
-                seat_guest_id.clone(),
-                token_key,
-                agent_id.to_string(),
-                http_client.clone(),
-                telegram_api_base.clone(),
-                telegram_file_api_base.clone(),
-                blob_base.clone(),
-                inbound_tx,
-            );
-            let runtime =
-                MembraneRuntime::new(hotel_socket_path(), &seat_guest_id, local_node_id())
-                    .with_inbound_rx(inbound_rx);
-
-            tasks.push(tokio::spawn(async move {
-                if let Err(e) = runtime.run(guest).await {
-                    error!("Seat [{}] exited with error: {}", seat_guest_id, e);
-                }
-            }));
+            seated.insert(agent_key.to_string(), agent_id.to_string());
+        }
+        for (agent_key, agent_id) in discover_graph_roster_entries(&hotel_guest_id).await {
+            seated.entry(agent_key).or_insert(agent_id);
         }
 
-        if tasks.is_empty() {
-            warn!("PHILOTIC_AGENT_ROSTER contained no valid seats. Membrane exiting.");
+        if seated.is_empty() {
+            warn!(
+                "No seats to spawn: PHILOTIC_AGENT_ROSTER was empty and graph discovery found \
+                 no telegram transport home naming this hotel. Membrane exiting."
+            );
             return Ok(());
         }
 
-        // All seats run indefinitely. Wait for all to exit (IPC disconnect or ctrl-c).
-        for task in tasks {
-            let _ = task.await;
+        let mut seats: JoinSet<()> = JoinSet::new();
+        let mut live_agent_keys: HashSet<String> = HashSet::new();
+        for (agent_key, agent_id) in seated {
+            spawn_seat(
+                &mut seats,
+                &hotel_guest_id,
+                &agent_key,
+                &agent_id,
+                &http_client,
+                &telegram_api_base,
+                &telegram_file_api_base,
+                &blob_base,
+            );
+            live_agent_keys.insert(agent_key);
+        }
+
+        // React to a live TransportHomeChanged push for an agent this hotel
+        // doesn't have a seat for yet by spawning one on the fly — no process
+        // restart, so no disruption to any other agent's already-running seat.
+        let (new_agent_tx, mut new_agent_rx) = mpsc::channel::<(String, String)>(16);
+        tokio::spawn(run_roster_watcher(hotel_guest_id.clone(), new_agent_tx));
+
+        loop {
+            tokio::select! {
+                Some(result) = seats.join_next() => {
+                    if let Err(e) = result {
+                        error!("Seat task panicked: {}", e);
+                    }
+                }
+                Some((agent_key, agent_id)) = new_agent_rx.recv() => {
+                    if live_agent_keys.insert(agent_key.clone()) {
+                        info!(
+                            "Dynamically spawning seat for agent [{}] (agent_key: {}) — \
+                             discovered via a live TransportHomeChanged push, not the static \
+                             roster",
+                            agent_id, agent_key
+                        );
+                        spawn_seat(
+                            &mut seats,
+                            &hotel_guest_id,
+                            &agent_key,
+                            &agent_id,
+                            &http_client,
+                            &telegram_api_base,
+                            &telegram_file_api_base,
+                            &blob_base,
+                        );
+                    }
+                }
+                else => break,
+            }
         }
         return Ok(());
     }
@@ -4086,7 +4321,7 @@ mod tests {
         normalize_telegram_menu_command_name, session_owned_by_agent, telegram_command,
         telegram_format_text, telegram_help_text, telegram_inbound_envelope,
     };
-    use super::{MembraneGuest, StandDownReason};
+    use super::{MembraneGuest, StandDownReason, transport_home_names_this_hotel};
     use philotic_client::CommandManifestEntry;
     use philotic_client::IpcResponse;
     use serde_json::{Value, json};
@@ -5788,5 +6023,49 @@ mod tests {
             Some(555),
             "the existing draft must be untouched by the notice"
         );
+    }
+
+    #[test]
+    fn transport_home_relevance_matches_active_home_in_either_form() {
+        // Canonical node_id form (post-DEF-124/143 transport.set_home writes).
+        assert!(transport_home_names_this_hotel(
+            "vps-jane-aiua-01",
+            &[],
+            "vps-jane-aiua-01",
+            Some("vps-jane"),
+        ));
+        // Legacy bare hotel_name form (never rewritten since before DEF-124).
+        assert!(transport_home_names_this_hotel(
+            "vps-jane",
+            &[],
+            "vps-jane-aiua-01",
+            Some("vps-jane"),
+        ));
+    }
+
+    #[test]
+    fn transport_home_relevance_matches_standby_in_either_form() {
+        assert!(transport_home_names_this_hotel(
+            "mac-jane-aiua-01",
+            &["vps-jane-aiua-01".to_string()],
+            "vps-jane-aiua-01",
+            Some("vps-jane"),
+        ));
+        assert!(transport_home_names_this_hotel(
+            "mac-jane-aiua-01",
+            &["vps-jane".to_string()],
+            "vps-jane-aiua-01",
+            Some("vps-jane"),
+        ));
+    }
+
+    #[test]
+    fn transport_home_relevance_is_false_for_an_unrelated_hotel() {
+        assert!(!transport_home_names_this_hotel(
+            "mac-jane-aiua-01",
+            &["mbp-jane-aiua-01".to_string()],
+            "vps-jane-aiua-01",
+            Some("vps-jane"),
+        ));
     }
 }
