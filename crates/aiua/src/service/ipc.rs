@@ -6951,6 +6951,18 @@ impl IpcServer {
                         peer_agent_node_from_roster(reg.remote_hotel_states(), &target_agent_id);
                 }
                 let Some(target_node_id) = target_node_id else {
+                    // Name the peers this hotel CAN reach, so the model can
+                    // correct a wrong agent id instead of guessing.
+                    let known: Vec<String> = {
+                        let reg = registry.read().await;
+                        let mut ids: Vec<String> = reg
+                            .remote_hotel_states()
+                            .flat_map(|state| state.agents.iter().map(|a| a.agent_id.clone()))
+                            .collect();
+                        ids.sort();
+                        ids.dedup();
+                        ids
+                    };
                     warn!(
                         target_agent_id = %target_agent_id,
                         authority_hotel = ?authority_hotel,
@@ -6960,15 +6972,21 @@ impl IpcServer {
                         "delegate_to_peer",
                         "DELEGATION_UNROUTABLE",
                         &format!(
-                            "no hotel on this mesh is known to host agent '{}'{}; the delegation was NOT sent — \
-                             the peer's hotel may not be syncing its roster, or the agent id is wrong",
+                            "no hotel on this mesh is known to host agent '{}'{}; the delegation was NOT sent \
+                             and nothing is queued — the peer agent ids this hotel can see are [{}]; retry with \
+                             one of them, or tell the user the peer is unreachable",
                             target_agent_id,
                             authority_hotel
                                 .as_deref()
                                 .map(|h| format!(
                                     " (its recorded authority hotel '{h}' resolves to no mesh node)"
                                 ))
-                                .unwrap_or_default()
+                                .unwrap_or_default(),
+                            if known.is_empty() {
+                                "none visible right now".to_string()
+                            } else {
+                                known.join(", ")
+                            }
                         ),
                     );
                 };
