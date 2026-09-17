@@ -1640,6 +1640,11 @@ pub struct LifeObserveInput {
     /// Optional living-cycle edges to MERGE idempotently with the node write.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub edges: Vec<ObserveEdge>,
+    /// Write this claim even though a live node already carries it. The
+    /// write-time duplicate guard refuses an identical claim under a new id;
+    /// set this only when the thing really is new (DEF-158).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub force_new: bool,
     /// Memory Transparency Slice M1 (`MEMORY_TRANSPARENCY_PROPOSAL.md`):
     /// the shared provenance envelope for this observation, additive to
     /// `evidence`'s richer LifeGraph-native `SourceRef`/`EvidencePacket`
@@ -3547,6 +3552,7 @@ mod tests {
     #[test]
     fn observe_input_roundtrips_provenance_and_edges() {
         let input = LifeObserveInput {
+            force_new: false,
             observation_id: "obs:prov:1".into(),
             evidence: evidence_packet(),
             proposed_graph_refs: vec![],
@@ -3591,6 +3597,7 @@ mod tests {
         let runner = MemoryGraphRagRunner::default();
         let plan = runner
             .plan(LifeGraphToolRequest::LifeObserve(LifeObserveInput {
+                force_new: false,
                 observation_id: "obs:prov:2".into(),
                 evidence: evidence_packet(),
                 proposed_graph_refs: vec![],
@@ -3615,6 +3622,7 @@ mod tests {
         let runner = MemoryGraphRagRunner::default();
         let err = runner
             .plan(LifeGraphToolRequest::LifeObserve(LifeObserveInput {
+                force_new: false,
                 observation_id: "obs:prov:3".into(),
                 evidence: evidence_packet(),
                 proposed_graph_refs: vec![],

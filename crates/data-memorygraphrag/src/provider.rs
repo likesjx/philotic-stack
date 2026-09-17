@@ -842,6 +842,41 @@ impl LifeGraphProvider {
 
         let graph = self.connect().await?;
 
+        // Write-time duplicate guard: a claim a live node already carries is
+        // refused under a NEW id (re-observing the SAME id is the update path
+        // and never blocked). Live 2026-09-16/17: five Events for one evening
+        // of practice, a misheard "Jackson's Drop-off Routine" beside the
+        // corrected "Daxton's", and a second bills item written while the
+        // operator was saying it already existed (DEF-158).
+        let duplicate_candidates = if input.force_new {
+            Vec::new()
+        } else {
+            self.observe_duplicate_candidates(
+                &graph,
+                &compiled.label,
+                &compiled.node_id,
+                &compiled.claim_summary,
+            )
+            .await
+            .unwrap_or_default()
+        };
+        if let Some(block) = duplicate_candidates
+            .first()
+            .filter(|h| h.similarity >= data_memorygraphrag::hygiene::GUARD_BLOCK_OVERLAP)
+        {
+            anyhow::bail!(
+                "{CONTRACT_ERROR_MARKER} life.observe refused: a live {} already carries this claim \
+                 ({}, {} {:.2}, state {}). NOTHING was written. Observe against that id to update it, \
+                 resolve/retire it if it is finished, or resend with force_new: true only if this is \
+                 genuinely a different thing.",
+                compiled.label,
+                block.id,
+                block.basis,
+                block.similarity,
+                block.validation_state
+            );
+        }
+
         let q = query(&compiled.query)
             .param("id", compiled.node_id.as_str())
             .param("created_at", compiled.created_at.as_str())
@@ -996,7 +1031,7 @@ impl LifeGraphProvider {
             },
         };
 
-        Ok(ProviderOutput::ResultSet(json!({
+        let mut out = json!({
             "status": "proposed",
             "node_id": node_id,
             "label": compiled.label,
@@ -1013,7 +1048,87 @@ impl LifeGraphProvider {
                 Value::String("node is confirmed/retired: claim_summary kept, this observation stored as last_observed_summary — use life.commit to rewrite confirmed truth".into())
             },
             "edges": edge_reports,
-        })))
+        });
+        // Not a block, but close enough that leaving both is how the graph
+        // grew five records for one evening: name them so the turn can
+        // consolidate now (life.tidy retire_duplicate) instead of the sweep
+        // finding them tomorrow.
+        if !duplicate_candidates.is_empty() {
+            out["duplicate_candidates"] = json!(
+                duplicate_candidates
+                    .iter()
+                    .map(|h| json!({
+                        "id": h.id,
+                        "similarity": h.similarity,
+                        "basis": h.basis,
+                        "validation_state": h.validation_state,
+                    }))
+                    .collect::<Vec<_>>()
+            );
+            out["duplicate_note"] = json!(
+                "A live node of this label already says something very close. If it is the same \
+                 thing, consolidate now: life.tidy retire_duplicate (proposed/inferred only), or \
+                 life.commit/life.resolve the one that is true."
+            );
+        }
+        Ok(ProviderOutput::ResultSet(out))
+    }
+
+    /// Live nodes of the same label whose claim already covers `summary`,
+    /// strongest first. Empty when the node id already exists (re-observing
+    /// the same id is an update, never a duplicate) or when nothing is close
+    /// enough to mention (DEF-158).
+    async fn observe_duplicate_candidates(
+        &self,
+        graph: &Graph,
+        label: &str,
+        node_id: &str,
+        summary: &str,
+    ) -> Result<Vec<data_memorygraphrag::hygiene::DuplicateGuardHit>> {
+        if summary.trim().is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut existing = bounded_query(
+            "observe_guard_exists",
+            graph.execute(
+                query("MATCH (n) WHERE n.id = $id RETURN count(n) AS c").param("id", node_id),
+            ),
+        )
+        .await?;
+        if let Some(row) = existing.next().await? {
+            if row.get::<i64>("c").unwrap_or(0) > 0 {
+                return Ok(Vec::new());
+            }
+        }
+        let cypher = format!(
+            "MATCH (n:{label}) WHERE n.id <> $id AND n.claim_summary IS NOT NULL              AND coalesce(n.validation_state, 'proposed') <> 'retired'              RETURN n.id AS id, n.claim_summary AS claim_summary,              coalesce(n.validation_state, 'proposed') AS validation_state,              n.observed_at AS observed_at LIMIT 500"
+        );
+        let mut rows = bounded_query(
+            "observe_guard_candidates",
+            graph.execute(query(&cypher).param("id", node_id)),
+        )
+        .await?;
+        let mut candidates: Vec<data_memorygraphrag::hygiene::DuplicateCandidate> = Vec::new();
+        while let Some(row) = rows.next().await? {
+            let Ok(id) = row.get::<String>("id") else {
+                continue;
+            };
+            let Ok(claim_summary) = row.get::<String>("claim_summary") else {
+                continue;
+            };
+            candidates.push(data_memorygraphrag::hygiene::DuplicateCandidate {
+                id,
+                claim_summary,
+                observed_at: row.get::<String>("observed_at").ok(),
+                validation_state: row
+                    .get::<String>("validation_state")
+                    .unwrap_or_else(|_| "proposed".into()),
+            });
+        }
+        Ok(data_memorygraphrag::hygiene::duplicate_guard_candidates(
+            summary,
+            &candidates,
+        ))
     }
 
     /// Write an embedding vector onto a freshly-observed node. Extracted from
@@ -4629,6 +4744,7 @@ mod tests {
 
     fn minimal_observe_input_for_provider_tests(observation_id: &str) -> LifeObserveInput {
         LifeObserveInput {
+            force_new: false,
             observation_id: observation_id.to_string(),
             evidence: EvidencePacket {
                 packet_id: "pkt-001".to_string(),

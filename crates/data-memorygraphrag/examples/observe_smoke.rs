@@ -26,6 +26,7 @@ async fn main() -> anyhow::Result<()> {
     let packet_id = format!("pkt-{}", Ulid::new().to_string().to_lowercase());
 
     let input = LifeObserveInput {
+        force_new: false,
         observation_id: observation_id.clone(),
         evidence: EvidencePacket {
             packet_id: packet_id.clone(),
