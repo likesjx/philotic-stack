@@ -5,7 +5,7 @@
 //! map arrived with that map serialized as a JSON *string* —
 //! `"properties": "{\"title\":\"…\",\"status\":\"confirmed\"}"` — so the runner
 //! answered `invalid type: string …, expected a map`, the automatic retry sent
-//! the identical string, and nothing was written (DEF-144). The tool schema
+//! the identical string, and nothing was written (DEF-146). The tool schema
 //! declares the field as an object; the model simply stringified the nested
 //! value, which some providers do for any nested object or array.
 //!
@@ -82,14 +82,44 @@ fn coerce_value(value: &mut Value, schema: &Value, replaced: &mut usize) {
     }
 }
 
-/// Repair a model tool call against the philote's own catalog entry for that
-/// tool. Tools without a catalog schema (MCP upstream, HTTP integrations)
-/// pass through untouched — their schemas are not known here.
+/// Repair a model tool call against the tool's definition (hotel record,
+/// else compiled catalog). A batch tool's items are also repaired against the
+/// MEMBER tool's schema, from the catalog file's `batch_of` — live 2026-09-16
+/// 11:18 EDT, `life.observe.batch` items carried `evidence.properties` as a
+/// JSON string that the batch's own `items: {type: object}` could not reach.
+/// Tools without a known schema (MCP upstream, HTTP integrations) pass through.
 pub(crate) fn coerce_tool_call_arguments(tool_call: &mut crate::r#loop::ToolCall) -> usize {
-    let Some(def) = crate::catalog::tool_catalog().get(tool_call.tool_name.as_str()) else {
-        return 0;
-    };
-    let replaced = coerce_stringified_json(&mut tool_call.arguments, &def.input_schema);
+    coerce_tool_call_arguments_with(
+        tool_call,
+        &|name| crate::catalog::tool_definition(name).map(|def| def.input_schema),
+        &crate::catalog::tool_batch_of,
+    )
+}
+
+/// [`coerce_tool_call_arguments`] with explicit lookups (tests inject them).
+pub(crate) fn coerce_tool_call_arguments_with(
+    tool_call: &mut crate::r#loop::ToolCall,
+    schema_for: &dyn Fn(&str) -> Option<Value>,
+    batch_of_for: &dyn Fn(&str) -> Option<ansible_mesh_core::graph::ToolBatchOf>,
+) -> usize {
+    let mut replaced = 0;
+    if let Some(schema) = schema_for(&tool_call.tool_name) {
+        replaced += coerce_stringified_json(&mut tool_call.arguments, &schema);
+    }
+    if let Some(batch) = batch_of_for(&tool_call.tool_name)
+        && let Some(member_schema) = schema_for(&batch.tool)
+        && let Some(Value::Array(items)) = tool_call.arguments.pointer_mut(&batch.items_pointer)
+    {
+        for item in items.iter_mut() {
+            if let Value::String(text) = item
+                && let Ok(parsed @ Value::Object(_)) = serde_json::from_str::<Value>(text.trim())
+            {
+                *item = parsed;
+                replaced += 1;
+            }
+            replaced += coerce_stringified_json(item, &member_schema);
+        }
+    }
     if replaced > 0 {
         tracing::info!(
             tool = %tool_call.tool_name,
@@ -165,6 +195,48 @@ mod tests {
         let mut args = json!({"properties": "[1,2]"});
         assert_eq!(coerce_stringified_json(&mut args, &schema), 0);
         assert!(args["properties"].is_string());
+    }
+
+    #[test]
+    fn batch_items_are_repaired_against_the_member_schema() {
+        // Live 2026-09-16 11:18 EDT shape: the batch schema says only
+        // `items: {type: object}`, so the item's stringified properties map
+        // is reachable only through the member tool's schema.
+        let mut call = crate::r#loop::ToolCall {
+            tool_name: "life.observe.batch".into(),
+            arguments: json!({
+                "observations": [
+                    {"evidence": {"claim_summary": "practice",
+                                  "properties": "{\"title\":\"Organ Practice\",\"status\":\"confirmed\"}"}},
+                    "{\"evidence\": {\"claim_summary\": \"warmup\", \"properties\": {\"title\": \"Choir Warmup\"}}}"
+                ]
+            }),
+        };
+        let batch_schema = json!({"type":"object","properties":{"observations":{"type":"array","items":{"type":"object"}}}});
+        let member = observe_schema();
+        let replaced = coerce_tool_call_arguments_with(
+            &mut call,
+            &|name| match name {
+                "life.observe.batch" => Some(batch_schema.clone()),
+                "life.observe" => Some(member.clone()),
+                _ => None,
+            },
+            &|name| {
+                (name == "life.observe.batch").then(|| ansible_mesh_core::graph::ToolBatchOf {
+                    tool: "life.observe".into(),
+                    items_pointer: "/observations".into(),
+                })
+            },
+        );
+        assert_eq!(replaced, 2, "{}", call.arguments);
+        assert_eq!(
+            call.arguments["observations"][0]["evidence"]["properties"]["status"],
+            json!("confirmed")
+        );
+        assert_eq!(
+            call.arguments["observations"][1]["evidence"]["properties"]["title"],
+            json!("Choir Warmup")
+        );
     }
 
     #[test]

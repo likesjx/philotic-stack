@@ -4373,7 +4373,7 @@ mod lenient_properties_tests {
         let err = serde_json::from_str::<LifeObserveInput>(raw)
             .unwrap_err()
             .to_string();
-        assert!(err.contains("expected a map"), "{err}");
+        assert!(err.contains("must be a JSON object"), "{err}");
         let raw = r#"{"evidence":{"claim_ref":{"id":"life:x","label":"Event"},"claim_summary":"s","properties":"{not json"}}"#;
         assert!(serde_json::from_str::<LifeObserveInput>(raw).is_err());
     }

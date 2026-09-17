@@ -405,6 +405,15 @@ impl AgentRuntime {
         bypass_approval: bool,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + '_>> {
         Box::pin(async move {
+            // DEF-146: repair stringified object/array arguments against the
+            // tool's own schema FIRST — live, every `life.observe` with
+            // `evidence.properties` arrived with the map as a JSON string and
+            // the runner refused it twice. Running before the gates below
+            // means the approval card, the duplicate-call loop guard (which
+            // compares against the repaired history) and dispatch all see
+            // the same arguments.
+            super::tool_args::coerce_tool_call_arguments(&mut tool_call);
+
             // `operator_approved` is a model-settable flag; on a life.tidy
             // `retire` it is the only thing standing between a confirmed node
             // and retirement. Honor it only when the operator's own message
@@ -838,12 +847,6 @@ impl AgentRuntime {
                     })
                     .await;
             }
-
-            // DEF-144: repair stringified object/array arguments against the
-            // tool's own schema before the call is stored, routed or run —
-            // live, every `life.observe` with `evidence.properties` arrived
-            // with the map as a JSON string and the runner refused it twice.
-            super::tool_args::coerce_tool_call_arguments(&mut tool_call);
 
             // Emit step_started if streaming is enabled.
             let stream_events = self
@@ -1638,6 +1641,57 @@ impl AgentRuntime {
                         let err = TaskErrorPayload::transport_error(
                             "philote",
                             format!("hotel.status: IPC transport error — {e}"),
+                        );
+                        (err.display_message(), Some(err))
+                    }
+                };
+                self.handle_tool_result(InboundTaskPayload {
+                    action: Some("tool_result".into()),
+                    source: Some("agent".into()),
+                    session_id: Some(payload.session_id),
+                    turn_id: Some(payload.turn_id),
+                    chat_id: Some(payload.chat_id),
+                    content: Some(content),
+                    error: tool_err,
+                    tool_name: Some(payload.tool_name),
+                    final_reply_to: Some(payload.final_reply_to),
+                    final_reply_role: Some(payload.final_reply_role),
+                    final_reply_guest_id: payload.final_reply_guest_id,
+                    ..Default::default()
+                })
+                .await
+            }
+            "memory.report" => {
+                // Proposal S6a: admin memory-health report. Mirrors hotel.status
+                // — a read-only hotel query returning the honest-sourcing report.
+                let (content, tool_err) = match self
+                    .ipc_client
+                    .send_request(IpcRequest::GetMemoryReport)
+                    .await
+                {
+                    Ok(IpcResponse::Standard {
+                        ok: true,
+                        data: Some(data),
+                        ..
+                    }) => {
+                        let text = serde_json::to_string_pretty(&data)
+                            .unwrap_or_else(|_| data.to_string());
+                        (text, None)
+                    }
+                    Ok(IpcResponse::Standard {
+                        ok: false,
+                        code,
+                        message,
+                        ..
+                    }) => {
+                        let e = TaskErrorPayload::ipc_failure("aiua", &*code, message);
+                        (e.display_message(), Some(e))
+                    }
+                    Ok(_) => ("Memory report unavailable.".into(), None),
+                    Err(e) => {
+                        let err = TaskErrorPayload::transport_error(
+                            "philote",
+                            format!("memory.report: IPC transport error — {e}"),
                         );
                         (err.display_message(), Some(err))
                     }
@@ -6565,6 +6619,31 @@ impl AgentRuntime {
                             "delegate.to_peer",
                             msg,
                             Some("DELEGATION_REJECTED"),
+                        );
+                        (e.display_message(), Some(e))
+                    }
+                    // The hotel's own refusal envelope. Without this arm it
+                    // fell to `Ok(_)` and the reason was replaced by
+                    // "unexpected hotel response": live 2026-09-17 03:00 UTC
+                    // Beacon addressed the peer as "bjork" (the agent id is
+                    // `agent-bjork-01`), the hotel refused with
+                    // DELEGATION_UNROUTABLE naming the problem, and she told
+                    // the operator it was "a transient IPC connectivity
+                    // failure" that she had "queued" (DEF-155).
+                    Ok(IpcResponse::Standard {
+                        ok: false,
+                        code,
+                        message,
+                        ..
+                    }) => {
+                        let e = TaskErrorPayload::tool_execution(
+                            "delegate.to_peer",
+                            message,
+                            Some(if code.is_empty() {
+                                "DELEGATION_REJECTED"
+                            } else {
+                                code.as_str()
+                            }),
                         );
                         (e.display_message(), Some(e))
                     }

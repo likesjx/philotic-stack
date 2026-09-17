@@ -177,10 +177,6 @@ if [[ -z "${AIUA_CELLAR}" ]]; then
   exit 1
 fi
 
-echo "▶ Stopping hotel '${HOTEL_NAME}' on ${REMOTE}..."
-BOOTOUT_LABEL="${LAUNCHD_LABEL:-com.philotic.aiua.${HOTEL_NAME}}"
-ssh "${SSH_OPTS[@]}" "${REMOTE}" "uid=\$(id -u); launchctl bootout gui/\${uid}/${BOOTOUT_LABEL} 2>/dev/null || true; pkill -f '[a]iua --hotel ${HOTEL_NAME}' 2>/dev/null || pkill -f '[a]iua-webrtc-debug --hotel ${HOTEL_NAME}' 2>/dev/null || true; sleep 2"
-
 echo "▶ Signing and verifying local binaries before push..."
 UNSIGNED=()
 while IFS= read -r bin_path; do
@@ -202,86 +198,157 @@ if [[ ${#UNSIGNED[@]} -gt 0 ]]; then
 fi
 echo "  ✓ All local binaries have adhoc signatures"
 
+# Stage EVERYTHING while the hotel is still serving. The copy is the slow part
+# (~10 min over the tailnet for ~20 binaries); it used to run AFTER the stop,
+# so every push was ~10 min of agent downtime, and a push killed mid-copy left
+# the hotel booted out (2026-09-16 16:33 UTC, mbp-jane). Now the stop → install
+# → restart window only covers local cp/mv/codesign on the remote: seconds.
+BIN_PATHS=()
+BIN_NAMES=()
+while IFS= read -r _bp; do
+  _bn="$(basename "${_bp}")"
+  if [[ "${_bn}" == "philotic-web" || "${_bn}" == "phil" || "${_bn}" == "graph-intelligence" ]]; then
+    continue
+  fi
+  BIN_PATHS+=("${_bp}")
+  BIN_NAMES+=("${_bn}")
+done < <(find "${ROOT_DIR}/target/release" -maxdepth 1 -type f -perm -111 -print | sort)
+
+INSTALL_PHIL=0
+if [[ -n "${PHIL_CELLAR}" && -f "${ROOT_DIR}/target/release/philotic-web" ]]; then
+  INSTALL_PHIL=1
+fi
+
+echo "▶ Staging ${#BIN_PATHS[@]} runtime binaries on ${REMOTE} (hotel still running)..."
+STAGE_SOURCES=("${BIN_PATHS[@]}")
+if [[ ${INSTALL_PHIL} -eq 1 ]]; then
+  STAGE_SOURCES+=("${ROOT_DIR}/target/release/philotic-web")
+fi
+staged=0
+for attempt in 1 2 3; do
+  if scp -q "${SSH_OPTS[@]}" "${STAGE_SOURCES[@]}" "${REMOTE}:${STAGE_DIR}/"; then
+    staged=1
+    break
+  fi
+  echo "⚠ staging copy failed (attempt ${attempt}/3); hotel untouched, retrying..." >&2
+  sleep 5
+done
+if [[ ${staged} -ne 1 ]]; then
+  echo "❌ Could not stage binaries on ${REMOTE}; the hotel was never stopped."
+  exit 1
+fi
+ssh -n "${SSH_OPTS[@]}" "${REMOTE}" "chmod +x '${STAGE_DIR}'/*"
+echo "  ✓ staged"
+
 # Homebrew leaves Cellar bin dirs (and installed binaries) read-only; without
 # this, copying a NEW binary in fails with Permission denied (bit the fleet on
-# 2026-07-02). Per-binary chmods below re-lock existing files after install.
+# 2026-07-02). The install step re-locks each binary. Harmless while running.
 echo "▶ Unlocking Cellar bin dirs for writes..."
 ssh "${SSH_OPTS[@]}" "${REMOTE}" "chmod -R u+w '${AIUA_CELLAR}' 2>/dev/null || true"
 if [[ -n "${PHIL_CELLAR}" ]]; then
   ssh "${SSH_OPTS[@]}" "${REMOTE}" "chmod -R u+w '${PHIL_CELLAR}' 2>/dev/null || true"
 fi
 
-echo "▶ Staging and installing runtime binaries on ${REMOTE}..."
-# Collect paths into array first — SSH commands inside a while-read loop would otherwise
-# consume stdin from the pipe, causing all but the first binary to be silently skipped.
-BIN_PATHS=()
-while IFS= read -r _bp; do BIN_PATHS+=("${_bp}"); done \
-  < <(find "${ROOT_DIR}/target/release" -maxdepth 1 -type f -perm -111 -print | sort)
-for bin_path in "${BIN_PATHS[@]}"; do
-  bin="$(basename "${bin_path}")"
-  if [[ "${bin}" == "philotic-web" || "${bin}" == "phil" || "${bin}" == "graph-intelligence" ]]; then
-    continue
-  fi
-
-  scp -q "${SSH_OPTS[@]}" "${bin_path}" "${REMOTE}:${STAGE_DIR}/${bin}"
-  ssh -n "${SSH_OPTS[@]}" "${REMOTE}" "chmod +x '${STAGE_DIR}/${bin}'"
-
-  if ! remote_file_exists "${AIUA_CELLAR}/${bin}"; then
-    # New binary not yet in Cellar — install it and create the symlink
-    ssh -n "${SSH_OPTS[@]}" "${REMOTE}" "cp '${STAGE_DIR}/${bin}' '${AIUA_CELLAR}/${bin}.new-inode' && mv -f '${AIUA_CELLAR}/${bin}.new-inode' '${AIUA_CELLAR}/${bin}'"
-    ssh -n "${SSH_OPTS[@]}" "${REMOTE}" "chmod +x '${AIUA_CELLAR}/${bin}' && xattr -d com.apple.quarantine '${AIUA_CELLAR}/${bin}' 2>/dev/null || true && codesign -s - --force '${AIUA_CELLAR}/${bin}' >/dev/null 2>&1 || true"
-    ssh -n "${SSH_OPTS[@]}" "${REMOTE}" "chmod 555 '${AIUA_CELLAR}/${bin}'"
-    ssh -n "${SSH_OPTS[@]}" "${REMOTE}" "ln -sf '${AIUA_CELLAR}/${bin}' '/opt/homebrew/bin/${bin}'"
-    echo "  + ${bin} (new)"
-    continue
-  fi
-
-  ssh -n "${SSH_OPTS[@]}" "${REMOTE}" "chmod u+w '${AIUA_CELLAR}/${bin}' 2>/dev/null || true"
-  ssh -n "${SSH_OPTS[@]}" "${REMOTE}" "cp '${STAGE_DIR}/${bin}' '${AIUA_CELLAR}/${bin}.new-inode' && mv -f '${AIUA_CELLAR}/${bin}.new-inode' '${AIUA_CELLAR}/${bin}'"
-  ssh -n "${SSH_OPTS[@]}" "${REMOTE}" "chmod +x '${AIUA_CELLAR}/${bin}' && xattr -d com.apple.quarantine '${AIUA_CELLAR}/${bin}' 2>/dev/null || true && codesign -s - --force '${AIUA_CELLAR}/${bin}' >/dev/null 2>&1 || true"
-  ssh -n "${SSH_OPTS[@]}" "${REMOTE}" "ln -sf '${AIUA_CELLAR}/${bin}' '/opt/homebrew/bin/${bin}'"
-  ssh -n "${SSH_OPTS[@]}" "${REMOTE}" "chmod u-w '${AIUA_CELLAR}/${bin}' 2>/dev/null || true"
-  echo "  ✓ ${bin}"
-done
-
-if [[ -n "${PHIL_CELLAR}" && -f "${ROOT_DIR}/target/release/philotic-web" ]]; then
-  echo "▶ Installing phil / philotic-web..."
-  scp -q "${SSH_OPTS[@]}" "${ROOT_DIR}/target/release/philotic-web" "${REMOTE}:${STAGE_DIR}/philotic-web"
-  ssh "${SSH_OPTS[@]}" "${REMOTE}" "chmod +x '${STAGE_DIR}/philotic-web'"
-  ssh "${SSH_OPTS[@]}" "${REMOTE}" "chmod u+w '${PHIL_CELLAR}/philotic-web' '${PHIL_CELLAR}/phil' 2>/dev/null || true"
-  # New-inode install (cp to temp + mv): an in-place cp reuses the inode and the
-  # kernel's cached code signature then SIGKILLs the binary at spawn
-  # (OS_REASON_CODESIGNING) — `codesign -f` alone does not clear that cache.
-  ssh "${SSH_OPTS[@]}" "${REMOTE}" "cp '${STAGE_DIR}/philotic-web' '${PHIL_CELLAR}/philotic-web.new-inode' && mv -f '${PHIL_CELLAR}/philotic-web.new-inode' '${PHIL_CELLAR}/philotic-web'"
-  ssh "${SSH_OPTS[@]}" "${REMOTE}" "cp '${STAGE_DIR}/philotic-web' '${PHIL_CELLAR}/phil.new-inode' && mv -f '${PHIL_CELLAR}/phil.new-inode' '${PHIL_CELLAR}/phil'"
-  ssh "${SSH_OPTS[@]}" "${REMOTE}" "chmod +x '${PHIL_CELLAR}/philotic-web' '${PHIL_CELLAR}/phil'"
-  ssh "${SSH_OPTS[@]}" "${REMOTE}" "xattr -d com.apple.quarantine '${PHIL_CELLAR}/philotic-web' '${PHIL_CELLAR}/phil' 2>/dev/null || true"
-  ssh "${SSH_OPTS[@]}" "${REMOTE}" "codesign -s - --force '${PHIL_CELLAR}/philotic-web' '${PHIL_CELLAR}/phil' >/dev/null 2>&1 || true"
-  ssh "${SSH_OPTS[@]}" "${REMOTE}" "chmod u-w '${PHIL_CELLAR}/philotic-web' '${PHIL_CELLAR}/phil' 2>/dev/null || true"
-  echo "  ✓ phil / philotic-web"
-fi
-
-if [[ -n "${LAUNCHD_LABEL}" ]]; then
-  echo "▶ Restarting hotel '${HOTEL_NAME}' via launchd (${LAUNCHD_LABEL})..."
-  # Clear the stale active_pid row first: aiua refuses to boot when the row
-  # points at a PID that still exists (or got reused), and a launchd respawn
-  # can race the old row. Same profile→db derivation the rest of this script
-  # uses: ~/.philotic/<profile>/context.db.
-  if ! ssh -n "${SSH_OPTS[@]}" "${REMOTE}" "sqlite3 \$HOME/.philotic/${REMOTE_PROFILE}/context.db \"UPDATE hotels SET active_pid = NULL WHERE hotel_name = '${HOTEL_NAME}';\""; then
-    echo "⚠ Could not clear hotels.active_pid (continuing — aiua may refuse to start if a stale live PID matches)"
-  fi
-  if remote_launchd_loaded "${LAUNCHD_LABEL}"; then
-    ssh -n "${SSH_OPTS[@]}" "${REMOTE}" "launchctl kickstart -k gui/\$(id -u)/${LAUNCHD_LABEL}"
+restart_hotel() {
+  if [[ -n "${LAUNCHD_LABEL}" ]]; then
+    echo "▶ Restarting hotel '${HOTEL_NAME}' via launchd (${LAUNCHD_LABEL})..."
+    # Clear the stale active_pid row first: aiua refuses to boot when the row
+    # points at a PID that still exists (or got reused), and a launchd respawn
+    # can race the old row. Same profile→db derivation the rest of this script
+    # uses: ~/.philotic/<profile>/context.db.
+    if ! ssh -n "${SSH_OPTS[@]}" "${REMOTE}" "sqlite3 \$HOME/.philotic/${REMOTE_PROFILE}/context.db \"UPDATE hotels SET active_pid = NULL WHERE hotel_name = '${HOTEL_NAME}';\""; then
+      echo "⚠ Could not clear hotels.active_pid (continuing — aiua may refuse to start if a stale live PID matches)"
+    fi
+    if remote_launchd_loaded "${LAUNCHD_LABEL}"; then
+      ssh -n "${SSH_OPTS[@]}" "${REMOTE}" "launchctl kickstart -k gui/\$(id -u)/${LAUNCHD_LABEL}"
+    else
+      # The stop step booted the service out; bring it back under launchd
+      # (RunAtLoad starts it). Never hand-start a launchd-managed hotel.
+      ssh -n "${SSH_OPTS[@]}" "${REMOTE}" "launchctl bootstrap gui/\$(id -u) \$HOME/Library/LaunchAgents/${LAUNCHD_LABEL}.plist"
+    fi
+    echo "  ✓ ${LAUNCHD_LABEL} restarted under launchd supervision"
   else
-    # The stop step booted the service out; bring it back under launchd
-    # (RunAtLoad starts it). Never hand-start a launchd-managed hotel.
-    ssh -n "${SSH_OPTS[@]}" "${REMOTE}" "launchctl bootstrap gui/\$(id -u) \$HOME/Library/LaunchAgents/${LAUNCHD_LABEL}.plist"
+    echo "▶ No launchd service — hand-starting hotel '${HOTEL_NAME}' on ${REMOTE} with Rust cutover flags..."
+    ssh "${SSH_OPTS[@]}" "${REMOTE}" "ulimit -n 65536; nohup env PATH=/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin PHILOTIC_PROFILE='${REMOTE_PROFILE}' PHILOTIC_GRAPH_DATABASE_DIR='${REMOTE_GRAPH_DIR}' PHILOTIC_LIFE_GRAPH_RUNNER_HOME_NODE='${LIFE_GRAPH_RUNNER_HOME_NODE}' PHILOTIC_REMOTE_LIFE_GRAPH_RUNNER_NODE='${REMOTE_LIFE_GRAPH_RUNNER_NODE}' PHILOTIC_ENABLE_RUST_AUTH=1 PHILOTIC_ENABLE_RUST_DISPATCHER=1 PHILOTIC_ENABLE_RUST_TASK_LIFECYCLE=1 /opt/homebrew/bin/aiua --hotel ${HOTEL_NAME} >> ~/.philotic/${REMOTE_PROFILE}/aiua.log 2>&1 & echo \$! > ~/.philotic/${REMOTE_PROFILE}/aiua.pid && echo 'aiua started pid '\$(cat ~/.philotic/${REMOTE_PROFILE}/aiua.pid)"
   fi
-  echo "  ✓ ${LAUNCHD_LABEL} restarted under launchd supervision"
-else
-  echo "▶ No launchd service — hand-starting hotel '${HOTEL_NAME}' on ${REMOTE} with Rust cutover flags..."
-  ssh "${SSH_OPTS[@]}" "${REMOTE}" "ulimit -n 65536; nohup env PATH=/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin PHILOTIC_PROFILE='${REMOTE_PROFILE}' PHILOTIC_GRAPH_DATABASE_DIR='${REMOTE_GRAPH_DIR}' PHILOTIC_LIFE_GRAPH_RUNNER_HOME_NODE='${LIFE_GRAPH_RUNNER_HOME_NODE}' PHILOTIC_REMOTE_LIFE_GRAPH_RUNNER_NODE='${REMOTE_LIFE_GRAPH_RUNNER_NODE}' PHILOTIC_ENABLE_RUST_AUTH=1 PHILOTIC_ENABLE_RUST_DISPATCHER=1 PHILOTIC_ENABLE_RUST_TASK_LIFECYCLE=1 /opt/homebrew/bin/aiua --hotel ${HOTEL_NAME} >> ~/.philotic/${REMOTE_PROFILE}/aiua.log 2>&1 & echo \$! > ~/.philotic/${REMOTE_PROFILE}/aiua.pid && echo 'aiua started pid '\$(cat ~/.philotic/${REMOTE_PROFILE}/aiua.pid)"
+}
+
+# If anything between the stop and the restart fails or the script is
+# interrupted, bring the hotel back on whatever binaries are in place rather
+# than leaving it booted out. (SIGKILL cannot be trapped; the installed
+# aiua-watchdog re-bootstraps an unloaded hotel within ~2 min for that case.)
+HOTEL_STOPPED=0
+on_exit_restart() {
+  local rc=$?
+  if [[ ${HOTEL_STOPPED} -eq 1 ]]; then
+    HOTEL_STOPPED=0
+    echo "⚠ Push aborted after the hotel was stopped (exit ${rc}) — restarting it so agents are not left down." >&2
+    restart_hotel || echo "❌ Automatic restart failed; bootstrap ${LAUNCHD_LABEL:-the hotel} on ${REMOTE} by hand." >&2
+  fi
+  exit "${rc}"
+}
+trap on_exit_restart EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+# One remote shell installs every staged binary through a NEW inode (cp to a
+# temp name + mv): an in-place cp reuses the inode and the kernel's cached code
+# signature then SIGKILLs the binary at spawn (OS_REASON_CODESIGNING) —
+# `codesign -f` alone does not clear that cache.
+read -r -d '' REMOTE_INSTALL <<'INSTALL' || true
+set -uo pipefail
+cellar="$1"; stage="$2"; phil_cellar="$3"; shift 3
+fail=0
+for bin in "$@"; do
+  new=1
+  if [ -f "$cellar/$bin" ]; then new=0; chmod u+w "$cellar/$bin" 2>/dev/null || true; fi
+  if ! cp "$stage/$bin" "$cellar/$bin.new-inode" || ! mv -f "$cellar/$bin.new-inode" "$cellar/$bin"; then
+    echo "  ✗ $bin"; fail=1; continue
+  fi
+  chmod +x "$cellar/$bin"
+  xattr -d com.apple.quarantine "$cellar/$bin" 2>/dev/null || true
+  codesign -s - --force "$cellar/$bin" >/dev/null 2>&1 || true
+  ln -sf "$cellar/$bin" "/opt/homebrew/bin/$bin"
+  if [ "$new" -eq 1 ]; then chmod 555 "$cellar/$bin"; echo "  + $bin (new)"
+  else chmod u-w "$cellar/$bin" 2>/dev/null || true; echo "  ✓ $bin"; fi
+done
+if [ -n "$phil_cellar" ] && [ -f "$stage/philotic-web" ]; then
+  chmod u+w "$phil_cellar/philotic-web" "$phil_cellar/phil" 2>/dev/null || true
+  if cp "$stage/philotic-web" "$phil_cellar/philotic-web.new-inode" && mv -f "$phil_cellar/philotic-web.new-inode" "$phil_cellar/philotic-web" \
+     && cp "$stage/philotic-web" "$phil_cellar/phil.new-inode" && mv -f "$phil_cellar/phil.new-inode" "$phil_cellar/phil"; then
+    chmod +x "$phil_cellar/philotic-web" "$phil_cellar/phil"
+    xattr -d com.apple.quarantine "$phil_cellar/philotic-web" "$phil_cellar/phil" 2>/dev/null || true
+    codesign -s - --force "$phil_cellar/philotic-web" "$phil_cellar/phil" >/dev/null 2>&1 || true
+    chmod u-w "$phil_cellar/philotic-web" "$phil_cellar/phil" 2>/dev/null || true
+    echo "  ✓ phil / philotic-web"
+  else
+    echo "  ✗ phil / philotic-web"; fail=1
+  fi
 fi
+exit "$fail"
+INSTALL
+
+PHIL_ARG=""
+if [[ ${INSTALL_PHIL} -eq 1 ]]; then
+  PHIL_ARG="${PHIL_CELLAR}"
+fi
+
+echo "▶ Stopping hotel '${HOTEL_NAME}' on ${REMOTE}..."
+STOP_EPOCH="$(date +%s)"
+HOTEL_STOPPED=1
+BOOTOUT_LABEL="${LAUNCHD_LABEL:-com.philotic.aiua.${HOTEL_NAME}}"
+ssh "${SSH_OPTS[@]}" "${REMOTE}" "uid=\$(id -u); launchctl bootout gui/\${uid}/${BOOTOUT_LABEL} 2>/dev/null || true; pkill -f '[a]iua --hotel ${HOTEL_NAME}' 2>/dev/null || pkill -f '[a]iua-webrtc-debug --hotel ${HOTEL_NAME}' 2>/dev/null || true; sleep 2"
+
+echo "▶ Installing staged binaries on ${REMOTE}..."
+if ! ssh "${SSH_OPTS[@]}" "${REMOTE}" "bash -s -- $(printf '%q ' "${AIUA_CELLAR}" "${STAGE_DIR}" "${PHIL_ARG}" "${BIN_NAMES[@]}")" <<<"${REMOTE_INSTALL}"; then
+  echo "❌ One or more binaries failed to install on ${REMOTE}." >&2
+  exit 1
+fi
+
+restart_hotel
+HOTEL_STOPPED=0
+trap - EXIT INT TERM
+echo "  hotel was stopped for $(( $(date +%s) - STOP_EPOCH ))s"
 
 # Loading mesh config may consult hotel-materialized services such as Muninn.
 # Do it only after supervision is restored, and retry during guest startup. A

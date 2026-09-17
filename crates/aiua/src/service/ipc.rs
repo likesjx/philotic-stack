@@ -6951,6 +6951,18 @@ impl IpcServer {
                         peer_agent_node_from_roster(reg.remote_hotel_states(), &target_agent_id);
                 }
                 let Some(target_node_id) = target_node_id else {
+                    // Name the peers this hotel CAN reach, so the model can
+                    // correct a wrong agent id instead of guessing.
+                    let known: Vec<String> = {
+                        let reg = registry.read().await;
+                        let mut ids: Vec<String> = reg
+                            .remote_hotel_states()
+                            .flat_map(|state| state.agents.iter().map(|a| a.agent_id.clone()))
+                            .collect();
+                        ids.sort();
+                        ids.dedup();
+                        ids
+                    };
                     warn!(
                         target_agent_id = %target_agent_id,
                         authority_hotel = ?authority_hotel,
@@ -6960,15 +6972,21 @@ impl IpcServer {
                         "delegate_to_peer",
                         "DELEGATION_UNROUTABLE",
                         &format!(
-                            "no hotel on this mesh is known to host agent '{}'{}; the delegation was NOT sent — \
-                             the peer's hotel may not be syncing its roster, or the agent id is wrong",
+                            "no hotel on this mesh is known to host agent '{}'{}; the delegation was NOT sent \
+                             and nothing is queued — the peer agent ids this hotel can see are [{}]; retry with \
+                             one of them, or tell the user the peer is unreachable",
                             target_agent_id,
                             authority_hotel
                                 .as_deref()
                                 .map(|h| format!(
                                     " (its recorded authority hotel '{h}' resolves to no mesh node)"
                                 ))
-                                .unwrap_or_default()
+                                .unwrap_or_default(),
+                            if known.is_empty() {
+                                "none visible right now".to_string()
+                            } else {
+                                known.join(", ")
+                            }
                         ),
                     );
                 };
@@ -8969,6 +8987,22 @@ impl IpcServer {
             // ── Cron scheduler ──────────────────────────────────────────────
             IpcRequest::RegisterCronJob { mut job } => {
                 Self::normalize_cron_target_role(graph, &mut job);
+                if job.target_role.starts_with("role:")
+                    && !crate::service::cron_ticker::cron_payload_reaches_an_agent(&job.payload)
+                {
+                    return IpcResponse::error(
+                        "register_cron_job",
+                        "CRON_PAYLOAD_UNDELIVERABLE",
+                        format!(
+                            "cron job NOT registered: a job for {} must carry its instruction in a \
+                             `message` string, e.g. {{\"message\": \"Run the LifeGraph gardening review \
+                             now: …\"}}. A payload with no `message`/`content` (got: {}) is dropped \
+                             by the agent every time it fires.",
+                            job.target_role,
+                            job.payload.chars().take(160).collect::<String>()
+                        ),
+                    );
+                }
                 // Ownership is stamped from the connection identity, never
                 // trusted from the wire: a guest's jobs belong to its agent.
                 if let Some(identity) = current_identity.as_ref() {
@@ -9549,6 +9583,14 @@ impl IpcServer {
                         "mesh_peers": mesh_peers,
                     })),
                 )
+            }
+
+            IpcRequest::GetMemoryReport => {
+                // Proposal S6a: honest-sourcing memory-health report. Read-only;
+                // sources recall effectiveness from the session-event ledger and
+                // marks the multi-node/replication fields `unavailable`.
+                let report = crate::memory_report::assemble_live_memory_report(graph);
+                IpcResponse::success("memory_report", serde_json::to_value(&report).ok())
             }
 
             IpcRequest::BestPlaceToRun {
@@ -11386,6 +11428,17 @@ impl IpcServer {
                     mcp_upstream_materialized: false,
                 }
             }
+
+            IpcRequest::GetToolCatalog {} => match graph.list_abstract_tools() {
+                Ok(tool_catalog) => IpcResponse::ToolCatalogState { tool_catalog },
+                Err(err) => IpcResponse::Standard {
+                    ok: false,
+                    code: "tool_catalog_read_failed".into(),
+                    message: format!("tool catalog read failed: {err}"),
+                    corr_id: String::new(),
+                    data: None,
+                },
+            },
 
             IpcRequest::GetMcpUpstreams {} => {
                 use ansible_mesh_core::mcp_upstream::{McpUpstreamCatalog, McpUpstreamConfig};
@@ -29634,6 +29687,7 @@ pub(crate) mod tests {
                 input_schema: serde_json::json!({ "type": "object" }),
                 class: "config".into(),
                 tool_markers: vec!["high_agency".into(), "local_only".into()],
+                batch_of: None,
             })
             .expect("seed abstract tool");
         graph

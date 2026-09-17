@@ -61,6 +61,15 @@ philotic_hotel_port: 9000        # IPC listen port
 philotic_runtime_dir: "/run/philotic"
 philotic_hotel_socket: "{{ philotic_runtime_dir }}/{{ philotic_hotel_runtime_name }}.sock"
 
+# Muninn memory sleep (Phase 2 M6, crates/aiua/src/dream.rs). Enable ONLY on the
+# Cortex hotel (the hotel with no muninn_write_route); other hotels skip at run
+# time anyway. `enabled` registers the nightly 03:30 UTC cron and produces a
+# proposal-only report at config memory_sleep:last_run:<hotel>. `mutate` lets it
+# consolidate exact duplicates and forget diagnostic traffic — read a proposal
+# run first.
+philotic_memory_sleep_enabled: false
+philotic_memory_sleep_mutate: false
+
 # Mesh auth
 philotic_enable_rust_auth: "1"
 philotic_enable_rust_dispatcher: "1"

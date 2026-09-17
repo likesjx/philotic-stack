@@ -129,7 +129,7 @@ pub(crate) fn tool_result_is_error(content: &str) -> bool {
     // failed: …", "Tool execution failed: …", "Unexpected hotel response …".
     // Live 2026-09-15 22:55 EDT: a runner contract_error rendered this way
     // read as ok, so the write receipt listed the failed observe as
-    // "Written this turn" and the plan step verified (DEF-144).
+    // "Written this turn" and the plan step verified (DEF-146).
     if head_l.starts_with("tool call failed")
         || head_l.starts_with("capability call failed")
         || head_l.starts_with("tool execution failed")
@@ -1046,7 +1046,7 @@ mod tool_result_is_error_tests {
 
     #[test]
     fn philote_rendered_tool_failure_is_an_error() {
-        // Live 2026-09-16 09:50 EDT shape (DEF-144).
+        // Live 2026-09-16 09:50 EDT shape (DEF-146).
         assert!(tool_result_is_error(
             "Tool call failed: provider failed: contract_error: failed to parse life.observe \
              parameters as LifeObserveInput: invalid type: string \"{}\", expected a map \
