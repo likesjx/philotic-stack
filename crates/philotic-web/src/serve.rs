@@ -699,7 +699,7 @@ pub async fn run(
         )
         .route(
             "/api/edge/lifegraph/node/:node_id",
-            get(edge::handle_edge_lifegraph_node),
+            get(edge::handle_edge_lifegraph_node).patch(edge::handle_edge_lifegraph_edit),
         )
         .route(
             "/api/edge/lifegraph/neighborhood/:node_id",

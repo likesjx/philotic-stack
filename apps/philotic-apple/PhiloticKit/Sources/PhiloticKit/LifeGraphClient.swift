@@ -274,6 +274,38 @@ public struct LifeNeighborhood: Codable, Equatable, Sendable {
 // MARK: - Client
 
 public struct LifeGraphClient: Sendable {
+    public enum EditError: Error, LocalizedError {
+        case conflict, unavailable, rejected(Int), invalidReceipt
+        public var errorDescription: String? {
+            switch self {
+            case .conflict: return "This node changed or is no longer available. Close the editor, reload, and review your changes before saving again."
+            case .unavailable: return "This hotel does not yet support node editing. Its web service and LifeGraph runner need the editor update."
+            case .rejected(let status): return "The hotel rejected this edit (HTTP \(status)). Your draft has been kept."
+            case .invalidReceipt: return "No valid audit receipt was returned. Reload to check the node before retrying."
+            }
+        }
+    }
+
+    public func editNode(baseURL: URL, bearerToken: String, nodeId: String,
+                         edit: LifeNodeEdit) async throws -> LifeNodeEditReceipt {
+        let url = baseURL.appending(path: "api/edge/lifegraph/node").appending(component: nodeId)
+        var request = URLRequest(url: url)
+        request.httpMethod = "PATCH"
+        request.setValue("Bearer \(bearerToken)", forHTTPHeaderField: "Authorization")
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = try JSONEncoder().encode(edit)
+        let (data, response) = try await session.data(for: request)
+        let status = (response as? HTTPURLResponse)?.statusCode ?? -1
+        if status == 409 { throw EditError.conflict }
+        if [404, 405, 501].contains(status) { throw EditError.unavailable }
+        guard status == 200 else { throw EditError.rejected(status) }
+        guard let receipt = try? JSONDecoder().decode(LifeNodeEditReceipt.self, from: data),
+              receipt.status == "saved", receipt.nodeId == nodeId, !receipt.auditId.isEmpty else {
+            throw EditError.invalidReceipt
+        }
+        return receipt
+    }
+
     public enum LifeGraphError: Error, Equatable {
         case badResponse(status: Int)
     }

@@ -679,6 +679,7 @@ impl DatasourceProvider for LifeGraphProvider {
             "life.patch.list" => self.handle_patch_list(task).await,
             "life.recall.stats" => self.handle_recall_stats(task).await,
             "life.view.node" => self.handle_view_node(task).await,
+            "life.node.edit" => self.handle_node_edit(task).await,
             "life.view.neighborhood" => self.handle_view_neighborhood(task).await,
             "life.list" => self.handle_list(task).await,
             "life.audit" => self.handle_audit(task).await,
@@ -736,6 +737,7 @@ fn change_notification_for(kind: &str, data: &Value) -> Option<Value> {
         "life.observe" => "observed",
         "life.tidy" => "tidied",
         "life.commit" => "committed",
+        "life.node.edit" => "edited",
         "life.resolve" | "life.conflict.resolve" => "resolved",
         "life.conflict" | "life.conflict.handle" => "conflict_opened",
         "life.patch.propose" => "patch_proposed",
@@ -748,7 +750,7 @@ fn change_notification_for(kind: &str, data: &Value) -> Option<Value> {
         .unwrap_or_default();
     let succeeded = matches!(
         status,
-        "proposed" | "committed" | "resolved" | "applied" | "awaiting_operator"
+        "proposed" | "committed" | "resolved" | "applied" | "awaiting_operator" | "saved"
     ) || (change_kind == "conflict_opened" && status == "open");
     if !succeeded {
         return None;
@@ -2768,6 +2770,49 @@ impl LifeGraphProvider {
             "count": output_rows.len(),
             "rows": output_rows,
         })))
+    }
+
+    async fn handle_node_edit(&self, task: &DatasourceTask) -> Result<ProviderOutput> {
+        use data_memorygraphrag::node_edit::{EDIT_QUERY, NodeEdit};
+        let input: NodeEdit = serde_json::from_value(task.parameters.clone())?;
+        if let Err(error) = input.validate() {
+            return Ok(ProviderOutput::ResultSet(
+                json!({"status": "invalid_request", "error": error}),
+            ));
+        }
+        let before = input
+            .before
+            .iter()
+            .map(|(k, v)| (k.clone(), json!(v)))
+            .collect();
+        let changes = input
+            .changes
+            .iter()
+            .map(|(k, v)| (k.clone(), json!(v)))
+            .collect();
+        let audit_id = format!("node-edit:{}", ulid::Ulid::new());
+        let graph = self.connect().await?;
+        let mut rows = graph
+            .execute(
+                query(EDIT_QUERY)
+                    .param("id", input.id.as_str())
+                    .param("actor", input.actor.as_str())
+                    .param("before", BoltType::Map(json_scalar_map_to_bolt(&before)))
+                    .param("changes", BoltType::Map(json_scalar_map_to_bolt(&changes)))
+                    .param("audit_id", audit_id.as_str())
+                    .param("edited_at", chrono::Utc::now().to_rfc3339())
+                    .param("before_json", serde_json::to_string(&input.before)?)
+                    .param("after_json", serde_json::to_string(&input.changes)?),
+            )
+            .await?;
+        let saved = rows.next().await?.is_some();
+        // Consume completion before returning a receipt (surface commit errors).
+        while rows.next().await?.is_some() {}
+        Ok(ProviderOutput::ResultSet(if saved {
+            json!({"status": "saved", "node_id": input.id, "audit_id": audit_id})
+        } else {
+            json!({"status": "conflict", "error": "Node missing, ambiguous, or changed. Reload before saving."})
+        }))
     }
 
     async fn handle_view_node(&self, task: &DatasourceTask) -> Result<ProviderOutput> {

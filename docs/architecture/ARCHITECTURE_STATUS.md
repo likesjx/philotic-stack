@@ -3,7 +3,7 @@ title: Philotic Architecture Status
 doc_type: status
 domain: runtime-sessions
 status: active
-last_updated: 2026-09-14
+last_updated: 2026-09-17
 tags:
 - source-of-truth
 - current-state
@@ -99,6 +99,11 @@ Philotic currently operates as a hotel-centered runtime:
 - The native Apple Health surface now separates selected-type, read-only HealthKit capture from explicit LifeGraph sharing: local ephemeral preview, completed local-day windows, no synthetic unavailable-store fallback, no background delivery, and no Health writes. Sleep intervals are clipped/unioned, observations use unique proposed Signals, and upload acknowledgment is checked per observation instead of treating failed/unknown batches as success. App logic and transport contracts are test-green; real-device permissions/capture, live sharing/agent recall, and server health-specific access/retention policy remain unproven or deferred. See [NATIVE_APPLE_APP_PROPOSAL.md](NATIVE_APPLE_APP_PROPOSAL.md).
 
 ## Implemented Foundations
+
+The native LifeGraph editor on `codex/lifegraph-editor` adds text corrections
+through an enrolled-device gateway and an atomic graph before/after audit, plus
+a one-hop directed relationship diagram. Contract/build tests pass; deployment
+and installed-app proof remain pending. See [scope and trust limitations](../../apps/philotic-apple/LIFEGRAPH.md).
 
 ### Runtime and authority
 
