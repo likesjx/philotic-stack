@@ -721,6 +721,18 @@ pub fn audit(nodes: &[AuditNode], edges: &[AuditEdge], opts: &AuditOptions) -> A
                 .into(),
         });
     }
+    // Category roles the operator already keeps (organist, pianist,
+    // health-and-wellness…). An orphan that names one belongs there; the
+    // anchor role is the fallback, not the destination for everything.
+    let role_targets: Vec<crate::bridging::BridgeTarget> = nodes
+        .iter()
+        .filter(|n| n.label == "Role" && n.validation_state.as_deref() != Some("retired"))
+        .map(|n| crate::bridging::BridgeTarget {
+            id: key_of(n),
+            label: "Role".into(),
+            title: n.claim_summary.clone(),
+        })
+        .collect();
     if let Some(anchor) = anchor_role_id.as_deref() {
         // Only canonical `life:` records are anchored. A node under another
         // scheme ("ontology:extensions", "pref-bjork-…") is a conformance
@@ -728,12 +740,31 @@ pub fn audit(nodes: &[AuditNode], edges: &[AuditEdge], opts: &AuditOptions) -> A
         // carries no id of its own for the plan evaluator to prove (live
         // 2026-09-15 18:30 UTC, DEF-137).
         for o in orphans.iter().filter(|o| o.id.starts_with("life:")) {
-            actions.push(TidyAction::Link {
-                from_id: o.id.clone(),
-                rel_type: "SCOPED_TO".into(),
-                to_id: anchor.to_string(),
-                reason: "orphan: attach to the operator's anchor role so it is reachable".into(),
-            });
+            let summary = index
+                .get(&o.id)
+                .and_then(|i| nodes[*i].claim_summary.as_deref())
+                .unwrap_or_default();
+            let category = crate::bridging::category_roles_for(summary, &role_targets)
+                .into_iter()
+                .find(|r| r != anchor);
+            match category {
+                Some(role) => actions.push(TidyAction::Link {
+                    from_id: o.id.clone(),
+                    rel_type: "SCOPED_TO".into(),
+                    reason: format!(
+                        "orphan: the claim names this role's own domain — attach it to {role} \
+                         rather than parking it on the anchor"
+                    ),
+                    to_id: role,
+                }),
+                None => actions.push(TidyAction::Link {
+                    from_id: o.id.clone(),
+                    rel_type: "SCOPED_TO".into(),
+                    to_id: anchor.to_string(),
+                    reason: "orphan: attach to the operator's anchor role so it is reachable"
+                        .into(),
+                }),
+            }
         }
     }
     actions.truncate(opts.max_actions);
@@ -990,6 +1021,53 @@ mod tests {
             r.suggested_actions
                 .iter()
                 .all(|a| matches!(a, TidyAction::RetireDuplicate { .. }))
+        );
+    }
+
+    /// DEF-160: an orphan that names a category role anchors there, not on
+    /// the operator's chief-of-staff spoke.
+    #[test]
+    fn an_orphan_anchors_to_the_category_role_it_names() {
+        let mut anchor = node("life:role:chief-of-staff", "Role", "confirmed");
+        anchor.claim_summary = Some("chief of staff".into());
+        let mut organist = node("life:role:organist", "Role", "confirmed");
+        organist.claim_summary = Some("organist".into());
+        let mut practice = node("life:event:organ_practice_20260916", "Event", "confirmed");
+        practice.claim_summary = Some("Jared practiced the organ tonight, two hymns.".into());
+        practice.best_date = Some("2099-01-01".into());
+        let mut errand = node("life:open_loop:buy_deodorant", "OpenLoop", "proposed");
+        errand.claim_summary = Some("Buy deodorant from Dr. Squatch.".into());
+
+        let opts = AuditOptions {
+            now_iso: "2026-09-17T12:00:00Z".into(),
+            ..AuditOptions::default()
+        };
+        // The anchor role is whatever most nodes are SCOPED_TO; give it one.
+        let mut settled = node("life:goal:already_anchored", "Goal", "confirmed");
+        settled.claim_summary = Some("An already-anchored goal.".into());
+        let r = audit(
+            &[anchor, organist, practice, errand, settled],
+            &[edge(
+                "life:goal:already_anchored",
+                "SCOPED_TO",
+                "life:role:chief-of-staff",
+            )],
+            &opts,
+        );
+        let link_to = |id: &str| -> Option<String> {
+            r.suggested_actions.iter().find_map(|a| match a {
+                TidyAction::Link { from_id, to_id, .. } if from_id == id => Some(to_id.clone()),
+                _ => None,
+            })
+        };
+        assert_eq!(
+            link_to("life:event:organ_practice_20260916").as_deref(),
+            Some("life:role:organist")
+        );
+        assert_eq!(
+            link_to("life:open_loop:buy_deodorant").as_deref(),
+            Some("life:role:chief-of-staff"),
+            "no category named → the anchor is the fallback"
         );
     }
 
