@@ -2557,9 +2557,11 @@ impl SessionState {
             return Vec::new();
         }
 
-        if !looks_like_memory_write_goal(&normalized) {
-            all_tools.retain(|tool| tool.tool_name != "memory.remember");
-        }
+        // Operator decision 2026-09-16: memory.remember is no longer hidden
+        // behind a write-intent keyword gate. It was offered on ≤2.5% of
+        // model calls, so a philote that learned something durable had no way
+        // to keep it — and one claimed a save it could not make. When the
+        // role grants it, the model always sees it.
         if !looks_like_memory_cultivation_goal(&normalized) {
             all_tools.retain(|tool| tool.tool_name != "memory.cultivate");
         }
@@ -5727,67 +5729,6 @@ fn looks_like_execution_goal(normalized: &str) -> bool {
     ]
     .iter()
     .any(|keyword| normalized.contains(keyword))
-}
-
-/// Whether to offer `memory.remember` for this turn.
-///
-/// Phase 2 M5 (2026-09-16 audit): the gate matched only explicit "remember" /
-/// "note this" phrasing, so the tool was offered on ≤2.5% of model calls and
-/// never called in 7 days. It now also opens on durable first-person facts,
-/// standing preferences and decisions — the statements a person expects to be
-/// remembered without saying "remember".
-fn looks_like_memory_write_goal(normalized: &str) -> bool {
-    const EXPLICIT: &[&str] = &[
-        "remember",
-        "write this down",
-        "store memory",
-        "save memory",
-        "note this",
-        "note that",
-        "make a note",
-        "keep in mind",
-        "don't forget",
-        "dont forget",
-        "for future reference",
-        "going forward",
-        "from now on",
-        "memory delta",
-        "decision:",
-        "operator preference",
-        "reality gap",
-        "next seam",
-        "closeout",
-    ];
-    const DURABLE_FIRST_PERSON: &[&str] = &[
-        "i prefer",
-        "i always",
-        "i never",
-        "i usually",
-        "i don't like",
-        "i dont like",
-        "i hate",
-        "i love",
-        "i decided",
-        "we decided",
-        "my birthday",
-        "my wife",
-        "my husband",
-        "my kids",
-        "my son",
-        "my daughter",
-        "my doctor",
-        "my address",
-        "my email",
-        "my phone",
-        "my schedule",
-        "call me",
-        "i'm allergic",
-        "i am allergic",
-    ];
-    EXPLICIT
-        .iter()
-        .chain(DURABLE_FIRST_PERSON.iter())
-        .any(|phrase| normalized.contains(phrase))
 }
 
 fn looks_like_memory_cultivation_goal(normalized: &str) -> bool {
@@ -11100,7 +11041,7 @@ mod tests {
     }
 
     #[test]
-    fn memory_write_tool_is_hidden_without_write_intent() {
+    fn memory_write_tool_is_visible_without_write_intent() {
         let mut state =
             SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
         state.clear_tool_bindings();
@@ -11116,7 +11057,8 @@ mod tests {
 
         assert!(projected_names.contains(&"memory.recall"));
         assert!(projected_names.contains(&"workspace.read"));
-        assert!(!projected_names.contains(&"memory.remember"));
+        // Operator decision 2026-09-16: granted memory tools are always visible.
+        assert!(projected_names.contains(&"memory.remember"));
     }
 
     #[test]
@@ -12095,29 +12037,6 @@ mod tests {
         // Whole items only: nothing is cut mid-content by the outer cap.
         assert!(!text.contains("truncated at"), "{text}");
         assert!(text.chars().count() <= 1_200, "{}", text.chars().count());
-    }
-
-    #[test]
-    fn memory_remember_is_offered_on_durable_personal_statements() {
-        for offered in [
-            "please remember my train leaves at 7",
-            "i prefer aisle seats on long flights",
-            "we decided to move rehearsal to thursdays",
-            "going forward, send the weekly review on sundays",
-            "i'm allergic to penicillin",
-        ] {
-            assert!(super::looks_like_memory_write_goal(offered), "{offered}");
-        }
-        for not_offered in [
-            "what time is it in london",
-            "thanks, that works",
-            "draft an email to the choir about sunday",
-        ] {
-            assert!(
-                !super::looks_like_memory_write_goal(not_offered),
-                "{not_offered}"
-            );
-        }
     }
 
     #[test]
