@@ -1,5 +1,7 @@
 pub use ansible_mesh_core::cron::{CronJob, CronJobId, CronJobSource};
-pub use ansible_mesh_core::graph::RoleIncarnationRecord;
+pub use ansible_mesh_core::graph::{
+    MembraneTransportHomeRecord, MembraneTransportHomeStatus, RoleIncarnationRecord,
+};
 pub use ansible_mesh_core::resources::{
     ResourceDenied, ResourceGranted, ResourceMaterializing, ResourceReleased, ResourceRequest,
     ResourceRevoked, ResourceType,
@@ -2424,6 +2426,18 @@ pub enum IpcRequest {
     RelocateHotelStatus {
         ceremony_id: String,
     },
+    /// List `membrane_transport_home` records, optionally filtered to one
+    /// agent and/or one transport. Read-only, no authority gate beyond
+    /// registration — used by a membrane guest at startup (and on an
+    /// ongoing basis, alongside `TransportHomeChanged` pushes) to discover
+    /// which agents it should seat a seat for, from graph truth rather than
+    /// only the static `PHILOTIC_AGENT_ROSTER` a hotel was booted with.
+    ListMembraneTransportHomes {
+        #[serde(default)]
+        agent_id: Option<String>,
+        #[serde(default)]
+        transport: Option<String>,
+    },
 }
 
 fn default_heal_queue_limit() -> usize {
@@ -3118,6 +3132,15 @@ pub enum IpcResponse {
         decline_reason: Option<String>,
         #[serde(default)]
         needs_operator_review: bool,
+    },
+    /// Response to [`IpcRequest::ListMembraneTransportHomes`].
+    ///
+    /// Untagged-serde safety: the required, uniquely-named
+    /// `membrane_transport_home_list` marker field disambiguates this
+    /// variant.
+    MembraneTransportHomeList {
+        membrane_transport_home_list: bool,
+        homes: Vec<MembraneTransportHomeRecord>,
     },
     // CRITICAL: `MemoryConfig` (all-optional payload) must remain the LAST
     // variant of this untagged enum — see `project_cron_scheduler.md` /
