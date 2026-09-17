@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - single-flight-materialization
+
+rectangle "single-flight-materialization" as single_flight_materialization #Orange {
+}
+
+
+@enduml

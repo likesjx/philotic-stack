@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - lyra-travel-agent
+
+rectangle "lyra-travel-agent" as lyra_travel_agent #Orange {
+}
+
+
+@enduml

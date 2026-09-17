@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - idea-closure-loop
+
+rectangle "idea-closure-loop" as idea_closure_loop #Orange {
+}
+
+
+@enduml

@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - mcp-client-guest
+
+rectangle "mcp-client-guest" as mcp_client_guest #Orange {
+}
+
+
+@enduml

@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - apple-custom-intents
+
+rectangle "apple-custom-intents" as apple_custom_intents #Orange {
+}
+
+
+@enduml

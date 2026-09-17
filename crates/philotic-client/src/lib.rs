@@ -3513,6 +3513,21 @@ impl PhiloticClient {
                 // response and contaminating subsequent request/response pairs.
                 | IpcResponse::MuninnStatus { .. }
                 | IpcResponse::NetworkState { .. }
+                // DEF-157: TransportHomeChanged is broadcast to EVERY locally-connected
+                // guest on this hotel (ipc.rs's local push, and main.rs's gossip-received
+                // push), not just the membrane seat it's actually for — every other guest's
+                // recv_task()/read_matching_response() call must be able to see it pass
+                // through cleanly instead of bailing as an unrecognized response. Found
+                // live 2026-09-16/17 running the Relocation Ceremony's R2 gate: guests with
+                // no interest in it at all (router-listener, model-router, philote-worker,
+                // membrane-discord, and membrane-telegram's own generic runtime loop) hit
+                // "Unexpected non-push IPC response" bails/errors whenever a flip landed
+                // mid-request on their connection — router-listener even logged a fatal
+                // error. The one guest that actually acts on it (membrane-telegram's
+                // MembraneRuntime::handle_push) already matches on it explicitly, so
+                // classifying it as a push here does not change that guest's behavior —
+                // it only stops recv_task() from erroring for everyone else.
+                | IpcResponse::TransportHomeChanged { .. }
         )
     }
 

@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - park-ttl
+
+rectangle "park-ttl" as park_ttl #Orange {
+}
+
+
+@enduml

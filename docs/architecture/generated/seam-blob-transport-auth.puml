@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - blob-transport-auth
+
+rectangle "blob-transport-auth" as blob_transport_auth #Orange {
+}
+
+
+@enduml

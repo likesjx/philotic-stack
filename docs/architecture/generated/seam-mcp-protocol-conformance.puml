@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - mcp-protocol-conformance
+
+rectangle "mcp-protocol-conformance" as mcp_protocol_conformance #Orange {
+}
+
+
+@enduml

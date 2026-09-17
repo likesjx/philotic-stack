@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - lifegraph-read-plane
+
+rectangle "lifegraph-read-plane" as lifegraph_read_plane #Orange {
+}
+
+
+@enduml

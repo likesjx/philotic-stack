@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - session-search-fts
+
+rectangle "session-search-fts" as session_search_fts #Orange {
+}
+
+
+@enduml

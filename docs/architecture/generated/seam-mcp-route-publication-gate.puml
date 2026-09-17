@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - mcp-route-publication-gate
+
+rectangle "mcp-route-publication-gate" as mcp_route_publication_gate #Orange {
+}
+
+
+@enduml
