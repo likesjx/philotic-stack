@@ -2925,6 +2925,15 @@ fn ensure_workspace_exists(workspace: &Path, existing_bundle: Option<&serde_json
     }
 }
 
+/// Remove `admin_password` from the `muninn` context-graph entry before it is
+/// persisted to node_config. Returns true when a password was removed.
+fn strip_muninn_admin_password(key: &str, value: &mut serde_json::Value) -> bool {
+    key == "muninn"
+        && value
+            .as_object_mut()
+            .is_some_and(|obj| obj.remove("admin_password").is_some())
+}
+
 fn extract_context_graph_entries(
     config_json: &serde_json::Value,
     hotel_name: Option<&str>,
@@ -7127,7 +7136,16 @@ async fn run_load_command(file: &str, hotel_name: &str) -> Result<()> {
     let entries = extract_context_graph_entries(&config_json, Some(hotel_name));
     if !entries.is_empty() {
         let mut count = 0;
-        for (key, value) in entries {
+        for (key, mut value) in entries {
+            // Never persist the Muninn admin password into node_config: the
+            // credential lives encrypted in the hotel vault
+            // (`muninn_admin_secret_ref`), resolved by
+            // `muninn_provision::resolve_admin_credential`.
+            if strip_muninn_admin_password(&key, &mut value) {
+                info!(
+                    "load: dropped plaintext muninn.admin_password from node_config (vault-held)"
+                );
+            }
             let val_str = if value.is_string() {
                 serde_json::to_string(&value)?
             } else {
@@ -7160,14 +7178,25 @@ async fn run_load_command(file: &str, hotel_name: &str) -> Result<()> {
             .get("endpoint")
             .and_then(|v| v.as_str())
             .unwrap_or("http://127.0.0.1:8475");
-        let username = muninn
-            .get("admin_username")
-            .and_then(|v| v.as_str())
-            .unwrap_or("root");
-        let password = muninn
-            .get("admin_password")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
+        // Prefer the hotel-vault credential; fall back to the config file.
+        // After an observer is restored from a Cortex checkpoint its auth store
+        // is the Cortex's, so a stale file password 401s the whole load.
+        let vault_credential = muninn_provision::resolve_admin_credential(&graph_domain)
+            .ok()
+            .flatten();
+        let (username, password) = match vault_credential.as_ref() {
+            Some(cred) => (cred.username.as_str(), cred.password.as_str()),
+            None => (
+                muninn
+                    .get("admin_username")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("root"),
+                muninn
+                    .get("admin_password")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or(""),
+            ),
+        };
         graph_domain.set_muninn_endpoint(endpoint)?;
         let vault_names = muninn_provision::derive_vault_names(&config_json);
         if !vault_names.is_empty() {
@@ -9041,6 +9070,29 @@ mod tests {
     /// class expansion (the thin utility/scheduler/virtuoso/codex/research
     /// profiles previously left theoretician, virtuosa, Chronos and echo
     /// without memory).
+    #[test]
+    fn load_never_persists_the_muninn_admin_password() {
+        let mut muninn = serde_json::json!({
+            "endpoint": "http://127.0.0.1:8475",
+            "admin_username": "root",
+            "admin_password": "plaintext"
+        });
+        assert!(super::strip_muninn_admin_password("muninn", &mut muninn));
+        assert!(muninn.get("admin_password").is_none());
+        assert_eq!(muninn["endpoint"], "http://127.0.0.1:8475");
+        assert_eq!(muninn["admin_username"], "root");
+
+        // Other keys and password-less entries are untouched.
+        let mut other = serde_json::json!({"admin_password": "keep"});
+        assert!(!super::strip_muninn_admin_password(
+            "integration",
+            &mut other
+        ));
+        assert_eq!(other["admin_password"], "keep");
+        let mut clean = serde_json::json!({"endpoint": "x"});
+        assert!(!super::strip_muninn_admin_password("muninn", &mut clean));
+    }
+
     #[test]
     fn every_seeded_profile_grants_memory_recall_and_remember() {
         let storage = SqliteGraphStorage::open(":memory:").expect("open sqlite");
