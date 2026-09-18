@@ -2970,7 +2970,41 @@ impl TelegramSeatGuest {
             }
         };
 
-        Ok((!token.is_empty()).then_some(token))
+        if !token.starts_with("secret://") {
+            return Ok((!token.is_empty()).then_some(token));
+        }
+        // The config key holds a vault ref (DEF-176): the token itself is
+        // encrypted in the hotel vault, readable by the `membrane` role.
+        match client
+            .send_request(IpcRequest::GetSecret {
+                secret_ref: token.clone(),
+            })
+            .await?
+        {
+            IpcResponse::SecretData {
+                value_json: Some(json_str),
+                ..
+            } => {
+                let resolved = serde_json::from_str::<String>(&json_str).unwrap_or(json_str);
+                Ok((!resolved.is_empty()).then_some(resolved))
+            }
+            IpcResponse::SecretData {
+                value_json: None, ..
+            } => {
+                warn!(
+                    "Telegram Bot Token key [{}] points at vault ref [{}], which this hotel does not hold.",
+                    self.telegram_token_key, token
+                );
+                Ok(None)
+            }
+            other => {
+                warn!(
+                    "Failed to resolve Telegram Bot Token vault ref for key [{}]: {:?}",
+                    self.telegram_token_key, other
+                );
+                Ok(None)
+            }
+        }
     }
 }
 
