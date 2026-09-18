@@ -2413,15 +2413,14 @@ impl AgentRuntime {
         );
 
         for memory_type in &memory_types {
-            // Derive session_id from memory_type: "short_session:{session_id}"
-            let Some(session_id) = memory_type.strip_prefix("short_session:") else {
-                continue;
-            };
-            let snapshot_key = format!("__session_snapshot__:{session_id}");
+            // Read the raw checkpoint, not the hotel's composed snapshot: the
+            // sweep writes back what it reads, and anything short of the full
+            // checkpoint would erase the fields it didn't carry (DEF-167).
+            let apartment_key = format!("__apartment__:{}:{memory_type}", self.agent_id);
             let checkpoint = match self
                 .ipc_client
                 .send_request_with_timeout(
-                    IpcRequest::GetConfig { key: snapshot_key },
+                    IpcRequest::GetConfig { key: apartment_key },
                     std::time::Duration::from_secs(5),
                 )
                 .await
@@ -2435,12 +2434,25 @@ impl AgentRuntime {
                 },
                 Err(_) => {
                     warn!(
-                        "sweep_stale_session_turns: snapshot fetch timed out for session {session_id} — skipping"
+                        "sweep_stale_session_turns: checkpoint fetch timed out for {memory_type} — skipping"
                     );
                     continue;
                 }
                 _ => continue,
             };
+            let Some(session_id) = checkpoint
+                .get("session_id")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+            else {
+                continue;
+            };
+            // Only sweep this process's own checkpoints: the orchestrator and
+            // each role process keep separate keys for the same session, and
+            // a turn in flight in another process is not this one's to drop.
+            if crate::session::session_checkpoint_memory_type(&session_id) != *memory_type {
+                continue;
+            }
 
             let had_active_turn = checkpoint
                 .get("active_turn")

@@ -1795,17 +1795,38 @@ impl GraphDomain {
     }
 
     /// List apartment memory types for an agent.
+    ///
+    /// A memory type can itself contain colons — a session checkpoint is
+    /// `short_session:{session_id}[:{role}]` and session ids are
+    /// `{source}:{chat}:{agent}` — so the type is everything after the
+    /// agent's key prefix, never the last segment (DEF-167: the last-segment
+    /// parse returned the agent id for every session checkpoint, so neither
+    /// the startup sweep nor any export could ever find one).
     pub fn list_apartments(&self, agent_id: &str) -> Result<Vec<String>> {
         let prefix = format!("{}:{}:", NODE_KIND_APARTMENT, agent_id);
         let mut out = Vec::new();
         for node in self.adapter.list_nodes_by_kind(NODE_KIND_APARTMENT)? {
-            if !node.node_key.starts_with(&prefix) {
+            let Some(from_key) = node.node_key.strip_prefix(&prefix) else {
+                continue;
+            };
+            if node
+                .data
+                .get("agent_id")
+                .and_then(serde_json::Value::as_str)
+                != Some(agent_id)
+                && node.data.get("agent_id").is_some()
+            {
+                // `agent-a:` is also a prefix of `agent-a:b`'s keys — the
+                // stored agent id settles which agent owns the node.
                 continue;
             }
-            if let Some(memory_type) = node.node_key.rsplit(':').next() {
-                if !memory_type.is_empty() {
-                    out.push(memory_type.to_string());
-                }
+            let memory_type = node
+                .data
+                .get("memory_type")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or(from_key);
+            if !memory_type.is_empty() {
+                out.push(memory_type.to_string());
             }
         }
         Ok(out)
