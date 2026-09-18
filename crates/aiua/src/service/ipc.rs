@@ -939,6 +939,60 @@ fn attach_delivery_context(
     serde_json::to_string(&payload).unwrap_or_else(|_| task_json.to_string())
 }
 
+/// Payload field naming the agent that owns a membrane-bound task no seat was
+/// addressed by. Membrane seats serving a different agent drop the task.
+pub(crate) const REPLY_OWNER_AGENT_ID_FIELD: &str = "reply_owner_agent_id";
+
+/// Stamps [`REPLY_OWNER_AGENT_ID_FIELD`] on a membrane-bound task that carries
+/// no seat target, taken from the emitter's registered identity — never from
+/// the payload, which any guest could forge.
+///
+/// A seat-less membrane task is delivered to EVERY local membrane seat, and a
+/// Telegram DM chat id is the same under every bot token. Seats filtered by
+/// parsing the agent out of the session id, which `cron:<job_id>` sessions
+/// never name — so each daily Bjork cron brief also went out through the
+/// Coach bot (2026-09-18). The emitter is the authority on who is replying.
+///
+/// Only a registered `agent` whose guest id (`agent-x` or `agent-x:<role>`)
+/// resolves to a known agent identity is stamped; anything else (subagents
+/// with UUID ids, infra guests) has the field removed so seats fall back to
+/// the session-id check.
+fn stamp_reply_owner_agent(
+    graph: &GraphDomain,
+    emitter: Option<&GuestIdentity>,
+    target_role: &str,
+    target_guest_id: Option<&str>,
+    task_json: String,
+) -> String {
+    if target_role != "membrane" || target_guest_id.is_some() {
+        return task_json;
+    }
+    let Ok(mut payload) = serde_json::from_str::<serde_json::Value>(&task_json) else {
+        return task_json;
+    };
+    let Some(obj) = payload.as_object_mut() else {
+        return task_json;
+    };
+    let owner = emitter
+        .filter(|identity| identity.role == "agent")
+        .and_then(|identity| identity.guest_id.split(':').next())
+        .filter(|agent_id| matches!(graph.get_agent_identity(agent_id), Ok(Some(_))));
+    match owner {
+        Some(agent_id) => {
+            obj.insert(
+                REPLY_OWNER_AGENT_ID_FIELD.to_string(),
+                serde_json::json!(agent_id),
+            );
+        }
+        None => {
+            if obj.remove(REPLY_OWNER_AGENT_ID_FIELD).is_none() {
+                return task_json;
+            }
+        }
+    }
+    serde_json::to_string(&payload).unwrap_or(task_json)
+}
+
 /// Guest-record roles that can never consume `role="agent"` deliveries. Used to reject
 /// poisoned placement-provenance hints (see `guest_can_fill_agent_placement`): tool and
 /// datasource runners such as `life-graph-runner` are dispatch TARGETS of an agent's
@@ -6078,6 +6132,13 @@ impl IpcServer {
                     );
                     return IpcResponse::success("emit", None);
                 }
+                let task_json = stamp_reply_owner_agent(
+                    graph,
+                    current_identity.as_ref(),
+                    &target_role,
+                    target_guest_id.as_deref(),
+                    task_json,
+                );
                 // Normalize the client-SDK default node id sentinel. A client
                 // that never learned its node (PHILOTIC_NODE_ID unset) sends
                 // "local-aiua-01", which means "the hotel I am connected to".
@@ -18507,6 +18568,115 @@ pub(crate) mod tests {
     fn register_skill_test_graph() -> GraphDomain {
         let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
         GraphDomain::new(Arc::new(graph_store.adapter()))
+    }
+
+    // ── stamp_reply_owner_agent (cron brief sent by every bot, 2026-09-18) ────
+
+    mod reply_owner_stamp {
+        use super::*;
+
+        fn graph_with_agents(agent_ids: &[&str]) -> GraphDomain {
+            let graph = register_skill_test_graph();
+            for agent_id in agent_ids {
+                graph
+                    .upsert_agent_identity(&AgentIdentityRecord {
+                        agent_id: (*agent_id).into(),
+                        persona_name: (*agent_id).into(),
+                        authority_hotel: "mac-jane".into(),
+                        bundle_json: serde_json::json!({}),
+                    })
+                    .expect("seed agent identity");
+            }
+            graph
+        }
+
+        fn identity(guest_id: &str, role: &str) -> GuestIdentity {
+            GuestIdentity {
+                guest_id: guest_id.into(),
+                role: role.into(),
+                supported_tools: Vec::new(),
+            }
+        }
+
+        fn cron_reply() -> String {
+            serde_json::json!({
+                "action": "send_reply",
+                "session_id": "cron:lifegraph-flywheel-daily:mac-jane",
+                "chat_id": "7898847424",
+                "content": "brief",
+            })
+            .to_string()
+        }
+
+        fn owner(task_json: &str) -> Option<String> {
+            serde_json::from_str::<serde_json::Value>(task_json).unwrap()
+                [REPLY_OWNER_AGENT_ID_FIELD]
+                .as_str()
+                .map(str::to_string)
+        }
+
+        #[test]
+        fn role_incarnation_reply_is_owned_by_its_agent() {
+            let graph = graph_with_agents(&["agent-bjork-01", "agent-coach"]);
+            let emitter = identity("agent-bjork-01:orchestrator", "agent");
+            let stamped =
+                stamp_reply_owner_agent(&graph, Some(&emitter), "membrane", None, cron_reply());
+            assert_eq!(owner(&stamped).as_deref(), Some("agent-bjork-01"));
+        }
+
+        #[test]
+        fn emitter_identity_overrides_a_forged_payload_owner() {
+            let graph = graph_with_agents(&["agent-bjork-01", "agent-coach"]);
+            let mut forged: serde_json::Value = serde_json::from_str(&cron_reply()).unwrap();
+            forged[REPLY_OWNER_AGENT_ID_FIELD] = serde_json::json!("agent-coach");
+            let emitter = identity("agent-bjork-01", "agent");
+            let stamped = stamp_reply_owner_agent(
+                &graph,
+                Some(&emitter),
+                "membrane",
+                None,
+                forged.to_string(),
+            );
+            assert_eq!(owner(&stamped).as_deref(), Some("agent-bjork-01"));
+        }
+
+        #[test]
+        fn unknown_or_non_agent_emitters_leave_no_owner() {
+            let graph = graph_with_agents(&["agent-bjork-01"]);
+            let mut forged: serde_json::Value = serde_json::from_str(&cron_reply()).unwrap();
+            forged[REPLY_OWNER_AGENT_ID_FIELD] = serde_json::json!("agent-coach");
+            for emitter in [
+                Some(identity("14ce429a-fd39-4b3e-8447-5867e59a9b30", "agent")),
+                Some(identity("agent-bjork-01", "tool")),
+                None,
+            ] {
+                let stamped = stamp_reply_owner_agent(
+                    &graph,
+                    emitter.as_ref(),
+                    "membrane",
+                    None,
+                    forged.to_string(),
+                );
+                assert_eq!(owner(&stamped), None, "emitter {emitter:?}");
+            }
+        }
+
+        #[test]
+        fn seat_targeted_and_non_membrane_tasks_are_untouched() {
+            let graph = graph_with_agents(&["agent-bjork-01"]);
+            let emitter = identity("agent-bjork-01", "agent");
+            let targeted = stamp_reply_owner_agent(
+                &graph,
+                Some(&emitter),
+                "membrane",
+                Some("mac-jane:membrane-gateway-bjork"),
+                cron_reply(),
+            );
+            assert_eq!(targeted, cron_reply());
+            let to_agent =
+                stamp_reply_owner_agent(&graph, Some(&emitter), "agent", None, cron_reply());
+            assert_eq!(to_agent, cron_reply());
+        }
     }
 
     // ── steward_agent_admin_gate (aria-mesh-steward slice 1) ──────────────────
