@@ -246,7 +246,7 @@ fn agent_graph_db_path(agent_id: &str) -> Option<String> {
 use ansible_mesh_core::domain::GraphDomain;
 use ansible_mesh_core::event::EventEnvelope;
 use auth::AuthCommand;
-use vault::{SecretAccess, SecretInput, resolve_secret, store_secret};
+use vault::{SecretAccess, SecretInput, resolve_secret, rotate_secret, store_secret};
 
 /// Instructions for the strictly-serialized DB writer thread
 pub enum LedgerCommand {
@@ -1251,6 +1251,66 @@ fn resolve_internal_secret(graph: &GraphDomain, secret_ref: &str) -> Result<Stri
         },
     )?
     .ok_or_else(|| anyhow::anyhow!("vault secret not found: {secret_ref}"))
+}
+
+/// Vault kind for a Telegram bot token.
+const TELEGRAM_BOT_TOKEN_SECRET_KIND: &str = "telegram_bot_token";
+
+/// Only Telegram seats read a bot token.
+const TELEGRAM_BOT_TOKEN_READER_ROLE: &str = "membrane";
+
+/// Is `key` a config key whose value is a Telegram bot token — the global
+/// `telegram_bot_token` or a per-agent `telegram_bot_token_{agent_key}`?
+fn is_telegram_bot_token_config_key(key: &str) -> bool {
+    key == "telegram_bot_token" || key.starts_with("telegram_bot_token_")
+}
+
+/// The vault ref a Telegram token key already points at, if it resolves.
+fn telegram_token_vault_ref(graph: &GraphDomain, key: &str) -> Result<Option<String>> {
+    let Some(value) = read_string_config(graph, key)? else {
+        return Ok(None);
+    };
+    if !value.starts_with("secret://") || graph.get_secret(&value)?.is_none() {
+        return Ok(None);
+    }
+    Ok(Some(value))
+}
+
+/// Move every plaintext Telegram bot token in config into the vault (DEF-176).
+///
+/// Tokens were plaintext `config:` values readable by any local process
+/// through ACL-less `GetConfig`, and a secret the vault doesn't hold can't
+/// be sealed to another hotel on a relocation. The key keeps its name —
+/// transport homes and seats address a token by it — but its value becomes
+/// the vault ref, readable only by the `membrane` role.
+fn migrate_plaintext_telegram_tokens(graph: &GraphDomain) -> Result<usize> {
+    let mut migrated = 0usize;
+    for key in graph.list_config_keys_with_prefix("telegram_bot_token")? {
+        if !is_telegram_bot_token_config_key(&key) {
+            continue;
+        }
+        let Some(plaintext) = read_string_config(graph, &key)? else {
+            continue;
+        };
+        if plaintext.starts_with("secret://") {
+            continue;
+        }
+        let secret_ref = store_secret(
+            graph,
+            SecretInput {
+                secret_kind: TELEGRAM_BOT_TOKEN_SECRET_KIND.into(),
+                scope: "hotel".into(),
+                allowed_roles: vec![TELEGRAM_BOT_TOKEN_READER_ROLE.into()],
+                allowed_guests: Vec::new(),
+                plaintext,
+            },
+        )
+        .with_context(|| format!("store Telegram bot token for {key}"))?;
+        graph.set_config_value(&key, &serde_json::to_string(&secret_ref)?)?;
+        info!(config_key = %key, "Moved a plaintext Telegram bot token into the hotel vault");
+        migrated += 1;
+    }
+    Ok(migrated)
 }
 
 fn migrate_plaintext_provider_api_keys(graph: &GraphDomain) -> Result<usize> {
@@ -7146,6 +7206,22 @@ async fn run_load_command(file: &str, hotel_name: &str) -> Result<()> {
                     "load: dropped plaintext muninn.admin_password from node_config (vault-held)"
                 );
             }
+            // A Telegram token already in the vault stays there: a re-seeded
+            // value rotates the secret in place instead of overwriting the
+            // ref with plaintext (DEF-176).
+            if is_telegram_bot_token_config_key(&key)
+                && let Some(plaintext) = value.as_str().filter(|v| !v.starts_with("secret://"))
+                && let Some(secret_ref) = telegram_token_vault_ref(&graph_domain, &key)?
+            {
+                if crate::vault::export_secret_plaintext(&graph_domain, &secret_ref)?.as_deref()
+                    != Some(plaintext)
+                {
+                    rotate_secret(&graph_domain, &secret_ref, plaintext)?;
+                    info!(config_key = %key, "load: rotated the vault-held Telegram bot token");
+                }
+                count += 1;
+                continue;
+            }
             let val_str = if value.is_string() {
                 serde_json::to_string(&value)?
             } else {
@@ -7159,6 +7235,7 @@ async fn run_load_command(file: &str, hotel_name: &str) -> Result<()> {
         warn!("Config file has no context_graph entries.");
     }
     migrate_plaintext_provider_api_keys(&graph_domain)?;
+    migrate_plaintext_telegram_tokens(&graph_domain)?;
 
     let seeded_peer_hotels = seed_peer_hotels_from_config(&graph_domain, &config_json, hotel_name)?;
     if seeded_peer_hotels > 0 {
@@ -7480,6 +7557,7 @@ async fn main() -> Result<()> {
 
     enforce_graph_datasource_home(&graph_domain_arc, &hotel_name)?;
     migrate_plaintext_provider_api_keys(&graph_domain_arc)?;
+    migrate_plaintext_telegram_tokens(&graph_domain_arc)?;
     let seeded_guests = graph_domain_arc.list_guests(&hotel_name, true)?;
     if seeded_guests.is_empty() {
         warn!(
@@ -8637,8 +8715,8 @@ mod tests {
         execution_reachability_for_hotel, extract_context_graph_entries, guest_seed_for_profile,
         guest_supervision_enabled, guest_supervision_enabled_from, hotel_base_port,
         hotel_ipc_socket_path, local_capability_advertisements, mesh_target_addr_for_node,
-        migrate_plaintext_provider_api_keys, nearest_available_base_port,
-        preserve_runtime_guest_activation, read_string_config,
+        migrate_plaintext_provider_api_keys, migrate_plaintext_telegram_tokens,
+        nearest_available_base_port, preserve_runtime_guest_activation, read_string_config,
         reconcile_peer_execution_reachability, resolve_runtime_ports, resolve_secret,
         seed_abstract_skill_catalog, seed_abstract_tool_catalog, seed_operator_timezone,
         seed_orchestrator_roles, seed_skill_crafting, seed_toolset_profiles,
@@ -10420,6 +10498,68 @@ mod tests {
             .expect("graph datasource");
         assert!(!graph_datasource.is_active);
         assert_eq!(graph_datasource.active_pid, None);
+    }
+
+    /// DEF-176: plaintext Telegram tokens move into the vault behind their
+    /// own key name, readable by the membrane role only.
+    #[test]
+    fn telegram_token_migration_moves_plaintext_to_a_membrane_only_vault_ref() {
+        unsafe {
+            std::env::set_var(
+                "PHILOTIC_VAULT_MASTER_KEY",
+                BASE64_STANDARD.encode([7u8; 32]),
+            );
+        }
+        let storage = SqliteGraphStorage::open(":memory:").expect("open sqlite");
+        let graph = GraphDomain::new(Arc::new(storage.adapter()));
+        for (key, token) in [
+            ("telegram_bot_token", "111:global"),
+            ("telegram_bot_token_bjork", "222:bjork"),
+        ] {
+            graph
+                .set_config_value(key, &serde_json::json!(token).to_string())
+                .expect("seed plaintext token");
+        }
+        graph
+            .set_config_value("telegram_allowed_users_bjork", "[\"7\"]")
+            .expect("seed unrelated key");
+
+        assert_eq!(
+            migrate_plaintext_telegram_tokens(&graph).expect("migrate"),
+            2
+        );
+        let secret_ref = read_string_config(&graph, "telegram_bot_token_bjork")
+            .expect("read")
+            .expect("key kept");
+        assert!(secret_ref.starts_with("secret://"), "{secret_ref}");
+        let membrane = SecretAccess {
+            role: "membrane".into(),
+            guest_id: "mac-jane:membrane-gateway-bjork".into(),
+        };
+        assert_eq!(
+            resolve_secret(&graph, &secret_ref, &membrane).expect("membrane reads"),
+            Some("222:bjork".into())
+        );
+        let agent = SecretAccess {
+            role: "agent".into(),
+            guest_id: "agent-bjork-01".into(),
+        };
+        assert!(
+            resolve_secret(&graph, &secret_ref, &agent).is_err(),
+            "an agent guest may not read a bot token"
+        );
+        assert_eq!(
+            graph
+                .get_config_value("telegram_allowed_users_bjork")
+                .unwrap()
+                .as_deref(),
+            Some("[\"7\"]")
+        );
+        assert_eq!(
+            migrate_plaintext_telegram_tokens(&graph).expect("re-run"),
+            0,
+            "a vaulted token is left alone"
+        );
     }
 
     #[test]
