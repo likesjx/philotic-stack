@@ -3,9 +3,7 @@ use super::lease_handlers::LoggingSubagentLeaseObserver;
 use crate::LedgerCommand;
 use crate::service::guest_manager::{GuestMaterializationRequester, HealRestartVerdict};
 use crate::service::lease::{LeaseProvider, RuntimeLeaseRegistry};
-use crate::vault::{
-    SecretAccess, SecretInput, export_secret_plaintext, resolve_secret, store_secret,
-};
+use crate::vault::{SecretAccess, SecretInput, resolve_secret, store_secret};
 use ansible_mesh_core::agent_graph_storage::{
     AgentGraphSnapshot, AgentGraphStorage, SqliteAgentGraphStorage,
 };
@@ -1510,6 +1508,46 @@ impl IpcServer {
                 .find(|hotel| hotel.capabilities.node_id == local_node_id)
                 .map(|hotel| hotel.hotel_name)
         })
+    }
+
+    /// May the authenticated peer `sender_node_id` place (pre-warm, or hand
+    /// continuity for) this agent's role on this hotel?
+    ///
+    /// Only the role's current home may move it (DEF-170). A role this
+    /// hotel has never seen, or has no home for, is open to the sender — a
+    /// first move has nothing to check against. A role this hotel itself is
+    /// home to is not a peer's to rewrite. The home record is gossiped
+    /// last-writer-wins (DEF-171), so this raises the bar rather than closing
+    /// it; the sender itself is authenticated by the batch HMAC.
+    pub(super) fn peer_may_place_role(
+        graph: &GraphDomain,
+        local_node_id: &str,
+        sender_node_id: &str,
+        agent_id: &str,
+        role_name: &str,
+    ) -> Result<(), String> {
+        let home = graph
+            .get_role_incarnation(agent_id, role_name)
+            .ok()
+            .flatten()
+            .and_then(|record| record.home_node);
+        let Some(home) = home else {
+            return Ok(());
+        };
+        let home_node = Self::resolve_hotel_node_id(graph, &home).unwrap_or(home);
+        if home_node == sender_node_id {
+            return Ok(());
+        }
+        if home_node == local_node_id {
+            return Err(format!(
+                "role '{role_name}' of agent '{agent_id}' is home on this hotel; \
+                 peer '{sender_node_id}' may not place it"
+            ));
+        }
+        Err(format!(
+            "role '{role_name}' of agent '{agent_id}' is home on '{home_node}', \
+             not on the requesting peer '{sender_node_id}'"
+        ))
     }
 
     /// Resolve a caller-supplied hotel reference to its canonical mesh
@@ -13230,39 +13268,12 @@ impl IpcServer {
             })
             .collect();
 
-        // ── 6. Vault entries (agent-specific telegram token) ─────────────────
-        let vault_registry: Vec<serde_json::Value> = graph
-            .get_config_value("vault_registry")?
-            .and_then(|s| serde_json::from_str(&s).ok())
-            .unwrap_or_default();
-
-        let token_config_key = format!("telegram_bot_token_{agent_key}");
-        let mut vault_entries: Vec<VaultEntryExport> = Vec::new();
-        if let Ok(Some(secret_ref_raw)) = graph.get_config_value(&token_config_key) {
-            // Config value may be a quoted JSON string or a bare string
-            let secret_ref =
-                serde_json::from_str::<String>(&secret_ref_raw).unwrap_or(secret_ref_raw.clone());
-            if let Ok(Some(plaintext)) = export_secret_plaintext(graph, &secret_ref) {
-                let vault_name = vault_registry
-                    .iter()
-                    .find_map(|e| {
-                        if e.get("secret_ref").and_then(|v| v.as_str()) == Some(&secret_ref) {
-                            e.get("vault_name")
-                                .and_then(|v| v.as_str())
-                                .map(str::to_string)
-                        } else {
-                            None
-                        }
-                    })
-                    .unwrap_or_else(|| "default".to_string());
-                vault_entries.push(VaultEntryExport {
-                    config_key: token_config_key,
-                    vault_name,
-                    plaintext,
-                    allowed_roles: Vec::new(),
-                });
-            }
-        }
+        // ── 6. Vault entries: never exported (DEF-172) ────────────────────────
+        // This bundle is written to the unauthenticated blob store and was
+        // applied with an empty role ACL, so a plaintext secret in it was
+        // readable by anyone who could reach either. Secrets move only with
+        // the relocation ceremony, sealed to the target.
+        let vault_entries: Vec<VaultEntryExport> = Vec::new();
 
         // ── 7. Non-vault agent config entries ────────────────────────────────
         let allowed_users_key = format!("telegram_allowed_users_{agent_key}");
@@ -15365,6 +15376,23 @@ impl IpcServer {
         let agent_id = role_record.agent_id.clone();
         let role_name = role_record.role_name.clone();
         let guest_id = role_record.guest_id.clone();
+        if let Err(reason) =
+            Self::peer_may_place_role(graph, local_node_id, source_node_id, &agent_id, &role_name)
+        {
+            warn!("Materialize request [{}] refused: {}", request_id, reason);
+            Self::reply_materialize_ready(
+                &dispatcher_tx,
+                local_node_id,
+                source_node_id,
+                &request_id,
+                &guest_id,
+                false,
+                None,
+                Some(reason),
+            )
+            .await;
+            return;
+        }
         let dry_run = payload
             .get("dry_run")
             .and_then(|v| v.as_bool())
@@ -15626,6 +15654,21 @@ impl IpcServer {
                         local_node_id
                     );
                 }
+                if bundle.origin_node_id != source_node_id {
+                    anyhow::bail!(
+                        "bundle claims origin '{}' but was sent by '{}'",
+                        bundle.origin_node_id,
+                        source_node_id
+                    );
+                }
+                Self::peer_may_place_role(
+                    graph,
+                    local_node_id,
+                    source_node_id,
+                    &bundle.agent_id,
+                    &bundle.role_name,
+                )
+                .map_err(anyhow::Error::msg)?;
                 let summary = crate::service::continuity::import_continuity_bundle(graph, &bundle)?;
                 info!(
                     "Continuity import [{}] for ceremony [{}] (agent '{}', role '{}'): {:?}",

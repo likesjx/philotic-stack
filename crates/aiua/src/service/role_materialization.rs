@@ -1038,6 +1038,21 @@ impl IpcServer {
                     return true;
                 }
                 if target_role == philotic_client::OPERATOR_SURFACE_QUERY_ROLE {
+                    if let Err(reason) =
+                        crate::service::operator_surface::mesh_operator_handoff_permitted(
+                            graph,
+                            local_node_id,
+                            &event.source_node_id,
+                            data,
+                        )
+                    {
+                        warn!(
+                            event_id = %event.event_id,
+                            source_node = %event.source_node_id,
+                            "Refusing operator surface handoff: {reason}"
+                        );
+                        return true;
+                    }
                     if let Some(tx) = operator_surface_tx {
                         let _ = tx.try_send(data.clone()).ok();
                         return true;
@@ -3736,6 +3751,56 @@ mod tests {
                 }),
             )
             .expect("seed checkpoint");
+    }
+
+    /// DEF-170: only a role's home may place it on another hotel.
+    #[test]
+    fn only_the_roles_home_may_place_it() {
+        let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
+        let graph = GraphDomain::new(Arc::new(graph_store.adapter()));
+        seed_relocatable_orchestrator(&graph); // Beacon's orchestrator: home mac-jane
+        assert!(
+            IpcServer::peer_may_place_role(
+                &graph,
+                "vps-jane-aiua-01",
+                "mac-jane-aiua-01",
+                "agent-beacon",
+                "orchestrator"
+            )
+            .is_ok(),
+            "the home hotel may move its role"
+        );
+        let refused = IpcServer::peer_may_place_role(
+            &graph,
+            "vps-jane-aiua-01",
+            "mbp-jane-aiua-01",
+            "agent-beacon",
+            "orchestrator",
+        )
+        .expect_err("a third hotel may not");
+        assert!(refused.contains("mac-jane-aiua-01"), "{refused}");
+        assert!(
+            IpcServer::peer_may_place_role(
+                &graph,
+                "mac-jane-aiua-01",
+                "vps-jane-aiua-01",
+                "agent-beacon",
+                "orchestrator"
+            )
+            .is_err(),
+            "a peer may not rewrite a role this hotel is home to"
+        );
+        assert!(
+            IpcServer::peer_may_place_role(
+                &graph,
+                "vps-jane-aiua-01",
+                "mbp-jane-aiua-01",
+                "agent-new",
+                "orchestrator"
+            )
+            .is_ok(),
+            "a role this hotel has never seen has nothing to check against"
+        );
     }
 
     /// R5: a target that supports continuity gets the role's checkpoints

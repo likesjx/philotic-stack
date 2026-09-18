@@ -59,6 +59,11 @@ impl PlacementApplied {
     }
 }
 
+/// How far ahead of this hotel's clock a gossiped placement stamp may be.
+/// Last-writer-wins by a sender-supplied stamp let any peer pin a home
+/// forever with `u64::MAX`; honest clocks on the tailnet agree to seconds.
+pub const MAX_PLACEMENT_CLOCK_SKEW_SECS: u64 = 300;
+
 /// Apply gossiped role homes and transport homes from `from_node`.
 ///
 /// Returns the records that were newly applied (strictly newer than the local
@@ -70,8 +75,17 @@ pub fn apply_remote_placement(
     transport_homes: &[MembraneTransportHomeRecord],
 ) -> PlacementApplied {
     let mut applied = PlacementApplied::default();
+    let latest_acceptable = crate::graph::placement_stamp_now() + MAX_PLACEMENT_CLOCK_SKEW_SECS;
     for home in role_homes {
         if home.placement_updated_unix == 0 {
+            continue;
+        }
+        if home.placement_updated_unix > latest_acceptable {
+            warn!(
+                "placement sync from {}: refusing role home for {}:{} stamped in the future ({}) — \
+                 a far-future stamp would pin it against every later move (DEF-171)",
+                from_node, home.agent_id, home.role_name, home.placement_updated_unix
+            );
             continue;
         }
         match graph.get_role_incarnation(&home.agent_id, &home.role_name) {
@@ -101,6 +115,13 @@ pub fn apply_remote_placement(
 
     for home in transport_homes {
         if home.updated_unix == 0 {
+            continue;
+        }
+        if home.updated_unix > latest_acceptable {
+            warn!(
+                "placement sync from {}: refusing transport home for {}:{}:{} stamped in the future ({}) (DEF-171)",
+                from_node, home.agent_id, home.transport, home.resource_ref, home.updated_unix
+            );
             continue;
         }
         let apply = match graph.get_membrane_transport_home(
@@ -214,6 +235,35 @@ mod tests {
                 .home_node,
             None
         );
+    }
+
+    /// DEF-171: a far-future stamp would pin a home against every later
+    /// move; it is refused for both record kinds.
+    #[test]
+    fn a_home_stamped_in_the_future_is_refused() {
+        let d = make_domain();
+        d.upsert_role_incarnation(&role(Some("mac-jane-aiua-01"), 100))
+            .unwrap();
+        let far_future = crate::graph::placement_stamp_now() + 10 * MAX_PLACEMENT_CLOCK_SKEW_SECS;
+        assert!(apply_remote_placement(
+            &d,
+            "mbp",
+            &[role_home(Some("mbp-jane-aiua-01"), u64::MAX)],
+            &[transport_home("mbp-jane", far_future)],
+        )
+        .is_empty());
+        assert_eq!(
+            d.get_role_incarnation("agent-bjork-01", "orchestrator")
+                .unwrap()
+                .unwrap()
+                .home_node
+                .as_deref(),
+            Some("mac-jane-aiua-01")
+        );
+        assert!(d
+            .get_membrane_transport_home("agent-bjork-01", "telegram", "telegram_bot_token_bjork")
+            .unwrap()
+            .is_none());
     }
 
     #[test]
