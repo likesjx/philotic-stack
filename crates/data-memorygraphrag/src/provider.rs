@@ -849,6 +849,12 @@ impl LifeGraphProvider {
         // corrected "Daxton's", and a second bills item written while the
         // operator was saying it already existed (DEF-158).
         let lived = data_memorygraphrag::hygiene::guard_applies_to_label(&compiled.label);
+        if !lived {
+            debug!(
+                label = %compiled.label,
+                "life.observe: duplicate guard and bridging skipped for system telemetry label"
+            );
+        }
         let duplicate_candidates = if input.force_new || !lived {
             Vec::new()
         } else {

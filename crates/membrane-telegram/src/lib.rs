@@ -807,6 +807,16 @@ fn draft_already_final(draft_text: &str, final_text: &str) -> bool {
     !draft_text.is_empty() && draft_text == final_text
 }
 
+/// Whether the seat serving `seat_agent_id` may act on a hotel push task.
+/// The hotel-stamped `reply_owner_agent_id` (the emitting agent) is
+/// authoritative; unstamped tasks fall back to [`session_owned_by_agent`].
+fn reply_task_owned_by_seat(task: &Value, session_id: &str, seat_agent_id: &str) -> bool {
+    if let Some(owner) = task.get("reply_owner_agent_id").and_then(Value::as_str) {
+        return owner == seat_agent_id;
+    }
+    session_id.is_empty() || session_owned_by_agent(session_id, seat_agent_id)
+}
+
 /// True when a session id belongs to the given agent — i.e. this seat may act
 /// on a reply/turn-event task for it. Telegram session ids are stamped by
 /// [`telegram_inbound_envelope`] as `telegram:{chat}[:{thread}]:{agent_id}`,
@@ -3464,11 +3474,19 @@ impl TelegramSeatGuest {
         // A Telegram DM chat_id is the same user id under every bot token, so
         // without this check each seat re-sends the same message and the
         // operator sees it once per bot. Only the seat owning the session's
-        // agent may act on the task.
-        if !session_id.is_empty() && !session_owned_by_agent(&session_id, &self.target_agent_id) {
+        // agent may act on the task. The hotel stamps the emitting agent as
+        // `reply_owner_agent_id`; that is authoritative, because a session id
+        // such as `cron:<job_id>` names no agent (2026-09-18: Bjork's daily
+        // cron briefs also went out through the Coach bot). The session-id
+        // parse remains the fallback for unstamped tasks.
+        if !reply_task_owned_by_seat(&task, &session_id, &self.target_agent_id) {
+            let owner = task
+                .get("reply_owner_agent_id")
+                .and_then(Value::as_str)
+                .unwrap_or("-");
             info!(
-                "Dropping reply task [{}] for session [{}]: session belongs to another seat's agent (this seat serves [{}]).",
-                action, session_id, self.target_agent_id
+                "Dropping reply task [{}] for session [{}] (owner [{}]): belongs to another seat's agent (this seat serves [{}]).",
+                action, session_id, owner, self.target_agent_id
             );
             return;
         }
@@ -4318,8 +4336,8 @@ mod tests {
         TelegramFileRef, TelegramSeatGuest, UpdateDedupe, approval_callback_content,
         build_combined_telegram_commands, build_telegram_menu_commands, default_attachment_name,
         enrich_attachment_with_transport, next_error_backoff_secs,
-        normalize_telegram_menu_command_name, session_owned_by_agent, telegram_command,
-        telegram_format_text, telegram_help_text, telegram_inbound_envelope,
+        normalize_telegram_menu_command_name, reply_task_owned_by_seat, session_owned_by_agent,
+        telegram_command, telegram_format_text, telegram_help_text, telegram_inbound_envelope,
     };
     use super::{MembraneGuest, StandDownReason, transport_home_names_this_hotel};
     use philotic_client::CommandManifestEntry;
@@ -5417,6 +5435,37 @@ mod tests {
         // Too-short / legacy shapes fail open.
         assert!(session_owned_by_agent("telegram:12345", "agent-aria"));
         assert!(session_owned_by_agent("", "agent-aria"));
+    }
+
+    #[test]
+    fn stamped_reply_owner_decides_which_seat_delivers() {
+        // 2026-09-18: `cron:<job_id>` names no agent, so Bjork's daily brief
+        // passed every seat's session check and also went out as Coach. The
+        // hotel-stamped owner lets only the emitting agent's seat deliver.
+        let session = "cron:lifegraph-flywheel-daily:mac-jane";
+        let stamped = serde_json::json!({
+            "action": "send_reply",
+            "session_id": session,
+            "reply_owner_agent_id": "agent-bjork-01",
+        });
+        assert!(reply_task_owned_by_seat(
+            &stamped,
+            session,
+            "agent-bjork-01"
+        ));
+        assert!(!reply_task_owned_by_seat(&stamped, session, "agent-coach"));
+        // The stamp wins even when the session id names another agent.
+        let heal = "heal:ephemeral:agent-bjork-01";
+        assert!(!reply_task_owned_by_seat(&stamped, heal, "agent-coach"));
+        // Unstamped tasks keep the session-id fallback.
+        let unstamped = serde_json::json!({ "action": "send_reply" });
+        assert!(reply_task_owned_by_seat(&unstamped, session, "agent-coach"));
+        assert!(!reply_task_owned_by_seat(
+            &unstamped,
+            "telegram:7898847424:agent-bjork-01",
+            "agent-coach"
+        ));
+        assert!(reply_task_owned_by_seat(&unstamped, "", "agent-coach"));
     }
 
     #[test]
