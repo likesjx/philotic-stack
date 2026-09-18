@@ -12,14 +12,19 @@
 //!
 //! The bundle rides the HMAC-signed execution plane inline, like
 //! `materialize.request`. It is signed, not encrypted — so it carries
-//! checkpoints and session rows, never vault entries.
+//! checkpoints and session rows in the clear, and a vault entry only sealed:
+//! when the transport moves with the role, its secret travels as a
+//! [`SealedSecret`] only the target can open (R7, see
+//! [`ansible_mesh_core::sealed_secret`]).
 
 use ansible_mesh_core::domain::GraphDomain;
 use ansible_mesh_core::relocation_ceremony::RelocationCeremonyRecord;
+use ansible_mesh_core::sealed_secret::{self, SealKey, SealedSecret};
 use ansible_mesh_core::storage::{AgentIdentityRecord, SessionRecord};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
+use std::sync::{Mutex, OnceLock};
 
 /// Refuse to ship a bundle larger than this inline; the ceremony rolls back
 /// rather than flood the execution plane (a frame is buffered whole).
@@ -60,6 +65,13 @@ pub(crate) struct ContinuityBundle {
     pub sessions: Vec<SessionRecord>,
     #[serde(default)]
     pub apartments: Vec<ContinuityApartment>,
+    /// The config key naming the moving transport's secret, when the
+    /// transport moves with the role.
+    #[serde(default)]
+    pub transport_resource_ref: Option<String>,
+    /// The transport's secret, sealed to the target (R7).
+    #[serde(default)]
+    pub sealed_secrets: Vec<SealedSecret>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -67,6 +79,9 @@ pub(crate) struct ContinuityImportSummary {
     pub sessions: usize,
     pub apartments: usize,
     pub identity_seeded: bool,
+    /// Sealed secrets opened and stored in this hotel's vault.
+    #[serde(default)]
+    pub secrets: usize,
     /// This ceremony's bundle was already imported — a retransmitted event.
     /// Nothing was rewritten, so turns the target has taken since survive.
     pub already_imported: bool,
@@ -149,7 +164,134 @@ pub(crate) fn export_continuity_bundle(
         agent_identity: graph.get_agent_identity(agent_id)?,
         sessions,
         apartments,
+        transport_resource_ref: ceremony
+            .include_transport
+            .then(|| ceremony.transport_resource_ref.clone())
+            .flatten(),
+        sealed_secrets: Vec::new(),
     })
+}
+
+/// How long a target's single-use seal key lives. STANDBY → CONTINUITY is
+/// seconds; a key left unused past this is dropped.
+const SEAL_KEY_TTL_SECS: u64 = 15 * 60;
+
+/// How long a sealed secret may take to arrive and be opened.
+pub(crate) const SEALED_SECRET_TTL_SECS: u64 = 10 * 60;
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Single-use seal keys, by the STANDBY request they were minted for. Held
+/// in memory only: a restart forgets them, which fails the import and rolls
+/// the move back — and leaves any ciphertext in a ledger unopenable.
+fn seal_keys() -> &'static Mutex<HashMap<String, (SealKey, u64)>> {
+    static KEYS: OnceLock<Mutex<HashMap<String, (SealKey, u64)>>> = OnceLock::new();
+    KEYS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Target side, at STANDBY: mint this move's single-use key; returns the
+/// public half for the origin to seal to.
+pub(crate) fn issue_seal_key(standby_request_id: &str) -> String {
+    let key = SealKey::generate();
+    let public = key.public_b64();
+    let now = unix_now();
+    let mut keys = seal_keys().lock().unwrap_or_else(|e| e.into_inner());
+    keys.retain(|_, (_, expires)| *expires > now);
+    keys.insert(
+        standby_request_id.to_string(),
+        (key, now + SEAL_KEY_TTL_SECS),
+    );
+    public
+}
+
+/// Take (and so retire) the seal key minted for a STANDBY request.
+fn take_seal_key(standby_request_id: &str) -> Option<SealKey> {
+    let now = unix_now();
+    let mut keys = seal_keys().lock().unwrap_or_else(|e| e.into_inner());
+    keys.remove(standby_request_id)
+        .filter(|(_, expires)| *expires > now)
+        .map(|(key, _)| key)
+}
+
+/// Config marker left on the origin once a transport's secret has moved: the
+/// origin holds no copy, and a re-seed from `mesh-config.json` must not make
+/// it a second holder.
+pub(crate) fn relocated_secret_marker_key(config_key: &str) -> String {
+    format!("transport_secret_relocated:{config_key}")
+}
+
+fn read_config_string(graph: &GraphDomain, key: &str) -> anyhow::Result<Option<String>> {
+    Ok(graph.get_config_value(key)?.map(|raw| {
+        serde_json::from_str::<String>(&raw)
+            .unwrap_or(raw)
+            .trim()
+            .to_string()
+    }))
+}
+
+/// Target side: open the transport's sealed secret and keep it in this
+/// hotel's vault under the same config key and the same (non-empty) role
+/// ACL. Everything the seal is bound to must name this very move.
+fn import_sealed_secret(
+    graph: &GraphDomain,
+    bundle: &ContinuityBundle,
+    sealed: &SealedSecret,
+) -> anyhow::Result<()> {
+    let context = &sealed.context;
+    anyhow::ensure!(
+        bundle.include_transport,
+        "a sealed secret arrived with a move that does not carry its transport"
+    );
+    anyhow::ensure!(
+        context.ceremony_id == bundle.ceremony_id
+            && context.origin_node_id == bundle.origin_node_id
+            && context.target_node_id == bundle.target_node_id
+            && context.agent_id == bundle.agent_id
+            && context.role_name == bundle.role_name,
+        "the sealed secret is bound to a different move"
+    );
+    anyhow::ensure!(
+        Some(&context.config_key) == bundle.transport_resource_ref.as_ref(),
+        "the sealed secret is not the moving transport's"
+    );
+    let key = take_seal_key(&context.standby_request_id).ok_or_else(|| {
+        anyhow::anyhow!(
+            "no live seal key for STANDBY request [{}] (expired, already used, or this hotel restarted)",
+            context.standby_request_id
+        )
+    })?;
+    let pair_key = crate::mesh_auth_key_for_node(graph, &bundle.origin_node_id)?
+        .ok_or_else(|| anyhow::anyhow!("no per-pair mesh key with '{}'", bundle.origin_node_id))?;
+    let plaintext = sealed_secret::open(sealed, &key, &pair_key, unix_now())?;
+
+    match read_config_string(graph, &context.config_key)? {
+        Some(existing)
+            if existing.starts_with("secret://") && graph.get_secret(&existing)?.is_some() =>
+        {
+            crate::vault::rotate_secret(graph, &existing, &plaintext)?;
+        }
+        _ => {
+            let secret_ref = crate::vault::store_secret(
+                graph,
+                crate::vault::SecretInput {
+                    secret_kind: context.secret_kind.clone(),
+                    scope: "hotel".into(),
+                    allowed_roles: context.allowed_roles.clone(),
+                    allowed_guests: Vec::new(),
+                    plaintext: plaintext.to_string(),
+                },
+            )?;
+            graph.set_config_value(&context.config_key, &serde_json::to_string(&secret_ref)?)?;
+        }
+    }
+    // A secret that moves back makes this hotel its holder again.
+    graph.remove_config_value(&relocated_secret_marker_key(&context.config_key))?;
+    Ok(())
 }
 
 fn continuity_import_marker_key(ceremony_id: &str) -> String {
@@ -262,10 +404,16 @@ pub(crate) fn import_continuity_bundle(
                 sessions: 0,
                 apartments: 0,
                 identity_seeded: false,
+                secrets: 0,
                 already_imported: true,
             });
         summary.already_imported = true;
         return Ok(summary);
+    }
+
+    // Open sealed secrets first: a seal that fails leaves nothing half-imported.
+    for sealed in &bundle.sealed_secrets {
+        import_sealed_secret(graph, bundle, sealed)?;
     }
 
     // Seed, never overwrite: an identity already on this hotel may carry
@@ -307,6 +455,7 @@ pub(crate) fn import_continuity_bundle(
         sessions: bundle.sessions.len(),
         apartments: bundle.apartments.len(),
         identity_seeded,
+        secrets: bundle.sealed_secrets.len(),
         already_imported: false,
     };
     graph.set_config_value(&marker_key, &serde_json::to_string(&summary)?)?;

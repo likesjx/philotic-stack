@@ -15559,7 +15559,10 @@ impl IpcServer {
             "Materialize request [{}] for role '{}' (agent '{}') settled: readiness={:?} ok={}",
             request_id, role_name, agent_id, readiness, ok
         );
-        Self::reply_materialize_ready(
+        // R7: a committed STANDBY mints this move's single-use key, so the
+        // origin can seal the transport's secret to this hotel alone.
+        let seal_public_key = ok.then(|| crate::service::continuity::issue_seal_key(&request_id));
+        Self::reply_materialize_ready_with_seal_key(
             &dispatcher_tx,
             local_node_id,
             source_node_id,
@@ -15568,10 +15571,12 @@ impl IpcServer {
             ok,
             Some(readiness.as_str().to_string()),
             None,
+            seal_public_key,
         )
         .await;
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn reply_materialize_ready(
         dispatcher_tx: &mpsc::Sender<LedgerCommand>,
         local_node_id: &str,
@@ -15581,6 +15586,32 @@ impl IpcServer {
         ok: bool,
         readiness: Option<String>,
         error: Option<String>,
+    ) {
+        Self::reply_materialize_ready_with_seal_key(
+            dispatcher_tx,
+            local_node_id,
+            dest_node_id,
+            request_id,
+            guest_id,
+            ok,
+            readiness,
+            error,
+            None,
+        )
+        .await;
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn reply_materialize_ready_with_seal_key(
+        dispatcher_tx: &mpsc::Sender<LedgerCommand>,
+        local_node_id: &str,
+        dest_node_id: &str,
+        request_id: &str,
+        guest_id: &str,
+        ok: bool,
+        readiness: Option<String>,
+        error: Option<String>,
+        seal_public_key: Option<String>,
     ) {
         let ts = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -15609,6 +15640,8 @@ impl IpcServer {
                     // only sends `ContinuityImport` to a target that says so,
                     // so an older peer never receives a kind it can't parse.
                     "supports_continuity": true,
+                    // R7: the public half of this move's single-use seal key.
+                    "sealed_secret_public_key": seal_public_key,
                 })
                 .to_string(),
             },
@@ -15739,17 +15772,29 @@ impl IpcServer {
 
     /// Relocation Ceremony R3, source side: receive the `MaterializeReady`
     /// reply and persist it so `hotel.materialize_status` can answer a poll.
-    pub(crate) fn handle_remote_materialize_ready(graph: &GraphDomain, data: &str) {
-        let Ok(payload) = serde_json::from_str::<serde_json::Value>(data) else {
+    pub(crate) fn handle_remote_materialize_ready(
+        graph: &GraphDomain,
+        source_node_id: &str,
+        data: &str,
+    ) {
+        let Ok(mut payload) = serde_json::from_str::<serde_json::Value>(data) else {
             warn!("handle_remote_materialize_ready: failed to parse payload");
             return;
         };
-        let Some(request_id) = payload.get("request_id").and_then(|v| v.as_str()) else {
+        let Some(request_id) = payload
+            .get("request_id")
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+        else {
             warn!("handle_remote_materialize_ready: missing request_id");
             return;
         };
         let key = format!("materialize_ready:{request_id}");
-        if let Err(err) = graph.set_config_value(&key, data) {
+        // Which hotel answered, as the batch HMAC proved it (DEF-170): the
+        // origin releases a sealed secret only to the ceremony's target.
+        payload["__sender"] = serde_json::json!(source_node_id);
+        let stored = payload.to_string();
+        if let Err(err) = graph.set_config_value(&key, &stored) {
             warn!(
                 "handle_remote_materialize_ready: failed to persist status for '{}': {}",
                 request_id, err

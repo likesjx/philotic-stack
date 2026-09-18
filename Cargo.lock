@@ -120,6 +120,7 @@ dependencies = [
  "tracing-subscriber",
  "uuid",
  "webrtc",
+ "zeroize",
 ]
 
 [[package]]
@@ -161,6 +162,7 @@ dependencies = [
  "ulid",
  "uuid",
  "x25519-dalek",
+ "zeroize",
 ]
 
 [[package]]

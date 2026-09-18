@@ -1225,6 +1225,24 @@ fn mesh_member_public_key_config_key(hotel_name: &str) -> String {
     format!("mesh_member_public_key:{hotel_name}")
 }
 
+/// The hotel already bound to `node_id`, if it is not `hotel_name` (DEF-174).
+///
+/// A join pins the joiner's Ed25519 key by hotel name but stores the
+/// per-pair auth key by the node id the joiner *claims*. Without this check
+/// an invite holder could join under a fresh hotel name while claiming an
+/// existing peer's node id, replacing that peer's auth key — and with it
+/// every message, and any secret, this hotel would trust as that peer's.
+fn node_id_bound_to_other_hotel(
+    graph: &GraphDomain,
+    node_id: &str,
+    hotel_name: &str,
+) -> Option<String> {
+    graph.list_hotels().ok()?.into_iter().find_map(|hotel| {
+        (hotel.capabilities.node_id == node_id && hotel.hotel_name != hotel_name)
+            .then_some(hotel.hotel_name)
+    })
+}
+
 fn mesh_auth_key_config_key(node_id: &str) -> String {
     format!("mesh_auth_key:{node_id}")
 }
@@ -1498,6 +1516,18 @@ fn handle_mesh_membership_accept(graph: &GraphDomain, payload_json: &str) {
             );
             return;
         }
+    }
+
+    if let Some(owner) = node_id_bound_to_other_hotel(
+        graph,
+        &payload.payload.capabilities.node_id,
+        &payload.payload.hotel_name,
+    ) {
+        warn!(
+            "Rejecting mesh membership acceptance for hotel [{}]: node id [{}] already belongs to hotel [{}] (DEF-174)",
+            payload.payload.hotel_name, payload.payload.capabilities.node_id, owner
+        );
+        return;
     }
 
     let Some(local_hotel_name) = pending
@@ -7197,6 +7227,16 @@ async fn run_load_command(file: &str, hotel_name: &str) -> Result<()> {
     if !entries.is_empty() {
         let mut count = 0;
         for (key, mut value) in entries {
+            // A secret a relocation moved to another hotel stays there: the
+            // seed file still names it, but this hotel is no longer its
+            // holder (R7 — one holder per secret).
+            if graph_domain
+                .get_config_value(&service::continuity::relocated_secret_marker_key(&key))?
+                .is_some()
+            {
+                info!(config_key = %key, "load: skipping a secret that moved to another hotel");
+                continue;
+            }
             // Never persist the Muninn admin password into node_config: the
             // credential lives encrypted in the hotel vault
             // (`muninn_admin_secret_ref`), resolved by
@@ -8716,7 +8756,8 @@ mod tests {
         guest_supervision_enabled, guest_supervision_enabled_from, hotel_base_port,
         hotel_ipc_socket_path, local_capability_advertisements, mesh_target_addr_for_node,
         migrate_plaintext_provider_api_keys, migrate_plaintext_telegram_tokens,
-        nearest_available_base_port, preserve_runtime_guest_activation, read_string_config,
+        nearest_available_base_port, node_id_bound_to_other_hotel,
+        preserve_runtime_guest_activation, read_string_config,
         reconcile_peer_execution_reachability, resolve_runtime_ports, resolve_secret,
         seed_abstract_skill_catalog, seed_abstract_tool_catalog, seed_operator_timezone,
         seed_orchestrator_roles, seed_skill_crafting, seed_toolset_profiles,
@@ -10498,6 +10539,45 @@ mod tests {
             .expect("graph datasource");
         assert!(!graph_datasource.is_active);
         assert_eq!(graph_datasource.active_pid, None);
+    }
+
+    /// DEF-174: a joiner may not claim a node id another hotel already owns.
+    #[test]
+    fn a_join_may_not_claim_another_hotels_node_id() {
+        let storage = SqliteGraphStorage::open(":memory:").expect("open sqlite");
+        let graph = GraphDomain::new(Arc::new(storage.adapter()));
+        graph
+            .upsert_hotel(&HotelRecord {
+                hotel_name: "mac-jane".into(),
+                capabilities: ansible_mesh_core::NodeCapabilities {
+                    node_id: "mac-jane-aiua-01".into(),
+                    roles: vec![],
+                    models: vec![],
+                    tools: vec![],
+                    constraints: Default::default(),
+                    build_version: String::new(),
+                },
+                mesh_port: 16370,
+                blob_port: 16371,
+                execution_port: 16372,
+                ipc_socket_path: String::new(),
+                active_pid: None,
+                mesh_host: None,
+            })
+            .expect("seed hotel");
+        assert_eq!(
+            node_id_bound_to_other_hotel(&graph, "mac-jane-aiua-01", "evil-hotel").as_deref(),
+            Some("mac-jane")
+        );
+        assert_eq!(
+            node_id_bound_to_other_hotel(&graph, "mac-jane-aiua-01", "mac-jane"),
+            None,
+            "the owner re-joining is not a collision"
+        );
+        assert_eq!(
+            node_id_bound_to_other_hotel(&graph, "new-aiua-01", "new-hotel"),
+            None
+        );
     }
 
     /// DEF-176: plaintext Telegram tokens move into the vault behind their
