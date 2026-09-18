@@ -7210,7 +7210,7 @@ async fn run_load_command(file: &str, hotel_name: &str) -> Result<()> {
             // value rotates the secret in place instead of overwriting the
             // ref with plaintext (DEF-176).
             if is_telegram_bot_token_config_key(&key)
-                && let Some(plaintext) = value.as_str()
+                && let Some(plaintext) = value.as_str().filter(|v| !v.starts_with("secret://"))
                 && let Some(secret_ref) = telegram_token_vault_ref(&graph_domain, &key)?
             {
                 if crate::vault::export_secret_plaintext(&graph_domain, &secret_ref)?.as_deref()
