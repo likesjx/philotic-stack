@@ -212,6 +212,42 @@ fn rewrite_guest_prefix(guest_id: &str, bundle: &ContinuityBundle) -> String {
     guest_id.to_string()
 }
 
+/// Most sessions a session index keeps — mirrors philote's
+/// `merge_session_index` cap.
+const SESSION_INDEX_CAP: usize = 32;
+
+/// The session index is merged everywhere it is written, never replaced:
+/// the target may already hold sessions this agent opened there. Imported
+/// entries win on a `session_id` collision; the newest `updated_at` survive
+/// the cap.
+fn merge_session_indexes(existing: &Value, mut imported: Value) -> Value {
+    let entries = |index: &Value| -> Vec<Value> {
+        index
+            .get("active_sessions")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default()
+    };
+    let mut merged = entries(&imported);
+    for entry in entries(existing) {
+        let session_id = entry.get("session_id").and_then(Value::as_str);
+        if !merged
+            .iter()
+            .any(|m| m.get("session_id").and_then(Value::as_str) == session_id)
+        {
+            merged.push(entry);
+        }
+    }
+    merged.sort_by_key(|entry| {
+        std::cmp::Reverse(entry.get("updated_at").and_then(Value::as_u64).unwrap_or(0))
+    });
+    merged.truncate(SESSION_INDEX_CAP);
+    if let Some(map) = imported.as_object_mut() {
+        map.insert("active_sessions".into(), Value::Array(merged));
+    }
+    imported
+}
+
 /// Target side: write the bundle into this hotel's graph. Idempotent per
 /// ceremony — mesh events can be redelivered, and a redelivery that landed
 /// after the target started taking turns must not roll them back.
@@ -257,6 +293,12 @@ pub(crate) fn import_continuity_bundle(
         rewrite_hotel_fields(&mut content, bundle);
         if let Some(Value::String(incarnation)) = content.get_mut("active_incarnation_id") {
             *incarnation = rewrite_guest_prefix(incarnation, bundle);
+        }
+        if apartment.memory_type == SESSION_INDEX_MEMORY_TYPE
+            && let Some(existing) =
+                graph.get_apartment(&bundle.agent_id, SESSION_INDEX_MEMORY_TYPE)?
+        {
+            content = merge_session_indexes(&existing, content);
         }
         graph.sync_apartment(&bundle.agent_id, &apartment.memory_type, &content)?;
     }
@@ -468,6 +510,40 @@ mod tests {
         assert!(
             checkpoint["carryover_plan"].is_null(),
             "the target's newer checkpoint must survive a redelivery"
+        );
+    }
+
+    #[test]
+    fn import_merges_the_session_index_instead_of_replacing_it() {
+        let bundle = export(&seeded_origin(), "orchestrator", false);
+        let target = graph();
+        target
+            .sync_apartment(
+                "agent-bjork-01",
+                "short",
+                &serde_json::json!({"active_sessions": [
+                    {"session_id": "smoke:bjork:ping", "updated_at": 5},
+                    {"session_id": SID, "updated_at": 1, "stale": true},
+                ]}),
+            )
+            .unwrap();
+        import_continuity_bundle(&target, &bundle).unwrap();
+
+        let index = target
+            .get_apartment("agent-bjork-01", "short")
+            .unwrap()
+            .unwrap();
+        let sessions = index["active_sessions"].as_array().unwrap();
+        assert_eq!(sessions.len(), 2, "both sessions survive: {index}");
+        let moved = sessions
+            .iter()
+            .find(|s| s["session_id"] == SID)
+            .expect("moved session indexed");
+        assert!(moved.get("stale").is_none(), "the imported entry wins");
+        assert!(
+            sessions
+                .iter()
+                .any(|s| s["session_id"] == "smoke:bjork:ping")
         );
     }
 
