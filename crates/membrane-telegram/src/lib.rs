@@ -3083,16 +3083,30 @@ impl MembraneGuest for TelegramSeatGuest {
                         .unwrap_or_else(|poisoned| poisoned.into_inner())
                         .take();
                     let was_reprobing_standby = std::mem::take(&mut self.reprobing_standby);
-                    if owner.is_none()
-                        && denial_code.as_deref() == Some("LEASE_TRANSPORT_HOME_MISMATCH")
-                    {
-                        // R2 (DEF-107): this hotel is not the transport home. The
-                        // seat is STANDBY — registered, token in hand, not acting —
-                        // and re-probes on the cadence or on a TransportHomeChanged
-                        // push naming this hotel as home. Quiet on re-confirmation.
+                    if owner.is_none() {
+                        // DEF-168: `owner: None` means the hotel declined the
+                        // acquire outright — no live competitor was identified
+                        // (transport-home mismatch, foreign authority, unknown
+                        // agent/authority, or a lookup failure). Gating this on
+                        // the single `LEASE_TRANSPORT_HOME_MISMATCH` code left
+                        // every OTHER ownerless denial (e.g. `LEASE_FOREIGN_
+                        // AUTHORITY` for a hotel discovered dynamically via R2
+                        // that was never in the agent's static authority list)
+                        // misclassified as `LeaseHeld` — the seat stood down
+                        // convinced someone else held the lease, self-healed
+                        // every reprobe finding it free, and re-denied itself
+                        // the same way forever, never actually polling even
+                        // while genuinely the transport home. R2 (DEF-107):
+                        // this hotel is not (or not yet recognized as) the
+                        // transport home. The seat is STANDBY — registered,
+                        // token in hand, not acting — and re-probes on the
+                        // cadence or on a TransportHomeChanged push naming
+                        // this hotel as home. Quiet on re-confirmation.
                         info!(
-                            "This hotel is not the active transport home for [{}]; seat [{}] is STANDBY (re-probe every {LEASE_REPROBE_SECS}s or on TransportHomeChanged).",
-                            lease_key, self.seat_guest_id
+                            "This hotel may not poll for [{}] (denied: {}); seat [{}] is STANDBY (re-probe every {LEASE_REPROBE_SECS}s or on TransportHomeChanged).",
+                            lease_key,
+                            denial_code.as_deref().unwrap_or("no competing owner"),
+                            self.seat_guest_id
                         );
                         self.stand_down = Some(StandDownReason::Standby {
                             next_probe_at: Instant::now() + Duration::from_secs(LEASE_REPROBE_SECS),
@@ -3103,8 +3117,10 @@ impl MembraneGuest for TelegramSeatGuest {
                                 "low",
                                 "seat_standby:not_transport_home",
                                 format!(
-                                    "Telegram seat [{}] is standby: this hotel is not the active transport home for [{}].",
-                                    self.seat_guest_id, lease_key
+                                    "Telegram seat [{}] is standby: hotel may not poll for [{}] ({}).",
+                                    self.seat_guest_id,
+                                    lease_key,
+                                    denial_code.as_deref().unwrap_or("no competing owner")
                                 ),
                             );
                         }
