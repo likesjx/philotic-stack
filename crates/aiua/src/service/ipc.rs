@@ -15091,7 +15091,7 @@ impl IpcServer {
             policy
         };
 
-        Ok(Some(serde_json::json!({
+        let mut snapshot = serde_json::json!({
             "session_id": session.session_id,
             "agent_id": session.primary_agent_id,
             "source": session.channel_kind,
@@ -15109,7 +15109,35 @@ impl IpcServer {
             "recent_turns": recent_turns,
             "active_turn": active_turn,
             "session_index": session_index,
-        })))
+        });
+        Self::overlay_philote_owned_checkpoint_fields(&mut snapshot, apartment_checkpoint.as_ref());
+        Ok(Some(snapshot))
+    }
+
+    /// Carry every checkpoint field the snapshot does not compute itself —
+    /// parked turns, the carryover plan, paracrine threads, watchdog clocks,
+    /// the fallback override, the life-recall cache (DEF-167). Before this the
+    /// snapshot projected only `recent_turns`/`active_turn` out of the
+    /// apartment, so a philote restoring a session — after a restart, or on
+    /// another hotel after a relocation — silently got defaults for all of
+    /// it. Hotel-computed keys win: the session row is the truth for
+    /// routing, status, and policy, and the hotel recomputes the profile and
+    /// assemblies that `checkpoint_json` deliberately leaves out.
+    fn overlay_philote_owned_checkpoint_fields(
+        snapshot: &mut serde_json::Value,
+        checkpoint: Option<&serde_json::Value>,
+    ) {
+        let (Some(snapshot), Some(checkpoint)) = (
+            snapshot.as_object_mut(),
+            checkpoint.and_then(serde_json::Value::as_object),
+        ) else {
+            return;
+        };
+        for (key, value) in checkpoint {
+            if !snapshot.contains_key(key) {
+                snapshot.insert(key.clone(), value.clone());
+            }
+        }
     }
 
     async fn compose_mesh_registry_snapshot(
@@ -26905,6 +26933,72 @@ pub(crate) mod tests {
         if Path::new(&socket_path).exists() {
             let _ = std::fs::remove_file(&socket_path);
         }
+    }
+
+    /// DEF-167: a restore must bring back the whole checkpoint, not just
+    /// `recent_turns`/`active_turn` — a parked plan turn, the carryover plan,
+    /// and the watchdog clocks survive, while hotel-owned keys stay the
+    /// session row's truth.
+    #[tokio::test]
+    async fn session_snapshot_carries_philote_owned_checkpoint_fields() {
+        let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
+        let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
+        graph
+            .upsert_session(&SessionRecord {
+                session_id: "telegram:7:agent-bjork-01".into(),
+                session_kind: "conversation".into(),
+                primary_agent_id: Some("agent-bjork-01".into()),
+                active_incarnation_id: Some("agent-bjork-01:orchestrator".into()),
+                channel_kind: Some("telegram".into()),
+                channel_session_key: Some("7".into()),
+                status: "active".into(),
+                lease_owner_component_id: None,
+                lease_expires_at: None,
+                summary_json: serde_json::json!({}),
+                created_at: 1,
+                updated_at: 2,
+            })
+            .expect("session should seed");
+        graph
+            .sync_apartment(
+                "agent-bjork-01",
+                "short_session:telegram:7:agent-bjork-01",
+                &serde_json::json!({
+                    "session_id": "telegram:7:agent-bjork-01",
+                    "active_incarnation_id": "stale-incarnation",
+                    "active_turn": null,
+                    "recent_turns": [{"turn_id": "t1", "user_content": "log practice"}],
+                    "carryover_plan": {"goal": "log practice", "steps": ["observe"]},
+                    "parked_plan_turn": {"turn_id": "t2", "phase": "planning_discussion"},
+                    "parked_plan_since_unix": 1_789_700_000_u64,
+                    "turn_waiting_since_unix": 1_789_700_001_u64,
+                }),
+            )
+            .expect("checkpoint should seed");
+
+        let inboxes: InboxRegistry = Arc::new(Mutex::new(HashMap::new()));
+        let registry = Arc::new(RwLock::new(NodeRegistry::new()));
+        let snapshot = IpcServer::compose_session_snapshot(
+            &graph,
+            &inboxes,
+            &registry,
+            "mac-jane-aiua-01",
+            "telegram:7:agent-bjork-01",
+            None,
+        )
+        .await
+        .expect("snapshot composes")
+        .expect("session exists");
+
+        assert_eq!(snapshot["carryover_plan"]["goal"], "log practice");
+        assert_eq!(snapshot["parked_plan_turn"]["turn_id"], "t2");
+        assert_eq!(snapshot["parked_plan_since_unix"], 1_789_700_000_u64);
+        assert_eq!(snapshot["turn_waiting_since_unix"], 1_789_700_001_u64);
+        assert_eq!(snapshot["recent_turns"][0]["user_content"], "log practice");
+        assert_eq!(
+            snapshot["active_incarnation_id"], "agent-bjork-01:orchestrator",
+            "the session row, not the checkpoint, owns routing"
+        );
     }
 
     #[tokio::test]
