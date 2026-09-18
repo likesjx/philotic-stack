@@ -974,8 +974,7 @@ fn stamp_reply_owner_agent(
         return task_json;
     };
     let owner = emitter
-        .filter(|identity| identity.role == "agent")
-        .and_then(|identity| identity.guest_id.split(':').next())
+        .and_then(emitter_agent_id)
         .filter(|agent_id| matches!(graph.get_agent_identity(agent_id), Ok(Some(_))));
     match owner {
         Some(agent_id) => {
@@ -991,6 +990,20 @@ fn stamp_reply_owner_agent(
         }
     }
     serde_json::to_string(&payload).unwrap_or(task_json)
+}
+
+/// The agent a philote connection speaks for, from how it registered (see
+/// `philote::main::role_registration`): a base philote is role `agent` with
+/// guest id `{agent_id}`; a role incarnation is role `role:{agent_id}:{role}`
+/// with guest id `{agent_id}:{role}`. The two must agree.
+fn emitter_agent_id(identity: &GuestIdentity) -> Option<&str> {
+    let guest_agent = identity.guest_id.split(':').next()?;
+    let role_agent = if identity.role == "agent" {
+        guest_agent
+    } else {
+        identity.role.strip_prefix("role:")?.split(':').next()?
+    };
+    (!guest_agent.is_empty() && guest_agent == role_agent).then_some(guest_agent)
 }
 
 /// Guest-record roles that can never consume `role="agent"` deliveries. Used to reject
@@ -18618,10 +18631,18 @@ pub(crate) mod tests {
         #[test]
         fn role_incarnation_reply_is_owned_by_its_agent() {
             let graph = graph_with_agents(&["agent-bjork-01", "agent-coach"]);
-            let emitter = identity("agent-bjork-01:orchestrator", "agent");
+            // Registration shape from `philote::main::role_registration`.
+            let emitter = identity(
+                "agent-bjork-01:orchestrator",
+                "role:agent-bjork-01:orchestrator",
+            );
             let stamped =
                 stamp_reply_owner_agent(&graph, Some(&emitter), "membrane", None, cron_reply());
             assert_eq!(owner(&stamped).as_deref(), Some("agent-bjork-01"));
+            let base = identity("agent-coach", "agent");
+            let stamped =
+                stamp_reply_owner_agent(&graph, Some(&base), "membrane", None, cron_reply());
+            assert_eq!(owner(&stamped).as_deref(), Some("agent-coach"));
         }
 
         #[test]
@@ -18648,6 +18669,11 @@ pub(crate) mod tests {
             for emitter in [
                 Some(identity("14ce429a-fd39-4b3e-8447-5867e59a9b30", "agent")),
                 Some(identity("agent-bjork-01", "tool")),
+                // Guest id and routing role naming different agents.
+                Some(identity(
+                    "agent-bjork-01:orchestrator",
+                    "role:agent-coach:orchestrator",
+                )),
                 None,
             ] {
                 let stamped = stamp_reply_owner_agent(
