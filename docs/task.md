@@ -31,7 +31,9 @@ Spec: [LifeGraph editor and relationships](../apps/philotic-apple/LIFEGRAPH.md).
 - [x] Add a bounded one-hop relationship diagram with labeled directed edges and neighbor navigation.
 - [x] Verify shared Swift contracts, Mac app build/tests, Rust contracts, and gateway authorization.
 - [x] Prove real Cypher saves, stale-write rejection, and audit persistence against isolated Memgraph.
-- [ ] Deploy both server boundaries and validate from the installed app with a disposable node.
+- [x] PR #545 merged; both server boundaries deployed in vps-jane `50e01247`. Running binaries verified; live API save/read-back, stale-write rejection, and persisted audit passed using the Mac app's enrolled credential and a disposable node (cleaned up).
+- [x] Integrate and launch the Mac companion preserving notch/Desktop work; 57 app tests pass; relationship view and editor opening inspected.
+- [ ] Validate native Save-button interaction and install the updated physical iPhone app; API smoke is not physical-device proof.
 - [ ] Follow-ups: ontology-driven typed property editing, audit-history/undo, embedding refresh, graph-wide browsing, and granular device edit grants.
 
 
