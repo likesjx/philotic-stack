@@ -1675,6 +1675,22 @@ impl GraphDomain {
         self.adapter.delete_node(&Self::config_key(key))
     }
 
+    /// Config keys starting with `prefix`, in no particular order.
+    pub fn list_config_keys_with_prefix(&self, prefix: &str) -> Result<Vec<String>> {
+        let node_prefix = Self::config_key(prefix);
+        Ok(self
+            .adapter
+            .list_nodes_by_kind(NODE_KIND_CONFIG)?
+            .into_iter()
+            .filter(|node| node.node_key.starts_with(&node_prefix))
+            .filter_map(|node| {
+                node.node_key
+                    .strip_prefix(&format!("{NODE_KIND_CONFIG}:"))
+                    .map(str::to_string)
+            })
+            .collect())
+    }
+
     // ── Vault registry (stored as a config value) ─────────────────────────────
 
     pub fn get_vault_registry(&self) -> Result<Vec<VaultRegistryEntry>> {
