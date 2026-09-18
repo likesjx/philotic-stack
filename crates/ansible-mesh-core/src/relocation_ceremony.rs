@@ -131,6 +131,11 @@ pub struct RelocationCeremonyRecord {
     /// `materialize_ready:{request_id}` while waiting.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub materialize_request_id: Option<String>,
+    /// The R5 `ContinuityImport` id this ceremony's CONTINUITY phase sent,
+    /// joined against `continuity_ack:{request_id}` while waiting. `None`
+    /// when the target predates continuity and the move ran degraded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub continuity_request_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub decline_reason: Option<String>,
     /// Set when a boot-time scan finds this ceremony interrupted at or
@@ -179,6 +184,7 @@ impl RelocationCeremonyRecord {
             requested_by_role,
             reason,
             materialize_request_id: None,
+            continuity_request_id: None,
             decline_reason: None,
             needs_operator_review: false,
             phase_history: vec![RelocationPhaseEvent {

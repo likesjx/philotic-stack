@@ -15577,12 +15577,121 @@ impl IpcServer {
                     "ok": ok,
                     "readiness": readiness,
                     "error": error,
+                    // R5: this build imports continuity bundles. An origin
+                    // only sends `ContinuityImport` to a target that says so,
+                    // so an older peer never receives a kind it can't parse.
+                    "supports_continuity": true,
                 })
                 .to_string(),
             },
             trace: vec![],
         };
         let _ = dispatcher_tx.send(LedgerCommand::AppendLocal(event)).await;
+    }
+
+    /// Relocation Ceremony R5, target side: import the origin's continuity
+    /// bundle and ack. Runs before the event commits, and inbound events are
+    /// not deduplicated, so the import itself is idempotent per ceremony.
+    pub(crate) async fn handle_remote_continuity_import(
+        graph: &GraphDomain,
+        dispatcher_tx: mpsc::Sender<LedgerCommand>,
+        local_node_id: &str,
+        source_node_id: &str,
+        data: &str,
+    ) {
+        let payload: serde_json::Value = match serde_json::from_str(data) {
+            Ok(v) => v,
+            Err(err) => {
+                warn!("handle_remote_continuity_import: failed to parse payload: {err}");
+                return;
+            }
+        };
+        let Some(request_id) = payload.get("request_id").and_then(|v| v.as_str()) else {
+            warn!("handle_remote_continuity_import: missing request_id");
+            return;
+        };
+        let outcome = payload
+            .get("bundle")
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("payload carries no bundle"))
+            .and_then(|raw| {
+                serde_json::from_value::<crate::service::continuity::ContinuityBundle>(raw)
+                    .map_err(anyhow::Error::from)
+            })
+            .and_then(|bundle| {
+                if bundle.target_node_id != local_node_id {
+                    anyhow::bail!(
+                        "bundle is addressed to '{}', not this hotel '{}'",
+                        bundle.target_node_id,
+                        local_node_id
+                    );
+                }
+                let summary = crate::service::continuity::import_continuity_bundle(graph, &bundle)?;
+                info!(
+                    "Continuity import [{}] for ceremony [{}] (agent '{}', role '{}'): {:?}",
+                    request_id, bundle.ceremony_id, bundle.agent_id, bundle.role_name, summary
+                );
+                Ok(summary)
+            });
+        let (ok, summary, error) = match outcome {
+            Ok(summary) => (true, serde_json::to_value(summary).ok(), None),
+            Err(err) => {
+                warn!("Continuity import [{}] failed: {}", request_id, err);
+                (false, None, Some(err.to_string()))
+            }
+        };
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let event = EventEnvelope {
+            event_id: Uuid::new_v4(),
+            seq: 0,
+            source_node_id: local_node_id.to_string(),
+            target_node_id: Some(source_node_id.to_string()),
+            source_agent_id: local_node_id.to_string(),
+            target_agent_id: None,
+            kind: ansible_mesh_core::event::EventKind::ContinuityAck,
+            corr_id: request_id.to_string(),
+            attempt: 0,
+            created_at: ts,
+            expires_at: None,
+            payload: ansible_mesh_core::event::EventPayload::Inline {
+                data: serde_json::json!({
+                    "request_id": request_id,
+                    "ok": ok,
+                    "summary": summary,
+                    "error": error,
+                })
+                .to_string(),
+            },
+            trace: vec![],
+        };
+        let _ = dispatcher_tx.send(LedgerCommand::AppendLocal(event)).await;
+    }
+
+    /// Relocation Ceremony R5, origin side: persist the target's
+    /// `ContinuityAck` so the ceremony's CONTINUITY phase can poll it.
+    pub(crate) fn handle_remote_continuity_ack(graph: &GraphDomain, data: &str) {
+        let Ok(payload) = serde_json::from_str::<serde_json::Value>(data) else {
+            warn!("handle_remote_continuity_ack: failed to parse payload");
+            return;
+        };
+        let Some(request_id) = payload.get("request_id").and_then(|v| v.as_str()) else {
+            warn!("handle_remote_continuity_ack: missing request_id");
+            return;
+        };
+        if let Err(err) = graph.set_config_value(&format!("continuity_ack:{request_id}"), data) {
+            warn!(
+                "handle_remote_continuity_ack: failed to persist ack for '{}': {}",
+                request_id, err
+            );
+            return;
+        }
+        info!(
+            "Continuity ack recorded for request [{}]: {}",
+            request_id, data
+        );
     }
 
     /// Relocation Ceremony R3, source side: receive the `MaterializeReady`
