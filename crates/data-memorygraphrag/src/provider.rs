@@ -25,7 +25,7 @@ use neo4rs::{
 use serde_json::{Value, json};
 use std::collections::HashSet;
 use std::sync::Arc;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 /// Default minimum cosine similarity gate for the named recall strategies.
 ///
