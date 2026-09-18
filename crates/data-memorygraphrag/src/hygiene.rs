@@ -115,6 +115,16 @@ pub fn normalize_claim_summary(raw: &str) -> String {
         .join(" ")
 }
 
+/// Does the write-time duplicate guard (and bridging) apply to this label?
+/// Only to lived facts. System telemetry — attention Signals, patches, drift
+/// findings — legitimately repeats identical text under fresh ids: the live
+/// graph held 286 Signals over 13 distinct summaries when the guard shipped,
+/// and the attention observer writes them fire-and-forget, so a refusal
+/// would drop them silently (DEF-161).
+pub fn guard_applies_to_label(label: &str) -> bool {
+    !crate::audit::SYSTEM_LABELS.contains(&label)
+}
+
 /// How strongly a pending claim matches a node that already exists.
 #[derive(Debug, Clone, PartialEq)]
 pub struct DuplicateGuardHit {
@@ -500,6 +510,16 @@ pub async fn sweep(graph: &Graph) -> Result<SweepSummary> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn telemetry_labels_are_exempt_from_the_guard() {
+        assert!(!super::guard_applies_to_label("Signal"));
+        assert!(!super::guard_applies_to_label("DriftFinding"));
+        assert!(!super::guard_applies_to_label("SkillPatch"));
+        assert!(super::guard_applies_to_label("Event"));
+        assert!(super::guard_applies_to_label("OpenLoop"));
+        assert!(super::guard_applies_to_label("Routine"));
+    }
+
     #[test]
     fn id_slug_overlap_sees_the_subject_through_wording() {
         assert!(
