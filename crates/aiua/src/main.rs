@@ -7167,6 +7167,16 @@ async fn run_load_command(file: &str, hotel_name: &str) -> Result<()> {
     if !entries.is_empty() {
         let mut count = 0;
         for (key, mut value) in entries {
+            // A secret a relocation moved to another hotel stays there: the
+            // seed file still names it, but this hotel is no longer its
+            // holder (R7 — one holder per secret).
+            if graph_domain
+                .get_config_value(&service::continuity::relocated_secret_marker_key(&key))?
+                .is_some()
+            {
+                info!(config_key = %key, "load: skipping a secret that moved to another hotel");
+                continue;
+            }
             // Never persist the Muninn admin password into node_config: the
             // credential lives encrypted in the hotel vault
             // (`muninn_admin_secret_ref`), resolved by

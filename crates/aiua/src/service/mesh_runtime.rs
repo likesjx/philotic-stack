@@ -489,6 +489,7 @@ pub(crate) async fn activate_mesh_runtime(ctx: MeshRuntimeContext) -> Result<()>
                                             {
                                                 IpcServer::handle_remote_materialize_ready(
                                                     inbound_graph.as_ref(),
+                                                    &event.source_node_id,
                                                     data,
                                                 );
                                             }

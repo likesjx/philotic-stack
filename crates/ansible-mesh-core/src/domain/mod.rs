@@ -1085,6 +1085,12 @@ impl GraphDomain {
         })
     }
 
+    /// Remove a vault secret. Used when a secret has moved to another hotel
+    /// and this one must stop holding a copy.
+    pub fn delete_secret(&self, secret_ref: &str) -> Result<()> {
+        self.adapter.delete_node(&Self::secret_key(secret_ref))
+    }
+
     pub fn get_secret(&self, secret_ref: &str) -> Result<Option<SecretRecord>> {
         match self.adapter.get_node(&Self::secret_key(secret_ref))? {
             None => Ok(None),
