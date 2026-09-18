@@ -27,6 +27,28 @@ use crate::{
     sample_node_health,
 };
 
+/// Does an inbound event's claimed source match the peer whose per-pair
+/// HMAC key authenticated the batch?
+///
+/// Handlers act on `event.source_node_id` — as the origin of a relocation,
+/// the hotel to reply to, the peer a secret may be released to — but that
+/// field sits inside the payload, and the batch's HMAC only proves who
+/// *sent* it. Without this check any authenticated peer could speak as any
+/// other hotel (DEF-170). Every hotel builds its envelopes with its own node
+/// id as the source and sends them directly, so for an event addressed here
+/// the two must agree. An event addressed to another node is left alone:
+/// delivery ignores it anyway.
+pub(crate) fn event_source_is_authenticated_sender(
+    event: &EventEnvelope,
+    authenticated_sender: &str,
+    local_node_id: &str,
+) -> bool {
+    match event.target_node_id.as_deref() {
+        Some(target) if target != local_node_id => true,
+        _ => event.source_node_id == authenticated_sender,
+    }
+}
+
 type BeaconInboxReceiver = Arc<Mutex<Option<mpsc::Receiver<ansible_mesh_core::BeaconMessage>>>>;
 type WebRtcSignalReceiver =
     Arc<Mutex<Option<mpsc::Receiver<ansible_mesh_core::webrtc::WebRtcSignalMessage>>>>;
@@ -374,6 +396,20 @@ pub(crate) async fn activate_mesh_runtime(ctx: MeshRuntimeContext) -> Result<()>
                             if !events.is_empty() {
                                 let max_seq = events.iter().map(|e| e.seq).max().unwrap_or(0);
                                 for event in &events {
+                                    if !event_source_is_authenticated_sender(
+                                        event,
+                                        &msg.src_node,
+                                        &inbound_local_node_id,
+                                    ) {
+                                        warn!(
+                                            event_id = %event.event_id,
+                                            claimed_source = %event.source_node_id,
+                                            authenticated_sender = %msg.src_node,
+                                            kind = ?event.kind,
+                                            "Dropping mesh event: it claims a source other than the peer that sent it (DEF-170)"
+                                        );
+                                        continue;
+                                    }
                                     IpcServer::deliver_event_envelope_or_park(
                                         &inbound_inboxes,
                                         event,
@@ -776,4 +812,66 @@ pub(crate) async fn activate_mesh_runtime(ctx: MeshRuntimeContext) -> Result<()>
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod sender_binding_tests {
+    use super::event_source_is_authenticated_sender;
+    use ansible_mesh_core::event::{EventEnvelope, EventKind, EventPayload};
+    use uuid::Uuid;
+
+    fn event(source: &str, target: Option<&str>) -> EventEnvelope {
+        EventEnvelope {
+            event_id: Uuid::new_v4(),
+            seq: 1,
+            source_node_id: source.into(),
+            target_node_id: target.map(str::to_string),
+            source_agent_id: source.into(),
+            target_agent_id: None,
+            kind: EventKind::ContinuityImport,
+            corr_id: String::new(),
+            attempt: 0,
+            created_at: 0,
+            expires_at: None,
+            payload: EventPayload::Inline { data: "{}".into() },
+            trace: vec![],
+        }
+    }
+
+    #[test]
+    fn an_event_from_its_own_sender_is_accepted() {
+        let e = event("mac-jane-aiua-01", Some("vps-jane-aiua-01"));
+        assert!(event_source_is_authenticated_sender(
+            &e,
+            "mac-jane-aiua-01",
+            "vps-jane-aiua-01"
+        ));
+    }
+
+    #[test]
+    fn a_peer_cannot_speak_as_another_hotel() {
+        // mbp-jane authenticated the batch but claims mac-jane sent it.
+        let e = event("mac-jane-aiua-01", Some("vps-jane-aiua-01"));
+        assert!(!event_source_is_authenticated_sender(
+            &e,
+            "mbp-jane-aiua-01",
+            "vps-jane-aiua-01"
+        ));
+        let untargeted = event("mac-jane-aiua-01", None);
+        assert!(!event_source_is_authenticated_sender(
+            &untargeted,
+            "mbp-jane-aiua-01",
+            "vps-jane-aiua-01"
+        ));
+    }
+
+    #[test]
+    fn an_event_addressed_elsewhere_is_not_ours_to_judge() {
+        let e = event("mac-jane-aiua-01", Some("mbp-jane-aiua-01"));
+        assert!(event_source_is_authenticated_sender(
+            &e,
+            "vps-jane-aiua-01",
+            "vps-jane-aiua-01"
+        ));
+    }
 }
