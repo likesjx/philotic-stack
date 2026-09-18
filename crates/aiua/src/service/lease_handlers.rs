@@ -778,13 +778,6 @@ impl IpcServer {
                 "guest must register before acquiring a Telegram poll lease",
             );
         };
-        let Some(agent_identity) = graph.get_agent_identity(&agent_id).ok().flatten() else {
-            return IpcResponse::error(
-                "telegram_poll_lease",
-                "LEASE_AGENT_UNKNOWN",
-                format!("no agent identity found for [{}]", agent_id),
-            );
-        };
         let Some(local_hotel_name) = Self::local_hotel_name(graph, local_node_id) else {
             return IpcResponse::error(
                 "telegram_poll_lease",
@@ -796,6 +789,22 @@ impl IpcServer {
             );
         };
         let transport_resource_ref = resource_ref.as_deref().unwrap_or(&lease_key);
+        // DEF-169: `agent_identity` is only needed for the legacy `Ok(None)`
+        // authority fallback below, but was fetched unconditionally up front
+        // — so a hotel with an explicit, authoritative `resolve_membrane_
+        // transport_home` record (Ok(Some(true/false)), which needs no
+        // agent-identity lookup at all) still got refused with
+        // `LEASE_AGENT_UNKNOWN` whenever that agent's identity record had
+        // never been seeded on this hotel — as any dynamically-discovered R2
+        // seat's agent is, since agent identities are seeded from the static
+        // mesh-config roster, not discovered from graph truth the way DEF-157
+        // taught the seat itself to be. Live on mac-jane: Beacon's transport
+        // home correctly flipped here (DEF-143/DEF-157 both proven working,
+        // and DEF-168 correctly classified the resulting denial as quiet
+        // Standby) but the seat could still never actually acquire, because
+        // every attempt hit this identity gate first regardless of the
+        // now-correct transport-home record. Fetch `agent_identity` lazily,
+        // only inside the branch that actually uses it.
         match Self::hotel_may_poll_transport_home(
             graph,
             &agent_id,
@@ -815,6 +824,14 @@ impl IpcServer {
                 );
             }
             Ok(None) => {
+                let Some(agent_identity) = graph.get_agent_identity(&agent_id).ok().flatten()
+                else {
+                    return IpcResponse::error(
+                        "telegram_poll_lease",
+                        "LEASE_AGENT_UNKNOWN",
+                        format!("no agent identity found for [{}]", agent_id),
+                    );
+                };
                 if !Self::hotel_may_poll_for_agent(&agent_identity, &local_hotel_name) {
                     return IpcResponse::error(
                         "telegram_poll_lease",
@@ -922,13 +939,6 @@ impl IpcServer {
                 "guest must register before renewing a Telegram poll lease",
             );
         };
-        let Some(agent_identity) = graph.get_agent_identity(&agent_id).ok().flatten() else {
-            return IpcResponse::error(
-                "telegram_poll_lease",
-                "LEASE_AGENT_UNKNOWN",
-                format!("no agent identity found for [{}]", agent_id),
-            );
-        };
         let Some(local_hotel_name) = Self::local_hotel_name(graph, local_node_id) else {
             return IpcResponse::error(
                 "telegram_poll_lease",
@@ -940,6 +950,22 @@ impl IpcServer {
             );
         };
         let transport_resource_ref = resource_ref.as_deref().unwrap_or(&lease_key);
+        // DEF-169: `agent_identity` is only needed for the legacy `Ok(None)`
+        // authority fallback below, but was fetched unconditionally up front
+        // — so a hotel with an explicit, authoritative `resolve_membrane_
+        // transport_home` record (Ok(Some(true/false)), which needs no
+        // agent-identity lookup at all) still got refused with
+        // `LEASE_AGENT_UNKNOWN` whenever that agent's identity record had
+        // never been seeded on this hotel — as any dynamically-discovered R2
+        // seat's agent is, since agent identities are seeded from the static
+        // mesh-config roster, not discovered from graph truth the way DEF-157
+        // taught the seat itself to be. Live on mac-jane: Beacon's transport
+        // home correctly flipped here (DEF-143/DEF-157 both proven working,
+        // and DEF-168 correctly classified the resulting denial as quiet
+        // Standby) but the seat could still never actually acquire, because
+        // every attempt hit this identity gate first regardless of the
+        // now-correct transport-home record. Fetch `agent_identity` lazily,
+        // only inside the branch that actually uses it.
         match Self::hotel_may_poll_transport_home(
             graph,
             &agent_id,
@@ -959,6 +985,14 @@ impl IpcServer {
                 );
             }
             Ok(None) => {
+                let Some(agent_identity) = graph.get_agent_identity(&agent_id).ok().flatten()
+                else {
+                    return IpcResponse::error(
+                        "telegram_poll_lease",
+                        "LEASE_AGENT_UNKNOWN",
+                        format!("no agent identity found for [{}]", agent_id),
+                    );
+                };
                 if !Self::hotel_may_poll_for_agent(&agent_identity, &local_hotel_name) {
                     return IpcResponse::error(
                         "telegram_poll_lease",
@@ -2488,6 +2522,106 @@ mod tests {
                 bundle_json: serde_json::json!({}),
             })
             .expect("seed agent identity");
+        graph
+            .upsert_membrane_transport_home(&MembraneTransportHomeRecord {
+                agent_id: "agent-beacon".into(),
+                transport: "telegram".into(),
+                resource_ref: "telegram_bot_token_beacon".into(),
+                active_home_hotel: "vps-jane".into(),
+                standby_hotels: vec!["local-hotel".into()],
+                managed_by_role: "orchestrator".into(),
+                lease_type: "telegram_poll".into(),
+                failover_policy: "manual-or-explicit-delegation".into(),
+                status: MembraneTransportHomeStatus::Active,
+                updated_unix: 0,
+            })
+            .expect("seed transport home");
+        let server = IpcServer::new(socket_path.clone(), "local-aiua-01", dispatcher_tx, graph);
+
+        let server_task = tokio::spawn(async move {
+            server.run().await.expect("ipc server should run");
+        });
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        unsafe {
+            std::env::set_var("PHILOTIC_HOTEL_SOCKET", &socket_path);
+        }
+
+        let mut poller = PhiloticClient::connect(GuestIdentity {
+            guest_id: "membrane-telegram-01".into(),
+            role: "membrane".into(),
+            supported_tools: Vec::new(),
+        })
+        .await
+        .expect("poller connect");
+
+        let response = poller
+            .send_request(IpcRequest::AcquireTelegramPollLease {
+                lease_key: "telegram:telegram_bot_token_beacon:deadbeefcafebabe".into(),
+                agent_id: "agent-beacon".into(),
+                resource_ref: Some("telegram_bot_token_beacon".into()),
+            })
+            .await
+            .expect("transport home mismatch request");
+
+        match response {
+            IpcResponse::Standard {
+                ok, code, message, ..
+            } => {
+                assert!(!ok);
+                assert_eq!(code, "LEASE_TRANSPORT_HOME_MISMATCH");
+                assert!(message.contains("local-hotel"));
+                assert!(message.contains("telegram_bot_token_beacon"));
+            }
+            other => panic!("unexpected response: {other:?}"),
+        }
+
+        unsafe {
+            std::env::remove_var("PHILOTIC_HOTEL_SOCKET");
+        }
+        server_task.abort();
+        let _ = server_task.await;
+        if Path::new(&socket_path).exists() {
+            let _ = std::fs::remove_file(&socket_path);
+        }
+    }
+
+    /// DEF-169: a hotel with no `agent_identity` record for this agent (e.g. a
+    /// dynamically-discovered R2 seat, whose agent was never in this hotel's
+    /// static mesh-config roster) must still be evaluated against an explicit
+    /// `MembraneTransportHomeRecord` — `LEASE_TRANSPORT_HOME_MISMATCH`, not
+    /// `LEASE_AGENT_UNKNOWN`. Reproduces the live mac-jane bug: the identity
+    /// gate fired unconditionally and masked the graph-owned transport-home
+    /// verdict entirely, so the seat could never acquire even once the
+    /// transport home correctly pointed at it.
+    #[tokio::test]
+    async fn telegram_poll_lease_denies_by_transport_home_without_agent_identity() {
+        let _env_guard = ipc_env_guard();
+        let socket_path = test_socket_path();
+        let (dispatcher_tx, _dispatcher_rx) = test_dispatcher_channel();
+        let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
+        let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
+        graph
+            .upsert_hotel(&HotelRecord {
+                hotel_name: "local-hotel".into(),
+                capabilities: NodeCapabilities {
+                    node_id: "local-aiua-01".into(),
+                    roles: vec![],
+                    models: vec![],
+                    tools: vec![],
+                    constraints: Default::default(),
+                    build_version: String::new(),
+                },
+                mesh_port: 9000,
+                blob_port: 9001,
+                execution_port: 9002,
+                ipc_socket_path: socket_path.clone(),
+                active_pid: None,
+                mesh_host: None,
+            })
+            .expect("seed local hotel");
+        // Deliberately NOT seeding an AgentIdentityRecord for agent-beacon —
+        // this hotel has never natively hosted this agent.
         graph
             .upsert_membrane_transport_home(&MembraneTransportHomeRecord {
                 agent_id: "agent-beacon".into(),
