@@ -457,6 +457,39 @@ pub(crate) async fn activate_mesh_runtime(ctx: MeshRuntimeContext) -> Result<()>
                                                 );
                                             }
                                         }
+                                        ansible_mesh_core::event::EventKind::ContinuityImport => {
+                                            if let ansible_mesh_core::event::EventPayload::Inline {
+                                                data,
+                                            } = &event.payload
+                                            {
+                                                let graph = inbound_graph.clone();
+                                                let node_id = inbound_local_node_id.clone();
+                                                let source_node = event.source_node_id.clone();
+                                                let data = data.clone();
+                                                let dispatcher_tx = dispatcher_inbound_tx.clone();
+                                                tokio::spawn(async move {
+                                                    IpcServer::handle_remote_continuity_import(
+                                                        graph.as_ref(),
+                                                        dispatcher_tx,
+                                                        &node_id,
+                                                        &source_node,
+                                                        &data,
+                                                    )
+                                                    .await;
+                                                });
+                                            }
+                                        }
+                                        ansible_mesh_core::event::EventKind::ContinuityAck => {
+                                            if let ansible_mesh_core::event::EventPayload::Inline {
+                                                data,
+                                            } = &event.payload
+                                            {
+                                                IpcServer::handle_remote_continuity_ack(
+                                                    inbound_graph.as_ref(),
+                                                    data,
+                                                );
+                                            }
+                                        }
                                         ansible_mesh_core::event::EventKind::SessionControl => {
                                             if let ansible_mesh_core::event::EventPayload::Inline {
                                                 data,

@@ -939,6 +939,73 @@ fn attach_delivery_context(
     serde_json::to_string(&payload).unwrap_or_else(|_| task_json.to_string())
 }
 
+/// Payload field naming the agent that owns a membrane-bound task no seat was
+/// addressed by. Membrane seats serving a different agent drop the task.
+pub(crate) const REPLY_OWNER_AGENT_ID_FIELD: &str = "reply_owner_agent_id";
+
+/// Stamps [`REPLY_OWNER_AGENT_ID_FIELD`] on a membrane-bound task that carries
+/// no seat target, taken from the emitter's registered identity — never from
+/// the payload, which any guest could forge.
+///
+/// A seat-less membrane task is delivered to EVERY local membrane seat, and a
+/// Telegram DM chat id is the same under every bot token. Seats filtered by
+/// parsing the agent out of the session id, which `cron:<job_id>` sessions
+/// never name — so each daily Bjork cron brief also went out through the
+/// Coach bot (2026-09-18). The emitter is the authority on who is replying.
+///
+/// Only a registered `agent` whose guest id (`agent-x` or `agent-x:<role>`)
+/// resolves to a known agent identity is stamped; anything else (subagents
+/// with UUID ids, infra guests) has the field removed so seats fall back to
+/// the session-id check.
+fn stamp_reply_owner_agent(
+    graph: &GraphDomain,
+    emitter: Option<&GuestIdentity>,
+    target_role: &str,
+    target_guest_id: Option<&str>,
+    task_json: String,
+) -> String {
+    if target_role != "membrane" || target_guest_id.is_some() {
+        return task_json;
+    }
+    let Ok(mut payload) = serde_json::from_str::<serde_json::Value>(&task_json) else {
+        return task_json;
+    };
+    let Some(obj) = payload.as_object_mut() else {
+        return task_json;
+    };
+    let owner = emitter
+        .and_then(emitter_agent_id)
+        .filter(|agent_id| matches!(graph.get_agent_identity(agent_id), Ok(Some(_))));
+    match owner {
+        Some(agent_id) => {
+            obj.insert(
+                REPLY_OWNER_AGENT_ID_FIELD.to_string(),
+                serde_json::json!(agent_id),
+            );
+        }
+        None => {
+            if obj.remove(REPLY_OWNER_AGENT_ID_FIELD).is_none() {
+                return task_json;
+            }
+        }
+    }
+    serde_json::to_string(&payload).unwrap_or(task_json)
+}
+
+/// The agent a philote connection speaks for, from how it registered (see
+/// `philote::main::role_registration`): a base philote is role `agent` with
+/// guest id `{agent_id}`; a role incarnation is role `role:{agent_id}:{role}`
+/// with guest id `{agent_id}:{role}`. The two must agree.
+fn emitter_agent_id(identity: &GuestIdentity) -> Option<&str> {
+    let guest_agent = identity.guest_id.split(':').next()?;
+    let role_agent = if identity.role == "agent" {
+        guest_agent
+    } else {
+        identity.role.strip_prefix("role:")?.split(':').next()?
+    };
+    (!guest_agent.is_empty() && guest_agent == role_agent).then_some(guest_agent)
+}
+
 /// Guest-record roles that can never consume `role="agent"` deliveries. Used to reject
 /// poisoned placement-provenance hints (see `guest_can_fill_agent_placement`): tool and
 /// datasource runners such as `life-graph-runner` are dispatch TARGETS of an agent's
@@ -6078,6 +6145,13 @@ impl IpcServer {
                     );
                     return IpcResponse::success("emit", None);
                 }
+                let task_json = stamp_reply_owner_agent(
+                    graph,
+                    current_identity.as_ref(),
+                    &target_role,
+                    target_guest_id.as_deref(),
+                    task_json,
+                );
                 // Normalize the client-SDK default node id sentinel. A client
                 // that never learned its node (PHILOTIC_NODE_ID unset) sends
                 // "local-aiua-01", which means "the hotel I am connected to".
@@ -15017,7 +15091,7 @@ impl IpcServer {
             policy
         };
 
-        Ok(Some(serde_json::json!({
+        let mut snapshot = serde_json::json!({
             "session_id": session.session_id,
             "agent_id": session.primary_agent_id,
             "source": session.channel_kind,
@@ -15035,7 +15109,35 @@ impl IpcServer {
             "recent_turns": recent_turns,
             "active_turn": active_turn,
             "session_index": session_index,
-        })))
+        });
+        Self::overlay_philote_owned_checkpoint_fields(&mut snapshot, apartment_checkpoint.as_ref());
+        Ok(Some(snapshot))
+    }
+
+    /// Carry every checkpoint field the snapshot does not compute itself —
+    /// parked turns, the carryover plan, paracrine threads, watchdog clocks,
+    /// the fallback override, the life-recall cache (DEF-167). Before this the
+    /// snapshot projected only `recent_turns`/`active_turn` out of the
+    /// apartment, so a philote restoring a session — after a restart, or on
+    /// another hotel after a relocation — silently got defaults for all of
+    /// it. Hotel-computed keys win: the session row is the truth for
+    /// routing, status, and policy, and the hotel recomputes the profile and
+    /// assemblies that `checkpoint_json` deliberately leaves out.
+    fn overlay_philote_owned_checkpoint_fields(
+        snapshot: &mut serde_json::Value,
+        checkpoint: Option<&serde_json::Value>,
+    ) {
+        let (Some(snapshot), Some(checkpoint)) = (
+            snapshot.as_object_mut(),
+            checkpoint.and_then(serde_json::Value::as_object),
+        ) else {
+            return;
+        };
+        for (key, value) in checkpoint {
+            if !snapshot.contains_key(key) {
+                snapshot.insert(key.clone(), value.clone());
+            }
+        }
     }
 
     async fn compose_mesh_registry_snapshot(
@@ -15475,12 +15577,121 @@ impl IpcServer {
                     "ok": ok,
                     "readiness": readiness,
                     "error": error,
+                    // R5: this build imports continuity bundles. An origin
+                    // only sends `ContinuityImport` to a target that says so,
+                    // so an older peer never receives a kind it can't parse.
+                    "supports_continuity": true,
                 })
                 .to_string(),
             },
             trace: vec![],
         };
         let _ = dispatcher_tx.send(LedgerCommand::AppendLocal(event)).await;
+    }
+
+    /// Relocation Ceremony R5, target side: import the origin's continuity
+    /// bundle and ack. Runs before the event commits, and inbound events are
+    /// not deduplicated, so the import itself is idempotent per ceremony.
+    pub(crate) async fn handle_remote_continuity_import(
+        graph: &GraphDomain,
+        dispatcher_tx: mpsc::Sender<LedgerCommand>,
+        local_node_id: &str,
+        source_node_id: &str,
+        data: &str,
+    ) {
+        let payload: serde_json::Value = match serde_json::from_str(data) {
+            Ok(v) => v,
+            Err(err) => {
+                warn!("handle_remote_continuity_import: failed to parse payload: {err}");
+                return;
+            }
+        };
+        let Some(request_id) = payload.get("request_id").and_then(|v| v.as_str()) else {
+            warn!("handle_remote_continuity_import: missing request_id");
+            return;
+        };
+        let outcome = payload
+            .get("bundle")
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("payload carries no bundle"))
+            .and_then(|raw| {
+                serde_json::from_value::<crate::service::continuity::ContinuityBundle>(raw)
+                    .map_err(anyhow::Error::from)
+            })
+            .and_then(|bundle| {
+                if bundle.target_node_id != local_node_id {
+                    anyhow::bail!(
+                        "bundle is addressed to '{}', not this hotel '{}'",
+                        bundle.target_node_id,
+                        local_node_id
+                    );
+                }
+                let summary = crate::service::continuity::import_continuity_bundle(graph, &bundle)?;
+                info!(
+                    "Continuity import [{}] for ceremony [{}] (agent '{}', role '{}'): {:?}",
+                    request_id, bundle.ceremony_id, bundle.agent_id, bundle.role_name, summary
+                );
+                Ok(summary)
+            });
+        let (ok, summary, error) = match outcome {
+            Ok(summary) => (true, serde_json::to_value(summary).ok(), None),
+            Err(err) => {
+                warn!("Continuity import [{}] failed: {}", request_id, err);
+                (false, None, Some(err.to_string()))
+            }
+        };
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let event = EventEnvelope {
+            event_id: Uuid::new_v4(),
+            seq: 0,
+            source_node_id: local_node_id.to_string(),
+            target_node_id: Some(source_node_id.to_string()),
+            source_agent_id: local_node_id.to_string(),
+            target_agent_id: None,
+            kind: ansible_mesh_core::event::EventKind::ContinuityAck,
+            corr_id: request_id.to_string(),
+            attempt: 0,
+            created_at: ts,
+            expires_at: None,
+            payload: ansible_mesh_core::event::EventPayload::Inline {
+                data: serde_json::json!({
+                    "request_id": request_id,
+                    "ok": ok,
+                    "summary": summary,
+                    "error": error,
+                })
+                .to_string(),
+            },
+            trace: vec![],
+        };
+        let _ = dispatcher_tx.send(LedgerCommand::AppendLocal(event)).await;
+    }
+
+    /// Relocation Ceremony R5, origin side: persist the target's
+    /// `ContinuityAck` so the ceremony's CONTINUITY phase can poll it.
+    pub(crate) fn handle_remote_continuity_ack(graph: &GraphDomain, data: &str) {
+        let Ok(payload) = serde_json::from_str::<serde_json::Value>(data) else {
+            warn!("handle_remote_continuity_ack: failed to parse payload");
+            return;
+        };
+        let Some(request_id) = payload.get("request_id").and_then(|v| v.as_str()) else {
+            warn!("handle_remote_continuity_ack: missing request_id");
+            return;
+        };
+        if let Err(err) = graph.set_config_value(&format!("continuity_ack:{request_id}"), data) {
+            warn!(
+                "handle_remote_continuity_ack: failed to persist ack for '{}': {}",
+                request_id, err
+            );
+            return;
+        }
+        info!(
+            "Continuity ack recorded for request [{}]: {}",
+            request_id, data
+        );
     }
 
     /// Relocation Ceremony R3, source side: receive the `MaterializeReady`
@@ -18507,6 +18718,128 @@ pub(crate) mod tests {
     fn register_skill_test_graph() -> GraphDomain {
         let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
         GraphDomain::new(Arc::new(graph_store.adapter()))
+    }
+
+    // ── stamp_reply_owner_agent (cron brief sent by every bot, 2026-09-18) ────
+
+    mod reply_owner_stamp {
+        use super::*;
+
+        fn graph_with_agents(agent_ids: &[&str]) -> GraphDomain {
+            let graph = register_skill_test_graph();
+            for agent_id in agent_ids {
+                graph
+                    .upsert_agent_identity(&AgentIdentityRecord {
+                        agent_id: (*agent_id).into(),
+                        persona_name: (*agent_id).into(),
+                        authority_hotel: "mac-jane".into(),
+                        bundle_json: serde_json::json!({}),
+                    })
+                    .expect("seed agent identity");
+            }
+            graph
+        }
+
+        fn identity(guest_id: &str, role: &str) -> GuestIdentity {
+            GuestIdentity {
+                guest_id: guest_id.into(),
+                role: role.into(),
+                supported_tools: Vec::new(),
+            }
+        }
+
+        fn cron_reply() -> String {
+            serde_json::json!({
+                "action": "send_reply",
+                "session_id": "cron:lifegraph-flywheel-daily:mac-jane",
+                "chat_id": "7898847424",
+                "content": "brief",
+            })
+            .to_string()
+        }
+
+        fn owner(task_json: &str) -> Option<String> {
+            serde_json::from_str::<serde_json::Value>(task_json).unwrap()
+                [REPLY_OWNER_AGENT_ID_FIELD]
+                .as_str()
+                .map(str::to_string)
+        }
+
+        #[test]
+        fn role_incarnation_reply_is_owned_by_its_agent() {
+            let graph = graph_with_agents(&["agent-bjork-01", "agent-coach"]);
+            // Registration shape from `philote::main::role_registration`.
+            let emitter = identity(
+                "agent-bjork-01:orchestrator",
+                "role:agent-bjork-01:orchestrator",
+            );
+            let stamped =
+                stamp_reply_owner_agent(&graph, Some(&emitter), "membrane", None, cron_reply());
+            assert_eq!(owner(&stamped).as_deref(), Some("agent-bjork-01"));
+            let base = identity("agent-coach", "agent");
+            let stamped =
+                stamp_reply_owner_agent(&graph, Some(&base), "membrane", None, cron_reply());
+            assert_eq!(owner(&stamped).as_deref(), Some("agent-coach"));
+        }
+
+        #[test]
+        fn emitter_identity_overrides_a_forged_payload_owner() {
+            let graph = graph_with_agents(&["agent-bjork-01", "agent-coach"]);
+            let mut forged: serde_json::Value = serde_json::from_str(&cron_reply()).unwrap();
+            forged[REPLY_OWNER_AGENT_ID_FIELD] = serde_json::json!("agent-coach");
+            let emitter = identity("agent-bjork-01", "agent");
+            let stamped = stamp_reply_owner_agent(
+                &graph,
+                Some(&emitter),
+                "membrane",
+                None,
+                forged.to_string(),
+            );
+            assert_eq!(owner(&stamped).as_deref(), Some("agent-bjork-01"));
+        }
+
+        #[test]
+        fn unknown_or_non_agent_emitters_leave_no_owner() {
+            let graph = graph_with_agents(&["agent-bjork-01"]);
+            let mut forged: serde_json::Value = serde_json::from_str(&cron_reply()).unwrap();
+            forged[REPLY_OWNER_AGENT_ID_FIELD] = serde_json::json!("agent-coach");
+            for emitter in [
+                Some(identity("14ce429a-fd39-4b3e-8447-5867e59a9b30", "agent")),
+                Some(identity("agent-bjork-01", "tool")),
+                // Guest id and routing role naming different agents.
+                Some(identity(
+                    "agent-bjork-01:orchestrator",
+                    "role:agent-coach:orchestrator",
+                )),
+                None,
+            ] {
+                let stamped = stamp_reply_owner_agent(
+                    &graph,
+                    emitter.as_ref(),
+                    "membrane",
+                    None,
+                    forged.to_string(),
+                );
+                assert_eq!(owner(&stamped), None, "emitter {emitter:?}");
+            }
+        }
+
+        #[test]
+        fn seat_targeted_and_non_membrane_tasks_are_untouched() {
+            let graph = graph_with_agents(&["agent-bjork-01"]);
+            let emitter = identity("agent-bjork-01", "agent");
+            let targeted = stamp_reply_owner_agent(
+                &graph,
+                Some(&emitter),
+                "membrane",
+                Some("mac-jane:membrane-gateway-bjork"),
+                cron_reply(),
+            );
+            assert_eq!(targeted, cron_reply());
+            let to_agent =
+                stamp_reply_owner_agent(&graph, Some(&emitter), "agent", None, cron_reply());
+            assert_eq!(to_agent, cron_reply());
+        }
     }
 
     // ── steward_agent_admin_gate (aria-mesh-steward slice 1) ──────────────────
@@ -26709,6 +27042,72 @@ pub(crate) mod tests {
         if Path::new(&socket_path).exists() {
             let _ = std::fs::remove_file(&socket_path);
         }
+    }
+
+    /// DEF-167: a restore must bring back the whole checkpoint, not just
+    /// `recent_turns`/`active_turn` — a parked plan turn, the carryover plan,
+    /// and the watchdog clocks survive, while hotel-owned keys stay the
+    /// session row's truth.
+    #[tokio::test]
+    async fn session_snapshot_carries_philote_owned_checkpoint_fields() {
+        let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
+        let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
+        graph
+            .upsert_session(&SessionRecord {
+                session_id: "telegram:7:agent-bjork-01".into(),
+                session_kind: "conversation".into(),
+                primary_agent_id: Some("agent-bjork-01".into()),
+                active_incarnation_id: Some("agent-bjork-01:orchestrator".into()),
+                channel_kind: Some("telegram".into()),
+                channel_session_key: Some("7".into()),
+                status: "active".into(),
+                lease_owner_component_id: None,
+                lease_expires_at: None,
+                summary_json: serde_json::json!({}),
+                created_at: 1,
+                updated_at: 2,
+            })
+            .expect("session should seed");
+        graph
+            .sync_apartment(
+                "agent-bjork-01",
+                "short_session:telegram:7:agent-bjork-01",
+                &serde_json::json!({
+                    "session_id": "telegram:7:agent-bjork-01",
+                    "active_incarnation_id": "stale-incarnation",
+                    "active_turn": null,
+                    "recent_turns": [{"turn_id": "t1", "user_content": "log practice"}],
+                    "carryover_plan": {"goal": "log practice", "steps": ["observe"]},
+                    "parked_plan_turn": {"turn_id": "t2", "phase": "planning_discussion"},
+                    "parked_plan_since_unix": 1_789_700_000_u64,
+                    "turn_waiting_since_unix": 1_789_700_001_u64,
+                }),
+            )
+            .expect("checkpoint should seed");
+
+        let inboxes: InboxRegistry = Arc::new(Mutex::new(HashMap::new()));
+        let registry = Arc::new(RwLock::new(NodeRegistry::new()));
+        let snapshot = IpcServer::compose_session_snapshot(
+            &graph,
+            &inboxes,
+            &registry,
+            "mac-jane-aiua-01",
+            "telegram:7:agent-bjork-01",
+            None,
+        )
+        .await
+        .expect("snapshot composes")
+        .expect("session exists");
+
+        assert_eq!(snapshot["carryover_plan"]["goal"], "log practice");
+        assert_eq!(snapshot["parked_plan_turn"]["turn_id"], "t2");
+        assert_eq!(snapshot["parked_plan_since_unix"], 1_789_700_000_u64);
+        assert_eq!(snapshot["turn_waiting_since_unix"], 1_789_700_001_u64);
+        assert_eq!(snapshot["recent_turns"][0]["user_content"], "log practice");
+        assert_eq!(
+            snapshot["active_incarnation_id"], "agent-bjork-01:orchestrator",
+            "the session row, not the checkpoint, owns routing"
+        );
     }
 
     #[tokio::test]

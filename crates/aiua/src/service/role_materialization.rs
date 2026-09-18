@@ -2308,6 +2308,117 @@ impl IpcServer {
         None
     }
 
+    /// Relocation Ceremony R5: CONTINUITY. Export the moving role's session
+    /// checkpoints, session rows and the agent identity, ship them to the
+    /// target inline over the signed execution plane, and wait for its ack.
+    ///
+    /// Advances the ceremony to CONTINUITY and records the outcome in the
+    /// phase note. A target that did not advertise `supports_continuity` in
+    /// its STANDBY reply predates R5: the move runs degraded, as before,
+    /// rather than send it an event kind it cannot parse. `Err` is a reason
+    /// to roll back — CONTINUITY is still pre-commitment.
+    async fn transfer_continuity(
+        graph: &GraphDomain,
+        dispatcher_tx: &mpsc::Sender<LedgerCommand>,
+        local_node_id: &str,
+        ceremony: &mut RelocationCeremonyRecord,
+        standby_ready: &serde_json::Value,
+    ) -> Result<(), String> {
+        let now = unix_ts();
+        if standby_ready
+            .get("supports_continuity")
+            .and_then(|v| v.as_bool())
+            != Some(true)
+        {
+            ceremony.advance(
+                RelocationCeremonyPhase::Continuity,
+                "degraded: the target predates continuity transfer; the role moves without its \
+                 session checkpoints and resumes its conversations fresh",
+                now,
+            );
+            let _ = graph.upsert_relocation_ceremony(ceremony);
+            return Ok(());
+        }
+
+        let bundle = crate::service::continuity::export_continuity_bundle(
+            graph,
+            ceremony,
+            IpcServer::local_hotel_name(graph, local_node_id),
+            IpcServer::local_hotel_name(graph, &ceremony.target_hotel),
+            now,
+        )
+        .map_err(|err| format!("CONTINUITY export failed: {err}"))?;
+        let request_id = Uuid::new_v4();
+        let data = serde_json::json!({
+            "request_id": request_id.to_string(),
+            "bundle": bundle,
+        })
+        .to_string();
+        if data.len() > crate::service::continuity::CONTINUITY_MAX_BYTES {
+            return Err(format!(
+                "CONTINUITY bundle is {} bytes, over the {}-byte inline limit",
+                data.len(),
+                crate::service::continuity::CONTINUITY_MAX_BYTES
+            ));
+        }
+        ceremony.continuity_request_id = Some(request_id.to_string());
+        ceremony.advance(
+            RelocationCeremonyPhase::Continuity,
+            format!(
+                "sending {} session checkpoint(s) and {} session row(s) ({} bytes)",
+                bundle.apartments.len(),
+                bundle.sessions.len(),
+                data.len()
+            ),
+            now,
+        );
+        let _ = graph.upsert_relocation_ceremony(ceremony);
+
+        let event = EventEnvelope {
+            event_id: request_id,
+            seq: 0,
+            source_node_id: local_node_id.to_string(),
+            target_node_id: Some(ceremony.target_hotel.clone()),
+            source_agent_id: local_node_id.to_string(),
+            target_agent_id: None,
+            kind: EventKind::ContinuityImport,
+            corr_id: request_id.to_string(),
+            attempt: 0,
+            created_at: now,
+            expires_at: None,
+            payload: EventPayload::Inline { data },
+            trace: vec![],
+        };
+        let _ = dispatcher_tx.send(LedgerCommand::AppendLocal(event)).await;
+
+        let key = format!("continuity_ack:{request_id}");
+        let mut ack = None;
+        for _ in 0..40 {
+            if let Ok(Some(raw)) = graph.get_config_value(&key) {
+                ack = Some(serde_json::from_str::<serde_json::Value>(&raw).unwrap_or_default());
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        }
+        let Some(ack) = ack else {
+            return Err("CONTINUITY timed out waiting for the target's import ack".to_string());
+        };
+        if ack.get("ok").and_then(|v| v.as_bool()) != Some(true) {
+            let error = ack
+                .get("error")
+                .and_then(|v| v.as_str())
+                .unwrap_or("target refused the import without a reason");
+            return Err(format!("target failed the CONTINUITY import: {error}"));
+        }
+        info!(
+            "Relocation ceremony [{}] CONTINUITY acked by '{}': {}",
+            ceremony.ceremony_id,
+            ceremony.target_hotel,
+            ack.get("summary").cloned().unwrap_or_default()
+        );
+        Ok(())
+    }
+
     /// Roll a still-pre-commitment ceremony back (free — nothing on the
     /// origin was ever touched) and persist the terminal state.
     fn roll_back_ceremony(
@@ -2478,7 +2589,7 @@ impl IpcServer {
         ceremony.materialize_request_id = Some(request_id.clone());
         let _ = graph.upsert_relocation_ceremony(&ceremony);
 
-        match Self::poll_materialize_ready(graph, &request_id, 40).await {
+        let standby_ready = match Self::poll_materialize_ready(graph, &request_id, 40).await {
             None => {
                 Self::roll_back_ceremony(
                     graph,
@@ -2500,18 +2611,27 @@ impl IpcServer {
                 );
                 return;
             }
-            Some(_) => {}
-        }
+            Some(reply) => reply,
+        };
 
-        // ── CONTINUITY (degraded — R5 not built) ────────────────────────
-        let now = unix_ts();
-        ceremony.advance(
-            RelocationCeremonyPhase::Continuity,
-            "degraded: no continuity blob transfer (R5 not built); STANDBY's role/toolset \
-             records are the only state this ceremony carries",
-            now,
-        );
-        let _ = graph.upsert_relocation_ceremony(&ceremony);
+        // ── CONTINUITY ───────────────────────────────────────────────────
+        // The export is the last read before SWITCH, so the snapshot the
+        // target resumes from is as close to the cutover as the round trip
+        // allows. Anything the origin process does between this export and
+        // SWITCH (a turn finishing mid-flight) is not carried — closing that
+        // window needs a drain contract with the origin philote.
+        if let Err(reason) = Self::transfer_continuity(
+            graph,
+            dispatcher_tx,
+            local_node_id,
+            &mut ceremony,
+            &standby_ready,
+        )
+        .await
+        {
+            Self::roll_back_ceremony(graph, &mut ceremony, reason);
+            return;
+        }
 
         // ── SWITCH ───────────────────────────────────────────────────────
         let now = unix_ts();
@@ -3502,6 +3622,218 @@ mod tests {
             !origin_guest.is_active,
             "RECONCILE should have deactivated the origin guest"
         );
+    }
+
+    /// Start a ceremony for Beacon's orchestrator, answer FEASIBILITY, and
+    /// answer STANDBY with `standby_reply`. Returns the ceremony id.
+    async fn drive_ceremony_through_standby(
+        graph: &GraphDomain,
+        dispatcher_tx: &mpsc::Sender<LedgerCommand>,
+        rx: &mut mpsc::UnboundedReceiver<LedgerCommand>,
+        standby_reply: serde_json::Value,
+    ) -> String {
+        let identity = GuestIdentity {
+            guest_id: "agent-beacon".into(),
+            role: "agent".into(),
+            supported_tools: vec![],
+        };
+        let resp = IpcServer::handle_relocate_hotel(
+            graph,
+            dispatcher_tx,
+            "mac-jane-aiua-01",
+            Some(&identity),
+            "agent-beacon".into(),
+            "orchestrator".into(),
+            "orchestrator".into(),
+            "vps-jane".into(),
+            false,
+            None,
+            None,
+            "test move".into(),
+        )
+        .await;
+        let IpcResponse::RelocationCeremonyStarted { ceremony_id, .. } = resp else {
+            panic!("expected IpcResponse::RelocationCeremonyStarted, got {resp:?}");
+        };
+        for reply in [
+            serde_json::json!({"ok": true, "readiness": "feasible"}),
+            standby_reply,
+        ] {
+            let request_id = next_inline_payload(rx).await["request_id"]
+                .as_str()
+                .expect("request_id")
+                .to_string();
+            graph
+                .set_config_value(
+                    &format!("materialize_ready:{request_id}"),
+                    &reply.to_string(),
+                )
+                .expect("seed materialize reply");
+        }
+        ceremony_id
+    }
+
+    async fn next_inline_payload(
+        rx: &mut mpsc::UnboundedReceiver<LedgerCommand>,
+    ) -> serde_json::Value {
+        let cmd = tokio::time::timeout(std::time::Duration::from_secs(3), rx.recv())
+            .await
+            .expect("dispatch within timeout")
+            .expect("mesh envelope dispatched");
+        let LedgerCommand::AppendLocal(event) = cmd else {
+            panic!("expected LedgerCommand::AppendLocal");
+        };
+        let EventPayload::Inline { data } = &event.payload else {
+            panic!("expected inline payload");
+        };
+        let mut payload: serde_json::Value = serde_json::from_str(data).expect("valid json");
+        payload["__kind"] = serde_json::to_value(&event.kind).expect("kind serializes");
+        payload["__target"] = serde_json::json!(event.target_node_id);
+        payload
+    }
+
+    async fn wait_for_terminal_ceremony(
+        graph: &GraphDomain,
+        ceremony_id: &str,
+    ) -> RelocationCeremonyRecord {
+        for _ in 0..80 {
+            let ceremony = graph
+                .get_relocation_ceremony(ceremony_id)
+                .expect("query ceremony")
+                .expect("ceremony exists");
+            if ceremony.phase.is_terminal() {
+                return ceremony;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        panic!("ceremony did not reach a terminal phase within bound");
+    }
+
+    fn seed_beacon_session_checkpoint(graph: &GraphDomain) {
+        graph
+            .upsert_session(&ansible_mesh_core::storage::SessionRecord {
+                session_id: "telegram:7:agent-beacon".into(),
+                session_kind: "conversation".into(),
+                primary_agent_id: Some("agent-beacon".into()),
+                active_incarnation_id: Some("agent-beacon:orchestrator".into()),
+                channel_kind: Some("telegram".into()),
+                channel_session_key: Some("7".into()),
+                status: "active".into(),
+                lease_owner_component_id: None,
+                lease_expires_at: None,
+                summary_json: serde_json::json!({}),
+                created_at: 1,
+                updated_at: 2,
+            })
+            .expect("seed session");
+        graph
+            .sync_apartment(
+                "agent-beacon",
+                "short_session:telegram:7:agent-beacon",
+                &serde_json::json!({
+                    "session_id": "telegram:7:agent-beacon",
+                    "carryover_plan": {"goal": "garden the LifeGraph"},
+                }),
+            )
+            .expect("seed checkpoint");
+    }
+
+    /// R5: a target that supports continuity gets the role's checkpoints
+    /// before SWITCH, and the move only closes once it acks.
+    #[tokio::test]
+    async fn relocate_hotel_carries_session_checkpoints_before_switch() {
+        let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
+        let graph = GraphDomain::new(Arc::new(graph_store.adapter()));
+        seed_relocatable_orchestrator(&graph);
+        seed_beacon_session_checkpoint(&graph);
+        let (dispatcher_tx, mut rx) = test_dispatcher_channel();
+
+        let ceremony_id = drive_ceremony_through_standby(
+            &graph,
+            &dispatcher_tx,
+            &mut rx,
+            serde_json::json!({"ok": true, "readiness": "routable", "supports_continuity": true}),
+        )
+        .await;
+
+        let import = next_inline_payload(&mut rx).await;
+        assert_eq!(import["__kind"], "CONTINUITY_IMPORT");
+        assert_eq!(import["__target"], "vps-jane-aiua-01");
+        assert_eq!(
+            import["bundle"]["apartments"][0]["content"]["carryover_plan"]["goal"],
+            "garden the LifeGraph"
+        );
+        assert_eq!(
+            import["bundle"]["sessions"][0]["session_id"],
+            "telegram:7:agent-beacon"
+        );
+        // SWITCH must wait for the ack: the role has not moved yet.
+        let role = graph
+            .get_role_incarnation("agent-beacon", "orchestrator")
+            .expect("query role")
+            .expect("role exists");
+        assert_eq!(role.home_node.as_deref(), Some("mac-jane"));
+
+        let request_id = import["request_id"].as_str().expect("request_id");
+        graph
+            .set_config_value(
+                &format!("continuity_ack:{request_id}"),
+                &serde_json::json!({"request_id": request_id, "ok": true}).to_string(),
+            )
+            .expect("seed continuity ack");
+
+        let ceremony = wait_for_terminal_ceremony(&graph, &ceremony_id).await;
+        assert_eq!(ceremony.phase, RelocationCeremonyPhase::Close);
+        assert_eq!(ceremony.continuity_request_id.as_deref(), Some(request_id));
+        let role = graph
+            .get_role_incarnation("agent-beacon", "orchestrator")
+            .expect("query role")
+            .expect("role exists");
+        assert_eq!(role.home_node.as_deref(), Some("vps-jane-aiua-01"));
+    }
+
+    /// R5: a refused import is still pre-commitment — the ceremony rolls
+    /// back and the role stays home.
+    #[tokio::test]
+    async fn relocate_hotel_rolls_back_when_target_refuses_continuity() {
+        let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
+        let graph = GraphDomain::new(Arc::new(graph_store.adapter()));
+        seed_relocatable_orchestrator(&graph);
+        seed_beacon_session_checkpoint(&graph);
+        let (dispatcher_tx, mut rx) = test_dispatcher_channel();
+
+        let ceremony_id = drive_ceremony_through_standby(
+            &graph,
+            &dispatcher_tx,
+            &mut rx,
+            serde_json::json!({"ok": true, "readiness": "routable", "supports_continuity": true}),
+        )
+        .await;
+        let import = next_inline_payload(&mut rx).await;
+        let request_id = import["request_id"].as_str().expect("request_id");
+        graph
+            .set_config_value(
+                &format!("continuity_ack:{request_id}"),
+                &serde_json::json!({"request_id": request_id, "ok": false, "error": "disk full"})
+                    .to_string(),
+            )
+            .expect("seed refusing ack");
+
+        let ceremony = wait_for_terminal_ceremony(&graph, &ceremony_id).await;
+        assert_eq!(ceremony.phase, RelocationCeremonyPhase::RolledBack);
+        assert!(
+            ceremony
+                .decline_reason
+                .as_deref()
+                .is_some_and(|r| r.contains("disk full")),
+            "decline reason should carry the target's error: {:?}",
+            ceremony.decline_reason
+        );
+        let role = graph
+            .get_role_incarnation("agent-beacon", "orchestrator")
+            .expect("query role")
+            .expect("role exists");
+        assert_eq!(role.home_node.as_deref(), Some("mac-jane"));
     }
 
     #[tokio::test]

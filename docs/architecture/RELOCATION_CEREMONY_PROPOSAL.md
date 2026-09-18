@@ -247,7 +247,7 @@ uselessness.
 | **R2** Membrane standby and push stand-down | **test-green 2026-09-05.** Hotel pushes `IpcResponse::TransportHomeChanged` to local guests on a local `transport.set_home` and on a gossiped record applied by `placement_sync`; the Telegram seat has an explicit `Standby` state, stops polling at once when the home moves away, releases the lease on the next tick, and re-probes on the next 20 s lease tick when the home moves here. Discord/desktop/MCP standby pending | G7 | test-green ✓; watched-live pending: Beacon's token vps ↔ mac with no dropped message |
 | **R3** Remote materialization request/ready | `materialize.request` / `materialize.ready` on the TCP execution plane carrying component template refs, `agent_identity`, role and toolset records, transport-home standby; target resolves binaries (Guest Binary Resolution), admits, spawns, reports | G2, G3 | test-green on two local hotels; smoke mac ↔ mbp |
 | **R4** Feasibility and placement | offer/decline with reasons: binary resolvable, secret refs present, controller resources present, `NodeHealthSnapshot` headroom, `max_concurrent_jobs`, version compatibility; `best_place_to_run` consumes the same checks | G8, G9 (readiness half) | test-green |
-| **R5** Continuity transfer | export session snapshot + checkpoint + dialogue window + apartment as an authenticated blob; import on target before switch. Requires blob-plane auth and mesh-interface bind (DEF-104 follow-on). Until then the ceremony runs in a declared degraded mode carrying only the `HandoffBundle` | G5 | smoke: in-flight parked turn survives a move |
+| **R5** Continuity transfer | export the moving role's session checkpoints, their session rows and the agent identity as the last read before SWITCH; ship inline as `ContinuityImport` over the HMAC-signed execution plane (signed, not encrypted: never vault entries); target imports idempotently and acks; SWITCH waits for the ack. Targets that don't advertise `supports_continuity` get the degraded move. Test-green 2026-09-18; needs DEF-167 (restore reads the whole checkpoint). Drain contract still open | G5 | smoke: in-flight parked turn survives a move |
 | **R6** `hotel.relocate` and the ceremony record | the philote-facing tool; `relocation_ceremony` graph record with phases; risk tiers; drain contract; rollback bounds; resume after crash | G9 (tier half), orchestration | watched-live: Bjork's orchestrator moves `mac-jane` → `vps-jane` from a Telegram turn and answers the next message from the VPS |
 | **R7** Sealed secret transfer | AEAD-sealed `secret_ref` payload over the peer-authenticated channel (X25519 material already exists for HMAC key derivation), or a TLS execution plane; until then secrets are pre-provisioned through the vault plane and R4 declines otherwise | G4 | security review + smoke |
 | **R8** Catalog sync truth | verify G10 live; if confirmed, wire the real `MeshCatalogSync` payload | G10 | smoke |
@@ -258,7 +258,7 @@ watched-live gate of R6, not a separate project.
 
 ## Prerequisites Outside This Proposal
 
-- **Blob plane auth and mesh-interface bind** before R5 (DEF-104 fixed the bind;
+- **Blob plane auth and mesh-interface bind** — no longer gates R5, which rides the signed execution plane inline (DEF-104 fixed the bind;
   auth is still absent). Until `vps-jane` is redeployed its execution and blob
   ports remain publicly reachable.
 - **Ansible peer port drift** on `jane-vps` host vars (mac-jane listed at
