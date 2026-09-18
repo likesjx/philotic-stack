@@ -102,8 +102,11 @@ Philotic currently operates as a hotel-centered runtime:
 
 The native LifeGraph editor on `codex/lifegraph-editor` adds text corrections
 through an enrolled-device gateway and an atomic graph before/after audit, plus
-a one-hop directed relationship diagram. Contract/build tests pass; deployment
-and installed-app proof remain pending. See [scope and trust limitations](../../apps/philotic-apple/LIFEGRAPH.md).
+a one-hop directed relationship diagram. PR #545 is deployed on vps-jane in
+develop `50e01247`; live enrolled-device save/read-back, stale-write rejection,
+and persisted audit checks passed on 2026-09-17. Updated Mac UI was inspected;
+native Save-button interaction and physical iPhone rollout remain unverified.
+See [scope and verification](../../apps/philotic-apple/LIFEGRAPH.md).
 
 ### Runtime and authority
 

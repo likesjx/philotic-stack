@@ -1,6 +1,6 @@
 # LifeGraph editor and relationships
 
-Status: implemented on `codex/lifegraph-editor`; production rollout pending.
+Status: PR #545 merged; vps-jane API save/audit verified live 2026-09-17.
 Parent: [Native Apple program](../../docs/architecture/NATIVE_APPLE_APP_PROPOSAL.md).
 Work: [LifeGraph editor](../../docs/task.md#native-lifegraph-editor).
 
@@ -63,10 +63,23 @@ invented. The view states its returned-edge limit; it is not a whole-graph map.
   55 passed; edge suite: 23 passed; edit authorization: two passed.
 - Baseline build repair: removed duplicate `deserialize_properties_leniently`
   definition while retaining the newer implementation and compatible error wording.
-- Still required: install updated `philotic-web` and `life-graph-runner` together,
-  integrate the Apple changes without losing the existing notch/desktop work,
-  and verify a disposable node from the installed app through the selected hotel.
-  No real operator nodes have been edited for validation.
+- Mac companion integrated without discarding notch/Desktop work: 57 app tests
+  pass; signed build launched; Life tab, directed relationships and editor opening
+  inspected. Native Save-button interaction and physical iPhone installation
+  remain unverified, separately from the live API checks below.
+- vps-jane's intervening develop `50e01247` rollout already contained PR #545.
+  Retained it instead of downgrading to staged `c052c577`. Running executable
+  paths and hashes matched installed artifacts; runner startup stamped
+  `50e012474366ef2b055cb01a48fb31f2b4323c8e` (runner PID 3064424,
+  gateway PID 3064593 at verification).
+- Live test using the Mac app's enrolled-device credential passed: save receipt,
+  read-back, stale-write HTTP 409, exactly one audit with expected before/after
+  text, device actor and timestamp, and unchanged confirmation status. The
+  synthetic Goal and its audit were removed and absence checked. Existing
+  operator nodes were untouched. API/audit verification: watched-live-green.
+- Validation reality gap: mgconsole CSV adds Cypher string quoting. The first
+  audit assertion failed in test parsing; the corrected rerun passed all checks.
+  Closeout telemetry was not started. Next: typed properties and audit-history UI.
 
 Reproduce database validation with a disposable local Memgraph at port 17687:
 `cargo test -p data-memorygraphrag --test node_edit_memgraph -- --ignored`.

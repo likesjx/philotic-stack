@@ -327,8 +327,11 @@ Two canonical owners, one mapping — no third source of truth:
 The `codex/lifegraph-editor` follow-on implements a direct, audited editor for
 node title/summary/description and a bounded directed-neighbor diagram. The
 enrolled device identity is stamped by the hotel, and a compare-and-set graph
-write creates the before/after audit atomically. This is test-green source, not
-an installed-runtime claim; server/app rollout and watched verification remain.
+write creates the before/after audit atomically. PR #545 is merged and deployed
+in vps-jane `50e01247`; live API save/read-back, stale-write rejection, and audit
+persistence checks passed using the Mac app's enrolled credential. Mac UI
+inspection passed; native Save-button interaction and physical iPhone installation
+remain separate verification gaps.
 See [contract and limitations](../../apps/philotic-apple/LIFEGRAPH.md) and
 [active work](../task.md#native-lifegraph-editor). The broader program disposition
 remains accepted for the current slice.
