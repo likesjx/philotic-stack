@@ -632,22 +632,28 @@ impl GraphDomain {
         session_id: &str,
         limit: usize,
     ) -> Result<Vec<SessionTurnRecord>> {
-        let prefix = format!("{}:{}:", NODE_KIND_SESSION_TURN, session_id);
+        // DEF-191: this used to load and deserialize EVERY session_turn in the
+        // hotel and filter by key prefix in memory. The silence sweep calls it
+        // once per active session, so a 30 s pass read the whole kind hundreds
+        // of times under the shared graph lock — ~10 s during which the process
+        // answered nothing. `session_id` has an expression index; ask for just
+        // this session's newest `limit` turns (oldest-first, as before).
         let mut out: Vec<SessionTurnRecord> = Vec::new();
-        for node in self.adapter.list_nodes_by_kind(NODE_KIND_SESSION_TURN)? {
-            if node.node_key.starts_with(&prefix) {
-                match serde_json::from_value::<SessionTurnRecord>(node.data) {
-                    Ok(record) => out.push(record),
-                    Err(e) => warn!(
-                        node_key = %node.node_key,
-                        error = %e,
-                        "list_session_turns: skipping malformed record"
-                    ),
-                }
+        for node in self.adapter.list_nodes_by_kind_json_eq(
+            NODE_KIND_SESSION_TURN,
+            "session_id",
+            session_id,
+            "started_at",
+            limit,
+        )? {
+            match serde_json::from_value::<SessionTurnRecord>(node.data) {
+                Ok(record) => out.push(record),
+                Err(e) => warn!(
+                    node_key = %node.node_key,
+                    error = %e,
+                    "list_session_turns: skipping malformed record"
+                ),
             }
-        }
-        if limit > 0 && out.len() > limit {
-            out.drain(..out.len() - limit);
         }
         Ok(out)
     }
@@ -2376,6 +2382,59 @@ mod tests {
         let storage =
             SqliteGraphStorage::open_in_memory().expect("in-memory SqliteGraphStorage failed");
         GraphDomain::new(Arc::new(storage.adapter()))
+    }
+
+    fn turn(session: &str, id: &str, started: Option<u64>) -> SessionTurnRecord {
+        SessionTurnRecord {
+            turn_id: id.into(),
+            session_id: session.into(),
+            request_event_id: None,
+            user_message_json: serde_json::Value::Null,
+            status: "completed".into(),
+            response_json: None,
+            error_json: None,
+            started_at: started,
+            completed_at: None,
+        }
+    }
+
+    /// DEF-191: `list_session_turns` answers from the `session_id` index — one
+    /// session's turns only, newest `limit` of them, oldest-first.
+    #[test]
+    fn list_session_turns_is_exact_windowed_and_time_ordered() {
+        let domain = make_domain();
+        // Turn ids sort OPPOSITE to time so a key-order slice would be wrong.
+        domain
+            .upsert_session_turn(&turn("telegram:1:agent-a", "z-oldest", Some(10)))
+            .unwrap();
+        domain
+            .upsert_session_turn(&turn("telegram:1:agent-a", "m-middle", Some(20)))
+            .unwrap();
+        domain
+            .upsert_session_turn(&turn("telegram:1:agent-a", "a-newest", Some(30)))
+            .unwrap();
+        // A session whose id EXTENDS this one must not bleed in (the old
+        // key-prefix filter matched `telegram:1:agent-a:` here).
+        domain
+            .upsert_session_turn(&turn("telegram:1:agent-a:role", "x", Some(99)))
+            .unwrap();
+        domain
+            .upsert_session_turn(&turn("telegram:2:agent-a", "y", Some(98)))
+            .unwrap();
+
+        let all = domain.list_session_turns("telegram:1:agent-a", 0).unwrap();
+        let ids: Vec<&str> = all.iter().map(|t| t.turn_id.as_str()).collect();
+        assert_eq!(ids, ["z-oldest", "m-middle", "a-newest"]);
+
+        let newest_two = domain.list_session_turns("telegram:1:agent-a", 2).unwrap();
+        let ids: Vec<&str> = newest_two.iter().map(|t| t.turn_id.as_str()).collect();
+        assert_eq!(
+            ids,
+            ["m-middle", "a-newest"],
+            "limit keeps the NEWEST turns"
+        );
+
+        assert!(domain.list_session_turns("nope", 5).unwrap().is_empty());
     }
 
     #[test]
