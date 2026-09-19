@@ -15241,6 +15241,64 @@ impl IpcServer {
         serde_json::json!({ "nodes": nodes })
     }
 
+    /// May a role record a peer sent with a `session.handoff` be admitted, and
+    /// as what? (DEF-183)
+    ///
+    /// The record arrives from the network and the handler goes on to
+    /// materialize a guest from it, so it is checked like any other peer claim:
+    /// - an existing local record is never overwritten — its `home_node`,
+    ///   `is_admin` and toolset are this hotel's truth (the old code upserted
+    ///   unconditionally although its own doc said "if not already present");
+    /// - a record for an agent whose authority hotel this hotel knows is
+    ///   accepted only from that hotel;
+    /// - a peer never grants admin: `is_admin` is cleared unless the sender is
+    ///   the agent's authority hotel.
+    ///
+    /// `Ok(None)` means "keep what is already here"; `Ok(Some(record))` is the
+    /// record to upsert; `Err` refuses the handoff.
+    pub(super) fn admit_handoff_role_record(
+        graph: &GraphDomain,
+        source_node_id: &str,
+        role_value: &serde_json::Value,
+    ) -> Result<Option<ansible_mesh_core::graph::RoleIncarnationRecord>, String> {
+        let mut record = serde_json::from_value::<ansible_mesh_core::graph::RoleIncarnationRecord>(
+            role_value.clone(),
+        )
+        .map_err(|err| format!("malformed role_record: {err}"))?;
+        if graph
+            .get_role_incarnation(&record.agent_id, &record.role_name)
+            .ok()
+            .flatten()
+            .is_some()
+        {
+            return Ok(None);
+        }
+        let sender_hotel = graph.list_hotels().ok().and_then(|hotels| {
+            hotels
+                .into_iter()
+                .find(|hotel| hotel.capabilities.node_id == source_node_id)
+                .map(|hotel| hotel.hotel_name)
+        });
+        let sender_is_authority = match lookup_agent_authority_hotel(graph, &record.agent_id) {
+            Some(authority) => {
+                if sender_hotel.as_deref() != Some(authority.as_str()) {
+                    return Err(format!(
+                        "agent '{}' answers to hotel '{authority}', not the sending peer '{source_node_id}'",
+                        record.agent_id
+                    ));
+                }
+                true
+            }
+            None => false,
+        };
+        if !sender_is_authority {
+            record.is_admin = false;
+        }
+        // Clear readiness — the remote hotel owns that state, not us.
+        record.readiness_state = ansible_mesh_core::graph::RoleReadinessState::Configured;
+        Ok(Some(record))
+    }
+
     /// Handle a `session.handoff` mesh event received from a remote hotel.
     ///
     /// The payload carries the `RoleIncarnationRecord` and optional `ToolsetProfileRecord`
@@ -15252,6 +15310,7 @@ impl IpcServer {
         parked_inbound: &ParkedInboundRegistry,
         materialization_requester: Option<Arc<dyn GuestMaterializationRequester>>,
         local_node_id: &str,
+        source_node_id: &str,
         data: &str,
     ) {
         let Ok(payload) = serde_json::from_str::<serde_json::Value>(data) else {
@@ -15269,20 +15328,25 @@ impl IpcServer {
         };
         let handoff_bundle = payload.get("handoff_bundle").cloned().unwrap_or_default();
 
-        // Upsert role_record into local graph so ensure_role_materialized can find it.
+        // Admit the role_record into the local graph so ensure_role_materialized
+        // can find it — but only as `admit_handoff_role_record` allows (DEF-183).
         if let Some(role_val) = payload.get("role_record") {
-            if let Ok(mut role_record) = serde_json::from_value::<
-                ansible_mesh_core::graph::RoleIncarnationRecord,
-            >(role_val.clone())
-            {
-                // Clear readiness — the remote hotel owns that state, not us.
-                role_record.readiness_state =
-                    ansible_mesh_core::graph::RoleReadinessState::Configured;
-                if let Err(err) = graph.upsert_role_incarnation(&role_record) {
+            match Self::admit_handoff_role_record(graph, source_node_id, role_val) {
+                Ok(Some(role_record)) => {
+                    if let Err(err) = graph.upsert_role_incarnation(&role_record) {
+                        warn!(
+                            "handle_remote_role_handoff: failed to upsert role_record for '{}': {}",
+                            role_name, err
+                        );
+                    }
+                }
+                Ok(None) => {}
+                Err(reason) => {
                     warn!(
-                        "handle_remote_role_handoff: failed to upsert role_record for '{}': {}",
-                        role_name, err
+                        "handle_remote_role_handoff: refusing handoff from '{}': {}",
+                        source_node_id, reason
                     );
+                    return;
                 }
             }
         }
@@ -25181,6 +25245,131 @@ pub(crate) mod tests {
         if Path::new(&socket_path).exists() {
             let _ = std::fs::remove_file(&socket_path);
         }
+    }
+
+    fn handoff_fixture() -> GraphDomain {
+        let graph = GraphDomain::new(Arc::new(
+            SqliteGraphStorage::open(":memory:")
+                .expect("graph")
+                .adapter(),
+        ));
+        for (hotel_name, node_id) in [
+            ("vps-jane", "vps-jane-aiua-01"),
+            ("mac-jane", "mac-jane-aiua-01"),
+        ] {
+            graph
+                .upsert_hotel(&HotelRecord {
+                    hotel_name: hotel_name.into(),
+                    capabilities: NodeCapabilities {
+                        node_id: node_id.into(),
+                        roles: vec![],
+                        models: vec![],
+                        tools: vec![],
+                        constraints: Default::default(),
+                        build_version: String::new(),
+                    },
+                    mesh_port: 9000,
+                    blob_port: 9001,
+                    execution_port: 9002,
+                    ipc_socket_path: String::new(),
+                    active_pid: None,
+                    mesh_host: None,
+                })
+                .expect("seed hotel");
+        }
+        graph
+            .upsert_agent_identity(&AgentIdentityRecord {
+                agent_id: "agent-beacon".into(),
+                persona_name: "Beacon".into(),
+                authority_hotel: "vps-jane".into(),
+                bundle_json: serde_json::json!({}),
+            })
+            .expect("seed identity");
+        graph
+    }
+
+    fn handoff_role(agent_id: &str, is_admin: bool) -> serde_json::Value {
+        serde_json::to_value(RoleIncarnationRecord {
+            agent_id: agent_id.into(),
+            role_name: "architect".into(),
+            guest_id: format!("{agent_id}:architect"),
+            toolset_profile: "architect".into(),
+            is_admin,
+            readiness_state: RoleReadinessState::ActiveInSession,
+            turn_loop_config: TurnLoopConfig::default(),
+            ..Default::default()
+        })
+        .expect("role serializes")
+    }
+
+    /// DEF-183: a `session.handoff` role record is a peer claim. It is admitted
+    /// only from the agent's authority hotel, never overwrites a local record,
+    /// and never grants admin to anyone else.
+    #[test]
+    fn a_handoff_role_record_is_admitted_only_as_its_sender_is_entitled() {
+        let graph = handoff_fixture();
+
+        // The agent's authority hotel may introduce its role, admin and all,
+        // with readiness reset, since the sender owns that state.
+        let admitted = IpcServer::admit_handoff_role_record(
+            &graph,
+            "vps-jane-aiua-01",
+            &handoff_role("agent-beacon", true),
+        )
+        .expect("the authority hotel is admitted")
+        .expect("a new record is returned to upsert");
+        assert!(admitted.is_admin);
+        assert_eq!(admitted.readiness_state, RoleReadinessState::Configured);
+
+        // Another hotel may not plant a role for an agent that answers elsewhere.
+        let refused = IpcServer::admit_handoff_role_record(
+            &graph,
+            "mac-jane-aiua-01",
+            &handoff_role("agent-beacon", true),
+        )
+        .expect_err("not the authority hotel");
+        assert!(refused.contains("answers to hotel 'vps-jane'"), "{refused}");
+
+        // An agent this hotel has no identity for is admitted, but a peer
+        // never grants it admin.
+        let unknown = IpcServer::admit_handoff_role_record(
+            &graph,
+            "mac-jane-aiua-01",
+            &handoff_role("agent-unknown", true),
+        )
+        .expect("no authority to contradict")
+        .expect("returned");
+        assert!(!unknown.is_admin, "a peer cannot grant admin");
+
+        // A record this hotel already holds is never overwritten.
+        graph
+            .upsert_role_incarnation(
+                &serde_json::from_value::<RoleIncarnationRecord>(handoff_role(
+                    "agent-beacon",
+                    false,
+                ))
+                .unwrap(),
+            )
+            .unwrap();
+        assert!(
+            IpcServer::admit_handoff_role_record(
+                &graph,
+                "vps-jane-aiua-01",
+                &handoff_role("agent-beacon", true),
+            )
+            .expect("fine")
+            .is_none(),
+            "keep the local record: its is_admin/home_node are this hotel's truth"
+        );
+
+        assert!(
+            IpcServer::admit_handoff_role_record(
+                &graph,
+                "vps-jane-aiua-01",
+                &serde_json::json!({"nonsense": true}),
+            )
+            .is_err()
+        );
     }
 
     /// A Telegram seat may poll on one hotel while its agent runs on another:
