@@ -42,7 +42,7 @@ source_of_truth_targets:
 
 Add a fourth kind of model capability next to generate, transform and embed: a **decision**. The caller sends a piece of state and a set of typed questions (yes/no, choose one of N, score on an ordered scale). The provider returns typed answers with calibrated probabilities and no free text. The first concrete provider is TypeSafe AI's **Jev**, reachable natively or through OpenRouter. The capability is defined provider-neutrally so a local classifier can fill the same envelope later.
 
-This is a research-backed proposal. **Nothing here is implemented. OpenRouter access was verified with one probe on 2026-09-19 (see Verified access).**
+This is a research-backed proposal. **Slice D0 (the pure envelope types and wire adapters) is implemented in `ansible-mesh-core/src/decisions.rs`; nothing is wired into a runtime yet. OpenRouter access was verified with one probe on 2026-09-19 (see Verified access).**
 
 ## Why this matters
 
@@ -158,7 +158,7 @@ Sent as the `task_json` of an `EmitTask` to a `model.decisions` controller role.
 
 ### Errors and the reply path
 
-- Typed error classes: `unavailable`, `timeout`, `rate_limited` (429/529), `invalid_request` (422), `auth` (401). Every one means **"use the deterministic decision"**; none may fail a turn.
+- Typed error classes: `unavailable`, `timeout`, `rate_limited` (429/529), `invalid_request` (400/422), `auth` (401/403), and `invalid_response` (the provider answered but the answer is unusable: malformed, unknown choice, missing or extra answers, out-of-range probability). Every one means **"use the deterministic decision"**; none may fail a turn. D0 implements these as `DecisionsErrorClass` with `classify_http_status`.
 - `decisions.evaluate` joins the list in `isolate_aux_failure_from_cognitive_ladder`, and `AuxTaskKind::from_task_kind` gets an arm.
 - Replies use a dedicated action (`decisions_response`) with a correlation id and a dedicated handler. They must never enter the `model_response` turn-reply path.
 - Provider timing: keep the invariant `attempt_policy().total_secs × retry_policy().max_attempts < 120 s`, but set decisions much tighter (single-digit seconds, one retry).
@@ -170,6 +170,8 @@ Sent as the `task_json` of an `EmitTask` to a `model.decisions` controller role.
 | Path | `POST /v1/systemone` | `POST /api/alpha/decisions` |
 | `model` | `jev-latest` | `~typesafe/jev-latest`, or pinned `typesafe/jev-1.13` |
 | Questions | array → map by id | same |
+| `choice` options | array of `{key, description}` → `criteria` **map** `key → description \| null` (order kept by a typed serializer) | same |
+| `score` levels | array → `criteria` **array of strings** (the description, else the key); the answer returns `legend` and `probabilities` keyed by **level index**, which the adapter maps back to level keys and checks against what was sent | same |
 | `noul` criteria | `when_true` / `when_false`, both optional | both required when present; fill neutral empty string |
 | Cost | not returned | `usage.cost`, plus `id`, `provider` |
 | State budget | 64 k tokens | 32 k tokens |
@@ -207,7 +209,7 @@ Blast radius abbreviated as BR. Line references were read at `d624e5b8`. Items m
 
 | Slice | Content | Verification |
 |---|---|---|
-| D0 `decisions-envelope` | `ansible-mesh-core::decisions` types, validation, native and OpenRouter wire adapters as pure functions, unit-tested against recorded fixtures. No network. Ordered-levels test. | test-green |
+| D0 `decisions-envelope` | `ansible-mesh-core::decisions` types, validation, native and OpenRouter wire adapters as pure functions, unit-tested against fixtures. No network. Ordered-levels test. **Done 2026-09-19** (26 tests). Only the OpenRouter `noul` fixture is recorded live; `choice` and `score` fixtures come from the vendor docs until D1's smoke records real bodies, and the `score` legend check is strict until then. | test-green |
 | D1 | model-router: `TaskKind::Decide`, `RequestClass::Judgment`, `ProviderOutput::Judgment`, `AuxTaskKind` arm, aux-isolation entry, `model_oracle` capability seeding, a provider with a native / OpenRouter transport switch, `model-controller-decisions` bin (role `model.decisions`), `decisions_response` reply action, `ResponseTrace` growth. | test-green, then smoke-green once a key exists |
 | D2 `decisions-shadow-heal` | `heal-dispatcher` calls the provider beside `gemma3:4b`, log-only, writes a `decision_traces` row per site (agreement, probabilities, latency, cost). Flag `PHILOTIC_SHADOW_DECISIONS`, default off. | watched-live-green on one hotel |
 | D3 | In-process client with local fallback; shadow sites #3 (`memory.recall` relevance) and #1 (say-do gate), both non-blocking. | smoke-green, then watched-live-green |
