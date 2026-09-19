@@ -4514,6 +4514,14 @@ impl IpcServer {
         })
     }
 
+    /// Do two agent-role guest ids belong to the same agent? A guest is the
+    /// base agent (`agent-jane`) or one of its role incarnations
+    /// (`agent-jane:orchestrator`), so the agent is everything before the
+    /// first `:`.
+    pub(super) fn same_agent_guest(a: &str, b: &str) -> bool {
+        a.split(':').next() == b.split(':').next()
+    }
+
     pub(super) fn resolve_orchestrator_guest_id(
         graph: &GraphDomain,
         session: &SessionRecord,
@@ -4535,10 +4543,38 @@ impl IpcServer {
             }
         }
 
+        // Last resort: any live orchestrator — but never another agent's when
+        // the session names its own (DEF-177). Beacon's bot polled from a
+        // hotel that does not host her fell through to Björk's orchestrator
+        // here and was answered as Björk. A session with no primary agent
+        // (a cron or system session) may still use the hotel's orchestrator.
         live_agent_guests
             .iter()
-            .find(|guest_id| guest_id.ends_with(":orchestrator"))
+            .find(|guest_id| {
+                guest_id.ends_with(":orchestrator")
+                    && session.primary_agent_id.as_deref().is_none_or(|agent_id| {
+                        Self::guest_belongs_to_agent(graph, guest_id, agent_id)
+                    })
+            })
             .cloned()
+    }
+
+    /// Does `guest_id` belong to `agent_id`? Guests are named after the agent
+    /// (`agent-jane`, `agent-jane:orchestrator`), but a role record is the
+    /// authority where the two differ (`agent-jane-01` owning
+    /// `agent-jane:orchestrator`).
+    pub(super) fn guest_belongs_to_agent(
+        graph: &GraphDomain,
+        guest_id: &str,
+        agent_id: &str,
+    ) -> bool {
+        guest_id.split(':').next() == Some(agent_id)
+            || graph
+                .list_role_incarnations_by_guest_id(guest_id)
+                .ok()
+                .into_iter()
+                .flatten()
+                .any(|record| record.agent_id == agent_id)
     }
 
     fn hydrate_agent_graph_snapshot(task_json: &str) -> anyhow::Result<Option<String>> {
@@ -6489,13 +6525,28 @@ impl IpcServer {
                                             &live_agent_guests,
                                         )
                                     {
-                                        warn!(
-                                            "Resolved agent guest [{}] is not configured locally and unknown to the mesh; falling back to orchestrator guest [{}].",
-                                            resolved_guest_id, orchestrator_guest_id
-                                        );
-                                        route_resolution = AgentRouteResolution::Deliver(Some(
-                                            orchestrator_guest_id,
-                                        ));
+                                        if Self::same_agent_guest(
+                                            &orchestrator_guest_id,
+                                            resolved_guest_id,
+                                        ) {
+                                            warn!(
+                                                "Resolved agent guest [{}] is not configured locally and unknown to the mesh; falling back to orchestrator guest [{}].",
+                                                resolved_guest_id, orchestrator_guest_id
+                                            );
+                                            route_resolution = AgentRouteResolution::Deliver(Some(
+                                                orchestrator_guest_id,
+                                            ));
+                                        } else {
+                                            // A task addressed to one agent must never be
+                                            // answered as another (DEF-177): Beacon's bot
+                                            // polled from a hotel that does not host her
+                                            // reached Björk's orchestrator and was answered
+                                            // as Björk. Better undelivered than impersonated.
+                                            error!(
+                                                "Resolved agent guest [{}] is not configured locally and unknown to the mesh; refusing to hand its task to another agent's orchestrator [{}].",
+                                                resolved_guest_id, orchestrator_guest_id
+                                            );
+                                        }
                                     }
                                 }
                             }
@@ -25006,6 +25057,102 @@ pub(crate) mod tests {
             }
             other => panic!("unexpected orchestrator inbound response: {other:?}"),
         }
+
+        unsafe {
+            std::env::remove_var("PHILOTIC_HOTEL_SOCKET");
+        }
+        server_task.abort();
+        let _ = server_task.await;
+        if Path::new(&socket_path).exists() {
+            let _ = std::fs::remove_file(&socket_path);
+        }
+    }
+
+    /// DEF-177: a task addressed to an agent this hotel doesn't host — and the
+    /// mesh doesn't know — must not be handed to another agent's live
+    /// orchestrator. Beacon's bot polled from mac-jane was answered by Björk.
+    #[tokio::test]
+    async fn emit_task_never_falls_back_to_another_agents_orchestrator() {
+        let _env_guard = ipc_env_guard();
+        let socket_path = test_socket_path();
+        let (dispatcher_tx, _dispatcher_rx) = test_dispatcher_channel();
+        let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
+        let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
+        graph
+            .upsert_role_incarnation(&RoleIncarnationRecord {
+                agent_id: "agent-bjork-01".into(),
+                role_name: "orchestrator".into(),
+                guest_id: "agent-bjork-01:orchestrator".into(),
+                toolset_profile: "orchestrator".into(),
+                readiness_state: RoleReadinessState::Configured,
+                turn_loop_config: TurnLoopConfig::default(),
+                ..Default::default()
+            })
+            .expect("Björk's orchestrator should seed");
+        graph
+            .upsert_session(&SessionRecord {
+                session_id: "telegram:7:agent-beacon".into(),
+                session_kind: "conversation".into(),
+                primary_agent_id: Some("agent-beacon".into()),
+                active_incarnation_id: None,
+                channel_kind: Some("telegram".into()),
+                channel_session_key: Some("7".into()),
+                status: "active".into(),
+                lease_owner_component_id: None,
+                lease_expires_at: None,
+                summary_json: serde_json::json!({}),
+                created_at: 1,
+                updated_at: 2,
+            })
+            .expect("session should seed");
+        let server = IpcServer::new(socket_path.clone(), "local-aiua-01", dispatcher_tx, graph);
+
+        let server_task = tokio::spawn(async move {
+            server.run().await.expect("ipc server should run");
+        });
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        unsafe {
+            std::env::set_var("PHILOTIC_HOTEL_SOCKET", &socket_path);
+        }
+
+        let mut bjork = PhiloticClient::connect(GuestIdentity {
+            guest_id: "agent-bjork-01:orchestrator".into(),
+            role: "agent".into(),
+            supported_tools: Vec::new(),
+        })
+        .await
+        .expect("Björk connect");
+        let mut membrane = PhiloticClient::connect(GuestIdentity {
+            guest_id: "mac-jane:membrane-gateway-beacon".into(),
+            role: "membrane".into(),
+            supported_tools: Vec::new(),
+        })
+        .await
+        .expect("membrane connect");
+
+        let _ = membrane
+            .send_request(IpcRequest::EmitTask {
+                target_node: "local-aiua-01".into(),
+                target_role: "agent".into(),
+                target_guest_id: Some("agent-beacon".into()),
+                task_json: serde_json::json!({
+                    "session_id": "telegram:7:agent-beacon",
+                    "source": "telegram",
+                    "chat_id": "7",
+                    "content": "are you there, Beacon?"
+                })
+                .to_string(),
+            })
+            .await
+            .expect("emit task");
+
+        let delivered =
+            tokio::time::timeout(tokio::time::Duration::from_millis(500), bjork.recv_task()).await;
+        assert!(
+            delivered.is_err(),
+            "Björk must not receive a task addressed to Beacon: {delivered:?}"
+        );
 
         unsafe {
             std::env::remove_var("PHILOTIC_HOTEL_SOCKET");

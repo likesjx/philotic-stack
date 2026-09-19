@@ -487,6 +487,24 @@ impl IpcServer {
             }
         }
 
+        // The caller named an agent and none of its guests is live here: keep
+        // the address. `Deliver(None)` drops it, and a role-wide agent
+        // delivery then reaches whichever agent happens to be subscribed —
+        // Björk answering Beacon's bot (DEF-177). A named agent is delivered
+        // to or not delivered at all, never to someone else.
+        if let Some(explicit_guest_id) = target_guest_id.as_deref() {
+            let named_agent = explicit_guest_id
+                .split(':')
+                .next()
+                .unwrap_or(explicit_guest_id);
+            let named_agent_is_live = live_agent_guests
+                .iter()
+                .any(|live| Self::guest_belongs_to_agent(graph, live, named_agent));
+            if !named_agent_is_live {
+                return AgentRouteResolution::Deliver(target_guest_id);
+            }
+        }
+
         AgentRouteResolution::Deliver(None)
     }
 
