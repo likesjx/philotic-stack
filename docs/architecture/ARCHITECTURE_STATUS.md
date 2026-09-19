@@ -3,7 +3,7 @@ title: Philotic Architecture Status
 doc_type: status
 domain: runtime-sessions
 status: active
-last_updated: 2026-09-17
+last_updated: 2026-09-19
 tags:
 - source-of-truth
 - current-state
@@ -105,8 +105,14 @@ through an enrolled-device gateway and an atomic graph before/after audit, plus
 a one-hop directed relationship diagram. PR #545 is deployed on vps-jane in
 develop `50e01247`; live enrolled-device save/read-back, stale-write rejection,
 and persisted audit checks passed on 2026-09-17. Updated Mac UI was inspected;
-native Save-button interaction and physical iPhone rollout remain unverified.
+native Mac Save was clicked and its receipt verified against the persisted audit
+on September 18. The companion iOS build was installed over Wi-Fi on iPhone 13
+Pro and launched after operator trust on September 19; phone Save remains untested.
 See [scope and verification](../../apps/philotic-apple/LIFEGRAPH.md).
+
+The [Cortex viewer](CORTEX_VIEWER_PROPOSAL.md) now has a tested proposed Swift
+inventory/detail contract only. The unified operator view, authorization adapter,
+live inventory and UI remain unimplemented; no new memory access is exposed.
 
 ### Runtime and authority
 
