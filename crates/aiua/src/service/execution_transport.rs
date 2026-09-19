@@ -21,14 +21,20 @@ pub async fn serve_execution_plane(
     let listener = TcpListener::bind(addr)
         .await
         .with_context(|| format!("Failed to bind execution transport to {}", addr))?;
-    let db_path = db_path.to_string();
+    // The replay window is in memory now; drop the SQLite table it replaced
+    // (826k rows on mac-jane, written on every inbound message).
+    let legacy_db = db_path.to_string();
+    if let Ok(Some(what)) =
+        tokio::task::spawn_blocking(move || NonceTracker::retire_legacy_store(&legacy_db)).await
+    {
+        tracing::info!("{what}");
+    }
 
     loop {
         let (mut stream, peer_addr) = listener.accept().await?;
         let inbox_tx = inbox_tx.clone();
         let local_node_id = local_capabilities.node_id.clone();
         let graph = graph.clone();
-        let db_path = db_path.clone();
 
         tokio::spawn(async move {
             match read_execution_message(&mut stream).await {
@@ -37,7 +43,6 @@ pub async fn serve_execution_plane(
                         &msg,
                         &local_node_id,
                         graph.as_ref(),
-                        &db_path,
                         enable_rust_auth,
                     ) {
                         warn!(
@@ -98,7 +103,6 @@ fn validate_execution_message(
     msg: &BeaconMessage,
     local_node_id: &str,
     graph: &GraphDomain,
-    db_path: &str,
     enable_rust_auth: bool,
 ) -> Result<()> {
     if msg.src_node == local_node_id {
@@ -116,8 +120,9 @@ fn validate_execution_message(
             msg.timestamp,
             &msg.hmac,
         )?;
-        let tracker = NonceTracker::open(db_path)?;
-        tracker.assert_and_record_nonce(&msg.msg_id)?;
+        // The process-wide in-memory window — not a SQLite connection opened
+        // against the live hotel DB for every inbound message.
+        NonceTracker::shared().assert_and_record_nonce(&msg.msg_id)?;
     }
 
     Ok(())
