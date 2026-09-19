@@ -25,7 +25,7 @@ use ansible_mesh_core::registry::NodeRegistry;
 use philotic_client::CommandManifestEntry;
 use serde_json::Value;
 use tokio::sync::mpsc;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 /// The `SessionControl` action that carries a manifest.
@@ -42,6 +42,36 @@ const MAX_MANIFEST_ENTRIES: usize = 200;
 /// overwrites its own with a peer's, and never re-broadcasts a peer's.
 fn origin_marker_key(agent_id: &str) -> String {
     format!("command_manifest_origin:{agent_id}")
+}
+
+/// True when this hotel runs `agent_id` right now: an ACTIVE guest here is the
+/// agent or one of its role incarnations (`agent-x`, `agent-x:role`).
+///
+/// This is the one definition of "hosts" both directions use (DEF-189). A
+/// leftover `command_manifest` apartment is NOT hosting — mac-jane kept
+/// Beacon's from when it ran her, re-broadcast it every 2 minutes for an agent
+/// it no longer served, and got refused `NotTheAgentsHost` each time, while the
+/// vps refused the mirror image (`LocallyHosted`) on a stale apartment of its own.
+fn hosts_agent(graph: &GraphDomain, hotel_name: &str, agent_id: &str) -> anyhow::Result<bool> {
+    Ok(graph.list_guests(hotel_name, true)?.iter().any(|guest| {
+        guest.guest_id == agent_id
+            || guest
+                .guest_id
+                .strip_prefix(agent_id)
+                .is_some_and(|rest| rest.starts_with(':'))
+    }))
+}
+
+/// First sighting of a (peer, agent, reason) refusal? Expected refusals recur
+/// every re-broadcast, so they are logged loudly once and quietly after — a
+/// stale peer must be visible without drowning the log (271 WARNs in 18 min).
+fn first_refusal(source: &str, agent_id: &str, reason: &str) -> bool {
+    static SEEN: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+        std::sync::OnceLock::new();
+    SEEN.get_or_init(Default::default)
+        .lock()
+        .map(|mut seen| seen.insert(format!("{source}|{agent_id}|{reason}")))
+        .unwrap_or(true)
 }
 
 fn now_secs() -> u64 {
@@ -111,6 +141,7 @@ pub(crate) async fn rebroadcast_local_manifests(
     graph: &GraphDomain,
     dispatcher_tx: &mpsc::Sender<LedgerCommand>,
     local_node_id: &str,
+    hotel_name: &str,
 ) {
     let Ok(nodes) = graph.list_agents_with_apartment(MANIFEST_MEMORY_TYPE) else {
         return;
@@ -122,6 +153,12 @@ pub(crate) async fn rebroadcast_local_manifests(
             .flatten()
             .is_some()
         {
+            continue;
+        }
+        // Only an agent this hotel is actually running: a stale apartment for
+        // one that moved away must not be presented to peers as current. A
+        // lookup failure skips the pass (it repeats in 2 minutes).
+        if !hosts_agent(graph, hotel_name, &agent_id).unwrap_or(false) {
             continue;
         }
         if let Ok(Some(commands)) = graph.get_apartment(&agent_id, MANIFEST_MEMORY_TYPE) {
@@ -148,6 +185,7 @@ pub(crate) enum ManifestRefused {
 pub(crate) fn apply_remote_manifest(
     graph: &GraphDomain,
     registry: &NodeRegistry,
+    hotel_name: &str,
     source_node_id: &str,
     data: &str,
 ) -> Result<String, ManifestRefused> {
@@ -173,12 +211,17 @@ pub(crate) fn apply_remote_manifest(
         return Err(ManifestRefused::NotTheAgentsHost);
     }
     let marker = origin_marker_key(agent_id);
+    // "Ours" means this hotel runs the agent AND its philote wrote the menu
+    // (no peer-copy marker). An unmarked apartment with no active guest behind
+    // it is a leftover from an agent that moved away: the peer that the roster
+    // says runs it now supersedes it. A lookup failure keeps what we have.
     let has_own = graph
         .get_apartment(agent_id, MANIFEST_MEMORY_TYPE)
         .ok()
         .flatten()
         .is_some()
-        && graph.get_config_value(&marker).ok().flatten().is_none();
+        && graph.get_config_value(&marker).ok().flatten().is_none()
+        && hosts_agent(graph, hotel_name, agent_id).unwrap_or(true);
     if has_own {
         return Err(ManifestRefused::LocallyHosted);
     }
@@ -193,19 +236,44 @@ pub(crate) fn apply_remote_manifest(
 pub(crate) fn handle_remote_manifest_sync(
     graph: &GraphDomain,
     registry: &NodeRegistry,
+    hotel_name: &str,
     source_node_id: &str,
     data: &str,
 ) {
-    match apply_remote_manifest(graph, registry, source_node_id, data) {
+    match apply_remote_manifest(graph, registry, hotel_name, source_node_id, data) {
         Ok(agent_id) => info!(
             agent_id = %agent_id,
             source = source_node_id,
             "Cached a peer hotel's command manifest for a seat on this hotel"
         ),
-        Err(refused) => warn!(
-            source = source_node_id,
-            "Refused a peer's command manifest: {refused:?}"
-        ),
+        // A malformed manifest is always worth a warning. The other two are
+        // steady-state disagreements that repeat with every re-broadcast: say so
+        // once per (peer, agent, reason), then drop to debug.
+        Err(refused) => {
+            let agent_id = serde_json::from_str::<Value>(data)
+                .ok()
+                .and_then(|v| {
+                    v.get("agent_id")
+                        .and_then(Value::as_str)
+                        .map(str::to_string)
+                })
+                .unwrap_or_default();
+            let repeat = !matches!(refused, ManifestRefused::Malformed(_))
+                && !first_refusal(source_node_id, &agent_id, &format!("{refused:?}"));
+            if repeat {
+                debug!(
+                    source = source_node_id,
+                    agent_id = %agent_id,
+                    "Refused a peer's command manifest again: {refused:?}"
+                );
+            } else {
+                warn!(
+                    source = source_node_id,
+                    agent_id = %agent_id,
+                    "Refused a peer's command manifest: {refused:?}"
+                );
+            }
+        }
     }
 }
 
@@ -214,11 +282,56 @@ mod tests {
     use super::*;
     use ansible_mesh_core::heartbeat::{HotelStateSyncAgent, HotelStateSyncGuest};
     use ansible_mesh_core::sqlite_storage::SqliteGraphStorage;
+    use ansible_mesh_core::storage::{GuestRecord, HotelRecord};
     use std::sync::Arc;
+
+    /// The hotel under test (the receiver / re-broadcaster).
+    const LOCAL: &str = "mac-jane";
 
     fn graph() -> GraphDomain {
         let store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
         GraphDomain::new(Arc::new(store.adapter()))
+    }
+
+    /// `agent` is running on the hotel under test (its orchestrator guest is active).
+    fn host_locally(g: &GraphDomain, agent: &str, active: bool) {
+        g.upsert_guest(&GuestRecord {
+            hotel_name: LOCAL.into(),
+            guest_id: format!("{agent}:orchestrator"),
+            role: "agent".into(),
+            config_json: "{}".into(),
+            is_active: active,
+            active_pid: None,
+            last_active_at: None,
+        })
+        .unwrap();
+    }
+
+    fn seed_peers(g: &GraphDomain) {
+        for (name, node) in [
+            ("vps-jane", "vps-jane-aiua-01"),
+            ("mac-jane", "mac-jane-aiua-01"),
+            ("mbp-jane", "mbp-jane-aiua-01"),
+        ] {
+            g.upsert_hotel(&HotelRecord {
+                hotel_name: name.into(),
+                capabilities: ansible_mesh_core::NodeCapabilities {
+                    node_id: node.into(),
+                    roles: vec![],
+                    models: vec![],
+                    tools: vec![],
+                    constraints: Default::default(),
+                    build_version: String::new(),
+                },
+                mesh_port: 9000,
+                blob_port: 9001,
+                execution_port: 9002,
+                ipc_socket_path: String::new(),
+                active_pid: None,
+                mesh_host: None,
+            })
+            .unwrap();
+        }
     }
 
     /// The vps runs Beacon; mac-jane (the caller) has her roster entry.
@@ -255,9 +368,14 @@ mod tests {
     #[test]
     fn a_seat_reads_the_peer_hotels_manifest_from_its_own_graph() {
         let g = graph();
-        let cached =
-            apply_remote_manifest(&g, &roster(), "vps-jane-aiua-01", &payload("agent-beacon"))
-                .expect("the agent's host may publish its manifest");
+        let cached = apply_remote_manifest(
+            &g,
+            &roster(),
+            LOCAL,
+            "vps-jane-aiua-01",
+            &payload("agent-beacon"),
+        )
+        .expect("the agent's host may publish its manifest");
         assert_eq!(cached, "agent-beacon");
 
         // Exactly the read `fetch_agent_command_manifest` does.
@@ -280,12 +398,24 @@ mod tests {
     fn only_the_hotel_that_runs_the_agent_may_publish_for_it() {
         let g = graph();
         assert_eq!(
-            apply_remote_manifest(&g, &roster(), "mbp-jane-aiua-01", &payload("agent-beacon")),
+            apply_remote_manifest(
+                &g,
+                &roster(),
+                LOCAL,
+                "mbp-jane-aiua-01",
+                &payload("agent-beacon")
+            ),
             Err(ManifestRefused::NotTheAgentsHost),
             "a peer that does not run Beacon cannot write her menu"
         );
         assert_eq!(
-            apply_remote_manifest(&g, &roster(), "vps-jane-aiua-01", &payload("agent-unknown")),
+            apply_remote_manifest(
+                &g,
+                &roster(),
+                LOCAL,
+                "vps-jane-aiua-01",
+                &payload("agent-unknown")
+            ),
             Err(ManifestRefused::NotTheAgentsHost)
         );
         assert!(
@@ -298,6 +428,7 @@ mod tests {
     #[test]
     fn a_hotel_never_overwrites_its_own_agents_manifest_with_a_peers() {
         let g = graph();
+        host_locally(&g, "agent-beacon", true);
         g.sync_apartment(
             "agent-beacon",
             "command_manifest",
@@ -305,7 +436,13 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            apply_remote_manifest(&g, &roster(), "vps-jane-aiua-01", &payload("agent-beacon")),
+            apply_remote_manifest(
+                &g,
+                &roster(),
+                LOCAL,
+                "vps-jane-aiua-01",
+                &payload("agent-beacon")
+            ),
             Err(ManifestRefused::LocallyHosted)
         );
         let stored = g
@@ -315,16 +452,105 @@ mod tests {
         assert_eq!(stored[0]["command"], "mine");
     }
 
+    /// DEF-189: an unmarked apartment with no ACTIVE guest behind it is a
+    /// leftover from an agent that moved away. The vps refused mac-jane's
+    /// Beacon manifest as `LocallyHosted` on exactly such a leftover, forever.
+    #[test]
+    fn a_leftover_apartment_is_superseded_by_the_host_the_roster_names() {
+        for guest in [None, Some(false)] {
+            let g = graph();
+            if let Some(active) = guest {
+                host_locally(&g, "agent-beacon", active); // stopped, not running
+            }
+            g.sync_apartment(
+                "agent-beacon",
+                "command_manifest",
+                &serde_json::json!([{"command": "stale", "description": "left behind"}]),
+            )
+            .unwrap();
+            apply_remote_manifest(
+                &g,
+                &roster(),
+                LOCAL,
+                "vps-jane-aiua-01",
+                &payload("agent-beacon"),
+            )
+            .expect("a stale local copy must not block the agent's real host");
+            let stored = g
+                .get_apartment("agent-beacon", "command_manifest")
+                .unwrap()
+                .unwrap();
+            assert_eq!(stored[0]["command"], "role", "replaced by the host's menu");
+            assert!(
+                g.get_config_value(&origin_marker_key("agent-beacon"))
+                    .unwrap()
+                    .is_some(),
+                "now marked as a peer's copy"
+            );
+        }
+    }
+
+    /// DEF-189: only an agent this hotel is actually running is presented to
+    /// peers; a stale apartment for one that moved away is not (it drew
+    /// `NotTheAgentsHost` from every peer every 2 minutes).
+    #[tokio::test]
+    async fn rebroadcast_only_covers_agents_this_hotel_runs() {
+        let g = graph();
+        seed_peers(&g);
+        let menu = serde_json::json!([{"command": "status", "description": "s"}]);
+        // Running here.
+        host_locally(&g, "agent-jane", true);
+        g.sync_apartment("agent-jane", "command_manifest", &menu)
+            .unwrap();
+        // Left behind: an apartment, but no guest of this hotel serves it.
+        g.sync_apartment("agent-beacon", "command_manifest", &menu)
+            .unwrap();
+        // Stopped guest is not running either.
+        host_locally(&g, "agent-astrid", false);
+        g.sync_apartment("agent-astrid", "command_manifest", &menu)
+            .unwrap();
+
+        let (tx, mut rx) = mpsc::channel(16);
+        rebroadcast_local_manifests(&g, &tx, "mac-jane-aiua-01", LOCAL).await;
+        drop(tx);
+        let mut agents = std::collections::BTreeSet::new();
+        while let Some(LedgerCommand::AppendLocal(event)) = rx.recv().await {
+            let EventPayload::Inline { data } = event.payload else {
+                panic!("manifest events are inline");
+            };
+            let v: Value = serde_json::from_str(&data).unwrap();
+            agents.insert(v["agent_id"].as_str().unwrap().to_string());
+        }
+        assert_eq!(agents, ["agent-jane".to_string()].into());
+    }
+
+    #[test]
+    fn a_repeated_refusal_is_reported_once() {
+        assert!(first_refusal("mac-x", "agent-y", "NotTheAgentsHost"));
+        assert!(!first_refusal("mac-x", "agent-y", "NotTheAgentsHost"));
+        // A different peer, agent or reason is a new fact worth a line.
+        assert!(first_refusal("mbp-x", "agent-y", "NotTheAgentsHost"));
+        assert!(first_refusal("mac-x", "agent-z", "NotTheAgentsHost"));
+        assert!(first_refusal("mac-x", "agent-y", "LocallyHosted"));
+    }
+
     #[test]
     fn a_newer_peer_copy_replaces_an_older_one() {
         let g = graph();
-        apply_remote_manifest(&g, &roster(), "vps-jane-aiua-01", &payload("agent-beacon")).unwrap();
+        apply_remote_manifest(
+            &g,
+            &roster(),
+            LOCAL,
+            "vps-jane-aiua-01",
+            &payload("agent-beacon"),
+        )
+        .unwrap();
         let newer = serde_json::json!({
             "action": SYNC_ACTION, "agent_id": "agent-beacon",
             "commands": [{"command": "only", "description": "one"}]
         })
         .to_string();
-        apply_remote_manifest(&g, &roster(), "vps-jane-aiua-01", &newer)
+        apply_remote_manifest(&g, &roster(), LOCAL, "vps-jane-aiua-01", &newer)
             .expect("a peer's copy is replaced by the peer's newer one");
         let stored = g
             .get_apartment("agent-beacon", "command_manifest")
@@ -337,7 +563,7 @@ mod tests {
     fn a_malformed_or_oversized_manifest_is_refused() {
         let g = graph();
         assert!(matches!(
-            apply_remote_manifest(&g, &roster(), "vps-jane-aiua-01", "not json"),
+            apply_remote_manifest(&g, &roster(), LOCAL, "vps-jane-aiua-01", "not json"),
             Err(ManifestRefused::Malformed(_))
         ));
         let too_many: Vec<Value> = (0..=MAX_MANIFEST_ENTRIES)
@@ -345,7 +571,7 @@ mod tests {
             .collect();
         let big = serde_json::json!({"agent_id": "agent-beacon", "commands": too_many}).to_string();
         assert!(matches!(
-            apply_remote_manifest(&g, &roster(), "vps-jane-aiua-01", &big),
+            apply_remote_manifest(&g, &roster(), LOCAL, "vps-jane-aiua-01", &big),
             Err(ManifestRefused::Malformed(_))
         ));
     }
@@ -353,30 +579,7 @@ mod tests {
     #[tokio::test]
     async fn the_hosting_hotel_publishes_to_every_peer_and_not_to_itself() {
         let g = graph();
-        for (name, node) in [
-            ("vps-jane", "vps-jane-aiua-01"),
-            ("mac-jane", "mac-jane-aiua-01"),
-            ("mbp-jane", "mbp-jane-aiua-01"),
-        ] {
-            g.upsert_hotel(&ansible_mesh_core::storage::HotelRecord {
-                hotel_name: name.into(),
-                capabilities: ansible_mesh_core::NodeCapabilities {
-                    node_id: node.into(),
-                    roles: vec![],
-                    models: vec![],
-                    tools: vec![],
-                    constraints: Default::default(),
-                    build_version: String::new(),
-                },
-                mesh_port: 9000,
-                blob_port: 9001,
-                execution_port: 9002,
-                ipc_socket_path: String::new(),
-                active_pid: None,
-                mesh_host: None,
-            })
-            .unwrap();
-        }
+        seed_peers(&g);
         let (tx, mut rx) = mpsc::channel(8);
         let commands = serde_json::json!([{"command": "status", "description": "s"}]);
         on_local_manifest_written(&g, &tx, "vps-jane-aiua-01", "agent-beacon", &commands).await;
