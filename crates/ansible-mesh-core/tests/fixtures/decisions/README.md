@@ -10,5 +10,6 @@ fixture only proves what it was made from.
 | `canonical_request_heal_classify.json` | The canonical request from `docs/architecture/DECISIONS_MODEL_PROPOSAL.md`, with concrete strings. |
 
 When a live smoke records a real `choice` or `score` response, add it as `recorded_*.json`
-and point the matching test at it. The score `legend` check is deliberately strict (it must
-echo exactly the level text we sent); relax it only against a recorded body that disagrees.
+and point the matching test at it. The parser maps a score `legend` by its text and falls
+back to position; a deviation sets `legend_mismatch` rather than failing, so a recorded body
+that disagrees with the docs shows up as a flag, not as silent fallbacks.

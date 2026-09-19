@@ -128,7 +128,7 @@ Sent as the `task_json` of an `EmitTask` to a `model.decisions` controller role.
 
 - `site` is **required**: the call-site id that keys shadow rows and traces, the same way `oracle_pick` is keyed today.
 - Questions are an ordered array with unique ids. The transport adapter turns them into TypeSafe's map. `score` levels are an ordered array, never an object.
-- `validate()` enforces: unique ids; choice ≤ 255 options; score 2–10 levels; state size under the transport budget (64 k tokens native, 32 k OpenRouter); `request_class: judgment` only with `decisions.evaluate`.
+- `validate()` enforces: unique ids; choice ≤ 255 options; score 2–10 levels; two size bounds, both estimated at 3 bytes per token (conservative, so it rejects early; the provider's 422 stays authoritative): `state` plus the longest question ≤ 32 k tokens on every transport, and the whole request ≤ 64 k native / 32 k OpenRouter; `request_class: judgment` only with `decisions.evaluate`.
 
 ### Response
 
@@ -174,7 +174,8 @@ Sent as the `task_json` of an `EmitTask` to a `model.decisions` controller role.
 | `score` levels | array → `criteria` **array of strings** (the description, else the key); the answer returns `legend` and `probabilities` keyed by **level index**, which the adapter maps back to level keys and checks against what was sent | same |
 | `noul` criteria | `when_true` / `when_false`, both optional | both required when present; fill neutral empty string |
 | Cost | not returned | `usage.cost`, plus `id`, `provider` |
-| State budget | 64 k tokens | 32 k tokens |
+| Request budget | 64 k tokens | 32 k tokens |
+| `state` + longest question | ≤ 32 k tokens (vendor docs) | ≤ 32 k tokens (enforced: it is the tighter bound) |
 
 ## Where it applies (candidates, ranked)
 
@@ -209,9 +210,9 @@ Blast radius abbreviated as BR. Line references were read at `d624e5b8`. Items m
 
 | Slice | Content | Verification |
 |---|---|---|
-| D0 `decisions-envelope` | `ansible-mesh-core::decisions` types, validation, native and OpenRouter wire adapters as pure functions, unit-tested against fixtures. No network. Ordered-levels test. **Done 2026-09-19** (26 tests). Only the OpenRouter `noul` fixture is recorded live; `choice` and `score` fixtures come from the vendor docs until D1's smoke records real bodies, and the `score` legend check is strict until then. | test-green |
+| D0 `decisions-envelope` | `ansible-mesh-core::decisions` types, validation, native and OpenRouter wire adapters as pure functions, unit-tested against fixtures. No network. Ordered-levels test. **Done 2026-09-19** (26 tests). Only the OpenRouter `noul` fixture is recorded live; `choice` and `score` fixtures come from the vendor docs until D1's smoke records real bodies, and the `score` legend is mapped by its text, falling back to position, with a `legend_mismatch` flag on the trace instead of an error. | test-green |
 | D1 | model-router: `TaskKind::Decide`, `RequestClass::Judgment`, `ProviderOutput::Judgment`, `AuxTaskKind` arm, aux-isolation entry, `model_oracle` capability seeding, a provider with a native / OpenRouter transport switch, `model-controller-decisions` bin (role `model.decisions`), `decisions_response` reply action, `ResponseTrace` growth. | test-green, then smoke-green once a key exists |
-| D2 `decisions-shadow-heal` | `heal-dispatcher` calls the provider beside `gemma3:4b`, log-only, writes a `decision_traces` row per site (agreement, probabilities, latency, cost). Flag `PHILOTIC_SHADOW_DECISIONS`, default off. | watched-live-green on one hotel |
+| D2 `decisions-shadow-heal` | `heal-dispatcher` calls the provider beside `gemma3:4b`, log-only, writes a `decision_traces` row per site (agreement, probabilities, latency, cost, resolved model, `legend_mismatch`, and the **error class**). Error classes are counted separately from disagreement: a parse failure and a disagreeing judge look identical in a log-only run, and calibrating on the first as if it were the second would be calibrating on nothing. Flag `PHILOTIC_SHADOW_DECISIONS`, default off. | watched-live-green on one hotel |
 | D3 | In-process client with local fallback; shadow sites #3 (`memory.recall` relevance) and #1 (say-do gate), both non-blocking. | smoke-green, then watched-live-green |
 | D4 | Calibration from `decision_traces`, `router_traces`, approve/deny events and `life.recall.feedback`; per-question thresholds; promotion via the existing autonomy postures (`ProposalOnly` → `ConfirmFirst` → `AutoWithAudit`, `ansible-mesh-core/src/autonomy.rs`). | field-evidence |
 | D5 (optional) | Make the decisions provider the first production producer of `Context1Advisory`. | test-green |

@@ -61,6 +61,10 @@ const PROBABILITY_SUM_SLACK: f64 = 1e-3;
 /// and rejects early; the provider's 422 remains authoritative.
 const BYTES_PER_TOKEN_ESTIMATE: usize = 3;
 
+/// TypeSafe docs (`models.md`): "64k tokens per request; 32k tokens for `state`
+/// plus the longest question". The second cap applies whatever the transport.
+pub const STATE_PLUS_QUESTION_BUDGET_TOKENS: usize = 32_000;
+
 // ──────────────────────────────────────────────────────────────────────────────
 // Transport
 // ──────────────────────────────────────────────────────────────────────────────
@@ -84,7 +88,9 @@ impl DecisionsTransport {
         }
     }
 
-    /// Request context budget in tokens (native 64 k, OpenRouter 32 k).
+    /// Whole-request context budget in tokens (native 64 k, OpenRouter 32 k).
+    /// Separately, `state` plus the longest question is capped at
+    /// [`STATE_PLUS_QUESTION_BUDGET_TOKENS`] on both.
     pub fn context_budget_tokens(self) -> usize {
         match self {
             Self::Native => 64_000,
@@ -297,35 +303,24 @@ pub struct DecisionsRequest {
 }
 
 impl DecisionsRequest {
-    /// Rough token count of everything the provider will read.
-    pub fn estimated_tokens(&self) -> usize {
-        let state = match &self.state {
+    fn state_bytes(&self) -> usize {
+        match &self.state {
             Value::String(text) => text.len(),
             other => other.to_string().len(),
-        };
-        let questions: usize = self
-            .questions
-            .iter()
-            .map(|q| {
-                q.id.len()
-                    + q.instructions.len()
-                    + match &q.spec {
-                        QuestionSpec::Noul {
-                            when_true,
-                            when_false,
-                        } => {
-                            when_true.as_deref().map_or(0, str::len)
-                                + when_false.as_deref().map_or(0, str::len)
-                        }
-                        QuestionSpec::Choice { options }
-                        | QuestionSpec::Score { levels: options } => options
-                            .iter()
-                            .map(|o| o.key.len() + o.description.as_deref().map_or(0, str::len))
-                            .sum(),
-                    }
-            })
-            .sum();
-        (state + questions).div_ceil(BYTES_PER_TOKEN_ESTIMATE)
+        }
+    }
+
+    /// Rough token count of everything the provider will read.
+    pub fn estimated_tokens(&self) -> usize {
+        let questions: usize = self.questions.iter().map(question_bytes).sum();
+        (self.state_bytes() + questions).div_ceil(BYTES_PER_TOKEN_ESTIMATE)
+    }
+
+    /// Rough token count of `state` plus the single longest question — the
+    /// quantity the vendor caps at 32 k regardless of the total request budget.
+    pub fn estimated_state_plus_longest_question_tokens(&self) -> usize {
+        let longest = self.questions.iter().map(question_bytes).max().unwrap_or(0);
+        (self.state_bytes() + longest).div_ceil(BYTES_PER_TOKEN_ESTIMATE)
     }
 
     /// Reject a request the provider would reject, before spending a network hop.
@@ -356,6 +351,13 @@ impl DecisionsRequest {
             }
             validate_spec(&question.id, &question.spec)?;
         }
+        let state_and_question = self.estimated_state_plus_longest_question_tokens();
+        if state_and_question > STATE_PLUS_QUESTION_BUDGET_TOKENS {
+            return Err(DecisionsError::invalid_request(format!(
+                "state plus the longest question is about {state_and_question} tokens, \
+                 over the {STATE_PLUS_QUESTION_BUDGET_TOKENS}-token cap"
+            )));
+        }
         let estimate = self.estimated_tokens();
         let budget = transport.context_budget_tokens();
         if estimate > budget {
@@ -366,6 +368,21 @@ impl DecisionsRequest {
         }
         Ok(())
     }
+}
+
+/// Bytes a question contributes to the provider's input.
+fn question_bytes(question: &DecisionQuestion) -> usize {
+    let spec = match &question.spec {
+        QuestionSpec::Noul {
+            when_true,
+            when_false,
+        } => when_true.as_deref().map_or(0, str::len) + when_false.as_deref().map_or(0, str::len),
+        QuestionSpec::Choice { options } | QuestionSpec::Score { levels: options } => options
+            .iter()
+            .map(|o| o.key.len() + o.description.as_deref().map_or(0, str::len))
+            .sum(),
+    };
+    question.id.len() + question.instructions.len() + spec
 }
 
 fn validate_site(site: &str) -> Result<(), DecisionsError> {
@@ -498,6 +515,12 @@ pub struct DecisionsTrace {
     /// OpenRouter generation id (`gen-dec-…`), when present.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub request_id: Option<String>,
+    /// A `score` legend did not echo the levels we sent, so the answer was
+    /// mapped by legend text or position. Count these separately: the
+    /// `score` value is in the provider's index space and should not feed
+    /// calibration until the mismatch is understood.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub legend_mismatch: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -512,6 +535,8 @@ pub struct WireOutcome {
     pub resolved_model: String,
     pub provider: Option<String>,
     pub request_id: Option<String>,
+    /// A `score` legend differed from the levels we sent.
+    pub legend_mismatch: bool,
     pub usage: DecisionsUsage,
     pub result: DecisionsResult,
 }
@@ -527,6 +552,7 @@ impl WireOutcome {
                 latency_ms,
                 usage: self.usage,
                 request_id: self.request_id,
+                legend_mismatch: self.legend_mismatch,
             },
         }
     }
@@ -721,6 +747,7 @@ pub fn parse_wire_response(
     }
 
     let mut answers = BTreeMap::new();
+    let mut legend_mismatch = false;
     for question in &request.questions {
         let raw = wire.answers.get(&question.id).ok_or_else(|| {
             DecisionsError::invalid_response(format!("no answer for question `{}`", question.id))
@@ -734,13 +761,16 @@ pub fn parse_wire_response(
                 )));
             }
         }
-        answers.insert(question.id.clone(), parse_answer(question, raw)?);
+        let (answer, mismatch) = parse_answer(question, raw)?;
+        legend_mismatch |= mismatch;
+        answers.insert(question.id.clone(), answer);
     }
 
     Ok(WireOutcome {
         resolved_model: wire.model,
         provider: wire.provider,
         request_id: wire.id,
+        legend_mismatch,
         usage: DecisionsUsage {
             input_tokens: wire.usage.input_tokens,
             output_tokens: wire.usage.output_tokens,
@@ -753,10 +783,12 @@ pub fn parse_wire_response(
     })
 }
 
+/// Parse one answer. The flag is true when a `score` legend did not match the
+/// levels we sent (see the legend policy below).
 fn parse_answer(
     question: &DecisionQuestion,
     raw: &Value,
-) -> Result<DecisionAnswer, DecisionsError> {
+) -> Result<(DecisionAnswer, bool), DecisionsError> {
     let id = question.id.as_str();
     let malformed = |err: serde_json::Error| {
         DecisionsError::invalid_response(format!("answer `{id}` is malformed: {err}"))
@@ -765,7 +797,7 @@ fn parse_answer(
         QuestionSpec::Noul { .. } => {
             let answer: WireNoulAnswer = serde_json::from_value(raw.clone()).map_err(malformed)?;
             check_unit(id, "noul", answer.noul)?;
-            Ok(DecisionAnswer::Noul { noul: answer.noul })
+            Ok((DecisionAnswer::Noul { noul: answer.noul }, false))
         }
         QuestionSpec::Choice { options } => {
             let answer: WireChoiceAnswer =
@@ -787,11 +819,14 @@ fn parse_answer(
                 )));
             }
             check_distribution(id, &answer.probabilities, answer.confidence)?;
-            Ok(DecisionAnswer::Choice {
-                choice: answer.choice,
-                probabilities: answer.probabilities,
-                confidence: answer.confidence,
-            })
+            Ok((
+                DecisionAnswer::Choice {
+                    choice: answer.choice,
+                    probabilities: answer.probabilities,
+                    confidence: answer.confidence,
+                },
+                false,
+            ))
         }
         QuestionSpec::Score { levels } => {
             let answer: WireScoreAnswer = serde_json::from_value(raw.clone()).map_err(malformed)?;
@@ -804,26 +839,47 @@ fn parse_answer(
                 )));
             }
             // The wire speaks in level indices; callers speak in level keys.
-            // The legend must echo exactly what we sent, or index `n` might
-            // not be the level we think it is.
-            for (index, level) in levels.iter().enumerate() {
-                match answer.legend.get(&index.to_string()) {
-                    Some(text) if text == level.level_text() => {}
-                    other => {
-                        return Err(DecisionsError::invalid_response(format!(
-                            "answer `{id}` legend[{index}] is {other:?}, expected `{}`",
-                            level.level_text()
-                        )));
+            // The legend says what each index means, so its text is the
+            // authority when it names one of our levels. If it does not (the
+            // vendor trimmed or rewrote the text, or reordered the levels) we
+            // fall back to position and flag the answer, rather than failing:
+            // in shadow mode a strict check would turn every score answer into
+            // an error indistinguishable from "the judge disagrees".
+            let mut position = Vec::with_capacity(levels.len());
+            let mut legend_mismatch = false;
+            for index in 0..levels.len() {
+                let text = answer.legend.get(&index.to_string()).ok_or_else(|| {
+                    DecisionsError::invalid_response(format!(
+                        "answer `{id}` legend has no entry for level index {index}"
+                    ))
+                })?;
+                let by_text: Vec<usize> = (0..levels.len())
+                    .filter(|&i| levels[i].level_text() == text)
+                    .collect();
+                match by_text.as_slice() {
+                    [i] if *i == index => position.push(index),
+                    [i] => {
+                        legend_mismatch = true;
+                        position.push(*i);
+                    }
+                    _ => {
+                        legend_mismatch = true;
+                        position.push(index);
                     }
                 }
+            }
+            if position.iter().collect::<BTreeSet<_>>().len() != levels.len() {
+                return Err(DecisionsError::invalid_response(format!(
+                    "answer `{id}` legend maps two indices to the same level"
+                )));
             }
             let mut probabilities = BTreeMap::new();
             for (index, probability) in &answer.probabilities {
                 let key = index
                     .parse::<usize>()
                     .ok()
-                    .and_then(|i| levels.get(i))
-                    .map(|level| level.key.clone())
+                    .and_then(|i| position.get(i))
+                    .map(|&i| levels[i].key.clone())
                     .ok_or_else(|| {
                         DecisionsError::invalid_response(format!(
                             "answer `{id}` gives a probability for level index `{index}`, which does not exist"
@@ -842,11 +898,14 @@ fn parse_answer(
                     answer.score
                 )));
             }
-            Ok(DecisionAnswer::Score {
-                score: answer.score,
-                probabilities,
-                confidence: answer.confidence,
-            })
+            Ok((
+                DecisionAnswer::Score {
+                    score: answer.score,
+                    probabilities,
+                    confidence: answer.confidence,
+                },
+                legend_mismatch,
+            ))
         }
     }
 }
@@ -1056,18 +1115,62 @@ mod tests {
     }
 
     #[test]
-    fn state_budget_differs_by_transport() {
-        // ~150 kB is about 50 k tokens by the estimate: fine natively, too big for OpenRouter.
+    fn state_plus_longest_question_is_capped_at_32k_on_every_transport() {
+        // TypeSafe: "64k tokens per request; 32k tokens for `state` plus the longest
+        // question". ~150 kB is about 50 k tokens by the estimate, over the 32 k cap
+        // even though it fits the native 64 k request budget.
         let mut request = urgency_request();
         request.state = json!("x".repeat(150_000));
+        for transport in [DecisionsTransport::Native, DecisionsTransport::OpenRouter] {
+            assert_eq!(
+                class_of(request.validate(transport)),
+                DecisionsErrorClass::InvalidRequest,
+                "{transport:?}"
+            );
+        }
+
+        // ~90 kB is about 30 k tokens: under the cap on both.
+        request.state = json!("x".repeat(90_000));
+        assert!(request.validate(DecisionsTransport::Native).is_ok());
+        assert!(request.validate(DecisionsTransport::OpenRouter).is_ok());
+    }
+
+    #[test]
+    fn whole_request_budget_differs_by_transport() {
+        // 20 k tokens of state plus 12 questions of ~3 k tokens each is ~56 k in
+        // total: state plus the longest question stays under 32 k, so native accepts
+        // it, but OpenRouter's 32 k request budget does not.
+        let mut request = urgency_request();
+        request.state = json!("x".repeat(60_000));
+        request.questions = (0..12)
+            .map(|i| DecisionQuestion {
+                id: format!("q{i}"),
+                instructions: "y".repeat(9_000),
+                spec: QuestionSpec::Noul {
+                    when_true: None,
+                    when_false: None,
+                },
+            })
+            .collect();
         assert!(request.validate(DecisionsTransport::Native).is_ok());
         assert_eq!(
             class_of(request.validate(DecisionsTransport::OpenRouter)),
             DecisionsErrorClass::InvalidRequest
         );
 
-        request.state = json!("x".repeat(400_000));
-        assert!(request.validate(DecisionsTransport::Native).is_err());
+        // Past 64 k in total, native refuses too.
+        request.questions.extend((12..30).map(|i| DecisionQuestion {
+            id: format!("q{i}"),
+            instructions: "y".repeat(9_000),
+            spec: QuestionSpec::Noul {
+                when_true: None,
+                when_false: None,
+            },
+        }));
+        assert_eq!(
+            class_of(request.validate(DecisionsTransport::Native)),
+            DecisionsErrorClass::InvalidRequest
+        );
     }
 
     // ── model slugs ──────────────────────────────────────────────────────────
@@ -1322,6 +1425,7 @@ mod tests {
     #[test]
     fn docs_native_response_maps_score_indices_back_to_level_keys() {
         let outcome = parse_wire_response(&canonical(), DOCS_NATIVE_MIXED).unwrap();
+        assert!(!outcome.legend_mismatch);
         assert_eq!(outcome.provider, None);
         assert_eq!(outcome.usage.cost_usd, None);
 
@@ -1438,19 +1542,61 @@ mod tests {
     }
 
     #[test]
-    fn score_legend_must_echo_what_was_sent() {
+    fn score_legend_is_authoritative_but_a_mismatch_is_flagged_not_fatal() {
+        // The legend can echo exactly what we sent (the docs example does).
         let good = with_answer(json!({
             "type": "score", "score": 0.3, "legend": { "0": "low", "1": "high" },
             "probabilities": { "0": 0.7, "1": 0.3 }, "confidence": 0.7
         }));
-        assert!(parse_wire_response(&score_request(), &good).is_ok());
+        let outcome = parse_wire_response(&score_request(), &good).unwrap();
+        assert!(!outcome.legend_mismatch);
 
-        let swapped = with_answer(json!({
+        // Reordered legend: the text says index 0 is our "high" level, so that is
+        // where the probability goes, and the answer is flagged.
+        let reordered = with_answer(json!({
             "type": "score", "score": 0.3, "legend": { "0": "high", "1": "low" },
             "probabilities": { "0": 0.7, "1": 0.3 }, "confidence": 0.7
         }));
+        let outcome = parse_wire_response(&score_request(), &reordered).unwrap();
+        assert!(outcome.legend_mismatch);
+        match &outcome.result.answers["q"] {
+            DecisionAnswer::Score { probabilities, .. } => {
+                assert_eq!(probabilities["hi"], 0.7);
+                assert_eq!(probabilities["lo"], 0.3);
+            }
+            other => panic!("expected a score, got {other:?}"),
+        }
+        assert!(
+            outcome
+                .into_outcome(DecisionsTransport::Native, 1)
+                .trace
+                .legend_mismatch
+        );
+
+        // Rewritten legend text (trimmed, re-cased, translated): fall back to
+        // position and flag it, so a vendor-side normalisation cannot turn every
+        // score answer into an error.
+        let rewritten = with_answer(json!({
+            "type": "score", "score": 0.3, "legend": { "0": "Low.", "1": "High." },
+            "probabilities": { "0": 0.7, "1": 0.3 }, "confidence": 0.7
+        }));
+        let outcome = parse_wire_response(&score_request(), &rewritten).unwrap();
+        assert!(outcome.legend_mismatch);
+        match &outcome.result.answers["q"] {
+            DecisionAnswer::Score { probabilities, .. } => {
+                assert_eq!(probabilities["lo"], 0.7);
+                assert_eq!(probabilities["hi"], 0.3);
+            }
+            other => panic!("expected a score, got {other:?}"),
+        }
+
+        // Two indices claiming the same level cannot be mapped.
+        let ambiguous = with_answer(json!({
+            "type": "score", "score": 0.3, "legend": { "0": "low", "1": "low" },
+            "probabilities": { "0": 0.7, "1": 0.3 }, "confidence": 0.7
+        }));
         assert_eq!(
-            class_of(parse_wire_response(&score_request(), &swapped)),
+            class_of(parse_wire_response(&score_request(), &ambiguous)),
             DecisionsErrorClass::InvalidResponse
         );
 
