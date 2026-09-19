@@ -49,6 +49,15 @@ pub(crate) fn event_source_is_authenticated_sender(
     }
 }
 
+/// Is this event addressed to a node other than this one? (An event with no
+/// target is a broadcast and is ours.)
+pub(crate) fn event_is_addressed_elsewhere(event: &EventEnvelope, local_node_id: &str) -> bool {
+    event
+        .target_node_id
+        .as_deref()
+        .is_some_and(|target| target != local_node_id)
+}
+
 type BeaconInboxReceiver = Arc<Mutex<Option<mpsc::Receiver<ansible_mesh_core::BeaconMessage>>>>;
 type WebRtcSignalReceiver =
     Arc<Mutex<Option<mpsc::Receiver<ansible_mesh_core::webrtc::WebRtcSignalMessage>>>>;
@@ -447,6 +456,16 @@ pub(crate) async fn activate_mesh_runtime(ctx: MeshRuntimeContext) -> Result<()>
                                         &inbound_delivery_claims,
                                     )
                                     .await;
+                                    // The control-plane handlers below act on their
+                                    // payload as addressed to THIS hotel. An event
+                                    // addressed to a third node is one the sender check
+                                    // above lets through only because delivery ignores
+                                    // it — running cron/identity/handoff handlers on it
+                                    // would apply a peer-supplied record with forged
+                                    // provenance (DEF-183).
+                                    if event_is_addressed_elsewhere(event, &inbound_local_node_id) {
+                                        continue;
+                                    }
                                     // Cron control-plane broadcasts.
                                     match &event.kind {
                                         ansible_mesh_core::event::EventKind::CronFired => {
@@ -586,6 +605,8 @@ pub(crate) async fn activate_mesh_runtime(ctx: MeshRuntimeContext) -> Result<()>
                                                         let mat_req = inbound_mat_req.clone();
                                                         let node_id =
                                                             inbound_local_node_id.clone();
+                                                        let source_node =
+                                                            event.source_node_id.clone();
                                                         let data = data.clone();
                                                         tokio::spawn(async move {
                                                             IpcServer::handle_remote_role_handoff(
@@ -594,6 +615,7 @@ pub(crate) async fn activate_mesh_runtime(ctx: MeshRuntimeContext) -> Result<()>
                                                                 &parked,
                                                                 mat_req,
                                                                 &node_id,
+                                                                &source_node,
                                                                 &data,
                                                             )
                                                             .await;
@@ -912,6 +934,23 @@ mod sender_binding_tests {
             "mbp-jane-aiua-01",
             "vps-jane-aiua-01"
         ));
+    }
+
+    #[test]
+    fn control_plane_handlers_skip_events_addressed_to_a_third_node() {
+        use super::event_is_addressed_elsewhere;
+        assert!(event_is_addressed_elsewhere(
+            &event("a", Some("mbp-jane-aiua-01")),
+            "vps-jane-aiua-01"
+        ));
+        assert!(!event_is_addressed_elsewhere(
+            &event("a", Some("vps-jane-aiua-01")),
+            "vps-jane-aiua-01"
+        ));
+        assert!(
+            !event_is_addressed_elsewhere(&event("a", None), "vps-jane-aiua-01"),
+            "a broadcast is ours"
+        );
     }
 
     #[test]

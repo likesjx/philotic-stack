@@ -7972,6 +7972,10 @@ async fn main() -> Result<()> {
     if flags.enable_rust_task_lifecycle {
         std::thread::spawn(move || {
             info!("Durable Event Ledger Writer Thread spanning up...");
+            // Kinds already reported as dropped for having no target node, so the
+            // warning appears once per kind instead of once per envelope.
+            let mut warned_untargeted: std::collections::HashSet<String> =
+                std::collections::HashSet::new();
             while let Some(cmd) = dispatcher_rx.blocking_recv() {
                 match cmd {
                     LedgerCommand::AppendLocal(mut evt) => {
@@ -7983,6 +7987,23 @@ async fn main() -> Result<()> {
                             .map(|t| t == local_node_id_writer.as_str())
                             .unwrap_or(true);
                         if is_local {
+                            if evt.target_node_id.is_none()
+                                && evt.target_agent_id.is_none()
+                                && warned_untargeted.insert(format!("{:?}", evt.kind))
+                            {
+                                // DEF-184: hotels do not broadcast. An envelope with no
+                                // target is never stored or sent, so cron control-plane
+                                // events (CronFired / CronJobSync) have never left their
+                                // hotel. Making this fan out would switch on cron
+                                // replication and fire-suppression that has never run
+                                // live — an operator decision, not an audit side effect.
+                                warn!(
+                                    kind = ?evt.kind,
+                                    "ledger: an envelope with no target node is never stored or sent — \
+                                     hotels do not broadcast; address each peer (DEF-184). Further \
+                                     drops of this kind are not logged"
+                                );
+                            }
                             if evt.target_node_id.is_none() && evt.target_agent_id.is_some() {
                                 // DEF-139: an envelope addressed to an agent with no
                                 // node was being skipped here as "same-hotel" — never

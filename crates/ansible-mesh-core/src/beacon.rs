@@ -19,6 +19,29 @@ use tracing::{debug, error, info, warn};
 /// receive loop is a single task, so every peer's traffic waits behind it.
 const SLOW_PACKET_WARN: std::time::Duration = std::time::Duration::from_millis(250);
 
+/// Does the node id a payload names equal the peer whose key authenticated
+/// the packet?
+///
+/// The HMAC proves who SENT a packet, but heartbeats, capability syncs and
+/// hotel-state syncs each carry the node they describe INSIDE the payload and
+/// every handler acted on that value. Any enrolled peer could therefore make
+/// every hotel believe it hosts an agent (roster injection), rewrite another
+/// hotel's stored `mesh_port` to its own source port, or feed placement
+/// gossip for another node — the same class DEF-170 closed on the event
+/// plane, still open here (DEF-183).
+fn claimed_node_is_sender(claimed_node_id: &str, msg: &BeaconMessage) -> bool {
+    if claimed_node_id == msg.src_node {
+        return true;
+    }
+    warn!(
+        claimed = claimed_node_id,
+        authenticated_sender = %msg.src_node,
+        msg_type = ?msg.msg_type,
+        "Packet dropped: its payload describes a node other than the peer that sent it (DEF-183)"
+    );
+    false
+}
+
 pub struct BeaconDaemon {
     socket: Arc<UdpSocket>,
     graph: Arc<GraphDomain>,
@@ -216,6 +239,9 @@ impl BeaconDaemon {
         match msg.msg_type {
             MsgType::Heartbeat => {
                 if let Ok(payload) = serde_json::from_slice::<HeartbeatPayload>(&msg.payload) {
+                    if !claimed_node_is_sender(&payload.capabilities.node_id, &msg) {
+                        return;
+                    }
                     info!(
                         "Received heartbeat from node: {} (roles: {:?})",
                         payload.capabilities.node_id, payload.capabilities.roles
@@ -344,6 +370,9 @@ impl BeaconDaemon {
             }
             MsgType::CapabilitySync => {
                 if let Ok(payload) = serde_json::from_slice::<CapabilitySyncPayload>(&msg.payload) {
+                    if !claimed_node_is_sender(&payload.capabilities.node_id, &msg) {
+                        return;
+                    }
                     let mut registry = self.registry.write().await;
                     registry.observe_capability_sync_chunk(
                         payload.capabilities,
@@ -408,6 +437,9 @@ impl BeaconDaemon {
             }
             MsgType::HotelStateSync => {
                 if let Ok(payload) = serde_json::from_slice::<HotelStateSyncPayload>(&msg.payload) {
+                    if !claimed_node_is_sender(&payload.node_id, &msg) {
+                        return;
+                    }
                     if payload.node_id != self.local_capabilities.node_id {
                         let t0 = std::time::Instant::now();
                         // Everything that touches SQLite happens BEFORE the
@@ -670,5 +702,112 @@ mod tests {
             !registry.read().await.is_node_stale("mbp-jane-aiua-01"),
             "node should be fresh after heartbeat"
         );
+    }
+
+    async fn daemon_with_registry(
+        graph: Arc<GraphDomain>,
+    ) -> (BeaconDaemon, Arc<RwLock<NodeRegistry>>) {
+        let registry = Arc::new(RwLock::new(NodeRegistry::new()));
+        let (inbox_tx, _inbox_rx) = tokio::sync::mpsc::channel(8);
+        let daemon = BeaconDaemon::bind_with_registry(
+            "127.0.0.1:0",
+            test_caps("mac-jane-aiua-01"),
+            inbox_tx,
+            graph,
+            "",
+            false,
+            registry.clone(),
+        )
+        .await
+        .unwrap();
+        (daemon, registry)
+    }
+
+    /// DEF-183: a heartbeat sent by mbp-jane that CLAIMS to describe vps-jane
+    /// must not create vps-jane's registry entry or move its stored port.
+    #[tokio::test]
+    async fn a_heartbeat_describing_another_node_is_dropped() {
+        let storage = SqliteGraphStorage::open_in_memory().unwrap();
+        let graph = Arc::new(GraphDomain::new(Arc::new(storage.adapter())));
+        graph
+            .upsert_hotel(&test_hotel("vps-jane", "vps-jane-aiua-01", 9200))
+            .unwrap();
+        let (daemon, registry) = daemon_with_registry(graph.clone()).await;
+
+        let mut forged = heartbeat_msg("vps-jane-aiua-01");
+        forged.src_node = "mbp-jane-aiua-01".to_string();
+        let attacker_src: SocketAddr = "100.79.239.64:6666".parse().unwrap();
+        daemon.dispatch_message(forged, attacker_src).await;
+
+        assert!(
+            registry.read().await.get_node("vps-jane-aiua-01").is_none(),
+            "a forged heartbeat must not create the described node"
+        );
+        assert_eq!(
+            graph.get_hotel("vps-jane").unwrap().unwrap().mesh_port,
+            9200,
+            "and must not rewrite its stored port to the sender's"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_roster_describing_another_node_is_dropped() {
+        let storage = SqliteGraphStorage::open_in_memory().unwrap();
+        let graph = Arc::new(GraphDomain::new(Arc::new(storage.adapter())));
+        let (daemon, registry) = daemon_with_registry(graph).await;
+
+        let payload = HotelStateSyncPayload {
+            node_id: "vps-jane-aiua-01".into(),
+            hotel_name: "vps-jane".into(),
+            guests: vec![],
+            agents: vec![crate::heartbeat::HotelStateSyncAgent {
+                agent_id: "agent-beacon".into(),
+                persona_name: "Beacon".into(),
+            }],
+            model_profiles: vec![],
+            role_homes: vec![],
+            transport_homes: vec![],
+        };
+        let mut msg = heartbeat_msg("mbp-jane-aiua-01");
+        msg.msg_type = MsgType::HotelStateSync;
+        msg.payload = serde_json::to_vec(&payload).unwrap().into();
+        daemon
+            .dispatch_message(msg.clone(), "100.79.239.64:1".parse().unwrap())
+            .await;
+        assert_eq!(
+            registry.read().await.remote_hotel_states().count(),
+            0,
+            "mbp-jane may not inject a roster for vps-jane"
+        );
+
+        // The same roster from the hotel it describes is accepted.
+        msg.src_node = "vps-jane-aiua-01".to_string();
+        daemon
+            .dispatch_message(msg, "100.64.212.8:1".parse().unwrap())
+            .await;
+        assert_eq!(registry.read().await.remote_hotel_states().count(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_capability_sync_describing_another_node_is_dropped() {
+        let storage = SqliteGraphStorage::open_in_memory().unwrap();
+        let graph = Arc::new(GraphDomain::new(Arc::new(storage.adapter())));
+        let (daemon, registry) = daemon_with_registry(graph).await;
+
+        let payload = CapabilitySyncPayload {
+            capabilities: test_caps("vps-jane-aiua-01"),
+            execution_reachability: None,
+            advertisements: vec![],
+            sync_id: Uuid::new_v4(),
+            chunk_index: 0,
+            chunk_total: 1,
+        };
+        let mut msg = heartbeat_msg("mbp-jane-aiua-01");
+        msg.msg_type = MsgType::CapabilitySync;
+        msg.payload = serde_json::to_vec(&payload).unwrap().into();
+        daemon
+            .dispatch_message(msg.clone(), "100.79.239.64:1".parse().unwrap())
+            .await;
+        assert!(registry.read().await.get_node("vps-jane-aiua-01").is_none());
     }
 }
