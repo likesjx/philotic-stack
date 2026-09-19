@@ -8,6 +8,13 @@ use uuid::Uuid;
 const DEFAULT_NODE_TTL: Duration = Duration::from_secs(15);
 const PENDING_SYNC_TTL: Duration = Duration::from_secs(30);
 
+/// How long a remote hotel's gossiped roster stays trustworthy. A hotel
+/// re-broadcasts its roster every 30 s, and nothing else refreshes it, so the
+/// 15 s node TTL expired it half of every cycle — an exact-guest lookup on
+/// the roster then failed for 15 s out of 30 and a cross-hotel task fell back
+/// to local handling. Three missed broadcasts (plus slack) is stale.
+pub const HOTEL_STATE_TTL: Duration = Duration::from_secs(90);
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CapabilityAdvertisement {
     pub hotel_id: String,
@@ -328,7 +335,7 @@ impl NodeRegistry {
         }
         self.remote_hotel_states
             .values()
-            .filter(|state| state.last_seen.elapsed() <= DEFAULT_NODE_TTL)
+            .filter(|state| state.last_seen.elapsed() <= HOTEL_STATE_TTL)
             .find(|state| {
                 state
                     .guests
@@ -338,6 +345,57 @@ impl NodeRegistry {
             })
             .map(|state| state.node_id.clone())
     }
+
+    /// The remote hotel that runs `agent_id`, from fresh gossiped rosters.
+    ///
+    /// A guest lookup needs the exact guest id, but a Telegram seat — or any
+    /// caller that means "this agent" — addresses the base agent
+    /// (`agent-beacon`) while the roster lists its guests
+    /// (`agent-beacon:orchestrator`). See [`best_host_for_agent`].
+    pub fn find_node_id_for_agent(&self, agent_id: &str) -> Option<String> {
+        best_host_for_agent(
+            self.remote_hotel_states
+                .values()
+                .filter(|state| state.last_seen.elapsed() <= HOTEL_STATE_TTL),
+            agent_id,
+        )
+        .map(|state| state.node_id.clone())
+    }
+}
+
+/// Is `guest_id` the agent itself or one of its role incarnations?
+fn guest_is_of_agent(guest_id: &str, agent_id: &str) -> bool {
+    guest_id == agent_id
+        || guest_id
+            .strip_prefix(agent_id)
+            .is_some_and(|rest| rest.starts_with(':'))
+}
+
+/// Pick the remote hotel that hosts `agent_id`.
+///
+/// Only hotels whose roster lists the agent's identity qualify — a bare
+/// name like a hotel's own prefix never matches. Several can: an identity is
+/// replicated to standby hotels that do not run the agent. Rank by how much
+/// of the agent is actually there — an active guest, then any guest, then the
+/// identity alone — and break ties by node id so the answer is stable
+/// between two calls (a HashMap's order is not).
+pub fn best_host_for_agent<'a>(
+    states: impl Iterator<Item = &'a RemoteHotelState>,
+    agent_id: &str,
+) -> Option<&'a RemoteHotelState> {
+    states
+        .filter(|state| state.agents.iter().any(|a| a.agent_id == agent_id))
+        .min_by_key(|state| {
+            let of_agent = |g: &&HotelStateSyncGuest| guest_is_of_agent(&g.guest_id, agent_id);
+            let rank = if state.guests.iter().filter(of_agent).any(|g| g.active) {
+                0
+            } else if state.guests.iter().any(|g| of_agent(&g)) {
+                1
+            } else {
+                2
+            };
+            (rank, state.node_id.clone())
+        })
 }
 
 #[cfg(test)]
@@ -545,5 +603,141 @@ mod tests {
         let ads: Vec<_> = registry.advertisements_for_role("model").collect();
         assert_eq!(ads.len(), 1);
         assert_eq!(ads[0].node_id, "fresh-node");
+    }
+
+    fn guest(guest_id: &str, active: bool) -> HotelStateSyncGuest {
+        HotelStateSyncGuest {
+            guest_id: guest_id.into(),
+            role: "agent".into(),
+            active,
+        }
+    }
+
+    fn agent(agent_id: &str) -> HotelStateSyncAgent {
+        HotelStateSyncAgent {
+            agent_id: agent_id.into(),
+            persona_name: agent_id.into(),
+        }
+    }
+
+    /// The incident's shape: Beacon runs on the vps, mbp-jane only holds her
+    /// identity (and a stray non-agent guest whose name merely contains it),
+    /// and mac-jane — the caller — knows neither.
+    fn beacon_roster() -> NodeRegistry {
+        let mut registry = NodeRegistry::new();
+        registry.observe_hotel_state(
+            "mbp-jane-aiua-01".into(),
+            "mbp-jane".into(),
+            vec![guest("mbp-jane:agent-graph-agent-beacon", true)],
+            vec![agent("agent-beacon")],
+        );
+        registry.observe_hotel_state(
+            "vps-jane-aiua-01".into(),
+            "vps-jane".into(),
+            vec![
+                guest("agent-beacon:orchestrator", true),
+                guest("agent-beacon:Chronos", true),
+            ],
+            vec![agent("agent-beacon")],
+        );
+        registry
+    }
+
+    #[test]
+    fn a_base_agent_id_resolves_to_the_hotel_that_runs_it() {
+        let registry = beacon_roster();
+        // The Telegram seat addresses the base agent; only roles are listed.
+        assert_eq!(registry.find_node_id_for_guest("agent-beacon"), None);
+        assert_eq!(
+            registry.find_node_id_for_agent("agent-beacon").as_deref(),
+            Some("vps-jane-aiua-01"),
+            "the hotel with a live guest wins over one that only holds the identity"
+        );
+        assert_eq!(registry.find_node_id_for_agent("agent-nobody"), None);
+        assert_eq!(
+            registry.find_node_id_for_agent("mbp-jane"),
+            None,
+            "a hotel's own name is not an agent"
+        );
+    }
+
+    #[test]
+    fn a_host_with_only_dormant_guests_beats_one_with_only_the_identity() {
+        let mut registry = NodeRegistry::new();
+        registry.observe_hotel_state(
+            "a-aiua-01".into(),
+            "a".into(),
+            vec![],
+            vec![agent("agent-x")],
+        );
+        registry.observe_hotel_state(
+            "b-aiua-01".into(),
+            "b".into(),
+            vec![guest("agent-x:orchestrator", false)],
+            vec![agent("agent-x")],
+        );
+        assert_eq!(
+            registry.find_node_id_for_agent("agent-x").as_deref(),
+            Some("b-aiua-01"),
+            "the remote hotel will materialize a dormant guest on receipt"
+        );
+    }
+
+    #[test]
+    fn an_agent_id_is_not_a_prefix_match() {
+        let mut registry = NodeRegistry::new();
+        registry.observe_hotel_state(
+            "a-aiua-01".into(),
+            "a".into(),
+            vec![guest("agent-beacon-two:orchestrator", true)],
+            vec![agent("agent-beacon")],
+        );
+        registry.observe_hotel_state(
+            "b-aiua-01".into(),
+            "b".into(),
+            vec![guest("agent-beacon:orchestrator", true)],
+            vec![agent("agent-beacon")],
+        );
+        assert_eq!(
+            registry.find_node_id_for_agent("agent-beacon").as_deref(),
+            Some("b-aiua-01")
+        );
+    }
+
+    /// A roster is re-broadcast every 30 s; it must not expire at 15 s.
+    #[test]
+    fn a_roster_survives_between_its_broadcasts_and_expires_after_missed_ones() {
+        let mut registry = beacon_roster();
+        registry
+            .remote_hotel_states
+            .get_mut("vps-jane-aiua-01")
+            .unwrap()
+            .last_seen = Instant::now() - Duration::from_secs(40);
+        assert_eq!(
+            registry
+                .find_node_id_for_guest("agent-beacon:orchestrator")
+                .as_deref(),
+            Some("vps-jane-aiua-01"),
+            "40 s old is between broadcasts, not stale"
+        );
+        assert_eq!(
+            registry.find_node_id_for_agent("agent-beacon").as_deref(),
+            Some("vps-jane-aiua-01")
+        );
+
+        registry
+            .remote_hotel_states
+            .get_mut("vps-jane-aiua-01")
+            .unwrap()
+            .last_seen = Instant::now() - (HOTEL_STATE_TTL + Duration::from_secs(1));
+        assert_eq!(
+            registry.find_node_id_for_guest("agent-beacon:orchestrator"),
+            None
+        );
+        assert_ne!(
+            registry.find_node_id_for_agent("agent-beacon").as_deref(),
+            Some("vps-jane-aiua-01"),
+            "a hotel that stopped broadcasting is not a route"
+        );
     }
 }

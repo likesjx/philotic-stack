@@ -890,10 +890,8 @@ pub(super) fn peer_agent_node_from_roster<'a>(
     states: impl Iterator<Item = &'a ansible_mesh_core::registry::RemoteHotelState>,
     agent_id: &str,
 ) -> Option<String> {
-    states
-        .filter(|state| state.agents.iter().any(|a| a.agent_id == agent_id))
+    ansible_mesh_core::registry::best_host_for_agent(states, agent_id)
         .map(|state| state.node_id.clone())
-        .next()
 }
 
 pub(super) fn lookup_agent_authority_hotel(graph: &GraphDomain, agent_id: &str) -> Option<String> {
@@ -4469,14 +4467,23 @@ impl IpcServer {
         // the task to a mesh peer that does not exist ("target node unknown
         // to this hotel — task may never deliver", live 2026-09-15 14:45 UTC,
         // DEF-132).
-        let home = graph
+        if let Some(home) = graph
             .list_role_incarnations_by_guest_id(guest_id)
             .unwrap_or_default()
             .into_iter()
-            .next()?
-            .home_node?;
-        let resolved = Self::resolve_hotel_node_id(graph, &home);
-        Some(resolved.unwrap_or(home))
+            .next()
+            .and_then(|record| record.home_node)
+        {
+            let resolved = Self::resolve_hotel_node_id(graph, &home);
+            return Some(resolved.unwrap_or(home));
+        }
+        // 3. The guest names an agent this hotel has no record of — the
+        // Telegram seat addresses the base agent (`agent-beacon`) while
+        // rosters list its role guests (`agent-beacon:orchestrator`). Route to
+        // the hotel that actually runs that agent, so a transport can poll on
+        // one hotel while its agent answers from another.
+        let agent_id = guest_id.split(':').next().unwrap_or(guest_id);
+        registry.find_node_id_for_agent(agent_id)
     }
 
     pub(super) fn local_delivery_provenance_hint(
@@ -25152,6 +25159,175 @@ pub(crate) mod tests {
         assert!(
             delivered.is_err(),
             "Björk must not receive a task addressed to Beacon: {delivered:?}"
+        );
+
+        unsafe {
+            std::env::remove_var("PHILOTIC_HOTEL_SOCKET");
+        }
+        server_task.abort();
+        let _ = server_task.await;
+        if Path::new(&socket_path).exists() {
+            let _ = std::fs::remove_file(&socket_path);
+        }
+    }
+
+    /// A Telegram seat may poll on one hotel while its agent runs on another:
+    /// a task addressed to the base agent (`agent-beacon`) is forwarded over
+    /// the mesh to the hotel the roster says runs her — and reaches nobody
+    /// local, in particular not Björk's live orchestrator.
+    #[tokio::test]
+    async fn emit_task_from_a_seat_reaches_its_agent_on_another_hotel() {
+        let _env_guard = ipc_env_guard();
+        let socket_path = test_socket_path();
+        let (dispatcher_tx, mut dispatcher_rx) = test_dispatcher_channel();
+        let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
+        let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
+        graph
+            .upsert_role_incarnation(&RoleIncarnationRecord {
+                agent_id: "agent-bjork-01".into(),
+                role_name: "orchestrator".into(),
+                guest_id: "agent-bjork-01:orchestrator".into(),
+                toolset_profile: "orchestrator".into(),
+                readiness_state: RoleReadinessState::Configured,
+                turn_loop_config: TurnLoopConfig::default(),
+                ..Default::default()
+            })
+            .expect("Björk's orchestrator should seed");
+        for (hotel_name, node_id) in [
+            ("mac-jane", "local-aiua-01"),
+            ("vps-jane", "vps-jane-aiua-01"),
+        ] {
+            graph
+                .upsert_hotel(&HotelRecord {
+                    hotel_name: hotel_name.into(),
+                    capabilities: NodeCapabilities {
+                        node_id: node_id.into(),
+                        roles: vec![],
+                        models: vec![],
+                        tools: vec![],
+                        constraints: Default::default(),
+                        build_version: String::new(),
+                    },
+                    mesh_port: 9000,
+                    blob_port: 9001,
+                    execution_port: 9002,
+                    ipc_socket_path: String::new(),
+                    active_pid: None,
+                    mesh_host: None,
+                })
+                .expect("seed hotel");
+        }
+        let registry = Arc::new(RwLock::new(NodeRegistry::new()));
+        // The vps is a live mesh peer (its heartbeat) and gossips its roster.
+        registry.write().await.observe_heartbeat(
+            ansible_mesh_core::NodeCapabilities {
+                node_id: "vps-jane-aiua-01".into(),
+                roles: vec![],
+                models: vec![],
+                tools: vec![],
+                constraints: Default::default(),
+                build_version: String::new(),
+            },
+            None,
+            None,
+        );
+        registry.write().await.observe_hotel_state(
+            "vps-jane-aiua-01".into(),
+            "vps-jane".into(),
+            vec![ansible_mesh_core::heartbeat::HotelStateSyncGuest {
+                guest_id: "agent-beacon:orchestrator".into(),
+                role: "agent".into(),
+                active: true,
+            }],
+            vec![ansible_mesh_core::heartbeat::HotelStateSyncAgent {
+                agent_id: "agent-beacon".into(),
+                persona_name: "Beacon".into(),
+            }],
+        );
+        let server = IpcServer::new(socket_path.clone(), "local-aiua-01", dispatcher_tx, graph)
+            .with_registry(registry);
+
+        let server_task = tokio::spawn(async move {
+            server.run().await.expect("ipc server should run");
+        });
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        unsafe {
+            std::env::set_var("PHILOTIC_HOTEL_SOCKET", &socket_path);
+        }
+
+        let mut bjork = PhiloticClient::connect(GuestIdentity {
+            guest_id: "agent-bjork-01:orchestrator".into(),
+            role: "agent".into(),
+            supported_tools: Vec::new(),
+        })
+        .await
+        .expect("Björk connect");
+        let mut seat = PhiloticClient::connect(GuestIdentity {
+            guest_id: "mac-jane:membrane-gateway-beacon".into(),
+            role: "membrane".into(),
+            supported_tools: Vec::new(),
+        })
+        .await
+        .expect("seat connect");
+
+        let emit_response = seat
+            .send_request(IpcRequest::EmitTask {
+                target_node: "local-aiua-01".into(),
+                target_role: "agent".into(),
+                target_guest_id: Some("agent-beacon".into()),
+                task_json: serde_json::json!({
+                    "session_id": "telegram:7:agent-beacon",
+                    "source": "telegram",
+                    "chat_id": "7",
+                    "content": "are you there, Beacon?",
+                    "final_reply_to": "local-aiua-01",
+                    "final_reply_role": "membrane",
+                    "final_reply_guest_id": "mac-jane:membrane-gateway-beacon"
+                })
+                .to_string(),
+            })
+            .await
+            .expect("emit task");
+
+        let mut forwarded = None;
+        let mut seen = Vec::new();
+        for _ in 0..20 {
+            let Ok(Some(LedgerCommand::AppendLocal(event))) = tokio::time::timeout(
+                tokio::time::Duration::from_millis(250),
+                dispatcher_rx.recv(),
+            )
+            .await
+            else {
+                continue;
+            };
+            seen.push(format!("{:?} -> {:?}", event.kind, event.target_node_id));
+            if event.target_node_id.as_deref() == Some("vps-jane-aiua-01") {
+                forwarded = Some(event);
+                break;
+            }
+        }
+        let event = forwarded.unwrap_or_else(|| {
+            panic!(
+                "the task is forwarded to the hotel that runs Beacon; EmitTask replied {emit_response:?}; the hotel emitted: {seen:?}"
+            )
+        });
+        let ansible_mesh_core::event::EventPayload::Inline { data } = &event.payload else {
+            panic!("expected an inline payload");
+        };
+        let payload: serde_json::Value = serde_json::from_str(data).expect("payload decodes");
+        assert_eq!(payload["session_id"], "telegram:7:agent-beacon");
+        assert_eq!(payload["content"], "are you there, Beacon?");
+        assert_eq!(
+            payload["final_reply_guest_id"], "mac-jane:membrane-gateway-beacon",
+            "the reply address rides along so Beacon answers back through this seat"
+        );
+
+        let leaked =
+            tokio::time::timeout(tokio::time::Duration::from_millis(300), bjork.recv_task()).await;
+        assert!(
+            leaked.is_err(),
+            "Björk must not receive Beacon's task: {leaked:?}"
         );
 
         unsafe {
