@@ -158,6 +158,31 @@ pub(crate) async fn activate_mesh_runtime(ctx: MeshRuntimeContext) -> Result<()>
         });
     }
 
+    // Re-broadcast this hotel's agents' command manifests so a peer that
+    // restarted or joined since the last publish catches up (DEF-180). The
+    // first pass waits for rosters to arrive; a peer only caches a manifest
+    // from the hotel its roster says runs the agent.
+    {
+        let cm_graph = ctx.graph_domain.clone();
+        let cm_tx = ctx.dispatcher_tx.clone();
+        let cm_node = ctx.caps.node_id.clone();
+        let mut cm_shutdown = ctx.shutdown_tx.subscribe();
+        tokio::spawn(async move {
+            let mut delay = tokio::time::Duration::from_secs(45);
+            loop {
+                tokio::select! {
+                    _ = tokio::time::sleep(delay) => {
+                        crate::service::command_manifest::rebroadcast_local_manifests(
+                            cm_graph.as_ref(), &cm_tx, &cm_node,
+                        ).await;
+                        delay = tokio::time::Duration::from_secs(120);
+                    }
+                    _ = cm_shutdown.recv() => break,
+                }
+            }
+        });
+    }
+
     let mut inbox_rx = {
         let mut guard = ctx.inbox_rx.lock().await;
         guard.take()
@@ -355,6 +380,7 @@ pub(crate) async fn activate_mesh_runtime(ctx: MeshRuntimeContext) -> Result<()>
     {
         let dispatcher_inbound_tx = ctx.dispatcher_tx.clone();
         let inbound_graph = ctx.graph_domain.clone();
+        let inbound_registry = ctx.registry.clone();
         let inbound_inboxes = ctx.ipc_inboxes.clone();
         let inbound_parked = ctx.ipc_parked_inbound.clone();
         let inbound_delivery_claims = ctx.ipc_delivery_claims.clone();
@@ -537,6 +563,20 @@ pub(crate) async fn activate_mesh_runtime(ctx: MeshRuntimeContext) -> Result<()>
                                                 >(data)
                                                 {
                                                     if v.get("action")
+                                                        .and_then(|a| a.as_str())
+                                                        == Some(
+                                                            crate::service::command_manifest::SYNC_ACTION,
+                                                        )
+                                                    {
+                                                        let registry =
+                                                            inbound_registry.read().await;
+                                                        crate::service::command_manifest::handle_remote_manifest_sync(
+                                                            inbound_graph.as_ref(),
+                                                            &registry,
+                                                            &event.source_node_id,
+                                                            data,
+                                                        );
+                                                    } else if v.get("action")
                                                         .and_then(|a| a.as_str())
                                                         == Some("session.handoff")
                                                     {
