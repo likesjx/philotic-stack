@@ -42,7 +42,7 @@ source_of_truth_targets:
 
 Add a fourth kind of model capability next to generate, transform and embed: a **decision**. The caller sends a piece of state and a set of typed questions (yes/no, choose one of N, score on an ordered scale). The provider returns typed answers with calibrated probabilities and no free text. The first concrete provider is TypeSafe AI's **Jev**, reachable natively or through OpenRouter. The capability is defined provider-neutrally so a local classifier can fill the same envelope later.
 
-This is a research-backed proposal. **Nothing here is implemented and no provider access has been verified.**
+This is a research-backed proposal. **Nothing here is implemented. OpenRouter access was verified with one probe on 2026-09-19 (see Verified access).**
 
 ## Why this matters
 
@@ -61,8 +61,25 @@ Sources are listed under References. Speed and cost numbers are **vendor claims*
 - Independent coverage notes "hallucination-free" only means a valid type, not a correct answer.
 - **Two transports, neither is chat completions:**
   - Native: `POST https://api.typesafe.ai/v1/systemone`, bearer key, model `jev-latest`.
-  - OpenRouter (alpha): `POST https://openrouter.ai/api/alpha/decisions`, model `typesafe/jev-latest`, 32 k context. Response adds `id`, `provider`, `usage.cost`. `noul` `criteria` requires both `true` and `false` when present. Reported to return HTTP 400 from `/api/v1/chat/completions`.
-- Availability: early access / waitlist. Zero data retention is enterprise-only. **Whether OpenRouter calls are waitlist-gated is unknown.**
+  - OpenRouter (alpha): `POST https://openrouter.ai/api/alpha/decisions`, model `~typesafe/jev-latest` (the alias; note the tilde) or pinned `typesafe/jev-1.13`, 32 k context. **The bare `typesafe/jev-latest` that a third-party issue used returns HTTP 400 `does not exist` (verified).** Response adds `id`, `provider`, `usage.cost`. `noul` `criteria` requires both `true` and `false` when present (third-party report). Reported to return HTTP 400 from `/api/v1/chat/completions` (not tested by us).
+- Availability: the native API is early access / waitlist. Zero data retention is enterprise-only. **Verified 2026-09-19: an ordinary OpenRouter key reaches Jev with no waitlist** (see Verified access).
+
+## Verified access (2026-09-19)
+
+One probe with the operator's own OpenRouter key and a single benign sentence (`"Help! My payouts have been failing for 3 days."`, one `noul` question):
+
+- `POST /api/alpha/decisions` with model `typesafe/jev-latest` returned **HTTP 400** `Model typesafe/jev-latest does not exist`. The key was accepted; only the slug was wrong.
+- The same request with `typesafe/jev-1.13` and with `~typesafe/jev-latest` returned **HTTP 200**, resolved to `typesafe/jev-1.13-20260917`, `answers.is_urgent.noul = 0.95`, `provider: "TypeSafe"`, and an `id` starting `gen-dec-`.
+- Response body: `{"model", "answers", "usage": {"input_tokens": 307, "output_tokens": 23, "cost": 0.000012894}, "id", "provider"}`. `cost` equals input tokens × $0.042 / M. `output_tokens` is **non-zero but free**, so the trace must record both and must not assume zero.
+- Latency was 0.29 s and 0.52 s wall time (curl total, including DNS and TLS from a Mac). Two successful calls, not a benchmark.
+
+Consequences:
+
+- The third-party issue's bare slug is wrong. The OpenRouter adapter maps to `~typesafe/jev-latest` or a pinned `typesafe/jev-1.13`.
+- Shadow sites should **pin** `typesafe/jev-1.13` so a moving alias cannot change decisions silently, and every trace records the **resolved** `model` from the response (`typesafe/jev-1.13-20260917`). Calibration is only meaningful per model version, exactly like `model_gen` on embeddings.
+- No waitlist is needed for an ordinary OpenRouter key. The native TypeSafe waitlist is now optional.
+
+Not yet tested: multi-question calls, `choice` and `score`, the 32 k state limit, error bodies for 422 / 429 / 529, and `noul` criteria with only one side present.
 
 ## What the repo has today (verified by reading code unless marked)
 
@@ -129,7 +146,7 @@ Sent as the `task_json` of an `EmitTask` to a `model.decisions` controller role.
   },
   "artifacts": [],
   "trace": { "provider": "typesafe", "model": "jev-1.13.0", "transport": "native",
-             "latency_ms": 118, "usage": { "input_tokens": 812, "output_tokens": 0, "cost_usd": null } },
+             "latency_ms": 118, "usage": { "input_tokens": 307, "output_tokens": 23, "cost_usd": 0.0000129 } },
   "provider_output": null
 }
 ```
@@ -151,7 +168,7 @@ Sent as the `task_json` of an `EmitTask` to a `model.decisions` controller role.
 | Canonical | Native TypeSafe | OpenRouter |
 |---|---|---|
 | Path | `POST /v1/systemone` | `POST /api/alpha/decisions` |
-| `model` | `jev-latest` | `typesafe/jev-latest` |
+| `model` | `jev-latest` | `~typesafe/jev-latest`, or pinned `typesafe/jev-1.13` |
 | Questions | array → map by id | same |
 | `noul` criteria | `when_true` / `when_false`, both optional | both required when present; fill neutral empty string |
 | Cost | not returned | `usage.cost`, plus `id`, `provider` |
@@ -199,7 +216,7 @@ Blast radius abbreviated as BR. Line references were read at `d624e5b8`. Items m
 
 ## Open questions
 
-1. **Access.** Is Jev reachable at all? Native early access is waitlisted; whether OpenRouter's alpha endpoint needs the waitlist is unknown. This gates D1's smoke and everything after.
+1. **Access. Resolved 2026-09-19:** Jev is reachable through an ordinary OpenRouter key with no waitlist (see Verified access). D1's smoke is unblocked; the native TypeSafe waitlist is optional.
 2. **Capability name.** `decisions.evaluate` with model type `decisions` is the proposal; the operator may prefer another.
 3. **Reply path.** A dedicated `decisions_response` action is recommended; confirm by test that reusing `model_response` really reaches `fail_active_turn`.
 4. **Metering.** Grow `ResponseTrace` (recommended) or keep cost in a side table.
