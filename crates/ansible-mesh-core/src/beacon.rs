@@ -10,11 +10,15 @@ use anyhow::{Context, Result};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::net::UdpSocket;
-use tokio::sync::{mpsc, Mutex, RwLock};
+use tokio::sync::{mpsc, RwLock};
 use tracing::{debug, error, info, warn};
 
 /// A lightweight beacon daemon that binds to a UDP port and listens
 /// for incoming mesh control messages.
+/// A beacon packet that takes longer than this to handle is logged: the
+/// receive loop is a single task, so every peer's traffic waits behind it.
+const SLOW_PACKET_WARN: std::time::Duration = std::time::Duration::from_millis(250);
+
 pub struct BeaconDaemon {
     socket: Arc<UdpSocket>,
     graph: Arc<GraphDomain>,
@@ -23,7 +27,7 @@ pub struct BeaconDaemon {
     inbox_tx: mpsc::Sender<BeaconMessage>,
     // Persistent nonce tracker — initialized once to avoid per-packet DB open overhead
     // and WAL contention on the main context.db under concurrent UDP load.
-    nonce_tracker: Option<Mutex<NonceTracker>>,
+    nonce_tracker: NonceTracker,
     enable_rust_auth: bool,
     /// Where newly applied gossiped placement records are reported so the
     /// hotel can push them to local guests at once (DEF-107). `None` = no
@@ -70,24 +74,17 @@ impl BeaconDaemon {
             .context(format!("Failed to bind UDP socket to {}", addr))?;
 
         info!("Beacon daemon listening on {}", socket.local_addr()?);
-        // Derive a sidecar nonces.db path alongside the main context DB.
-        // Using a dedicated file avoids WAL write contention with the hotel's main DB
-        // on every incoming beacon packet.
-        let nonce_tracker = if enable_rust_auth {
-            let nonce_path = std::path::Path::new(db_path)
-                .parent()
-                .map(|p| p.join("nonces.db").to_string_lossy().to_string())
-                .unwrap_or_else(|| "nonces.db".to_string());
-            match NonceTracker::open(&nonce_path) {
-                Ok(t) => Some(Mutex::new(t)),
-                Err(e) => {
-                    warn!("Failed to initialize beacon nonce tracker (replay protection disabled): {e}");
-                    None
-                }
-            }
-        } else {
-            None
-        };
+        // The replay window is held in memory. The sidecar nonces.db it replaced
+        // grew without bound (274-411 MB per hotel, sweep never called), so
+        // retire it.
+        let nonce_tracker = NonceTracker::new();
+        let legacy_sidecar = std::path::Path::new(db_path)
+            .parent()
+            .map(|p| p.join("nonces.db").to_string_lossy().to_string())
+            .unwrap_or_else(|| "nonces.db".to_string());
+        if let Some(what) = NonceTracker::retire_legacy_store(&legacy_sidecar) {
+            info!("{what}");
+        }
         Ok(Self {
             socket: Arc::new(socket),
             graph,
@@ -128,7 +125,17 @@ impl BeaconDaemon {
         loop {
             match self.socket.recv_from(&mut buf).await {
                 Ok((size, src)) => {
+                    let started = std::time::Instant::now();
                     self.handle_packet(&buf[..size], src).await;
+                    let took = started.elapsed();
+                    if took >= SLOW_PACKET_WARN {
+                        warn!(
+                            took_ms = took.as_millis() as u64,
+                            bytes = size,
+                            %src,
+                            "slow beacon packet: the single receive loop was busy this long (DEF-191)"
+                        );
+                    }
                 }
                 Err(e) => {
                     error!("UDP receive error: {}", e);
@@ -181,17 +188,8 @@ impl BeaconDaemon {
                         return;
                     }
 
-                    if let Some(ref tracker_mutex) = self.nonce_tracker {
-                        let tracker = tracker_mutex.lock().await;
-                        if let Err(e) = tracker.assert_and_record_nonce(&msg.msg_id) {
-                            warn!("Packet dropped: {}", e);
-                            return;
-                        }
-                    } else {
-                        warn!(
-                            "Packet dropped: nonce tracker unavailable for {}",
-                            msg.msg_id
-                        );
+                    if let Err(e) = self.nonce_tracker.assert_and_record_nonce(&msg.msg_id) {
+                        warn!("Packet dropped: {}", e);
                         return;
                     }
                 } else {
@@ -411,20 +409,18 @@ impl BeaconDaemon {
             MsgType::HotelStateSync => {
                 if let Ok(payload) = serde_json::from_slice::<HotelStateSyncPayload>(&msg.payload) {
                     if payload.node_id != self.local_capabilities.node_id {
-                        let mut registry = self.registry.write().await;
-                        registry.observe_hotel_state(
-                            payload.node_id.clone(),
-                            payload.hotel_name.clone(),
-                            payload.guests,
-                            payload.agents,
-                        );
+                        let t0 = std::time::Instant::now();
+                        // Everything that touches SQLite happens BEFORE the
+                        // registry lock is taken. It used to run inside it, so
+                        // heartbeats and message routing — every registry
+                        // reader — queued behind synchronous graph writes.
                         let mut replicated_profiles = 0usize;
                         for profile in payload
                             .model_profiles
-                            .into_iter()
+                            .iter()
                             .filter(|profile| profile.node_id == payload.node_id)
                         {
-                            if let Err(err) = self.graph.upsert_model_profile(&profile) {
+                            if let Err(err) = self.graph.upsert_model_profile(profile) {
                                 warn!(
                                     "Hotel state sync from {}: failed to upsert model profile {}@{}: {}",
                                     payload.node_id, profile.model_ref, profile.node_id, err
@@ -433,14 +429,17 @@ impl BeaconDaemon {
                                 replicated_profiles += 1;
                             }
                         }
+                        let profiles_ms = t0.elapsed().as_millis() as u64;
                         // Placement is graph truth every hotel must agree on
                         // (DEF-107): apply newer role/transport homes, LWW.
+                        let t1 = std::time::Instant::now();
                         let applied = crate::placement_sync::apply_remote_placement(
                             &self.graph,
                             &payload.node_id,
                             &payload.role_homes,
                             &payload.transport_homes,
                         );
+                        let placement_ms = t1.elapsed().as_millis() as u64;
                         if !applied.is_empty() {
                             info!(
                                 "Hotel state sync from {}: applied {} role home(s), {} transport home(s)",
@@ -454,22 +453,34 @@ impl BeaconDaemon {
                                 }
                             }
                         }
+                        let (guest_count, agent_count) =
+                            (payload.guests.len(), payload.agents.len());
+                        let (node_id, hotel_name) =
+                            (payload.node_id.clone(), payload.hotel_name.clone());
+                        let t2 = std::time::Instant::now();
+                        let mut registry = self.registry.write().await;
+                        let lock_wait_ms = t2.elapsed().as_millis() as u64;
+                        registry.observe_hotel_state(
+                            payload.node_id,
+                            payload.hotel_name,
+                            payload.guests,
+                            payload.agents,
+                        );
+                        drop(registry);
                         info!(
                             "Hotel state sync from {} ({}): {} guests, {} agents, {} model profiles",
-                            payload.hotel_name,
-                            payload.node_id,
-                            registry
-                                .remote_hotel_states()
-                                .find(|s| s.node_id == payload.node_id)
-                                .map(|s| s.guests.len())
-                                .unwrap_or(0),
-                            registry
-                                .remote_hotel_states()
-                                .find(|s| s.node_id == payload.node_id)
-                                .map(|s| s.agents.len())
-                                .unwrap_or(0),
-                            replicated_profiles,
+                            hotel_name, node_id, guest_count, agent_count, replicated_profiles,
                         );
+                        let total_ms = t0.elapsed().as_millis() as u64;
+                        if total_ms >= SLOW_PACKET_WARN.as_millis() as u64 {
+                            warn!(
+                                total_ms,
+                                profiles_ms,
+                                placement_ms,
+                                registry_lock_wait_ms = lock_wait_ms,
+                                "slow hotel-state sync from {node_id} (DEF-191)"
+                            );
+                        }
                     }
                 }
             }
