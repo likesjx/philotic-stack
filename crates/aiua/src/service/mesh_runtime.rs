@@ -652,18 +652,26 @@ pub(crate) async fn activate_mesh_runtime(ctx: MeshRuntimeContext) -> Result<()>
                                         timestamp,
                                         hmac: hmac.into(),
                                     };
-                                    if let Err(err) =
-                                        crate::service::execution_transport::send_execution_message(
-                                            &target_addr,
-                                            &ack,
-                                        )
-                                        .await
-                                    {
-                                        warn!(
-                                            "Failed to return execution ACK to {} at {}: {}",
-                                            msg.src_node, target_addr, err
-                                        );
-                                    }
+                                    // Off the inbound loop: this loop is the only
+                                    // consumer of every peer's batches, heartbeats and
+                                    // signals, and an ACK to a peer that just went dark
+                                    // used to hold all of them for the connect timeout
+                                    // (DEF-181). The send has its own bounded timeouts.
+                                    let ack_dest = msg.src_node.clone();
+                                    tokio::spawn(async move {
+                                        if let Err(err) =
+                                            crate::service::execution_transport::send_execution_message(
+                                                &target_addr,
+                                                &ack,
+                                            )
+                                            .await
+                                        {
+                                            warn!(
+                                                "Failed to return execution ACK to {} at {}: {}",
+                                                ack_dest, target_addr, err
+                                            );
+                                        }
+                                    });
                                 } else {
                                     warn!(
                                         "No mesh target address found for ACK destination {}",
