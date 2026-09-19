@@ -1104,7 +1104,7 @@ impl IpcServer {
                     }
                     return true;
                 }
-                let target_guest_id: Option<String> =
+                let mut target_guest_id: Option<String> =
                     serde_json::from_str::<serde_json::Value>(data)
                         .ok()
                         .and_then(|v| {
@@ -1112,6 +1112,36 @@ impl IpcServer {
                                 .and_then(serde_json::Value::as_str)
                                 .map(str::to_string)
                         });
+                // A sender that only knows the AGENT — a Telegram seat on
+                // another hotel addresses `agent-beacon` — cannot know which of
+                // its processes owns the session here. Trusting that address
+                // delivered the turn to the base process while the model's
+                // answer went to `agent-beacon:orchestrator`, which had no
+                // active turn and dropped it (DEF-179); it also overwrote the
+                // session's active incarnation. Resolve the process this hotel
+                // itself answers through. A sender that named a specific
+                // incarnation (a handoff, a paracrine reply) is left alone.
+                if target_role == "agent"
+                    && let Some(base_guest) = target_guest_id
+                        .as_deref()
+                        .filter(|guest| !guest.contains(':'))
+                    && let Some(resolved) = Self::resolve_agent_process_for_remote_task(
+                        graph,
+                        inboxes,
+                        local_node_id,
+                        base_guest,
+                        data,
+                    )
+                    .await
+                {
+                    info!(
+                        event_id = %event.event_id,
+                        base_agent = base_guest,
+                        process = %resolved,
+                        "Cross-hotel task addressed to a base agent id: delivering to the process this hotel answers through"
+                    );
+                    target_guest_id = Some(resolved);
+                }
 
                 let is_subscribed = {
                     let guard = inboxes.lock().await;
@@ -1233,6 +1263,46 @@ impl IpcServer {
             }
             _ => false,
         }
+    }
+
+    /// The live process on this hotel that should take a task addressed to
+    /// the base agent id `base_guest` (DEF-179).
+    ///
+    /// The session's own routing decides first (its active incarnation, its
+    /// provenance); with no session yet, the agent's live orchestrator
+    /// incarnation is the process this hotel routes the model's answers to.
+    /// `None` keeps the address as sent — a single-process philote registers
+    /// under the base id and handles every role itself.
+    async fn resolve_agent_process_for_remote_task(
+        graph: &GraphDomain,
+        inboxes: &InboxRegistry,
+        local_node_id: &str,
+        base_guest: &str,
+        task_json: &str,
+    ) -> Option<String> {
+        if let AgentRouteResolution::Deliver(Some(guest_id)) = Self::resolve_agent_route(
+            graph,
+            inboxes,
+            local_node_id,
+            "agent",
+            Some(base_guest.to_string()),
+            task_json,
+        )
+        .await
+            && guest_id != base_guest
+        {
+            return Some(guest_id);
+        }
+        let orchestrator = format!("{base_guest}:orchestrator");
+        let live = {
+            let guard = inboxes.lock().await;
+            guard
+                .get("agent")
+                .into_iter()
+                .flatten()
+                .any(|subscriber| subscriber.guest_id == orchestrator)
+        };
+        live.then_some(orchestrator)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -4735,6 +4805,172 @@ mod tests {
         assert!(
             parked_inbound.lock().await.is_empty(),
             "claimed replay must not park a duplicate copy"
+        );
+    }
+
+    /// Register a live `agent`-role subscriber the way a philote does.
+    async fn subscribe_live_agent(
+        inboxes: &InboxRegistry,
+        guest_id: &str,
+    ) -> mpsc::UnboundedReceiver<IpcResponse> {
+        let (tx, rx) = mpsc::unbounded_channel::<IpcResponse>();
+        let mut subscribed_roles = Vec::new();
+        IpcServer::add_subscription(
+            inboxes,
+            "agent",
+            Uuid::new_v4(),
+            guest_id,
+            &[],
+            &crate::service::ipc::CountedSender::detached(&tx),
+            &mut subscribed_roles,
+        )
+        .await;
+        rx
+    }
+
+    fn remote_seat_task(session_id: &str, delivery_guest: &str) -> EventEnvelope {
+        EventEnvelope {
+            event_id: Uuid::new_v4(),
+            seq: 1,
+            source_node_id: "mac-jane-aiua-01".into(),
+            target_node_id: Some("vps-jane-aiua-01".into()),
+            source_agent_id: "mac-jane:membrane-gateway-beacon".into(),
+            target_agent_id: Some("agent".into()),
+            kind: EventKind::TaskInvoke,
+            corr_id: String::new(),
+            attempt: 0,
+            created_at: 0,
+            expires_at: None,
+            payload: EventPayload::Inline {
+                data: serde_json::json!({
+                    "session_id": session_id,
+                    "content": "hello from telegram",
+                    "delivery_target_guest_id": delivery_guest,
+                })
+                .to_string(),
+            },
+            trace: vec![],
+        }
+    }
+
+    /// DEF-179: a Telegram seat on another hotel addresses the base agent; the
+    /// hosting hotel delivers to the process it answers through — the agent's
+    /// orchestrator — not to the base process that has no turn to receive the
+    /// model's response.
+    #[tokio::test]
+    async fn a_remote_task_for_a_base_agent_goes_to_its_orchestrator_process() {
+        let inboxes: InboxRegistry = Arc::new(Mutex::new(HashMap::new()));
+        let graph = GraphDomain::new(Arc::new(
+            SqliteGraphStorage::open(":memory:")
+                .expect("graph")
+                .adapter(),
+        ));
+        let parked: Arc<Mutex<HashMap<String, Vec<ParkedInboundTask>>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+        let mat_req = MockMaterializationRequester::default();
+        let claims = new_delivery_claim_registry();
+        let mut base_rx = subscribe_live_agent(&inboxes, "agent-beacon").await;
+        let mut orchestrator_rx = subscribe_live_agent(&inboxes, "agent-beacon:orchestrator").await;
+
+        let event = remote_seat_task("telegram:7:agent-beacon", "agent-beacon");
+        assert!(
+            IpcServer::deliver_event_envelope_or_park(
+                &inboxes,
+                &event,
+                None,
+                &graph,
+                "vps-jane-aiua-01",
+                &parked,
+                Some(&mat_req),
+                &claims,
+            )
+            .await
+        );
+
+        assert!(
+            matches!(
+                orchestrator_rx.try_recv(),
+                Ok(IpcResponse::InboundTask { .. })
+            ),
+            "the orchestrator process takes the turn"
+        );
+        assert!(
+            base_rx.try_recv().is_err(),
+            "the base process must not also receive it"
+        );
+    }
+
+    /// The session's own routing wins: with the session pinned to a specialist
+    /// incarnation, the task goes there — and a sender that named an
+    /// incarnation itself is never rewritten.
+    #[tokio::test]
+    async fn a_known_session_keeps_its_active_incarnation_and_named_incarnations_are_left_alone() {
+        let inboxes: InboxRegistry = Arc::new(Mutex::new(HashMap::new()));
+        let graph = GraphDomain::new(Arc::new(
+            SqliteGraphStorage::open(":memory:")
+                .expect("graph")
+                .adapter(),
+        ));
+        graph
+            .upsert_session(&ansible_mesh_core::storage::SessionRecord {
+                session_id: "telegram:7:agent-beacon".into(),
+                session_kind: "conversation".into(),
+                primary_agent_id: Some("agent-beacon".into()),
+                active_incarnation_id: Some("agent-beacon:Chronos".into()),
+                channel_kind: Some("telegram".into()),
+                channel_session_key: Some("7".into()),
+                status: "active".into(),
+                lease_owner_component_id: None,
+                lease_expires_at: None,
+                summary_json: serde_json::json!({}),
+                created_at: 1,
+                updated_at: 2,
+            })
+            .expect("session");
+        let parked: Arc<Mutex<HashMap<String, Vec<ParkedInboundTask>>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+        let mat_req = MockMaterializationRequester::default();
+        let claims = new_delivery_claim_registry();
+        let mut orchestrator_rx = subscribe_live_agent(&inboxes, "agent-beacon:orchestrator").await;
+        let mut chronos_rx = subscribe_live_agent(&inboxes, "agent-beacon:Chronos").await;
+
+        let event = remote_seat_task("telegram:7:agent-beacon", "agent-beacon");
+        IpcServer::deliver_event_envelope_or_park(
+            &inboxes,
+            &event,
+            None,
+            &graph,
+            "vps-jane-aiua-01",
+            &parked,
+            Some(&mat_req),
+            &claims,
+        )
+        .await;
+        assert!(
+            matches!(chronos_rx.try_recv(), Ok(IpcResponse::InboundTask { .. })),
+            "the session's active incarnation takes it"
+        );
+        assert!(orchestrator_rx.try_recv().is_err());
+
+        // A sender that names an incarnation (a handoff) is trusted as sent.
+        let named = remote_seat_task("telegram:7:agent-beacon", "agent-beacon:orchestrator");
+        IpcServer::deliver_event_envelope_or_park(
+            &inboxes,
+            &named,
+            None,
+            &graph,
+            "vps-jane-aiua-01",
+            &parked,
+            Some(&mat_req),
+            &claims,
+        )
+        .await;
+        assert!(
+            matches!(
+                orchestrator_rx.try_recv(),
+                Ok(IpcResponse::InboundTask { .. })
+            ),
+            "an explicitly named incarnation is delivered as addressed"
         );
     }
 
