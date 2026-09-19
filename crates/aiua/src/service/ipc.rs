@@ -6205,6 +6205,18 @@ impl IpcServer {
                     return IpcResponse::error("sync", "SYNC_ERROR", e.to_string());
                 }
                 Self::record_apartment_checkpoint(graph, &agent_id, &memory_type, &content_json);
+                if memory_type == "command_manifest" {
+                    // The philote just published its slash-command manifest: tell
+                    // peer hotels, so a Telegram seat there can menu it (DEF-180).
+                    crate::service::command_manifest::on_local_manifest_written(
+                        graph,
+                        &dispatcher_tx,
+                        local_node_id,
+                        &agent_id,
+                        &content_json,
+                    )
+                    .await;
+                }
                 IpcResponse::success("sync", None)
             }
             IpcRequest::QueryStatus { task_id: _ } => IpcResponse::success("query", None),

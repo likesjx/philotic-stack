@@ -1816,6 +1816,27 @@ impl GraphDomain {
         }
     }
 
+    /// Agents that hold an apartment of `memory_type`.
+    pub fn list_agents_with_apartment(&self, memory_type: &str) -> Result<Vec<String>> {
+        let mut out = Vec::new();
+        for node in self.adapter.list_nodes_by_kind(NODE_KIND_APARTMENT)? {
+            let is_type = node
+                .data
+                .get("memory_type")
+                .and_then(serde_json::Value::as_str)
+                == Some(memory_type);
+            if let (true, Some(agent_id)) = (
+                is_type,
+                node.data
+                    .get("agent_id")
+                    .and_then(serde_json::Value::as_str),
+            ) {
+                out.push(agent_id.to_string());
+            }
+        }
+        Ok(out)
+    }
+
     /// List apartment memory types for an agent.
     ///
     /// A memory type can itself contain colons — a session checkpoint is
