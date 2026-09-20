@@ -2944,34 +2944,91 @@ impl TelegramSeatGuest {
         let config_req = IpcRequest::GetConfig {
             key: self.telegram_token_key.clone(),
         };
-        let token = match client.send_request(config_req).await? {
-            IpcResponse::ConfigData { key: _, value_json } => match value_json {
-                Some(json_str) => {
-                    if let Ok(val) = serde_json::from_str::<Value>(&json_str) {
-                        val.as_str().unwrap_or("").to_string()
-                    } else {
-                        json_str
-                    }
-                }
-                None => {
-                    warn!(
-                        "Telegram Bot Token key [{}] found, but value was empty in Context Graph.",
-                        self.telegram_token_key
-                    );
-                    String::new()
-                }
-            },
+        let value_json = match client.send_request(config_req).await? {
+            IpcResponse::ConfigData { key: _, value_json } => value_json,
             _ => {
                 warn!(
                     "Failed to retrieve Telegram Bot Token from Context Graph key [{}].",
                     self.telegram_token_key
                 );
-                String::new()
+                None
             }
         };
-
-        Ok((!token.is_empty()).then_some(token))
+        let secret_ref = match classify_config_token(value_json.as_deref()) {
+            ConfigToken::Missing => {
+                warn!(
+                    "Telegram Bot Token key [{}] has no value in Context Graph.",
+                    self.telegram_token_key
+                );
+                return Ok(None);
+            }
+            ConfigToken::Plain(token) => return Ok(Some(token)),
+            ConfigToken::VaultRef(secret_ref) => secret_ref,
+        };
+        // The config key holds a vault ref (DEF-176): the token itself is
+        // encrypted in the hotel vault, readable by the `membrane` role.
+        match client
+            .send_request(IpcRequest::GetSecret {
+                secret_ref: secret_ref.clone(),
+            })
+            .await?
+        {
+            IpcResponse::SecretData { value_json, .. } => {
+                let resolved = token_from_secret_data(value_json);
+                if resolved.is_none() {
+                    warn!(
+                        "Telegram Bot Token key [{}] points at vault ref [{}], which this hotel does not hold.",
+                        self.telegram_token_key, secret_ref
+                    );
+                }
+                Ok(resolved)
+            }
+            other => {
+                warn!(
+                    "Failed to resolve Telegram Bot Token vault ref for key [{}]: {:?}",
+                    self.telegram_token_key, other
+                );
+                Ok(None)
+            }
+        }
     }
+}
+
+/// What a Telegram token config key holds.
+#[derive(Debug, PartialEq, Eq)]
+enum ConfigToken {
+    Missing,
+    /// A raw token (legacy, or a hotel that has not migrated yet).
+    Plain(String),
+    /// A `secret://` ref to resolve through the vault (DEF-176).
+    VaultRef(String),
+}
+
+fn classify_config_token(value_json: Option<&str>) -> ConfigToken {
+    let Some(raw) = value_json else {
+        return ConfigToken::Missing;
+    };
+    let value = match serde_json::from_str::<Value>(raw) {
+        Ok(Value::String(s)) => s,
+        Ok(_) => String::new(),
+        Err(_) => raw.to_string(),
+    };
+    let value = value.trim().to_string();
+    if value.is_empty() {
+        ConfigToken::Missing
+    } else if value.starts_with("secret://") {
+        ConfigToken::VaultRef(value)
+    } else {
+        ConfigToken::Plain(value)
+    }
+}
+
+/// The token a `GetSecret` reply carries — never the ref itself, never empty.
+fn token_from_secret_data(value_json: Option<String>) -> Option<String> {
+    let raw = value_json?;
+    let token = serde_json::from_str::<String>(&raw).unwrap_or(raw);
+    let token = token.trim().to_string();
+    (!token.is_empty() && !token.starts_with("secret://")).then_some(token)
 }
 
 #[async_trait]
@@ -4355,7 +4412,10 @@ mod tests {
         normalize_telegram_menu_command_name, reply_task_owned_by_seat, session_owned_by_agent,
         telegram_command, telegram_format_text, telegram_help_text, telegram_inbound_envelope,
     };
-    use super::{MembraneGuest, StandDownReason, transport_home_names_this_hotel};
+    use super::{
+        ConfigToken, MembraneGuest, StandDownReason, classify_config_token, token_from_secret_data,
+        transport_home_names_this_hotel,
+    };
     use philotic_client::CommandManifestEntry;
     use philotic_client::IpcResponse;
     use serde_json::{Value, json};
@@ -4685,6 +4745,45 @@ mod tests {
         let built = build_telegram_menu_commands(&commands);
         assert_eq!(built.len(), TELEGRAM_MAX_COMMANDS);
         assert_eq!(built[0]["command"], "foo_bar");
+    }
+
+    /// DEF-176: a seat must use a raw token as before, resolve a vault ref,
+    /// and never send a ref (or nothing) to Telegram as if it were a token.
+    #[test]
+    fn a_token_key_holds_a_raw_token_or_a_vault_ref() {
+        assert_eq!(
+            classify_config_token(Some("\"123:abc\"")),
+            ConfigToken::Plain("123:abc".into())
+        );
+        assert_eq!(
+            classify_config_token(Some("123:abc")),
+            ConfigToken::Plain("123:abc".into())
+        );
+        assert_eq!(
+            classify_config_token(Some("\"secret://hotel/default/telegram_bot_token/x\"")),
+            ConfigToken::VaultRef("secret://hotel/default/telegram_bot_token/x".into())
+        );
+        assert_eq!(classify_config_token(Some("\"\"")), ConfigToken::Missing);
+        assert_eq!(classify_config_token(None), ConfigToken::Missing);
+    }
+
+    #[test]
+    fn a_resolved_vault_ref_yields_the_token_and_never_the_ref() {
+        assert_eq!(
+            token_from_secret_data(Some("\"123:abc\"".into())),
+            Some("123:abc".into())
+        );
+        assert_eq!(
+            token_from_secret_data(None),
+            None,
+            "the vault lacks the ref"
+        );
+        assert_eq!(token_from_secret_data(Some("\"\"".into())), None);
+        assert_eq!(
+            token_from_secret_data(Some("\"secret://hotel/default/x/y\"".into())),
+            None,
+            "a ref pointing at a ref is not a token"
+        );
     }
 
     #[test]

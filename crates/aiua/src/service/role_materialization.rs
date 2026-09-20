@@ -487,6 +487,24 @@ impl IpcServer {
             }
         }
 
+        // The caller named an agent and none of its guests is live here: keep
+        // the address. `Deliver(None)` drops it, and a role-wide agent
+        // delivery then reaches whichever agent happens to be subscribed —
+        // Björk answering Beacon's bot (DEF-177). A named agent is delivered
+        // to or not delivered at all, never to someone else.
+        if let Some(explicit_guest_id) = target_guest_id.as_deref() {
+            let named_agent = explicit_guest_id
+                .split(':')
+                .next()
+                .unwrap_or(explicit_guest_id);
+            let named_agent_is_live = live_agent_guests
+                .iter()
+                .any(|live| Self::guest_belongs_to_agent(graph, live, named_agent));
+            if !named_agent_is_live {
+                return AgentRouteResolution::Deliver(target_guest_id);
+            }
+        }
+
         AgentRouteResolution::Deliver(None)
     }
 
@@ -1038,6 +1056,21 @@ impl IpcServer {
                     return true;
                 }
                 if target_role == philotic_client::OPERATOR_SURFACE_QUERY_ROLE {
+                    if let Err(reason) =
+                        crate::service::operator_surface::mesh_operator_handoff_permitted(
+                            graph,
+                            local_node_id,
+                            &event.source_node_id,
+                            data,
+                        )
+                    {
+                        warn!(
+                            event_id = %event.event_id,
+                            source_node = %event.source_node_id,
+                            "Refusing operator surface handoff: {reason}"
+                        );
+                        return true;
+                    }
                     if let Some(tx) = operator_surface_tx {
                         let _ = tx.try_send(data.clone()).ok();
                         return true;
@@ -1071,7 +1104,7 @@ impl IpcServer {
                     }
                     return true;
                 }
-                let target_guest_id: Option<String> =
+                let mut target_guest_id: Option<String> =
                     serde_json::from_str::<serde_json::Value>(data)
                         .ok()
                         .and_then(|v| {
@@ -1079,6 +1112,36 @@ impl IpcServer {
                                 .and_then(serde_json::Value::as_str)
                                 .map(str::to_string)
                         });
+                // A sender that only knows the AGENT — a Telegram seat on
+                // another hotel addresses `agent-beacon` — cannot know which of
+                // its processes owns the session here. Trusting that address
+                // delivered the turn to the base process while the model's
+                // answer went to `agent-beacon:orchestrator`, which had no
+                // active turn and dropped it (DEF-179); it also overwrote the
+                // session's active incarnation. Resolve the process this hotel
+                // itself answers through. A sender that named a specific
+                // incarnation (a handoff, a paracrine reply) is left alone.
+                if target_role == "agent"
+                    && let Some(base_guest) = target_guest_id
+                        .as_deref()
+                        .filter(|guest| !guest.contains(':'))
+                    && let Some(resolved) = Self::resolve_agent_process_for_remote_task(
+                        graph,
+                        inboxes,
+                        local_node_id,
+                        base_guest,
+                        data,
+                    )
+                    .await
+                {
+                    info!(
+                        event_id = %event.event_id,
+                        base_agent = base_guest,
+                        process = %resolved,
+                        "Cross-hotel task addressed to a base agent id: delivering to the process this hotel answers through"
+                    );
+                    target_guest_id = Some(resolved);
+                }
 
                 let is_subscribed = {
                     let guard = inboxes.lock().await;
@@ -1200,6 +1263,46 @@ impl IpcServer {
             }
             _ => false,
         }
+    }
+
+    /// The live process on this hotel that should take a task addressed to
+    /// the base agent id `base_guest` (DEF-179).
+    ///
+    /// The session's own routing decides first (its active incarnation, its
+    /// provenance); with no session yet, the agent's live orchestrator
+    /// incarnation is the process this hotel routes the model's answers to.
+    /// `None` keeps the address as sent — a single-process philote registers
+    /// under the base id and handles every role itself.
+    async fn resolve_agent_process_for_remote_task(
+        graph: &GraphDomain,
+        inboxes: &InboxRegistry,
+        local_node_id: &str,
+        base_guest: &str,
+        task_json: &str,
+    ) -> Option<String> {
+        if let AgentRouteResolution::Deliver(Some(guest_id)) = Self::resolve_agent_route(
+            graph,
+            inboxes,
+            local_node_id,
+            "agent",
+            Some(base_guest.to_string()),
+            task_json,
+        )
+        .await
+            && guest_id != base_guest
+        {
+            return Some(guest_id);
+        }
+        let orchestrator = format!("{base_guest}:orchestrator");
+        let live = {
+            let guard = inboxes.lock().await;
+            guard
+                .get("agent")
+                .into_iter()
+                .flatten()
+                .any(|subscriber| subscriber.guest_id == orchestrator)
+        };
+        live.then_some(orchestrator)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2330,6 +2433,13 @@ impl IpcServer {
             .and_then(|v| v.as_bool())
             != Some(true)
         {
+            if ceremony.include_transport {
+                return Err(
+                    "the target predates continuity and sealed secret transfer; moving the \
+                     transport there would leave it without its secret"
+                        .to_string(),
+                );
+            }
             ceremony.advance(
                 RelocationCeremonyPhase::Continuity,
                 "degraded: the target predates continuity transfer; the role moves without its \
@@ -2340,7 +2450,7 @@ impl IpcServer {
             return Ok(());
         }
 
-        let bundle = crate::service::continuity::export_continuity_bundle(
+        let mut bundle = crate::service::continuity::export_continuity_bundle(
             graph,
             ceremony,
             IpcServer::local_hotel_name(graph, local_node_id),
@@ -2348,6 +2458,14 @@ impl IpcServer {
             now,
         )
         .map_err(|err| format!("CONTINUITY export failed: {err}"))?;
+        if ceremony.include_transport {
+            bundle.sealed_secrets.push(Self::seal_transport_secret(
+                graph,
+                ceremony,
+                standby_ready,
+                now,
+            )?);
+        }
         let request_id = Uuid::new_v4();
         let data = serde_json::json!({
             "request_id": request_id.to_string(),
@@ -2417,6 +2535,121 @@ impl IpcServer {
             ack.get("summary").cloned().unwrap_or_default()
         );
         Ok(())
+    }
+
+    /// Relocation Ceremony R7, origin side: seal the moving transport's
+    /// secret to the target.
+    ///
+    /// Authorized by this hotel's own ceremony record alone — the ceremony
+    /// is this hotel's, it carries the transport, and the secret is exactly
+    /// the transport's `transport_resource_ref`. Never by a home or
+    /// transport-home record: both are gossiped by peers (DEF-171). The
+    /// single-use key it seals to must come from the STANDBY reply the
+    /// ceremony's target itself sent, as the batch HMAC proved (DEF-170).
+    fn seal_transport_secret(
+        graph: &GraphDomain,
+        ceremony: &RelocationCeremonyRecord,
+        standby_ready: &serde_json::Value,
+        now: u64,
+    ) -> Result<ansible_mesh_core::sealed_secret::SealedSecret, String> {
+        let sender = standby_ready.get("__sender").and_then(|v| v.as_str());
+        if sender != Some(ceremony.target_hotel.as_str()) {
+            return Err(format!(
+                "the STANDBY reply came from {sender:?}, not the target '{}'; no secret is released",
+                ceremony.target_hotel
+            ));
+        }
+        let target_public = standby_ready
+            .get("sealed_secret_public_key")
+            .and_then(|v| v.as_str())
+            .ok_or("the target sent no seal key; moving the transport would leave it without its secret")?;
+        let config_key = ceremony
+            .transport_resource_ref
+            .clone()
+            .ok_or("the ceremony carries a transport but names no transport_resource_ref")?;
+        let secret_ref = graph
+            .get_config_value(&config_key)
+            .ok()
+            .flatten()
+            .map(|raw| serde_json::from_str::<String>(&raw).unwrap_or(raw))
+            .filter(|value| value.starts_with("secret://"))
+            .ok_or_else(|| {
+                format!("the transport's secret '{config_key}' is not in this hotel's vault")
+            })?;
+        let record = graph
+            .get_secret(&secret_ref)
+            .ok()
+            .flatten()
+            .ok_or_else(|| format!("vault ref for '{config_key}' does not resolve"))?;
+        if record.allowed_roles.is_empty() {
+            return Err(format!(
+                "the transport's secret '{config_key}' has an empty role ACL; refusing to release it"
+            ));
+        }
+        let plaintext = zeroize::Zeroizing::new(
+            crate::vault::export_secret_plaintext(graph, &secret_ref)
+                .map_err(|err| format!("could not read '{config_key}' from the vault: {err}"))?
+                .ok_or_else(|| format!("vault ref for '{config_key}' does not resolve"))?,
+        );
+        let pair_key = crate::mesh_auth_key_for_node(graph, &ceremony.target_hotel)
+            .ok()
+            .flatten()
+            .ok_or_else(|| format!("no per-pair mesh key with '{}'", ceremony.target_hotel))?;
+        let standby_request_id = ceremony
+            .materialize_request_id
+            .clone()
+            .ok_or("the ceremony has no STANDBY request id")?;
+        let context = ansible_mesh_core::sealed_secret::SealContext {
+            ceremony_id: ceremony.ceremony_id.clone(),
+            standby_request_id,
+            origin_node_id: ceremony.origin_hotel.clone(),
+            target_node_id: ceremony.target_hotel.clone(),
+            agent_id: ceremony.agent_id.clone(),
+            role_name: ceremony.role_name.clone(),
+            config_key: config_key.clone(),
+            secret_kind: record.secret_kind,
+            allowed_roles: record.allowed_roles,
+            expires_at_unix: now + crate::service::continuity::SEALED_SECRET_TTL_SECS,
+        };
+        ansible_mesh_core::sealed_secret::seal(&plaintext, context, target_public, &pair_key)
+            .map_err(|err| format!("sealing '{config_key}' failed: {err}"))
+    }
+
+    /// Relocation Ceremony R7, after SWITCH: the transport's secret now lives
+    /// on the target, so the origin drops its copy and leaves a marker that
+    /// stops a later `aiua load` from re-seeding it here. One holder.
+    fn retire_relocated_transport_secret(graph: &GraphDomain, ceremony: &RelocationCeremonyRecord) {
+        let Some(config_key) = ceremony.transport_resource_ref.as_deref() else {
+            return;
+        };
+        let secret_ref = graph
+            .get_config_value(config_key)
+            .ok()
+            .flatten()
+            .map(|raw| serde_json::from_str::<String>(&raw).unwrap_or(raw));
+        if let Some(secret_ref) = secret_ref.filter(|r| r.starts_with("secret://"))
+            && let Err(err) = graph.delete_secret(&secret_ref)
+        {
+            warn!(
+                "Relocation ceremony [{}]: failed to retire the origin's copy of '{}': {} — two hotels hold it",
+                ceremony.ceremony_id, config_key, err
+            );
+            return;
+        }
+        let _ = graph.remove_config_value(config_key);
+        let marker = serde_json::json!({
+            "relocated_to": ceremony.target_hotel,
+            "ceremony_id": ceremony.ceremony_id,
+            "at_unix": unix_ts(),
+        });
+        let _ = graph.set_config_value(
+            &crate::service::continuity::relocated_secret_marker_key(config_key),
+            &marker.to_string(),
+        );
+        info!(
+            "Relocation ceremony [{}]: '{}' moved to '{}'; this hotel no longer holds it",
+            ceremony.ceremony_id, config_key, ceremony.target_hotel
+        );
     }
 
     /// Roll a still-pre-commitment ceremony back (free — nothing on the
@@ -2696,6 +2929,7 @@ impl IpcServer {
                 );
                 return;
             }
+            Self::retire_relocated_transport_secret(graph, &ceremony);
         }
 
         // ── RECONCILE ────────────────────────────────────────────────────
@@ -3738,6 +3972,251 @@ mod tests {
             .expect("seed checkpoint");
     }
 
+    /// R7 fixture: an origin (mac-jane) holding Björk's bot token in its vault
+    /// (membrane-only), a target (vps-jane), a shared per-pair key on both,
+    /// and a ceremony moving her orchestrator with its Telegram transport.
+    fn sealed_transfer_fixture(
+        standby_request_id: &str,
+        ceremony_id: &str,
+    ) -> (GraphDomain, GraphDomain, RelocationCeremonyRecord) {
+        let origin = GraphDomain::new(Arc::new(
+            SqliteGraphStorage::open(":memory:")
+                .expect("origin graph")
+                .adapter(),
+        ));
+        let target = GraphDomain::new(Arc::new(
+            SqliteGraphStorage::open(":memory:")
+                .expect("target graph")
+                .adapter(),
+        ));
+        let token_ref = crate::vault::store_secret(
+            &origin,
+            crate::vault::SecretInput {
+                secret_kind: "telegram_bot_token".into(),
+                scope: "hotel".into(),
+                allowed_roles: vec!["membrane".into()],
+                allowed_guests: Vec::new(),
+                plaintext: "777:bjork-token".into(),
+            },
+        )
+        .expect("vault the token on the origin");
+        origin
+            .set_config_value(
+                "telegram_bot_token_bjork",
+                &serde_json::to_string(&token_ref).unwrap(),
+            )
+            .unwrap();
+        origin
+            .set_config_value("mesh_auth_key:vps-jane-aiua-01", "\"pair-mac-vps\"")
+            .unwrap();
+        target
+            .set_config_value("mesh_auth_key:mac-jane-aiua-01", "\"pair-mac-vps\"")
+            .unwrap();
+        let mut ceremony = RelocationCeremonyRecord::new(
+            ceremony_id.into(),
+            "agent-bjork-01".into(),
+            "orchestrator".into(),
+            "mac-jane-aiua-01".into(),
+            "vps-jane-aiua-01".into(),
+            true,
+            Some("telegram".into()),
+            Some("telegram_bot_token_bjork".into()),
+            "orchestrator".into(),
+            "move Björk".into(),
+            1,
+        );
+        ceremony.materialize_request_id = Some(standby_request_id.into());
+        (origin, target, ceremony)
+    }
+
+    /// R7: the transport's token reaches the target sealed, lands in its
+    /// vault readable by the membrane role only, and the origin stops
+    /// holding it after SWITCH.
+    #[test]
+    fn a_moving_transport_carries_its_token_sealed_to_the_target() {
+        let _env = crate::service::ipc::tests::ipc_env_guard();
+        let _key = crate::service::ipc::tests::VaultKeyEnv::set(
+            "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=",
+        );
+        let (origin, target, ceremony) = sealed_transfer_fixture("standby-r7-1", "relocate-r7-1");
+        let public = crate::service::continuity::issue_seal_key("standby-r7-1");
+        let ready = serde_json::json!({
+            "__sender": "vps-jane-aiua-01",
+            "sealed_secret_public_key": public,
+        });
+        let now = unix_ts();
+        let sealed = IpcServer::seal_transport_secret(&origin, &ceremony, &ready, now)
+            .expect("the ceremony's own target gets the seal");
+        assert!(
+            !serde_json::to_string(&sealed)
+                .unwrap()
+                .contains("bjork-token"),
+            "the token never crosses the mesh in the clear"
+        );
+        let mut bundle = crate::service::continuity::export_continuity_bundle(
+            &origin,
+            &ceremony,
+            Some("mac-jane".into()),
+            Some("vps-jane".into()),
+            now,
+        )
+        .unwrap();
+        bundle.sealed_secrets.push(sealed);
+
+        let summary = crate::service::continuity::import_continuity_bundle(&target, &bundle)
+            .expect("the target opens and stores it");
+        assert_eq!(summary.secrets, 1);
+        let target_ref: String = serde_json::from_str(
+            &target
+                .get_config_value("telegram_bot_token_bjork")
+                .unwrap()
+                .expect("key set on the target"),
+        )
+        .unwrap();
+        let read_as = |role: &str| {
+            crate::vault::resolve_secret(
+                &target,
+                &target_ref,
+                &crate::vault::SecretAccess {
+                    role: role.into(),
+                    guest_id: "vps-jane:membrane-gateway-bjork".into(),
+                },
+            )
+        };
+        assert_eq!(read_as("membrane").unwrap(), Some("777:bjork-token".into()));
+        assert!(read_as("agent").is_err(), "the ACL travels with the secret");
+
+        IpcServer::retire_relocated_transport_secret(&origin, &ceremony);
+        assert!(
+            origin
+                .get_config_value("telegram_bot_token_bjork")
+                .unwrap()
+                .is_none(),
+            "the origin no longer names the token"
+        );
+        assert!(
+            origin
+                .get_config_value("transport_secret_relocated:telegram_bot_token_bjork")
+                .unwrap()
+                .is_some(),
+            "a re-seed from mesh-config must not make the origin a second holder"
+        );
+    }
+
+    /// R7: nothing is sealed to a reply that did not come from the target,
+    /// or to a target that minted no key; a single-use key opens once.
+    #[test]
+    fn a_sealed_token_goes_only_to_the_ceremonys_target_and_only_once() {
+        let _env = crate::service::ipc::tests::ipc_env_guard();
+        let _key = crate::service::ipc::tests::VaultKeyEnv::set(
+            "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=",
+        );
+        let (origin, target, ceremony) = sealed_transfer_fixture("standby-r7-2", "relocate-r7-2");
+        let public = crate::service::continuity::issue_seal_key("standby-r7-2");
+        let now = unix_ts();
+
+        let impostor = serde_json::json!({
+            "__sender": "mbp-jane-aiua-01",
+            "sealed_secret_public_key": public,
+        });
+        assert!(IpcServer::seal_transport_secret(&origin, &ceremony, &impostor, now).is_err());
+        let keyless = serde_json::json!({"__sender": "vps-jane-aiua-01"});
+        assert!(IpcServer::seal_transport_secret(&origin, &ceremony, &keyless, now).is_err());
+
+        let ready = serde_json::json!({
+            "__sender": "vps-jane-aiua-01",
+            "sealed_secret_public_key": public,
+        });
+        let sealed = IpcServer::seal_transport_secret(&origin, &ceremony, &ready, now).unwrap();
+        let mut bundle = crate::service::continuity::export_continuity_bundle(
+            &origin, &ceremony, None, None, now,
+        )
+        .unwrap();
+        bundle.sealed_secrets.push(sealed.clone());
+        crate::service::continuity::import_continuity_bundle(&target, &bundle).unwrap();
+
+        // The identical bundle replayed into a hotel with no import marker
+        // still cannot be opened: the single-use key is gone.
+        let fresh = GraphDomain::new(Arc::new(
+            SqliteGraphStorage::open(":memory:")
+                .expect("fresh graph")
+                .adapter(),
+        ));
+        fresh
+            .set_config_value("mesh_auth_key:mac-jane-aiua-01", "\"pair-mac-vps\"")
+            .unwrap();
+        let err = crate::service::continuity::import_continuity_bundle(&fresh, &bundle)
+            .expect_err("a single-use key opens once");
+        assert!(format!("{err:#}").contains("no live seal key"), "{err:#}");
+        assert!(
+            fresh
+                .get_config_value("telegram_bot_token_bjork")
+                .unwrap()
+                .is_none(),
+            "a failed seal leaves nothing half-imported"
+        );
+
+        // Re-addressed to another ceremony, the seal no longer matches.
+        let mut readdressed = bundle;
+        readdressed.ceremony_id = "relocate-r7-other".into();
+        let err = crate::service::continuity::import_continuity_bundle(&fresh, &readdressed)
+            .expect_err("bound to its own move");
+        assert!(
+            format!("{err:#}").contains("bound to a different move"),
+            "{err:#}"
+        );
+    }
+
+    /// DEF-170: only a role's home may place it on another hotel.
+    #[test]
+    fn only_the_roles_home_may_place_it() {
+        let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
+        let graph = GraphDomain::new(Arc::new(graph_store.adapter()));
+        seed_relocatable_orchestrator(&graph); // Beacon's orchestrator: home mac-jane
+        assert!(
+            IpcServer::peer_may_place_role(
+                &graph,
+                "vps-jane-aiua-01",
+                "mac-jane-aiua-01",
+                "agent-beacon",
+                "orchestrator"
+            )
+            .is_ok(),
+            "the home hotel may move its role"
+        );
+        let refused = IpcServer::peer_may_place_role(
+            &graph,
+            "vps-jane-aiua-01",
+            "mbp-jane-aiua-01",
+            "agent-beacon",
+            "orchestrator",
+        )
+        .expect_err("a third hotel may not");
+        assert!(refused.contains("mac-jane-aiua-01"), "{refused}");
+        assert!(
+            IpcServer::peer_may_place_role(
+                &graph,
+                "mac-jane-aiua-01",
+                "vps-jane-aiua-01",
+                "agent-beacon",
+                "orchestrator"
+            )
+            .is_err(),
+            "a peer may not rewrite a role this hotel is home to"
+        );
+        assert!(
+            IpcServer::peer_may_place_role(
+                &graph,
+                "vps-jane-aiua-01",
+                "mbp-jane-aiua-01",
+                "agent-new",
+                "orchestrator"
+            )
+            .is_ok(),
+            "a role this hotel has never seen has nothing to check against"
+        );
+    }
+
     /// R5: a target that supports continuity gets the role's checkpoints
     /// before SWITCH, and the move only closes once it acks.
     #[tokio::test]
@@ -4326,6 +4805,172 @@ mod tests {
         assert!(
             parked_inbound.lock().await.is_empty(),
             "claimed replay must not park a duplicate copy"
+        );
+    }
+
+    /// Register a live `agent`-role subscriber the way a philote does.
+    async fn subscribe_live_agent(
+        inboxes: &InboxRegistry,
+        guest_id: &str,
+    ) -> mpsc::UnboundedReceiver<IpcResponse> {
+        let (tx, rx) = mpsc::unbounded_channel::<IpcResponse>();
+        let mut subscribed_roles = Vec::new();
+        IpcServer::add_subscription(
+            inboxes,
+            "agent",
+            Uuid::new_v4(),
+            guest_id,
+            &[],
+            &crate::service::ipc::CountedSender::detached(&tx),
+            &mut subscribed_roles,
+        )
+        .await;
+        rx
+    }
+
+    fn remote_seat_task(session_id: &str, delivery_guest: &str) -> EventEnvelope {
+        EventEnvelope {
+            event_id: Uuid::new_v4(),
+            seq: 1,
+            source_node_id: "mac-jane-aiua-01".into(),
+            target_node_id: Some("vps-jane-aiua-01".into()),
+            source_agent_id: "mac-jane:membrane-gateway-beacon".into(),
+            target_agent_id: Some("agent".into()),
+            kind: EventKind::TaskInvoke,
+            corr_id: String::new(),
+            attempt: 0,
+            created_at: 0,
+            expires_at: None,
+            payload: EventPayload::Inline {
+                data: serde_json::json!({
+                    "session_id": session_id,
+                    "content": "hello from telegram",
+                    "delivery_target_guest_id": delivery_guest,
+                })
+                .to_string(),
+            },
+            trace: vec![],
+        }
+    }
+
+    /// DEF-179: a Telegram seat on another hotel addresses the base agent; the
+    /// hosting hotel delivers to the process it answers through — the agent's
+    /// orchestrator — not to the base process that has no turn to receive the
+    /// model's response.
+    #[tokio::test]
+    async fn a_remote_task_for_a_base_agent_goes_to_its_orchestrator_process() {
+        let inboxes: InboxRegistry = Arc::new(Mutex::new(HashMap::new()));
+        let graph = GraphDomain::new(Arc::new(
+            SqliteGraphStorage::open(":memory:")
+                .expect("graph")
+                .adapter(),
+        ));
+        let parked: Arc<Mutex<HashMap<String, Vec<ParkedInboundTask>>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+        let mat_req = MockMaterializationRequester::default();
+        let claims = new_delivery_claim_registry();
+        let mut base_rx = subscribe_live_agent(&inboxes, "agent-beacon").await;
+        let mut orchestrator_rx = subscribe_live_agent(&inboxes, "agent-beacon:orchestrator").await;
+
+        let event = remote_seat_task("telegram:7:agent-beacon", "agent-beacon");
+        assert!(
+            IpcServer::deliver_event_envelope_or_park(
+                &inboxes,
+                &event,
+                None,
+                &graph,
+                "vps-jane-aiua-01",
+                &parked,
+                Some(&mat_req),
+                &claims,
+            )
+            .await
+        );
+
+        assert!(
+            matches!(
+                orchestrator_rx.try_recv(),
+                Ok(IpcResponse::InboundTask { .. })
+            ),
+            "the orchestrator process takes the turn"
+        );
+        assert!(
+            base_rx.try_recv().is_err(),
+            "the base process must not also receive it"
+        );
+    }
+
+    /// The session's own routing wins: with the session pinned to a specialist
+    /// incarnation, the task goes there — and a sender that named an
+    /// incarnation itself is never rewritten.
+    #[tokio::test]
+    async fn a_known_session_keeps_its_active_incarnation_and_named_incarnations_are_left_alone() {
+        let inboxes: InboxRegistry = Arc::new(Mutex::new(HashMap::new()));
+        let graph = GraphDomain::new(Arc::new(
+            SqliteGraphStorage::open(":memory:")
+                .expect("graph")
+                .adapter(),
+        ));
+        graph
+            .upsert_session(&ansible_mesh_core::storage::SessionRecord {
+                session_id: "telegram:7:agent-beacon".into(),
+                session_kind: "conversation".into(),
+                primary_agent_id: Some("agent-beacon".into()),
+                active_incarnation_id: Some("agent-beacon:Chronos".into()),
+                channel_kind: Some("telegram".into()),
+                channel_session_key: Some("7".into()),
+                status: "active".into(),
+                lease_owner_component_id: None,
+                lease_expires_at: None,
+                summary_json: serde_json::json!({}),
+                created_at: 1,
+                updated_at: 2,
+            })
+            .expect("session");
+        let parked: Arc<Mutex<HashMap<String, Vec<ParkedInboundTask>>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+        let mat_req = MockMaterializationRequester::default();
+        let claims = new_delivery_claim_registry();
+        let mut orchestrator_rx = subscribe_live_agent(&inboxes, "agent-beacon:orchestrator").await;
+        let mut chronos_rx = subscribe_live_agent(&inboxes, "agent-beacon:Chronos").await;
+
+        let event = remote_seat_task("telegram:7:agent-beacon", "agent-beacon");
+        IpcServer::deliver_event_envelope_or_park(
+            &inboxes,
+            &event,
+            None,
+            &graph,
+            "vps-jane-aiua-01",
+            &parked,
+            Some(&mat_req),
+            &claims,
+        )
+        .await;
+        assert!(
+            matches!(chronos_rx.try_recv(), Ok(IpcResponse::InboundTask { .. })),
+            "the session's active incarnation takes it"
+        );
+        assert!(orchestrator_rx.try_recv().is_err());
+
+        // A sender that names an incarnation (a handoff) is trusted as sent.
+        let named = remote_seat_task("telegram:7:agent-beacon", "agent-beacon:orchestrator");
+        IpcServer::deliver_event_envelope_or_park(
+            &inboxes,
+            &named,
+            None,
+            &graph,
+            "vps-jane-aiua-01",
+            &parked,
+            Some(&mat_req),
+            &claims,
+        )
+        .await;
+        assert!(
+            matches!(
+                orchestrator_rx.try_recv(),
+                Ok(IpcResponse::InboundTask { .. })
+            ),
+            "an explicitly named incarnation is delivered as addressed"
         );
     }
 

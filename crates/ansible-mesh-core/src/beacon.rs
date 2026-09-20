@@ -10,11 +10,38 @@ use anyhow::{Context, Result};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::net::UdpSocket;
-use tokio::sync::{mpsc, Mutex, RwLock};
+use tokio::sync::{mpsc, RwLock};
 use tracing::{debug, error, info, warn};
 
 /// A lightweight beacon daemon that binds to a UDP port and listens
 /// for incoming mesh control messages.
+/// A beacon packet that takes longer than this to handle is logged: the
+/// receive loop is a single task, so every peer's traffic waits behind it.
+const SLOW_PACKET_WARN: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// Does the node id a payload names equal the peer whose key authenticated
+/// the packet?
+///
+/// The HMAC proves who SENT a packet, but heartbeats, capability syncs and
+/// hotel-state syncs each carry the node they describe INSIDE the payload and
+/// every handler acted on that value. Any enrolled peer could therefore make
+/// every hotel believe it hosts an agent (roster injection), rewrite another
+/// hotel's stored `mesh_port` to its own source port, or feed placement
+/// gossip for another node — the same class DEF-170 closed on the event
+/// plane, still open here (DEF-183).
+fn claimed_node_is_sender(claimed_node_id: &str, msg: &BeaconMessage) -> bool {
+    if claimed_node_id == msg.src_node {
+        return true;
+    }
+    warn!(
+        claimed = claimed_node_id,
+        authenticated_sender = %msg.src_node,
+        msg_type = ?msg.msg_type,
+        "Packet dropped: its payload describes a node other than the peer that sent it (DEF-183)"
+    );
+    false
+}
+
 pub struct BeaconDaemon {
     socket: Arc<UdpSocket>,
     graph: Arc<GraphDomain>,
@@ -23,7 +50,7 @@ pub struct BeaconDaemon {
     inbox_tx: mpsc::Sender<BeaconMessage>,
     // Persistent nonce tracker — initialized once to avoid per-packet DB open overhead
     // and WAL contention on the main context.db under concurrent UDP load.
-    nonce_tracker: Option<Mutex<NonceTracker>>,
+    nonce_tracker: NonceTracker,
     enable_rust_auth: bool,
     /// Where newly applied gossiped placement records are reported so the
     /// hotel can push them to local guests at once (DEF-107). `None` = no
@@ -70,24 +97,17 @@ impl BeaconDaemon {
             .context(format!("Failed to bind UDP socket to {}", addr))?;
 
         info!("Beacon daemon listening on {}", socket.local_addr()?);
-        // Derive a sidecar nonces.db path alongside the main context DB.
-        // Using a dedicated file avoids WAL write contention with the hotel's main DB
-        // on every incoming beacon packet.
-        let nonce_tracker = if enable_rust_auth {
-            let nonce_path = std::path::Path::new(db_path)
-                .parent()
-                .map(|p| p.join("nonces.db").to_string_lossy().to_string())
-                .unwrap_or_else(|| "nonces.db".to_string());
-            match NonceTracker::open(&nonce_path) {
-                Ok(t) => Some(Mutex::new(t)),
-                Err(e) => {
-                    warn!("Failed to initialize beacon nonce tracker (replay protection disabled): {e}");
-                    None
-                }
-            }
-        } else {
-            None
-        };
+        // The replay window is held in memory. The sidecar nonces.db it replaced
+        // grew without bound (274-411 MB per hotel, sweep never called), so
+        // retire it.
+        let nonce_tracker = NonceTracker::new();
+        let legacy_sidecar = std::path::Path::new(db_path)
+            .parent()
+            .map(|p| p.join("nonces.db").to_string_lossy().to_string())
+            .unwrap_or_else(|| "nonces.db".to_string());
+        if let Some(what) = NonceTracker::retire_legacy_store(&legacy_sidecar) {
+            info!("{what}");
+        }
         Ok(Self {
             socket: Arc::new(socket),
             graph,
@@ -128,7 +148,17 @@ impl BeaconDaemon {
         loop {
             match self.socket.recv_from(&mut buf).await {
                 Ok((size, src)) => {
+                    let started = std::time::Instant::now();
                     self.handle_packet(&buf[..size], src).await;
+                    let took = started.elapsed();
+                    if took >= SLOW_PACKET_WARN {
+                        warn!(
+                            took_ms = took.as_millis() as u64,
+                            bytes = size,
+                            %src,
+                            "slow beacon packet: the single receive loop was busy this long (DEF-191)"
+                        );
+                    }
                 }
                 Err(e) => {
                     error!("UDP receive error: {}", e);
@@ -181,17 +211,8 @@ impl BeaconDaemon {
                         return;
                     }
 
-                    if let Some(ref tracker_mutex) = self.nonce_tracker {
-                        let tracker = tracker_mutex.lock().await;
-                        if let Err(e) = tracker.assert_and_record_nonce(&msg.msg_id) {
-                            warn!("Packet dropped: {}", e);
-                            return;
-                        }
-                    } else {
-                        warn!(
-                            "Packet dropped: nonce tracker unavailable for {}",
-                            msg.msg_id
-                        );
+                    if let Err(e) = self.nonce_tracker.assert_and_record_nonce(&msg.msg_id) {
+                        warn!("Packet dropped: {}", e);
                         return;
                     }
                 } else {
@@ -218,6 +239,9 @@ impl BeaconDaemon {
         match msg.msg_type {
             MsgType::Heartbeat => {
                 if let Ok(payload) = serde_json::from_slice::<HeartbeatPayload>(&msg.payload) {
+                    if !claimed_node_is_sender(&payload.capabilities.node_id, &msg) {
+                        return;
+                    }
                     info!(
                         "Received heartbeat from node: {} (roles: {:?})",
                         payload.capabilities.node_id, payload.capabilities.roles
@@ -346,6 +370,9 @@ impl BeaconDaemon {
             }
             MsgType::CapabilitySync => {
                 if let Ok(payload) = serde_json::from_slice::<CapabilitySyncPayload>(&msg.payload) {
+                    if !claimed_node_is_sender(&payload.capabilities.node_id, &msg) {
+                        return;
+                    }
                     let mut registry = self.registry.write().await;
                     registry.observe_capability_sync_chunk(
                         payload.capabilities,
@@ -410,21 +437,22 @@ impl BeaconDaemon {
             }
             MsgType::HotelStateSync => {
                 if let Ok(payload) = serde_json::from_slice::<HotelStateSyncPayload>(&msg.payload) {
+                    if !claimed_node_is_sender(&payload.node_id, &msg) {
+                        return;
+                    }
                     if payload.node_id != self.local_capabilities.node_id {
-                        let mut registry = self.registry.write().await;
-                        registry.observe_hotel_state(
-                            payload.node_id.clone(),
-                            payload.hotel_name.clone(),
-                            payload.guests,
-                            payload.agents,
-                        );
+                        let t0 = std::time::Instant::now();
+                        // Everything that touches SQLite happens BEFORE the
+                        // registry lock is taken. It used to run inside it, so
+                        // heartbeats and message routing — every registry
+                        // reader — queued behind synchronous graph writes.
                         let mut replicated_profiles = 0usize;
                         for profile in payload
                             .model_profiles
-                            .into_iter()
+                            .iter()
                             .filter(|profile| profile.node_id == payload.node_id)
                         {
-                            if let Err(err) = self.graph.upsert_model_profile(&profile) {
+                            if let Err(err) = self.graph.upsert_model_profile(profile) {
                                 warn!(
                                     "Hotel state sync from {}: failed to upsert model profile {}@{}: {}",
                                     payload.node_id, profile.model_ref, profile.node_id, err
@@ -433,14 +461,17 @@ impl BeaconDaemon {
                                 replicated_profiles += 1;
                             }
                         }
+                        let profiles_ms = t0.elapsed().as_millis() as u64;
                         // Placement is graph truth every hotel must agree on
                         // (DEF-107): apply newer role/transport homes, LWW.
+                        let t1 = std::time::Instant::now();
                         let applied = crate::placement_sync::apply_remote_placement(
                             &self.graph,
                             &payload.node_id,
                             &payload.role_homes,
                             &payload.transport_homes,
                         );
+                        let placement_ms = t1.elapsed().as_millis() as u64;
                         if !applied.is_empty() {
                             info!(
                                 "Hotel state sync from {}: applied {} role home(s), {} transport home(s)",
@@ -454,22 +485,34 @@ impl BeaconDaemon {
                                 }
                             }
                         }
+                        let (guest_count, agent_count) =
+                            (payload.guests.len(), payload.agents.len());
+                        let (node_id, hotel_name) =
+                            (payload.node_id.clone(), payload.hotel_name.clone());
+                        let t2 = std::time::Instant::now();
+                        let mut registry = self.registry.write().await;
+                        let lock_wait_ms = t2.elapsed().as_millis() as u64;
+                        registry.observe_hotel_state(
+                            payload.node_id,
+                            payload.hotel_name,
+                            payload.guests,
+                            payload.agents,
+                        );
+                        drop(registry);
                         info!(
                             "Hotel state sync from {} ({}): {} guests, {} agents, {} model profiles",
-                            payload.hotel_name,
-                            payload.node_id,
-                            registry
-                                .remote_hotel_states()
-                                .find(|s| s.node_id == payload.node_id)
-                                .map(|s| s.guests.len())
-                                .unwrap_or(0),
-                            registry
-                                .remote_hotel_states()
-                                .find(|s| s.node_id == payload.node_id)
-                                .map(|s| s.agents.len())
-                                .unwrap_or(0),
-                            replicated_profiles,
+                            hotel_name, node_id, guest_count, agent_count, replicated_profiles,
                         );
+                        let total_ms = t0.elapsed().as_millis() as u64;
+                        if total_ms >= SLOW_PACKET_WARN.as_millis() as u64 {
+                            warn!(
+                                total_ms,
+                                profiles_ms,
+                                placement_ms,
+                                registry_lock_wait_ms = lock_wait_ms,
+                                "slow hotel-state sync from {node_id} (DEF-191)"
+                            );
+                        }
                     }
                 }
             }
@@ -659,5 +702,112 @@ mod tests {
             !registry.read().await.is_node_stale("mbp-jane-aiua-01"),
             "node should be fresh after heartbeat"
         );
+    }
+
+    async fn daemon_with_registry(
+        graph: Arc<GraphDomain>,
+    ) -> (BeaconDaemon, Arc<RwLock<NodeRegistry>>) {
+        let registry = Arc::new(RwLock::new(NodeRegistry::new()));
+        let (inbox_tx, _inbox_rx) = tokio::sync::mpsc::channel(8);
+        let daemon = BeaconDaemon::bind_with_registry(
+            "127.0.0.1:0",
+            test_caps("mac-jane-aiua-01"),
+            inbox_tx,
+            graph,
+            "",
+            false,
+            registry.clone(),
+        )
+        .await
+        .unwrap();
+        (daemon, registry)
+    }
+
+    /// DEF-183: a heartbeat sent by mbp-jane that CLAIMS to describe vps-jane
+    /// must not create vps-jane's registry entry or move its stored port.
+    #[tokio::test]
+    async fn a_heartbeat_describing_another_node_is_dropped() {
+        let storage = SqliteGraphStorage::open_in_memory().unwrap();
+        let graph = Arc::new(GraphDomain::new(Arc::new(storage.adapter())));
+        graph
+            .upsert_hotel(&test_hotel("vps-jane", "vps-jane-aiua-01", 9200))
+            .unwrap();
+        let (daemon, registry) = daemon_with_registry(graph.clone()).await;
+
+        let mut forged = heartbeat_msg("vps-jane-aiua-01");
+        forged.src_node = "mbp-jane-aiua-01".to_string();
+        let attacker_src: SocketAddr = "100.79.239.64:6666".parse().unwrap();
+        daemon.dispatch_message(forged, attacker_src).await;
+
+        assert!(
+            registry.read().await.get_node("vps-jane-aiua-01").is_none(),
+            "a forged heartbeat must not create the described node"
+        );
+        assert_eq!(
+            graph.get_hotel("vps-jane").unwrap().unwrap().mesh_port,
+            9200,
+            "and must not rewrite its stored port to the sender's"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_roster_describing_another_node_is_dropped() {
+        let storage = SqliteGraphStorage::open_in_memory().unwrap();
+        let graph = Arc::new(GraphDomain::new(Arc::new(storage.adapter())));
+        let (daemon, registry) = daemon_with_registry(graph).await;
+
+        let payload = HotelStateSyncPayload {
+            node_id: "vps-jane-aiua-01".into(),
+            hotel_name: "vps-jane".into(),
+            guests: vec![],
+            agents: vec![crate::heartbeat::HotelStateSyncAgent {
+                agent_id: "agent-beacon".into(),
+                persona_name: "Beacon".into(),
+            }],
+            model_profiles: vec![],
+            role_homes: vec![],
+            transport_homes: vec![],
+        };
+        let mut msg = heartbeat_msg("mbp-jane-aiua-01");
+        msg.msg_type = MsgType::HotelStateSync;
+        msg.payload = serde_json::to_vec(&payload).unwrap().into();
+        daemon
+            .dispatch_message(msg.clone(), "100.79.239.64:1".parse().unwrap())
+            .await;
+        assert_eq!(
+            registry.read().await.remote_hotel_states().count(),
+            0,
+            "mbp-jane may not inject a roster for vps-jane"
+        );
+
+        // The same roster from the hotel it describes is accepted.
+        msg.src_node = "vps-jane-aiua-01".to_string();
+        daemon
+            .dispatch_message(msg, "100.64.212.8:1".parse().unwrap())
+            .await;
+        assert_eq!(registry.read().await.remote_hotel_states().count(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_capability_sync_describing_another_node_is_dropped() {
+        let storage = SqliteGraphStorage::open_in_memory().unwrap();
+        let graph = Arc::new(GraphDomain::new(Arc::new(storage.adapter())));
+        let (daemon, registry) = daemon_with_registry(graph).await;
+
+        let payload = CapabilitySyncPayload {
+            capabilities: test_caps("vps-jane-aiua-01"),
+            execution_reachability: None,
+            advertisements: vec![],
+            sync_id: Uuid::new_v4(),
+            chunk_index: 0,
+            chunk_total: 1,
+        };
+        let mut msg = heartbeat_msg("mbp-jane-aiua-01");
+        msg.msg_type = MsgType::CapabilitySync;
+        msg.payload = serde_json::to_vec(&payload).unwrap().into();
+        daemon
+            .dispatch_message(msg.clone(), "100.79.239.64:1".parse().unwrap())
+            .await;
+        assert!(registry.read().await.get_node("vps-jane-aiua-01").is_none());
     }
 }

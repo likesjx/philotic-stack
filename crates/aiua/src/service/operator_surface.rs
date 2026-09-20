@@ -1951,9 +1951,161 @@ impl IpcServer {
     }
 }
 
+/// Config key: JSON array of mesh node ids allowed to send this hotel
+/// operator-surface handoffs that change state. Unset means none.
+pub(crate) const OPERATOR_AUTHORITY_NODES_CONFIG_KEY: &str = "operator_authority_nodes";
+
+/// Operator surfaces a peer may query without authority: they only read.
+const READ_ONLY_OPERATOR_SURFACES: &[&str] = &[
+    "operator.targets.guests",
+    "operator.targets.status",
+    "operator.targets.agents",
+    "operator.targets.components",
+    "operator.targets.config",
+    "operator.targets.secrets",
+    "operator.targets.placement",
+];
+
+/// Surfaces the mesh never carries, whoever sends them. `agent.deploy_bundle`
+/// fetched an unauthenticated URL and applied a bundle of plaintext secrets,
+/// config writes and guest spawn commands; relocation carries agents now.
+const RETIRED_OPERATOR_SURFACES: &[&str] = &["agent.deploy_bundle"];
+
+/// May the authenticated peer `source_node_id` hand this hotel the operator
+/// surface in `task_json`? (DEF-172)
+///
+/// The operator's authority lives in philotic-web, not in the mesh — but a
+/// forwarded handoff used to be applied from any peer, so any hotel could
+/// rotate any secret, rewrite config, or spawn components on any other.
+/// Read-only surfaces stay open to every peer; a surface that changes state
+/// is applied only from this hotel itself or from a node listed in
+/// `operator_authority_nodes`. Deny by default: an unset list authorizes no
+/// peer.
+pub(crate) fn mesh_operator_handoff_permitted(
+    graph: &GraphDomain,
+    local_node_id: &str,
+    source_node_id: &str,
+    task_json: &str,
+) -> Result<(), String> {
+    let surface = serde_json::from_str::<serde_json::Value>(task_json)
+        .ok()
+        .and_then(|v| {
+            v.get("surface")
+                .and_then(|s| s.as_str())
+                .map(str::to_string)
+        })
+        .ok_or_else(|| "handoff names no surface".to_string())?;
+    if RETIRED_OPERATOR_SURFACES.contains(&surface.as_str()) {
+        return Err(format!("surface [{surface}] is retired from the mesh"));
+    }
+    if READ_ONLY_OPERATOR_SURFACES.contains(&surface.as_str()) || source_node_id == local_node_id {
+        return Ok(());
+    }
+    let authorities: Vec<String> = graph
+        .get_config_value(OPERATOR_AUTHORITY_NODES_CONFIG_KEY)
+        .ok()
+        .flatten()
+        .and_then(|raw| serde_json::from_str(&raw).ok())
+        .unwrap_or_default();
+    if authorities.iter().any(|node| node == source_node_id) {
+        return Ok(());
+    }
+    Err(format!(
+        "surface [{surface}] changes state and peer '{source_node_id}' is not in \
+         {OPERATOR_AUTHORITY_NODES_CONFIG_KEY}"
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn graph() -> GraphDomain {
+        let store = ansible_mesh_core::sqlite_storage::SqliteGraphStorage::open(":memory:")
+            .expect("open sqlite graph store");
+        GraphDomain::new(Arc::new(store.adapter()))
+    }
+
+    fn handoff(surface: &str) -> String {
+        serde_json::json!({"surface": surface}).to_string()
+    }
+
+    #[test]
+    fn any_peer_may_read_but_not_rotate_a_secret() {
+        let g = graph();
+        assert!(
+            mesh_operator_handoff_permitted(
+                &g,
+                "mac-jane-aiua-01",
+                "mbp-jane-aiua-01",
+                &handoff("operator.targets.secrets")
+            )
+            .is_ok()
+        );
+        assert!(
+            mesh_operator_handoff_permitted(
+                &g,
+                "mac-jane-aiua-01",
+                "mbp-jane-aiua-01",
+                &handoff("operator.targets.secrets.rotate")
+            )
+            .is_err(),
+            "deny by default: no authority list, no state change"
+        );
+    }
+
+    #[test]
+    fn a_listed_authority_may_change_state() {
+        let g = graph();
+        g.set_config_value(
+            OPERATOR_AUTHORITY_NODES_CONFIG_KEY,
+            r#"["vps-jane-aiua-01"]"#,
+        )
+        .unwrap();
+        for surface in [
+            "operator.targets.secrets.rotate",
+            "operator.targets.config.set",
+            "operator.targets.components.restart",
+        ] {
+            assert!(
+                mesh_operator_handoff_permitted(
+                    &g,
+                    "mac-jane-aiua-01",
+                    "vps-jane-aiua-01",
+                    &handoff(surface)
+                )
+                .is_ok()
+            );
+            assert!(
+                mesh_operator_handoff_permitted(
+                    &g,
+                    "mac-jane-aiua-01",
+                    "mbp-jane-aiua-01",
+                    &handoff(surface)
+                )
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn a_bundle_deploy_never_rides_the_mesh() {
+        let g = graph();
+        g.set_config_value(
+            OPERATOR_AUTHORITY_NODES_CONFIG_KEY,
+            r#"["vps-jane-aiua-01"]"#,
+        )
+        .unwrap();
+        assert!(
+            mesh_operator_handoff_permitted(
+                &g,
+                "mac-jane-aiua-01",
+                "vps-jane-aiua-01",
+                &handoff("agent.deploy_bundle")
+            )
+            .is_err()
+        );
+    }
 
     #[test]
     fn operator_surface_reply_ignores_oob_before_inbound_task() {
