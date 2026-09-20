@@ -3,7 +3,7 @@ title: Cortex Viewer for the Apple Apps
 doc_type: proposal
 domain: memory-context
 status: accepted-current-slice
-last_updated: 2026-09-19
+last_updated: 2026-09-20
 tags: [cortex, muninn, apple, observability, read-only]
 related_docs:
   - MUNINN_MEMORY_CORE_PROPOSAL.md
@@ -39,16 +39,32 @@ repair are out of scope for the first viewer.
 
 ## Disposition
 
-Accepted for the data-contract foundation. No viewer, HTTP endpoint or live
-Cortex inventory is implemented by this first change.
+Accepted for the native read-only viewer. The adapter and shared UI are now
+implemented in source; deployment and watched-live inventory remain pending.
 
 ## Current Slice
 
-`PhiloticKit/CortexSnapshot.swift` defines a proposed read response contract,
-with tests for incomplete inventories, unavailable counts, explicit exclusions,
-unknown states and vault-qualified memory identities. It has no transport and
-cannot widen access. The backend adapter must adopt or revise this contract
-before the app connects to it.
+`GET /api/cortex` requires a fresh hotel-issued administrator session on every
+request and rechecks it after the read. Device enrollment is insufficient.
+The exact local management adapter identity invokes `ReadCortex`; the hotel
+uses its existing server-held Muninn administrator credential. Upstream URLs,
+methods and paths are not caller-controlled. Responses are bounded to 4 MiB,
+pages to 50 entries and inventory to 512 vaults; the hotel read has a 35-second
+deadline. Redirects are disabled. Access logging records session ID and status,
+not memory content or tokens; a dedicated durable access-audit ledger is deferred.
+
+Rollout must inspect the canonical server and set `cortex_viewer_endpoint` to
+the JSON string matching `muninn_endpoint`. Missing/mismatched attestation or
+a remote write route fails closed. This attestation is transitional, not a
+live cluster leadership proof; migration must revoke/update it.
+
+The shared SwiftUI Cortex tab lists vaults, loads pages and displays full memory
+details. Filtering covers loaded rows only, not a global or semantic search.
+Offset pagination is not a stable snapshot under concurrent writes. The client
+pins the operator-approved `http://100.64.212.8:7700` Tailscale origin, rejects
+redirects and retains tokens/content only in memory. Backgrounding or logout
+clears them. An existing operator session must be entered manually; integrated
+native operator sign-in remains deferred. Public desktop routing is unchanged.
 
 ### Coverage is evidence, not a label
 
@@ -82,6 +98,9 @@ before the app connects to it.
 
 ## Verification
 
-Contract tests are only foundation evidence. Installed UI, authorization,
-pagination completeness, live inventory and deployment remain unproven.
+Nine Swift contract/client tests, two hotel adapter unit tests and the gateway
+authorization regression pass. The latter rejects anonymous, device-only,
+non-admin and revoked sessions. The Mac app compiled successfully. These are
+test/build evidence only: installed UI, live inventory, partial-outage behavior,
+pagination coverage and the new viewer's physical iPhone deployment remain unproven.
 See [current status](ARCHITECTURE_STATUS.md) and [execution work](../task.md).

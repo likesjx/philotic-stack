@@ -2074,6 +2074,12 @@ pub enum IpcRequest {
     /// effectiveness and other memory-health fields, each honest about whether
     /// it could be sourced. Read-only; no memory content or secrets included.
     GetMemoryReport,
+    /// Bounded read-only Cortex inventory/page/detail, management identity only.
+    ReadCortex {
+        vault: Option<String>,
+        id: Option<String>,
+        offset: u32,
+    },
     /// Return the hotel's current network security perimeter snapshot.
     GetPerimeterStatus,
     /// Force the hotel's PerimeterService to re-derive the snapshot from live interfaces.

@@ -28,9 +28,11 @@ Branch: `codex/cortex-viewer`; seam: `muninn-admin-observability-plane`.
 Spec: [Cortex viewer](architecture/CORTEX_VIEWER_PROPOSAL.md).
 
 - [x] Define and test the read-only Swift inventory/detail contract, including partial coverage and vault-qualified identities (6 tests).
-- [ ] Implement operator-authorized Cortex inventory, pagination and detail reads; do not equate device enrollment with all-vault authority.
-- [ ] Build the shared Mac/iPhone viewer and verify against live Cortex inventory.
-- [ ] Verify revoked/denied access and partial-outage behavior before deployment.
+- [x] Implement bounded operator-authorized Cortex inventory, pagination and detail reads; device enrollment grants no all-vault authority.
+- [x] Add shared native viewer and pinned private client; nine Swift tests, two adapter tests, gateway authorization regression and Mac build pass.
+- [ ] Integrate current develop without rolling back newer runtime fixes, deploy the backend and attest the inspected canonical endpoint.
+- [ ] Verify live inventory, partial outages and pagination; install the viewer while preserving the companion's notch/Desktop work.
+- [ ] Follow up with native operator sign-in, durable access auditing and global search; current filtering covers loaded rows only.
 
 ### Native LifeGraph editor
 

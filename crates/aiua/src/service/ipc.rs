@@ -9671,6 +9671,34 @@ impl IpcServer {
                 IpcResponse::success("memory_report", serde_json::to_value(&report).ok())
             }
 
+            IpcRequest::ReadCortex { vault, id, offset } => {
+                if !current_identity.as_ref().is_some_and(|identity| {
+                    identity.role == "management" && identity.guest_id == "philotic-web-cortex"
+                }) {
+                    return IpcResponse::error(
+                        "cortex",
+                        "FORBIDDEN",
+                        "Cortex reads require the operator management adapter",
+                    );
+                }
+                match tokio::time::timeout(
+                    std::time::Duration::from_secs(35),
+                    crate::cortex_viewer::read(graph, local_node_id, vault, id, offset),
+                )
+                .await
+                {
+                    Ok(Ok(data)) => IpcResponse::success("cortex", Some(data)),
+                    _ => {
+                        tracing::warn!("Cortex read failed or exceeded deadline");
+                        IpcResponse::error(
+                            "cortex",
+                            "UNAVAILABLE",
+                            "Cortex read unavailable; check hotel configuration and connectivity",
+                        )
+                    }
+                }
+            }
+
             IpcRequest::BestPlaceToRun {
                 agent_id,
                 role_name,

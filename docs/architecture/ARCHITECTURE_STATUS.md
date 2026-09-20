@@ -110,9 +110,12 @@ on September 18. The companion iOS build was installed over Wi-Fi on iPhone 13
 Pro and launched after operator trust on September 19; phone Save remains untested.
 See [scope and verification](../../apps/philotic-apple/LIFEGRAPH.md).
 
-The [Cortex viewer](CORTEX_VIEWER_PROPOSAL.md) now has a tested proposed Swift
-inventory/detail contract only. The unified operator view, authorization adapter,
-live inventory and UI remain unimplemented; no new memory access is exposed.
+The [Cortex viewer](CORTEX_VIEWER_PROPOSAL.md) now has a native Mac/iPhone tab
+and a bounded hotel-owned read adapter in source. Fresh administrator sessions,
+an explicitly attested canonical endpoint and a pinned private client origin
+gate access; device enrollment alone is insufficient. Targeted tests pass and
+the Mac builds. Deployment, live inventory and phone viewer validation remain
+pending; manual operator sign-in and loaded-row filtering are transitional.
 
 ### Runtime and authority
 
