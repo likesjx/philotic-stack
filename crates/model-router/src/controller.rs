@@ -1322,6 +1322,9 @@ pub struct ResponseTrace {
     pub provider: Option<String>,
     pub model: Option<String>,
     pub voice: Option<String>,
+    // The three fields below are decisions-only and are NOT forwarded by
+    // `emit_text_response`, which hand-lists provider/model/voice: the decisions
+    // reply carries the full `DecisionsTrace` on its own action instead.
     /// Decisions only: `native` or `openrouter`.
     pub transport: Option<String>,
     /// Decisions only: wall time of the provider hop, measured by the provider.
@@ -1451,6 +1454,13 @@ impl ControllerResponseEnvelope {
                     provider_output: Value::Null,
                 })
             }
+            // NOT on the production decisions path. `handle_decisions_task` ->
+            // `evaluate_task` -> `DecisionReply::body()` never builds a
+            // `ControllerResponseEnvelope`, and `emit_text_response` (which would
+            // send this as a `model_response` and drop the trace fields below)
+            // must never see a decision. This arm exists because the match is
+            // exhaustive, and so tools that want a generic envelope have a typed
+            // one. Do not route decisions through it.
             ProviderOutput::Judgment(outcome) => {
                 let trace = &outcome.trace;
                 Ok(Self {

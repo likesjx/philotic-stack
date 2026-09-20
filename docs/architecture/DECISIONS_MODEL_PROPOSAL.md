@@ -218,6 +218,13 @@ Blast radius abbreviated as BR. Line references were read at `d624e5b8`. Items m
 | D4 | Calibration from `decision_traces`, `router_traces`, approve/deny events and `life.recall.feedback`; per-question thresholds; promotion via the existing autonomy postures (`ProposalOnly` → `ConfirmFirst` → `AutoWithAudit`, `ansible-mesh-core/src/autonomy.rs`). | field-evidence |
 | D5 (optional) | Make the decisions provider the first production producer of `Context1Advisory`. | test-green |
 
+### D2 shape (found while building D1)
+
+- **`decisions_response` has no consumer yet.** `EmitTask` is fire-and-forget, the `correlation_id` has no correlator on the receiving side, and philote maps an unrecognised `action` to `IngressAction::Unknown`, which nothing handles. D1's reply path is therefore inert until D3 writes a consumer. It is correct and tested on the sending side only.
+- **D2 is simplest in-process.** `heal-dispatcher` already holds its own `reqwest` client and calls Ollama directly; it is a 30 s poll loop with no inbox. It should call the decisions provider directly rather than through the `model.decisions` controller. It cannot depend on `model-router` (ONNX, MLX and friends), so the HTTP hop (`DecisionsProvider::evaluate`, currently in `model-router/src/providers/decisions.rs`) should move into a small shared crate that both use.
+- **How `heal-dispatcher` gets a key is a decision, not a detail.** (a) an environment variable on its unit, simplest and matching the `provider_keys` note that env keys are for ephemeral/CI use; (b) a vault role grant for `heal-dispatcher`, which widens who can read the OpenRouter key; (c) routing through `model.decisions` over IPC, which keeps the key in one place but needs an inbox and a correlator in `heal-dispatcher` plus the D3 consumer. Not chosen yet.
+- **Do not start D2 logging before real `choice` and `score` bodies are recorded** (D1 smoke). `legend_mismatch` and per-class error counts will show if the docs-derived fixtures were wrong, but shadow rows recorded before that fix would be misleading.
+
 ## Open questions
 
 1. **Access. Resolved 2026-09-19:** Jev is reachable through an ordinary OpenRouter key with no waitlist (see Verified access). D1's smoke is unblocked; the native TypeSafe waitlist is optional.

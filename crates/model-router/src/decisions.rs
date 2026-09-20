@@ -20,10 +20,13 @@ use std::time::{Duration, Instant};
 /// The dedicated reply action. Never `model_response`.
 pub const REPLY_ACTION: &str = "decisions_response";
 
-/// Whole-call budget when the task carries no `deadline_ms`.
-const DEFAULT_DEADLINE: Duration = Duration::from_millis(12_000);
+/// Whole-call budget when the task carries no `deadline_ms`. Deliberately tight:
+/// the provider advertises 70-500 ms, and a hot-path caller that forgets to set
+/// its own deadline must not inherit a multi-second wait on a user turn. Callers
+/// on the turn path should always pass `deadline_ms` explicitly.
+const DEFAULT_DEADLINE: Duration = Duration::from_millis(4_000);
 const MIN_DEADLINE: Duration = Duration::from_millis(250);
-const MAX_DEADLINE: Duration = Duration::from_secs(30);
+const MAX_DEADLINE: Duration = Duration::from_secs(15);
 /// Do not start an attempt with less than this left.
 const MIN_ATTEMPT: Duration = Duration::from_millis(250);
 
