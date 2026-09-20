@@ -292,7 +292,7 @@ pub struct DecisionQuestion {
 }
 
 /// State plus ordered typed questions for one call site.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DecisionsRequest {
     /// Call-site id (`heal.classify`). Keys shadow rows and traces. Required.
     pub site: String,

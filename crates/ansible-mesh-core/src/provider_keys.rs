@@ -73,7 +73,9 @@ pub const PROVIDER_KEY_SPECS: &[ProviderKeySpec] = &[
         route_key: Some("openrouter_route"),
         default_model: Some("openai/gpt-4.1-mini"),
         default_base_url: Some("https://openrouter.ai/api"),
-        allowed_roles: &["model", "model.openrouter"],
+        // `model.decisions` serves Jev through OpenRouter's alpha decisions
+        // endpoint with this same key. It only reads the key for that hop.
+        allowed_roles: &["model", "model.openrouter", "model.decisions"],
     },
     ProviderKeySpec {
         provider: "openai",
