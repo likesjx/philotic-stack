@@ -175,6 +175,7 @@ pub(crate) async fn activate_mesh_runtime(ctx: MeshRuntimeContext) -> Result<()>
         let cm_graph = ctx.graph_domain.clone();
         let cm_tx = ctx.dispatcher_tx.clone();
         let cm_node = ctx.caps.node_id.clone();
+        let cm_hotel = ctx.hotel_name.clone();
         let mut cm_shutdown = ctx.shutdown_tx.subscribe();
         tokio::spawn(async move {
             let mut delay = tokio::time::Duration::from_secs(45);
@@ -182,7 +183,7 @@ pub(crate) async fn activate_mesh_runtime(ctx: MeshRuntimeContext) -> Result<()>
                 tokio::select! {
                     _ = tokio::time::sleep(delay) => {
                         crate::service::command_manifest::rebroadcast_local_manifests(
-                            cm_graph.as_ref(), &cm_tx, &cm_node,
+                            cm_graph.as_ref(), &cm_tx, &cm_node, &cm_hotel,
                         ).await;
                         delay = tokio::time::Duration::from_secs(120);
                     }
@@ -389,6 +390,7 @@ pub(crate) async fn activate_mesh_runtime(ctx: MeshRuntimeContext) -> Result<()>
     {
         let dispatcher_inbound_tx = ctx.dispatcher_tx.clone();
         let inbound_graph = ctx.graph_domain.clone();
+        let inbound_hotel = ctx.hotel_name.clone();
         let inbound_registry = ctx.registry.clone();
         let inbound_inboxes = ctx.ipc_inboxes.clone();
         let inbound_parked = ctx.ipc_parked_inbound.clone();
@@ -592,6 +594,7 @@ pub(crate) async fn activate_mesh_runtime(ctx: MeshRuntimeContext) -> Result<()>
                                                         crate::service::command_manifest::handle_remote_manifest_sync(
                                                             inbound_graph.as_ref(),
                                                             &registry,
+                                                            &inbound_hotel,
                                                             &event.source_node_id,
                                                             data,
                                                         );
