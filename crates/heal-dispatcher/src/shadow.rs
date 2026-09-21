@@ -109,14 +109,16 @@ impl ShadowJudge {
             Ok(config) if config.api_key.is_some() => config,
             Ok(_) => {
                 warn!(
-                    "{ENV_FLAG} is set but no decisions key is configured \
-                     (`phil keys configure decisions`); shadow judge stays off"
+                    "{ENV_FLAG} is set but no OpenRouter key is configured \
+                     (`phil keys configure openrouter`); shadow judge stays off"
                 );
                 return None;
             }
             Err(e) => {
                 warn!(
-                    "{ENV_FLAG} is set but the decisions key could not be loaded: {e:#}; shadow judge stays off"
+                    "{ENV_FLAG} is set but the OpenRouter key could not be loaded: {e:#}. If it is \
+                     an access denial, run `aiua auth sync-roles --provider openrouter --db <context db>` \
+                     on this hotel; shadow judge stays off"
                 );
                 return None;
             }

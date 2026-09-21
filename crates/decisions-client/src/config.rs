@@ -1,14 +1,19 @@
-//! Loading the dedicated `decisions` key and its settings from the hotel.
+//! Loading the OpenRouter key and settings for decisions from the hotel.
 //!
-//! The key is its own vault entry (`decisions_api_key`), readable only by the
-//! roles on its `ProviderKeySpec` (`model.decisions` and `heal-dispatcher`), so
-//! the chat OpenRouter key's role list is never widened and the decisions key
-//! can be rotated, budgeted and revoked on its own.
+//! Decisions reuse the hotel's existing `openrouter` vault entry, at the
+//! operator's direction. Its `ProviderKeySpec` lists `model.decisions` and
+//! `heal-dispatcher` beside the chat roles. The trade-off: the chat key and the
+//! decisions calls share one spend, one rate limit and one revocation.
 //!
 //! Unlike `model-router`'s per-provider loader, an ACL denial here is an error,
 //! not a soft `None`: the caller is one of the intended roles, so a denial means
-//! the key was sealed without its role and needs `phil keys configure decisions`
-//! re-run. Callers treat any error as "no decisions available" and fall back.
+//! the entry was sealed before those roles were added. Fix it without re-entering
+//! the key: `aiua auth sync-roles --provider openrouter --db <context db>`.
+//! Callers treat any error as "no decisions available" and fall back.
+//!
+//! The MODEL is never read from `openrouter_default_model`: that is the chat model,
+//! and a decision sent to it would be nonsense. The model comes only from
+//! `PHILOTIC_DECISIONS_MODEL`; unset means the pinned `typesafe/jev-1.13`.
 
 use ansible_mesh_core::provider_keys::provider_key_spec;
 use anyhow::{Context, Result, bail};
@@ -16,7 +21,8 @@ use philotic_client::{IpcRequest, IpcResponse, PhiloticClient};
 use serde_json::Value;
 use std::fmt;
 
-const PROVIDER: &str = "decisions";
+/// The existing vault entry decisions read.
+const PROVIDER: &str = "openrouter";
 const ENV_BASE_URL: &str = "PHILOTIC_DECISIONS_BASE_URL";
 const ENV_MODEL: &str = "PHILOTIC_DECISIONS_MODEL";
 
@@ -41,7 +47,7 @@ impl fmt::Debug for DecisionsConfig {
 /// Load the decisions config: environment overrides first (ephemeral or CI use),
 /// then the hotel's vault entry and config keys.
 pub async fn load_decisions_config(ipc: &mut PhiloticClient) -> Result<DecisionsConfig> {
-    let spec = provider_key_spec(PROVIDER).context("decisions provider key spec missing")?;
+    let spec = provider_key_spec(PROVIDER).context("openrouter provider key spec missing")?;
 
     let api_key = if let Some(value) = env_nonempty(spec.env_api_key) {
         Some(value)
@@ -60,13 +66,8 @@ pub async fn load_decisions_config(ipc: &mut PhiloticClient) -> Result<Decisions
             None => None,
         },
     };
-    let model = match env_nonempty(ENV_MODEL) {
-        Some(value) => Some(value),
-        None => match spec.default_model_key {
-            Some(key) => fetch_config(ipc, key).await?,
-            None => None,
-        },
-    };
+    // Deliberately no config fallback: `openrouter_default_model` is the CHAT model.
+    let model = env_nonempty(ENV_MODEL);
 
     Ok(DecisionsConfig {
         api_key,
@@ -201,13 +202,27 @@ mod tests {
     }
 
     #[test]
-    fn the_dedicated_spec_is_scoped_to_exactly_its_two_roles() {
-        let spec = provider_key_spec("decisions").expect("spec exists");
-        assert_eq!(spec.vault_name, "decisions_api_key");
-        assert_eq!(spec.allowed_roles, &["model.decisions", "heal-dispatcher"]);
-        // It never widens the chat OpenRouter key.
-        let openrouter = provider_key_spec("openrouter").unwrap();
-        assert!(!openrouter.allowed_roles.contains(&"heal-dispatcher"));
-        assert!(!openrouter.allowed_roles.contains(&"model.decisions"));
+    fn decisions_read_the_existing_openrouter_entry_and_only_two_more_roles_can() {
+        let spec = provider_key_spec(PROVIDER).expect("spec exists");
+        assert_eq!(spec.vault_name, "openrouter_api_key");
+        assert_eq!(spec.api_key_ref_key, "openrouter_api_key_ref");
+        // The chat roles keep access, and exactly the two decisions roles are added.
+        assert_eq!(
+            spec.allowed_roles,
+            &[
+                "model",
+                "model.openrouter",
+                "model.decisions",
+                "heal-dispatcher"
+            ]
+        );
+        // There is no separate decisions entry any more.
+        assert!(provider_key_spec("decisions").is_none());
+        // No other provider's key gained these roles.
+        for other in ["anthropic", "gemini", "openai", "elevenlabs"] {
+            let roles = provider_key_spec(other).unwrap().allowed_roles;
+            assert!(!roles.contains(&"heal-dispatcher"), "{other}");
+            assert!(!roles.contains(&"model.decisions"), "{other}");
+        }
     }
 }

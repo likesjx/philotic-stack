@@ -1,10 +1,10 @@
 //! Controller guest for typed judgments (`decisions.evaluate`, role
 //! `model.decisions`). Serves TypeSafe's Jev over its native API when a native
 //! key is present in the environment (early access, ephemeral/CI use), and
-//! otherwise over OpenRouter's alpha decisions endpoint with the dedicated
-//! `decisions` vault key (`phil keys configure decisions`), which is readable only
-//! by this role and by `heal-dispatcher`. Not in any fallback tier: a decision is
-//! never a turn reply.
+//! otherwise over OpenRouter's alpha decisions endpoint with the hotel's existing
+//! `openrouter` vault key, which this role and `heal-dispatcher` are allowed to
+//! read (`aiua auth sync-roles --provider openrouter` adds them to an entry sealed
+//! earlier). Not in any fallback tier: a decision is never a turn reply.
 
 use anyhow::Result;
 use decisions_client::DecisionsClient;

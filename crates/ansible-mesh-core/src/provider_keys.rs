@@ -73,30 +73,18 @@ pub const PROVIDER_KEY_SPECS: &[ProviderKeySpec] = &[
         route_key: Some("openrouter_route"),
         default_model: Some("openai/gpt-4.1-mini"),
         default_base_url: Some("https://openrouter.ai/api"),
-        allowed_roles: &["model", "model.openrouter"],
-    },
-    // Typed decisions (TypeSafe Jev through OpenRouter's alpha decisions
-    // endpoint). Deliberately its OWN vault entry rather than a widening of the
-    // `openrouter` key above: the chat key's role list stays as it was, and the
-    // decisions key can be rotated, budgeted and revoked independently. Readable
-    // only by the controller and by the in-process shadow pilot.
-    ProviderKeySpec {
-        provider: "decisions",
-        display_name: "Decisions (Jev via OpenRouter)",
-        vault_name: "decisions_api_key",
-        api_key_ref_key: "decisions_api_key_ref",
-        legacy_api_key_key: "decisions_api_key",
-        env_api_key: "PHILOTIC_DECISIONS_API_KEY",
-        env_api_key_ref: "PHILOTIC_DECISIONS_API_KEY_REF",
-        default_model_key: Some("decisions_default_model"),
-        base_url_key: Some("decisions_base_url"),
-        embedding_model_key: None,
-        fallback_models_key: None,
-        route_key: None,
-        // Pinned, never the moving alias: calibration is per model version.
-        default_model: Some("typesafe/jev-1.13"),
-        default_base_url: Some("https://openrouter.ai/api"),
-        allowed_roles: &["model.decisions", "heal-dispatcher"],
+        // Typed decisions (TypeSafe Jev via OpenRouter's alpha decisions endpoint)
+        // reuse this same key, at the operator's direction: `model.decisions`
+        // serves the calls and `heal-dispatcher` runs the in-process shadow pilot.
+        // The trade-off is that the chat key and the decisions calls now share one
+        // spend, one rate limit and one revocation. An entry sealed before these
+        // roles were added needs `aiua auth sync-roles --provider openrouter`.
+        allowed_roles: &[
+            "model",
+            "model.openrouter",
+            "model.decisions",
+            "heal-dispatcher",
+        ],
     },
     ProviderKeySpec {
         provider: "openai",
