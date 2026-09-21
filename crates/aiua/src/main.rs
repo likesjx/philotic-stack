@@ -38,6 +38,7 @@ use tracing::{debug, error, info, warn};
 mod architect_charter;
 mod auth;
 mod autonomy_sweep;
+mod cortex_viewer;
 mod dream;
 mod graph;
 mod lyra_charter;

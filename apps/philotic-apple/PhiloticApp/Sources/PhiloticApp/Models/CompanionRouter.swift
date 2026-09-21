@@ -2,7 +2,7 @@ import Foundation
 import Observation
 
 enum CompanionTab: String, CaseIterable, Identifiable {
-    case today, agents, life
+    case today, agents, life, cortex
     var id: String { rawValue }
 }
 

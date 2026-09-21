@@ -3,6 +3,13 @@
   "scanner": "scripts/check-outbound-egress-inventory.py",
   "direct_callers": [
     {
+      "path": "crates/aiua/src/cortex_viewer.rs",
+      "traffic_classes": ["local-resource"],
+      "disposition": "named-exception",
+      "authority": "hotel-attested Cortex endpoint and operator administrator session",
+      "note": "Read-only Muninn administration adapter; server-held credentials, no caller-controlled upstream URL, redirects disabled and bounded responses."
+    },
+    {
       "path": "crates/egress-http-runner/src/lib.rs",
       "traffic_classes": ["general-api"],
       "disposition": "controlled-boundary",

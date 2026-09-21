@@ -3,7 +3,7 @@ title: Philotic Architecture Status
 doc_type: status
 domain: runtime-sessions
 status: active
-last_updated: 2026-09-17
+last_updated: 2026-09-19
 tags:
 - source-of-truth
 - current-state
@@ -105,8 +105,20 @@ through an enrolled-device gateway and an atomic graph before/after audit, plus
 a one-hop directed relationship diagram. PR #545 is deployed on vps-jane in
 develop `50e01247`; live enrolled-device save/read-back, stale-write rejection,
 and persisted audit checks passed on 2026-09-17. Updated Mac UI was inspected;
-native Save-button interaction and physical iPhone rollout remain unverified.
+native Mac Save was clicked and its receipt verified against the persisted audit
+on September 18. The companion iOS build was installed over Wi-Fi on iPhone 13
+Pro and launched after operator trust on September 19; phone Save remains untested.
 See [scope and verification](../../apps/philotic-apple/LIFEGRAPH.md).
+
+The [Cortex viewer](CORTEX_VIEWER_PROPOSAL.md) now has a native Mac/iPhone tab
+and a bounded hotel-owned read adapter in source. Fresh administrator sessions,
+an explicitly attested canonical endpoint and a pinned private client origin
+gate access; device enrollment alone is insufficient. PR #578 is merged and
+deployed: running server hashes match CI artifacts. Live inventory reported 13
+vaults and 1,464 memories, with page/detail reads and revoked-session rejection
+verified on September 21. The Mac connection screen runs with Desktop preserved.
+Authenticated native UI and phone installation remain pending; manual operator
+sign-in and loaded-row filtering are transitional, not global search.
 
 ### Runtime and authority
 
