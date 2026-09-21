@@ -4,7 +4,7 @@
 //!
 //! One HTTP hop around the pure adapters in `ansible_mesh_core::decisions`
 //! (all validation, ordering and response checking lives there), plus the
-//! vault-key loader for the dedicated `decisions` key. It lives in its own small
+//! vault-key loader for the hotel's OpenRouter key. It lives in its own small
 //! crate so both `model-router` (the `model.decisions` controller) and
 //! `heal-dispatcher` (the in-process shadow pilot) can use it without either
 //! depending on the other. Every failure is a typed `DecisionsError` meaning
@@ -280,7 +280,7 @@ mod tests {
     fn provider(base: &str) -> DecisionsClient {
         // The hotel's configured base ends in `/api`; the provider must not double it.
         DecisionsClient::openrouter(
-            reqwest::Client::new(),
+            reqwest::Client::default(),
             Some("test-key".into()),
             Some(format!("{base}/api")),
             None,
@@ -289,7 +289,7 @@ mod tests {
 
     #[test]
     fn openrouter_base_url_never_doubles_the_api_segment() {
-        let http = reqwest::Client::new();
+        let http = reqwest::Client::default();
         for base in [
             "https://openrouter.ai/api",
             "https://openrouter.ai/api/",
@@ -393,7 +393,8 @@ mod tests {
 
     #[tokio::test]
     async fn a_missing_key_fails_as_auth_without_touching_the_network() {
-        let p = DecisionsClient::openrouter(reqwest::Client::new(), Some("  ".into()), None, None);
+        let p =
+            DecisionsClient::openrouter(reqwest::Client::default(), Some("  ".into()), None, None);
         let err = p
             .evaluate(&request(), None, Duration::from_secs(5))
             .await
@@ -407,7 +408,7 @@ mod tests {
         bad.questions.clear();
         // Nothing listens on this port; an attempted connection would be `Unavailable`.
         let p = DecisionsClient::openrouter(
-            reqwest::Client::new(),
+            reqwest::Client::default(),
             Some("k".into()),
             Some("http://127.0.0.1:9".into()),
             None,
@@ -422,7 +423,7 @@ mod tests {
     #[tokio::test]
     async fn an_unreachable_provider_is_unavailable() {
         let p = DecisionsClient::openrouter(
-            reqwest::Client::new(),
+            reqwest::Client::default(),
             Some("k".into()),
             Some("http://127.0.0.1:9".into()),
             None,
@@ -441,7 +442,7 @@ mod tests {
         // Nothing listens here; a connection attempt would be `Unavailable`, and a
         // missing key would be `Auth`. Policy must win over both.
         let client = DecisionsClient::openrouter(
-            reqwest::Client::new(),
+            reqwest::Client::default(),
             None,
             Some("http://127.0.0.1:9".into()),
             None,
@@ -488,7 +489,7 @@ mod tests {
             "error": r#"[beacon][text.generate] openai: 400 {\"messages\":[{\"role\":\"user\",\"content\":\"my private note\"}]}"#,
         });
         let client = DecisionsClient::openrouter(
-            reqwest::Client::new(),
+            reqwest::Client::default(),
             Some("k".into()),
             Some("http://127.0.0.1:9".into()),
             None,
@@ -518,7 +519,7 @@ mod tests {
 
     #[tokio::test]
     async fn bytes_are_zero_when_the_request_never_leaves() {
-        let client = DecisionsClient::openrouter(reqwest::Client::new(), None, None, None);
+        let client = DecisionsClient::openrouter(reqwest::Client::default(), None, None, None);
         // No key: fails as Auth before anything is put on the wire.
         let audited = client
             .evaluate_audited(&request(), None, Duration::from_secs(1))
@@ -579,7 +580,8 @@ mod tests {
                 },
             ],
         };
-        let provider = DecisionsClient::openrouter(reqwest::Client::new(), Some(key), None, None);
+        let provider =
+            DecisionsClient::openrouter(reqwest::Client::default(), Some(key), None, None);
         let outcome = provider
             .evaluate(&request, None, Duration::from_secs(15))
             .await

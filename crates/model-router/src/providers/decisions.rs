@@ -107,7 +107,7 @@ mod tests {
     #[test]
     fn supports_only_decide_tasks_with_a_block() {
         let provider = DecisionsProvider::new(DecisionsClient::openrouter(
-            reqwest::Client::new(),
+            reqwest::Client::default(),
             None,
             None,
             None,
@@ -123,7 +123,7 @@ mod tests {
     async fn invoke_preserves_the_typed_error_class_through_anyhow() {
         // No key: fails as Auth before any network hop.
         let provider = DecisionsProvider::new(DecisionsClient::openrouter(
-            reqwest::Client::new(),
+            reqwest::Client::default(),
             None,
             None,
             None,

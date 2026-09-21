@@ -8,7 +8,7 @@
 //! failed, the error class. Errors and disagreement are separate columns.
 //!
 //! Default off. `PHILOTIC_SHADOW_DECISIONS` must be set, the dedicated
-//! `decisions` key must be readable by this role, and the site must be on the
+//! OpenRouter key must be readable by this role (`aiua auth sync-roles`), and the site must be on the
 //! client's allow-list (`heal.classify`, data class A). The client redacts every
 //! string in the state before it leaves (`decisions_client::gate`).
 
@@ -547,7 +547,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = Arc::new(SqliteDecisionTraceStorage::open(dir.path().join("d.db")).unwrap());
         let client = DecisionsClient::openrouter(
-            reqwest::Client::new(),
+            reqwest::Client::default(),
             Some("k".into()),
             Some("http://127.0.0.1:9".into()),
             None,
@@ -600,7 +600,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = Arc::new(SqliteDecisionTraceStorage::open(dir.path().join("d.db")).unwrap());
         let client = DecisionsClient::openrouter(
-            reqwest::Client::new(),
+            reqwest::Client::default(),
             Some("k".into()),
             Some("http://127.0.0.1:9".into()),
             None,
@@ -726,7 +726,7 @@ mod tests {
     fn judge(base: &str, dir: &std::path::Path) -> (ShadowJudge, Arc<SqliteDecisionTraceStorage>) {
         let store = Arc::new(SqliteDecisionTraceStorage::open(dir.join("d.db")).unwrap());
         let client = DecisionsClient::openrouter(
-            reqwest::Client::new(),
+            reqwest::Client::default(),
             Some("test-key".into()),
             Some(format!("{base}/api")),
             None,
