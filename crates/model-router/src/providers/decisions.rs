@@ -457,4 +457,94 @@ mod tests {
             .expect("typed error survives");
         assert_eq!(typed.class, DecisionsErrorClass::Auth);
     }
+
+    /// Live smoke through the real provider code. Sends ONE synthetic sentence
+    /// (no operator data) with a noul, a choice and a score question. Run with:
+    ///
+    /// `PHILOTIC_DECISIONS_LIVE_KEY=<dedicated key> cargo test -p model-router --lib live_smoke -- --ignored --nocapture`
+    ///
+    /// Use a dedicated key, never the hotel's vault key. The key is read from the
+    /// environment only and is never logged.
+    #[tokio::test]
+    #[ignore = "needs a real OpenRouter key in PHILOTIC_DECISIONS_LIVE_KEY"]
+    async fn live_smoke_openrouter_noul_choice_and_score() {
+        let key = std::env::var("PHILOTIC_DECISIONS_LIVE_KEY")
+            .ok()
+            .filter(|k| !k.trim().is_empty())
+            .expect("set PHILOTIC_DECISIONS_LIVE_KEY to run the live smoke");
+        let request = DecisionsRequest {
+            site: "smoke.live".into(),
+            state: json!(
+                "The payment service has returned connection refused for the last 40 minutes and three retries have failed."
+            ),
+            questions: vec![
+                DecisionQuestion {
+                    id: "needs_restart".into(),
+                    instructions: "Would restarting the service plausibly fix this?".into(),
+                    spec: QuestionSpec::Noul {
+                        when_true: Some("A restart would clear the condition".into()),
+                        when_false: Some("A restart would not help".into()),
+                    },
+                },
+                DecisionQuestion {
+                    id: "severity".into(),
+                    instructions: "How severe is this failure?".into(),
+                    spec: QuestionSpec::Choice {
+                        options: vec![
+                            DecisionOption::new("critical", "The service is down"),
+                            DecisionOption::new("high", "Degraded and needs attention soon"),
+                            DecisionOption::new("low", "Minor and can wait"),
+                        ],
+                    },
+                },
+                DecisionQuestion {
+                    id: "harm".into(),
+                    instructions: "How much user-visible harm has occurred?".into(),
+                    spec: QuestionSpec::Score {
+                        levels: vec![
+                            DecisionOption::new("none", "No visible harm"),
+                            DecisionOption::new("minor", "Minor degradation"),
+                            DecisionOption::new("major", "Major outage"),
+                        ],
+                    },
+                },
+            ],
+        };
+        let provider = DecisionsProvider::openrouter(reqwest::Client::new(), Some(key), None, None);
+        let outcome = provider
+            .evaluate(&request, None, Duration::from_secs(15))
+            .await
+            .expect("live call succeeds");
+
+        println!(
+            "model={} provider={} latency_ms={} usage={:?} request_id={:?}",
+            outcome.trace.model,
+            outcome.trace.provider,
+            outcome.trace.latency_ms,
+            outcome.trace.usage,
+            outcome.trace.request_id
+        );
+        assert!(
+            outcome.trace.model.starts_with("typesafe/jev-1.13"),
+            "the pinned model answered, not the alias: {}",
+            outcome.trace.model
+        );
+        assert!(
+            !outcome.trace.legend_mismatch,
+            "the score legend echoed our levels"
+        );
+        assert_eq!(outcome.result.answers.len(), 3);
+        assert!(matches!(
+            outcome.result.answers["needs_restart"],
+            DecisionAnswer::Noul { .. }
+        ));
+        assert!(matches!(
+            outcome.result.answers["severity"],
+            DecisionAnswer::Choice { .. }
+        ));
+        assert!(matches!(
+            outcome.result.answers["harm"],
+            DecisionAnswer::Score { .. }
+        ));
+    }
 }

@@ -947,7 +947,16 @@ mod tests {
     /// The generation id is redacted; the shape and numbers are as returned.
     const RECORDED_OPENROUTER_NOUL: &str =
         include_str!("../tests/fixtures/decisions/recorded_openrouter_noul.json");
-    /// Built from TypeSafe's HTTP API docs, NOT yet recorded from a live call.
+    /// Recorded live 2026-09-21 (OpenRouter, `typesafe/jev-1.13`): one `noul`,
+    /// one `choice`, one `score` in a single call, with the exact request that
+    /// produced it. Only the generation id is redacted.
+    const RECORDED_MIXED_REQUEST: &str =
+        include_str!("../tests/fixtures/decisions/recorded_openrouter_mixed_request.json");
+    const RECORDED_MIXED_RESPONSE: &str =
+        include_str!("../tests/fixtures/decisions/recorded_openrouter_mixed.json");
+    /// Built from TypeSafe's HTTP API docs for the NATIVE transport, NOT yet
+    /// recorded from a live call (no native key). The OpenRouter body above has
+    /// the same answer shapes.
     const DOCS_NATIVE_MIXED: &str =
         include_str!("../tests/fixtures/decisions/docs_native_mixed.json");
     /// The proposal's canonical request example.
@@ -1395,6 +1404,116 @@ mod tests {
     }
 
     // ── wire response ────────────────────────────────────────────────────────
+
+    /// The request behind the recorded mixed response, in canonical form.
+    fn recorded_mixed_request() -> DecisionsRequest {
+        DecisionsRequest {
+            site: "smoke.heal".into(),
+            state: json!(
+                "The payment service has returned connection refused for the last 40 minutes and three retries have failed."
+            ),
+            questions: vec![
+                DecisionQuestion {
+                    id: "needs_restart".into(),
+                    instructions: "Would restarting the service plausibly fix this?".into(),
+                    spec: QuestionSpec::Noul {
+                        when_true: Some("A restart would clear the condition".into()),
+                        when_false: Some("A restart would not help".into()),
+                    },
+                },
+                DecisionQuestion {
+                    id: "severity".into(),
+                    instructions: "How severe is this failure?".into(),
+                    spec: QuestionSpec::Choice {
+                        options: vec![
+                            DecisionOption::new("critical", "The service is down"),
+                            DecisionOption::new("high", "Degraded and needs attention soon"),
+                            DecisionOption::new("low", "Minor and can wait"),
+                        ],
+                    },
+                },
+                DecisionQuestion {
+                    id: "harm".into(),
+                    instructions: "How much user-visible harm has occurred?".into(),
+                    spec: QuestionSpec::Score {
+                        levels: vec![
+                            DecisionOption::new("none", "No visible harm"),
+                            DecisionOption::new("minor", "Minor degradation"),
+                            DecisionOption::new("major", "Major outage"),
+                        ],
+                    },
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn our_wire_request_matches_the_recorded_request_that_returned_200() {
+        let request = recorded_mixed_request();
+        let body = build_wire_request(
+            DecisionsTransport::OpenRouter,
+            &request,
+            "typesafe/jev-1.13",
+        )
+        .unwrap();
+        let sent: Value = serde_json::from_str(&body).unwrap();
+        let recorded: Value = serde_json::from_str(RECORDED_MIXED_REQUEST).unwrap();
+        assert_eq!(sent, recorded);
+        // Not just equal as JSON: the same key order, which is the whole reason
+        // the adapters serialize from typed structs.
+        let at = |needle: &str| body.find(needle).unwrap();
+        assert!(at("needs_restart") < at("\"severity\"") && at("\"severity\"") < at("\"harm\""));
+        assert!(at("\"critical\"") < at("\"high\"") && at("\"high\"") < at("\"low\""));
+    }
+
+    #[test]
+    fn recorded_mixed_response_parses_choice_score_and_noul_and_the_legend_matches() {
+        let outcome = parse_wire_response(&recorded_mixed_request(), RECORDED_MIXED_RESPONSE)
+            .expect("the real response parses");
+        // The docs-derived assumption held: the vendor echoes the level text we
+        // sent, so no legend mismatch.
+        assert!(!outcome.legend_mismatch);
+        assert_eq!(outcome.resolved_model, "typesafe/jev-1.13-20260917");
+        assert_eq!(outcome.usage.input_tokens, 436);
+        assert_eq!(outcome.usage.output_tokens, 69);
+        assert_eq!(outcome.usage.cost_usd, Some(0.000018312));
+
+        assert_eq!(
+            outcome.result.answers["needs_restart"],
+            DecisionAnswer::Noul { noul: 0.55 }
+        );
+        match &outcome.result.answers["severity"] {
+            DecisionAnswer::Choice {
+                choice,
+                probabilities,
+                confidence,
+            } => {
+                assert_eq!(choice, "critical");
+                assert_eq!(probabilities["critical"], 0.89);
+                assert_eq!(probabilities["high"], 0.11);
+                // Zero-probability options are returned, not omitted.
+                assert_eq!(probabilities["low"], 0.0);
+                assert_eq!(*confidence, 0.83);
+            }
+            other => panic!("severity should be a choice, got {other:?}"),
+        }
+        match &outcome.result.answers["harm"] {
+            DecisionAnswer::Score {
+                score,
+                probabilities,
+                ..
+            } => {
+                // The score is the probability-weighted level index.
+                assert_eq!(*score, 1.88);
+                let weighted = probabilities["minor"] + 2.0 * probabilities["major"];
+                assert!((weighted - *score).abs() < 1e-9, "{weighted} vs {score}");
+                assert_eq!(probabilities["none"], 0.01);
+                assert_eq!(probabilities["minor"], 0.1);
+                assert_eq!(probabilities["major"], 0.89);
+            }
+            other => panic!("harm should be a score, got {other:?}"),
+        }
+    }
 
     #[test]
     fn recorded_openrouter_noul_response_parses() {

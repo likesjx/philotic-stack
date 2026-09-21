@@ -79,7 +79,9 @@ Consequences:
 - Shadow sites should **pin** `typesafe/jev-1.13` so a moving alias cannot change decisions silently, and every trace records the **resolved** `model` from the response (`typesafe/jev-1.13-20260917`). Calibration is only meaningful per model version, exactly like `model_gen` on embeddings.
 - No waitlist is needed for an ordinary OpenRouter key. The native TypeSafe waitlist is now optional.
 
-Not yet tested: multi-question calls, `choice` and `score`, the 32 k state limit, error bodies for 422 / 429 / 529, and `noul` criteria with only one side present.
+A second probe on 2026-09-21 (dedicated key, one synthetic sentence) sent a `noul`, a `choice` (3 options) and a `score` (3 levels) in one call and returned HTTP 200 in 0.51 s, resolved to `typesafe/jev-1.13-20260917`. It confirmed, against a **recorded** body: `choice` returns the full distribution including zero-probability options; `score` returns `legend` echoing exactly the level strings we sent, `probabilities` keyed by level index, and `score` equal to the probability-weighted index (1.88 = 0·0.01 + 1·0.10 + 2·0.89); usage was 436 input and 69 output tokens with `cost` $0.000018312, input-priced. The same request through the real `DecisionsProvider` (an `#[ignore]`d live test) answered in 609 ms with no legend mismatch. Both bodies are checked in as fixtures.
+
+Not yet tested: the native transport (no key), the 32 k state limit, error bodies for 422 / 429 / 529, and `noul` criteria with only one side present.
 
 ## What the repo has today (verified by reading code unless marked)
 
@@ -207,11 +209,31 @@ Blast radius abbreviated as BR. Line references were read at `d624e5b8`. Items m
 6. **Distributions out, policy in code.** The envelope never carries a threshold or a verdict.
 7. **Privacy gate per site.** Every judged state leaves the mesh, and OpenRouter adds an intermediary. Operator message content and LifeGraph content are excluded from any site until retention terms are confirmed. Zero data retention is enterprise-only at TypeSafe.
 
+## Data policy (recommended 2026-09-21; the operator asked for a recommendation, so this is NOT yet confirmed)
+
+Every judged state leaves the mesh, and OpenRouter adds an intermediary. Zero data retention is enterprise-only at TypeSafe, and we have not verified OpenRouter's account-level logging and retention settings. So the default is narrow, and widening it is a visible diff.
+
+**Data classes**
+
+| Class | What | Policy |
+|---|---|---|
+| A | Machine-generated system telemetry: heal-queue failure text, error classes and codes, capability and tool names, counts, timings, status flags, and synthetic smoke strings | Allowed for shadow sites, after the redaction gate below |
+| B | Features derived from operator content (length, language, a detected label), never the content itself | Allowed only per site, after an explicit operator opt-in recorded in the site table |
+| C | Operator message text, LifeGraph / memory / Muninn content, session and turn text, anything from a persona's conversation, credentials, personal data, file contents | **Never**, until retention terms are confirmed in writing |
+
+**Mechanics**
+
+1. **Sites are allow-listed by id** in one const table in code, each with a declared `data_class`. An unknown site id is refused before any network hop. A site builds its `state` only from enumerated fields, so class C cannot arrive by accident through a "just send the whole row" call. Widening the policy means editing that table, which shows up in review.
+2. **A redaction gate runs on every string that leaves**, even class A. Heal text is machine-generated but not safe by construction: DEF-089 is a live leak of bot tokens inside reqwest error URLs, and log lines carry URLs, keys and addresses. The gate strips URLs with credentials or query tokens, bearer and `sk-`-style keys, bot-token shapes (`<digits>:<token>`), long hex or base64 runs, email addresses and absolute home paths, then truncates to a fixed tail (heal text only needs the end). It ships with a test corpus, including the DEF-089 shape.
+3. **Default off, with a kill switch.** `PHILOTIC_SHADOW_DECISIONS` is unset by default; a site table entry alone sends nothing.
+4. **Audit without content.** Each call's trace row records `site`, `data_class`, the byte count sent, the resolved model and the outcome. It never stores the text sent.
+5. **Provider.** OpenRouter is acceptable for class A only, with a dedicated key. Before enabling in production, check the OpenRouter account's data-logging and retention settings; the native TypeSafe API is preferable if early access is granted and its retention terms are acceptable.
+
 ## Slices
 
 | Slice | Content | Verification |
 |---|---|---|
-| D0 `decisions-envelope` | `ansible-mesh-core::decisions` types, validation, native and OpenRouter wire adapters as pure functions, unit-tested against fixtures. No network. Ordered-levels test. **Done 2026-09-19** (26 tests). Only the OpenRouter `noul` fixture is recorded live; `choice` and `score` fixtures come from the vendor docs until D1's smoke records real bodies, and the `score` legend is mapped by its text, falling back to position, with a `legend_mismatch` flag on the trace instead of an error. | test-green |
+| D0 `decisions-envelope` | `ansible-mesh-core::decisions` types, validation, native and OpenRouter wire adapters as pure functions, unit-tested against fixtures. No network. Ordered-levels test. **Done 2026-09-19** (26 tests). The OpenRouter `noul` and a mixed `noul` + `choice` + `score` response are recorded live (2026-09-19 and 2026-09-21); only the native-transport fixture still comes from the vendor docs. The `score` legend is mapped by its text, falling back to position, with a `legend_mismatch` flag on the trace instead of an error. | test-green |
 | D1 | model-router: `TaskKind::Decide`, `RequestClass::Judgment`, `ProviderOutput::Judgment`, `AuxTaskKind` arm, aux-isolation entry, `model_oracle` request-class mapping, a provider with a native / OpenRouter transport switch, `model-controller-decisions` bin (role `model.decisions`), `decisions_response` reply action, `ResponseTrace` growth. **Code done 2026-09-19, test-green** (23 new tests; the full `model-router` and `ansible-mesh-core` lib suites pass). `model.decisions` is added to the OpenRouter key's `allowed_roles`; a sealed key bakes roles in at seal time, so `phil keys configure openrouter` must be re-run for it to take effect. **Not done:** seeding the guest in the hotel (`aiua/src/main.rs`, a hot file and a deployment decision) and the live smoke with a dedicated key. | test-green, then smoke-green once a key exists |
 | D2 `decisions-shadow-heal` | `heal-dispatcher` calls the provider beside `gemma3:4b`, log-only, writes a `decision_traces` row per site (agreement, probabilities, latency, cost, resolved model, `legend_mismatch`, and the **error class**). Error classes are counted separately from disagreement: a parse failure and a disagreeing judge look identical in a log-only run, and calibrating on the first as if it were the second would be calibrating on nothing. Flag `PHILOTIC_SHADOW_DECISIONS`, default off. | watched-live-green on one hotel |
 | D3 | In-process client with local fallback; shadow sites #3 (`memory.recall` relevance) and #1 (say-do gate), both non-blocking. | smoke-green, then watched-live-green |
@@ -231,7 +253,7 @@ Blast radius abbreviated as BR. Line references were read at `d624e5b8`. Items m
 2. **Capability name.** `decisions.evaluate` with model type `decisions` is the proposal; the operator may prefer another.
 3. **Reply path.** A dedicated `decisions_response` action is recommended; confirm by test that reusing `model_response` really reaches `fail_active_turn`.
 4. **Metering.** Grow `ResponseTrace` (recommended) or keep cost in a side table.
-5. **Data policy.** Which sites are allowed to send which state, and whether OpenRouter is acceptable as an intermediary for anything beyond system telemetry.
+5. **Data policy.** Recommended in the "Data policy" section above (class A only for now, redaction gate, allow-listed sites). **Awaiting the operator's confirmation or amendment.**
 6. **Local fill.** Whether an ONNX or local classifier should implement the same envelope so a site never depends on a hosted provider (`LOCAL_ONNX_INFERENCE` names the sidecar as the fast path for latency-sensitive consumers).
 7. **Prior claims to re-verify.** The 67.8 % "agreement with references" figure attributed to TypeSafe in a third-party issue, and the 193.6× / 444.6× vendor benchmark, are unverified.
 
