@@ -1,16 +1,22 @@
-//! The data-policy gate (see "Data policy" in
+//! The data-policy gate (ee "Data policy" in
 //! `docs/architecture/DECISIONS_MODEL_PROPOSAL.md`).
 //!
-//! Every judged state leaves the mesh, so two rules hold at the single egress
+//! Every judged state leaves the mesh, so three rules hold at the single egress
 //! point (`DecisionsClient::evaluate`), for every caller:
 //!
 //! 1. **Sites are allow-listed by id** in [`SITES`], each with a declared data
 //!    class. An unknown site, or one whose class the policy does not allow, is
 //!    refused before any network hop. Widening the policy means editing that
 //!    table, which shows up in review.
-//! 2. **Every string in `state` is redacted** and truncated to a fixed tail,
+//! 2. **State that looks like a conversation payload is refused** ([`screen`]).
+//!    The allow-list keys on the site id, not on what the state contains, and a
+//!    provider error body can echo the request that failed. This is a fail-closed
+//!    heuristic, not a guarantee.
+//! 3. **Every string in `state` is redacted** and truncated to a fixed tail,
 //!    even for class A. Machine-generated text is not safe by construction:
 //!    DEF-089 is a live leak of bot tokens inside reqwest error URLs.
+//!
+//! A refusal is `DecisionsErrorClass::PolicyRefused`: nothing left the machine.
 //!
 //! Redaction is best effort and pattern based. It is a second line of defence
 //! behind rule 1 (only telemetry sites are allowed), not a licence to send
@@ -77,7 +83,7 @@ pub const MAX_TEXT_CHARS: usize = 1_500;
 pub fn site_spec(site: &str) -> Result<&'static SiteSpec, DecisionsError> {
     let spec = SITES.iter().find(|s| s.id == site).ok_or_else(|| {
         DecisionsError::new(
-            DecisionsErrorClass::InvalidRequest,
+            DecisionsErrorClass::PolicyRefused,
             format!("site `{site}` is not on the decisions allow-list"),
         )
     })?;
@@ -90,7 +96,7 @@ pub fn site_spec(site: &str) -> Result<&'static SiteSpec, DecisionsError> {
         Ok(spec)
     } else {
         Err(DecisionsError::new(
-            DecisionsErrorClass::InvalidRequest,
+            DecisionsErrorClass::PolicyRefused,
             format!(
                 "site `{site}` is data class {} and the data policy does not allow it",
                 spec.class.as_str()
@@ -99,16 +105,60 @@ pub fn site_spec(site: &str) -> Result<&'static SiteSpec, DecisionsError> {
     }
 }
 
+/// Substrings that mark text as a conversation or request payload rather than
+/// machine telemetry. Provider error bodies can echo part of the request that
+/// failed, and `heal-dispatcher` sees those (only `model-router`'s
+/// `emit_failure` pushes untriaged heal entries, with the provider's error text).
+/// Redaction cannot recognise operator prose, so text carrying these markers is
+/// refused outright: fail closed, the incumbent decision stands.
+const PAYLOAD_ECHO_MARKERS: &[&str] = &[
+    "\"role\"",
+    "\"messages\"",
+    "\"content\"",
+    "\"parts\"",
+    "\"prompt\"",
+    "\"system_instruction\"",
+];
+
+/// Refuse a state that looks like a conversation payload (data class C risk).
+/// This is a heuristic: it lowers the chance of operator content leaving through
+/// a class-A site, it does not remove it. See the residual-risk note in the
+/// proposal's data policy.
+pub fn screen(request: &DecisionsRequest) -> Result<(), DecisionsError> {
+    match first_payload_marker(&request.state) {
+        None => Ok(()),
+        Some(marker) => Err(DecisionsError::new(
+            DecisionsErrorClass::PolicyRefused,
+            format!(
+                "state for site `{}` resembles a conversation payload (`{marker}`) and was not sent",
+                request.site
+            ),
+        )),
+    }
+}
+
+fn first_payload_marker(value: &Value) -> Option<&'static str> {
+    match value {
+        Value::String(text) => {
+            // A payload quoted inside a log line arrives JSON-escaped (`\"role\"`),
+            // so compare with the escapes removed.
+            let flat = text.replace('\\', "").to_ascii_lowercase();
+            PAYLOAD_ECHO_MARKERS
+                .iter()
+                .find(|marker| flat.contains(*marker))
+                .copied()
+        }
+        Value::Array(items) => items.iter().find_map(first_payload_marker),
+        Value::Object(map) => map.values().find_map(first_payload_marker),
+        _ => None,
+    }
+}
+
 /// A copy of `request` with every string in `state` redacted and truncated.
 pub fn redacted(request: &DecisionsRequest) -> DecisionsRequest {
     let mut out = request.clone();
     out.state = redact_value(&request.state);
     out
-}
-
-/// Bytes the request sends (state plus questions), for the content-free audit row.
-pub fn egress_bytes(request: &DecisionsRequest) -> usize {
-    serde_json::to_string(request).map_or(0, |s| s.len())
 }
 
 fn redact_value(value: &Value) -> Value {
@@ -178,7 +228,9 @@ pub fn redact(text: &str) -> String {
     tail(&text, MAX_TEXT_CHARS)
 }
 
-fn tail(text: &str, max_chars: usize) -> String {
+/// The last `max_chars` characters of `text`, prefixed with `…` if it was cut.
+/// Char-boundary safe.
+pub fn tail(text: &str, max_chars: usize) -> String {
     let count = text.chars().count();
     if count <= max_chars {
         return text.to_string();
@@ -202,7 +254,7 @@ mod tests {
         assert!(site_spec("smoke.live").is_ok());
         assert_eq!(
             site_spec("memory.recall").unwrap_err().class,
-            DecisionsErrorClass::InvalidRequest,
+            DecisionsErrorClass::PolicyRefused,
             "an unknown site is refused"
         );
         assert!(site_spec("").is_err());
@@ -294,6 +346,42 @@ mod tests {
             assert!(!out.contains(leaked), "leaked {leaked}: {out}");
         }
         assert!(out.contains("/<home>/code/x"), "{out}");
+    }
+
+    fn heal_state(error: &str) -> DecisionsRequest {
+        DecisionsRequest {
+            site: "heal.classify".into(),
+            state: json!({ "guest": "beacon", "error": error }),
+            questions: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn the_screen_refuses_conversation_payloads_even_when_json_escaped() {
+        for echoed in [
+            r#"400 {"messages":[{"role":"user","content":"hello"}]}"#,
+            r#"openai: 400 {\"messages\":[{\"role\":\"user\"}]}"#,
+            r#"gemini: invalid payload {"contents":[{"parts":[{"text":"x"}]}]}"#,
+            r#"bad request {"Prompt": "summarise my notes"}"#,
+            r#"anthropic {"system_instruction":"be terse"}"#,
+        ] {
+            let err = screen(&heal_state(echoed)).expect_err(echoed);
+            assert_eq!(err.class, DecisionsErrorClass::PolicyRefused, "{echoed}");
+            // The refusal names the marker, never the content.
+            assert!(!err.message.contains("hello") && !err.message.contains("summarise"));
+        }
+    }
+
+    #[test]
+    fn the_screen_lets_ordinary_telemetry_through() {
+        for line in [
+            "connection refused (os error 61) after 3 retries",
+            "[beacon][text.generate] openai: HTTP 429 rate limit exceeded",
+            "thread 'main' panicked at src/main.rs:42: index out of bounds",
+            "Provider invocation failed: request timed out after 8s",
+        ] {
+            assert!(screen(&heal_state(line)).is_ok(), "{line}");
+        }
     }
 
     #[test]

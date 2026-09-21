@@ -298,6 +298,12 @@ impl OllamaBreaker {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // `heal-dispatcher --decision-summary`: print what the shadow judge has
+    // recorded, then exit. Read-only; it never starts the daemon.
+    if std::env::args().nth(1).as_deref() == Some("--decision-summary") {
+        return shadow::print_summary();
+    }
+
     tracing_subscriber::fmt::init();
     info!("heal-dispatcher starting");
 

@@ -249,21 +249,36 @@ pub struct DecisionSummary {
     pub ok: u64,
     /// Calls that failed, by error class. Never mixed into agreement.
     pub errors_by_class: BTreeMap<String, u64>,
+    /// Calls the data policy declined to send (`outcome = skipped`), by reason.
+    /// Nothing left the machine. Neither an error nor a disagreement.
+    pub skipped_by_reason: BTreeMap<String, u64>,
     /// `ok` calls whose score legend did not echo the levels sent.
     pub legend_mismatches: u64,
     /// Per question, over `ok` calls where the comparison was defined:
     /// `(agreed, compared)`.
     pub agreement: BTreeMap<String, (u64, u64)>,
     pub total_cost_usd: f64,
+    /// Bytes that actually left the machine, summed over all rows.
+    pub total_bytes_sent: u64,
 }
 
-/// Summarize records. Error rows contribute only to `errors_by_class`, so a
-/// provider outage can never read as the judge disagreeing.
+/// Summarize records. Error rows contribute only to `errors_by_class` and skipped
+/// rows only to `skipped_by_reason`, so neither a provider outage nor a policy
+/// refusal can ever read as the judge disagreeing.
 pub fn summarize(records: &[DecisionTraceRecord]) -> DecisionSummary {
     let mut summary = DecisionSummary::default();
     for record in records {
         summary.total += 1;
         summary.total_cost_usd += record.cost_usd.unwrap_or(0.0);
+        summary.total_bytes_sent += record.bytes_sent;
+        if record.outcome == "skipped" {
+            let reason = record
+                .error_class
+                .clone()
+                .unwrap_or_else(|| "unknown".into());
+            *summary.skipped_by_reason.entry(reason).or_default() += 1;
+            continue;
+        }
         if record.outcome != "ok" {
             let class = record
                 .error_class
@@ -409,6 +424,31 @@ mod tests {
         assert_eq!(summary.agreement["severity"], (2, 3));
         // `needs_restart`: d was not comparable, so only a and e count.
         assert_eq!(summary.agreement["needs_restart"], (0, 2));
+    }
+
+    #[test]
+    fn policy_refusals_are_skipped_rows_not_errors_and_not_disagreement() {
+        let refused = |id: &str| DecisionTraceRecord {
+            outcome: "skipped".into(),
+            error_class: Some("policy_refused".into()),
+            bytes_sent: 0,
+            ..error(id, 9, "policy_refused")
+        };
+        let summary = summarize(&[
+            record("a", 1, "ok"),
+            refused("r1"),
+            refused("r2"),
+            error("b", 2, "timeout"),
+        ]);
+        assert_eq!(summary.total, 4);
+        assert_eq!(summary.skipped_by_reason["policy_refused"], 2);
+        assert_eq!(summary.errors_by_class.len(), 1);
+        assert_eq!(summary.errors_by_class["timeout"], 1);
+        assert!(!summary.errors_by_class.contains_key("policy_refused"));
+        // Only the one ok row was compared.
+        assert_eq!(summary.agreement["severity"], (1, 1));
+        // Refusals sent nothing: only the ok and timeout rows carry bytes (512 each).
+        assert_eq!(summary.total_bytes_sent, 512 + 512);
     }
 
     #[test]

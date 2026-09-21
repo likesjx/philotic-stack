@@ -26,6 +26,14 @@ const NATIVE_DEFAULT_MODEL: &str = "jev-latest";
 /// Decisions are small and off the model ladder: single-digit seconds per attempt.
 pub const DEFAULT_ATTEMPT_SECS: u64 = 8;
 
+/// An outcome plus the bytes that actually left the machine.
+#[derive(Debug)]
+pub struct Audited {
+    pub result: Result<DecisionsOutcome, DecisionsError>,
+    /// Length of the request body sent; zero if nothing was sent.
+    pub bytes_sent: u64,
+}
+
 pub struct DecisionsClient {
     http: reqwest::Client,
     transport: DecisionsTransport,
@@ -98,10 +106,37 @@ impl DecisionsClient {
         model: Option<&str>,
         timeout: Duration,
     ) -> Result<DecisionsOutcome, DecisionsError> {
+        self.evaluate_audited(request, model, timeout).await.result
+    }
+
+    /// Like [`evaluate`](Self::evaluate), but also reports how many bytes were
+    /// actually put on the wire: the length of the request body that was sent, not
+    /// a re-derivation. It is zero whenever nothing left the machine (a policy
+    /// refusal, a missing key, a request that failed validation).
+    pub async fn evaluate_audited(
+        &self,
+        request: &DecisionsRequest,
+        model: Option<&str>,
+        timeout: Duration,
+    ) -> Audited {
+        let mut bytes_sent = 0;
+        let result = self.send(request, model, timeout, &mut bytes_sent).await;
+        Audited { result, bytes_sent }
+    }
+
+    async fn send(
+        &self,
+        request: &DecisionsRequest,
+        model: Option<&str>,
+        timeout: Duration,
+        bytes_sent: &mut u64,
+    ) -> Result<DecisionsOutcome, DecisionsError> {
         // The data policy holds at this single egress point, for every caller:
-        // an unknown or disallowed site is refused before any network hop, and
-        // every string in `state` is redacted and truncated before it leaves.
+        // an unknown or disallowed site, or state that looks like a conversation
+        // payload, is refused before any network hop, and every string in `state`
+        // is redacted and truncated before it leaves.
         gate::site_spec(&request.site)?;
+        gate::screen(request)?;
         let request = &gate::redacted(request);
         let Some(key) = self.api_key.as_deref() else {
             return Err(DecisionsError::new(
@@ -118,6 +153,8 @@ impl DecisionsClient {
             model.unwrap_or(self.default_model.as_str()),
         )?;
 
+        // From here the body leaves the machine.
+        *bytes_sent = body.len() as u64;
         let started = Instant::now();
         let response = self
             .http
@@ -413,7 +450,7 @@ mod tests {
             .evaluate(&unlisted, None, Duration::from_secs(1))
             .await
             .expect_err("unlisted site");
-        assert_eq!(err.class, DecisionsErrorClass::InvalidRequest);
+        assert_eq!(err.class, DecisionsErrorClass::PolicyRefused);
         assert!(err.message.contains("allow-list"), "{}", err.message);
     }
 
@@ -438,6 +475,56 @@ mod tests {
         // What classification needs still arrives.
         assert!(raw.contains("<url:api.telegram.org>"), "{raw}");
         assert!(raw.contains("beacon"));
+    }
+
+    #[tokio::test]
+    async fn state_that_looks_like_a_conversation_payload_is_refused_and_nothing_is_sent() {
+        // A provider error that echoes the failed request, quoted inside a log
+        // line, so the JSON arrives escaped.
+        let mut echo = request();
+        echo.site = "heal.classify".into();
+        echo.state = json!({
+            "guest": "beacon",
+            "error": r#"[beacon][text.generate] openai: 400 {\"messages\":[{\"role\":\"user\",\"content\":\"my private note\"}]}"#,
+        });
+        let client = DecisionsClient::openrouter(
+            reqwest::Client::new(),
+            Some("k".into()),
+            Some("http://127.0.0.1:9".into()),
+            None,
+        );
+        let audited = client
+            .evaluate_audited(&echo, None, Duration::from_secs(1))
+            .await;
+        let err = audited.result.expect_err("refused");
+        assert_eq!(err.class, DecisionsErrorClass::PolicyRefused, "{err}");
+        assert_eq!(audited.bytes_sent, 0, "nothing left the machine");
+        assert!(!err.message.contains("my private note"), "{}", err.message);
+    }
+
+    #[tokio::test]
+    async fn bytes_sent_is_the_length_of_the_body_that_actually_went_out() {
+        let (base, seen) = serve_once("200 OK", OK_BODY).await;
+        let audited = provider(&base)
+            .evaluate_audited(&request(), None, Duration::from_secs(5))
+            .await;
+        assert!(audited.result.is_ok());
+
+        let raw = seen.await.unwrap();
+        let (_, body) = raw.split_once("\r\n\r\n").expect("http request");
+        assert_eq!(audited.bytes_sent, body.len() as u64);
+        assert!(audited.bytes_sent > 0);
+    }
+
+    #[tokio::test]
+    async fn bytes_are_zero_when_the_request_never_leaves() {
+        let client = DecisionsClient::openrouter(reqwest::Client::new(), None, None, None);
+        // No key: fails as Auth before anything is put on the wire.
+        let audited = client
+            .evaluate_audited(&request(), None, Duration::from_secs(1))
+            .await;
+        assert_eq!(audited.result.unwrap_err().class, DecisionsErrorClass::Auth);
+        assert_eq!(audited.bytes_sent, 0);
     }
 
     /// Live smoke through the real client code. Sends ONE synthetic sentence

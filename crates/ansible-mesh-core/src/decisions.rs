@@ -154,6 +154,10 @@ pub enum DecisionsErrorClass {
     /// The provider answered but the answer is unusable (malformed, unknown
     /// choice, missing or extra answers, out-of-range probability).
     InvalidResponse,
+    /// The data policy refused to send this (an unlisted site, a disallowed data
+    /// class, or state that looks like conversation content). Nothing left the
+    /// machine. Not an outage and not a bad request, so it is counted apart.
+    PolicyRefused,
 }
 
 impl DecisionsErrorClass {
@@ -165,6 +169,7 @@ impl DecisionsErrorClass {
             Self::InvalidRequest => "invalid_request",
             Self::Auth => "auth",
             Self::InvalidResponse => "invalid_response",
+            Self::PolicyRefused => "policy_refused",
         }
     }
 
@@ -1842,6 +1847,12 @@ mod tests {
         assert!(!DecisionsErrorClass::Auth.retryable());
         assert!(!DecisionsErrorClass::InvalidRequest.retryable());
         assert!(!DecisionsErrorClass::InvalidResponse.retryable());
+        // A policy refusal is a decision, not a fault: retrying cannot change it.
+        assert!(!DecisionsErrorClass::PolicyRefused.retryable());
+        assert_eq!(
+            DecisionsErrorClass::PolicyRefused.as_str(),
+            "policy_refused"
+        );
     }
 
     #[test]
