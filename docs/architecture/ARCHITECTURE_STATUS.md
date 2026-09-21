@@ -113,9 +113,12 @@ See [scope and verification](../../apps/philotic-apple/LIFEGRAPH.md).
 The [Cortex viewer](CORTEX_VIEWER_PROPOSAL.md) now has a native Mac/iPhone tab
 and a bounded hotel-owned read adapter in source. Fresh administrator sessions,
 an explicitly attested canonical endpoint and a pinned private client origin
-gate access; device enrollment alone is insufficient. Targeted tests pass and
-the Mac builds. Deployment, live inventory and phone viewer validation remain
-pending; manual operator sign-in and loaded-row filtering are transitional.
+gate access; device enrollment alone is insufficient. PR #578 is merged and
+deployed: running server hashes match CI artifacts. Live inventory reported 13
+vaults and 1,464 memories, with page/detail reads and revoked-session rejection
+verified on September 21. The Mac connection screen runs with Desktop preserved.
+Authenticated native UI and phone installation remain pending; manual operator
+sign-in and loaded-row filtering are transitional, not global search.
 
 ### Runtime and authority
 
