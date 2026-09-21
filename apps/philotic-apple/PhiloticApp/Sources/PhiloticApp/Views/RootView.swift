@@ -31,6 +31,8 @@ struct RootView: View {
                 LifeView(session: session).toolbar { settingsButton }
             }
             .tabItem { Label("Life", systemImage: "brain") }.tag(CompanionTab.life)
+            NavigationStack { CortexView() }
+            .tabItem { Label("Cortex", systemImage: "brain.head.profile") }.tag(CompanionTab.cortex)
         }
             #if os(macOS)
             connectionStatus

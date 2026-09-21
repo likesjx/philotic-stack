@@ -22,6 +22,18 @@
 
 ## Current Work Item Split
 
+### Cortex viewer
+
+Branch: `codex/cortex-viewer`; seam: `muninn-admin-observability-plane`.
+Spec: [Cortex viewer](architecture/CORTEX_VIEWER_PROPOSAL.md).
+
+- [x] Define and test the read-only Swift inventory/detail contract, including partial coverage and vault-qualified identities (6 tests).
+- [x] Implement bounded operator-authorized Cortex inventory, pagination and detail reads; device enrollment grants no all-vault authority.
+- [x] Add shared native viewer and pinned private client; nine Swift tests, two adapter tests, gateway authorization regression and Mac build pass.
+- [ ] Integrate current develop without rolling back newer runtime fixes, deploy the backend and attest the inspected canonical endpoint.
+- [ ] Verify live inventory, partial outages and pagination; install the viewer while preserving the companion's notch/Desktop work.
+- [ ] Follow up with native operator sign-in, durable access auditing and global search; current filtering covers loaded rows only.
+
 ### Native LifeGraph editor
 
 Branch: `codex/lifegraph-editor`; seam: `lifegraph-lens-ui`.
@@ -33,7 +45,7 @@ Spec: [LifeGraph editor and relationships](../apps/philotic-apple/LIFEGRAPH.md).
 - [x] Prove real Cypher saves, stale-write rejection, and audit persistence against isolated Memgraph.
 - [x] PR #545 merged; both server boundaries deployed in vps-jane `50e01247`. Running binaries verified; live API save/read-back, stale-write rejection, and persisted audit passed using the Mac app's enrolled credential and a disposable node (cleaned up).
 - [x] Integrate and launch the Mac companion preserving notch/Desktop work; 57 app tests pass; relationship view and editor opening inspected.
-- [ ] Validate native Save-button interaction and install the updated physical iPhone app; API smoke is not physical-device proof.
+- [x] Native Mac Save clicked and audited on 2026-09-18; disposable node and test audits removed. Updated companion iOS build installed over Wi-Fi on iPhone 13 Pro on 2026-09-19; developer trusted by operator and process launch confirmed. Phone Save interaction remains untested.
 - [ ] Follow-ups: ontology-driven typed property editing, audit-history/undo, embedding refresh, graph-wide browsing, and granular device edit grants.
 
 
