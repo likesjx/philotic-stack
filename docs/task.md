@@ -30,8 +30,10 @@ Spec: [Cortex viewer](architecture/CORTEX_VIEWER_PROPOSAL.md).
 - [x] Define and test the read-only Swift inventory/detail contract, including partial coverage and vault-qualified identities (6 tests).
 - [x] Implement bounded operator-authorized Cortex inventory, pagination and detail reads; device enrollment grants no all-vault authority.
 - [x] Add shared native viewer and pinned private client; nine Swift tests, two adapter tests, gateway authorization regression and Mac build pass.
-- [ ] Integrate current develop without rolling back newer runtime fixes, deploy the backend and attest the inspected canonical endpoint.
-- [ ] Verify live inventory, partial outages and pagination; install the viewer while preserving the companion's notch/Desktop work.
+- [x] Integrate current develop, merge PR #578, deploy both backend binaries with running-hash proof, and attest the inspected primary Cortex endpoint.
+- [x] Live backend inventory (13 vaults / 1,464 memories), page/detail and second-page reads; temporary admin session revoked and token replay rejected (September 21).
+- [x] Build and launch Mac viewer with existing notch/Desktop work preserved; observe Cortex connection screen.
+- [ ] Verify authenticated native UI, partial outages and exhaustive pagination. Signed iPhone build passes; installation awaits phone reconnection after a connection reset.
 - [ ] Follow up with native operator sign-in, durable access auditing and global search; current filtering covers loaded rows only.
 
 ### Native LifeGraph editor

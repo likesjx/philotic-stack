@@ -3,7 +3,7 @@ title: Cortex Viewer for the Apple Apps
 doc_type: proposal
 domain: memory-context
 status: accepted-current-slice
-last_updated: 2026-09-20
+last_updated: 2026-09-21
 tags: [cortex, muninn, apple, observability, read-only]
 related_docs:
   - MUNINN_MEMORY_CORE_PROPOSAL.md
@@ -39,8 +39,9 @@ repair are out of scope for the first viewer.
 
 ## Disposition
 
-Accepted for the native read-only viewer. The adapter and shared UI are now
-implemented in source; deployment and watched-live inventory remain pending.
+Accepted for the native read-only viewer. The adapter is deployed and live
+reads are verified. The Mac connection screen is running; authenticated native
+UI and physical iPhone viewer validation remain pending.
 
 ## Current Slice
 
@@ -98,9 +99,24 @@ native operator sign-in remains deferred. Public desktop routing is unchanged.
 
 ## Verification
 
-Nine Swift contract/client tests, two hotel adapter unit tests and the gateway
-authorization regression pass. The latter rejects anonymous, device-only,
-non-admin and revoked sessions. The Mac app compiled successfully. These are
-test/build evidence only: installed UI, live inventory, partial-outage behavior,
-pagination coverage and the new viewer's physical iPhone deployment remain unproven.
+PR #578 merged as `9ef26207`; Linux build `35539749776` at `6ba0b372` was
+installed on vps-jane. Both running executable hashes match the CI artifacts.
+Nine Swift tests, two hotel adapter tests and all 205 web tests pass. Mac and
+signed iPhone builds pass; the installed Mac Cortex connection screen was
+observed with the existing Desktop tab preserved.
+
+On September 21, following explicit operator approval, the live probe verified
+the upstream primary/leader and attested its existing endpoint through hotel
+IPC. The deployed endpoint returned **13 vaults, zero unavailable, 1,464
+memories**. Inventory, first page, full detail and a second page succeeded;
+the two pages had no duplicate identities. Anonymous access returned 401.
+The temporary bootstrap-issued admin session was logged out through the normal
+route; replaying its token returned 401. No credential was printed or saved
+locally. This is watched-live evidence for the backend, not exhaustive inventory
+or replica-completeness proof.
+
+Authenticated native UI, partial-outage behavior, full pagination coverage and
+the new viewer's physical iPhone deployment remain unproven. Installation hit a
+connection reset; the phone subsequently reported unavailable. Native sign-in
+still requires an existing operator session entered manually.
 See [current status](ARCHITECTURE_STATUS.md) and [execution work](../task.md).
