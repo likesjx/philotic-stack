@@ -84,7 +84,7 @@ mod tests {
 
     fn task() -> ControllerTask {
         let request = DecisionsRequest {
-            site: "smoke.urgency".into(),
+            site: "smoke.live".into(),
             state: json!("Help! My payouts have been failing for 3 days."),
             questions: vec![DecisionQuestion {
                 id: "kind".into(),

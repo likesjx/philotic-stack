@@ -8,6 +8,7 @@ description = "HTTP hop and vault-key loading for typed decisions (Jev via OpenR
 ansible-mesh-core = { path = "../ansible-mesh-core" }
 philotic-client = { path = "../philotic-client" }
 anyhow = "1.0"
+regex = "1"
 reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
 serde_json = "1.0"
 

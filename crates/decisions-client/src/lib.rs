@@ -17,6 +17,7 @@ use ansible_mesh_core::decisions::{
 use std::time::{Duration, Instant};
 
 mod config;
+pub mod gate;
 
 pub use config::{DecisionsConfig, load_decisions_config};
 
@@ -97,6 +98,11 @@ impl DecisionsClient {
         model: Option<&str>,
         timeout: Duration,
     ) -> Result<DecisionsOutcome, DecisionsError> {
+        // The data policy holds at this single egress point, for every caller:
+        // an unknown or disallowed site is refused before any network hop, and
+        // every string in `state` is redacted and truncated before it leaves.
+        gate::site_spec(&request.site)?;
+        let request = &gate::redacted(request);
         let Some(key) = self.api_key.as_deref() else {
             return Err(DecisionsError::new(
                 DecisionsErrorClass::Auth,
@@ -163,7 +169,7 @@ mod tests {
 
     fn request() -> DecisionsRequest {
         DecisionsRequest {
-            site: "smoke.urgency".into(),
+            site: "smoke.live".into(),
             state: json!("Help! My payouts have been failing for 3 days."),
             questions: vec![
                 DecisionQuestion {
@@ -389,6 +395,49 @@ mod tests {
             .await
             .expect_err("nothing listening");
         assert_eq!(err.class, DecisionsErrorClass::Unavailable);
+    }
+
+    #[tokio::test]
+    async fn an_unlisted_site_is_refused_before_any_network_hop() {
+        let mut unlisted = request();
+        unlisted.site = "memory.recall".into();
+        // Nothing listens here; a connection attempt would be `Unavailable`, and a
+        // missing key would be `Auth`. Policy must win over both.
+        let client = DecisionsClient::openrouter(
+            reqwest::Client::new(),
+            None,
+            Some("http://127.0.0.1:9".into()),
+            None,
+        );
+        let err = client
+            .evaluate(&unlisted, None, Duration::from_secs(1))
+            .await
+            .expect_err("unlisted site");
+        assert_eq!(err.class, DecisionsErrorClass::InvalidRequest);
+        assert!(err.message.contains("allow-list"), "{}", err.message);
+    }
+
+    #[tokio::test]
+    async fn secrets_in_state_never_reach_the_wire() {
+        let (base, seen) = serve_once("200 OK", OK_BODY).await;
+        let mut leaky = request();
+        leaky.site = "heal.classify".into();
+        leaky.state = json!({
+            "guest": "beacon",
+            "error": "error sending request for url (https://api.telegram.org/bot123456789:AAE_abcdefghijklmnopqrstuvwxyz012345/getUpdates) Bearer abcdef1234567890xyz",
+        });
+        provider(&base)
+            .evaluate(&leaky, None, Duration::from_secs(5))
+            .await
+            .expect("call succeeds");
+
+        let raw = seen.await.unwrap();
+        for leaked in ["AAE_abcdefghij", "123456789:", "abcdef1234567890xyz"] {
+            assert!(!raw.contains(leaked), "`{leaked}` reached the wire: {raw}");
+        }
+        // What classification needs still arrives.
+        assert!(raw.contains("<url:api.telegram.org>"), "{raw}");
+        assert!(raw.contains("beacon"));
     }
 
     /// Live smoke through the real client code. Sends ONE synthetic sentence
