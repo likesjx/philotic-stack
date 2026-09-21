@@ -1775,6 +1775,10 @@ async fn emit_failure(
     Ok(())
 }
 
+/// Loading the decisions key is a few IPC round trips; if the hotel does not
+/// answer within this, the caller falls back rather than waiting on a vault stall.
+const DECISIONS_CONFIG_LOAD_TIMEOUT: Duration = Duration::from_secs(3);
+
 /// Serve one `decisions.evaluate` task end to end and reply with a
 /// `decisions_response`. Every path, including a failed config load, replies
 /// with a typed decision error; none goes through `emit_failure`, which would
@@ -1791,26 +1795,45 @@ async fn handle_decisions_task(
     use ansible_mesh_core::decisions::DecisionsErrorClass;
 
     let started = Instant::now();
-    let decision =
-        match tokio::time::timeout(model_dispatch_timeout(), ProviderConfigs::load(ipc_client))
-            .await
-        {
-            Ok(Ok(configs)) => {
-                let providers =
-                    ProviderRegistry::new((config.providers)(http_client.clone(), &configs));
-                crate::decisions::evaluate_task(task_value, &providers).await
-            }
-            Ok(Err(err)) => crate::decisions::DecisionReply::failed(
+    // Only the decisions key is loaded (a few round trips), not the dozen
+    // unrelated provider configs every other task reloads, and under a timeout
+    // sized for a decision rather than the 55 s model dispatch cap. Time spent
+    // here is not counted against the task's own `deadline_ms`.
+    let decision = match tokio::time::timeout(
+        DECISIONS_CONFIG_LOAD_TIMEOUT,
+        decisions_client::load_decisions_config(ipc_client),
+    )
+    .await
+    {
+        Ok(Ok(decisions)) => {
+            let configs = ProviderConfigs {
+                decisions,
+                ..ProviderConfigs::default()
+            };
+            let providers =
+                ProviderRegistry::new((config.providers)(http_client.clone(), &configs));
+            crate::decisions::evaluate_task(task_value, &providers).await
+        }
+        Ok(Err(err)) => {
+            // An ACL denial means the key was sealed without this role: a
+            // credential problem, not an outage.
+            let class = if err.to_string().contains("not accessible") {
+                DecisionsErrorClass::Auth
+            } else {
+                DecisionsErrorClass::Unavailable
+            };
+            crate::decisions::DecisionReply::failed(
                 task_value,
-                DecisionsErrorClass::Unavailable,
-                format!("provider config refresh failed: {err}"),
-            ),
-            Err(_) => crate::decisions::DecisionReply::failed(
-                task_value,
-                DecisionsErrorClass::Timeout,
-                "provider config load exceeded the dispatch timeout",
-            ),
-        };
+                class,
+                format!("decisions key load failed: {err}"),
+            )
+        }
+        Err(_) => crate::decisions::DecisionReply::failed(
+            task_value,
+            DecisionsErrorClass::Timeout,
+            "decisions key load exceeded its timeout",
+        ),
+    };
 
     let latency_ms = started.elapsed().as_millis() as u64;
     let (model_id, token_count) = decision.model_and_tokens();

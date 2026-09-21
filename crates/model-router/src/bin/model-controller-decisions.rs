@@ -1,11 +1,13 @@
 //! Controller guest for typed judgments (`decisions.evaluate`, role
 //! `model.decisions`). Serves TypeSafe's Jev over its native API when a native
 //! key is present in the environment (early access, ephemeral/CI use), and
-//! otherwise over OpenRouter's alpha decisions endpoint using the hotel's
-//! existing OpenRouter key. Not in any fallback tier: a decision is never a
-//! turn reply.
+//! otherwise over OpenRouter's alpha decisions endpoint with the dedicated
+//! `decisions` vault key (`phil keys configure decisions`), which is readable only
+//! by this role and by `heal-dispatcher`. Not in any fallback tier: a decision is
+//! never a turn reply.
 
 use anyhow::Result;
+use decisions_client::DecisionsClient;
 use model_router::providers::DecisionsProvider;
 use model_router::runtime::{ControllerGuestConfig, run_model_controller};
 use std::sync::Arc;
@@ -21,22 +23,23 @@ async fn main() -> Result<()> {
         role: "model.decisions",
         allow_inline_audio: false,
         providers: Box::new(|http_client, configs| {
-            let provider = match env_nonempty("PHILOTIC_TYPESAFE_API_KEY") {
-                Some(native_key) => DecisionsProvider::native(
+            let client = match env_nonempty("PHILOTIC_TYPESAFE_API_KEY") {
+                Some(native_key) => DecisionsClient::native(
                     http_client,
                     Some(native_key),
                     env_nonempty("PHILOTIC_TYPESAFE_BASE_URL"),
                 ),
-                None => DecisionsProvider::openrouter(
+                // `configs.decisions` is filled by the decisions handler from the
+                // dedicated vault key. An unset model means the pinned
+                // `typesafe/jev-1.13`, never the moving `~typesafe/jev-latest`.
+                None => DecisionsClient::openrouter(
                     http_client,
-                    configs.openrouter_api_key.clone(),
-                    configs.openrouter_base_url.clone(),
-                    // Unset means the pinned `typesafe/jev-1.13`, never the
-                    // moving `~typesafe/jev-latest` alias.
-                    env_nonempty("PHILOTIC_DECISIONS_MODEL"),
+                    configs.decisions.api_key.clone(),
+                    configs.decisions.base_url.clone(),
+                    configs.decisions.model.clone(),
                 ),
             };
-            vec![Arc::new(provider)]
+            vec![Arc::new(DecisionsProvider::new(client))]
         }),
         live_providers: Box::new(|_http_client, _configs| Vec::new()),
     })

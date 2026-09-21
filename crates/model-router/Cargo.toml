@@ -7,6 +7,7 @@ edition = "2024"
 anyhow = "1.0"
 futures = "0.3"
 ansible-mesh-core = { path = "../ansible-mesh-core" }
+decisions-client = { path = "../decisions-client" }
 async-trait = "0.1"
 axum = { version = "0.8", features = ["json"] }
 base64 = "0.22"
@@ -31,8 +32,6 @@ ulid = "1"
 # Used to prove the real philote tool catalog (life.* schemas) sanitizes into
 # Gemini-valid function declarations.
 philote = { path = "../philote" }
-# The decisions provider tests serve canned HTTP responses from a local socket.
-tokio = { version = "1.42", features = ["net"] }
 
 # Clippy ratchet: this crate is warning-free and must stay that way.
 [lints]

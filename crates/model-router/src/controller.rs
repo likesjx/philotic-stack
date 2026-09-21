@@ -5,6 +5,7 @@ use ansible_mesh_core::decisions::{
 use ansible_mesh_core::provider_keys::{ProviderKeySpec, provider_key_spec};
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
+use decisions_client::DecisionsConfig;
 use media_prep::serialize_audio_artifact_envelope;
 use philotic_client::{IpcRequest, IpcResponse, PhiloticClient};
 use serde_json::{Map, Value, json};
@@ -1548,6 +1549,9 @@ pub struct ProviderConfigs {
     pub openrouter_default_embedding_model: Option<String>,
     pub openrouter_fallback_models: Vec<String>,
     pub openrouter_route: Option<String>,
+    /// The dedicated decisions key and settings. Populated only by the decisions
+    /// handler (`load_decisions_config`), never by `ProviderConfigs::load`.
+    pub decisions: DecisionsConfig,
 }
 
 impl ProviderConfigs {
@@ -1655,6 +1659,11 @@ impl ProviderConfigs {
                 "openrouter_route",
             )
             .await?),
+            // Deliberately not loaded here: every controller reloads this struct
+            // on every task, and the decisions key is readable only by
+            // `model.decisions` and `heal-dispatcher`. The decisions handler loads
+            // it itself, without the dozen unrelated round trips.
+            decisions: DecisionsConfig::default(),
         })
     }
 

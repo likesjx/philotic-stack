@@ -1227,6 +1227,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "092966b41edc516079bdf31ec78a2e0588d1d0c08f78b91d8307215928642b2b"
 
 [[package]]
+name = "decisions-client"
+version = "0.1.0"
+dependencies = [
+ "ansible-mesh-core",
+ "anyhow",
+ "philotic-client",
+ "reqwest",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "delegate"
 version = "0.13.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2895,6 +2907,7 @@ dependencies = [
  "base64 0.22.1",
  "clap",
  "datasource",
+ "decisions-client",
  "futures",
  "media-codec",
  "media-prep",

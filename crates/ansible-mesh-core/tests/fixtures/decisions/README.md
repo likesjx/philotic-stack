@@ -12,8 +12,8 @@ fixture only proves what it was made from.
 | `canonical_request_heal_classify.json` | The canonical request from `docs/architecture/DECISIONS_MODEL_PROPOSAL.md`, with concrete strings. |
 
 To record another body, use a **dedicated** key and one synthetic sentence (never operator
-data): `PHILOTIC_DECISIONS_LIVE_KEY=<key> cargo test -p model-router --lib live_smoke -- --ignored --nocapture`
-exercises the real provider; for raw bodies, POST the request file with `curl`. Redact the
+data): `PHILOTIC_DECISIONS_LIVE_KEY=<key> cargo test -p decisions-client --lib live_smoke -- --ignored --nocapture`
+exercises the real client; for raw bodies, POST the request file with `curl`. Redact the
 `gen-dec-…` id before checking a body in.
 
 The parser maps a score `legend` by its text and falls back to position; a deviation sets
