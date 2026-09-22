@@ -43,6 +43,7 @@ pub mod relocation_ceremony;
 pub mod resources;
 pub mod router_trace;
 pub mod runtime;
+pub mod sealed_secret;
 pub mod sqlite_storage;
 pub mod storage;
 pub mod tools;

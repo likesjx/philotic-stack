@@ -743,6 +743,36 @@ fn graph_storage_sync_apartment_independent_types() {
     );
 }
 
+/// DEF-167: a session checkpoint's memory type carries colons; listing must
+/// return it whole, and must not leak a longer agent id's apartments.
+#[test]
+fn list_apartments_returns_colon_bearing_session_checkpoints_whole() {
+    let store = open_graph_storage();
+    seed_agent_identity(&store, "agent-a");
+    let session_type = "short_session:telegram:7:agent-a:virtuosa";
+    store
+        .sync_apartment("agent-a", "short", &serde_json::json!({"s": 1}))
+        .unwrap();
+    store
+        .sync_apartment("agent-a", session_type, &serde_json::json!({"c": 1}))
+        .unwrap();
+    store
+        .sync_apartment("agent-a:b", "short", &serde_json::json!({"x": 1}))
+        .unwrap();
+
+    let mut types = store.domain.list_apartments("agent-a").unwrap();
+    types.sort();
+    assert_eq!(types, vec!["short".to_string(), session_type.to_string()]);
+    assert!(
+        store
+            .domain
+            .get_apartment("agent-a", &types[1])
+            .unwrap()
+            .is_some(),
+        "a listed type must round-trip through get_apartment"
+    );
+}
+
 #[test]
 fn graph_storage_sync_apartment_independent_agents() {
     let store = open_graph_storage();

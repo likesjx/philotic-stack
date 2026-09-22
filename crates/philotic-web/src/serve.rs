@@ -95,6 +95,7 @@
 //!   GET  /api/edge/ws — edge-mesh protocol termination (philotic-edge-protocol
 //!              JSON envelopes; per-device bearer auth; see serve/edge.rs)
 
+mod cortex;
 pub(crate) mod edge;
 
 use ansible_mesh_core::domain::GraphDomain;
@@ -733,6 +734,7 @@ pub async fn run(
         // API routes
         .route("/api/mesh/roster", get(handle_mesh_roster))
         .route("/api/auth/status", get(handle_auth_status))
+        .route("/api/cortex", get(cortex::read))
         .route(
             "/api/auth/user",
             get(handle_auth_user_get).patch(handle_auth_user_patch),
@@ -9916,6 +9918,59 @@ mod tests {
         );
         assert_eq!(resolve_edge_token(Some("  ".into()), None), None);
         assert_eq!(resolve_edge_token(None, None), None);
+    }
+
+    #[tokio::test]
+    async fn cortex_rejects_anonymous_edge_nonadmin_and_revoked_sessions() {
+        let state = test_state(Some("edge-only"), ExposureTier::Mesh);
+        ensure_operator_auth_tables(&state.db_path, &state.hotel).unwrap();
+        async fn status(state: &AppState, token: Option<&str>) -> StatusCode {
+            let mut headers = HeaderMap::new();
+            if let Some(token) = token {
+                headers.insert(
+                    header::AUTHORIZATION,
+                    HeaderValue::from_str(&format!("Bearer {token}")).unwrap(),
+                );
+            }
+            let query = serde_json::from_value(json!({})).unwrap();
+            cortex::read(headers, State(state.clone()), Query(query))
+                .await
+                .status()
+        }
+        assert_eq!(status(&state, None).await, StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            status(&state, Some("edge-only")).await,
+            StatusCode::UNAUTHORIZED
+        );
+        let session =
+            issue_operator_session(&state.db_path, &state.hotel, "Test", "test", None).unwrap();
+        // An administrator reaches the adapter (the test intentionally has no IPC server).
+        assert_eq!(
+            status(&state, Some(&session.session_token)).await,
+            StatusCode::BAD_GATEWAY
+        );
+        let conn = Connection::open(&state.db_path).unwrap();
+        conn.execute(
+            "UPDATE operator_sessions SET posture = 'viewer' WHERE session_id = ?1",
+            [&session.session_id],
+        )
+        .unwrap();
+        assert_eq!(
+            status(&state, Some(&session.session_token)).await,
+            StatusCode::FORBIDDEN
+        );
+        conn.execute(
+            "UPDATE operator_sessions SET posture = 'admin' WHERE session_id = ?1",
+            [&session.session_id],
+        )
+        .unwrap();
+        revoke_operator_session(&state.db_path, &session.session_token).unwrap();
+        assert_eq!(
+            status(&state, Some(&session.session_token)).await,
+            StatusCode::UNAUTHORIZED
+        );
+        drop(conn);
+        let _ = fs::remove_file(&state.db_path);
     }
 
     fn test_state(edge_token: Option<&str>, tier: ExposureTier) -> AppState {

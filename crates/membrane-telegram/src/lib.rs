@@ -807,6 +807,16 @@ fn draft_already_final(draft_text: &str, final_text: &str) -> bool {
     !draft_text.is_empty() && draft_text == final_text
 }
 
+/// Whether the seat serving `seat_agent_id` may act on a hotel push task.
+/// The hotel-stamped `reply_owner_agent_id` (the emitting agent) is
+/// authoritative; unstamped tasks fall back to [`session_owned_by_agent`].
+fn reply_task_owned_by_seat(task: &Value, session_id: &str, seat_agent_id: &str) -> bool {
+    if let Some(owner) = task.get("reply_owner_agent_id").and_then(Value::as_str) {
+        return owner == seat_agent_id;
+    }
+    session_id.is_empty() || session_owned_by_agent(session_id, seat_agent_id)
+}
+
 /// True when a session id belongs to the given agent — i.e. this seat may act
 /// on a reply/turn-event task for it. Telegram session ids are stamped by
 /// [`telegram_inbound_envelope`] as `telegram:{chat}[:{thread}]:{agent_id}`,
@@ -2934,34 +2944,91 @@ impl TelegramSeatGuest {
         let config_req = IpcRequest::GetConfig {
             key: self.telegram_token_key.clone(),
         };
-        let token = match client.send_request(config_req).await? {
-            IpcResponse::ConfigData { key: _, value_json } => match value_json {
-                Some(json_str) => {
-                    if let Ok(val) = serde_json::from_str::<Value>(&json_str) {
-                        val.as_str().unwrap_or("").to_string()
-                    } else {
-                        json_str
-                    }
-                }
-                None => {
-                    warn!(
-                        "Telegram Bot Token key [{}] found, but value was empty in Context Graph.",
-                        self.telegram_token_key
-                    );
-                    String::new()
-                }
-            },
+        let value_json = match client.send_request(config_req).await? {
+            IpcResponse::ConfigData { key: _, value_json } => value_json,
             _ => {
                 warn!(
                     "Failed to retrieve Telegram Bot Token from Context Graph key [{}].",
                     self.telegram_token_key
                 );
-                String::new()
+                None
             }
         };
-
-        Ok((!token.is_empty()).then_some(token))
+        let secret_ref = match classify_config_token(value_json.as_deref()) {
+            ConfigToken::Missing => {
+                warn!(
+                    "Telegram Bot Token key [{}] has no value in Context Graph.",
+                    self.telegram_token_key
+                );
+                return Ok(None);
+            }
+            ConfigToken::Plain(token) => return Ok(Some(token)),
+            ConfigToken::VaultRef(secret_ref) => secret_ref,
+        };
+        // The config key holds a vault ref (DEF-176): the token itself is
+        // encrypted in the hotel vault, readable by the `membrane` role.
+        match client
+            .send_request(IpcRequest::GetSecret {
+                secret_ref: secret_ref.clone(),
+            })
+            .await?
+        {
+            IpcResponse::SecretData { value_json, .. } => {
+                let resolved = token_from_secret_data(value_json);
+                if resolved.is_none() {
+                    warn!(
+                        "Telegram Bot Token key [{}] points at vault ref [{}], which this hotel does not hold.",
+                        self.telegram_token_key, secret_ref
+                    );
+                }
+                Ok(resolved)
+            }
+            other => {
+                warn!(
+                    "Failed to resolve Telegram Bot Token vault ref for key [{}]: {:?}",
+                    self.telegram_token_key, other
+                );
+                Ok(None)
+            }
+        }
     }
+}
+
+/// What a Telegram token config key holds.
+#[derive(Debug, PartialEq, Eq)]
+enum ConfigToken {
+    Missing,
+    /// A raw token (legacy, or a hotel that has not migrated yet).
+    Plain(String),
+    /// A `secret://` ref to resolve through the vault (DEF-176).
+    VaultRef(String),
+}
+
+fn classify_config_token(value_json: Option<&str>) -> ConfigToken {
+    let Some(raw) = value_json else {
+        return ConfigToken::Missing;
+    };
+    let value = match serde_json::from_str::<Value>(raw) {
+        Ok(Value::String(s)) => s,
+        Ok(_) => String::new(),
+        Err(_) => raw.to_string(),
+    };
+    let value = value.trim().to_string();
+    if value.is_empty() {
+        ConfigToken::Missing
+    } else if value.starts_with("secret://") {
+        ConfigToken::VaultRef(value)
+    } else {
+        ConfigToken::Plain(value)
+    }
+}
+
+/// The token a `GetSecret` reply carries — never the ref itself, never empty.
+fn token_from_secret_data(value_json: Option<String>) -> Option<String> {
+    let raw = value_json?;
+    let token = serde_json::from_str::<String>(&raw).unwrap_or(raw);
+    let token = token.trim().to_string();
+    (!token.is_empty() && !token.starts_with("secret://")).then_some(token)
 }
 
 #[async_trait]
@@ -3083,16 +3150,30 @@ impl MembraneGuest for TelegramSeatGuest {
                         .unwrap_or_else(|poisoned| poisoned.into_inner())
                         .take();
                     let was_reprobing_standby = std::mem::take(&mut self.reprobing_standby);
-                    if owner.is_none()
-                        && denial_code.as_deref() == Some("LEASE_TRANSPORT_HOME_MISMATCH")
-                    {
-                        // R2 (DEF-107): this hotel is not the transport home. The
-                        // seat is STANDBY — registered, token in hand, not acting —
-                        // and re-probes on the cadence or on a TransportHomeChanged
-                        // push naming this hotel as home. Quiet on re-confirmation.
+                    if owner.is_none() {
+                        // DEF-168: `owner: None` means the hotel declined the
+                        // acquire outright — no live competitor was identified
+                        // (transport-home mismatch, foreign authority, unknown
+                        // agent/authority, or a lookup failure). Gating this on
+                        // the single `LEASE_TRANSPORT_HOME_MISMATCH` code left
+                        // every OTHER ownerless denial (e.g. `LEASE_FOREIGN_
+                        // AUTHORITY` for a hotel discovered dynamically via R2
+                        // that was never in the agent's static authority list)
+                        // misclassified as `LeaseHeld` — the seat stood down
+                        // convinced someone else held the lease, self-healed
+                        // every reprobe finding it free, and re-denied itself
+                        // the same way forever, never actually polling even
+                        // while genuinely the transport home. R2 (DEF-107):
+                        // this hotel is not (or not yet recognized as) the
+                        // transport home. The seat is STANDBY — registered,
+                        // token in hand, not acting — and re-probes on the
+                        // cadence or on a TransportHomeChanged push naming
+                        // this hotel as home. Quiet on re-confirmation.
                         info!(
-                            "This hotel is not the active transport home for [{}]; seat [{}] is STANDBY (re-probe every {LEASE_REPROBE_SECS}s or on TransportHomeChanged).",
-                            lease_key, self.seat_guest_id
+                            "This hotel may not poll for [{}] (denied: {}); seat [{}] is STANDBY (re-probe every {LEASE_REPROBE_SECS}s or on TransportHomeChanged).",
+                            lease_key,
+                            denial_code.as_deref().unwrap_or("no competing owner"),
+                            self.seat_guest_id
                         );
                         self.stand_down = Some(StandDownReason::Standby {
                             next_probe_at: Instant::now() + Duration::from_secs(LEASE_REPROBE_SECS),
@@ -3103,8 +3184,10 @@ impl MembraneGuest for TelegramSeatGuest {
                                 "low",
                                 "seat_standby:not_transport_home",
                                 format!(
-                                    "Telegram seat [{}] is standby: this hotel is not the active transport home for [{}].",
-                                    self.seat_guest_id, lease_key
+                                    "Telegram seat [{}] is standby: hotel may not poll for [{}] ({}).",
+                                    self.seat_guest_id,
+                                    lease_key,
+                                    denial_code.as_deref().unwrap_or("no competing owner")
                                 ),
                             );
                         }
@@ -3464,11 +3547,19 @@ impl TelegramSeatGuest {
         // A Telegram DM chat_id is the same user id under every bot token, so
         // without this check each seat re-sends the same message and the
         // operator sees it once per bot. Only the seat owning the session's
-        // agent may act on the task.
-        if !session_id.is_empty() && !session_owned_by_agent(&session_id, &self.target_agent_id) {
+        // agent may act on the task. The hotel stamps the emitting agent as
+        // `reply_owner_agent_id`; that is authoritative, because a session id
+        // such as `cron:<job_id>` names no agent (2026-09-18: Bjork's daily
+        // cron briefs also went out through the Coach bot). The session-id
+        // parse remains the fallback for unstamped tasks.
+        if !reply_task_owned_by_seat(&task, &session_id, &self.target_agent_id) {
+            let owner = task
+                .get("reply_owner_agent_id")
+                .and_then(Value::as_str)
+                .unwrap_or("-");
             info!(
-                "Dropping reply task [{}] for session [{}]: session belongs to another seat's agent (this seat serves [{}]).",
-                action, session_id, self.target_agent_id
+                "Dropping reply task [{}] for session [{}] (owner [{}]): belongs to another seat's agent (this seat serves [{}]).",
+                action, session_id, owner, self.target_agent_id
             );
             return;
         }
@@ -4318,10 +4409,13 @@ mod tests {
         TelegramFileRef, TelegramSeatGuest, UpdateDedupe, approval_callback_content,
         build_combined_telegram_commands, build_telegram_menu_commands, default_attachment_name,
         enrich_attachment_with_transport, next_error_backoff_secs,
-        normalize_telegram_menu_command_name, session_owned_by_agent, telegram_command,
-        telegram_format_text, telegram_help_text, telegram_inbound_envelope,
+        normalize_telegram_menu_command_name, reply_task_owned_by_seat, session_owned_by_agent,
+        telegram_command, telegram_format_text, telegram_help_text, telegram_inbound_envelope,
     };
-    use super::{MembraneGuest, StandDownReason, transport_home_names_this_hotel};
+    use super::{
+        ConfigToken, MembraneGuest, StandDownReason, classify_config_token, token_from_secret_data,
+        transport_home_names_this_hotel,
+    };
     use philotic_client::CommandManifestEntry;
     use philotic_client::IpcResponse;
     use serde_json::{Value, json};
@@ -4651,6 +4745,45 @@ mod tests {
         let built = build_telegram_menu_commands(&commands);
         assert_eq!(built.len(), TELEGRAM_MAX_COMMANDS);
         assert_eq!(built[0]["command"], "foo_bar");
+    }
+
+    /// DEF-176: a seat must use a raw token as before, resolve a vault ref,
+    /// and never send a ref (or nothing) to Telegram as if it were a token.
+    #[test]
+    fn a_token_key_holds_a_raw_token_or_a_vault_ref() {
+        assert_eq!(
+            classify_config_token(Some("\"123:abc\"")),
+            ConfigToken::Plain("123:abc".into())
+        );
+        assert_eq!(
+            classify_config_token(Some("123:abc")),
+            ConfigToken::Plain("123:abc".into())
+        );
+        assert_eq!(
+            classify_config_token(Some("\"secret://hotel/default/telegram_bot_token/x\"")),
+            ConfigToken::VaultRef("secret://hotel/default/telegram_bot_token/x".into())
+        );
+        assert_eq!(classify_config_token(Some("\"\"")), ConfigToken::Missing);
+        assert_eq!(classify_config_token(None), ConfigToken::Missing);
+    }
+
+    #[test]
+    fn a_resolved_vault_ref_yields_the_token_and_never_the_ref() {
+        assert_eq!(
+            token_from_secret_data(Some("\"123:abc\"".into())),
+            Some("123:abc".into())
+        );
+        assert_eq!(
+            token_from_secret_data(None),
+            None,
+            "the vault lacks the ref"
+        );
+        assert_eq!(token_from_secret_data(Some("\"\"".into())), None);
+        assert_eq!(
+            token_from_secret_data(Some("\"secret://hotel/default/x/y\"".into())),
+            None,
+            "a ref pointing at a ref is not a token"
+        );
     }
 
     #[test]
@@ -5417,6 +5550,37 @@ mod tests {
         // Too-short / legacy shapes fail open.
         assert!(session_owned_by_agent("telegram:12345", "agent-aria"));
         assert!(session_owned_by_agent("", "agent-aria"));
+    }
+
+    #[test]
+    fn stamped_reply_owner_decides_which_seat_delivers() {
+        // 2026-09-18: `cron:<job_id>` names no agent, so Bjork's daily brief
+        // passed every seat's session check and also went out as Coach. The
+        // hotel-stamped owner lets only the emitting agent's seat deliver.
+        let session = "cron:lifegraph-flywheel-daily:mac-jane";
+        let stamped = serde_json::json!({
+            "action": "send_reply",
+            "session_id": session,
+            "reply_owner_agent_id": "agent-bjork-01",
+        });
+        assert!(reply_task_owned_by_seat(
+            &stamped,
+            session,
+            "agent-bjork-01"
+        ));
+        assert!(!reply_task_owned_by_seat(&stamped, session, "agent-coach"));
+        // The stamp wins even when the session id names another agent.
+        let heal = "heal:ephemeral:agent-bjork-01";
+        assert!(!reply_task_owned_by_seat(&stamped, heal, "agent-coach"));
+        // Unstamped tasks keep the session-id fallback.
+        let unstamped = serde_json::json!({ "action": "send_reply" });
+        assert!(reply_task_owned_by_seat(&unstamped, session, "agent-coach"));
+        assert!(!reply_task_owned_by_seat(
+            &unstamped,
+            "telegram:7898847424:agent-bjork-01",
+            "agent-coach"
+        ));
+        assert!(reply_task_owned_by_seat(&unstamped, "", "agent-coach"));
     }
 
     #[test]

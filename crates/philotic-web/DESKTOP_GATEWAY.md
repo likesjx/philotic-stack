@@ -60,6 +60,17 @@ denial, hidden issuance routes and cross-service revocation.
 
 ## Rollout gate
 
+September 22 integration checkpoint: current develop (`6f0aceaa`, including
+Cortex PRs #578/#579) is combined with the desktop bridge. All 199 standard web
+tests, the explicit real Node-to-Rust integration test, and 17 desktop gateway
+tests pass locally. Cortex retains the same gateway-bound session resolution.
+This is not a deployment or a real OAuth/Mongo administrator-login proof.
+
+The previously staged bridge-only binary must not replace the deployed Cortex
+binary. Build one combined artifact, preserve the full desktop assets, and merge
+website/desktop changes into their normal release branches before rollout so
+automatic deployments cannot silently remove the new authentication endpoints.
+
 Provision distinct server secrets securely, inspect pre-existing identity mappings,
 deploy compatible website/gateway/hotel artifacts privately, verify real invited
 admin login and non-admin denial, then replace public deny-all routing. Rollback

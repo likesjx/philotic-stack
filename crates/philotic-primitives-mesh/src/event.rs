@@ -89,6 +89,18 @@ pub enum EventKind {
     /// Payload: `{ "request_id": "...", "guest_id": "...", "ok": bool,
     /// "readiness": "..."|null, "error": "..."|null }`.
     MaterializeReady,
+    /// Relocation Ceremony R5: the origin hotel's continuity bundle — the
+    /// moving role's session checkpoints, their session rows, and the agent
+    /// identity — sent as the last step before SWITCH so the target resumes
+    /// the role's conversations instead of starting them fresh. Only sent
+    /// to a target whose `MaterializeReady` advertised
+    /// `supports_continuity`, so an older peer never sees this kind.
+    /// Payload: `{ "request_id": "...", "bundle": ContinuityBundle }`.
+    ContinuityImport,
+    /// Reply to [`EventKind::ContinuityImport`].
+    /// Payload: `{ "request_id": "...", "ok": bool, "summary": {...}|null,
+    /// "error": "..."|null }`.
+    ContinuityAck,
 }
 
 /// The payload definition. Large files must use `BlobRef`.

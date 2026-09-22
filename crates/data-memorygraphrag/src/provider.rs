@@ -25,7 +25,7 @@ use neo4rs::{
 use serde_json::{Value, json};
 use std::collections::HashSet;
 use std::sync::Arc;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 /// Default minimum cosine similarity gate for the named recall strategies.
 ///
@@ -848,7 +848,14 @@ impl LifeGraphProvider {
         // of practice, a misheard "Jackson's Drop-off Routine" beside the
         // corrected "Daxton's", and a second bills item written while the
         // operator was saying it already existed (DEF-158).
-        let duplicate_candidates = if input.force_new {
+        let lived = data_memorygraphrag::hygiene::guard_applies_to_label(&compiled.label);
+        if !lived {
+            debug!(
+                label = %compiled.label,
+                "life.observe: duplicate guard and bridging skipped for system telemetry label"
+            );
+        }
+        let duplicate_candidates = if input.force_new || !lived {
             Vec::new()
         } else {
             self.observe_duplicate_candidates(
@@ -1055,10 +1062,13 @@ impl LifeGraphProvider {
         // for the turn or the sweep to decide. Live 2026-09-17 a drop-off
         // Event sat with no edge to Daxton until the operator asked for one
         // by hand (DEF-160).
-        let (bridged, suggested) = self
-            .bridge_new_node(&graph, &compiled, &input, &now)
-            .await
-            .unwrap_or_default();
+        let (bridged, suggested) = if lived {
+            self.bridge_new_node(&graph, &compiled, &input, &now)
+                .await
+                .unwrap_or_default()
+        } else {
+            (Vec::new(), Vec::new())
+        };
         if !bridged.is_empty() {
             out["bridged_edges"] = json!(bridged);
         }
