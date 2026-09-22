@@ -23,6 +23,11 @@
   pre_tasks:
     - name: Load host vault vars
       include_vars: "vault/{{ inventory_hostname }}.yml"
+      # Every role task that needs a vault_* var depends on this running first,
+      # regardless of which --tags filter is given (binary, config, muninn, …).
+      # Untagged pre_tasks are skipped by a --tags filter like any other task —
+      # this is what made `--tags config` fail with vault vars undefined.
+      tags: always
 
   roles:
     - role: philotic_hotel
