@@ -22,6 +22,15 @@
 
 ## Current Work Item Split
 
+### Desktop hotel sessions
+
+Branch: `codex/desktop-hotel-session`; seam: `operator-session-auth`.
+Contract: [desktop gateway hotel sessions](../crates/philotic-web/DESKTOP_GATEWAY.md).
+
+- [x] Implement distinct hotel user/session issuance after confidential gateway attestation; no shared root session or browser bearer forwarding.
+- [x] Validate replay/expiry/gateway binding and real Node-to-Rust session/revocation flow on loopback with an isolated database.
+- [ ] Provision and deploy compatible website, gateway and hotel artifacts privately; validate real invited admin/non-admin flows before opening the public tunnel.
+
 ### Cortex viewer
 
 Branch: `codex/cortex-viewer`; seam: `muninn-admin-observability-plane`.

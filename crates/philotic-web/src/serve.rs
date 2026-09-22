@@ -152,6 +152,7 @@ use philotic_client::{
 struct UiAssets;
 
 const AUTH_COOKIE_NAME: &str = "philotic_session";
+mod desktop_session;
 const AUTH_COOKIE_MAX_AGE_SECS: u64 = 60 * 60 * 8;
 const HEADER_COOP: &str = "cross-origin-opener-policy";
 const HEADER_CORP: &str = "cross-origin-resource-policy";
@@ -161,6 +162,7 @@ const HEADER_CORP: &str = "cross-origin-resource-policy";
 #[derive(Clone)]
 pub(crate) struct AppState {
     bootstrap_token: Arc<String>,
+    desktop_gateway_key: Option<Arc<String>>,
     db_path: PathBuf,
     /// Mesh config path — consulted for `web_roster` / `web_edge_token` fallbacks
     config_path: Arc<PathBuf>,
@@ -648,6 +650,10 @@ pub async fn run(
 
     let state = AppState {
         bootstrap_token: Arc::new(bootstrap_token.clone()),
+        desktop_gateway_key: std::env::var("PHILOTIC_DESKTOP_GATEWAY_KEY")
+            .ok()
+            .filter(|key| key.len() >= 32)
+            .map(Arc::new),
         db_path,
         config_path: Arc::new(config_path.clone()),
         hotel: Arc::new(hotel),
@@ -685,6 +691,14 @@ pub async fn run(
     let app = Router::new()
         // Unauthenticated lightweight probe endpoint — allowed on every tier
         .route("/health", get(handle_health))
+        .route(
+            "/internal/desktop/session",
+            post(desktop_session::issue).layer(axum::extract::DefaultBodyLimit::max(4096)),
+        )
+        .route(
+            "/internal/desktop/session/status",
+            get(desktop_session::status),
+        )
         // Edge-mesh tier (see serve/edge.rs): invite-code-gated enrollment plus
         // the bearer-authenticated edge-protocol WebSocket termination
         .route("/api/edge/enroll", post(edge::handle_edge_enroll))
@@ -7386,9 +7400,23 @@ fn current_operator_session(
     state: &AppState,
 ) -> Option<OperatorSessionRecord> {
     let token = header_bearer_token(headers).or_else(|| cookie_token(headers, AUTH_COOKIE_NAME))?;
-    resolve_operator_session(&state.db_path, token)
+    let session = resolve_operator_session(&state.db_path, token)
         .ok()
-        .flatten()
+        .flatten()?;
+    if session.auth_method == "desktop_gateway" {
+        if session.issuing_hotel != *state.hotel
+            || !desktop_session::gateway_authorized(headers, state)
+        {
+            return None;
+        }
+        let user = resolve_operator_user(&state.db_path, &state.hotel, &session.user_id)
+            .ok()
+            .flatten()?;
+        if user.status != "active" {
+            return None;
+        }
+    }
+    Some(session)
 }
 
 fn ensure_operator_auth_tables(db_path: &PathBuf, hotel: &str) -> Result<()> {
@@ -9949,6 +9977,7 @@ mod tests {
         let (tx, _) = broadcast::channel::<String>(4);
         AppState {
             bootstrap_token: Arc::new("philotic-test".into()),
+            desktop_gateway_key: None,
             db_path: temp_db_path("fence"),
             config_path: Arc::new(PathBuf::from("/nonexistent/mesh-config.json")),
             hotel: Arc::new("mac-jane".into()),
