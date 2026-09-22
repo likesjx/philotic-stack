@@ -59,9 +59,30 @@ worktree_exists() {
     git worktree list --porcelain | awk '/^worktree / {print $2}' | grep -Fxq "$path"
 }
 
+# DEF-197: a new workstream branched straight off the LOCAL base-ref with no
+# fetch, so a stale local `develop` (observed 11-23 commits behind origin on
+# 2026-09-19/22) silently seeded every new slice from old code. When
+# `base_ref` names a branch that origin also tracks, fetch it and resolve to
+# `origin/<base_ref>` instead — the local branch itself is left untouched
+# (safe even when it's checked out in this or another worktree, e.g. the main
+# checkout sitting on `develop`). Any other ref (a SHA, a tag, a local-only
+# experimental branch) passes through unchanged. A fetch failure (offline)
+# falls back to the literal ref rather than hard-erroring.
+resolve_base_ref() {
+    local base_ref=$1
+    if git show-ref --verify --quiet "refs/remotes/origin/${base_ref}"; then
+        if git fetch origin "${base_ref}" >&2; then
+            echo "origin/${base_ref}"
+            return
+        fi
+        echo "warn: git fetch origin ${base_ref} failed; branching from possibly-stale local '${base_ref}'" >&2
+    fi
+    echo "${base_ref}"
+}
+
 cmd_create() {
     local slug=${1:-}
-    local base_ref=${2:-main}
+    local base_ref=${2:-develop}
     [ -n "${slug}" ] || die "missing slug"
 
     local branch path
@@ -75,7 +96,9 @@ cmd_create() {
     if branch_exists "${branch}"; then
         git worktree add "${path}" "${branch}"
     else
-        git worktree add -b "${branch}" "${path}" "${base_ref}"
+        local resolved_base
+        resolved_base=$(resolve_base_ref "${base_ref}")
+        git worktree add -b "${branch}" "${path}" "${resolved_base}"
     fi
 
     cat <<EOF
