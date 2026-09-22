@@ -70,6 +70,15 @@ philotic_hotel_socket: "{{ philotic_runtime_dir }}/{{ philotic_hotel_runtime_nam
 philotic_memory_sleep_enabled: false
 philotic_memory_sleep_mutate: false
 
+# Decisions model (TypeSafe Jev) shadow pilot — log-only; see
+# crates/heal-dispatcher/src/shadow.rs and DECISIONS_MODEL_PROPOSAL.md. Only
+# heal-dispatcher reads this; every guest inherits it via aiua's environment,
+# but nothing else on the fleet acts on it. Requires the openrouter vault key
+# to also grant roles model.decisions + heal-dispatcher (fresh phil keys
+# configure openrouter bakes both in; an older entry needs
+# `aiua auth sync-roles --provider openrouter`).
+philotic_shadow_decisions_enabled: false
+
 # Mesh auth
 philotic_enable_rust_auth: "1"
 philotic_enable_rust_dispatcher: "1"
