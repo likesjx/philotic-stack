@@ -73,7 +73,18 @@ pub const PROVIDER_KEY_SPECS: &[ProviderKeySpec] = &[
         route_key: Some("openrouter_route"),
         default_model: Some("openai/gpt-4.1-mini"),
         default_base_url: Some("https://openrouter.ai/api"),
-        allowed_roles: &["model", "model.openrouter"],
+        // Typed decisions (TypeSafe Jev via OpenRouter's alpha decisions endpoint)
+        // reuse this same key, at the operator's direction: `model.decisions`
+        // serves the calls and `heal-dispatcher` runs the in-process shadow pilot.
+        // The trade-off is that the chat key and the decisions calls now share one
+        // spend, one rate limit and one revocation. An entry sealed before these
+        // roles were added needs `aiua auth sync-roles --provider openrouter`.
+        allowed_roles: &[
+            "model",
+            "model.openrouter",
+            "model.decisions",
+            "heal-dispatcher",
+        ],
     },
     ProviderKeySpec {
         provider: "openai",

@@ -1,0 +1,838 @@
+//! Shadow pilot for typed decisions (slice D2): a log-only judge beside the
+//! incumbent `gemma3:4b` classifier for novel failure lines.
+//!
+//! The judge NEVER decides anything. It runs after the incumbent, off the poll
+//! loop's path (a spawned task, a small in-flight cap, a short deadline), and
+//! writes one content-free `decision_traces` row per call: the incumbent's
+//! verdict, the judge's typed answers, whether they agreed, and, when the call
+//! failed, the error class. Errors and disagreement are separate columns.
+//!
+//! Default off. `PHILOTIC_SHADOW_DECISIONS` must be set, the dedicated
+//! OpenRouter key must be readable by this role (`aiua auth sync-roles`), and the site must be on the
+//! client's allow-list (`heal.classify`, data class A). The client redacts every
+//! string in the state before it leaves (`decisions_client::gate`).
+
+use ansible_mesh_core::decision_trace::{DecisionSummary, summarize};
+use ansible_mesh_core::decision_trace::{
+    DecisionTraceRecord, DecisionTraceStorage, SqliteDecisionTraceStorage, default_db_path,
+};
+use ansible_mesh_core::decisions::{
+    DecisionAnswer, DecisionOption, DecisionQuestion, DecisionsError, DecisionsErrorClass,
+    DecisionsOutcome, DecisionsRequest, QuestionSpec,
+};
+use decisions_client::{DecisionsClient, gate, load_decisions_config};
+use philotic_client::PhiloticClient;
+use serde_json::json;
+use std::collections::BTreeMap;
+use std::sync::Arc;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use tokio::sync::Semaphore;
+use tracing::{debug, info, warn};
+use ulid::Ulid;
+
+/// The allow-listed site id (see `decisions_client::gate::SITES`).
+pub const SITE: &str = "heal.classify";
+const ENV_FLAG: &str = "PHILOTIC_SHADOW_DECISIONS";
+/// Shadow calls in flight at once. A burst beyond this is skipped, not queued:
+/// the pilot must never build a backlog or slow the poll loop.
+const MAX_IN_FLIGHT: usize = 4;
+/// One provider attempt. Shadow calls do not retry.
+const DEADLINE: Duration = Duration::from_secs(4);
+/// Only this many trailing characters of a failure line are ever asked about.
+const MAX_LINE_CHARS: usize = 500;
+
+/// Model capabilities whose failure lines are never sent. `model-router`'s
+/// `emit_failure` is the only source of untriaged model failures, and its text is
+/// `[guest][capability] provider: <provider error body>`; a provider's error body
+/// can echo part of the request that failed, i.e. conversation content. Those
+/// lines are excluded outright rather than trusted to redaction.
+const MODEL_CAPABILITIES: &[&str] = &[
+    "text.generate",
+    "response.generate",
+    "voice.dialogue",
+    "voice.transcribe",
+    "voice.synthesize",
+    "media.analyze",
+    "text.embed",
+    "decisions.evaluate",
+];
+
+/// `[guest][capability] rest` gives `capability`, when the line has that envelope.
+fn envelope_capability(line: &str) -> Option<&str> {
+    let rest = line.trim_start().strip_prefix('[')?;
+    let (_guest, rest) = rest.split_once("][")?;
+    let (capability, _) = rest.split_once(']')?;
+    Some(capability)
+}
+
+/// Is this a model-controller failure line (a provider error body may be in it)?
+fn is_model_failure_line(line: &str) -> bool {
+    envelope_capability(line).is_some_and(|c| MODEL_CAPABILITIES.contains(&c))
+}
+
+/// What the incumbent classifier decided for the same line.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Incumbent {
+    pub severity: String,
+    pub pattern_tag: String,
+    pub heal_action: String,
+}
+
+/// `PHILOTIC_SHADOW_DECISIONS` is off unless set to a truthy value.
+pub fn shadow_enabled(env: impl Fn(&str) -> Option<String>) -> bool {
+    env(ENV_FLAG).is_some_and(|v| {
+        matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "on" | "yes"
+        )
+    })
+}
+
+pub struct ShadowJudge {
+    inner: Arc<Inner>,
+}
+
+struct Inner {
+    client: DecisionsClient,
+    store: Arc<dyn DecisionTraceStorage>,
+    permits: Arc<Semaphore>,
+}
+
+impl ShadowJudge {
+    /// `None` (and no network or IPC cost) unless the flag is set. If it is set
+    /// but the key or the trace store is unavailable, warn once and stay off.
+    pub async fn init(ipc: &mut PhiloticClient, http: &reqwest::Client) -> Option<Self> {
+        if !shadow_enabled(|k| std::env::var(k).ok()) {
+            return None;
+        }
+        let config = match load_decisions_config(ipc).await {
+            Ok(config) if config.api_key.is_some() => config,
+            Ok(_) => {
+                warn!(
+                    "{ENV_FLAG} is set but no OpenRouter key is configured \
+                     (`phil keys configure openrouter`); shadow judge stays off"
+                );
+                return None;
+            }
+            Err(e) => {
+                warn!(
+                    "{ENV_FLAG} is set but the OpenRouter key could not be loaded: {e:#}. If it is \
+                     an access denial, run `aiua auth sync-roles --provider openrouter --db <context db>` \
+                     on this hotel; shadow judge stays off"
+                );
+                return None;
+            }
+        };
+        let store = match SqliteDecisionTraceStorage::open(default_db_path()) {
+            Ok(store) => Arc::new(store) as Arc<dyn DecisionTraceStorage>,
+            Err(e) => {
+                warn!("decision trace store unavailable ({e:#}); shadow judge stays off");
+                return None;
+            }
+        };
+        let client = DecisionsClient::openrouter(
+            http.clone(),
+            config.api_key,
+            config.base_url,
+            config.model,
+        );
+        info!(
+            site = SITE,
+            "heal-dispatcher: shadow decisions enabled (log-only)"
+        );
+        Some(Self::from_parts(client, store))
+    }
+
+    pub fn from_parts(client: DecisionsClient, store: Arc<dyn DecisionTraceStorage>) -> Self {
+        Self {
+            inner: Arc::new(Inner {
+                client,
+                store,
+                permits: Arc::new(Semaphore::new(MAX_IN_FLIGHT)),
+            }),
+        }
+    }
+
+    /// Fire and forget. Returns immediately; never fails the caller. If too many
+    /// calls are already in flight this one is skipped.
+    pub fn observe(&self, guest_id: &str, raw_text: &str, incumbent: Option<Incumbent>) {
+        let Ok(permit) = self.inner.permits.clone().try_acquire_owned() else {
+            debug!("shadow judge busy; skipping one observation");
+            return;
+        };
+        let inner = self.inner.clone();
+        let guest_id = guest_id.to_string();
+        let raw_text = raw_text.to_string();
+        tokio::spawn(async move {
+            let _permit = permit;
+            inner.run(&guest_id, &raw_text, incumbent).await;
+        });
+    }
+}
+
+impl Inner {
+    async fn run(&self, guest_id: &str, raw_text: &str, incumbent: Option<Incumbent>) {
+        // Model-controller failure lines carry provider error bodies that can echo
+        // the failed request. They are never sent; the skip is recorded so the
+        // operator can see how often it happens.
+        if is_model_failure_line(raw_text) {
+            let refused = Err(DecisionsError::new(
+                DecisionsErrorClass::PolicyRefused,
+                "model-controller failure line: a provider error body can echo the request",
+            ));
+            let record = trace_record(guest_id, 0, incumbent.as_ref(), &refused);
+            if let Err(e) = self.store.record_trace(&record) {
+                warn!("decision trace write failed: {e:#}");
+            }
+            return;
+        }
+        // Only the tail of the line is asked about. Heal classification needs the
+        // error, not the whole message, and every extra character is exposure.
+        let request = build_request(guest_id, &gate::tail(raw_text, MAX_LINE_CHARS));
+        // The byte count is what the client actually put on the wire (zero when the
+        // data policy refused), not a second derivation.
+        let audited = self.client.evaluate_audited(&request, None, DEADLINE).await;
+        let record = trace_record(
+            guest_id,
+            audited.bytes_sent,
+            incumbent.as_ref(),
+            &audited.result,
+        );
+        if let Err(e) = self.store.record_trace(&record) {
+            warn!("decision trace write failed: {e:#}");
+        }
+    }
+}
+
+/// Render a summary of the shadow run: errors, skipped and disagreement are kept
+/// on separate lines so an outage or a policy refusal never reads as the judge
+/// disagreeing.
+pub fn format_summary(s: &DecisionSummary) -> String {
+    let mut out = String::new();
+    out.push_str(&format!(
+        "decision traces: {} rows ({} ok, {} legend mismatches), {} bytes sent, ${:.6} spent\n",
+        s.total, s.ok, s.legend_mismatches, s.total_bytes_sent, s.total_cost_usd
+    ));
+    let list = |m: &BTreeMap<String, u64>| {
+        if m.is_empty() {
+            "none".to_string()
+        } else {
+            m.iter()
+                .map(|(k, v)| format!("{k}={v}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        }
+    };
+    out.push_str(&format!("errors by class: {}\n", list(&s.errors_by_class)));
+    out.push_str(&format!(
+        "skipped by policy: {}\n",
+        list(&s.skipped_by_reason)
+    ));
+    if s.agreement.is_empty() {
+        out.push_str("agreement: no comparable rows yet\n");
+    }
+    for (question, (agreed, compared)) in &s.agreement {
+        let pct = 100.0 * *agreed as f64 / (*compared).max(1) as f64;
+        out.push_str(&format!(
+            "agreement[{question}]: {agreed}/{compared} ({pct:.0}%)\n"
+        ));
+    }
+    out
+}
+
+/// `heal-dispatcher --decision-summary`: read `decision_traces.db` and print the
+/// summary. Read-only: it does not create the database if it is absent.
+pub fn print_summary() -> anyhow::Result<()> {
+    let path = default_db_path();
+    if !path.exists() {
+        println!(
+            "no decision traces yet ({} does not exist). Set {ENV_FLAG}=1 on this heal-dispatcher and let it run.",
+            path.display()
+        );
+        return Ok(());
+    }
+    let store = SqliteDecisionTraceStorage::open(&path)?;
+    let records = store.list_traces(100_000)?;
+    println!("store: {}", path.display());
+    print!("{}", format_summary(&summarize(&records)));
+    Ok(())
+}
+
+/// The typed questions for a failure line. The state is the guest id and the raw
+/// text; the client redacts and truncates it.
+pub fn build_request(guest_id: &str, raw_text: &str) -> DecisionsRequest {
+    DecisionsRequest {
+        site: SITE.into(),
+        state: json!({ "guest": guest_id, "error": raw_text }),
+        questions: vec![
+            DecisionQuestion {
+                id: "severity".into(),
+                instructions: "How severe is this guest process error for the operator's system?"
+                    .into(),
+                spec: QuestionSpec::Choice {
+                    options: vec![
+                        DecisionOption::new("critical", "The service is down or data is at risk"),
+                        DecisionOption::new("high", "Degraded and needs attention soon"),
+                        DecisionOption::new("medium", "Noticeable but not urgent"),
+                        DecisionOption::new("low", "Minor or cosmetic"),
+                    ],
+                },
+            },
+            DecisionQuestion {
+                id: "needs_restart".into(),
+                instructions: "Would restarting the guest process plausibly resolve this error?"
+                    .into(),
+                spec: QuestionSpec::Noul {
+                    when_true: Some(
+                        "A transient or stuck-process condition that a restart clears".into(),
+                    ),
+                    when_false: Some(
+                        "A restart would not help: configuration, credentials, an upstream service, or benign"
+                            .into(),
+                    ),
+                },
+            },
+        ],
+    }
+}
+
+/// Did the judge agree with the incumbent, per question? `None` = not
+/// comparable. The 0.5 on `needs_restart` is a logging convenience so a row can
+/// say "agreed"; it is NOT a decision threshold, and the raw probability is
+/// stored beside it for calibration.
+pub fn compare(
+    incumbent: &Incumbent,
+    outcome: &DecisionsOutcome,
+) -> BTreeMap<String, Option<bool>> {
+    let mut agreement = BTreeMap::new();
+
+    let severity = match outcome.result.answers.get("severity") {
+        Some(DecisionAnswer::Choice { choice, .. })
+            if matches!(
+                incumbent.severity.as_str(),
+                "critical" | "high" | "medium" | "low"
+            ) =>
+        {
+            Some(*choice == incumbent.severity)
+        }
+        _ => None,
+    };
+    agreement.insert("severity".to_string(), severity);
+
+    let restart = match outcome.result.answers.get("needs_restart") {
+        Some(DecisionAnswer::Noul { noul })
+            if matches!(
+                incumbent.heal_action.as_str(),
+                "restart_guest" | "escalate" | "noop"
+            ) =>
+        {
+            Some((*noul > 0.5) == (incumbent.heal_action == "restart_guest"))
+        }
+        _ => None,
+    };
+    agreement.insert("needs_restart".to_string(), restart);
+    agreement
+}
+
+fn trace_record(
+    guest_id: &str,
+    bytes_sent: u64,
+    incumbent: Option<&Incumbent>,
+    result: &Result<DecisionsOutcome, DecisionsError>,
+) -> DecisionTraceRecord {
+    let incumbent_json = incumbent.map(|i| {
+        json!({
+            "severity": i.severity,
+            "pattern_tag": i.pattern_tag,
+            "heal_action": i.heal_action,
+        })
+    });
+    let base = DecisionTraceRecord {
+        trace_id: Ulid::new().to_string(),
+        timestamp: SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs()),
+        site: SITE.into(),
+        data_class: gate::site_spec(SITE)
+            .map_or("A", |s| s.class.as_str())
+            .into(),
+        bytes_sent,
+        outcome: "ok".into(),
+        error_class: None,
+        provider: None,
+        model: None,
+        transport: None,
+        latency_ms: None,
+        input_tokens: None,
+        output_tokens: None,
+        cost_usd: None,
+        legend_mismatch: false,
+        request_id: None,
+        subject: Some(guest_id.to_string()),
+        incumbent: incumbent_json,
+        answers: None,
+        agreement: BTreeMap::new(),
+    };
+    match result {
+        Ok(outcome) => DecisionTraceRecord {
+            provider: Some(outcome.trace.provider.clone()),
+            model: Some(outcome.trace.model.clone()),
+            transport: Some(outcome.trace.transport.as_str().to_string()),
+            latency_ms: Some(outcome.trace.latency_ms),
+            input_tokens: Some(outcome.trace.usage.input_tokens),
+            output_tokens: Some(outcome.trace.usage.output_tokens),
+            cost_usd: outcome.trace.usage.cost_usd,
+            legend_mismatch: outcome.trace.legend_mismatch,
+            request_id: outcome.trace.request_id.clone(),
+            answers: serde_json::to_value(&outcome.result.answers).ok(),
+            agreement: incumbent.map(|i| compare(i, outcome)).unwrap_or_default(),
+            ..base
+        },
+        // The data policy declined to send: nothing left the machine. Recorded as
+        // `skipped`, never as an error or a disagreement.
+        Err(error) if error.class == DecisionsErrorClass::PolicyRefused => DecisionTraceRecord {
+            outcome: "skipped".into(),
+            error_class: Some(error.class.as_str().to_string()),
+            ..base
+        },
+        Err(error) => DecisionTraceRecord {
+            outcome: "error".into(),
+            error_class: Some(error.class.as_str().to_string()),
+            ..base
+        },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ansible_mesh_core::decisions::{
+        DecisionsErrorClass, DecisionsResult, DecisionsTrace, DecisionsTransport,
+        DecisionsTransport as T, DecisionsUsage, build_wire_request,
+    };
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    fn incumbent(severity: &str, action: &str) -> Incumbent {
+        Incumbent {
+            severity: severity.into(),
+            pattern_tag: "connection_refused".into(),
+            heal_action: action.into(),
+        }
+    }
+
+    fn outcome(choice: &str, needs_restart: f64) -> DecisionsOutcome {
+        DecisionsOutcome {
+            result: DecisionsResult {
+                site: SITE.into(),
+                answers: BTreeMap::from([
+                    (
+                        "severity".to_string(),
+                        DecisionAnswer::Choice {
+                            choice: choice.into(),
+                            probabilities: BTreeMap::from([(choice.to_string(), 0.9)]),
+                            confidence: 0.9,
+                        },
+                    ),
+                    (
+                        "needs_restart".to_string(),
+                        DecisionAnswer::Noul {
+                            noul: needs_restart,
+                        },
+                    ),
+                ]),
+            },
+            trace: DecisionsTrace {
+                provider: "TypeSafe".into(),
+                model: "typesafe/jev-1.13-20260917".into(),
+                transport: DecisionsTransport::OpenRouter,
+                latency_ms: 300,
+                usage: DecisionsUsage {
+                    input_tokens: 400,
+                    output_tokens: 60,
+                    cost_usd: Some(0.0000168),
+                },
+                request_id: Some("gen-dec-x".into()),
+                legend_mismatch: false,
+            },
+        }
+    }
+
+    #[test]
+    fn the_flag_is_off_unless_explicitly_truthy() {
+        let with = |v: Option<&'static str>| shadow_enabled(move |_| v.map(str::to_string));
+        assert!(!with(None));
+        assert!(!with(Some("")));
+        assert!(!with(Some("0")));
+        assert!(!with(Some("false")));
+        assert!(!with(Some("maybe")));
+        for on in ["1", "true", "TRUE", " on ", "yes"] {
+            assert!(with(Some(on)), "{on}");
+        }
+    }
+
+    #[test]
+    fn the_request_is_on_the_allow_list_valid_and_ordered() {
+        let request = build_request("beacon", "connection refused");
+        gate::site_spec(&request.site).expect("heal.classify is allow-listed");
+        build_wire_request(T::OpenRouter, &request, "typesafe/jev-1.13")
+            .expect("valid on the wire");
+        let ids: Vec<&str> = request.questions.iter().map(|q| q.id.as_str()).collect();
+        assert_eq!(ids, ["severity", "needs_restart"]);
+        assert_eq!(request.state["guest"], "beacon");
+    }
+
+    #[test]
+    fn agreement_is_per_question_and_none_when_not_comparable() {
+        // Judge says high, restart unlikely.
+        let judged = outcome("high", 0.1);
+        let a = compare(&incumbent("high", "escalate"), &judged);
+        assert_eq!(a["severity"], Some(true));
+        assert_eq!(
+            a["needs_restart"],
+            Some(true),
+            "escalate is a non-restart, judge agrees"
+        );
+
+        let a = compare(&incumbent("medium", "restart_guest"), &judged);
+        assert_eq!(a["severity"], Some(false));
+        assert_eq!(
+            a["needs_restart"],
+            Some(false),
+            "incumbent restarts, judge does not"
+        );
+
+        // "unknown" is outside the judge's options: not comparable, not disagreement.
+        let a = compare(&incumbent("unknown", "noop"), &judged);
+        assert_eq!(a["severity"], None);
+        assert_eq!(a["needs_restart"], Some(true));
+
+        let a = compare(&incumbent("high", "something_new"), &judged);
+        assert_eq!(a["needs_restart"], None);
+    }
+
+    #[test]
+    fn a_trace_row_holds_provenance_and_answers() {
+        let record = trace_record(
+            "beacon",
+            512,
+            Some(&incumbent("high", "restart_guest")),
+            &Ok(outcome("high", 0.8)),
+        );
+        assert_eq!(record.site, "heal.classify");
+        assert_eq!(record.data_class, "A");
+        assert_eq!(record.outcome, "ok");
+        assert_eq!(record.model.as_deref(), Some("typesafe/jev-1.13-20260917"));
+        assert_eq!(record.agreement["severity"], Some(true));
+        assert_eq!(record.bytes_sent, 512);
+    }
+
+    #[test]
+    fn a_policy_refusal_is_a_skipped_row_that_sent_nothing() {
+        let refused = Err(DecisionsError::new(
+            DecisionsErrorClass::PolicyRefused,
+            "state resembles a conversation payload",
+        ));
+        let record = trace_record("beacon", 0, Some(&incumbent("high", "noop")), &refused);
+        assert_eq!(record.outcome, "skipped");
+        assert_eq!(record.error_class.as_deref(), Some("policy_refused"));
+        assert_eq!(record.bytes_sent, 0);
+        assert!(record.agreement.is_empty());
+    }
+
+    #[test]
+    fn a_line_that_echoes_a_conversation_is_skipped_end_to_end_and_never_sent() {
+        // An unreachable base: if the judge tried to send, this would be an
+        // `unavailable` error row, not a `skipped` one.
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(SqliteDecisionTraceStorage::open(dir.path().join("d.db")).unwrap());
+        let client = DecisionsClient::openrouter(
+            reqwest::Client::default(),
+            Some("k".into()),
+            Some("http://127.0.0.1:9".into()),
+            None,
+        );
+        let judge = ShadowJudge::from_parts(client, store.clone());
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            judge
+                .inner
+                .run(
+                    "beacon",
+                    r#"[beacon][text.generate] openai: 400 {"messages":[{"role":"user","content":"private"}]}"#,
+                    None,
+                )
+                .await;
+        });
+        let rows = store.list_traces(10).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].outcome, "skipped");
+        assert_eq!(rows[0].error_class.as_deref(), Some("policy_refused"));
+        assert_eq!(rows[0].bytes_sent, 0);
+        assert!(!serde_json::to_string(&rows[0]).unwrap().contains("private"));
+    }
+
+    #[test]
+    fn model_failure_envelopes_are_recognised_and_other_lines_are_not() {
+        // The exact shape model-router's emit_failure pushes.
+        for capability in MODEL_CAPABILITIES {
+            let line = format!("[model-controller-openai-01][{capability}] openai: HTTP 400 x");
+            assert_eq!(envelope_capability(&line), Some(*capability), "{line}");
+            assert!(is_model_failure_line(&line), "{line}");
+        }
+        for line in [
+            "thread 'main' panicked at src/main.rs:42",
+            "connection refused",
+            "[beacon] started",
+            "[membrane][telegram.poll] getUpdates failed",
+            "",
+        ] {
+            assert!(!is_model_failure_line(line), "{line:?}");
+        }
+    }
+
+    #[test]
+    fn a_model_failure_line_is_skipped_without_any_network_hop() {
+        // An unreachable base: an attempted send would be an `unavailable` error row.
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(SqliteDecisionTraceStorage::open(dir.path().join("d.db")).unwrap());
+        let client = DecisionsClient::openrouter(
+            reqwest::Client::default(),
+            Some("k".into()),
+            Some("http://127.0.0.1:9".into()),
+            None,
+        );
+        let judge = ShadowJudge::from_parts(client, store.clone());
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            judge
+                .inner
+                .run(
+                    "model-controller-openai-01",
+                    "[model-controller-openai-01][text.generate] openai: HTTP 400 weird error",
+                    Some(incumbent("unknown", "noop")),
+                )
+                .await;
+        });
+        let rows = store.list_traces(10).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].outcome, "skipped");
+        assert_eq!(rows[0].error_class.as_deref(), Some("policy_refused"));
+        assert_eq!(rows[0].bytes_sent, 0);
+    }
+
+    #[test]
+    fn only_the_tail_of_a_long_line_is_asked_about() {
+        let long = format!("{}THE-ERROR", "x".repeat(MAX_LINE_CHARS * 3));
+        let tail = gate::tail(&long, MAX_LINE_CHARS);
+        assert!(tail.ends_with("THE-ERROR"));
+        assert_eq!(tail.chars().count(), MAX_LINE_CHARS + 1);
+    }
+
+    #[test]
+    fn the_summary_keeps_errors_skips_and_agreement_on_separate_lines() {
+        let summary = summarize(&[
+            {
+                let mut r = trace_record(
+                    "beacon",
+                    600,
+                    Some(&incumbent("high", "restart_guest")),
+                    &Ok(outcome("high", 0.9)),
+                );
+                r.trace_id = "a".into();
+                r
+            },
+            {
+                let mut r = trace_record(
+                    "beacon",
+                    600,
+                    None,
+                    &Err(DecisionsError::new(DecisionsErrorClass::Timeout, "slow")),
+                );
+                r.trace_id = "b".into();
+                r
+            },
+            {
+                let mut r = trace_record(
+                    "beacon",
+                    0,
+                    None,
+                    &Err(DecisionsError::new(
+                        DecisionsErrorClass::PolicyRefused,
+                        "no",
+                    )),
+                );
+                r.trace_id = "c".into();
+                r
+            },
+        ]);
+        let text = format_summary(&summary);
+        assert!(text.contains("3 rows (1 ok"), "{text}");
+        assert!(text.contains("errors by class: timeout=1"), "{text}");
+        assert!(
+            text.contains("skipped by policy: policy_refused=1"),
+            "{text}"
+        );
+        assert!(text.contains("agreement[severity]: 1/1 (100%)"), "{text}");
+        assert!(text.contains("1200 bytes sent"), "{text}");
+        assert!(format_summary(&DecisionSummary::default()).contains("no comparable rows yet"));
+    }
+
+    #[test]
+    fn a_failed_call_is_an_error_row_with_no_agreement() {
+        let failed = Err(DecisionsError::new(
+            DecisionsErrorClass::RateLimited,
+            "slow",
+        ));
+        let record = trace_record("beacon", 100, Some(&incumbent("high", "noop")), &failed);
+        assert_eq!(record.outcome, "error");
+        assert_eq!(record.error_class.as_deref(), Some("rate_limited"));
+        assert!(record.agreement.is_empty() && record.answers.is_none() && record.model.is_none());
+        assert_eq!(record.incumbent.as_ref().unwrap()["heal_action"], "noop");
+    }
+
+    // ── end to end against a local socket ────────────────────────────────────
+
+    const OK_BODY: &str = r#"{"model":"typesafe/jev-1.13-20260917","answers":{"severity":{"type":"choice","choice":"high","probabilities":{"critical":0.05,"high":0.9,"medium":0.03,"low":0.02},"confidence":0.9},"needs_restart":{"type":"noul","noul":0.8}},"usage":{"input_tokens":400,"output_tokens":60,"cost":0.0000168},"id":"gen-dec-x","provider":"TypeSafe"}"#;
+
+    /// Serve one canned response, or (when `hang`) accept and never answer.
+    async fn serve(status_line: &'static str, body: &'static str, hang: bool) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buf = vec![0u8; 8192];
+            let _ = socket.read(&mut buf).await;
+            if hang {
+                tokio::time::sleep(Duration::from_secs(60)).await;
+                return;
+            }
+            let response = format!(
+                "HTTP/1.1 {status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = socket.write_all(response.as_bytes()).await;
+            let _ = socket.shutdown().await;
+        });
+        format!("http://{addr}")
+    }
+
+    fn judge(base: &str, dir: &std::path::Path) -> (ShadowJudge, Arc<SqliteDecisionTraceStorage>) {
+        let store = Arc::new(SqliteDecisionTraceStorage::open(dir.join("d.db")).unwrap());
+        let client = DecisionsClient::openrouter(
+            reqwest::Client::default(),
+            Some("test-key".into()),
+            Some(format!("{base}/api")),
+            None,
+        );
+        (ShadowJudge::from_parts(client, store.clone()), store)
+    }
+
+    async fn wait_for_rows(
+        store: &SqliteDecisionTraceStorage,
+        n: usize,
+    ) -> Vec<DecisionTraceRecord> {
+        for _ in 0..100 {
+            let rows = store.list_traces(10).unwrap();
+            if rows.len() >= n {
+                return rows;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        panic!("no trace row appeared");
+    }
+
+    #[tokio::test]
+    async fn observe_records_an_ok_row_with_agreement() {
+        let base = serve("200 OK", OK_BODY, false).await;
+        let dir = tempfile::tempdir().unwrap();
+        let (judge, store) = judge(&base, dir.path());
+
+        judge.observe(
+            "beacon",
+            "connection refused",
+            Some(incumbent("high", "restart_guest")),
+        );
+        let rows = wait_for_rows(&store, 1).await;
+        let row = &rows[0];
+        assert_eq!(row.outcome, "ok");
+        assert_eq!(row.agreement["severity"], Some(true));
+        assert_eq!(row.agreement["needs_restart"], Some(true));
+        assert_eq!(row.model.as_deref(), Some("typesafe/jev-1.13-20260917"));
+        assert_eq!(row.transport.as_deref(), Some("openrouter"));
+        assert!(row.answers.is_some());
+    }
+
+    #[tokio::test]
+    async fn the_stored_row_never_contains_the_text_that_was_sent() {
+        // The real path end to end: a line carrying a key and a home path goes
+        // through the judge to a local socket, and the row that lands in the store
+        // must hold none of it. (The wire-level redaction is asserted in
+        // decisions-client; this pins the audit side.)
+        let base = serve("200 OK", OK_BODY, false).await;
+        let dir = tempfile::tempdir().unwrap();
+        let (judge, store) = judge(&base, dir.path());
+
+        judge.observe(
+            "beacon",
+            "boom sk-or-v1-0123456789abcdef at /Users/jaredlikes/x",
+            Some(incumbent("high", "restart_guest")),
+        );
+        let rows = wait_for_rows(&store, 1).await;
+        assert_eq!(rows[0].outcome, "ok");
+        assert!(rows[0].bytes_sent > 0, "the wire body's length is recorded");
+        let stored = serde_json::to_string(&rows[0]).unwrap();
+        for leaked in ["sk-or-v1", "jaredlikes", "boom"] {
+            assert!(!stored.contains(leaked), "`{leaked}` in {stored}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_provider_error_is_an_error_row_not_a_disagreement() {
+        let base = serve("429 Too Many Requests", "slow down", false).await;
+        let dir = tempfile::tempdir().unwrap();
+        let (judge, store) = judge(&base, dir.path());
+
+        judge.observe("beacon", "novel failure", Some(incumbent("high", "noop")));
+        let rows = wait_for_rows(&store, 1).await;
+        assert_eq!(rows[0].outcome, "error");
+        assert_eq!(rows[0].error_class.as_deref(), Some("rate_limited"));
+        assert!(rows[0].agreement.is_empty());
+    }
+
+    #[tokio::test]
+    async fn observe_never_blocks_even_when_the_provider_hangs() {
+        let base = serve("200 OK", OK_BODY, true).await;
+        let dir = tempfile::tempdir().unwrap();
+        let (judge, _store) = judge(&base, dir.path());
+
+        let started = std::time::Instant::now();
+        judge.observe("beacon", "novel failure", None);
+        assert!(
+            started.elapsed() < Duration::from_millis(100),
+            "observe must return immediately, took {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[tokio::test]
+    async fn observations_beyond_the_in_flight_cap_are_skipped_not_queued() {
+        let base = serve("200 OK", OK_BODY, true).await;
+        let dir = tempfile::tempdir().unwrap();
+        let (judge, _store) = judge(&base, dir.path());
+        // Hold every permit, as if MAX_IN_FLIGHT slow calls were outstanding.
+        let held: Vec<_> = (0..MAX_IN_FLIGHT)
+            .map(|_| judge.inner.permits.clone().try_acquire_owned().unwrap())
+            .collect();
+        judge.observe("beacon", "one more", None);
+        assert_eq!(judge.inner.permits.available_permits(), 0);
+        drop(held);
+        assert_eq!(judge.inner.permits.available_permits(), MAX_IN_FLIGHT);
+    }
+}

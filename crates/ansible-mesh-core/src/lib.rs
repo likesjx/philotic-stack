@@ -13,6 +13,8 @@ pub mod capability;
 pub mod catalog_rights;
 pub mod cron;
 pub mod cursor;
+pub mod decision_trace;
+pub mod decisions;
 pub mod domain;
 pub mod event;
 pub mod graph;

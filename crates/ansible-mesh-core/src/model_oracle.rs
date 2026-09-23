@@ -177,6 +177,9 @@ pub fn task_kind_for_request_class(request_class: &str) -> &'static str {
     match request_class {
         "embedding" => "text.embed",
         "synthesis" => "voice.synthesize",
+        // A judgment must never rank chat models: no `text.generate` profile
+        // supports it, so a judgment need matches nothing rather than the wrong thing.
+        "judgment" => "decisions.evaluate",
         _ => "text.generate",
     }
 }
@@ -396,6 +399,18 @@ pub fn apply_model_outcome(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn request_classes_map_to_the_task_kind_a_profile_must_support() {
+        assert_eq!(task_kind_for_request_class("embedding"), "text.embed");
+        assert_eq!(task_kind_for_request_class("synthesis"), "voice.synthesize");
+        assert_eq!(task_kind_for_request_class("cognitive"), "text.generate");
+        // A judgment never falls through to the chat default.
+        assert_eq!(
+            task_kind_for_request_class("judgment"),
+            "decisions.evaluate"
+        );
+    }
 
     #[test]
     fn shadow_oracle_agreement_agree() {

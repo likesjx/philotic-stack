@@ -1,7 +1,11 @@
 use ansible_mesh_core::catalog_rights::{has_right, tool_right};
+use ansible_mesh_core::decisions::{
+    CAPABILITY_DECISIONS_EVALUATE, DecisionsOutcome, DecisionsRequest, DecisionsTransport,
+};
 use ansible_mesh_core::provider_keys::{ProviderKeySpec, provider_key_spec};
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
+use decisions_client::DecisionsConfig;
 use media_prep::serialize_audio_artifact_envelope;
 use philotic_client::{IpcRequest, IpcResponse, PhiloticClient};
 use serde_json::{Map, Value, json};
@@ -16,6 +20,10 @@ pub enum TaskKind {
     VoiceDialogue,
     VoiceSynthesize,
     Embed,
+    /// Typed judgment: state plus typed questions in, typed probabilities out.
+    /// Handled on its own reply path (`decisions_response`), never through the
+    /// turn-reply ladder. See `ansible_mesh_core::decisions`.
+    Decide,
 }
 
 impl TaskKind {
@@ -28,6 +36,7 @@ impl TaskKind {
             Self::VoiceDialogue => "voice.dialogue",
             Self::VoiceSynthesize => "voice.synthesize",
             Self::Embed => "text.embed",
+            Self::Decide => CAPABILITY_DECISIONS_EVALUATE,
         }
     }
 
@@ -43,6 +52,8 @@ pub enum RequestClass {
     Transform,
     Synthesis,
     Embedding,
+    /// A typed decision (`decisions.evaluate`): distributions out, no text.
+    Judgment,
 }
 
 impl RequestClass {
@@ -52,6 +63,7 @@ impl RequestClass {
             Self::Transform => "transform",
             Self::Synthesis => "synthesis",
             Self::Embedding => "embedding",
+            Self::Judgment => "judgment",
         }
     }
 
@@ -63,6 +75,7 @@ impl RequestClass {
             TaskKind::MediaAnalyze | TaskKind::AudioTranscribe => Self::Transform,
             TaskKind::VoiceSynthesize => Self::Synthesis,
             TaskKind::Embed => Self::Embedding,
+            TaskKind::Decide => Self::Judgment,
         }
     }
 
@@ -76,6 +89,7 @@ impl RequestClass {
             "transform" => Ok(Self::Transform),
             "synthesis" => Ok(Self::Synthesis),
             "embedding" => Ok(Self::Embedding),
+            "judgment" => Ok(Self::Judgment),
             other => bail!("unsupported request_class [{}]", other),
         }
     }
@@ -272,6 +286,9 @@ pub struct ControllerTask {
     pub response_route: Option<ResponseRouteBucket>,
     pub provider_options: Map<String, Value>,
     pub effective_rights: Vec<String>,
+    /// The typed request for a `decisions.evaluate` task. Questions are a typed
+    /// block, never `provider_options` passthrough. `None` for every other kind.
+    pub decisions: Option<DecisionsRequest>,
     /// Tools the agent has available this turn. Non-empty signals tool-enabled mode.
     /// Each entry is a raw JSON object with at minimum `tool_name` and `description`.
     pub tools: Vec<Value>,
@@ -308,6 +325,7 @@ impl ControllerTask {
             Some("voice.dialogue") | Some("voice_dialogue") => TaskKind::VoiceDialogue,
             Some("voice.synthesize") | Some("voice_synthesize") => TaskKind::VoiceSynthesize,
             Some("text.embed") | Some("embed") => TaskKind::Embed,
+            Some(CAPABILITY_DECISIONS_EVALUATE) => TaskKind::Decide,
             Some(other) => bail!("unsupported task kind [{}]", other),
             None if task.get("prompt").and_then(Value::as_str).is_some() => TaskKind::TextGenerate,
             None if !context.attachments.is_empty() => TaskKind::MediaAnalyze,
@@ -400,6 +418,7 @@ impl ControllerTask {
                         .collect()
                 })
                 .unwrap_or_default(),
+            decisions: parse_decisions(task.get("decisions"))?,
             tools: task
                 .get("tools_for_model")
                 .and_then(Value::as_array)
@@ -755,6 +774,18 @@ impl ControllerTask {
                     bail!("text.embed task input text cannot be empty");
                 }
             }
+            TaskKind::Decide => {
+                let decisions = self
+                    .decisions
+                    .as_ref()
+                    .context("decisions.evaluate task missing the `decisions` block")?;
+                // Provider-independent checks (ids, option counts, the 32k
+                // state+question cap). The transport's whole-request budget is
+                // enforced again when the wire request is built.
+                decisions
+                    .validate(DecisionsTransport::Native)
+                    .map_err(|err| anyhow::anyhow!("{err}"))?;
+            }
         }
 
         match self.request_class {
@@ -799,9 +830,30 @@ impl ControllerTask {
                     );
                 }
             }
+            RequestClass::Judgment => {
+                if self.kind != TaskKind::Decide {
+                    bail!(
+                        "request_class [judgment] requires task kind [{}], got [{}]",
+                        TaskKind::Decide.as_str(),
+                        self.kind.as_str()
+                    );
+                }
+            }
         }
 
         Ok(())
+    }
+}
+
+/// Parse the typed `decisions` block. Absent is fine (every other task kind);
+/// present but malformed is an error, so a bad envelope never silently becomes
+/// a task with no questions.
+fn parse_decisions(value: Option<&Value>) -> Result<Option<DecisionsRequest>> {
+    match value {
+        None | Some(Value::Null) => Ok(None),
+        Some(raw) => serde_json::from_value(raw.clone())
+            .map(Some)
+            .context("malformed `decisions` block"),
     }
 }
 
@@ -1252,6 +1304,10 @@ pub enum ProviderOutput {
         vector: Vec<f32>,
         model_gen: String,
     },
+    /// Typed answers (probabilities, no text) plus provenance from a decisions
+    /// provider. Never converted to reply text: it leaves through the dedicated
+    /// `decisions_response` action.
+    Judgment(Box<DecisionsOutcome>),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1267,6 +1323,16 @@ pub struct ResponseTrace {
     pub provider: Option<String>,
     pub model: Option<String>,
     pub voice: Option<String>,
+    // The three fields below are decisions-only and are NOT forwarded by
+    // `emit_text_response`, which hand-lists provider/model/voice: the decisions
+    // reply carries the full `DecisionsTrace` on its own action instead.
+    /// Decisions only: `native` or `openrouter`.
+    pub transport: Option<String>,
+    /// Decisions only: wall time of the provider hop, measured by the provider.
+    pub latency_ms: Option<u64>,
+    /// Decisions only: `{input_tokens, output_tokens, cost_usd}`. Output tokens
+    /// are non-zero but free for Jev, so both are recorded.
+    pub usage: Option<Value>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1326,6 +1392,7 @@ impl ControllerResponseEnvelope {
                         provider: Some(provider_id.to_string()),
                         model: task.model.clone(),
                         voice: None,
+                        ..Default::default()
                     },
                     provider_output: Value::Null,
                 })
@@ -1349,6 +1416,7 @@ impl ControllerResponseEnvelope {
                         provider: Some(provider_id.to_string()),
                         model: Some(audio.model.clone()),
                         voice: Some(audio.voice_id.clone()),
+                        ..Default::default()
                     },
                     provider_output: Value::Null,
                 })
@@ -1382,8 +1450,40 @@ impl ControllerResponseEnvelope {
                         provider: Some(provider_id.to_string()),
                         model: task.model.clone(),
                         voice: None,
+                        ..Default::default()
                     },
                     provider_output: Value::Null,
+                })
+            }
+            // NOT on the production decisions path. `handle_decisions_task` ->
+            // `evaluate_task` -> `DecisionReply::body()` never builds a
+            // `ControllerResponseEnvelope`, and `emit_text_response` (which would
+            // send this as a `model_response` and drop the trace fields below)
+            // must never see a decision. This arm exists because the match is
+            // exhaustive, and so tools that want a generic envelope have a typed
+            // one. Do not route decisions through it.
+            ProviderOutput::Judgment(outcome) => {
+                let trace = &outcome.trace;
+                Ok(Self {
+                    capability: task.kind.as_str().to_string(),
+                    // A machine string, never answer text (Embed does the same
+                    // with `model_gen`).
+                    content: format!("decisions:{}", outcome.result.site),
+                    result: serde_json::to_value(&outcome.result)?,
+                    artifacts: Vec::new(),
+                    trace: ResponseTrace {
+                        provider: Some(trace.provider.clone()),
+                        // The RESOLVED model, not the alias asked for:
+                        // calibration is per model version.
+                        model: Some(trace.model.clone()),
+                        voice: None,
+                        transport: Some(trace.transport.as_str().to_string()),
+                        latency_ms: Some(trace.latency_ms),
+                        usage: Some(serde_json::to_value(trace.usage)?),
+                    },
+                    // Carries request_id and legend_mismatch, which the flat
+                    // trace does not.
+                    provider_output: serde_json::to_value(trace)?,
                 })
             }
             // ToolCall is intercepted in runtime.rs before reaching from_output.
@@ -1449,6 +1549,9 @@ pub struct ProviderConfigs {
     pub openrouter_default_embedding_model: Option<String>,
     pub openrouter_fallback_models: Vec<String>,
     pub openrouter_route: Option<String>,
+    /// The dedicated decisions key and settings. Populated only by the decisions
+    /// handler (`load_decisions_config`), never by `ProviderConfigs::load`.
+    pub decisions: DecisionsConfig,
 }
 
 impl ProviderConfigs {
@@ -1556,6 +1659,11 @@ impl ProviderConfigs {
                 "openrouter_route",
             )
             .await?),
+            // Deliberately not loaded here: every controller reloads this struct
+            // on every task, and the decisions key is readable only by
+            // `model.decisions` and `heal-dispatcher`. The decisions handler loads
+            // it itself, without the dozen unrelated round trips.
+            decisions: DecisionsConfig::default(),
         })
     }
 
@@ -2821,5 +2929,129 @@ mod tests {
             )),
         );
         assert_eq!(result, None);
+    }
+
+    fn decisions_block() -> serde_json::Value {
+        json!({
+            "site": "heal.classify",
+            "state": { "guest": "beacon", "log_tail": "connection refused" },
+            "questions": [
+                { "id": "needs_restart", "type": "noul", "instructions": "Would a restart fix this?" },
+                { "id": "severity", "type": "choice", "instructions": "How severe?",
+                  "options": [ { "key": "high", "description": "soon" }, { "key": "low", "description": "later" } ] }
+            ]
+        })
+    }
+
+    #[test]
+    fn decisions_task_parses_into_the_typed_block_with_the_judgment_class() {
+        let task = ControllerTask::from_value(&json!({
+            "kind": "decisions.evaluate",
+            "decisions": decisions_block(),
+        }))
+        .unwrap();
+        assert_eq!(task.kind, TaskKind::Decide);
+        assert_eq!(task.kind.as_str(), "decisions.evaluate");
+        assert_eq!(task.request_class, RequestClass::Judgment);
+        let decisions = task.decisions.expect("typed block");
+        assert_eq!(decisions.site, "heal.classify");
+        assert_eq!(decisions.questions.len(), 2);
+        // Questions stay a typed block, not provider_options passthrough.
+        assert!(task.provider_options.is_empty());
+        assert!(!task.kind.is_native_live());
+    }
+
+    #[test]
+    fn decisions_task_rejects_a_missing_or_malformed_block_and_a_wrong_class() {
+        let missing = ControllerTask::from_value(&json!({ "kind": "decisions.evaluate" }));
+        assert!(format!("{:#}", missing.unwrap_err()).contains("`decisions` block"));
+
+        let malformed = ControllerTask::from_value(&json!({
+            "kind": "decisions.evaluate", "decisions": 7,
+        }));
+        assert!(format!("{:#}", malformed.unwrap_err()).contains("malformed"));
+
+        // Validation from the pure envelope surfaces here: no questions.
+        let mut empty = decisions_block();
+        empty["questions"] = json!([]);
+        let err = ControllerTask::from_value(&json!({
+            "kind": "decisions.evaluate", "decisions": empty,
+        }))
+        .unwrap_err();
+        assert!(format!("{err:#}").contains("at least one question"));
+
+        // `judgment` belongs to decisions only, and decisions to `judgment` only.
+        let wrong_kind = ControllerTask::from_value(&json!({
+            "kind": "text.generate", "prompt": "hi", "request_class": "judgment",
+        }));
+        assert!(wrong_kind.is_err());
+        let wrong_class = ControllerTask::from_value(&json!({
+            "kind": "decisions.evaluate", "decisions": decisions_block(),
+            "request_class": "cognitive",
+        }));
+        assert!(wrong_class.is_err());
+    }
+
+    #[test]
+    fn other_task_kinds_carry_no_decisions_block() {
+        let task = ControllerTask::from_value(&json!({ "kind": "text.generate", "prompt": "hi" }))
+            .unwrap();
+        assert!(task.decisions.is_none());
+    }
+
+    #[test]
+    fn judgment_output_becomes_a_machine_envelope_with_a_grown_trace() {
+        use ansible_mesh_core::decisions::{
+            DecisionAnswer, DecisionsOutcome, DecisionsResult, DecisionsTrace, DecisionsTransport,
+            DecisionsUsage,
+        };
+        use std::collections::BTreeMap;
+
+        let task = ControllerTask::from_value(&json!({
+            "kind": "decisions.evaluate", "decisions": decisions_block(),
+        }))
+        .unwrap();
+        let outcome = DecisionsOutcome {
+            result: DecisionsResult {
+                site: "heal.classify".into(),
+                answers: BTreeMap::from([(
+                    "needs_restart".to_string(),
+                    DecisionAnswer::Noul { noul: 0.07 },
+                )]),
+            },
+            trace: DecisionsTrace {
+                provider: "TypeSafe".into(),
+                model: "typesafe/jev-1.13-20260917".into(),
+                transport: DecisionsTransport::OpenRouter,
+                latency_ms: 290,
+                usage: DecisionsUsage {
+                    input_tokens: 307,
+                    output_tokens: 23,
+                    cost_usd: Some(0.0000129),
+                },
+                request_id: Some("gen-dec-x".into()),
+                legend_mismatch: false,
+            },
+        };
+        let envelope = ControllerResponseEnvelope::from_output(
+            &task,
+            "typesafe",
+            ProviderOutput::Judgment(Box::new(outcome)),
+        )
+        .unwrap();
+
+        assert_eq!(envelope.capability, "decisions.evaluate");
+        // A machine string, never answer text.
+        assert_eq!(envelope.content, "decisions:heal.classify");
+        assert!(envelope.artifacts.is_empty());
+        assert_eq!(envelope.result["answers"]["needs_restart"]["noul"], 0.07);
+        assert_eq!(
+            envelope.trace.model.as_deref(),
+            Some("typesafe/jev-1.13-20260917")
+        );
+        assert_eq!(envelope.trace.transport.as_deref(), Some("openrouter"));
+        assert_eq!(envelope.trace.latency_ms, Some(290));
+        assert_eq!(envelope.trace.usage.as_ref().unwrap()["output_tokens"], 23);
+        assert_eq!(envelope.provider_output["request_id"], "gen-dec-x");
     }
 }

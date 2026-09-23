@@ -10,13 +10,20 @@ path = "src/main.rs"
 [dependencies]
 anyhow = "1.0"
 ansible-mesh-core = { path = "../ansible-mesh-core" }
+decisions-client = { path = "../decisions-client" }
 philotic-client = { path = "../philotic-client" }
 reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync"] }
 tracing = "0.1"
 tracing-subscriber = "0.3"
+ulid = "1"
+
+[dev-dependencies]
+# The shadow judge tests serve canned HTTP responses from a local socket.
+tempfile = "3"
+tokio = { version = "1", features = ["net", "io-util"] }
 
 # Clippy ratchet: this crate is warning-free and must stay that way.
 [lints]
