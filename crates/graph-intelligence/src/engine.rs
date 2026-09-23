@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use rusqlite::{params, Connection, Transaction};
+use tracing::warn;
 
 use crate::schema::*;
 
@@ -15,6 +16,31 @@ pub struct EmbeddingSnapshotRow {
 
 pub struct GraphEngine {
     conn: Connection,
+}
+
+/// Turn free text into a literal FTS5 MATCH query (DEF-198).
+///
+/// `graph_search` documents `query` as plain search text, but FTS5's query
+/// grammar treats `-` as its column-filter/NOT operator, `:` as a column
+/// prefix, `*` as a prefix wildcard, and unbalanced `"` as a syntax error — so
+/// a caller searching "model-oracle" got `no such column: oracle` instead of
+/// results, and the same trap waits for any other punctuation-bearing term
+/// (`check-engine`, `DEF-197`, `agent:jane`, ...). Every whitespace-separated
+/// token becomes its own quoted phrase (embedded `"` doubled, FTS5's escape
+/// for a literal quote), so punctuation inside a token is just text and
+/// tokens combine with FTS5's default implicit AND — the same effective
+/// semantics plain barewords had before, minus the parser trap. `None` for an
+/// all-whitespace query; querying FTS5 with nothing meaningful to match is
+/// the caller's job to skip, not this function's job to fake an answer for.
+fn fts5_literal_query(text: &str) -> Option<String> {
+    let mut tokens = text.split_whitespace().peekable();
+    tokens.peek()?;
+    Some(
+        tokens
+            .map(|t| format!("\"{}\"", t.replace('"', "\"\"")))
+            .collect::<Vec<_>>()
+            .join(" "),
+    )
 }
 
 #[derive(Debug, Clone)]
@@ -187,6 +213,55 @@ impl GraphEngine {
 
     // ── Node CRUD ──
 
+    /// Keep `nodes_fts` (an external-content index, `content=nodes`) in sync
+    /// with one row of `nodes` by its `id`.
+    ///
+    /// FTS5 does not implement the `ON CONFLICT ... DO ...` UPSERT syntax on a
+    /// virtual table (`UPSERT not implemented for virtual table`); every write
+    /// site here used to ask for it anyway and threw the error away with
+    /// `.ok()` ("best-effort"), so the index was NEVER populated by any write
+    /// path — `search_nodes` and `graph_search` silently returned nothing for
+    /// every query, not only the hyphenated ones DEF-198 first reported.
+    /// `INSERT OR IGNORE` is the supported conflict resolution for a virtual
+    /// table and fixes that: a node is indexed the first time it is written.
+    ///
+    /// Known remaining gap (filed as DEF-199, deliberately NOT attempted
+    /// here): a rowid already in the index is left as-is, so a renamed node's
+    /// old text stays searchable until `clear_worktree`'s next full rescan
+    /// deletes the `nodes` row — and even that leaves an orphaned `nodes_fts`
+    /// entry behind, since `clear_worktree` never touches the fts tables
+    /// either. A delete-then-reinsert sync (SQLite's documented pattern for
+    /// external-content fts5 tables) reproducibly raised "database disk image
+    /// is malformed" against this crate's bundled SQLite even in the
+    /// simplest single-row case — a deeper, separate problem than the one
+    /// this slice set out to fix. Still best-effort: a search-index hiccup
+    /// must never fail the graph write, but it now warns instead of vanishing.
+    fn sync_node_fts(&self, node_id: &str) {
+        let synced = self.conn.execute(
+            "INSERT OR IGNORE INTO nodes_fts(rowid, name) SELECT rowid, name FROM nodes WHERE id = ?1",
+            params![node_id],
+        );
+        if let Err(e) = synced {
+            warn!(node_id, error = %e, "search index out of sync: nodes_fts resync failed");
+        }
+    }
+
+    /// The `snippets_fts` counterpart of [`Self::sync_node_fts`]. Unlike the
+    /// node path, no write site ever synced this index at all — `snippets`
+    /// had a search table with nothing in it, so `search_snippets` always
+    /// returned zero results. Same `INSERT OR IGNORE` treatment and the same
+    /// DEF-199 staleness-on-update gap.
+    fn sync_snippet_fts(&self, snippet_id: &str) {
+        let synced = self.conn.execute(
+            "INSERT OR IGNORE INTO snippets_fts(rowid, signature, doc_comment, body)
+             SELECT rowid, signature, doc_comment, body FROM snippets WHERE id = ?1",
+            params![snippet_id],
+        );
+        if let Err(e) = synced {
+            warn!(snippet_id, error = %e, "search index out of sync: snippets_fts resync failed");
+        }
+    }
+
     pub fn upsert_node(&self, node: &Node) -> Result<()> {
         let embedding_blob = node
             .embedding
@@ -224,15 +299,7 @@ impl GraphEngine {
                 node.embedding_hash,
             ],
         )?;
-        // Update FTS
-        self.conn
-            .execute(
-                "INSERT INTO nodes_fts(rowid, name)
-             SELECT rowid, name FROM nodes WHERE id = ?1
-             ON CONFLICT DO NOTHING",
-                params![node.id],
-            )
-            .ok(); // FTS sync is best-effort
+        self.sync_node_fts(&node.id);
         Ok(())
     }
 
@@ -263,14 +330,7 @@ impl GraphEngine {
             ],
         )? > 0;
         if changed {
-            self.conn
-                .execute(
-                    "INSERT INTO nodes_fts(rowid, name)
-                 SELECT rowid, name FROM nodes WHERE id = ?1
-                 ON CONFLICT DO NOTHING",
-                    params![node.id],
-                )
-                .ok();
+            self.sync_node_fts(&node.id);
         }
         Ok(changed)
     }
@@ -315,14 +375,7 @@ impl GraphEngine {
             ],
         )? > 0;
         if changed {
-            self.conn
-                .execute(
-                    "INSERT INTO nodes_fts(rowid, name)
-                 SELECT rowid, name FROM nodes WHERE id = ?1
-                 ON CONFLICT DO NOTHING",
-                    params![node.id],
-                )
-                .ok();
+            self.sync_node_fts(&node.id);
         }
         Ok(changed)
     }
@@ -472,6 +525,7 @@ impl GraphEngine {
                 snippet.language,
             ],
         )?;
+        self.sync_snippet_fts(&snippet.id);
         Ok(())
     }
 
@@ -489,6 +543,9 @@ impl GraphEngine {
     }
 
     pub fn search_snippets(&self, query: &str) -> Result<Vec<Snippet>> {
+        let Some(fts_query) = fts5_literal_query(query) else {
+            return Ok(Vec::new());
+        };
         let mut stmt = self.conn.prepare(
             "SELECT s.id, s.node_id, s.kind, s.signature, s.doc_comment, s.body, s.body_hash, s.file_path, s.line_start, s.line_end, s.language
              FROM snippets s
@@ -496,7 +553,7 @@ impl GraphEngine {
              WHERE snippets_fts MATCH ?1
              LIMIT 100",
         )?;
-        let rows = stmt.query_map(params![query], |row| Ok(row_to_snippet(row)))?;
+        let rows = stmt.query_map(params![fts_query], |row| Ok(row_to_snippet(row)))?;
         let mut snippets = Vec::new();
         for row in rows {
             snippets.push(row??);
@@ -788,6 +845,9 @@ impl GraphEngine {
 
     /// Full-text search over nodes by name.
     pub fn search_nodes(&self, query: &str) -> Result<Vec<Node>> {
+        let Some(fts_query) = fts5_literal_query(query) else {
+            return Ok(Vec::new());
+        };
         let mut stmt = self.conn.prepare(
             "SELECT n.id, n.kind, n.name, n.properties, n.file_path, n.worktree, n.created_at, n.updated_at,
                     n.embedding, n.embedding_model, n.embedding_dims, n.embedding_updated, n.embedding_hash
@@ -796,7 +856,7 @@ impl GraphEngine {
              WHERE nodes_fts MATCH ?1
              LIMIT 100",
         )?;
-        let rows = stmt.query_map(params![query], |row| Ok(row_to_node(row)))?;
+        let rows = stmt.query_map(params![fts_query], |row| Ok(row_to_node(row)))?;
         let mut nodes = Vec::new();
         for row in rows {
             nodes.push(row??);
@@ -1342,6 +1402,164 @@ fn row_to_mutation(row: &rusqlite::Row) -> Result<Mutation> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fts5_literal_query_quotes_every_token() {
+        assert_eq!(
+            fts5_literal_query("model-oracle"),
+            Some("\"model-oracle\"".to_string())
+        );
+        assert_eq!(
+            fts5_literal_query("session turn repair"),
+            Some("\"session\" \"turn\" \"repair\"".to_string())
+        );
+        // Embedded double quotes are FTS5's own escape for a literal quote.
+        assert_eq!(
+            fts5_literal_query("say \"hi\""),
+            Some("\"say\" \"\"\"hi\"\"\"".to_string())
+        );
+        // Other MATCH-grammar punctuation (`:`, `*`) is just text once quoted.
+        assert_eq!(
+            fts5_literal_query("agent:jane*"),
+            Some("\"agent:jane*\"".to_string())
+        );
+        assert_eq!(fts5_literal_query(""), None);
+        assert_eq!(fts5_literal_query("   "), None);
+    }
+
+    /// DEF-198: a hyphenated node name (`model-oracle`) used to raise
+    /// `no such column: oracle` because raw text hit FTS5's MATCH grammar,
+    /// where `-` is the column-filter/NOT operator. It must now be found by
+    /// its exact name and by any of its words, without erroring.
+    #[test]
+    fn search_nodes_handles_hyphenated_terms() {
+        let engine = GraphEngine::open(":memory:").unwrap();
+        let now = chrono::Utc::now();
+        engine
+            .upsert_node(&Node {
+                id: "crate:model-oracle".into(),
+                kind: NodeKind::Crate,
+                name: "model-oracle".into(),
+                properties: serde_json::json!({}),
+                file_path: None,
+                worktree: "develop".into(),
+                created_at: now,
+                updated_at: now,
+                embedding: None,
+                embedding_model: None,
+                embedding_dims: None,
+                embedding_updated: None,
+                embedding_hash: None,
+            })
+            .unwrap();
+
+        let by_full_name = engine.search_nodes("model-oracle").unwrap();
+        assert_eq!(by_full_name.len(), 1, "exact hyphenated name must match");
+        assert_eq!(by_full_name[0].id, "crate:model-oracle");
+
+        let by_bare_word = engine.search_nodes("oracle").unwrap();
+        assert_eq!(by_bare_word.len(), 1, "a word inside the name must match");
+
+        assert!(
+            engine
+                .search_nodes("no-such-crate-anywhere")
+                .unwrap()
+                .is_empty(),
+            "a clean miss must return no results, not an error"
+        );
+        assert!(engine.search_nodes("   ").unwrap().is_empty());
+    }
+
+    /// The three write paths that call `sync_node_fts` (`upsert_node`,
+    /// `insert_node_if_absent`, `compare_and_swap_node`) all used the same
+    /// broken `ON CONFLICT DO NOTHING` on a virtual table before this fix —
+    /// silently swallowed by `.ok()`, so `nodes_fts` was NEVER populated by
+    /// any of them. Exercise all three.
+    #[test]
+    fn every_node_write_path_keeps_the_search_index_current() {
+        let engine = GraphEngine::open(":memory:").unwrap();
+        let now = chrono::Utc::now();
+        let mk = |id: &str, name: &str| Node {
+            id: id.into(),
+            kind: NodeKind::Crate,
+            name: name.into(),
+            properties: serde_json::json!({}),
+            file_path: None,
+            worktree: "develop".into(),
+            created_at: now,
+            updated_at: now,
+            embedding: None,
+            embedding_model: None,
+            embedding_dims: None,
+            embedding_updated: None,
+            embedding_hash: None,
+        };
+
+        engine
+            .insert_node_if_absent(&mk("crate:a", "aiua"))
+            .unwrap();
+        assert_eq!(engine.search_nodes("aiua").unwrap().len(), 1);
+
+        engine
+            .upsert_node(&mk("crate:b", "ansible-mesh-core"))
+            .unwrap();
+        assert_eq!(engine.search_nodes("ansible-mesh-core").unwrap().len(), 1);
+
+        let c = mk("crate:c", "philote");
+        engine.upsert_node(&c).unwrap();
+        engine.compare_and_swap_node(&c, now).unwrap();
+        assert_eq!(engine.search_nodes("philote").unwrap().len(), 1);
+
+        // DEF-199 (known, separate gap — not this slice's fix): a rename
+        // does not currently resync the index, so the OLD name is still
+        // findable. Documented here so a future fix flips this assertion,
+        // not just discovers the behavior by surprise.
+        let mut renamed = mk("crate:d", "before-rename");
+        engine.upsert_node(&renamed).unwrap();
+        renamed.name = "after-rename".into();
+        engine.upsert_node(&renamed).unwrap();
+        assert_eq!(
+            engine.search_nodes("before-rename").unwrap().len(),
+            1,
+            "DEF-199: a rename does not resync nodes_fts yet"
+        );
+    }
+
+    /// `upsert_snippet` never synced `snippets_fts` at all — `search_snippets`
+    /// returned zero results for everything, unconditionally.
+    #[test]
+    fn search_snippets_finds_an_upserted_snippet() {
+        let engine = GraphEngine::open(":memory:").unwrap();
+        engine
+            .upsert_snippet(&Snippet {
+                id: "snip:fetch-agent-command-manifest".into(),
+                node_id: "fn:fetch_agent_command_manifest".into(),
+                kind: SnippetKind::Function,
+                signature: "fn fetch_agent_command_manifest(agent_id: &str)".into(),
+                doc_comment: Some("Read the seat's command menu.".into()),
+                body: Some("graph.get_apartment(agent_id, \"command_manifest\")".into()),
+                body_hash: "abc123".into(),
+                file_path: "crates/aiua/src/service/command_manifest.rs".into(),
+                line_start: 1,
+                line_end: 5,
+                language: "rust".into(),
+            })
+            .unwrap();
+
+        assert_eq!(engine.search_snippets("command_manifest").unwrap().len(), 1);
+        assert_eq!(
+            engine
+                .search_snippets("fetch_agent_command_manifest")
+                .unwrap()
+                .len(),
+            1,
+            "a hyphen-free but underscore-bearing identifier must also match"
+        );
+        assert!(engine
+            .search_snippets("nothing-in-this-body")
+            .unwrap()
+            .is_empty());
+    }
 
     #[test]
     fn embeddings_survive_destructive_rescan() {
