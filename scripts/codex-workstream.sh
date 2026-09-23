@@ -92,6 +92,11 @@ Recommended next steps:
 
 Rules:
   - Keep one active implementation thread per worktree.
+  - This worktree builds into its OWN target/ (~11GB cold). Do NOT point it at a
+    shared CARGO_TARGET_DIR — cargo would report "Finished" while leaving another
+    branch's binary in place. Run `just build-cache-setup` once per machine so the
+    605 deps compile from cache instead, and `just worktree-gc-apply` to reclaim
+    merged worktrees. See docs/guides/CARGO_BUILD_ARTIFACT_BUDGET.md.
   - Merge or rebase from origin/develop before touching hot runtime files.
   - PRs target develop, not main. main is releases only.
   - Run just workstream-overlap ${slug} before opening a PR.
