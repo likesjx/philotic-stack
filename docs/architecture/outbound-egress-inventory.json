@@ -59,6 +59,13 @@
       "note": "Hotel-to-hotel artifact transfer has a dedicated signed edge protocol."
     },
     {
+      "path": "crates/philotic-web/src/serve/desktop_session.rs",
+      "traffic_classes": ["local-resource"],
+      "disposition": "named-exception",
+      "authority": "desktop hotel-session issuer HTTP contract tests",
+      "note": "The only direct client is in the module's #[cfg(test)] code, exercising the issuer's loopback endpoint; production code in this file makes no outbound calls."
+    },
+    {
       "path": "crates/graph-intelligence/src/embeddings.rs",
       "traffic_classes": ["local-resource"],
       "disposition": "named-exception",
