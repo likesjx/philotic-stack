@@ -261,7 +261,7 @@ mod tests {
         let task = tokio::spawn(async move {
             axum::serve(listener, app).await.unwrap();
         });
-        let client = reqwest::Client::default();
+        let client = reqwest::Client::new();
         let body = json!({"provider":"google","provider_id":"test","hotel":"test-hotel","exchange_id":"x".repeat(43),"expires_at":now_epoch_secs()+60});
         assert_eq!(
             client.post(&url).json(&body).send().await.unwrap().status(),
