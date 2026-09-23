@@ -8,11 +8,12 @@ orchestrator
 
 ## Active Skills
 
+- check-engine
 - graph-intelligence
 - muninn-memory-habit
-- proposal-pipeline
+- philotic-slice-closeout
 - session-hygiene
-- verification-ladder
+- verification-orchestrator
 
 ## Muninn Memory
 
