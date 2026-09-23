@@ -8695,6 +8695,7 @@ async fn main() -> Result<()> {
     // Peers carry small attachments to/from this store inside the task itself
     // (DEF-200), so the transfer module needs to know where it lives.
     service::blob_transfer::register_local_store(blob_dir.clone(), blob_port);
+    service::blob::spawn_retention(blob_dir.clone());
     let blob_service = BlobService::new(blob_dir);
     tokio::spawn(async move {
         if let Err(e) = blob_service.serve(&blob_addr).await {
