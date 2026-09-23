@@ -1,0 +1,80 @@
+{
+ "_source": "bjork telegram turn 2026-09-16 11:18 EDT (mac-jane): the life.observe.batch call and its result as rendered to the model; the live plan reported 'Plan stopped before finishing: 0/2 steps verified' (DEF-147).",
+ "plan_steps": [
+  {
+   "description": "Propose tonight's organ practice session with Rachel Hammond in LifeGraph",
+   "tool_name": "life.observe"
+  },
+  {
+   "description": "Propose Sunday's choir warmup session in LifeGraph",
+   "tool_name": "life.observe"
+  }
+ ],
+ "call_arguments": {
+  "observations": [
+   {
+    "edges": [
+     {
+      "rel_type": "RELATES_TO",
+      "target_id": "life:event:sacrament_music_20260920"
+     }
+    ],
+    "evidence": {
+     "claim_ref": {
+      "id": "life:appointment:organ_practice_20260916",
+      "label": "Appointment"
+     },
+     "claim_summary": "Organ practice tonight with Rachel Hammond to practice SATB layering for the opening song.",
+     "confidence": 1.0,
+     "occurs_at": "2026-09-16T19:00:00Z",
+     "packet_id": "pkt:organ_practice_rachel_20260916",
+     "properties": "{\"title\":\"Organ Practice with Rachel Hammond\",\"status\":\"confirmed\"}",
+     "source_refs": [
+      {
+       "reliability": {
+        "basis": "operator_confirmed",
+        "score": 1.0
+       },
+       "source_id": "membrane:telegram",
+       "source_kind": "membrane_event"
+      }
+     ],
+     "validation_state": "confirmed"
+    },
+    "observation_id": "obs:organ_practice_rachel_20260916"
+   },
+   {
+    "edges": [
+     {
+      "rel_type": "RELATES_TO",
+      "target_id": "life:event:sacrament_music_20260920"
+     }
+    ],
+    "evidence": {
+     "claim_ref": {
+      "id": "life:appointment:choir_warmup_20260920",
+      "label": "Appointment"
+     },
+     "claim_summary": "Choir warmup in the chapel on Sunday morning at 9:00 AM before the sacrament meeting.",
+     "confidence": 1.0,
+     "occurs_at": "2026-09-20T09:00:00-04:00",
+     "packet_id": "pkt:choir_warmup_20260920",
+     "properties": "{\"title\":\"Choir Warmup\",\"status\":\"confirmed\"}",
+     "source_refs": [
+      {
+       "reliability": {
+        "basis": "operator_confirmed",
+        "score": 1.0
+       },
+       "source_id": "membrane:telegram",
+       "source_kind": "membrane_event"
+      }
+     ],
+     "validation_state": "confirmed"
+    },
+    "observation_id": "obs:choir_warmup_20260920"
+   }
+  ]
+ },
+ "result_content": "{\n  \"data\": {\n    \"change_notification\": {\n      \"change_kind\": \"observed\",\n      \"node_id\": \"life:appointment:organ_practice_20260916\",\n      \"summary\": \"batch: 2 observations\"\n    },\n    \"evaluation\": {\n      \"budget_exhausted\": false,\n      \"budget_secs\": 60,\n      \"next_action\": [\n        \"all observations landed durably — do not re-send them\"\n      ],\n      \"not_attempted\": [],\n      \"rejected\": [],\n      \"rollback\": false,\n      \"written\": 2\n    },\n    \"failed\": 0,\n    \"first_node_id\": \"life:appointment:organ_practice_20260916\",\n    \"requested\": 2,\n    \"results\": [\n      {\n        \"index\": 0,\n        \"result\": {\n          \"edges\": [\n            {\n              \"rel_type\": \"RELATES_TO\",\n              \"status\": \"target_missing\",\n              \"target_id\": \"life:event:sacrament_music_20260920\"\n            }\n          ],\n          \"embed_status\": \"ok\",\n          \"label\": \"Appointment\",\n          \"node_id\": \"life:appointment:organ_practice_20260916\",\n          \"observation_id\": \"obs:organ_practice_rachel_20260916\",\n          \"observed_by\": \"agent:unknown\",\n          \"observed_role\": null,\n          \"origin_engram_id\": null,\n          \"origin_trust\": null,\n          \"packet_id\": \"pkt:organ_practice_rachel_20260916\",\n          \"status\": \"proposed\",\n          \"summary_note\": null,\n          \"summary_updated\": true,\n          \"validation_state\": \"confirmed\"\n        }\n      },\n      {\n        \"index\": 1,\n        \"result\": {\n          \"edges\": [\n            {\n              \"rel_type\": \"RELATES_TO\",\n              \"status\": \"target_missing\",\n              \"target_id\": \"life:event:sacrament_music_20260920\"\n            }\n          ],\n          \"embed_status\": \"ok\",\n          \"label\": \"Appointment\",\n          \"node_id\": \"life:appointment:choir_warmup_20260920\",\n          \"observation_id\": \"obs:choir_warmup_20260920\",\n          \"observed_by\": \"agent:unknown\",\n          \"observed_role\": null,\n          \"origin_engram_id\": null,\n          \"origin_trust\": null,\n          \"packet_id\": \"pkt:choir_warmup_20260920\",\n          \"status\": \"proposed\",\n          \"summary_note\": null,\n          \"summary_updated\": true,\n          \"validation_state\": \"confirmed\"\n        }\n      }\n    ],\n    \"status\": \"ok\",\n    \"succeeded\": 2\n  },\n  \"status\": \"success\"\n}"
+}

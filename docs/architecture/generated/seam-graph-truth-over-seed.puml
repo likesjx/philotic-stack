@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - graph-truth-over-seed
+
+rectangle "graph-truth-over-seed" as graph_truth_over_seed #Orange {
+}
+
+
+@enduml

@@ -6,6 +6,7 @@ use crate::{
     LifePatchProposalInput, LifeResolveInput, ObserveEdge, PatchKind, RetrievalFeedbackInput,
     RetrievalFeedbackRating, SourceKind, ValidationState,
 };
+use std::collections::BTreeMap;
 
 const KNOWN_LABELS: &[&str] = &[
     "Person",
@@ -63,6 +64,11 @@ pub const LIVING_CYCLE_REL_TYPES: &[&str] = &[
     "RELATES_TO",
     "SCOPED_TO",
 ];
+
+/// Every agenda rel type (the endpoint-validated vocabulary).
+pub fn agenda_rel_types() -> Vec<&'static str> {
+    AGENDA_EDGE_RULES.iter().map(|r| r.rel_type).collect()
+}
 
 pub fn is_living_cycle_rel_type(rel_type: &str) -> bool {
     LIVING_CYCLE_REL_TYPES.contains(&rel_type)
@@ -250,6 +256,12 @@ pub struct ObserveCypher {
     /// stored as Memgraph `null`, not an empty-string sentinel, since this
     /// is a JSON blob rather than a plain scalar.
     pub provenance_envelope_json: Option<String>,
+    /// Typed properties (validated at plan time against the ontology) merged
+    /// onto the node with `n += $properties` on create and on match — a
+    /// re-observation may correct a difficulty rating even on a confirmed
+    /// node, since the claim text (not the structured facts) is what
+    /// confirmation protects.
+    pub properties: BTreeMap<String, serde_json::Value>,
 }
 
 /// One compiled living-cycle edge MERGE for a `life.observe` request.
@@ -270,6 +282,9 @@ pub struct ObserveEdgeCypher {
 pub struct CommitCypher {
     pub query: String,
     pub node_id: String,
+    /// `node_id` parsed as a Memgraph internal id when it is all digits,
+    /// else -1 (the query's `$id_numeric >= 0` guard makes it inert).
+    pub node_id_numeric: i64,
     pub label: String,
     pub packet_id: String,
     pub confidence: f64,
@@ -426,8 +441,22 @@ pub fn compile_observe_with_extensions(
             "n.due_at = CASE $due_at WHEN '' THEN null ELSE $due_at END, ",
             "n.starts_at = CASE $starts_at WHEN '' THEN null ELSE $starts_at END, ",
             "n.occurs_at = CASE $occurs_at WHEN '' THEN null ELSE $occurs_at END, ",
-            "n.ends_at = CASE $ends_at WHEN '' THEN null ELSE $ends_at END ",
+            "n.ends_at = CASE $ends_at WHEN '' THEN null ELSE $ends_at END, ",
+            "n += $properties ",
             "ON MATCH SET ",
+            // A fresh observation of a node that is still proposed/inferred
+            // carries the newest lived fact — take it. Live 2026-09-12 16:49
+            // UTC: "My home address is 137 Harmony Grove Rd" re-observed
+            // `life:place:home`, the runner answered "observed", the model
+            // told the operator it was recorded, and the node kept its
+            // generic summary. Confirmed and retired nodes keep their
+            // summary (only life.commit may rewrite confirmed truth); the
+            // latest observation is still kept beside it so nothing is lost,
+            // and `summary_updated` tells the caller which happened.
+            "n.summary_updated = NOT coalesce(n.validation_state, '') IN ['confirmed', 'retired'], ",
+            "n.claim_summary = CASE WHEN coalesce(n.validation_state, '') IN ['confirmed', 'retired'] THEN n.claim_summary ELSE $claim_summary END, ",
+            "n.last_observed_summary = $claim_summary, ",
+            "n.observed_at = $observed_at, ",
             "n.confidence = $confidence, ",
             "n.observation_id = $observation_id, ",
             "n.packet_id = $packet_id, ",
@@ -437,8 +466,10 @@ pub fn compile_observe_with_extensions(
             "n.due_at = CASE $due_at WHEN '' THEN n.due_at ELSE $due_at END, ",
             "n.starts_at = CASE $starts_at WHEN '' THEN n.starts_at ELSE $starts_at END, ",
             "n.occurs_at = CASE $occurs_at WHEN '' THEN n.occurs_at ELSE $occurs_at END, ",
-            "n.ends_at = CASE $ends_at WHEN '' THEN n.ends_at ELSE $ends_at END ",
-            "RETURN n.id AS id, n.validation_state AS validation_state",
+            "n.ends_at = CASE $ends_at WHEN '' THEN n.ends_at ELSE $ends_at END, ",
+            "n += $properties ",
+            "RETURN n.id AS id, n.validation_state AS validation_state, ",
+            "coalesce(n.summary_updated, true) AS summary_updated",
         ),
         label = label
     );
@@ -473,6 +504,7 @@ pub fn compile_observe_with_extensions(
         origin_engram_id,
         origin_trust,
         provenance_envelope_json,
+        properties: input.evidence.properties.clone(),
     })
 }
 
@@ -624,9 +656,19 @@ pub fn compile_commit(input: &LifeCommitInput, now_iso: &str) -> Result<CommitCy
     // pattern as observed_role/origin_engram_id in compile_observe: an empty
     // string parameter means "leave the existing property untouched" rather
     // than overwriting it with null.
+    //
+    // MATCH, never MERGE: a commit promotes an EXISTING node to confirmed
+    // truth. MERGE on an unknown id manufactured a brand-new node — live
+    // 2026-09-11, Beacon committed `claim_ref.id = "557"` (the Memgraph
+    // internal id it had just read via graph.query) and the graph gained a
+    // stray `Commitment {id: "557"}` marked confirmed while the real node
+    // `life:commitment:mei_due_date_update_20260909` stayed proposed. The
+    // provider reports a miss when no row comes back. As a courtesy to that
+    // exact mistake, an all-digit id also matches the internal `id(n)`.
     let query = format!(
         concat!(
-            "MERGE (n:{label} {{id: $id}}) ",
+            "MATCH (n:{label}) ",
+            "WHERE n.id = $id OR ($id_numeric >= 0 AND id(n) = $id_numeric) ",
             "SET n.validation_state = 'confirmed', ",
             "n.last_confirmed_at = $confirmed_at, ",
             "n.confidence = $confidence, ",
@@ -643,6 +685,7 @@ pub fn compile_commit(input: &LifeCommitInput, now_iso: &str) -> Result<CommitCy
     Ok(CommitCypher {
         query,
         node_id: input.evidence.claim_ref.id.clone(),
+        node_id_numeric: numeric_node_id(&input.evidence.claim_ref.id),
         label: label.clone(),
         packet_id: input.evidence.packet_id.clone(),
         confidence: input.evidence.confidence as f64,
@@ -650,6 +693,136 @@ pub fn compile_commit(input: &LifeCommitInput, now_iso: &str) -> Result<CommitCy
         confirmed_at: now_iso.to_string(),
         loop_status: input.loop_status.clone().unwrap_or_default(),
         resolution_note: input.resolution_note.clone().unwrap_or_default(),
+    })
+}
+
+/// An all-digit claim id is (almost certainly) a Memgraph internal `id(n)`
+/// the model copied out of a `graph.query` row. Returns it as an integer so
+/// the commit can match on `id(n)`; -1 for anything else.
+fn numeric_node_id(id: &str) -> i64 {
+    let trimmed = id.trim();
+    if trimmed.is_empty() || !trimmed.bytes().all(|b| b.is_ascii_digit()) {
+        return -1;
+    }
+    trimmed.parse::<i64>().unwrap_or(-1)
+}
+
+/// Compiled `life.tidy` write: one parameterized statement per action.
+/// Every branch MATCHes existing nodes (never MERGE-creates), stamps
+/// `tidied_at`/`tidied_by`/`tidy_reason`, and never deletes. Retire and
+/// resolve refuse confirmed nodes unless the operator approved.
+#[derive(Debug, Clone)]
+pub struct TidyCypher {
+    pub query: String,
+    pub kind: &'static str,
+    pub a: String,
+    pub b: String,
+    pub reason: String,
+    pub now_iso: String,
+    pub actor: String,
+}
+
+pub fn compile_tidy(
+    action: &crate::audit::TidyAction,
+    operator_approved: bool,
+    actor: &str,
+    now_iso: &str,
+) -> Result<TidyCypher, String> {
+    use crate::audit::TidyAction;
+    let retirable = if operator_approved {
+        "true"
+    } else {
+        "coalesce(n.validation_state, 'inferred') IN ['proposed', 'inferred']"
+    };
+    let (query, kind, a, b, reason) = match action {
+        TidyAction::RetireDuplicate {
+            duplicate_id,
+            keeper_id,
+            reason,
+        } => (
+            format!(
+                concat!(
+                    "MATCH (n {{id: $a}}), (k {{id: $b}}) ",
+                    "WHERE {retirable} ",
+                    "SET n.validation_state = 'retired', n.retired_at = $now, n.retired_by = $actor, ",
+                    "n.resolution_note = $reason, n.tidied_at = $now, n.tidied_by = $actor, ",
+                    "n.tidy_reason = $reason ",
+                    "MERGE (k)-[r:SUPERSEDES]->(n) ",
+                    "ON CREATE SET r.tidied_at = $now, r.tidied_by = $actor ",
+                    "RETURN n.id AS id, k.id AS keeper_id, n.validation_state AS validation_state"
+                ),
+                retirable = retirable
+            ),
+            "retire_duplicate",
+            duplicate_id.clone(),
+            keeper_id.clone(),
+            reason.clone(),
+        ),
+        TidyAction::Link {
+            from_id,
+            rel_type,
+            to_id,
+            reason,
+        } => {
+            if !rel_type.chars().all(|c| c.is_ascii_uppercase() || c == '_') || rel_type.is_empty()
+            {
+                return Err(format!("rel_type '{rel_type}' is not an identifier"));
+            }
+            (
+                format!(
+                    concat!(
+                        "MATCH (n {{id: $a}}), (m {{id: $b}}) ",
+                        "MERGE (n)-[r:{rel}]->(m) ",
+                        "ON CREATE SET r.tidied_at = $now, r.tidied_by = $actor, r.tidy_reason = $reason ",
+                        "RETURN n.id AS id, m.id AS to_id, type(r) AS rel_type, r.tidied_at = $now AS created"
+                    ),
+                    rel = rel_type
+                ),
+                "link",
+                from_id.clone(),
+                to_id.clone(),
+                reason.clone(),
+            )
+        }
+        TidyAction::Resolve { node_id, reason } => (
+            concat!(
+                "MATCH (n {id: $a}) ",
+                "WHERE coalesce(n.validation_state, 'inferred') <> 'retired' ",
+                "SET n.status = 'resolved', n.resolved_at = $now, n.resolution_note = $reason, ",
+                "n.tidied_at = $now, n.tidied_by = $actor, n.tidy_reason = $reason ",
+                "RETURN n.id AS id, n.status AS status, n.validation_state AS validation_state"
+            )
+            .to_string(),
+            "resolve",
+            node_id.clone(),
+            String::new(),
+            reason.clone(),
+        ),
+        TidyAction::Retire { node_id, reason } => (
+            format!(
+                concat!(
+                    "MATCH (n) WHERE (n.id = $a OR toString(id(n)) = $a) AND {retirable} ",
+                    "SET n.validation_state = 'retired', n.retired_at = $now, n.retired_by = $actor, ",
+                    "n.resolution_note = $reason, n.tidied_at = $now, n.tidied_by = $actor, ",
+                    "n.tidy_reason = $reason ",
+                    "RETURN coalesce(n.id, toString(id(n))) AS id, n.validation_state AS validation_state"
+                ),
+                retirable = retirable
+            ),
+            "retire",
+            node_id.clone(),
+            String::new(),
+            reason.clone(),
+        ),
+    };
+    Ok(TidyCypher {
+        query,
+        kind,
+        a,
+        b,
+        reason,
+        now_iso: now_iso.to_string(),
+        actor: actor.to_string(),
     })
 }
 
@@ -1078,6 +1251,31 @@ fn feedback_rating_str(rating: &RetrievalFeedbackRating) -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    /// Live 2026-09-15 16:34 UTC: a re-link of an existing edge came back
+    /// "tidied". The query now reports whether MERGE created the edge.
+    #[test]
+    fn compile_tidy_link_reports_whether_the_edge_was_created() {
+        let action = crate::audit::TidyAction::Link {
+            from_id: "life:goal:a".into(),
+            rel_type: "SCOPED_TO".into(),
+            to_id: "life:role:chief-of-staff".into(),
+            reason: "orphan: attach to the anchor role".into(),
+        };
+        let c = super::compile_tidy(&action, false, "lifegraph.gardener", "2026-09-15T16:34:00Z")
+            .expect("link compiles");
+        assert_eq!(c.kind, "link");
+        assert!(
+            c.query.contains("MERGE (n)-[r:SCOPED_TO]->(m)"),
+            "{}",
+            c.query
+        );
+        assert!(
+            c.query.contains("r.tidied_at = $now AS created"),
+            "{}",
+            c.query
+        );
+    }
+
     /// The write-enabled edge vocabulary is duplicated in prose in
     /// `docs/architecture/life-graph/LIFE_GRAPH_SCHEMA.md`, and the two HAVE
     /// drifted: on 2026-07-27 the doc described the agenda edges as
@@ -1216,6 +1414,7 @@ mod tests {
 
     fn minimal_observe_input(label: &str) -> LifeObserveInput {
         LifeObserveInput {
+            force_new: false,
             observation_id: "obs-001".to_string(),
             evidence: EvidencePacket {
                 packet_id: "pkt-001".to_string(),
@@ -1246,6 +1445,7 @@ mod tests {
                 conflict_ids: vec![],
                 adjudication_status: AdjudicationStatus::NotNeeded,
                 metadata: serde_json::Value::Null,
+                properties: Default::default(),
             },
             proposed_graph_refs: vec![],
             observed_by: None,
@@ -1255,10 +1455,63 @@ mod tests {
         }
     }
 
+    /// Live 2026-09-12 16:49 UTC: re-observing `life:place:home` with the
+    /// operator's address kept the generic summary — ON MATCH never touched
+    /// `claim_summary`. A still-proposed node now takes the newest
+    /// observation; confirmed/retired nodes keep theirs; the caller learns
+    /// which via `summary_updated`.
+    #[test]
+    fn compile_observe_on_match_updates_summary_unless_confirmed() {
+        let compiled =
+            compile_observe(&minimal_observe_input("Place"), "2026-09-12T16:49:00Z").unwrap();
+        let q = &compiled.query;
+        let on_match = &q[q.find("ON MATCH SET").expect("on match clause")..];
+        assert!(on_match.contains(
+            "n.claim_summary = CASE WHEN coalesce(n.validation_state, '') IN ['confirmed', 'retired'] THEN n.claim_summary ELSE $claim_summary END"
+        ));
+        assert!(on_match.contains("n.last_observed_summary = $claim_summary"));
+        assert!(on_match.contains("n.observed_at = $observed_at"));
+        assert!(q.contains("coalesce(n.summary_updated, true) AS summary_updated"));
+    }
+
+    #[test]
+    fn commit_normalize_defaults_fills_packet_id() {
+        let mut evidence = minimal_observe_input("Commitment").evidence;
+        evidence.packet_id = String::new();
+        let mut input = crate::LifeCommitInput {
+            evidence,
+            operator_approved: true,
+            loop_status: None,
+            resolution_note: None,
+        };
+        input.normalize_defaults();
+        assert!(input.evidence.packet_id.starts_with("commit-"));
+        // Validation would have rejected the empty id before.
+        assert!(input.evidence.validate().is_ok());
+        // A caller-supplied id is left alone.
+        input.evidence.packet_id = "pkt:mine".into();
+        input.normalize_defaults();
+        assert_eq!(input.evidence.packet_id, "pkt:mine");
+    }
+
     /// Structured temporal fields must ride the observe write (ontology gap
     /// G1 closure): dates the caller extracts land as node properties, and
     /// omitted dates preserve existing values on re-observe instead of
     /// clobbering them to null.
+    /// Reflexive Life Graph R1: typed properties ride the compiled write as a
+    /// map parameter merged on create and on match.
+    #[test]
+    fn compile_observe_merges_typed_properties_on_create_and_match() {
+        let mut input = minimal_observe_input("CreativeWork");
+        input
+            .evidence
+            .properties
+            .insert("difficulty".into(), serde_json::json!(55));
+        let compiled = compile_observe(&input, "2026-09-15T12:00:00Z").unwrap();
+        assert_eq!(compiled.properties["difficulty"], 55);
+        assert_eq!(compiled.query.matches("n += $properties").count(), 2);
+    }
+
     #[test]
     fn compile_observe_writes_structured_dates_and_preserves_on_match() {
         let mut input = minimal_observe_input("Commitment");
@@ -1805,7 +2058,16 @@ mod tests {
 
         assert_eq!(compiled.label, "OpenLoop");
         assert_eq!(compiled.confirmed_at, "2026-06-05T09:00:00Z");
-        assert!(compiled.query.contains("MERGE (n:OpenLoop {id: $id})"));
+        // MATCH, not MERGE: a commit promotes an existing node and must never
+        // manufacture one from an unknown id (live 2026-09-11: stray
+        // `Commitment {id: "557"}`).
+        assert!(
+            compiled
+                .query
+                .contains("MATCH (n:OpenLoop) WHERE n.id = $id")
+        );
+        assert!(!compiled.query.contains("MERGE"));
+        assert_eq!(compiled.node_id_numeric, -1, "life: ids are not numeric");
         assert!(compiled.query.contains("n.validation_state = 'confirmed'"));
         // No loop_status supplied — the sentinel is empty, so the query must
         // preserve the existing n.status rather than clobbering it with null.
@@ -1849,6 +2111,31 @@ mod tests {
                 .query
                 .contains("n.resolution_note = CASE $resolution_note")
         );
+    }
+
+    #[test]
+    fn compile_commit_numeric_id_matches_internal_id() {
+        // The model copied Memgraph's internal id out of a graph.query row.
+        // Match it on id(n) rather than creating `Commitment {id: "557"}`.
+        let mut evidence = minimal_observe_input("Commitment").evidence;
+        evidence.validation_state = ValidationState::Confirmed;
+        evidence.claim_ref.id = "557".to_string();
+        let compiled = compile_commit(
+            &crate::LifeCommitInput {
+                evidence,
+                operator_approved: true,
+                loop_status: None,
+                resolution_note: None,
+            },
+            "2026-09-11T13:28:11Z",
+        )
+        .unwrap();
+        assert_eq!(compiled.node_id_numeric, 557);
+        assert!(compiled.query.contains("id(n) = $id_numeric"));
+        assert_eq!(numeric_node_id(" 12 "), 12);
+        assert_eq!(numeric_node_id("life:open_loop:x"), -1);
+        assert_eq!(numeric_node_id(""), -1);
+        assert_eq!(numeric_node_id("12a"), -1);
     }
 
     #[test]

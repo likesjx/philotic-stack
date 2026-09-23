@@ -3,7 +3,7 @@ title: Architectural Rule Registry
 doc_type: reference
 domain: governance
 status: active
-last_updated: 2026-03-31
+last_updated: 2026-09-05
 tags:
 - rules
 - governance
@@ -38,6 +38,8 @@ See [ARCH_RULES_AND_ROADMAP_PROPOSAL.md](ARCH_RULES_AND_ROADMAP_PROPOSAL.md) for
 | `poll-lease-anchored-to-home-hotel` | `membrane-transport` | `TELEGRAM_POLL_LEASE_PROPOSAL` | Telegram poll lease authority is anchored to the agent's home hotel, not the currently routed role. | hard | poll lease acquire, renew, and delegation logic |
 | `transport-home-distinct-from-role-home` | `membrane-transport` | `MEMBRANE_TRANSPORT_HOME_PROPOSAL` | Membrane transport home is distinct from role home; moving a role must not implicitly move the external transport owner or poller. | hard | role placement, membrane materialization, transport lease acquisition |
 | `external-ingress-defaults-to-stable-hotel` | `membrane-transport` | `MEMBRANE_TRANSPORT_HOME_PROPOSAL` | Always-on external ingress membranes should default to a stable home hotel such as `vps-jane`, with laptop hotels acting only through explicit standby or delegation policy. | guidance | deployment config, supervisor materialization, operator transport-home changes |
+| `materialization-anywhere-anytime` | `mesh-placement` | `RELOCATION_CEREMONY_PROPOSAL` | Any component class — membrane, role incarnation, model controller, tool runner, datasource — must be materializable on any admitted hotel at runtime, initiated by a philote through a recorded ceremony; a component that can only exist where it was deployed is a gap to close, not a design. | guidance | placement, materialization, deployment config, new component classes |
+| `graph-truth-outlives-config-seed` | `mesh-placement` | `RELOCATION_CEREMONY_PROPOSAL` | `mesh-config.json` and deployment YAML are fill-only seeds; a runtime placement decision recorded in the graph (`home_node`, `membrane_transport_home`, guest activation) must never be reverted by a hotel restart. | hard | all seeding at hotel boot, fleet supervision reconciliation |
 | `routed-messages-carry-identity-context` | `tooling-execution` | `AGENT_RESOURCE_MODEL_PROPOSAL` | Router-observable messages must carry `agent_id`, `session_id`, and `active_role` for training reconstruction. | hard | all new IPC message types that flow through the hotel router |
 | `execution-layer-cannot-self-authorize` | `tooling-execution` | `TOOL_ASSEMBLY_EXECUTION_PROPOSAL` | Execution infrastructure may receive scoped credentials and route eligibility metadata, but it must not inject new rights or expand the visible capability surface beyond the hotel's projected session bindings. | hard | tool assembly, model-router request shaping, runner dispatch |
 | `graph-domain-layer` | `runtime-sessions` | `GRAPH_LAYER_UNIFICATION_PROPOSAL` | All domain graph operations must go through `GraphDomain`, not directly against the storage backend. | hard | all new storage consumers; any code calling `GraphStorage` directly |

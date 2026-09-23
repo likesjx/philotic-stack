@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - ipados-shell
+
+rectangle "ipados-shell" as ipados_shell #Orange {
+}
+
+
+@enduml

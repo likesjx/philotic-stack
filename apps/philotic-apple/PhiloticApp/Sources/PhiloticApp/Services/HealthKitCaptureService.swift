@@ -1,36 +1,18 @@
-// HealthKitCaptureService.swift
-// Pillar 3: HealthKit -> LifeGraph. Reads daily HealthKit aggregates and
-// turns each metric/day into a LifeGraph `HealthMetric` observation, then
-// POSTs them to the edge observe endpoint.
-//
-// Platform strategy: HealthKit *imports* on native macOS (the module exists
-// in the macOS SDK) but there is no health data there, so all real query
-// code is gated behind `#if os(iOS)`. On macOS (the build gate) the service
-// reports `isAvailable == false` and a demo path synthesizes plausible
-// sample observations so the end-to-end POST is exercisable. Keeping the
-// gate on `os(iOS)` rather than `canImport(HealthKit)` is deliberate:
-// canImport is TRUE on macOS, so it would not exclude the framework.
-
+// Read-only foreground capture. Preview is local and ephemeral; only an
+// explicit share of that exact preview may reach LifeGraph.
 import Foundation
 import Observation
 import PhiloticKit
 
-#if os(iOS)
-    import HealthKit
-#endif
-
-/// A health metric the app can sync to the LifeGraph.
-public enum HealthMetric: String, CaseIterable, Identifiable, Sendable {
+enum HealthMetric: String, CaseIterable, Identifiable, Sendable {
     case steps = "step_count"
     case restingHeartRate = "resting_heart_rate"
     case heartRate = "heart_rate"
     case sleep = "sleep_asleep_duration"
     case activeEnergy = "active_energy_burned"
 
-    public var id: String { rawValue }
-
-    /// Human display name for the toggle row.
-    public var displayName: String {
+    var id: String { rawValue }
+    var displayName: String {
         switch self {
         case .steps: return "Steps"
         case .restingHeartRate: return "Resting Heart Rate"
@@ -39,8 +21,7 @@ public enum HealthMetric: String, CaseIterable, Identifiable, Sendable {
         case .activeEnergy: return "Active Energy"
         }
     }
-
-    public var systemImage: String {
+    var systemImage: String {
         switch self {
         case .steps: return "figure.walk"
         case .restingHeartRate: return "heart"
@@ -49,8 +30,6 @@ public enum HealthMetric: String, CaseIterable, Identifiable, Sendable {
         case .activeEnergy: return "flame"
         }
     }
-
-    /// Unit string recorded in observation metadata (HealthKit-style).
     var unit: String {
         switch self {
         case .steps: return "count"
@@ -59,368 +38,253 @@ public enum HealthMetric: String, CaseIterable, Identifiable, Sendable {
         case .activeEnergy: return "kcal"
         }
     }
+}
 
-    /// Hyphenated slug used inside the claim_ref id
-    /// (`healthmetric:<slug>:<yyyy-MM-dd>`).
-    var claimSlug: String {
-        switch self {
-        case .steps: return "steps"
-        case .restingHeartRate: return "resting-hr"
-        case .heartRate: return "heart-rate"
-        case .sleep: return "sleep"
-        case .activeEnergy: return "active-energy"
-        }
-    }
+enum HealthReadWindow: Int, CaseIterable, Identifiable {
+    case yesterday = 1
+    case week = 7
+    var id: Int { rawValue }
+    var title: String { self == .yesterday ? "Yesterday" : "Last 7 completed days" }
+}
 
-    /// Plausible sample value used on macOS / when HealthKit is unavailable,
-    /// so the observe path is demoable without a device.
-    var sampleValue: Double {
+/// nil means no readable samples, never proof of zero activity or denial.
+@MainActor
+protocol HealthDataReading {
+    var isAvailable: Bool { get }
+    func requestAuthorization(for metrics: Set<HealthMetric>) async throws
+    func aggregate(_ metric: HealthMetric, interval: DateInterval) async throws -> Double?
+}
+
+enum HealthCaptureError: LocalizedError {
+    case unavailable, authorizationFailed, invalidValue
+    var errorDescription: String? {
         switch self {
-        case .steps: return 8000
-        case .restingHeartRate: return 58
-        case .heartRate: return 72
-        case .sleep: return 431  // ~7h11m in minutes
-        case .activeEnergy: return 540
+        case .unavailable:
+            return "Apple Health is unavailable on this device. No data was read or sent."
+        case .authorizationFailed:
+            return "The Apple Health permission request did not complete. Try again."
+        case .invalidValue:
+            return "Apple Health returned an invalid reading. Nothing was prepared for sharing."
         }
     }
 }
 
-/// One captured daily aggregate before it becomes a `LifeObservation`.
-struct HealthSample {
-    let metric: HealthMetric
-    let value: Double
-    /// The day this aggregate summarizes (local calendar day).
-    let day: Date
+struct HealthPreviewItem: Identifiable {
+    let observation: LifeObservation
+    var id: String { observation.observationId }
 }
 
 @MainActor
 @Observable
-public final class HealthKitCaptureService {
-    /// Source identifier stamped on every observation.
-    public static let observedBy = "edge:ios-healthkit"
-
-    /// True when real HealthKit data can be read (iOS with health data).
-    public var isAvailable: Bool {
-        #if os(iOS)
-            return HKHealthStore.isHealthDataAvailable()
-        #else
-            return false
-        #endif
+final class HealthKitCaptureService {
+    static let observedBy = "edge:ios-healthkit"
+    // Do not migrate the old all-enabled default or persist health previews.
+    var enabledMetrics: Set<HealthMetric> = [] {
+        didSet { if oldValue != enabledMetrics { discardPreview() } }
     }
-
-    /// Which metrics the operator wants synced. Persisted to UserDefaults.
-    public var enabledMetrics: Set<HealthMetric> {
-        didSet { persistEnabledMetrics() }
+    var window: HealthReadWindow = .yesterday {
+        didSet { if oldValue != window { discardPreview() } }
     }
+    private(set) var isReading = false
+    private(set) var isSharing = false
+    private(set) var previewID: UUID?
+    private(set) var previewItems: [HealthPreviewItem] = []
+    private(set) var missingCount = 0
+    private(set) var statusMessage: String?
+    private(set) var lastError: String?
+    var isAvailable: Bool { reader.isAvailable }
+    var isBusy: Bool { isReading || isSharing }
 
-    public private(set) var isSyncing = false
-    public private(set) var lastSyncDate: Date?
-    public private(set) var lastSyncSummary: String?
-    public var lastError: String?
+    @ObservationIgnored private let reader: any HealthDataReading
+    @ObservationIgnored private let post:
+        ([LifeObservation], URL, String) async throws -> ObserveResult
+    @ObservationIgnored private var revision = UUID()
 
-    private static let enabledDefaultsKey = "com.philotic.apple.health.enabledMetrics"
-
-    #if os(iOS)
-        private let healthStore = HKHealthStore()
-    #endif
-
-    public init() {
-        if let raw = UserDefaults.standard.array(forKey: Self.enabledDefaultsKey) as? [String] {
-            enabledMetrics = Set(raw.compactMap(HealthMetric.init(rawValue:)))
-        } else {
-            // Sensible default: everything on.
-            enabledMetrics = Set(HealthMetric.allCases)
+    init(
+        reader: (any HealthDataReading)? = nil,
+        post: @escaping ([LifeObservation], URL, String) async throws -> ObserveResult = {
+            try await LifeGraphClient().postObservations($0, baseURL: $1, bearerToken: $2)
         }
+    ) {
+        self.reader = reader ?? DeviceHealthReader()
+        self.post = post
     }
 
-    private func persistEnabledMetrics() {
-        UserDefaults.standard.set(
-            enabledMetrics.map(\.rawValue), forKey: Self.enabledDefaultsKey)
-    }
-
-    // MARK: - Authorization
-
-    /// Requests read authorization for the starter metric set. No-op (returns
-    /// true) where HealthKit is unavailable — the sample path needs no grant.
-    @discardableResult
-    public func requestAuthorization() async -> Bool {
-        #if os(iOS)
-            guard HKHealthStore.isHealthDataAvailable() else { return false }
-            let readTypes = Set(Self.allReadTypes())
-            return await withCheckedContinuation { continuation in
-                healthStore.requestAuthorization(toShare: [], read: readTypes) { granted, _ in
-                    continuation.resume(returning: granted)
-                }
-            }
-        #else
-            return true
-        #endif
-    }
-
-    // MARK: - Capture
-
-    /// Captures one observation per enabled metric for `date`'s calendar day.
-    /// Uses real HealthKit aggregates on iOS; synthesizes sample values
-    /// elsewhere (macOS demo).
-    public func captureDailySummaries(for date: Date) async -> [LifeObservation] {
-        let metrics = HealthMetric.allCases.filter(enabledMetrics.contains)
-        guard !metrics.isEmpty else { return [] }
-
-        var samples: [HealthSample] = []
-        for metric in metrics {
-            if let value = await aggregate(metric: metric, day: date) {
-                samples.append(HealthSample(metric: metric, value: value, day: date))
-            }
-        }
-        return samples.map(Self.observation(from:))
-    }
-
-    /// Returns the daily aggregate for a metric, or nil when there's no data.
-    private func aggregate(metric: HealthMetric, day: Date) async -> Double? {
-        #if os(iOS)
-            guard HKHealthStore.isHealthDataAvailable() else { return metric.sampleValue }
-            let (start, end) = Self.dayBounds(for: day)
-            let predicate = HKQuery.predicateForSamples(
-                withStart: start, end: end, options: .strictStartDate)
-
-            switch metric {
-            case .sleep:
-                return await sleepAsleepMinutes(predicate: predicate)
-            case .steps, .activeEnergy:
-                return await sumQuantity(metric: metric, predicate: predicate)
-            case .restingHeartRate, .heartRate:
-                return await averageQuantity(metric: metric, predicate: predicate)
-            }
-        #else
-            // macOS / no HealthKit: plausible demo value.
-            return metric.sampleValue
-        #endif
-    }
-
-    // MARK: - Observation construction
-
-    static func observation(from sample: HealthSample) -> LifeObservation {
-        let dayString = dateOnlyFormatter.string(from: sample.day)
-        let claimId = "healthmetric:\(sample.metric.claimSlug):\(dayString)"
-        let observedAt = rfc3339Formatter.string(from: endOfDay(for: sample.day))
-        let valueText = formatValue(sample.value, metric: sample.metric)
-        let summary =
-            "\(sample.metric.displayName) \(valueText) \(sample.metric.unit) (daily, \(dayString))"
-
-        let evidence = EvidencePacket(
-            packetId: "pkt-\(UUID().uuidString)",
-            // LifeGraph label MUST be a known ontology label (cypher.rs
-            // KNOWN_LABELS) — "HealthMetric" is rejected at Cypher compile
-            // ("unknown Life Graph label"). Health readings are Signals; the
-            // specific metric kind rides in metadata.metric.
-            claimRef: GraphRecordRef(id: claimId, label: "Signal", datasource: "memgraph"),
-            claimSummary: summary,
-            sourceRefs: [
-                SourceRef(
-                    sourceId: observedBy,
-                    sourceKind: "runtime_observation",
-                    reliability: Reliability(score: 0.9, basis: "direct_observation")
-                )
-            ],
-            confidence: 0.9,
-            validationState: "proposed",
-            observedAt: observedAt,
-            sourceReliability: 0.9,
-            adjudicationStatus: "not_needed",
-            metadata: [
-                "metric": .string(sample.metric.rawValue),
-                "unit": .string(sample.metric.unit),
-                "value": .number(sample.value),
-            ]
-        )
-        return LifeObservation(
-            observationId: "obs-\(UUID().uuidString)",
-            evidence: evidence,
-            observedBy: observedBy,
-            observedRole: "sensor"
-        )
-    }
-
-    // MARK: - Sync
-
-    /// Captures the last `dayCount` days (inclusive of today) for enabled
-    /// metrics and POSTs them via `LifeGraphClient`. Updates status state.
-    public func syncNow(baseURL: URL, bearerToken: String, dayCount: Int = 7) async {
-        guard !isSyncing else { return }
-        isSyncing = true
+    func discardPreview() {
+        revision = UUID()
+        previewID = nil
+        previewItems = []
+        missingCount = 0
+        statusMessage = nil
         lastError = nil
-        defer { isSyncing = false }
+    }
 
-        _ = await requestAuthorization()
-
-        let calendar = Calendar.current
-        var observations: [LifeObservation] = []
-        for offset in 0..<max(1, dayCount) {
-            guard let day = calendar.date(byAdding: .day, value: -offset, to: Date()) else { continue }
-            observations += await captureDailySummaries(for: day)
-        }
-
-        guard !observations.isEmpty else {
-            lastSyncSummary = "No metrics enabled — nothing to sync."
-            lastSyncDate = Date()
+    /// Authorization completion does NOT indicate read permission. HealthKit
+    /// makes denial indistinguishable from an empty store. No upload or
+    /// app-owned disk writes occur while preparing a preview.
+    func preparePreview(now: Date = Date(), calendar: Calendar = .current) async {
+        guard !isBusy else { return }
+        discardPreview()
+        guard isAvailable else {
+            lastError = HealthCaptureError.unavailable.localizedDescription
             return
         }
-
+        guard !enabledMetrics.isEmpty else {
+            statusMessage = "Choose at least one metric to preview."
+            return
+        }
+        isReading = true
+        defer { isReading = false }
+        let requestRevision = revision
+        let metrics = enabledMetrics
+        let intervals = Self.completedDays(before: now, count: window.rawValue, calendar: calendar)
         do {
-            let result = try await LifeGraphClient().postObservations(
-                observations, baseURL: baseURL, bearerToken: bearerToken)
-            lastSyncDate = Date()
-            let mode = isAvailable ? "HealthKit" : "sample data"
-            lastSyncSummary =
-                "Synced \(observations.count) observations (\(mode)) — status \(result.status)."
-            if result.status == "error" {
-                lastError = "Server rejected the observation batch."
+            try await reader.requestAuthorization(for: metrics)
+            var items: [HealthPreviewItem] = []
+            var missing = 0
+            for interval in intervals {
+                for metric in HealthMetric.allCases where metrics.contains(metric) {
+                    try Task.checkCancellation()
+                    guard revision == requestRevision else { return }
+                    guard let value = try await reader.aggregate(metric, interval: interval) else {
+                        missing += 1
+                        continue
+                    }
+                    guard value.isFinite, value >= 0 else { throw HealthCaptureError.invalidValue }
+                    items.append(
+                        HealthPreviewItem(
+                            observation: Self.observation(
+                                metric: metric, value: value, interval: interval,
+                                capturedAt: now, timeZone: calendar.timeZone)))
+                }
+            }
+            try Task.checkCancellation()
+            guard revision == requestRevision else { return }
+            previewItems = items
+            previewID = items.isEmpty ? nil : UUID()
+            missingCount = missing
+            statusMessage =
+                items.isEmpty
+                ? "No readable data. The selected days may be empty or access may be off in Apple Health."
+                : "Preview ready. Nothing has left this device."
+        } catch is CancellationError {
+            if revision == requestRevision { discardPreview() }
+        } catch {
+            if revision == requestRevision {
+                // Do not echo health data or identifiers from framework errors.
+                lastError =
+                    "Could not read Apple Health. Check access in Health and try again. Nothing was sent."
+            }
+        }
+    }
+
+    /// UI confirmation carries preview identity and destination. A preview is
+    /// single-attempt: partial/unknown writes are never automatically retried.
+    func sharePreview(id: UUID, baseURL: URL, bearerToken: String) async {
+        guard !isBusy, previewID == id, !previewItems.isEmpty else { return }
+        guard !bearerToken.isEmpty else { return }
+        let observations = previewItems.map(\.observation)
+        let requestRevision = revision
+        isSharing = true
+        lastError = nil
+        statusMessage = nil
+        previewID = nil
+        defer { isSharing = false }
+        do {
+            let result = try await post(observations, baseURL, bearerToken)
+            guard revision == requestRevision else { return }
+            let acknowledged = Set(
+                result.results.compactMap { item -> String? in
+                    guard item.status == "proposed" else { return nil }
+                    return item.observationId
+                })
+            if result.status == "ok", result.results.count == observations.count,
+                result.results.allSatisfy({ $0.status == "proposed" }),
+                acknowledged == Set(observations.map(\.observationId))
+            {
+                statusMessage =
+                    "Server acknowledged \(observations.count) health summaries. Agent recall is not yet verified."
+            } else {
+                lastError =
+                    "The server did not confirm the full batch. Some summaries may be stored. Check LifeGraph before sending again."
             }
         } catch {
-            lastError = "Sync failed: \(error.localizedDescription)"
-            lastSyncSummary = nil
+            guard revision == requestRevision else { return }
+            lastError =
+                "Sharing was not confirmed. Some summaries may have arrived; check LifeGraph before sending again."
         }
     }
 
-    // MARK: - Formatting helpers
-
-    private static let dateOnlyFormatter: DateFormatter = {
-        let f = DateFormatter()
-        f.calendar = Calendar(identifier: .gregorian)
-        f.locale = Locale(identifier: "en_US_POSIX")
-        f.timeZone = TimeZone(identifier: "UTC")
-        f.dateFormat = "yyyy-MM-dd"
-        return f
-    }()
-
-    private static let rfc3339Formatter: ISO8601DateFormatter = {
-        let f = ISO8601DateFormatter()
-        f.timeZone = TimeZone(identifier: "UTC")
-        f.formatOptions = [.withInternetDateTime]  // no fractional seconds
-        return f
-    }()
-
-    private static func endOfDay(for day: Date) -> Date {
-        var cal = Calendar(identifier: .gregorian)
-        cal.timeZone = TimeZone(identifier: "UTC")!
-        let startOfDay = cal.startOfDay(for: day)
-        // 23:59:00 UTC of that day.
-        return startOfDay.addingTimeInterval(86_340)
-    }
-
-    private static func formatValue(_ value: Double, metric: HealthMetric) -> String {
-        switch metric {
-        case .steps, .restingHeartRate, .heartRate, .sleep, .activeEnergy:
-            // All whole-number-ish; drop the decimal when integral.
-            return value == value.rounded() ? String(Int(value)) : String(format: "%.1f", value)
-        }
-    }
-}
-
-// MARK: - HealthKit query internals (iOS only)
-
-#if os(iOS)
-    extension HealthKitCaptureService {
-        fileprivate static func dayBounds(for day: Date) -> (Date, Date) {
-            let cal = Calendar.current
-            let start = cal.startOfDay(for: day)
-            let end = cal.date(byAdding: .day, value: 1, to: start) ?? day
-            return (start, end)
-        }
-
-        static func quantityType(for metric: HealthMetric) -> HKQuantityType? {
-            let identifier: HKQuantityTypeIdentifier?
-            switch metric {
-            case .steps: identifier = .stepCount
-            case .restingHeartRate: identifier = .restingHeartRate
-            case .heartRate: identifier = .heartRate
-            case .activeEnergy: identifier = .activeEnergyBurned
-            case .sleep: identifier = nil
-            }
-            return identifier.flatMap(HKQuantityType.quantityType(forIdentifier:))
-        }
-
-        static func hkUnit(for metric: HealthMetric) -> HKUnit {
-            switch metric {
-            case .steps: return .count()
-            case .restingHeartRate, .heartRate: return HKUnit.count().unitDivided(by: .minute())
-            case .activeEnergy: return .kilocalorie()
-            case .sleep: return .minute()
-            }
-        }
-
-        static func allReadTypes() -> [HKObjectType] {
-            var types: [HKObjectType] = []
-            for metric in HealthMetric.allCases where metric != .sleep {
-                if let t = quantityType(for: metric) { types.append(t) }
-            }
-            if let sleep = HKCategoryType.categoryType(forIdentifier: .sleepAnalysis) {
-                types.append(sleep)
-            }
-            return types
-        }
-
-        fileprivate func sumQuantity(metric: HealthMetric, predicate: NSPredicate) async -> Double? {
-            guard let type = Self.quantityType(for: metric) else { return nil }
-            let unit = Self.hkUnit(for: metric)
-            return await withCheckedContinuation { continuation in
-                let query = HKStatisticsQuery(
-                    quantityType: type, quantitySamplePredicate: predicate,
-                    options: .cumulativeSum
-                ) { _, stats, _ in
-                    continuation.resume(returning: stats?.sumQuantity()?.doubleValue(for: unit))
-                }
-                healthStore.execute(query)
-            }
-        }
-
-        fileprivate func averageQuantity(metric: HealthMetric, predicate: NSPredicate) async -> Double?
-        {
-            guard let type = Self.quantityType(for: metric) else { return nil }
-            let unit = Self.hkUnit(for: metric)
-            return await withCheckedContinuation { continuation in
-                let query = HKStatisticsQuery(
-                    quantityType: type, quantitySamplePredicate: predicate,
-                    options: .discreteAverage
-                ) { _, stats, _ in
-                    continuation.resume(
-                        returning: stats?.averageQuantity()?.doubleValue(for: unit))
-                }
-                healthStore.execute(query)
-            }
-        }
-
-        fileprivate func sleepAsleepMinutes(predicate: NSPredicate) async -> Double? {
-            guard let type = HKCategoryType.categoryType(forIdentifier: .sleepAnalysis) else {
+    static func completedDays(before now: Date, count: Int, calendar: Calendar) -> [DateInterval] {
+        let today = calendar.startOfDay(for: now)
+        return (1...min(7, max(1, count))).compactMap { offset in
+            guard let day = calendar.date(byAdding: .day, value: -offset, to: today) else {
                 return nil
             }
-            return await withCheckedContinuation { continuation in
-                let query = HKSampleQuery(
-                    sampleType: type, predicate: predicate, limit: HKObjectQueryNoLimit,
-                    sortDescriptors: nil
-                ) { _, samples, _ in
-                    guard let categorySamples = samples as? [HKCategorySample] else {
-                        continuation.resume(returning: nil)
-                        return
-                    }
-                    let asleepValues: Set<Int> = [
-                        HKCategoryValueSleepAnalysis.asleepUnspecified.rawValue,
-                        HKCategoryValueSleepAnalysis.asleepCore.rawValue,
-                        HKCategoryValueSleepAnalysis.asleepDeep.rawValue,
-                        HKCategoryValueSleepAnalysis.asleepREM.rawValue,
-                    ]
-                    let seconds = categorySamples
-                        .filter { asleepValues.contains($0.value) }
-                        .reduce(0.0) { $0 + $1.endDate.timeIntervalSince($1.startDate) }
-                    continuation.resume(returning: seconds > 0 ? seconds / 60.0 : nil)
-                }
-                healthStore.execute(query)
+            return calendar.dateInterval(of: .day, for: day)
+        }
+    }
+
+    /// Union clipped asleep intervals: crossing midnight and duplicate sources
+    /// must not lose sleep or double-count overlapping stages/samples.
+    nonisolated static func asleepMinutes(_ intervals: [DateInterval], within day: DateInterval)
+        -> Double?
+    {
+        let clipped = intervals.compactMap { interval -> DateInterval? in
+            let start = max(interval.start, day.start)
+            let end = min(interval.end, day.end)
+            return end > start ? DateInterval(start: start, end: end) : nil
+        }.sorted { $0.start < $1.start }
+        guard var current = clipped.first else { return nil }
+        var seconds = 0.0
+        for interval in clipped.dropFirst() {
+            if interval.start <= current.end {
+                current = DateInterval(start: current.start, end: max(current.end, interval.end))
+            } else {
+                seconds += current.duration
+                current = interval
             }
         }
-
-        // TODO(background): HKObserverQuery + enableBackgroundDelivery for
-        // passive daily sync is intentionally deferred — capture-on-demand is
-        // the shipped path. Background delivery needs the background-mode
-        // capability and a stable server contract, and is a separate slice.
+        return (seconds + current.duration) / 60
     }
-#endif
+
+    static func observation(
+        metric: HealthMetric, value: Double, interval: DateInterval,
+        capturedAt: Date, timeZone: TimeZone
+    ) -> LifeObservation {
+        let timestamp = ISO8601DateFormatter()
+        let start = timestamp.string(from: interval.start)
+        let end = timestamp.string(from: interval.end)
+        let captured = timestamp.string(from: capturedAt)
+        let valueText = String(format: "%.1f", locale: Locale(identifier: "en_US_POSIX"), value)
+        // Unique claim per snapshot: life.observe does not update existing
+        // claim summaries. Keep facts in text until server metadata persists.
+        let summary =
+            "\(metric.displayName): \(valueText) \(metric.unit); "
+            + "completed local day [\(start), \(end)) (\(timeZone.identifier)); "
+            + "read from Apple Health at \(captured). Available samples only, not a clinical assessment."
+        return LifeObservation(
+            observationId: "obs-health-\(UUID().uuidString)",
+            evidence: EvidencePacket(
+                packetId: "pkt-\(UUID().uuidString)",
+                claimRef: GraphRecordRef(
+                    id: "signal:health-snapshot:\(UUID().uuidString)", label: "Signal",
+                    datasource: "memgraph"
+                ),
+                claimSummary: summary,
+                sourceRefs: [
+                    SourceRef(
+                        sourceId: observedBy, sourceKind: "imported_record",
+                        reliability: Reliability(score: 0.9, basis: "imported_authority"))
+                ],
+                confidence: 0.9, validationState: "proposed", observedAt: captured,
+                sourceReliability: 0.9, adjudicationStatus: "not_needed",
+                metadata: [
+                    "metric": .string(metric.rawValue), "unit": .string(metric.unit),
+                    "value": .number(value),
+                    "period_start": .string(start), "period_end": .string(end),
+                    "time_zone": .string(timeZone.identifier), "snapshot_only": .bool(true),
+                ]),
+            observedBy: observedBy, observedRole: "sensor")
+    }
+}

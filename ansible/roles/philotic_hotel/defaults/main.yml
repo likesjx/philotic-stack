@@ -61,6 +61,15 @@ philotic_hotel_port: 9000        # IPC listen port
 philotic_runtime_dir: "/run/philotic"
 philotic_hotel_socket: "{{ philotic_runtime_dir }}/{{ philotic_hotel_runtime_name }}.sock"
 
+# Muninn memory sleep (Phase 2 M6, crates/aiua/src/dream.rs). Enable ONLY on the
+# Cortex hotel (the hotel with no muninn_write_route); other hotels skip at run
+# time anyway. `enabled` registers the nightly 03:30 UTC cron and produces a
+# proposal-only report at config memory_sleep:last_run:<hotel>. `mutate` lets it
+# consolidate exact duplicates and forget diagnostic traffic — read a proposal
+# run first.
+philotic_memory_sleep_enabled: false
+philotic_memory_sleep_mutate: false
+
 # Mesh auth
 philotic_enable_rust_auth: "1"
 philotic_enable_rust_dispatcher: "1"
@@ -78,7 +87,12 @@ philotic_oidc_public_base_url: ""
 # Central Cypher graph provider. When enabled, graph-datasource can target a
 # local Memgraph Bolt endpoint while agents still see the same graph.query tool.
 philotic_memgraph_enabled: false
-philotic_memgraph_image: "memgraph/memgraph:latest"
+# MAGE image, pinned to the running Memgraph version: the LifeGraph gardener
+# skill needs the graph-science procedures (weakly_connected_components,
+# pagerank, community_detection, node_similarity, degree_centrality) that the
+# plain memgraph/memgraph image does not ship. Same on-disk format as
+# memgraph/memgraph of the same version, so the bind-mounted data dir carries over.
+philotic_memgraph_image: "memgraph/memgraph-mage:3.10.1"
 philotic_memgraph_container_name: "philotic-memgraph"
 # uid/gid of the `memgraph` user inside memgraph/memgraph:*. The data dir is a
 # host bind mount, so these must match or the database cannot write to it.

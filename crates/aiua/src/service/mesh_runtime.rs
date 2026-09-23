@@ -27,6 +27,37 @@ use crate::{
     sample_node_health,
 };
 
+/// Does an inbound event's claimed source match the peer whose per-pair
+/// HMAC key authenticated the batch?
+///
+/// Handlers act on `event.source_node_id` — as the origin of a relocation,
+/// the hotel to reply to, the peer a secret may be released to — but that
+/// field sits inside the payload, and the batch's HMAC only proves who
+/// *sent* it. Without this check any authenticated peer could speak as any
+/// other hotel (DEF-170). Every hotel builds its envelopes with its own node
+/// id as the source and sends them directly, so for an event addressed here
+/// the two must agree. An event addressed to another node is left alone:
+/// delivery ignores it anyway.
+pub(crate) fn event_source_is_authenticated_sender(
+    event: &EventEnvelope,
+    authenticated_sender: &str,
+    local_node_id: &str,
+) -> bool {
+    match event.target_node_id.as_deref() {
+        Some(target) if target != local_node_id => true,
+        _ => event.source_node_id == authenticated_sender,
+    }
+}
+
+/// Is this event addressed to a node other than this one? (An event with no
+/// target is a broadcast and is ours.)
+pub(crate) fn event_is_addressed_elsewhere(event: &EventEnvelope, local_node_id: &str) -> bool {
+    event
+        .target_node_id
+        .as_deref()
+        .is_some_and(|target| target != local_node_id)
+}
+
 type BeaconInboxReceiver = Arc<Mutex<Option<mpsc::Receiver<ansible_mesh_core::BeaconMessage>>>>;
 type WebRtcSignalReceiver =
     Arc<Mutex<Option<mpsc::Receiver<ansible_mesh_core::webrtc::WebRtcSignalMessage>>>>;
@@ -63,6 +94,10 @@ pub(crate) struct MeshRuntimeContext {
     /// Shared hotel roster snapshot used by BeaconDaemon for anchor handshakes.
     pub(crate) local_hotel_state:
         Arc<RwLock<Option<ansible_mesh_core::heartbeat::HotelStateSyncPayload>>>,
+    /// Newly applied gossiped placement records flow here so the hotel can
+    /// push `TransportHomeChanged` to local guests at once (DEF-107).
+    pub(crate) placement_change_tx:
+        Option<mpsc::UnboundedSender<ansible_mesh_core::placement_sync::PlacementChange>>,
 }
 
 pub(crate) async fn activate_mesh_runtime(ctx: MeshRuntimeContext) -> Result<()> {
@@ -76,7 +111,8 @@ pub(crate) async fn activate_mesh_runtime(ctx: MeshRuntimeContext) -> Result<()>
             ctx.enable_rust_auth,
             ctx.registry.clone(),
         )
-        .await?,
+        .await?
+        .with_placement_change_tx(ctx.placement_change_tx.clone()),
     );
     *daemon.local_hotel_state.write().await = ctx.local_hotel_state.read().await.clone();
     // Keep beacon's snapshot in sync: whenever the shared Arc is updated, propagate here.
@@ -126,6 +162,32 @@ pub(crate) async fn activate_mesh_runtime(ctx: MeshRuntimeContext) -> Result<()>
                         }
                     }
                     _ = hs_shutdown.recv() => break,
+                }
+            }
+        });
+    }
+
+    // Re-broadcast this hotel's agents' command manifests so a peer that
+    // restarted or joined since the last publish catches up (DEF-180). The
+    // first pass waits for rosters to arrive; a peer only caches a manifest
+    // from the hotel its roster says runs the agent.
+    {
+        let cm_graph = ctx.graph_domain.clone();
+        let cm_tx = ctx.dispatcher_tx.clone();
+        let cm_node = ctx.caps.node_id.clone();
+        let cm_hotel = ctx.hotel_name.clone();
+        let mut cm_shutdown = ctx.shutdown_tx.subscribe();
+        tokio::spawn(async move {
+            let mut delay = tokio::time::Duration::from_secs(45);
+            loop {
+                tokio::select! {
+                    _ = tokio::time::sleep(delay) => {
+                        crate::service::command_manifest::rebroadcast_local_manifests(
+                            cm_graph.as_ref(), &cm_tx, &cm_node, &cm_hotel,
+                        ).await;
+                        delay = tokio::time::Duration::from_secs(120);
+                    }
+                    _ = cm_shutdown.recv() => break,
                 }
             }
         });
@@ -328,6 +390,8 @@ pub(crate) async fn activate_mesh_runtime(ctx: MeshRuntimeContext) -> Result<()>
     {
         let dispatcher_inbound_tx = ctx.dispatcher_tx.clone();
         let inbound_graph = ctx.graph_domain.clone();
+        let inbound_hotel = ctx.hotel_name.clone();
+        let inbound_registry = ctx.registry.clone();
         let inbound_inboxes = ctx.ipc_inboxes.clone();
         let inbound_parked = ctx.ipc_parked_inbound.clone();
         let inbound_delivery_claims = ctx.ipc_delivery_claims.clone();
@@ -369,6 +433,20 @@ pub(crate) async fn activate_mesh_runtime(ctx: MeshRuntimeContext) -> Result<()>
                             if !events.is_empty() {
                                 let max_seq = events.iter().map(|e| e.seq).max().unwrap_or(0);
                                 for event in &events {
+                                    if !event_source_is_authenticated_sender(
+                                        event,
+                                        &msg.src_node,
+                                        &inbound_local_node_id,
+                                    ) {
+                                        warn!(
+                                            event_id = %event.event_id,
+                                            claimed_source = %event.source_node_id,
+                                            authenticated_sender = %msg.src_node,
+                                            kind = ?event.kind,
+                                            "Dropping mesh event: it claims a source other than the peer that sent it (DEF-170)"
+                                        );
+                                        continue;
+                                    }
                                     IpcServer::deliver_event_envelope_or_park(
                                         &inbound_inboxes,
                                         event,
@@ -380,6 +458,16 @@ pub(crate) async fn activate_mesh_runtime(ctx: MeshRuntimeContext) -> Result<()>
                                         &inbound_delivery_claims,
                                     )
                                     .await;
+                                    // The control-plane handlers below act on their
+                                    // payload as addressed to THIS hotel. An event
+                                    // addressed to a third node is one the sender check
+                                    // above lets through only because delivery ignores
+                                    // it — running cron/identity/handoff handlers on it
+                                    // would apply a peer-supplied record with forged
+                                    // provenance (DEF-183).
+                                    if event_is_addressed_elsewhere(event, &inbound_local_node_id) {
+                                        continue;
+                                    }
                                     // Cron control-plane broadcasts.
                                     match &event.kind {
                                         ansible_mesh_core::event::EventKind::CronFired => {
@@ -415,6 +503,77 @@ pub(crate) async fn activate_mesh_runtime(ctx: MeshRuntimeContext) -> Result<()>
                                                 );
                                             }
                                         }
+                                        ansible_mesh_core::event::EventKind::MaterializeRequest => {
+                                            if let ansible_mesh_core::event::EventPayload::Inline {
+                                                data,
+                                            } = &event.payload
+                                            {
+                                                let graph = inbound_graph.clone();
+                                                let inboxes = inbound_inboxes.clone();
+                                                let mat_req = inbound_mat_req.clone();
+                                                let node_id = inbound_local_node_id.clone();
+                                                let source_node = event.source_node_id.clone();
+                                                let data = data.clone();
+                                                let dispatcher_tx = dispatcher_inbound_tx.clone();
+                                                tokio::spawn(async move {
+                                                    IpcServer::handle_remote_materialize_request(
+                                                        graph.as_ref(),
+                                                        &inboxes,
+                                                        mat_req,
+                                                        dispatcher_tx,
+                                                        &node_id,
+                                                        &source_node,
+                                                        &data,
+                                                    )
+                                                    .await;
+                                                });
+                                            }
+                                        }
+                                        ansible_mesh_core::event::EventKind::MaterializeReady => {
+                                            if let ansible_mesh_core::event::EventPayload::Inline {
+                                                data,
+                                            } = &event.payload
+                                            {
+                                                IpcServer::handle_remote_materialize_ready(
+                                                    inbound_graph.as_ref(),
+                                                    &event.source_node_id,
+                                                    data,
+                                                );
+                                            }
+                                        }
+                                        ansible_mesh_core::event::EventKind::ContinuityImport => {
+                                            if let ansible_mesh_core::event::EventPayload::Inline {
+                                                data,
+                                            } = &event.payload
+                                            {
+                                                let graph = inbound_graph.clone();
+                                                let node_id = inbound_local_node_id.clone();
+                                                let source_node = event.source_node_id.clone();
+                                                let data = data.clone();
+                                                let dispatcher_tx = dispatcher_inbound_tx.clone();
+                                                tokio::spawn(async move {
+                                                    IpcServer::handle_remote_continuity_import(
+                                                        graph.as_ref(),
+                                                        dispatcher_tx,
+                                                        &node_id,
+                                                        &source_node,
+                                                        &data,
+                                                    )
+                                                    .await;
+                                                });
+                                            }
+                                        }
+                                        ansible_mesh_core::event::EventKind::ContinuityAck => {
+                                            if let ansible_mesh_core::event::EventPayload::Inline {
+                                                data,
+                                            } = &event.payload
+                                            {
+                                                IpcServer::handle_remote_continuity_ack(
+                                                    inbound_graph.as_ref(),
+                                                    data,
+                                                );
+                                            }
+                                        }
                                         ansible_mesh_core::event::EventKind::SessionControl => {
                                             if let ansible_mesh_core::event::EventPayload::Inline {
                                                 data,
@@ -426,6 +585,21 @@ pub(crate) async fn activate_mesh_runtime(ctx: MeshRuntimeContext) -> Result<()>
                                                 {
                                                     if v.get("action")
                                                         .and_then(|a| a.as_str())
+                                                        == Some(
+                                                            crate::service::command_manifest::SYNC_ACTION,
+                                                        )
+                                                    {
+                                                        let registry =
+                                                            inbound_registry.read().await;
+                                                        crate::service::command_manifest::handle_remote_manifest_sync(
+                                                            inbound_graph.as_ref(),
+                                                            &registry,
+                                                            &inbound_hotel,
+                                                            &event.source_node_id,
+                                                            data,
+                                                        );
+                                                    } else if v.get("action")
+                                                        .and_then(|a| a.as_str())
                                                         == Some("session.handoff")
                                                     {
                                                         let graph = inbound_graph.clone();
@@ -434,6 +608,8 @@ pub(crate) async fn activate_mesh_runtime(ctx: MeshRuntimeContext) -> Result<()>
                                                         let mat_req = inbound_mat_req.clone();
                                                         let node_id =
                                                             inbound_local_node_id.clone();
+                                                        let source_node =
+                                                            event.source_node_id.clone();
                                                         let data = data.clone();
                                                         tokio::spawn(async move {
                                                             IpcServer::handle_remote_role_handoff(
@@ -442,6 +618,7 @@ pub(crate) async fn activate_mesh_runtime(ctx: MeshRuntimeContext) -> Result<()>
                                                                 &parked,
                                                                 mat_req,
                                                                 &node_id,
+                                                                &source_node,
                                                                 &data,
                                                             )
                                                             .await;
@@ -500,18 +677,26 @@ pub(crate) async fn activate_mesh_runtime(ctx: MeshRuntimeContext) -> Result<()>
                                         timestamp,
                                         hmac: hmac.into(),
                                     };
-                                    if let Err(err) =
-                                        crate::service::execution_transport::send_execution_message(
-                                            &target_addr,
-                                            &ack,
-                                        )
-                                        .await
-                                    {
-                                        warn!(
-                                            "Failed to return execution ACK to {} at {}: {}",
-                                            msg.src_node, target_addr, err
-                                        );
-                                    }
+                                    // Off the inbound loop: this loop is the only
+                                    // consumer of every peer's batches, heartbeats and
+                                    // signals, and an ACK to a peer that just went dark
+                                    // used to hold all of them for the connect timeout
+                                    // (DEF-181). The send has its own bounded timeouts.
+                                    let ack_dest = msg.src_node.clone();
+                                    tokio::spawn(async move {
+                                        if let Err(err) =
+                                            crate::service::execution_transport::send_execution_message(
+                                                &target_addr,
+                                                &ack,
+                                            )
+                                            .await
+                                        {
+                                            warn!(
+                                                "Failed to return execution ACK to {} at {}: {}",
+                                                ack_dest, target_addr, err
+                                            );
+                                        }
+                                    });
                                 } else {
                                     warn!(
                                         "No mesh target address found for ACK destination {}",
@@ -701,4 +886,83 @@ pub(crate) async fn activate_mesh_runtime(ctx: MeshRuntimeContext) -> Result<()>
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod sender_binding_tests {
+    use super::event_source_is_authenticated_sender;
+    use ansible_mesh_core::event::{EventEnvelope, EventKind, EventPayload};
+    use uuid::Uuid;
+
+    fn event(source: &str, target: Option<&str>) -> EventEnvelope {
+        EventEnvelope {
+            event_id: Uuid::new_v4(),
+            seq: 1,
+            source_node_id: source.into(),
+            target_node_id: target.map(str::to_string),
+            source_agent_id: source.into(),
+            target_agent_id: None,
+            kind: EventKind::ContinuityImport,
+            corr_id: String::new(),
+            attempt: 0,
+            created_at: 0,
+            expires_at: None,
+            payload: EventPayload::Inline { data: "{}".into() },
+            trace: vec![],
+        }
+    }
+
+    #[test]
+    fn an_event_from_its_own_sender_is_accepted() {
+        let e = event("mac-jane-aiua-01", Some("vps-jane-aiua-01"));
+        assert!(event_source_is_authenticated_sender(
+            &e,
+            "mac-jane-aiua-01",
+            "vps-jane-aiua-01"
+        ));
+    }
+
+    #[test]
+    fn a_peer_cannot_speak_as_another_hotel() {
+        // mbp-jane authenticated the batch but claims mac-jane sent it.
+        let e = event("mac-jane-aiua-01", Some("vps-jane-aiua-01"));
+        assert!(!event_source_is_authenticated_sender(
+            &e,
+            "mbp-jane-aiua-01",
+            "vps-jane-aiua-01"
+        ));
+        let untargeted = event("mac-jane-aiua-01", None);
+        assert!(!event_source_is_authenticated_sender(
+            &untargeted,
+            "mbp-jane-aiua-01",
+            "vps-jane-aiua-01"
+        ));
+    }
+
+    #[test]
+    fn control_plane_handlers_skip_events_addressed_to_a_third_node() {
+        use super::event_is_addressed_elsewhere;
+        assert!(event_is_addressed_elsewhere(
+            &event("a", Some("mbp-jane-aiua-01")),
+            "vps-jane-aiua-01"
+        ));
+        assert!(!event_is_addressed_elsewhere(
+            &event("a", Some("vps-jane-aiua-01")),
+            "vps-jane-aiua-01"
+        ));
+        assert!(
+            !event_is_addressed_elsewhere(&event("a", None), "vps-jane-aiua-01"),
+            "a broadcast is ours"
+        );
+    }
+
+    #[test]
+    fn an_event_addressed_elsewhere_is_not_ours_to_judge() {
+        let e = event("mac-jane-aiua-01", Some("mbp-jane-aiua-01"));
+        assert!(event_source_is_authenticated_sender(
+            &e,
+            "vps-jane-aiua-01",
+            "vps-jane-aiua-01"
+        ));
+    }
 }

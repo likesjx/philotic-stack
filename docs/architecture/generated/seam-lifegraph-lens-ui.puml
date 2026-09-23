@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - lifegraph-lens-ui
+
+rectangle "lifegraph-lens-ui" as lifegraph_lens_ui #Orange {
+}
+
+
+@enduml

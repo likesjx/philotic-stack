@@ -131,6 +131,30 @@ public struct LifeLensData: Codable, Equatable, Sendable {
         case fallbackUsed = "fallback_used"
         case contextPacket = "context_packet"
     }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        status = try container.decode(String.self, forKey: .status)
+        namedStrategy = try container.decodeIfPresent(String.self, forKey: .namedStrategy)
+        contextPacket = try container.decodeIfPresent(LifeContextPacket.self, forKey: .contextPacket)
+
+        if try !container.contains(.fallbackUsed) || container.decodeNil(forKey: .fallbackUsed) {
+            fallbackUsed = nil
+        } else if let legacyValue = try? container.decode(Bool.self, forKey: .fallbackUsed) {
+            fallbackUsed = legacyValue
+        } else {
+            // data-memorygraphrag's FallbackUsage emits strings, not JSON booleans.
+            // Keep the existing boolean projection while accepting both wire formats.
+            switch try container.decode(String.self, forKey: .fallbackUsed) {
+            case "false": fallbackUsed = false
+            case "topped_up", "full_fallback": fallbackUsed = true
+            default:
+                throw DecodingError.dataCorruptedError(
+                    forKey: .fallbackUsed, in: container,
+                    debugDescription: "Unknown LifeGraph fallback usage")
+            }
+        }
+    }
 }
 
 /// `GET /api/edge/lifegraph/lens/:lens` response.
@@ -250,6 +274,38 @@ public struct LifeNeighborhood: Codable, Equatable, Sendable {
 // MARK: - Client
 
 public struct LifeGraphClient: Sendable {
+    public enum EditError: Error, LocalizedError {
+        case conflict, unavailable, rejected(Int), invalidReceipt
+        public var errorDescription: String? {
+            switch self {
+            case .conflict: return "This node changed or is no longer available. Close the editor, reload, and review your changes before saving again."
+            case .unavailable: return "This hotel does not yet support node editing. Its web service and LifeGraph runner need the editor update."
+            case .rejected(let status): return "The hotel rejected this edit (HTTP \(status)). Your draft has been kept."
+            case .invalidReceipt: return "No valid audit receipt was returned. Reload to check the node before retrying."
+            }
+        }
+    }
+
+    public func editNode(baseURL: URL, bearerToken: String, nodeId: String,
+                         edit: LifeNodeEdit) async throws -> LifeNodeEditReceipt {
+        let url = baseURL.appending(path: "api/edge/lifegraph/node").appending(component: nodeId)
+        var request = URLRequest(url: url)
+        request.httpMethod = "PATCH"
+        request.setValue("Bearer \(bearerToken)", forHTTPHeaderField: "Authorization")
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = try JSONEncoder().encode(edit)
+        let (data, response) = try await session.data(for: request)
+        let status = (response as? HTTPURLResponse)?.statusCode ?? -1
+        if status == 409 { throw EditError.conflict }
+        if [404, 405, 501].contains(status) { throw EditError.unavailable }
+        guard status == 200 else { throw EditError.rejected(status) }
+        guard let receipt = try? JSONDecoder().decode(LifeNodeEditReceipt.self, from: data),
+              receipt.status == "saved", receipt.nodeId == nodeId, !receipt.auditId.isEmpty else {
+            throw EditError.invalidReceipt
+        }
+        return receipt
+    }
+
     public enum LifeGraphError: Error, Equatable {
         case badResponse(status: Int)
     }
@@ -346,9 +402,11 @@ public struct LifeGraphClient: Sendable {
             )
             merged.append(contentsOf: result.results)
             switch result.status {
-            case "error": sawError = true
+            case "ok": break
             case "partial": sawPartial = true
-            default: break
+            // Failed, invalid_request, unknown, and future statuses must not
+            // become a successful health/location upload by default.
+            default: sawError = true
             }
         }
 

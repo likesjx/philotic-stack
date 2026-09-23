@@ -8,6 +8,13 @@ This document covers the three current client paths:
 - Perplexity and other external capture clients using the Philotic HTTPS frontdoor
 - governed LifeGraph clients using a separate LifeGraph MCP endpoint
 
+Philotes provisioning their own endpoints follow the same rules through the
+`mcp.endpoint_steward` skill ([skills/mcp-endpoint-steward/SKILL.md](/Users/jaredlikes/code/philotic-stack/skills/mcp-endpoint-steward/SKILL.md)):
+`mcp.status` → design the surface and per-tool handler policies →
+`mcp.provision` → `mcp.grant_token` → smoke → record. The raw token is
+returned once in the `mcp.grant_token` result and must be relayed to the
+operator's secret store, never stored by the agent.
+
 ## Default Posture
 
 Native Muninn MCP is a private trusted-client surface.

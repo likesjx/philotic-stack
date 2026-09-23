@@ -30,6 +30,7 @@ thiserror = "1.0"
 tracing = "0.1"
 ulid = "1"
 x25519-dalek = { version = "2", features = ["static_secrets"] }
+zeroize = "1"
 
 [dev-dependencies]
 philotic-client = { path = "../philotic-client" }

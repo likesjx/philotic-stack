@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - device-tool-plane
+
+rectangle "device-tool-plane" as device_tool_plane #Orange {
+}
+
+
+@enduml

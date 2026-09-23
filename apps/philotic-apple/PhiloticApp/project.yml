@@ -43,13 +43,31 @@ targets:
         INFOPLIST_KEY_LSApplicationCategoryType: "public.app-category.utilities"
         INFOPLIST_KEY_NSMicrophoneUsageDescription: "PhiloticApp uses the microphone for voice messages to your agents."
         INFOPLIST_KEY_NSSpeechRecognitionUsageDescription: "Speech is transcribed on-device to send voice messages."
+        INFOPLIST_KEY_NSLocationUsageDescription: "PhiloticApp shares a location snapshot with your agents only when you tap Share Current Location."
+        INFOPLIST_KEY_NSRemindersFullAccessUsageDescription: "Preview upcoming reminders on this Mac. Philotic does not change reminders or send them to agents."
 
   PhiloticApp-iOS:
     type: application
     platform: iOS
     deploymentTarget: "17.0"
+    # Nested Info.plist dictionaries must be emitted as properties; an
+    # INFOPLIST_KEY_NSAppTransportSecurity_NSAllowsLocalNetworking setting
+    # does not produce an ATS dictionary in Xcode's generated app plist.
+    info:
+      path: PhiloticApp-iOS-Info.plist
+      properties:
+        CFBundleShortVersionString: "$(MARKETING_VERSION)"
+        CFBundleVersion: "$(CURRENT_PROJECT_VERSION)"
+        NSAppTransportSecurity:
+          NSExceptionDomains:
+            # Transitional private vps-jane endpoint. Requires Tailscale on
+            # the phone; remove this exception when the edge has HTTPS.
+            "100.64.212.8":
+              NSExceptionAllowsInsecureHTTPLoads: true
+        NSLocalNetworkUsageDescription: "Connect to your configured Philotic server on your private network."
     sources:
       - path: Sources/PhiloticApp
+      - path: Resources/Assets.xcassets
     dependencies:
       - package: PhiloticKit
         product: PhiloticKit
@@ -64,15 +82,17 @@ targets:
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.philotic.apple.ios
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
         PRODUCT_NAME: PhiloticApp
         GENERATE_INFOPLIST_FILE: "YES"
         INFOPLIST_KEY_UILaunchScreen_Generation: "YES"
         INFOPLIST_KEY_UIApplicationSceneManifest_Generation: "YES"
         INFOPLIST_KEY_UISupportedInterfaceOrientations: "UIInterfaceOrientationPortrait UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight"
-        INFOPLIST_KEY_NSAppTransportSecurity_NSAllowsLocalNetworking: "YES"
         INFOPLIST_KEY_NSMicrophoneUsageDescription: "PhiloticApp uses the microphone for voice messages to your agents."
         INFOPLIST_KEY_NSSpeechRecognitionUsageDescription: "Speech is transcribed on-device to send voice messages."
-        INFOPLIST_KEY_NSHealthShareUsageDescription: "PhiloticApp reads your health metrics to build your life graph."
+        INFOPLIST_KEY_NSHealthShareUsageDescription: "Review selected activity, sleep, and heart-rate summaries for personal wellness. Data stays on this device unless you separately confirm sharing summaries with your LifeGraph and agents."
+        INFOPLIST_KEY_NSLocationWhenInUseUsageDescription: "PhiloticApp shares a location snapshot with your agents only when you tap Share Current Location."
+        INFOPLIST_KEY_NSRemindersFullAccessUsageDescription: "Preview upcoming reminders on this iPhone. Philotic does not change reminders or send them to agents."
         TARGETED_DEVICE_FAMILY: "1,2"
         # Device-install ready. Automatic signing: open the project in Xcode,
         # select the PhiloticApp-iOS target -> Signing & Capabilities, and
@@ -90,6 +110,36 @@ targets:
         CODE_SIGN_IDENTITY: "Apple Development"
         DEVELOPMENT_TEAM: ""
 
+  PhiloticAppTests-macOS:
+    type: bundle.unit-test
+    platform: macOS
+    deploymentTarget: "14.0"
+    sources:
+      - path: Tests/PhiloticAppTests
+    dependencies:
+      - target: PhiloticApp-macOS
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.philotic.apple.mac.tests
+        GENERATE_INFOPLIST_FILE: "YES"
+        TEST_HOST: "$(BUILT_PRODUCTS_DIR)/PhiloticApp.app/Contents/MacOS/PhiloticApp"
+        BUNDLE_LOADER: "$(TEST_HOST)"
+
+  PhiloticAppTests-iOS:
+    type: bundle.unit-test
+    platform: iOS
+    deploymentTarget: "17.0"
+    sources:
+      - path: Tests/PhiloticAppTests
+    dependencies:
+      - target: PhiloticApp-iOS
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.philotic.apple.ios.tests
+        GENERATE_INFOPLIST_FILE: "YES"
+        TEST_HOST: "$(BUILT_PRODUCTS_DIR)/PhiloticApp.app/PhiloticApp"
+        BUNDLE_LOADER: "$(TEST_HOST)"
+
 schemes:
   PhiloticApp-macOS:
     build:
@@ -99,6 +149,8 @@ schemes:
       config: Debug
     test:
       config: Debug
+      targets:
+        - PhiloticAppTests-macOS
   PhiloticApp-iOS:
     build:
       targets:
@@ -107,3 +159,5 @@ schemes:
       config: Debug
     test:
       config: Debug
+      targets:
+        - PhiloticAppTests-iOS

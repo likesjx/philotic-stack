@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - relocation-ceremony
+
+rectangle "relocation-ceremony" as relocation_ceremony #Orange {
+}
+
+
+@enduml

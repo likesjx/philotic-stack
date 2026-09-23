@@ -1,4 +1,4 @@
-use ansible_mesh_core::graph::{AbstractSkillRecord, AbstractToolRecord, ToolsetProfileRecord};
+use ansible_mesh_core::graph::{AbstractSkillRecord, ToolsetProfileRecord};
 use ansible_mesh_core::membership::{
     MeshMembershipAcceptPayload, derive_transport_session_key, fingerprint_from_base64url,
     now_epoch_secs, verify_join_request,
@@ -38,17 +38,21 @@ use tracing::{debug, error, info, warn};
 mod architect_charter;
 mod auth;
 mod autonomy_sweep;
+mod cortex_viewer;
 mod dream;
 mod graph;
 mod lyra_charter;
 mod memory;
 mod memory_delta_digest;
 mod memory_hygiene;
+mod memory_promotion;
+mod memory_report;
 mod mesh;
 mod muninn_provision;
 mod vault;
 
 mod service;
+mod tool_catalog;
 use service::blob::BlobService;
 use service::cron_ticker::CronTicker;
 use service::ipc::IpcServer;
@@ -56,6 +60,20 @@ use service::mesh_runtime::{MeshRuntimeContext, activate_mesh_runtime};
 use std::sync::Arc;
 
 const DEFAULT_GRAPH_DATASOURCE_HOME_HOTEL: &str = "vps-jane";
+
+/// Bind address for the blob HTTP listener.
+///
+/// This MUST stay in lockstep with the `blob` [`ListenerDecl`] in the perimeter
+/// declaration below. The hotel classifies its own exposure tier from that
+/// declaration and persists it to `__hotel_perimeter__`, so binding wider here
+/// than we declare does not just widen the listener — it makes the perimeter
+/// snapshot report `Local` for a socket that is actually world-reachable.
+///
+/// The blob plane is unauthenticated (`POST /upload` accepts anonymous writes,
+/// `GET /download` is a bare `ServeDir`), and every real consumer reaches it over
+/// loopback via `PHILOTIC_BLOB_BASE_URL=http://127.0.0.1:<blob_port>`. Do not widen
+/// this without adding authentication first.
+const BLOB_BIND_ADDR: std::net::Ipv4Addr = std::net::Ipv4Addr::LOCALHOST;
 
 fn graph_datasource_home_hotel() -> String {
     std::env::var("PHILOTIC_GRAPH_DATASOURCE_HOME_HOTEL")
@@ -229,7 +247,7 @@ fn agent_graph_db_path(agent_id: &str) -> Option<String> {
 use ansible_mesh_core::domain::GraphDomain;
 use ansible_mesh_core::event::EventEnvelope;
 use auth::AuthCommand;
-use vault::{SecretAccess, SecretInput, resolve_secret, store_secret};
+use vault::{SecretAccess, SecretInput, resolve_secret, rotate_secret, store_secret};
 
 /// Instructions for the strictly-serialized DB writer thread
 pub enum LedgerCommand {
@@ -1012,6 +1030,7 @@ fn default_hotel_record(hotel_name: &str) -> HotelRecord {
             models: vec![],
             tools: vec![],
             constraints: Default::default(),
+            build_version: env!("CARGO_PKG_VERSION").to_string(),
         },
         mesh_host: None,
         mesh_port: base_port,
@@ -1207,6 +1226,24 @@ fn mesh_member_public_key_config_key(hotel_name: &str) -> String {
     format!("mesh_member_public_key:{hotel_name}")
 }
 
+/// The hotel already bound to `node_id`, if it is not `hotel_name` (DEF-174).
+///
+/// A join pins the joiner's Ed25519 key by hotel name but stores the
+/// per-pair auth key by the node id the joiner *claims*. Without this check
+/// an invite holder could join under a fresh hotel name while claiming an
+/// existing peer's node id, replacing that peer's auth key — and with it
+/// every message, and any secret, this hotel would trust as that peer's.
+fn node_id_bound_to_other_hotel(
+    graph: &GraphDomain,
+    node_id: &str,
+    hotel_name: &str,
+) -> Option<String> {
+    graph.list_hotels().ok()?.into_iter().find_map(|hotel| {
+        (hotel.capabilities.node_id == node_id && hotel.hotel_name != hotel_name)
+            .then_some(hotel.hotel_name)
+    })
+}
+
 fn mesh_auth_key_config_key(node_id: &str) -> String {
     format!("mesh_auth_key:{node_id}")
 }
@@ -1233,6 +1270,66 @@ fn resolve_internal_secret(graph: &GraphDomain, secret_ref: &str) -> Result<Stri
         },
     )?
     .ok_or_else(|| anyhow::anyhow!("vault secret not found: {secret_ref}"))
+}
+
+/// Vault kind for a Telegram bot token.
+const TELEGRAM_BOT_TOKEN_SECRET_KIND: &str = "telegram_bot_token";
+
+/// Only Telegram seats read a bot token.
+const TELEGRAM_BOT_TOKEN_READER_ROLE: &str = "membrane";
+
+/// Is `key` a config key whose value is a Telegram bot token — the global
+/// `telegram_bot_token` or a per-agent `telegram_bot_token_{agent_key}`?
+fn is_telegram_bot_token_config_key(key: &str) -> bool {
+    key == "telegram_bot_token" || key.starts_with("telegram_bot_token_")
+}
+
+/// The vault ref a Telegram token key already points at, if it resolves.
+fn telegram_token_vault_ref(graph: &GraphDomain, key: &str) -> Result<Option<String>> {
+    let Some(value) = read_string_config(graph, key)? else {
+        return Ok(None);
+    };
+    if !value.starts_with("secret://") || graph.get_secret(&value)?.is_none() {
+        return Ok(None);
+    }
+    Ok(Some(value))
+}
+
+/// Move every plaintext Telegram bot token in config into the vault (DEF-176).
+///
+/// Tokens were plaintext `config:` values readable by any local process
+/// through ACL-less `GetConfig`, and a secret the vault doesn't hold can't
+/// be sealed to another hotel on a relocation. The key keeps its name —
+/// transport homes and seats address a token by it — but its value becomes
+/// the vault ref, readable only by the `membrane` role.
+fn migrate_plaintext_telegram_tokens(graph: &GraphDomain) -> Result<usize> {
+    let mut migrated = 0usize;
+    for key in graph.list_config_keys_with_prefix("telegram_bot_token")? {
+        if !is_telegram_bot_token_config_key(&key) {
+            continue;
+        }
+        let Some(plaintext) = read_string_config(graph, &key)? else {
+            continue;
+        };
+        if plaintext.starts_with("secret://") {
+            continue;
+        }
+        let secret_ref = store_secret(
+            graph,
+            SecretInput {
+                secret_kind: TELEGRAM_BOT_TOKEN_SECRET_KIND.into(),
+                scope: "hotel".into(),
+                allowed_roles: vec![TELEGRAM_BOT_TOKEN_READER_ROLE.into()],
+                allowed_guests: Vec::new(),
+                plaintext,
+            },
+        )
+        .with_context(|| format!("store Telegram bot token for {key}"))?;
+        graph.set_config_value(&key, &serde_json::to_string(&secret_ref)?)?;
+        info!(config_key = %key, "Moved a plaintext Telegram bot token into the hotel vault");
+        migrated += 1;
+    }
+    Ok(migrated)
 }
 
 fn migrate_plaintext_provider_api_keys(graph: &GraphDomain) -> Result<usize> {
@@ -1420,6 +1517,18 @@ fn handle_mesh_membership_accept(graph: &GraphDomain, payload_json: &str) {
             );
             return;
         }
+    }
+
+    if let Some(owner) = node_id_bound_to_other_hotel(
+        graph,
+        &payload.payload.capabilities.node_id,
+        &payload.payload.hotel_name,
+    ) {
+        warn!(
+            "Rejecting mesh membership acceptance for hotel [{}]: node id [{}] already belongs to hotel [{}] (DEF-174)",
+            payload.payload.hotel_name, payload.payload.capabilities.node_id, owner
+        );
+        return;
     }
 
     let Some(local_hotel_name) = pending
@@ -2907,6 +3016,15 @@ fn ensure_workspace_exists(workspace: &Path, existing_bundle: Option<&serde_json
     }
 }
 
+/// Remove `admin_password` from the `muninn` context-graph entry before it is
+/// persisted to node_config. Returns true when a password was removed.
+fn strip_muninn_admin_password(key: &str, value: &mut serde_json::Value) -> bool {
+    key == "muninn"
+        && value
+            .as_object_mut()
+            .is_some_and(|obj| obj.remove("admin_password").is_some())
+}
+
 fn extract_context_graph_entries(
     config_json: &serde_json::Value,
     hotel_name: Option<&str>,
@@ -3124,6 +3242,15 @@ fn reconcile_hotel_record(graph: &GraphDomain, hotel_name: &str) -> Result<Hotel
         hotel.execution_port = desired.execution_port;
         changed = true;
     }
+    // Refresh build_version to the binary actually running this boot — unlike
+    // the rest of `capabilities`, this field is meant to change on every
+    // upgrade, not persist as graph truth (Relocation Ceremony R4: version
+    // compatibility feasibility check needs the CURRENT build, not whichever
+    // build first seeded this hotel's record).
+    if hotel.capabilities.build_version != desired.capabilities.build_version {
+        hotel.capabilities.build_version = desired.capabilities.build_version;
+        changed = true;
+    }
     let explicit_socket = std::env::var("PHILOTIC_HOTEL_SOCKET")
         .ok()
         .map(|value| value.trim().to_string())
@@ -3332,1090 +3459,22 @@ fn enforce_graph_datasource_home(graph: &GraphDomain, hotel_name: &str) -> Resul
 /// present are inserted; existing entries are updated to the current definition.
 /// Operator-added or tool-runner-provided tools with distinct names are unaffected.
 fn seed_abstract_tool_catalog(graph: &GraphDomain) -> anyhow::Result<()> {
-    let catalog = [
-        AbstractToolRecord {
-            tool_name: "session.status".into(),
-            description: "Returns a summary of the current session state, including the active \
-                          session ID, turn count, approval policy, and active tool runners."
-                .into(),
-            input_schema: serde_json::json!({ "type": "object", "properties": {} }),
-            class: "session".into(),
-            tool_markers: Vec::new(),
-        },
-        AbstractToolRecord {
-            tool_name: "echo".into(),
-            description: "Echoes a string back unchanged. Use for testing tool routing and \
-                          round-trip connectivity."
-                .into(),
-            input_schema: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "text": { "type": "string", "description": "The text to echo back." }
-                },
-                "required": ["text"]
-            }),
-            class: "utility".into(),
-            tool_markers: Vec::new(),
-        },
-        AbstractToolRecord {
-            tool_name: "workspace.list".into(),
-            description: "Lists files and directories at the given path within the workspace. \
-                          Defaults to the workspace root if no path is provided."
-                .into(),
-            input_schema: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "path": {
-                        "type": "string",
-                        "description": "Relative path within the workspace to list."
-                    }
-                }
-            }),
-            class: "workspace".into(),
-            tool_markers: Vec::new(),
-        },
-        AbstractToolRecord {
-            tool_name: "workspace.read".into(),
-            description: "Reads the contents of a file in the workspace. Supports optional \
-                          byte-range limiting via offset and limit."
-                .into(),
-            input_schema: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "path": {
-                        "type": "string",
-                        "description": "Relative path to the file within the workspace."
-                    },
-                    "offset": {
-                        "type": "integer",
-                        "description": "Byte offset to start reading from."
-                    },
-                    "limit": {
-                        "type": "integer",
-                        "description": "Maximum number of bytes to read."
-                    }
-                },
-                "required": ["path"]
-            }),
-            class: "workspace".into(),
-            tool_markers: Vec::new(),
-        },
-        AbstractToolRecord {
-            tool_name: "agent.configure".into(),
-            description: "Update an agent configuration field. Supports approval_policy, \
-                          profile, and bindings sections. Requires operator approval unless \
-                          preapproved."
-                .into(),
-            input_schema: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "config_path": { "type": "string" },
-                    "value": {},
-                    "operation": {
-                        "type": "string",
-                        "enum": ["set", "append", "remove"]
-                    }
-                },
-                "required": ["config_path", "value"]
-            }),
-            class: "config".into(),
-            tool_markers: Vec::new(),
-        },
-        AbstractToolRecord {
-            tool_name: "hotel.status".into(),
-            description: "Returns the current hotel status: active guests, registered roles, \
-                          materialized processes, and system health. Use this before asking the \
-                          operator for information about running agents or system state."
-                .into(),
-            input_schema: serde_json::json!({ "type": "object", "properties": {} }),
-            class: "session".into(),
-            tool_markers: Vec::new(),
-        },
-        AbstractToolRecord {
-            tool_name: "hotel.logs".into(),
-            description: "Returns recent hotel log lines. Use this to inspect system events, \
-                          errors, and agent activity before reaching for bash.exec. Defaults to \
-                          50 lines; request up to 500."
-                .into(),
-            input_schema: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "lines": {
-                        "type": "integer",
-                        "description": "Number of recent log lines to return (max 500, default 50)."
-                    }
-                }
-            }),
-            class: "session".into(),
-            tool_markers: Vec::new(),
-        },
-        AbstractToolRecord {
-            tool_name: "hotel.perimeter.status".into(),
-            description: "Returns the hotel's current network security perimeter snapshot: \
-                          exposure ceiling tier (Local/Lan/Mesh/Internet), per-listener profiles, \
-                          Tailscale presence, and detected public/private IP addresses. \
-                          Use this to understand what auth is required on ingress and what \
-                          egress policies apply."
-                .into(),
-            input_schema: serde_json::json!({ "type": "object", "properties": {} }),
-            class: "session".into(),
-            tool_markers: Vec::new(),
-        },
-        AbstractToolRecord {
-            tool_name: "hotel.perimeter.refresh".into(),
-            description: "Forces the hotel to re-derive its network security perimeter from live \
-                          OS interfaces and returns the updated snapshot. Use this after a network \
-                          change (e.g. joining a VPN, gaining a public IP) to ensure the fence \
-                          tiers reflect current topology."
-                .into(),
-            input_schema: serde_json::json!({ "type": "object", "properties": {} }),
-            class: "session".into(),
-            tool_markers: Vec::new(),
-        },
-        AbstractToolRecord {
-            tool_name: "hotel.egress.check".into(),
-            description: "Check whether an outbound HTTP request is permitted by the hotel's \
-                          egress policy. Returns `allowed`, `credential_binding_configured`, and \
-                          `deny_reason` if blocked. Credential values are never returned; they \
-                          remain inside the hotel-owned executor that performs the request. Call \
-                          this before privileged outbound requests at Mesh or Internet exposure."
-                .into(),
-            input_schema: serde_json::json!({
-                "type": "object",
-                "required": ["target_url"],
-                "properties": {
-                    "target_url": {
-                        "type": "string",
-                        "description": "Full URL of the outbound request (e.g. https://api.perplexity.ai/chat/completions)."
-                    },
-                    "method": {
-                        "type": "string",
-                        "description": "HTTP method (default: GET)."
-                    },
-                    "agent_id": {
-                        "type": "string",
-                        "description": "Calling agent's ID for vault access decisions."
-                    }
-                }
-            }),
-            class: "session".into(),
-            tool_markers: Vec::new(),
-        },
-        AbstractToolRecord {
-            tool_name: "role.list".into(),
-            description: "Lists all role incarnations configured for this agent, with their \
-                          toolset profile, readiness state, and home hotel. Call this before \
-                          role.configure or role.set_home to confirm the current roster."
-                .into(),
-            input_schema: serde_json::json!({ "type": "object", "properties": {} }),
-            class: "session".into(),
-            tool_markers: Vec::new(),
-        },
-        AbstractToolRecord {
-            tool_name: "role.set_home".into(),
-            description: "Pin a role's execution to a specific hotel (or clear the pin to use \
-                          the authority hotel). After pinning, handoff.to_role routes the role \
-                          there automatically. Requires role_name, reason, and optionally \
-                          target_hotel (omit or null to clear)."
-                .into(),
-            input_schema: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "role_name": {
-                        "type": "string",
-                        "description": "The role to re-home."
-                    },
-                    "target_hotel": {
-                        "type": "string",
-                        "description": "Hotel name to pin to. Omit or set null to clear the pin."
-                    },
-                    "reason": {
-                        "type": "string",
-                        "description": "Why this role belongs on this hotel."
-                    }
-                },
-                "required": ["role_name", "reason"]
-            }),
-            class: "config".into(),
-            tool_markers: Vec::new(),
-        },
-        AbstractToolRecord {
-            tool_name: "transport.set_home".into(),
-            description: "Pin an external membrane transport resource to the one hotel that may \
-                          own its inbound poller or gateway. This is separate from role.set_home: \
-                          roles may run elsewhere while a single stable hotel owns scarce \
-                          transport ingress. Requires transport, resource_ref, target_hotel, \
-                          and reason; standby_hotels is optional."
-                .into(),
-            input_schema: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "transport": {
-                        "type": "string",
-                        "description": "Transport implementation name, e.g. 'telegram', 'discord', or 'desktop'."
-                    },
-                    "resource_ref": {
-                        "type": "string",
-                        "description": "Stable transport resource reference, such as a bot token key."
-                    },
-                    "target_hotel": {
-                        "type": "string",
-                        "description": "Hotel node_id/name that should own the active poller or gateway."
-                    },
-                    "standby_hotels": {
-                        "type": "array",
-                        "items": { "type": "string" },
-                        "description": "Optional standby hotels allowed for explicit future failover."
-                    },
-                    "reason": {
-                        "type": "string",
-                        "description": "Why this transport belongs on this hotel."
-                    }
-                },
-                "required": ["transport", "resource_ref", "target_hotel", "reason"]
-            }),
-            class: "config".into(),
-            tool_markers: Vec::new(),
-        },
-        AbstractToolRecord {
-            tool_name: "bash.exec".into(),
-            description: "Last-resort shell execution. Runs a shell command and returns stdout, \
-                          stderr, and exit code. Use ONLY when no Philotic-native tool can \
-                          accomplish the task. Requires explicit operator approval before execution."
-                .into(),
-            input_schema: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "command": {
-                        "type": "string",
-                        "description": "The shell command to execute (passed to `sh -c`)."
-                    },
-                    "working_dir": {
-                        "type": "string",
-                        "description": "Optional absolute path to use as the working directory."
-                    },
-                    "timeout_secs": {
-                        "type": "integer",
-                        "description": "Maximum seconds to wait before killing the process. Defaults to 30."
-                    }
-                },
-                "required": ["command"]
-            }),
-            class: "shell".into(),
-            tool_markers: vec!["high_agency".into()],
-        },
-        AbstractToolRecord {
-            tool_name: "desktop.observe".into(),
-            description: "Returns low-agency metadata about the bound desktop automation runner \
-                          and desktop session. This observe-only CUA scaffold does not take a \
-                          screenshot and cannot click, type, press keys, or scroll."
-                .into(),
-            input_schema: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "detail": {
-                        "type": "string",
-                        "enum": ["summary"],
-                        "description": "Observation detail level. Only summary metadata is supported in the first scaffold."
-                    }
-                }
-            }),
-            class: "desktop".into(),
-            tool_markers: vec!["desktop_bound".into(), "local_only".into(), "low_agency".into()],
-        },
-        // ── Training data admin tools ─────────────────────────────────────
-        AbstractToolRecord {
-            tool_name: "training.list".into(),
-            description: "List captured voice training samples. Filter by state: all (default), \
-                          uncorrected, eligible, or exported. Optionally narrow by agent_id."
-                .into(),
-            input_schema: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "limit": {
-                        "type": "integer",
-                        "description": "Number of samples to return (default 20, max 200)."
-                    },
-                    "filter": {
-                        "type": "string",
-                        "enum": ["all", "uncorrected", "eligible", "exported"],
-                        "description": "Filter samples by correction/export state."
-                    },
-                    "agent_id": {
-                        "type": "string",
-                        "description": "Restrict to samples from a specific agent."
-                    }
-                }
-            }),
-            class: "training".into(),
-            tool_markers: Vec::new(),
-        },
-        AbstractToolRecord {
-            tool_name: "training.correct".into(),
-            description: "Apply an operator correction to a captured voice training sample. \
-                          Sets the ground-truth transcript and marks the sample training_eligible."
-                .into(),
-            input_schema: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "turn_id": {
-                        "type": "string",
-                        "description": "The turn to correct."
-                    },
-                    "corrected_transcript": {
-                        "type": "string",
-                        "description": "The ground-truth transcript."
-                    }
-                },
-                "required": ["turn_id", "corrected_transcript"]
-            }),
-            class: "training".into(),
-            tool_markers: vec!["high_agency".into()],
-        },
-        AbstractToolRecord {
-            tool_name: "training.export".into(),
-            description: "Export training-eligible samples to a file for the fine-tuning pipeline. \
-                          Supports huggingface (JSON array) and nemo (one-JSON-per-line manifest) formats. \
-                          Marks exported samples so they are not re-exported."
-                .into(),
-            input_schema: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "format": {
-                        "type": "string",
-                        "enum": ["huggingface", "nemo"],
-                        "description": "Output format."
-                    },
-                    "output_path": {
-                        "type": "string",
-                        "description": "Absolute path for the export file."
-                    },
-                    "limit": {
-                        "type": "integer",
-                        "description": "Max samples to export (default: all eligible)."
-                    }
-                },
-                "required": ["format", "output_path"]
-            }),
-            class: "training".into(),
-            tool_markers: vec!["high_agency".into()],
-        },
-        AbstractToolRecord {
-            tool_name: "training.status".into(),
-            description: "Return a summary of voice training sample counts: total captured, \
-                          uncorrected, eligible for export, and already exported. \
-                          Optionally filtered by agent_id."
-                .into(),
-            input_schema: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "agent_id": {
-                        "type": "string",
-                        "description": "Restrict counts to a specific agent."
-                    }
-                }
-            }),
-            class: "training".into(),
-            tool_markers: Vec::new(),
-        },
-        AbstractToolRecord {
-            tool_name: "asr.setup".into(),
-            description: "Set up the Parakeet ASR provider on this node: verifies Python + nemo-toolkit, \
-                          optionally installs nemo-toolkit[asr] via pip, writes the component config, \
-                          and registers the model-controller-parakeet guest for automatic materialization. \
-                          python_path defaults to 'python3'; auto_install defaults to true."
-                .into(),
-            input_schema: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "python_path": {
-                        "type": "string",
-                        "description": "Python interpreter path (must have or will get nemo-toolkit)."
-                    },
-                    "model_name": {
-                        "type": "string",
-                        "description": "NeMo model name (default: nvidia/parakeet-tdt-0.6b-v2)."
-                    },
-                    "auto_install": {
-                        "type": "boolean",
-                        "description": "Attempt pip install if nemo import fails (default: true)."
-                    }
-                }
-            }),
-            class: "asr".into(),
-            tool_markers: vec!["high_agency".into()],
-        },
-        AbstractToolRecord {
-            tool_name: "asr.status".into(),
-            description: "Return the current status of the Parakeet ASR provider: whether the guest \
-                          is registered and active, its PID if running, and whether nemo-toolkit is \
-                          importable on this node."
-                .into(),
-            input_schema: serde_json::json!({
-                "type": "object",
-                "properties": {}
-            }),
-            class: "asr".into(),
-            tool_markers: Vec::new(),
-        },
-        // ── Vision provider tools ─────────────────────────────────────────────
-        AbstractToolRecord {
-            tool_name: "vision.setup".into(),
-            description: "Set up the local ONNX vision provider (Florence-2): writes the component \
-                          config, upserts a ModelProfileRecord so health-aware routing picks it up, \
-                          and registers the model-controller-vision guest for automatic materialization. \
-                          The model is downloaded from HuggingFace Hub on first start. \
-                          repo_id defaults to 'onnx-community/Florence-2-base-ft'."
-                .into(),
-            input_schema: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "repo_id": {
-                        "type": "string",
-                        "description": "HuggingFace repo ID for the Florence-2 ONNX model (optional)."
-                    }
-                }
-            }),
-            class: "vision".into(),
-            tool_markers: vec!["high_agency".into()],
-        },
-        AbstractToolRecord {
-            tool_name: "vision.status".into(),
-            description: "Return the current status of the ONNX vision provider: whether the guest is \
-                          registered and active, its PID if running, the configured model repo, \
-                          and the ModelProfileRecord health status."
-                .into(),
-            input_schema: serde_json::json!({
-                "type": "object",
-                "properties": {}
-            }),
-            class: "vision".into(),
-            tool_markers: Vec::new(),
-        },
-        AbstractToolRecord {
-            tool_name: "image.ocr".into(),
-            description: "Extract text from an image using the local vision provider. \
-                          Provide image_url (HTTP/file URL) or image_base64 (base64-encoded PNG/JPEG). \
-                          Returns the extracted text."
-                .into(),
-            input_schema: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "image_url": {
-                        "type": "string",
-                        "description": "HTTP or file URL of the image to process."
-                    },
-                    "image_base64": {
-                        "type": "string",
-                        "description": "Base64-encoded PNG or JPEG image data."
-                    },
-                    "hint": {
-                        "type": "string",
-                        "description": "Optional text prompt to guide OCR (e.g. 'extract only the table')."
-                    }
-                }
-            }),
-            class: "vision".into(),
-            tool_markers: Vec::new(),
-        },
-        AbstractToolRecord {
-            tool_name: "image.ground".into(),
-            description: "Locate objects or regions in an image (visual grounding). \
-                          Provide image_url or image_base64 and a query describing what to find. \
-                          Returns bounding boxes and labels."
-                .into(),
-            input_schema: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "image_url": {
-                        "type": "string",
-                        "description": "HTTP or file URL of the image to process."
-                    },
-                    "image_base64": {
-                        "type": "string",
-                        "description": "Base64-encoded PNG or JPEG image data."
-                    },
-                    "query": {
-                        "type": "string",
-                        "description": "Natural language description of what to locate in the image."
-                    }
-                },
-                "required": ["query"]
-            }),
-            class: "vision".into(),
-            tool_markers: Vec::new(),
-        },
-        // ── Cron scheduler tools ──────────────────────────────────────────────
-        AbstractToolRecord {
-            tool_name: "cron.register".into(),
-            description: "Register or update a cron job on the hotel. The job fires on a 7-field \
-                          cron schedule and delivers a JSON payload to a target role's inbox. \
-                          Include a top-level paracrine_signal object in the payload to emit a \
-                          typed cron-backed paracrine heartbeat signal instead of a legacy cron task. \
-                          For Life Graph heartbeats, prefer the canonical \
-                          ansible_mesh_core::cron::ParacrineHeartbeatTemplate payload shape. \
-                          Use cron.list first to avoid duplicates. Responds with the assigned job_id."
-                .into(),
-            input_schema: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "schedule": {
-                        "type": "string",
-                        "description": "7-field cron expression: <sec> <min> <hour> <dom> <month> <dow> <year>. Example: \"0 */5 * * * * *\" for every 5 minutes."
-                    },
-                    "target_role": {
-                        "type": "string",
-                        "description": "Name of one of YOUR OWN configured roles (e.g. \"orchestrator\") whose inbox receives the trigger payload — the hotel resolves it to that role's routing key automatically. The target role's guest does not need to be running already: the hotel will materialize it on fire if needed. Use role.list to see your available roles."
-                    },
-                    "payload": {
-                        "type": "string",
-                        "description": "JSON payload string delivered to the role. Supports {timestamp}, {iso_timestamp}, {job_id}, {node_id}, {target_role} interpolation. If the JSON contains a top-level paracrine_signal object, cron emits action=paracrine_signal with normalized signal metadata. For Life Graph heartbeats, use the ParacrineHeartbeatTemplate shape."
-                    },
-                    "guaranteed": {
-                        "type": "boolean",
-                        "description": "Mesh-coordinated delivery (future feature, currently ignored). Default false."
-                    }
-                },
-                "required": ["schedule", "target_role", "payload"]
-            }),
-            class: "cron".into(),
-            tool_markers: vec!["high_agency".into()],
-        },
-        AbstractToolRecord {
-            tool_name: "cron.list".into(),
-            description: "List all cron jobs registered on this hotel, including their schedule, \
-                          target role, enabled state, and next fire time."
-                .into(),
-            input_schema: serde_json::json!({
-                "type": "object",
-                "properties": {}
-            }),
-            class: "cron".into(),
-            tool_markers: Vec::new(),
-        },
-        AbstractToolRecord {
-            tool_name: "cron.enable".into(),
-            description: "Re-enable a previously disabled cron job. The job resumes firing on its \
-                          schedule from the next occurrence after now."
-                .into(),
-            input_schema: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "job_id": {
-                        "type": "string",
-                        "description": "The cron job UUID to enable."
-                    }
-                },
-                "required": ["job_id"]
-            }),
-            class: "cron".into(),
-            tool_markers: Vec::new(),
-        },
-        AbstractToolRecord {
-            tool_name: "life.observe".into(),
-            description: "Write an observation to the life graph. Use to record open loops, \
-                          goals, commitments, signals, or events that matter to the agent or user. \
-                          The life graph stores these nodes in Memgraph for semantic retrieval. \
-                          Embed-on-write is automatic — no embedding input required."
-                .into(),
-            input_schema: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "observation_id": {
-                        "type": "string",
-                        "description": "Optional stable ID for this observation (UUID). Generated if omitted."
-                    },
-                    "evidence": {
-                        "type": "object",
-                        "description": "The observation to write.",
-                        "properties": {
-                            "packet_id": { "type": "string", "description": "Unique evidence packet ID (UUID)." },
-                            "claim_ref": {
-                                "type": "object",
-                                "description": "The graph node this observation is about.",
-                                "properties": {
-                                    "id": { "type": "string", "description": "Stable node ID (use a descriptive slug or UUID)." },
-                                    "label": {
-                                        "type": "string",
-                                        "description": "Graph node label.",
-                                        "enum": ["Signal", "OpenLoop", "Commitment", "Event", "Goal", "Insight"]
-                                    }
-                                },
-                                "required": ["id", "label"]
-                            },
-                            "claim_summary": {
-                                "type": "string",
-                                "description": "Human-readable summary of the observation (embedded for semantic search)."
-                            },
-                            "source_refs": {
-                                "type": "array",
-                                "description": "Sources supporting this observation.",
-                                "items": {
-                                    "type": "object",
-                                    "properties": {
-                                        "source_id": { "type": "string" },
-                                        "source_kind": { "type": "string", "description": "e.g. agent_observation, conversation, runtime_observation" }
-                                    }
-                                }
-                            },
-                            "confidence": {
-                                "type": "number",
-                                "description": "Confidence in this observation (0.0-1.0).",
-                                "minimum": 0.0,
-                                "maximum": 1.0
-                            },
-                            "validation_state": {
-                                "type": "string",
-                                "description": "Initial validation state.",
-                                "enum": ["proposed", "accepted"]
-                            },
-                            "observed_at": {
-                                "type": "string",
-                                "description": "ISO 8601 timestamp (e.g. 2026-06-08T12:00:00Z)."
-                            }
-                        },
-                        "required": ["packet_id", "claim_ref", "claim_summary", "confidence", "observed_at"]
-                    }
-                },
-                "required": ["evidence"]
-            }),
-            class: "life_graph".into(),
-            tool_markers: Vec::new(),
-        },
-        AbstractToolRecord {
-            tool_name: "life.recall".into(),
-            description: "Retrieve relevant observations, open loops, goals, or commitments from \
-                          the life graph using semantic and graph-based search. Returns a context \
-                          packet with ranked nodes. Use named_strategy to narrow the search: \
-                          'open_loops_by_context' (default), 'goals_and_next_actions', \
-                          'commitments_approaching', 're_entry_context', \
-                          'cross_domain_entanglement'."
-                .into(),
-            input_schema: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "query_text": {
-                        "type": "string",
-                        "description": "Natural language query. The life graph embeds this automatically."
-                    },
-                    "named_strategy": {
-                        "type": "string",
-                        "description": "Recall strategy. Defaults to open_loops_by_context.",
-                        "enum": [
-                            "open_loops_by_context",
-                            "goals_and_next_actions",
-                            "commitments_approaching",
-                            "re_entry_context",
-                            "cross_domain_entanglement"
-                        ]
-                    },
-                    "max_context_packets": {
-                        "type": "integer",
-                        "description": "Maximum number of result packets to return. Default 5.",
-                        "minimum": 1,
-                        "maximum": 20
-                    },
-                    "due_within_hours": {
-                        "type": "integer",
-                        "description": "For commitments_approaching strategy: how many hours ahead to look. Default 72."
-                    }
-                },
-                "required": ["query_text"]
-            }),
-            class: "life_graph".into(),
-            tool_markers: Vec::new(),
-        },
-        AbstractToolRecord {
-            tool_name: "life.recall.feedback".into(),
-            description: "Record retrieval reward or friction for a LifeGraph recall packet. \
-                          Ratings such as useful, stale, missing, noisy, overconfident, or \
-                          disconnected help the graph propose safe bridge/ranking/attention \
-                          improvements without confirming new life truth."
-                .into(),
-            input_schema: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "feedback_id": { "type": "string", "description": "Unique feedback event ID." },
-                    "packet_id": { "type": "string", "description": "Retrieval packet ID being evaluated." },
-                    "query_summary": { "type": "string", "description": "Short summary of the original recall query." },
-                    "rating": {
-                        "type": "string",
-                        "enum": ["useful", "stale", "missing", "noisy", "overconfident", "disconnected"]
-                    },
-                    "note": { "type": "string", "description": "Brief reason for the rating." },
-                    "candidate_count": { "type": "integer", "minimum": 0 },
-                    "connected_candidate_count": { "type": "integer", "minimum": 0 },
-                    "missing_context_refs": {
-                        "type": "array",
-                        "items": { "type": "string" },
-                        "default": []
-                    },
-                    "noisy_node_refs": {
-                        "type": "array",
-                        "items": { "type": "object" },
-                        "default": []
-                    },
-                    "stale_node_refs": {
-                        "type": "array",
-                        "items": { "type": "object" },
-                        "default": []
-                    },
-                    "evidence_packets": {
-                        "type": "array",
-                        "items": { "type": "object" },
-                        "default": []
-                    }
-                },
-                "required": ["feedback_id", "packet_id", "rating"]
-            }),
-            class: "life_graph".into(),
-            tool_markers: vec!["feedback".into(), "self_improving".into()],
-        },
-        AbstractToolRecord {
-            tool_name: "life.commit".into(),
-            description: "Commit a proposed observation — advances its validation_state from \
-                          'proposed' to 'accepted'. Use after confirming an observation is correct."
-                .into(),
-            input_schema: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "node_id": { "type": "string", "description": "The life graph node ID to commit." }
-                },
-                "required": ["node_id"]
-            }),
-            class: "life_graph".into(),
-            tool_markers: Vec::new(),
-        },
-        AbstractToolRecord {
-            tool_name: "life.resolve".into(),
-            description: "Mark an open loop or commitment as resolved/closed in the life graph."
-                .into(),
-            input_schema: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "node_id": { "type": "string", "description": "The life graph node ID to resolve." },
-                    "resolution_summary": { "type": "string", "description": "Short note on how it was resolved." }
-                },
-                "required": ["node_id"]
-            }),
-            class: "life_graph".into(),
-            tool_markers: Vec::new(),
-        },
-        AbstractToolRecord {
-            tool_name: "life.conflict".into(),
-            description: "Flag a conflicting observation in the life graph for adjudication."
-                .into(),
-            input_schema: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "node_id": { "type": "string", "description": "The life graph node ID that has a conflict." },
-                    "conflict_summary": { "type": "string", "description": "Description of the conflict." }
-                },
-                "required": ["node_id", "conflict_summary"]
-            }),
-            class: "life_graph".into(),
-            tool_markers: Vec::new(),
-        },
-        AbstractToolRecord {
-            tool_name: "life.patch.propose".into(),
-            description: "Propose a governed Life Graph improvement. A schema_patch is executable \
-                          only when it carries an ontology_extension containing new labels and/or \
-                          edges; it cannot add properties or edit compiled core labels. A \
-                          SkillPatch is a review artifact: use skill.register and skill.assign as \
-                          the catalog actuator after approval."
-                .into(),
-            input_schema: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "patch_id": {"type": "string"},
-                    "patch_kind": {
-                        "type": "string",
-                        "enum": ["schema_patch", "skill_patch", "tool_patch", "attention_patch", "system_patch"]
-                    },
-                    "summary": {"type": "string"},
-                    "rationale": {"type": "string"},
-                    "evidence_packets": {"type": "array", "minItems": 1, "items": {"type": "object"}},
-                    "risk": {"type": "string", "enum": ["low", "medium", "high"]},
-                    "operator_approved": {"type": "boolean", "default": false},
-                    "ontology_extension": {
-                        "type": "object",
-                        "description": "Executable schema_patch payload for NEW labels and endpoint-validated edges only.",
-                        "properties": {
-                            "labels": {
-                                "type": "array",
-                                "items": {
-                                    "type": "object",
-                                    "required": ["name", "space"],
-                                    "properties": {
-                                        "name": {"type": "string"},
-                                        "space": {"type": "string"},
-                                        "guidance": {"type": "string"}
-                                    }
-                                }
-                            },
-                            "edges": {
-                                "type": "array",
-                                "items": {
-                                    "type": "object",
-                                    "required": ["rel_type", "source_labels", "target_labels"],
-                                    "properties": {
-                                        "rel_type": {"type": "string"},
-                                        "source_labels": {"type": "array", "items": {"type": "string"}},
-                                        "target_labels": {"type": "array", "items": {"type": "string"}}
-                                    }
-                                }
-                            }
-                        }
-                    }
-                },
-                "required": ["patch_id", "patch_kind", "summary", "rationale", "evidence_packets", "risk"]
-            }),
-            class: "life_graph".into(),
-            tool_markers: Vec::new(),
-        },
-        AbstractToolRecord {
-            tool_name: "life.list".into(),
-            description: "READ-ONLY deterministic Life Graph listing by exact predicates or a \
-                          named maintenance query (past_dated_events, aging_loops_oldest_first, \
-                          duplicate_candidates, recently_retired, past_due_commitments). \
-                          Preferred over life.recall for gardening/maintenance — same call, \
-                          same graph state, same rows."
-                .into(),
-            input_schema: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "named_query": {
-                        "type": "string",
-                        "enum": ["past_dated_events", "aging_loops_oldest_first",
-                                 "duplicate_candidates", "recently_retired",
-                                 "past_due_commitments"],
-                        "description": "Named maintenance query; mutually exclusive with filters."
-                    },
-                    "labels": { "type": "array", "items": { "type": "string" } },
-                    "statuses": { "type": "array", "items": { "type": "string" } },
-                    "validation_states": { "type": "array", "items": { "type": "string" } },
-                    "include_terminal": { "type": "boolean", "default": false },
-                    "observed_after": { "type": "string" },
-                    "observed_before": { "type": "string" },
-                    "date_before": { "type": "string" },
-                    "date_after": { "type": "string" },
-                    "limit": { "type": "integer", "default": 50 }
-                }
-            }),
-            class: "life_graph".into(),
-            tool_markers: Vec::new(),
-        },
-        AbstractToolRecord {
-            tool_name: "life.ontology".into(),
-            description: "READ-ONLY canonical Life Graph vocabulary: labels, terminal statuses, \
-                          property conventions, date fields, named queries, rules, and known \
-                          gaps. Consult before composing life.list filters."
-                .into(),
-            input_schema: serde_json::json!({
-                "type": "object",
-                "properties": {}
-            }),
-            class: "life_graph".into(),
-            tool_markers: Vec::new(),
-        },
-        AbstractToolRecord {
-            tool_name: "life.patch.apply".into(),
-            description: "Confirm or reject an awaiting_confirmation Life Graph patch (call \
-                          only after explicit operator approval). Confirming a schema_patch \
-                          with an ontology_extension makes the new vocabulary live. This does NOT \
-                          register SkillPatch records; use skill.register then skill.assign."
-                .into(),
-            input_schema: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "patch_id": { "type": "string" },
-                    "decision": { "type": "string", "enum": ["confirm", "reject"] },
-                    "operator_approved": { "type": "boolean", "description": "Must be true; set only after explicit operator approval in conversation." }
-                },
-                "required": ["patch_id", "decision", "operator_approved"]
-            }),
-            class: "life_graph".into(),
-            tool_markers: Vec::new(),
-        },
-        AbstractToolRecord {
-            tool_name: "life.patch.list".into(),
-            description: "READ-ONLY list of Life Graph patch proposals and statuses.".into(),
-            input_schema: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "status": { "type": "string" }
-                }
-            }),
-            class: "life_graph".into(),
-            tool_markers: Vec::new(),
-        },
-        AbstractToolRecord {
-            tool_name: "cron.disable".into(),
-            description: "Disable a cron job without removing it. The job record is preserved and \
-                          can be re-enabled with cron.enable."
-                .into(),
-            input_schema: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "job_id": {
-                        "type": "string",
-                        "description": "The cron job UUID to disable."
-                    }
-                },
-                "required": ["job_id"]
-            }),
-            class: "cron".into(),
-            tool_markers: Vec::new(),
-        },
-        AbstractToolRecord {
-            tool_name: "cron.remove".into(),
-            description: "Permanently remove a cron job from the hotel. This cannot be undone. \
-                          Use cron.disable instead if you may want to resume the job later."
-                .into(),
-            input_schema: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "job_id": {
-                        "type": "string",
-                        "description": "The cron job UUID to remove."
-                    }
-                },
-                "required": ["job_id"]
-            }),
-            class: "cron".into(),
-            tool_markers: vec!["high_agency".into()],
-        },
-        // ── Mesh steward (heal class, aria-mesh-steward slice 1) ────────────
-        AbstractToolRecord {
-            tool_name: "heal.list".into(),
-            description: "Diagnostic only. Returns the hotel's self-heal state: pending \
-                          (unresolved) heal_queue entries and open heal work items filed by the \
-                          heal circuit. Use this to review outstanding maintenance before \
-                          resolving entries or closing work items."
-                .into(),
-            input_schema: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "scope": {
-                        "type": "string",
-                        "enum": ["queue", "work_items", "both"],
-                        "description": "Which surface to list: the pending heal queue, filed work items, or both (default both)."
-                    },
-                    "limit": {
-                        "type": "integer",
-                        "description": "Maximum pending heal_queue entries to return (default 20)."
-                    }
-                }
-            }),
-            class: "heal".into(),
-            tool_markers: Vec::new(),
-        },
-        AbstractToolRecord {
-            tool_name: "heal.resolve".into(),
-            description: "Mark a heal_queue entry resolved with an observed outcome. Mutating — \
-                          always record what happened in `outcome`. Requires operational admin \
-                          authority; non-admin agents are refused server-side."
-                .into(),
-            input_schema: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "entry_id": {
-                        "type": "string",
-                        "description": "The heal_queue entry id to resolve (from heal.list)."
-                    },
-                    "outcome": {
-                        "type": "string",
-                        "description": "Short note describing the observed outcome. Defaults to 'resolved_by_agent'."
-                    }
-                },
-                "required": ["entry_id"]
-            }),
-            class: "heal".into(),
-            tool_markers: Vec::new(),
-        },
-        AbstractToolRecord {
-            tool_name: "heal.close_work_item".into(),
-            description: "Close a filed heal work item once its underlying recurring fault is \
-                          repaired. Mutating and idempotent. Requires operational admin \
-                          authority; non-admin agents are refused server-side."
-                .into(),
-            input_schema: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "work_item_id": {
-                        "type": "string",
-                        "description": "The heal work item id to close (from heal.list work_items)."
-                    },
-                    "reason": {
-                        "type": "string",
-                        "description": "Short note explaining why the item is being closed."
-                    }
-                },
-                "required": ["work_item_id"]
-            }),
-            class: "heal".into(),
-            tool_markers: Vec::new(),
-        },
-        AbstractToolRecord {
-            tool_name: "host.vitals".into(),
-            description: "Diagnostic only. Returns the latest host health scan snapshot: disk \
-                          headroom, memory pressure, and load. Statuses are pre-graded against \
-                          the hotel's thresholds — trust the reported status over raw \
-                          percentages."
-                .into(),
-            input_schema: serde_json::json!({ "type": "object", "properties": {} }),
-            class: "heal".into(),
-            tool_markers: Vec::new(),
-        },
-        AbstractToolRecord {
-            tool_name: "session.repair_stale".into(),
-            description: "Repair session turns stuck in 'running' longer than min_age_secs \
-                          (default 300) — the zombie-turn sweep, on demand. Mutating but \
-                          bounded: it only fails-out already-dead turns. Requires operational \
-                          admin authority; non-admin agents are refused server-side."
-                .into(),
-            input_schema: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "min_age_secs": {
-                        "type": "integer",
-                        "description": "Only repair turns older than this many seconds (default 300)."
-                    }
-                }
-            }),
-            class: "heal".into(),
-            tool_markers: Vec::new(),
-        },
-        AbstractToolRecord {
-            tool_name: "component.restart".into(),
-            description: "Restart a wedged materialized guest: the hotel terminates the process \
-                          and immediately re-spawns it. HIGH AGENCY and respawn-budget-gated \
-                          server-side — if the budget is exhausted the restart is refused; \
-                          escalate to the operator instead of retrying. Requires operational \
-                          admin authority; non-admin agents are refused server-side."
-                .into(),
-            input_schema: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "guest_id": {
-                        "type": "string",
-                        "description": "The materialized guest id to restart (from hotel.status)."
-                    },
-                    "reason_note": {
-                        "type": "string",
-                        "description": "Short note explaining why the restart is needed."
-                    }
-                },
-                "required": ["guest_id"]
-            }),
-            class: "heal".into(),
-            tool_markers: vec!["high_agency".into()],
-        },
-    ];
-
-    for tool in &catalog {
+    // Tools are data: `catalog/tools.yaml` (compiled in as the floor) plus the
+    // profile's `tool-catalog.yaml` / PHILOTIC_TOOL_CATALOG overrides. This
+    // replaced a 49-entry compiled array that had drifted from the philote's
+    // 108-tool compiled catalog. Records the file does not name are left alone.
+    let loaded = crate::tool_catalog::load_tool_catalog(profile_dir().as_deref())?;
+    for problem in &loaded.errors {
+        error!(problem = %problem, "tool catalog override rejected; hotel keeps the rest");
+    }
+    for tool in &loaded.records {
         graph.upsert_abstract_tool(tool)?;
     }
+    info!(
+        tools = loaded.records.len(),
+        sources = ?loaded.sources,
+        "Seeded abstract tool catalog from catalog file(s)"
+    );
     Ok(())
 }
 
@@ -4859,6 +3918,33 @@ fn seed_abstract_skill_catalog(graph: &GraphDomain) -> anyhow::Result<()> {
             ..Default::default()
         },
         AbstractSkillRecord {
+            skill_name: "lifegraph.gardener".into(),
+            description: "Keep the operator's LifeGraph pristine with graph science: life.audit \
+                          (components, orphans, hubs, duplicates, stale loops, conformance, \
+                          health_score) then one life.tidy step per suggested action; never \
+                          delete, never invent an id, report the delta and what needs judgment."
+                .into(),
+            implied_tools: vec![
+                "life.audit".into(),
+                "life.tidy".into(),
+                "life.list".into(),
+                "life.view.neighborhood".into(),
+                "life.recall".into(),
+                "life.commit".into(),
+                "life.resolve".into(),
+                "life.ontology".into(),
+            ],
+            validation_state: ansible_mesh_core::graph::SkillValidationState::Draft,
+            skill_markers: vec!["governed".into(), "life_graph".into(), "never_delete".into()],
+            field_sources: serde_json::json!({
+                "required_fields": [],
+                "optional_fields": ["labels", "max_actions", "duplicate_similarity", "stale_days"],
+                "repo_skill_path": "skills/lifegraph-gardener/SKILL.md",
+                "workflow": "life.audit -> one life.tidy step per suggested action -> life.audit again -> report delta"
+            }),
+            ..Default::default()
+        },
+        AbstractSkillRecord {
             skill_name: "context.synthesize".into(),
             description: "Restore session continuity at the start of a new conversation or after \
                           context compaction. Pull current state from hotel (session.status, \
@@ -4976,6 +4062,84 @@ fn seed_abstract_skill_catalog(graph: &GraphDomain) -> anyhow::Result<()> {
             ..Default::default()
         },
         AbstractSkillRecord {
+            skill_name: "mcp.endpoint_steward".into(),
+            description: "Safely expose this agent to external MCP clients and answer their \
+                          calls deterministically first, by inference only as the declared \
+                          fallback. Workflow: mcp.status (audit what already exists) → design \
+                          the smallest tool surface, naming the storage each tool touches → \
+                          set a handler policy per philote-targeted tool (validate_input, \
+                          static/reflex steps, then a model or error fallback) and route \
+                          data reads to datasource/tool targets so they never reach the \
+                          cognitive loop → mcp.provision with exposure no wider than needed \
+                          and bearer auth on anything beyond loopback (never set \
+                          allow_unauthenticated without the operator saying so) → \
+                          mcp.grant_token per client with an allotment and expiry, relay the \
+                          raw token ONCE → smoke tools/list and one tools/call from the \
+                          client's network position → record the grant. Preapproval rules \
+                          must be narrower than the tool list. Rotate with mcp.rotate_token; \
+                          retire with mcp.revoke_token / mcp.revoke. Doctrine: \
+                          skills/mcp-endpoint-steward/SKILL.md."
+                .into(),
+            implied_tools: vec![
+                "mcp.status".into(),
+                "mcp.provision".into(),
+                "mcp.grant_token".into(),
+                "mcp.rotate_token".into(),
+                "mcp.revoke_token".into(),
+                "mcp.revoke".into(),
+                "session.status".into(),
+            ],
+            validation_state: ansible_mesh_core::graph::SkillValidationState::Validated,
+            skill_markers: vec![
+                "governed".into(),
+                "membrane".into(),
+                "boundary_hygiene".into(),
+            ],
+            field_sources: serde_json::json!({
+                "required_fields": ["endpoint_id", "intended_client", "tools", "exposure"],
+                "optional_fields": ["handler", "preapproval_rules", "allotment", "expires_at"],
+                "repo_skill_path": "skills/mcp-endpoint-steward/SKILL.md",
+                "workflow": "mcp.status → design surface + handler policies → mcp.provision → mcp.grant_token → smoke tools/list + tools/call → record grant"
+            }),
+            ..Default::default()
+        },
+        AbstractSkillRecord {
+            skill_name: "integration.steward".into(),
+            description: "Connect to an external HTTP API on the operator's behalf through a \
+                          governed binding, in order: integration.list (reuse an existing \
+                          binding for the same host) → read the vendor's contract (exact \
+                          paths, auth header name/format, push vs poll) → integration.bind_http \
+                          with the narrowest path prefixes and methods, credential_header + \
+                          credential_format declared, placement local unless a remote exit \
+                          hotel is proven reachable → the OPERATOR provisions the secret with \
+                          `phil integration set-credential` (never paste keys in chat) → smoke \
+                          one http:<binding>.request and read the status code (200 live; \
+                          401 credential; 404 your path; timeout = runner/placement, never \
+                          'network issues') → only then automate with cron.register polling \
+                          + life.observe. A bind is a permission grant, not a connection: \
+                          never say 'live' before a 2xx smoke. Webhooks need an inbound \
+                          ingress the stack does not have; offer polling. Doctrine: \
+                          skills/integration-steward/SKILL.md."
+                .into(),
+            implied_tools: vec![
+                "integration.list".into(),
+                "integration.bind_http".into(),
+                "integration.unbind".into(),
+                "session.status".into(),
+                "cron.list".into(),
+                "cron.register".into(),
+            ],
+            validation_state: ansible_mesh_core::graph::SkillValidationState::Validated,
+            skill_markers: vec!["governed".into(), "egress".into(), "high_agency".into()],
+            field_sources: serde_json::json!({
+                "required_fields": ["binding_id", "base_url", "allowed_methods", "allowed_path_prefixes"],
+                "optional_fields": ["credential_header", "credential_format", "placement", "traffic_class", "grant_agents"],
+                "repo_skill_path": "skills/integration-steward/SKILL.md",
+                "workflow": "integration.list → read contract → integration.bind_http → operator set-credential → smoke http:<binding>.request → cron poll → record"
+            }),
+            ..Default::default()
+        },
+        AbstractSkillRecord {
             skill_name: "mcp.manage".into(),
             description: "Provision, inspect, and revoke MCP endpoints and their access tokens. \
                           mcp.provision declares or updates an endpoint this agent exposes; \
@@ -5004,6 +4168,30 @@ fn seed_abstract_skill_catalog(graph: &GraphDomain) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Procedural graphs (doc:procedural-graphs P0): the repo expert prior.
+/// Fill-only — `GraphDomain::seed_procedure` never clobbers a record an
+/// operator, an agent, or the refiner has since edited, and only bumps a
+/// repo-provenance record to a newer repo version.
+fn seed_procedure_catalog(graph: &GraphDomain) -> anyhow::Result<()> {
+    for seed in ansible_mesh_core::procedure::seeded_procedures() {
+        if let Err(errors) = seed.validate() {
+            anyhow::bail!(
+                "seeded procedure {} is invalid: {}",
+                seed.procedure_id,
+                errors.join("; ")
+            );
+        }
+        if graph.seed_procedure(&seed)? {
+            info!(
+                procedure_id = %seed.procedure_id,
+                version = seed.version,
+                "Seeded procedure"
+            );
+        }
+    }
+    Ok(())
+}
+
 fn seed_toolset_profiles(graph: &GraphDomain) -> anyhow::Result<()> {
     let profiles = [
         ToolsetProfileRecord {
@@ -5012,6 +4200,8 @@ fn seed_toolset_profiles(graph: &GraphDomain) -> anyhow::Result<()> {
                 "session.status".into(),
                 "hotel.status".into(),
                 "hotel.logs".into(),
+                // S6a: admin memory-health report (read-only, honest-sourcing).
+                "memory.report".into(),
                 "hotel.best_place_to_run".into(),
                 "echo".into(),
                 "agent.configure".into(),
@@ -5079,6 +4269,7 @@ fn seed_toolset_profiles(graph: &GraphDomain) -> anyhow::Result<()> {
             // ~47 tool schemas to ~10-15 for typical orchestrator turns.
             on_demand_skills: vec![
                 "life.steward".into(),
+                "lifegraph.gardener".into(),
                 "lifegraph.truth_summarizer".into(),
                 "cron.manage".into(),
                 "observability.pipeline".into(),
@@ -5091,6 +4282,8 @@ fn seed_toolset_profiles(graph: &GraphDomain) -> anyhow::Result<()> {
                 "agent.initiate".into(),
                 "profile.manage".into(),
                 "mcp.manage".into(),
+                "mcp.endpoint_steward".into(),
+                "integration.steward".into(),
                 // Projects only on maintenance-language turns; the server-side
                 // operational-admin gate protects the mutating heal ops from
                 // non-admin agents.
@@ -5107,11 +4300,23 @@ fn seed_toolset_profiles(graph: &GraphDomain) -> anyhow::Result<()> {
                 "echo".into(),
                 "skill.list".into(),
                 "role.list".into(),
+                // Operator decision 2026-09-16: every philote role can recall and
+                // remember (writes route to the Cortex; see Phase 2 M4).
+                "memory.recall".into(),
+                "memory.remember".into(),
                 "workspace.list".into(),
                 "workspace.read".into(),
                 "graph.query".into(),
                 "graph.create".into(),
                 "graph.list".into(),
+                // Operator decision 2026-09-04: cron tools are open to every
+                // role; the hotel scopes list/enable/disable/remove to the
+                // caller agent's own crontab (`cron_job_visible_to`).
+                "cron.register".into(),
+                "cron.list".into(),
+                "cron.enable".into(),
+                "cron.disable".into(),
+                "cron.remove".into(),
             ],
             allowed_classes: vec!["session".into(), "utility".into(), "workspace".into(), "life_graph".into()],
             allowed_skills: vec![
@@ -5122,7 +4327,7 @@ fn seed_toolset_profiles(graph: &GraphDomain) -> anyhow::Result<()> {
                 "graph.knowledge".into(),
                 "lifegraph.truth_summarizer".into(),
             ],
-            on_demand_skills: vec![],
+            on_demand_skills: vec!["cron.manage".into()],
             remote_tool_runners: vec![],
             seed_baseline: None,
             description: Some("Codex specialist role profile — workspace read access.".into()),
@@ -5134,9 +4339,21 @@ fn seed_toolset_profiles(graph: &GraphDomain) -> anyhow::Result<()> {
                 "echo".into(),
                 "skill.list".into(),
                 "role.list".into(),
+                // Operator decision 2026-09-16: every philote role can recall and
+                // remember (writes route to the Cortex; see Phase 2 M4).
+                "memory.recall".into(),
+                "memory.remember".into(),
                 "graph.query".into(),
                 "graph.create".into(),
                 "graph.list".into(),
+                // Operator decision 2026-09-04: cron tools are open to every
+                // role; the hotel scopes list/enable/disable/remove to the
+                // caller agent's own crontab (`cron_job_visible_to`).
+                "cron.register".into(),
+                "cron.list".into(),
+                "cron.enable".into(),
+                "cron.disable".into(),
+                "cron.remove".into(),
             ],
             allowed_classes: vec!["session".into(), "utility".into(), "life_graph".into()],
             allowed_skills: vec![
@@ -5147,7 +4364,7 @@ fn seed_toolset_profiles(graph: &GraphDomain) -> anyhow::Result<()> {
                 "graph.knowledge".into(),
                 "lifegraph.truth_summarizer".into(),
             ],
-            on_demand_skills: vec![],
+            on_demand_skills: vec!["cron.manage".into()],
             remote_tool_runners: vec![],
             seed_baseline: None,
             description: Some("Research specialist role profile — minimal tool surface.".into()),
@@ -5159,9 +4376,21 @@ fn seed_toolset_profiles(graph: &GraphDomain) -> anyhow::Result<()> {
                 "echo".into(),
                 "skill.list".into(),
                 "role.list".into(),
+                // Operator decision 2026-09-16: every philote role can recall and
+                // remember (writes route to the Cortex; see Phase 2 M4).
+                "memory.recall".into(),
+                "memory.remember".into(),
                 "graph.query".into(),
                 "graph.create".into(),
                 "graph.list".into(),
+                // Operator decision 2026-09-04: cron tools are open to every
+                // role; the hotel scopes list/enable/disable/remove to the
+                // caller agent's own crontab (`cron_job_visible_to`).
+                "cron.register".into(),
+                "cron.list".into(),
+                "cron.enable".into(),
+                "cron.disable".into(),
+                "cron.remove".into(),
             ],
             allowed_classes: vec!["session".into(), "utility".into(), "life_graph".into()],
             allowed_skills: vec![
@@ -5170,7 +4399,7 @@ fn seed_toolset_profiles(graph: &GraphDomain) -> anyhow::Result<()> {
                 "session.recover".into(),
                 "lifegraph.truth_summarizer".into(),
             ],
-            on_demand_skills: vec![],
+            on_demand_skills: vec!["cron.manage".into()],
             remote_tool_runners: vec![],
             seed_baseline: None,
             description: Some("Bare utility profile — session and echo only.".into()),
@@ -5182,6 +4411,10 @@ fn seed_toolset_profiles(graph: &GraphDomain) -> anyhow::Result<()> {
                 "echo".into(),
                 "skill.list".into(),
                 "role.list".into(),
+                // Operator decision 2026-09-16: every philote role can recall and
+                // remember (writes route to the Cortex; see Phase 2 M4).
+                "memory.recall".into(),
+                "memory.remember".into(),
                 "cron.register".into(),
                 "cron.list".into(),
                 "cron.enable".into(),
@@ -5201,9 +4434,10 @@ fn seed_toolset_profiles(graph: &GraphDomain) -> anyhow::Result<()> {
                 "session.recover".into(),
                 "cron.manage".into(),
                 "life.steward".into(),
+                "lifegraph.gardener".into(),
                 "lifegraph.truth_summarizer".into(),
             ],
-            on_demand_skills: vec![],
+            on_demand_skills: vec!["cron.manage".into()],
             remote_tool_runners: vec![],
             seed_baseline: None,
             description: Some(
@@ -5217,6 +4451,8 @@ fn seed_toolset_profiles(graph: &GraphDomain) -> anyhow::Result<()> {
                 "session.status".into(),
                 "hotel.status".into(),
                 "hotel.logs".into(),
+                // S6a: admin memory-health report (read-only, honest-sourcing).
+                "memory.report".into(),
                 "echo".into(),
                 "agent.configure".into(),
                 "skill.register".into(),
@@ -5309,10 +4545,15 @@ fn seed_toolset_profiles(graph: &GraphDomain) -> anyhow::Result<()> {
                 "context.synthesize".into(),
                 "profile.manage".into(),
                 "life.steward".into(),
+                "lifegraph.gardener".into(),
                 "lifegraph.truth_summarizer".into(),
                 "mesh.steward".into(),
             ],
-            on_demand_skills: vec![],
+            on_demand_skills: vec![
+                "cron.manage".into(),
+                "mcp.endpoint_steward".into(),
+                "integration.steward".into(),
+            ],
             remote_tool_runners: vec![],
             seed_baseline: None,
             description: Some(
@@ -5342,6 +4583,14 @@ fn seed_toolset_profiles(graph: &GraphDomain) -> anyhow::Result<()> {
                 "graph.query".into(),
                 "graph.create".into(),
                 "graph.list".into(),
+                // Operator decision 2026-09-04: cron tools are open to every
+                // role; the hotel scopes list/enable/disable/remove to the
+                // caller agent's own crontab (`cron_job_visible_to`).
+                "cron.register".into(),
+                "cron.list".into(),
+                "cron.enable".into(),
+                "cron.disable".into(),
+                "cron.remove".into(),
             ],
             // "heal": the architect-charter daily brief (DEFAULT_CHARTER_MANIFEST
             // in architect_charter.rs) instructs the typed heal.list /
@@ -5363,7 +4612,11 @@ fn seed_toolset_profiles(graph: &GraphDomain) -> anyhow::Result<()> {
                 // charter's heal.list instruction depends on.
                 "mesh.steward".into(),
             ],
-            on_demand_skills: vec![],
+            on_demand_skills: vec![
+                "cron.manage".into(),
+                "mcp.endpoint_steward".into(),
+                "integration.steward".into(),
+            ],
             remote_tool_runners: vec![],
             seed_baseline: None,
             description: Some(
@@ -5389,6 +4642,14 @@ fn seed_toolset_profiles(graph: &GraphDomain) -> anyhow::Result<()> {
                 "graph.query".into(),
                 "graph.create".into(),
                 "graph.list".into(),
+                // Operator decision 2026-09-04: cron tools are open to every
+                // role; the hotel scopes list/enable/disable/remove to the
+                // caller agent's own crontab (`cron_job_visible_to`).
+                "cron.register".into(),
+                "cron.list".into(),
+                "cron.enable".into(),
+                "cron.disable".into(),
+                "cron.remove".into(),
             ],
             allowed_classes: vec![
                 "session".into(),
@@ -5408,7 +4669,7 @@ fn seed_toolset_profiles(graph: &GraphDomain) -> anyhow::Result<()> {
                 "graph.knowledge".into(),
                 "lifegraph.truth_summarizer".into(),
             ],
-            on_demand_skills: vec![],
+            on_demand_skills: vec!["cron.manage".into()],
             remote_tool_runners: vec![],
             seed_baseline: None,
             description: Some(
@@ -5423,9 +4684,21 @@ fn seed_toolset_profiles(graph: &GraphDomain) -> anyhow::Result<()> {
                 "echo".into(),
                 "skill.list".into(),
                 "role.list".into(),
+                // Operator decision 2026-09-16: every philote role can recall and
+                // remember (writes route to the Cortex; see Phase 2 M4).
+                "memory.recall".into(),
+                "memory.remember".into(),
                 "graph.query".into(),
                 "graph.create".into(),
                 "graph.list".into(),
+                // Operator decision 2026-09-04: cron tools are open to every
+                // role; the hotel scopes list/enable/disable/remove to the
+                // caller agent's own crontab (`cron_job_visible_to`).
+                "cron.register".into(),
+                "cron.list".into(),
+                "cron.enable".into(),
+                "cron.disable".into(),
+                "cron.remove".into(),
             ],
             allowed_classes: vec!["session".into(), "utility".into(), "life_graph".into()],
             allowed_skills: vec![
@@ -5434,7 +4707,7 @@ fn seed_toolset_profiles(graph: &GraphDomain) -> anyhow::Result<()> {
                 "session.recover".into(),
                 "lifegraph.truth_summarizer".into(),
             ],
-            on_demand_skills: vec![],
+            on_demand_skills: vec!["cron.manage".into()],
             remote_tool_runners: vec![],
             seed_baseline: None,
             description: Some(
@@ -5455,6 +4728,14 @@ fn seed_toolset_profiles(graph: &GraphDomain) -> anyhow::Result<()> {
                 "graph.query".into(),
                 "graph.create".into(),
                 "graph.list".into(),
+                // Operator decision 2026-09-04: cron tools are open to every
+                // role; the hotel scopes list/enable/disable/remove to the
+                // caller agent's own crontab (`cron_job_visible_to`).
+                "cron.register".into(),
+                "cron.list".into(),
+                "cron.enable".into(),
+                "cron.disable".into(),
+                "cron.remove".into(),
             ],
             // "life_graph": travel truth lives in the LifeGraph (trips as
             // Project containing Commitment/Event/NextAction) — this class
@@ -5474,9 +4755,10 @@ fn seed_toolset_profiles(graph: &GraphDomain) -> anyhow::Result<()> {
                 "context.synthesize".into(),
                 "session.recover".into(),
                 "life.steward".into(),
+                "lifegraph.gardener".into(),
                 "lifegraph.truth_summarizer".into(),
             ],
-            on_demand_skills: vec![],
+            on_demand_skills: vec!["cron.manage".into()],
             remote_tool_runners: vec![],
             seed_baseline: None,
             description: Some(
@@ -5533,7 +4815,9 @@ fn seed_toolset_profiles(graph: &GraphDomain) -> anyhow::Result<()> {
                     "life.list",
                     "life.ontology",
                     "life.patch.apply",
-                    "life.patch.list"
+                    "life.patch.list",
+                    "life.audit",
+                    "life.tidy"
                 ],
                 "execution_mode": "capability"
             });
@@ -5769,6 +5053,14 @@ fn seed_orchestrator_roles(graph: &GraphDomain, profiles: &[AgentProfile]) -> an
         let content_policy = mesh_content_policy
             .or_else(|| existing.as_ref().map(|r| r.content_policy.clone()))
             .unwrap_or_else(ansible_mesh_core::graph::default_content_policy);
+        // Placement is graph truth, not seed truth (ARCH rule
+        // `graph-truth-outlives-config-seed`, DEF-106): a runtime `role.set_home`
+        // must survive every restart, so carry the existing home + stamp forward
+        // instead of resetting to `None` on every `aiua load`.
+        let (home_node, placement_updated_unix) = existing
+            .as_ref()
+            .map(|r| (r.home_node.clone(), r.placement_updated_unix))
+            .unwrap_or((None, 0));
         let role_identity_addendum = existing.and_then(|r| r.role_identity_addendum);
 
         let record = ansible_mesh_core::graph::RoleIncarnationRecord {
@@ -5783,7 +5075,8 @@ fn seed_orchestrator_roles(graph: &GraphDomain, profiles: &[AgentProfile]) -> an
             readiness_state: ansible_mesh_core::graph::RoleReadinessState::Configured,
             inactive_ttl_seconds: None,
             turn_loop_config,
-            home_node: None,
+            home_node,
+            placement_updated_unix,
             ..Default::default()
         };
         // Always upsert — the hotel seed is the canonical source for the orchestrator manifest.
@@ -7934,7 +7227,42 @@ async fn run_load_command(file: &str, hotel_name: &str) -> Result<()> {
     let entries = extract_context_graph_entries(&config_json, Some(hotel_name));
     if !entries.is_empty() {
         let mut count = 0;
-        for (key, value) in entries {
+        for (key, mut value) in entries {
+            // A secret a relocation moved to another hotel stays there: the
+            // seed file still names it, but this hotel is no longer its
+            // holder (R7 — one holder per secret).
+            if graph_domain
+                .get_config_value(&service::continuity::relocated_secret_marker_key(&key))?
+                .is_some()
+            {
+                info!(config_key = %key, "load: skipping a secret that moved to another hotel");
+                continue;
+            }
+            // Never persist the Muninn admin password into node_config: the
+            // credential lives encrypted in the hotel vault
+            // (`muninn_admin_secret_ref`), resolved by
+            // `muninn_provision::resolve_admin_credential`.
+            if strip_muninn_admin_password(&key, &mut value) {
+                info!(
+                    "load: dropped plaintext muninn.admin_password from node_config (vault-held)"
+                );
+            }
+            // A Telegram token already in the vault stays there: a re-seeded
+            // value rotates the secret in place instead of overwriting the
+            // ref with plaintext (DEF-176).
+            if is_telegram_bot_token_config_key(&key)
+                && let Some(plaintext) = value.as_str().filter(|v| !v.starts_with("secret://"))
+                && let Some(secret_ref) = telegram_token_vault_ref(&graph_domain, &key)?
+            {
+                if crate::vault::export_secret_plaintext(&graph_domain, &secret_ref)?.as_deref()
+                    != Some(plaintext)
+                {
+                    rotate_secret(&graph_domain, &secret_ref, plaintext)?;
+                    info!(config_key = %key, "load: rotated the vault-held Telegram bot token");
+                }
+                count += 1;
+                continue;
+            }
             let val_str = if value.is_string() {
                 serde_json::to_string(&value)?
             } else {
@@ -7948,6 +7276,7 @@ async fn run_load_command(file: &str, hotel_name: &str) -> Result<()> {
         warn!("Config file has no context_graph entries.");
     }
     migrate_plaintext_provider_api_keys(&graph_domain)?;
+    migrate_plaintext_telegram_tokens(&graph_domain)?;
 
     let seeded_peer_hotels = seed_peer_hotels_from_config(&graph_domain, &config_json, hotel_name)?;
     if seeded_peer_hotels > 0 {
@@ -7967,14 +7296,25 @@ async fn run_load_command(file: &str, hotel_name: &str) -> Result<()> {
             .get("endpoint")
             .and_then(|v| v.as_str())
             .unwrap_or("http://127.0.0.1:8475");
-        let username = muninn
-            .get("admin_username")
-            .and_then(|v| v.as_str())
-            .unwrap_or("root");
-        let password = muninn
-            .get("admin_password")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
+        // Prefer the hotel-vault credential; fall back to the config file.
+        // After an observer is restored from a Cortex checkpoint its auth store
+        // is the Cortex's, so a stale file password 401s the whole load.
+        let vault_credential = muninn_provision::resolve_admin_credential(&graph_domain)
+            .ok()
+            .flatten();
+        let (username, password) = match vault_credential.as_ref() {
+            Some(cred) => (cred.username.as_str(), cred.password.as_str()),
+            None => (
+                muninn
+                    .get("admin_username")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("root"),
+                muninn
+                    .get("admin_password")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or(""),
+            ),
+        };
         graph_domain.set_muninn_endpoint(endpoint)?;
         let vault_names = muninn_provision::derive_vault_names(&config_json);
         if !vault_names.is_empty() {
@@ -8029,6 +7369,7 @@ async fn run_load_command(file: &str, hotel_name: &str) -> Result<()> {
     seed_abstract_skill_catalog(&graph_domain)?;
     seed_toolset_profiles(&graph_domain)?;
     seed_skill_crafting(&graph_domain)?;
+    seed_procedure_catalog(&graph_domain)?;
 
     for profile in &all_profiles {
         let agent_config = raw_agent_config_for_key(&config_json, hotel_name, &profile.agent_key);
@@ -8257,6 +7598,7 @@ async fn main() -> Result<()> {
 
     enforce_graph_datasource_home(&graph_domain_arc, &hotel_name)?;
     migrate_plaintext_provider_api_keys(&graph_domain_arc)?;
+    migrate_plaintext_telegram_tokens(&graph_domain_arc)?;
     let seeded_guests = graph_domain_arc.list_guests(&hotel_name, true)?;
     if seeded_guests.is_empty() {
         warn!(
@@ -8286,10 +7628,13 @@ async fn main() -> Result<()> {
 
     let mut hotel = reconcile_hotel_record(&graph_domain_arc, &hotel_name)?;
 
+    crate::service::role_materialization::scan_interrupted_relocation_ceremonies(&graph_domain_arc);
+
     seed_abstract_tool_catalog(&graph_domain_arc)?;
     seed_abstract_skill_catalog(&graph_domain_arc)?;
     seed_toolset_profiles(&graph_domain_arc)?;
     seed_skill_crafting(&graph_domain_arc)?;
+    seed_procedure_catalog(&graph_domain_arc)?;
 
     // Config-time model-routing coherence: warn + heal-queue any fallback tier
     // that names a controller role with no seeded+active guest on this hotel.
@@ -8563,7 +7908,7 @@ async fn main() -> Result<()> {
             },
             ListenerDecl {
                 purpose: "blob",
-                bind_addr: IpAddr::V4(Ipv4Addr::LOCALHOST),
+                bind_addr: IpAddr::V4(BLOB_BIND_ADDR),
                 port: hotel.blob_port,
                 iface: None,
             },
@@ -8628,6 +7973,10 @@ async fn main() -> Result<()> {
     if flags.enable_rust_task_lifecycle {
         std::thread::spawn(move || {
             info!("Durable Event Ledger Writer Thread spanning up...");
+            // Kinds already reported as dropped for having no target node, so the
+            // warning appears once per kind instead of once per envelope.
+            let mut warned_untargeted: std::collections::HashSet<String> =
+                std::collections::HashSet::new();
             while let Some(cmd) = dispatcher_rx.blocking_recv() {
                 match cmd {
                     LedgerCommand::AppendLocal(mut evt) => {
@@ -8639,6 +7988,34 @@ async fn main() -> Result<()> {
                             .map(|t| t == local_node_id_writer.as_str())
                             .unwrap_or(true);
                         if is_local {
+                            if evt.target_node_id.is_none()
+                                && evt.target_agent_id.is_none()
+                                && warned_untargeted.insert(format!("{:?}", evt.kind))
+                            {
+                                // DEF-184: hotels do not broadcast. An envelope with no
+                                // target is never stored or sent, so cron control-plane
+                                // events (CronFired / CronJobSync) have never left their
+                                // hotel. Making this fan out would switch on cron
+                                // replication and fire-suppression that has never run
+                                // live — an operator decision, not an audit side effect.
+                                warn!(
+                                    kind = ?evt.kind,
+                                    "ledger: an envelope with no target node is never stored or sent — \
+                                     hotels do not broadcast; address each peer (DEF-184). Further \
+                                     drops of this kind are not logged"
+                                );
+                            }
+                            if evt.target_node_id.is_none() && evt.target_agent_id.is_some() {
+                                // DEF-139: an envelope addressed to an agent with no
+                                // node was being skipped here as "same-hotel" — never
+                                // stored, never routed, never delivered.
+                                warn!(
+                                    event_id = %evt.event_id,
+                                    target_agent_id = ?evt.target_agent_id,
+                                    kind = ?evt.kind,
+                                    "ledger: envelope addressed to an agent without a target node is not routable and was dropped"
+                                );
+                            }
                             continue;
                         }
                         if let Err(e) = ledger_writer.append_event(&mut evt) {
@@ -8817,7 +8194,7 @@ async fn main() -> Result<()> {
 
     {
         use ansible_mesh_core::heartbeat::{
-            HotelStateSyncAgent, HotelStateSyncGuest, HotelStateSyncPayload,
+            HotelStateSyncAgent, HotelStateSyncGuest, HotelStateSyncPayload, HotelStateSyncRoleHome,
         };
         let sync_graph = graph_domain_arc.clone();
         let sync_hotel = hotel.clone();
@@ -8858,12 +8235,35 @@ async fn main() -> Result<()> {
                             .into_iter()
                             .filter(|profile| profile.node_id == sync_caps.node_id)
                             .collect();
+                        // Runtime placements are graph truth every peer must share
+                        // (DEF-107). Only runtime-stamped records travel; seed-only
+                        // (zero-stamp) homes stay local.
+                        let role_homes: Vec<HotelStateSyncRoleHome> = sync_graph
+                            .list_all_role_incarnations()
+                            .unwrap_or_default()
+                            .into_iter()
+                            .filter(|r| r.placement_updated_unix > 0)
+                            .map(|r| HotelStateSyncRoleHome {
+                                agent_id: r.agent_id,
+                                role_name: r.role_name,
+                                home_node: r.home_node,
+                                placement_updated_unix: r.placement_updated_unix,
+                            })
+                            .collect();
+                        let transport_homes = sync_graph
+                            .list_membrane_transport_homes(None)
+                            .unwrap_or_default()
+                            .into_iter()
+                            .filter(|h| h.updated_unix > 0)
+                            .collect();
                         let payload = HotelStateSyncPayload {
                             node_id: sync_caps.node_id.clone(),
                             hotel_name: sync_hotel.hotel_name.clone(),
                             guests,
                             agents,
                             model_profiles,
+                            role_homes,
+                            transport_homes,
                         };
                         *sync_state.write().await = Some(payload.clone());
                     }
@@ -8919,6 +8319,9 @@ async fn main() -> Result<()> {
     let ipc_delivery_claims = crate::service::ipc::new_delivery_claim_registry();
     let network_broadcast_tx = ipc_server.network_broadcast_tx();
     let perimeter_broadcast_tx = network_broadcast_tx.clone();
+    // Placement-change push (R2, DEF-107) — cloned before the network monitor
+    // task below takes ownership of `network_broadcast_tx`.
+    let placement_push_tx = network_broadcast_tx.clone();
 
     tokio::spawn(async move {
         if let Err(e) = ipc_server.run().await {
@@ -9050,6 +8453,61 @@ async fn main() -> Result<()> {
         shutdown_rx.resubscribe(),
     ));
 
+    // R2 (DEF-107): a transport home applied from mesh gossip is pushed to
+    // local guests immediately, so a membrane seat on the new home probes on
+    // its next lease tick and the seat on the old home stops polling now —
+    // instead of waiting for a lease denial plus a 180 s re-probe.
+    let (placement_change_tx, mut placement_change_rx) = tokio::sync::mpsc::unbounded_channel::<
+        ansible_mesh_core::placement_sync::PlacementChange,
+    >();
+    {
+        use ansible_mesh_core::placement_sync::PlacementChange;
+        let push_tx = placement_push_tx;
+        let push_graph = graph_domain_arc.clone();
+        let push_local_node_id = caps.node_id.clone();
+        let mut push_shutdown = shutdown_tx.subscribe();
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    Some(change) = placement_change_rx.recv() => {
+                        if let PlacementChange::TransportHome(home) = change {
+                            // DEF-143: `home.active_home_hotel` may be a bare
+                            // hotel_name (legacy) or a node_id (any record
+                            // touched by transport.set_home since DEF-124) —
+                            // resolve before comparing, mirroring the fix in
+                            // lease_handlers.rs's hotel_may_poll_transport_home.
+                            let hotel_is_home = crate::service::ipc::IpcServer::resolve_hotel_node_id(
+                                &push_graph,
+                                &home.active_home_hotel,
+                            )
+                            .as_deref()
+                                == Some(push_local_node_id.as_str());
+                            info!(
+                                agent_id = %home.agent_id,
+                                transport = %home.transport,
+                                resource_ref = %home.resource_ref,
+                                active_home_hotel = %home.active_home_hotel,
+                                hotel_is_home,
+                                "Transport home changed via mesh gossip — pushing TransportHomeChanged to local guests"
+                            );
+                            let _ = push_tx.send(IpcResponse::TransportHomeChanged {
+                                transport_home_changed: true,
+                                agent_id: home.agent_id,
+                                transport: home.transport,
+                                resource_ref: home.resource_ref,
+                                active_home_hotel: home.active_home_hotel,
+                                standby_hotels: home.standby_hotels,
+                                updated_unix: home.updated_unix,
+                                hotel_is_home,
+                            });
+                        }
+                    }
+                    _ = push_shutdown.recv() => break,
+                }
+            }
+        });
+    }
+
     let mesh_runtime = MeshRuntimeContext {
         hotel_name: hotel_name.clone(),
         hotel: hotel.clone(),
@@ -9076,6 +8534,7 @@ async fn main() -> Result<()> {
         perimeter_svc: perimeter_svc.clone(),
         ipc_operator_surface_tx: Some(inbound_operator_surface_tx),
         local_hotel_state: local_hotel_state.clone(),
+        placement_change_tx: Some(placement_change_tx),
     };
 
     if let Err(e) = activate_mesh_runtime(mesh_runtime.clone()).await {
@@ -9228,7 +8687,7 @@ async fn main() -> Result<()> {
 
     // PORT-BP-005: Large Payload Transport via Dedicated HTTP Server
     let blob_port = hotel.blob_port;
-    let blob_addr = format!("0.0.0.0:{}", blob_port);
+    let blob_addr = format!("{}:{}", BLOB_BIND_ADDR, blob_port);
     let blob_dir = std::path::Path::new(db_path)
         .parent()
         .unwrap_or(std::path::Path::new("."))
@@ -9290,12 +8749,10 @@ async fn main() -> Result<()> {
     }
     info!("All guest subscribers drained (or drain window elapsed). Shutting down hotel.");
 
-    // DreamsPhase: semantic consolidation + Hebbian sweep across all agent vaults.
-    // Runs after guests drain, before the internal shutdown broadcast.
-    // Uses direct HTTP to ONNX sidecar (:11435) and Ollama (:11434) — no IPC needed.
-    if let Some(ref cfg) = muninn_config_arc {
-        dream::dream_sweep(cfg, &graph_domain_arc, &hotel_name).await;
-    }
+    // Memory sleep no longer runs at shutdown (Phase 2 M6): it lists and
+    // maintains every memory vault through the Cortex, which would stall
+    // hotel restarts and deploys. It runs on its nightly cron instead
+    // (`PHILOTIC_DREAM_SWEEP_ENABLED`, Cortex hotel only).
 
     let _ = shutdown_tx.send(());
     tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
@@ -9309,6 +8766,7 @@ async fn main() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use super::BLOB_BIND_ADDR;
     use super::resolve_retention_days;
     use super::{
         AgentProfile, BASE64_STANDARD, SecretAccess, StartupTest, agent_graph_guest_record,
@@ -9319,7 +8777,8 @@ mod tests {
         execution_reachability_for_hotel, extract_context_graph_entries, guest_seed_for_profile,
         guest_supervision_enabled, guest_supervision_enabled_from, hotel_base_port,
         hotel_ipc_socket_path, local_capability_advertisements, mesh_target_addr_for_node,
-        migrate_plaintext_provider_api_keys, nearest_available_base_port,
+        migrate_plaintext_provider_api_keys, migrate_plaintext_telegram_tokens,
+        nearest_available_base_port, node_id_bound_to_other_hotel,
         preserve_runtime_guest_activation, read_string_config,
         reconcile_peer_execution_reachability, resolve_runtime_ports, resolve_secret,
         seed_abstract_skill_catalog, seed_abstract_tool_catalog, seed_operator_timezone,
@@ -9747,6 +9206,57 @@ mod tests {
     /// be granted by the profile (directly or via an allowed_classes
     /// expansion), otherwise the incarnation has instructions it cannot
     /// follow (the same invisible-tool defect the architect test above pins).
+    /// Operator decision 2026-09-16: every philote role can recall and remember.
+    /// Every seeded profile must grant both memory tools, directly or through a
+    /// class expansion (the thin utility/scheduler/virtuoso/codex/research
+    /// profiles previously left theoretician, virtuosa, Chronos and echo
+    /// without memory).
+    #[test]
+    fn load_never_persists_the_muninn_admin_password() {
+        let mut muninn = serde_json::json!({
+            "endpoint": "http://127.0.0.1:8475",
+            "admin_username": "root",
+            "admin_password": "plaintext"
+        });
+        assert!(super::strip_muninn_admin_password("muninn", &mut muninn));
+        assert!(muninn.get("admin_password").is_none());
+        assert_eq!(muninn["endpoint"], "http://127.0.0.1:8475");
+        assert_eq!(muninn["admin_username"], "root");
+
+        // Other keys and password-less entries are untouched.
+        let mut other = serde_json::json!({"admin_password": "keep"});
+        assert!(!super::strip_muninn_admin_password(
+            "integration",
+            &mut other
+        ));
+        assert_eq!(other["admin_password"], "keep");
+        let mut clean = serde_json::json!({"endpoint": "x"});
+        assert!(!super::strip_muninn_admin_password("muninn", &mut clean));
+    }
+
+    #[test]
+    fn every_seeded_profile_grants_memory_recall_and_remember() {
+        let storage = SqliteGraphStorage::open(":memory:").expect("open sqlite");
+        let graph = GraphDomain::new(Arc::new(storage.adapter()));
+        seed_toolset_profiles(&graph).expect("seed toolset profiles");
+
+        let profiles = graph.list_toolset_profiles().expect("list profiles");
+        assert!(!profiles.is_empty());
+        for profile in profiles {
+            for tool in ["memory.recall", "memory.remember"] {
+                let granted = profile.allowed_tools.iter().any(|t| t == tool)
+                    || profile.allowed_classes.iter().any(|class| {
+                        ansible_mesh_core::graph::tools_for_tool_class(class).contains(&tool)
+                    });
+                assert!(
+                    granted,
+                    "profile {:?} must grant {tool}",
+                    profile.profile_name
+                );
+            }
+        }
+    }
+
     #[test]
     fn travel_profile_grants_every_tool_the_lyra_charters_name() {
         use crate::lyra_charter::{
@@ -9896,6 +9406,47 @@ mod tests {
             !fresh.is_active,
             "a first-seen dormant seed stays dormant — activation is on-demand"
         );
+    }
+
+    /// Operator decision 2026-09-04: the hotel's native cron tools are open to
+    /// every role (the hotel scopes them to the caller agent's own crontab).
+    /// Every seeded profile must carry all five tools and reach `cron.manage`
+    /// (on-demand or allowed) so the tools project on cron-shaped turns.
+    #[test]
+    fn seed_toolset_profiles_grant_cron_tools_to_every_profile() {
+        let storage = SqliteGraphStorage::open(":memory:").expect("open sqlite");
+        let graph = GraphDomain::new(Arc::new(storage.adapter()));
+        seed_toolset_profiles(&graph).expect("seed toolset profiles");
+        let profiles = graph.list_toolset_profiles().expect("list profiles");
+        assert!(
+            profiles.len() >= 10,
+            "expected the full seeded set, got {}",
+            profiles.len()
+        );
+        for profile in &profiles {
+            for tool in [
+                "cron.register",
+                "cron.list",
+                "cron.enable",
+                "cron.disable",
+                "cron.remove",
+            ] {
+                assert!(
+                    profile.allowed_tools.iter().any(|t| t == tool),
+                    "profile {} is missing {tool}",
+                    profile.profile_name
+                );
+            }
+            assert!(
+                profile
+                    .on_demand_skills
+                    .iter()
+                    .chain(profile.allowed_skills.iter())
+                    .any(|s| s == "cron.manage"),
+                "profile {} cannot reach cron.manage",
+                profile.profile_name
+            );
+        }
     }
 
     #[test]
@@ -11012,6 +10563,107 @@ mod tests {
         assert_eq!(graph_datasource.active_pid, None);
     }
 
+    /// DEF-174: a joiner may not claim a node id another hotel already owns.
+    #[test]
+    fn a_join_may_not_claim_another_hotels_node_id() {
+        let storage = SqliteGraphStorage::open(":memory:").expect("open sqlite");
+        let graph = GraphDomain::new(Arc::new(storage.adapter()));
+        graph
+            .upsert_hotel(&HotelRecord {
+                hotel_name: "mac-jane".into(),
+                capabilities: ansible_mesh_core::NodeCapabilities {
+                    node_id: "mac-jane-aiua-01".into(),
+                    roles: vec![],
+                    models: vec![],
+                    tools: vec![],
+                    constraints: Default::default(),
+                    build_version: String::new(),
+                },
+                mesh_port: 16370,
+                blob_port: 16371,
+                execution_port: 16372,
+                ipc_socket_path: String::new(),
+                active_pid: None,
+                mesh_host: None,
+            })
+            .expect("seed hotel");
+        assert_eq!(
+            node_id_bound_to_other_hotel(&graph, "mac-jane-aiua-01", "evil-hotel").as_deref(),
+            Some("mac-jane")
+        );
+        assert_eq!(
+            node_id_bound_to_other_hotel(&graph, "mac-jane-aiua-01", "mac-jane"),
+            None,
+            "the owner re-joining is not a collision"
+        );
+        assert_eq!(
+            node_id_bound_to_other_hotel(&graph, "new-aiua-01", "new-hotel"),
+            None
+        );
+    }
+
+    /// DEF-176: plaintext Telegram tokens move into the vault behind their
+    /// own key name, readable by the membrane role only.
+    #[test]
+    fn telegram_token_migration_moves_plaintext_to_a_membrane_only_vault_ref() {
+        unsafe {
+            std::env::set_var(
+                "PHILOTIC_VAULT_MASTER_KEY",
+                BASE64_STANDARD.encode([7u8; 32]),
+            );
+        }
+        let storage = SqliteGraphStorage::open(":memory:").expect("open sqlite");
+        let graph = GraphDomain::new(Arc::new(storage.adapter()));
+        for (key, token) in [
+            ("telegram_bot_token", "111:global"),
+            ("telegram_bot_token_bjork", "222:bjork"),
+        ] {
+            graph
+                .set_config_value(key, &serde_json::json!(token).to_string())
+                .expect("seed plaintext token");
+        }
+        graph
+            .set_config_value("telegram_allowed_users_bjork", "[\"7\"]")
+            .expect("seed unrelated key");
+
+        assert_eq!(
+            migrate_plaintext_telegram_tokens(&graph).expect("migrate"),
+            2
+        );
+        let secret_ref = read_string_config(&graph, "telegram_bot_token_bjork")
+            .expect("read")
+            .expect("key kept");
+        assert!(secret_ref.starts_with("secret://"), "{secret_ref}");
+        let membrane = SecretAccess {
+            role: "membrane".into(),
+            guest_id: "mac-jane:membrane-gateway-bjork".into(),
+        };
+        assert_eq!(
+            resolve_secret(&graph, &secret_ref, &membrane).expect("membrane reads"),
+            Some("222:bjork".into())
+        );
+        let agent = SecretAccess {
+            role: "agent".into(),
+            guest_id: "agent-bjork-01".into(),
+        };
+        assert!(
+            resolve_secret(&graph, &secret_ref, &agent).is_err(),
+            "an agent guest may not read a bot token"
+        );
+        assert_eq!(
+            graph
+                .get_config_value("telegram_allowed_users_bjork")
+                .unwrap()
+                .as_deref(),
+            Some("[\"7\"]")
+        );
+        assert_eq!(
+            migrate_plaintext_telegram_tokens(&graph).expect("re-run"),
+            0,
+            "a vaulted token is left alone"
+        );
+    }
+
     #[test]
     fn provider_api_key_migration_moves_plaintext_to_vault_ref() {
         unsafe {
@@ -11267,6 +10919,40 @@ mod tests {
     }
 
     #[test]
+    fn seed_orchestrator_roles_preserves_runtime_home_node_across_reseed() {
+        // DEF-106: a runtime `role.set_home` (graph truth) must survive the
+        // origin hotel's next `aiua load`, which reseeds every orchestrator.
+        let storage = SqliteGraphStorage::open(":memory:").expect("open sqlite graph");
+        let graph = GraphDomain::new(Arc::new(storage.adapter()));
+        seed_orchestrator_roles(&graph, &[model_bindings_test_profile(None)])
+            .expect("initial seed");
+        let mut relocated = graph
+            .get_role_incarnation("agent-jane", "orchestrator")
+            .expect("get role incarnation")
+            .expect("role exists");
+        assert_eq!(relocated.home_node, None);
+        assert_eq!(relocated.placement_updated_unix, 0);
+        relocated.home_node = Some("vps-jane-aiua-01".to_string());
+        relocated.placement_updated_unix = 1_757_000_000;
+        graph
+            .upsert_role_incarnation(&relocated)
+            .expect("runtime relocation");
+
+        seed_orchestrator_roles(&graph, &[model_bindings_test_profile(None)])
+            .expect("reseed on restart");
+        let reseeded = graph
+            .get_role_incarnation("agent-jane", "orchestrator")
+            .expect("get role incarnation")
+            .expect("role exists");
+        assert_eq!(
+            reseeded.home_node.as_deref(),
+            Some("vps-jane-aiua-01"),
+            "a restart must never un-migrate a relocated orchestrator (DEF-106)"
+        );
+        assert_eq!(reseeded.placement_updated_unix, 1_757_000_000);
+    }
+
+    #[test]
     fn seed_orchestrator_roles_mesh_config_model_bindings_win_when_present() {
         let storage = SqliteGraphStorage::open(":memory:").expect("open sqlite graph");
         let graph = GraphDomain::new(Arc::new(storage.adapter()));
@@ -11396,5 +11082,23 @@ mod tests {
             .expect("get role incarnation")
             .expect("role exists");
         assert_eq!(reseeded.content_policy, "unrestricted");
+    }
+
+    /// The blob plane is unauthenticated: `POST /upload` accepts anonymous 100MB
+    /// multipart writes and `GET /download` is a bare `ServeDir`. It is declared to
+    /// the perimeter as a `Local` listener, and the hotel persists that classification
+    /// to `__hotel_perimeter__`.
+    ///
+    /// Regression guard for the case where the declaration said `LOCALHOST` while the
+    /// actual bind was hardcoded `0.0.0.0`: on a host with a public IP that exposed an
+    /// anonymous write endpoint to the internet while the perimeter snapshot still
+    /// reported `Local`. Widening this bind requires adding authentication first.
+    #[test]
+    fn blob_listener_binds_loopback_to_match_perimeter_declaration() {
+        assert!(
+            BLOB_BIND_ADDR.is_loopback(),
+            "blob listener must bind loopback — the blob plane has no authentication"
+        );
+        assert_eq!(format!("{}:{}", BLOB_BIND_ADDR, 16371), "127.0.0.1:16371");
     }
 }

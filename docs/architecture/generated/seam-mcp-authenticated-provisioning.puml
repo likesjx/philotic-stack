@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - mcp-authenticated-provisioning
+
+rectangle "mcp-authenticated-provisioning" as mcp_authenticated_provisioning #Orange {
+}
+
+
+@enduml

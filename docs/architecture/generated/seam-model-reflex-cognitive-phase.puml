@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - model-reflex-cognitive-phase
+
+rectangle "model-reflex-cognitive-phase" as model_reflex_cognitive_phase #Orange {
+}
+
+
+@enduml

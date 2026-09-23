@@ -102,10 +102,9 @@ impl BeaconPayload {
             ENCODING_LEGACY => WireEncoding::LegacyIntArray,
             ENCODING_BASE64 => WireEncoding::Base64,
             _ => {
-                let from_env = match std::env::var("PHILOTIC_BEACON_PAYLOAD_B64") {
-                    Ok(value) if value.trim() == "1" => ENCODING_BASE64,
-                    _ => ENCODING_LEGACY,
-                };
+                let from_env = encoding_from_env_value(
+                    std::env::var("PHILOTIC_BEACON_PAYLOAD_B64").ok().as_deref(),
+                );
                 // Only claim the slot if still unset so a concurrent explicit
                 // set_wire_encoding always wins.
                 let _ = WIRE_ENCODING.compare_exchange(
@@ -120,6 +119,19 @@ impl BeaconPayload {
                 }
             }
         }
+    }
+}
+
+/// Base64 is the default wire encoding: every hotel has dual-read decoding
+/// since 2026-07-04, and the legacy integer-array form wraps a 3 KB roster
+/// to ~10 KB on the wire — over macOS's 9216-byte `net.inet.udp.maxdgram` —
+/// so mac-jane's hotel-state broadcast failed EMSGSIZE every 30 s and no peer
+/// learned its agents (DEF-140, live 2026-09-15). `PHILOTIC_BEACON_PAYLOAD_B64=0`
+/// pins the legacy form for a peer that somehow predates dual-read.
+fn encoding_from_env_value(value: Option<&str>) -> u8 {
+    match value.map(str::trim) {
+        Some("0") | Some("false") | Some("legacy") => ENCODING_LEGACY,
+        _ => ENCODING_BASE64,
     }
 }
 
@@ -261,6 +273,23 @@ pub enum MsgType {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn base64_is_the_default_wire_encoding_unless_pinned_legacy() {
+        assert_eq!(super::encoding_from_env_value(None), super::ENCODING_BASE64);
+        assert_eq!(
+            super::encoding_from_env_value(Some("1")),
+            super::ENCODING_BASE64
+        );
+        assert_eq!(
+            super::encoding_from_env_value(Some(" 0 ")),
+            super::ENCODING_LEGACY
+        );
+        assert_eq!(
+            super::encoding_from_env_value(Some("legacy")),
+            super::ENCODING_LEGACY
+        );
+    }
+
     use super::{BeaconMessage, BeaconPayload, MsgType, WireEncoding};
     use std::sync::Mutex;
     use uuid::Uuid;

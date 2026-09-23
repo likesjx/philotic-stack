@@ -95,6 +95,7 @@
 //!   GET  /api/edge/ws — edge-mesh protocol termination (philotic-edge-protocol
 //!              JSON envelopes; per-device bearer auth; see serve/edge.rs)
 
+mod cortex;
 pub(crate) mod edge;
 
 use ansible_mesh_core::domain::GraphDomain;
@@ -151,6 +152,7 @@ use philotic_client::{
 struct UiAssets;
 
 const AUTH_COOKIE_NAME: &str = "philotic_session";
+mod desktop_session;
 const AUTH_COOKIE_MAX_AGE_SECS: u64 = 60 * 60 * 8;
 const HEADER_COOP: &str = "cross-origin-opener-policy";
 const HEADER_CORP: &str = "cross-origin-resource-policy";
@@ -160,6 +162,7 @@ const HEADER_CORP: &str = "cross-origin-resource-policy";
 #[derive(Clone)]
 pub(crate) struct AppState {
     bootstrap_token: Arc<String>,
+    desktop_gateway_key: Option<Arc<String>>,
     db_path: PathBuf,
     /// Mesh config path — consulted for `web_roster` / `web_edge_token` fallbacks
     config_path: Arc<PathBuf>,
@@ -647,6 +650,10 @@ pub async fn run(
 
     let state = AppState {
         bootstrap_token: Arc::new(bootstrap_token.clone()),
+        desktop_gateway_key: std::env::var("PHILOTIC_DESKTOP_GATEWAY_KEY")
+            .ok()
+            .filter(|key| key.len() >= 32)
+            .map(Arc::new),
         db_path,
         config_path: Arc::new(config_path.clone()),
         hotel: Arc::new(hotel),
@@ -684,6 +691,14 @@ pub async fn run(
     let app = Router::new()
         // Unauthenticated lightweight probe endpoint — allowed on every tier
         .route("/health", get(handle_health))
+        .route(
+            "/internal/desktop/session",
+            post(desktop_session::issue).layer(axum::extract::DefaultBodyLimit::max(4096)),
+        )
+        .route(
+            "/internal/desktop/session/status",
+            get(desktop_session::status),
+        )
         // Edge-mesh tier (see serve/edge.rs): invite-code-gated enrollment plus
         // the bearer-authenticated edge-protocol WebSocket termination
         .route("/api/edge/enroll", post(edge::handle_edge_enroll))
@@ -699,7 +714,7 @@ pub async fn run(
         )
         .route(
             "/api/edge/lifegraph/node/:node_id",
-            get(edge::handle_edge_lifegraph_node),
+            get(edge::handle_edge_lifegraph_node).patch(edge::handle_edge_lifegraph_edit),
         )
         .route(
             "/api/edge/lifegraph/neighborhood/:node_id",
@@ -719,6 +734,7 @@ pub async fn run(
         // API routes
         .route("/api/mesh/roster", get(handle_mesh_roster))
         .route("/api/auth/status", get(handle_auth_status))
+        .route("/api/cortex", get(cortex::read))
         .route(
             "/api/auth/user",
             get(handle_auth_user_get).patch(handle_auth_user_patch),
@@ -7384,9 +7400,23 @@ fn current_operator_session(
     state: &AppState,
 ) -> Option<OperatorSessionRecord> {
     let token = header_bearer_token(headers).or_else(|| cookie_token(headers, AUTH_COOKIE_NAME))?;
-    resolve_operator_session(&state.db_path, token)
+    let session = resolve_operator_session(&state.db_path, token)
         .ok()
-        .flatten()
+        .flatten()?;
+    if session.auth_method == "desktop_gateway" {
+        if session.issuing_hotel != *state.hotel
+            || !desktop_session::gateway_authorized(headers, state)
+        {
+            return None;
+        }
+        let user = resolve_operator_user(&state.db_path, &state.hotel, &session.user_id)
+            .ok()
+            .flatten()?;
+        if user.status != "active" {
+            return None;
+        }
+    }
+    Some(session)
 }
 
 fn ensure_operator_auth_tables(db_path: &PathBuf, hotel: &str) -> Result<()> {
@@ -9890,10 +9920,64 @@ mod tests {
         assert_eq!(resolve_edge_token(None, None), None);
     }
 
+    #[tokio::test]
+    async fn cortex_rejects_anonymous_edge_nonadmin_and_revoked_sessions() {
+        let state = test_state(Some("edge-only"), ExposureTier::Mesh);
+        ensure_operator_auth_tables(&state.db_path, &state.hotel).unwrap();
+        async fn status(state: &AppState, token: Option<&str>) -> StatusCode {
+            let mut headers = HeaderMap::new();
+            if let Some(token) = token {
+                headers.insert(
+                    header::AUTHORIZATION,
+                    HeaderValue::from_str(&format!("Bearer {token}")).unwrap(),
+                );
+            }
+            let query = serde_json::from_value(json!({})).unwrap();
+            cortex::read(headers, State(state.clone()), Query(query))
+                .await
+                .status()
+        }
+        assert_eq!(status(&state, None).await, StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            status(&state, Some("edge-only")).await,
+            StatusCode::UNAUTHORIZED
+        );
+        let session =
+            issue_operator_session(&state.db_path, &state.hotel, "Test", "test", None).unwrap();
+        // An administrator reaches the adapter (the test intentionally has no IPC server).
+        assert_eq!(
+            status(&state, Some(&session.session_token)).await,
+            StatusCode::BAD_GATEWAY
+        );
+        let conn = Connection::open(&state.db_path).unwrap();
+        conn.execute(
+            "UPDATE operator_sessions SET posture = 'viewer' WHERE session_id = ?1",
+            [&session.session_id],
+        )
+        .unwrap();
+        assert_eq!(
+            status(&state, Some(&session.session_token)).await,
+            StatusCode::FORBIDDEN
+        );
+        conn.execute(
+            "UPDATE operator_sessions SET posture = 'admin' WHERE session_id = ?1",
+            [&session.session_id],
+        )
+        .unwrap();
+        revoke_operator_session(&state.db_path, &session.session_token).unwrap();
+        assert_eq!(
+            status(&state, Some(&session.session_token)).await,
+            StatusCode::UNAUTHORIZED
+        );
+        drop(conn);
+        let _ = fs::remove_file(&state.db_path);
+    }
+
     fn test_state(edge_token: Option<&str>, tier: ExposureTier) -> AppState {
         let (tx, _) = broadcast::channel::<String>(4);
         AppState {
             bootstrap_token: Arc::new("philotic-test".into()),
+            desktop_gateway_key: None,
             db_path: temp_db_path("fence"),
             config_path: Arc::new(PathBuf::from("/nonexistent/mesh-config.json")),
             hotel: Arc::new("mac-jane".into()),

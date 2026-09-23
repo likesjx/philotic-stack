@@ -84,6 +84,132 @@ pub struct McpToolSpec {
     /// Per-tool auth override. Inherits the endpoint caller's token if absent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auth: Option<McpAuthScheme>,
+    /// How the receiving philote handles a call to this tool: an ordered
+    /// deterministic ladder (input validation, static results, built-in
+    /// reflexes) that runs before any model inference, plus the declared
+    /// fallback when the ladder does not produce a result. Absent = the
+    /// legacy behaviour (validate nothing, go straight to a model turn).
+    ///
+    /// Only meaningful for `McpRouteTarget::Philote` targets; datasource and
+    /// tool targets never reach a philote and are deterministic by
+    /// construction.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub handler: Option<McpHandlerPolicy>,
+}
+
+// ── Handler policy (deterministic-first, inference-second) ────────────────────
+
+/// Built-in deterministic reflexes a philote can run for an MCP call without
+/// a model turn. Kept as a closed list so a provisioning turn cannot name an
+/// arbitrary philote tool and have it execute unattended.
+pub const MCP_REFLEX_KINDS: &[&str] = &["echo", "memory.recall", "memory.capture"];
+
+fn default_true() -> bool {
+    true
+}
+
+/// One rung of the deterministic ladder.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum McpHandlerStep {
+    /// Answer with a fixed JSON value. Use for capability descriptors, health
+    /// probes, and any tool whose answer was known at provisioning time.
+    Static { result: serde_json::Value },
+    /// Run a built-in philote reflex (see [`MCP_REFLEX_KINDS`]) with
+    /// `args` rendered against the call payload. String values of the form
+    /// `"${payload.<dot.path>}"` are substituted from the inbound payload;
+    /// the bare string `"${payload}"` substitutes the whole payload object.
+    /// When `escalate_on_empty` is set and the reflex yields nothing, the
+    /// ladder continues to the next step (and ultimately the fallback)
+    /// instead of returning an empty result.
+    Reflex {
+        reflex: String,
+        #[serde(default)]
+        args: serde_json::Value,
+        #[serde(default)]
+        escalate_on_empty: bool,
+    },
+}
+
+/// What happens when no deterministic step produced a result.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum McpHandlerFallback {
+    /// Hand the call to the philote's cognitive loop. `instructions` is
+    /// rendered into the turn so the model knows it is answering an MCP tool
+    /// call and what shape the caller expects back.
+    Model {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        instructions: Option<String>,
+    },
+    /// Refuse deterministically. The caller receives an `isError` result
+    /// carrying `message`; no model turn is ever started.
+    Error { message: String },
+}
+
+impl Default for McpHandlerFallback {
+    fn default() -> Self {
+        Self::Model { instructions: None }
+    }
+}
+
+/// Per-tool handling policy carried on [`McpToolSpec::handler`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct McpHandlerPolicy {
+    /// Reject calls whose arguments violate the tool's `input_schema`
+    /// (`required` keys and primitive `type`s) before any step runs.
+    /// Defaults to `true`.
+    #[serde(default = "default_true")]
+    pub validate_input: bool,
+    /// Deterministic ladder, tried in order.
+    #[serde(default)]
+    pub steps: Vec<McpHandlerStep>,
+    /// Fallback once the ladder is exhausted. Defaults to a model turn.
+    #[serde(default)]
+    pub fallback: McpHandlerFallback,
+}
+
+impl Default for McpHandlerPolicy {
+    fn default() -> Self {
+        Self {
+            validate_input: true,
+            steps: Vec::new(),
+            fallback: McpHandlerFallback::default(),
+        }
+    }
+}
+
+impl McpHandlerPolicy {
+    /// Structural validation performed at provisioning time so a bad policy
+    /// fails the `mcp.provision` turn instead of every later call.
+    pub fn validate(&self) -> Result<(), String> {
+        for (idx, step) in self.steps.iter().enumerate() {
+            if let McpHandlerStep::Reflex { reflex, args, .. } = step {
+                if !MCP_REFLEX_KINDS.contains(&reflex.as_str()) {
+                    return Err(format!(
+                        "handler step {idx}: unknown reflex '{reflex}' (known: {})",
+                        MCP_REFLEX_KINDS.join(", ")
+                    ));
+                }
+                if !(args.is_null() || args.is_object()) {
+                    return Err(format!(
+                        "handler step {idx}: reflex args must be an object or omitted"
+                    ));
+                }
+            }
+        }
+        if let McpHandlerFallback::Error { message } = &self.fallback {
+            if message.trim().is_empty() {
+                return Err("handler fallback 'error' requires a non-empty message".into());
+            }
+        }
+        Ok(())
+    }
+
+    /// True when the ladder can never reach a model turn.
+    pub fn is_fully_deterministic(&self) -> bool {
+        matches!(self.fallback, McpHandlerFallback::Error { .. })
+    }
 }
 
 // ── Inbound transform ─────────────────────────────────────────────────────────
@@ -229,6 +355,7 @@ mod tests {
                 },
                 outbound_transform: McpOutboundTransform::PassThrough,
                 auth: None,
+                handler: None,
             }],
             default_auth: None,
             allow_unauthenticated: false,
@@ -241,5 +368,54 @@ mod tests {
             }],
             updated_at: 1_700_000_000,
         });
+    }
+
+    #[test]
+    fn handler_policy_defaults_are_validate_then_model() {
+        let policy: McpHandlerPolicy = serde_json::from_str("{}").unwrap();
+        assert!(policy.validate_input);
+        assert!(policy.steps.is_empty());
+        assert_eq!(
+            policy.fallback,
+            McpHandlerFallback::Model { instructions: None }
+        );
+        assert!(!policy.is_fully_deterministic());
+        assert!(policy.validate().is_ok());
+    }
+
+    #[test]
+    fn handler_policy_round_trips_and_validates_reflex_names() {
+        let json = serde_json::json!({
+            "validate_input": true,
+            "steps": [
+                { "kind": "static", "result": { "ok": true } },
+                { "kind": "reflex", "reflex": "memory.recall",
+                  "args": { "query": "${payload.query}" }, "escalate_on_empty": true }
+            ],
+            "fallback": { "kind": "error", "message": "not answerable" }
+        });
+        let policy: McpHandlerPolicy = serde_json::from_value(json.clone()).unwrap();
+        assert!(policy.validate().is_ok());
+        assert!(policy.is_fully_deterministic());
+        assert_eq!(serde_json::to_value(&policy).unwrap(), json);
+
+        let bad: McpHandlerPolicy = serde_json::from_value(serde_json::json!({
+            "steps": [{ "kind": "reflex", "reflex": "bash.exec" }]
+        }))
+        .unwrap();
+        let err = bad.validate().unwrap_err();
+        assert!(err.contains("unknown reflex 'bash.exec'"), "{err}");
+    }
+
+    #[test]
+    fn tool_spec_without_handler_still_deserializes() {
+        let spec: McpToolSpec = serde_json::from_value(serde_json::json!({
+            "name": "t", "description": "d", "input_schema": {},
+            "inbound_transform": { "kind": "field_map", "action": "a",
+                "target": { "kind": "philote", "agent_id": "x" } },
+            "outbound_transform": { "kind": "pass_through" }
+        }))
+        .unwrap();
+        assert!(spec.handler.is_none());
     }
 }

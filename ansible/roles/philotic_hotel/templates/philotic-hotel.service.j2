@@ -41,6 +41,13 @@ Environment="PHILOTIC_MEMGRAPH_DB={{ philotic_memgraph_db }}"
 {% endif %}
 {% endif %}
 Environment="PHILOTIC_TABLE_DB={{ philotic_data_dir }}/tables"
+{% if philotic_memory_sleep_enabled | bool %}
+# Muninn memory sleep: nightly Cortex-side maintenance (proposal-only unless mutate).
+Environment="PHILOTIC_DREAM_SWEEP_ENABLED=1"
+{% if philotic_memory_sleep_mutate | bool %}
+Environment="PHILOTIC_MEMORY_SLEEP_MUTATE=1"
+{% endif %}
+{% endif %}
 
 # Mesh PSK — injected from Ansible vault; never stored in plaintext on disk
 EnvironmentFile={{ philotic_etc_dir }}/secrets.env

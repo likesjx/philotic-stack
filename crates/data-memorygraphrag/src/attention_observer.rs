@@ -129,6 +129,7 @@ fn record_observation_input(
     let (observed_by, observed_role_owned, edges) = anchor_fields(agent_id, observed_role);
 
     LifeObserveInput {
+        force_new: false,
         observation_id,
         evidence: EvidencePacket {
             packet_id,
@@ -166,6 +167,7 @@ fn record_observation_input(
                 "policy_tags": signal.policy_tags,
                 "subject_refs": signal.subject_refs,
             }),
+            properties: Default::default(),
         },
         proposed_graph_refs: vec![],
         observed_by,
@@ -190,6 +192,7 @@ fn propose_sil_input(
     let (observed_by, observed_role_owned, edges) = anchor_fields(agent_id, observed_role);
 
     LifeObserveInput {
+        force_new: false,
         observation_id,
         evidence: EvidencePacket {
             packet_id,
@@ -228,6 +231,7 @@ fn propose_sil_input(
                 "evidence_refs": sil.evidence_refs,
                 "signal_id": signal.signal_id,
             }),
+            properties: Default::default(),
         },
         proposed_graph_refs: vec![],
         observed_by,
@@ -261,6 +265,7 @@ fn active_checkin_awaiting_posture_input(
     }
 
     LifeObserveInput {
+        force_new: false,
         observation_id,
         evidence: EvidencePacket {
             packet_id,
@@ -302,6 +307,7 @@ fn active_checkin_awaiting_posture_input(
                 "sil_ref": sil_ref,
                 "confirmed_sil_entries": signal.confirmed_sil_entries,
             }),
+            properties: Default::default(),
         },
         proposed_graph_refs: vec![],
         observed_by,

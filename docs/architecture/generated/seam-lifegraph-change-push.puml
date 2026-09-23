@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - lifegraph-change-push
+
+rectangle "lifegraph-change-push" as lifegraph_change_push #Orange {
+}
+
+
+@enduml

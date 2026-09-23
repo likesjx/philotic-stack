@@ -12,7 +12,47 @@ use rusqlite::types::{Type, ValueRef};
 use rusqlite::{params, Connection};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
-use tracing::{debug, info};
+use std::time::{Duration, Instant};
+use tracing::{debug, info, warn};
+
+/// A graph read that holds the shared connection lock this long is a stall:
+/// every other task that touches the graph blocks a runtime worker on that
+/// `std::sync::Mutex`, so the whole process goes quiet (DEF-191: a per-session
+/// N+1 full scan froze the vps for ~10 s of every 30).
+const SLOW_GRAPH_QUERY: Duration = Duration::from_millis(250);
+
+/// Warns on drop when the guarded query held the connection lock for
+/// [`SLOW_GRAPH_QUERY`] or more. Declare it AFTER taking the lock so the wait
+/// for the lock is not billed to the query.
+struct SlowQueryGuard<'a> {
+    op: &'static str,
+    detail: &'a str,
+    started: Instant,
+}
+
+impl<'a> SlowQueryGuard<'a> {
+    fn new(op: &'static str, detail: &'a str) -> Self {
+        Self {
+            op,
+            detail,
+            started: Instant::now(),
+        }
+    }
+}
+
+impl Drop for SlowQueryGuard<'_> {
+    fn drop(&mut self) {
+        let elapsed = self.started.elapsed();
+        if elapsed >= SLOW_GRAPH_QUERY {
+            warn!(
+                op = self.op,
+                detail = self.detail,
+                elapsed_ms = elapsed.as_millis() as u64,
+                "slow graph query held the shared connection lock"
+            );
+        }
+    }
+}
 
 // ══════════════════════════════════════════════════════════════════════
 // SqliteEventStorage
@@ -395,6 +435,7 @@ impl GraphAdapter for SqliteGraphAdapter {
 
     fn list_nodes_by_kind(&self, kind: &str) -> Result<Vec<GraphNode>> {
         let conn = self.conn.lock().unwrap();
+        let _slow = SlowQueryGuard::new("list_nodes_by_kind", kind);
         let mut stmt = conn.prepare(
             "SELECT node_key, kind, label, data_json
              FROM graph_nodes
@@ -447,6 +488,7 @@ impl GraphAdapter for SqliteGraphAdapter {
              LIMIT ?3",
         );
         let conn = self.conn.lock().unwrap();
+        let _slow = SlowQueryGuard::new("list_nodes_by_kind_json_eq", kind);
         let mut stmt = conn.prepare(&sql)?;
         let limit_sql: i64 = if limit == 0 { -1 } else { limit as i64 };
         let rows = stmt.query_map(params![kind, value, limit_sql], |row| {
@@ -736,5 +778,39 @@ impl SqliteGraphStorage {
     /// (e.g., ad-hoc config seeding in `main.rs`).
     pub fn raw_conn(&self) -> &Arc<Mutex<Connection>> {
         &self.conn
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn plan_for(sql: &str) -> String {
+        let storage = SqliteGraphStorage::open_in_memory().unwrap();
+        let conn = storage.raw_conn().lock().unwrap();
+        let mut stmt = conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
+        let rows = stmt
+            .query_map([], |row| row.get::<_, String>(3))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect::<Vec<_>>();
+        rows.join(" | ")
+    }
+
+    /// DEF-191 guard: the per-session turn lookup must be answered by the
+    /// `session_id` expression index, never a scan of the whole kind. The
+    /// silence sweep runs it once per active session under the shared graph
+    /// lock, so a scan here is a process-wide stall.
+    #[test]
+    fn session_turn_lookup_uses_the_session_id_index() {
+        let plan = plan_for(
+            "SELECT node_key, kind, label, data_json FROM graph_nodes
+             WHERE kind = 'session_turn' AND json_extract(data_json, '$.session_id') = 's'
+             ORDER BY json_extract(data_json, '$.started_at') DESC LIMIT 8",
+        );
+        assert!(
+            plan.contains("idx_graph_nodes_kind_session_id"),
+            "per-session lookup is not index-backed: {plan}"
+        );
     }
 }

@@ -624,6 +624,7 @@ pub fn project_hit_to_evidence_packet(hit: &VectorHit, generated_at: &str) -> Ev
             "similarity": hit.similarity,
             "bolt_id": hit.bolt_id,
         }),
+        properties: Default::default(),
     }
 }
 

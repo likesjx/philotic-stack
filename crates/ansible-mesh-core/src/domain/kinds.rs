@@ -46,3 +46,16 @@ pub const NODE_KIND_AUTONOMY_AUDIT: &str = "autonomy_audit";
 // Autopoiesis Slice A3 (doc:AUTOPOIESIS_PROPOSAL)
 /// Fix request filed by the heal-dispatcher for a recurring failure pattern.
 pub const NODE_KIND_HEAL_WORK_ITEM: &str = "heal_work_item";
+
+// Procedural graphs (doc:procedural-graphs, slice P0)
+/// A procedural graph: tool-bound nodes + typed edges with condition/guidance/pitfalls.
+pub const NODE_KIND_PROCEDURE: &str = "procedure";
+/// Append-only ledger of terminal plan evaluations attributed to a procedure.
+pub const NODE_KIND_PROCEDURE_RUN: &str = "procedure_run";
+/// Refiner-proposed edit to a procedure, with its trial outcome (P4). Never deleted.
+pub const NODE_KIND_PROCEDURE_PATCH: &str = "procedure_patch";
+
+// Relocation Ceremony (doc:relocation-ceremony, slice R6)
+/// A recorded, resumable multi-phase relocation of a role incarnation (and
+/// optionally its paired transport) from one hotel to another. Never deleted.
+pub const NODE_KIND_RELOCATION_CEREMONY: &str = "relocation_ceremony";

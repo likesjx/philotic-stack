@@ -5,7 +5,8 @@ use ansible_mesh_core::storage::{CursorStorage, EventStorage};
 use ansible_mesh_core::{BeaconMessage, MsgType};
 use anyhow::Result;
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::net::UdpSocket;
 use tokio::sync::{RwLock, broadcast};
@@ -21,6 +22,18 @@ use crate::service::execution_transport::send_execution_message;
 /// whose local secret is transiently broken) produces ~60 log lines a minute.
 const NO_AUTH_KEY_WARN_INTERVAL: Duration = Duration::from_secs(300);
 
+/// First pause before retrying a peer that failed; it doubles per consecutive
+/// failure up to [`BACKOFF_MAX`]. Without it a dead peer was dialled every
+/// second forever.
+const BACKOFF_BASE: Duration = Duration::from_secs(1);
+const BACKOFF_MAX: Duration = Duration::from_secs(30);
+
+/// After sending an event, wait this long for its ACK before sending it
+/// again. The sender used to re-send every unacked event on every 1 s tick,
+/// so a receiver that took a few seconds to ACK got the same event several
+/// times (measured 2026-09-19: 1.72x overall, one event 10x).
+const ACK_GRACE: Duration = Duration::from_secs(5);
+
 /// Outcome of one `dispatch_for_target` attempt, so the caller can react
 /// without treating an unauthenticatable (but otherwise benign) target as a
 /// hard error to be logged every tick.
@@ -31,11 +44,92 @@ enum DispatchStatus {
     /// cannot sign them. Not an error — the caller skips (throttled-warn).
     NoAuthKey,
     /// At least one event was dispatched (or attempted over the wire).
-    Dispatched,
+    Dispatched {
+        /// Highest event seq that reached the peer's socket this attempt
+        /// (0 if none did).
+        sent_through: u64,
+        /// The attempt stopped at a failed send.
+        send_failed: bool,
+    },
+}
+
+/// What the dispatcher remembers about one peer between ticks.
+#[derive(Debug, Default)]
+struct TargetProgress {
+    failures: u32,
+    next_attempt: Option<Instant>,
+    sent_through: u64,
+    sent_at: Option<Instant>,
+}
+
+/// The pause after `failures` consecutive failures: 1, 2, 4, 8, 16, 30, 30…
+fn backoff_after(failures: u32) -> Duration {
+    BACKOFF_BASE
+        .checked_mul(1u32 << failures.saturating_sub(1).min(5))
+        .unwrap_or(BACKOFF_MAX)
+        .min(BACKOFF_MAX)
+}
+
+impl TargetProgress {
+    /// Is this peer due another attempt (not still backing off)?
+    fn ready(&self, now: Instant) -> bool {
+        self.next_attempt.is_none_or(|at| now >= at)
+    }
+
+    /// Events at or below this seq were sent recently enough to be waiting on
+    /// their ACK and must not be sent again yet; 0 once the grace has run out.
+    fn skip_through(&self, now: Instant) -> u64 {
+        match self.sent_at {
+            Some(at) if now.duration_since(at) < ACK_GRACE => self.sent_through,
+            _ => 0,
+        }
+    }
+
+    fn record(&mut self, now: Instant, status: &DispatchStatus) {
+        match status {
+            DispatchStatus::Idle | DispatchStatus::NoAuthKey => {}
+            DispatchStatus::Dispatched {
+                sent_through,
+                send_failed,
+            } => {
+                if *sent_through > 0 {
+                    self.sent_through = *sent_through;
+                    self.sent_at = Some(now);
+                }
+                if *send_failed {
+                    self.record_failure(now);
+                } else {
+                    self.failures = 0;
+                    self.next_attempt = None;
+                }
+            }
+        }
+    }
+
+    fn record_failure(&mut self, now: Instant) {
+        self.failures = self.failures.saturating_add(1);
+        self.next_attempt = Some(now + backoff_after(self.failures));
+    }
+}
+
+/// One peer's slot: its own progress, and a guard so a slow peer is never
+/// dispatched to twice at once.
+#[derive(Default)]
+struct TargetSlot {
+    in_flight: AtomicBool,
+    progress: Mutex<TargetProgress>,
+    last_no_auth_warn: Mutex<Option<Instant>>,
 }
 
 /// Continuously polls the EventStorage and CursorStorage to dispatch durable
 /// mesh events over UDP to their target nodes.
+///
+/// Every peer is dispatched to in its OWN task (DEF-181). Targets used to be
+/// walked one after another inside the tick, so one unreachable peer — whose
+/// connect waited out the OS SYN timeout — delayed every other peer's traffic
+/// on every tick. Now a slow peer occupies only its own slot, a failing one
+/// backs off, and events already sent are given time to be ACKed before they
+/// are sent again.
 pub async fn outbound_dispatcher(
     ledger: Arc<dyn EventStorage>,
     tracker: Arc<dyn CursorStorage>,
@@ -49,12 +143,7 @@ pub async fn outbound_dispatcher(
 
     // Poll every 1 second
     let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(1));
-
-    // Last time we warned about a target we could not authenticate to, keyed by
-    // target node id. Throttles the "no auth key" warning to at most once per
-    // target per `NO_AUTH_KEY_WARN_INTERVAL` so a single unauthenticatable
-    // target cannot spam the log every tick.
-    let mut last_no_auth_warn: HashMap<String, Instant> = HashMap::new();
+    let mut slots: HashMap<String, Arc<TargetSlot>> = HashMap::new();
 
     loop {
         tokio::select! {
@@ -66,27 +155,69 @@ pub async fn outbound_dispatcher(
                         continue;
                     }
                 };
-                for (target_node_id, target_addr) in &targets {
-                    match dispatch_for_target(ledger.as_ref(), tracker.as_ref(), graph.as_ref(), &local_node_id, target_node_id, target_addr).await {
-                        Ok(DispatchStatus::Idle) | Ok(DispatchStatus::Dispatched) => {}
-                        Ok(DispatchStatus::NoAuthKey) => {
-                            let now = Instant::now();
-                            let due = last_no_auth_warn
-                                .get(target_node_id)
-                                .map(|last| now.duration_since(*last) >= NO_AUTH_KEY_WARN_INTERVAL)
-                                .unwrap_or(true);
-                            if due {
-                                last_no_auth_warn.insert(target_node_id.clone(), now);
-                                warn!(
-                                    "skipping mesh dispatch to {}: no auth key (unauthenticated/orphan target)",
-                                    target_node_id
-                                );
+                let now = Instant::now();
+                for (target_node_id, target_addr) in targets {
+                    let slot = slots.entry(target_node_id.clone()).or_default().clone();
+                    let skip_through = {
+                        let progress = slot.progress.lock().unwrap_or_else(|e| e.into_inner());
+                        if !progress.ready(now) {
+                            continue;
+                        }
+                        progress.skip_through(now)
+                    };
+                    // Still working on the previous tick's attempt: leave it be.
+                    if slot.in_flight.swap(true, Ordering::AcqRel) {
+                        continue;
+                    }
+                    let ledger = ledger.clone();
+                    let tracker = tracker.clone();
+                    let graph = graph.clone();
+                    let local_node_id = local_node_id.clone();
+                    tokio::spawn(async move {
+                        let result = dispatch_for_target(
+                            ledger.as_ref(),
+                            tracker.as_ref(),
+                            graph.as_ref(),
+                            &local_node_id,
+                            &target_node_id,
+                            &target_addr,
+                            skip_through,
+                        )
+                        .await;
+                        let finished = Instant::now();
+                        match result {
+                            Ok(status) => {
+                                if matches!(status, DispatchStatus::NoAuthKey) {
+                                    let mut last = slot
+                                        .last_no_auth_warn
+                                        .lock()
+                                        .unwrap_or_else(|e| e.into_inner());
+                                    let due = last
+                                        .map(|at| finished.duration_since(at) >= NO_AUTH_KEY_WARN_INTERVAL)
+                                        .unwrap_or(true);
+                                    if due {
+                                        *last = Some(finished);
+                                        warn!(
+                                            "skipping mesh dispatch to {}: no auth key (unauthenticated/orphan target)",
+                                            target_node_id
+                                        );
+                                    }
+                                }
+                                slot.progress
+                                    .lock()
+                                    .unwrap_or_else(|e| e.into_inner())
+                                    .record(finished, &status);
+                            }
+                            Err(e) => {
+                                error!("Failed to dispatch to {}: {}", target_node_id, e);
+                                slot.progress
+                                    .lock()
+                                    .unwrap_or_else(|e| e.into_inner())
+                                    .record_failure(finished);
                             }
                         }
-                        Err(e) => {
-                            error!("Failed to dispatch to {}: {}", target_node_id, e);
-                        }
-                    }
+                        slot.in_flight.store(false, Ordering::Release);
+                    });
                 }
             }
             _ = shutdown_rx.recv() => {
@@ -134,12 +265,18 @@ async fn dispatch_for_target(
     local_node_id: &str,
     target_node_id: &str,
     target_addr: &str,
+    skip_through: u64,
 ) -> Result<DispatchStatus> {
     // 1. Where does the target node's cursor currently sit?
     let cursor = tracker.get_cursor(target_node_id)?;
 
-    // 2. Query up to 50 un-acked events
-    let unacked_events = ledger.query_unacked_events(target_node_id, cursor, 50)?;
+    // 2. Query up to 50 un-acked events, minus those sent so recently that
+    //    their ACK is still on its way.
+    let unacked_events: Vec<_> = ledger
+        .query_unacked_events(target_node_id, cursor, 50)?
+        .into_iter()
+        .filter(|event| event.seq > skip_through)
+        .collect();
 
     if unacked_events.is_empty() {
         return Ok(DispatchStatus::Idle);
@@ -165,6 +302,8 @@ async fn dispatch_for_target(
     );
 
     // 4. Prepare the BeaconMessage batch (for now sending one event in the batch)
+    let mut sent_through = 0u64;
+    let mut send_failed = false;
     for event in unacked_events {
         let payload = serde_json::to_vec(&vec![&event])?;
 
@@ -190,10 +329,10 @@ async fn dispatch_for_target(
 
         match send_execution_message(target_addr, &msg).await {
             Ok(()) => {
-                let bytes_sent = serde_json::to_vec(&msg)?.len();
+                sent_through = sent_through.max(event.seq);
                 debug!(
-                    "Dispatched Event {} (seq: {}) to {} over execution transport ({} bytes)",
-                    event.event_id, event.seq, target_node_id, bytes_sent
+                    "Dispatched Event {} (seq: {}) to {} over execution transport",
+                    event.event_id, event.seq, target_node_id
                 );
             }
             Err(e) => {
@@ -201,13 +340,18 @@ async fn dispatch_for_target(
                     "Failed to send execution packet to {} at {}: {}",
                     target_node_id, target_addr, e
                 );
-                // Break out of the loop and try again next tick so we don't spam errors
+                // Stop here; the caller backs off and retries later, so a dead
+                // peer is not dialled every second.
+                send_failed = true;
                 break;
             }
         }
     }
 
-    Ok(DispatchStatus::Dispatched)
+    Ok(DispatchStatus::Dispatched {
+        sent_through,
+        send_failed,
+    })
 }
 
 #[cfg(test)]
@@ -243,6 +387,7 @@ mod tests {
                     latency_hint_ms: None,
                     trust_level: None,
                 },
+                build_version: String::new(),
             },
             mesh_host: mesh_host.map(str::to_string),
             mesh_port: execution_port.saturating_sub(2),
@@ -339,6 +484,7 @@ mod tests {
             "local-aiua-01",
             "orphan-aiua-01",
             "127.0.0.1:1",
+            0,
         )
         .await
         .expect("dispatch");
@@ -366,9 +512,132 @@ mod tests {
             "local-aiua-01",
             "orphan-aiua-01",
             "127.0.0.1:1",
+            0,
         )
         .await
         .expect("dispatch");
         assert!(matches!(status, DispatchStatus::NoAuthKey));
+    }
+
+    use super::{
+        ACK_GRACE, BACKOFF_MAX, DispatchStatus as Status, TargetProgress, TargetSlot, backoff_after,
+    };
+    use std::sync::atomic::Ordering;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn a_failing_peer_backs_off_and_a_success_resets_it() {
+        assert_eq!(backoff_after(1), Duration::from_secs(1));
+        assert_eq!(backoff_after(2), Duration::from_secs(2));
+        assert_eq!(backoff_after(4), Duration::from_secs(8));
+        assert_eq!(backoff_after(6), Duration::from_secs(30));
+        assert_eq!(backoff_after(60), BACKOFF_MAX, "capped, never overflowing");
+
+        let mut progress = TargetProgress::default();
+        let t0 = Instant::now();
+        assert!(progress.ready(t0));
+        let failed = Status::Dispatched {
+            sent_through: 0,
+            send_failed: true,
+        };
+        progress.record(t0, &failed);
+        progress.record(t0, &failed);
+        progress.record(t0, &failed);
+        assert!(!progress.ready(t0 + Duration::from_secs(3)), "backing off");
+        assert!(progress.ready(t0 + Duration::from_secs(5)));
+
+        progress.record(
+            t0 + Duration::from_secs(5),
+            &Status::Dispatched {
+                sent_through: 9,
+                send_failed: false,
+            },
+        );
+        assert!(
+            progress.ready(t0 + Duration::from_secs(5)),
+            "success resets it"
+        );
+    }
+
+    /// An event just sent is left alone while its ACK is due, and re-sent once
+    /// the grace has run out — a lost ACK still recovers.
+    #[test]
+    fn a_sent_event_waits_for_its_ack_then_is_retried() {
+        let mut progress = TargetProgress::default();
+        let t0 = Instant::now();
+        progress.record(
+            t0,
+            &Status::Dispatched {
+                sent_through: 42,
+                send_failed: false,
+            },
+        );
+        assert_eq!(progress.skip_through(t0 + Duration::from_secs(1)), 42);
+        assert_eq!(
+            progress.skip_through(t0 + ACK_GRACE - Duration::from_millis(1)),
+            42
+        );
+        assert_eq!(
+            progress.skip_through(t0 + ACK_GRACE + Duration::from_millis(1)),
+            0,
+            "no ACK after the grace: send it again"
+        );
+    }
+
+    /// A slow peer occupies only its own slot and is never dispatched twice.
+    #[test]
+    fn a_peer_being_dispatched_to_is_not_dispatched_to_again() {
+        let slot = TargetSlot::default();
+        assert!(
+            !slot.in_flight.swap(true, Ordering::AcqRel),
+            "first tick takes it"
+        );
+        assert!(
+            slot.in_flight.swap(true, Ordering::AcqRel),
+            "second tick sees it busy"
+        );
+        slot.in_flight.store(false, Ordering::Release);
+        assert!(!slot.in_flight.swap(true, Ordering::AcqRel), "free again");
+    }
+
+    /// Events inside their ACK grace are not selected for sending.
+    #[tokio::test]
+    async fn events_inside_the_ack_grace_are_not_resent() {
+        let storage = SqliteGraphStorage::open(":memory:").expect("open sqlite graph");
+        let graph = GraphDomain::new(Arc::new(storage.adapter()));
+        let ledger = SqliteEventStorage::open(":memory:").expect("open event storage");
+        let tracker = SqliteCursorStorage::open(":memory:").expect("open cursor storage");
+        let mut env = unacked_event("peer-aiua-01");
+        ledger.append_event(&mut env).expect("append");
+        let seq = env.seq;
+        assert!(seq > 0);
+
+        // Already sent through this seq and awaiting its ACK: nothing to do.
+        let status = dispatch_for_target(
+            &ledger,
+            &tracker,
+            &graph,
+            "local-aiua-01",
+            "peer-aiua-01",
+            "127.0.0.1:1",
+            seq,
+        )
+        .await
+        .expect("dispatch");
+        assert!(matches!(status, Status::Idle));
+
+        // Past the grace it is selected again (no auth key here, so it stops there).
+        let status = dispatch_for_target(
+            &ledger,
+            &tracker,
+            &graph,
+            "local-aiua-01",
+            "peer-aiua-01",
+            "127.0.0.1:1",
+            0,
+        )
+        .await
+        .expect("dispatch");
+        assert!(matches!(status, Status::NoAuthKey));
     }
 }

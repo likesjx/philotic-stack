@@ -3,7 +3,7 @@ title: Philotic Stack Architecture Reference
 doc_type: reference
 domain: runtime-sessions
 status: active
-last_updated: 2026-07-25
+last_updated: 2026-09-18
 tags:
 - runtime
 - reference
@@ -35,7 +35,7 @@ tracks_domains:
 
 # Philotic Stack — Architecture Reference
 
-> **Status:** Living Document | **Last Updated:** 2026-07-25
+> **Status:** Living Document | **Last Updated:** 2026-09-18
 
 This document describes the full runtime architecture of the Philotic Stack —
 a distributed AI agent operating system built in Rust. It is built around a powerful and intuitive **Hotel & Guest** metaphor. It covers The Hotel daemon (the orchestrator), all crates, all materialized Guest processes (the agents and gateways), the IPC and mesh transports,
@@ -48,6 +48,14 @@ work. For a legacy/transitional snapshot of current implementation status, use
 
 Generated UML/PlantUML diagrams for the graph-visible hierarchy live under
 `docs/architecture/generated/` and should be treated as derived views.
+
+Desktop operator access separates website identity and current MongoDB admin
+authority from hotel-owned sessions. A confidential gateway attests account-bound
+invite admission and obtains a short-lived, non-root hotel session; browser
+requests cannot supply that upstream credential. Both authorities are checked
+again during access. The [desktop gateway contract](../../crates/philotic-web/DESKTOP_GATEWAY.md)
+defines this boundary and its deployment gates; local integration tests are not
+proof that the public tunnel is enabled or production login is verified.
 
 ---
 

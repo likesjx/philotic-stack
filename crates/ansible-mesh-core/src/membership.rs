@@ -294,6 +294,7 @@ mod tests {
                 latency_hint_ms: Some(20),
                 trust_level: Some("trusted".into()),
             },
+            build_version: String::new(),
         }
     }
 
@@ -454,6 +455,7 @@ mod tests {
                 input_schema: serde_json::json!({"type": "object"}),
                 class: "config".into(),
                 tool_markers: vec![],
+                batch_of: None,
             }],
             abstract_skills: vec![AbstractSkillRecord {
                 skill_name: "role.governance".into(),

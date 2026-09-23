@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - http-egress-execution-boundary
+
+rectangle "http-egress-execution-boundary" as http_egress_execution_boundary #Orange {
+}
+
+
+@enduml

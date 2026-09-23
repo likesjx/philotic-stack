@@ -184,12 +184,117 @@ pub struct ExtensionEdge {
     pub target_labels: Vec<String>,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+/// Value kind of a declared typed property.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PropertyKind {
+    String,
+    Integer,
+    Float,
+    Boolean,
+}
+
+impl PropertyKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            PropertyKind::String => "string",
+            PropertyKind::Integer => "integer",
+            PropertyKind::Float => "float",
+            PropertyKind::Boolean => "boolean",
+        }
+    }
+}
+
+/// A typed property declared for one label at runtime (Reflexive Life Graph
+/// R1, seam `lifegraph-typed-properties`). Declared through the same governed
+/// patch pipeline as labels and edges; once applied, `life.observe` accepts
+/// the key in `evidence.properties` for that label, validates its kind and
+/// range, and writes it onto the node — so "difficulty 55" is a number a
+/// query can read, not a phrase in `claim_summary`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ExtensionProperty {
+    /// Core or extension label the property belongs to.
+    pub label: String,
+    /// snake_case property name.
+    pub name: String,
+    pub kind: PropertyKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max: Option<f64>,
+    /// Closed vocabulary for string properties (empty = free text).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allowed: Vec<String>,
+    #[serde(default)]
+    pub guidance: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct OntologyExtensions {
     #[serde(default)]
     pub labels: Vec<ExtensionLabel>,
     #[serde(default)]
     pub edges: Vec<ExtensionEdge>,
+    #[serde(default)]
+    pub properties: Vec<ExtensionProperty>,
+}
+
+/// Properties every label accepts without a declaration.
+pub const UNIVERSAL_PROPERTIES: &[&str] = &["title", "status"];
+
+/// Node properties the runner owns; a caller may never set them through
+/// `evidence.properties`.
+pub const RESERVED_NODE_PROPERTIES: &[&str] = &[
+    "id",
+    "created_at",
+    "claim_summary",
+    "last_observed_summary",
+    "summary_updated",
+    "validation_state",
+    "observed_at",
+    "observed_by",
+    "observed_role",
+    "source_membrane",
+    "provenance",
+    "provenance_envelope",
+    "confidence",
+    "observation_id",
+    "packet_id",
+    "origin_engram_id",
+    "origin_trust",
+    "due_at",
+    "starts_at",
+    "occurs_at",
+    "ends_at",
+    "loop_status",
+    "last_confirmed_at",
+    "confirmed_at",
+    "resolved_at",
+    "retired_at",
+    "retired_by",
+    "tidied_at",
+    "tidied_by",
+    "tidied_reason",
+    "recall_utility",
+    "embedding",
+    "embedding_model_gen",
+    "embedding_dims",
+    "embedding_updated_at",
+    "embedding_space",
+];
+
+/// Identifier shape for a typed property NAME: snake_case, letters/digits/
+/// underscores, starts with a letter. Names reach Cypher only as map keys
+/// (`n += $properties`) and projected columns (`{var}.name`), so the shape
+/// gate is the injection guard, as for labels.
+pub fn valid_property_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    matches!(chars.next(), Some(c) if c.is_ascii_lowercase())
+        && name.len() >= 2
+        && name.len() <= 40
+        && name
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
 }
 
 /// Identifier shape for an extension LABEL: PascalCase, letters/digits only.
@@ -235,8 +340,9 @@ impl OntologyExtensions {
     /// rejected — an extension can never shadow compiled vocabulary.
     pub fn validate_against(&self, existing: &OntologyExtensions) -> Result<(), Vec<String>> {
         let mut violations = Vec::new();
-        if self.labels.is_empty() && self.edges.is_empty() {
-            violations.push("ontology_extension must add at least one label or edge".into());
+        if self.labels.is_empty() && self.edges.is_empty() && self.properties.is_empty() {
+            violations
+                .push("ontology_extension must add at least one label, edge or property".into());
         }
         for label in &self.labels {
             if !valid_extension_label_name(&label.name) {
@@ -295,6 +401,42 @@ impl OntologyExtensions {
                 }
             }
         }
+        for prop in &self.properties {
+            if !valid_property_name(&prop.name) {
+                violations.push(format!(
+                    "property '{}' is not a valid identifier (snake_case, 2-40 chars)",
+                    prop.name
+                ));
+            }
+            if RESERVED_NODE_PROPERTIES.contains(&prop.name.as_str())
+                || UNIVERSAL_PROPERTIES.contains(&prop.name.as_str())
+            {
+                violations.push(format!(
+                    "property '{}' collides with a runner-owned or universal property",
+                    prop.name
+                ));
+            }
+            if !label_known(&prop.label) {
+                violations.push(format!(
+                    "property '{}' names unknown label '{}'",
+                    prop.name, prop.label
+                ));
+            }
+            if let (Some(min), Some(max)) = (prop.min, prop.max)
+                && min > max
+            {
+                violations.push(format!(
+                    "property '{}' has min {} above max {}",
+                    prop.name, min, max
+                ));
+            }
+            if !prop.allowed.is_empty() && prop.kind != PropertyKind::String {
+                violations.push(format!(
+                    "property '{}' declares an allowed list but is not a string",
+                    prop.name
+                ));
+            }
+        }
         if violations.is_empty() {
             Ok(())
         } else {
@@ -313,8 +455,119 @@ impl OntologyExtensions {
             self.edges.retain(|e| e.rel_type != edge.rel_type);
             self.edges.push(edge);
         }
+        for prop in incoming.properties {
+            self.properties
+                .retain(|p| !(p.label == prop.label && p.name == prop.name));
+            self.properties.push(prop);
+        }
+    }
+
+    /// Typed properties declared for `label`.
+    pub fn declared_properties(&self, label: &str) -> Vec<&ExtensionProperty> {
+        self.properties
+            .iter()
+            .filter(|p| p.label == label)
+            .collect()
+    }
+
+    /// Validate an observation's `properties` map for `label`: every key must
+    /// be universal or declared for the label, every value a scalar of the
+    /// declared kind within its range or allowed list. Returns violations in
+    /// the contract's `contract_invalid` prose, naming the allowed keys so the
+    /// caller can fix the payload in one retry.
+    pub fn validate_properties(
+        &self,
+        label: &str,
+        properties: &std::collections::BTreeMap<String, serde_json::Value>,
+    ) -> Vec<String> {
+        let mut violations = Vec::new();
+        if properties.is_empty() {
+            return violations;
+        }
+        let declared = self.declared_properties(label);
+        let allowed_keys = || {
+            let mut keys: Vec<String> = UNIVERSAL_PROPERTIES
+                .iter()
+                .map(|k| (*k).to_string())
+                .collect();
+            keys.extend(declared.iter().map(|p| p.name.clone()));
+            keys.join(", ")
+        };
+        for (key, value) in properties {
+            if let Some(prop) = declared.iter().find(|p| &p.name == key) {
+                match prop.kind {
+                    PropertyKind::String => match value.as_str() {
+                        Some(s) => {
+                            if !prop.allowed.is_empty() && !prop.allowed.iter().any(|a| a == s) {
+                                violations.push(format!(
+                                    "properties.{key} '{s}' is not one of: {}",
+                                    prop.allowed.join(", ")
+                                ));
+                            }
+                        }
+                        None => violations.push(format!("properties.{key} must be a string")),
+                    },
+                    PropertyKind::Integer => match value.as_i64() {
+                        Some(n) => check_range(&mut violations, key, n as f64, prop),
+                        None => violations.push(format!("properties.{key} must be an integer")),
+                    },
+                    PropertyKind::Float => match value.as_f64() {
+                        Some(n) => check_range(&mut violations, key, n, prop),
+                        None => violations.push(format!("properties.{key} must be a number")),
+                    },
+                    PropertyKind::Boolean => {
+                        if !value.is_boolean() {
+                            violations.push(format!("properties.{key} must be a boolean"));
+                        }
+                    }
+                }
+            } else if UNIVERSAL_PROPERTIES.contains(&key.as_str()) {
+                if !value.is_string() {
+                    violations.push(format!("properties.{key} must be a string"));
+                }
+            } else {
+                violations.push(format!(
+                    "properties.{key} is not declared for label {label} (allowed keys: {})",
+                    allowed_keys()
+                ));
+            }
+        }
+        violations
     }
 }
+
+fn check_range(violations: &mut Vec<String>, key: &str, n: f64, prop: &ExtensionProperty) {
+    if let Some(min) = prop.min
+        && n < min
+    {
+        violations.push(format!("properties.{key} {n} is below min {min}"));
+    }
+    if let Some(max) = prop.max
+        && n > max
+    {
+        violations.push(format!("properties.{key} {n} is above max {max}"));
+    }
+}
+
+/// Cypher projection fragment (leading comma included) returning every
+/// universal and declared typed property as a `prop__<name>` column, so
+/// `life.list` rows carry typed values without shipping `properties(n)`
+/// (which would drag the embedding vector along).
+pub fn property_projection(var: &str, ext: &OntologyExtensions) -> String {
+    let mut names: Vec<&str> = UNIVERSAL_PROPERTIES.to_vec();
+    for prop in &ext.properties {
+        if valid_property_name(&prop.name) && !names.contains(&prop.name.as_str()) {
+            names.push(prop.name.as_str());
+        }
+    }
+    names
+        .iter()
+        .map(|name| format!(", {var}.{name} AS prop__{name}"))
+        .collect::<String>()
+}
+
+/// Column prefix used by [`property_projection`].
+pub const PROPERTY_COLUMN_PREFIX: &str = "prop__";
 
 /// The agent-facing vocabulary document with runtime extensions merged in.
 pub fn ontology_document_with(ext: &OntologyExtensions) -> Value {
@@ -324,9 +577,18 @@ pub fn ontology_document_with(ext: &OntologyExtensions) -> Value {
             labels.push(json!(label.name));
         }
     }
+    doc["typed_properties"] = json!({
+        "universal": UNIVERSAL_PROPERTIES,
+        "declared": ext.properties,
+        "rule": "Structured facts go in evidence.properties, validated per label \
+                 (kind, range, allowed values) and written onto the node; keys not \
+                 declared for the label are rejected. Prose stays in claim_summary. \
+                 Declare new properties through the same schema_patch pipeline as labels.",
+    });
     doc["extensions"] = json!({
         "labels": ext.labels,
         "edges": ext.edges,
+        "properties": ext.properties,
         "rule": "Runtime extensions added through the governed patch pipeline \
                  (life.patch.propose patch_kind=schema_patch with an \
                  ontology_extension payload → operator confirm → \
@@ -679,6 +941,7 @@ mod tests {
 
     fn sample_extension() -> OntologyExtensions {
         OntologyExtensions {
+            properties: Vec::new(),
             labels: vec![ExtensionLabel {
                 name: "Pet".into(),
                 space: "life_event_semantic".into(),
@@ -700,6 +963,7 @@ mod tests {
         // Core collision, bad identifier, unknown space, unknown endpoint,
         // core rel collision — every class of violation reported.
         let bad = OntologyExtensions {
+            properties: Vec::new(),
             labels: vec![
                 ExtensionLabel {
                     name: "Event".into(),
@@ -735,6 +999,7 @@ mod tests {
     fn extension_merge_replaces_same_name_entries() {
         let mut current = sample_extension();
         current.merge(OntologyExtensions {
+            properties: Vec::new(),
             labels: vec![ExtensionLabel {
                 name: "Pet".into(),
                 space: "life_event_semantic".into(),
@@ -796,5 +1061,172 @@ mod tests {
             NamedMaintenanceQuery::ALL.len()
         );
         assert!(doc["known_gaps"].as_array().unwrap().len() >= 3);
+    }
+}
+
+#[cfg(test)]
+mod typed_property_tests {
+    use super::*;
+    use serde_json::json;
+    use std::collections::BTreeMap;
+
+    fn music_properties() -> OntologyExtensions {
+        OntologyExtensions {
+            labels: vec![ExtensionLabel {
+                name: "MusicSection".into(),
+                space: "life_event_semantic".into(),
+                guidance: String::new(),
+            }],
+            edges: vec![],
+            properties: vec![
+                ExtensionProperty {
+                    label: "CreativeWork".into(),
+                    name: "difficulty".into(),
+                    kind: PropertyKind::Integer,
+                    min: Some(0.0),
+                    max: Some(100.0),
+                    allowed: vec![],
+                    guidance: "0-100".into(),
+                },
+                ExtensionProperty {
+                    label: "CreativeWork".into(),
+                    name: "key".into(),
+                    kind: PropertyKind::String,
+                    min: None,
+                    max: None,
+                    allowed: vec![],
+                    guidance: String::new(),
+                },
+                ExtensionProperty {
+                    label: "MusicSection".into(),
+                    name: "measure_span".into(),
+                    kind: PropertyKind::String,
+                    min: None,
+                    max: None,
+                    allowed: vec![],
+                    guidance: String::new(),
+                },
+            ],
+        }
+    }
+
+    fn props(pairs: &[(&str, serde_json::Value)]) -> BTreeMap<String, serde_json::Value> {
+        pairs
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), v.clone()))
+            .collect()
+    }
+
+    #[test]
+    fn declared_properties_validate_by_kind_range_and_label() {
+        let ext = music_properties();
+        assert!(ext.validate_against(&OntologyExtensions::default()).is_ok());
+        assert!(
+            ext.validate_properties(
+                "CreativeWork",
+                &props(&[
+                    ("difficulty", json!(55)),
+                    ("key", json!("G minor")),
+                    ("title", json!("Passacaglia"))
+                ])
+            )
+            .is_empty()
+        );
+        let v = ext.validate_properties("CreativeWork", &props(&[("difficulty", json!(140))]));
+        assert!(v[0].contains("above max 100"), "{v:?}");
+        let v = ext.validate_properties("CreativeWork", &props(&[("difficulty", json!("hard"))]));
+        assert!(v[0].contains("must be an integer"), "{v:?}");
+        // A key declared for another label is not declared for this one.
+        let v = ext.validate_properties("CreativeWork", &props(&[("measure_span", json!("1-8"))]));
+        assert!(
+            v[0].contains("not declared for label CreativeWork"),
+            "{v:?}"
+        );
+        assert!(v[0].contains("difficulty"), "names the allowed keys: {v:?}");
+        // Undeclared label: only universal keys pass.
+        assert!(
+            ext.validate_properties("Project", &props(&[("status", json!("active"))]))
+                .is_empty()
+        );
+        let v = ext.validate_properties("Project", &props(&[("tempo", json!("Allegro"))]));
+        assert_eq!(v.len(), 1);
+    }
+
+    #[test]
+    fn property_declarations_are_validated_and_merged() {
+        let bad = OntologyExtensions {
+            labels: vec![],
+            edges: vec![],
+            properties: vec![
+                ExtensionProperty {
+                    label: "Nowhere".into(),
+                    name: "Bad-Name".into(),
+                    kind: PropertyKind::Integer,
+                    min: Some(10.0),
+                    max: Some(1.0),
+                    allowed: vec!["x".into()],
+                    guidance: String::new(),
+                },
+                ExtensionProperty {
+                    label: "Project".into(),
+                    name: "claim_summary".into(),
+                    kind: PropertyKind::String,
+                    min: None,
+                    max: None,
+                    allowed: vec![],
+                    guidance: String::new(),
+                },
+            ],
+        };
+        let errs = bad
+            .validate_against(&OntologyExtensions::default())
+            .unwrap_err();
+        let joined = errs.join("\n");
+        assert!(joined.contains("not a valid identifier"), "{joined}");
+        assert!(joined.contains("unknown label 'Nowhere'"), "{joined}");
+        assert!(joined.contains("min 10 above max 1"), "{joined}");
+        assert!(
+            joined.contains("allowed list but is not a string"),
+            "{joined}"
+        );
+        assert!(joined.contains("collides with a runner-owned"), "{joined}");
+
+        let mut current = music_properties();
+        current.merge(OntologyExtensions {
+            labels: vec![],
+            edges: vec![],
+            properties: vec![ExtensionProperty {
+                label: "CreativeWork".into(),
+                name: "difficulty".into(),
+                kind: PropertyKind::Integer,
+                min: Some(1.0),
+                max: Some(10.0),
+                allowed: vec![],
+                guidance: "1-10".into(),
+            }],
+        });
+        let d = current.declared_properties("CreativeWork");
+        assert_eq!(d.len(), 2);
+        assert_eq!(
+            d.iter().find(|p| p.name == "difficulty").unwrap().max,
+            Some(10.0)
+        );
+    }
+
+    #[test]
+    fn projection_covers_universal_and_declared_names_once() {
+        let frag = property_projection("n", &music_properties());
+        assert!(frag.contains(", n.title AS prop__title"));
+        assert!(frag.contains(", n.difficulty AS prop__difficulty"));
+        assert!(frag.contains(", n.measure_span AS prop__measure_span"));
+        assert_eq!(frag.matches("prop__key").count(), 1);
+        let doc = ontology_document_with(&music_properties());
+        assert_eq!(
+            doc["typed_properties"]["declared"]
+                .as_array()
+                .unwrap()
+                .len(),
+            3
+        );
     }
 }
