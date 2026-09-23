@@ -6763,6 +6763,15 @@ impl IpcServer {
                         "emit_task",
                     );
                 }
+                // An attachment's `blob_download_url` is this hotel's loopback,
+                // meaningless to the peer (DEF-200: a voice note from a Telegram
+                // seat on mac-jane died on the vps dialling its own 127.0.0.1).
+                // Carry small blobs with the task; the peer re-files them.
+                let wire_json = if target_node != local_node_id {
+                    crate::service::blob_transfer::embed_local_blobs(&task_json).await
+                } else {
+                    task_json.clone()
+                };
                 let env = EventEnvelope {
                     event_id: task_id,
                     seq: 0,
@@ -6775,9 +6784,7 @@ impl IpcServer {
                     attempt: 0,
                     created_at: 0,
                     expires_at: None,
-                    payload: EventPayload::Inline {
-                        data: task_json.clone(),
-                    },
+                    payload: EventPayload::Inline { data: wire_json },
                     trace: vec![],
                 };
                 let _ = dispatcher_tx.send(LedgerCommand::AppendLocal(env)).await;
