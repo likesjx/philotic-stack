@@ -176,6 +176,8 @@ fn file_inline_blob(dir: &Path, blob_id: &str, b64: &str) -> Result<(), Rejected
     }
     let final_path = dir.join(blob_id);
     if final_path.exists() {
+        // Needed again: keep it out of the retention sweep.
+        crate::service::blob::touch_blob(&final_path);
         return Ok(());
     }
     std::fs::create_dir_all(dir).map_err(|e| Rejected::Io(e.to_string()))?;
