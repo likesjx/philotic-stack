@@ -33,6 +33,12 @@ Contract: [desktop gateway hotel sessions](../crates/philotic-web/DESKTOP_GATEWA
 
 ### Cortex viewer
 
+Native sign-in continuation: [handoff proposal](architecture/NATIVE_OPERATOR_SIGNIN_PROPOSAL.md),
+branch `codex/native-signin`, seam `operator-session-auth`. Local-only PKCE/state
+and callback primitive added; no UI wiring, endpoint enablement or credential
+transmission. Agree the HTTPS gateway origin and scoped native handle contract
+with the desktop deployment owner before server implementation and app hookup.
+
 Branch: `codex/cortex-viewer`; seam: `muninn-admin-observability-plane`.
 Spec: [Cortex viewer](architecture/CORTEX_VIEWER_PROPOSAL.md).
 
