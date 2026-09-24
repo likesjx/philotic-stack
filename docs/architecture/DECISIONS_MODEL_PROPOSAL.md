@@ -192,12 +192,29 @@ Blast radius abbreviated as BR. Line references were read at `d624e5b8`. Items m
 | 4 | Approval intent and risk tier `philote/src/tool_exec.rs:422-463` *(survey)* | substring "yes" (matches "yesterday") | approved yes/no + P; risk Low/Med/High | tool path | highest consequence per false positive; abstain means ask again. |
 | 5 | LifeGraph duplicate guard and audit `closable` `data-memorygraphrag/src/hygiene.rs`, `audit.rs` *(survey)* | Jaccard 0.80 / 0.55, cosine 0.90 | same / related / distinct; closable / needs_judgment / leave | write-time and batch | DEF-158, DEF-159. Dates stay in code. |
 | 6 | Lived-fact classifier `philote/src/life_capture.rs:255` *(survey)* | keyword vocabulary | OpenLoop / Commitment / Goal / Habit / Event / Decision / none | post-turn | already abstains on ambiguity. |
-| 7 | Model difficulty for routing (`RouteNeed`, `model_oracle.rs:146`) | health-based only | difficulty score | routing | new capability; no defect history. |
+| 7 | Model difficulty for routing (`RouteNeed`, `model_oracle.rs:146`) | health-based only | difficulty score | routing | new capability; no defect history. See "Assessment: Jev as a model router" below. |
 | 8 | Open-request, shame-tone, correction detectors *(survey)* | keyword lists | yes/no | post-turn | low BR. |
 
 **Best first pilot: `heal-dispatcher` classify** (`crates/heal-dispatcher/src/main.rs:804`). It is off the hot path (30 s poll), already a typed JSON classifier (`gemma3:4b`, `format: json`) with a circuit breaker and a severity floor (`gate_llm_action`, `:854`), and needs no calibration data on day one.
 
 **Not targets:** `philote/src/reflex.rs` (a typed rule table, no ambiguity), media and voice routing (config lookups), `prompt-guard` and `exec-guard` (deliberately model-free), cron payload validation (better fixed with a validator), zombie-turn and silence detection (time and count thresholds).
+
+### Assessment: Jev as a model router (candidate 7, 2026-09-24)
+
+The operator asked whether the decisions model could act as the model router. Short answer: **not as a synchronous per-turn router today. It can serve as a shadow-mode difficulty judge that informs routing later**, and that job needs its own slices. Findings (read at `61a4c4a8`):
+
+- **Data policy blocks the obvious input.** The user's message is class C, and `decisions-client/src/gate.rs` hard-codes class C as never allowed. `SITES` lists only `heal.classify` and `smoke.live`. A routing site may send only class-B *features* derived from the ask, never its text: character or token length, attachment kinds, count of tools offered, whether the ask is a cron turn, the active role, and the fields `QueryModelRoute` already carries (`request_class`, `needs_tools`, `needs_structured`, `approx_context_tokens`, `latency_class`, `trust_ceiling`). Class B needs an explicit `operator_opt_in` row. **That is an operator decision and has not been made.** Features that thin may not beat a rule table, and the shadow run exists to measure exactly that.
+- **Latency does not fit an inline router.** Measured round trips are 0.29-0.61 s over OpenRouter, while `MODEL_GRAPH_FLYWHEEL_PROPOSAL` Slice 9 budgets "<50ms local" for a routing oracle. An inline call would add that delay to every first dispatch. The call must be non-blocking, or parallel with a deadline and a deterministic fallback to the ladder.
+- **A verdict has nowhere to land yet.** Every dispatch site overwrites `model_req.model` from `role_model_binding` unconditionally: `philote/src/runtime.rs:2918, :3734, :4256, :4986, :5619` and `turn_loop.rs:904, :2726, :2893, :3157`. The "per-ask" tier in `MODEL_REFLEX_PROPOSAL` (Seam A, keep a model the caller already set) does not exist. That seam is a prerequisite whoever makes the decision.
+- **What already exists to build on.** The health oracle (`model_oracle.rs`, `rank_models`, IPC `QueryModelRoute`) filters by capability and health. `shadow_oracle_pick` (`turn_loop.rs:3700`, `PHILOTIC_SHADOW_ORACLE`) already logs oracle-vs-ladder disagreement, but hard-codes `approx_context_tokens: 0` and `needs_tools: true`. philote has no token estimator. The catalog (`model_catalog.openrouter`) holds tools/context/price per model, and `model_profile` holds live per-hotel health. Since DEF-202/203/204 both are fresh on every hotel.
+- **What Jev should answer, and what it should not.** It fits the typed question "how hard is this ask?" (`score`: trivial / normal / hard / long-context) or "which tier?" (`choice` over the role's `fallback_tiers`). The concrete model is still picked in code from the tier, the catalog and the health rows, so Jev never names a model id and never becomes an authority. Thresholds stay in call-site code (invariant). An abstain or error means the ladder, as today.
+
+**Proposed order (not yet slices; each needs the operator's go):**
+
+1. **R0 — Seam A.** Dispatch sites keep a model already set on the request (`.or_else`), plus a `SelectionSource::PerAsk` variant. No behaviour change until something sets it.
+2. **R1 — features.** A token estimate and a `RouteFeatures` struct built at `handle_user_message` (`runtime.rs:~3628`, before `resolve_model_execution_target`). Feed the real values into `shadow_oracle_pick` instead of the hard-coded ones.
+3. **R2 — shadow site `route.difficulty`.** A class-B site, log-only, fired in parallel with dispatch, writing `decision_traces`. Compare its answers with `router_traces` outcomes (latency, failure, escalation). **Blocked on the operator's class-B opt-in.** A local classifier (open question 6, e.g. `gemma3` on Ollama) can fill the same envelope first with no data-policy question at all.
+4. **R3 — promote.** Only if the traces show the verdict would have avoided failures or cost, set the per-ask tier from it, below the operator pin and sticky override and above the ladder primary. The ladder stays the fallback.
 
 ## Invariants
 
