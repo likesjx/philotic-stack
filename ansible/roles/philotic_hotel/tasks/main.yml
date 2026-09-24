@@ -167,6 +167,7 @@
     mode: "0600"
   no_log: true
   notify: Restart philotic-hotel
+  tags: [config]
 
 # ── Agent workspace access ─────────────────────────────────────────────────────
 # Grant the philotic user read access to any declared agent import_workspace paths.
@@ -238,6 +239,7 @@
     mode: "0600"
   no_log: true
   notify: Restart philotic-hotel
+  tags: [config]
 
 - name: Seed hotel graph/config from mesh-config.json
   command:
@@ -304,6 +306,7 @@
   notify:
     - Reload systemd
     - Restart philotic-hotel
+  tags: [config]
 
 - name: Enable and start philotic-hotel
   systemd:

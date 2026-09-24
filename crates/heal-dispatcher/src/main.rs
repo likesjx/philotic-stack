@@ -1,5 +1,6 @@
 mod notify;
 mod recurrence;
+mod shadow;
 
 use ansible_mesh_core::heal_queue::HealQueueRow;
 use anyhow::Result;
@@ -297,6 +298,12 @@ impl OllamaBreaker {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // `heal-dispatcher --decision-summary`: print what the shadow judge has
+    // recorded, then exit. Read-only; it never starts the daemon.
+    if std::env::args().nth(1).as_deref() == Some("--decision-summary") {
+        return shadow::print_summary();
+    }
+
     tracing_subscriber::fmt::init();
     info!("heal-dispatcher starting");
 
@@ -365,6 +372,10 @@ async fn run(
         .timeout(Duration::from_secs(30))
         .build()?;
 
+    // Log-only decisions pilot beside the incumbent classifier. `None` (and no
+    // cost) unless PHILOTIC_SHADOW_DECISIONS is set and the dedicated key loads.
+    let shadow = shadow::ShadowJudge::init(&mut ipc, &http).await;
+
     let mut interval = tokio::time::interval(Duration::from_secs(POLL_INTERVAL_SECS));
     loop {
         interval.tick().await;
@@ -377,6 +388,7 @@ async fn run(
             breaker,
             notifier,
             intel_graph_url,
+            shadow.as_ref(),
         )
         .await
         {
@@ -398,6 +410,7 @@ async fn dispatch_cycle(
     breaker: &mut OllamaBreaker,
     notifier: &mut OperatorNotifier,
     intel_graph_url: Option<&str>,
+    shadow: Option<&shadow::ShadowJudge>,
 ) -> Result<()> {
     // Proactively repair session turns the guest can no longer speak for. This is
     // a BACKSTOP, not the primary turn timeout: philote bounds its own turns and
@@ -474,6 +487,7 @@ async fn dispatch_cycle(
             breaker,
             notifier,
             intel_graph_url,
+            shadow,
             &row,
         )
         .await?;
@@ -491,6 +505,7 @@ async fn process_row(
     breaker: &mut OllamaBreaker,
     notifier: &mut OperatorNotifier,
     intel_graph_url: Option<&str>,
+    shadow: Option<&shadow::ShadowJudge>,
     row: &HealQueueRow,
 ) -> Result<()> {
     // Rows from the hotel's turn-failure intake (FailTask classification,
@@ -515,6 +530,7 @@ async fn process_row(
                     ollama_url,
                     ollama_model,
                     breaker,
+                    shadow,
                     &row.guest_id,
                     &row.raw_text,
                 )
@@ -806,6 +822,7 @@ async fn classify(
     ollama_url: &str,
     ollama_model: &str,
     breaker: &mut OllamaBreaker,
+    shadow: Option<&shadow::ShadowJudge>,
     guest_id: &str,
     raw_text: &str,
 ) -> (String, String, String) {
@@ -819,6 +836,10 @@ async fn classify(
     // single cycle full of novel lines from stalling for BATCH_LIMIT*30s.
     if breaker.is_open(Instant::now()) {
         debug!("heal-dispatcher: ollama circuit breaker open, short-circuiting classify to noop");
+        // The incumbent had no verdict here; the shadow judge still observes.
+        if let Some(shadow) = shadow {
+            shadow.observe(guest_id, raw_text, None);
+        }
         return noop_classification();
     }
 
@@ -832,11 +853,27 @@ async fn classify(
         Ok((severity, pattern_tag, heal_action)) => {
             breaker.record_success();
             let heal_action = gate_llm_action(&severity, &heal_action);
+            // Log-only: the judge sees the same line and records whether it
+            // agrees with what the incumbent just decided. It never changes it.
+            if let Some(shadow) = shadow {
+                shadow.observe(
+                    guest_id,
+                    raw_text,
+                    Some(shadow::Incumbent {
+                        severity: severity.clone(),
+                        pattern_tag: pattern_tag.clone(),
+                        heal_action: heal_action.clone(),
+                    }),
+                );
+            }
             (severity, pattern_tag, heal_action)
         }
         Err(e) => {
             breaker.record_failure(Instant::now());
             warn!("gemma classify failed ({e}), falling back to noop");
+            if let Some(shadow) = shadow {
+                shadow.observe(guest_id, raw_text, None);
+            }
             noop_classification()
         }
     }

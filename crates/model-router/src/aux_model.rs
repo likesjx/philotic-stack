@@ -71,7 +71,8 @@ impl AuxTaskKind {
     /// Map a dispatched task's [`TaskKind`] onto the aux kind it configures,
     /// if any. Returns `None` for cognitive/synthesis kinds (`TextGenerate`,
     /// `ResponseGenerate`, `VoiceDialogue`, `VoiceSynthesize`) — those are out
-    /// of scope for this slice (see module docs on `TitleGen`).
+    /// of scope for this slice (see module docs on `TitleGen`). `Decide` is also
+    /// `None`: a decision is handled on its own path and is not model-pinned.
     pub fn from_task_kind(kind: TaskKind) -> Option<Self> {
         match kind {
             TaskKind::MediaAnalyze => Some(Self::Summarization),
@@ -80,7 +81,8 @@ impl AuxTaskKind {
             TaskKind::TextGenerate
             | TaskKind::ResponseGenerate
             | TaskKind::VoiceDialogue
-            | TaskKind::VoiceSynthesize => None,
+            | TaskKind::VoiceSynthesize
+            | TaskKind::Decide => None,
         }
     }
 }

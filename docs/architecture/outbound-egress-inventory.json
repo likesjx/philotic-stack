@@ -59,6 +59,13 @@
       "note": "Hotel-to-hotel artifact transfer has a dedicated signed edge protocol."
     },
     {
+      "path": "crates/philotic-web/src/serve/desktop_session.rs",
+      "traffic_classes": ["local-resource"],
+      "disposition": "named-exception",
+      "authority": "desktop hotel-session issuer HTTP contract tests",
+      "note": "The only direct client is in the module's #[cfg(test)] code, exercising the issuer's loopback endpoint; production code in this file makes no outbound calls."
+    },
+    {
       "path": "crates/graph-intelligence/src/embeddings.rs",
       "traffic_classes": ["local-resource"],
       "disposition": "named-exception",
@@ -144,10 +151,10 @@
     },
     {
       "path": "crates/heal-dispatcher/src/main.rs",
-      "traffic_classes": ["local-resource"],
+      "traffic_classes": ["local-resource", "model-provider"],
       "disposition": "named-exception",
-      "authority": "heal dispatcher configuration",
-      "note": "Local Ollama, intel-graph, and health-probe protocols."
+      "authority": "heal dispatcher configuration; DECISIONS_MODEL_PROPOSAL.md data policy",
+      "note": "Local Ollama, intel-graph, and health-probe protocols. This shared client is also lent to the shadow decisions judge (shadow.rs), which can call OpenRouter's /api/alpha/decisions ONLY when PHILOTIC_SHADOW_DECISIONS is set (default off): allow-listed site (heal.classify, data class A), conversation-payload screen and redaction at decisions-client's egress point, model-controller failure lines never sent, last 500 characters only."
     },
     {
       "path": "crates/model-router/src/runtime.rs",

@@ -1921,6 +1921,7 @@ impl ModelProvider for GeminiProvider {
             }
             TaskKind::VoiceSynthesize => bail!("Gemini does not support voice synthesis"),
             TaskKind::Embed => bail!("Gemini does not support local embedding (use OnnxProvider)"),
+            TaskKind::Decide => bail!("Gemini does not support decisions.evaluate"),
         };
 
         // Per-agent content policy → safetySettings. A single post-processing
@@ -2778,6 +2779,7 @@ mod tests {
             response_route: None,
             provider_options: Default::default(),
             effective_rights: Vec::new(),
+            decisions: None,
             tools,
         }
     }
@@ -3004,6 +3006,7 @@ mod tests {
             response_route: None,
             provider_options: Default::default(),
             effective_rights: Vec::new(),
+            decisions: None,
             tools: vec![],
         };
 
@@ -3051,6 +3054,7 @@ mod tests {
             response_route: None,
             provider_options: Default::default(),
             effective_rights: Vec::new(),
+            decisions: None,
             tools: vec![],
         };
 
@@ -3087,6 +3091,7 @@ mod tests {
             response_route: None,
             provider_options: Default::default(),
             effective_rights: Vec::new(),
+            decisions: None,
             tools: vec![],
         };
 
@@ -3126,6 +3131,7 @@ mod tests {
             response_route: None,
             provider_options: Default::default(),
             effective_rights: Vec::new(),
+            decisions: None,
             tools: vec![],
         };
         let voice_dialogue = ControllerTask {
@@ -3162,6 +3168,7 @@ mod tests {
             response_route: None,
             provider_options: Default::default(),
             effective_rights: Vec::new(),
+            decisions: None,
             tools: vec![],
         };
 
@@ -3205,6 +3212,7 @@ mod tests {
             response_route: None,
             provider_options: Default::default(),
             effective_rights: Vec::new(),
+            decisions: None,
             tools: vec![],
         };
 
@@ -3931,6 +3939,7 @@ mod tests {
             response_route: None,
             provider_options,
             effective_rights: Vec::new(),
+            decisions: None,
             tools: vec![],
         };
 

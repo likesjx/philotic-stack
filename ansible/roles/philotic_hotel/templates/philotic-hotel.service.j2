@@ -48,6 +48,12 @@ Environment="PHILOTIC_DREAM_SWEEP_ENABLED=1"
 Environment="PHILOTIC_MEMORY_SLEEP_MUTATE=1"
 {% endif %}
 {% endif %}
+{% if philotic_shadow_decisions_enabled | default(false) | bool %}
+# Decisions model shadow pilot (heal-dispatcher only, log-only). See
+# crates/heal-dispatcher/src/shadow.rs.
+Environment="PHILOTIC_SHADOW_DECISIONS=1"
+Environment="PHILOTIC_DECISION_TRACE_DB={{ philotic_data_dir }}/decision_traces.db"
+{% endif %}
 
 # Mesh PSK — injected from Ansible vault; never stored in plaintext on disk
 EnvironmentFile={{ philotic_etc_dir }}/secrets.env

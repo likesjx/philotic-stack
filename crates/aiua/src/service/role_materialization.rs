@@ -1055,6 +1055,15 @@ impl IpcServer {
                     );
                     return true;
                 }
+                // A peer's attachment arrives inline (DEF-200): file it in this
+                // hotel's blob store and point the task at it, so the agent
+                // fetches from its own loopback instead of the sender's.
+                let materialized = if event.source_node_id != local_node_id {
+                    crate::service::blob_transfer::materialize_inline_blobs(data).await
+                } else {
+                    data.clone()
+                };
+                let data = &materialized;
                 if target_role == philotic_client::OPERATOR_SURFACE_QUERY_ROLE {
                     if let Err(reason) =
                         crate::service::operator_surface::mesh_operator_handoff_permitted(

@@ -1,4 +1,5 @@
 pub mod blob;
+pub mod blob_transfer;
 pub mod command_manifest;
 pub mod continuity;
 pub mod cron_ticker;
