@@ -88,8 +88,92 @@ pub fn shadow_enabled(env: impl Fn(&str) -> Option<String>) -> bool {
     })
 }
 
-pub struct ShadowJudge {
+/// The typed-decisions judge for failure lines. Two independent modes:
+///
+/// - **shadow** (`PHILOTIC_SHADOW_DECISIONS`): log-only, beside the incumbent;
+///   see [`DecisionsJudge::observe`].
+/// - **fallback** (`PHILOTIC_HEAL_DECISIONS_FALLBACK`): when the incumbent has no
+///   verdict (Ollama down or its breaker open), the judge's answer IS applied —
+///   bounded to tagging + severity, never a restart; see
+///   [`DecisionsJudge::classify_fallback`].
+const FALLBACK_ENV_FLAG: &str = "PHILOTIC_HEAL_DECISIONS_FALLBACK";
+/// Fallback calls allowed per wall-clock minute; beyond it rows keep the old
+/// `unclassified`/noop fail-safe, so an Ollama outage cannot stall the loop.
+const FALLBACK_CALLS_PER_MINUTE: u32 = 30;
+/// Consecutive fallback failures (errors or timeouts) that open its breaker.
+const FALLBACK_BREAKER_THRESHOLD: u32 = 3;
+/// How long an open fallback breaker skips the call.
+const FALLBACK_BREAKER_COOLDOWN_SECS: u64 = 60;
+/// A tag is applied only when its probability reaches this; below it the row
+/// stays `unclassified`. Call-site threshold (invariant: thresholds live in
+/// code, calibrated per question from `decision_traces`).
+pub const FALLBACK_MIN_TAG_PROBABILITY: f64 = 0.6;
+/// Option key meaning "none of the listed patterns".
+pub const OTHER_TAG: &str = "other";
+
+/// The patterns the fallback may assign: `(tag, description)`. Every tag maps
+/// through `heal_action_for_pattern_tag`; none maps to `restart_guest`, and the
+/// verdict caps any restart to `escalate` regardless.
+pub const FALLBACK_TAGS: &[(&str, &str)] = &[
+    (
+        "telegram_poll_conflict",
+        "Telegram 409 Conflict: another process is polling the same bot token (getUpdates)",
+    ),
+    (
+        "external_api_4xx",
+        "A non-model external API (Telegram, Discord, an integration) rejected our request: 4xx",
+    ),
+    (
+        "external_api_5xx",
+        "A non-model external API or upstream service failed or was unreachable: 5xx, timeout, connection refused",
+    ),
+    (
+        "service_probe_failed",
+        "A local dependency service (memory store, database, sidecar) is unreachable",
+    ),
+    (
+        "delivery_channel_closed",
+        "A message or task could not be delivered because a channel or socket was closed",
+    ),
+    (
+        "config_error",
+        "Missing or invalid configuration, credential, token, or permission",
+    ),
+    (
+        "benign_log",
+        "Informational or expected noise: a retry notice, back-off, shutdown, or a warning with no failure",
+    ),
+    (OTHER_TAG, "None of the above"),
+];
+
+/// `PHILOTIC_HEAL_DECISIONS_FALLBACK` is off unless set to a truthy value.
+pub fn fallback_enabled(env: impl Fn(&str) -> Option<String>) -> bool {
+    env(FALLBACK_ENV_FLAG).is_some_and(|v| {
+        matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "on" | "yes"
+        )
+    })
+}
+
+fn unix_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
+}
+
+pub struct DecisionsJudge {
     inner: Arc<Inner>,
+    shadow_on: bool,
+    fallback_on: bool,
+    /// `(minute, calls)` — fallback calls are budgeted per wall-clock minute.
+    fallback_budget: std::sync::Mutex<(u64, u32)>,
+    /// `(consecutive failures, open until unix secs)`. The fallback is awaited
+    /// inline, so a hung or unreachable provider must not cost every row the
+    /// full deadline: after [`FALLBACK_BREAKER_THRESHOLD`] failures in a row it
+    /// is skipped for [`FALLBACK_BREAKER_COOLDOWN_SECS`] (the dispatcher's
+    /// heartbeat watchdog fires at 90 s).
+    fallback_breaker: std::sync::Mutex<(u32, u64)>,
 }
 
 struct Inner {
@@ -98,11 +182,13 @@ struct Inner {
     permits: Arc<Semaphore>,
 }
 
-impl ShadowJudge {
+impl DecisionsJudge {
     /// `None` (and no network or IPC cost) unless the flag is set. If it is set
     /// but the key or the trace store is unavailable, warn once and stay off.
     pub async fn init(ipc: &mut PhiloticClient, http: &reqwest::Client) -> Option<Self> {
-        if !shadow_enabled(|k| std::env::var(k).ok()) {
+        let shadow_on = shadow_enabled(|k| std::env::var(k).ok());
+        let fallback_on = fallback_enabled(|k| std::env::var(k).ok());
+        if !shadow_on && !fallback_on {
             return None;
         }
         let config = match load_decisions_config(ipc).await {
@@ -138,11 +224,14 @@ impl ShadowJudge {
         );
         info!(
             site = SITE,
-            "heal-dispatcher: shadow decisions enabled (log-only)"
+            shadow = shadow_on,
+            fallback = fallback_on,
+            "heal-dispatcher: decisions judge enabled"
         );
-        Some(Self::from_parts(client, store))
+        Some(Self::from_parts(client, store).with_modes(shadow_on, fallback_on))
     }
 
+    /// Shadow mode only (the D2 default); see [`Self::with_modes`].
     pub fn from_parts(client: DecisionsClient, store: Arc<dyn DecisionTraceStorage>) -> Self {
         Self {
             inner: Arc::new(Inner {
@@ -150,12 +239,139 @@ impl ShadowJudge {
                 store,
                 permits: Arc::new(Semaphore::new(MAX_IN_FLIGHT)),
             }),
+            shadow_on: true,
+            fallback_on: false,
+            fallback_budget: std::sync::Mutex::new((0, 0)),
+            fallback_breaker: std::sync::Mutex::new((0, 0)),
         }
+    }
+
+    pub fn with_modes(mut self, shadow_on: bool, fallback_on: bool) -> Self {
+        self.shadow_on = shadow_on;
+        self.fallback_on = fallback_on;
+        self
+    }
+
+    pub fn fallback_on(&self) -> bool {
+        self.fallback_on
+    }
+
+    /// Classify a failure line the incumbent could not (slice H1). Returns
+    /// `None` — leaving the caller on its old fail-safe — when fallback mode is
+    /// off, the line is a model-failure line, the minute's budget is spent, or
+    /// the call fails. Awaited inline: the dispatcher is off the hot path and
+    /// the call is capped at [`DEADLINE`]. Every call writes a trace row keyed
+    /// by the heal row id.
+    pub async fn classify_fallback(
+        &self,
+        row_id: &str,
+        guest_id: &str,
+        raw_text: &str,
+    ) -> Option<(String, String, String)> {
+        if !self.fallback_on {
+            return None;
+        }
+        let refused = is_model_failure_line(raw_text);
+        let now = unix_secs();
+        if !refused && self.fallback_breaker_open(now) {
+            debug!("decisions fallback breaker open; leaving row unclassified");
+            return None;
+        }
+        if !refused && !self.take_fallback_budget(now) {
+            debug!("decisions fallback budget spent this minute; leaving row unclassified");
+            return None;
+        }
+        let (bytes_sent, result) = if refused {
+            (
+                0,
+                Err(DecisionsError::new(
+                    DecisionsErrorClass::PolicyRefused,
+                    "model-controller failure line: a provider error body can echo the request",
+                )),
+            )
+        } else {
+            let request = build_fallback_request(guest_id, &gate::tail(raw_text, MAX_LINE_CHARS));
+            let audited = self
+                .inner
+                .client
+                .evaluate_audited(&request, None, DEADLINE)
+                .await;
+            (audited.bytes_sent, audited.result)
+        };
+        match &result {
+            Ok(_) => self.record_fallback_result(true, unix_secs()),
+            Err(e) if e.class != DecisionsErrorClass::PolicyRefused => {
+                self.record_fallback_result(false, unix_secs())
+            }
+            Err(_) => {}
+        }
+        let verdict = result
+            .as_ref()
+            .ok()
+            .map(|outcome| fallback_verdict(&outcome.result.answers));
+        let mut record = trace_record(guest_id, bytes_sent, None, &result);
+        record.incumbent = Some(json!({
+            "mode": "fallback",
+            "row_id": row_id,
+            "applied": verdict.as_ref().map(|(sev, tag, action)| json!({
+                "severity": sev, "pattern_tag": tag, "heal_action": action,
+            })),
+        }));
+        if let Err(e) = self.inner.store.record_trace(&record) {
+            warn!("decision trace write failed: {e:#}");
+        }
+        verdict
+    }
+
+    fn fallback_breaker_open(&self, now_secs: u64) -> bool {
+        let breaker = self
+            .fallback_breaker
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        now_secs < breaker.1
+    }
+
+    fn record_fallback_result(&self, ok: bool, now_secs: u64) {
+        let mut breaker = self
+            .fallback_breaker
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if ok {
+            *breaker = (0, 0);
+            return;
+        }
+        breaker.0 += 1;
+        if breaker.0 >= FALLBACK_BREAKER_THRESHOLD {
+            warn!(
+                failures = breaker.0,
+                "decisions fallback failing; skipping it for {FALLBACK_BREAKER_COOLDOWN_SECS}s"
+            );
+            *breaker = (0, now_secs + FALLBACK_BREAKER_COOLDOWN_SECS);
+        }
+    }
+
+    fn take_fallback_budget(&self, now_secs: u64) -> bool {
+        let minute = now_secs / 60;
+        let mut budget = self
+            .fallback_budget
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if budget.0 != minute {
+            *budget = (minute, 0);
+        }
+        if budget.1 >= FALLBACK_CALLS_PER_MINUTE {
+            return false;
+        }
+        budget.1 += 1;
+        true
     }
 
     /// Fire and forget. Returns immediately; never fails the caller. If too many
     /// calls are already in flight this one is skipped.
     pub fn observe(&self, guest_id: &str, raw_text: &str, incumbent: Option<Incumbent>) {
+        if !self.shadow_on {
+            return;
+        }
         let Ok(permit) = self.inner.permits.clone().try_acquire_owned() else {
             debug!("shadow judge busy; skipping one observation");
             return;
@@ -294,6 +510,53 @@ pub fn build_request(guest_id: &str, raw_text: &str) -> DecisionsRequest {
             },
         ],
     }
+}
+
+/// The fallback's questions: the shadow's severity choice plus a pattern choice
+/// over [`FALLBACK_TAGS`]. Same site and state as [`build_request`].
+pub fn build_fallback_request(guest_id: &str, raw_text: &str) -> DecisionsRequest {
+    let mut request = build_request(guest_id, raw_text);
+    request.questions.retain(|q| q.id == "severity");
+    request.questions.push(DecisionQuestion {
+        id: "pattern".into(),
+        instructions: "Which kind of failure is this guest process error?".into(),
+        spec: QuestionSpec::Choice {
+            options: FALLBACK_TAGS
+                .iter()
+                .map(|(key, description)| DecisionOption::new(*key, *description))
+                .collect(),
+        },
+    });
+    request
+}
+
+/// Map the fallback's answers to `(severity, pattern_tag, heal_action)`.
+/// Below [`FALLBACK_MIN_TAG_PROBABILITY`], or on `other`, the tag stays
+/// `unclassified`. The action comes from the deterministic tag table and is
+/// capped at `escalate`: the judge may label and route a line, never restart.
+pub fn fallback_verdict(answers: &BTreeMap<String, DecisionAnswer>) -> (String, String, String) {
+    let severity = match answers.get("severity") {
+        Some(DecisionAnswer::Choice { choice, .. }) => choice.clone(),
+        _ => "unknown".to_string(),
+    };
+    let tag = match answers.get("pattern") {
+        Some(DecisionAnswer::Choice {
+            choice,
+            probabilities,
+            ..
+        }) if choice != OTHER_TAG
+            && probabilities.get(choice).copied().unwrap_or(0.0)
+                >= FALLBACK_MIN_TAG_PROBABILITY =>
+        {
+            choice.clone()
+        }
+        _ => "unclassified".to_string(),
+    };
+    let action = match ansible_mesh_core::heal_queue::heal_action_for_pattern_tag(&tag) {
+        "restart_guest" => "escalate",
+        other => other,
+    };
+    (severity, tag, action.to_string())
 }
 
 /// Did the judge agree with the incumbent, per question? `None` = not
@@ -552,7 +815,7 @@ mod tests {
             Some("http://127.0.0.1:9".into()),
             None,
         );
-        let judge = ShadowJudge::from_parts(client, store.clone());
+        let judge = DecisionsJudge::from_parts(client, store.clone());
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -605,7 +868,7 @@ mod tests {
             Some("http://127.0.0.1:9".into()),
             None,
         );
-        let judge = ShadowJudge::from_parts(client, store.clone());
+        let judge = DecisionsJudge::from_parts(client, store.clone());
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -723,7 +986,10 @@ mod tests {
         format!("http://{addr}")
     }
 
-    fn judge(base: &str, dir: &std::path::Path) -> (ShadowJudge, Arc<SqliteDecisionTraceStorage>) {
+    fn judge(
+        base: &str,
+        dir: &std::path::Path,
+    ) -> (DecisionsJudge, Arc<SqliteDecisionTraceStorage>) {
         let store = Arc::new(SqliteDecisionTraceStorage::open(dir.join("d.db")).unwrap());
         let client = DecisionsClient::openrouter(
             reqwest::Client::default(),
@@ -731,7 +997,7 @@ mod tests {
             Some(format!("{base}/api")),
             None,
         );
-        (ShadowJudge::from_parts(client, store.clone()), store)
+        (DecisionsJudge::from_parts(client, store.clone()), store)
     }
 
     async fn wait_for_rows(
@@ -746,6 +1012,163 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
         panic!("no trace row appeared");
+    }
+
+    // ── fallback mode (slice H1) ─────────────────────────────────────────────
+
+    fn choice(choice: &str, p: &[(&str, f64)]) -> DecisionAnswer {
+        DecisionAnswer::Choice {
+            choice: choice.into(),
+            probabilities: p.iter().map(|(k, v)| (k.to_string(), *v)).collect(),
+            confidence: p.iter().map(|(_, v)| *v).fold(0.0, f64::max),
+        }
+    }
+
+    #[test]
+    fn fallback_verdict_applies_a_confident_tag_through_the_action_table() {
+        let answers = BTreeMap::from([
+            ("severity".to_string(), choice("high", &[("high", 0.8)])),
+            (
+                "pattern".to_string(),
+                choice("telegram_poll_conflict", &[("telegram_poll_conflict", 0.9)]),
+            ),
+        ]);
+        assert_eq!(
+            fallback_verdict(&answers),
+            (
+                "high".into(),
+                "telegram_poll_conflict".into(),
+                "escalate".into()
+            )
+        );
+    }
+
+    #[test]
+    fn fallback_verdict_keeps_unclassified_below_threshold_or_on_other() {
+        let unsure = BTreeMap::from([(
+            "pattern".to_string(),
+            choice("config_error", &[("config_error", 0.4)]),
+        )]);
+        assert_eq!(fallback_verdict(&unsure).1, "unclassified");
+        assert_eq!(fallback_verdict(&unsure).0, "unknown");
+        let other = BTreeMap::from([(
+            "pattern".to_string(),
+            choice(OTHER_TAG, &[(OTHER_TAG, 0.99)]),
+        )]);
+        assert_eq!(fallback_verdict(&other).1, "unclassified");
+        assert_eq!(fallback_verdict(&other).2, "noop");
+    }
+
+    #[test]
+    fn no_fallback_tag_can_restart_a_guest() {
+        for (tag, _) in FALLBACK_TAGS {
+            let answers = BTreeMap::from([("pattern".to_string(), choice(tag, &[(tag, 1.0)]))]);
+            assert_ne!(fallback_verdict(&answers).2, "restart_guest", "{tag}");
+        }
+    }
+
+    #[test]
+    fn fallback_request_is_valid_and_asks_severity_and_pattern() {
+        let request = build_fallback_request("mac-jane:membrane-gateway", "Conflict: 409");
+        request.validate(T::OpenRouter).expect("valid envelope");
+        let ids: Vec<_> = request.questions.iter().map(|q| q.id.as_str()).collect();
+        assert_eq!(ids, ["severity", "pattern"]);
+        assert_eq!(request.site, SITE);
+    }
+
+    #[test]
+    fn fallback_budget_resets_each_minute() {
+        let dir = tempfile::tempdir().unwrap();
+        let (judge, _) = judge("http://127.0.0.1:9", dir.path());
+        let judge = judge.with_modes(false, true);
+        for _ in 0..FALLBACK_CALLS_PER_MINUTE {
+            assert!(judge.take_fallback_budget(600));
+        }
+        assert!(!judge.take_fallback_budget(659), "spent within the minute");
+        assert!(judge.take_fallback_budget(660), "a new minute resets it");
+    }
+
+    const FALLBACK_BODY: &str = r#"{"model":"typesafe/jev-1.13-20260917","answers":{"severity":{"type":"choice","choice":"high","probabilities":{"critical":0.05,"high":0.9,"medium":0.03,"low":0.02},"confidence":0.9},"pattern":{"type":"choice","choice":"telegram_poll_conflict","probabilities":{"telegram_poll_conflict":0.93,"external_api_4xx":0.04,"other":0.03},"confidence":0.93}},"usage":{"input_tokens":420,"output_tokens":40,"cost":0.0000176},"id":"gen-dec-f","provider":"TypeSafe"}"#;
+
+    #[tokio::test]
+    async fn fallback_applies_the_verdict_and_traces_the_row_id() {
+        let base = serve("200 OK", FALLBACK_BODY, false).await;
+        let dir = tempfile::tempdir().unwrap();
+        let (judge, store) = judge(&base, dir.path());
+        let judge = judge.with_modes(false, true);
+
+        let verdict = judge
+            .classify_fallback(
+                "01ROWID",
+                "mac-jane:membrane-gateway",
+                "Telegram API error: Conflict: terminated by other getUpdates request",
+            )
+            .await;
+        assert_eq!(
+            verdict,
+            Some((
+                "high".into(),
+                "telegram_poll_conflict".into(),
+                "escalate".into()
+            ))
+        );
+        let rows = store.list_traces(10).unwrap();
+        assert_eq!(rows.len(), 1);
+        let incumbent = rows[0].incumbent.as_ref().unwrap();
+        assert_eq!(incumbent["mode"], "fallback");
+        assert_eq!(incumbent["row_id"], "01ROWID");
+        assert_eq!(
+            incumbent["applied"]["pattern_tag"],
+            "telegram_poll_conflict"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failing_provider_opens_the_fallback_breaker() {
+        let dir = tempfile::tempdir().unwrap();
+        // A hung provider: each call costs the full deadline and fails.
+        let base = serve("200 OK", FALLBACK_BODY, true).await;
+        let (judge, store) = judge(&base, dir.path());
+        let judge = judge.with_modes(false, true);
+        let start = std::time::Instant::now();
+        assert_eq!(judge.classify_fallback("r1", "g", "boom").await, None);
+        assert!(start.elapsed() >= DEADLINE, "the hang cost the deadline");
+        // Two more failures open the breaker (these also hang to the deadline:
+        // the unanswered listener stays alive and queues the connections).
+        for id in ["r2", "r3"] {
+            assert_eq!(judge.classify_fallback(id, "g", "boom").await, None);
+        }
+        assert!(judge.fallback_breaker_open(unix_secs()));
+        let before = store.list_traces(10).unwrap().len();
+        let start = std::time::Instant::now();
+        assert_eq!(judge.classify_fallback("r4", "g", "boom").await, None);
+        assert!(
+            start.elapsed() < Duration::from_millis(100),
+            "open breaker skips the call"
+        );
+        assert_eq!(
+            store.list_traces(10).unwrap().len(),
+            before,
+            "no call, no trace"
+        );
+        // It closes after the cooldown.
+        assert!(!judge.fallback_breaker_open(unix_secs() + FALLBACK_BREAKER_COOLDOWN_SECS));
+    }
+
+    #[tokio::test]
+    async fn fallback_never_sends_a_model_failure_line_and_shadow_mode_does_not_apply() {
+        let dir = tempfile::tempdir().unwrap();
+        // Unroutable base: any network attempt would error, not return a verdict.
+        let (judge, store) = judge("http://127.0.0.1:9", dir.path());
+        let fallback = judge.with_modes(false, true);
+        let line = "[mac-jane:model-controller][text.generate] gemini: 400 bad request";
+        assert_eq!(fallback.classify_fallback("r1", "g", line).await, None);
+        let rows = store.list_traces(10).unwrap();
+        assert_eq!(rows[0].outcome, "skipped");
+        assert_eq!(rows[0].bytes_sent, 0);
+
+        let shadow_only = fallback.with_modes(true, false);
+        assert_eq!(shadow_only.classify_fallback("r2", "g", "boom").await, None);
     }
 
     #[tokio::test]

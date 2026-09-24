@@ -140,6 +140,10 @@ Seam IDs: `model-catalog-schema`, `model-catalog-seed`, `model-catalog-projectio
 - [x] Mesh freshness (2026-09-24, `codex/model-graph-mesh-freshness`): DEF-202 (catalog refresh stalled on sleeping Macs — wall-clock due check), DEF-203 (vps `PHILOTIC_GRAPH_DB_PATH` pointed at retired `graph-runner.db`, stranding vps model health), DEF-204 (one legacy `model_profile` row emptied vps's gossiped profile list). Code + template test-green.
   - [ ] Deploy: aiua to all 3 hotels; `deploy_hotel.yml` (config) + hotel restart on vps-jane; delete the 2 legacy vps rows.
   - [ ] Watched-live proof: a `model_profile:*:vps-jane-aiua-01` row appears in mac-jane's/mbp-jane's `context.db`; mac-jane `model_catalog.openrouter` refreshes within 6 h wall time without a restart.
+- [x] Heal-queue drain/organize H0+H1 (2026-09-24, `codex/heal-queue-organize`): stale-escalation sweep, `occurrences` count, ANSI strip, recurrence on row time (DEF-205/208); decisions fallback for rows Ollama cannot classify (DEF-206). Test-green.
+  - [ ] Deploy all 3 hotels; set `PHILOTIC_HEAL_DECISIONS_FALLBACK=1` on mac-jane's heal-dispatcher (Ollama 93% errors there) after `aiua auth sync-roles --provider openrouter --db ~/.philotic/bjork/context.db`; watch `heal-dispatcher --decision-summary` and new `telegram_poll_conflict` rows.
+  - [ ] H2 cluster triage (`heal.triage`), H3 digest + D4 calibration — see DECISIONS_MODEL_PROPOSAL "Heal-queue drain and organize".
+  - [ ] DEF-207 Telegram 409 second poller (mac-jane + vps-jane).
 - [ ] Jev as model router — assessed 2026-09-24 in `DECISIONS_MODEL_PROPOSAL.md` ("Assessment: Jev as a model router"): not an inline router; R0 Seam A (per-ask tier) → R1 route features + token estimate → R2 shadow `route.difficulty` (blocked on operator class-B opt-in, or local classifier first) → R3 promote on evidence.
 
 ## New Project: Cypher-First Graph Datasource
