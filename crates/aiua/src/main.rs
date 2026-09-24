@@ -8128,15 +8128,33 @@ async fn main() -> Result<()> {
                 // without bound. Ceiling is env-overridable, defaulting to
                 // several days.
                 tokio::spawn(async move {
-                    use ansible_mesh_core::heal_queue::DEFAULT_ABANDON_CEILING_SECS;
+                    use ansible_mesh_core::heal_queue::{
+                        DEFAULT_ABANDON_CEILING_SECS, DEFAULT_STALE_ESCALATION_SECS,
+                    };
                     const SEVEN_DAYS: u64 = 7 * 24 * 3600;
                     let abandon_ceiling = std::env::var("PHILOTIC_HEAL_ABANDON_CEILING_SECS")
                         .ok()
                         .and_then(|v| v.parse::<u64>().ok())
                         .filter(|v| *v > 0)
                         .unwrap_or(DEFAULT_ABANDON_CEILING_SECS);
+                    // `0` disables the stale-escalation sweep.
+                    let stale_escalation = std::env::var("PHILOTIC_HEAL_STALE_ESCALATION_SECS")
+                        .ok()
+                        .and_then(|v| v.parse::<u64>().ok())
+                        .unwrap_or(DEFAULT_STALE_ESCALATION_SECS);
                     loop {
                         tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+                        // Close escalations whose pattern stopped recurring, so the
+                        // escalated view holds live hand-offs, not a week of history.
+                        if stale_escalation > 0 {
+                            match hq_vacuum.close_stale_escalations(stale_escalation) {
+                                Ok(n) if n > 0 => {
+                                    info!(closed = n, "heal_queue closed stale escalations")
+                                }
+                                Ok(_) => {}
+                                Err(e) => warn!("heal_queue stale-escalation sweep failed: {e}"),
+                            }
+                        }
                         // Abandon stuck pending/assigned rows first so this
                         // pass's vacuum_old can reap the ones already past 7d.
                         match hq_vacuum.vacuum_abandoned(abandon_ceiling) {
