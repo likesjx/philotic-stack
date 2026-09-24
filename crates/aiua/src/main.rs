@@ -8142,8 +8142,27 @@ async fn main() -> Result<()> {
                         .ok()
                         .and_then(|v| v.parse::<u64>().ok())
                         .unwrap_or(DEFAULT_STALE_ESCALATION_SECS);
+                    // Hourly by WALL clock, polled on a short tick: a plain
+                    // `sleep(3600)` counts awake time only, which a mostly-asleep
+                    // laptop hotel rarely accrues (DEF-202). First pass shortly
+                    // after boot, so a restart clears a stale backlog at once.
+                    let wall = || {
+                        std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_secs())
+                            .unwrap_or(0)
+                    };
+                    tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                    let mut last_pass: Option<u64> = None;
                     loop {
-                        tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+                        if let Some(at) = last_pass {
+                            tokio::time::sleep(std::time::Duration::from_secs(300)).await;
+                            let now = wall();
+                            if now >= at && now - at < 3600 {
+                                continue;
+                            }
+                        }
+                        last_pass = Some(wall());
                         // Close escalations whose pattern stopped recurring, so the
                         // escalated view holds live hand-offs, not a week of history.
                         if stale_escalation > 0 {

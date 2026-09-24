@@ -100,6 +100,10 @@ const FALLBACK_ENV_FLAG: &str = "PHILOTIC_HEAL_DECISIONS_FALLBACK";
 /// Fallback calls allowed per wall-clock minute; beyond it rows keep the old
 /// `unclassified`/noop fail-safe, so an Ollama outage cannot stall the loop.
 const FALLBACK_CALLS_PER_MINUTE: u32 = 30;
+/// Consecutive fallback failures (errors or timeouts) that open its breaker.
+const FALLBACK_BREAKER_THRESHOLD: u32 = 3;
+/// How long an open fallback breaker skips the call.
+const FALLBACK_BREAKER_COOLDOWN_SECS: u64 = 60;
 /// A tag is applied only when its probability reaches this; below it the row
 /// stays `unclassified`. Call-site threshold (invariant: thresholds live in
 /// code, calibrated per question from `decision_traces`).
@@ -164,6 +168,12 @@ pub struct DecisionsJudge {
     fallback_on: bool,
     /// `(minute, calls)` — fallback calls are budgeted per wall-clock minute.
     fallback_budget: std::sync::Mutex<(u64, u32)>,
+    /// `(consecutive failures, open until unix secs)`. The fallback is awaited
+    /// inline, so a hung or unreachable provider must not cost every row the
+    /// full deadline: after [`FALLBACK_BREAKER_THRESHOLD`] failures in a row it
+    /// is skipped for [`FALLBACK_BREAKER_COOLDOWN_SECS`] (the dispatcher's
+    /// heartbeat watchdog fires at 90 s).
+    fallback_breaker: std::sync::Mutex<(u32, u64)>,
 }
 
 struct Inner {
@@ -232,6 +242,7 @@ impl DecisionsJudge {
             shadow_on: true,
             fallback_on: false,
             fallback_budget: std::sync::Mutex::new((0, 0)),
+            fallback_breaker: std::sync::Mutex::new((0, 0)),
         }
     }
 
@@ -261,7 +272,12 @@ impl DecisionsJudge {
             return None;
         }
         let refused = is_model_failure_line(raw_text);
-        if !refused && !self.take_fallback_budget(unix_secs()) {
+        let now = unix_secs();
+        if !refused && self.fallback_breaker_open(now) {
+            debug!("decisions fallback breaker open; leaving row unclassified");
+            return None;
+        }
+        if !refused && !self.take_fallback_budget(now) {
             debug!("decisions fallback budget spent this minute; leaving row unclassified");
             return None;
         }
@@ -282,6 +298,13 @@ impl DecisionsJudge {
                 .await;
             (audited.bytes_sent, audited.result)
         };
+        match &result {
+            Ok(_) => self.record_fallback_result(true, unix_secs()),
+            Err(e) if e.class != DecisionsErrorClass::PolicyRefused => {
+                self.record_fallback_result(false, unix_secs())
+            }
+            Err(_) => {}
+        }
         let verdict = result
             .as_ref()
             .ok()
@@ -298,6 +321,33 @@ impl DecisionsJudge {
             warn!("decision trace write failed: {e:#}");
         }
         verdict
+    }
+
+    fn fallback_breaker_open(&self, now_secs: u64) -> bool {
+        let breaker = self
+            .fallback_breaker
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        now_secs < breaker.1
+    }
+
+    fn record_fallback_result(&self, ok: bool, now_secs: u64) {
+        let mut breaker = self
+            .fallback_breaker
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if ok {
+            *breaker = (0, 0);
+            return;
+        }
+        breaker.0 += 1;
+        if breaker.0 >= FALLBACK_BREAKER_THRESHOLD {
+            warn!(
+                failures = breaker.0,
+                "decisions fallback failing; skipping it for {FALLBACK_BREAKER_COOLDOWN_SECS}s"
+            );
+            *breaker = (0, now_secs + FALLBACK_BREAKER_COOLDOWN_SECS);
+        }
     }
 
     fn take_fallback_budget(&self, now_secs: u64) -> bool {
@@ -1071,6 +1121,38 @@ mod tests {
             incumbent["applied"]["pattern_tag"],
             "telegram_poll_conflict"
         );
+    }
+
+    #[tokio::test]
+    async fn a_failing_provider_opens_the_fallback_breaker() {
+        let dir = tempfile::tempdir().unwrap();
+        // A hung provider: each call costs the full deadline and fails.
+        let base = serve("200 OK", FALLBACK_BODY, true).await;
+        let (judge, store) = judge(&base, dir.path());
+        let judge = judge.with_modes(false, true);
+        let start = std::time::Instant::now();
+        assert_eq!(judge.classify_fallback("r1", "g", "boom").await, None);
+        assert!(start.elapsed() >= DEADLINE, "the hang cost the deadline");
+        // Two more failures open the breaker (these also hang to the deadline:
+        // the unanswered listener stays alive and queues the connections).
+        for id in ["r2", "r3"] {
+            assert_eq!(judge.classify_fallback(id, "g", "boom").await, None);
+        }
+        assert!(judge.fallback_breaker_open(unix_secs()));
+        let before = store.list_traces(10).unwrap().len();
+        let start = std::time::Instant::now();
+        assert_eq!(judge.classify_fallback("r4", "g", "boom").await, None);
+        assert!(
+            start.elapsed() < Duration::from_millis(100),
+            "open breaker skips the call"
+        );
+        assert_eq!(
+            store.list_traces(10).unwrap().len(),
+            before,
+            "no call, no trace"
+        );
+        // It closes after the cooldown.
+        assert!(!judge.fallback_breaker_open(unix_secs() + FALLBACK_BREAKER_COOLDOWN_SECS));
     }
 
     #[tokio::test]

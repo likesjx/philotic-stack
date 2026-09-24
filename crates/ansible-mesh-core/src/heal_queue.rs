@@ -147,6 +147,12 @@ pub const HEAL_STATUS_ABANDONED: &str = "abandoned";
 /// apart by `phil doctor`, dashboards, and anyone reading the table.
 pub const HEAL_STATUS_ESCALATED: &str = "escalated";
 
+/// Terminal status for an escalation closed by the stale sweep because its
+/// `(guest_id, pattern_tag)` stopped recurring. Deliberately neither `resolved`
+/// (nothing was repaired — DEF-070) nor `escalated` (nobody needs to look now).
+/// See [`HealQueueStorage::close_stale_escalations`].
+pub const HEAL_STATUS_STALE: &str = "stale";
+
 /// Map a dispatcher outcome string to the terminal status it earns.
 ///
 /// Only outcomes that actually *repaired* something may claim `resolved`.
@@ -559,7 +565,7 @@ pub trait HealQueueStorage: Send + Sync {
     /// Close `escalated` rows older than `max_age_secs` whose
     /// `(guest_id, pattern_tag)` has NOT been seen again within that window:
     /// the condition stopped recurring, so the hand-off is stale. Status becomes
-    /// `resolved` with a `stale_closed` outcome note (never deleted here —
+    /// [`HEAL_STATUS_STALE`] with a `stale_closed` outcome note (never deleted here —
     /// [`vacuum_old`] still reaps it on the normal schedule). A pattern that is
     /// still recurring keeps every escalated row open. Returns rows closed.
     ///
@@ -749,9 +755,15 @@ impl SqliteHealQueueStorage {
             .prepare("SELECT 1 FROM pragma_table_info('heal_queue') WHERE name = 'occurrences'")?
             .exists([])?;
         if !has_occurrences {
-            conn.execute_batch(
+            // Several openers (hotel, host-health scan, catalog sync) can race
+            // the first open after deploy: a concurrent winner is success.
+            match conn.execute_batch(
                 "ALTER TABLE heal_queue ADD COLUMN occurrences INTEGER NOT NULL DEFAULT 1;",
-            )?;
+            ) {
+                Ok(()) => {}
+                Err(e) if e.to_string().contains("duplicate column name") => {}
+                Err(e) => return Err(e.into()),
+            }
         }
         Ok(())
     }
@@ -766,7 +778,7 @@ impl SqliteHealQueueStorage {
         let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         let n = conn.execute(
             "UPDATE heal_queue AS old
-             SET status = 'resolved', outcome = ?1
+             SET status = 'stale', outcome = ?1
              WHERE old.status = 'escalated' AND old.timestamp < ?2
                AND NOT EXISTS (
                    SELECT 1 FROM heal_queue AS recent
@@ -879,7 +891,8 @@ impl HealQueueStorage for SqliteHealQueueStorage {
         // table without bound (919 rows in three days on mbp-jane).
         let n = conn.execute(
             "DELETE FROM heal_queue
-             WHERE status IN ('resolved', 'abandoned', 'escalated') AND timestamp < ?1",
+             WHERE status IN ('resolved', 'abandoned', 'escalated', 'stale')
+               AND timestamp < ?1",
             params![cutoff],
         )?;
         Ok(n)
@@ -1756,7 +1769,7 @@ mod tests {
                 .map(|r| r.status.clone())
                 .unwrap()
         };
-        assert_eq!(status("mac", now - 3 * day), "resolved");
+        assert_eq!(status("mac", now - 3 * day), HEAL_STATUS_STALE);
         assert_eq!(status("vps", now - 3 * day), HEAL_STATUS_ESCALATED);
         assert_eq!(status("vps", now - 3600), HEAL_STATUS_ESCALATED);
         assert_eq!(status("mbp", now - 3600), HEAL_STATUS_ESCALATED);
