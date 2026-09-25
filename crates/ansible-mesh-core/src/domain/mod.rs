@@ -1107,6 +1107,20 @@ impl GraphDomain {
         }
     }
 
+    /// Every secret this hotel's vault holds. Used by whole-vault operations
+    /// (master-key rotation, doctor checks) that a single `get_secret` by ref
+    /// can't serve. A record that fails to deserialize is skipped rather than
+    /// failing the whole listing, matching `philotic-web`'s doctor scan.
+    pub fn list_secrets(&self) -> Result<Vec<SecretRecord>> {
+        let mut out = Vec::new();
+        for node in self.adapter.list_nodes_by_kind(NODE_KIND_SECRET)? {
+            if let Ok(record) = serde_json::from_value::<SecretRecord>(node.data) {
+                out.push(record);
+            }
+        }
+        Ok(out)
+    }
+
     // ── Abstract skill methods ────────────────────────────────────────────────
 
     fn abstract_skill_key(skill_name: &str) -> String {
@@ -3576,6 +3590,45 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(loaded.ciphertext_b64, "abc123");
+    }
+
+    #[test]
+    fn list_secrets_returns_every_stored_secret() {
+        let d = make_domain();
+        assert!(d.list_secrets().unwrap().is_empty());
+
+        for (n, kind) in ["openrouter_api_key", "gemini_api_key"]
+            .into_iter()
+            .enumerate()
+        {
+            d.upsert_secret(&SecretRecord {
+                secret_ref: format!("secret://hotel/default/{kind}/{n}"),
+                secret_kind: kind.to_string(),
+                scope: "hotel".to_string(),
+                allowed_roles: vec![],
+                allowed_guests: vec![],
+                ciphertext_b64: "ct".to_string(),
+                nonce_b64: "nonce".to_string(),
+                created_at: 0,
+                updated_at: 0,
+            })
+            .unwrap();
+        }
+
+        let mut refs: Vec<String> = d
+            .list_secrets()
+            .unwrap()
+            .into_iter()
+            .map(|s| s.secret_ref)
+            .collect();
+        refs.sort();
+        assert_eq!(
+            refs,
+            [
+                "secret://hotel/default/gemini_api_key/1",
+                "secret://hotel/default/openrouter_api_key/0",
+            ]
+        );
     }
 
     // ── Skills and toolset profiles ───────────────────────────────────────────

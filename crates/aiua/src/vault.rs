@@ -6,6 +6,7 @@ use ansible_mesh_core::storage::SecretRecord;
 use anyhow::{Context, Result, bail};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
+use sha2::Digest;
 use std::fs;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -66,6 +67,139 @@ pub fn rotate_secret(graph: &GraphDomain, secret_ref: &str, plaintext: &str) -> 
     record.nonce_b64 = nonce_b64;
     record.updated_at = now_secs();
     graph.upsert_secret(&record)
+}
+
+/// What [`rotate_master_key`] found and did.
+#[derive(Debug, Clone)]
+pub struct MasterKeyRotationReport {
+    pub total: usize,
+    pub migrated: usize,
+    pub already_on_new_key: usize,
+    pub old_key_fingerprint: String,
+    pub new_key_fingerprint: String,
+}
+
+/// Re-encrypt every secret this hotel's vault holds under `new_key_bytes`.
+///
+/// Resumable, not transactional: each secret is decrypted and re-encrypted
+/// independently and written as soon as it's done, rather than staged into
+/// one big commit. A secret that decrypts under NEITHER the current root key
+/// nor `new_key_bytes` stops the run immediately without writing anything
+/// for it or any secret after it in the listing — already-migrated secrets
+/// from earlier in this run (or a previous run) stay migrated. Investigate
+/// that secret, then re-run with the same `new_key_bytes`: already-migrated
+/// records are detected (they decrypt under `new_key_bytes` already) and
+/// skipped, so the run converges instead of needing a rollback.
+///
+/// Does NOT persist `new_key_bytes` anywhere (env file, Keychain, ansible
+/// vault) — applying it is a separate, host-specific step. In particular, on
+/// a host where `PHILOTIC_VAULT_MASTER_KEY` is set via a systemd
+/// EnvironmentFile (vps-jane today), writing `~/.philotic/vault-master-key.env`
+/// here would do nothing, because the env var wins over the file in
+/// [`load_or_create_root_key`].
+pub fn rotate_master_key(
+    graph: &GraphDomain,
+    new_key_bytes: &[u8; 32],
+    dry_run: bool,
+) -> Result<MasterKeyRotationReport> {
+    let old_key_bytes = load_or_create_root_key()?;
+    let secrets = graph.list_secrets()?;
+    let mut migrated = 0usize;
+    let mut already_on_new_key = 0usize;
+
+    for secret in &secrets {
+        if decrypt_with_key(secret, new_key_bytes).is_ok() {
+            already_on_new_key += 1;
+            continue;
+        }
+
+        let plaintext = decrypt_with_key(secret, &old_key_bytes).with_context(|| {
+            format!(
+                "secret [{}] decrypts under neither the current root key nor the new key; \
+                 stopping now with nothing written for it or any secret after it — \
+                 investigate this one, then re-run with the same new key",
+                secret.secret_ref
+            )
+        })?;
+
+        if dry_run {
+            migrated += 1;
+            continue;
+        }
+
+        let (ciphertext_b64, nonce_b64) = encrypt_with_key(&plaintext, new_key_bytes)?;
+        let mut record = secret.clone();
+        record.ciphertext_b64 = ciphertext_b64;
+        record.nonce_b64 = nonce_b64;
+
+        // Round-trip proof before this record is written: a cipher/key
+        // mistake fails loud right here instead of silently bricking the
+        // secret once the old plaintext is out of scope.
+        let verify = decrypt_with_key(&record, new_key_bytes).with_context(|| {
+            format!(
+                "post-encrypt round-trip check failed for [{}]; not written",
+                secret.secret_ref
+            )
+        })?;
+        if verify != plaintext {
+            bail!(
+                "post-encrypt round-trip mismatch for [{}]; not written",
+                secret.secret_ref
+            );
+        }
+
+        record.updated_at = now_secs();
+        graph.upsert_secret(&record)?;
+        migrated += 1;
+    }
+
+    Ok(MasterKeyRotationReport {
+        total: secrets.len(),
+        migrated,
+        already_on_new_key,
+        old_key_fingerprint: key_fingerprint(&old_key_bytes),
+        new_key_fingerprint: key_fingerprint(new_key_bytes),
+    })
+}
+
+/// A non-secret fingerprint for operator-facing rotation confirmations and
+/// audit trails: sha256 of the key, first 8 bytes as hex. Never enough to
+/// reconstruct the key. Mirrors `philotic-web`'s `root_key_fingerprint`.
+pub fn key_fingerprint(key_bytes: &[u8]) -> String {
+    let digest = sha2::Sha256::digest(key_bytes);
+    format!("sha256:{}", hex::encode(&digest[..8]))
+}
+
+/// Generate a fresh 32-byte root key, base64-encoded, for an operator about
+/// to rotate the master key. Nothing in this crate stores the result —
+/// whoever calls this must capture it before doing anything else with it.
+pub fn generate_root_key_b64() -> String {
+    BASE64_STANDARD.encode(random_root_key())
+}
+
+/// Decode a base64-encoded 32-byte master key an operator is about to make
+/// active (e.g. `aiua auth rotate-master-key --new-key`).
+pub fn decode_master_key_b64(raw: &str) -> Result<[u8; 32]> {
+    let bytes = decode_root_key(raw.trim(), "--new-key")?;
+    bytes
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("--new-key must decode to exactly 32 bytes"))
+}
+
+/// Where the currently-active root key is actually coming from, so an
+/// operator applying a new one knows which source to change. Re-resolves via
+/// the same precedence as [`load_or_create_root_key`] without exposing the
+/// key material.
+pub fn describe_root_key_source() -> &'static str {
+    if load_env_root_key().is_ok() {
+        "the PHILOTIC_VAULT_MASTER_KEY environment variable — a systemd EnvironmentFile or \
+         shell export keeps winning over any file you write, so update that source, not a file"
+    } else if load_env_file_root_key().is_ok() {
+        "~/.philotic/vault-master-key.env — safe to overwrite directly"
+    } else {
+        "the macOS Keychain (ai.philotic.hotel-vault) — use `security add-generic-password` \
+         to overwrite it, or delete the item and let it regenerate"
+    }
 }
 
 /// What [`sync_secret_roles`] found and did.
@@ -182,7 +316,15 @@ pub(crate) fn export_secret_plaintext(
 }
 
 fn encrypt(plaintext: &str) -> Result<(String, String)> {
-    let cipher = cipher()?;
+    encrypt_with_key(plaintext, &load_or_create_root_key()?)
+}
+
+fn decrypt(secret: &SecretRecord) -> Result<String> {
+    decrypt_with_key(secret, &load_or_create_root_key()?)
+}
+
+fn encrypt_with_key(plaintext: &str, key_bytes: &[u8]) -> Result<(String, String)> {
+    let cipher = cipher_for_key(key_bytes)?;
     let nonce_bytes = random_nonce();
     let nonce = Nonce::from_slice(&nonce_bytes);
     let ciphertext = cipher
@@ -194,8 +336,8 @@ fn encrypt(plaintext: &str) -> Result<(String, String)> {
     ))
 }
 
-fn decrypt(secret: &SecretRecord) -> Result<String> {
-    let cipher = cipher()?;
+fn decrypt_with_key(secret: &SecretRecord, key_bytes: &[u8]) -> Result<String> {
+    let cipher = cipher_for_key(key_bytes)?;
     let nonce_bytes = BASE64_STANDARD
         .decode(&secret.nonce_b64)
         .context("failed to decode vault nonce")?;
@@ -209,10 +351,8 @@ fn decrypt(secret: &SecretRecord) -> Result<String> {
     String::from_utf8(plaintext).context("vault secret plaintext was not utf-8")
 }
 
-fn cipher() -> Result<Aes256Gcm> {
-    let key_bytes = load_or_create_root_key()?;
-
-    Ok(Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&key_bytes)))
+fn cipher_for_key(key_bytes: &[u8]) -> Result<Aes256Gcm> {
+    Ok(Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(key_bytes)))
 }
 
 /// Resolve the vault root key deterministically: explicit env var first, then the
@@ -407,8 +547,9 @@ fn now_secs() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        SecretAccess, SecretInput, decode_root_key, load_or_create_root_key, resolve_secret,
-        store_secret, sync_secret_roles, vault_key_account,
+        SecretAccess, SecretInput, decode_root_key, decrypt_with_key, encrypt_with_key,
+        generate_root_key_b64, key_fingerprint, load_or_create_root_key, resolve_secret,
+        rotate_master_key, store_secret, sync_secret_roles, vault_key_account,
     };
     use ansible_mesh_core::domain::GraphDomain;
     use ansible_mesh_core::sqlite_storage::SqliteGraphStorage;
@@ -586,6 +727,136 @@ mod tests {
         .unwrap();
 
         assert_eq!(secret.as_deref(), Some("shh"));
+    }
+
+    #[test]
+    fn rotate_master_key_migrates_every_secret_and_the_old_key_no_longer_decrypts() {
+        set_test_key();
+        let graph = GraphDomain::new(Arc::new(
+            SqliteGraphStorage::open(":memory:").unwrap().adapter(),
+        ));
+        let ref_a = stored(&graph, &["model"], &[]);
+        let ref_b = stored(&graph, &["heal-dispatcher"], &[]);
+        let old_key = load_or_create_root_key().unwrap();
+        let new_key = [9u8; 32];
+
+        let report = rotate_master_key(&graph, &new_key, false).unwrap();
+        assert_eq!(report.total, 2);
+        assert_eq!(report.migrated, 2);
+        assert_eq!(report.already_on_new_key, 0);
+        assert_eq!(report.old_key_fingerprint, key_fingerprint(&old_key));
+        assert_eq!(report.new_key_fingerprint, key_fingerprint(&new_key));
+
+        for secret_ref in [&ref_a, &ref_b] {
+            let record = graph.get_secret(secret_ref).unwrap().unwrap();
+            assert_eq!(
+                decrypt_with_key(&record, &new_key).unwrap(),
+                "sk-or-test-plaintext"
+            );
+            assert!(
+                decrypt_with_key(&record, &old_key).is_err(),
+                "the old key must no longer open a migrated secret"
+            );
+        }
+    }
+
+    #[test]
+    fn rotate_master_key_is_resumable_when_a_secret_is_already_on_the_new_key() {
+        set_test_key();
+        let graph = GraphDomain::new(Arc::new(
+            SqliteGraphStorage::open(":memory:").unwrap().adapter(),
+        ));
+        let ref_a = stored(&graph, &["model"], &[]);
+        let ref_b = stored(&graph, &["heal-dispatcher"], &[]);
+        let new_key = [9u8; 32];
+
+        // Simulate a prior run that migrated ref_a and then stopped.
+        let mut record_a = graph.get_secret(&ref_a).unwrap().unwrap();
+        let (ciphertext_b64, nonce_b64) =
+            encrypt_with_key("sk-or-test-plaintext", &new_key).unwrap();
+        record_a.ciphertext_b64 = ciphertext_b64;
+        record_a.nonce_b64 = nonce_b64;
+        graph.upsert_secret(&record_a).unwrap();
+
+        let report = rotate_master_key(&graph, &new_key, false).unwrap();
+        assert_eq!(report.total, 2);
+        assert_eq!(
+            report.already_on_new_key, 1,
+            "the already-migrated secret must be detected, not re-encrypted"
+        );
+        assert_eq!(report.migrated, 1);
+
+        for secret_ref in [&ref_a, &ref_b] {
+            let record = graph.get_secret(secret_ref).unwrap().unwrap();
+            assert_eq!(
+                decrypt_with_key(&record, &new_key).unwrap(),
+                "sk-or-test-plaintext"
+            );
+        }
+    }
+
+    #[test]
+    fn rotate_master_key_stops_without_corrupting_anything_when_a_secret_is_unreadable() {
+        set_test_key();
+        let graph = GraphDomain::new(Arc::new(
+            SqliteGraphStorage::open(":memory:").unwrap().adapter(),
+        ));
+        let good_ref = stored(&graph, &["model"], &[]);
+        let old_key = load_or_create_root_key().unwrap();
+        let new_key = [9u8; 32];
+
+        // A secret whose ciphertext decrypts under neither key.
+        let mut bad = graph.get_secret(&good_ref).unwrap().unwrap();
+        bad.secret_ref = "secret://hotel/default/corrupted/deadbeef".into();
+        bad.ciphertext_b64 =
+            base64::engine::general_purpose::STANDARD.encode(b"not gcm ciphertext");
+        graph.upsert_secret(&bad).unwrap();
+
+        let err = rotate_master_key(&graph, &new_key, false).unwrap_err();
+        assert!(err.to_string().contains("decrypts under neither"), "{err}");
+
+        // The good secret must still be readable under some key — a failure
+        // on one secret must never cost another one its readability.
+        let good_after = graph.get_secret(&good_ref).unwrap().unwrap();
+        let still_readable = decrypt_with_key(&good_after, &old_key).is_ok()
+            || decrypt_with_key(&good_after, &new_key).is_ok();
+        assert!(still_readable);
+    }
+
+    #[test]
+    fn rotate_master_key_dry_run_writes_nothing() {
+        set_test_key();
+        let graph = GraphDomain::new(Arc::new(
+            SqliteGraphStorage::open(":memory:").unwrap().adapter(),
+        ));
+        let secret_ref = stored(&graph, &["model"], &[]);
+        let before = graph.get_secret(&secret_ref).unwrap().unwrap();
+        let new_key = [9u8; 32];
+
+        let report = rotate_master_key(&graph, &new_key, true).unwrap();
+        assert_eq!(report.total, 1);
+        assert_eq!(report.migrated, 1);
+
+        let after = graph.get_secret(&secret_ref).unwrap().unwrap();
+        assert_eq!(before.ciphertext_b64, after.ciphertext_b64);
+        assert_eq!(before.nonce_b64, after.nonce_b64);
+    }
+
+    #[test]
+    fn key_fingerprint_is_deterministic_and_distinguishes_keys() {
+        let a = key_fingerprint(&[1u8; 32]);
+        let b = key_fingerprint(&[1u8; 32]);
+        let c = key_fingerprint(&[2u8; 32]);
+        assert_eq!(a, b);
+        assert_ne!(a, c);
+        assert!(a.starts_with("sha256:"));
+    }
+
+    #[test]
+    fn generate_root_key_b64_produces_a_valid_32_byte_key() {
+        let encoded = generate_root_key_b64();
+        let decoded = decode_root_key(&encoded, "test").unwrap();
+        assert_eq!(decoded.len(), 32);
     }
 
     /// The explicit env key must win over the key file (and, implicitly, over the
