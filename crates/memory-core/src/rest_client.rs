@@ -213,6 +213,35 @@ struct WriteRequest {
     /// reinforce rather than accumulate.
     #[serde(skip_serializing_if = "Option::is_none")]
     idempotent_id: Option<String>,
+    /// Inline enrichment: MuninnDB's REAL entity fields (`[{name, type}]`).
+    /// Entities sent here land in the entity knowledge graph immediately
+    /// (find_by_entity, entity timelines, contradiction detection) instead
+    /// of sitting invisible inside the opaque metadata blob.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    entities: Option<serde_json::Value>,
+    /// Inline typed entity-to-entity relationships
+    /// (`[{from_entity, to_entity, rel_type, weight}]`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    entity_relationships: Option<serde_json::Value>,
+}
+
+/// Lift the caller's shaped entities/relationships out of the metadata blob
+/// into MuninnDB's first-class write fields. The metadata copy is kept —
+/// the recall read side still renders its entity overlay from metadata
+/// (activate items do not return server-side entities yet). Shapes already
+/// match the wire contract: philote's `shaped_memory_entities` emits
+/// `{name, type}` and `shaped_memory_relationships` emits
+/// `{from_entity, rel_type, to_entity, weight}`.
+fn inline_enrichment_from_metadata(
+    metadata: Option<&serde_json::Value>,
+) -> (Option<serde_json::Value>, Option<serde_json::Value>) {
+    let field = |key: &str| {
+        metadata
+            .and_then(|m| m.get(key))
+            .filter(|v| v.as_array().is_some_and(|a| !a.is_empty()))
+            .cloned()
+    };
+    (field("entities"), field("relationships"))
 }
 
 #[derive(Debug, Deserialize)]
@@ -962,6 +991,7 @@ impl MuninnRestEngine {
             serde_json::Value::Null => None,
             other => Some(other),
         };
+        let (entities, entity_relationships) = inline_enrichment_from_metadata(metadata.as_ref());
         let body = WriteRequest {
             vault: vault.to_string(),
             concept: concept.to_string(),
@@ -970,6 +1000,8 @@ impl MuninnRestEngine {
             confidence: None,
             metadata,
             idempotent_id: Some(format!("{}:{}", vault, concept)),
+            entities,
+            entity_relationships,
         };
         let resp = self
             .with_auth(self.client.post(self.url("/api/engrams")), vault)
@@ -1018,6 +1050,7 @@ impl MemoryEngine for MuninnRestEngine {
             other => Some(other),
         };
 
+        let (entities, entity_relationships) = inline_enrichment_from_metadata(metadata.as_ref());
         let body = WriteRequest {
             vault: vault.clone(),
             concept: concept.to_string(),
@@ -1026,6 +1059,8 @@ impl MemoryEngine for MuninnRestEngine {
             confidence: None,
             metadata,
             idempotent_id: Some(format!("{}:{}", vault, concept)),
+            entities,
+            entity_relationships,
         };
 
         let resp = self
@@ -2293,5 +2328,28 @@ mod shared_write_route_tests {
         let json = serde_json::to_string(&cfg).unwrap();
         let back: MuninnConfig = serde_json::from_str(&json).unwrap();
         assert_eq!(back.shared_write_route.as_deref(), Some("vps-jane-aiua-01"));
+    }
+
+    #[test]
+    fn inline_enrichment_lifts_entities_out_of_metadata() {
+        let metadata = serde_json::json!({
+            "entities": [{"name": "proposal:life-graph-os", "type": "proposal"}],
+            "relationships": [{
+                "from_entity": "seam:x", "rel_type": "belongs_to",
+                "to_entity": "proposal:life-graph-os", "weight": 0.9
+            }],
+            "other": "kept",
+        });
+        let (ents, rels) = inline_enrichment_from_metadata(Some(&metadata));
+        assert_eq!(ents.unwrap()[0]["name"], "proposal:life-graph-os");
+        assert_eq!(rels.unwrap()[0]["rel_type"], "belongs_to");
+
+        // Empty arrays, wrong types, and absent metadata all stay None —
+        // never send an empty/garbage inline field the server would reject.
+        let empty = serde_json::json!({"entities": [], "relationships": "nope"});
+        let (ents, rels) = inline_enrichment_from_metadata(Some(&empty));
+        assert!(ents.is_none() && rels.is_none());
+        let (ents, rels) = inline_enrichment_from_metadata(None);
+        assert!(ents.is_none() && rels.is_none());
     }
 }
