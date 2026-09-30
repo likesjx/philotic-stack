@@ -520,6 +520,9 @@ async fn handle_tools_call(
                 "tool": tool_name,
                 "target_kind": inbound.target_kind,
                 "target_id": inbound.target_id,
+                // Cross-hotel pin (McpUpstream targets only); the membrane
+                // runtime turns a non-null value into an EmitTask to that node.
+                "target_node": inbound.target_node,
             }),
             requires_approval,
             final_reply_to: Some(state.node_id.clone()),
@@ -589,6 +592,19 @@ async fn handle_tools_call(
             return JsonRpcResponse::err(id, auth_error_code(&e), e.to_string());
         }
     };
+
+    // Legacy routes have no action mapping, so an upstream target cannot name
+    // its remote tool. Refuse rather than mis-dispatching to the agent role.
+    if matches!(
+        route.record.target,
+        ansible_mesh_core::mcp_route::McpRouteTarget::McpUpstream { .. }
+    ) {
+        return JsonRpcResponse::err(
+            id,
+            error_code::DISPATCH_ERROR,
+            format!("tool '{tool_name}': mcp_upstream targets require an endpoint config"),
+        );
+    }
 
     let requires_approval = route.record.security.require_approval;
     let timeout = if requires_approval {
