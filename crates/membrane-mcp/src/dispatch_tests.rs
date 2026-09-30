@@ -635,3 +635,28 @@ async fn deliver_error_reply_yields_err_outcome() {
         other => panic!("expected Err, got {other:?}"),
     }
 }
+
+// ── Loopback trust behind a reverse proxy ─────────────────────────────────────
+
+#[test]
+fn proxied_loopback_request_is_not_trusted_as_local() {
+    use crate::server::is_trusted_loopback;
+    use axum::http::{HeaderMap, HeaderValue};
+
+    let loopback: SocketAddr = "127.0.0.1:50000".parse().unwrap();
+    let remote: SocketAddr = "100.64.0.7:50000".parse().unwrap();
+
+    assert!(is_trusted_loopback(&loopback, &HeaderMap::new()));
+    assert!(!is_trusted_loopback(&remote, &HeaderMap::new()));
+
+    // The TLS proxy on vps-jane reaches the listener over 127.0.0.1 and adds
+    // forwarding headers; any of them marks the request as remote.
+    for header in ["x-forwarded-for", "forwarded", "x-real-ip"] {
+        let mut headers = HeaderMap::new();
+        headers.insert(header, HeaderValue::from_static("203.0.113.9"));
+        assert!(
+            !is_trusted_loopback(&loopback, &headers),
+            "{header} on a loopback peer must not be trusted as local"
+        );
+    }
+}

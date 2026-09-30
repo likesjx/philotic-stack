@@ -52,6 +52,27 @@ pub enum McpRouteTarget {
     Tool { tool_ref: String },
     /// Route to a datasource guest (e.g. `"graph-datasource-01"`).
     Datasource { datasource_id: String },
+    /// Route to an upstream MCP server registered with the MCP client fabric
+    /// (`mcp-client-runner`, see `mcp_upstream`). The membrane dispatches the
+    /// call as `mcp:<upstream_id>.<action>` with the authenticated caller
+    /// (`mcp:<token_id>`) as `agent_id`, so the upstream's `grant_agents` and
+    /// tool allowlist remain the authority. `target_node` pins the call to the
+    /// hotel that owns the upstream (e.g. the Mac hotel for native Muninn /
+    /// intel-graph); absent means local.
+    ///
+    /// Only supported on endpoint-config (`McpEndpointConfig`) tools, whose
+    /// `FieldMap.action` names the remote tool.
+    McpUpstream {
+        upstream_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        target_node: Option<String>,
+    },
+}
+
+/// Principal the membrane presents to downstream guests for an MCP caller
+/// authenticated with `token_id`. Upstream `grant_agents` entries use this form.
+pub fn mcp_caller_principal(token_id: &str) -> String {
+    format!("mcp:{token_id}")
 }
 
 // ── Security envelope ─────────────────────────────────────────────────────────
@@ -157,6 +178,24 @@ mod tests {
         round_trip(&McpRouteTarget::Datasource {
             datasource_id: "graph-datasource-01".into(),
         });
+        round_trip(&McpRouteTarget::McpUpstream {
+            upstream_id: "muninn-local".into(),
+            target_node: Some("mac-jane-aiua-01".into()),
+        });
+    }
+
+    #[test]
+    fn mcp_upstream_target_wire_shape() {
+        let v = serde_json::json!({ "kind": "mcp_upstream", "upstream_id": "intel-graph" });
+        let t: McpRouteTarget = serde_json::from_value(v).unwrap();
+        assert_eq!(
+            t,
+            McpRouteTarget::McpUpstream {
+                upstream_id: "intel-graph".into(),
+                target_node: None,
+            }
+        );
+        assert_eq!(mcp_caller_principal("claude-cloud"), "mcp:claude-cloud");
     }
 
     #[test]

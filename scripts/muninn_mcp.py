@@ -116,10 +116,126 @@ class MuninnMcpClient:
         )
 
 
+
+class FrontdoorMcpClient:
+    """Streamable-HTTP client for the Philotic MCP frontdoor (membrane-mcp).
+
+    Remote agents (cloud Claude Code, Codex, other MCP clients) cannot reach
+    native Muninn on loopback. The frontdoor re-projects the same four
+    ``muninn_*`` tools under the same names behind a per-agent bearer, so only
+    the transport differs: every JSON-RPC message is a plain ``POST`` to one
+    URL, with no SSE endpoint handshake.
+    """
+
+    def __init__(self, url: str, token: Optional[str] = None, request_timeout: float = 60.0):
+        self.url = url
+        self.token = token
+        self.request_timeout = request_timeout
+        self.session_id: Optional[str] = None
+
+    def connect(self) -> None:
+        self._post(
+            {
+                "jsonrpc": "2.0",
+                "id": "initialize",
+                "method": "initialize",
+                "params": {
+                    "protocolVersion": "2025-03-26",
+                    "capabilities": {},
+                    "clientInfo": {"name": "muninn_mcp.py", "version": "1.0"},
+                },
+            }
+        )
+        self._post({"jsonrpc": "2.0", "method": "notifications/initialized", "params": {}})
+
+    def close(self) -> None:
+        self.session_id = None
+
+    def _post(self, payload: dict) -> dict:
+        headers = {
+            "content-type": "application/json",
+            "accept": "application/json, text/event-stream",
+        }
+        if self.token:
+            headers["authorization"] = f"Bearer {self.token}"
+        if self.session_id:
+            headers["mcp-session-id"] = self.session_id
+        req = urllib.request.Request(
+            self.url, data=json.dumps(payload).encode("utf-8"), headers=headers, method="POST"
+        )
+        with urllib.request.urlopen(req, timeout=self.request_timeout) as response:
+            session_id = response.headers.get("mcp-session-id")
+            if session_id:
+                self.session_id = session_id
+            content_type = response.headers.get("content-type", "")
+            raw = response.read().decode("utf-8", errors="replace")
+        return parse_frontdoor_body(raw, content_type)
+
+    def tools_list(self) -> dict:
+        return self._post({"jsonrpc": "2.0", "id": "tools-list", "method": "tools/list", "params": {}})
+
+    def call_tool(self, name: str, arguments: dict) -> dict:
+        return self._post(
+            {
+                "jsonrpc": "2.0",
+                "id": f"tool-{name}",
+                "method": "tools/call",
+                "params": {"name": name, "arguments": arguments},
+            }
+        )
+
+
+def parse_frontdoor_body(raw: str, content_type: str = "") -> dict:
+    """Parse a Streamable-HTTP response: JSON, or an SSE stream whose last
+    ``data:`` event carries the JSON-RPC response."""
+    if not raw.strip():
+        return {}
+    if "text/event-stream" in content_type:
+        events = [line[len("data:") :].strip() for line in raw.splitlines() if line.startswith("data:")]
+        for event in reversed(events):
+            if event:
+                return json.loads(event)
+        return {}
+    return json.loads(raw)
+
+
+def resolve_frontdoor_url(args: argparse.Namespace) -> Optional[str]:
+    url = getattr(args, "frontdoor_url", None) or os.environ.get("PHILOTIC_FRONTDOOR_URL")
+    return url.strip() if url and url.strip() else None
+
+
+def resolve_frontdoor_token(args: argparse.Namespace) -> Optional[str]:
+    token = os.environ.get("PHILOTIC_AGENT_MCP_TOKEN")
+    if token and token.strip():
+        return token.strip()
+    token_file = os.environ.get("PHILOTIC_AGENT_MCP_TOKEN_FILE")
+    if token_file:
+        path = pathlib.Path(token_file).expanduser()
+        if path.exists():
+            value = path.read_text(encoding="utf-8").strip()
+            return value or None
+    return None
+
+
+def make_client(args: argparse.Namespace, token: Optional[str]):
+    """Frontdoor client when a frontdoor URL is configured, else native Muninn."""
+    frontdoor = resolve_frontdoor_url(args)
+    if frontdoor:
+        return FrontdoorMcpClient(frontdoor, resolve_frontdoor_token(args), request_timeout=args.timeout)
+    return MuninnMcpClient(args.base_url, token, request_timeout=args.timeout)
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Muninn MCP helper")
     parser.add_argument("--base-url", default=DEFAULT_BASE_URL, help="Muninn MCP base URL")
     parser.add_argument("--token", help="MCP bearer token; defaults to MUNINN_MCP_TOKEN or token file")
+    parser.add_argument(
+        "--frontdoor-url",
+        help=(
+            "Philotic MCP frontdoor URL for remote agents (defaults to PHILOTIC_FRONTDOOR_URL). "
+            "When set, the helper uses Streamable HTTP with PHILOTIC_AGENT_MCP_TOKEN "
+            "instead of native Muninn, and bootstrap never tries to start a local server."
+        ),
+    )
     parser.add_argument(
         "--timeout",
         type=float,
@@ -217,9 +333,9 @@ def extract_tool_names(result: dict) -> List[str]:
     return names
 
 
-def health_payload(base_url: str, token: Optional[str] = None) -> dict:
+def health_payload(base_url: str, token: Optional[str] = None, client=None) -> dict:
     payload = {
-        "base_url": base_url,
+        "base_url": getattr(client, "url", base_url),
         "reachable": False,
         "required_tools_present": False,
         "missing_tools": [],
@@ -228,7 +344,10 @@ def health_payload(base_url: str, token: Optional[str] = None) -> dict:
         "status": "unreachable",
     }
 
-    client = MuninnMcpClient(base_url, token)
+    if client is None:
+        client = MuninnMcpClient(base_url, token)
+    else:
+        payload["transport"] = "frontdoor"
     try:
         client.connect()
         payload["reachable"] = True
@@ -459,15 +578,24 @@ def main() -> int:
     parser = build_parser()
     args = parser.parse_args()
     token = resolve_token(args)
+    frontdoor = resolve_frontdoor_url(args)
+
+    def check() -> dict:
+        client = make_client(args, token) if frontdoor else None
+        return health_payload(args.base_url, token, client)
 
     if args.command == "health":
-        payload = health_payload(args.base_url, token)
+        payload = check()
         json.dump(payload, sys.stdout, indent=2, sort_keys=True)
         sys.stdout.write("\n")
         return 0 if payload["status"] == "ready" else 1
 
     if args.command == "bootstrap":
-        payload = health_payload(args.base_url, token)
+        payload = check()
+        if frontdoor and payload["status"] != "ready":
+            # Remote agents have no local daemon to start.
+            payload["start_attempted"] = False
+            return emit_approval_required(payload)
         if payload["status"] == "ready":
             payload["start_attempted"] = False
             payload["started"] = False
@@ -491,14 +619,14 @@ def main() -> int:
         return 0
 
     if args.command == "require":
-        payload = health_payload(args.base_url, token)
+        payload = check()
         if payload["status"] != "ready":
             return emit_approval_required(payload)
         json.dump(payload, sys.stdout, indent=2, sort_keys=True)
         sys.stdout.write("\n")
         return 0
 
-    client = MuninnMcpClient(args.base_url, token, request_timeout=args.timeout)
+    client = make_client(args, token)
     client.connect()
 
     if args.command == "tools":
