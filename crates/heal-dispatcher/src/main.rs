@@ -872,6 +872,16 @@ async fn classify(
         // LLM branch passes through here.
         Ok((severity, pattern_tag, heal_action)) => {
             breaker.record_success();
+            // Gemma answered but abstained (`unclassified`, which its own prompt
+            // offers as a label, or no tag): that is no verdict either. Seen live
+            // 2026-09-30 — every Telegram 409 line came back `unclassified`/noop
+            // with Ollama healthy, so the Ollama-failure-only fallback never ran.
+            if gemma_abstained(&pattern_tag)
+                && let Some(judge) = shadow.filter(|j| j.fallback_on())
+                && let Some(verdict) = judge.classify_fallback(row_id, guest_id, raw_text).await
+            {
+                return verdict;
+            }
             let heal_action = gate_llm_action(&severity, &heal_action);
             // Log-only: the judge sees the same line and records whether it
             // agrees with what the incumbent just decided. It never changes it.
@@ -916,6 +926,11 @@ async fn no_incumbent_verdict(
         }
     }
     noop_classification()
+}
+
+/// Did the incumbent classifier decline to name a pattern?
+fn gemma_abstained(pattern_tag: &str) -> bool {
+    matches!(pattern_tag.trim(), "" | "unclassified" | "unknown")
 }
 
 /// The clock recurrence counting runs on: when the failure HAPPENED (the row's
@@ -1207,9 +1222,17 @@ async fn execute_action(
 mod tests {
     use super::{
         HEARTBEAT_KEY, OLLAMA_BREAKER_COOLDOWN, OLLAMA_BREAKER_THRESHOLD, OllamaBreaker,
-        OperatorNotifier, gate_llm_action, heartbeat_request, ipc_timeout_error, is_session_like,
-        no_incumbent_verdict, recurrence_clock, rule_classify, with_ipc_timeout,
+        OperatorNotifier, gate_llm_action, gemma_abstained, heartbeat_request, ipc_timeout_error,
+        is_session_like, no_incumbent_verdict, recurrence_clock, rule_classify, with_ipc_timeout,
     };
+
+    #[test]
+    fn an_unclassified_gemma_answer_counts_as_no_verdict() {
+        assert!(gemma_abstained("unclassified"));
+        assert!(gemma_abstained(" "));
+        assert!(gemma_abstained("unknown"));
+        assert!(!gemma_abstained("connection_refused"));
+    }
     use crate::notify::EscalationNotifier;
     use philotic_client::{IpcRequest, IpcResponse, is_ipc_disconnect};
     use std::time::{Duration, Instant};
