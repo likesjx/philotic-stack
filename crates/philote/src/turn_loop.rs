@@ -3884,8 +3884,12 @@ impl AgentRuntime {
         } else {
             memory_candidate
         };
-        self.maybe_autocapture_life_fact(&session_id, memory_candidate.as_ref())
-            .await;
+        self.maybe_autocapture_life_fact(
+            &session_id,
+            memory_candidate.as_ref(),
+            memory_concept.as_deref(),
+        )
+        .await;
 
         // Claim audit: a turn WITH tool calls can still over-claim. Every
         // LifeGraph id the reply cites must either have been written by a
