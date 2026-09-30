@@ -155,10 +155,7 @@ pub async fn dream_sweep(config: &MuninnConfig, graph: &GraphDomain, hotel_name:
     }
     let mutate = mutate_enabled(|k| std::env::var(k).ok());
 
-    let client = match reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(30))
-        .build()
-    {
+    let client = match memory_core::admin::AdminClient::new(&config.base_url) {
         Ok(c) => c,
         Err(e) => {
             warn!("MemorySleep: failed to build HTTP client — {e}");
@@ -177,7 +174,7 @@ pub async fn dream_sweep(config: &MuninnConfig, graph: &GraphDomain, hotel_name:
         let Some(token) = config.vault_tokens.get(vault) else {
             continue;
         };
-        match sleep_vault(&client, &config.base_url, token, vault, mutate).await {
+        match sleep_vault(&client, token, vault, mutate).await {
             Ok(outcome) => summary.absorb(vault, outcome),
             Err(e) => {
                 warn!(vault = %vault, error = %e, "MemorySleep: vault failed — continuing");
@@ -345,13 +342,12 @@ impl SleepRunSummary {
 }
 
 async fn sleep_vault(
-    client: &reqwest::Client,
-    base_url: &str,
+    client: &memory_core::admin::AdminClient,
     token: &str,
     vault: &str,
     mutate: bool,
 ) -> Result<VaultSleepOutcome> {
-    let engrams = list_engrams(client, base_url, token, vault).await?;
+    let engrams = list_engrams(client, token, vault).await?;
     let plan = plan_vault_sleep(&engrams);
     let mut outcome = VaultSleepOutcome {
         engrams_scanned: engrams.len(),
@@ -359,22 +355,14 @@ async fn sleep_vault(
         diagnostic: plan.forget.len(),
         contradictions: count_json_array(
             client,
-            base_url,
             token,
             vault,
             "/api/contradictions",
             "contradictions",
         )
         .await,
-        tombstones: count_json_array(
-            client,
-            base_url,
-            token,
-            vault,
-            "/api/deleted?limit=100",
-            "deleted",
-        )
-        .await,
+        tombstones: count_json_array(client, token, vault, "/api/deleted?limit=100", "deleted")
+            .await,
         ..Default::default()
     };
 
@@ -391,32 +379,21 @@ async fn sleep_vault(
     }
 
     for (ids, merged) in &plan.consolidate {
-        let url = format!("{}/api/consolidate", base_url.trim_end_matches('/'));
-        let resp = client
-            .post(&url)
-            .bearer_auth(token)
-            .json(&serde_json::json!({ "vault": vault, "ids": ids, "merged_content": merged }))
-            .send()
-            .await;
-        match resp {
-            Ok(r) if r.status().is_success() => outcome.consolidated += ids.len(),
-            Ok(r) => {
-                warn!(vault = %vault, status = %r.status(), "MemorySleep: consolidate refused")
+        let body = serde_json::json!({ "vault": vault, "ids": ids, "merged_content": merged });
+        match client.post_json(token, "/api/consolidate", &body).await {
+            Ok(status) if status.is_success() => outcome.consolidated += ids.len(),
+            Ok(status) => {
+                warn!(vault = %vault, status = %status, "MemorySleep: consolidate refused")
             }
             Err(e) => warn!(vault = %vault, error = %e, "MemorySleep: consolidate failed"),
         }
     }
     for id in &plan.forget {
-        let url = format!(
-            "{}/api/engrams/{}?vault={}",
-            base_url.trim_end_matches('/'),
-            id,
-            vault
-        );
-        match client.delete(&url).bearer_auth(token).send().await {
-            Ok(r) if r.status().is_success() => outcome.forgotten += 1,
-            Ok(r) => {
-                warn!(vault = %vault, id = %id, status = %r.status(), "MemorySleep: forget refused")
+        let path = format!("/api/engrams/{id}?vault={vault}");
+        match client.delete(token, &path).await {
+            Ok(status) if status.is_success() => outcome.forgotten += 1,
+            Ok(status) => {
+                warn!(vault = %vault, id = %id, status = %status, "MemorySleep: forget refused")
             }
             Err(e) => warn!(vault = %vault, id = %id, error = %e, "MemorySleep: forget failed"),
         }
@@ -425,8 +402,7 @@ async fn sleep_vault(
 }
 
 async fn list_engrams(
-    client: &reqwest::Client,
-    base_url: &str,
+    client: &memory_core::admin::AdminClient,
     token: &str,
     vault: &str,
 ) -> Result<Vec<EngramItem>> {
@@ -438,18 +414,8 @@ async fn list_engrams(
     let mut out = Vec::new();
     let mut offset = 0usize;
     while out.len() < MAX_ENGRAMS_PER_VAULT {
-        let url = format!(
-            "{}/api/engrams?vault={}&limit={}&offset={}",
-            base_url.trim_end_matches('/'),
-            vault,
-            LIST_PAGE,
-            offset
-        );
-        let resp = client.get(&url).bearer_auth(token).send().await?;
-        if !resp.status().is_success() {
-            anyhow::bail!("list engrams returned {}", resp.status());
-        }
-        let page: Page = resp.json().await?;
+        let path = format!("/api/engrams?vault={vault}&limit={LIST_PAGE}&offset={offset}");
+        let page: Page = client.get_json(token, &path).await?;
         let n = page.engrams.len();
         out.extend(page.engrams);
         if n < LIST_PAGE {
@@ -463,32 +429,14 @@ async fn list_engrams(
 /// Length of a JSON array found at `field` (or the top level) of a GET
 /// response; 0 when the endpoint is unavailable. Report-only.
 async fn count_json_array(
-    client: &reqwest::Client,
-    base_url: &str,
+    client: &memory_core::admin::AdminClient,
     token: &str,
     vault: &str,
     path_and_query: &str,
     field: &str,
 ) -> usize {
-    let sep = if path_and_query.contains('?') {
-        '&'
-    } else {
-        '?'
-    };
-    let url = format!(
-        "{}{}{}vault={}",
-        base_url.trim_end_matches('/'),
-        path_and_query,
-        sep,
-        vault
-    );
-    let Ok(resp) = client.get(&url).bearer_auth(token).send().await else {
-        return 0;
-    };
-    if !resp.status().is_success() {
-        return 0;
-    }
-    let Ok(json) = resp.json::<serde_json::Value>().await else {
+    let path = memory_core::admin::AdminClient::with_vault(path_and_query, vault);
+    let Some(json) = client.try_get_value(token, &path).await else {
         return 0;
     };
     json.get(field)
