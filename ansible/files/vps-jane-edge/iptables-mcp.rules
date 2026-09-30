@@ -1,0 +1,6 @@
+# INPUT rules for the MCP listeners on vps-jane, persisted in
+# /etc/iptables/rules.v4 (iptables-persistent). Docker bridges may reach the
+# listeners (Traefik); the public interface may not — TLS goes through Traefik.
+-A INPUT -i br+ -p tcp -m multiport --dports 8911,8912,9100 -j ACCEPT
+-A INPUT -i docker0 -p tcp -m multiport --dports 8911,8912,9100 -j ACCEPT
+-A INPUT -i eth0 -p tcp -m multiport --dports 8911,8912,9100 -j DROP
