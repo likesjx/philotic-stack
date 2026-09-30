@@ -325,10 +325,10 @@ fn build_inbound_request(
 
     // The upstream grant check keys on `agent_id`; it must be the membrane's
     // authenticated caller, never something a transport extra could override.
-    if target_kind == Some("mcp_upstream") {
-        if let Some(obj) = payload.as_object_mut() {
-            obj.insert("agent_id".into(), mcp_caller_principal(envelope).into());
-        }
+    if target_kind == Some("mcp_upstream")
+        && let Some(obj) = payload.as_object_mut()
+    {
+        obj.insert("agent_id".into(), mcp_caller_principal(envelope).into());
     }
 
     if let Some(node) = target_node {
