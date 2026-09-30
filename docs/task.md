@@ -424,7 +424,8 @@ Seam IDs: `mcp-upstream-route-target`, `agent-frontdoor-endpoint`, `remote-munin
 - [x] S2 `scripts/muninn_mcp.py` frontdoor mode (`PHILOTIC_FRONTDOOR_URL` / `PHILOTIC_AGENT_MCP_TOKEN`); mock-frontdoor verified.
 - [x] S1 compiled + tested on mac-jane after merging develop (5 new tests green, `just check` green).
 - [ ] S3 Register upstreams — `intel-graph` on mac-jane DONE (connected, 12 tools; granted call ok, ungranted refused); `muninn-cortex` on vps-jane DONE (connected, 4 tools, Cortex bearer stored; granted recall ok, ungranted refused — moved off the Mac: Mac Muninn is a write-rejecting observer); provision `agent-frontdoor` endpoint on vps-jane; TLS path `/agent/mcp`.
-- [ ] S4 Hardening: proxy loopback trust, Mac-offline fast-fail, caller tag on writes, response-shape check.
+- [ ] S4 Hardening: proxy loopback trust DONE (#597, `is_trusted_loopback`); response-shape DONE (#601, no double-wrap); Mac-offline fast-fail = DEF-210 (30 s hang, follow-up); caller tag on writes: v1 relies on clients tagging (`claude`/`codex`), per-agent principal is in the endpoint audit.
+- [x] S3 endpoint `agent-frontdoor` provisioned on vps-jane (:8912, mesh, 16 tools, tokens for claude-cloud/codex-cloud in mac Keychain `philotic-agent-frontdoor`); loopback smoke green (`muninn_mcp.py bootstrap` → `transport: frontdoor`).
 - [ ] S5 Cloud client config (Claude Code / Codex env + allowlist, `.mcp.json` entry once live).
 - [ ] S6 `remote-agent-frontdoor` credential class + `mcp-client-uat.sh agent-frontdoor` mode.
 
