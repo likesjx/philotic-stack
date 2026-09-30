@@ -50,12 +50,16 @@ pub trait MemoryEngine: Send + Sync {
         entries: Vec<(String, String, Vec<String>)>, // (concept, content, tags)
     ) -> anyhow::Result<Vec<EngramRef>>;
 
-    /// Update an existing engram's content or tags.
-    /// The engram's core identity (id, vault) is immutable.
+    /// Evolve an existing engram: the new content supersedes the old version,
+    /// which stays retrievable as history. `reason` is required by MuninnDB's
+    /// native evolve endpoint and recorded on the version chain. Tags are
+    /// inherited from the previous version (retag separately when needed);
+    /// implementations that cannot honor a `tags` override should say so.
     async fn evolve(
         &self,
         id: &EngramId,
         content: &str,
+        reason: &str,
         tags: Option<Vec<String>>,
     ) -> anyhow::Result<EngramRef>;
 

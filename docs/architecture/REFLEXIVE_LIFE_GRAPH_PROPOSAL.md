@@ -2,10 +2,10 @@
 title: Reflexive Life Graph — Skills That Own Their Structure
 doc_type: proposal
 domain: memory-context
-status: proposed
+status: accepted-current-slice
 disposition: proposed
 verification_level: none
-last_updated: 2026-09-15
+last_updated: 2026-09-30
 tags:
   - lifegraph
   - skills
@@ -217,7 +217,10 @@ closing step meaningful.
 
 ## Disposition
 
-Proposed 2026-09-15. Slice 1 = R1 (typed properties) — the smallest change that turns
-"difficulty 0–100" from a sentence into a number the operator can cross-reference
-against practice. Records and audit live in the hotel context graph; the proposal is
+Accepted for current slice. Slice 1 = R1 (typed properties) SHIPPED 2026-09-15: the
+runner declares per-label typed properties (`ExtensionProperty` kind/range/allowed
+values), `life.observe` rejects undeclared keys, and the schema doc's typed-properties
+section reflects it — "difficulty 0–100" is a validated number, not a sentence.
+Status corrected 2026-09-30 (memory-RAG audit): the doc still said "proposed" while
+slice 1 was live. Records and audit live in the hotel context graph; the proposal is
 indexed from the main checkout after merge.

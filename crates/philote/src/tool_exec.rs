@@ -416,21 +416,29 @@ impl AgentRuntime {
 
             // `operator_approved` is a model-settable flag; on a life.tidy
             // `retire` it is the only thing standing between a confirmed node
-            // and retirement. Honor it only when the operator's own message
-            // this turn reads as an approval — live 2026-09-14 20:47 UTC the
-            // model set it on its own initiative.
-            if tool_call.tool_name == "life.tidy" {
-                let is_retire = tool_call
-                    .arguments
-                    .pointer("/action/kind")
-                    .and_then(serde_json::Value::as_str)
-                    == Some("retire");
+            // and retirement, on life.commit it promotes a proposed node to
+            // confirmed truth, and on life.patch.apply it lands an ontology
+            // change. Honor it only when the operator's own message this turn
+            // reads as an approval — live 2026-09-14 20:47 UTC the model set
+            // it on its own initiative.
+            let approval_gated = match tool_call.tool_name.as_str() {
+                "life.tidy" => {
+                    tool_call
+                        .arguments
+                        .pointer("/action/kind")
+                        .and_then(serde_json::Value::as_str)
+                        == Some("retire")
+                }
+                "life.commit" | "life.patch.apply" => true,
+                _ => false,
+            };
+            if approval_gated {
                 let claimed = tool_call
                     .arguments
                     .get("operator_approved")
                     .and_then(serde_json::Value::as_bool)
                     .unwrap_or(false);
-                if is_retire && claimed {
+                if claimed {
                     let user_text = self
                         .sessions
                         .get(&session_id)
@@ -453,7 +461,8 @@ impl AgentRuntime {
                     if !approved {
                         warn!(
                             session_id = %session_id,
-                            "life.tidy retire: dropping model-set operator_approved (no approval in the operator's message)"
+                            tool = %tool_call.tool_name,
+                            "dropping model-set operator_approved (no approval in the operator's message)"
                         );
                         if let Some(args) = tool_call.arguments.as_object_mut() {
                             args.insert("operator_approved".into(), serde_json::Value::Bool(false));
@@ -6902,6 +6911,8 @@ impl AgentRuntime {
             "memory.recall" => self.execute_memory_recall_tool(payload).await,
 
             "memory.remember" => self.execute_memory_remember_tool(payload).await,
+
+            "memory.evolve" => self.execute_memory_evolve_tool(payload).await,
 
             "memory.cultivate" => self.execute_memory_cultivate_tool(payload).await,
 

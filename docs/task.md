@@ -424,7 +424,7 @@ Seam IDs: `mcp-upstream-route-target`, `agent-frontdoor-endpoint`, `remote-munin
 - [x] S2 `scripts/muninn_mcp.py` frontdoor mode (`PHILOTIC_FRONTDOOR_URL` / `PHILOTIC_AGENT_MCP_TOKEN`); mock-frontdoor verified.
 - [x] S1 compiled + tested on mac-jane after merging develop (5 new tests green, `just check` green).
 - [ ] S3 Register upstreams — `intel-graph` on mac-jane DONE (connected, 12 tools; granted call ok, ungranted refused); `muninn-cortex` on vps-jane DONE (connected, 4 tools, Cortex bearer stored; granted recall ok, ungranted refused — moved off the Mac: Mac Muninn is a write-rejecting observer); provision `agent-frontdoor` endpoint on vps-jane; TLS path `/agent/mcp`.
-- [ ] S4 Hardening: proxy loopback trust DONE (#597, `is_trusted_loopback`); response-shape DONE (#601, no double-wrap); Mac-offline fast-fail = DEF-210 (30 s hang, follow-up); caller tag on writes: v1 relies on clients tagging (`claude`/`codex`), per-agent principal is in the endpoint audit.
+- [ ] S4 Hardening: proxy loopback trust DONE (#597, `is_trusted_loopback`); response-shape DONE (#601, no double-wrap); Mac-offline fast-fail = DEF-211 (30 s hang); endpoint config pushes dropped = DEF-212 (fixed #601); caller tag on writes: v1 relies on clients tagging (`claude`/`codex`), per-agent principal is in the endpoint audit.
 - [x] S3 endpoint `agent-frontdoor` provisioned on vps-jane (:8912, mesh, 16 tools, tokens for claude-cloud/codex-cloud in mac Keychain `philotic-agent-frontdoor`); loopback smoke green (`muninn_mcp.py bootstrap` → `transport: frontdoor`).
 - [ ] S5 Cloud client config (Claude Code / Codex env + allowlist, `.mcp.json` entry once live).
 - [ ] S6 `remote-agent-frontdoor` credential class + `mcp-client-uat.sh agent-frontdoor` mode.
@@ -2278,3 +2278,20 @@ A typed, calibrated decision capability (yes/no, choose-one, score) beside gener
 - [ ] D4 calibrate per question from `decision_traces` / `router_traces` / approve-deny events / `life.recall.feedback`; promote through the autonomy postures only on earned agreement.
 - [ ] D5 (optional) make the provider the first production producer of `Context1Advisory` (`philote/src/session/types.rs:398`, currently test-only).
 - [ ] Re-verify vendor claims before relying on them: 70–500 ms latency, 67.8 % agreement, 193.6×/444.6× benchmark.
+
+## New Project: Memory Graph RAG Audit Fixes (S1–S10)
+
+Audit 2026-09-30 (full read: philote Muninn lane, `data-memorygraphrag` runner, Muninn↔LifeGraph overlap, live probe — findings on `doc:life-graph-os` via graph_decide and in Muninn). All ten ranked recommendations implemented on `codex/memory-rag-fixes`, one commit per slice, PR #599 → develop. Test-green: philote 641/641, data-memorygraphrag 222/222, memory-core 43/43, workspace check + fmt clean.
+
+- [x] S1 `life.commit` promotion gate: provider checks the STORED node's `validation_state`; philote drops model-set `operator_approved` on `life.commit`/`life.patch.apply` (same guard as tidy-retire). Closes the self-attestable confirmation hole.
+- [x] S2 Ownership clarity: LifeGraph added to both Muninn skills' ownership tables; `KNOWLEDGE_ARCHITECTURE_PROPOSAL` Overlap Ownership Rules (preferences, people, lived facts, ideas).
+- [x] S3 Muninn lineage through the auto-fork: `life_capture` derives the Attend `{vault}:{concept}` key (lockstep-tested) → `muninn_engram` source ref → `origin_engram_id`/`origin_trust` populate on real traffic (agent-inference trust; the ≥0.7 bonus stays reserved).
+- [x] S4 Attend hardening + curation: inline 401-heal/retry/enrich on Attend's local write; memory-core uses MuninnDB's NATIVE evolve endpoint (`POST /api/engrams/{id}/evolve` — the shim comment was stale); new `memory.evolve` tool, cluster-routed.
+- [x] S5 Hygiene sweep default-ON (opt out `PHILOTIC_LIFE_HYGIENE_ENABLED=0`); gardener skill gains the proposed-backlog confirm-or-retire triage lane (backlog was 210/856 nodes). NOTE: the gardening cron is ALIVE (`ac6e8d5f`, Beacon reports 2026-09-30) — the audit's "dead cron" finding was corrected live.
+- [x] S6 Entities in MuninnDB's first-class write fields (inline enrichment) instead of the opaque metadata blob. Read-side entity return from activate is the named follow-up seam.
+- [x] S7 Health & fitness domain: `Workout`/`Measurement` labels + V007 vector indexes (**apply migration on vps Memgraph BEFORE runner rollout**) + `scripts/lifegraph-ingest-hevy.py` (first real ingestion lane; deterministic ids, `imported_record`/`inferred` provenance).
+- [x] S8 Recall resilience: 60s Unreachable circuit breaker in the vault skip registry; partial token heals deferred to post-reply; `[Memory status]` degraded-recall prompt marker (outage ≠ empty history).
+- [x] S9 `memory_core::admin::AdminClient` canonical; dream sweep ported; remaining hand-rolled clients tracked as DEF-210 (hygiene+delta first, then the two memory_explain copies onto `MemoryEngine::activate`).
+- [x] S10 Docs true-up: MEMORY_TRANSPARENCY stale promotion-seam claim corrected; MEMORY_CONTEXT superseded; REFLEXIVE_LIFE_GRAPH slice-1 status fixed.
+- [ ] Deploy: apply V007 on vps Memgraph, then standard 3-hotel rollout; watch one live turn for the auto-recall marker and one auto-capture carrying `origin_engram_id`.
+- [ ] Follow-ups (ranked): DEF-209 client ports; activate-side entity return; positive reinforcement in `life.recall.feedback`; Measurement importer (HealthKit); life.audit O(n²) → MAGE.

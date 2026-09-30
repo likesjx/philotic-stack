@@ -112,6 +112,7 @@ pub enum ForwardedWriteOp {
     Evolve {
         id: String,
         content: String,
+        reason: String,
         tags: Option<Vec<String>>,
     },
     Forget {
@@ -181,6 +182,11 @@ pub fn parse_forwarded_write_op(payload: &serde_json::Value) -> Result<Forwarded
                 .get("content")
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
+                .to_string(),
+            reason: payload
+                .get("reason")
+                .and_then(|v| v.as_str())
+                .unwrap_or("evolved via forwarded write")
                 .to_string(),
             tags: payload.get("tags").and_then(|v| v.as_array()).map(|arr| {
                 arr.iter()
@@ -328,8 +334,13 @@ pub async fn apply_forwarded_write(graph: &GraphDomain, task_json: &str) -> Resu
                 .await?;
             Ok(engram.id)
         }
-        ForwardedWriteOp::Evolve { id, content, tags } => {
-            let engram = engine.evolve(&id, &content, tags).await?;
+        ForwardedWriteOp::Evolve {
+            id,
+            content,
+            reason,
+            tags,
+        } => {
+            let engram = engine.evolve(&id, &content, &reason, tags).await?;
             Ok(engram.id)
         }
         ForwardedWriteOp::Forget { id } => {
@@ -389,9 +400,15 @@ mod tests {
     fn parse_forwarded_write_dispatches_every_verb() {
         let evolve = serde_json::json!({"op":"evolve","id":"01ABC","content":"new"});
         match parse_forwarded_write_op(&evolve).unwrap() {
-            ForwardedWriteOp::Evolve { id, content, tags } => {
+            ForwardedWriteOp::Evolve {
+                id,
+                content,
+                reason,
+                tags,
+            } => {
                 assert_eq!(id, "01ABC");
                 assert_eq!(content, "new");
+                assert_eq!(reason, "evolved via forwarded write");
                 assert!(tags.is_none());
             }
             other => panic!("expected Evolve, got {other:?}"),
