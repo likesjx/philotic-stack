@@ -36,6 +36,15 @@ active_seams:
 
 # Agent Frontdoor — Remote Agents Reach Muninn + Intel-Graph Through membrane-mcp
 
+> **Correction (2026-09-30, after reading `origin/develop`):** this branch was cut
+> from a stale `main`. On develop, Muninn runs as a cluster: the **writable Cortex
+> is on vps-jane**; mac-jane and mbp-jane run read-only observers that reject
+> writes with HTTP 421 (`MUNINN_MEMORY_CORE_PROPOSAL.md`). So the `muninn-local`
+> upstream should be registered on **vps-jane itself** (same hotel as the
+> frontdoor, no mesh hop); only `intel-graph` stays on mac-jane. Also verify
+> whether local Claude Code / Codex `muninn_remember` writes against the Mac
+> observer still land. Rebase this branch onto `origin/develop` before any PR.
+
 ## Problem
 
 Local Claude Code and Codex on the Mac follow the session protocol in

@@ -6,6 +6,15 @@
 > [AGENT_FRONTDOOR_PROPOSAL.md](architecture/AGENT_FRONTDOOR_PROPOSAL.md).
 > Branch: `claude/stoic-goldberg-f8w99b`.
 
+> **Correction (2026-09-30, after reading `origin/develop`):** this branch was cut
+> from a stale `main`. On develop, Muninn runs as a cluster: the **writable Cortex
+> is on vps-jane**; mac-jane and mbp-jane run read-only observers that reject
+> writes with HTTP 421 (`MUNINN_MEMORY_CORE_PROPOSAL.md`). So the `muninn-local`
+> upstream should be registered on **vps-jane itself** (same hotel as the
+> frontdoor, no mesh hop); only `intel-graph` stays on mac-jane. Also verify
+> whether local Claude Code / Codex `muninn_remember` writes against the Mac
+> observer still land. Rebase this branch onto `origin/develop` before any PR.
+
 ## Goal
 
 Let cloud agents use the same Muninn continuity and intel-graph coordination
