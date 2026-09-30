@@ -1763,6 +1763,11 @@ impl AgentRuntime {
         reason: &str,
         elapsed: std::time::Duration,
     ) {
+        // Silent memory loss was invisible: a failed recall produced a turn
+        // indistinguishable from "no relevant memories", so the model would
+        // confidently treat absence of recall as absence of history. Stamp
+        // the turn so prompt composition injects a one-line marker.
+        self.mark_turn_memory_degraded(session_id, reason);
         let _ = self
             .emit_turn_event(
                 session_id,
@@ -1773,6 +1778,27 @@ impl AgentRuntime {
                 )),
             )
             .await;
+    }
+
+    /// Stamp the active turn as memory-degraded so `project_recalled_memory`
+    /// renders the "memory unavailable" marker instead of silence.
+    fn mark_turn_memory_degraded(&mut self, session_id: &str, reason: &str) {
+        if let Some(state) = self.sessions.get_mut(session_id) {
+            if let Some(turn) = state.active_turn.as_mut() {
+                turn.memory_degraded = Some(reason.to_string());
+            }
+        }
+    }
+
+    /// Drain deferred vault-token heals (called post-reply from
+    /// `deliver_text_reply`): one heal attempt per vault, off the turn path.
+    pub(super) async fn drain_pending_token_heals(&mut self) {
+        let vaults = std::mem::take(&mut self.pending_token_heals);
+        for vault in vaults {
+            if !self.heal_memory_token(&vault).await {
+                warn!(vault = %vault, "Deferred memory token heal failed — will retry on next rejection.");
+            }
+        }
     }
 
     pub(super) async fn maybe_auto_recall_turn_memory(&mut self, session_id: &str) -> Result<()> {
@@ -1939,12 +1965,14 @@ impl AgentRuntime {
         let recall_latency_ms = recall_started.elapsed().as_millis();
 
         // Partial token rejection: other vaults answered, so the call did not
-        // error and the all-vaults heal above never fired. Heal the rejected
-        // vault for the next turn (the engine skips it meanwhile).
-        if let Some(vault) = result.rejected_vaults.first().cloned()
-            && !self.heal_memory_token(&vault).await
-        {
-            warn!(session_id = %session_id, vault = %vault, "Auto recall: partial token rejection could not be healed.");
+        // error and the all-vaults heal above never fired. DEFER the heal to
+        // after the reply is delivered (drained in deliver_text_reply) — the
+        // heal is a 20s-budget IPC round-trip that must not block the turn.
+        // The engine skips the rejected vault meanwhile.
+        for vault in &result.rejected_vaults {
+            if !self.pending_token_heals.contains(vault) {
+                self.pending_token_heals.push(vault.clone());
+            }
         }
 
         let recall_reason = result.decision.reason.clone();
@@ -1965,6 +1993,12 @@ impl AgentRuntime {
             .chain(result.failed_vaults.iter())
             .cloned()
             .collect();
+        if !degraded_vaults.is_empty() {
+            self.mark_turn_memory_degraded(
+                session_id,
+                &format!("vaults unavailable: {}", degraded_vaults.join(", ")),
+            );
+        }
         let recalled_memories = result
             .engrams
             .into_iter()
@@ -2144,6 +2178,7 @@ impl AgentRuntime {
                 pending_approval: None,
                 working_tool_history: Vec::new(),
                 recalled_memories: Vec::new(),
+                memory_degraded: None,
                 active_plan: None,
                 consecutive_step_failures: 0,
                 streak_extension: 0,
@@ -2645,6 +2680,142 @@ impl AgentRuntime {
                             }
                             Err(e) => format!("memory.remember error: {e}"),
                         }
+                    }
+                }
+            }
+        };
+
+        self.handle_tool_result(InboundTaskPayload {
+            action: Some("tool_result".into()),
+            agent_action: None,
+            handoff_bundle: None,
+            source: Some("agent".into()),
+            session_id: Some(payload.session_id),
+            turn_id: Some(payload.turn_id),
+            transport: None,
+            chat_id: Some(payload.chat_id),
+            thread_id: None,
+            sender_id: None,
+            sender_username: None,
+            message_kind: None,
+            content: Some(result_text),
+            attachments: Vec::new(),
+            command: None,
+            callback_data: None,
+            raw_transport_event: None,
+            error: None,
+            tool_name: Some(payload.tool_name),
+            arguments: None,
+            final_reply_to: Some(payload.final_reply_to),
+            final_reply_role: Some(payload.final_reply_role),
+            final_reply_guest_id: payload.final_reply_guest_id,
+            ..Default::default()
+        })
+        .await
+    }
+
+    /// `memory.evolve`: supersede an existing engram's content in place via
+    /// MuninnDB's native evolve (the old version stays retrievable history).
+    /// This is the curation half the write lane was missing: the model sees
+    /// recalled memory ids in its prompt and can correct/refresh a stale fact
+    /// instead of minting a rival near-duplicate with `memory.remember`.
+    pub(super) async fn execute_memory_evolve_tool(
+        &mut self,
+        payload: ToolExecutionPayload,
+    ) -> Result<()> {
+        use memory_core::MemoryEngine as _;
+
+        let memory_id = payload
+            .arguments
+            .get("memory_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        let content = payload
+            .arguments
+            .get("content")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        let reason = payload
+            .arguments
+            .get("reason")
+            .and_then(|v| v.as_str())
+            .unwrap_or("superseded by a corrected or refreshed fact")
+            .trim()
+            .to_string();
+
+        let result_text = if memory_id.is_empty() || content.is_empty() {
+            "memory.evolve error: both 'memory_id' and 'content' are required.".to_string()
+        } else if let Some(route) = self
+            .muninn_config
+            .as_ref()
+            .and_then(|cfg| cfg.shared_write_route.clone())
+            .filter(|route| *route != local_node_id())
+        {
+            // Cluster single-writer routing, like memory.remember: an evolve
+            // on an observer replica would strand — hand it to the Cortex,
+            // which discovers the engram's vault and applies it there.
+            let task_json = serde_json::json!({
+                "action": "memory.write_forward",
+                "op": "evolve",
+                "id": memory_id,
+                "content": content,
+                "reason": reason,
+                "origin_node": local_node_id(),
+                "origin_agent": self.agent_id,
+                "session_id": payload.session_id,
+            })
+            .to_string();
+            if self.send_memory_forward(&route, task_json).await {
+                format!(
+                    "Memory {memory_id} evolve routed to the cluster primary {route}; the \
+                     superseding version will appear in recall after replication."
+                )
+            } else {
+                format!(
+                    "memory.evolve could not reach the cluster primary {route} right now — \
+                     not applied. Retry later; do not report the memory as updated."
+                )
+            }
+        } else {
+            let memory_user_id = self
+                .sessions
+                .get(&payload.session_id)
+                .map(turn_memory_user_id)
+                .unwrap_or_else(|| self.agent_id.clone());
+            match self.memory_engine_for(&self.agent_id, &memory_user_id) {
+                None => "Memory unavailable: MuninnDB not configured.".to_string(),
+                Some(engine) => {
+                    let mut engine = engine;
+                    let mut evolved = engine.evolve(&memory_id, &content, &reason, None).await;
+                    // Token-401 → hotel re-mint → retry once, like remember.
+                    if let Err(err) = &evolved {
+                        if let Some(vault) = memory_core::token_rejected_vault(err) {
+                            let vault = vault.to_string();
+                            if self.heal_memory_token(&vault).await {
+                                if let Some(fresh) =
+                                    self.memory_engine_for(&self.agent_id, &memory_user_id)
+                                {
+                                    engine = fresh;
+                                    evolved =
+                                        engine.evolve(&memory_id, &content, &reason, None).await;
+                                }
+                            }
+                        }
+                    }
+                    match evolved {
+                        Ok(engram_ref) => {
+                            let _ = engine.retry_enrich(&engram_ref.id).await;
+                            format!(
+                                "Evolved memory {memory_id} → {} (vault: {}). The old version \
+                                 is retired but retrievable as history.",
+                                engram_ref.id, engram_ref.vault_id
+                            )
+                        }
+                        Err(e) => format!("memory.evolve error: {e}"),
                     }
                 }
             }

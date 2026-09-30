@@ -51,6 +51,7 @@ impl MemoryEngine for NullMemoryEngine {
         &self,
         _id: &EngramId,
         _content: &str,
+        _reason: &str,
         _tags: Option<Vec<String>>,
     ) -> anyhow::Result<EngramRef> {
         anyhow::bail!("NullMemoryEngine: no memory backend configured")

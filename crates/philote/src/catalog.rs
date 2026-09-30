@@ -340,6 +340,7 @@ pub fn skill_implied_tools(skill_name: &str) -> &'static [&'static str] {
         "memory" => &[
             "memory.recall",
             "memory.remember",
+            "memory.evolve",
             "memory.cultivate",
             "memory.true_up",
             "memory.promote_candidate",
@@ -3080,6 +3081,40 @@ fn build_catalog() -> HashMap<String, ToolDefinition> {
                     }
                 },
                 "required": ["concept", "content"]
+            }),
+            class: Some("memory".into()),
+        },
+    );
+
+    m.insert(
+        "memory.evolve".into(),
+        ToolDefinition {
+            tool_name: "memory.evolve".into(),
+            description: "Evolve an EXISTING memory: the new content supersedes the old version \
+                          in place (the old version stays retrievable as history). Use this — \
+                          not memory.remember — when a recalled memory is wrong, stale, or \
+                          refreshed by this turn, so recall is not crowded by rival duplicates. \
+                          Take memory_id from a recalled memory or memory.explain."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "memory_id": {
+                        "type": "string",
+                        "description": "The engram id (ULID) of the memory to evolve, as shown \
+                                        by recall or memory.explain."
+                    },
+                    "content": {
+                        "type": "string",
+                        "description": "The corrected/refreshed content. Keep atomic — one fact \
+                                        or decision, 1–3 sentences."
+                    },
+                    "reason": {
+                        "type": "string",
+                        "description": "Why the memory changed (recorded on the version chain)."
+                    }
+                },
+                "required": ["memory_id", "content"]
             }),
             class: Some("memory".into()),
         },

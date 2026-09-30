@@ -2507,6 +2507,27 @@ tools:
         description: Trailing window size in hours. Defaults to 24 if omitted.
         type: integer
     type: object
+- tool_name: memory.evolve
+  class: memory
+  description: 'Evolve an EXISTING memory: the new content supersedes the old version in place (the
+    old version stays retrievable as history). Use this — not memory.remember — when a recalled memory
+    is wrong, stale, or refreshed by this turn, so recall is not crowded by rival duplicates. Take
+    memory_id from a recalled memory or memory.explain.'
+  input_schema:
+    properties:
+      content:
+        description: The corrected/refreshed content. Keep atomic — one fact or decision, 1–3 sentences.
+        type: string
+      memory_id:
+        description: The engram id (ULID) of the memory to evolve, as shown by recall or memory.explain.
+        type: string
+      reason:
+        description: Why the memory changed (recorded on the version chain).
+        type: string
+    required:
+    - memory_id
+    - content
+    type: object
 - tool_name: memory.explain
   class: memory
   description: Answer 'why do you believe X?' by fanning a claim out across all three memory planes —

@@ -430,6 +430,59 @@ impl LifeCaptureLedger {
 }
 
 // ---------------------------------------------------------------------------
+// Muninn origin lineage
+// ---------------------------------------------------------------------------
+
+/// Lineage back to the Muninn engram the Attend hook stores for the same
+/// candidate. The fork fires before the Attend write (the turn is still
+/// active here; it is already completed by the time Attend runs), so the
+/// engram ULID cannot exist yet. But Attend writes are idempotent on
+/// `{vault}:{concept}`, which makes that pair a durable, chaseable handle —
+/// carried as `muninn:{vault}:{concept}` in a `muninn_engram` source ref so
+/// the runner pins `origin_engram_id`/`origin_trust` onto the node.
+#[derive(Debug, Clone, PartialEq)]
+pub(super) struct MuninnOriginRef {
+    pub handle: String,
+    pub trust: f64,
+}
+
+/// Mirror of the Attend hook's candidate-write derivation (`turn_loop.rs`
+/// Attend block): same hygiene gates, same concept normalization. Returns the
+/// concept the Attend hook will store this candidate under, or `None` when
+/// Attend will skip it (diagnostic / non-atomic). MUST stay in lockstep with
+/// that block — the paired unit test pins the derivation.
+pub(super) fn attend_candidate_concept(
+    agent_id: &str,
+    session_id: &str,
+    memory_concept: Option<&str>,
+    candidate: &MemoryCandidate,
+) -> Option<String> {
+    let concept = memory_concept.unwrap_or(&candidate.concept).to_string();
+    let mut tags = vec![format!("agent:{agent_id}"), format!("session:{session_id}")];
+    tags.extend(candidate.tags.iter().cloned());
+    if memory_core::write_hygiene::is_diagnostic_capture(&concept, &candidate.content, &tags) {
+        return None;
+    }
+    if memory_core::write_hygiene::exceeds_auto_capture_limit(&candidate.content) {
+        return None;
+    }
+    Some(memory_core::write_hygiene::distinct_concept(
+        &concept,
+        &candidate.content,
+    ))
+}
+
+/// The vault the Attend hook resolves for a SelfOnly candidate write —
+/// the other half of the idempotent `{vault}:{concept}` handle.
+pub(super) fn attend_selfonly_vault(agent_id: &str) -> String {
+    memory_core::VaultResolver {
+        agent_id: agent_id.to_string(),
+        user_id: agent_id.to_string(),
+    }
+    .resolve_primary(&MemoryScope::SelfOnly)
+}
+
+// ---------------------------------------------------------------------------
 // life.observe task construction
 // ---------------------------------------------------------------------------
 
@@ -471,6 +524,7 @@ pub(super) fn life_autocapture_task_json(
     label: LivedFactLabel,
     candidate: &MemoryCandidate,
     observed_role: Option<&str>,
+    muninn_origin: Option<&MuninnOriginRef>,
 ) -> Value {
     let now_iso = chrono::Utc::now().to_rfc3339();
     // Observation/evidence ids stay unique per observation; node identity is
@@ -481,6 +535,33 @@ pub(super) fn life_autocapture_task_json(
         .confidence
         .unwrap_or(LIFE_AUTOCAPTURE_DEFAULT_CONFIDENCE)
         .clamp(0.0, 1.0);
+
+    // The agent_inference ref stays FIRST: the runner derives the node's
+    // provenance string from the first source ref, and an auto-captured node
+    // is honestly agent-inferred. The muninn_engram ref (when the candidate
+    // is also Muninn-bound) rides second — the runner scans all refs for the
+    // first MuninnEngram to pin origin_engram_id/origin_trust lineage. The
+    // trust stays at the agent-inference level on purpose: lineage is not a
+    // trust upgrade, and the retrieval ranking bonus (origin_trust ≥ 0.7) is
+    // reserved for genuinely trusted origins, not self-signed ones.
+    let mut source_refs = vec![serde_json::json!({
+        "source_id": format!("agent:{agent_id}"),
+        "source_kind": "agent_inference",
+        "reliability": {
+            "score": LIFE_AUTOCAPTURE_SOURCE_RELIABILITY,
+            "basis": "agent_inferred"
+        }
+    })];
+    if let Some(origin) = muninn_origin {
+        source_refs.push(serde_json::json!({
+            "source_id": origin.handle,
+            "source_kind": "muninn_engram",
+            "reliability": {
+                "score": origin.trust,
+                "basis": "muninn_trust"
+            }
+        }));
+    }
 
     let arguments = serde_json::json!({
         // Per-agent provenance: observed_by is the canonical agent identity.
@@ -495,14 +576,7 @@ pub(super) fn life_autocapture_task_json(
                 "datasource": "life-graph"
             },
             "claim_summary": candidate.content,
-            "source_refs": [{
-                "source_id": format!("agent:{agent_id}"),
-                "source_kind": "agent_inference",
-                "reliability": {
-                    "score": LIFE_AUTOCAPTURE_SOURCE_RELIABILITY,
-                    "basis": "agent_inferred"
-                }
-            }],
+            "source_refs": source_refs,
             "passage_refs": [],
             "confidence": confidence,
             "validation_state": "proposed",
@@ -548,6 +622,7 @@ impl AgentRuntime {
         &mut self,
         session_id: &str,
         candidate: Option<&MemoryCandidate>,
+        memory_concept: Option<&str>,
     ) {
         let Some(candidate) = candidate else {
             return;
@@ -639,6 +714,23 @@ impl AgentRuntime {
             return;
         }
 
+        // Muninn lineage: the Attend hook will store this same candidate
+        // under an idempotent `{vault}:{concept}` key (fork, not move).
+        // Deriving that key here — with the same gates Attend applies —
+        // lets the graph node carry origin lineage without waiting on the
+        // write. When Attend ends up skipping or failing, the handle is a
+        // benign dangling pointer that self-heals on any re-observation.
+        let muninn_origin = if self.muninn_config.is_some() {
+            attend_candidate_concept(&self.agent_id, session_id, memory_concept, candidate).map(
+                |concept| MuninnOriginRef {
+                    handle: format!("muninn:{}:{concept}", attend_selfonly_vault(&self.agent_id)),
+                    trust: LIFE_AUTOCAPTURE_SOURCE_RELIABILITY,
+                },
+            )
+        } else {
+            None
+        };
+
         let task_json = life_autocapture_task_json(
             &self.agent_id,
             &self.own_guest_id(),
@@ -649,6 +741,7 @@ impl AgentRuntime {
             label,
             candidate,
             observed_role.as_deref(),
+            muninn_origin.as_ref(),
         );
         let node_id = task_json
             .pointer("/arguments/evidence/claim_ref/id")
@@ -1090,6 +1183,7 @@ mod tests {
             LivedFactLabel::Decision,
             &cand,
             Some("chief_of_staff"),
+            None,
         );
 
         assert_eq!(task["action"], "execute_tool");
@@ -1189,6 +1283,7 @@ mod tests {
             LivedFactLabel::Goal,
             &cand,
             None,
+            None,
         );
         let input: data_memorygraphrag::LifeObserveInput =
             serde_json::from_value(task["arguments"].clone()).expect("contract parse");
@@ -1221,6 +1316,7 @@ mod tests {
             LivedFactLabel::Decision,
             &cand,
             None,
+            None,
         );
         // Candidate is untouched — Muninn receives exactly what it does today.
         assert_eq!(cand.concept, "decision: sqlite over postgres");
@@ -1249,6 +1345,7 @@ mod tests {
             LivedFactLabel::Goal,
             &cand,
             None,
+            None,
         );
         assert_eq!(
             task["arguments"]["evidence"]["confidence"],
@@ -1259,5 +1356,88 @@ mod tests {
     #[test]
     fn budget_env_parsing_falls_back_to_defaults() {
         assert_eq!(env_u32("PHILOTIC_TEST_NO_SUCH_VAR_XYZ", 7), 7);
+    }
+
+    // ── Muninn origin lineage ─────────────────────────────────────────────
+
+    #[test]
+    fn muninn_origin_ref_lands_as_second_source_ref_and_pins_lineage() {
+        let cand = candidate(
+            "decision: sqlite over postgres",
+            "We decided to keep SQLite as the hotel store instead of Postgres.",
+            &[],
+        );
+        let origin = MuninnOriginRef {
+            handle: "muninn:agent_beacon_01:decision-sqlite-over-postgres".into(),
+            trust: LIFE_AUTOCAPTURE_SOURCE_RELIABILITY,
+        };
+        let task = life_autocapture_task_json(
+            "agent-beacon-01",
+            "agent-beacon-01",
+            "sess-1",
+            "turn-1",
+            "chat-1",
+            "node-1",
+            LivedFactLabel::Decision,
+            &cand,
+            None,
+            Some(&origin),
+        );
+
+        // agent_inference stays FIRST (provenance string derives from it);
+        // muninn_engram rides second (lineage scan finds it anywhere).
+        let refs = task["arguments"]["evidence"]["source_refs"]
+            .as_array()
+            .expect("source_refs array");
+        assert_eq!(refs.len(), 2);
+        assert_eq!(refs[0]["source_kind"], "agent_inference");
+        assert_eq!(refs[1]["source_kind"], "muninn_engram");
+        assert_eq!(refs[1]["source_id"], origin.handle);
+        assert_eq!(refs[1]["reliability"]["basis"], "muninn_trust");
+
+        // The contract parses and the compiled Cypher pins the origin fields.
+        let input: data_memorygraphrag::LifeObserveInput =
+            serde_json::from_value(task["arguments"].clone()).expect("contract parse");
+        let compiled = data_memorygraphrag::cypher::compile_observe(&input, "2026-09-30T00:00:00Z")
+            .expect("observe compiles");
+        assert_eq!(
+            compiled.origin_engram_id.as_deref(),
+            Some(origin.handle.as_str())
+        );
+        let trust = compiled.origin_trust.expect("origin trust pinned");
+        assert!((trust - LIFE_AUTOCAPTURE_SOURCE_RELIABILITY).abs() < 1e-5);
+        // Provenance string still reflects the first (agent_inference) ref.
+        assert_eq!(compiled.provenance, "agent_inferred");
+        // Lineage must never claim more trust than the retrieval ranking
+        // bonus threshold (0.7) — auto-captures are self-signed.
+        assert!(trust < 0.7);
+    }
+
+    #[test]
+    fn attend_candidate_concept_mirrors_attend_gates() {
+        // Healthy candidate → the distinct_concept-normalized Attend key.
+        let cand = candidate(
+            "fitness goal",
+            "Jared is working toward rowing a marathon distance by December.",
+            &[],
+        );
+        let derived = attend_candidate_concept("agent-a", "sess-1", None, &cand)
+            .expect("healthy candidate derives a concept");
+        assert_eq!(
+            derived,
+            memory_core::write_hygiene::distinct_concept("fitness goal", &cand.content)
+        );
+        // An explicit memory_concept overrides the candidate's own, exactly
+        // as the Attend block's `memory_concept.unwrap_or(candidate.concept)`.
+        let overridden =
+            attend_candidate_concept("agent-a", "sess-1", Some("goal: row a marathon"), &cand)
+                .expect("override derives");
+        assert_eq!(
+            overridden,
+            memory_core::write_hygiene::distinct_concept("goal: row a marathon", &cand.content)
+        );
+        // Non-atomic content is gated out, like the Attend hook's skip.
+        let long = candidate("long", &"x".repeat(900), &[]);
+        assert!(attend_candidate_concept("agent-a", "sess-1", None, &long).is_none());
     }
 }

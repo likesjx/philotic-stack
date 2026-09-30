@@ -52,6 +52,8 @@ pub fn labels_for_space(space: &SemanticSpace) -> &'static [&'static str] {
             "Appointment",
             "Moment",
             "Place",
+            "Workout",
+            "Measurement",
         ],
         SemanticSpace::GoalSystemSemantic => &[
             "Goal",
@@ -93,9 +95,8 @@ pub fn labels_for_space(space: &SemanticSpace) -> &'static [&'static str] {
 /// or `None` if the label has no vector index.
 pub fn embedding_space_for_label(label: &str) -> Option<&'static str> {
     match label {
-        "Event" | "Signal" | "OpenLoop" | "Trip" | "Appointment" | "Moment" | "Place" => {
-            Some("life_event_semantic")
-        }
+        "Event" | "Signal" | "OpenLoop" | "Trip" | "Appointment" | "Moment" | "Place"
+        | "Workout" | "Measurement" => Some("life_event_semantic"),
         "Goal" | "System" | "Habit" | "Project" | "Routine" | "NextAction" | "Subscription"
         | "Asset" | "CreativeWork" => Some("goal_system_semantic"),
         "GrowthHypothesis" | "GrowthExperiment" | "DriftFinding" | "CapabilityPatch"

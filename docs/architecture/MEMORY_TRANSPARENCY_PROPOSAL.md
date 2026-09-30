@@ -107,11 +107,14 @@ surfaced: (a) the model-invoked `life.observe` tool call and the hand-rolled
 `direct_life_observe_input` JSON path have no provenance-injection point yet
 — `tool_exec::inject_scoped_to_anchor` is the existing precedent for
 server-side injection into a model-originated payload and is the template
-for closing this; (b) `seam:lifegraph-muninn-promotion` does not exist as
-code anywhere in this repo yet (only reserved-field comments in `cypher.rs`
-and `projection.rs`), so M1's "cross-plane lineage" goal is unimplementable
-until that promotion path is actually built — a prerequisite for M2, not a
-skipped M1 task.
+for closing this; (b) `seam:lifegraph-muninn-promotion` — STALE as written
+(corrected 2026-09-30): the promotion path now exists in code. The writer
+pins `origin_engram_id`/`origin_trust` from the first `muninn_engram` source
+ref (`cypher.rs`), retrieval grants a confirmation-term bonus for trusted
+Muninn origins (`projection.rs`), and since the 2026-09-30 memory-RAG fixes
+the automatic `life_capture` fork carries a durable `muninn:{vault}:{concept}`
+handle, so lineage populates on real traffic (at agent-inference trust, below
+the bonus threshold by design).
 
 M2 (explain-surface) **landed** 2026-07-11 on
 `codex/memory-m2-explain-surface`; see the M2 row above for the full

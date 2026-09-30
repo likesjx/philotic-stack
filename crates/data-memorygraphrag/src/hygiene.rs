@@ -53,13 +53,16 @@ const CANDIDATE_FETCH_LIMIT: i64 = 1000;
 
 // ── Env parsing (pure, testable) ────────────────────────────────────────────
 
-/// Parse a truthy env value: `"1"`, `"true"`, `"yes"` (case-insensitive,
-/// trimmed). Anything else — including unset/empty/garbage — is `false`.
-/// Hygiene defaults OFF; an operator must opt in explicitly.
+/// Hygiene defaults ON (2026-09-30 memory-RAG audit: the sweep stayed
+/// opt-in past its pilot and the proposed backlog grew to 210 of 856 nodes
+/// with no retire lane running). An operator opts OUT explicitly with
+/// `"0"`/`"false"`/`"no"` (case-insensitive, trimmed); anything else —
+/// including unset/empty/garbage — is `true`. The sweep stays safe to
+/// default: proposed-only, write-capped, confirmed nodes never touched.
 pub fn parse_enabled(raw: Option<&str>) -> bool {
-    matches!(
+    !matches!(
         raw.map(str::trim).map(str::to_ascii_lowercase).as_deref(),
-        Some("1") | Some("true") | Some("yes")
+        Some("0") | Some("false") | Some("no")
     )
 }
 
@@ -813,18 +816,22 @@ mod tests {
     // ── env gating ────────────────────────────────────────────────────────
 
     #[test]
-    fn parse_enabled_accepts_known_truthy_forms_case_insensitive() {
+    fn parse_enabled_defaults_on_and_accepts_truthy_forms() {
         for v in ["1", "true", "TRUE", "True", "yes", "YES", "  yes  "] {
             assert!(parse_enabled(Some(v)), "{v:?} must be truthy");
+        }
+        // Default-on (2026-09-30): unset, empty, and garbage all run the sweep.
+        assert!(parse_enabled(None), "unset must default ON");
+        for v in ["", "   ", "on", "enabled"] {
+            assert!(parse_enabled(Some(v)), "{v:?} must default ON");
         }
     }
 
     #[test]
-    fn parse_enabled_rejects_everything_else() {
-        for v in ["0", "false", "no", "", "   ", "on", "enabled"] {
-            assert!(!parse_enabled(Some(v)), "{v:?} must not be truthy");
+    fn parse_enabled_honors_explicit_opt_out() {
+        for v in ["0", "false", "FALSE", "no", "No", "  no  "] {
+            assert!(!parse_enabled(Some(v)), "{v:?} must opt out");
         }
-        assert!(!parse_enabled(None), "unset must default OFF");
     }
 
     // ── apply_write_cap ───────────────────────────────────────────────────

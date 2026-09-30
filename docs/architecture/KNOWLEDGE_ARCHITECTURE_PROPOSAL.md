@@ -3,7 +3,7 @@ title: Cross-Agent Knowledge Architecture Proposal
 doc_type: proposal
 domain: memory-context
 status: accepted-current-slice
-last_updated: 2026-06-28
+last_updated: 2026-09-30
 tags:
   - muninn
   - lifegraph
@@ -71,6 +71,26 @@ The live-safe posture is:
 | `life.commit` / `life.resolve` | LifeGraph runner | confirmed graph truth | n/a | unavailable or approval-gated externally |
 | `life.recall` | LifeGraph runner | recall feedback only if invoked | governed context packets | HTTPS bearer, scoped endpoint |
 | graph-intelligence MCP | Intel Graph | project decisions and verification | repo/project structure | local/dev or operator-scoped |
+
+## Overlap Ownership Rules
+
+Some operator-fact classes can legitimately appear in both Muninn and the LifeGraph. These
+rules name the canonical owner so the second copy stays a pointer, not a rival:
+
+- **Preferences.** The LifeGraph `Preference` node is canonical for a stable, confirmed
+  operator preference. Muninn keeps the learned working form ("tends to X when Y") and the
+  lesson of how it was learned. When a preference stabilizes, promote it through
+  `life.observe` -> `life.commit`; the Muninn memory should then reference the node id
+  instead of restating the fact.
+- **People.** LifeGraph `Person` nodes are canonical for identity, relationships, and life
+  facts about a person. Muninn entities for the same person are retrieval keys, not
+  authority; when both exist, the Muninn entity should carry the LifeGraph node id so the
+  two resolve to one identity.
+- **Lived facts** (commitments, goals, open loops, events). Deliberately dual-written by the
+  philote auto-fork ("forked, not moved"): the LifeGraph copy is the governed fact that gets
+  confirmed and resolved; the Muninn copy is the continuity trace.
+- **Ideas.** The LifeGraph `GrowthHypothesis` node is the provenance anchor and the intel
+  graph owns execution state; Muninn stores at most the decision or lesson.
 
 ## Muninn To LifeGraph Flow
 
