@@ -303,6 +303,18 @@ async fn main() -> Result<()> {
     if std::env::args().nth(1).as_deref() == Some("--decision-summary") {
         return shadow::print_summary();
     }
+    // `heal-dispatcher --decision-smoke`: one live decisions call with this
+    // hotel's vault key, then exit. Connects as a separate guest id so it never
+    // collides with the running dispatcher's registration.
+    if std::env::args().nth(1).as_deref() == Some("--decision-smoke") {
+        let mut ipc = PhiloticClient::connect(GuestIdentity {
+            guest_id: format!("{GUEST_ID}-smoke"),
+            role: ROLE.to_string(),
+            supported_tools: Vec::new(),
+        })
+        .await?;
+        return shadow::run_smoke(&mut ipc).await;
+    }
 
     tracing_subscriber::fmt::init();
     info!("heal-dispatcher starting");

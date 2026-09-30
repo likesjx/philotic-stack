@@ -1,28 +1,37 @@
-//! The data-policy gate (ee "Data policy" in
+//! The data-policy gate (see "Data policy" in
 //! `docs/architecture/DECISIONS_MODEL_PROPOSAL.md`).
 //!
-//! Every judged state leaves the mesh, so three rules hold at the single egress
-//! point (`DecisionsClient::evaluate`), for every caller:
+//! Every judged state leaves the mesh, so these rules hold at the single egress
+//! point ([`admit`], called by `DecisionsClient::evaluate`) for every caller:
 //!
 //! 1. **Sites are allow-listed by id** in [`SITES`], each with a declared data
-//!    class. An unknown site, or one whose class the policy does not allow, is
-//!    refused before any network hop. Widening the policy means editing that
-//!    table, which shows up in review.
-//! 2. **State that looks like a conversation payload is refused** ([`screen`]).
-//!    The allow-list keys on the site id, not on what the state contains, and a
-//!    provider error body can echo the request that failed. This is a fail-closed
-//!    heuristic, not a guarantee.
-//! 3. **Every string in `state` is redacted** and truncated to a fixed tail,
-//!    even for class A. Machine-generated text is not safe by construction:
-//!    DEF-089 is a live leak of bot tokens inside reqwest error URLs.
+//!    class. An unknown site, or one whose class the policy does not allow on
+//!    this transport, is refused before any network hop. Widening the policy
+//!    means editing that table, which shows up in review.
+//! 2. **Operator content (class C) leaves only under zero data retention.** The
+//!    operator allowed full prompts on 2026-09-30, on condition that they go only
+//!    where nothing is kept: a class-C site needs an opt-in row AND a transport
+//!    that pins ZDR on every request (OpenRouter; see
+//!    `DecisionsTransport::enforces_zero_retention`). The native TypeSafe API
+//!    offers ZDR to enterprise accounts only, so class C is refused there.
+//! 3. **Class A and B state that looks like a conversation payload is refused**
+//!    ([`screen`]). The allow-list keys on the site id, not on what the state
+//!    contains, and a provider error body can echo the request that failed. This
+//!    is a fail-closed heuristic, not a guarantee.
+//! 4. **Every string in `state` is redacted.** Class A and B get full redaction
+//!    and a fixed tail ([`redact`]): machine-generated text is not safe by
+//!    construction (DEF-089 leaks bot tokens inside reqwest error URLs). Class C
+//!    keeps its full text for judgment but still loses credentials
+//!    ([`redact_secrets`]); its size is bounded by the request's token budget.
 //!
 //! A refusal is `DecisionsErrorClass::PolicyRefused`: nothing left the machine.
 //!
-//! Redaction is best effort and pattern based. It is a second line of defence
-//! behind rule 1 (only telemetry sites are allowed), not a licence to send
-//! operator content.
+//! Redaction is best effort and pattern based, a second line of defence behind
+//! rules 1 and 2.
 
-use ansible_mesh_core::decisions::{DecisionsError, DecisionsErrorClass, DecisionsRequest};
+use ansible_mesh_core::decisions::{
+    DecisionsError, DecisionsErrorClass, DecisionsRequest, DecisionsTransport,
+};
 use regex::Regex;
 use serde_json::Value;
 use std::sync::OnceLock;
@@ -35,8 +44,10 @@ pub enum DataClass {
     /// Features derived from operator content, never the content. Allowed only
     /// per site after an explicit opt-in recorded in the site table.
     B,
-    /// Operator messages, LifeGraph or memory content, transcripts, credentials.
-    /// Never allowed.
+    /// Operator messages, LifeGraph or memory content, transcripts. Allowed only
+    /// per site after an opt-in recorded in the site table, and only on a
+    /// transport that pins zero data retention. Credentials are redacted even
+    /// here.
     C,
 }
 
@@ -55,7 +66,7 @@ impl DataClass {
 pub struct SiteSpec {
     pub id: &'static str,
     pub class: DataClass,
-    /// Required for class B. Recorded here so the opt-in is a visible diff.
+    /// Required for class B and C. Recorded here so the opt-in is a visible diff.
     pub operator_opt_in: bool,
 }
 
@@ -79,20 +90,12 @@ pub const SITES: &[SiteSpec] = &[
 /// Longest tail of any single state string that may leave (characters).
 pub const MAX_TEXT_CHARS: usize = 1_500;
 
-/// Look up a site and check the policy allows it.
+/// Look up a site and check the policy allows it on a transport that keeps
+/// data (the conservative answer: class C is refused). [`admit`] is the
+/// transport-aware check.
 pub fn site_spec(site: &str) -> Result<&'static SiteSpec, DecisionsError> {
-    let spec = SITES.iter().find(|s| s.id == site).ok_or_else(|| {
-        DecisionsError::new(
-            DecisionsErrorClass::PolicyRefused,
-            format!("site `{site}` is not on the decisions allow-list"),
-        )
-    })?;
-    let allowed = match spec.class {
-        DataClass::A => true,
-        DataClass::B => spec.operator_opt_in,
-        DataClass::C => false,
-    };
-    if allowed {
+    let spec = lookup(site)?;
+    if class_allowed(spec.class, spec.operator_opt_in, false) {
         Ok(spec)
     } else {
         Err(DecisionsError::new(
@@ -102,6 +105,67 @@ pub fn site_spec(site: &str) -> Result<&'static SiteSpec, DecisionsError> {
                 spec.class.as_str()
             ),
         ))
+    }
+}
+
+fn lookup(site: &str) -> Result<&'static SiteSpec, DecisionsError> {
+    SITES.iter().find(|s| s.id == site).ok_or_else(|| {
+        DecisionsError::new(
+            DecisionsErrorClass::PolicyRefused,
+            format!("site `{site}` is not on the decisions allow-list"),
+        )
+    })
+}
+
+/// The policy: class A always; class B with an opt-in; class C with an opt-in
+/// and only where every request is pinned to zero data retention.
+pub fn class_allowed(class: DataClass, operator_opt_in: bool, zero_retention: bool) -> bool {
+    match class {
+        DataClass::A => true,
+        DataClass::B => operator_opt_in,
+        DataClass::C => operator_opt_in && zero_retention,
+    }
+}
+
+/// The single egress check. Returns the state that may leave (screened and
+/// redacted for its class), or `PolicyRefused` with nothing sent.
+pub fn admit(
+    request: &DecisionsRequest,
+    transport: DecisionsTransport,
+) -> Result<DecisionsRequest, DecisionsError> {
+    admit_as(lookup(&request.site)?, request, transport)
+}
+
+fn admit_as(
+    spec: &SiteSpec,
+    request: &DecisionsRequest,
+    transport: DecisionsTransport,
+) -> Result<DecisionsRequest, DecisionsError> {
+    if !class_allowed(
+        spec.class,
+        spec.operator_opt_in,
+        transport.enforces_zero_retention(),
+    ) {
+        return Err(DecisionsError::new(
+            DecisionsErrorClass::PolicyRefused,
+            format!(
+                "site `{}` is data class {} and the data policy does not allow it on the {} transport",
+                spec.id,
+                spec.class.as_str(),
+                transport.as_str()
+            ),
+        ));
+    }
+    match spec.class {
+        DataClass::A | DataClass::B => {
+            screen(request)?;
+            Ok(redacted(request))
+        }
+        DataClass::C => {
+            let mut out = request.clone();
+            out.state = map_strings(&request.state, &redact_secrets);
+            Ok(out)
+        }
     }
 }
 
@@ -157,17 +221,18 @@ fn first_payload_marker(value: &Value) -> Option<&'static str> {
 /// A copy of `request` with every string in `state` redacted and truncated.
 pub fn redacted(request: &DecisionsRequest) -> DecisionsRequest {
     let mut out = request.clone();
-    out.state = redact_value(&request.state);
+    out.state = map_strings(&request.state, &redact);
     out
 }
 
-fn redact_value(value: &Value) -> Value {
+/// Apply `f` to every string in a JSON value, keeping its shape.
+fn map_strings(value: &Value, f: &dyn Fn(&str) -> String) -> Value {
     match value {
-        Value::String(text) => Value::String(redact(text)),
-        Value::Array(items) => Value::Array(items.iter().map(redact_value).collect()),
+        Value::String(text) => Value::String(f(text)),
+        Value::Array(items) => Value::Array(items.iter().map(|v| map_strings(v, f)).collect()),
         Value::Object(map) => Value::Object(
             map.iter()
-                .map(|(k, v)| (k.clone(), redact_value(v)))
+                .map(|(k, v)| (k.clone(), map_strings(v, f)))
                 .collect(),
         ),
         other => other.clone(),
@@ -228,6 +293,18 @@ pub fn redact(text: &str) -> String {
     tail(&text, MAX_TEXT_CHARS)
 }
 
+/// Credentials only, for class C: bearer tokens, `key=value` secrets, bot tokens
+/// and `sk-`-style keys. The text is otherwise left whole (no URL, address or
+/// path rewriting, no truncation) because the operator's words are what is
+/// being judged.
+pub fn redact_secrets(text: &str) -> String {
+    let r = rules();
+    let text = r.bearer.replace_all(text, "Bearer <redacted>");
+    let text = r.key_value.replace_all(&text, "$1$2<redacted>");
+    let text = r.bot_token.replace_all(&text, "<bot-token>");
+    r.api_key.replace_all(&text, "<key>").into_owned()
+}
+
 /// The last `max_chars` characters of `text`, prefixed with `…` if it was cut.
 /// Char-boundary safe.
 pub fn tail(text: &str, max_chars: usize) -> String {
@@ -272,16 +349,74 @@ mod tests {
     }
 
     #[test]
-    fn class_b_needs_an_opt_in_and_class_c_is_never_allowed() {
-        // The policy function, exercised directly on constructed specs.
-        let allowed = |class, opt_in| match class {
-            DataClass::A => true,
-            DataClass::B => opt_in,
-            DataClass::C => false,
-        };
-        assert!(!allowed(DataClass::B, false));
-        assert!(allowed(DataClass::B, true));
-        assert!(!allowed(DataClass::C, true));
+    fn class_b_needs_an_opt_in_and_class_c_needs_an_opt_in_and_zero_retention() {
+        assert!(class_allowed(DataClass::A, false, false));
+        assert!(!class_allowed(DataClass::B, false, true));
+        assert!(class_allowed(DataClass::B, true, false));
+        assert!(!class_allowed(DataClass::C, false, true), "no opt-in");
+        assert!(
+            !class_allowed(DataClass::C, true, false),
+            "retaining transport"
+        );
+        assert!(class_allowed(DataClass::C, true, true));
+    }
+
+    const OPERATOR_SITE: SiteSpec = SiteSpec {
+        id: "test.operator",
+        class: DataClass::C,
+        operator_opt_in: true,
+    };
+
+    fn operator_request(state: Value) -> DecisionsRequest {
+        let mut request = heal_state("x");
+        request.site = OPERATOR_SITE.id.into();
+        request.state = state;
+        request
+    }
+
+    #[test]
+    fn class_c_is_refused_on_the_native_transport() {
+        let request = operator_request(json!("remind me to call Mara about the lease"));
+        let err = admit_as(&OPERATOR_SITE, &request, DecisionsTransport::Native).unwrap_err();
+        assert_eq!(err.class, DecisionsErrorClass::PolicyRefused);
+    }
+
+    #[test]
+    fn class_c_leaves_whole_under_zero_retention_minus_credentials() {
+        // A conversation payload and prose longer than the class-A tail: both are
+        // the point of a class-C site, so neither the screen nor the tail applies.
+        let long = format!(
+            "{} and my api_key=sk-live-abcdef123456 ok",
+            "word ".repeat(600)
+        );
+        let request = operator_request(json!({
+            "messages": [{ "role": "user", "content": long }],
+            "note": "email me at jo@example.com about https://example.com/page"
+        }));
+        let out = admit_as(&OPERATOR_SITE, &request, DecisionsTransport::OpenRouter).unwrap();
+        let text = out.state["messages"][0]["content"].as_str().unwrap();
+        assert!(text.starts_with("word word"), "not truncated to a tail");
+        assert!(!text.contains("sk-live"), "credentials still redacted");
+        assert_eq!(
+            out.state["note"], "email me at jo@example.com about https://example.com/page",
+            "operator prose is not rewritten"
+        );
+    }
+
+    #[test]
+    fn class_a_keeps_the_screen_and_full_redaction_on_every_transport() {
+        let request = heal_state("{\"role\":\"user\",\"content\":\"hi\"}");
+        for transport in [DecisionsTransport::OpenRouter, DecisionsTransport::Native] {
+            assert_eq!(
+                admit(&request, transport).unwrap_err().class,
+                DecisionsErrorClass::PolicyRefused
+            );
+        }
+        let ok = heal_state(
+            "connect to https://api.telegram.org/bot123456789:AAE_abcdefghijklmnopqrstuvwxyz012345/x failed",
+        );
+        let out = admit(&ok, DecisionsTransport::OpenRouter).unwrap();
+        assert!(!out.state.to_string().contains("AAE_"));
     }
 
     #[test]

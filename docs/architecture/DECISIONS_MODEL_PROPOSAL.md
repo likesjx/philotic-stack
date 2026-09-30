@@ -237,9 +237,11 @@ Operator ask: use the decisions call to drain and organize the self-heal queue. 
 6. **Distributions out, policy in code.** The envelope never carries a threshold or a verdict.
 7. **Privacy gate per site.** Every judged state leaves the mesh, and OpenRouter adds an intermediary. Operator message content and LifeGraph content are excluded from any site until retention terms are confirmed. Zero data retention is enterprise-only at TypeSafe.
 
-## Data policy (recommended 2026-09-21; the operator asked for a recommendation, so this is NOT yet confirmed)
+## Data policy (confirmed 2026-09-23; class C widened under zero data retention 2026-09-30)
 
-Every judged state leaves the mesh, and OpenRouter adds an intermediary. Zero data retention is enterprise-only at TypeSafe, and we have not verified OpenRouter's account-level logging and retention settings. So the default is narrow, and widening it is a visible diff.
+Every judged state leaves the mesh, and OpenRouter adds an intermediary. The default is narrow, and widening it is a visible diff.
+
+**2026-09-30: the operator allowed full prompts (class C) under zero data retention.** Research that day corrected the old premise. "ZDR is enterprise-only" is TypeSafe's policy for its own API. Through OpenRouter, `typesafe/jev-1.13-20260917` is on OpenRouter's ZDR endpoint list (`/api/v1/endpoints/zdr`), and its model page records `retainsPrompts: false, training: false`. TypeSafe's privacy policy says it never trains on inputs. OpenRouter stores prompts only if the account opts in to logging, though it samples a small number of prompts for anonymous categorization using a ZDR model. Code consequence: every OpenRouter decisions request now carries `provider: {zdr: true, data_collection: "deny"}` (`build_wire_request`), so OpenRouter either routes to a ZDR endpoint or refuses the call. The gate allows a class-C site only with an opt-in row **and** a transport that pins ZDR (`gate::admit`, `DecisionsTransport::enforces_zero_retention`: OpenRouter yes, native no). The operator also enables "enforce ZDR" in the OpenRouter account's Privacy settings as a second layer. **Live smoke 2026-09-30 (smoke-green):** `heal-dispatcher --decision-smoke` on mac-jane, with the vault key loaded over IPC, sent a ZDR-pinned request and got a 200 from TypeSafe (`typesafe/jev-1.13-20260917`, request `gen-dec-1790795213-…`). **Still open:** written confirmation from TypeSafe (sales@typesafe.ai) that OpenRouter traffic is covered by ZDR, since TypeSafe publishes no retention period for its non-enterprise API.
 
 **Data classes**
 
@@ -247,7 +249,7 @@ Every judged state leaves the mesh, and OpenRouter adds an intermediary. Zero da
 |---|---|---|
 | A | Machine-generated system telemetry: heal-queue failure text, error classes and codes, capability and tool names, counts, timings, status flags, and synthetic smoke strings | Allowed for shadow sites, after the redaction gate below |
 | B | Features derived from operator content (length, language, a detected label), never the content itself | Allowed only per site, after an explicit operator opt-in recorded in the site table |
-| C | Operator message text, LifeGraph / memory / Muninn content, session and turn text, anything from a persona's conversation, credentials, personal data, file contents | **Never**, until retention terms are confirmed in writing |
+| C | Operator message text, LifeGraph / memory / Muninn content, session and turn text, anything from a persona's conversation, personal data, file contents | Allowed per site after an opt-in row, **only on a transport that pins zero data retention** (OpenRouter with `zdr: true`; never the native API). No payload screen, no tail truncation (the token budget bounds size); credentials are still redacted |
 
 **Mechanics**
 
@@ -255,7 +257,7 @@ Every judged state leaves the mesh, and OpenRouter adds an intermediary. Zero da
 2. **A redaction gate runs on every string that leaves**, even class A. Heal text is machine-generated but not safe by construction: DEF-089 is a live leak of bot tokens inside reqwest error URLs, and log lines carry URLs, keys and addresses. The gate strips URLs with credentials or query tokens, bearer and `sk-`-style keys, bot-token shapes (`<digits>:<token>`), long hex or base64 runs, email addresses and absolute home paths, then truncates to a fixed tail (heal text only needs the end). It ships with a test corpus, including the DEF-089 shape.
 3. **Default off, with a kill switch.** `PHILOTIC_SHADOW_DECISIONS` is unset by default; a site table entry alone sends nothing.
 4. **Audit without content.** Each call's trace row records `site`, `data_class`, the bytes that actually went out (the length of the request body as sent, measured at the wire, and zero when nothing was sent), the resolved model and the outcome. It never stores the text sent, and the schema has no column that could hold it. `heal-dispatcher --decision-summary` prints the totals, with errors, skips and agreement on separate lines.
-5. **Provider.** OpenRouter is acceptable for class A only, using the hotel's existing OpenRouter key (the operator's choice; see "Key access" above for the shared spend and revocation trade-off). Before enabling in production, check the OpenRouter account's data-logging and retention settings; the native TypeSafe API is preferable if early access is granted and its retention terms are acceptable.
+5. **Provider.** OpenRouter, using the hotel's existing OpenRouter key (the operator's choice; see "Key access" above for the shared spend and revocation trade-off), with every request pinned to ZDR. The native TypeSafe API may carry class A and B only, unless an enterprise ZDR agreement is in place. **Wiring (2026-09-30):** `DecisionsClient::send` calls `gate::admit`, the single egress check. No class-C site is on the allow-list yet; each shadow slice adds its own row.
 6. **A fail-closed payload screen** at the same egress point refuses state that looks like a conversation payload (`"role"`, `"messages"`, `"content"`, `"parts"`, `"prompt"`, `"system_instruction"`, matched even when JSON-escaped inside a log line). The allow-list keys on the site id, not on what the state holds, so this is the check that looks at content. A refusal is the error class `policy_refused`, sends nothing, and is recorded as a `skipped` row, never as an error or a disagreement.
 7. **The heal-dispatcher pilot sends less than the gate would allow.** Rule-classified lines are never sent. Any line carrying a model-capability envelope (`[guest][text.generate] …`) is skipped: `model-router`'s `emit_failure` is the only source of untriaged model failures, and its text is a provider error body, which can echo the request that failed. And only the last 500 characters of a line are asked about.
 
@@ -285,7 +287,7 @@ Every judged state leaves the mesh, and OpenRouter adds an intermediary. Zero da
 2. **Capability name.** `decisions.evaluate` with model type `decisions` is the proposal; the operator may prefer another.
 3. **Reply path.** A dedicated `decisions_response` action is recommended; confirm by test that reusing `model_response` really reaches `fail_active_turn`.
 4. **Metering.** Grow `ResponseTrace` (recommended) or keep cost in a side table.
-5. **Data policy.** Recommended in the "Data policy" section above (class A only for now, redaction gate, allow-listed sites). **Awaiting the operator's confirmation or amendment.**
+5. **Data policy. Confirmed 2026-09-23; class C allowed under ZDR 2026-09-30** (see the "Data policy" section).
 6. **Local fill.** Whether an ONNX or local classifier should implement the same envelope so a site never depends on a hosted provider (`LOCAL_ONNX_INFERENCE` names the sidecar as the fast path for latency-sensitive consumers).
 7. **Prior claims to re-verify.** The 67.8 % "agreement with references" figure attributed to TypeSafe in a third-party issue, and the 193.6× / 444.6× vendor benchmark, are unverified.
 
