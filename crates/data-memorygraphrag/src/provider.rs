@@ -1993,6 +1993,43 @@ impl LifeGraphProvider {
         let compiled = cypher::compile_commit(&input, &now)
             .map_err(|e| anyhow::anyhow!("life.commit Cypher compilation failed: {e}"))?;
         let graph = self.connect().await?;
+
+        // Promotion gate against the STORED node, not the caller's evidence:
+        // a payload claiming `validation_state: confirmed` passed the plan
+        // gate on its own say-so. Only an already-confirmed stored node may
+        // be re-committed without operator approval.
+        if !input.operator_approved {
+            let check_query = format!(
+                "MATCH (n:{label}) WHERE n.id = $id OR ($id_numeric >= 0 AND id(n) = $id_numeric) \
+                 RETURN n.validation_state AS vs",
+                label = compiled.label
+            );
+            let mut check_rows = graph
+                .execute(
+                    query(&check_query)
+                        .param("id", compiled.node_id.as_str())
+                        .param("id_numeric", compiled.node_id_numeric),
+                )
+                .await?;
+            // A missing row falls through: the commit itself reports the
+            // canonical "target not found" error below.
+            if let Some(row) = check_rows.next().await? {
+                let stored = row.get::<String>("vs").ok();
+                if let Some(reason) = MemoryGraphRagRunner::commit_promotion_block_reason(
+                    stored.as_deref(),
+                    input.operator_approved,
+                ) {
+                    return Ok(ProviderOutput::ResultSet(json!({
+                        "status": "blocked",
+                        "node_id": compiled.node_id,
+                        "label": compiled.label,
+                        "stored_validation_state": stored,
+                        "reasons": [reason],
+                    })));
+                }
+            }
+        }
+
         let mut rows = graph
             .execute(
                 query(&compiled.query)
