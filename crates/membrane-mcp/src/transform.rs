@@ -17,6 +17,9 @@ pub struct InboundResult {
     pub payload: Value,
     pub target_kind: String,
     pub target_id: String,
+    /// Hotel node the envelope must be dispatched to; `None` = local.
+    /// Only `McpUpstream` targets carry one today.
+    pub target_node: Option<String>,
 }
 
 /// Apply the inbound transform for `spec` to the caller-supplied `args`.
@@ -30,12 +33,13 @@ pub fn apply_inbound(spec: &McpToolSpec, args: &Value) -> Result<InboundResult, 
             mappings,
         } => {
             let payload = apply_field_map(args, mappings);
-            let (target_kind, target_id) = target_parts(target);
+            let (target_kind, target_id, target_node) = target_parts(target);
             Ok(InboundResult {
                 action: action.clone(),
                 payload,
                 target_kind,
                 target_id,
+                target_node,
             })
         }
         McpInboundTransform::Template { .. } => {
@@ -90,14 +94,24 @@ fn set_dot_path(obj: &mut serde_json::Map<String, Value>, path: &str, value: Val
     }
 }
 
-fn target_parts(target: &ansible_mesh_core::mcp_route::McpRouteTarget) -> (String, String) {
+fn target_parts(
+    target: &ansible_mesh_core::mcp_route::McpRouteTarget,
+) -> (String, String, Option<String>) {
     use ansible_mesh_core::mcp_route::McpRouteTarget;
     match target {
-        McpRouteTarget::Philote { agent_id, .. } => ("philote".into(), agent_id.clone()),
-        McpRouteTarget::Tool { tool_ref } => ("tool".into(), tool_ref.clone()),
+        McpRouteTarget::Philote { agent_id, .. } => ("philote".into(), agent_id.clone(), None),
+        McpRouteTarget::Tool { tool_ref } => ("tool".into(), tool_ref.clone(), None),
         McpRouteTarget::Datasource { datasource_id } => {
-            ("datasource".into(), datasource_id.clone())
+            ("datasource".into(), datasource_id.clone(), None)
         }
+        McpRouteTarget::McpUpstream {
+            upstream_id,
+            target_node,
+        } => (
+            "mcp_upstream".into(),
+            upstream_id.clone(),
+            target_node.clone().filter(|n| !n.is_empty()),
+        ),
     }
 }
 
@@ -227,6 +241,32 @@ mod tests {
         );
         let response = json!({ "ok": true }).to_string();
         assert_eq!(apply_outbound(&spec, &response), response);
+    }
+
+    #[test]
+    fn mcp_upstream_target_carries_node() {
+        let mut spec = make_spec(vec![], McpOutboundTransform::PassThrough);
+        spec.inbound_transform = McpInboundTransform::FieldMap {
+            action: "muninn_recall".into(),
+            target: McpRouteTarget::McpUpstream {
+                upstream_id: "muninn-local".into(),
+                target_node: Some("mac-jane-aiua-01".into()),
+            },
+            mappings: vec![],
+        };
+        let result = apply_inbound(&spec, &json!({ "context": ["x"] })).unwrap();
+        assert_eq!(result.action, "muninn_recall");
+        assert_eq!(result.target_kind, "mcp_upstream");
+        assert_eq!(result.target_id, "muninn-local");
+        assert_eq!(result.target_node.as_deref(), Some("mac-jane-aiua-01"));
+
+        // Non-upstream targets stay local.
+        let ds = apply_inbound(
+            &make_spec(vec![], McpOutboundTransform::PassThrough),
+            &json!({}),
+        )
+        .unwrap();
+        assert_eq!(ds.target_node, None);
     }
 
     #[test]

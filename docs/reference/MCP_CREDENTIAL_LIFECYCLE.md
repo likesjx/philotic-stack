@@ -42,6 +42,7 @@ Not allowed:
 | `external-context-capture` | Philotic HTTPS MCP frontdoor | `context.write` only | 30-90 days | hotel vault hash + operator secret store |
 | `lifegraph-readonly` | Philotic HTTPS LifeGraph MCP endpoint | `life.recall` | 30-90 days | hotel vault hash + operator secret store |
 | `lifegraph-observe` | Philotic HTTPS LifeGraph MCP endpoint | `life.observe` proposed evidence only | 7-30 days | hotel vault hash + operator secret store |
+| `remote-agent-frontdoor` | Philotic HTTPS agent frontdoor (`/agent/mcp`) | one bearer per cloud agent (`claude-cloud`, `codex-cloud`); `muninn_*` continuity (4) + intel-graph coordination (12) | 30 days | hotel vault BLAKE3 hash + cloud environment secret |
 | `operator-admin` | native/API maintenance | full, manual maintenance only | shortest practical | operator secret store only |
 
 ## Provisioning Rules
@@ -80,6 +81,21 @@ Required outcome:
 - `life.observe` is absent unless `INCLUDE_LIFE_OBSERVE=1` was intentionally set
 - `life.commit` and `life.resolve` are absent for external clients
 - returned packets include provenance and authority labels
+
+### Agent Frontdoor
+
+Provision with [provision-agent-frontdoor.py](../../scripts/provision-agent-frontdoor.py)
+on vps-jane, after [register-frontdoor-upstreams.py](../../scripts/register-frontdoor-upstreams.py)
+registered `muninn-cortex` (vps-jane) and `intel-graph` (mac-jane) with
+`grant_agents` listing each `mcp:<agent>`.
+
+Required outcome:
+
+- `tools/list` exposes exactly the 16 continuity/coordination tools; no `life.*`, no `context.capture`
+- each agent has its own token; revoking one agent is one grant removal on the endpoint or on an upstream
+- raw tokens exist only in the cloud environment's secret settings, never in chat, commits, or files left on the box
+- `graph_*` calls fail fast (not hang) while mac-jane is asleep; `muninn_*` keep working
+- `scripts/mcp-client-uat.sh agent-frontdoor` passes
 
 ### Native Muninn
 
@@ -132,6 +148,7 @@ Run [mcp-client-uat.sh](/Users/jaredlikes/code/philotic-stack/scripts/mcp-client
 | Claude | trusted local config/harness exposes Muninn tools or uses stdio proxy shape | no, unless testing app config |
 | Perplexity | `tools/list` shows only `context.capture`; call writes Muninn memory | yes |
 | LifeGraph readonly | `tools/list` shows `life.recall` and not write tools | yes |
+| Agent frontdoor | `mcp-client-uat.sh agent-frontdoor`: 16 tools, recall + graph_status round trips, revoked token refused | yes |
 | Remote native Muninn | loopback-only binding and SSH tunnel health pass | SSH access |
 
 Useful commands:

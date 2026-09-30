@@ -107,6 +107,18 @@ pub fn build_router(state: SharedState) -> Router {
 
 // ── Ingress fence helper ──────────────────────────────────────────────────────
 
+/// Whether a request may be trusted as local. A loopback peer is not enough:
+/// on vps-jane the public TLS proxy (Traefik in Docker, bridged by socat)
+/// reaches this listener over 127.0.0.1, so every internet request would look
+/// local. A request that carries a reverse-proxy forwarding header came from
+/// somewhere else and is treated as remote.
+pub(crate) fn is_trusted_loopback(addr: &SocketAddr, headers: &HeaderMap) -> bool {
+    addr.ip().is_loopback()
+        && !["x-forwarded-for", "forwarded", "x-real-ip"]
+            .iter()
+            .any(|h| headers.contains_key(*h))
+}
+
 /// Run the listener-level ingress fence for a request. Returns `None` when the
 /// request may proceed, or a ready-to-send denial response.
 fn ingress_fence_gate(
@@ -137,7 +149,7 @@ async fn handle_health(
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
 ) -> axum::response::Response {
-    let is_loopback = addr.ip().is_loopback();
+    let is_loopback = is_trusted_loopback(&addr, &headers);
     if !is_loopback && let Some(denied) = ingress_fence_gate(&state, &headers, is_loopback) {
         return denied;
     }
@@ -155,7 +167,8 @@ async fn handle_mcp_sse(
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
 ) -> axum::response::Response {
-    if let Some(denied) = ingress_fence_gate(&state, &headers, addr.ip().is_loopback()) {
+    if let Some(denied) = ingress_fence_gate(&state, &headers, is_trusted_loopback(&addr, &headers))
+    {
         return denied;
     }
     let body = ": keepalive\n\n";
@@ -177,7 +190,7 @@ async fn handle_mcp(
     headers: HeaderMap,
     axum::Json(req): axum::Json<JsonRpcRequest>,
 ) -> axum::response::Response {
-    let is_loopback = addr.ip().is_loopback();
+    let is_loopback = is_trusted_loopback(&addr, &headers);
     let auth_header = headers.get("authorization").and_then(|v| v.to_str().ok());
     dispatch_rpc(&state, req, auth_header, is_loopback).await
 }
@@ -523,6 +536,9 @@ async fn handle_tools_call(
                 "tool": tool_name,
                 "target_kind": inbound.target_kind,
                 "target_id": inbound.target_id,
+                // Cross-hotel pin (McpUpstream targets only); the membrane
+                // runtime turns a non-null value into an EmitTask to that node.
+                "target_node": inbound.target_node,
                 "handler": tool_spec.handler,
                 "input_schema": tool_spec.input_schema,
                 "args": args,
@@ -595,6 +611,19 @@ async fn handle_tools_call(
             return JsonRpcResponse::err(id, auth_error_code(&e), e.to_string());
         }
     };
+
+    // Legacy routes have no action mapping, so an upstream target cannot name
+    // its remote tool. Refuse rather than mis-dispatching to the agent role.
+    if matches!(
+        route.record.target,
+        ansible_mesh_core::mcp_route::McpRouteTarget::McpUpstream { .. }
+    ) {
+        return JsonRpcResponse::err(
+            id,
+            error_code::DISPATCH_ERROR,
+            format!("tool '{tool_name}': mcp_upstream targets require an endpoint config"),
+        );
+    }
 
     let requires_approval = route.record.security.require_approval;
     let timeout = if requires_approval {
