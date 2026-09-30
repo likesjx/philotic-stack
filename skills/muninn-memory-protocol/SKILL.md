@@ -27,6 +27,7 @@ Use the right owner:
 - repo docs and code store implemented truth
 - Intel Graph stores structure, seams, work coordination, decisions, and verification evidence
 - `docs/task.md` stores active execution work
+- the LifeGraph (Memgraph, `life.*` tools) stores structured operator-world truth under governance: people, preferences-as-facts, commitments, goals, open loops, events. An operator fact belongs there; Muninn keeps at most a compact pointer or the lesson about it, not a rival copy
 - Muninn stores why something matters next time: compact decisions, learned preferences, reality gaps, validation outcomes, and continuity handles
 
 ## Use The Shared Helper
