@@ -87,11 +87,11 @@
       "note": "Downloads routed artifacts from the hotel blob service."
     },
     {
-      "path": "crates/aiua/src/dream.rs",
+      "path": "crates/memory-core/src/admin.rs",
       "traffic_classes": ["local-resource"],
       "disposition": "named-exception",
-      "authority": "dream consolidation configuration",
-      "note": "Local Muninn, embedding, and Ollama consolidation protocols."
+      "authority": "memory datasource configuration (callers include aiua dream consolidation)",
+      "note": "Shared Muninn admin REST client; PR #599 moved the direct caller here from aiua/src/dream.rs. Local Muninn protocol only, bounded timeout."
     },
     {
       "path": "crates/aiua/src/memory_hygiene.rs",

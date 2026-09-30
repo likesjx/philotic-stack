@@ -80,3 +80,6 @@ philotic_onnx_prefer_quantized: true
 # Decisions model shadow pilot (log-only; heal-dispatcher only). Requires the
 # openrouter vault key to also grant model.decisions + heal-dispatcher.
 philotic_shadow_decisions_enabled: true
+# Decisions fallback applied on novel lines Gemma cannot classify (2026-09-30,
+# watched-live on mac-jane first: Telegram 409 -> telegram_poll_conflict).
+philotic_heal_decisions_fallback_enabled: true
