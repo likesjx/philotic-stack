@@ -6,13 +6,17 @@ Remote agents (cloud Claude Code, Codex, any MCP client that can send a bearer
 header) get the same continuity and coordination tools local clients use, by
 name, without native Muninn or intel-graph ever leaving loopback:
 
-  agent --HTTPS+bearer--> membrane-mcp endpoint (this hotel, e.g. vps-jane)
-        --mesh EmitTask--> mcp-client-runner on the upstream hotel (the Mac)
-        --loopback-------> muninn-local (stdio `muninn mcp`) / intel-graph (:8901)
+  agent --HTTPS+bearer--> membrane-mcp endpoint (this hotel, vps-jane)
+        --local CreateTask--> mcp-client-runner (vps-jane) --> muninn-cortex (Cortex :8750)
+        --mesh EmitTask-----> mcp-client-runner (mac-jane) --> intel-graph (:8901)
+
+Muninn is served from the Cortex on the frontdoor hotel itself: the Mac Muninn
+nodes are cluster observers that reject writes, and keeping Muninn off the Mac
+means continuity still works while the Mac sleeps.
 
 Each agent gets its own bearer grant (token_id = agent name). membrane-mcp
 presents the caller to mcp-client-runner as `mcp:<token_id>`, so the upstream
-registrations on the Mac must list those principals in `grant_agents`
+registrations (both hotels) must list those principals in `grant_agents`
 (see docs/HANDOFF-2026-09-30-agent-frontdoor-mac-jane.md).
 
 Raw tokens are minted here, written to TOKEN_OUT_DIR/<agent>.token (0600), and
@@ -40,13 +44,15 @@ import time
 
 SOCKET_PATH = os.environ.get("PHILOTIC_HOTEL_SOCKET", "/run/philotic/vps-jane.sock")
 ENDPOINT_ID = os.environ.get("ENDPOINT_ID", "agent-frontdoor")
-OWNER_AGENT_ID = os.environ.get("OWNER_AGENT_ID", "agent-beacon-01")
+OWNER_AGENT_ID = os.environ.get("OWNER_AGENT_ID", "agent-beacon")
 PORT = int(os.environ.get("PORT", "8912"))
 EXPOSURE = os.environ.get("EXPOSURE", "mesh")
 AGENTS = [a.strip() for a in os.environ.get("AGENTS", "claude-cloud,codex-cloud").split(",") if a.strip()]
-UPSTREAM_NODE = os.environ.get("UPSTREAM_NODE", "mac-jane-aiua-01")
-MUNINN_UPSTREAM = os.environ.get("MUNINN_UPSTREAM", "muninn-local")
+MUNINN_UPSTREAM = os.environ.get("MUNINN_UPSTREAM", "muninn-cortex")
+# Empty = the upstream lives on this (frontdoor) hotel.
+MUNINN_NODE = os.environ.get("MUNINN_NODE", "")
 GRAPH_UPSTREAM = os.environ.get("GRAPH_UPSTREAM", "intel-graph")
+GRAPH_NODE = os.environ.get("GRAPH_NODE", "mac-jane-aiua-01")
 EXPIRES_DAYS = int(os.environ.get("EXPIRES_DAYS", "30"))
 CALLS_PER_HOUR = int(os.environ.get("CALLS_PER_HOUR", "300"))
 TOKEN_OUT_DIR = pathlib.Path(
@@ -78,31 +84,39 @@ GRAPH_TOOLS = [
 ]
 
 
-def send_frame(sock, payload: dict) -> None:
-    data = json.dumps(payload).encode()
-    sock.sendall(struct.pack(">I", len(data)) + data)
+class Ipc:
+    """Length-prefixed JSON IPC. The hotel pushes unsolicited frames on the same
+    stream (e.g. a blob-endpoint advert right after connect), so a call reads
+    until it sees a Standard ok/code envelope or a key it expects."""
 
+    def __init__(self, path: str):
+        self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.sock.settimeout(15.0)
+        self.sock.connect(path)
 
-def recv_frame(sock) -> dict:
-    raw_len = b""
-    while len(raw_len) < 4:
-        chunk = sock.recv(4 - len(raw_len))
-        if not chunk:
-            raise RuntimeError("socket closed")
-        raw_len += chunk
-    length = struct.unpack(">I", raw_len)[0]
-    data = b""
-    while len(data) < length:
-        chunk = sock.recv(length - len(data))
-        if not chunk:
-            raise RuntimeError("socket closed mid-frame")
-        data += chunk
-    return json.loads(data)
+    def _read_exact(self, n: int) -> bytes:
+        buf = b""
+        while len(buf) < n:
+            chunk = self.sock.recv(n - len(buf))
+            if not chunk:
+                raise RuntimeError("socket closed")
+            buf += chunk
+        return buf
 
+    def call(self, operation: str, payload: dict, expect_keys=()) -> dict:
+        data = json.dumps({"operation": operation, "payload": payload}).encode()
+        self.sock.sendall(struct.pack(">I", len(data)) + data)
+        for _ in range(50):
+            (length,) = struct.unpack(">I", self._read_exact(4))
+            frame = json.loads(self._read_exact(length))
+            if isinstance(frame, dict) and (
+                "ok" in frame or "code" in frame or any(k in frame for k in expect_keys)
+            ):
+                return frame
+        raise RuntimeError(f"no response for {operation}")
 
-def ipc_call(sock, operation: str, payload: dict) -> dict:
-    send_frame(sock, {"operation": operation, "payload": payload})
-    return recv_frame(sock)
+    def close(self) -> None:
+        self.sock.close()
 
 
 def response_payload(resp: dict) -> dict:
@@ -119,14 +133,20 @@ def is_endpoint_success(resp: dict) -> bool:
     )
 
 
-def upstream_target(upstream_id: str) -> dict:
-    return {"kind": "mcp_upstream", "upstream_id": upstream_id, "target_node": UPSTREAM_NODE}
+def upstream_target(upstream_id: str, node: str) -> dict:
+    target = {"kind": "mcp_upstream", "upstream_id": upstream_id}
+    if node:
+        target["target_node"] = node
+    return target
 
 
 def build_tools(grants: list[dict]) -> list[dict]:
     auth = {"scheme": "bearer_token", "grants": grants}
     tools = []
-    for upstream_id, catalog in ((MUNINN_UPSTREAM, MUNINN_TOOLS), (GRAPH_UPSTREAM, GRAPH_TOOLS)):
+    for upstream_id, node, catalog in (
+        (MUNINN_UPSTREAM, MUNINN_NODE, MUNINN_TOOLS),
+        (GRAPH_UPSTREAM, GRAPH_NODE, GRAPH_TOOLS),
+    ):
         for name, description in catalog:
             tools.append(
                 {
@@ -138,7 +158,7 @@ def build_tools(grants: list[dict]) -> list[dict]:
                     "inbound_transform": {
                         "kind": "field_map",
                         "action": name,
-                        "target": upstream_target(upstream_id),
+                        "target": upstream_target(upstream_id, node),
                         "mappings": [],
                     },
                     "outbound_transform": {"kind": "pass_through"},
@@ -159,7 +179,7 @@ def build_config(grants: list[dict], now: int) -> dict:
         "tools": tools,
         # Remote agents cannot sit through the 300s approval hold: every
         # projected tool is pre-approved by this operator provisioning run.
-        # Authority stays with the upstream allowlist + grant_agents on the Mac.
+        # Authority stays with each upstream's allowlist + grant_agents.
         "preapproval_rules": [
             {
                 "action_pattern": tool["name"],
@@ -200,15 +220,15 @@ def main() -> None:
         print("blake3 not available (install with: python3 -m pip install blake3)", file=sys.stderr)
         sys.exit(1)
 
-    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    sock.connect(SOCKET_PATH)
-    sock.settimeout(10.0)
-    reg = ipc_call(
-        sock,
-        "register_guest",
-        {"guest_id": "agent-frontdoor-provisioner", "role": "hotel.internal", "supported_tools": []},
+    ipc = Ipc(SOCKET_PATH)
+    # Owner checks accept `<owner>:<suffix>` guest ids (aiua mcp_owner_identity_ok).
+    reg = ipc.call(
+        "register",
+        {"guest_id": f"{OWNER_AGENT_ID}:frontdoor-provisioner", "role": "hotel.internal", "supported_tools": []},
     )
-    print(f"Register: {reg.get('ok', reg)}")
+    if reg.get("ok") is not True:
+        print(f"ERROR: register failed: {reg}", file=sys.stderr)
+        sys.exit(1)
 
     TOKEN_OUT_DIR.mkdir(parents=True, exist_ok=True)
     os.chmod(TOKEN_OUT_DIR, 0o700)
@@ -216,8 +236,7 @@ def main() -> None:
     grants = []
     for agent in AGENTS:
         raw = secrets.token_urlsafe(32)
-        resp = ipc_call(
-            sock,
+        resp = ipc.call(
             "add_vault_entry",
             {
                 "vault_name": "default",
@@ -237,19 +256,19 @@ def main() -> None:
         grants.append(grant(agent, vault_ref, now))
 
     config = build_config(grants, now)
-    resp = ipc_call(sock, "provision_mcp_endpoint", {"config": config})
-    sock.close()
+    resp = ipc.call("provision_mcp_endpoint", {"config": config}, expect_keys=("endpoint_id",))
+    ipc.close()
     if not is_endpoint_success(resp):
         print(f"ERROR: ProvisionMcpEndpoint failed: {resp}", file=sys.stderr)
         sys.exit(1)
 
     print("\nProvisioned agent frontdoor")
     print(f"  endpoint_id:   {ENDPOINT_ID}  port={PORT} exposure={EXPOSURE}")
-    print(f"  upstream node: {UPSTREAM_NODE} ({MUNINN_UPSTREAM}, {GRAPH_UPSTREAM})")
+    print(f"  upstreams:     {MUNINN_UPSTREAM}@{MUNINN_NODE or 'local'}, {GRAPH_UPSTREAM}@{GRAPH_NODE or 'local'}")
     print(f"  tools:         {len(config['tools'])}")
     print(f"  agents:        {', '.join(AGENTS)} (expires in {EXPIRES_DAYS}d)")
     print(f"  tokens:        {TOKEN_OUT_DIR}/<agent>.token  (move to secret store, then delete)")
-    print(f"  Mac grant_agents must include: {', '.join('mcp:' + a for a in AGENTS)}")
+    print(f"  upstream grant_agents must include: {', '.join('mcp:' + a for a in AGENTS)}")
 
 
 if __name__ == "__main__":

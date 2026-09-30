@@ -6,6 +6,16 @@
 > [AGENT_FRONTDOOR_PROPOSAL.md](architecture/AGENT_FRONTDOOR_PROPOSAL.md).
 > Branch: `claude/stoic-goldberg-f8w99b`.
 
+## Status (mac-jane session, 2026-09-30)
+
+- Step 1 done: compiled and tested after merging `develop` (conflicts in
+  `membrane/src/runtime.rs` tests and `membrane-mcp/src/server.rs` were
+  additive; `build_inbound_request` now also takes the local node id).
+- Step 2 changed the design: the Mac Muninn is a write-rejecting cluster
+  observer, so Muninn is now `muninn-cortex` **on vps-jane** (see the
+  proposal's "Reality gaps" section). `muninn-local` below is superseded.
+- Step 3 done for `intel-graph` on mac-jane (owner `agent-bjork-01`).
+
 ## Goal
 
 Let cloud agents use the same Muninn continuity and intel-graph coordination

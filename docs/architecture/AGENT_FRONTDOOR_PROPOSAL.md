@@ -85,14 +85,13 @@ mcp.jaredlikes.com/agent/mcp ──TLS proxy──► vps-jane membrane-mcp endp
    │  per-agent grants (token_id = claude-cloud / codex-cloud / …), 30-day expiry, allotments
    │  tools named exactly as upstream: muninn_* and graph_*/session_*
    │  every tool pre-approved at provisioning (no 300 s approval hold)
-   ▼  target = McpUpstream { upstream_id, target_node: mac-jane-aiua-01 }
-   │  membrane runtime → EmitTask(role=mcp-client-runner, agent_id="mcp:<token_id>")
-   ▼  mesh (tailnet)
-mac-jane mcp-client-runner  (existing MCP client fabric)
-   │  grant_agents ∋ "mcp:<token_id>", tool_allowlist, per-tool allotment
-   ├─► muninn-local  (stdio `muninn mcp` → 127.0.0.1:8750, default vault)
-   └─► intel-graph   (http 127.0.0.1:8901/mcp)
-   ▼  datasource_response → EmitTask back to vps-jane membrane-mcp → HTTP reply
+   │  membrane runtime → mcp-client-runner, agent_id="mcp:<token_id>"
+   ├─ muninn_*  target = McpUpstream { upstream_id: muninn-cortex }            (local CreateTask)
+   │     vps-jane mcp-client-runner ─► muninn-cortex (http 127.0.0.1:8750/mcp, Cortex, default vault)
+   └─ graph_*   target = McpUpstream { upstream_id: intel-graph, target_node: mac-jane-aiua-01 }  (mesh EmitTask)
+         mac-jane mcp-client-runner ─► intel-graph (http 127.0.0.1:8901/mcp)
+   each runner checks grant_agents ∋ "mcp:<token_id>", tool_allowlist, per-tool allotment
+   ▼  datasource_response → back to vps-jane membrane-mcp → HTTP reply
 ```
 
 ### Why this shape
@@ -109,11 +108,11 @@ mac-jane mcp-client-runner  (existing MCP client fabric)
   - a stdio command allowlist
   - owner/`grant_agents` authorization
 
-  Authority stays with the upstream registration on the Mac, which is the
-  hotel that owns the data.
+  Authority stays with each upstream registration, on the hotel that owns the
+  data (vps-jane for the Muninn Cortex, mac-jane for intel-graph).
 - **Caller identity is end-to-end.** The frontdoor authenticates the bearer and
   forwards `agent_id = mcp:<token_id>`. A transport extra cannot override it.
-  The Mac-side grant check then decides per agent, so revoking one agent is
+  The upstream-side grant check then decides per agent, so revoking one agent is
   one grant removal on either side.
 - **Same tool names as upstream.** `scripts/muninn_mcp.py`, the
   `muninn-memory-habit` and `graph-intelligence` skills and the harness text
@@ -123,7 +122,7 @@ mac-jane mcp-client-runner  (existing MCP client fabric)
 
 | Upstream | Tools |
 |---|---|
-| `muninn-local` | `muninn_where_left_off`, `muninn_recall`, `muninn_remember`, `muninn_decide` |
+| `muninn-cortex` | `muninn_where_left_off`, `muninn_recall`, `muninn_remember`, `muninn_decide` |
 | `intel-graph` | `graph_status`, `graph_digest`, `graph_next_task`, `graph_context_for`, `graph_impact`, `graph_search`, `graph_agent_dashboard`, `session_start`, `session_activity`, `session_close`, `graph_decide`, `graph_record_test_run` |
 
 Deliberately excluded:
@@ -190,10 +189,13 @@ handoff.
   only BLAKE3 hashes in the hotel vault. Raw tokens go to 0600 files, never
   stdout. It then provisions `agent-frontdoor` (default port 8912,
   exposure `mesh`) with every tool pre-approved. `DRY_RUN=1` prints the config.
-- On mac-jane:
-  - register `muninn-local` as a stdio upstream;
-  - register `intel-graph` as an HTTP upstream;
-  - add allowlists and `grant_agents = ["mcp:claude-cloud", "mcp:codex-cloud", …]`.
+- `scripts/register-frontdoor-upstreams.py` (`UPSTREAMS=…`), with fail-closed
+  allowlists and `grant_agents = ["mcp:claude-cloud", "mcp:codex-cloud", …]`:
+  - on vps-jane: `muninn-cortex`, an HTTP upstream to the Cortex at
+    `127.0.0.1:8750/mcp`, with the `default`-vault Cortex bearer stored via
+    `provision_mcp_upstream_credential`;
+  - on mac-jane: `intel-graph`, an HTTP upstream to `127.0.0.1:8901/mcp`
+    (no token; loopback bind).
   - See `docs/HANDOFF-2026-09-30-agent-frontdoor-mac-jane.md`.
 - Out-of-repo TLS proxy: add `mcp.jaredlikes.com/agent/mcp → 127.0.0.1:8912/mcp`
   with a path rewrite, mirroring `/lifegraph/mcp`.
@@ -273,6 +275,33 @@ Add `remote-agent-frontdoor` to `MCP_CREDENTIAL_LIFECYCLE.md`:
 | Grants | one per agent |
 | Storage | hotel vault hash, raw token in the operator secret store, cloud environment variable |
 | UAT | `tools/list` shows exactly the v1 set; a `muninn_recall` round trip succeeds; a revoked token fails `tools/list`; a non-granted principal is refused by `mcp-client-runner` |
+
+## Reality gaps found on mac-jane (2026-09-30)
+
+The cloud session drafted S1-S3 without tailnet access. Checking against the
+live Mac changed the design in one place and fixed two script bugs:
+
+- **The Mac Muninn is a cluster observer and rejects writes.** `muninn mcp` on
+  mac-jane reads fine under the client's scrubbed env (only `HOME` is needed;
+  it defaults to `127.0.0.1:8750`, no token), but `muninn_remember` returns
+  `-32002 … writes are accepted only on the Cortex`. Local Claude does not use
+  the Mac listener for Muninn at all: its `muninn` server is the vps Cortex
+  over the tailnet. So the Muninn upstream moved to **`muninn-cortex` on
+  vps-jane** (HTTP to the Cortex's loopback listener). Side benefit: Muninn
+  continuity no longer depends on the Mac being awake; only the `graph_*`
+  tools do.
+- **`register_guest` is not an IPC op** (it is `register`). The drafted
+  scripts, copied from `provision-lifegraph-mcp.py` / `provision-mcp-bearer.py`,
+  printed the error and carried on unidentified (see DEF-209).
+- **The hotel pushes an unsolicited frame after connect** (a blob-endpoint
+  advert), so a one-frame-per-call reader returns every reply one op late and
+  a refused registration looks green. Both frontdoor scripts now read until
+  the op's own reply arrives.
+- Confirmed as assumed: mac-jane's node id is `mac-jane-aiua-01`;
+  `mcp-client-runner` runs there; intel-graph (`:8901`) has no token;
+  the Cortex bearer local Claude uses resolves to the `default` vault.
+- Upstream owners: `agent-bjork-01` (intel-graph on mac-jane),
+  `agent-beacon` (muninn-cortex and the endpoint on vps-jane).
 
 ## Open questions
 
