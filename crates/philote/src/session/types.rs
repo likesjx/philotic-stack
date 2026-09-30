@@ -765,6 +765,7 @@ impl WorkingTurn {
             pending_approval: None,
             working_tool_history: Vec::new(),
             recalled_memories: Vec::new(),
+            memory_degraded: None,
             active_plan: None,
             consecutive_step_failures: 0,
             streak_extension: 0,
@@ -821,6 +822,11 @@ pub struct WorkingTurn {
     pub working_tool_history: Vec<(ToolCall, ToolResult)>,
     /// Long-term memories auto-recalled for this turn before the first model request.
     pub recalled_memories: Vec<RecalledMemoryRecord>,
+    /// Set when this turn's memory recall failed or degraded (reason text).
+    /// Prompt composition renders a one-line marker so the model never
+    /// mistakes a memory outage for an empty history. Not checkpoint-critical.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_degraded: Option<String>,
     /// Current execution plan if the model has declared one. Updated from model
     /// responses; threaded into context on re-entry.
     pub active_plan: Option<ActivePlan>,
@@ -998,6 +1004,7 @@ impl WorkingTurn {
             pending_approval: None,
             working_tool_history: Vec::new(),
             recalled_memories: Vec::new(),
+            memory_degraded: None,
             active_plan: None,
             consecutive_step_failures: 0,
             streak_extension: 0,
@@ -2159,6 +2166,7 @@ mod paracrine_budget_tests {
             pending_approval: None,
             working_tool_history: Vec::new(),
             recalled_memories: Vec::new(),
+            memory_degraded: None,
             active_plan: None,
             consecutive_step_failures: 0,
             streak_extension: 0,

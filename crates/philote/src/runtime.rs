@@ -1684,6 +1684,11 @@ pub struct AgentRuntime {
     /// Dedup + budget ledger for the LifeGraph auto-capture lane (Slice E2).
     /// Live-only (never checkpointed), mirroring the prefetch-dispatched flag.
     life_capture_ledger: LifeCaptureLedger,
+    /// Vaults whose tokens were rejected during a partial cross-scope recall.
+    /// Healed AFTER the reply is delivered (deliver_text_reply) instead of on
+    /// the recall path — the heal is a 20s-budget IPC round-trip that must
+    /// not sit between the user's message and the model call.
+    pending_token_heals: Vec<String>,
     /// Correlation id of an in-flight origin-tier probe per session (Slice 2
     /// fallback-override auto-recovery — see `turn_loop::probe_degraded_sessions`).
     /// Bounds "at most one probe in flight per session": a session_id present
@@ -2023,6 +2028,7 @@ impl AgentRuntime {
             network_offline: false,
             role_name: None,
             life_capture_ledger: LifeCaptureLedger::default(),
+            pending_token_heals: Vec::new(),
             pending_fallback_probes: HashMap::new(),
             voice_chunk_pipelines: HashMap::new(),
         }
@@ -3170,6 +3176,7 @@ impl AgentRuntime {
                 pending_approval: None,
                 working_tool_history: Vec::new(),
                 recalled_memories: Vec::new(),
+                memory_degraded: None,
                 active_plan: seeded_plan,
                 consecutive_step_failures: 0,
                 streak_extension: 0,
@@ -7797,6 +7804,7 @@ mod tests {
             pending_approval: None,
             working_tool_history: Vec::new(),
             recalled_memories: Vec::new(),
+            memory_degraded: None,
             active_plan: None,
             consecutive_step_failures: 0,
             streak_extension: 0,
@@ -8895,6 +8903,7 @@ mod tests {
             pending_approval: None,
             working_tool_history: Vec::new(),
             recalled_memories: Vec::new(),
+            memory_degraded: None,
             active_plan: None,
             consecutive_step_failures: 0,
             streak_extension: 0,

@@ -557,6 +557,10 @@ enum VaultSkipReason {
     Empty,
     /// The vault's token was rejected (HTTP 401).
     TokenRejected,
+    /// The vault timed out or refused the connection. Circuit breaker: a hung
+    /// Muninn otherwise costs the full recall timeout on EVERY turn. Short
+    /// TTL so a transient blip recovers within a minute.
+    Unreachable,
     /// Confirmed to hold memories; not skipped. Recorded so a non-empty vault
     /// that returns nothing for an off-topic query is not re-checked each turn.
     NonEmpty,
@@ -564,9 +568,21 @@ enum VaultSkipReason {
 
 impl VaultSkipReason {
     fn skips_recall(self) -> bool {
-        matches!(self, Self::Empty | Self::TokenRejected)
+        matches!(self, Self::Empty | Self::TokenRejected | Self::Unreachable)
+    }
+
+    /// Per-reason registry TTL: empties/401s are stable states worth the full
+    /// TTL; an unreachable vault gets a short breaker window.
+    fn ttl(self) -> Duration {
+        match self {
+            Self::Unreachable => VAULT_UNREACHABLE_TTL,
+            _ => VAULT_SKIP_TTL,
+        }
     }
 }
+
+/// Circuit-breaker window for a vault that timed out or refused connection.
+const VAULT_UNREACHABLE_TTL: Duration = Duration::from_secs(60);
 
 #[derive(Debug, Deserialize)]
 struct StatsResponse {
@@ -786,7 +802,7 @@ impl MuninnRestEngine {
         let key = self.vault_skip_key(vault);
         let mut registry = vault_skip_registry().lock().unwrap();
         match registry.get(&key) {
-            Some((at, reason)) if at.elapsed() < VAULT_SKIP_TTL => Some(*reason),
+            Some((at, reason)) if at.elapsed() < reason.ttl() => Some(*reason),
             Some(_) => {
                 registry.remove(&key);
                 None
@@ -1429,6 +1445,10 @@ impl MemoryEngine for MuninnRestEngine {
                             first_token_rejected = Some(err);
                         }
                     } else {
+                        // Timeout / connect refusal: open the short-TTL
+                        // breaker so the next turns skip this vault instead
+                        // of re-paying the full recall timeout each time.
+                        self.mark_vault_skip(vault, VaultSkipReason::Unreachable);
                         failed_vaults.push(vault.clone());
                     }
                     continue;

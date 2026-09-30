@@ -1763,6 +1763,11 @@ impl AgentRuntime {
         reason: &str,
         elapsed: std::time::Duration,
     ) {
+        // Silent memory loss was invisible: a failed recall produced a turn
+        // indistinguishable from "no relevant memories", so the model would
+        // confidently treat absence of recall as absence of history. Stamp
+        // the turn so prompt composition injects a one-line marker.
+        self.mark_turn_memory_degraded(session_id, reason);
         let _ = self
             .emit_turn_event(
                 session_id,
@@ -1773,6 +1778,27 @@ impl AgentRuntime {
                 )),
             )
             .await;
+    }
+
+    /// Stamp the active turn as memory-degraded so `project_recalled_memory`
+    /// renders the "memory unavailable" marker instead of silence.
+    fn mark_turn_memory_degraded(&mut self, session_id: &str, reason: &str) {
+        if let Some(state) = self.sessions.get_mut(session_id) {
+            if let Some(turn) = state.active_turn.as_mut() {
+                turn.memory_degraded = Some(reason.to_string());
+            }
+        }
+    }
+
+    /// Drain deferred vault-token heals (called post-reply from
+    /// `deliver_text_reply`): one heal attempt per vault, off the turn path.
+    pub(super) async fn drain_pending_token_heals(&mut self) {
+        let vaults = std::mem::take(&mut self.pending_token_heals);
+        for vault in vaults {
+            if !self.heal_memory_token(&vault).await {
+                warn!(vault = %vault, "Deferred memory token heal failed — will retry on next rejection.");
+            }
+        }
     }
 
     pub(super) async fn maybe_auto_recall_turn_memory(&mut self, session_id: &str) -> Result<()> {
@@ -1939,12 +1965,14 @@ impl AgentRuntime {
         let recall_latency_ms = recall_started.elapsed().as_millis();
 
         // Partial token rejection: other vaults answered, so the call did not
-        // error and the all-vaults heal above never fired. Heal the rejected
-        // vault for the next turn (the engine skips it meanwhile).
-        if let Some(vault) = result.rejected_vaults.first().cloned()
-            && !self.heal_memory_token(&vault).await
-        {
-            warn!(session_id = %session_id, vault = %vault, "Auto recall: partial token rejection could not be healed.");
+        // error and the all-vaults heal above never fired. DEFER the heal to
+        // after the reply is delivered (drained in deliver_text_reply) — the
+        // heal is a 20s-budget IPC round-trip that must not block the turn.
+        // The engine skips the rejected vault meanwhile.
+        for vault in &result.rejected_vaults {
+            if !self.pending_token_heals.contains(vault) {
+                self.pending_token_heals.push(vault.clone());
+            }
         }
 
         let recall_reason = result.decision.reason.clone();
@@ -1965,6 +1993,12 @@ impl AgentRuntime {
             .chain(result.failed_vaults.iter())
             .cloned()
             .collect();
+        if !degraded_vaults.is_empty() {
+            self.mark_turn_memory_degraded(
+                session_id,
+                &format!("vaults unavailable: {}", degraded_vaults.join(", ")),
+            );
+        }
         let recalled_memories = result
             .engrams
             .into_iter()
@@ -2144,6 +2178,7 @@ impl AgentRuntime {
                 pending_approval: None,
                 working_tool_history: Vec::new(),
                 recalled_memories: Vec::new(),
+                memory_degraded: None,
                 active_plan: None,
                 consecutive_step_failures: 0,
                 streak_extension: 0,

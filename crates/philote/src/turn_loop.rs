@@ -4332,6 +4332,10 @@ impl AgentRuntime {
             }
         }
 
+        // Deferred vault-token heals from this turn's recall: run them now,
+        // post-reply, where the 20s IPC budget costs bookkeeping time only.
+        self.drain_pending_token_heals().await;
+
         // Attend hook (Slice E): autobiographical memory write.
         // Saves the model's explicit `memory_candidate` when it gave one. When it
         // did not, a conservative deterministic classifier (S3) may capture an
