@@ -6912,6 +6912,8 @@ impl AgentRuntime {
 
             "memory.remember" => self.execute_memory_remember_tool(payload).await,
 
+            "memory.evolve" => self.execute_memory_evolve_tool(payload).await,
+
             "memory.cultivate" => self.execute_memory_cultivate_tool(payload).await,
 
             "memory.true_up" => self.execute_memory_true_up_tool(payload).await,

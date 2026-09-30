@@ -4446,21 +4446,50 @@ impl AgentRuntime {
                     warn!(agent = %agent_id, concept = %concept, "Attend: memory write queued for the cluster primary");
                 }
                 super::memory_integration::ForwardOutcome::NotApplicable => {
+                    // Inline, not spawned: the reply is already delivered by
+                    // this point, so awaiting costs only bookkeeping time —
+                    // and a spawned task cannot heal a stale vault token
+                    // (IPC needs the runtime), which silently lost
+                    // autobiographical writes. Mirror memory.remember:
+                    // write → 401-heal → retry once → prompt enrichment.
                     if let Some(engine) = self.memory_engine_for(&agent_id, &memory_user_id) {
-                        tokio::spawn(async move {
-                            use memory_core::MemoryEngine as _;
-                            match engine
-                                .remember_with_metadata(scope, &concept, &content, tags, metadata)
-                                .await
-                            {
-                                Ok(engram) => {
-                                    info!(agent = %agent_id, id = %engram.id, "Attend: memory written")
-                                }
-                                Err(e) => {
-                                    warn!(agent = %agent_id, error = %e, "Attend: memory write failed (non-fatal)")
+                        use memory_core::MemoryEngine as _;
+                        let mut engine = engine;
+                        let mut write = engine
+                            .remember_with_metadata(
+                                scope.clone(),
+                                &concept,
+                                &content,
+                                tags.clone(),
+                                metadata.clone(),
+                            )
+                            .await;
+                        if let Err(err) = &write {
+                            if let Some(vault) = memory_core::token_rejected_vault(err) {
+                                let vault = vault.to_string();
+                                if self.heal_memory_token(&vault).await {
+                                    if let Some(fresh) =
+                                        self.memory_engine_for(&agent_id, &memory_user_id)
+                                    {
+                                        engine = fresh;
+                                        write = engine
+                                            .remember_with_metadata(
+                                                scope, &concept, &content, tags, metadata,
+                                            )
+                                            .await;
+                                    }
                                 }
                             }
-                        });
+                        }
+                        match write {
+                            Ok(engram) => {
+                                let _ = engine.retry_enrich(&engram.id).await;
+                                info!(agent = %agent_id, id = %engram.id, "Attend: memory written")
+                            }
+                            Err(e) => {
+                                warn!(agent = %agent_id, error = %e, "Attend: memory write failed (non-fatal)")
+                            }
+                        }
                     }
                 }
             }

@@ -1122,26 +1122,75 @@ impl MemoryEngine for MuninnRestEngine {
         &self,
         id: &EngramId,
         content: &str,
+        reason: &str,
         tags: Option<Vec<String>>,
     ) -> anyhow::Result<EngramRef> {
-        // MuninnDB REST does not yet expose a direct PATCH endpoint;
-        // evolve is available via MCP (muninn_evolve). For now, write the
-        // updated content as a new engram and link it as supersedes.
-        // Phase 5 (MBP) will replace this with a native evolve call.
-        let existing = self
-            .read(id)
+        // Native MuninnDB evolve: POST /api/engrams/{id}/evolve supersedes
+        // the old version in place (it stays retrievable as history) instead
+        // of the old read-copy-Supersedes shim, which left the stale copy
+        // fully active and competing in recall. Tags are inherited from the
+        // previous version by the server; an explicit override is not part
+        // of the endpoint, so it is reported rather than silently dropped.
+        if tags.is_some() {
+            tracing::debug!(
+                id = %id,
+                "evolve: tag override ignored — native evolve inherits tags; retag separately"
+            );
+        }
+        let reason = if reason.trim().is_empty() {
+            "evolved via memory engine"
+        } else {
+            reason
+        };
+        let body = serde_json::json!({ "new_content": content, "reason": reason });
+
+        #[derive(serde::Deserialize)]
+        struct EvolveResponse {
+            id: String,
+        }
+
+        let base_url = self.url(&format!("/api/engrams/{id}/evolve"));
+        if let Some(vault) = self.cached_vault(id).await {
+            // Fast path: vault known from the write-side cache.
+            let url = format!("{}?vault={}", base_url, vault);
+            let resp = self
+                .with_auth(self.client.post(&url), &vault)
+                .json(&body)
+                .send()
+                .await?;
+            let resp = Self::auth_checked(resp, &vault)?.error_for_status()?;
+            let evolved: EvolveResponse = resp.json().await?;
+            self.invalidate_recall_state();
+            if let Ok(mut cache) = self.id_vault_cache.try_write() {
+                cache.insert(evolved.id.clone(), vault.clone());
+            }
+            return Ok(EngramRef {
+                id: evolved.id,
+                vault_id: vault,
+            });
+        }
+
+        // Slow path: vault unknown — try the configured vaults like forget().
+        let client = &self.client;
+        if let Some((vault, resp)) = self
+            .discover_vault(|vault, token| {
+                let url = format!("{}?vault={}", base_url, vault);
+                client.post(&url).bearer_auth(token).json(&body)
+            })
             .await?
-            .ok_or_else(|| anyhow::anyhow!("evolve: engram not found: {id}"))?;
-
-        let effective_tags = tags.unwrap_or_else(|| existing.tags.clone());
-        let scope = MemoryScope::SelfOnly; // evolve preserves vault via link
-        let new_ref = self
-            .remember(scope, &existing.concept, content, effective_tags)
-            .await?;
-
-        self.link(id, &new_ref.id, LinkKind::Supersedes).await?;
-
-        Ok(new_ref)
+        {
+            let resp = resp.error_for_status()?;
+            let evolved: EvolveResponse = resp.json().await?;
+            self.invalidate_recall_state();
+            if let Ok(mut cache) = self.id_vault_cache.try_write() {
+                cache.insert(evolved.id.clone(), vault.clone());
+            }
+            return Ok(EngramRef {
+                id: evolved.id,
+                vault_id: vault,
+            });
+        }
+        anyhow::bail!("evolve: engram not found in any configured vault: {id}")
     }
 
     async fn forget(&self, id: &EngramId) -> anyhow::Result<()> {
