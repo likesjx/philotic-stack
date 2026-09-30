@@ -482,7 +482,7 @@ Embedding space: `skill_tool_semantic`
 | `SUGGESTS_PATCH` | `DriftFinding`, `GrowthExperiment` | `*Patch` | Leads to a patch proposal |
 | `APPLIES_TO_ROLE` | `Preference`, `Value`, `Concern`, `*Patch` | `Role` | Scoped to a specific role |
 | `INVOLVES` | `Event`, `Trip`, `Appointment`, `Moment`, `Commitment` | `Person` | Who takes part |
-| `OCCURS_AT` | `Event`, `Trip`, `Appointment`, `Moment`, `Routine` | `Place` | Where it happens |
+| `OCCURS_AT` | `Event`, `Trip`, `Appointment`, `Moment`, `Routine`, `Workout` | `Place` | Where it happens |
 | `PART_OF` | `Event`, `Appointment`, `Moment`, `NextAction` | `Trip`, `Project` | Itinerary / rollup membership |
 | `ABOUT` | `OpenLoop`, `NextAction`, `Commitment`, `Decision`, `Concern`, `Signal` | `Person`, `Place`, `Asset`, `Subscription`, `CreativeWork`, `Trip` | What the item concerns |
 | `MAINTAINS` | `Routine`, `Habit`, `NextAction` | `Asset`, `CreativeWork`, `Subscription` | Upkeep of a durable thing |
@@ -504,6 +504,16 @@ remembering becomes a `Moment` (same `INVOLVES`/`OCCURS_AT` edges); gardening re
 proposed `Event`s but never retires `Moment`s. Spaces: Trip/Appointment/Moment/Place →
 `life_event_semantic`; Subscription/Asset/CreativeWork → `goal_system_semantic` (indexes in
 `migrations/V006__nouns_verbs_expansion.cypher`).
+
+**Health & fitness domain (V007, 2026-09-30):** `Workout`, `Measurement` — structured lived
+records for the `human` domain (steward: coach). A `Workout` is one tracked training session
+(first importer: Hevy via `scripts/lifegraph-ingest-hevy.py`, deterministic ids
+`life:workout:hevy-<id>` so re-runs MERGE); a `Measurement` is a point-in-time health/body
+reading (weight, HRV, resting HR) for future HealthKit/withings-style importers. Both →
+`life_event_semantic` (indexes in `migrations/V007__health_fitness_domain.cypher` — apply
+BEFORE deploying a runner that sweeps them). `Workout` may `OCCURS_AT` a `Place`. Imported
+records land `validation_state: inferred` with `source_kind: imported_record`; promotion to
+confirmed stays governed by `life.commit`.
 
 Edge provenance: the full provenance envelope applies to agent-inferred edges. Operator-asserted edges may carry only `source_membrane` and `observed_at`.
 
