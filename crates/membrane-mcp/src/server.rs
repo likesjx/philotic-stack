@@ -361,6 +361,26 @@ fn auth_error_code(e: &AuthError) -> i32 {
 /// Await a dispatched call's terminal outcome and map it onto the MCP result
 /// shape: business errors become `isError: true` results, approval-window
 /// timeouts become `APPROVAL_REQUIRED`, transport failures stay JSON-RPC errors.
+/// An upstream MCP server (McpUpstream route) already answers with a
+/// `CallToolResult`. Wrapping that again as JSON text would hand the caller an
+/// escaped `{"content":[…]}` string, so a value that is exactly that shape —
+/// only `content` / `isError` / `structuredContent` / `_meta` keys, and every
+/// content item typed — is returned as the result itself.
+pub(crate) fn mcp_call_result_passthrough(value: &Value) -> Option<Value> {
+    let obj = value.as_object()?;
+    let content = obj.get("content")?.as_array()?;
+    let known_keys = obj.keys().all(|k| {
+        matches!(
+            k.as_str(),
+            "content" | "isError" | "structuredContent" | "_meta"
+        )
+    });
+    let typed_items = content
+        .iter()
+        .all(|item| item.get("type").and_then(Value::as_str).is_some());
+    (known_keys && typed_items).then(|| value.clone())
+}
+
 async fn await_dispatch_outcome(
     state: &SharedState,
     id: Value,
@@ -372,10 +392,12 @@ async fn await_dispatch_outcome(
     transform_ok: impl FnOnce(&str) -> Value,
 ) -> JsonRpcResponse {
     match tokio::time::timeout(timeout, rx).await {
-        Ok(Ok(DispatchOutcome::Ok(content))) => JsonRpcResponse::ok(
-            id,
-            serde_json::to_value(ToolCallResult::json(transform_ok(&content))).unwrap(),
-        ),
+        Ok(Ok(DispatchOutcome::Ok(content))) => {
+            let value = transform_ok(&content);
+            let result = mcp_call_result_passthrough(&value)
+                .unwrap_or_else(|| serde_json::to_value(ToolCallResult::json(value)).unwrap());
+            JsonRpcResponse::ok(id, result)
+        }
         Ok(Ok(DispatchOutcome::Err(message))) => JsonRpcResponse::ok(
             id,
             serde_json::to_value(ToolCallResult::error(message)).unwrap(),
