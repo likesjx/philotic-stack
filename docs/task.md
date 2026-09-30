@@ -290,6 +290,18 @@ Seam IDs: `session-compaction`
 - [x] Add approval interrupts with explicit history and a pre-approval runtime path.
 - [x] Extend the shared cross-component task error envelope beyond the current model/TTS path so tool-runner, membrane, and other routed components return structured failures instead of silent fallback strings.
 
+## New Project: Agent Frontdoor (remote agents → Muninn + intel-graph)
+
+Proposal: [AGENT_FRONTDOOR_PROPOSAL.md](architecture/AGENT_FRONTDOOR_PROPOSAL.md). Handoff: [HANDOFF-2026-09-30-agent-frontdoor-mac-jane.md](HANDOFF-2026-09-30-agent-frontdoor-mac-jane.md).
+Seam IDs: `mcp-upstream-route-target`, `agent-frontdoor-endpoint`, `remote-muninn-bootstrap`, `frontdoor-proxy-loopback-trust`
+
+- [ ] S1 `McpUpstream` route target + cross-hotel endpoint-config dispatch + caller principal (code on `claude/stoic-goldberg-f8w99b`; not yet compiled — cloud session had no crates.io download access).
+- [x] S2 `scripts/muninn_mcp.py` frontdoor mode (`PHILOTIC_FRONTDOOR_URL` / `PHILOTIC_AGENT_MCP_TOKEN`); mock-frontdoor verified.
+- [ ] S3 Register `muninn-local` + `intel-graph` upstreams on mac-jane; provision `agent-frontdoor` endpoint on vps-jane; TLS path `/agent/mcp`.
+- [ ] S4 Hardening: proxy loopback trust, Mac-offline fast-fail, caller tag on writes, response-shape check.
+- [ ] S5 Cloud client config (Claude Code / Codex env + allowlist, `.mcp.json` entry once live).
+- [ ] S6 `remote-agent-frontdoor` credential class + `mcp-client-uat.sh agent-frontdoor` mode.
+
 ## New Project: Agent Loop Gap Closure
 
 - [x] Review [AGENT_LOOP_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/AGENT_LOOP_PROPOSAL.md).
