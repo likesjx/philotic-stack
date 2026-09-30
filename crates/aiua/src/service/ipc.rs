@@ -3814,6 +3814,29 @@ impl IpcServer {
     /// before dispatching must close it on `false` — otherwise the turn sits
     /// `running` until the 300s stale-turn reaper mislabels it
     /// `ZOMBIE_TURN_REPAIR`. See `fail_undelivered_session_turn`.
+    /// Push a task (`update_mcp_config`, `revoke_mcp_config`, perimeter
+    /// updates) to ONE membrane-mcp endpoint guest. Inboxes are keyed by role,
+    /// so the guest is addressed as role `mcp-membrane` pinned to its guest id
+    /// (`mcp-membrane-<endpoint_id>`). Keying by the guest id alone matched no
+    /// subscriber and the push was dropped: a running endpoint never saw
+    /// config updates, new grants, or revocations until it restarted.
+    pub(crate) async fn push_to_mcp_endpoint_guest(
+        inboxes: &InboxRegistry,
+        source_node: &str,
+        guest_id: &str,
+        task_json: String,
+    ) -> bool {
+        Self::deliver_inbound_task(
+            inboxes,
+            source_node,
+            "mcp-membrane",
+            Some(guest_id),
+            Uuid::new_v4(),
+            task_json,
+        )
+        .await
+    }
+
     pub(crate) async fn deliver_inbound_task(
         inboxes: &InboxRegistry,
         source_node: &str,
@@ -10226,15 +10249,8 @@ impl IpcServer {
                     "config": config,
                 })
                 .to_string();
-                Self::deliver_inbound_task(
-                    inboxes,
-                    local_node_id,
-                    &guest_id,
-                    None,
-                    Uuid::new_v4(),
-                    task_json,
-                )
-                .await;
+                Self::push_to_mcp_endpoint_guest(inboxes, local_node_id, &guest_id, task_json)
+                    .await;
 
                 // Also re-push the current perimeter tier so that a membrane-mcp guest
                 // that reconnected after a hotel restart has the correct fence tier even
@@ -10253,12 +10269,10 @@ impl IpcServer {
                         "tier": ceiling,
                     })
                     .to_string();
-                    Self::deliver_inbound_task(
+                    Self::push_to_mcp_endpoint_guest(
                         inboxes,
                         local_node_id,
                         &guest_id,
-                        None,
-                        Uuid::new_v4(),
                         perimeter_task,
                     )
                     .await;
@@ -10413,15 +10427,8 @@ impl IpcServer {
                     "endpoint_id": endpoint_id,
                 })
                 .to_string();
-                Self::deliver_inbound_task(
-                    inboxes,
-                    local_node_id,
-                    &guest_id,
-                    None,
-                    Uuid::new_v4(),
-                    task_json,
-                )
-                .await;
+                Self::push_to_mcp_endpoint_guest(inboxes, local_node_id, &guest_id, task_json)
+                    .await;
 
                 // Mark guest inactive so hotel doesn't respawn after revoke.
                 if let Some(hotel_name) = Self::local_hotel_name(graph, local_node_id) {
@@ -10622,15 +10629,8 @@ impl IpcServer {
                     "config": config,
                 })
                 .to_string();
-                Self::deliver_inbound_task(
-                    inboxes,
-                    local_node_id,
-                    &guest_id,
-                    None,
-                    Uuid::new_v4(),
-                    task_json,
-                )
-                .await;
+                Self::push_to_mcp_endpoint_guest(inboxes, local_node_id, &guest_id, task_json)
+                    .await;
 
                 info!(
                     endpoint_id,
@@ -10740,15 +10740,8 @@ impl IpcServer {
                     "config": config,
                 })
                 .to_string();
-                Self::deliver_inbound_task(
-                    inboxes,
-                    local_node_id,
-                    &guest_id,
-                    None,
-                    Uuid::new_v4(),
-                    task_json,
-                )
-                .await;
+                Self::push_to_mcp_endpoint_guest(inboxes, local_node_id, &guest_id, task_json)
+                    .await;
 
                 info!(endpoint_id, token_id, removed, "MCP token grant revoked.");
 
@@ -35906,6 +35899,46 @@ pub(crate) mod tests {
             )
             .await;
             (rx, drained)
+        }
+
+        /// Endpoint config pushes reach exactly the endpoint's own guest, and
+        /// the old guest-id-as-role addressing matches nobody (regression for
+        /// the agent-frontdoor revocation gap, 2026-09-30).
+        #[tokio::test]
+        async fn mcp_endpoint_push_reaches_only_that_endpoint_guest() {
+            let inboxes: InboxRegistry = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+            let recorder = Arc::new(DeliveryRecorder::default());
+            let (mut rx_a, _) =
+                subscribe_recorded(&inboxes, "mcp-membrane", "mcp-membrane-a", &recorder).await;
+            let (mut rx_b, _) =
+                subscribe_recorded(&inboxes, "mcp-membrane", "mcp-membrane-b", &recorder).await;
+
+            let json = r#"{"action":"update_mcp_config"}"#.to_string();
+            assert!(
+                IpcServer::push_to_mcp_endpoint_guest(&inboxes, "node-1", "mcp-membrane-a", json)
+                    .await
+            );
+            assert!(matches!(
+                rx_a.try_recv(),
+                Ok(IpcResponse::InboundTask { .. })
+            ));
+            assert!(
+                rx_b.try_recv().is_err(),
+                "other endpoint guests must not get the push"
+            );
+
+            assert!(
+                !IpcServer::deliver_inbound_task(
+                    &inboxes,
+                    "node-1",
+                    "mcp-membrane-a",
+                    None,
+                    Uuid::new_v4(),
+                    "{}".into(),
+                )
+                .await,
+                "no subscriber is keyed by an endpoint guest id"
+            );
         }
 
         /// One live subscription per guest identity: a re-registration (new
