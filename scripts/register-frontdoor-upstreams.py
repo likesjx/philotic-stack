@@ -12,7 +12,8 @@ grants them to the frontdoor caller principals (`mcp:<agent>`):
 Muninn is registered on vps-jane, not the Mac: the Mac Muninn nodes are
 cluster observers and reject writes (-32002), so `muninn_remember` /
 `muninn_decide` only work against the Cortex. The Cortex bearer (the same
-`default`-vault token local Claude uses) is read from MUNINN_TOKEN_FILE and
+`default`-vault token local Claude uses) is read from MUNINN_TOKEN_FILE (`-` =
+stdin, so it never lands on disk: `… | ssh vps 'MUNINN_TOKEN_FILE=- …'`) and
 stored in the hotel vault via provision_mcp_upstream_credential; it is never
 printed.
 
@@ -122,7 +123,10 @@ def read_muninn_token() -> str:
     if not MUNINN_TOKEN_FILE:
         print("ERROR: MUNINN_TOKEN_FILE required for muninn-cortex", file=sys.stderr)
         sys.exit(1)
-    token = open(os.path.expanduser(MUNINN_TOKEN_FILE)).read().strip()
+    if MUNINN_TOKEN_FILE == "-":
+        token = sys.stdin.read().strip()
+    else:
+        token = open(os.path.expanduser(MUNINN_TOKEN_FILE)).read().strip()
     # Accept either the raw key or a full "Bearer <key>" header value; the
     # client formats the header itself.
     return token.removeprefix("Bearer ").strip()
@@ -142,6 +146,9 @@ def main() -> None:
     if DRY_RUN:
         print(json.dumps(configs, indent=2))
         return
+    # Read secrets before touching the hotel so a bad token source cannot leave
+    # an upstream registered without its credential.
+    muninn_token = read_muninn_token() if any(UPSTREAM_SPECS[u][2] for u in UPSTREAMS) else ""
 
     ipc = Ipc(SOCKET_PATH)
     # Owner checks accept `<owner>:<suffix>` guest ids (aiua mcp_owner_identity_ok).
@@ -167,7 +174,7 @@ def main() -> None:
         if ok and UPSTREAM_SPECS[upstream_id][2]:
             cred = ipc.call(
                 "provision_mcp_upstream_credential",
-                {"upstream_id": upstream_id, "owner_agent_id": OWNER_AGENT_ID, "credential": read_muninn_token()},
+                {"upstream_id": upstream_id, "owner_agent_id": OWNER_AGENT_ID, "credential": muninn_token},
             )
             cred_ok = cred.get("ok") is True
             print(f"ProvisionMcpUpstreamCredential {upstream_id}: {'ok' if cred_ok else json.dumps(cred)}")
