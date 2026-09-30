@@ -456,6 +456,74 @@ pub fn format_summary(s: &DecisionSummary) -> String {
     out
 }
 
+/// `heal-dispatcher --decision-smoke`: one live call on the synthetic
+/// `smoke.live` site, using this hotel's vault key through the same IPC path as
+/// the pilot, so the key never leaves the process. Every OpenRouter request
+/// carries the zero-data-retention routing block, so a 200 here proves
+/// OpenRouter accepts ZDR-pinned decisions calls. Prints only the resolved
+/// model, provider, latency and answers; writes no trace.
+pub async fn run_smoke(ipc: &mut PhiloticClient) -> anyhow::Result<()> {
+    let config = load_decisions_config(ipc).await?;
+    anyhow::ensure!(
+        config.api_key.is_some(),
+        "no OpenRouter key configured on this hotel (`phil keys configure openrouter`)"
+    );
+    let client = DecisionsClient::openrouter(
+        reqwest::Client::default(),
+        config.api_key,
+        config.base_url,
+        config.model,
+    );
+    let request = DecisionsRequest {
+        site: "smoke.live".into(),
+        state: json!(
+            "The payment service has returned connection refused for the last 40 minutes and three retries have failed."
+        ),
+        questions: vec![
+            DecisionQuestion {
+                id: "needs_restart".into(),
+                instructions: "Would restarting the service plausibly fix this?".into(),
+                spec: QuestionSpec::Noul {
+                    when_true: Some("A restart would clear the condition".into()),
+                    when_false: Some("A restart would not help".into()),
+                },
+            },
+            DecisionQuestion {
+                id: "severity".into(),
+                instructions: "How severe is this failure?".into(),
+                spec: QuestionSpec::Choice {
+                    options: vec![
+                        DecisionOption::new("critical", "The service is down"),
+                        DecisionOption::new("high", "Degraded and needs attention soon"),
+                        DecisionOption::new("low", "Minor and can wait"),
+                    ],
+                },
+            },
+        ],
+    };
+    let outcome = client
+        .evaluate(&request, None, Duration::from_secs(15))
+        .await
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "decisions smoke failed [{}]: {}",
+                e.class.as_str(),
+                e.message
+            )
+        })?;
+    println!(
+        "ok: model={} provider={} latency_ms={} request_id={:?}",
+        outcome.trace.model,
+        outcome.trace.provider,
+        outcome.trace.latency_ms,
+        outcome.trace.request_id
+    );
+    for (id, answer) in &outcome.result.answers {
+        println!("  {id}: {answer:?}");
+    }
+    Ok(())
+}
+
 /// `heal-dispatcher --decision-summary`: read `decision_traces.db` and print the
 /// summary. Read-only: it does not create the database if it is absent.
 pub fn print_summary() -> anyhow::Result<()> {

@@ -132,12 +132,10 @@ impl DecisionsClient {
         bytes_sent: &mut u64,
     ) -> Result<DecisionsOutcome, DecisionsError> {
         // The data policy holds at this single egress point, for every caller:
-        // an unknown or disallowed site, or state that looks like a conversation
-        // payload, is refused before any network hop, and every string in `state`
-        // is redacted and truncated before it leaves.
-        gate::site_spec(&request.site)?;
-        gate::screen(request)?;
-        let request = &gate::redacted(request);
+        // an unknown site, or a class this transport may not carry (operator
+        // content needs zero data retention), is refused before any network hop,
+        // and `state` is screened and redacted for its class before it leaves.
+        let request = &gate::admit(request, self.transport)?;
         let Some(key) = self.api_key.as_deref() else {
             return Err(DecisionsError::new(
                 DecisionsErrorClass::Auth,
