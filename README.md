@@ -25,6 +25,8 @@ This installs the `phil` CLI (symlinked from `philotic-web`), the `aiua` hotel d
 ```bash
 git clone https://github.com/likesjx/philotic-stack.git
 cd philotic-stack
+just preflight            # check system dependencies BEFORE the first build
+just install-git-hooks    # secret-push guard + pre-commit rustfmt gate
 cargo build --release
 
 # Put the operator CLI on your PATH as `phil`. Homebrew creates this symlink
@@ -50,7 +52,7 @@ table is what it checks and why.
 | `npm` (conditional) | `philotic-web/build.rs` | Only when `PHILOTIC_DESKTOP_DIR` or `PHILOTIC_REFRESH_DESKTOP_UI` is set — otherwise the committed `ui-dist` is reused. build.rs **panics** if npm is missing. |
 | `rustup` (recommended) | `rust-toolchain.toml` | The 1.94.0 pin is only honoured by rustup. With a Homebrew toolchain the file is inert and local builds drift from CI. |
 
->Binaries are built to `target/release/`. A full release build emits ~24 binaries (the deployed set is pinned in `AIUA_BINS` in the [justfile](justfile) and mirrored by [.github/workflows/build-linux.yml](.github/workflows/build-linux.yml)). The primary ones:
+Binaries are built to `target/release/`. A full release build emits ~24 binaries (the deployed set is pinned in `AIUA_BINS` in the [justfile](justfile) and mirrored by [.github/workflows/build-linux.yml](.github/workflows/build-linux.yml)). The primary ones:
 
 | Binary | Purpose |
 |---|---|

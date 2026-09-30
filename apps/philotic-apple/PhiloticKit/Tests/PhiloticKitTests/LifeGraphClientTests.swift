@@ -21,7 +21,7 @@ final class LifeGraphClientTests: XCTestCase {
         let body = Data(
             """
             {"lens":"open_loops_by_context","data":{
-              "status":"ok","named_strategy":"open_loops_by_context","fallback_used":false,
+              "status":"ok","named_strategy":"open_loops_by_context","fallback_used":"false",
               "context_packet":{
                 "context_id":"ctx-1","query_id":"edge-lens-open_loops_by_context",
                 "strategy":"semantic_pivot_bounded_expansion",
@@ -69,6 +69,7 @@ final class LifeGraphClientTests: XCTestCase {
         XCTAssertEqual(response.lens, "open_loops_by_context")
         XCTAssertEqual(response.data.status, "ok")
         XCTAssertEqual(response.data.namedStrategy, "open_loops_by_context")
+        XCTAssertEqual(response.data.fallbackUsed, false)
         let packets = response.data.contextPacket?.rankedPackets ?? []
         XCTAssertEqual(packets.count, 1)
         XCTAssertEqual(packets[0].score, 0.91, accuracy: 0.0001)
@@ -77,6 +78,43 @@ final class LifeGraphClientTests: XCTestCase {
         XCTAssertEqual(packets[0].packet.claimSummary, "call the pharmacy about refill")
         XCTAssertEqual(packets[0].packet.validationState, "proposed")
         XCTAssertEqual(packets[0].packet.confidence, 0.8, accuracy: 0.0001)
+    }
+
+    func testLensFallbackDecodesServerStringsAndLegacyBooleans() throws {
+        let cases: [(String, Bool?)] = [
+            (#""false""#, false),
+            (#""topped_up""#, true),
+            (#""full_fallback""#, true),
+            ("false", false),
+            ("true", true),
+            ("null", nil),
+        ]
+        for (value, expected) in cases {
+            let body = Data("{\"status\":\"ok\",\"fallback_used\":\(value)}".utf8)
+            let data = try JSONDecoder().decode(LifeLensData.self, from: body)
+            XCTAssertEqual(data.fallbackUsed, expected, "fallback_used: \(value)")
+        }
+        let missing = try JSONDecoder().decode(
+            LifeLensData.self, from: Data(#"{"status":"ok"}"#.utf8))
+        XCTAssertNil(missing.fallbackUsed)
+    }
+
+    func testLensFallbackRejectsUnknownValues() {
+        for value in [#""unexpected""#, "42", "[]", "{}"] {
+            let body = Data("{\"status\":\"ok\",\"fallback_used\":\(value)}".utf8)
+            XCTAssertThrowsError(try JSONDecoder().decode(LifeLensData.self, from: body)) {
+                error in
+                guard let error = error as? DecodingError else {
+                    return XCTFail("Expected a decoding error")
+                }
+                switch error {
+                case .dataCorrupted(let context), .typeMismatch(_, let context):
+                    XCTAssertEqual(context.codingPath.last?.stringValue, "fallback_used")
+                default:
+                    XCTFail("Unexpected decoding error: \(error)")
+                }
+            }
+        }
     }
 
     func testFetchNodeDecodesProvenanceAndNeighbors() async throws {

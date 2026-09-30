@@ -129,6 +129,7 @@ fn record_observation_input(
     let (observed_by, observed_role_owned, edges) = anchor_fields(agent_id, observed_role);
 
     LifeObserveInput {
+        force_new: false,
         observation_id,
         evidence: EvidencePacket {
             packet_id,
@@ -153,6 +154,8 @@ fn record_observation_input(
             validation_state: ValidationState::Proposed,
             observed_at: Some(signal.observed_at.clone()),
             valid_time_range: None,
+            due_at: None,
+            occurs_at: None,
             source_reliability: 0.75,
             conflict_ids: vec![],
             adjudication_status: AdjudicationStatus::NotNeeded,
@@ -164,6 +167,7 @@ fn record_observation_input(
                 "policy_tags": signal.policy_tags,
                 "subject_refs": signal.subject_refs,
             }),
+            properties: Default::default(),
         },
         proposed_graph_refs: vec![],
         observed_by,
@@ -188,6 +192,7 @@ fn propose_sil_input(
     let (observed_by, observed_role_owned, edges) = anchor_fields(agent_id, observed_role);
 
     LifeObserveInput {
+        force_new: false,
         observation_id,
         evidence: EvidencePacket {
             packet_id,
@@ -212,6 +217,8 @@ fn propose_sil_input(
             validation_state: ValidationState::Proposed,
             observed_at: Some(now_iso.to_string()),
             valid_time_range: None,
+            due_at: None,
+            occurs_at: None,
             source_reliability: 0.65,
             conflict_ids: vec![],
             adjudication_status: AdjudicationStatus::NotNeeded,
@@ -224,6 +231,7 @@ fn propose_sil_input(
                 "evidence_refs": sil.evidence_refs,
                 "signal_id": signal.signal_id,
             }),
+            properties: Default::default(),
         },
         proposed_graph_refs: vec![],
         observed_by,
@@ -257,6 +265,7 @@ fn active_checkin_awaiting_posture_input(
     }
 
     LifeObserveInput {
+        force_new: false,
         observation_id,
         evidence: EvidencePacket {
             packet_id,
@@ -281,6 +290,8 @@ fn active_checkin_awaiting_posture_input(
             validation_state: ValidationState::Proposed,
             observed_at: Some(now_iso.to_string()),
             valid_time_range: None,
+            due_at: None,
+            occurs_at: None,
             source_reliability: 0.75,
             conflict_ids: vec![],
             adjudication_status: AdjudicationStatus::NotNeeded,
@@ -296,6 +307,7 @@ fn active_checkin_awaiting_posture_input(
                 "sil_ref": sil_ref,
                 "confirmed_sil_entries": signal.confirmed_sil_entries,
             }),
+            properties: Default::default(),
         },
         proposed_graph_refs: vec![],
         observed_by,

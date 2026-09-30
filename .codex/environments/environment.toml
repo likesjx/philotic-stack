@@ -1,0 +1,10 @@
+version = 1
+name = "Philotic Apple Companion"
+
+[setup]
+script = ""
+
+[[actions]]
+name = "Run"
+icon = "run"
+command = "./apps/philotic-apple/script/build_and_run.sh --verify"

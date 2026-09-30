@@ -35,8 +35,12 @@ async fn main() -> Result<()> {
         .send_request(IpcRequest::EmitTask {
             target_node,
             target_role: "agent".into(),
-            target_guest_id,
+            target_guest_id: target_guest_id.clone(),
             task_json: serde_json::json!({
+                // The hotel binds the session to this agent; without it the
+                // smoke session was snapshotted with no role and the philote ran
+                // the turn on the always-on minimum toolset (2026-09-16).
+                "agent_id": target_guest_id,
                 "source": "smoke",
                 "session_id": session_id,
                 "turn_id": turn_id,

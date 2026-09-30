@@ -48,8 +48,11 @@ pub async fn invite(hotel_name: String, mesh_host: String, out: Option<PathBuf>)
                 .unwrap_or("?");
             let output_path =
                 out.unwrap_or_else(|| PathBuf::from(format!("{hotel_name}-mesh-invite.json")));
-            fs::write(&output_path, invite_json)
-                .with_context(|| format!("write {}", output_path.display()))?;
+            // Owner-only: possession of this invite is what grants mesh
+            // membership, and a mesh peer can mutate every reachable hotel. It
+            // lands in the CWD, so 0644 would expose it to other local accounts
+            // and to anything that later archives the directory.
+            crate::init::write_private_file(&output_path, invite_json)?;
             println!("Mesh invite written: {}", output_path.display());
             println!("Inviter: {hotel_name}");
             println!("Mesh endpoint: {}", mesh_host.trim());

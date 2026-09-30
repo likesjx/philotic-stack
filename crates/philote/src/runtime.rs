@@ -45,6 +45,15 @@ mod paracrine;
 #[path = "tool_exec.rs"]
 mod tool_exec;
 
+#[path = "deterministic_capture.rs"]
+mod deterministic_capture;
+
+#[path = "tool_args.rs"]
+pub(crate) mod tool_args;
+
+#[path = "distill.rs"]
+pub(crate) mod distill;
+
 #[path = "memory_integration.rs"]
 mod memory_integration;
 use memory_integration::*;
@@ -52,6 +61,13 @@ use memory_integration::*;
 #[path = "life_capture.rs"]
 mod life_capture;
 use life_capture::*;
+
+#[path = "mcp_handling.rs"]
+mod mcp_handling;
+use mcp_handling::*;
+
+#[path = "procedure_runtime.rs"]
+mod procedure_runtime;
 
 #[path = "memory_explain_tool.rs"]
 mod memory_explain_tool;
@@ -486,6 +502,7 @@ fn low_progress_tool_name(tool_name: &str) -> bool {
             | "hotel.logs"
             | "hotel.status"
             | "mcp.status"
+            | "memory.report"
             | "memory.status"
             | "role.list"
             | "session.status"
@@ -497,12 +514,32 @@ fn duplicate_tool_skip(result: &ToolResult) -> bool {
     result.content.starts_with("[Duplicate call skipped]")
 }
 
+/// True when a call to a normally low-signal tool is in fact this turn's
+/// declared work.
+///
+/// The tools in [`low_progress_tool_name`] are diagnostics — an agent that
+/// strings four of them together is usually circling rather than progressing.
+/// But "check the hotel status and tell me what's wrong" is a plan whose steps
+/// legitimately *are* those calls, and counting them as low progress truncated
+/// exactly the read-only plans the loop was asked to carry to completion. A
+/// call bound to a plan step is the plan being executed, whatever the tool.
+fn call_serves_a_plan_step(turn: &WorkingTurn, call: &ToolCall) -> bool {
+    turn.active_plan.as_ref().is_some_and(|plan| {
+        plan.steps
+            .iter()
+            .any(|s| s.tool_name.as_deref() == Some(call.tool_name.as_str()))
+    })
+}
+
 fn recent_low_progress_tool_run(turn: &WorkingTurn) -> usize {
     turn.working_tool_history
         .iter()
         .rev()
         .take_while(|(call, result)| {
-            low_progress_tool_name(&call.tool_name) || duplicate_tool_skip(result)
+            // A duplicate is still a duplicate even when a step declares that
+            // tool: repeating an identical call is not executing the next step.
+            duplicate_tool_skip(result)
+                || (low_progress_tool_name(&call.tool_name) && !call_serves_a_plan_step(turn, call))
         })
         .count()
 }
@@ -1524,7 +1561,7 @@ fn build_capability_request(
 fn command_bypasses_turn_start(command: &SlashCommand) -> bool {
     matches!(
         command,
-        SlashCommand::Ping | SlashCommand::Status | SlashCommand::Context
+        SlashCommand::Ping | SlashCommand::Status | SlashCommand::Context | SlashCommand::Hotel
     )
 }
 
@@ -1588,14 +1625,22 @@ pub struct AgentRuntime {
     /// Tracks hotel-broadcast MuninnDB reachability. False = hotel reported endpoint down.
     /// When false, `memory_engine_for` returns None even if `muninn_config` is set.
     muninn_available: bool,
+    /// Memory writes routed to the Cortex whose EmitTask could not be enqueued
+    /// yet: `(target_node, task_json)`, oldest first. Re-sent before every new
+    /// forward and at turn start. In-memory only (bounded) — the mesh ledger is
+    /// the durable queue once the local hotel accepts the task.
+    pending_memory_forwards: std::collections::VecDeque<(String, String)>,
+    /// Deterministic operator-fact captures spent today: `(utc_day, count)`.
+    deterministic_capture_budget: (u64, usize),
     /// Role configurations registered via `role.configure`, keyed by role_name.
     configured_roles: HashMap<String, CachedRoleConfig>,
-    /// Cached OpenRouter catalog snapshot for `/model` display: the set of
-    /// model ids whose endpoints accept tool calls, plus the set of all known
-    /// ids (absent-from-catalog models stay unannotated). Refreshed lazily
-    /// when older than [`OPENROUTER_CATALOG_TTL`]; `None` until first fetch or
-    /// when the last fetch failed (annotation is best-effort — dispatch-time
-    /// tools handling lives in model-router, not here).
+    /// Cached hotel-owned OpenRouter catalog snapshot for `/model` display:
+    /// the set of model ids whose endpoints accept tool calls, plus the set of
+    /// all known ids (absent-from-catalog models stay unannotated). Refreshed
+    /// lazily when older than [`OPENROUTER_CATALOG_TTL`]; `None` until the
+    /// hotel's governed discovery job publishes its first snapshot
+    /// (annotation is best-effort — dispatch-time tools handling lives in
+    /// model-router, not here).
     openrouter_tools_catalog: Option<OpenRouterToolsCatalog>,
     /// Agent profile (identity_text, soul_text, etc.) fetched from hotel at startup.
     /// Applied to every new session so the correct persona is used from the first turn.
@@ -1604,6 +1649,9 @@ pub struct AgentRuntime {
     /// or is granted, cached from `GetMcpUpstreams`. Copied into each session's
     /// bindings so the tool assembly projects them (proposal mcp-client-fabric).
     mcp_upstream_tools: Vec<crate::session::McpUpstreamToolBinding>,
+    /// Governed HTTP integrations resolved by the hotel against live mesh
+    /// placement and copied into each session's projected tool assembly.
+    http_integration_tools: Vec<crate::session::HttpIntegrationToolBinding>,
     /// Tasks dequeued from a session's pending_user_tasks after a turn completed.
     /// Dispatched at the top of the main event loop to avoid async recursion.
     pending_drains: std::collections::VecDeque<(Uuid, InboundTaskPayload)>,
@@ -1651,9 +1699,8 @@ pub struct AgentRuntime {
 }
 
 /// One model row from the hotel's compact catalog (config node
-/// `model_catalog.openrouter`, written by aiua's model-catalog-sync job) or
-/// from the direct-OpenRouter fallback fetch. Backs both the `/models`
-/// drill-down and the `/model` tool badges.
+/// `model_catalog.openrouter`, written by aiua's governed model-catalog-sync
+/// job). Backs both the `/models` drill-down and the `/model` tool badges.
 #[derive(Debug, Clone)]
 struct CatalogModelEntry {
     id: String,
@@ -1680,6 +1727,26 @@ impl OpenRouterToolsCatalog {
     }
 }
 
+fn parse_compact_model_catalog(raw: &str) -> Option<Vec<CatalogModelEntry>> {
+    let rows: Vec<serde_json::Value> = serde_json::from_str(raw).ok()?;
+    let entries: Vec<CatalogModelEntry> = rows
+        .iter()
+        .filter_map(|row| {
+            Some(CatalogModelEntry {
+                id: row.get("id")?.as_str()?.to_string(),
+                name: row.get("name").and_then(|n| n.as_str()).map(str::to_string),
+                tools: row.get("tools").and_then(|t| t.as_bool()),
+                ctx: row.get("ctx").and_then(|c| c.as_u64()).map(|c| c as u32),
+            })
+        })
+        .collect();
+    if entries.is_empty() {
+        None
+    } else {
+        Some(entries)
+    }
+}
+
 /// Refresh cadence for the `/model` tool-capability annotation catalog.
 const OPENROUTER_CATALOG_TTL: Duration = Duration::from_secs(600);
 /// Buttons per drill-down page in `/models` (Telegram keyboards stay usable
@@ -1690,6 +1757,57 @@ const MODELS_PAGE_SIZE: usize = 10;
 const TELEGRAM_CALLBACK_LIMIT: usize = 64;
 
 impl AgentRuntime {
+    /// Tools the harness may call on the model's behalf: read-only, no
+    /// arguments, no approval class. A step bound to one of these is a
+    /// measurement, and a measurement should not depend on the model
+    /// remembering to take it.
+    const HARNESS_RUNNABLE_TOOLS: &'static [&'static str] = &["life.audit"];
+
+    /// On a plan-continuation turn whose remaining (not done/failed) steps
+    /// are all bound to harness-runnable tools, the first such call.
+    fn harness_runnable_step(&self, session_id: &str, content: &str) -> Option<ToolCall> {
+        if !content.trim_start().starts_with("[Plan continuation") {
+            return None;
+        }
+        let state = self.sessions.get(session_id)?;
+        let turn = state.active_turn.as_ref()?;
+        let plan = turn.active_plan.as_ref()?;
+        let remaining: Vec<&crate::session::PlanStep> = plan
+            .steps
+            .iter()
+            .enumerate()
+            .filter(|(i, s)| {
+                !turn.plan_steps_verified.get(*i).copied().unwrap_or(false)
+                    && s.status != "done"
+                    && s.status != "failed"
+            })
+            .map(|(_, s)| s)
+            .collect();
+        if remaining.is_empty() {
+            return None;
+        }
+        let all_runnable = remaining.iter().all(|s| {
+            s.tool_name
+                .as_deref()
+                .is_some_and(|t| Self::HARNESS_RUNNABLE_TOOLS.contains(&t))
+        });
+        if !all_runnable {
+            return None;
+        }
+        let tool = remaining[0].tool_name.clone()?;
+        // Never loop: one harness call per tool per turn.
+        if turn
+            .working_tool_history
+            .iter()
+            .any(|(c, _)| c.tool_name == tool)
+        {
+            return None;
+        }
+        Some(ToolCall {
+            tool_name: tool,
+            arguments: serde_json::json!({}),
+        })
+    }
     /// Live merged `/model` preset list: the hotel config key `model_presets`
     /// (JSON array of `{alias, label, tier, model, description}`) merged over
     /// the compiled-in defaults. Config edits apply on the next `/model` —
@@ -1722,11 +1840,12 @@ impl AgentRuntime {
             .and_then(|c| c.supports_tools(model_id))
     }
 
-    /// Refresh the cached catalog if stale. HOTEL-FIRST: reads the compact
-    /// catalog aiua's model-catalog-sync job persists to the config node
-    /// `model_catalog.openrouter` (one fetch per hotel, mesh-consistent);
-    /// falls back to a direct OpenRouter fetch when the hotel hasn't run
-    /// discovery yet. A failed refresh keeps the previous snapshot.
+    /// Refresh the cached catalog if stale. Reads only the compact catalog
+    /// aiua's governed model-catalog-sync job persists to the config node
+    /// `model_catalog.openrouter` (one external fetch per hotel rather than one
+    /// ambient fetch per philote). A failed refresh keeps the previous
+    /// snapshot; absence remains visible instead of creating a second network
+    /// authority inside cognition.
     async fn ensure_openrouter_catalog(&mut self) {
         let stale = self
             .openrouter_tools_catalog
@@ -1736,11 +1855,7 @@ impl AgentRuntime {
         if !stale {
             return;
         }
-        let fresh = match self.fetch_hotel_catalog().await {
-            Some(entries) => Some(entries),
-            None => self.fetch_openrouter_catalog_direct().await,
-        };
-        if let Some(entries) = fresh {
+        if let Some(entries) = self.fetch_hotel_catalog().await {
             self.openrouter_tools_catalog = Some(OpenRouterToolsCatalog {
                 fetched_at: std::time::Instant::now(),
                 entries,
@@ -1768,91 +1883,7 @@ impl AgentRuntime {
             }) => v,
             _ => return None,
         };
-        let rows: Vec<serde_json::Value> = serde_json::from_str(&raw).ok()?;
-        let entries: Vec<CatalogModelEntry> = rows
-            .iter()
-            .filter_map(|row| {
-                Some(CatalogModelEntry {
-                    id: row.get("id")?.as_str()?.to_string(),
-                    name: row.get("name").and_then(|n| n.as_str()).map(str::to_string),
-                    tools: row.get("tools").and_then(|t| t.as_bool()),
-                    ctx: row.get("ctx").and_then(|c| c.as_u64()).map(|c| c as u32),
-                })
-            })
-            .collect();
-        if entries.is_empty() {
-            None
-        } else {
-            Some(entries)
-        }
-    }
-
-    /// Direct OpenRouter fallback for hotels that haven't run catalog
-    /// discovery yet (public endpoint, no key).
-    async fn fetch_openrouter_catalog_direct(&mut self) -> Option<Vec<CatalogModelEntry>> {
-        let base = match self
-            .ipc_client
-            .send_request_with_timeout(
-                IpcRequest::GetConfig {
-                    key: "openrouter_base_url".into(),
-                },
-                Duration::from_secs(3),
-            )
-            .await
-        {
-            Ok(IpcResponse::ConfigData {
-                value_json: Some(v),
-                ..
-            }) => v,
-            _ => "https://openrouter.ai/api".to_string(),
-        };
-        let base = base
-            .trim()
-            .trim_matches('"')
-            .trim_end_matches('/')
-            .trim_end_matches("/v1")
-            .trim_end_matches('/')
-            .to_string();
-        let url = format!("{base}/v1/models");
-        let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(4))
-            .build()
-            .ok()?;
-        let body: serde_json::Value = client.get(&url).send().await.ok()?.json().await.ok()?;
-        let entries: Vec<CatalogModelEntry> = body
-            .get("data")
-            .and_then(|d| d.as_array())?
-            .iter()
-            .filter_map(|model| {
-                let id = model.get("id").and_then(|i| i.as_str())?.to_string();
-                let tools = model
-                    .get("supported_parameters")
-                    .and_then(|p| p.as_array())
-                    .map(|params| {
-                        params
-                            .iter()
-                            .filter_map(|p| p.as_str())
-                            .any(|p| p == "tools")
-                    });
-                Some(CatalogModelEntry {
-                    id,
-                    name: model
-                        .get("name")
-                        .and_then(|n| n.as_str())
-                        .map(str::to_string),
-                    tools,
-                    ctx: model
-                        .get("context_length")
-                        .and_then(|c| c.as_u64())
-                        .map(|c| c as u32),
-                })
-            })
-            .collect();
-        if entries.is_empty() {
-            None
-        } else {
-            Some(entries)
-        }
+        parse_compact_model_catalog(&raw)
     }
 
     /// Build the `/models` drill-down reply: bare → vendor buttons; with a
@@ -1864,8 +1895,9 @@ impl AgentRuntime {
         self.ensure_openrouter_catalog().await;
         let Some(catalog) = self.openrouter_tools_catalog.as_ref() else {
             return (
-                "Model catalog unavailable — the hotel's discovery job hasn't run yet and \
-                 OpenRouter is unreachable. You can still bind directly: /model <vendor/model>."
+                "Model catalog unavailable — the hotel's governed discovery job hasn't \
+                 published a snapshot yet. You can still bind directly: \
+                 /model <vendor/model>."
                     .to_string(),
                 None,
             );
@@ -1976,10 +2008,13 @@ impl AgentRuntime {
             sessions: HashMap::new(),
             muninn_config: None,
             muninn_available: true,
+            pending_memory_forwards: std::collections::VecDeque::new(),
+            deterministic_capture_budget: (0, 0),
             configured_roles: HashMap::new(),
             openrouter_tools_catalog: None,
             default_agent_profile: AgentProfile::default(),
             mcp_upstream_tools: Vec::new(),
+            http_integration_tools: Vec::new(),
             pending_drains: std::collections::VecDeque::new(),
             stuck_turn_first_seen: HashMap::new(),
             stuck_turn_signature: HashMap::new(),
@@ -2378,15 +2413,14 @@ impl AgentRuntime {
         );
 
         for memory_type in &memory_types {
-            // Derive session_id from memory_type: "short_session:{session_id}"
-            let Some(session_id) = memory_type.strip_prefix("short_session:") else {
-                continue;
-            };
-            let snapshot_key = format!("__session_snapshot__:{session_id}");
+            // Read the raw checkpoint, not the hotel's composed snapshot: the
+            // sweep writes back what it reads, and anything short of the full
+            // checkpoint would erase the fields it didn't carry (DEF-167).
+            let apartment_key = format!("__apartment__:{}:{memory_type}", self.agent_id);
             let checkpoint = match self
                 .ipc_client
                 .send_request_with_timeout(
-                    IpcRequest::GetConfig { key: snapshot_key },
+                    IpcRequest::GetConfig { key: apartment_key },
                     std::time::Duration::from_secs(5),
                 )
                 .await
@@ -2400,12 +2434,25 @@ impl AgentRuntime {
                 },
                 Err(_) => {
                     warn!(
-                        "sweep_stale_session_turns: snapshot fetch timed out for session {session_id} — skipping"
+                        "sweep_stale_session_turns: checkpoint fetch timed out for {memory_type} — skipping"
                     );
                     continue;
                 }
                 _ => continue,
             };
+            let Some(session_id) = checkpoint
+                .get("session_id")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+            else {
+                continue;
+            };
+            // Only sweep this process's own checkpoints: the orchestrator and
+            // each role process keep separate keys for the same session, and
+            // a turn in flight in another process is not this one's to drop.
+            if crate::session::session_checkpoint_memory_type(&session_id) != *memory_type {
+                continue;
+            }
 
             let had_active_turn = checkpoint
                 .get("active_turn")
@@ -2570,7 +2617,7 @@ impl AgentRuntime {
                             )
                             .await
                         }
-                        SlashCommand::Status | SlashCommand::Context => {
+                        SlashCommand::Status | SlashCommand::Context | SlashCommand::Hotel => {
                             self.handle_read_only_session_command(
                                 task_id,
                                 session_id,
@@ -2586,7 +2633,10 @@ impl AgentRuntime {
                         _ => unreachable!("command_bypasses_turn_start gate should be exhaustive"),
                     };
                 }
-                SlashCommand::Ping | SlashCommand::Status | SlashCommand::Context => {
+                SlashCommand::Ping
+                | SlashCommand::Status
+                | SlashCommand::Context
+                | SlashCommand::Hotel => {
                     unreachable!("read-only commands should bypass turn start")
                 }
                 SlashCommand::Pause | SlashCommand::Resume => {}
@@ -3018,6 +3068,7 @@ impl AgentRuntime {
                 paracrine_reply_session_id,
                 paracrine_reply_chat_id,
                 paracrine_response_routing,
+                paracrine_intent,
             ) = {
                 let exosome = task
                     .exosome
@@ -3028,6 +3079,13 @@ impl AgentRuntime {
                     exosome.as_ref().and_then(|e| e.source_session_id.clone()),
                     exosome.as_ref().and_then(|e| e.source_chat_id.clone()),
                     exosome.as_ref().and_then(|e| e.response_routing.clone()),
+                    exosome.as_ref().and_then(|e| {
+                        e.context
+                            .as_ref()
+                            .and_then(|c| c.get("intent"))
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.to_string())
+                    }),
                 )
             };
 
@@ -3035,24 +3093,16 @@ impl AgentRuntime {
             // (completed steps marked done) so the model sees exactly what is
             // left, and enter pre-confirmed so the plan gate does not re-park.
             let is_plan_continuation = task.action.as_deref() == Some("plan_continuation");
-            let (seeded_plan, seeded_plan_confirmed) = if is_plan_continuation {
+            let (seeded_plan, seeded_verified, seeded_plan_confirmed) = if is_plan_continuation {
                 match state.carryover_plan.as_ref() {
                     Some(carry) => {
-                        let mut plan = carry.plan.clone();
-                        for (i, step) in plan.steps.iter_mut().enumerate() {
-                            if carry.steps_done.get(i).copied().unwrap_or(false) {
-                                step.status = "done".into();
-                            }
-                        }
-                        if plan.status == "planning" {
-                            plan.status = "executing".into();
-                        }
-                        (Some(plan), true)
+                        let (plan, verified) = carry.seed_turn_plan();
+                        (Some(plan), verified, true)
                     }
-                    None => (None, false),
+                    None => (None, Vec::new(), false),
                 }
             } else {
-                (None, false)
+                (None, Vec::new(), false)
             };
 
             // Cron-triggered turns get CronPrimary (the honest marker is
@@ -3088,6 +3138,23 @@ impl AgentRuntime {
                 SelectionSource::ConfiguredDefault
             };
 
+            // Self-Improvement Loop L1: a distill review starts from a clean
+            // slate — the lookaside session's earlier verdicts must not steer
+            // this one. See `SessionState::forget_dialogue_for_lookaside`.
+            if paracrine_intent
+                .as_deref()
+                .is_some_and(|i| i == distill::INTENT || i.starts_with("skills.distill:"))
+            {
+                let forgotten = state.forget_dialogue_for_lookaside();
+                if forgotten > 0 {
+                    info!(
+                        session_id = %session_id,
+                        forgotten_turns = forgotten,
+                        "skills.distill: lookaside session dialogue forgotten before review"
+                    );
+                }
+            }
+
             state.start_turn(WorkingTurn {
                 task_id,
                 turn_id: turn_id.clone(),
@@ -3107,6 +3174,8 @@ impl AgentRuntime {
                 consecutive_step_failures: 0,
                 streak_extension: 0,
                 provider_repair_note: None,
+                say_do_nudged: false,
+                media_analysis: false,
                 provider_repair_attempts: 0,
                 pending_text_reply: None,
                 had_voice_input,
@@ -3118,6 +3187,7 @@ impl AgentRuntime {
                 paracrine_reply_chat_id,
                 paracrine_response_routing,
                 paracrine_merge_completed: false,
+                paracrine_intent,
                 plan_confirmed: seeded_plan_confirmed,
                 plan_confirm_note: None,
                 fallback_tier: if self.network_offline { 1 } else { 0 },
@@ -3126,6 +3196,9 @@ impl AgentRuntime {
                 streamed_content: String::new(),
                 paracrine_hop_count: 0,
                 paracrine_chain_started_at: None,
+                started_at_unix: Some(crate::plan_eval::unix_now()),
+                last_interim_at_unix: None,
+                plan_steps_verified: seeded_verified,
                 selection_source,
             });
             state.set_active_turn_phase(TurnPhase::LoadingContext);
@@ -3263,11 +3336,17 @@ impl AgentRuntime {
             model_context,
             context_projection,
             tools_for_model,
+            seeded_outcome_target,
         ) = {
             let state = self
                 .sessions
                 .get_mut(&session_id)
                 .expect("session should exist after ensuring and binding transport target");
+            // Outcome reflex: an operator report that settles a recalled loop
+            // gets a harness-seeded observe+commit plan BEFORE tools are
+            // projected, so the plan binds its tools and the evaluator has
+            // something to check. See SessionState::seed_outcome_plan.
+            let seeded_outcome_target = state.seed_outcome_plan();
             let tools_for_model = state.project_tools_for_turn(&content);
             let (model_prompt, model_context, context_projection) =
                 state.model_request_payloads(&content, &tools_for_model);
@@ -3287,6 +3366,7 @@ impl AgentRuntime {
                 model_context,
                 context_projection,
                 tools_for_model,
+                seeded_outcome_target,
             )
         };
 
@@ -3294,6 +3374,44 @@ impl AgentRuntime {
             .sync_apartment(&self.agent_id, &checkpoint_memory_type, checkpoint_json)
             .await?;
         self.sync_session_index(&index_state).await?;
+
+        if let Some(target) = seeded_outcome_target.as_deref() {
+            info!(
+                session_id = %session_id,
+                target,
+                "outcome reflex seeded an observe+commit plan for a recalled loop"
+            );
+            let _ = self
+                .emit_turn_event(
+                    &session_id,
+                    "plan_seeded",
+                    Some(format!("outcome reflex: observe outcome, resolve {target}")),
+                )
+                .await;
+        }
+
+        // Gardener closer: a continuation whose only remaining steps are
+        // read-only measurements (`life.audit`) is run by the harness, not
+        // asked of the model — live 2026-09-14 21:35 UTC the model replied
+        // "all 12 actions verified" three times without ever calling the
+        // closing audit, and the plan blocked at 0/1.
+        if let Some(call) = self.harness_runnable_step(&session_id, &content) {
+            info!(
+                session_id = %session_id,
+                tool = %call.tool_name,
+                "harness runs the plan's remaining read-only step itself"
+            );
+            let _ = self
+                .emit_turn_event(
+                    &session_id,
+                    "plan_step_harness_run",
+                    Some(format!("{}: only read-only step(s) remain", call.tool_name)),
+                )
+                .await;
+            return self
+                .route_tool_call_execution(session_id, turn_id, call, false)
+                .await;
+        }
 
         if let Some(command) = parse_slash_command(&content) {
             return match command {
@@ -3303,6 +3421,7 @@ impl AgentRuntime {
                 }
                 SlashCommand::Status
                 | SlashCommand::Context
+                | SlashCommand::Hotel
                 | SlashCommand::Pause
                 | SlashCommand::Resume
                 | SlashCommand::ToolsAdd { .. }
@@ -3383,6 +3502,12 @@ impl AgentRuntime {
             .as_ref()
             .map(|routing| routing.action == "transcribe")
             .unwrap_or(false);
+        // A vision/document analysis turn: its reply is the only text form of
+        // the attachment, so the reply path must not discard it (DEF-163/164).
+        let media_analysis_dispatch = media_routing
+            .as_ref()
+            .map(|routing| routing.action != "transcribe")
+            .unwrap_or(false);
 
         let _ = self
             .ipc_client
@@ -3406,6 +3531,7 @@ impl AgentRuntime {
             state.bump_active_turn_iteration();
             state.set_active_turn_phase(TurnPhase::WaitingModel);
             state.set_active_turn_awaiting_transcription_reentry(awaiting_transcription_reentry);
+            state.set_active_turn_media_analysis(media_analysis_dispatch);
             (
                 state.checkpoint_memory_type(),
                 state.checkpoint_json(),
@@ -3880,6 +4006,17 @@ impl AgentRuntime {
     }
 
     async fn emit_partial_reply(&mut self, session_id: &str, content: String) -> Result<()> {
+        // Stamp the turn before sending, so every interim path — plan progress,
+        // a handoff announcement, a paracrine signal — draws on the same quiet
+        // period. Rate-limiting only the progress notes would let two of these
+        // land back to back and reproduce the chatter the gate exists to stop.
+        if let Some(turn) = self
+            .sessions
+            .get_mut(session_id)
+            .and_then(|s| s.active_turn.as_mut())
+        {
+            turn.last_interim_at_unix = Some(crate::plan_eval::unix_now());
+        }
         let (turn_id, chat_id, final_reply_to, final_reply_role, final_reply_guest_id) = {
             let Some(state) = self.sessions.get(session_id) else {
                 return Ok(());
@@ -4047,11 +4184,19 @@ impl AgentRuntime {
             state.clear_handoff_summary();
         }
 
+        // `partial_replies` is offered on the re-entry path only. This is the
+        // one dispatch that can be followed by another tool call, so it is the
+        // only place a turn can speak and still keep working; the initial
+        // dispatch is iteration 0, which the interim gate declines anyway.
+        // Deliberately not added to `voice_response_contract` — an interim on a
+        // voice turn would route through the draft-edit path that voice replies
+        // delete, which is untested.
         let response_contract = Some(cognitive_response_contract(&[
             "spoken_text",
             "memory_candidate",
             "active_plan",
             "memory_concept",
+            "partial_replies",
         ]));
         let response_route = Some(model_response_route(
             self.sessions.get(&session_id),
@@ -5262,8 +5407,8 @@ impl AgentRuntime {
                 task_id: original_task_id,
                 error_code: "APPROVAL_CANCELLED".into(),
                 reason: cancel_reason.to_string(),
-                session_id: None,
-                turn_id: None,
+                session_id: Some(session_id.clone()),
+                turn_id: Some(original_turn_id.clone()),
             })
             .await?;
 
@@ -5398,7 +5543,16 @@ impl AgentRuntime {
         let tools_for_model = self
             .sessions
             .get(&session_id)
-            .map(|state| state.tool_assembly.tools_for_model.clone())
+            .map(|state| {
+                // A fully verified plan has nothing left but the report; a
+                // model handed its tools here re-ran twelve completed tidies
+                // (live 2026-09-15 16:33 UTC).
+                if state.plan_fully_verified() {
+                    Vec::new()
+                } else {
+                    state.tool_assembly.tools_for_model.clone()
+                }
+            })
             .unwrap_or_default();
 
         let (context, context_projection) = self
@@ -6036,6 +6190,28 @@ impl AgentRuntime {
                         "chat_id": command_chat_id,
                     }),
                 ),
+                SlashCommand::Hotel => (
+                    {
+                        let hotel = local_hotel_name().unwrap_or_else(|| "unknown".into());
+                        let node = local_node_id();
+                        hotel_location_text(
+                            &hotel,
+                            &node,
+                            &self.agent_id,
+                            self.role_name.as_deref(),
+                        )
+                    },
+                    "hotel_location_reported",
+                    serde_json::json!({
+                        "session_id": session_id,
+                        "turn_id": command_turn_id,
+                        "chat_id": command_chat_id,
+                        "hotel_name": local_hotel_name(),
+                        "node_id": local_node_id(),
+                        "agent_id": self.agent_id,
+                        "role_name": self.role_name,
+                    }),
+                ),
                 SlashCommand::Pause => {
                     state.set_status("paused");
                     (
@@ -6326,6 +6502,23 @@ impl AgentRuntime {
                     "session_id": session_id,
                     "turn_id": command_turn_id,
                     "chat_id": command_chat_id,
+                })),
+            ),
+            SlashCommand::Hotel => (
+                {
+                    let hotel = local_hotel_name().unwrap_or_else(|| "unknown".into());
+                    let node = local_node_id();
+                    hotel_location_text(&hotel, &node, &self.agent_id, self.role_name.as_deref())
+                },
+                Some("hotel_location_reported"),
+                Some(serde_json::json!({
+                    "session_id": session_id,
+                    "turn_id": command_turn_id,
+                    "chat_id": command_chat_id,
+                    "hotel_name": local_hotel_name(),
+                    "node_id": local_node_id(),
+                    "agent_id": self.agent_id,
+                    "role_name": self.role_name,
                 })),
             ),
             _ => {
@@ -6648,6 +6841,33 @@ impl AgentRuntime {
     /// it to every live session (proposal mcp-client-fabric). Sessions whose
     /// projection changed get their tool assembly rebuilt, so revoked
     /// upstreams disappear and newly reported catalogs appear.
+    /// Fetch the hotel's tool catalog records (`catalog/tools.yaml` as loaded
+    /// into the hotel graph) and rebuild every session's tool assembly when
+    /// they changed. On failure the compiled catalog stays in effect.
+    pub(crate) async fn refresh_tool_catalog(&mut self) {
+        match self
+            .ipc_client
+            .send_request_with_timeout(IpcRequest::GetToolCatalog {}, Duration::from_secs(5))
+            .await
+        {
+            Ok(IpcResponse::ToolCatalogState { tool_catalog }) => {
+                let count = tool_catalog.len();
+                if crate::catalog::set_hotel_tool_records(tool_catalog) {
+                    info!(tools = count, "tool catalog loaded from hotel records");
+                    for state in self.sessions.values_mut() {
+                        state.rebuild_default_tool_assembly();
+                    }
+                }
+            }
+            Ok(_) => warn!(
+                "refresh_tool_catalog: hotel did not return a tool catalog; compiled catalog stays"
+            ),
+            Err(e) => {
+                warn!("refresh_tool_catalog: GetToolCatalog failed: {e}; compiled catalog stays")
+            }
+        }
+    }
+
     pub(crate) async fn refresh_mcp_upstream_projection(&mut self) {
         let entries = match self
             .ipc_client
@@ -6693,6 +6913,89 @@ impl AgentRuntime {
         }
     }
 
+    pub(crate) async fn refresh_http_integration_projection(&mut self) {
+        let entries = match self
+            .ipc_client
+            .send_request_with_timeout(
+                IpcRequest::GetIntegrationBindings {},
+                Duration::from_secs(5),
+            )
+            .await
+        {
+            Ok(IpcResponse::IntegrationBindingsState {
+                integration_bindings,
+            }) => integration_bindings,
+            Ok(_) => return,
+            Err(error) => {
+                warn!("refresh_http_integration_projection: request failed: {error}");
+                return;
+            }
+        };
+        let mut projected = Vec::new();
+        for entry in entries {
+            if !entry.binding.is_granted_to(&self.agent_id) {
+                continue;
+            }
+            if !matches!(
+                entry.binding.target,
+                ansible_mesh_core::integration::IntegrationTarget::Http(_)
+            ) {
+                continue;
+            }
+            let Some(execution_node_id) = entry.execution_node_id else {
+                continue;
+            };
+            if matches!(
+                entry.placement,
+                ansible_mesh_core::integration::EgressPlacementDecision::Deny { .. }
+            ) {
+                continue;
+            }
+            projected.push(crate::session::HttpIntegrationToolBinding {
+                binding: entry.binding,
+                placement: entry.placement,
+                execution_node_id,
+            });
+        }
+        self.http_integration_tools = projected;
+        let cache = self.http_integration_tools.clone();
+        let agent_id = self.agent_id.clone();
+        for state in self.sessions.values_mut() {
+            let available: Vec<_> = cache
+                .iter()
+                .filter(|entry| {
+                    entry
+                        .binding
+                        .is_available_to(&agent_id, &state.bindings.effective_skillset)
+                })
+                .cloned()
+                .collect();
+            if state.bindings.http_integration_tools != available {
+                state.bindings.http_integration_tools = available;
+                state.rebuild_default_tool_assembly();
+            }
+        }
+    }
+
+    fn apply_http_integration_projection(&mut self, session_id: &str) {
+        let cache = self.http_integration_tools.clone();
+        let agent_id = self.agent_id.clone();
+        if let Some(state) = self.sessions.get_mut(session_id) {
+            let available: Vec<_> = cache
+                .into_iter()
+                .filter(|entry| {
+                    entry
+                        .binding
+                        .is_available_to(&agent_id, &state.bindings.effective_skillset)
+                })
+                .collect();
+            if state.bindings.http_integration_tools != available {
+                state.bindings.http_integration_tools = available;
+                state.rebuild_default_tool_assembly();
+            }
+        }
+    }
+
     /// Copy the cached upstream projection into one session's bindings if it
     /// drifted (e.g. a session restored from a pre-projection checkpoint).
     fn apply_mcp_upstream_projection(&mut self, session_id: &str) {
@@ -6724,11 +7027,14 @@ impl AgentRuntime {
             _ => None,
         };
 
-        let Some(state) = self.sessions.get_mut(session_id) else {
-            return;
-        };
         let Some(snapshot) = snapshot else { return };
-        Self::merge_snapshot_bindings(state, &snapshot);
+        {
+            let Some(state) = self.sessions.get_mut(session_id) else {
+                return;
+            };
+            Self::merge_snapshot_bindings(state, &snapshot);
+        }
+        self.apply_http_integration_projection(session_id);
     }
 
     fn merge_snapshot_bindings(state: &mut SessionState, snapshot: &serde_json::Value) {
@@ -6741,6 +7047,23 @@ impl AgentRuntime {
         let new_skillset: Option<Vec<String>> = bindings
             .get("effective_skillset")
             .and_then(|v| serde_json::from_value(v.clone()).ok());
+        // Hotel-composed "name — description" doctrine lines for the skills in
+        // play. Without carrying these, only a checkpoint-restored session ever
+        // has them — a fresh session's [Skill guidance] prompt section (see
+        // SessionState::project_agent_self) would stay empty forever.
+        let new_skill_guidance: Option<Vec<String>> = bindings
+            .get("effective_skill_guidance")
+            .and_then(|v| serde_json::from_value(v.clone()).ok());
+        // Procedural graphs ride the same lane as skill guidance: prompt-facing,
+        // never a tool-assembly rebuild.
+        let new_procedures: Option<Vec<ansible_mesh_core::procedure::ProcedureGraphRecord>> =
+            bindings
+                .get("effective_procedures")
+                .and_then(|v| serde_json::from_value(v.clone()).ok());
+        let new_skill_records: Option<Vec<ansible_mesh_core::graph::AbstractSkillRecord>> =
+            bindings
+                .get("effective_skill_records")
+                .and_then(|v| serde_json::from_value(v.clone()).ok());
         let new_allowed_classes: Option<Vec<String>> = bindings
             .get("allowed_classes")
             .and_then(|v| serde_json::from_value(v.clone()).ok());
@@ -6760,6 +7083,24 @@ impl AgentRuntime {
             if skillset != state.bindings.effective_skillset {
                 state.bindings.effective_skillset = skillset;
                 changed = true;
+            }
+        }
+        if let Some(skill_guidance) = new_skill_guidance {
+            // Prompt-facing only — guidance never affects tool routing, so it
+            // deliberately does not set `changed` (no tool-assembly rebuild).
+            if skill_guidance != state.bindings.effective_skill_guidance {
+                state.bindings.effective_skill_guidance = skill_guidance;
+            }
+        }
+        if let Some(procedures) = new_procedures {
+            if procedures != state.bindings.effective_procedures {
+                state.bindings.effective_procedures = procedures;
+            }
+        }
+        if let Some(records) = new_skill_records {
+            // Projection-facing only, like guidance: no tool-assembly rebuild.
+            if records != state.bindings.effective_skill_records {
+                state.bindings.effective_skill_records = records;
             }
         }
         if let Some(allowed_classes) = new_allowed_classes {
@@ -6786,6 +7127,7 @@ impl AgentRuntime {
     ) -> Result<()> {
         if self.sessions.contains_key(session_id) {
             self.apply_mcp_upstream_projection(session_id);
+            self.apply_http_integration_projection(session_id);
             return Ok(());
         }
 
@@ -6922,8 +7264,40 @@ impl AgentRuntime {
                             }
                         }
 
+                        // Checkpoint-restored sessions carry the agent
+                        // profile as of when the checkpoint was written —
+                        // fields configured SINCE then (user_timezone from the
+                        // hotel user profile) never reach long-lived sessions
+                        // otherwise. Overlay missing fields from the current
+                        // default profile; never override what the session
+                        // already has. Same bug class as the voice-routing
+                        // loss on restore (restore must apply
+                        // default_agent_profile).
+                        if state.agent_profile.user_timezone.is_none() {
+                            state.agent_profile.user_timezone =
+                                self.default_agent_profile.user_timezone.clone();
+                        }
+
+                        // A session created by a task that carried no agent id
+                        // (smoke drivers, MCP loopback, shadow control) is
+                        // snapshotted before this philote's first checkpoint, so it
+                        // comes back with no role and an empty toolset. Treat it
+                        // like a fresh session instead of running the whole first
+                        // turn on the always-on minimum (found live 2026-09-16:
+                        // Björk had no memory tools and claimed a save it never made).
+                        if state.role_activation.is_none()
+                            && state.bindings.effective_toolset.is_empty()
+                        {
+                            info!(
+                                session_id = %session_id,
+                                "Restored session has no role or toolset — activating the default role."
+                            );
+                            self.activate_default_role(&mut state, session_id).await;
+                        }
+
                         self.sessions.insert(session_id.to_string(), state);
                         self.apply_mcp_upstream_projection(session_id);
+                        self.apply_http_integration_projection(session_id);
                         return Ok(());
                     }
                 }
@@ -6943,11 +7317,34 @@ impl AgentRuntime {
         // Auto-activate the agent's default role incarnation on fresh sessions so the
         // correct manifest, toolset, and skill guidance are present from turn zero
         // without requiring an explicit handoff.to_role call.
+        //
+        // A role-incarnation process (PHILOTIC_ROLE_NAME set) exists to serve
+        // exactly that role: its fresh sessions activate ITS role, not the
+        // agent's default. Before this, a whisper to Chronos materialized a
+        // Chronos philote whose paracrine session then auto-activated
+        // `orchestrator` — the specialist answered without the specialist's
+        // lens, manifest, or toolset (found live 2026-08-25).
+        self.activate_default_role(&mut state, session_id).await;
+
+        self.sessions.insert(session_id.to_string(), state);
+        self.apply_mcp_upstream_projection(session_id);
+        self.apply_http_integration_projection(session_id);
+        Ok(())
+    }
+
+    /// Activate this philote's default role on a session with no role yet:
+    /// manifest, turn-loop settings and the role's toolset profile bindings.
+    async fn activate_default_role(&mut self, state: &mut SessionState, session_id: &str) {
         let default_role = self
-            .default_agent_profile
-            .default_role_name
+            .role_name
             .clone()
             .filter(|role| !role.trim().is_empty())
+            .or_else(|| {
+                self.default_agent_profile
+                    .default_role_name
+                    .clone()
+                    .filter(|role| !role.trim().is_empty())
+            })
             .unwrap_or_else(|| "orchestrator".into());
         {
             if let Some(activation) = self.fetch_role_activation(&default_role).await {
@@ -6974,7 +7371,7 @@ impl AgentRuntime {
                 }
                 state.role_activation = Some(activation);
                 if let Some(profile_name) = toolset_profile_ref.as_deref() {
-                    self.hydrate_bindings_from_toolset_profile(&mut state, profile_name)
+                    self.hydrate_bindings_from_toolset_profile(state, profile_name)
                         .await;
                 }
                 info!(
@@ -6984,10 +7381,6 @@ impl AgentRuntime {
                 );
             }
         }
-
-        self.sessions.insert(session_id.to_string(), state);
-        self.apply_mcp_upstream_projection(session_id);
-        Ok(())
     }
 
     /// Fetches durable rules from the hotel and injects them into the session state.
@@ -7069,6 +7462,19 @@ fn local_hotel_name() -> Option<String> {
         .ok()
         .map(|name| name.trim().to_string())
         .filter(|name| !name.is_empty())
+}
+
+/// Builds the `/hotel` reply: a quick "where am I running" readout — which
+/// hotel (node) materialized this philote, and under which role, if any.
+/// Takes resolved values rather than reading env vars itself, so callers
+/// (and tests) control the source and formatting stays independent of the
+/// process environment.
+fn hotel_location_text(hotel: &str, node: &str, agent_id: &str, role_name: Option<&str>) -> String {
+    let role = role_name.unwrap_or("orchestrator");
+    let guest_identity = compose_guest_identity(agent_id, role_name);
+    format!(
+        "Hotel: {hotel}. Node: {node}. Agent: {agent_id}. Role: {role}. Guest identity: {guest_identity}."
+    )
 }
 
 fn projected_user_context_from_profile(profile: &UserProfileDataPayload) -> Option<String> {
@@ -7187,9 +7593,10 @@ mod tests {
         extract_model_error, extract_model_error_payload, format_role_command_reply,
         format_roles_report, loop_stop_fallback_reply, loop_stop_reason,
         media_analysis_attachments, next_ladder_tier, normalized_user_content,
-        parse_memory_candidate, pick_oracle_role, primary_dispatch_used_ladder, provider_for_role,
-        resolve_media_routing, resolve_model_execution_target, role_model_binding,
-        shadow_eligible_capability, should_attempt_provider_repair, tool_step_earns_streak,
+        parse_compact_model_catalog, pick_oracle_role, primary_dispatch_used_ladder,
+        provider_for_role, resolve_media_routing, resolve_model_execution_target,
+        role_model_binding, shadow_eligible_capability, should_attempt_provider_repair,
+        tool_step_earns_streak,
     };
     use crate::commands::SlashCommand;
     use crate::r#loop::{ApprovalRequest, PlanProposalAction, ToolCall, ToolResult, TurnPhase};
@@ -7204,6 +7611,33 @@ mod tests {
     };
     use philotic_client::{TaskErrorPayload, UserProfileDataPayload};
     use uuid::Uuid;
+
+    #[test]
+    fn compact_model_catalog_parser_keeps_hotel_projection_fields() {
+        let entries = parse_compact_model_catalog(
+            r#"[
+                {"id":"openai/gpt-5.6","name":"GPT 5.6","tools":true,"ctx":1050000},
+                {"name":"missing id"},
+                {"id":"anthropic/claude","tools":false}
+            ]"#,
+        )
+        .expect("valid compact catalog");
+
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].id, "openai/gpt-5.6");
+        assert_eq!(entries[0].name.as_deref(), Some("GPT 5.6"));
+        assert_eq!(entries[0].tools, Some(true));
+        assert_eq!(entries[0].ctx, Some(1_050_000));
+        assert_eq!(entries[1].id, "anthropic/claude");
+        assert_eq!(entries[1].tools, Some(false));
+    }
+
+    #[test]
+    fn compact_model_catalog_parser_rejects_absent_or_invalid_snapshots() {
+        assert!(parse_compact_model_catalog("not-json").is_none());
+        assert!(parse_compact_model_catalog("[]").is_none());
+        assert!(parse_compact_model_catalog(r#"[{"name":"missing id"}]"#).is_none());
+    }
 
     // ── Routing-oracle helpers ────────────────────────────────────────────
 
@@ -7367,6 +7801,8 @@ mod tests {
             consecutive_step_failures: 0,
             streak_extension: 0,
             provider_repair_note: None,
+            say_do_nudged: false,
+            media_analysis: false,
             provider_repair_attempts: 0,
             pending_text_reply: None,
             had_voice_input: false,
@@ -7378,6 +7814,7 @@ mod tests {
             paracrine_reply_chat_id: None,
             paracrine_response_routing: None,
             paracrine_merge_completed: false,
+            paracrine_intent: None,
             plan_confirmed: false,
             plan_confirm_note: None,
             fallback_tier: 0,
@@ -7386,6 +7823,9 @@ mod tests {
             streamed_content: String::new(),
             paracrine_hop_count: 0,
             paracrine_chain_started_at: None,
+            started_at_unix: None,
+            last_interim_at_unix: None,
+            plan_steps_verified: Vec::new(),
             selection_source: SelectionSource::default(),
         }
     }
@@ -7499,6 +7939,89 @@ mod tests {
         }
 
         assert!(loop_stop_reason(&turn, 10).is_none());
+    }
+
+    /// A plan whose steps genuinely are diagnostic reads must be allowed to
+    /// finish. Treating its own declared steps as "circling" truncated exactly
+    /// the read-only plans the loop is supposed to carry to completion.
+    #[test]
+    fn loop_stop_reason_allows_a_plan_built_from_diagnostic_tools() {
+        let mut turn = test_working_turn(TurnPhase::WaitingModel);
+        let diagnostics = ["hotel.status", "role.list", "skill.list", "session.status"];
+        turn.active_plan = Some(ActivePlan {
+            goal: "report on hotel health".into(),
+            steps: diagnostics
+                .iter()
+                .enumerate()
+                .map(|(i, tool)| PlanStep {
+                    id: i as u32 + 1,
+                    description: format!("read {tool}"),
+                    tool_name: Some((*tool).to_string()),
+                    status: "pending".into(),
+                })
+                .collect(),
+            status: "executing".into(),
+            context_1_advisory: None,
+            procedure_id: None,
+        });
+        for tool_name in diagnostics {
+            push_test_tool(&mut turn, tool_name, "ok");
+        }
+
+        assert!(loop_stop_reason(&turn, 10).is_none());
+    }
+
+    /// The exemption is for *declared* steps only — an unplanned diagnostic run
+    /// still stops the turn even when a plan is present.
+    #[test]
+    fn loop_stop_reason_still_stops_undeclared_diagnostic_run_under_a_plan() {
+        let mut turn = test_working_turn(TurnPhase::WaitingModel);
+        turn.active_plan = Some(ActivePlan {
+            goal: "add a memory".into(),
+            steps: vec![PlanStep {
+                id: 1,
+                description: "record the fact".into(),
+                tool_name: Some("memory.remember".into()),
+                status: "pending".into(),
+            }],
+            status: "executing".into(),
+            context_1_advisory: None,
+            procedure_id: None,
+        });
+        for tool_name in ["hotel.status", "role.list", "skill.list", "session.status"] {
+            push_test_tool(&mut turn, tool_name, "ok");
+        }
+
+        let reason = loop_stop_reason(&turn, 10).expect("diagnostic run should still stop");
+        assert!(reason.contains("status"));
+    }
+
+    /// Repeating an identical call is not executing the next step, even when a
+    /// plan step declares that tool.
+    #[test]
+    fn loop_stop_reason_still_stops_duplicate_calls_on_a_planned_tool() {
+        let mut turn = test_working_turn(TurnPhase::WaitingModel);
+        turn.active_plan = Some(ActivePlan {
+            goal: "report on hotel health".into(),
+            steps: vec![PlanStep {
+                id: 1,
+                description: "read hotel.status".into(),
+                tool_name: Some("hotel.status".into()),
+                status: "pending".into(),
+            }],
+            status: "executing".into(),
+            context_1_advisory: None,
+            procedure_id: None,
+        });
+        for _ in 0..4 {
+            push_test_tool(
+                &mut turn,
+                "hotel.status",
+                "[Duplicate call skipped] hotel.status",
+            );
+        }
+
+        assert!(loop_stop_reason(&turn, 10).is_some());
     }
 
     #[test]
@@ -8376,6 +8899,8 @@ mod tests {
             consecutive_step_failures: 0,
             streak_extension: 0,
             provider_repair_note: None,
+            say_do_nudged: false,
+            media_analysis: false,
             provider_repair_attempts: 0,
             pending_text_reply: None,
             had_voice_input: false,
@@ -8387,6 +8912,7 @@ mod tests {
             paracrine_reply_chat_id: None,
             paracrine_response_routing: None,
             paracrine_merge_completed: false,
+            paracrine_intent: None,
             plan_confirmed: false,
             plan_confirm_note: None,
             fallback_tier: 0,
@@ -8395,6 +8921,9 @@ mod tests {
             streamed_content: String::new(),
             paracrine_hop_count: 0,
             paracrine_chain_started_at: None,
+            started_at_unix: None,
+            last_interim_at_unix: None,
+            plan_steps_verified: Vec::new(),
             selection_source: SelectionSource::default(),
         });
 
@@ -8976,10 +9505,23 @@ mod tests {
         assert!(super::command_bypasses_turn_start(&SlashCommand::Ping));
         assert!(super::command_bypasses_turn_start(&SlashCommand::Status));
         assert!(super::command_bypasses_turn_start(&SlashCommand::Context));
+        assert!(super::command_bypasses_turn_start(&SlashCommand::Hotel));
         assert!(!super::command_bypasses_turn_start(&SlashCommand::Pause));
         assert!(!super::command_bypasses_turn_start(
             &SlashCommand::Approve { note: None }
         ));
+    }
+
+    #[test]
+    fn hotel_location_text_reports_agent_and_role() {
+        assert_eq!(
+            super::hotel_location_text("mac-jane", "local-aiua-01", "astrid", None),
+            "Hotel: mac-jane. Node: local-aiua-01. Agent: astrid. Role: orchestrator. Guest identity: astrid."
+        );
+        assert_eq!(
+            super::hotel_location_text("vps-jane", "vps-01", "astrid", Some("chronos")),
+            "Hotel: vps-jane. Node: vps-01. Agent: astrid. Role: chronos. Guest identity: astrid:chronos."
+        );
     }
 
     #[test]
@@ -9409,6 +9951,273 @@ mod tests {
         assert_eq!(reply["target_guest_id"], "membrane-seat-1");
     }
 
+    /// Keepalive must buy a slow tool more PHASE time without ever buying it
+    /// unlimited TOTAL time. If a ping could push back the total-turn ceiling,
+    /// a wedged tool that keeps pinging would hang the session forever — worse
+    /// than the eviction it is avoiding. The two clocks are separate maps and
+    /// must stay that way; this test is what enforces it.
+    #[tokio::test]
+    async fn tool_progress_refreshes_phase_clock_but_never_the_total_turn_ceiling() {
+        let socket_path = format!("/tmp/philote-ping-{}.sock", Uuid::new_v4().simple());
+        let listener = tokio::net::UnixListener::bind(&socket_path).expect("bind");
+        let emitted = std::sync::Arc::new(std::sync::Mutex::new(Vec::<serde_json::Value>::new()));
+        let server = tokio::spawn(run_recording_hotel(listener, emitted.clone()));
+
+        let client = philotic_client::PhiloticClient::connect_at(
+            &socket_path,
+            philotic_client::GuestIdentity {
+                guest_id: "agent-ping".into(),
+                role: "agent".into(),
+                supported_tools: Vec::new(),
+            },
+        )
+        .await
+        .expect("connect to stub hotel");
+        let mut runtime = AgentRuntime::new(client, "agent-ping");
+
+        let session_id = "sess-ping";
+        let turn_id = "turn-ping";
+        runtime
+            .ensure_session_loaded(session_id, "telegram")
+            .await
+            .expect("session load");
+        runtime
+            .sessions
+            .get_mut(session_id)
+            .expect("session exists")
+            .start_turn(def004_working_turn(turn_id, "life.observe.batch"));
+
+        // Seed both clocks well in the past, as they would be for a turn that
+        // has already been waiting a long time.
+        let long_ago = std::time::Instant::now() - std::time::Duration::from_secs(300);
+        runtime
+            .stuck_turn_first_seen
+            .insert(session_id.to_string(), long_ago);
+        runtime
+            .total_active_since
+            .insert(session_id.to_string(), long_ago);
+
+        runtime.handle_tool_progress(&InboundTaskPayload {
+            action: Some("tool_progress".into()),
+            session_id: Some(session_id.into()),
+            turn_id: Some(turn_id.into()),
+            tool_name: Some("life.observe.batch".into()),
+            ..Default::default()
+        });
+
+        let phase_clock = *runtime
+            .stuck_turn_first_seen
+            .get(session_id)
+            .expect("phase clock present");
+        let total_clock = *runtime
+            .total_active_since
+            .get(session_id)
+            .expect("total clock present");
+        assert!(
+            phase_clock > long_ago,
+            "a ping must refresh the phase watchdog"
+        );
+        assert_eq!(
+            total_clock, long_ago,
+            "a ping must NOT push back the total-turn ceiling — that would let a \
+             wedged tool ping forever and hang the session"
+        );
+
+        // A ping naming a DIFFERENT turn is ignored, so a late ping from an
+        // already-evicted tool cannot hold a new turn's watchdog open.
+        let before = *runtime.stuck_turn_first_seen.get(session_id).unwrap();
+        runtime.handle_tool_progress(&InboundTaskPayload {
+            action: Some("tool_progress".into()),
+            session_id: Some(session_id.into()),
+            turn_id: Some("turn-already-evicted".into()),
+            tool_name: Some("life.observe.batch".into()),
+            ..Default::default()
+        });
+        assert_eq!(
+            *runtime.stuck_turn_first_seen.get(session_id).unwrap(),
+            before,
+            "a ping for a non-active turn must be ignored"
+        );
+
+        drop(runtime);
+        let _ = server.await;
+        let _ = std::fs::remove_file(&socket_path);
+    }
+
+    /// Dropping a stale result protects the new turn, but the tool already ran.
+    /// A WRITE that reached the graph has changed durable state for a turn the
+    /// operator was told had died — so the drop must not also be silent, or the
+    /// graph and the conversation diverge with nothing recording it. Read-only
+    /// tools and clean rejections changed nothing and must stay quiet, otherwise
+    /// every evicted read files diagnostic noise.
+    #[test]
+    fn orphaned_write_summary_reports_writes_and_ignores_everything_else() {
+        use super::AgentRuntime;
+
+        // Batch with durable writes → reported, naming the count.
+        let summary = AgentRuntime::orphaned_write_summary(
+            "life.observe.batch",
+            Some(r#"{"status":"partial","requested":25,"succeeded":18,"failed":7}"#),
+        )
+        .expect("a batch that wrote must be reported");
+        assert!(
+            summary.contains("18") && summary.contains("25"),
+            "summary must quantify what landed: {summary}"
+        );
+
+        // Batch that wrote nothing → nothing to reconcile.
+        assert!(
+            AgentRuntime::orphaned_write_summary(
+                "life.observe.batch",
+                Some(r#"{"status":"failed","requested":3,"succeeded":0,"failed":3}"#),
+            )
+            .is_none(),
+            "a batch that wrote nothing must not raise a heal event"
+        );
+
+        // Single durable write → reported with its node id.
+        let summary = AgentRuntime::orphaned_write_summary(
+            "life.observe",
+            Some(r#"{"status":"proposed","node_id":"goal-42"}"#),
+        )
+        .expect("a completed single write must be reported");
+        assert!(
+            summary.contains("goal-42"),
+            "summary names the node: {summary}"
+        );
+
+        // Read-only result → silent.
+        assert!(
+            AgentRuntime::orphaned_write_summary(
+                "life.recall",
+                Some(r#"{"status":"ok","context_packet":{"ranked_packets":[]}}"#),
+            )
+            .is_none(),
+            "an evicted read must not file a heal event"
+        );
+
+        // Blocked / rejected write → nothing landed, stay silent.
+        assert!(
+            AgentRuntime::orphaned_write_summary(
+                "life.observe",
+                Some(r#"{"status":"blocked","reasons":["policy"]}"#),
+            )
+            .is_none(),
+            "a blocked write changed nothing"
+        );
+
+        // Unparseable or absent body → conservative silence, never a guess.
+        assert!(AgentRuntime::orphaned_write_summary("life.observe", Some("not json")).is_none());
+        assert!(AgentRuntime::orphaned_write_summary("life.observe", None).is_none());
+    }
+
+    // ── Stale tool result must not poison the turn that replaced it ──────────
+    //
+    // `handle_model_response` has always dropped a response whose turn_id is not
+    // the active turn. `handle_tool_result` had no such guard, so a result that
+    // outlived its turn was applied to whatever turn was active by the time it
+    // landed. Reachable whenever a tool outruns the 90s WaitingTool watchdog —
+    // e.g. a slow `life.observe.batch`: the turn is evicted, the operator sends
+    // another message, and the runner's late reply (still carrying the ORIGINAL
+    // turn_id, and cancelled by nothing) clears the NEW turn's pending tool call
+    // and injects a foreign result, so the new turn hangs on a call that can
+    // never complete. One slow tool call poisons the following turn.
+    #[tokio::test]
+    async fn stale_tool_result_does_not_clobber_the_new_active_turn() {
+        let socket_path = format!("/tmp/philote-stale-{}.sock", Uuid::new_v4().simple());
+        let listener = tokio::net::UnixListener::bind(&socket_path).expect("bind");
+        let emitted = std::sync::Arc::new(std::sync::Mutex::new(Vec::<serde_json::Value>::new()));
+        let server = tokio::spawn(run_recording_hotel(listener, emitted.clone()));
+
+        let identity = philotic_client::GuestIdentity {
+            guest_id: "agent-stale".into(),
+            role: "agent".into(),
+            supported_tools: Vec::new(),
+        };
+        let client = philotic_client::PhiloticClient::connect_at(&socket_path, identity)
+            .await
+            .expect("connect to stub hotel");
+        let mut runtime = AgentRuntime::new(client, "agent-stale");
+
+        let session_id = "sess-stale";
+        runtime
+            .ensure_session_loaded(session_id, "telegram")
+            .await
+            .expect("session load");
+
+        // Turn A was evicted by the watchdog while its batch was still running;
+        // turn B is now active and waiting on its own, unrelated tool.
+        runtime
+            .sessions
+            .get_mut(session_id)
+            .expect("session exists")
+            .start_turn(def004_working_turn("turn-b", "session.status"));
+
+        // Turn A's `life.observe.batch` finally returns — long after eviction.
+        runtime
+            .handle_tool_result(InboundTaskPayload {
+                action: Some("tool_result".into()),
+                session_id: Some(session_id.into()),
+                turn_id: Some("turn-a-evicted".into()),
+                tool_name: Some("life.observe.batch".into()),
+                content: Some(r#"{"status":"ok","succeeded":25}"#.into()),
+                ..Default::default()
+            })
+            .await
+            .expect("stale result is dropped, not an error");
+
+        {
+            let state = runtime.sessions.get(session_id).expect("session");
+            let turn = state.active_turn.as_ref().expect("turn B still active");
+            assert_eq!(turn.turn_id, "turn-b", "turn B must remain the active turn");
+            assert_eq!(
+                turn.pending_tool_call
+                    .as_ref()
+                    .map(|c| c.tool_name.as_str()),
+                Some("session.status"),
+                "turn B's pending tool call must survive a stale result for another turn"
+            );
+            assert!(
+                turn.working_tool_history.is_empty(),
+                "a foreign turn's result must never enter turn B's history: {:?}",
+                turn.working_tool_history
+            );
+            assert_eq!(
+                turn.iteration, 0,
+                "a dropped result must not advance turn B"
+            );
+        }
+
+        // Control: the SAME payload addressed to turn B is still accepted, so the
+        // guard rejects only genuinely stale results rather than tool results at
+        // large.
+        runtime
+            .handle_tool_result(InboundTaskPayload {
+                action: Some("tool_result".into()),
+                session_id: Some(session_id.into()),
+                turn_id: Some("turn-b".into()),
+                tool_name: Some("session.status".into()),
+                content: Some("session green".into()),
+                ..Default::default()
+            })
+            .await
+            .expect("matching tool result");
+
+        {
+            let state = runtime.sessions.get(session_id).expect("session");
+            let turn = state.active_turn.as_ref().expect("turn B active");
+            assert_eq!(
+                turn.working_tool_history.len(),
+                1,
+                "a result for the active turn must still be accepted"
+            );
+        }
+
+        drop(runtime);
+        let _ = server.await;
+        let _ = std::fs::remove_file(&socket_path);
+    }
+
     // ── life.observe contract-error retry (2026-07-10 LifeGraph forensic) ────
     //
     // A model-invoked `life.observe` call whose payload fails datasource's
@@ -9760,26 +10569,179 @@ mod tests {
         let _ = std::fs::remove_file(&socket_path);
 
         let emitted = emitted.lock().unwrap();
+        // A MODEL-invoked life.observe transport failure flows through the
+        // normal loop re-entry: the model sees the error in its tool history
+        // and decides what to do (try differently, continue other work, or
+        // tell the user itself). It must NOT be short-circuited with a canned
+        // apology that ends the turn — that short-circuit is reserved for the
+        // operator's direct text command, which has no model in the loop.
         assert!(
             emitted
                 .iter()
-                .all(|e| e["task"]["action"] != "generate_text"),
-            "a non-contract error must never trigger the life.observe retry: {:#?}",
+                .any(|e| e["task"]["action"] == "generate_text"),
+            "a model-invoked failure must re-enter the model loop: {:#?}",
             *emitted
         );
         assert!(
             emitted.iter().all(|e| e.get("heal_event").is_none()),
-            "a non-contract error must not use the new life.observe heal path: {:#?}",
+            "a non-contract error must not use the life.observe heal path: {:#?}",
             *emitted
         );
-        let send_replies: Vec<_> = emitted
+        assert!(
+            emitted.iter().all(|e| e["task"]["action"] != "send_reply"),
+            "no canned apology may end a model-invoked turn: {:#?}",
+            *emitted
+        );
+    }
+
+    /// The live 2026-08-27 habit incident: the model called life.observe as
+    /// the first of several captures, and the turn was force-completed with a
+    /// canned "Recorded this …" receipt — one artifact per turn, the operator
+    /// asked six times. A model-invoked SUCCESS must re-enter the loop so the
+    /// model can execute the remaining items and write its own final reply.
+    #[tokio::test]
+    async fn life_observe_model_invoked_success_reenters_loop() {
+        let socket_path = format!(
+            "/tmp/philote-lifeobs-modelok-{}.sock",
+            Uuid::new_v4().simple()
+        );
+        let listener = tokio::net::UnixListener::bind(&socket_path).expect("bind");
+        let emitted = std::sync::Arc::new(std::sync::Mutex::new(Vec::<serde_json::Value>::new()));
+        let server = tokio::spawn(run_recording_hotel(listener, emitted.clone()));
+
+        let identity = philotic_client::GuestIdentity {
+            guest_id: "agent-lifeobs-modelok".into(),
+            role: "agent".into(),
+            supported_tools: Vec::new(),
+        };
+        let client = philotic_client::PhiloticClient::connect_at(&socket_path, identity)
+            .await
+            .expect("connect to stub hotel");
+        let mut runtime = AgentRuntime::new(client, "agent-lifeobs-modelok");
+
+        let session_id = "sess-lifeobs-modelok";
+        let turn_id = "turn-lifeobs-modelok";
+        runtime
+            .ensure_session_loaded(session_id, "telegram")
+            .await
+            .expect("session load");
+        runtime
+            .sessions
+            .get_mut(session_id)
+            .expect("session exists")
+            .start_turn(life_observe_working_turn(turn_id, false));
+
+        runtime
+            .handle_tool_result(InboundTaskPayload {
+                action: Some("tool_result".into()),
+                session_id: Some(session_id.into()),
+                turn_id: Some(turn_id.into()),
+                tool_name: Some("life.observe".into()),
+                content: Some(
+                    r#"{"status":"proposed","node_id":"life:habit:duolingo_morning"}"#.into(),
+                ),
+                ..Default::default()
+            })
+            .await
+            .expect("tool result handled");
+
+        {
+            let state = runtime.session(session_id).expect("session");
+            assert!(
+                state.active_turn.is_some(),
+                "the turn must still be alive after a model-invoked life.observe"
+            );
+        }
+
+        drop(runtime);
+        let _ = server.await;
+        let _ = std::fs::remove_file(&socket_path);
+
+        let emitted = emitted.lock().unwrap();
+        assert!(
+            emitted
+                .iter()
+                .any(|e| e["task"]["action"] == "generate_text"),
+            "a model-invoked life.observe success must re-enter the model loop: {:#?}",
+            *emitted
+        );
+        assert!(
+            emitted.iter().all(|e| !(e["task"]["action"] == "send_reply"
+                && e["task"]["content"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("Recorded this"))),
+            "the canned receipt must never end a model-invoked turn: {:#?}",
+            *emitted
+        );
+    }
+
+    /// The operator's direct text command ("record this …") has no model in
+    /// the loop — its success must still complete the turn with the canned
+    /// receipt exactly as before.
+    #[tokio::test]
+    async fn life_observe_direct_origin_success_still_receipts() {
+        let socket_path = format!(
+            "/tmp/philote-lifeobs-directok-{}.sock",
+            Uuid::new_v4().simple()
+        );
+        let listener = tokio::net::UnixListener::bind(&socket_path).expect("bind");
+        let emitted = std::sync::Arc::new(std::sync::Mutex::new(Vec::<serde_json::Value>::new()));
+        let server = tokio::spawn(run_recording_hotel(listener, emitted.clone()));
+
+        let identity = philotic_client::GuestIdentity {
+            guest_id: "agent-lifeobs-directok".into(),
+            role: "agent".into(),
+            supported_tools: Vec::new(),
+        };
+        let client = philotic_client::PhiloticClient::connect_at(&socket_path, identity)
+            .await
+            .expect("connect to stub hotel");
+        let mut runtime = AgentRuntime::new(client, "agent-lifeobs-directok");
+
+        let session_id = "sess-lifeobs-directok";
+        let turn_id = "turn-lifeobs-directok";
+        runtime
+            .ensure_session_loaded(session_id, "telegram")
+            .await
+            .expect("session load");
+        runtime
+            .sessions
+            .get_mut(session_id)
+            .expect("session exists")
+            .start_turn(life_observe_working_turn(turn_id, true));
+
+        runtime
+            .handle_tool_result(InboundTaskPayload {
+                action: Some("tool_result".into()),
+                session_id: Some(session_id.into()),
+                turn_id: Some(turn_id.into()),
+                tool_name: Some("life.observe".into()),
+                content: Some(r#"{"status":"proposed","node_id":"life:openloop:1"}"#.into()),
+                ..Default::default()
+            })
+            .await
+            .expect("tool result handled");
+
+        drop(runtime);
+        let _ = server.await;
+        let _ = std::fs::remove_file(&socket_path);
+
+        let emitted = emitted.lock().unwrap();
+        let receipts: Vec<_> = emitted
             .iter()
-            .filter(|e| e["task"]["action"] == "send_reply")
+            .filter(|e| {
+                e["task"]["action"] == "send_reply"
+                    && e["task"]["content"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .contains("Recorded this")
+            })
             .collect();
         assert_eq!(
-            send_replies.len(),
+            receipts.len(),
             1,
-            "existing apology-to-user behavior must be unchanged: {:#?}",
+            "the direct-command path must keep its canned receipt: {:#?}",
             *emitted
         );
     }
@@ -9878,6 +10840,141 @@ mod tests {
 
     // ── Turn-failure heal intake (self-heal) ─────────────────────────────────
 
+    /// An approval that times out mid-plan must leave the plan resumable —
+    /// not discarded. Before this fix, eviction cleared `parked_approval_turn`
+    /// (and everything it carried) with no carryover set, so the NEXT user
+    /// message restarted the whole goal from step 1 instead of continuing at
+    /// the step whose approval actually timed out. Live 2026-08-27: a
+    /// 4-step `skill.register` plan restarted from scratch three separate
+    /// times and never registered anything.
+    #[tokio::test]
+    async fn approval_timeout_eviction_stashes_plan_into_carryover() {
+        let socket_path = format!(
+            "/tmp/philote-approvalcarry-{}.sock",
+            Uuid::new_v4().simple()
+        );
+        let listener = tokio::net::UnixListener::bind(&socket_path).expect("bind");
+        let emitted = std::sync::Arc::new(std::sync::Mutex::new(Vec::<serde_json::Value>::new()));
+        let server = tokio::spawn(run_recording_hotel(listener, emitted.clone()));
+
+        let identity = philotic_client::GuestIdentity {
+            guest_id: "agent-approval-carry".into(),
+            role: "agent".into(),
+            supported_tools: Vec::new(),
+        };
+        let client = philotic_client::PhiloticClient::connect_at(&socket_path, identity)
+            .await
+            .expect("connect to stub hotel");
+        let mut runtime = AgentRuntime::new(client, "agent-approval-carry");
+
+        let session_id = "sess-approval-carry";
+        runtime
+            .ensure_session_loaded(session_id, "telegram")
+            .await
+            .expect("session load");
+
+        let mut turn = def004_working_turn("turn-approval-carry", "skill.register");
+        turn.phase = TurnPhase::WaitingApproval;
+        turn.active_plan = Some(ActivePlan {
+            goal: "Register four music stewardship skills".into(),
+            steps: vec![
+                PlanStep {
+                    id: 1,
+                    description: "register practice-tracker".into(),
+                    tool_name: Some("skill.register".into()),
+                    status: "done".into(),
+                },
+                PlanStep {
+                    id: 2,
+                    description: "register fatigue-monitor".into(),
+                    tool_name: Some("skill.register".into()),
+                    status: "pending".into(),
+                },
+                PlanStep {
+                    id: 3,
+                    description: "register tempo-log".into(),
+                    tool_name: Some("skill.register".into()),
+                    status: "pending".into(),
+                },
+            ],
+            status: "executing".into(),
+            context_1_advisory: None,
+            procedure_id: None,
+        });
+        turn.plan_steps_verified = vec![true, false, false];
+
+        {
+            let state = runtime
+                .sessions
+                .get_mut(session_id)
+                .expect("session exists");
+            state.start_turn(turn);
+            state.park_active_turn_for_approval();
+        }
+
+        let past = std::time::Instant::now()
+            .checked_sub(std::time::Duration::from_secs(400))
+            .expect("backdate instant");
+        {
+            let state = runtime
+                .sessions
+                .get_mut(session_id)
+                .expect("session exists");
+            state.parked_approval_since = Some(past);
+        }
+        runtime
+            .stuck_turn_first_seen
+            .insert(session_id.to_string(), past);
+        runtime.stuck_turn_signature.insert(
+            session_id.to_string(),
+            "parked_approval:turn-approval-carry".to_string(),
+        );
+
+        runtime.evict_timed_out_turns().await;
+
+        let state = runtime
+            .sessions
+            .get(session_id)
+            .expect("session survives eviction");
+        assert!(
+            state.parked_approval_turn.is_none(),
+            "eviction must still clear the parked turn"
+        );
+        let carry = state
+            .carryover_plan
+            .as_ref()
+            .expect("the plan must survive as a carryover, not vanish");
+        assert_eq!(carry.plan.goal, "Register four music stewardship skills");
+        assert_eq!(
+            carry.steps_done,
+            vec![true, false, false],
+            "steps_done must mirror each step's own status"
+        );
+        assert_eq!(
+            carry.verified_step_ids,
+            vec![1],
+            "only the step actually backed by a verified tool result carries forward"
+        );
+
+        drop(runtime);
+        let _ = server.await;
+        let _ = std::fs::remove_file(&socket_path);
+
+        // The unblock notice must name it as an approval timeout, distinct
+        // from a generic tool/model hang, and hint that the next message
+        // resumes rather than restarts.
+        let emitted = emitted.lock().unwrap();
+        let reply = emitted
+            .iter()
+            .find(|e| e["task"]["action"] == "send_reply")
+            .expect("unblock notice must be sent");
+        let content = reply["task"]["content"].as_str().unwrap_or_default();
+        assert!(
+            content.contains("timed out") && content.contains("resumes"),
+            "approval-timeout unblock message must name the timeout and resumability: {content}"
+        );
+    }
+
     /// A watchdog eviction must push a `stuck_turn_evicted:{phase}` heal
     /// event to the hotel (turn-failure heal intake) in addition to failing
     /// the task and unblocking the session.
@@ -9916,11 +11013,21 @@ mod tests {
             .expect("session exists")
             .start_turn(turn);
 
-        // Backdate the watchdog bookkeeping past the WaitingTool deadline,
-        // with the matching wait signature so reconcile keeps the timestamp.
+        // Backdate past the WaitingTool deadline (now 300s), with the matching wait
+        // signature so reconcile keeps the timestamp. `turn_waiting_since` is the
+        // authoritative clock the watchdog reads — set it the way production does, via
+        // the phase stamp, rather than relying only on the watchdog's own bookkeeping.
         let past = std::time::Instant::now()
-            .checked_sub(std::time::Duration::from_secs(120))
+            .checked_sub(std::time::Duration::from_secs(400))
             .expect("backdate instant");
+        {
+            let state = runtime
+                .sessions
+                .get_mut(session_id)
+                .expect("session exists");
+            state.turn_waiting_since = Some(past);
+            state.active_turn_since = Some(past);
+        }
         runtime
             .stuck_turn_first_seen
             .insert(session_id.to_string(), past);
@@ -9971,6 +11078,104 @@ mod tests {
         assert!(
             emitted.iter().any(|e| e["task"]["action"] == "send_reply"),
             "eviction must still emit the unblock send_reply: {:#?}",
+            *emitted
+        );
+    }
+
+    /// A whisper past its deadline must DEGRADE, not die: the specialist's
+    /// silence is converted into a tool_result the model can react to, the
+    /// turn continues (re-enters the model), no eviction fires, and the heal
+    /// queue gets `paracrine_whisper_timeout` instead of a stuck-turn event.
+    #[tokio::test]
+    async fn whisper_deadline_converts_to_tool_result_not_eviction() {
+        let socket_path = format!("/tmp/philote-wdl-{}.sock", Uuid::new_v4().simple());
+        let listener = tokio::net::UnixListener::bind(&socket_path).expect("bind");
+        let emitted = std::sync::Arc::new(std::sync::Mutex::new(Vec::<serde_json::Value>::new()));
+        let server = tokio::spawn(run_recording_hotel(listener, emitted.clone()));
+
+        let identity = philotic_client::GuestIdentity {
+            guest_id: "agent-wdl".into(),
+            role: "agent".into(),
+            supported_tools: Vec::new(),
+        };
+        let client = philotic_client::PhiloticClient::connect_at(&socket_path, identity)
+            .await
+            .expect("connect to stub hotel");
+        let mut runtime = AgentRuntime::new(client, "agent-wdl");
+
+        let session_id = "sess-wdl";
+        runtime
+            .ensure_session_loaded(session_id, "telegram")
+            .await
+            .expect("session load");
+
+        let turn = def004_working_turn("turn-wdl", "delegate.whisper");
+        runtime
+            .sessions
+            .get_mut(session_id)
+            .expect("session exists")
+            .start_turn(turn);
+
+        // Backdate past PARACRINE_WHISPER_WAIT_SECS (660s).
+        let past = std::time::Instant::now()
+            .checked_sub(std::time::Duration::from_secs(700))
+            .expect("backdate instant");
+        {
+            let state = runtime
+                .sessions
+                .get_mut(session_id)
+                .expect("session exists");
+            state.turn_waiting_since = Some(past);
+            state.active_turn_since = Some(past);
+        }
+        runtime
+            .total_active_since
+            .insert(session_id.to_string(), past);
+
+        runtime.evict_timed_out_turns().await;
+
+        let state = runtime.sessions.get(session_id).expect("session");
+        let turn = state
+            .active_turn
+            .as_ref()
+            .expect("whisper deadline must NOT evict the turn");
+        assert!(
+            !matches!(turn.phase, TurnPhase::WaitingTool),
+            "turn must have moved on from WaitingTool, got {:?}",
+            turn.phase
+        );
+
+        drop(runtime);
+        let _ = server.await;
+        let _ = std::fs::remove_file(&socket_path);
+
+        let emitted = emitted.lock().unwrap();
+        assert!(
+            emitted
+                .iter()
+                .any(|e| e["heal_event"]["pattern_tag"] == "paracrine_whisper_timeout"),
+            "must push the whisper-timeout heal event: {:#?}",
+            *emitted
+        );
+        assert!(
+            !emitted.iter().any(|e| {
+                e["heal_event"]["pattern_tag"]
+                    .as_str()
+                    .map(|t| t.starts_with("stuck_turn_evicted"))
+                    .unwrap_or(false)
+            }),
+            "no eviction heal event may fire for a whisper deadline: {:#?}",
+            *emitted
+        );
+        assert!(
+            emitted.iter().any(|e| {
+                e["task"]["action"] == "generate_text"
+                    && e["task"]["prompt"]
+                        .as_str()
+                        .map(|p| p.contains("did not respond"))
+                        .unwrap_or(false)
+            }),
+            "specialist silence must re-enter the model as a visible tool failure: {:#?}",
             *emitted
         );
     }
@@ -11845,6 +13050,67 @@ mod tests {
         let _ = std::fs::remove_file(&socket_path);
     }
 
+    /// Live incident 2026-08-30: a handoff bundle whose `active_goal` is a
+    /// slash command (e.g. "/role chronos") — because it was built while the
+    /// sender's active_turn.user_content WAS that very command — must never
+    /// be auto-executed. The receiving role's local session state hasn't yet
+    /// recorded the new incarnation as active, so re-parsing that goal as a
+    /// fresh command and re-dispatching it re-triggers the same same-identity
+    /// handoff from the specialist's own process, evading
+    /// handle_role_command's self-handoff guard and looping until the
+    /// ROLE_SWITCH_MAX throttle intervenes. `build_same_identity_handoff_bundle`
+    /// is fixed to never construct such a bundle in the first place; this is
+    /// the defense-in-depth check on the receiving side.
+    #[tokio::test]
+    async fn handoff_bundle_never_auto_executes_a_slash_command_active_goal() {
+        let socket_path = format!("/tmp/philote-selfloop-{}.sock", Uuid::new_v4().simple());
+        let listener = tokio::net::UnixListener::bind(&socket_path).expect("bind");
+        let emitted = std::sync::Arc::new(std::sync::Mutex::new(Vec::<serde_json::Value>::new()));
+        let server = tokio::spawn(run_recording_hotel(listener, emitted.clone()));
+
+        let identity = philotic_client::GuestIdentity {
+            guest_id: "agent-beacon:Chronos".into(),
+            role: "role:agent-beacon:Chronos".into(),
+            supported_tools: Vec::new(),
+        };
+        let client = philotic_client::PhiloticClient::connect_at(&socket_path, identity)
+            .await
+            .expect("connect to stub hotel");
+        let mut runtime = AgentRuntime::new(client, "agent-beacon");
+
+        let session_id = "sess-selfloop";
+        let bundle = philotic_client::HandoffBundle {
+            to_role: Some("chronos".into()),
+            from_role: Some("orchestrator".into()),
+            handoff_reason: Some("manual_role_switch".into()),
+            active_goal: Some("/role chronos".into()),
+            ..Default::default()
+        };
+        runtime
+            .handle_handoff_bundle(
+                InboundTaskPayload {
+                    action: Some("handoff_bundle".into()),
+                    session_id: Some(session_id.into()),
+                    turn_id: Some("turn-selfloop".into()),
+                    handoff_bundle: Some(bundle),
+                    ..Default::default()
+                },
+                Uuid::new_v4(),
+            )
+            .await
+            .expect("handoff bundle");
+
+        assert!(
+            runtime.pending_drains.is_empty(),
+            "a slash-command active_goal must never be queued for auto-execution: {:?}",
+            runtime.pending_drains
+        );
+
+        drop(runtime);
+        let _ = server.await;
+        let _ = std::fs::remove_file(&socket_path);
+    }
+
     // ── Plan-eval-repeat loop ───────────────────────────────────────────────
 
     /// Serializes tests that read or mutate PHILOTIC_DISABLE_PLAN_CONTINUATION,
@@ -11870,6 +13136,7 @@ mod tests {
                 .collect(),
             status: "executing".into(),
             context_1_advisory: None,
+            procedure_id: None,
         }
     }
 
@@ -12038,13 +13305,20 @@ mod tests {
             state.carryover_plan = Some(CarryoverPlan {
                 plan: plan_with_statuses("ship it", &["done", "pending", "pending"]),
                 steps_done: vec![true, false, false],
+                verified_step_ids: vec![1],
+                stalled_continuations: 0,
                 continuations_used: 3,
+                lifetime_continuations: 3,
                 created_turn_id: "turn-origin".into(),
             });
-            // This continuation made progress (step 2 done) but one step remains.
+            // This continuation settled nothing new (first stall — not yet
+            // Blocked), so the spent budget is NOT refunded and must bind.
             let mut turn = test_working_turn(TurnPhase::WaitingModel);
             turn.turn_id = "turn-plan-4".into();
-            turn.active_plan = Some(plan_with_statuses("ship it", &["done", "done", "pending"]));
+            turn.active_plan = Some(plan_with_statuses(
+                "ship it",
+                &["done", "pending", "pending"],
+            ));
             state.start_turn(turn);
         }
 
@@ -12068,21 +13342,308 @@ mod tests {
         let _ = std::fs::remove_file(&socket_path);
 
         let emitted = emitted.lock().unwrap();
-        let notices: Vec<_> = emitted
+
+        // The stop notice is recorded, not spoken. It used to be delivered to
+        // the user verbatim ("*(Plan paused: … /plan drop to discard.)*"),
+        // which is the plan machinery narrating itself into the conversation.
+        let chat_notices: Vec<_> = emitted
             .iter()
             .filter(|e| {
                 e["task"]["action"] == "send_reply"
                     && e["task"]["content"]
                         .as_str()
                         .unwrap_or_default()
-                        .contains("budget")
+                        .contains("/plan drop")
             })
             .collect();
-        assert_eq!(notices.len(), 1, "one stop notice: {:#?}", *emitted);
-        let notice = notices[0]["task"]["content"].as_str().unwrap();
-        assert!(notice.contains("2/3 steps done"), "{notice}");
+        assert!(
+            chat_notices.is_empty(),
+            "plan scaffolding must not be sent to the user: {:#?}",
+            *emitted
+        );
+
+        let stopped: Vec<_> = emitted
+            .iter()
+            .filter(|e| e["task"]["action"] == "turn_event" && e["task"]["event"] == "plan_stopped")
+            .collect();
+        assert_eq!(stopped.len(), 1, "one plan_stopped event: {:#?}", *emitted);
+        let notice = stopped[0]["task"]["partial_content"].as_str().unwrap();
+        assert!(notice.contains("1/3 steps done"), "{notice}");
         assert!(notice.contains("work item 3"), "{notice}");
-        assert!(notice.contains("/plan drop"), "{notice}");
+    }
+
+    /// Progress refunds the per-stretch budget: a continuation that settles a
+    /// new step must keep the loop going even with `continuations_used` at the
+    /// configured budget. The stall ceiling — not the budget — is what stops a
+    /// plan; the budget only binds stretches that settle nothing.
+    #[tokio::test]
+    async fn plan_continuation_progress_refunds_budget() {
+        let _guard = plan_env_guard();
+        unsafe {
+            std::env::remove_var("PHILOTIC_DISABLE_PLAN_CONTINUATION");
+        }
+        let (mut runtime, _emitted, server, socket_path) = plan_test_runtime("planrefund").await;
+        let session_id = "sess-planrefund";
+        runtime
+            .ensure_session_loaded(session_id, "telegram")
+            .await
+            .expect("session load");
+
+        {
+            let state = runtime.sessions.get_mut(session_id).expect("session");
+            // Budget fully spent — but this continuation lands step 2.
+            state.carryover_plan = Some(CarryoverPlan {
+                plan: plan_with_statuses("ship it", &["done", "pending", "pending"]),
+                steps_done: vec![true, false, false],
+                verified_step_ids: vec![1],
+                stalled_continuations: 0,
+                continuations_used: 3,
+                lifetime_continuations: 3,
+                created_turn_id: "turn-origin".into(),
+            });
+            let mut turn = test_working_turn(TurnPhase::WaitingModel);
+            turn.turn_id = "turn-plan-4".into();
+            turn.active_plan = Some(plan_with_statuses("ship it", &["done", "done", "pending"]));
+            state.start_turn(turn);
+        }
+
+        runtime
+            .handle_model_response(respond_payload(session_id, "turn-plan-4", "more progress"))
+            .await
+            .expect("respond");
+
+        let state = runtime.session(session_id).expect("session");
+        let carry = state
+            .carryover_plan
+            .as_ref()
+            .expect("carryover must survive — progress refunds the budget");
+        assert_eq!(
+            carry.continuations_used, 1,
+            "refund resets the stretch, then the synthesized continuation charges 1"
+        );
+        assert_eq!(
+            carry.lifetime_continuations, 4,
+            "the lifetime counter is never refunded"
+        );
+        assert!(
+            !runtime.pending_drains.is_empty(),
+            "a continuation must be synthesized for the remaining step"
+        );
+
+        drop(runtime);
+        let _ = server.await;
+        let _ = std::fs::remove_file(&socket_path);
+    }
+
+    /// The lifetime cap is the absolute backstop behind the refund: a plan at
+    /// the cap stops even when its latest continuation made progress.
+    #[tokio::test]
+    async fn plan_continuation_lifetime_cap_stops_even_with_progress() {
+        let _guard = plan_env_guard();
+        unsafe {
+            std::env::remove_var("PHILOTIC_DISABLE_PLAN_CONTINUATION");
+        }
+        let (mut runtime, emitted, server, socket_path) = plan_test_runtime("planlifetime").await;
+        let session_id = "sess-planlifetime";
+        runtime
+            .ensure_session_loaded(session_id, "telegram")
+            .await
+            .expect("session load");
+
+        {
+            let state = runtime.sessions.get_mut(session_id).expect("session");
+            state.carryover_plan = Some(CarryoverPlan {
+                plan: plan_with_statuses("ship it", &["done", "pending", "pending"]),
+                steps_done: vec![true, false, false],
+                verified_step_ids: vec![1],
+                stalled_continuations: 0,
+                continuations_used: 0,
+                lifetime_continuations: crate::plan_eval::PLAN_CONTINUATION_LIFETIME_CAP,
+                created_turn_id: "turn-origin".into(),
+            });
+            let mut turn = test_working_turn(TurnPhase::WaitingModel);
+            turn.turn_id = "turn-plan-cap".into();
+            turn.active_plan = Some(plan_with_statuses("ship it", &["done", "done", "pending"]));
+            state.start_turn(turn);
+        }
+
+        runtime
+            .handle_model_response(respond_payload(session_id, "turn-plan-cap", "progress"))
+            .await
+            .expect("respond");
+
+        let state = runtime.session(session_id).expect("session");
+        assert!(
+            state.carryover_plan.is_none(),
+            "lifetime cap must clear the carryover"
+        );
+        assert!(runtime.pending_drains.is_empty());
+
+        drop(runtime);
+        let _ = server.await;
+        let _ = std::fs::remove_file(&socket_path);
+
+        let emitted = emitted.lock().unwrap();
+        let stopped: Vec<_> = emitted
+            .iter()
+            .filter(|e| e["task"]["action"] == "turn_event" && e["task"]["event"] == "plan_stopped")
+            .collect();
+        assert_eq!(stopped.len(), 1, "one plan_stopped event: {:#?}", *emitted);
+        assert!(
+            stopped[0]["task"]["partial_content"]
+                .as_str()
+                .unwrap()
+                .contains("lifetime continuation cap"),
+        );
+    }
+
+    /// A failed turn must resume — not strand — the session's carryover.
+    /// The first dead turn charges a stall and synthesizes a continuation;
+    /// a second consecutive dead turn stops the plan with a plan_stopped
+    /// event instead of retrying forever.
+    #[tokio::test]
+    async fn failed_turn_resumes_carryover_then_stops_on_repeat() {
+        let _guard = plan_env_guard();
+        unsafe {
+            std::env::remove_var("PHILOTIC_DISABLE_PLAN_CONTINUATION");
+        }
+        let (mut runtime, emitted, server, socket_path) = plan_test_runtime("planfail").await;
+        let session_id = "sess-planfail";
+        runtime
+            .ensure_session_loaded(session_id, "telegram")
+            .await
+            .expect("session load");
+
+        {
+            let state = runtime.sessions.get_mut(session_id).expect("session");
+            state.carryover_plan = Some(CarryoverPlan {
+                plan: plan_with_statuses("ship it", &["done", "pending", "pending"]),
+                steps_done: vec![true, false, false],
+                verified_step_ids: vec![1],
+                stalled_continuations: 0,
+                continuations_used: 1,
+                lifetime_continuations: 1,
+                created_turn_id: "turn-origin".into(),
+            });
+            let mut turn = test_working_turn(TurnPhase::WaitingModel);
+            turn.turn_id = "turn-plan-dead".into();
+            state.start_turn(turn);
+        }
+
+        runtime
+            .fail_active_turn(
+                session_id.to_string(),
+                "turn-plan-dead".to_string(),
+                "model died".to_string(),
+            )
+            .await
+            .expect("fail turn");
+
+        {
+            let state = runtime.session(session_id).expect("session");
+            let carry = state
+                .carryover_plan
+                .as_ref()
+                .expect("first failure must keep the carryover and resume it");
+            assert_eq!(carry.stalled_continuations, 1, "failure charged as a stall");
+            assert!(
+                !runtime.pending_drains.is_empty(),
+                "a continuation must be synthesized after the failed turn"
+            );
+            runtime.pending_drains.clear();
+        }
+
+        // Second consecutive dead turn: the plan stops instead of spinning.
+        {
+            let state = runtime.sessions.get_mut(session_id).expect("session");
+            let mut turn = test_working_turn(TurnPhase::WaitingModel);
+            turn.turn_id = "turn-plan-dead-2".into();
+            state.start_turn(turn);
+        }
+        runtime
+            .fail_active_turn(
+                session_id.to_string(),
+                "turn-plan-dead-2".to_string(),
+                "model died again".to_string(),
+            )
+            .await
+            .expect("fail turn 2");
+
+        let state = runtime.session(session_id).expect("session");
+        assert!(
+            state.carryover_plan.is_none(),
+            "second consecutive failure must stop the plan"
+        );
+        assert!(runtime.pending_drains.is_empty());
+
+        drop(runtime);
+        let _ = server.await;
+        let _ = std::fs::remove_file(&socket_path);
+
+        let emitted = emitted.lock().unwrap();
+        let stopped: Vec<_> = emitted
+            .iter()
+            .filter(|e| e["task"]["action"] == "turn_event" && e["task"]["event"] == "plan_stopped")
+            .collect();
+        assert_eq!(stopped.len(), 1, "one plan_stopped event: {:#?}", *emitted);
+        assert!(
+            stopped[0]["task"]["partial_content"]
+                .as_str()
+                .unwrap()
+                .contains("failed repeatedly"),
+        );
+    }
+
+    /// A new plan with a different goal replacing an unfinished carryover must
+    /// leave an auditable plan_stopped record, not vanish the old goal.
+    #[tokio::test]
+    async fn superseded_carryover_emits_plan_stopped() {
+        let _guard = plan_env_guard();
+        unsafe {
+            std::env::remove_var("PHILOTIC_DISABLE_PLAN_CONTINUATION");
+        }
+        let (mut runtime, emitted, server, socket_path) = plan_test_runtime("plansuper").await;
+        let session_id = "sess-plansuper";
+        runtime
+            .ensure_session_loaded(session_id, "telegram")
+            .await
+            .expect("session load");
+
+        {
+            let state = runtime.sessions.get_mut(session_id).expect("session");
+            state.carryover_plan = Some(CarryoverPlan {
+                plan: plan_with_statuses("old goal", &["done", "pending"]),
+                steps_done: vec![true, false],
+                verified_step_ids: vec![1],
+                stalled_continuations: 0,
+                continuations_used: 1,
+                lifetime_continuations: 1,
+                created_turn_id: "turn-origin".into(),
+            });
+            let mut turn = test_working_turn(TurnPhase::WaitingModel);
+            turn.turn_id = "turn-new-goal".into();
+            turn.active_plan = Some(plan_with_statuses("new goal", &["done"]));
+            state.start_turn(turn);
+        }
+
+        runtime
+            .handle_model_response(respond_payload(session_id, "turn-new-goal", "done"))
+            .await
+            .expect("respond");
+
+        drop(runtime);
+        let _ = server.await;
+        let _ = std::fs::remove_file(&socket_path);
+
+        let emitted = emitted.lock().unwrap();
+        let stopped: Vec<_> = emitted
+            .iter()
+            .filter(|e| e["task"]["action"] == "turn_event" && e["task"]["event"] == "plan_stopped")
+            .collect();
+        assert_eq!(stopped.len(), 1, "one plan_stopped event: {:#?}", *emitted);
+        let notice = stopped[0]["task"]["partial_content"].as_str().unwrap();
+        assert!(notice.contains("superseded by a new plan"), "{notice}");
+        assert!(notice.contains("old goal"), "{notice}");
     }
 
     #[tokio::test]
@@ -12159,7 +13720,10 @@ mod tests {
             state.carryover_plan = Some(CarryoverPlan {
                 plan: plan_with_statuses("old goal", &["done", "pending"]),
                 steps_done: vec![true, false],
+                verified_step_ids: vec![1],
+                stalled_continuations: 0,
                 continuations_used: 1,
+                lifetime_continuations: 0,
                 created_turn_id: "turn-old".into(),
             });
             let mut turn = test_working_turn(TurnPhase::Thinking);
@@ -12294,7 +13858,10 @@ mod tests {
             .carryover_plan = Some(CarryoverPlan {
             plan: plan_with_statuses("ship it", &["done", "pending"]),
             steps_done: vec![true, false],
+            verified_step_ids: vec![1],
+            stalled_continuations: 0,
             continuations_used: 1,
+            lifetime_continuations: 0,
             created_turn_id: "turn-origin".into(),
         });
 
@@ -12506,7 +14073,13 @@ mod tests {
                 "sess-memroute",
             )
             .await;
-        assert!(routed.is_some(), "SharedUser write must be forwarded");
+        assert!(
+            matches!(
+                routed,
+                super::memory_integration::ForwardOutcome::Forwarded(_)
+            ),
+            "SharedUser write must be forwarded"
+        );
 
         {
             let emitted = emitted.lock().unwrap();
@@ -12535,7 +14108,10 @@ mod tests {
                 "sess-memroute-fallback",
             )
             .await;
-        assert!(routed_fallback.is_some());
+        assert!(matches!(
+            routed_fallback,
+            super::memory_integration::ForwardOutcome::Forwarded(_)
+        ));
         {
             let emitted = emitted.lock().unwrap();
             let fwd = emitted
@@ -12549,9 +14125,10 @@ mod tests {
             );
         }
 
-        // Self-scope writes stay local even with a route configured — agent
-        // vaults are per-host by design (the vault registry never replicates).
-        let not_routed = runtime
+        // Phase 2 M4: self-scope writes are routed too. Observer replicas
+        // reject writes (HTTP 421), so a local self-vault write on a Mac hotel
+        // was lost; the agent's self vault exists on the Cortex.
+        let self_routed = runtime
             .forward_shared_memory_write(
                 &memory_core::MemoryScope::SelfOnly,
                 "likesjx",
@@ -12562,7 +14139,44 @@ mod tests {
                 "sess-memroute",
             )
             .await;
-        assert!(not_routed.is_none(), "SelfOnly write must stay local");
+        assert!(
+            matches!(
+                self_routed,
+                super::memory_integration::ForwardOutcome::Forwarded(_)
+            ),
+            "SelfOnly write must be forwarded when a route is configured"
+        );
+        {
+            let emitted = emitted.lock().unwrap();
+            let fwd = emitted
+                .iter()
+                .filter(|e| e["target_role"] == philotic_client::MEMORY_WRITE_FORWARD_ROLE)
+                .last()
+                .expect("self-scope forward present");
+            let vault = fwd["task"]["vault"].as_str().unwrap_or_default();
+            assert!(vault.starts_with("self_"), "{vault}");
+        }
+
+        // Session-scope writes stay local: per-session scratch vaults would
+        // mint throwaway tokens on the primary.
+        let session_local = runtime
+            .forward_shared_memory_write(
+                &memory_core::MemoryScope::Session("sess-memroute".into()),
+                "likesjx",
+                "session concept",
+                "session content",
+                &[],
+                &serde_json::Value::Null,
+                "sess-memroute",
+            )
+            .await;
+        assert!(
+            matches!(
+                session_local,
+                super::memory_integration::ForwardOutcome::NotApplicable
+            ),
+            "Session write must stay local"
+        );
 
         drop(runtime);
         let _ = server.await;
@@ -12571,6 +14185,27 @@ mod tests {
 
     /// No route configured (the default, and the Cortex hotel itself):
     /// every write proceeds locally.
+    #[tokio::test]
+    async fn deterministic_capture_budget_caps_per_day() {
+        let (mut runtime, _emitted, server, socket_path) = plan_test_runtime("capbudget").await;
+        let cap = super::memory_integration::DETERMINISTIC_CAPTURE_DAILY_CAP;
+        for _ in 0..cap {
+            assert!(runtime.take_deterministic_capture_budget());
+        }
+        assert!(
+            !runtime.take_deterministic_capture_budget(),
+            "the cap must hold within a day"
+        );
+        // A new UTC day resets the budget.
+        runtime.deterministic_capture_budget.0 =
+            runtime.deterministic_capture_budget.0.saturating_sub(1);
+        assert!(runtime.take_deterministic_capture_budget());
+
+        drop(runtime);
+        let _ = server.await;
+        let _ = std::fs::remove_file(&socket_path);
+    }
+
     #[tokio::test]
     async fn shared_scope_write_stays_local_without_route() {
         let (mut runtime, emitted, server, socket_path) = plan_test_runtime("memnoroute").await;
@@ -12587,7 +14222,10 @@ mod tests {
                 "sess-memnoroute",
             )
             .await;
-        assert!(routed.is_none());
+        assert!(matches!(
+            routed,
+            super::memory_integration::ForwardOutcome::NotApplicable
+        ));
         assert!(
             emitted
                 .lock()

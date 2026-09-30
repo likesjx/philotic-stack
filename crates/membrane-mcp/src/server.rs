@@ -138,10 +138,8 @@ async fn handle_health(
     headers: HeaderMap,
 ) -> axum::response::Response {
     let is_loopback = addr.ip().is_loopback();
-    if !is_loopback {
-        if let Some(denied) = ingress_fence_gate(&state, &headers, is_loopback) {
-            return denied;
-        }
+    if !is_loopback && let Some(denied) = ingress_fence_gate(&state, &headers, is_loopback) {
+        return denied;
     }
     (StatusCode::OK, "membrane-mcp ok").into_response()
 }
@@ -515,6 +513,11 @@ async fn handle_tools_call(
             attachments: vec![],
             command: Some(inbound.action.clone()),
             reply_to: Some(turn_id.clone()),
+            // The receiving philote runs the tool's handler policy
+            // (deterministic ladder, then the declared fallback) before any
+            // model turn. It also gets the advertised schema and the raw
+            // args so input validation happens against what the caller
+            // actually saw in `tools/list`.
             raw_transport: json!({
                 "transport": "mcp",
                 "tool": tool_name,
@@ -523,6 +526,9 @@ async fn handle_tools_call(
                 // Cross-hotel pin (McpUpstream targets only); the membrane
                 // runtime turns a non-null value into an EmitTask to that node.
                 "target_node": inbound.target_node,
+                "handler": tool_spec.handler,
+                "input_schema": tool_spec.input_schema,
+                "args": args,
             }),
             requires_approval,
             final_reply_to: Some(state.node_id.clone()),

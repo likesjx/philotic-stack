@@ -20,6 +20,11 @@ pub enum MemoryScope {
     SharedUser,
     /// Active working context — vault `session:{session_id}`
     Session(SessionId),
+    /// Shared fleet knowledge every philote should be able to recall — vault
+    /// `fleet_knowledge`. Curated by construction: only deliberate `scope=fleet`
+    /// writes and gated promotion (proposal S4) land here, so it stays a
+    /// high-signal shared layer rather than a dump of every self memory.
+    SharedFleet,
     /// Fan-out query across multiple vaults simultaneously
     CrossScope(Vec<MemoryScope>),
 }
@@ -78,6 +83,14 @@ pub struct EngramRef {
 pub struct ActivationResult {
     pub engrams: Vec<Engram>,
     pub total: usize,
+    /// Vaults whose token was rejected (HTTP 401) during a cross-scope
+    /// activation that still returned. Callers can self-heal just these.
+    #[serde(default)]
+    pub rejected_vaults: Vec<VaultId>,
+    /// Vaults that could not be queried for another reason (timeout, network,
+    /// server error) during a cross-scope activation that still returned.
+    #[serde(default)]
+    pub failed_vaults: Vec<VaultId>,
 }
 
 // ──── Link ────────────────────────────────────────────────────────────────────

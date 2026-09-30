@@ -3,7 +3,7 @@ title: Life Graph Schema
 doc_type: specification
 domain: memory-context
 status: proposed
-last_updated: 2026-07-07
+last_updated: 2026-09-15
 tags:
 - life-graph
 - schema
@@ -82,6 +82,39 @@ Nodes that participate in semantic retrieval carry these additional properties a
 Never mix models or dimensions inside one `embedding_space`. When `embedding_model_gen` changes, schedule a re-embedding job before relying on retrieval results from that space.
 
 ---
+
+## Typed Properties (seam: `lifegraph-typed-properties`)
+
+Until 2026-09-15 the per-label property tables below were aspiration: `life.observe`
+wrote only the provenance envelope, the structured dates and `claim_summary`, so
+"Key: G minor. Difficulty: 55/100." lived in prose and no query could read it.
+They are contract now (Reflexive Life Graph R1):
+
+- `evidence.properties` on `life.observe` / `life.observe.batch` is a flat map of
+  scalars (string, number, boolean) written onto the node with `n += $properties`
+  on create **and** on match — a re-observation may correct a structured fact even
+  on a confirmed node; confirmation protects the claim text, not the numbers.
+- **Universal keys** every label accepts: `title`, `status` (strings).
+- **Declared keys** come from the ontology: a `schema_patch` carries
+  `ontology_extension.properties[]`, each `{label, name, kind, min?, max?, allowed?,
+  guidance}` with `kind ∈ string | integer | float | boolean`. `life.patch.apply`
+  validates the declaration (snake_case name, known label, no collision with
+  runner-owned fields, `min ≤ max`, `allowed` only for strings) and merges it;
+  `life.ontology` lists the result under `typed_properties`.
+- **Validation at plan time**, in the same `contract_invalid` shape as the rest of
+  the packet: an undeclared key is rejected naming the allowed keys for that label;
+  a wrong kind, an out-of-range number or a value outside `allowed` is rejected
+  naming the bound.
+- **Runner-owned fields** (`id`, `claim_summary`, `validation_state`, provenance,
+  the date fields, embeddings, tidy stamps…) can never be set through
+  `properties`.
+- `life.list` returns the universal and declared properties per row under
+  `properties` (nulls dropped); the projection names the declared columns
+  explicitly rather than shipping `properties(n)`, which would drag the embedding.
+
+The first declared set is the music repertoire: `CreativeWork{key, tempo,
+difficulty 0–100, accuracy 0–100}` and `MusicSection{measure_span, focus}`, declared
+by the repertoire skill's schema patch, not by hand.
 
 ## Node Types
 
@@ -448,6 +481,29 @@ Embedding space: `skill_tool_semantic`
 | `REDUCES_FRICTION_FOR` | `System`, `Habit`, `Routine` | `Role`, `Goal`, `Habit` | Explicitly reduces barrier |
 | `SUGGESTS_PATCH` | `DriftFinding`, `GrowthExperiment` | `*Patch` | Leads to a patch proposal |
 | `APPLIES_TO_ROLE` | `Preference`, `Value`, `Concern`, `*Patch` | `Role` | Scoped to a specific role |
+| `INVOLVES` | `Event`, `Trip`, `Appointment`, `Moment`, `Commitment` | `Person` | Who takes part |
+| `OCCURS_AT` | `Event`, `Trip`, `Appointment`, `Moment`, `Routine` | `Place` | Where it happens |
+| `PART_OF` | `Event`, `Appointment`, `Moment`, `NextAction` | `Trip`, `Project` | Itinerary / rollup membership |
+| `ABOUT` | `OpenLoop`, `NextAction`, `Commitment`, `Decision`, `Concern`, `Signal` | `Person`, `Place`, `Asset`, `Subscription`, `CreativeWork`, `Trip` | What the item concerns |
+| `MAINTAINS` | `Routine`, `Habit`, `NextAction` | `Asset`, `CreativeWork`, `Subscription` | Upkeep of a durable thing |
+| `RENEWS` | `NextAction`, `OpenLoop`, `Commitment` | `Subscription`, `Asset` | Renewal-cycle work |
+
+**Write-enabled on `life.observe`** (LIFE_GRAPH_ACTIVE proposal, S2 + nouns-verbs expansion
+2026-08-25): the living-cycle six (`OWNS`, `SHAPES`, `SETS`, `SPAWNS`, `RELATES_TO`, plus
+server-injected `SCOPED_TO`) and the twelve endpoint-validated types (`ADVANCES`,
+`BLOCKED_BY`, `NEEDS_FOLLOWUP`, `PROMISED_TO`, `CONTAINS`, `SUPPORTS`, `INVOLVES`,
+`OCCURS_AT`, `PART_OF`, `ABOUT`, `MAINTAINS`, `RENEWS`). Endpoint-validated edges are checked
+against this table — wrong source label is rejected at compile time; a wrong-label target
+matches nothing and reports `target_missing` (see `cypher::AGENDA_EDGE_RULES`). The remaining
+rows (`RECURS`, `SUPERSEDES`, `CONTRADICTS`, `EVIDENCED_BY`, `REDUCES_FRICTION_FOR`,
+`SUGGESTS_PATCH`, `APPLIES_TO_ROLE`) are not yet writable via `life.observe`.
+
+**Lived-world nouns (V006, 2026-08-25):** `Place`, `Trip`, `Appointment`, `Subscription`,
+`Asset`, `CreativeWork`, `Moment`. `Moment` is KEPT history — a confirmed past `Event` worth
+remembering becomes a `Moment` (same `INVOLVES`/`OCCURS_AT` edges); gardening retires stale
+proposed `Event`s but never retires `Moment`s. Spaces: Trip/Appointment/Moment/Place →
+`life_event_semantic`; Subscription/Asset/CreativeWork → `goal_system_semantic` (indexes in
+`migrations/V006__nouns_verbs_expansion.cypher`).
 
 Edge provenance: the full provenance envelope applies to agent-inferred edges. Operator-asserted edges may carry only `source_membrane` and `observed_at`.
 

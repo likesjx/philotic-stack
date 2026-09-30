@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - outbound-fleet-enforcement
+
+rectangle "outbound-fleet-enforcement" as outbound_fleet_enforcement #Orange {
+}
+
+
+@enduml

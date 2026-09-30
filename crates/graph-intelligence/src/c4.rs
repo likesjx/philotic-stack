@@ -8,7 +8,7 @@ pub fn generate_c4_context(engine: &GraphEngine, system_name: &str) -> Result<St
     let mut uml = String::new();
     uml.push_str("@startuml\n");
     uml.push_str("!include https://raw.githubusercontent.com/plantuml-stdlib/C4-PlantUML/master/C4_Context.puml\n\n");
-    uml.push_str(&format!("LAYOUT_WITH_LEGEND()\n\n"));
+    uml.push_str("LAYOUT_WITH_LEGEND()\n\n");
     uml.push_str(&format!("title C4 Context Diagram - {}\n\n", system_name));
 
     // Find the system

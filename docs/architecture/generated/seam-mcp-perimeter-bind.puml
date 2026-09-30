@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - mcp-perimeter-bind
+
+rectangle "mcp-perimeter-bind" as mcp_perimeter_bind #Orange {
+}
+
+
+@enduml

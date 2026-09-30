@@ -4,7 +4,7 @@ doc_type: proposal
 domain: runtime-and-sessions
 status: accepted-current-slice
 disposition: implemented
-last_updated: 2026-03-31
+last_updated: 2026-09-05
 tags:
 - cron
 - scheduling
@@ -200,6 +200,9 @@ loop (1-second tick or earlier on next_fire_at deadline):
 ---
 
 ## Disposition
+
+**Ownership scoping (2026-09-05, PR #484, develop `f2cf1ba9`).** Operator decision: the cron tools are open to every role, but each philote only sees and manages its own crontab. Every seeded toolset profile now carries `cron.register` / `cron.list` / `cron.enable` / `cron.disable` / `cron.remove` and reaches `cron.manage` on demand. The hotel scopes them by **agent**: `RegisterCronJob` stamps `created_by` from the connection identity (never from the wire); `ListCronJobs` returns only jobs created by any of the caller agent's roles or operator jobs whose `target_role` belongs to the agent; `EnableCronJob` / `DisableCronJob` / `RemoveCronJob` refuse `CRON_FORBIDDEN` otherwise. Orchestrator and management identities (bare or `role:{agent}:`-scoped) and the operator surfaces see the whole hotel. Tool descriptions name the hotel's native scheduler as the only cron a philote consults; system crontab and launchd are out of scope. Watched-live on mac-jane 2026-09-05 18:40 UTC: Bjork's `architect` role called `cron.list` and saw exactly her three agent-scoped jobs. Motivation: the 2026-09-04 distill drill showed the `architect` profile had no cron tool at all, so asked for "the cron jobs" she went looking for system crontabs.
+
 
 **Accepted for current slice.** Slices 1 and 2 implemented on `codex/cron-scheduler`.
 

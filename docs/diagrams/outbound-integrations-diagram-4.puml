@@ -1,0 +1,14 @@
+@startuml
+participant HotelService
+participant SourceHotel
+participant ExitRunner
+participant ExternalAPI
+HotelService -> SourceHotel: Ensure system IntegrationBinding
+SourceHotel --> HotelService: Binding placement and execution node
+HotelService -> SourceHotel: Emit bounded HTTP task
+SourceHotel -> ExitRunner: Route task and return route
+ExitRunner -> ExternalAPI: Validated request
+ExternalAPI --> ExitRunner: HTTP response
+ExitRunner -> SourceHotel: Append content free audit
+ExitRunner --> HotelService: Sanitized response
+@enduml

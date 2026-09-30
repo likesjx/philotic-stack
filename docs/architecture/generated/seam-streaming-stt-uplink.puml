@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - streaming-stt-uplink
+
+rectangle "streaming-stt-uplink" as streaming_stt_uplink #Orange {
+}
+
+
+@enduml

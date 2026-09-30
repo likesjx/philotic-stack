@@ -83,8 +83,7 @@ pub async fn connect_voice_gateway(
                     "token": token
                 }
             })
-            .to_string()
-            .into(),
+            .to_string(),
         ))
         .await?;
 
@@ -151,8 +150,7 @@ pub async fn connect_voice_gateway(
                     }
                 }
             })
-            .to_string()
-            .into(),
+            .to_string(),
         ))
         .await?;
 
@@ -195,8 +193,7 @@ pub async fn connect_voice_gateway(
                     "ssrc": bot_ssrc
                 }
             })
-            .to_string()
-            .into(),
+            .to_string(),
         ))
         .await?;
 
@@ -232,7 +229,7 @@ pub async fn connect_voice_gateway(
         let mut nonce: u64 = 0;
         loop {
             tick.tick().await;
-            let msg = Message::Text(json!({ "op": 3, "d": nonce }).to_string().into());
+            let msg = Message::Text(json!({ "op": 3, "d": nonce }).to_string());
             if hb_tx_clone.send(msg).is_err() {
                 break;
             }
@@ -294,8 +291,7 @@ where
                 "op": 5,
                 "d": { "speaking": speaking, "delay": 0, "ssrc": ssrc }
             })
-            .to_string()
-            .into(),
+            .to_string(),
         ))
         .await
         .map_err(|e| anyhow::anyhow!("Send speaking failed: {}", e))

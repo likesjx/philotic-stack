@@ -2,9 +2,9 @@
 title: Perimeter Egress Control Proposal
 doc_type: proposal
 domain: operator-control-plane
-status: proposed
+status: accepted-current-slice
 disposition: accepted-current-slice
-last_updated: 2026-03-31
+last_updated: 2026-07-28
 tags:
 - egress
 - perimeter
@@ -17,14 +17,23 @@ related_docs:
 - MEMBRANE_COMPONENT_PROPOSAL.md
 - MEMBRANE_EXTERNAL_AGENT_AND_EVENT_TRANSPORT_PROPOSAL.md
 - CONTROL_PLANE_ADMIN_SURFACE_PROPOSAL.md
+- OUTBOUND_INTEGRATION_FABRIC_PROPOSAL.md
+- OUTBOUND_EGRESS_INVENTORY.md
 task_refs:
 - docs/task.md
 proposal_id: perimeter-egress-control
 implements: []
-implemented_by: []
+implemented_by:
+- crates/ansible-mesh-core/src/integration.rs
+- crates/egress-http-runner/src/lib.rs
+- crates/aiua/src/service/governed_http.rs
+- crates/aiua/src/service/model_catalog_sync.rs
+- crates/aiua/src/service/ipc.rs
+- crates/philotic-web/src/serve.rs
+- docs/architecture/outbound-egress-inventory.json
+- scripts/check-outbound-egress-inventory.py
 active_seams:
-- egress-policy-object
-- outbound-classification
+- outbound-fleet-enforcement
 source_of_truth_targets:
 - ARCHITECTURE_STATUS.md
 ---
@@ -41,6 +50,15 @@ Define a deterministic outbound egress boundary for Philotic so the system can a
 - how egress policy, audit, and security review stay machine-checkable instead of becoming ambient lore
 
 This proposal exists because "inside the perimeter" is only half the story. If we do not define how traffic leaves the system, security posture becomes a collection of vibes plus whichever crate imported `reqwest` first.
+
+## Disposition
+
+`accepted-current-slice`. The canonical policy, bounded HTTP executor,
+MCP-over-HTTP delegation, first hotel-owned general-API migration, and
+credential-safe operator OIDC migration are implemented. Fleet enforcement
+remains active because named model-provider, communication, local-resource,
+mesh, and artifact exceptions have not all moved behind executable host-level
+rules.
 
 ## Core Recommendation
 
@@ -62,7 +80,10 @@ This means Philotic should not silently allow every guest to make arbitrary outb
 
 ## Disposition
 
-Proposed.
+Accepted for the current slice. The bounded general-API execution boundary,
+content-free audit, direct-client inventory, and first governed migration are
+implemented. Specialized exceptions and remaining migration work keep the
+broader perimeter enforcement program open.
 
 Track follow-on work in [docs/task.md](/Users/jaredlikes/code/philotic-stack/docs/task.md).
 
@@ -81,16 +102,30 @@ If we blur these together too early, we risk either:
 
 ## Current Reality
 
-Today the repo has no unified outbound egress control plane.
+Today the repo has a hotel-owned policy and HTTP execution boundary plus an
+explicit inventory of direct exceptions.
 
-Current likely shape:
+Current proven shape:
 
-- membranes make transport-native outbound calls
-- tool/model/provider code can make direct HTTP calls where needed
-- there is no first-class egress policy object
-- there is no canonical place to audit "what external requests may leave this hotel"
-
-That is acceptable for current implementation velocity, but not a stable long-term security posture.
+- `perimeter-core` defines `EgressPolicy`, destination allow/deny evaluation,
+  credential bindings, traffic classes, and exit-placement policy
+- `aiua` owns `HotelEgressGateway` and the `CheckEgress` IPC path
+- `hotel.egress.check` is authorization-only; it does not return resolved
+  credential material
+- `egress-http-runner` executes bounded HTTP requests and emits durable
+  content-free audit records
+- MCP-over-HTTP delegates its wire exchange to that runner while the MCP
+  manager retains protocol authority
+- the OpenRouter model-catalog poll is the first hotel-owned general-API caller
+  migrated to a system binding, with installed watched-live proof from
+  `mbp-jane` through the selected `vps-jane-aiua-01` executor
+- Philote consumes only the hotel-owned compact catalog and no longer owns a
+  direct OpenRouter fallback client
+- 32 remaining production direct-client files have machine-checked
+  dispositions, while two migrated callers are regression-guarded in
+  `outbound-egress-inventory.json`
+- model providers, communications, local resources, mesh, and artifacts remain
+  named specialized exceptions; operator auth is a temporary exception
 
 ## Recommended Egress Taxonomy
 
@@ -201,23 +236,38 @@ Then a later cognitive/security cycle may:
 
 But the cognitive layer should interpret deterministic facts, not replace them as the source of truth.
 
-## First Slice Recommendation
+## Current Slice
 
-The first coherent implementation slice should:
+The coherent implementation slices now are:
 
-1. Define the canonical egress policy object and finding schema.
-2. Inventory current direct outbound HTTP call sites by component class.
-3. Classify which current egress paths are:
+1. **Implemented, test-green:** define traffic classes and exit-placement
+   decisions; make checks authorization-only and keep credentials out of model
+   tool results.
+2. **Implemented, smoke-green:** inventory current direct outbound HTTP call
+   sites by component class.
+3. **Implemented:** classify current egress paths as:
    - perimeter-controlled already
    - temporary direct exceptions
    - violations of the intended future model
-4. Pick one non-model outbound HTTP path and route it through the perimeter boundary.
-5. Keep model/provider egress as an explicit documented exception until a later decision.
+4. **Implemented and watched-live-green for selected `vps-jane` placement:** add
+   the bounded hotel-owned HTTP executor defined by
+   [OUTBOUND_INTEGRATION_FABRIC_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/OUTBOUND_INTEGRATION_FABRIC_PROPOSAL.md).
+5. **Implemented, smoke-green:** route the hotel-owned OpenRouter catalog sync
+   through that executor.
+6. **Implemented, smoke-green:** route operator OIDC token and userinfo
+   back-channel exchange through a typed local-only binding; keep client
+   secrets and access/refresh tokens inside the execution hotel, return only
+   allowlisted identity claims, and audit both legs separately.
+7. Keep model/provider egress as an explicit documented exception until a
+   later decision.
 
 ## Open Questions
 
-- Should the first implementation live in `membrane`, a dedicated egress service, or hotel-owned request mediation?
-- What is the minimum useful audit payload for outbound requests?
+- The first implementation is a dedicated `egress-http-runner` selected and
+  mediated by the hotel; membranes retain transport semantics.
+- The implemented audit payload records target, status, size, duration,
+  placement, credential reference, and disposition without request or response
+  content. Revisit only when an operator use case proves that insufficient.
 - Which outbound classes should support approval-gated release versus strict deterministic allow/deny?
 - When should model/provider egress stop being an exception?
 - How does this intersect with future perimeter health / membrane supervision checks?

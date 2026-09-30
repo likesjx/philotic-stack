@@ -15,9 +15,14 @@
 #      EVERY `git status --porcelain` line EXCEPT untracked `target/` dirs
 #      (those are exactly the build artifacts we want to reclaim). A dirty
 #      worktree is always PRESERVED.
-#   3. NEVER remove a worktree whose HEAD is not an ancestor of origin/develop
-#      (i.e. it still holds unmerged commits). Merged is verified against a
-#      FRESH `git fetch origin` so the check reflects current origin/develop.
+#   3. NEVER remove a worktree whose work is not on origin/develop. Merged
+#      means EITHER the tip is an ancestor of origin/develop (merge-commit /
+#      fast-forward PRs) OR the tip is EXACTLY the head commit (headRefOid) of
+#      a squash-merged PR per the GitHub API — squash merges rewrite history,
+#      so ancestry alone preserved every squashed branch forever. A commit
+#      added after the squash merge makes the tip differ -> preserved. If `gh`
+#      is unavailable the fallback is skipped (fail safe: preserve). Ancestry
+#      is verified against a FRESH `git fetch origin`.
 #   4. NEVER remove an EXCLUDE-listed branch (held-epic bookmarks, operator
 #      pins via PHILOTIC_WTGC_KEEP).
 #   5. NEVER remove a detached-HEAD worktree (no branch to reason about).
@@ -124,6 +129,41 @@ is_excluded() {
     return 1
 }
 
+# --- squash-merge detection ---------------------------------------------------
+# PRs into develop are often SQUASH-merged, so a merged branch tip is never an
+# ancestor of origin/develop and the ancestry check alone preserves everything
+# forever (observed: 27 worktrees / ~75GB of target/ accumulated while every
+# 2h apply run reclaimed 0.00 GB). Fallback: ask GitHub for merged PRs and
+# treat a branch as merged IFF its CURRENT tip commit is exactly the head
+# commit a merged PR was squashed from (headRefOid). Any commit added to the
+# branch after the merge makes the tip differ from headRefOid -> preserved.
+# FAIL SAFE: if gh is missing or the API call fails, the list stays empty and
+# every non-ancestor branch is preserved, exactly as before this fallback.
+# Newline-separated "branch<SP>oid" lines (macOS bash 3.2: no assoc arrays).
+SQUASH_MERGED_LINES=""
+load_squash_merged_lines() {
+    if ! command -v gh >/dev/null 2>&1; then
+        log "WARNING: gh unavailable — squash-merge detection disabled (ancestry check only)"
+        return 0
+    fi
+    local rows
+    if rows="$(cd "${MAIN_REPO}" && gh pr list --state merged --limit 300 \
+        --json headRefName,headRefOid,baseRefName \
+        --jq '.[] | select(.baseRefName == "develop" or .baseRefName == "main") | "\(.headRefName) \(.headRefOid)"' 2>>"${LOG_FILE}")"; then
+        SQUASH_MERGED_LINES="${rows}"
+        log "loaded $(printf '%s\n' "${rows}" | grep -c .) merged-PR head refs for squash-merge detection"
+    else
+        log "WARNING: gh pr list failed — squash-merge detection disabled (ancestry check only)"
+    fi
+}
+
+# True iff this branch's tip is exactly the head commit of a merged PR.
+is_squash_merged() {
+    local branch="$1" head="$2"
+    [[ -n "${SQUASH_MERGED_LINES}" ]] || return 1
+    printf '%s\n' "${SQUASH_MERGED_LINES}" | grep -qxF "${branch} ${head}"
+}
+
 # has_uncommitted <worktree>: true if any porcelain line is NOT an untracked
 # target/ dir. Anchored on `^\?\? ` so modified/staged tracked files (which
 # start with ` M`, `M `, `A `, etc.) are ALWAYS counted, and a directory that
@@ -147,12 +187,51 @@ newest_activity_epoch() {
     local wt="$1"
     local gitdir newest=0 marker m
     gitdir="$(git -C "${wt}" rev-parse --absolute-git-dir 2>/dev/null || true)"
-    for marker in "${wt}/.git" "${gitdir:+${gitdir}/HEAD}"; do
+    # .git and HEAD alone are a POOR activity signal: neither is touched by
+    # editing files, compiling, or running tests, so a worktree an agent has
+    # been working in for hours looks completely idle. index/logs/HEAD/ORIG_HEAD
+    # move whenever anyone runs git in the worktree (status refreshes the
+    # index), which is a far better proxy for "someone is here".
+    for marker in \
+        "${wt}/.git" \
+        "${gitdir:+${gitdir}/HEAD}" \
+        "${gitdir:+${gitdir}/index}" \
+        "${gitdir:+${gitdir}/logs/HEAD}" \
+        "${gitdir:+${gitdir}/ORIG_HEAD}"; do
         [[ -n "${marker}" && -e "${marker}" ]] || continue
         m="$(stat -f %m "${marker}" 2>/dev/null || true)"
         [[ -n "${m}" && "${m}" -gt "${newest}" ]] && newest="${m}"
     done
     printf '%s' "${newest}"
+}
+
+# worktree_in_use <worktree>: 0 if any LIVE process has its cwd inside it.
+#
+# This is the invariant that was missing, and it is the only one that is
+# actually true by construction: a worktree somebody is standing in must not be
+# deleted, regardless of how its branch looks. Without it, a worktree is
+# eligible the moment its work is committed and pushed — which is exactly when
+# an agent is most likely to still be working in it. It has removed an active
+# worktree out from under a running session three times; the session's shell
+# then silently falls back to the MAIN checkout, where the next git command
+# operates on the wrong repository.
+#
+# `-d cwd` restricts lsof to current-working-directory descriptors, which is
+# vastly cheaper than `+D` (that would walk the whole tree, target/ included).
+# If lsof is unavailable we fail SAFE — treat the worktree as in use — because
+# wrongly keeping a stale worktree costs disk, and wrongly deleting a live one
+# costs work.
+worktree_in_use() {
+    local wt="$1" resolved
+    resolved="$(cd "${wt}" 2>/dev/null && pwd -P)" || return 0
+    command -v lsof >/dev/null 2>&1 || return 0
+    lsof -a -d cwd -F n 2>/dev/null | awk -v p="${resolved}" '
+        /^n/ {
+            path = substr($0, 2)
+            if (path == p || index(path, p "/") == 1) { found = 1; exit }
+        }
+        END { exit(found ? 0 : 1) }
+    '
 }
 
 # --- preflight ----------------------------------------------------------------
@@ -176,6 +255,8 @@ if ! git -C "${MAIN_REPO}" rev-parse --verify --quiet origin/develop >/dev/null;
     log "ERROR: origin/develop is unknown — refusing to remove anything"
     exit 1
 fi
+
+load_squash_merged_lines
 
 FREE_BEFORE_KB="$(disk_free_kb)"
 
@@ -211,11 +292,17 @@ process_worktree() {
         return
     fi
 
-    # Invariant 3: unmerged commits are always preserved.
+    # Invariant 3: unmerged commits are always preserved. Merged means either
+    # the tip is an ancestor of origin/develop (merge-commit / fast-forward
+    # PRs) OR the tip is exactly the head commit of a squash-merged PR.
     if ! git -C "${MAIN_REPO}" merge-base --is-ancestor "${head}" origin/develop 2>/dev/null; then
-        log "PRESERVE (unmerged): ${wt} (${branch})"
-        n_preserved=$((n_preserved + 1))
-        return
+        if is_squash_merged "${branch}" "${head}"; then
+            log "merged via squash PR (tip ${head} == merged PR headRefOid): ${wt} (${branch})"
+        else
+            log "PRESERVE (unmerged): ${wt} (${branch})"
+            n_preserved=$((n_preserved + 1))
+            return
+        fi
     fi
 
     # Invariant 4: excluded branches are always preserved.
@@ -225,7 +312,14 @@ process_worktree() {
         return
     fi
 
-    # Invariant 9: grace period. This worktree is otherwise removable
+    # Invariant 9: never reap a worktree a live process is sitting in.
+    if worktree_in_use "${wt}"; then
+        log "PRESERVE (in use: a live process has its cwd here): ${wt} (${branch})"
+        n_preserved=$((n_preserved + 1))
+        return
+    fi
+
+    # Invariant 10: grace period. This worktree is otherwise removable
     # (merged+clean+not-excluded), but a freshly-created one looks exactly like
     # this the instant it exists. Preserve it if its most-recent git activity is
     # within the grace window so a session that just created it isn't reaped

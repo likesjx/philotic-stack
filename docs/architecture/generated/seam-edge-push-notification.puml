@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - edge-push-notification
+
+rectangle "edge-push-notification" as edge_push_notification #Orange {
+}
+
+
+@enduml

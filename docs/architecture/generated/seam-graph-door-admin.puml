@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - graph-door-admin
+
+rectangle "graph-door-admin" as graph_door_admin #Orange {
+}
+
+
+@enduml

@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - graph-door-query
+
+rectangle "graph-door-query" as graph_door_query #Orange {
+}
+
+
+@enduml

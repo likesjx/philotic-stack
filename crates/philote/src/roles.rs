@@ -213,6 +213,10 @@ impl AgentRuntime {
                     toolset_profile_ref: Some(toolset_profile),
                     skillset_profile_ref: None,
                     effective_skillset: vec![],
+                    // Empty on construction, NOT a discard: skill guidance is
+                    // hotel-composed into bindings.effective_skill_guidance
+                    // (merge_snapshot_bindings) and filled onto the activation
+                    // per turn by projected_role_activation_for_turn.
                     effective_skill_guidance: vec![],
                     working_memory_policy: None,
                     memory_projection_policy: None,
@@ -479,6 +483,10 @@ impl AgentRuntime {
                     }),
                 skillset_profile_ref: None,
                 effective_skillset: vec![],
+                // Empty on construction, NOT a discard: skill guidance is
+                // hotel-composed into bindings.effective_skill_guidance
+                // (merge_snapshot_bindings) and filled onto the activation
+                // per turn by projected_role_activation_for_turn.
                 effective_skill_guidance: vec![],
                 working_memory_policy: None,
                 memory_projection_policy: None,
@@ -548,7 +556,16 @@ impl AgentRuntime {
         // When active_goal is present the handoff is a task delegation, not a bare role switch.
         // Push a synthetic task so the receiving role executes the goal immediately without
         // waiting for the operator to send another message.
-        if let Some(goal) = auto_execute_goal {
+        //
+        // Defense in depth against the self-perpetuating handoff loop fixed in
+        // build_same_identity_handoff_bundle (2026-08-30): never auto-execute a
+        // goal that is itself a slash command. A stray "/role X" (or any other
+        // control-flow command) reaching here — from this bundle's own sender
+        // logic or any future one — would otherwise get re-parsed as a fresh
+        // command and re-trigger this exact handoff from the specialist's own
+        // process, whose local session state doesn't yet know it's already
+        // active, so handle_role_command's self-handoff guard can't catch it.
+        if let Some(goal) = auto_execute_goal.filter(|g| parse_slash_command(g).is_none()) {
             let synthetic = crate::protocol::InboundTaskPayload {
                 action: Some("role_directed_task".into()),
                 session_id: Some(session_id.clone()),

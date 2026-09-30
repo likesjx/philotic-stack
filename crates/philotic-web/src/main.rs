@@ -12,6 +12,7 @@ mod footprint;
 mod harness;
 mod heal;
 mod init;
+mod integration;
 mod keys;
 mod load;
 mod mcp;
@@ -20,6 +21,7 @@ mod mesh;
 mod muninn;
 mod onboard;
 mod presets;
+mod procedure;
 mod reset;
 mod serve;
 mod service;
@@ -162,6 +164,9 @@ enum Command {
         /// Keep ~/.philotic/identity/ (preserves operator keypair)
         #[arg(long)]
         keep_identity: bool,
+        /// Skip the interactive confirmation (required for non-interactive use)
+        #[arg(long)]
+        yes: bool,
     },
 
     /// Apply a config file to the Context Graph DB (run once on setup or when config changes)
@@ -216,6 +221,12 @@ enum Command {
         action: mcp::McpAction,
     },
 
+    /// Manage governed outbound HTTP/API integration bindings
+    Integration {
+        #[command(subcommand)]
+        action: integration::IntegrationAction,
+    },
+
     /// Manage provider keys and model configuration in the hotel vault/config plane
     Keys {
         #[command(subcommand)]
@@ -239,6 +250,13 @@ enum Command {
     Autonomy {
         #[command(subcommand)]
         action: autonomy::AutonomyAction,
+    },
+
+    /// Procedural graphs — list, inspect, and read the run ledger of the
+    /// learned execution structures philotes follow (doc:procedural-graphs)
+    Procedure {
+        #[command(subcommand)]
+        action: procedure::ProcedureAction,
     },
 
     /// Memory Transparency — merged provenance query across Muninn, the intel
@@ -558,7 +576,7 @@ async fn main() -> Result<()> {
         ),
         Command::Explain { action } => explain::run(action),
         Command::Agents { config } => status::run_agents(config).await,
-        Command::Reset { keep_identity } => reset::run(keep_identity).await,
+        Command::Reset { keep_identity, yes } => reset::run(keep_identity, yes).await,
         Command::Service { action } => match action {
             ServiceAction::Install { hotel } => service::install(hotel).await,
             ServiceAction::Start { hotel } => service::start(hotel).await,
@@ -583,10 +601,12 @@ async fn main() -> Result<()> {
             } => mesh::accept(invite, hotel, host).await,
         },
         Command::Mcp { action } => mcp::run(action).await,
+        Command::Integration { action } => integration::run(action).await,
         Command::Keys { action } => keys::run(action).await,
         Command::Heal { action } => heal::run(action).await,
         Command::Config { action } => config::run(action).await,
         Command::Autonomy { action } => autonomy::run(action).await,
+        Command::Procedure { action } => procedure::run(action).await,
         Command::Memory { action } => memory_explain::run(action).await,
         Command::Graph { action } => {
             use graph_intelligence::{scanner, GraphEngine};

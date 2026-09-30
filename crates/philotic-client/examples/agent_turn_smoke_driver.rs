@@ -22,9 +22,14 @@ async fn main() -> Result<()> {
         std::env::var("PHILOTIC_TARGET_AGENT").unwrap_or_else(|_| "agent-bjork-01".to_string());
 
     let operator_session_id = format!("smoke-agent-turn-{}", Uuid::new_v4().simple());
-    let content = "Use the life.observe tool to record this open loop: \
+    // PHILOTIC_SMOKE_CONTENT overrides the message (e.g. to drive a
+    // subagent.spawn live check without editing the driver).
+    let content = std::env::var("PHILOTIC_SMOKE_CONTENT").unwrap_or_else(|_| {
+        "Use the life.observe tool to record this open loop: \
         'verify life-graph routing works end-to-end from mac-jane'. \
-        After calling the tool, tell me the node_id from the response.";
+        After calling the tool, tell me the node_id from the response."
+            .to_string()
+    });
 
     eprintln!("smoke: connecting to IPC socket {socket_path}");
     eprintln!("smoke: sending turn to {target_agent} @ {target_node}");
@@ -50,7 +55,7 @@ async fn main() -> Result<()> {
             target_agent_id: target_agent.clone(),
             operator_session_id: operator_session_id.clone(),
             conversation_id: None,
-            content: content.into(),
+            content,
         }),
     )
     .await

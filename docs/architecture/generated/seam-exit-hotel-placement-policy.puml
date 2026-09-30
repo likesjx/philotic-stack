@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - exit-hotel-placement-policy
+
+rectangle "exit-hotel-placement-policy" as exit_hotel_placement_policy #Orange {
+}
+
+
+@enduml

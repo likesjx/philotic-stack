@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - mcp-ipc-identity
+
+rectangle "mcp-ipc-identity" as mcp_ipc_identity #Orange {
+}
+
+
+@enduml

@@ -142,12 +142,12 @@ impl EntangledHit {
                 let a = self
                     .domain_a_anchors
                     .first()
-                    .map(|anchor| anchor_desc(anchor))
+                    .map(anchor_desc)
                     .unwrap_or_else(|| "a domain-A hit".to_string());
                 let b = self
                     .domain_b_anchors
                     .first()
-                    .map(|anchor| anchor_desc(anchor))
+                    .map(anchor_desc)
                     .unwrap_or_else(|| "a domain-B hit".to_string());
                 format!(
                     "bridge node: living-cycle {} link to {} on the domain-A side and {} link to {} on the domain-B side",

@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - skills-distill-trigger
+
+rectangle "skills-distill-trigger" as skills_distill_trigger #Orange {
+}
+
+
+@enduml

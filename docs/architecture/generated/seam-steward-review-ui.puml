@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - steward-review-ui
+
+rectangle "steward-review-ui" as steward_review_ui #Orange {
+}
+
+
+@enduml

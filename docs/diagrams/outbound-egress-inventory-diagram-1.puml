@@ -1,0 +1,15 @@
+@startuml
+participant CatalogService
+participant SourceHotel
+participant ExitRunner
+participant OpenRouter
+CatalogService -> SourceHotel: Ensure system IntegrationBinding
+SourceHotel --> CatalogService: Selected execution node and policy
+CatalogService -> SourceHotel: Emit bounded catalog task
+SourceHotel -> ExitRunner: Route task and return route
+ExitRunner -> OpenRouter: GET exact model catalog path
+OpenRouter --> ExitRunner: Catalog JSON
+ExitRunner -> SourceHotel: Append content free audit
+ExitRunner --> CatalogService: Sanitized bounded response
+CatalogService -> SourceHotel: Persist compact catalog
+@enduml

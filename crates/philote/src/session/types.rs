@@ -281,6 +281,12 @@ pub struct ActivePlan {
     /// This is advisory only; approval policy still decides whether a tool may run.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_1_advisory: Option<Context1Advisory>,
+    /// The procedural graph this plan was seeded from or attributed to
+    /// (doc:procedural-graphs). Stamped by the harness when it seeds a plan
+    /// from a procedure's backbone; otherwise resolved at eval time by tool
+    /// overlap. Drives run-ledger attribution and localized guidance.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub procedure_id: Option<String>,
 }
 
 /// A plan carried across turns by the plan-eval-repeat loop.
@@ -295,10 +301,47 @@ pub struct CarryoverPlan {
     /// The plan as last seen on the completed turn.
     pub plan: ActivePlan,
     /// Index-aligned per-step completion mirror from the last plan eval.
+    ///
+    /// "Settled", not "verified": a step with no bound tool settles on the
+    /// model's own claim, because there is no artifact to check it against.
+    /// Recomputed from scratch on every eval, so it is safe against a plan
+    /// whose steps were re-emitted in a different order.
     pub steps_done: Vec<bool>,
+    /// Ids of steps backed by a real tool result, carried across continuation
+    /// turns.
+    ///
+    /// Keyed by step **id**, not index, because a continuation turn may split a
+    /// bundled step and renumber the tail — index-aligned evidence would then
+    /// be attributed to the wrong step. Distinct from `steps_done` on purpose:
+    /// a flag here can only ever have been set by [`crate::plan_eval::
+    /// verify_plan_steps`] against an actual tool result, never by the model's
+    /// `status` field. Feeding `steps_done` back as evidence would launder
+    /// self-certification through the carryover and make grounded verification
+    /// decorative.
+    #[serde(default)]
+    pub verified_step_ids: Vec<u32>,
+    /// Consecutive continuation turns that settled no new step.
+    ///
+    /// One stall is normal — a turn can legitimately spend its iterations on a
+    /// failed call or a read that sets up the next step. Repeated stalls mean
+    /// the loop is spinning. See `MAX_CONSECUTIVE_PLAN_STALLS`.
+    #[serde(default)]
+    pub stalled_continuations: u32,
     /// Number of continuation turns already synthesized for this plan.
+    ///
+    /// Refunded to zero whenever a continuation settles a new step, so the
+    /// budget only ever binds stretches that are not making progress — a plan
+    /// that keeps verifiably landing steps is never cut off mid-goal. See
+    /// `PLAN_CONTINUATION_LIFETIME_CAP` for the absolute backstop.
     #[serde(default)]
     pub continuations_used: u32,
+    /// Total continuation turns synthesized over this plan's whole lifetime.
+    ///
+    /// Never refunded. Progress resets `continuations_used`, so without this a
+    /// plan that alternates one settled step with a fresh batch of self-added
+    /// steps could hold the loop forever. See `PLAN_CONTINUATION_LIFETIME_CAP`.
+    #[serde(default)]
+    pub lifetime_continuations: u32,
     /// The turn that originally produced this carryover.
     pub created_turn_id: String,
 }
@@ -306,6 +349,36 @@ pub struct CarryoverPlan {
 impl CarryoverPlan {
     pub fn steps_done_count(&self) -> usize {
         self.steps_done.iter().filter(|d| **d).count()
+    }
+
+    /// Evidence flags re-keyed onto `plan`'s current steps by id.
+    pub fn verified_flags_for(&self, plan: &ActivePlan) -> Vec<bool> {
+        plan.steps
+            .iter()
+            .map(|s| self.verified_step_ids.contains(&s.id))
+            .collect()
+    }
+
+    /// The plan a continuation turn opens with, and the evidence it opens
+    /// with. Settled steps are marked done for the model; evidence-backed
+    /// steps are latched as verified for the harness — the in-turn hint,
+    /// the integrity note and the duplicate-call guard all read
+    /// `plan_steps_verified`, and a continuation that opened with none
+    /// told the model "1/13 verified, still outstanding: steps 1–12" right
+    /// after the harness ran the closing audit (live 2026-09-15 19:22 UTC),
+    /// so it re-ran all twelve landed tidies.
+    pub fn seed_turn_plan(&self) -> (ActivePlan, Vec<bool>) {
+        let mut plan = self.plan.clone();
+        for (i, step) in plan.steps.iter_mut().enumerate() {
+            if self.steps_done.get(i).copied().unwrap_or(false) {
+                step.status = "done".into();
+            }
+        }
+        if plan.status == "planning" {
+            plan.status = "executing".into();
+        }
+        let verified = self.verified_flags_for(&plan);
+        (plan, verified)
     }
 }
 
@@ -671,6 +744,61 @@ pub struct FallbackOverride {
     pub notice_sent: bool,
 }
 
+#[cfg(test)]
+impl WorkingTurn {
+    /// Minimal fresh working turn for unit tests across the runtime
+    /// submodules: no tools, no plan, no paracrine state, budget counters
+    /// at their starting values.
+    pub(crate) fn test_turn(turn_id: &str, user_content: &str) -> WorkingTurn {
+        WorkingTurn {
+            task_id: Uuid::new_v4(),
+            turn_id: turn_id.into(),
+            chat_id: "chat-1".into(),
+            primary_user_id: None,
+            user_content: user_content.into(),
+            final_reply_to: "node-1".into(),
+            final_reply_role: "membrane".into(),
+            final_reply_guest_id: None,
+            phase: TurnPhase::WaitingTool,
+            iteration: 0,
+            pending_tool_call: None,
+            pending_approval: None,
+            working_tool_history: Vec::new(),
+            recalled_memories: Vec::new(),
+            active_plan: None,
+            consecutive_step_failures: 0,
+            streak_extension: 0,
+            provider_repair_note: None,
+            say_do_nudged: false,
+            media_analysis: false,
+            provider_repair_attempts: 0,
+            pending_text_reply: None,
+            had_voice_input: false,
+            awaiting_transcription_reentry: false,
+            scripted_loop_context: None,
+            associated_paracrine_ids: Vec::new(),
+            paracrine_origin: None,
+            paracrine_reply_session_id: None,
+            paracrine_reply_chat_id: None,
+            paracrine_response_routing: None,
+            paracrine_merge_completed: false,
+            paracrine_intent: None,
+            plan_confirmed: false,
+            plan_confirm_note: None,
+            fallback_tier: 0,
+            ladder_tier0_dispatched: false,
+            streaming_retry_attempts: 0,
+            streamed_content: String::new(),
+            paracrine_hop_count: 0,
+            paracrine_chain_started_at: None,
+            selection_source: SelectionSource::default(),
+            started_at_unix: None,
+            last_interim_at_unix: None,
+            plan_steps_verified: Vec::new(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkingTurn {
     pub task_id: Uuid,
@@ -714,6 +842,20 @@ pub struct WorkingTurn {
     pub provider_repair_note: Option<String>,
     /// Number of corrective provider retries attempted for this turn.
     pub provider_repair_attempts: u32,
+    /// True once this turn has been sent back to the model for a say-do
+    /// check: the model replied with text that tells the user it is
+    /// executing work now, while the turn had made no tool call. One nudge
+    /// per turn; a second promise-only reply is delivered with an honest
+    /// trailer instead of looping. Never persisted — a turn that survives a
+    /// checkpoint restore is mid-`WaitingTool`, past this gate.
+    #[serde(default)]
+    pub say_do_nudged: bool,
+    /// This turn was dispatched to the media-analysis capability (a photo
+    /// or document went to the vision model). The analysis reply is the
+    /// ONLY place the attachment's content exists in text, so the reply
+    /// path must carry it forward rather than drop it (DEF-163/164).
+    #[serde(default)]
+    pub media_analysis: bool,
     /// Stashed text content while waiting for voice synthesis to complete.
     pub pending_text_reply: Option<String>,
     pub had_voice_input: bool,
@@ -744,6 +886,12 @@ pub struct WorkingTurn {
     /// Captured from the inbound exosome and echoed back on `paracrine_response`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub paracrine_response_routing: Option<philotic_client::ParacrineRouting>,
+    /// Structured intent carried in the inbound exosome's `context.intent`
+    /// (e.g. `skills.distill:tool_count`). Lets the tool layer recognise a
+    /// lookaside turn whose legal tool surface is narrower than the role's
+    /// default — a distill whisper may only draft a skill or write memory.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub paracrine_intent: Option<String>,
     /// Set to true when the specialist explicitly calls `delegate.merge` during a turn.
     /// Suppresses the auto-emit of `paracrine_response` in deliver_text_reply so there
     /// is no duplicate delivery after the explicit merge already fired.
@@ -804,6 +952,84 @@ pub struct WorkingTurn {
     /// checkpoints deserialize to `None`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub paracrine_chain_started_at: Option<u64>,
+    /// Unix-seconds when this turn began. The hotel's zombie watchdog fails a
+    /// turn 300s after its `started_at` with no heartbeat to reset the clock,
+    /// so in-turn plan execution measures its wall-clock budget from here and
+    /// stops early enough to still deliver a reply. See
+    /// [`crate::plan_eval::PLAN_EXECUTION_BUDGET_SECS`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_at_unix: Option<u64>,
+    /// Unix-seconds of the last interim message this turn sent to the user
+    /// without ending the turn. Gates the next one, so a long turn stays
+    /// audible without narrating every step. See
+    /// [`crate::plan_eval::interim_reply_admissible`]. `#[serde(default)]` so
+    /// old checkpoints deserialize to `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_interim_at_unix: Option<u64>,
+    /// Model-immutable per-step verification flags, index-aligned with
+    /// `active_plan.steps`.
+    ///
+    /// These deliberately do NOT live inside `active_plan`: the model re-emits
+    /// `active_plan` on most iterations and `set_active_plan` replaces it
+    /// wholesale, so flags stored there would be erased whenever the model
+    /// re-sent a step as `pending`. Grounded verification has to survive the
+    /// model's own bookkeeping — that is the entire point of it.
+    #[serde(default)]
+    pub plan_steps_verified: Vec<bool>,
+}
+
+#[cfg(test)]
+impl WorkingTurn {
+    /// Bare turn for unit tests that only exercise plan logic. Every field
+    /// that plan evaluation reads is left for the caller to set.
+    pub(crate) fn for_plan_tests() -> Self {
+        Self {
+            task_id: Uuid::nil(),
+            turn_id: "turn-test".into(),
+            chat_id: String::new(),
+            primary_user_id: None,
+            user_content: String::new(),
+            final_reply_to: String::new(),
+            final_reply_role: String::new(),
+            final_reply_guest_id: None,
+            phase: crate::r#loop::TurnPhase::Thinking,
+            iteration: 0,
+            pending_tool_call: None,
+            pending_approval: None,
+            working_tool_history: Vec::new(),
+            recalled_memories: Vec::new(),
+            active_plan: None,
+            consecutive_step_failures: 0,
+            streak_extension: 0,
+            provider_repair_note: None,
+            say_do_nudged: false,
+            media_analysis: false,
+            provider_repair_attempts: 0,
+            pending_text_reply: None,
+            had_voice_input: false,
+            awaiting_transcription_reentry: false,
+            scripted_loop_context: None,
+            associated_paracrine_ids: Vec::new(),
+            paracrine_origin: None,
+            paracrine_reply_session_id: None,
+            paracrine_reply_chat_id: None,
+            paracrine_response_routing: None,
+            paracrine_merge_completed: false,
+            paracrine_intent: None,
+            plan_confirmed: false,
+            plan_confirm_note: None,
+            fallback_tier: 0,
+            ladder_tier0_dispatched: false,
+            selection_source: SelectionSource::default(),
+            streaming_retry_attempts: 0,
+            streamed_content: String::new(),
+            paracrine_hop_count: 0,
+            paracrine_chain_started_at: None,
+            started_at_unix: None,
+            last_interim_at_unix: None,
+            plan_steps_verified: Vec::new(),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1161,7 +1387,8 @@ impl ContextWindowPolicy {
 ///
 /// Slice 0 applies `persona_chars`, `rules_chars`, and `recalled_memory_chars`
 /// to the layers that exist today (`project_agent_self`, `project_rules`,
-/// `project_recalled_memory`). `memory_snapshot_chars`, `skills_chars`, and
+/// `project_recalled_memory`); `skills_chars` caps the `[Skill guidance]`
+/// section (DEF-145). `memory_snapshot_chars` and
 /// `reflex_snapshot_chars` are reserved for the frozen `MemorySnapshot` and
 /// tiered skill/reflex projections landing in later slices — no renderer
 /// consumes them yet.
@@ -1173,12 +1400,20 @@ pub struct InjectionBudget {
     pub memory_snapshot_chars: usize,
     /// Cap for the per-turn RecalledMemory layer (`project_recalled_memory`).
     pub recalled_memory_chars: usize,
-    /// Reserved for a future skills/role-manifest index projection. Unused today.
+    /// Cap for the per-turn `[Skill guidance]` section (DEF-145: it used to
+    /// live under `persona_chars` and was the part the persona overflow cut).
     pub skills_chars: usize,
     /// Reserved for a future reflex-state projection. Unused today.
     pub reflex_snapshot_chars: usize,
     /// Cap for the Rules layer (`project_rules`).
     pub rules_chars: usize,
+    /// Cap for the dialogue window (`[Recent session context]`).
+    ///
+    /// This layer is the only one whose size the operator controls directly —
+    /// one pasted document lands in it and is then re-sent on every request for
+    /// as long as it stays inside the window. It was the one unbudgeted layer
+    /// until 2026-08-30, when coach was sending 236KB requests.
+    pub dialogue_chars: usize,
     /// Whole-envelope ceiling (sum of all rendered layer chars). Drives
     /// `ReflexEvent::ContextPressure` emission — see `BudgetLedger`.
     pub total_envelope_chars: usize,
@@ -1193,6 +1428,7 @@ impl Default for InjectionBudget {
             skills_chars: 2_500,
             reflex_snapshot_chars: 1_000,
             rules_chars: 2_000,
+            dialogue_chars: 8_000,
             total_envelope_chars: 60_000,
         }
     }
@@ -1523,6 +1759,24 @@ pub struct SessionBindings {
     pub effective_skillset: Vec<String>,
     #[serde(default)]
     pub effective_skill_guidance: Vec<String>,
+    /// Procedural graphs projected for this session (doc:procedural-graphs):
+    /// the hotel sends the full records for the skills in play so philote
+    /// can localize the active step without an IPC round trip. Prompt-facing
+    /// only — never affects tool routing or the tool assembly.
+    #[serde(default)]
+    pub effective_procedures: Vec<ansible_mesh_core::procedure::ProcedureGraphRecord>,
+    /// Hotel skill records for every skill in play (the role-assigned SkillDAG
+    /// closure plus on-demand skills), so per-turn projection reads implied
+    /// tools, description and goal text from the RECORD. Until 2026-09-15 the
+    /// philote decided projection from compiled tables keyed by skill name, so
+    /// every skill registered at runtime — every skill a philote or the distill
+    /// lane authors — returned no tools, was never relevant, and never
+    /// projected: the rule "always use music.repertoire-gardener" fired on a
+    /// turn where the skill was absent and the model reached for
+    /// `subagent.spawn`. Projection-facing only; never a tool grant (grants
+    /// are expanded by the hotel into `effective_toolset`).
+    #[serde(default)]
+    pub effective_skill_records: Vec<ansible_mesh_core::graph::AbstractSkillRecord>,
     /// Skills whose tools are in the ToolAssembly but suppressed per-turn unless
     /// the turn content signals the skill is needed. Populated from the role's
     /// toolset profile `on_demand_skills` list at session snapshot time.
@@ -1561,6 +1815,12 @@ pub struct SessionBindings {
     /// `GetMcpUpstreams`; descriptions/schemas are third-party content.
     #[serde(default)]
     pub mcp_upstream_tools: Vec<McpUpstreamToolBinding>,
+    /// Governed HTTP integrations projected as `http:<binding>.request`.
+    /// Each entry carries its non-secret binding and the hotel's live placement
+    /// decision so dispatch can route to the selected runner without giving
+    /// the model ambient URL authority.
+    #[serde(default)]
+    pub http_integration_tools: Vec<HttpIntegrationToolBinding>,
 }
 
 /// One projected upstream MCP tool bound into a session (see
@@ -1575,6 +1835,13 @@ pub struct McpUpstreamToolBinding {
     /// Remote input schema verbatim (a JSON object).
     #[serde(default)]
     pub input_schema: serde_json::Value,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HttpIntegrationToolBinding {
+    pub binding: ansible_mesh_core::integration::IntegrationBinding,
+    pub placement: ansible_mesh_core::integration::EgressPlacementDecision,
+    pub execution_node_id: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -1896,6 +2163,8 @@ mod paracrine_budget_tests {
             consecutive_step_failures: 0,
             streak_extension: 0,
             provider_repair_note: None,
+            say_do_nudged: false,
+            media_analysis: false,
             provider_repair_attempts: 0,
             pending_text_reply: None,
             had_voice_input: false,
@@ -1907,6 +2176,7 @@ mod paracrine_budget_tests {
             paracrine_reply_chat_id: None,
             paracrine_response_routing: None,
             paracrine_merge_completed: false,
+            paracrine_intent: None,
             plan_confirmed: false,
             plan_confirm_note: None,
             fallback_tier: 0,
@@ -1916,6 +2186,9 @@ mod paracrine_budget_tests {
             paracrine_hop_count: 0,
             paracrine_chain_started_at: None,
             selection_source: SelectionSource::default(),
+            started_at_unix: None,
+            last_interim_at_unix: None,
+            plan_steps_verified: Vec::new(),
         }
     }
 

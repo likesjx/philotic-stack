@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - graph-door-mutate
+
+rectangle "graph-door-mutate" as graph_door_mutate #Orange {
+}
+
+
+@enduml

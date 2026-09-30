@@ -68,23 +68,23 @@ pub async fn normalize_audio(
 
     let target_mime = provider.fallback_mime();
 
-    if let Some(c) = cache {
-        if let Some(cached) = c.get(&bytes, target_mime)? {
-            tracing::debug!(source_mime, target_mime, "media-codec: cache hit");
-            return Ok(NormalizeResult {
-                bytes: cached,
-                mime_type: target_mime.to_string(),
-                transcoded: false,
-            });
-        }
+    if let Some(c) = cache
+        && let Some(cached) = c.get(&bytes, target_mime)?
+    {
+        tracing::debug!(source_mime, target_mime, "media-codec: cache hit");
+        return Ok(NormalizeResult {
+            bytes: cached,
+            mime_type: target_mime.to_string(),
+            transcoded: false,
+        });
     }
 
     let transcoded = transcode_to_wav_16k(bytes.clone(), source_mime, ffmpeg_bin).await?;
 
-    if let Some(c) = cache {
-        if let Err(e) = c.put(&bytes, target_mime, &transcoded) {
-            tracing::warn!("media-codec: cache write failed: {e:#}");
-        }
+    if let Some(c) = cache
+        && let Err(e) = c.put(&bytes, target_mime, &transcoded)
+    {
+        tracing::warn!("media-codec: cache write failed: {e:#}");
     }
 
     Ok(NormalizeResult {

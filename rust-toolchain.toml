@@ -1,0 +1,23 @@
+# Pinned toolchain for the whole fleet.
+#
+# Why: mac-jane, mbp-jane and vps-jane all run binaries produced from this
+# workspace, and release.yml builds six target triples. Before this pin every
+# build resolved `stable` at job time, so a Rust release could change shipped
+# binaries — or break the release pipeline — with no commit in this repo.
+#
+# CAVEAT — this pin governs CI, not the dev Macs, today. rustup is not
+# installed on mac-jane/mbp-jane; cargo and rustc come from Homebrew
+# (/opt/homebrew/bin), and Homebrew's cargo does not read this file. GitHub
+# runners use rustup, so they do honour it. To make the pin real fleet-wide,
+# install rustup on the dev machines and let it shadow the Homebrew toolchain.
+# Until then: CI builds are reproducible, local builds follow whatever version
+# `brew upgrade rust` last installed.
+#
+# Bumping: change `channel` here AND the `toolchain:` input in
+# .github/workflows/{pr-check,build-linux,release}.yml in the same commit. The
+# workflows must pass the pinned version explicitly, because they also pass
+# `targets:` — rustup installs cross-compilation targets against the toolchain
+# the action selects, and that has to be this one.
+[toolchain]
+channel = "1.94.0"
+components = ["rustfmt", "clippy"]

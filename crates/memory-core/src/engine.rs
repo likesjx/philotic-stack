@@ -144,6 +144,9 @@ pub trait MemoryEngine: Send + Sync {
                 decision,
                 engrams: Vec::new(),
                 total: 0,
+                dropped_by_gate: 0,
+                rejected_vaults: Vec::new(),
+                failed_vaults: Vec::new(),
             });
         }
 
@@ -154,11 +157,22 @@ pub trait MemoryEngine: Send + Sync {
         let activation = self
             .activate(&query, context.scope.clone(), decision.limit)
             .await?;
+        let mut engrams = activation.engrams;
+        // Automatic recall is gated; an explicit recall shows what the caller
+        // asked for (the projection labels bands).
+        let dropped_by_gate = if matches!(context.trigger, crate::RecallTrigger::ExplicitToolCall) {
+            0
+        } else {
+            crate::retain_turn_relevant(&mut engrams)
+        };
 
         Ok(TurnRecallResult {
             decision,
-            engrams: activation.engrams,
+            engrams,
             total: activation.total,
+            dropped_by_gate,
+            rejected_vaults: activation.rejected_vaults,
+            failed_vaults: activation.failed_vaults,
         })
     }
 

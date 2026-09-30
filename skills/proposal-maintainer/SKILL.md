@@ -1,5 +1,7 @@
+---
 name: proposal-maintainer
 description: HIGH PRIORITY. Use this skill to keep architecture and process proposals concise, current, and linked to active tasks. A proposal is not a static doc; it is an active plan. Trigger for disposition updates, task alignment, or removing stale certainty. In Philotic, pair this with architecture-docs-maintainer when metadata, domains, or source-of-truth linkage also need upkeep.
+---
 
 # Proposal Maintainer
 

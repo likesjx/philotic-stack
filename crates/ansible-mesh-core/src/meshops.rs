@@ -9,6 +9,12 @@ use tracing::info;
 /// (the quantum-networking inspired meshops routing layer).
 pub struct MeshopsNodeInvoker;
 
+impl Default for MeshopsNodeInvoker {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl MeshopsNodeInvoker {
     pub fn new() -> Self {
         Self

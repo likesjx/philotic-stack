@@ -42,6 +42,16 @@ impl EgressGateway for HotelEgressGateway {
         evaluate_egress_policy(&self.policies, request)
     }
 
+    fn credential_binding_configured(&self, request: &EgressRequest) -> bool {
+        let Some(policy) = self.policies.get(&request.tier) else {
+            return false;
+        };
+        let Some(host) = host_from_url(&request.target_url) else {
+            return false;
+        };
+        Self::credential_for_host(policy, host).is_some()
+    }
+
     async fn inject_credentials(&self, request: &mut EgressRequest) -> anyhow::Result<()> {
         let policy = match self.policies.get(&request.tier) {
             Some(p) => p,

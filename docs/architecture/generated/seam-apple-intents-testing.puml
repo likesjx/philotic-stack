@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - apple-intents-testing
+
+rectangle "apple-intents-testing" as apple_intents_testing #Orange {
+}
+
+
+@enduml

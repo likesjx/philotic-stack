@@ -1,5 +1,7 @@
+---
 name: muninn-memory-habit
 description: HIGH PRIORITY. Use this skill at the START of EVERY session to retrieve project context and during the session to store decisions. It is the mandatory bootstrap mechanism for continuity and the engine for project optimization. Retrieve before meaningful work, write back important decisions, and use revealed gaps to improve repo-local protocols.
+---
 
 # Muninn Memory Habit
 

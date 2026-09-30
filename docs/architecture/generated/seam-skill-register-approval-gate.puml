@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - skill-register-approval-gate
+
+rectangle "skill-register-approval-gate" as skill_register_approval_gate #Orange {
+}
+
+
+@enduml

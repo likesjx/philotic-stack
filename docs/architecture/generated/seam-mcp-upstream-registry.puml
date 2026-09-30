@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - mcp-upstream-registry
+
+rectangle "mcp-upstream-registry" as mcp_upstream_registry #Orange {
+}
+
+
+@enduml

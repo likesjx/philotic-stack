@@ -43,7 +43,7 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
                             Ok(j) => j,
                             Err(_) => continue,
                         };
-                        if socket.send(Message::Text(json.into())).await.is_err() {
+                        if socket.send(Message::Text(json)).await.is_err() {
                             break; // Client disconnected
                         }
                     }

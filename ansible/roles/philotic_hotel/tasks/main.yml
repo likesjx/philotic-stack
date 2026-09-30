@@ -71,12 +71,15 @@
 # ── Central graph database (optional Memgraph provider) ───────────────────────
 
 - name: Create Memgraph data directory
+  # Owned by the in-container memgraph user (uid 101 / gid 103), not root:
+  # this directory IS the database. Memgraph writes its snapshots and WAL
+  # here, and cannot start if it may not write.
   file:
     path: "{{ philotic_memgraph_data_dir }}"
     state: directory
-    owner: "root"
-    group: "root"
-    mode: "0755"
+    owner: "{{ philotic_memgraph_uid }}"
+    group: "{{ philotic_memgraph_gid }}"
+    mode: "0750"
   when: philotic_memgraph_enabled | bool
 
 - name: Deploy Memgraph systemd unit
@@ -164,6 +167,7 @@
     mode: "0600"
   no_log: true
   notify: Restart philotic-hotel
+  tags: [config]
 
 # ── Agent workspace access ─────────────────────────────────────────────────────
 # Grant the philotic user read access to any declared agent import_workspace paths.
@@ -235,6 +239,7 @@
     mode: "0600"
   no_log: true
   notify: Restart philotic-hotel
+  tags: [config]
 
 - name: Seed hotel graph/config from mesh-config.json
   command:
@@ -245,7 +250,7 @@
       - --
       - sh
       - -lc
-      - "cd {{ philotic_data_dir | quote }} && {{ philotic_bin_dir | quote }}/aiua load --file {{ philotic_etc_dir | quote }}/mesh-config.json --hotel {{ philotic_hotel_runtime_name | quote }}"
+      - "set -a && . {{ (philotic_etc_dir ~ '/secrets.env') | quote }} && set +a && cd {{ philotic_data_dir | quote }} && {{ philotic_bin_dir | quote }}/aiua load --file {{ philotic_etc_dir | quote }}/mesh-config.json --hotel {{ philotic_hotel_runtime_name | quote }}"
   environment:
     PHILOTIC_BIN_DIR: "{{ philotic_bin_dir }}"
     PHILOTIC_HOTEL_SOCKET: "{{ philotic_hotel_socket }}"
@@ -301,6 +306,7 @@
   notify:
     - Reload systemd
     - Restart philotic-hotel
+  tags: [config]
 
 - name: Enable and start philotic-hotel
   systemd:
@@ -356,3 +362,71 @@
     - philotic_onnx_sidecar_enabled
     - ufw_check.rc == 0
   ignore_errors: yes
+
+# ── Muninn maintenance timer ────────────────────────────────────────────────
+# Muninn prunes its own backup dir and (since the replication-log retention
+# fix) its own log, but nothing retains the agent-driven nightly backups and
+# nothing watches the store size. Reachability probes stayed green through a
+# leak that grew the store from 311 MB to 20 GB.
+
+- name: Install muninn maintenance script
+  template:
+    src: muninn-maintenance.sh.j2
+    dest: /usr/local/bin/muninn-maintenance.sh
+    owner: root
+    group: root
+    mode: "0755"
+  when: muninn_enabled | default(true) | bool
+
+- name: Install muninn maintenance systemd unit
+  template:
+    src: muninn-maintenance.service.j2
+    dest: /etc/systemd/system/muninn-maintenance.service
+    owner: root
+    group: root
+    mode: "0644"
+  notify:
+    - Reload systemd
+  when: muninn_enabled | default(true) | bool
+
+- name: Install muninn maintenance timer
+  template:
+    src: muninn-maintenance.timer.j2
+    dest: /etc/systemd/system/muninn-maintenance.timer
+    owner: root
+    group: root
+    mode: "0644"
+  notify:
+    - Reload systemd
+  when: muninn_enabled | default(true) | bool
+
+- name: Enable and start muninn maintenance timer
+  systemd:
+    name: muninn-maintenance.timer
+    enabled: true
+    state: started
+    daemon_reload: true
+  when: muninn_enabled | default(true) | bool
+
+# ── Philotic heartbeat cleanup ───────────────────────────────────────────────
+# The heartbeat now ticks inside the life-graph-runner (data-memorygraphrag),
+# shipping with every build. Remove the retired systemd timer + script so a
+# host deployed before the port doesn't keep a second sensor running.
+
+- name: Stop and disable retired philotic heartbeat timer
+  systemd:
+    name: philotic-heartbeat.timer
+    enabled: false
+    state: stopped
+  failed_when: false
+
+- name: Remove retired philotic heartbeat files
+  file:
+    path: "{{ item }}"
+    state: absent
+  loop:
+    - /etc/systemd/system/philotic-heartbeat.timer
+    - /etc/systemd/system/philotic-heartbeat.service
+    - /usr/local/bin/philotic-heartbeat.py
+  notify:
+    - Reload systemd

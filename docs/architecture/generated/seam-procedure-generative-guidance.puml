@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - procedure-generative-guidance
+
+rectangle "procedure-generative-guidance" as procedure_generative_guidance #Orange {
+}
+
+
+@enduml

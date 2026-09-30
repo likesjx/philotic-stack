@@ -364,7 +364,9 @@ pub fn catalog() -> Vec<Box<dyn Check>> {
         Box::new(VaultKeySourceDivergence),
         Box::new(LogsRotationMissing),
         Box::new(SecretsStorePermissions),
+        Box::new(VaultMasterKeyPermissions),
         Box::new(HealQueueDepth),
+        Box::new(HealEscalatedUnrepaired),
         Box::new(HealOldestPendingAge),
         Box::new(HealDispatcherStaleness),
         Box::new(SystemDiskSpace),
@@ -974,20 +976,23 @@ fn vault_key_account() -> String {
 /// Read-only Keychain lookup. Unlike aiua's `load_or_create_root_key`, this
 /// never generates or stores a key on a miss — doctor must not write.
 fn keychain_key_source() -> Option<Vec<u8>> {
-    if !cfg!(target_os = "macos") {
+    // Also skipped where there is no unlocked login keychain — `security`
+    // blocks forever there rather than failing, and doctor must never hang.
+    if !ansible_mesh_core::keychain::enabled() {
         return None;
     }
-    let output = std::process::Command::new("security")
-        .args([
+    let output = ansible_mesh_core::keychain::run_security(
+        &[
             "find-generic-password",
             "-s",
             VAULT_KEYCHAIN_SERVICE,
             "-a",
             &vault_key_account(),
             "-w",
-        ])
-        .output()
-        .ok()?;
+        ],
+        "reading the Philotic vault root key",
+    )
+    .ok()?;
     if !output.status.success() {
         return None;
     }
@@ -1793,6 +1798,106 @@ impl Check for SecretsStorePermissions {
     }
 }
 
+/// Permissions on the vault master key file itself.
+///
+/// `SecretsStorePermissions` above deliberately reasons that a loose context DB
+/// is "not an immediate plaintext leak" *because the master key lives
+/// elsewhere*. That argument only holds while the key file is actually
+/// protected — and nothing was checking it. If `~/.philotic/vault-master-key.env`
+/// is group/other-readable, every secret in the vault is decryptable by any
+/// local reader and doctor would still report green.
+///
+/// Hence a separate check with a blunter message and Error severity: this is
+/// the key, not a key-adjacent store.
+struct VaultMasterKeyPermissions;
+
+/// Path checked by [`VaultMasterKeyPermissions`]; mirrors
+/// `start::load_vault_master_key_env_file`.
+fn vault_master_key_path() -> std::path::PathBuf {
+    crate::init::philotic_dir().join("vault-master-key.env")
+}
+
+impl Check for VaultMasterKeyPermissions {
+    fn id(&self) -> &'static str {
+        "secrets.master-key-permissions"
+    }
+
+    fn severity(&self) -> Severity {
+        Severity::Error
+    }
+
+    fn detect(&self, _ctx: &DoctorCtx) -> Result<Vec<Finding>> {
+        #[cfg(unix)]
+        {
+            let path = vault_master_key_path();
+            // Absent is fine — the key may live in the Keychain or the env.
+            let Some(mode) = unix_perms::mode(&path) else {
+                return Ok(Vec::new());
+            };
+            if mode & GROUP_OTHER_ANY_BIT == 0 {
+                return Ok(Vec::new());
+            }
+            let display = path.to_string_lossy().to_string();
+            return Ok(vec![Finding {
+                check_id: self.id().to_string(),
+                severity: Severity::Error,
+                message: format!(
+                    "vault master key {display} is {mode:04o} (want {WANT_DB_MODE:04o}) — any \
+                     local account can read the key and decrypt every vault secret; this is a \
+                     plaintext key exposure, not a hardening nicety"
+                ),
+                evidence: json!({
+                    "path": display,
+                    "mode": format!("{mode:04o}"),
+                    "want_mode": format!("{WANT_DB_MODE:04o}"),
+                }),
+                fix_hint: format!("chmod {WANT_DB_MODE:o} {display}"),
+                auto_repairable: true,
+            }]);
+        }
+        #[cfg(not(unix))]
+        {
+            Ok(Vec::new())
+        }
+    }
+
+    /// Narrowing-only, same rationale as `SecretsStorePermissions::repair`.
+    fn repair(&self, ctx: &DoctorCtx, finding: &Finding, apply: bool) -> Result<RepairOutcome> {
+        #[cfg(unix)]
+        {
+            let path = finding
+                .evidence
+                .get("path")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string();
+            let description = format!("chmod {WANT_DB_MODE:o} {path}");
+            if !apply {
+                return Ok(RepairOutcome::Planned { description });
+            }
+            use std::os::unix::fs::PermissionsExt;
+            let target = std::path::Path::new(&path);
+            let before = unix_perms::mode(target);
+            std::fs::set_permissions(target, std::fs::Permissions::from_mode(WANT_DB_MODE))
+                .with_context(|| format!("chmod {WANT_DB_MODE:o} {path}"))?;
+            let after = unix_perms::mode(target);
+            append_repair_journal(
+                &ctx.profile_dir,
+                self.id(),
+                "chmod-master-key-permissions",
+                json!({ "mode": before.map(|m| format!("{m:04o}")) }),
+                json!({ "mode": after.map(|m| format!("{m:04o}")) }),
+            )?;
+            Ok(RepairOutcome::Applied { description })
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = (ctx, finding, apply);
+            Ok(RepairOutcome::NotRepairable)
+        }
+    }
+}
+
 // ── self-heal circuit observability ─────────────────────────────────────
 //
 // Three read-only checks that make the self-heal circuit's health visible at
@@ -1985,6 +2090,106 @@ impl Check for HealQueueDepth {
             |row| row.get(0),
         )?;
         Ok(evaluate_heal_queue_depth(self.id(), pending, assigned))
+    }
+}
+
+// ── heal.escalated-unrepaired ────────────────────────────────────────────
+
+/// A single fault escalating for longer than this without repair is a warning.
+const ESCALATED_UNREPAIRED_WARN_SECS: i64 = 3600;
+/// …and longer than this is critical: nobody is acting on it.
+const ESCALATED_UNREPAIRED_CRITICAL_SECS: i64 = 6 * 3600;
+/// Below this many escalations a recurring-fault verdict isn't meaningful yet.
+const ESCALATED_UNREPAIRED_MIN_COUNT: i64 = 3;
+
+/// Threshold logic for [`HealEscalatedUnrepaired`], split out so it is testable
+/// without a database.
+///
+/// DEF-070: escalation is a hand-off, not a repair. A `(pattern_tag, guest_id)`
+/// pair that keeps escalating and never repairs is exactly the shape of the
+/// muninn outage — 919 rows over three days, every one of them "handled".
+/// Nothing surfaced it because escalated rows were stamped `resolved` and the
+/// only queue check counts `pending`.
+fn evaluate_heal_escalated_unrepaired(
+    check_id: &'static str,
+    worst: Option<(String, String, i64, i64)>,
+) -> Vec<Finding> {
+    let Some((pattern_tag, guest_id, count, span_secs)) = worst else {
+        return Vec::new();
+    };
+    if count < ESCALATED_UNREPAIRED_MIN_COUNT {
+        return Vec::new();
+    }
+    let severity = if span_secs > ESCALATED_UNREPAIRED_CRITICAL_SECS {
+        Severity::Critical
+    } else if span_secs > ESCALATED_UNREPAIRED_WARN_SECS {
+        Severity::Warning
+    } else {
+        return Vec::new();
+    };
+
+    let hours = span_secs as f64 / 3600.0;
+    vec![Finding {
+        check_id: check_id.to_string(),
+        severity,
+        message: format!(
+            "fault [{pattern_tag}] on [{guest_id}] has escalated {count} time(s) over {hours:.1}h \
+             and was never repaired — escalation is a hand-off, not a fix; either the escalation \
+             target is not acting (or is itself the failing component), or this pattern needs a \
+             repair action instead of an escalate action"
+        ),
+        evidence: json!({
+            "pattern_tag": pattern_tag,
+            "guest_id": guest_id,
+            "escalations": count,
+            "span_secs": span_secs,
+            "warn_above_secs": ESCALATED_UNREPAIRED_WARN_SECS,
+            "critical_above_secs": ESCALATED_UNREPAIRED_CRITICAL_SECS,
+        }),
+        fix_hint: "inspect with `phil heal list`; repair the underlying service, then give this \
+                   pattern a bounded repair action so it stops relying on a human noticing"
+            .to_string(),
+        auto_repairable: false,
+    }]
+}
+
+struct HealEscalatedUnrepaired;
+
+impl Check for HealEscalatedUnrepaired {
+    fn id(&self) -> &'static str {
+        "heal.escalated-unrepaired"
+    }
+
+    fn severity(&self) -> Severity {
+        Severity::Warning
+    }
+
+    fn detect(&self, ctx: &DoctorCtx) -> Result<Vec<Finding>> {
+        if let Some(findings) = missing_table_finding(ctx, self.id(), "heal_queue")? {
+            return Ok(findings);
+        }
+        // Worst offender only: one finding beats N near-identical ones, and the
+        // worst pair is the one an operator should look at first.
+        let worst = ctx
+            .conn
+            .query_row(
+                "SELECT COALESCE(pattern_tag, '(unclassified)'), guest_id, COUNT(*), \
+                        MAX(timestamp) - MIN(timestamp) \
+                 FROM heal_queue WHERE status = 'escalated' \
+                 GROUP BY pattern_tag, guest_id \
+                 ORDER BY COUNT(*) DESC LIMIT 1",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, i64>(3)?,
+                    ))
+                },
+            )
+            .optional()?;
+        Ok(evaluate_heal_escalated_unrepaired(self.id(), worst))
     }
 }
 
@@ -4234,6 +4439,42 @@ mod tests {
         ));
     }
 
+    // heal.escalated-unrepaired threshold logic (DEF-070).
+    #[test]
+    fn heal_escalated_unrepaired_thresholds_fire_by_span() {
+        let id = "heal.escalated-unrepaired";
+        let f = |count: i64, span: i64| {
+            evaluate_heal_escalated_unrepaired(
+                id,
+                Some((
+                    "service_probe_failed:muninn".into(),
+                    "host-health-scan".into(),
+                    count,
+                    span,
+                )),
+            )
+        };
+
+        // Nothing escalated at all → clean.
+        assert!(evaluate_heal_escalated_unrepaired(id, None).is_empty());
+        // A couple of escalations is not yet a recurring-fault verdict.
+        assert!(f(2, 10 * 3600).is_empty());
+        // Recurring but young (inside the warn window) → clean.
+        assert!(f(5, ESCALATED_UNREPAIRED_WARN_SECS).is_empty());
+        // Over warn → Warning; exactly at critical is still Warning.
+        assert!(only(
+            &[Severity::Warning],
+            &f(5, ESCALATED_UNREPAIRED_WARN_SECS + 1)
+        ));
+        assert!(only(
+            &[Severity::Warning],
+            &f(5, ESCALATED_UNREPAIRED_CRITICAL_SECS)
+        ));
+        // Over critical → Critical. This is the muninn shape: 919 escalations
+        // across three days, every one of them previously "resolved".
+        assert!(only(&[Severity::Critical], &f(919, 3 * 24 * 3600)));
+    }
+
     // heal.oldest-pending-age threshold logic.
     #[test]
     fn heal_oldest_pending_thresholds_fire_by_age() {
@@ -4345,6 +4586,7 @@ mod tests {
         let ctx = DoctorCtx::open_at("jane", path).expect("open ctx");
         for check in [
             Box::new(HealQueueDepth) as Box<dyn Check>,
+            Box::new(HealEscalatedUnrepaired) as Box<dyn Check>,
             Box::new(HealOldestPendingAge) as Box<dyn Check>,
         ] {
             let findings = check.detect(&ctx).expect("detect must not error");

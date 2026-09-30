@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - apple-fm-provider
+
+rectangle "apple-fm-provider" as apple_fm_provider #Orange {
+}
+
+
+@enduml

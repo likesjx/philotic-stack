@@ -303,7 +303,7 @@ impl<'a> CronInterpolationVars<'a> {
         let iso_timestamp = Utc
             .timestamp_millis_opt(timestamp_ms as i64)
             .single()
-            .unwrap_or_else(|| Utc::now())
+            .unwrap_or_else(Utc::now)
             .to_rfc3339();
         Self {
             timestamp_ms,
@@ -341,7 +341,7 @@ pub fn next_fire_after(schedule_str: &str, after_ms: u64) -> Result<u64> {
     let after_dt = Utc
         .timestamp_millis_opt(after_ms as i64)
         .single()
-        .unwrap_or_else(|| Utc::now());
+        .unwrap_or_else(Utc::now);
     let next = schedule
         .after(&after_dt)
         .next()

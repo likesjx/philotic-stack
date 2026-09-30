@@ -7,13 +7,13 @@ use data_memorygraphrag::projection;
 use data_memorygraphrag::zoning;
 use data_memorygraphrag::{
     AdjudicationStatus, ConflictHandoff, ContextPacket, EvidencePacket, FeedbackEdgeSpec,
-    GraphRecordRef, LifeCommitInput, LifeGraphToolRequest, LifeObserveBatchInput, LifeObserveInput,
-    LifePatchApplyInput, LifePatchListInput, LifePatchProposalInput, LifeRecallStatsInput,
-    LifeResolveInput, LifeViewNeighborhoodInput, LifeViewNodeInput, MAX_OBSERVE_BATCH,
-    MemoryGraphRagRunner, PatchApplyDecision, PatchGate, PatchKind, PatchRisk, PolicyFilter,
-    RankingWeights, ReliabilityBasis, RetrievalFeedbackInput, RetrievalFeedbackRating,
-    RetrievalQuery, RetrievalStrategy, RunnerConfig, RunnerPlanTarget, SemanticSpace, SourceKind,
-    SourceRef, SourceReliability, ValidationState, feedback_edge_specs,
+    GraphRecordRef, LifeCommitInput, LifeGraphToolRequest, LifeListInput, LifeObserveBatchInput,
+    LifeObserveInput, LifePatchApplyInput, LifePatchListInput, LifePatchProposalInput,
+    LifeRecallStatsInput, LifeResolveInput, LifeViewNeighborhoodInput, LifeViewNodeInput,
+    MAX_OBSERVE_BATCH, MemoryGraphRagRunner, PatchApplyDecision, PatchGate, PatchKind, PatchRisk,
+    PolicyFilter, RankingWeights, ReliabilityBasis, RetrievalFeedbackInput,
+    RetrievalFeedbackRating, RetrievalQuery, RetrievalStrategy, RunnerConfig, RunnerPlanTarget,
+    SemanticSpace, SourceKind, SourceRef, SourceReliability, ValidationState, feedback_edge_specs,
 };
 use datasource::controller::{
     CONTRACT_ERROR_MARKER, DatasourceProvider, DatasourceTask, ProviderOutput, TaskKind,
@@ -25,7 +25,7 @@ use neo4rs::{
 use serde_json::{Value, json};
 use std::collections::HashSet;
 use std::sync::Arc;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 /// Default minimum cosine similarity gate for the named recall strategies.
 ///
@@ -309,6 +309,7 @@ impl AutonomyGate for HotelAutonomyGate {
             action_summary: action_summary.to_string(),
             evidence: evidence.to_string(),
             reversal_hint: reversal_hint.to_string(),
+            filing: false,
         })
         .await?;
         Ok(AutonomyDecision::from_response_data(&data))
@@ -372,6 +373,60 @@ fn plan_bridge_action(decision: &AutonomyDecision) -> BridgeAction {
 /// queued and the batch stalled until the 93s WaitingTool watchdog evicted it.
 static LIFE_GRAPH_POOL: tokio::sync::OnceCell<Graph> = tokio::sync::OnceCell::const_new();
 
+/// Per-query bound on a single Memgraph round trip.
+///
+/// neo4rs 0.9 exposes NO timeout on `ConfigBuilder` (only `fetch_size` and
+/// `max_connections`), so a query that never comes back is an unbounded await
+/// by default — the same failure class already fixed for the embed sidecar.
+/// Memgraph's own `query_execution_timeout_sec=600` is no help here: it is
+/// 6.7x the caller's 90s watchdog, so the caller always gives up first and the
+/// server-side limit never protects anyone.
+///
+/// Sized so `OBSERVE_BATCH_BUDGET_SECS` can absorb several slow queries and
+/// still return a useful partial result rather than surrendering the whole
+/// budget to one of them. See `datasource::runtime::PROVIDER_INVOKE_TIMEOUT_SECS`
+/// for the full deadline chain.
+const MEMGRAPH_QUERY_TIMEOUT_SECS: u64 = 15;
+
+/// Bound one Memgraph round trip, naming the site so a timeout says WHICH
+/// query hung rather than just that something did.
+///
+/// Note this bounds the round trip that dispatches the query; streaming further
+/// rows is bounded in turn by the batch budget and the provider-invoke deadline
+/// above it.
+async fn bounded_query<F, T>(what: &str, fut: F) -> Result<T>
+where
+    F: std::future::Future<Output = std::result::Result<T, neo4rs::Error>>,
+{
+    match tokio::time::timeout(
+        std::time::Duration::from_secs(MEMGRAPH_QUERY_TIMEOUT_SECS),
+        fut,
+    )
+    .await
+    {
+        Ok(Ok(value)) => Ok(value),
+        Ok(Err(err)) => Err(err.into()),
+        Err(_) => Err(anyhow::anyhow!(
+            "Memgraph query '{what}' exceeded the {MEMGRAPH_QUERY_TIMEOUT_SECS}s client deadline \
+             (server-side query_execution_timeout_sec is far larger and would not have fired)"
+        )),
+    }
+}
+
+/// Wall-clock budget for one `life.observe.batch`, deliberately smaller than
+/// philote's 90s `WAITING_TOOL_SECS` watchdog (`crates/philote/src/turn_loop.rs`).
+///
+/// The runner cannot see the caller's deadline and nothing cancels an in-flight
+/// batch when that deadline fires, so without a self-imposed budget a slow batch
+/// keeps writing durably long after the turn waiting on it was evicted — the
+/// caller is told the turn died while the graph quietly changes underneath it.
+/// The ~30s of headroom covers mesh transport plus philote-side processing on
+/// the cross-hotel path, so the response still lands inside the caller's window.
+///
+/// Keep this BELOW `WAITING_TOOL_SECS`; raising it past that reintroduces
+/// exactly the orphaned-write window it exists to close.
+const OBSERVE_BATCH_BUDGET_SECS: u64 = 60;
+
 /// Soft, non-error result for an advisory `life.recall.feedback` call that
 /// could not be recorded (bad params or contract-invalid rating). Returned as a
 /// normal `ProviderOutput` (not an `Err`) so the turn loop does NOT treat it as
@@ -420,10 +475,10 @@ impl LifeGraphProvider {
             .user(self.config.user.as_str())
             .password(self.config.password.as_str());
 
-        if let Ok(db) = std::env::var("PHILOTIC_MEMGRAPH_DB") {
-            if !db.is_empty() {
-                builder = builder.db(db.as_str());
-            }
+        if let Ok(db) = std::env::var("PHILOTIC_MEMGRAPH_DB")
+            && !db.is_empty()
+        {
+            builder = builder.db(db.as_str());
         }
 
         Ok(Graph::connect(builder.build()?)?)
@@ -431,7 +486,7 @@ impl LifeGraphProvider {
 
     async fn execute_cypher(&self, cypher: &str) -> Result<Value> {
         let graph = self.connect().await?;
-        let mut rows = graph.execute(query(cypher)).await?;
+        let mut rows = bounded_query("execute_cypher", graph.execute(query(cypher))).await?;
         let mut output = Vec::new();
         while let Some(row) = rows.next().await? {
             output.push(row_to_json(&row)?);
@@ -442,7 +497,11 @@ impl LifeGraphProvider {
     /// Execute a vector-search query with the embedding bound as `$vec`.
     async fn execute_cypher_with_vec(&self, cypher: &str, vec_param: Vec<f64>) -> Result<Value> {
         let graph = self.connect().await?;
-        let mut rows = graph.execute(query(cypher).param("vec", vec_param)).await?;
+        let mut rows = bounded_query(
+            "vector_query",
+            graph.execute(query(cypher).param("vec", vec_param)),
+        )
+        .await?;
         let mut output = Vec::new();
         while let Some(row) = rows.next().await? {
             output.push(row_to_json(&row)?);
@@ -455,6 +514,141 @@ impl LifeGraphProvider {
     /// `data_memorygraphrag::hygiene` for the pure planning logic; this just
     /// wires it to the shared connection pool. Called from the runner's
     /// internal timer (`main.rs`) — never on the request path.
+    /// Load the runtime ontology extensions (governed self-serve vocabulary).
+    /// Single-node read; absence or parse failure degrades to empty — the
+    /// compiled core vocabulary always works.
+    pub async fn load_ontology_extensions(
+        &self,
+    ) -> data_memorygraphrag::ontology::OntologyExtensions {
+        let Ok(graph) = self.connect().await else {
+            return Default::default();
+        };
+        let Ok(mut rows) = graph
+            .execute(query(
+                "MATCH (n:OntologyExtension {id: 'ontology:extensions'}) \
+                 RETURN n.extensions_json AS extensions_json",
+            ))
+            .await
+        else {
+            return Default::default();
+        };
+        match rows.next().await {
+            Ok(Some(row)) => {
+                let raw: String = row.get("extensions_json").unwrap_or_default();
+                serde_json::from_str(&raw).unwrap_or_default()
+            }
+            _ => Default::default(),
+        }
+    }
+
+    /// Persist the merged extension set (bumps version, stamps updated_at).
+    async fn persist_ontology_extensions(
+        &self,
+        ext: &data_memorygraphrag::ontology::OntologyExtensions,
+    ) -> Result<()> {
+        let graph = self.connect().await?;
+        let json = serde_json::to_string(ext)?;
+        let now = chrono::Utc::now().to_rfc3339();
+        let mut rows = graph
+            .execute(
+                query(
+                    "MERGE (n:OntologyExtension {id: 'ontology:extensions'}) \
+                     SET n.extensions_json = $json, \
+                     n.version = coalesce(n.version, 0) + 1, \
+                     n.updated_at = $now \
+                     RETURN n.version AS version",
+                )
+                .param("json", json.as_str())
+                .param("now", now.as_str()),
+            )
+            .await?;
+        let _ = rows.next().await?;
+        Ok(())
+    }
+
+    /// Create the vector index for each extension label. Labels passed here
+    /// have already passed `valid_extension_label_name`, and spaces are from
+    /// the closed prefix set — safe to interpolate. An already-existing
+    /// index is tolerated (re-apply / re-merge).
+    async fn create_extension_indexes(
+        &self,
+        labels: &[data_memorygraphrag::ontology::ExtensionLabel],
+    ) -> Vec<String> {
+        let mut created = Vec::new();
+        let Ok(graph) = self.connect().await else {
+            return created;
+        };
+        for label in labels {
+            let index_name = format!("{}__{}", label.space, label.name);
+            let cypher = format!(
+                "CREATE VECTOR INDEX {index_name} ON :{name}(embedding) WITH CONFIG \
+                 {{\"dimension\": {dims}, \"capacity\": 10000, \"metric\": \"cos\"}}",
+                name = label.name,
+                dims = LIFE_GRAPH_EMBEDDING_DIMS,
+            );
+            match graph.execute(query(&cypher)).await {
+                Ok(mut rows) => {
+                    let _ = rows.next().await;
+                    created.push(index_name);
+                }
+                Err(e) => {
+                    let msg = e.to_string();
+                    if msg.contains("already exists") {
+                        created.push(index_name);
+                    } else {
+                        warn!(index = index_name.as_str(), error = %msg,
+                              "extension index creation failed");
+                    }
+                }
+            }
+        }
+        created
+    }
+
+    /// One heartbeat tick of the reminders sensor (hotel-managed, see
+    /// `data_memorygraphrag::heartbeat`): select due un-dispatched nodes,
+    /// stamp them, return the pre-formatted delivery message — or None on a
+    /// quiet tick. Stamp-then-emit: at-most-once by construction; a lost
+    /// emit is caught by the daily-brief safety net, never duplicated.
+    pub async fn heartbeat_reminders_tick(&self, window_secs: u64) -> Result<Option<String>> {
+        use data_memorygraphrag::heartbeat;
+        let now = chrono::Utc::now();
+        let result = self
+            .execute_cypher(&heartbeat::due_reminders_cypher(now, window_secs))
+            .await?;
+        let rows = result
+            .get("rows")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        if rows.is_empty() {
+            return Ok(None);
+        }
+        let tz = heartbeat::operator_tz();
+        let mut ids = Vec::new();
+        let mut lines = Vec::new();
+        for row in &rows {
+            let id = row.get("id").and_then(Value::as_str).unwrap_or("");
+            if id.is_empty() {
+                continue;
+            }
+            let due = row.get("due_at").and_then(Value::as_str).unwrap_or("");
+            let claim = row.get("claim").and_then(Value::as_str).unwrap_or("");
+            ids.push(id.to_string());
+            lines.push(heartbeat::format_reminder_line(claim, due, id, &tz));
+        }
+        if ids.is_empty() {
+            return Ok(None);
+        }
+        self.execute_cypher(&heartbeat::stamp_cypher(&ids, now))
+            .await?;
+        info!(
+            reminders = ids.len(),
+            "heartbeat: reminders selected, stamped, handing to delivery"
+        );
+        Ok(Some(heartbeat::dispatch_message(&lines)))
+    }
+
     pub async fn hygiene_sweep(&self) -> Result<data_memorygraphrag::hygiene::SweepSummary> {
         let graph = self.connect().await?;
         data_memorygraphrag::hygiene::sweep(&graph).await
@@ -485,7 +679,19 @@ impl DatasourceProvider for LifeGraphProvider {
             "life.patch.list" => self.handle_patch_list(task).await,
             "life.recall.stats" => self.handle_recall_stats(task).await,
             "life.view.node" => self.handle_view_node(task).await,
+            "life.node.edit" => self.handle_node_edit(task).await,
             "life.view.neighborhood" => self.handle_view_neighborhood(task).await,
+            "life.list" => self.handle_list(task).await,
+            "life.audit" => self.handle_audit(task).await,
+            "life.tidy" => self.handle_tidy(task).await,
+            "life.ontology" => {
+                let ext = self.load_ontology_extensions().await;
+                Ok(ProviderOutput::ResultSet(json!({
+                    "status": "ok",
+                    "read_only": true,
+                    "ontology": data_memorygraphrag::ontology::ontology_document_with(&ext),
+                })))
+            }
             other => {
                 warn!(tool = other, "life.* tool not yet implemented in runner");
                 Ok(ProviderOutput::ResultSet(json!({
@@ -498,10 +704,10 @@ impl DatasourceProvider for LifeGraphProvider {
         // change_notification that the datasource runtime fans out to the
         // configured observer role (which philotic-web turns into retained
         // LifeGraphChange frames for enrolled edge devices).
-        if let ProviderOutput::ResultSet(data) = &mut output {
-            if let Some(change) = change_notification_for(task.kind.as_str(), data) {
-                data["change_notification"] = change;
-            }
+        if let ProviderOutput::ResultSet(data) = &mut output
+            && let Some(change) = change_notification_for(task.kind.as_str(), data)
+        {
+            data["change_notification"] = change;
         }
         Ok(output)
     }
@@ -529,7 +735,9 @@ fn change_notification_for(kind: &str, data: &Value) -> Option<Value> {
     }
     let change_kind = match kind {
         "life.observe" => "observed",
+        "life.tidy" => "tidied",
         "life.commit" => "committed",
+        "life.node.edit" => "edited",
         "life.resolve" | "life.conflict.resolve" => "resolved",
         "life.conflict" | "life.conflict.handle" => "conflict_opened",
         "life.patch.propose" => "patch_proposed",
@@ -542,7 +750,7 @@ fn change_notification_for(kind: &str, data: &Value) -> Option<Value> {
         .unwrap_or_default();
     let succeeded = matches!(
         status,
-        "proposed" | "committed" | "resolved" | "applied" | "awaiting_operator"
+        "proposed" | "committed" | "resolved" | "applied" | "awaiting_operator" | "saved"
     ) || (change_kind == "conflict_opened" && status == "open");
     if !succeeded {
         return None;
@@ -604,9 +812,11 @@ impl LifeGraphProvider {
         // before plan/validate, which require non-empty ids.
         input.normalize_defaults();
 
+        // Runtime ontology extensions are full vocabulary on the write path.
+        let ext = self.load_ontology_extensions().await;
         let plan = self
             .runner
-            .plan(LifeGraphToolRequest::LifeObserve(input.clone()))
+            .plan_with_extensions(LifeGraphToolRequest::LifeObserve(input.clone()), &ext)
             .map_err(|e| {
                 anyhow::anyhow!("{CONTRACT_ERROR_MARKER} life.observe plan validation failed: {e}")
             })?;
@@ -619,16 +829,60 @@ impl LifeGraphProvider {
         }
 
         let now = chrono::Utc::now().to_rfc3339();
-        let compiled = cypher::compile_observe(&input, &now).map_err(|e| {
-            anyhow::anyhow!("{CONTRACT_ERROR_MARKER} Cypher compilation failed: {e}")
-        })?;
+        let compiled =
+            cypher::compile_observe_with_extensions(&input, &now, &ext).map_err(|e| {
+                anyhow::anyhow!("{CONTRACT_ERROR_MARKER} Cypher compilation failed: {e}")
+            })?;
         // Compile edges up-front so an unknown rel_type rejects the request
         // before any node write happens.
-        let compiled_edges = cypher::compile_observe_edges(&input).map_err(|e| {
-            anyhow::anyhow!("{CONTRACT_ERROR_MARKER} edge Cypher compilation failed: {e}")
-        })?;
+        let compiled_edges =
+            cypher::compile_observe_edges_with_extensions(&input, &ext).map_err(|e| {
+                anyhow::anyhow!("{CONTRACT_ERROR_MARKER} edge Cypher compilation failed: {e}")
+            })?;
 
         let graph = self.connect().await?;
+
+        // Write-time duplicate guard: a claim a live node already carries is
+        // refused under a NEW id (re-observing the SAME id is the update path
+        // and never blocked). Live 2026-09-16/17: five Events for one evening
+        // of practice, a misheard "Jackson's Drop-off Routine" beside the
+        // corrected "Daxton's", and a second bills item written while the
+        // operator was saying it already existed (DEF-158).
+        let lived = data_memorygraphrag::hygiene::guard_applies_to_label(&compiled.label);
+        if !lived {
+            debug!(
+                label = %compiled.label,
+                "life.observe: duplicate guard and bridging skipped for system telemetry label"
+            );
+        }
+        let duplicate_candidates = if input.force_new || !lived {
+            Vec::new()
+        } else {
+            self.observe_duplicate_candidates(
+                &graph,
+                &compiled.label,
+                &compiled.node_id,
+                &compiled.claim_summary,
+            )
+            .await
+            .unwrap_or_default()
+        };
+        if let Some(block) = duplicate_candidates
+            .first()
+            .filter(|h| h.similarity >= data_memorygraphrag::hygiene::GUARD_BLOCK_OVERLAP)
+        {
+            anyhow::bail!(
+                "{CONTRACT_ERROR_MARKER} life.observe refused: a live {} already carries this claim \
+                 ({}, {} {:.2}, state {}). NOTHING was written. Observe against that id to update it, \
+                 resolve/retire it if it is finished, or resend with force_new: true only if this is \
+                 genuinely a different thing.",
+                compiled.label,
+                block.id,
+                block.basis,
+                block.similarity,
+                block.validation_state
+            );
+        }
 
         let q = query(&compiled.query)
             .param("id", compiled.node_id.as_str())
@@ -658,15 +912,35 @@ impl LifeGraphProvider {
             .param(
                 "provenance_envelope",
                 compiled.provenance_envelope_json.as_deref().unwrap_or(""),
+            )
+            // Structured temporal fields (ontology DATE_PROPERTIES); empty
+            // sentinel preserves any existing value on re-observe.
+            .param("due_at", compiled.due_at.as_deref().unwrap_or(""))
+            .param("starts_at", compiled.starts_at.as_deref().unwrap_or(""))
+            .param("occurs_at", compiled.occurs_at.as_deref().unwrap_or(""))
+            .param("ends_at", compiled.ends_at.as_deref().unwrap_or(""))
+            // Reflexive Life Graph R1: typed properties, already validated
+            // against the ontology at plan time, merged as a map.
+            .param(
+                "properties",
+                BoltType::Map(json_scalar_map_to_bolt(&compiled.properties)),
             );
 
-        let mut rows = graph.execute(q).await?;
+        let mut rows = bounded_query("observe_node_write", graph.execute(q)).await?;
         let first_row = rows.next().await?;
 
         let node_id = first_row
             .as_ref()
             .and_then(|r| r.get::<String>("id").ok())
             .unwrap_or_else(|| compiled.node_id.clone());
+        // False only when the node already existed as confirmed/retired and
+        // kept its summary (the observation is retained as
+        // `last_observed_summary`); the caller must not report the new text
+        // as recorded in that case.
+        let summary_updated = first_row
+            .as_ref()
+            .and_then(|r| r.get::<bool>("summary_updated").ok())
+            .unwrap_or(true);
 
         info!(
             node_id = %node_id,
@@ -674,6 +948,7 @@ impl LifeGraphProvider {
             observation_id = %compiled.observation_id,
             packet_id = %compiled.packet_id,
             observed_by = %compiled.observed_by,
+            summary_updated,
             "life.observe: proposed evidence node written to Memgraph"
         );
 
@@ -688,7 +963,8 @@ impl LifeGraphProvider {
                 .param("created_at", now.as_str())
                 .param("observation_id", compiled.observation_id.as_str())
                 .param("observed_by", compiled.observed_by.as_str());
-            let status = match graph.execute(edge_query).await {
+            let status = match bounded_query("observe_edge_merge", graph.execute(edge_query)).await
+            {
                 Ok(mut rows) => match rows.next().await {
                     Ok(Some(_)) => "written",
                     Ok(None) => {
@@ -762,7 +1038,7 @@ impl LifeGraphProvider {
             },
         };
 
-        Ok(ProviderOutput::ResultSet(json!({
+        let mut out = json!({
             "status": "proposed",
             "node_id": node_id,
             "label": compiled.label,
@@ -774,8 +1050,217 @@ impl LifeGraphProvider {
             "origin_engram_id": compiled.origin_engram_id,
             "origin_trust": compiled.origin_trust,
             "embed_status": embed_status,
+            "summary_updated": summary_updated,
+            "summary_note": if summary_updated { Value::Null } else {
+                Value::String("node is confirmed/retired: claim_summary kept, this observation stored as last_observed_summary — use life.commit to rewrite confirmed truth".into())
+            },
             "edges": edge_reports,
-        })))
+        });
+        // Bridge the new claim to what it names: the ontology's validated
+        // pairs are written now (Event INVOLVES Person, OpenLoop ABOUT
+        // Subscription, Routine OCCURS_AT Place), anything else is reported
+        // for the turn or the sweep to decide. Live 2026-09-17 a drop-off
+        // Event sat with no edge to Daxton until the operator asked for one
+        // by hand (DEF-160).
+        let (bridged, suggested) = if lived {
+            self.bridge_new_node(&graph, &compiled, &input, &now)
+                .await
+                .unwrap_or_default()
+        } else {
+            (Vec::new(), Vec::new())
+        };
+        if !bridged.is_empty() {
+            out["bridged_edges"] = json!(bridged);
+        }
+        if !suggested.is_empty() {
+            out["suggested_edges"] = json!(suggested);
+            out["suggested_edges_note"] = json!(
+                "These live nodes are named in the claim but the ontology has no validated edge for \
+                 the pair. Add the right one with life.observe edges (or life.tidy link) if the \
+                 connection is real."
+            );
+        }
+
+        // Not a block, but close enough that leaving both is how the graph
+        // grew five records for one evening: name them so the turn can
+        // consolidate now (life.tidy retire_duplicate) instead of the sweep
+        // finding them tomorrow.
+        if !duplicate_candidates.is_empty() {
+            out["duplicate_candidates"] = json!(
+                duplicate_candidates
+                    .iter()
+                    .map(|h| json!({
+                        "id": h.id,
+                        "similarity": h.similarity,
+                        "basis": h.basis,
+                        "validation_state": h.validation_state,
+                    }))
+                    .collect::<Vec<_>>()
+            );
+            out["duplicate_note"] = json!(
+                "A live node of this label already says something very close. If it is the same \
+                 thing, consolidate now: life.tidy retire_duplicate (proposed/inferred only), or \
+                 life.commit/life.resolve the one that is true."
+            );
+        }
+        Ok(ProviderOutput::ResultSet(out))
+    }
+
+    /// Labels a claim can name: the nouns of the operator's life. Loops and
+    /// events are deliberately absent — they are the claims, not the things
+    /// claims are about.
+    const BRIDGE_TARGET_LABELS: &'static [&'static str] = &[
+        "Person",
+        "Place",
+        "CreativeWork",
+        "Asset",
+        "Subscription",
+        "Trip",
+        "Project",
+        "Goal",
+    ];
+
+    /// Write the validated edges a new claim earns and report the rest.
+    /// Returns `(written, suggested)` for the observe result.
+    async fn bridge_new_node(
+        &self,
+        graph: &Graph,
+        compiled: &cypher::ObserveCypher,
+        input: &LifeObserveInput,
+        now: &str,
+    ) -> Result<(Vec<Value>, Vec<Value>)> {
+        if compiled.claim_summary.trim().is_empty() {
+            return Ok((Vec::new(), Vec::new()));
+        }
+        let labels = Self::BRIDGE_TARGET_LABELS
+            .iter()
+            .map(|l| format!("'{l}'"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let cypher = format!(
+            "MATCH (n) WHERE n.id IS NOT NULL AND head(labels(n)) IN [{labels}]              AND coalesce(n.validation_state, 'proposed') <> 'retired'              RETURN n.id AS id, head(labels(n)) AS label, n.title AS title LIMIT 800"
+        );
+        let mut rows =
+            bounded_query("observe_bridge_targets", graph.execute(query(&cypher))).await?;
+        let mut targets: Vec<data_memorygraphrag::bridging::BridgeTarget> = Vec::new();
+        while let Some(row) = rows.next().await? {
+            let (Ok(id), Ok(label)) = (row.get::<String>("id"), row.get::<String>("label")) else {
+                continue;
+            };
+            targets.push(data_memorygraphrag::bridging::BridgeTarget {
+                id,
+                label,
+                title: row.get::<String>("title").ok(),
+            });
+        }
+        let already: Vec<&str> = input.edges.iter().map(|e| e.target_id.as_str()).collect();
+        let edges = data_memorygraphrag::bridging::bridges_for(
+            &compiled.label,
+            &compiled.node_id,
+            &compiled.claim_summary,
+            &targets,
+            6,
+        );
+        let mut written = Vec::new();
+        let mut suggested = Vec::new();
+        for edge in edges {
+            if already.contains(&edge.target_id.as_str()) {
+                continue;
+            }
+            let entry = json!({
+                "target_id": edge.target_id,
+                "target_label": edge.target_label,
+                "rel_type": edge.rel_type,
+                "matched": edge.matched,
+            });
+            if !edge.validated {
+                suggested.push(entry);
+                continue;
+            }
+            let merge = format!(
+                "MATCH (n {{id: $id}}), (m {{id: $target}}) MERGE (n)-[r:{}]->(m)                  ON CREATE SET r.bridged_at = $now, r.bridged_by = 'lifegraph.bridging',                  r.bridge_match = $matched RETURN type(r) AS rel_type",
+                edge.rel_type
+            );
+            match bounded_query(
+                "observe_bridge_write",
+                graph.execute(
+                    query(&merge)
+                        .param("id", compiled.node_id.as_str())
+                        .param("target", edge.target_id.as_str())
+                        .param("now", now)
+                        .param("matched", edge.matched.as_str()),
+                ),
+            )
+            .await
+            {
+                Ok(mut r) => match r.next().await {
+                    Ok(Some(_)) => written.push(entry),
+                    _ => suggested.push(entry),
+                },
+                Err(e) => {
+                    warn!(target_id = %edge.target_id, "bridge edge MERGE failed: {e}");
+                    suggested.push(entry);
+                }
+            }
+        }
+        Ok((written, suggested))
+    }
+
+    /// Live nodes of the same label whose claim already covers `summary`,
+    /// strongest first. Empty when the node id already exists (re-observing
+    /// the same id is an update, never a duplicate) or when nothing is close
+    /// enough to mention (DEF-158).
+    async fn observe_duplicate_candidates(
+        &self,
+        graph: &Graph,
+        label: &str,
+        node_id: &str,
+        summary: &str,
+    ) -> Result<Vec<data_memorygraphrag::hygiene::DuplicateGuardHit>> {
+        if summary.trim().is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut existing = bounded_query(
+            "observe_guard_exists",
+            graph.execute(
+                query("MATCH (n) WHERE n.id = $id RETURN count(n) AS c").param("id", node_id),
+            ),
+        )
+        .await?;
+        if let Some(row) = existing.next().await?
+            && row.get::<i64>("c").unwrap_or(0) > 0
+        {
+            return Ok(Vec::new());
+        }
+        let cypher = format!(
+            "MATCH (n:{label}) WHERE n.id <> $id AND n.claim_summary IS NOT NULL              AND coalesce(n.validation_state, 'proposed') <> 'retired'              RETURN n.id AS id, n.claim_summary AS claim_summary,              coalesce(n.validation_state, 'proposed') AS validation_state,              n.observed_at AS observed_at LIMIT 500"
+        );
+        let mut rows = bounded_query(
+            "observe_guard_candidates",
+            graph.execute(query(&cypher).param("id", node_id)),
+        )
+        .await?;
+        let mut candidates: Vec<data_memorygraphrag::hygiene::DuplicateCandidate> = Vec::new();
+        while let Some(row) = rows.next().await? {
+            let Ok(id) = row.get::<String>("id") else {
+                continue;
+            };
+            let Ok(claim_summary) = row.get::<String>("claim_summary") else {
+                continue;
+            };
+            candidates.push(data_memorygraphrag::hygiene::DuplicateCandidate {
+                id,
+                claim_summary,
+                observed_at: row.get::<String>("observed_at").ok(),
+                validation_state: row
+                    .get::<String>("validation_state")
+                    .unwrap_or_else(|_| "proposed".into()),
+            });
+        }
+        Ok(data_memorygraphrag::hygiene::duplicate_guard_candidates(
+            summary,
+            &candidates,
+        ))
     }
 
     /// Write an embedding vector onto a freshly-observed node. Extracted from
@@ -885,13 +1370,21 @@ impl LifeGraphProvider {
     /// durably; a failing item is reported in its result row and never rolls
     /// back or aborts the rest of the batch.
     async fn handle_observe_batch(&self, task: &DatasourceTask) -> Result<ProviderOutput> {
-        let input: LifeObserveBatchInput = serde_json::from_value(task.parameters.clone())
+        let mut input: LifeObserveBatchInput = serde_json::from_value(task.parameters.clone())
             .map_err(|e| {
                 anyhow::anyhow!(
                     "{CONTRACT_ERROR_MARKER} failed to parse life.observe.batch parameters \
                      as LifeObserveBatchInput: {e}"
                 )
             })?;
+        // Every item is a full life.observe input, so it gets the same courtesy
+        // the single call gets: synthesize the ids a model-authored payload
+        // omits, before plan/validate demand them. Live 2026-09-17 09:16 and
+        // 09:18 EDT both batches were rejected wholesale for an empty
+        // packet_id and cost a retry model call each (DEF-165).
+        for observation in input.observations.iter_mut() {
+            observation.normalize_defaults();
+        }
         if input.observations.is_empty() {
             return Ok(ProviderOutput::ResultSet(json!({
                 "status": "invalid_request",
@@ -913,41 +1406,102 @@ impl LifeGraphProvider {
 
         let requested = input.observations.len();
 
-        // One shared sidecar round trip for the whole batch
+        // ── Plan phase ───────────────────────────────────────────────────────
+        // Validate EVERY item before writing ANY of them. Each item's plan gate
+        // used to run lazily inside the write loop, so a batch whose last item
+        // was contract-invalid had already written the earlier ones by the time
+        // anyone noticed — the caller learned about a structural mistake only
+        // after it had half-landed. Planning first means the rejection set is
+        // known up front and reported whole, and the shared embed round trip
+        // below is not spent on items that were never going to be written.
+        //
+        // This deliberately does NOT become all-or-nothing: valid items still
+        // write. Per-item durability is the documented contract, and the
+        // `life.steward` skill prompt tells the model "partial failure never
+        // rolls anything back, so never report a rollback" — rejecting the whole
+        // batch here would contradict the instructions the model is acting on.
+        let mut rejected: Vec<Value> = Vec::new();
+        let mut planned_ok: Vec<(usize, LifeObserveInput)> = Vec::with_capacity(requested);
+        let ext = self.load_ontology_extensions().await;
+        for (index, observation) in input.observations.into_iter().enumerate() {
+            match self
+                .runner
+                .plan_with_extensions(LifeGraphToolRequest::LifeObserve(observation.clone()), &ext)
+            {
+                Ok(plan) if !plan.allowed() => rejected.push(json!({
+                    "index": index,
+                    "observation_id": observation.observation_id,
+                    "reason": "blocked",
+                    "detail": plan.blocked_reasons,
+                })),
+                Ok(_) => planned_ok.push((index, observation)),
+                Err(err) => rejected.push(json!({
+                    "index": index,
+                    "observation_id": observation.observation_id,
+                    "reason": "contract_invalid",
+                    "detail": err.to_string(),
+                })),
+            }
+        }
+
+        // One shared sidecar round trip for the surviving items
         // (lifegraph-batch-observe-embeds seam). The embed source is exactly
         // what the single-item path embeds: evidence.claim_summary. Failure
         // modes degrade per-item: Ok(None) = old sidecar without the batch
         // route, Err = sidecar down — both fall back to the per-item
         // embed_text call inside handle_observe (which fails fast under the
         // shared circuit breaker when the sidecar is genuinely down).
-        let embed_sources: Vec<String> = input
-            .observations
+        // Indexed by POSITION IN `planned_ok`, not by original batch index.
+        let embed_sources: Vec<String> = planned_ok
             .iter()
-            .map(|observation| observation.evidence.claim_summary.clone())
+            .map(|(_, observation)| observation.evidence.claim_summary.clone())
             .collect();
-        let mut precomputed_embeddings: Vec<Option<(Vec<f32>, String)>> = match embed_texts_batch(
-            &embed_sources,
-        )
-        .await
+        let mut precomputed_embeddings: Vec<Option<(Vec<f32>, String)>> = if embed_sources
+            .is_empty()
         {
-            Ok(Some(vectors)) => vectors.into_iter().map(Some).collect(),
-            Ok(None) => {
-                info!(
-                    "life.observe.batch: sidecar has no batch endpoint — falling back to per-item embeds"
-                );
-                vec![None; requested]
-            }
-            Err(e) => {
-                warn!("life.observe.batch: batch embed failed ({e:#}) — per-item fallback");
-                vec![None; requested]
+            Vec::new()
+        } else {
+            match embed_texts_batch(&embed_sources).await {
+                Ok(Some(vectors)) => vectors.into_iter().map(Some).collect(),
+                Ok(None) => {
+                    info!(
+                        "life.observe.batch: sidecar has no batch endpoint — falling back to per-item embeds"
+                    );
+                    vec![None; planned_ok.len()]
+                }
+                Err(e) => {
+                    warn!("life.observe.batch: batch embed failed ({e:#}) — per-item fallback");
+                    vec![None; planned_ok.len()]
+                }
             }
         };
 
-        let mut results = Vec::with_capacity(requested);
+        // ── Write phase (wall-clock bounded) ─────────────────────────────────
+        // The caller's watchdog (philote's 90s `WAITING_TOOL_SECS`) cannot see
+        // inside this loop, and nothing cancels the runner when it fires, so an
+        // unbounded batch can outlive the very turn waiting on it — writing
+        // durably while the caller was already told the turn died. Self-limiting
+        // keeps the batch inside the caller's budget by construction: whatever
+        // is still unwritten when the budget runs out is reported as
+        // `not_attempted` for the caller to re-send, never silently dropped.
+        let deadline =
+            std::time::Instant::now() + std::time::Duration::from_secs(OBSERVE_BATCH_BUDGET_SECS);
+        let mut results = Vec::with_capacity(planned_ok.len());
         let mut succeeded = 0usize;
-        let mut failed = 0usize;
+        let mut write_failed = 0usize;
+        let mut not_attempted: Vec<Value> = Vec::new();
         let mut first_node_id: Option<String> = None;
-        for (index, observation) in input.observations.into_iter().enumerate() {
+        let mut budget_exhausted = false;
+
+        for (slot, (index, observation)) in planned_ok.into_iter().enumerate() {
+            if budget_exhausted || std::time::Instant::now() >= deadline {
+                budget_exhausted = true;
+                not_attempted.push(json!({
+                    "index": index,
+                    "observation_id": observation.observation_id,
+                }));
+                continue;
+            }
             let item_task = DatasourceTask {
                 kind: TaskKind::Custom("life.observe".into()),
                 provider: task.provider.clone(),
@@ -957,7 +1511,7 @@ impl LifeGraphProvider {
                 parameters: serde_json::to_value(&observation)?,
                 identity: task.identity.clone(),
             };
-            let precomputed = precomputed_embeddings.get_mut(index).and_then(Option::take);
+            let precomputed = precomputed_embeddings.get_mut(slot).and_then(Option::take);
             let item_result = match self
                 .handle_observe_with_embedding(&item_task, precomputed)
                 .await
@@ -979,21 +1533,63 @@ impl LifeGraphProvider {
                         .map(str::to_string);
                 }
             } else {
-                failed += 1;
+                write_failed += 1;
             }
             results.push(json!({ "index": index, "result": item_result }));
         }
 
-        let status = if failed == 0 {
+        // Plan-phase rejections count as batch failures alongside any item that
+        // passed planning but failed at write time. `failed` keeps its original
+        // meaning for existing callers: everything that did not land.
+        let failed = write_failed + rejected.len();
+
+        let status = if failed == 0 && not_attempted.is_empty() {
             "ok"
         } else if succeeded > 0 {
             "partial"
         } else {
             "failed"
         };
+
+        // ── Evaluation ───────────────────────────────────────────────────────
+        // An actionable summary, so the caller does not have to reduce N result
+        // rows to work out what to do next. The three outcomes need genuinely
+        // different responses: `rejected` items must be FIXED before re-sending,
+        // `not_attempted` items can be re-sent AS-IS, and anything that landed
+        // is durable and must NOT be re-sent.
+        let mut next_action = Vec::new();
+        if !rejected.is_empty() {
+            next_action.push(format!(
+                "{} item(s) failed validation and were never written — fix the payload \
+                 (see evaluation.rejected[].detail) and re-send only those",
+                rejected.len()
+            ));
+        }
+        if !not_attempted.is_empty() {
+            next_action.push(format!(
+                "{} item(s) were not attempted because the {OBSERVE_BATCH_BUDGET_SECS}s batch \
+                 budget ran out — re-send exactly those, unchanged, in a new call",
+                not_attempted.len()
+            ));
+        }
+        if write_failed > 0 {
+            next_action.push(format!(
+                "{write_failed} item(s) passed validation but failed at write time — inspect \
+                 results[].result.error before retrying"
+            ));
+        }
+        if next_action.is_empty() {
+            next_action.push("all observations landed durably — do not re-send them".into());
+        }
+
         info!(
             requested,
-            succeeded, failed, "life.observe.batch: bulk observation write completed"
+            succeeded,
+            failed,
+            rejected = rejected.len(),
+            not_attempted = not_attempted.len(),
+            budget_exhausted,
+            "life.observe.batch: bulk observation write completed"
         );
         Ok(ProviderOutput::ResultSet(json!({
             "status": status,
@@ -1002,13 +1598,40 @@ impl LifeGraphProvider {
             "failed": failed,
             "first_node_id": first_node_id,
             "results": results,
+            "evaluation": {
+                "written": succeeded,
+                "rejected": rejected,
+                "not_attempted": not_attempted,
+                "budget_exhausted": budget_exhausted,
+                "budget_secs": OBSERVE_BATCH_BUDGET_SECS,
+                "rollback": false,
+                "next_action": next_action,
+            },
         })))
     }
 
     async fn handle_recall(&self, task: &DatasourceTask) -> Result<ProviderOutput> {
         let query_val: RetrievalQuery = serde_json::from_value(task.parameters.clone())
             .context("failed to parse life.recall parameters as RetrievalQuery")?;
-        let named_strategy = NamedRecallStrategy::from_task(task);
+        let mut named_strategy = NamedRecallStrategy::from_task(task);
+        // A bare call — `{query_id, query_text}` and nothing else — lands on
+        // SemanticPivot with no pivots, whose dispatch loop then runs zero
+        // queries and whose fallback labels come from the same empty list.
+        // The result was a well-formed, "ok", EMPTY packet on every explicit
+        // life.recall Beacon made on 2026-09-11, so the model re-observed
+        // facts already in the graph and fell back to raw Cypher to find a
+        // node. There is a query_text and an embedding: sweep the core
+        // spaces with it instead of silently returning nothing.
+        if matches!(named_strategy, NamedRecallStrategy::SemanticPivot)
+            && query_val.semantic_pivots.is_empty()
+        {
+            info!(
+                query_id = %query_val.query_id,
+                "life.recall: no named_strategy/operator_intent and no semantic_pivots; \
+                 dispatching as current_prompt_semantic instead of an empty pivot sweep"
+            );
+            named_strategy = NamedRecallStrategy::CurrentPromptSemantic;
+        }
         if !named_strategy.agrees_with(&query_val.strategy) {
             warn!(
                 named_strategy = named_strategy.as_str(),
@@ -1187,12 +1810,19 @@ impl LifeGraphProvider {
                 .await?;
             }
             NamedRecallStrategy::SemanticPivot => {
+                // Full-space sweeps include runtime ontology extension labels
+                // (their vector indexes were created at patch apply).
+                let ext = self.load_ontology_extensions().await;
                 for pivot in &query_val.semantic_pivots {
-                    for label in projection::labels_for_space(&pivot.space) {
+                    let core = projection::labels_for_space(&pivot.space).iter().copied();
+                    let extension =
+                        ext.labels_for_space_prefix(projection::space_prefix(&pivot.space));
+                    let labels: Vec<&str> = core.chain(extension).collect();
+                    for label in labels {
                         self.extend_vector_hits(
                             &mut all_hits,
                             pivot.space.clone(),
-                            &[*label],
+                            &[label],
                             top_k,
                             min_similarity,
                             &embedding,
@@ -1345,8 +1975,9 @@ impl LifeGraphProvider {
     }
 
     async fn handle_commit(&self, task: &DatasourceTask) -> Result<ProviderOutput> {
-        let input: LifeCommitInput = serde_json::from_value(task.parameters.clone())
+        let mut input: LifeCommitInput = serde_json::from_value(task.parameters.clone())
             .context("failed to parse life.commit parameters as LifeCommitInput")?;
+        input.normalize_defaults();
         let plan = self
             .runner
             .plan(LifeGraphToolRequest::LifeCommit(input.clone()))
@@ -1366,6 +1997,7 @@ impl LifeGraphProvider {
             .execute(
                 query(&compiled.query)
                     .param("id", compiled.node_id.as_str())
+                    .param("id_numeric", compiled.node_id_numeric)
                     .param("confirmed_at", compiled.confirmed_at.as_str())
                     .param("confidence", compiled.confidence)
                     .param("claim_summary", compiled.claim_summary.as_str())
@@ -1375,6 +2007,18 @@ impl LifeGraphProvider {
             )
             .await?;
         let first_row = rows.next().await?;
+        // MATCH semantics: no row means no such node. Say so instead of
+        // reporting "committed" for a write that touched nothing (or, under
+        // the old MERGE, manufactured a stray node).
+        let Some(first_row) = first_row else {
+            anyhow::bail!(
+                "life.commit target not found: no {} node with id '{}'. Call life.recall or \
+                 life.list first and commit the exact `id` it returns (e.g. life:open_loop:…).",
+                compiled.label,
+                compiled.node_id
+            );
+        };
+        let first_row = Some(first_row);
         let node_id = first_row
             .as_ref()
             .and_then(|r| r.get::<String>("id").ok())
@@ -1450,12 +2094,22 @@ impl LifeGraphProvider {
     async fn handle_patch_propose(&self, task: &DatasourceTask) -> Result<ProviderOutput> {
         let input: LifePatchProposalInput = serde_json::from_value(task.parameters.clone())
             .context("failed to parse life.patch.propose parameters as LifePatchProposalInput")?;
+        let ext = self.load_ontology_extensions().await;
         let plan = self
             .runner
-            .plan(LifeGraphToolRequest::LifePatchPropose(input.clone()))
+            .plan_with_extensions(LifeGraphToolRequest::LifePatchPropose(input.clone()), &ext)
             .map_err(|e| anyhow::anyhow!("life.patch.propose plan validation failed: {e}"))?;
         let now = chrono::Utc::now().to_rfc3339();
-        let compiled = cypher::compile_patch_proposal(&input, &now)
+        // An ontology_extension is by definition a confirm-gated change:
+        // park it as awaiting_confirmation so `life.patch.apply` (called
+        // after explicit operator approval) can actually act on it — the
+        // default `proposed` status is invisible to apply.
+        let status = if input.ontology_extension.is_some() {
+            cypher::PATCH_STATUS_AWAITING_CONFIRMATION
+        } else {
+            cypher::PATCH_STATUS_PROPOSED
+        };
+        let compiled = cypher::compile_patch_proposal_with_status(&input, &now, status)
             .map_err(|e| anyhow::anyhow!("life.patch.propose Cypher compilation failed: {e}"))?;
 
         let graph = self.connect().await?;
@@ -1542,7 +2196,7 @@ impl LifeGraphProvider {
         } else {
             q = q.param("connectivity_ratio", 0.0_f64);
         }
-        let mut rows = graph.execute(q).await?;
+        let mut rows = bounded_query("recall_feedback_write", graph.execute(q)).await?;
         let _ = rows.next().await?;
 
         // ── Feedback-informed ranking (recall_utility EWMA) ───────────────
@@ -1833,20 +2487,63 @@ impl LifeGraphProvider {
         let current_status: String = row.get("status").unwrap_or_default();
         let patch_json: String = row.get("patch_json").unwrap_or_default();
         if current_status != cypher::PATCH_STATUS_AWAITING_CONFIRMATION {
+            let stored_patch = serde_json::from_str::<LifePatchProposalInput>(&patch_json).ok();
+            let patch_kind = stored_patch
+                .as_ref()
+                .and_then(|patch| serde_json::to_value(&patch.patch_kind).ok())
+                .and_then(|kind| kind.as_str().map(str::to_string));
+            let next_action = patch_apply_next_action(stored_patch.as_ref());
             return Ok(ProviderOutput::ResultSet(json!({
                 "status": "not_applicable",
                 "patch_id": input.patch_id,
                 "current_status": current_status,
+                "patch_kind": patch_kind,
+                "reason": "patch is not awaiting_confirmation",
+                "next_action": next_action,
             })));
         }
         let patch: LifePatchProposalInput = serde_json::from_str(&patch_json)
             .context("life.patch.apply: stored patch_json failed to parse")?;
 
         let now = chrono::Utc::now().to_rfc3339();
+        let mut ontology_applied: Option<Value> = None;
         let (new_status, edges_written, missing_targets, outcome) = match input.decision {
             PatchApplyDecision::Confirm => {
                 let (written, missing) =
                     Self::execute_bridge_edges(&graph, &patch.edge_specs).await?;
+                // Ontology self-serve: a confirmed schema_patch carrying an
+                // ontology_extension becomes live vocabulary — validate
+                // against core + current extensions, create the vector index
+                // for each new label, then persist the merged set.
+                if let Some(extension) = &patch.ontology_extension {
+                    let mut current = self.load_ontology_extensions().await;
+                    match extension.validate_against(&current) {
+                        Err(violations) => {
+                            ontology_applied = Some(json!({
+                                "status": "rejected",
+                                "violations": violations,
+                            }));
+                        }
+                        Ok(()) => {
+                            let indexes = self.create_extension_indexes(&extension.labels).await;
+                            current.merge(extension.clone());
+                            self.persist_ontology_extensions(&current).await?;
+                            info!(
+                                labels = extension.labels.len(),
+                                edges = extension.edges.len(),
+                                "life.patch.apply: ontology extension applied"
+                            );
+                            ontology_applied = Some(json!({
+                                "status": "applied",
+                                "labels_added": extension.labels.iter()
+                                    .map(|l| l.name.clone()).collect::<Vec<_>>(),
+                                "edges_added": extension.edges.iter()
+                                    .map(|e| e.rel_type.clone()).collect::<Vec<_>>(),
+                                "indexes_created": indexes,
+                            }));
+                        }
+                    }
+                }
                 (
                     cypher::PATCH_STATUS_APPLIED,
                     written,
@@ -1903,7 +2600,7 @@ impl LifeGraphProvider {
             }
         }
 
-        Ok(ProviderOutput::ResultSet(json!({
+        let mut result = json!({
             "status": new_status,
             "patch_id": input.patch_id,
             "edges_written": edges_written,
@@ -1911,7 +2608,11 @@ impl LifeGraphProvider {
             "audit_id": patch.autonomy_audit_id,
             "outcome": outcome,
             "outcome_reported": outcome_reported,
-        })))
+        });
+        if let Some(ontology) = ontology_applied {
+            result["ontology_extension"] = ontology;
+        }
+        Ok(ProviderOutput::ResultSet(result))
     }
 
     /// Handle `life.patch.list` — the READ-ONLY patch review surface.
@@ -1928,7 +2629,7 @@ impl LifeGraphProvider {
         let cypher = cypher::patch_list_query(&statuses, limit);
 
         let graph = self.connect().await?;
-        let mut rows = graph.execute(query(&cypher)).await?;
+        let mut rows = bounded_query("patch_list_read", graph.execute(query(&cypher))).await?;
         let mut patches = Vec::new();
         while let Some(row) = rows.next().await? {
             let risk: String = row.get("risk").unwrap_or_default();
@@ -2023,6 +2724,361 @@ impl LifeGraphProvider {
     /// gating, two bounded read queries, never a write. The provenance
     /// envelope (validation_state, confidence, source_membrane, observed_at,
     /// …) rides in the returned node's `properties`.
+    /// Handle `life.list` — the READ-ONLY deterministic maintenance query
+    /// surface (lifegraph-steward-capability-plane seam). Named queries and
+    /// typed filters both compile from the central `ontology` vocabulary;
+    /// date bounds ride as Bolt params.
+    /// `life.audit`: export the graph (ids, labels, states, dates, summaries,
+    /// embeddings, edges) and run `audit::audit` over it. Read-only.
+    async fn handle_audit(&self, task: &DatasourceTask) -> Result<ProviderOutput> {
+        let input: data_memorygraphrag::LifeAuditInput = if task.parameters.is_null() {
+            Default::default()
+        } else {
+            match serde_json::from_value(task.parameters.clone()) {
+                Ok(v) => v,
+                Err(e) => {
+                    return Ok(ProviderOutput::ResultSet(json!({
+                        "status": "invalid_request",
+                        "read_only": true,
+                        "error": format!("could not parse life.audit parameters: {e}"),
+                    })));
+                }
+            }
+        };
+        if let Err(err) = self
+            .runner
+            .plan(LifeGraphToolRequest::LifeAudit(input.clone()))
+        {
+            return Ok(ProviderOutput::ResultSet(json!({
+                "status": "invalid_request",
+                "read_only": true,
+                "violations": err.violations,
+            })));
+        }
+        let graph = self.connect().await?;
+        let now_iso = chrono::Utc::now().to_rfc3339();
+
+        let node_cypher = concat!(
+            "MATCH (n) RETURN coalesce(n.id, '') AS id, id(n) AS internal_id, ",
+            "coalesce(labels(n)[0], '') AS label, n.validation_state AS validation_state, ",
+            "coalesce(n.status, n.loop_status) AS status, n.observed_at AS observed_at, ",
+            "coalesce(n.due_at, n.occurs_at, n.starts_at) AS best_date, ",
+            "n.claim_summary AS claim_summary, n.embedding AS embedding"
+        );
+        let mut rows = bounded_query("life_audit_nodes", graph.execute(query(node_cypher))).await?;
+        let mut nodes: Vec<data_memorygraphrag::audit::AuditNode> = Vec::new();
+        while let Some(row) = rows.next().await? {
+            let v = row_to_json(&row)?;
+            let embedding = v.get("embedding").and_then(Value::as_array).map(|arr| {
+                arr.iter()
+                    .filter_map(|x| x.as_f64().map(|f| f as f32))
+                    .collect::<Vec<f32>>()
+            });
+            let text = |k: &str| v.get(k).and_then(Value::as_str).map(str::to_string);
+            nodes.push(data_memorygraphrag::audit::AuditNode {
+                id: text("id").unwrap_or_default(),
+                internal_id: v.get("internal_id").and_then(Value::as_i64).unwrap_or(-1),
+                label: text("label").unwrap_or_default(),
+                validation_state: text("validation_state"),
+                status: text("status"),
+                observed_at: text("observed_at"),
+                best_date: text("best_date"),
+                claim_summary: text("claim_summary"),
+                embedding: embedding.filter(|e| !e.is_empty()),
+            });
+        }
+        let edge_cypher = concat!(
+            "MATCH (a)-[r]->(b) RETURN coalesce(a.id, '#' + toString(id(a))) AS src, ",
+            "coalesce(b.id, '#' + toString(id(b))) AS dst, type(r) AS rel_type"
+        );
+        let mut rows = bounded_query("life_audit_edges", graph.execute(query(edge_cypher))).await?;
+        let mut edges: Vec<data_memorygraphrag::audit::AuditEdge> = Vec::new();
+        while let Some(row) = rows.next().await? {
+            let v = row_to_json(&row)?;
+            let text = |k: &str| v.get(k).and_then(Value::as_str).unwrap_or("").to_string();
+            edges.push(data_memorygraphrag::audit::AuditEdge {
+                src: text("src"),
+                dst: text("dst"),
+                rel_type: text("rel_type"),
+            });
+        }
+        let opts = data_memorygraphrag::audit::AuditOptions {
+            now_iso: now_iso.clone(),
+            duplicate_similarity: input.duplicate_similarity,
+            stale_days: input.stale_days,
+            max_actions: input.max_actions,
+            labels: input.labels.clone(),
+        };
+        let report = data_memorygraphrag::audit::audit(&nodes, &edges, &opts);
+        info!(
+            nodes = report.nodes,
+            edges = report.edges,
+            live_orphans = report.live_orphans,
+            duplicates = report.duplicates.len(),
+            health = report.health_score,
+            actions = report.suggested_actions.len(),
+            "life.audit: graph-science report served"
+        );
+        let mut out = serde_json::to_value(&report)?;
+        out["status"] = json!("ok");
+        out["read_only"] = json!(true);
+        out["how_to_act"] = json!(
+            "Each suggested_actions entry is ONE life.tidy call ({\"action\": <entry>}); \
+             declare them as plan steps bound to life.tidy and execute in order. Items under \
+             needs_judgment are not actions: resolve them with evidence or ask the operator."
+        );
+        Ok(ProviderOutput::ResultSet(out))
+    }
+
+    /// `life.tidy`: one governed write per call (retire duplicate under a
+    /// keeper, link, resolve, retire). Nothing is ever deleted; every touched
+    /// node/edge is stamped with when, by whom, and why.
+    async fn handle_tidy(&self, task: &DatasourceTask) -> Result<ProviderOutput> {
+        let input: data_memorygraphrag::LifeTidyInput =
+            serde_json::from_value(task.parameters.clone())
+                .context("failed to parse life.tidy parameters as LifeTidyInput")?;
+        let ext = self.load_ontology_extensions().await;
+        let plan = self
+            .runner
+            .plan_with_extensions(LifeGraphToolRequest::LifeTidy(input.clone()), &ext)
+            .map_err(|e| anyhow::anyhow!("life.tidy plan validation failed: {e}"))?;
+        if !plan.allowed() {
+            return Ok(ProviderOutput::ResultSet(json!({
+                "status": "blocked",
+                "reasons": plan.blocked_reasons,
+            })));
+        }
+        let now = chrono::Utc::now().to_rfc3339();
+        let actor = task
+            .parameters
+            .get("observed_by")
+            .and_then(Value::as_str)
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or("lifegraph.gardener")
+            .to_string();
+        let compiled = cypher::compile_tidy(&input.action, input.operator_approved, &actor, &now)
+            .map_err(|e| anyhow::anyhow!("life.tidy Cypher compilation failed: {e}"))?;
+        let graph = self.connect().await?;
+        let mut rows = bounded_query(
+            "life_tidy",
+            graph.execute(
+                query(&compiled.query)
+                    .param("a", compiled.a.as_str())
+                    .param("b", compiled.b.as_str())
+                    .param("reason", compiled.reason.as_str())
+                    .param("now", compiled.now_iso.as_str())
+                    .param("actor", compiled.actor.as_str()),
+            ),
+        )
+        .await?;
+        let Some(row) = rows.next().await? else {
+            // Idempotence: a retry after the action already landed is a
+            // success, not a failure — live 2026-09-14 21:20 UTC five
+            // "matched nothing" retries on already-retired duplicates
+            // tripped the stall detector and killed the pass.
+            let probe = concat!(
+                "MATCH (n) WHERE n.id = $a OR toString(id(n)) = $a ",
+                "RETURN coalesce(n.id, toString(id(n))) AS id, n.validation_state AS validation_state, ",
+                "coalesce(n.status, n.loop_status) AS status LIMIT 1"
+            );
+            let mut probe_rows = bounded_query(
+                "life_tidy_probe",
+                graph.execute(query(probe).param("a", compiled.a.as_str())),
+            )
+            .await?;
+            if let Some(existing) = probe_rows.next().await? {
+                let existing = row_to_json(&existing)?;
+                let vs = existing
+                    .get("validation_state")
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                let st = existing.get("status").and_then(Value::as_str).unwrap_or("");
+                let already = match compiled.kind {
+                    "retire_duplicate" | "retire" => vs == "retired",
+                    "resolve" => st == "resolved" || vs == "retired",
+                    _ => false,
+                };
+                if already {
+                    info!(kind = compiled.kind, node = %compiled.a, "life.tidy: already applied (idempotent)");
+                    return Ok(ProviderOutput::ResultSet(json!({
+                        "status": "already_applied",
+                        "kind": compiled.kind,
+                        "node_id": compiled.a,
+                        "touched": existing,
+                        "note": "this action had already been applied; nothing changed",
+                    })));
+                }
+                anyhow::bail!(
+                    "life.tidy {} refused: {} is {} — confirmed nodes need operator_approved, and \
+                     a retire needs a proposed/inferred target (nothing was changed)",
+                    compiled.kind,
+                    compiled.a,
+                    if vs.is_empty() { "unstated" } else { vs }
+                );
+            }
+            anyhow::bail!(
+                "life.tidy {} matched nothing: no node with id '{}' exists (nothing was changed)",
+                compiled.kind,
+                compiled.a
+            );
+        };
+        let touched = row_to_json(&row)?;
+        // MERGE matched an existing edge: nothing changed. Report it as such
+        // so the receipt does not list a re-link as a write (live 2026-09-15
+        // 16:34 UTC: twelve re-applied links, all "tidied").
+        if compiled.kind == "link" && touched.get("created").and_then(Value::as_bool) != Some(true)
+        {
+            info!(kind = compiled.kind, node = %compiled.a, "life.tidy: link already present (idempotent)");
+            return Ok(ProviderOutput::ResultSet(json!({
+                "status": "already_applied",
+                "kind": compiled.kind,
+                "node_id": compiled.a,
+                "touched": touched,
+                "note": "this edge already existed; nothing changed",
+            })));
+        }
+        info!(kind = compiled.kind, node = %compiled.a, "life.tidy: applied");
+        Ok(ProviderOutput::ResultSet(json!({
+            "status": "tidied",
+            "kind": compiled.kind,
+            "node_id": compiled.a,
+            "touched": touched,
+            "tidied_at": compiled.now_iso,
+            "tidied_by": compiled.actor,
+        })))
+    }
+
+    async fn handle_list(&self, task: &DatasourceTask) -> Result<ProviderOutput> {
+        let input: LifeListInput = match serde_json::from_value(task.parameters.clone()) {
+            Ok(input) => input,
+            Err(e) => {
+                return Ok(ProviderOutput::ResultSet(json!({
+                    "status": "invalid_request",
+                    "read_only": true,
+                    "error": format!("could not parse life.list parameters: {e}"),
+                })));
+            }
+        };
+        let ext = self.load_ontology_extensions().await;
+        let plan = self.runner.plan_with_extensions(
+            data_memorygraphrag::LifeGraphToolRequest::LifeList(input.clone()),
+            &ext,
+        );
+        if let Err(err) = plan {
+            return Ok(ProviderOutput::ResultSet(json!({
+                "status": "invalid_request",
+                "read_only": true,
+                "violations": err.violations,
+            })));
+        }
+
+        let limit = input.effective_limit();
+        let now_iso = chrono::Utc::now().to_rfc3339();
+        let (query_kind, cypher) = match input.named_query.as_deref() {
+            Some(name) => {
+                // plan_list validated the name parses.
+                let named = data_memorygraphrag::ontology::NamedMaintenanceQuery::parse(name)
+                    .expect("plan_list validated named_query");
+                (
+                    named.as_str().to_string(),
+                    named.cypher_with_extensions(limit, &ext),
+                )
+            }
+            None => (
+                "filtered".to_string(),
+                input.filtered_cypher_with_extensions(&ext),
+            ),
+        };
+
+        let graph = self.connect().await?;
+        let mut q = query(&cypher);
+        if cypher.contains("$now") {
+            q = q.param("now", now_iso.as_str());
+        }
+        if let Some(v) = input.observed_after.as_deref() {
+            q = q.param("observed_after", v);
+        }
+        if let Some(v) = input.observed_before.as_deref() {
+            q = q.param("observed_before", v);
+        }
+        if let Some(v) = input.date_before.as_deref() {
+            q = q.param("date_before", v);
+        }
+        if let Some(v) = input.date_after.as_deref() {
+            q = q.param("date_after", v);
+        }
+        let mut rows = bounded_query("life_list", graph.execute(q)).await?;
+        let mut output_rows = Vec::new();
+        while let Some(row) = rows.next().await? {
+            output_rows.push(fold_property_columns(row_to_json(&row)?));
+        }
+        info!(
+            query = query_kind.as_str(),
+            rows = output_rows.len(),
+            "life.list: deterministic list served"
+        );
+        let mut out = json!({
+            "status": "ok",
+            "read_only": true,
+            "query": query_kind,
+            "as_of": now_iso,
+            "count": output_rows.len(),
+            "limit": limit,
+            "truncated": list_page_is_full(output_rows.len(), limit),
+            "rows": output_rows,
+        });
+        if list_page_is_full(out["count"].as_u64().unwrap_or(0) as usize, limit) {
+            out["note"] = json!(format!(
+                "This page is FULL ({limit} rows): more matching nodes exist. Do not present these \
+                 rows as all of them — narrow by labels, or raise limit (max 200)."
+            ));
+        }
+        Ok(ProviderOutput::ResultSet(out))
+    }
+
+    async fn handle_node_edit(&self, task: &DatasourceTask) -> Result<ProviderOutput> {
+        use data_memorygraphrag::node_edit::{EDIT_QUERY, NodeEdit};
+        let input: NodeEdit = serde_json::from_value(task.parameters.clone())?;
+        if let Err(error) = input.validate() {
+            return Ok(ProviderOutput::ResultSet(
+                json!({"status": "invalid_request", "error": error}),
+            ));
+        }
+        let before = input
+            .before
+            .iter()
+            .map(|(k, v)| (k.clone(), json!(v)))
+            .collect();
+        let changes = input
+            .changes
+            .iter()
+            .map(|(k, v)| (k.clone(), json!(v)))
+            .collect();
+        let audit_id = format!("node-edit:{}", ulid::Ulid::new());
+        let graph = self.connect().await?;
+        let mut rows = graph
+            .execute(
+                query(EDIT_QUERY)
+                    .param("id", input.id.as_str())
+                    .param("actor", input.actor.as_str())
+                    .param("before", BoltType::Map(json_scalar_map_to_bolt(&before)))
+                    .param("changes", BoltType::Map(json_scalar_map_to_bolt(&changes)))
+                    .param("audit_id", audit_id.as_str())
+                    .param("edited_at", chrono::Utc::now().to_rfc3339())
+                    .param("before_json", serde_json::to_string(&input.before)?)
+                    .param("after_json", serde_json::to_string(&input.changes)?),
+            )
+            .await?;
+        let saved = rows.next().await?.is_some();
+        // Consume completion before returning a receipt (surface commit errors).
+        while rows.next().await?.is_some() {}
+        Ok(ProviderOutput::ResultSet(if saved {
+            json!({"status": "saved", "node_id": input.id, "audit_id": audit_id})
+        } else {
+            json!({"status": "conflict", "error": "Node missing, ambiguous, or changed. Reload before saving."})
+        }))
+    }
+
     async fn handle_view_node(&self, task: &DatasourceTask) -> Result<ProviderOutput> {
         let input: LifeViewNodeInput =
             serde_json::from_value(task.parameters.clone()).unwrap_or_default();
@@ -2223,7 +3279,7 @@ impl LifeGraphProvider {
         if let Some(summary) = &compiled.resolution_summary {
             q = q.param("resolution_summary", summary.as_str());
         }
-        let mut rows = graph.execute(q).await?;
+        let mut rows = bounded_query("conflict_cypher", graph.execute(q)).await?;
         let _ = rows.next().await?;
         Ok(())
     }
@@ -2749,18 +3805,13 @@ fn raw_recall_fallback_cypher(labels: &[&str], limit: usize) -> String {
         .collect::<Vec<_>>()
         .join(", ");
     format!(
-        concat!(
-            "MATCH (n) ",
-            "WHERE any(label IN labels(n) WHERE label IN [{labels}]) ",
-            "AND coalesce(n.validation_state, 'inferred') <> 'retired' ",
-            "AND coalesce(n.status, '') <> 'retired' ",
-            "AND coalesce(n.status, '') <> 'done' ",
-            "RETURN n AS node, 0.25 AS similarity ",
-            "ORDER BY coalesce(n.observed_at, n.created_at, '') DESC ",
-            "LIMIT {limit}"
-        ),
-        labels = labels,
-        limit = limit
+        "MATCH (n) \
+         WHERE any(label IN labels(n) WHERE label IN [{labels}]) \
+         AND {live} \
+         RETURN n AS node, 0.25 AS similarity \
+         ORDER BY coalesce(n.observed_at, n.created_at, '') DESC \
+         LIMIT {limit}",
+        live = data_memorygraphrag::ontology::liveness_predicate("n"),
     )
 }
 
@@ -2977,6 +4028,7 @@ fn recall_feedback_patch_proposal(
         operator_approved: false,
         edge_specs: Vec::new(),
         autonomy_audit_id: None,
+        ontology_extension: None,
     })
 }
 
@@ -3007,6 +4059,8 @@ fn feedback_signal_evidence(input: &RetrievalFeedbackInput) -> EvidencePacket {
         validation_state: ValidationState::Confirmed,
         observed_at: None,
         valid_time_range: None,
+        due_at: None,
+        occurs_at: None,
         source_reliability: 1.0,
         conflict_ids: vec![],
         adjudication_status: AdjudicationStatus::NotNeeded,
@@ -3016,6 +4070,372 @@ fn feedback_signal_evidence(input: &RetrievalFeedbackInput) -> EvidencePacket {
             "rating": input.rating,
             "connectivity_ratio": input.connectivity_ratio(),
         }),
+        properties: Default::default(),
+    }
+}
+
+/// Compute seconds elapsed since `observed_at` ISO 8601 string.
+/// Returns 0 on parse failure (treat unknown age as fresh).
+/// Call the ONNX sidecar's `/api/embeddings` endpoint and return `(vector, model_gen)`.
+///
+/// The sidecar address is read from `PHILOTIC_ONNX_SIDECAR_ADDR`
+/// (default `http://127.0.0.1:11435`).
+/// Returns an explicit error on dim mismatch — callers should surface this, not silently
+/// continue with a wrong-dim vector.
+/// Hard ceiling for a single embed-on-write sidecar call. Sized so a stalled
+/// ONNX embedding sidecar fails fast — surfacing as a graceful "sidecar
+/// unavailable" skip in `handle_observe` (the node is already written; the
+/// embedding is optional) — instead of hanging the observe indefinitely. That
+/// indefinite hang is what wedged `life.observe.batch`: with no timeout, each
+/// per-item embed blocked forever and the turn sat until the watchdog evicted
+/// it. Kept small so even a multi-item batch degrades within the turn watchdog.
+const EMBED_SIDECAR_TIMEOUT_SECS: u64 = 8;
+
+/// After an embed sidecar failure, treat it as down for this long and
+/// short-circuit further embed calls (fast Err, no HTTP). This turns a
+/// persistently-down sidecar from "N × timeout per bulk write" into a single
+/// timeout, so `life.observe.batch` and the steward distillation sweep don't
+/// wedge when embeddings are unavailable — the observations still land, just
+/// without vectors.
+const EMBED_SIDECAR_COOLDOWN_SECS: u64 = 60;
+
+/// Unix-seconds deadline before which the embed sidecar is treated as down.
+/// `0` = healthy. Process-global, best-effort (Relaxed) — a stale read only
+/// costs at most one extra timeout, never correctness.
+static EMBED_SIDECAR_DOWN_UNTIL: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+fn now_unix_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Circuit-breaking wrapper over [`embed_text_inner`]: skips the sidecar during
+/// the post-failure cooldown, and arms the cooldown on any failure. Callers get
+/// an `Err` (handled as a graceful "sidecar_unavailable" skip) either way.
+async fn embed_text(text: &str) -> anyhow::Result<(Vec<f32>, String)> {
+    use std::sync::atomic::Ordering;
+    let now = now_unix_secs();
+    if EMBED_SIDECAR_DOWN_UNTIL.load(Ordering::Relaxed) > now {
+        anyhow::bail!("embed_text: sidecar in cooldown after a recent failure");
+    }
+    match embed_text_inner(text).await {
+        Ok(result) => {
+            // Recovered (or never down): clear any lingering cooldown.
+            EMBED_SIDECAR_DOWN_UNTIL.store(0, Ordering::Relaxed);
+            Ok(result)
+        }
+        Err(e) => {
+            EMBED_SIDECAR_DOWN_UNTIL.store(
+                now.saturating_add(EMBED_SIDECAR_COOLDOWN_SECS),
+                Ordering::Relaxed,
+            );
+            Err(e)
+        }
+    }
+}
+
+/// One-round-trip batch embed via the sidecar's `/api/embeddings/batch`
+/// (lifegraph-batch-observe-embeds seam). Outcomes:
+/// - `Ok(Some(vectors))` — one vector per input text, shared model gen;
+/// - `Ok(None)` — the sidecar predates the batch endpoint (404): the caller
+///   falls back to per-item [`embed_text`] so mixed fleets keep working;
+/// - `Err` — transport/inference failure; arms the same circuit breaker as
+///   [`embed_text`], so subsequent per-item calls fail fast too.
+async fn embed_texts_batch(texts: &[String]) -> anyhow::Result<Option<Vec<(Vec<f32>, String)>>> {
+    use std::sync::atomic::Ordering;
+    let now = now_unix_secs();
+    if EMBED_SIDECAR_DOWN_UNTIL.load(Ordering::Relaxed) > now {
+        anyhow::bail!("embed_texts_batch: sidecar in cooldown after a recent failure");
+    }
+
+    let base = std::env::var("PHILOTIC_ONNX_SIDECAR_ADDR")
+        .unwrap_or_else(|_| "http://127.0.0.1:11435".to_string());
+    let url = format!("{base}/api/embeddings/batch");
+    let client = reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(3))
+        // Whole-batch budget: sequential inference server-side, so scale the
+        // single-item budget by batch size (bounded by the server's own cap).
+        .timeout(std::time::Duration::from_secs(
+            EMBED_SIDECAR_TIMEOUT_SECS.saturating_mul(texts.len().max(1) as u64),
+        ))
+        .build()
+        .context("embed_texts_batch: failed to build HTTP client")?;
+
+    let arm_cooldown = || {
+        EMBED_SIDECAR_DOWN_UNTIL.store(
+            now.saturating_add(EMBED_SIDECAR_COOLDOWN_SECS),
+            Ordering::Relaxed,
+        );
+    };
+
+    let response = match client
+        .post(&url)
+        .json(&serde_json::json!({ "prompts": texts }))
+        .send()
+        .await
+    {
+        Ok(response) => response,
+        Err(e) => {
+            arm_cooldown();
+            return Err(e).context("embed_texts_batch: HTTP request failed");
+        }
+    };
+    if response.status() == reqwest::StatusCode::NOT_FOUND {
+        // Older sidecar without the batch route — NOT a health failure.
+        return Ok(None);
+    }
+    let resp: serde_json::Value = match response.json().await {
+        Ok(value) => value,
+        Err(e) => {
+            arm_cooldown();
+            return Err(e).context("embed_texts_batch: failed to parse JSON response");
+        }
+    };
+    if let Some(err) = resp.get("error").and_then(serde_json::Value::as_str) {
+        arm_cooldown();
+        anyhow::bail!("embed_texts_batch: sidecar error: {err}");
+    }
+
+    let model_gen = resp
+        .get("model")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("unknown")
+        .to_string();
+    let embeddings: Vec<Vec<f32>> = resp
+        .get("embeddings")
+        .and_then(serde_json::Value::as_array)
+        .map(|rows| {
+            rows.iter()
+                .map(|row| {
+                    row.as_array()
+                        .map(|arr| {
+                            arr.iter()
+                                .filter_map(|v| v.as_f64().map(|f| f as f32))
+                                .collect()
+                        })
+                        .unwrap_or_default()
+                })
+                .collect()
+        })
+        .ok_or_else(|| {
+            arm_cooldown();
+            anyhow::anyhow!("embed_texts_batch: response missing 'embeddings' array")
+        })?;
+    if embeddings.len() != texts.len() {
+        arm_cooldown();
+        anyhow::bail!(
+            "embed_texts_batch: sidecar returned {} embeddings for {} prompts",
+            embeddings.len(),
+            texts.len()
+        );
+    }
+
+    EMBED_SIDECAR_DOWN_UNTIL.store(0, Ordering::Relaxed);
+    Ok(Some(
+        embeddings
+            .into_iter()
+            .map(|vector| (vector, model_gen.clone()))
+            .collect(),
+    ))
+}
+
+async fn embed_text_inner(text: &str) -> anyhow::Result<(Vec<f32>, String)> {
+    let base = std::env::var("PHILOTIC_ONNX_SIDECAR_ADDR")
+        .unwrap_or_else(|_| "http://127.0.0.1:11435".to_string());
+    let url = format!("{base}/api/embeddings");
+
+    // Bounded client: a sidecar that accepts the TCP connection but never
+    // responds must NOT hang embed-on-write forever (see EMBED_SIDECAR_TIMEOUT_SECS).
+    let client = reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(3))
+        .timeout(std::time::Duration::from_secs(EMBED_SIDECAR_TIMEOUT_SECS))
+        .build()
+        .context("embed_text: failed to build HTTP client")?;
+    let resp: serde_json::Value = client
+        .post(&url)
+        .json(&serde_json::json!({"prompt": text}))
+        .send()
+        .await
+        .context("embed_text: HTTP request failed")?
+        .json()
+        .await
+        .context("embed_text: failed to parse JSON response")?;
+
+    if let Some(err) = resp.get("error").and_then(serde_json::Value::as_str) {
+        anyhow::bail!("embed_text: sidecar error: {err}");
+    }
+
+    let vector: Vec<f32> = resp
+        .get("embedding")
+        .and_then(serde_json::Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_f64().map(|f| f as f32))
+                .collect()
+        })
+        .ok_or_else(|| anyhow::anyhow!("embed_text: response missing 'embedding' array"))?;
+
+    let model_gen = resp
+        .get("model")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("unknown")
+        .to_string();
+
+    Ok((vector, model_gen))
+}
+
+fn compute_age_secs(observed_at: Option<&str>, now: &chrono::DateTime<chrono::Utc>) -> u64 {
+    observed_at
+        .and_then(|ts| chrono::DateTime::parse_from_rfc3339(ts).ok())
+        .map(|dt| {
+            let elapsed = *now - dt.with_timezone(&chrono::Utc);
+            elapsed.num_seconds().max(0) as u64
+        })
+        .unwrap_or(0)
+}
+
+// ── Bolt → JSON conversion (mirrors graph-datasource/memgraph_provider.rs) ────
+
+fn row_to_json(row: &Row) -> Result<Value> {
+    let mut object = serde_json::Map::new();
+    for key in row.keys() {
+        let key = key.value.as_str();
+        let value: BoltType = row.get(key)?;
+        object.insert(key.to_string(), bolt_value_to_json(value));
+    }
+    Ok(Value::Object(object))
+}
+
+/// Scalar JSON map → Bolt map for the `$properties` parameter. Non-scalar
+/// values cannot reach here (the contract rejects them at plan time); they
+/// are skipped defensively rather than serialised as strings.
+fn json_scalar_map_to_bolt(map: &std::collections::BTreeMap<String, Value>) -> BoltMap {
+    let mut out = BoltMap::new();
+    for (key, value) in map {
+        let bolt = match value {
+            Value::String(s) => BoltType::String(neo4rs::BoltString::from(s.as_str())),
+            Value::Bool(b) => BoltType::Boolean(neo4rs::BoltBoolean::new(*b)),
+            Value::Number(n) => {
+                if let Some(i) = n.as_i64() {
+                    BoltType::Integer(neo4rs::BoltInteger::new(i))
+                } else if let Some(f) = n.as_f64() {
+                    BoltType::Float(neo4rs::BoltFloat::new(f))
+                } else {
+                    continue;
+                }
+            }
+            _ => continue,
+        };
+        out.put(neo4rs::BoltString::from(key.as_str()), bolt);
+    }
+    out
+}
+
+/// Fold the `prop__<name>` columns of a `life.list` row into one
+/// `properties` object, dropping nulls (a declared property the node does
+/// not carry) and the raw columns.
+pub(crate) fn fold_property_columns(mut row: Value) -> Value {
+    let Some(obj) = row.as_object_mut() else {
+        return row;
+    };
+    let prefix = data_memorygraphrag::ontology::PROPERTY_COLUMN_PREFIX;
+    let keys: Vec<String> = obj
+        .keys()
+        .filter(|k| k.starts_with(prefix))
+        .cloned()
+        .collect();
+    if keys.is_empty() {
+        return row;
+    }
+    let mut props = serde_json::Map::new();
+    for key in keys {
+        if let Some(value) = obj.remove(&key)
+            && !value.is_null()
+        {
+            props.insert(key[prefix.len()..].to_string(), value);
+        }
+    }
+    if !props.is_empty() {
+        obj.insert("properties".into(), Value::Object(props));
+    }
+    row
+}
+
+fn bolt_value_to_json(value: BoltType) -> Value {
+    match value {
+        BoltType::String(v) => json!(v.value),
+        BoltType::Boolean(v) => json!(v.value),
+        BoltType::Integer(v) => json!(v.value),
+        BoltType::Float(v) => json!(v.value),
+        BoltType::Null(_) => Value::Null,
+        BoltType::List(v) => bolt_list_to_json(v),
+        BoltType::Map(v) => bolt_map_to_json(v),
+        BoltType::Node(v) => bolt_node_to_json(v),
+        BoltType::Relation(v) => bolt_relation_to_json(v),
+        BoltType::UnboundedRelation(v) => bolt_unbounded_relation_to_json(v),
+        BoltType::Bytes(v) => json!(v.value),
+        other => json!({ "kind": "unsupported_bolt_value", "debug": format!("{other:?}") }),
+    }
+}
+
+fn bolt_list_to_json(v: BoltList) -> Value {
+    Value::Array(v.into_iter().map(bolt_value_to_json).collect())
+}
+
+fn bolt_map_to_json(v: BoltMap) -> Value {
+    Value::Object(
+        v.value
+            .into_iter()
+            .map(|(k, val)| (k.value, bolt_value_to_json(val)))
+            .collect(),
+    )
+}
+
+fn bolt_node_to_json(v: BoltNode) -> Value {
+    json!({
+        "kind": "node",
+        "id": v.id.value,
+        "labels": bolt_list_to_json(v.labels),
+        "properties": bolt_map_to_json(v.properties),
+    })
+}
+
+fn bolt_relation_to_json(v: BoltRelation) -> Value {
+    json!({
+        "kind": "relationship",
+        "id": v.id.value,
+        "source": v.start_node_id.value,
+        "target": v.end_node_id.value,
+        "label": v.typ.value,
+        "properties": bolt_map_to_json(v.properties),
+    })
+}
+
+fn bolt_unbounded_relation_to_json(v: BoltUnboundedRelation) -> Value {
+    json!({
+        "kind": "relationship",
+        "id": v.id.value,
+        "label": v.typ.value,
+        "properties": bolt_map_to_json(v.properties),
+    })
+}
+
+fn patch_apply_next_action(patch: Option<&LifePatchProposalInput>) -> &'static str {
+    match patch.map(|patch| &patch.patch_kind) {
+        Some(PatchKind::SkillPatch) => {
+            "SkillPatch is a review artifact. Author an executable skill definition, then use skill.register and skill.assign."
+        }
+        Some(PatchKind::SchemaPatch)
+            if patch.is_some_and(|patch| patch.ontology_extension.is_none()) =>
+        {
+            "This prose-only SchemaPatch has no executable ontology_extension. Propose a new schema_patch with labels/edges in ontology_extension; property or core-label changes require a code change."
+        }
+        _ => {
+            "Only patches parked in awaiting_confirmation with an executable payload can be applied. Review or replace this proposal with the correct actuator payload."
+        }
     }
 }
 
@@ -3035,6 +4455,35 @@ mod tests {
             parameters,
             identity: json!({}),
         }
+    }
+
+    #[test]
+    fn not_applicable_patch_guidance_routes_to_the_real_actuator() {
+        let skill_patch: LifePatchProposalInput = serde_json::from_value(json!({
+            "patch_id": "patch:music-skills",
+            "patch_kind": "skill_patch",
+            "summary": "Register music skills",
+            "rationale": "Operator requested them",
+            "evidence_packets": [],
+            "risk": "medium"
+        }))
+        .unwrap();
+        let schema_patch: LifePatchProposalInput = serde_json::from_value(json!({
+            "patch_id": "patch:music-schema",
+            "patch_kind": "schema_patch",
+            "summary": "Add music fields",
+            "rationale": "Track repertoire",
+            "evidence_packets": [],
+            "risk": "medium"
+        }))
+        .unwrap();
+
+        assert!(patch_apply_next_action(Some(&skill_patch)).contains("skill.register"));
+        assert!(patch_apply_next_action(Some(&skill_patch)).contains("skill.assign"));
+        assert!(
+            patch_apply_next_action(Some(&schema_patch))
+                .contains("property or core-label changes require a code change")
+        );
     }
 
     #[tokio::test]
@@ -3112,6 +4561,226 @@ mod tests {
             .await
             .expect_err("garbage batch parameters must be a contract error");
         assert!(format!("{err:#}").contains(CONTRACT_ERROR_MARKER));
+    }
+
+    /// The plan phase must validate the WHOLE batch before writing anything.
+    /// Previously each item's plan gate ran lazily inside the write loop, so a
+    /// batch whose last item was contract-invalid had already written the
+    /// earlier ones before anyone noticed.
+    ///
+    /// Every item here carries a `rel_type` outside BOTH closed vocabularies
+    /// (living-cycle and agenda), so planning rejects all of them — and because
+    /// that now happens up front, the batch returns without opening a Memgraph
+    /// connection at all, which is exactly what lets this run with no database.
+    ///
+    /// The fixture deliberately uses a relation that can never become valid
+    /// rather than a real-but-misused one: an earlier draft used `ADVANCES`,
+    /// which passed only because the fixture's `OpenLoop` source label failed
+    /// *endpoint* validation — so the test would have silently stopped
+    /// exercising vocabulary rejection as the agenda vocabulary grew.
+    /// DEF-165, live 2026-09-17 09:16 and 09:18 EDT: both batches were
+    /// rejected wholesale for "packet_id must not be empty" and each cost a
+    /// retry model call, while a single life.observe fills the same ids.
+    #[tokio::test]
+    async fn observe_batch_fills_the_ids_a_model_omits() {
+        let provider = LifeGraphProvider::from_env();
+        let mut first = minimal_observe_input_for_provider_tests("");
+        first.evidence.packet_id = String::new();
+        let mut second = minimal_observe_input_for_provider_tests("obs-supplied");
+        second.evidence.packet_id = "pkt-supplied".into();
+        // Force both items to fail PLANNING, so the outcome reports the
+        // contract state of each item without touching the graph.
+        for observation in [&mut first, &mut second] {
+            observation.edges = vec![ObserveEdge {
+                rel_type: "NOT_A_REAL_RELATION".into(),
+                target_id: "some-target".into(),
+                upsert_target: false,
+            }];
+        }
+        let parameters = serde_json::to_value(LifeObserveBatchInput {
+            observations: vec![first, second],
+        })
+        .expect("serialize batch input");
+        let out = provider
+            .handle_observe_batch(&DatasourceTask {
+                kind: TaskKind::Custom("life.observe.batch".into()),
+                provider: None,
+                db: None,
+                graph_id: None,
+                query: None,
+                parameters,
+                identity: json!({}),
+            })
+            .await
+            .expect("batch reports outcomes");
+        let ProviderOutput::ResultSet(value) = out else {
+            panic!("expected ResultSet");
+        };
+        let rejected = value["evaluation"]["rejected"]
+            .as_array()
+            .expect("rejected array");
+        assert_eq!(rejected.len(), 2, "{}", value["evaluation"]);
+        let detail = serde_json::to_string(rejected).unwrap();
+        assert!(
+            !detail.contains("packet_id must not be empty"),
+            "ids must be synthesized before validation: {detail}"
+        );
+        // The supplied id is never overwritten, and the omitted one is filled.
+        let ids: Vec<&str> = rejected
+            .iter()
+            .filter_map(|r| r["observation_id"].as_str())
+            .collect();
+        assert!(ids.contains(&"obs-supplied"), "{ids:?}");
+        assert!(
+            ids.iter()
+                .any(|id| id.starts_with("obs-") && *id != "obs-supplied"),
+            "the omitted observation_id should be synthesized: {ids:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn observe_batch_plans_every_item_before_writing_any() {
+        let provider = LifeGraphProvider::from_env();
+        let observations: Vec<LifeObserveInput> = (0..3)
+            .map(|i| {
+                let mut observation = minimal_observe_input_for_provider_tests(&format!("obs-{i}"));
+                observation.edges = vec![ObserveEdge {
+                    rel_type: "NOT_A_REAL_RELATION".into(),
+                    target_id: "some-target".into(),
+                    upsert_target: false,
+                }];
+                observation
+            })
+            .collect();
+        let parameters = serde_json::to_value(LifeObserveBatchInput { observations })
+            .expect("serialize batch input");
+        let out = provider
+            .handle_observe_batch(&DatasourceTask {
+                kind: TaskKind::Custom("life.observe.batch".into()),
+                provider: None,
+                db: None,
+                graph_id: None,
+                query: None,
+                parameters,
+                identity: json!({}),
+            })
+            .await
+            .expect("an all-invalid batch is a reported outcome, not an Err");
+        let ProviderOutput::ResultSet(value) = out else {
+            panic!("expected ResultSet");
+        };
+
+        assert_eq!(value["status"], "failed");
+        assert_eq!(value["succeeded"], 0);
+        assert_eq!(value["failed"], 3, "plan rejections count as failures");
+
+        // Nothing was attempted: no per-item write rows at all.
+        assert!(
+            value["results"]
+                .as_array()
+                .expect("results array")
+                .is_empty(),
+            "no item may be written when every item fails planning: {}",
+            value["results"]
+        );
+
+        // All three rejections are reported together, each naming its cause.
+        let rejected = value["evaluation"]["rejected"]
+            .as_array()
+            .expect("rejected array");
+        assert_eq!(rejected.len(), 3, "every invalid item must be reported");
+        for entry in rejected {
+            assert_eq!(entry["reason"], "contract_invalid");
+            let detail = entry["detail"].as_str().unwrap_or_default();
+            assert!(
+                detail.contains("NOT_A_REAL_RELATION"),
+                "rejection must name the offending relation: {detail}"
+            );
+        }
+
+        // The evaluation must never imply a rollback — per-item durability is
+        // the documented contract the model prompt relies on.
+        assert_eq!(value["evaluation"]["rollback"], json!(false));
+        let next_action = value["evaluation"]["next_action"]
+            .as_array()
+            .expect("next_action array")
+            .iter()
+            .filter_map(Value::as_str)
+            .collect::<Vec<_>>()
+            .join(" | ");
+        assert!(
+            next_action.contains("fix"),
+            "caller must be told to fix rather than blindly retry: {next_action}"
+        );
+    }
+
+    /// The datasource runtime runs "read-only" capabilities concurrently and
+    /// off the critical path, which is only safe if they genuinely do not
+    /// write — concurrent writes would break the read-after-write ordering the
+    /// sequential path exists to guarantee.
+    ///
+    /// `change_notification_for` is this crate's own authority on what counts as
+    /// a write (it fires a device ping for exactly the mutating outcomes), so it
+    /// makes a good independent cross-check on the allowlist in another crate.
+    ///
+    /// This test earns its keep: it catches the mistake actually made while
+    /// writing that allowlist — `life.conflict` looks like a query but OPENS a
+    /// conflict, and `change_notification_for` classifies it `conflict_opened`.
+    #[test]
+    fn no_capability_treated_as_read_only_can_emit_a_write_notification() {
+        // Permissive payload carrying every id and status the write branches
+        // look for, so any capability classified as a write WILL produce a
+        // notification and fail the assertion below.
+        let statuses = [
+            "proposed",
+            "committed",
+            "resolved",
+            "applied",
+            "awaiting_operator",
+            "open",
+            "ok",
+            "partial",
+        ];
+        let read_only = [
+            "life.recall",
+            "life.recall.stats",
+            "life.view.node",
+            "life.view.neighborhood",
+            "life.patch.list",
+        ];
+
+        for capability in read_only {
+            assert!(
+                datasource::runtime::is_read_only_capability(capability),
+                "{capability} is listed here but the runtime no longer treats it as read-only — \
+                 keep the two lists in step"
+            );
+            for status in statuses {
+                let data = json!({
+                    "status": status,
+                    "node_id": "n-1",
+                    "patch_id": "p-1",
+                    "conflict_id": "c-1",
+                    "first_node_id": "n-1",
+                    "succeeded": 1,
+                });
+                assert!(
+                    change_notification_for(capability, &data).is_none(),
+                    "{capability} produced a write notification for status={status}, so it \
+                     MUTATES and must not run concurrently off the critical path"
+                );
+            }
+        }
+
+        // And the converse for the one that caught us out.
+        assert!(
+            !datasource::runtime::is_read_only_capability("life.conflict"),
+            "life.conflict opens a conflict — it is a write and must stay sequential"
+        );
+        assert!(
+            !datasource::runtime::is_read_only_capability("life.observe.batch"),
+            "the observe batch is the write this whole change exists to keep sequential"
+        );
     }
 
     #[test]
@@ -3275,6 +4944,7 @@ mod tests {
 
     fn minimal_observe_input_for_provider_tests(observation_id: &str) -> LifeObserveInput {
         LifeObserveInput {
+            force_new: false,
             observation_id: observation_id.to_string(),
             evidence: EvidencePacket {
                 packet_id: "pkt-001".to_string(),
@@ -3299,10 +4969,13 @@ mod tests {
                 validation_state: ValidationState::Proposed,
                 observed_at: Some("2026-07-10T00:00:00Z".to_string()),
                 valid_time_range: None,
+                due_at: None,
+                occurs_at: None,
                 source_reliability: 0.9,
                 conflict_ids: vec![],
                 adjudication_status: AdjudicationStatus::NotNeeded,
                 metadata: serde_json::Value::Null,
+                properties: Default::default(),
             },
             proposed_graph_refs: vec![],
             observed_by: None,
@@ -3981,6 +5654,18 @@ mod tests {
     }
 
     #[test]
+    fn raw_recall_fallback_excludes_resolved_on_both_status_properties() {
+        let cypher = raw_recall_fallback_cypher(&["OpenLoop"], 6);
+
+        assert!(cypher.contains(
+            "NOT coalesce(n.status, '') IN ['retired', 'done', 'fulfilled', 'abandoned', 'resolved']"
+        ));
+        assert!(cypher.contains(
+            "NOT coalesce(n.loop_status, '') IN ['retired', 'done', 'fulfilled', 'abandoned', 'resolved']"
+        ));
+    }
+
+    #[test]
     fn commitments_approaching_cypher_returns_vector_hit_shape() {
         let cypher = commitments_approaching_cypher("2026-06-08T09:00:00Z");
 
@@ -4124,296 +5809,47 @@ mod tests {
     }
 }
 
-/// Compute seconds elapsed since `observed_at` ISO 8601 string.
-/// Returns 0 on parse failure (treat unknown age as fresh).
-/// Call the ONNX sidecar's `/api/embeddings` endpoint and return `(vector, model_gen)`.
-///
-/// The sidecar address is read from `PHILOTIC_ONNX_SIDECAR_ADDR`
-/// (default `http://127.0.0.1:11435`).
-/// Returns an explicit error on dim mismatch — callers should surface this, not silently
-/// continue with a wrong-dim vector.
-/// Hard ceiling for a single embed-on-write sidecar call. Sized so a stalled
-/// ONNX embedding sidecar fails fast — surfacing as a graceful "sidecar
-/// unavailable" skip in `handle_observe` (the node is already written; the
-/// embedding is optional) — instead of hanging the observe indefinitely. That
-/// indefinite hang is what wedged `life.observe.batch`: with no timeout, each
-/// per-item embed blocked forever and the turn sat until the watchdog evicted
-/// it. Kept small so even a multi-item batch degrades within the turn watchdog.
-const EMBED_SIDECAR_TIMEOUT_SECS: u64 = 8;
-
-/// After an embed sidecar failure, treat it as down for this long and
-/// short-circuit further embed calls (fast Err, no HTTP). This turns a
-/// persistently-down sidecar from "N × timeout per bulk write" into a single
-/// timeout, so `life.observe.batch` and the steward distillation sweep don't
-/// wedge when embeddings are unavailable — the observations still land, just
-/// without vectors.
-const EMBED_SIDECAR_COOLDOWN_SECS: u64 = 60;
-
-/// Unix-seconds deadline before which the embed sidecar is treated as down.
-/// `0` = healthy. Process-global, best-effort (Relaxed) — a stale read only
-/// costs at most one extra timeout, never correctness.
-static EMBED_SIDECAR_DOWN_UNTIL: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
-
-fn now_unix_secs() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
+/// A `life.list` page that came back at its limit is presumed truncated:
+/// live 2026-09-16 19:38 UTC Beacon rendered "all proposed items" from a
+/// 50-row page while 197 proposed nodes existed (DEF-153).
+fn list_page_is_full(rows: usize, limit: usize) -> bool {
+    limit > 0 && rows >= limit
 }
 
-/// Circuit-breaking wrapper over [`embed_text_inner`]: skips the sidecar during
-/// the post-failure cooldown, and arms the cooldown on any failure. Callers get
-/// an `Err` (handled as a graceful "sidecar_unavailable" skip) either way.
-async fn embed_text(text: &str) -> anyhow::Result<(Vec<f32>, String)> {
-    use std::sync::atomic::Ordering;
-    let now = now_unix_secs();
-    if EMBED_SIDECAR_DOWN_UNTIL.load(Ordering::Relaxed) > now {
-        anyhow::bail!("embed_text: sidecar in cooldown after a recent failure");
-    }
-    match embed_text_inner(text).await {
-        Ok(result) => {
-            // Recovered (or never down): clear any lingering cooldown.
-            EMBED_SIDECAR_DOWN_UNTIL.store(0, Ordering::Relaxed);
-            Ok(result)
-        }
-        Err(e) => {
-            EMBED_SIDECAR_DOWN_UNTIL.store(
-                now.saturating_add(EMBED_SIDECAR_COOLDOWN_SECS),
-                Ordering::Relaxed,
-            );
-            Err(e)
-        }
-    }
-}
+#[cfg(test)]
+mod typed_property_row_tests {
+    use super::*;
 
-/// One-round-trip batch embed via the sidecar's `/api/embeddings/batch`
-/// (lifegraph-batch-observe-embeds seam). Outcomes:
-/// - `Ok(Some(vectors))` — one vector per input text, shared model gen;
-/// - `Ok(None)` — the sidecar predates the batch endpoint (404): the caller
-///   falls back to per-item [`embed_text`] so mixed fleets keep working;
-/// - `Err` — transport/inference failure; arms the same circuit breaker as
-///   [`embed_text`], so subsequent per-item calls fail fast too.
-async fn embed_texts_batch(texts: &[String]) -> anyhow::Result<Option<Vec<(Vec<f32>, String)>>> {
-    use std::sync::atomic::Ordering;
-    let now = now_unix_secs();
-    if EMBED_SIDECAR_DOWN_UNTIL.load(Ordering::Relaxed) > now {
-        anyhow::bail!("embed_texts_batch: sidecar in cooldown after a recent failure");
+    #[test]
+    fn a_full_list_page_is_flagged_truncated() {
+        assert!(list_page_is_full(50, 50));
+        assert!(!list_page_is_full(26, 50));
+        assert!(!list_page_is_full(0, 50));
     }
 
-    let base = std::env::var("PHILOTIC_ONNX_SIDECAR_ADDR")
-        .unwrap_or_else(|_| "http://127.0.0.1:11435".to_string());
-    let url = format!("{base}/api/embeddings/batch");
-    let client = reqwest::Client::builder()
-        .connect_timeout(std::time::Duration::from_secs(3))
-        // Whole-batch budget: sequential inference server-side, so scale the
-        // single-item budget by batch size (bounded by the server's own cap).
-        .timeout(std::time::Duration::from_secs(
-            EMBED_SIDECAR_TIMEOUT_SECS.saturating_mul(texts.len().max(1) as u64),
-        ))
-        .build()
-        .context("embed_texts_batch: failed to build HTTP client")?;
-
-    let arm_cooldown = || {
-        EMBED_SIDECAR_DOWN_UNTIL.store(
-            now.saturating_add(EMBED_SIDECAR_COOLDOWN_SECS),
-            Ordering::Relaxed,
-        );
-    };
-
-    let response = match client
-        .post(&url)
-        .json(&serde_json::json!({ "prompts": texts }))
-        .send()
-        .await
-    {
-        Ok(response) => response,
-        Err(e) => {
-            arm_cooldown();
-            return Err(e).context("embed_texts_batch: HTTP request failed");
-        }
-    };
-    if response.status() == reqwest::StatusCode::NOT_FOUND {
-        // Older sidecar without the batch route — NOT a health failure.
-        return Ok(None);
-    }
-    let resp: serde_json::Value = match response.json().await {
-        Ok(value) => value,
-        Err(e) => {
-            arm_cooldown();
-            return Err(e).context("embed_texts_batch: failed to parse JSON response");
-        }
-    };
-    if let Some(err) = resp.get("error").and_then(serde_json::Value::as_str) {
-        arm_cooldown();
-        anyhow::bail!("embed_texts_batch: sidecar error: {err}");
+    #[test]
+    fn list_rows_fold_typed_columns_and_drop_nulls() {
+        let row = json!({
+            "id": "life:creative_work:x", "label": "CreativeWork",
+            "prop__title": "Passacaglia", "prop__difficulty": 55, "prop__key": null
+        });
+        let folded = fold_property_columns(row);
+        assert_eq!(folded["properties"]["difficulty"], 55);
+        assert_eq!(folded["properties"]["title"], "Passacaglia");
+        assert!(folded.get("prop__title").is_none());
+        assert!(folded["properties"].get("key").is_none());
+        let plain = fold_property_columns(json!({"id": "x"}));
+        assert!(plain.get("properties").is_none());
     }
 
-    let model_gen = resp
-        .get("model")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or("unknown")
-        .to_string();
-    let embeddings: Vec<Vec<f32>> = resp
-        .get("embeddings")
-        .and_then(serde_json::Value::as_array)
-        .map(|rows| {
-            rows.iter()
-                .map(|row| {
-                    row.as_array()
-                        .map(|arr| {
-                            arr.iter()
-                                .filter_map(|v| v.as_f64().map(|f| f as f32))
-                                .collect()
-                        })
-                        .unwrap_or_default()
-                })
-                .collect()
-        })
-        .ok_or_else(|| {
-            arm_cooldown();
-            anyhow::anyhow!("embed_texts_batch: response missing 'embeddings' array")
-        })?;
-    if embeddings.len() != texts.len() {
-        arm_cooldown();
-        anyhow::bail!(
-            "embed_texts_batch: sidecar returned {} embeddings for {} prompts",
-            embeddings.len(),
-            texts.len()
-        );
+    #[test]
+    fn scalar_map_converts_to_bolt() {
+        let mut map = std::collections::BTreeMap::new();
+        map.insert("difficulty".to_string(), json!(55));
+        map.insert("key".to_string(), json!("G minor"));
+        map.insert("ok".to_string(), json!(true));
+        map.insert("skipped".to_string(), json!({"nested": 1}));
+        let bolt = json_scalar_map_to_bolt(&map);
+        assert_eq!(bolt.value.len(), 3);
     }
-
-    EMBED_SIDECAR_DOWN_UNTIL.store(0, Ordering::Relaxed);
-    Ok(Some(
-        embeddings
-            .into_iter()
-            .map(|vector| (vector, model_gen.clone()))
-            .collect(),
-    ))
-}
-
-async fn embed_text_inner(text: &str) -> anyhow::Result<(Vec<f32>, String)> {
-    let base = std::env::var("PHILOTIC_ONNX_SIDECAR_ADDR")
-        .unwrap_or_else(|_| "http://127.0.0.1:11435".to_string());
-    let url = format!("{base}/api/embeddings");
-
-    // Bounded client: a sidecar that accepts the TCP connection but never
-    // responds must NOT hang embed-on-write forever (see EMBED_SIDECAR_TIMEOUT_SECS).
-    let client = reqwest::Client::builder()
-        .connect_timeout(std::time::Duration::from_secs(3))
-        .timeout(std::time::Duration::from_secs(EMBED_SIDECAR_TIMEOUT_SECS))
-        .build()
-        .context("embed_text: failed to build HTTP client")?;
-    let resp: serde_json::Value = client
-        .post(&url)
-        .json(&serde_json::json!({"prompt": text}))
-        .send()
-        .await
-        .context("embed_text: HTTP request failed")?
-        .json()
-        .await
-        .context("embed_text: failed to parse JSON response")?;
-
-    if let Some(err) = resp.get("error").and_then(serde_json::Value::as_str) {
-        anyhow::bail!("embed_text: sidecar error: {err}");
-    }
-
-    let vector: Vec<f32> = resp
-        .get("embedding")
-        .and_then(serde_json::Value::as_array)
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|v| v.as_f64().map(|f| f as f32))
-                .collect()
-        })
-        .ok_or_else(|| anyhow::anyhow!("embed_text: response missing 'embedding' array"))?;
-
-    let model_gen = resp
-        .get("model")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or("unknown")
-        .to_string();
-
-    Ok((vector, model_gen))
-}
-
-fn compute_age_secs(observed_at: Option<&str>, now: &chrono::DateTime<chrono::Utc>) -> u64 {
-    observed_at
-        .and_then(|ts| chrono::DateTime::parse_from_rfc3339(ts).ok())
-        .map(|dt| {
-            let elapsed = *now - dt.with_timezone(&chrono::Utc);
-            elapsed.num_seconds().max(0) as u64
-        })
-        .unwrap_or(0)
-}
-
-// ── Bolt → JSON conversion (mirrors graph-datasource/memgraph_provider.rs) ────
-
-fn row_to_json(row: &Row) -> Result<Value> {
-    let mut object = serde_json::Map::new();
-    for key in row.keys() {
-        let key = key.value.as_str();
-        let value: BoltType = row.get(key)?;
-        object.insert(key.to_string(), bolt_value_to_json(value));
-    }
-    Ok(Value::Object(object))
-}
-
-fn bolt_value_to_json(value: BoltType) -> Value {
-    match value {
-        BoltType::String(v) => json!(v.value),
-        BoltType::Boolean(v) => json!(v.value),
-        BoltType::Integer(v) => json!(v.value),
-        BoltType::Float(v) => json!(v.value),
-        BoltType::Null(_) => Value::Null,
-        BoltType::List(v) => bolt_list_to_json(v),
-        BoltType::Map(v) => bolt_map_to_json(v),
-        BoltType::Node(v) => bolt_node_to_json(v),
-        BoltType::Relation(v) => bolt_relation_to_json(v),
-        BoltType::UnboundedRelation(v) => bolt_unbounded_relation_to_json(v),
-        BoltType::Bytes(v) => json!(v.value),
-        other => json!({ "kind": "unsupported_bolt_value", "debug": format!("{other:?}") }),
-    }
-}
-
-fn bolt_list_to_json(v: BoltList) -> Value {
-    Value::Array(v.into_iter().map(bolt_value_to_json).collect())
-}
-
-fn bolt_map_to_json(v: BoltMap) -> Value {
-    Value::Object(
-        v.value
-            .into_iter()
-            .map(|(k, val)| (k.value, bolt_value_to_json(val)))
-            .collect(),
-    )
-}
-
-fn bolt_node_to_json(v: BoltNode) -> Value {
-    json!({
-        "kind": "node",
-        "id": v.id.value,
-        "labels": bolt_list_to_json(v.labels),
-        "properties": bolt_map_to_json(v.properties),
-    })
-}
-
-fn bolt_relation_to_json(v: BoltRelation) -> Value {
-    json!({
-        "kind": "relationship",
-        "id": v.id.value,
-        "source": v.start_node_id.value,
-        "target": v.end_node_id.value,
-        "label": v.typ.value,
-        "properties": bolt_map_to_json(v.properties),
-    })
-}
-
-fn bolt_unbounded_relation_to_json(v: BoltUnboundedRelation) -> Value {
-    json!({
-        "kind": "relationship",
-        "id": v.id.value,
-        "label": v.typ.value,
-        "properties": bolt_map_to_json(v.properties),
-    })
 }

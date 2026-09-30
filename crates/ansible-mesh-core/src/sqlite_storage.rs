@@ -5,21 +5,54 @@
 //! consume them as `Arc<dyn EventStorage>`, etc.
 
 use crate::event::{EventEnvelope, EventId, EventKind, EventPayload};
-use crate::graph::{
-    AbstractSkillRecord, AbstractToolRecord, GraphEdge, GraphNode, RoleIncarnationRecord,
-    RuleRecord, ToolsetProfileRecord,
-};
-use crate::storage::{
-    CursorStorage, EventStorage, GraphAdapter, GuestRecord, HotelRecord, SecretRecord,
-    SessionEventRecord, SessionParticipantRecord, SessionRecord, SessionTurnRecord,
-};
+use crate::graph::{GraphEdge, GraphNode};
+use crate::storage::{CursorStorage, EventStorage, GraphAdapter};
 use anyhow::{Context, Result};
 use rusqlite::types::{Type, ValueRef};
 use rusqlite::{params, Connection};
-use serde::Deserialize;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
-use tracing::{debug, info};
+use std::time::{Duration, Instant};
+use tracing::{debug, info, warn};
+
+/// A graph read that holds the shared connection lock this long is a stall:
+/// every other task that touches the graph blocks a runtime worker on that
+/// `std::sync::Mutex`, so the whole process goes quiet (DEF-191: a per-session
+/// N+1 full scan froze the vps for ~10 s of every 30).
+const SLOW_GRAPH_QUERY: Duration = Duration::from_millis(250);
+
+/// Warns on drop when the guarded query held the connection lock for
+/// [`SLOW_GRAPH_QUERY`] or more. Declare it AFTER taking the lock so the wait
+/// for the lock is not billed to the query.
+struct SlowQueryGuard<'a> {
+    op: &'static str,
+    detail: &'a str,
+    started: Instant,
+}
+
+impl<'a> SlowQueryGuard<'a> {
+    fn new(op: &'static str, detail: &'a str) -> Self {
+        Self {
+            op,
+            detail,
+            started: Instant::now(),
+        }
+    }
+}
+
+impl Drop for SlowQueryGuard<'_> {
+    fn drop(&mut self) {
+        let elapsed = self.started.elapsed();
+        if elapsed >= SLOW_GRAPH_QUERY {
+            warn!(
+                op = self.op,
+                detail = self.detail,
+                elapsed_ms = elapsed.as_millis() as u64,
+                "slow graph query held the shared connection lock"
+            );
+        }
+    }
+}
 
 // ══════════════════════════════════════════════════════════════════════
 // SqliteEventStorage
@@ -327,6 +360,12 @@ impl SqliteGraphAdapter {
 
             CREATE INDEX IF NOT EXISTS idx_graph_nodes_kind
                 ON graph_nodes(kind);
+            CREATE INDEX IF NOT EXISTS idx_graph_nodes_kind_session_id
+                ON graph_nodes(kind, json_extract(data_json, '$.session_id'));
+            CREATE INDEX IF NOT EXISTS idx_graph_nodes_kind_status
+                ON graph_nodes(kind, json_extract(data_json, '$.status'));
+            CREATE INDEX IF NOT EXISTS idx_graph_nodes_kind_updated_at
+                ON graph_nodes(kind, updated_at);
             CREATE INDEX IF NOT EXISTS idx_graph_edges_src_kind
                 ON graph_edges(src_node_key, edge_kind);
             CREATE INDEX IF NOT EXISTS idx_graph_edges_dst
@@ -396,6 +435,7 @@ impl GraphAdapter for SqliteGraphAdapter {
 
     fn list_nodes_by_kind(&self, kind: &str) -> Result<Vec<GraphNode>> {
         let conn = self.conn.lock().unwrap();
+        let _slow = SlowQueryGuard::new("list_nodes_by_kind", kind);
         let mut stmt = conn.prepare(
             "SELECT node_key, kind, label, data_json
              FROM graph_nodes
@@ -423,6 +463,87 @@ impl GraphAdapter for SqliteGraphAdapter {
             out.push(row?);
         }
         Ok(out)
+    }
+
+    fn list_nodes_by_kind_json_eq(
+        &self,
+        kind: &str,
+        field: &str,
+        value: &str,
+        order_field: &str,
+        limit: usize,
+    ) -> Result<Vec<GraphNode>> {
+        // json_extract paths are inlined so expression indexes can match;
+        // field names come from domain-level constants, never user input.
+        for f in [field, order_field] {
+            if !f.chars().all(|c| c.is_ascii_lowercase() || c == '_') {
+                anyhow::bail!("list_nodes_by_kind_json_eq: invalid json field name {f:?}");
+            }
+        }
+        let sql = format!(
+            "SELECT node_key, kind, label, data_json
+             FROM graph_nodes
+             WHERE kind = ?1 AND json_extract(data_json, '$.{field}') = ?2
+             ORDER BY json_extract(data_json, '$.{order_field}') DESC
+             LIMIT ?3",
+        );
+        let conn = self.conn.lock().unwrap();
+        let _slow = SlowQueryGuard::new("list_nodes_by_kind_json_eq", kind);
+        let mut stmt = conn.prepare(&sql)?;
+        let limit_sql: i64 = if limit == 0 { -1 } else { limit as i64 };
+        let rows = stmt.query_map(params![kind, value, limit_sql], |row| {
+            let data_json = json_column_as_string(row, 3)?;
+            Ok(GraphNode {
+                node_key: row.get(0)?,
+                kind: row.get(1)?,
+                label: row.get(2)?,
+                data: serde_json::from_str(&data_json).map_err(|e| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        3,
+                        rusqlite::types::Type::Text,
+                        Box::new(e),
+                    )
+                })?,
+            })
+        })?;
+
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        // Query returns newest-first for the LIMIT; callers expect ascending.
+        out.reverse();
+        Ok(out)
+    }
+
+    fn delete_nodes_by_kind_older_than(
+        &self,
+        kind: &str,
+        cutoff_unix_secs: u64,
+        keep_json_field_eq: Option<(&str, &str)>,
+    ) -> Result<usize> {
+        let conn = self.conn.lock().unwrap();
+        let deleted = match keep_json_field_eq {
+            None => conn.execute(
+                "DELETE FROM graph_nodes
+                 WHERE kind = ?1 AND updated_at < datetime(?2, 'unixepoch')",
+                params![kind, cutoff_unix_secs as i64],
+            )?,
+            Some((field, value)) => {
+                if !field.chars().all(|c| c.is_ascii_lowercase() || c == '_') {
+                    anyhow::bail!(
+                        "delete_nodes_by_kind_older_than: invalid json field name {field:?}"
+                    );
+                }
+                let sql = format!(
+                    "DELETE FROM graph_nodes
+                     WHERE kind = ?1 AND updated_at < datetime(?2, 'unixepoch')
+                       AND COALESCE(json_extract(data_json, '$.{field}'), '') <> ?3",
+                );
+                conn.execute(&sql, params![kind, cutoff_unix_secs as i64, value])?
+            }
+        };
+        Ok(deleted)
     }
 
     fn upsert_edge(&self, edge: &GraphEdge) -> Result<()> {
@@ -658,68 +779,38 @@ impl SqliteGraphStorage {
     pub fn raw_conn(&self) -> &Arc<Mutex<Connection>> {
         &self.conn
     }
+}
 
-    fn config_node_key(key: &str) -> String {
-        format!("config:{key}")
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn plan_for(sql: &str) -> String {
+        let storage = SqliteGraphStorage::open_in_memory().unwrap();
+        let conn = storage.raw_conn().lock().unwrap();
+        let mut stmt = conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
+        let rows = stmt
+            .query_map([], |row| row.get::<_, String>(3))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect::<Vec<_>>();
+        rows.join(" | ")
     }
 
-    fn hotel_node_key(hotel_name: &str) -> String {
-        format!("hotel:{hotel_name}")
-    }
-
-    fn guest_node_key(hotel_name: &str, guest_id: &str) -> String {
-        format!("hotel:{hotel_name}:guest:{guest_id}")
-    }
-
-    fn hotel_guest_edge_key(hotel_name: &str, guest_id: &str) -> String {
-        format!("edge:hotel:{hotel_name}:has_guest:{guest_id}")
-    }
-
-    fn agent_node_key(agent_id: &str) -> String {
-        format!("agent:{agent_id}")
-    }
-
-    fn agent_identity_node_key(agent_id: &str) -> String {
-        format!("agent:{agent_id}:identity")
-    }
-
-    fn apartment_node_key(agent_id: &str, memory_type: &str) -> String {
-        format!("agent:{agent_id}:apartment:{memory_type}")
-    }
-
-    fn agent_apartment_edge_key(agent_id: &str, memory_type: &str) -> String {
-        format!("edge:agent:{agent_id}:owns_apartment:{memory_type}")
-    }
-
-    fn session_node_key(session_id: &str) -> String {
-        format!("session:{session_id}")
-    }
-
-    fn session_participant_node_key(session_id: &str, component_id: &str) -> String {
-        format!("session:{session_id}:participant:{component_id}")
-    }
-
-    fn session_turn_node_key(session_id: &str, turn_id: &str) -> String {
-        format!("session:{session_id}:turn:{turn_id}")
-    }
-
-    fn session_event_node_key(session_id: &str, event_id: &str) -> String {
-        format!("session:{session_id}:event:{event_id}")
-    }
-
-    fn session_participant_edge_key(session_id: &str, component_id: &str) -> String {
-        format!("edge:session:{session_id}:has_participant:{component_id}")
-    }
-
-    fn session_turn_edge_key(session_id: &str, turn_id: &str) -> String {
-        format!("edge:session:{session_id}:has_turn:{turn_id}")
-    }
-
-    fn session_event_edge_key(session_id: &str, event_id: &str) -> String {
-        format!("edge:session:{session_id}:has_event:{event_id}")
-    }
-
-    fn turn_event_edge_key(session_id: &str, turn_id: &str, event_id: &str) -> String {
-        format!("edge:session:{session_id}:turn:{turn_id}:has_event:{event_id}")
+    /// DEF-191 guard: the per-session turn lookup must be answered by the
+    /// `session_id` expression index, never a scan of the whole kind. The
+    /// silence sweep runs it once per active session under the shared graph
+    /// lock, so a scan here is a process-wide stall.
+    #[test]
+    fn session_turn_lookup_uses_the_session_id_index() {
+        let plan = plan_for(
+            "SELECT node_key, kind, label, data_json FROM graph_nodes
+             WHERE kind = 'session_turn' AND json_extract(data_json, '$.session_id') = 's'
+             ORDER BY json_extract(data_json, '$.started_at') DESC LIMIT 8",
+        );
+        assert!(
+            plan.contains("idx_graph_nodes_kind_session_id"),
+            "per-session lookup is not index-backed: {plan}"
+        );
     }
 }

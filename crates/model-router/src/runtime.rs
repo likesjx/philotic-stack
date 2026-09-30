@@ -281,6 +281,24 @@ pub async fn run_model_controller(config: ControllerGuestConfig) -> Result<()> {
 
                 let reply = ReplyRoute::from_task(&task_value);
 
+                // Decisions answer on their own action, never `model_response`,
+                // so a failed decision cannot fail a turn. They are recognised
+                // from the raw kind before task parsing, config load, the stub
+                // and the fallback ladder, all of which reply generically.
+                if crate::decisions::is_decisions_task(&task_value) {
+                    handle_decisions_task(
+                        &mut ipc_client,
+                        &config,
+                        &http_client,
+                        trace_store.as_deref(),
+                        &task_value,
+                        &task_id.to_string(),
+                        &reply,
+                    )
+                    .await?;
+                    continue;
+                }
+
                 if let Some(stub_response) =
                     short_circuit_response(&task_value, stub_response.as_deref())
                 {
@@ -564,15 +582,15 @@ pub async fn run_model_controller(config: ControllerGuestConfig) -> Result<()> {
                                     model_id,
                                     None,
                                 );
-                                if let Some(ref gd) = graph_domain {
-                                    if let Err(e) = gd.observe_model_outcome(
+                                if let Some(ref gd) = graph_domain
+                                    && let Err(e) = gd.observe_model_outcome(
                                         &provider_id,
                                         &local_node_id(),
                                         latency_ms,
                                         true,
-                                    ) {
-                                        warn!("observe_model_outcome (success): {e}");
-                                    }
+                                    )
+                                {
+                                    warn!("observe_model_outcome (success): {e}");
                                 }
                                 fire_transcription_capture_fanout(
                                     &controller_task,
@@ -780,6 +798,11 @@ pub async fn run_model_controller(config: ControllerGuestConfig) -> Result<()> {
                         // (attempts + rotations) stays under the philote watchdog.
                         let mut active_pool_member = gemini_active_member;
                         let mut rotations_left: u8 = 2;
+                        // Network-outage patience: how many 5s connectivity
+                        // waits a dispatch may burn before giving up early.
+                        // The outer dispatch timeout stays the hard ceiling.
+                        const NETWORK_WAIT_SECS: u64 = 5;
+                        let mut network_waits_left: u8 = 20;
 
                         while attempt < retry.max_attempts {
                             if attempt > 0 {
@@ -901,11 +924,10 @@ pub async fn run_model_controller(config: ControllerGuestConfig) -> Result<()> {
 
                             match attempt_result {
                                 Ok(output) => {
-                                    if provider.id() == "gemini" {
-                                        if let Some(idx) = active_pool_member {
+                                    if provider.id() == "gemini"
+                                        && let Some(idx) = active_pool_member {
                                             gemini_pool.note_success(idx);
                                         }
-                                    }
                                     result = Some(Ok(output));
                                     break;
                                 }
@@ -953,6 +975,45 @@ pub async fn run_model_controller(config: ControllerGuestConfig) -> Result<()> {
                                         }
                                         // Rebuild lost the provider (should not happen) —
                                         // fall through to normal failure handling.
+                                    }
+                                    // Connect-class failures (DNS, refused,
+                                    // unreachable) are almost always the LOCAL
+                                    // network being down — e.g. a Mac waking
+                                    // from sleep before Wi-Fi is up — so tier
+                                    // escalation cannot help: every provider
+                                    // rides the same dead network. Wait it out
+                                    // here instead, bounded by the outer
+                                    // dispatch timeout (which converts a real
+                                    // sustained outage into provider_timeout →
+                                    // the ladder engages as before). Bounded
+                                    // attempt count is a belt against a
+                                    // misconfigured outer timeout.
+                                    let is_network_error = classified.sub_kind.as_deref()
+                                        == Some("network_error");
+                                    if is_network_error && network_waits_left > 0 {
+                                        network_waits_left -= 1;
+                                        warn!(
+                                            "Provider [{}] network-unreachable; waiting {}s for connectivity ({} waits left): {}",
+                                            provider.id(),
+                                            NETWORK_WAIT_SECS,
+                                            network_waits_left,
+                                            e
+                                        );
+                                        emit_dispatch_status(
+                                            &mut ipc_client,
+                                            &reply,
+                                            attempt,
+                                            "waiting_for_network",
+                                        )
+                                        .await;
+                                        tokio::time::sleep(Duration::from_secs(NETWORK_WAIT_SECS))
+                                            .await;
+                                        last_err = e;
+                                        // `continue` skips the attempt counter:
+                                        // network patience is time-bounded by
+                                        // the outer dispatch timeout, not the
+                                        // provider's attempt budget.
+                                        continue;
                                     }
                                     let retryable = classified.retryable.unwrap_or(false);
                                     let has_more = attempt + 1 < retry.max_attempts;
@@ -1025,15 +1086,15 @@ pub async fn run_model_controller(config: ControllerGuestConfig) -> Result<()> {
                                 model_id,
                                 None,
                             );
-                            if let Some(ref gd) = graph_domain {
-                                if let Err(e) = gd.observe_model_outcome(
+                            if let Some(ref gd) = graph_domain
+                                && let Err(e) = gd.observe_model_outcome(
                                     &provider_id,
                                     &local_node_id(),
                                     latency_ms,
                                     true,
-                                ) {
-                                    warn!("observe_model_outcome (success): {e}");
-                                }
+                                )
+                            {
+                                warn!("observe_model_outcome (success): {e}");
                             }
 
                             // ── Transcription flywheel fan-out ────────────────
@@ -1072,15 +1133,15 @@ pub async fn run_model_controller(config: ControllerGuestConfig) -> Result<()> {
                                 None,
                                 None,
                             );
-                            if let Some(ref gd) = graph_domain {
-                                if let Err(e) = gd.observe_model_outcome(
+                            if let Some(ref gd) = graph_domain
+                                && let Err(e) = gd.observe_model_outcome(
                                     &provider_id,
                                     &local_node_id(),
                                     latency_ms,
                                     false,
-                                ) {
-                                    warn!("observe_model_outcome (failure): {e}");
-                                }
+                                )
+                            {
+                                warn!("observe_model_outcome (failure): {e}");
                             }
                             error!("Provider invocation failed: {}", err);
                             emit_failure(
@@ -1231,18 +1292,16 @@ async fn handle_stream_frame(
             if let (Some(session_id), Some(reply)) = (
                 transcribe_stream::stream_session_id(task_value),
                 transcribe_stream::reply_address(task_value),
-            ) {
-                if let Ok(mut sink) = IpcStreamReplySink::connect(controller_guest_id, reply).await
-                {
-                    let _ = sink
-                        .send(
-                            session_id,
-                            "",
-                            true,
-                            Some(&format!("invalid stream frame: {err}")),
-                        )
-                        .await;
-                }
+            ) && let Ok(mut sink) = IpcStreamReplySink::connect(controller_guest_id, reply).await
+            {
+                let _ = sink
+                    .send(
+                        session_id,
+                        "",
+                        true,
+                        Some(&format!("invalid stream frame: {err}")),
+                    )
+                    .await;
             }
         }
     }
@@ -1637,6 +1696,9 @@ fn isolate_aux_failure_from_cognitive_ladder(
         Some(k) if k == TaskKind::MediaAnalyze.as_str()
             || k == TaskKind::AudioTranscribe.as_str()
             || k == TaskKind::Embed.as_str()
+            // Decisions never reach `emit_failure` (they have their own reply
+            // path), but if one ever did, it must not engage the ladder either.
+            || k == TaskKind::Decide.as_str()
     );
     if is_aux_capability {
         payload.error_class = None;
@@ -1710,6 +1772,116 @@ async fn emit_failure(
         .send_request_with_timeout(reply_req, Duration::from_secs(30))
         .await
         .context("emit_failure: ipc ack failed or timed out after 30s")?;
+    Ok(())
+}
+
+/// Loading the decisions key is a few IPC round trips; if the hotel does not
+/// answer within this, the caller falls back rather than waiting on a vault stall.
+const DECISIONS_CONFIG_LOAD_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// Serve one `decisions.evaluate` task end to end and reply with a
+/// `decisions_response`. Every path, including a failed config load, replies
+/// with a typed decision error; none goes through `emit_failure`, which would
+/// use `model_response` and fail the requester's turn.
+async fn handle_decisions_task(
+    ipc_client: &mut PhiloticClient,
+    config: &ControllerGuestConfig,
+    http_client: &reqwest::Client,
+    trace_store: Option<&dyn RouterTraceStorage>,
+    task_value: &Value,
+    task_id: &str,
+    reply: &ReplyRoute,
+) -> Result<()> {
+    use ansible_mesh_core::decisions::DecisionsErrorClass;
+
+    let started = Instant::now();
+    // Only the decisions key is loaded (a few round trips), not the dozen
+    // unrelated provider configs every other task reloads, and under a timeout
+    // sized for a decision rather than the 55 s model dispatch cap. Time spent
+    // here is not counted against the task's own `deadline_ms`.
+    let decision = match tokio::time::timeout(
+        DECISIONS_CONFIG_LOAD_TIMEOUT,
+        decisions_client::load_decisions_config(ipc_client),
+    )
+    .await
+    {
+        Ok(Ok(decisions)) => {
+            let configs = ProviderConfigs {
+                decisions,
+                ..ProviderConfigs::default()
+            };
+            let providers =
+                ProviderRegistry::new((config.providers)(http_client.clone(), &configs));
+            crate::decisions::evaluate_task(task_value, &providers).await
+        }
+        Ok(Err(err)) => {
+            // An ACL denial means the key was sealed without this role: a
+            // credential problem, not an outage.
+            let class = if err.to_string().contains("not accessible") {
+                DecisionsErrorClass::Auth
+            } else {
+                DecisionsErrorClass::Unavailable
+            };
+            crate::decisions::DecisionReply::failed(
+                task_value,
+                class,
+                format!("decisions key load failed: {err}"),
+            )
+        }
+        Err(_) => crate::decisions::DecisionReply::failed(
+            task_value,
+            DecisionsErrorClass::Timeout,
+            "decisions key load exceeded its timeout",
+        ),
+    };
+
+    let latency_ms = started.elapsed().as_millis() as u64;
+    let (model_id, token_count) = decision.model_and_tokens();
+    record_routing_trace(
+        trace_store,
+        reply,
+        crate::providers::decisions::PROVIDER_ID,
+        TaskKind::Decide.as_str(),
+        if decision.outcome.is_ok() {
+            "success"
+        } else {
+            "failure"
+        },
+        decision.failure_code(),
+        latency_ms,
+        model_id,
+        token_count,
+    );
+    if let Err(err) = &decision.outcome {
+        warn!(
+            site = ?decision.site,
+            class = %err.class,
+            "decision failed; the caller falls back to its deterministic decision: {}",
+            err.message
+        );
+    }
+
+    let correlation_id = crate::decisions::correlation_id(task_value, task_id);
+    let mut payload = decision.body(&correlation_id);
+    payload.insert("return_route".into(), reply.return_route.as_json());
+    payload.insert("reply_guest_id".into(), json!(reply.return_route.guest_id));
+    // Echoed for the requester's correlation only. No `final_reply_*` and no
+    // `content`: those belong to turn replies.
+    payload.insert("session_id".into(), json!(reply.session_id));
+    payload.insert("turn_id".into(), json!(reply.turn_id));
+
+    ipc_client
+        .send_request_with_timeout(
+            IpcRequest::EmitTask {
+                target_node: reply.return_route.node.clone(),
+                target_role: reply.return_route.role.clone(),
+                target_guest_id: reply.return_route.guest_id.clone(),
+                task_json: Value::Object(payload).to_string(),
+            },
+            Duration::from_secs(30),
+        )
+        .await
+        .context("handle_decisions_task: ipc ack failed or timed out after 30s")?;
     Ok(())
 }
 
@@ -1803,10 +1975,9 @@ fn extract_http_status(message: &str) -> Option<u16> {
         if let Ok(n) = std::str::from_utf8(&bytes[i..i + 3])
             .unwrap_or("")
             .parse::<u16>()
+            && (400..=599).contains(&n)
         {
-            if (400..=599).contains(&n) {
-                return Some(n);
-            }
+            return Some(n);
         }
     }
     None
@@ -1974,6 +2145,8 @@ fn extract_output_model_gen(output: &ProviderOutput) -> Option<String> {
     match output {
         ProviderOutput::Text { model_gen, .. } => model_gen.clone(),
         ProviderOutput::Embedding { model_gen, .. } => Some(model_gen.clone()),
+        // The resolved model version, not the alias requested.
+        ProviderOutput::Judgment(outcome) => Some(outcome.trace.model.clone()),
         ProviderOutput::Audio(_) | ProviderOutput::ToolCall { .. } => None,
     }
 }
@@ -1981,6 +2154,11 @@ fn extract_output_model_gen(output: &ProviderOutput) -> Option<String> {
 /// Record a routing decision into the training-tap store, if one is open.
 ///
 /// Failures to write are logged as warnings and do not abort the request path.
+// All nine parameters are flat fields of one RouterTrainingRecord, so a
+// RoutingTrace struct would genuinely read better than this positional list.
+// Not done here: there are nine call sites and the win is cosmetic, so it is
+// left as a deliberate follow-up rather than a rushed positional rewrite.
+#[allow(clippy::too_many_arguments)]
 fn record_routing_trace(
     store: Option<&dyn RouterTraceStorage>,
     reply: &ReplyRoute,

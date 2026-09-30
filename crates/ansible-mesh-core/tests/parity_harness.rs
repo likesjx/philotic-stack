@@ -70,8 +70,8 @@ async fn test_authz_crypto_validation_and_time_bound() {
 
 #[test]
 fn test_nonce_replay_guard() {
-    // In-memory sqlite DB for test
-    let tracker = NonceTracker::open(":memory:").expect("Failed to open volatile DB");
+    // In-memory replay window for test
+    let tracker = NonceTracker::new();
     let msg_id = uuid::Uuid::new_v4();
 
     // 1. First seen is allowed

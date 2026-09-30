@@ -4,9 +4,41 @@ use std::fs;
 use crate::init::philotic_dir;
 use crate::start::{process_alive, read_pid};
 
-pub async fn run(keep_identity: bool) -> Result<()> {
+pub async fn run(keep_identity: bool, yes: bool) -> Result<()> {
     println!("phil reset");
     println!("─────────────────────────────────────────");
+
+    // Confirm before destroying anything.
+    //
+    // This removes `~/.philotic` and `~/.muninn` wholesale: every profile's
+    // context DB (and therefore the vault ciphertexts), the entire Muninn
+    // engram store, and — without `--keep-identity` — the operator's ed25519
+    // keypair. None of it is backed up first and none of it is recoverable.
+    // A destructive verb of that reach should not be one tab-completion away
+    // from running, and this fleet has already lost operator files to an
+    // unguarded one.
+    if !yes {
+        let identity_note = if keep_identity {
+            "  ~/.philotic/identity/  PRESERVED (--keep-identity)"
+        } else {
+            "  ~/.philotic/identity/  DELETED — the operator keypair is unrecoverable"
+        };
+        println!("  This will permanently delete:");
+        println!("    ~/.philotic   all profiles, context DBs, vault ciphertexts");
+        println!("    ~/.muninn     the entire memory store");
+        println!("{identity_note}");
+        println!("  There is no backup and no undo.");
+        println!();
+
+        let confirmed = inquire::Confirm::new("Proceed with reset?")
+            .with_default(false)
+            .prompt()
+            .unwrap_or(false);
+        if !confirmed {
+            println!("  aborted — nothing was deleted");
+            return Ok(());
+        }
+    }
 
     // ── Stop aiua ─────────────────────────────────────────────────────────
     if let Some(pid) = read_pid() {

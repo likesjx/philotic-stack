@@ -12,13 +12,29 @@ build:
 check:
     cargo check --workspace
 
+# Keep every production direct network constructor explicitly classified.
+outbound-egress-check:
+    python3 scripts/check-outbound-egress-inventory.py
+
+# Prove the hotel-owned OpenRouter catalog leaves through the governed runner.
+model-catalog-egress-smoke:
+    ./scripts/smoke-model-catalog-egress-roundtrip.sh
+
 # Verify the repo bootstrap engine: Muninn, helper scripts, and workspace baseline.
 engine-check:
     ./scripts/engine-check.sh
 
-# Install repo-local git hooks such as the deterministic pre-push secret check.
+# Install repo-local git hooks: the deterministic pre-push secret check and the
+# pre-commit rustfmt gate. core.hooksPath lives in .git/config, which is shared
+# across linked worktrees, so this covers every worktree at once.
 install-git-hooks:
     git config core.hooksPath .githooks
+
+# Check the system packages the workspace needs but does not declare.
+# Run this first on a new machine — it fails loudly at setup instead of letting
+# the build die confusingly three minutes in.
+preflight:
+    ./scripts/preflight-system-deps.sh
 
 # Mandatory Muninn bootstrap gate for meaningful sessions.
 session-start:
@@ -150,7 +166,7 @@ start-aiua hotel:
 
 # Rebuild the local runtime binaries that the hotel materializes during watched UAT.
 build-runtime:
-    cargo build -p aiua -p philote -p membrane-telegram -p model-router -p tool-runner -p graph-datasource -p philotic-web
+    cargo build -p aiua -p philote -p membrane-telegram -p membrane-mcp-client -p egress-http-runner -p model-router -p tool-runner -p graph-datasource -p philotic-web
 
 # Kill local Philotic hotel/guest binaries from this checkout and clear stale sockets.
 kill-local-stack:
@@ -164,6 +180,8 @@ kill-local-stack:
     @pkill -KILL -f "target/debug/model-controller-openai" 2>/dev/null || true
     @pkill -KILL -f "target/debug/model-controller-ollama" 2>/dev/null || true
     @pkill -KILL -f "target/debug/tool-runner" 2>/dev/null || true
+    @pkill -KILL -f "target/debug/egress-http-runner" 2>/dev/null || true
+    @pkill -KILL -f "target/debug/membrane-mcp-client" 2>/dev/null || true
     @pkill -KILL -f "target/debug/graph-runner" 2>/dev/null || true
     @pkill -KILL -f "target/debug/graph-datasource" 2>/dev/null || true
     @pkill -KILL -f "target/debug/model-controller-mlx" 2>/dev/null || true
@@ -392,6 +410,14 @@ smoke-session-control:
 smoke-mcp:
     ./scripts/mcp-client-uat.sh safe
 
+# Run the governed HTTP integration binary smoke test
+smoke-integration-http:
+    ./scripts/smoke-integration-http-roundtrip.sh
+
+# Run MCP protocol management with its HTTP wire exchange through governed egress
+smoke-mcp-http-egress:
+    ./scripts/smoke-mcp-http-egress-roundtrip.sh
+
 # Run the session bindings binary smoke test
 smoke-session-bindings:
     ./scripts/smoke-session-bindings-roundtrip.sh
@@ -502,6 +528,8 @@ smoke-suite:
     ./scripts/smoke-preapprove-roundtrip.sh
     ./scripts/smoke-session-control-roundtrip.sh
     ./scripts/smoke-session-bindings-roundtrip.sh
+    ./scripts/smoke-integration-http-roundtrip.sh
+    ./scripts/smoke-mcp-http-egress-roundtrip.sh
     ./scripts/smoke-subagent-roundtrip.sh
     bash scripts/smoke-cognitive-roundtrip.sh
     bash scripts/smoke-cognitive-reentry-roundtrip.sh
@@ -552,9 +580,9 @@ local-push:
     set -euo pipefail
     AIUA_CELLAR=/opt/homebrew/Cellar/aiua/0.1.0-alpha/bin
     PHIL_CELLAR=/opt/homebrew/Cellar/philotic-web/0.1.0-alpha/bin
-    AIUA_BINS="aiua philote membrane-telegram membrane-discord membrane-mcp model-router model-controller-gemini model-controller-elevenlabs model-controller-openrouter model-controller-anthropic model-controller-openai model-controller-mlx model-controller-ollama model-controller-onnx model-controller-parakeet model-controller-vision philote-worker tool-runner graph-datasource table-datasource router-listener agent-datasource heal-dispatcher life-graph-runner"
+    AIUA_BINS="aiua philote membrane-telegram membrane-discord membrane-mcp membrane-mcp-client egress-http-runner model-router model-controller-gemini model-controller-elevenlabs model-controller-openrouter model-controller-anthropic model-controller-openai model-controller-mlx model-controller-ollama model-controller-onnx model-controller-parakeet model-controller-vision philote-worker tool-runner graph-datasource table-datasource router-listener agent-datasource heal-dispatcher life-graph-runner"
     echo "▶ Building release binaries..."
-    cargo build --release -p aiua -p philote -p membrane-telegram -p membrane-discord -p membrane-mcp -p model-router -p tool-runner -p graph-datasource -p philotic-web -p table-datasource -p router-listener -p agent-datasource -p heal-dispatcher -p data-memorygraphrag
+    cargo build --release -p aiua -p philote -p membrane-telegram -p membrane-discord -p membrane-mcp -p membrane-mcp-client -p egress-http-runner -p model-router -p tool-runner -p graph-datasource -p philotic-web -p table-datasource -p router-listener -p agent-datasource -p heal-dispatcher -p data-memorygraphrag
     echo "▶ Installing aiua stack to ${AIUA_CELLAR}..."
     # Make bin dir writable so we can delete+recreate files (new inode avoids macOS codesign cache poisoning)
     chmod u+w "${AIUA_CELLAR}"
@@ -582,10 +610,27 @@ local-push:
     done
     chmod u-w "${AIUA_CELLAR}"
     echo "▶ Installing phil to ${PHIL_CELLAR}..."
-    chmod u+w "${PHIL_CELLAR}/philotic-web" "${PHIL_CELLAR}/phil" 2>/dev/null || true
+    # rm BEFORE cp so the new binary lands on a NEW INODE. Overwriting in
+    # place poisons macOS's code-signature cache: the kernel keeps the old
+    # CDHash for that inode, decides the replacement does not match, and
+    # SIGKILLs it. The symptom is brutal to diagnose — every invocation exits
+    # 137 with no output whatsoever, while `codesign -v` reports the binary as
+    # perfectly valid. The AIUA_CELLAR loop above already does this; this path
+    # did not, so `phil` was dead on arrival after every deploy while aiua and
+    # philote were fine.
+    #
+    # Note ${PHIL_CELLAR}/phil is a SYMLINK to philotic-web, so it needs no
+    # copy of its own — writing through it would just rewrite the same file.
+    chmod u+w "${PHIL_CELLAR}" "${PHIL_CELLAR}/philotic-web" 2>/dev/null || true
+    rm -f "${PHIL_CELLAR}/philotic-web"
     cp target/release/philotic-web "${PHIL_CELLAR}/philotic-web"
-    cp target/release/philotic-web "${PHIL_CELLAR}/phil"
-    chmod u-w "${PHIL_CELLAR}/philotic-web" "${PHIL_CELLAR}/phil"
+    chmod u-w "${PHIL_CELLAR}/philotic-web"
+    # Fail loudly here rather than shipping a binary the kernel will kill.
+    if ! "${PHIL_CELLAR}/philotic-web" --version >/dev/null 2>&1; then
+        echo "  ✗ phil was installed but will not execute (exit $?)." >&2
+        echo "    Usually macOS code-signature cache poisoning — check the inode changed." >&2
+        exit 1
+    fi
     echo "  ✓ phil"
     echo "✅ Local Homebrew install updated."
 
@@ -784,6 +829,8 @@ vps-push:
       -p membrane-telegram \
       -p membrane-discord \
       -p membrane-mcp \
+      -p membrane-mcp-client \
+      -p egress-http-runner \
       -p model-router \
       -p tool-runner \
       -p graph-datasource \
@@ -869,6 +916,19 @@ vps-deploy-ci:
       deploy_hotel.yml \
       --limit jane-vps \
       --extra-vars "philotic_artifacts_remote=true philotic_artifacts_dir=${REMOTE_DIR}"
+
+# Live smoke of the orchestrator skill administration plane (PR #430) against
+# a RUNNING hotel socket: gate rejections, SkillDAG edge persistence,
+# suspend/reinstate lifecycle, audit trail. Registers a throwaway
+# `<agent>:skilldrill` orchestrator guest and retires its drill skills.
+#   just smoke-skill-admin ~/.philotic/bjork/aiua-mac-jane.sock agent-bjork-01
+#   ssh deploy@jane-vps sudo -u philotic python3 scripts/smoke-skill-admin.py /run/philotic/vps-jane.sock agent-beacon-01
+smoke-skill-admin socket agent="agent-bjork-01":
+    python3 scripts/smoke-skill-admin.py {{socket}} {{agent}}
+
+# Paracrine delegation plane smoke against a live hotel socket.
+smoke-paracrine socket role="Chronos":
+    python3 scripts/smoke-paracrine.py {{socket}} {{role}}
 
 # Check that vps-jane host_vars peer ports match the live context graph.
 vps-port-drift-check:

@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - paracrine-response-return-route
+
+rectangle "paracrine-response-return-route" as paracrine_response_return_route #Orange {
+}
+
+
+@enduml

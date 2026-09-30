@@ -36,7 +36,7 @@ pub fn generate_sequence_diagram(
         let sanitized = sanitize_seq_id(p);
         uml.push_str(&format!("participant \"{}\" as {}\n", p, sanitized));
     }
-    uml.push_str("\n");
+    uml.push('\n');
 
     // Add calls
     for (from, to, label, depth) in calls {
@@ -133,7 +133,7 @@ pub fn generate_state_diagram(
                 let state_id = sanitize_state_id(variant);
                 uml.push_str(&format!("state \"{}\" as {}\n", variant, state_id));
             }
-            uml.push_str("\n");
+            uml.push('\n');
 
             // Try to find transitions by looking for match statements
             let transitions = find_state_transitions(engine, enum_id, &variants)?;
@@ -326,7 +326,7 @@ pub fn generate_module_interaction(engine: &GraphEngine, crate_name: &str) -> Re
             sanitize_seq_id(short)
         ));
     }
-    uml.push_str("\n");
+    uml.push('\n');
 
     // Show interactions
     for (from, to, count) in interactions {

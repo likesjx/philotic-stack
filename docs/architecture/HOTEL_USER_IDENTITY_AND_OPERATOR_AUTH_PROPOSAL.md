@@ -3,7 +3,7 @@ title: Hotel User Identity And Operator Auth Proposal
 doc_type: proposal
 domain: operator-control-plane
 status: accepted-current-slice
-last_updated: 2026-05-16
+last_updated: 2026-09-18
 tags:
 - operator
 - identity
@@ -229,6 +229,15 @@ Suggested first record families:
 - `status`
 
 ## Current Slice
+
+The desktop gateway session bridge is implemented locally on
+`codex/desktop-hotel-session`, not deployed. After website invitation/current-admin
+checks, a separately authenticated gateway obtains a hotel-issued session for a
+stable provider-subject user, never a shared root identity. Both website and hotel
+authority are revalidated; gateway credentials and per-user tokens stay server-side.
+See [contract and rollout gate](../../crates/philotic-web/DESKTOP_GATEWAY.md) and
+[execution status](../task.md#desktop-hotel-sessions). Conflicting legacy identity
+links require explicit migration rather than silent remapping.
 
 The first concrete bootstrap/session slice is now real in `philotic-web`:
 

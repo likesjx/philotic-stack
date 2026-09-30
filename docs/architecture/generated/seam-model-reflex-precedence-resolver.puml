@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - model-reflex-precedence-resolver
+
+rectangle "model-reflex-precedence-resolver" as model_reflex_precedence_resolver #Orange {
+}
+
+
+@enduml

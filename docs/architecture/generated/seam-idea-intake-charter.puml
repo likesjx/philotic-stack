@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - idea-intake-charter
+
+rectangle "idea-intake-charter" as idea_intake_charter #Orange {
+}
+
+
+@enduml

@@ -15,11 +15,13 @@ related_docs:
 - INTER_HOTEL_ROUTING_PROPOSAL.md
 - PERIMETER_EGRESS_CONTROL_PROPOSAL.md
 - MEMBRANE_EXTERNAL_AGENT_AND_EVENT_TRANSPORT_PROPOSAL.md
+- BLOB_EXECUTION_PERIMETER_HARDENING_PROPOSAL.md
 task_refs:
 - docs/task.md
 proposal_id: hotel-perimeter-trust
 implements: []
-implemented_by: []
+implemented_by:
+- blob-execution-perimeter-hardening
 active_seams:
 - hotel-membership-records
 - perimeter-authz-policy

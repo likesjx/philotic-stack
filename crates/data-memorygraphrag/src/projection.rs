@@ -23,14 +23,19 @@ use serde_json::Value;
 ///
 /// Must stay in sync with the index names created by V001 migration.
 pub fn index_name(space: &SemanticSpace, label: &str) -> String {
-    let prefix = match space {
+    format!("{}__{}", space_prefix(space), label)
+}
+
+/// The index-name prefix for a semantic space (matches
+/// `ontology::SEMANTIC_SPACE_PREFIXES` and the V00x migrations).
+pub fn space_prefix(space: &SemanticSpace) -> &'static str {
+    match space {
         SemanticSpace::LifeEventSemantic => "life_event_semantic",
         SemanticSpace::GoalSystemSemantic => "goal_system_semantic",
         SemanticSpace::SkillToolSemantic => "skill_tool_semantic",
         SemanticSpace::RolePersonSemantic => "role_person_semantic",
         SemanticSpace::MemoryBridgeSemantic => "memory_bridge_semantic",
-    };
-    format!("{}__{}", prefix, label)
+    }
 }
 
 /// All node labels that participate in a given semantic space.
@@ -39,7 +44,15 @@ pub fn index_name(space: &SemanticSpace, label: &str) -> String {
 /// V001 migration index names.
 pub fn labels_for_space(space: &SemanticSpace) -> &'static [&'static str] {
     match space {
-        SemanticSpace::LifeEventSemantic => &["Event", "Signal", "OpenLoop"],
+        SemanticSpace::LifeEventSemantic => &[
+            "Event",
+            "Signal",
+            "OpenLoop",
+            "Trip",
+            "Appointment",
+            "Moment",
+            "Place",
+        ],
         SemanticSpace::GoalSystemSemantic => &[
             "Goal",
             "System",
@@ -47,6 +60,9 @@ pub fn labels_for_space(space: &SemanticSpace) -> &'static [&'static str] {
             "Project",
             "Routine",
             "NextAction",
+            "Subscription",
+            "Asset",
+            "CreativeWork",
         ],
         SemanticSpace::SkillToolSemantic => &[
             "GrowthHypothesis",
@@ -77,10 +93,11 @@ pub fn labels_for_space(space: &SemanticSpace) -> &'static [&'static str] {
 /// or `None` if the label has no vector index.
 pub fn embedding_space_for_label(label: &str) -> Option<&'static str> {
     match label {
-        "Event" | "Signal" | "OpenLoop" => Some("life_event_semantic"),
-        "Goal" | "System" | "Habit" | "Project" | "Routine" | "NextAction" => {
-            Some("goal_system_semantic")
+        "Event" | "Signal" | "OpenLoop" | "Trip" | "Appointment" | "Moment" | "Place" => {
+            Some("life_event_semantic")
         }
+        "Goal" | "System" | "Habit" | "Project" | "Routine" | "NextAction" | "Subscription"
+        | "Asset" | "CreativeWork" => Some("goal_system_semantic"),
         "GrowthHypothesis" | "GrowthExperiment" | "DriftFinding" | "CapabilityPatch"
         | "SkillPatch" | "ToolPatch" | "SchemaPatch" | "AttentionPatch" | "SystemPatch" => {
             Some("skill_tool_semantic")
@@ -177,11 +194,14 @@ impl VectorHit {
     }
 
     pub fn is_retired(&self) -> bool {
+        // The terminal vocabulary lives in `ontology` (single source):
+        // `resolved` is what life.commit/life.resolve write on loop closure
+        // (PR #434 regression), and the legacy `loop_status` alias is read
+        // because production nodes exist where the closure landed there.
         matches!(self.validation_state(), ValidationState::Retired)
-            || matches!(
-                self.prop_str("status").unwrap_or(""),
-                "retired" | "done" | "fulfilled" | "abandoned"
-            )
+            || crate::ontology::STATUS_PROPERTIES
+                .iter()
+                .any(|prop| crate::ontology::is_terminal_status(self.prop_str(prop).unwrap_or("")))
     }
 }
 
@@ -235,16 +255,19 @@ pub fn parse_vector_search_rows(result: &Value) -> Vec<VectorHit> {
 pub const EXPANSION_SCORE_DECAY: f32 = 0.6;
 
 /// Effective relationship types for read-side expansion: the intersection of
-/// the caller's `ExpansionPolicy.allowed_edge_types` with the living-cycle
-/// vocabulary. An empty allowlist means all living-cycle types. Unknown
-/// caller-supplied types are ignored (never interpolated into Cypher).
+/// the caller's `ExpansionPolicy.allowed_edge_types` with the writable
+/// vocabulary (living-cycle + agenda relations). An empty allowlist means
+/// all writable types. Unknown caller-supplied types are ignored (never
+/// interpolated into Cypher).
 pub fn expansion_rel_types(allowed_edge_types: &[String]) -> Vec<&'static str> {
-    if allowed_edge_types.is_empty() {
-        return crate::cypher::LIVING_CYCLE_REL_TYPES.to_vec();
-    }
-    crate::cypher::LIVING_CYCLE_REL_TYPES
+    let writable = crate::cypher::LIVING_CYCLE_REL_TYPES
         .iter()
         .copied()
+        .chain(crate::cypher::AGENDA_EDGE_RULES.iter().map(|r| r.rel_type));
+    if allowed_edge_types.is_empty() {
+        return writable.collect();
+    }
+    writable
         .filter(|rel| allowed_edge_types.iter().any(|allowed| allowed == rel))
         .collect()
 }
@@ -591,6 +614,8 @@ pub fn project_hit_to_evidence_packet(hit: &VectorHit, generated_at: &str) -> Ev
         validation_state: hit.validation_state(),
         observed_at: hit.prop_str("observed_at").map(str::to_string),
         valid_time_range: None,
+        due_at: None,
+        occurs_at: None,
         source_reliability: hit.confidence(),
         conflict_ids: Vec::new(),
         adjudication_status: AdjudicationStatus::NotNeeded,
@@ -599,6 +624,7 @@ pub fn project_hit_to_evidence_packet(hit: &VectorHit, generated_at: &str) -> Ev
             "similarity": hit.similarity,
             "bolt_id": hit.bolt_id,
         }),
+        properties: Default::default(),
     }
 }
 
@@ -673,10 +699,8 @@ pub fn project_context_packet(
             datasource: Some("life-graph".into()),
         };
         let mut packet = project_hit_to_evidence_packet(&hit, generated_at);
-        if fallback_origin {
-            if let Some(meta) = packet.metadata.as_object_mut() {
-                meta.insert("fallback_origin".into(), true.into());
-            }
+        if fallback_origin && let Some(meta) = packet.metadata.as_object_mut() {
+            meta.insert("fallback_origin".into(), true.into());
         }
         let evidence_path = match &expansion_origin {
             Some(exp) => {
@@ -857,6 +881,41 @@ mod tests {
         assert!(log[0].contains("ExcludeRetired"));
     }
 
+    /// Live regression (vps-jane, 2026-08-20): loops closed via the
+    /// life.commit/life.resolve path get `status = "resolved"`, and some
+    /// production nodes carry the closure on `loop_status` instead. Both
+    /// kept surfacing in daily-brief recall because neither value was in
+    /// the ExcludeRetired set.
+    #[test]
+    fn policy_filter_excludes_resolved_loops() {
+        let result = json!({
+            "rows": [
+                bolt_node_row(1, "OpenLoop",
+                    json!({ "id": "l:ol:open", "title": "Active loop",
+                             "confidence": 0.8, "validation_state": "confirmed",
+                             "status": "open" }),
+                    0.9),
+                bolt_node_row(2, "OpenLoop",
+                    json!({ "id": "l:ol:resolved-status", "title": "Resolved via status",
+                             "confidence": 0.8, "validation_state": "confirmed",
+                             "status": "resolved" }),
+                    0.88),
+                bolt_node_row(3, "OpenLoop",
+                    json!({ "id": "l:ol:resolved-loop-status", "title": "Resolved via loop_status",
+                             "confidence": 0.8, "validation_state": "confirmed",
+                             "loop_status": "resolved" }),
+                    0.87),
+            ]
+        });
+
+        let hits = parse_vector_search_rows(&result);
+        let (surviving, log) = apply_policy_filters(hits, &[PolicyFilter::ExcludeRetired]);
+
+        assert_eq!(surviving.len(), 1);
+        assert_eq!(surviving[0].node_id(), "l:ol:open");
+        assert_eq!(log.len(), 2);
+    }
+
     #[test]
     fn policy_filter_drops_low_confidence_on_require_evidence() {
         let result = json!({
@@ -899,7 +958,7 @@ mod tests {
 
         assert!(score_fresh > score_stale, "fresh hit should rank higher");
         assert!(score_fresh > 0.5, "fresh confirmed hit should score well");
-        assert!(score_stale >= 0.0 && score_stale <= 1.0);
+        assert!((0.0..=1.0).contains(&score_stale));
     }
 
     #[test]
@@ -1197,12 +1256,13 @@ mod tests {
         let rel_types = expansion_rel_types(&[]);
         let cypher = expansion_cypher(&["l:ol:a", "l:ol:b'quote"], &rel_types, 32);
 
-        // Empty allowlist -> full living-cycle vocabulary, which now includes
-        // SCOPED_TO (LifeGraph auto-anchor Slice 1) so recall expansion
-        // traverses the server-injected node->Role anchor edges too.
-        assert!(
-            cypher.contains("MATCH (n)-[r:OWNS|SHAPES|SETS|SPAWNS|RELATES_TO|SCOPED_TO]-(related)")
-        );
+        // Empty allowlist -> full writable vocabulary: living-cycle (incl.
+        // SCOPED_TO, the server-injected node->Role anchor) plus the agenda
+        // relations (LIFE_GRAPH_ACTIVE S2) so recall expansion traverses
+        // goal/commitment topology too.
+        assert!(cypher.contains(
+            "MATCH (n)-[r:OWNS|SHAPES|SETS|SPAWNS|RELATES_TO|SCOPED_TO|ADVANCES|BLOCKED_BY|NEEDS_FOLLOWUP|PROMISED_TO|CONTAINS|SUPPORTS|INVOLVES|OCCURS_AT|PART_OF|ABOUT|MAINTAINS|RENEWS]-(related)"
+        ));
         assert!(cypher.contains("n.id IN ['l:ol:a', 'l:ol:b\\'quote']"));
         assert!(cypher.contains("coalesce(related.validation_state, 'inferred') <> 'retired'"));
         assert!(cypher.contains("RETURN n.id AS origin_id, type(r) AS rel_type, related AS node"));
@@ -1210,7 +1270,7 @@ mod tests {
     }
 
     #[test]
-    fn expansion_rel_types_intersects_allowlist_with_living_cycle_vocabulary() {
+    fn expansion_rel_types_intersects_allowlist_with_writable_vocabulary() {
         assert_eq!(
             expansion_rel_types(&[]),
             vec![
@@ -1219,12 +1279,28 @@ mod tests {
                 "SETS",
                 "SPAWNS",
                 "RELATES_TO",
-                "SCOPED_TO"
+                "SCOPED_TO",
+                "ADVANCES",
+                "BLOCKED_BY",
+                "NEEDS_FOLLOWUP",
+                "PROMISED_TO",
+                "CONTAINS",
+                "SUPPORTS",
+                "INVOLVES",
+                "OCCURS_AT",
+                "PART_OF",
+                "ABOUT",
+                "MAINTAINS",
+                "RENEWS"
             ]
         );
         assert_eq!(
             expansion_rel_types(&["OWNS".into(), "BOGUS_TYPE".into()]),
             vec!["OWNS"]
+        );
+        assert_eq!(
+            expansion_rel_types(&["ADVANCES".into(), "BOGUS_TYPE".into()]),
+            vec!["ADVANCES"]
         );
         // A fully-unknown allowlist yields no rel types (expansion disabled),
         // never an injection vector.

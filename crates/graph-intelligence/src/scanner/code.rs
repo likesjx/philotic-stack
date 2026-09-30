@@ -69,7 +69,7 @@ pub fn scan_rust_workspace(
         for entry in WalkDir::new(&src_dir)
             .into_iter()
             .filter_map(|e| e.ok())
-            .filter(|e| e.path().extension().map_or(false, |ext| ext == "rs"))
+            .filter(|e| e.path().extension().is_some_and(|ext| ext == "rs"))
         {
             let file_path = entry.path();
             let rel_path = file_path
@@ -151,33 +151,47 @@ pub fn scan_rust_workspace(
             engine.upsert_node(&module_with_metrics)?;
 
             // Process each item in the file
-            scan_items(
-                &file_ast.items,
-                &module_id,
-                &rel_path,
+            let ctx = FileScanContext {
+                file_path: &rel_path,
                 worktree,
-                &source,
-                engine,
-                &mut metrics,
+                source: &source,
                 now,
-            )?;
+            };
+            scan_items(&file_ast.items, &module_id, &ctx, engine, &mut metrics)?;
         }
     }
 
     Ok(metrics)
 }
 
+/// The per-file invariants threaded through the recursive item scan.
+///
+/// `module_id` is deliberately NOT a member: a nested `mod` block recurses with
+/// a different module id while everything here stays fixed for the whole file.
+/// All fields are `Copy`, so the body can destructure this once and carry on
+/// using the plain names.
+#[derive(Clone, Copy)]
+struct FileScanContext<'a> {
+    file_path: &'a str,
+    worktree: &'a str,
+    source: &'a str,
+    now: chrono::DateTime<Utc>,
+}
+
 /// Scan a list of syn Items, extracting types, functions, impl blocks, tests, etc.
 fn scan_items(
     items: &[Item],
     module_id: &str,
-    file_path: &str,
-    worktree: &str,
-    source: &str,
+    ctx: &FileScanContext<'_>,
     engine: &GraphEngine,
     metrics: &mut ScanMetrics,
-    now: chrono::DateTime<Utc>,
 ) -> Result<()> {
+    let FileScanContext {
+        file_path,
+        worktree,
+        source,
+        now,
+    } = *ctx;
     for item in items {
         match item {
             Item::Struct(s) => {
@@ -693,9 +707,7 @@ fn scan_items(
                     metrics.edges_created += 1;
                     metrics.modules_found += 1;
 
-                    scan_items(
-                        items, &sub_mod, file_path, worktree, source, engine, metrics, now,
-                    )?;
+                    scan_items(items, &sub_mod, ctx, engine, metrics)?;
                 }
             }
 
@@ -781,7 +793,7 @@ fn has_test_attr(attrs: &[Attribute]) -> bool {
                     .path()
                     .segments
                     .last()
-                    .map_or(false, |s| s.ident == "test"))
+                    .is_some_and(|s| s.ident == "test"))
     })
 }
 
@@ -880,10 +892,7 @@ fn format_enum_signature(e: &syn::ItemEnum) -> String {
 }
 
 fn sanitize_id(s: &str) -> String {
-    s.replace(' ', "_")
-        .replace('<', "_")
-        .replace('>', "_")
-        .replace("::", "_")
+    s.replace([' ', '<', '>'], "_").replace("::", "_")
 }
 
 fn extract_use_crate(tree: &syn::UseTree) -> Option<String> {

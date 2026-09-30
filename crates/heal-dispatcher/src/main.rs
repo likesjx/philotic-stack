@@ -1,5 +1,6 @@
 mod notify;
 mod recurrence;
+mod shadow;
 
 use ansible_mesh_core::heal_queue::HealQueueRow;
 use anyhow::Result;
@@ -297,6 +298,12 @@ impl OllamaBreaker {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // `heal-dispatcher --decision-summary`: print what the shadow judge has
+    // recorded, then exit. Read-only; it never starts the daemon.
+    if std::env::args().nth(1).as_deref() == Some("--decision-summary") {
+        return shadow::print_summary();
+    }
+
     tracing_subscriber::fmt::init();
     info!("heal-dispatcher starting");
 
@@ -365,6 +372,10 @@ async fn run(
         .timeout(Duration::from_secs(30))
         .build()?;
 
+    // Log-only decisions pilot beside the incumbent classifier. `None` (and no
+    // cost) unless PHILOTIC_SHADOW_DECISIONS is set and the dedicated key loads.
+    let shadow = shadow::DecisionsJudge::init(&mut ipc, &http).await;
+
     let mut interval = tokio::time::interval(Duration::from_secs(POLL_INTERVAL_SECS));
     loop {
         interval.tick().await;
@@ -377,6 +388,7 @@ async fn run(
             breaker,
             notifier,
             intel_graph_url,
+            shadow.as_ref(),
         )
         .await
         {
@@ -398,11 +410,19 @@ async fn dispatch_cycle(
     breaker: &mut OllamaBreaker,
     notifier: &mut OperatorNotifier,
     intel_graph_url: Option<&str>,
+    shadow: Option<&shadow::DecisionsJudge>,
 ) -> Result<()> {
-    // Proactively repair session turns stuck in "running" for more than 5 minutes.
+    // Proactively repair session turns the guest can no longer speak for. This is
+    // a BACKSTOP, not the primary turn timeout: philote bounds its own turns and
+    // reports honest errors, so this threshold must outlast the guest's ceiling.
+    // It was 300s — equal to philote's per-phase budget and below its 600s
+    // aggregate ceiling — so the hotel always won and slow-but-healthy turns died
+    // as ZOMBIE_TURN_REPAIR (46 of 96 turns fleet-wide on 2026-08-05).
     match send_request_timeout(
         ipc,
-        IpcRequest::RepairStaleSessionTurns { min_age_secs: 300 },
+        IpcRequest::RepairStaleSessionTurns {
+            min_age_secs: ansible_mesh_core::turn_budget::TURN_ZOMBIE_REAP_SECS,
+        },
         IPC_TIMEOUT,
     )
     .await
@@ -410,13 +430,13 @@ async fn dispatch_cycle(
         Ok(IpcResponse::Standard {
             data: Some(data), ..
         }) => {
-            if let Some(n) = data.get("repaired").and_then(|v| v.as_u64()) {
-                if n > 0 {
-                    info!(
-                        repaired = n,
-                        "heal-dispatcher: zombie turn scan repaired stale turns"
-                    );
-                }
+            if let Some(n) = data.get("repaired").and_then(|v| v.as_u64())
+                && n > 0
+            {
+                info!(
+                    repaired = n,
+                    "heal-dispatcher: zombie turn scan repaired stale turns"
+                );
             }
         }
         Ok(_) => {}
@@ -467,6 +487,7 @@ async fn dispatch_cycle(
             breaker,
             notifier,
             intel_graph_url,
+            shadow,
             &row,
         )
         .await?;
@@ -484,6 +505,7 @@ async fn process_row(
     breaker: &mut OllamaBreaker,
     notifier: &mut OperatorNotifier,
     intel_graph_url: Option<&str>,
+    shadow: Option<&shadow::DecisionsJudge>,
     row: &HealQueueRow,
 ) -> Result<()> {
     // Rows from the hotel's turn-failure intake (FailTask classification,
@@ -491,6 +513,10 @@ async fn process_row(
     // assigned at insert. Honour them — the tag keys A3 recurrence
     // aggregation, and re-classifying could split the same pattern across
     // two tags. Only the heal action is derived here.
+    //
+    // Everything that reaches a classifier or the recurrence evidence reads
+    // colour-free text (rows stored before the push-time strip still carry it).
+    let clean_text = ansible_mesh_core::heal_queue::strip_ansi(&row.raw_text);
     let (severity, pattern_tag, heal_action) =
         match row.pattern_tag.as_deref().filter(|tag| !tag.is_empty()) {
             Some(tag) => (
@@ -508,8 +534,10 @@ async fn process_row(
                     ollama_url,
                     ollama_model,
                     breaker,
+                    shadow,
+                    &row.id,
                     &row.guest_id,
-                    &row.raw_text,
+                    &clean_text,
                 )
                 .await
             }
@@ -540,21 +568,26 @@ async fn process_row(
     // Recurrence tracking (Autopoiesis Slice A3): a (pattern_tag, guest_id)
     // pair breaching the sliding-window threshold files a heal work item on
     // the hotel through the fleet.heal_slices autonomy lane.
-    if !row.raw_text.starts_with(WORK_ITEM_FILED_PREFIX) {
-        if let Some(breach) = tracker.record(&pattern_tag, &row.guest_id, now, &row.raw_text) {
-            file_heal_work_item(
-                ipc,
-                http,
-                notifier,
-                intel_graph_url,
-                &pattern_tag,
-                &row.guest_id,
-                breach,
-                tracker.window_secs(),
-                now,
-            )
-            .await?;
-        }
+    if !row.raw_text.starts_with(WORK_ITEM_FILED_PREFIX)
+        && let Some(breach) = tracker.record(
+            &pattern_tag,
+            &row.guest_id,
+            recurrence_clock(row.timestamp, now),
+            &clean_text,
+        )
+    {
+        file_heal_work_item(
+            ipc,
+            http,
+            notifier,
+            intel_graph_url,
+            &pattern_tag,
+            &row.guest_id,
+            breach,
+            tracker.window_secs(),
+            now,
+        )
+        .await?;
     }
 
     // Execute the action and record outcome.
@@ -590,10 +623,11 @@ async fn process_row(
     // notification failure (swallowed inside) can't disturb row resolution.
     // Skip our own work_item_filed echo rows — they never carry the escalate
     // action, but guard anyway.
-    if heal_action == "escalate" && !row.raw_text.starts_with(WORK_ITEM_FILED_PREFIX) {
-        if let Some(ping) = notifier.on_escalate(&pattern_tag, &row.guest_id, now) {
-            notifier.push(ipc, ping).await;
-        }
+    if heal_action == "escalate"
+        && !row.raw_text.starts_with(WORK_ITEM_FILED_PREFIX)
+        && let Some(ping) = notifier.on_escalate(&pattern_tag, &row.guest_id, now)
+    {
+        notifier.push(ipc, ping).await;
     }
 
     Ok(())
@@ -793,11 +827,14 @@ async fn push_intel_graph_record(
 // ── Classifier ────────────────────────────────────────────────────────────────
 
 // Returns (severity, pattern_tag, heal_action).
+#[allow(clippy::too_many_arguments)]
 async fn classify(
     http: &reqwest::Client,
     ollama_url: &str,
     ollama_model: &str,
     breaker: &mut OllamaBreaker,
+    shadow: Option<&shadow::DecisionsJudge>,
+    row_id: &str,
     guest_id: &str,
     raw_text: &str,
 ) -> (String, String, String) {
@@ -810,8 +847,8 @@ async fn classify(
     // timeout entirely and return the fail-safe classification. This prevents a
     // single cycle full of novel lines from stalling for BATCH_LIMIT*30s.
     if breaker.is_open(Instant::now()) {
-        debug!("heal-dispatcher: ollama circuit breaker open, short-circuiting classify to noop");
-        return noop_classification();
+        debug!("heal-dispatcher: ollama circuit breaker open, short-circuiting classify");
+        return no_incumbent_verdict(shadow, row_id, guest_id, raw_text).await;
     }
 
     // FunctionGemma: call Ollama for novel/unclassified patterns.
@@ -824,14 +861,56 @@ async fn classify(
         Ok((severity, pattern_tag, heal_action)) => {
             breaker.record_success();
             let heal_action = gate_llm_action(&severity, &heal_action);
+            // Log-only: the judge sees the same line and records whether it
+            // agrees with what the incumbent just decided. It never changes it.
+            if let Some(shadow) = shadow {
+                shadow.observe(
+                    guest_id,
+                    raw_text,
+                    Some(shadow::Incumbent {
+                        severity: severity.clone(),
+                        pattern_tag: pattern_tag.clone(),
+                        heal_action: heal_action.clone(),
+                    }),
+                );
+            }
             (severity, pattern_tag, heal_action)
         }
         Err(e) => {
             breaker.record_failure(Instant::now());
-            warn!("gemma classify failed ({e}), falling back to noop");
-            noop_classification()
+            warn!("gemma classify failed ({e}), falling back");
+            no_incumbent_verdict(shadow, row_id, guest_id, raw_text).await
         }
     }
+}
+
+/// The incumbent has no verdict (Ollama down or its breaker open). With the
+/// decisions fallback on (slice H1) the judge's bounded verdict is applied;
+/// otherwise — or when the fallback declines — the shadow judge observes and the
+/// row takes the old `unclassified`/noop fail-safe. Never both calls for one row.
+async fn no_incumbent_verdict(
+    judge: Option<&shadow::DecisionsJudge>,
+    row_id: &str,
+    guest_id: &str,
+    raw_text: &str,
+) -> (String, String, String) {
+    if let Some(judge) = judge {
+        if judge.fallback_on() {
+            if let Some(verdict) = judge.classify_fallback(row_id, guest_id, raw_text).await {
+                return verdict;
+            }
+        } else {
+            judge.observe(guest_id, raw_text, None);
+        }
+    }
+    noop_classification()
+}
+
+/// The clock recurrence counting runs on: when the failure HAPPENED (the row's
+/// timestamp), never later than now. Processing time would squeeze a drained
+/// backlog of days into one window and file false work items.
+fn recurrence_clock(row_timestamp: i64, now: u64) -> u64 {
+    u64::try_from(row_timestamp).map_or(now, |ts| ts.min(now))
 }
 
 fn noop_classification() -> (String, String, String) {
@@ -1117,11 +1196,28 @@ mod tests {
     use super::{
         HEARTBEAT_KEY, OLLAMA_BREAKER_COOLDOWN, OLLAMA_BREAKER_THRESHOLD, OllamaBreaker,
         OperatorNotifier, gate_llm_action, heartbeat_request, ipc_timeout_error, is_session_like,
-        rule_classify, with_ipc_timeout,
+        no_incumbent_verdict, recurrence_clock, rule_classify, with_ipc_timeout,
     };
     use crate::notify::EscalationNotifier;
     use philotic_client::{IpcRequest, IpcResponse, is_ipc_disconnect};
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn recurrence_runs_on_when_the_failure_happened_not_when_it_was_processed() {
+        // A backlog row from yesterday counts at its own time …
+        assert_eq!(recurrence_clock(1_000, 90_000), 1_000);
+        // … a future-stamped row is clamped to now, and a bad stamp falls back.
+        assert_eq!(recurrence_clock(95_000, 90_000), 90_000);
+        assert_eq!(recurrence_clock(-5, 90_000), 90_000);
+    }
+
+    #[tokio::test]
+    async fn no_judge_keeps_the_old_unclassified_fail_safe() {
+        assert_eq!(
+            no_incumbent_verdict(None, "r", "g", "boom").await,
+            ("unknown".into(), "unclassified".into(), "noop".into())
+        );
+    }
 
     /// Build an OperatorNotifier with an explicit throttle for deterministic
     /// tests (no env, no wall clock).

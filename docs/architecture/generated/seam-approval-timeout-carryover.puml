@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - approval-timeout-carryover
+
+rectangle "approval-timeout-carryover" as approval_timeout_carryover #Orange {
+}
+
+
+@enduml

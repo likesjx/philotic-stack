@@ -1035,7 +1035,7 @@ pub fn impact_analysis(engine: &GraphEngine, target: &str) -> Result<ImpactRepor
                     NodeKind::Test | NodeKind::TestRun => affected_tests.push(node.id.clone()),
                     _ => _affected_nodes.push(node.id.clone()),
                 }
-                if depth + 1 <= max_depth {
+                if depth < max_depth {
                     queue.push_back((edge.source_id.clone(), depth + 1));
                 }
             }
@@ -1056,7 +1056,7 @@ pub fn impact_analysis(engine: &GraphEngine, target: &str) -> Result<ImpactRepor
                     NodeKind::Test | NodeKind::TestRun => affected_tests.push(node.id.clone()),
                     _ => {}
                 }
-                if depth + 1 <= max_depth {
+                if depth < max_depth {
                     queue.push_back((edge.target_id.clone(), depth + 1));
                 }
             }

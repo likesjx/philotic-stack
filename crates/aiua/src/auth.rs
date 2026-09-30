@@ -31,6 +31,26 @@ const DEFAULT_SCOPES: [&str; 2] = [
 pub enum AuthCommand {
     Google(AuthGoogleArgs),
     OpenAI(AuthOpenAIArgs),
+    /// Add the roles a provider's key spec now lists to a vault entry sealed
+    /// before they were added, without decrypting or re-entering the key.
+    SyncRoles(SyncRolesArgs),
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct SyncRolesArgs {
+    /// Provider whose vault entry to update (its `ProviderKeySpec` is the source
+    /// of truth for the roles).
+    #[arg(long, default_value = "openrouter")]
+    pub provider: String,
+
+    /// Path to this hotel's context database (mac-jane: `context.db`; vps:
+    /// `/opt/philotic/data/aiua_context.db`). Falls back to `PHILOTIC_GRAPH_DB_PATH`.
+    #[arg(long)]
+    pub db: Option<String>,
+
+    /// Show what would change and write nothing.
+    #[arg(long)]
+    pub dry_run: bool,
 }
 
 #[derive(Debug, Args)]
@@ -160,7 +180,55 @@ pub async fn run_auth_command(command: AuthCommand) -> Result<()> {
         AuthCommand::OpenAI(AuthOpenAIArgs {
             command: OpenAIAuthCommand::Validate(args),
         }) => run_openai_auth_validate(args).await,
+        AuthCommand::SyncRoles(args) => run_sync_roles(args),
     }
+}
+
+/// `aiua auth sync-roles`: make an existing vault entry's `allowed_roles` include
+/// every role its `ProviderKeySpec` lists. Additive, offline, never decrypts.
+fn run_sync_roles(args: SyncRolesArgs) -> Result<()> {
+    let spec = provider_key_spec(&args.provider).with_context(|| {
+        format!(
+            "provider key spec is not configured for '{}'",
+            args.provider
+        )
+    })?;
+    let db = args
+        .db
+        .or_else(|| std::env::var("PHILOTIC_GRAPH_DB_PATH").ok())
+        .filter(|path| !path.trim().is_empty())
+        .context("pass --db <this hotel's context db> or set PHILOTIC_GRAPH_DB_PATH")?;
+    // `open` would silently create an empty database at a wrong path.
+    if !std::path::Path::new(&db).is_file() {
+        bail!("no such database file: {db}");
+    }
+
+    let storage = ansible_mesh_core::sqlite_storage::SqliteGraphStorage::open(&db)?;
+    let domain = GraphDomain::new(Arc::new(storage.adapter()));
+    let secret_ref = domain
+        .get_config_value(spec.api_key_ref_key)?
+        .map(|raw| serde_json::from_str::<String>(&raw).unwrap_or(raw))
+        .filter(|secret_ref| !secret_ref.trim().is_empty())
+        .with_context(|| {
+            format!(
+                "{db} has no `{}`: is the {} key configured on this hotel?",
+                spec.api_key_ref_key, spec.display_name
+            )
+        })?;
+
+    let result =
+        crate::vault::sync_secret_roles(&domain, &secret_ref, spec.allowed_roles, args.dry_run)?;
+    println!("{} key: {secret_ref}", spec.display_name);
+    println!("roles before: {}", result.before.join(", "));
+    if result.added.is_empty() {
+        println!("already lists every role in the spec; nothing to do");
+    } else if result.written {
+        println!("added: {}", result.added.join(", "));
+        println!("roles after:  {}", result.after.join(", "));
+    } else {
+        println!("dry run, would add: {}", result.added.join(", "));
+    }
+    Ok(())
 }
 
 async fn run_openai_auth_start(args: OpenAIStartArgs) -> Result<()> {

@@ -44,6 +44,8 @@ async fn main() -> Result<()> {
                     goal: "Return a structured mesh smoke acknowledgment.".into(),
                     allowed_tools: vec!["session.status".into()],
                     allowed_classes: Vec::new(),
+                    allowed_skills: Vec::new(),
+                    origin: None,
                     hook_subscriptions: Vec::new(),
                     completion_route: HookRoute::PersonaAgent,
                     failure_route: HookRoute::PersonaAgent,

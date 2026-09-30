@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - procedure-graph-record
+
+rectangle "procedure-graph-record" as procedure_graph_record #Orange {
+}
+
+
+@enduml

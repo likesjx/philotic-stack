@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - procedure-run-ledger
+
+rectangle "procedure-run-ledger" as procedure_run_ledger #Orange {
+}
+
+
+@enduml

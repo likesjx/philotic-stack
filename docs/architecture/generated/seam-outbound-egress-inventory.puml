@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - Outbound Egress Inventory and Classification
+
+rectangle "Outbound Egress Inventory and Classification" as Outbound_Egress_Inventory_and_Classification #Orange {
+}
+
+
+@enduml

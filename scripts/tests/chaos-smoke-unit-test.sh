@@ -86,6 +86,20 @@ assert_true  "telegram_bot_token denied"          config_key_denied "telegram_bo
 assert_true  "vault key denied"                   config_key_denied "vault_beacon_telegram_bot_token"
 assert_true  "empty key denied"                   config_key_denied ""
 
+# Rail 6 protects real muninn vaults from the memory-token-wipe drill. These
+# are the exact vault names live on the fleet (see config:vault_registry) —
+# if any of them ever becomes drillable, a chaos run can strand real memory.
+echo "== vault_name_denied() (rail 6, memory-token-wipe) =="
+assert_false "chaos_smoke_token_drill allowed"    vault_name_denied "chaos_smoke_token_drill"
+assert_false "any chaos_smoke* vault allowed"     vault_name_denied "chaos_smoke_alt"
+assert_true  "default vault denied"               vault_name_denied "default"
+assert_true  "self_agent-bjork-01 denied"         vault_name_denied "self_agent-bjork-01"
+assert_true  "self_agent-coach denied"            vault_name_denied "self_agent-coach"
+assert_true  "user_likesjx denied"                vault_name_denied "user_likesjx"
+assert_true  "session_* vault denied"             vault_name_denied "session_abc123"
+assert_true  "api-key vault denied"               vault_name_denied "openai_api_key"
+assert_true  "empty vault denied"                 vault_name_denied ""
+
 echo "== heal_open_for_guest() + preflight_check() open_count parsing =="
 FAKE_PHIL_DIR="$(mktemp -d)"
 trap 'rm -rf "$FAKE_PHIL_DIR"' EXIT

@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - prompt-guard-scan
+
+rectangle "prompt-guard-scan" as prompt_guard_scan #Orange {
+}
+
+
+@enduml

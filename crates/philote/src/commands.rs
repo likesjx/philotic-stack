@@ -221,6 +221,11 @@ pub fn command_manifest(_active_skills: &[String]) -> Vec<CommandManifestEntry> 
             usage_hint: None,
         },
         CommandManifestEntry {
+            command: "hotel".into(),
+            description: "Show which hotel and role this philote is currently running as.".into(),
+            usage_hint: None,
+        },
+        CommandManifestEntry {
             command: "back".into(),
             description: "Return to the orchestrator role.".into(),
             usage_hint: None,
@@ -307,6 +312,9 @@ pub enum SlashCommand {
     },
     Roles,
     Back,
+    /// Report which hotel (node) and role this philote is currently
+    /// materialized as — a quick "where am I running" readout.
+    Hotel,
     ToolsAdd {
         tool: String,
     },
@@ -390,6 +398,7 @@ impl SlashCommand {
             Self::Role { .. } => None,
             Self::Roles => None,
             Self::Back => None,
+            Self::Hotel => None,
             Self::ToolsAdd { .. } => None,
             Self::ToolsClear => None,
             Self::SkillsAdd { .. } => None,
@@ -443,6 +452,7 @@ pub fn parse_slash_command(input: &str) -> Option<SlashCommand> {
         }),
         ["/roles", ..] => Some(SlashCommand::Roles),
         ["/back", ..] => Some(SlashCommand::Back),
+        ["/hotel", ..] => Some(SlashCommand::Hotel),
         ["/tools", "add", tool, ..] => Some(SlashCommand::ToolsAdd {
             tool: (*tool).to_string(),
         }),
@@ -587,6 +597,8 @@ mod tests {
         );
         assert_eq!(parse_slash_command("/roles"), Some(SlashCommand::Roles));
         assert_eq!(parse_slash_command("/back"), Some(SlashCommand::Back));
+        assert_eq!(parse_slash_command("/hotel"), Some(SlashCommand::Hotel));
+        assert_eq!(parse_slash_command("/hotel now"), Some(SlashCommand::Hotel));
         assert_eq!(
             parse_slash_command("/tools add echo"),
             Some(SlashCommand::ToolsAdd {

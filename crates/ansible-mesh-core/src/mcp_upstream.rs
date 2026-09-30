@@ -57,6 +57,16 @@ pub struct McpUpstreamConfig {
     pub owner_agent_id: String,
     /// How to reach the server.
     pub transport: McpUpstreamTransport,
+    /// Which hotel performs HTTP transport I/O. MCP protocol/session
+    /// ownership remains with `mcp-client-runner`; its HTTP envelopes cross
+    /// the same governed egress runner as ordinary API integrations.
+    #[serde(default)]
+    pub placement: crate::integration::EgressPlacementPolicy,
+    /// Optional resolved-address scope override. When absent, literal
+    /// loopback/tailnet/private hosts are inferred and DNS names default to
+    /// public addresses.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub http_network_scope: Option<crate::integration::HttpNetworkScope>,
     /// Vault ref for the outbound credential (sent as `Authorization: Bearer`).
     /// `None` = unauthenticated upstream (egress policy confines these to
     /// loopback/tailnet by default).
@@ -312,6 +322,8 @@ mod tests {
             transport: McpUpstreamTransport::Http {
                 url: "http://127.0.0.1:8901/mcp".into(),
             },
+            placement: crate::integration::EgressPlacementPolicy::Local,
+            http_network_scope: Some(crate::integration::HttpNetworkScope::Loopback),
             credential_ref: Some("vault_mcp_upstream_intel_graph".into()),
             tool_allowlist: vec![McpUpstreamToolGrant {
                 remote_name: "graph_status".into(),

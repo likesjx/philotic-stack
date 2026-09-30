@@ -1,8 +1,8 @@
 // LifeView.swift
 // The Life surface: lens-first LifeGraph browsing. A lens is one named
 // life.recall retrieval strategy rendered as a native list — every row is a
-// graph node with provenance chips, tap-through to node detail. The canvas
-// view comes in a later slice; the graph is for acting, not admiring.
+// graph node with provenance chips, an audited text editor, and a bounded
+// one-hop relationship diagram with navigable neighbors.
 
 import PhiloticKit
 import SwiftUI
@@ -171,6 +171,9 @@ struct LifeNodeDetailView: View {
 
     @State private var detail: LifeNodeDetail?
     @State private var loadError: String?
+    @State private var editing = false
+    @State private var auditId: String?
+    @State private var loadedHotel: URL?
 
     /// Provenance-envelope keys rendered in their own section (and therefore
     /// excluded from the generic properties list).
@@ -182,6 +185,15 @@ struct LifeNodeDetailView: View {
 
     var body: some View {
         List {
+            if let auditId {
+                Section {
+                    Label("Saved · audit \(auditId)", systemImage: "checkmark.circle")
+                        .font(.caption).textSelection(.enabled)
+                }
+            }
+            if detail != nil, let loadError {
+                Text(loadError).foregroundStyle(.orange)
+            }
             if let detail, let node = detail.node {
                 nodeSections(node: node, neighbors: detail.neighbors)
             } else if let loadError {
@@ -199,6 +211,20 @@ struct LifeNodeDetailView: View {
         }
         .navigationTitle(detail?.node?.string("title") ?? detail?.node?.primaryLabel ?? nodeId)
         .task(id: nodeId) { await load() }
+        .refreshable { await load() }
+        .toolbar {
+            Button("Reload", systemImage: "arrow.clockwise") { Task { await load() } }
+            Button("Edit", systemImage: "pencil") { editing = true }
+                .disabled(detail?.node?.canonicalId?.hasPrefix("life:") != true)
+        }
+        .sheet(isPresented: $editing) {
+            if let node = detail?.node, let loadedHotel {
+                LifeNodeEditor(session: session, node: node, hotelURL: loadedHotel) { receipt in
+                    auditId = receipt
+                    Task { await load() }
+                }
+            }
+        }
     }
 
     @ViewBuilder
@@ -240,6 +266,11 @@ struct LifeNodeDetailView: View {
             }
         }
 
+        if !neighbors.isEmpty {
+            Section("Relationships") {
+                LifeRelationshipsView(session: session, node: node, neighbors: neighbors)
+            }
+        }
         let grouped = Dictionary(grouping: neighbors, by: \.relType)
         ForEach(grouped.keys.sorted(), id: \.self) { relType in
             Section(relType) {
@@ -249,6 +280,9 @@ struct LifeNodeDetailView: View {
                             destination: LifeNodeDetailView(session: session, nodeId: id)
                         ) {
                             VStack(alignment: .leading, spacing: 2) {
+                                Text(neighbor.fromId == node.canonicalId ? "Outgoing →" :
+                                    neighbor.toId == node.canonicalId ? "← Incoming" : "Direction unavailable")
+                                    .font(.caption2).foregroundStyle(.secondary)
                                 Text(
                                     neighborNode.string("title")
                                         ?? neighborNode.string("claim_summary") ?? id
@@ -272,8 +306,11 @@ struct LifeNodeDetailView: View {
             return
         }
         do {
-            detail = try await session.lifeGraph.nodeDetail(
+            let fetched = try await session.lifeGraph.nodeDetail(
                 baseURL: baseURL, bearerToken: token, nodeId: nodeId)
+            guard !Task.isCancelled, session.lifeGraphCredentials()?.0 == baseURL else { return }
+            detail = fetched
+            loadedHotel = baseURL
             loadError = nil
         } catch {
             loadError = String(describing: error)

@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - apple-entity-index-plane
+
+rectangle "apple-entity-index-plane" as apple_entity_index_plane #Orange {
+}
+
+
+@enduml

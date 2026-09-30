@@ -1,7 +1,9 @@
+---
 name: sver-harness
 description: Use this skill for the mechanics of harness trial tracking and close-out in Philotic. It owns trial start/report/close discipline, explicit verification on completed closes, and the narrow process glue around SVER telemetry. Use it for harness lifecycle mechanics, not for deciding verification level or advancing the ladder.
 domain: runtime-sessions
 sver: verification-ladder-proposal
+---
 
 # SVER Harness Workflow
 

@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - edge-sessions-bridge
+
+rectangle "edge-sessions-bridge" as edge_sessions_bridge #Orange {
+}
+
+
+@enduml

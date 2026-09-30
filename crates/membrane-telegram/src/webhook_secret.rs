@@ -48,7 +48,7 @@ pub const MAX_SECRET_LEN: usize = 256;
 /// `_` and `-`. A generated hex secret is a strict subset of this.
 pub fn is_valid_secret_shape(secret: &str) -> bool {
     let len = secret.len();
-    if len < MIN_SECRET_LEN || len > MAX_SECRET_LEN {
+    if !(MIN_SECRET_LEN..=MAX_SECRET_LEN).contains(&len) {
         return false;
     }
     secret

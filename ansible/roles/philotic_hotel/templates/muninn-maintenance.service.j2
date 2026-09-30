@@ -1,0 +1,8 @@
+[Unit]
+Description=Muninn maintenance — backup retention and store-size alarm
+After=muninn.service
+
+[Service]
+Type=oneshot
+User={{ philotic_deploy_user | default('deploy') }}
+ExecStart=/usr/local/bin/muninn-maintenance.sh

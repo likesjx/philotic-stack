@@ -35,3 +35,7 @@ reqwest = { version = "0.12", features = ["json"] }
 tempfile = "3"
 axum = { version = "0.7", features = ["ws"] }
 tokio = { version = "1.42", features = ["rt", "rt-multi-thread", "net", "macros", "signal", "sync", "time"] }
+
+# Clippy ratchet: this crate is warning-free and must stay that way.
+[lints]
+workspace = true

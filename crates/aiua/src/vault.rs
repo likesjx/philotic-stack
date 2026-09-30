@@ -1,13 +1,13 @@
 use aes_gcm::aead::{Aead, KeyInit};
 use aes_gcm::{Aes256Gcm, Key, Nonce};
 use ansible_mesh_core::domain::GraphDomain;
+use ansible_mesh_core::keychain;
 use ansible_mesh_core::storage::SecretRecord;
 use anyhow::{Context, Result, bail};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use std::fs;
 use std::path::PathBuf;
-use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
@@ -66,6 +66,72 @@ pub fn rotate_secret(graph: &GraphDomain, secret_ref: &str, plaintext: &str) -> 
     record.nonce_b64 = nonce_b64;
     record.updated_at = now_secs();
     graph.upsert_secret(&record)
+}
+
+/// What [`sync_secret_roles`] found and did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RoleSync {
+    pub before: Vec<String>,
+    pub after: Vec<String>,
+    /// Roles added (empty when the entry already listed them all).
+    pub added: Vec<String>,
+    /// Whether the record was written (false for a dry run or nothing to add).
+    pub written: bool,
+}
+
+/// Add `desired` roles to an existing vault secret's `allowed_roles`, without
+/// decrypting it or touching the ciphertext, so an entry sealed before a role was
+/// added to its `ProviderKeySpec` can be opened by that role without re-entering
+/// the key. It only ADDS: existing roles are kept in order.
+///
+/// Two cases are refused rather than "fixed", because a grant would be misleading:
+/// - an empty `allowed_roles` means *any role* may read it, so adding a role would
+///   RESTRICT it;
+/// - a non-empty `allowed_guests` keeps denying other guests whatever roles it lists.
+pub fn sync_secret_roles(
+    graph: &GraphDomain,
+    secret_ref: &str,
+    desired: &[&str],
+    dry_run: bool,
+) -> Result<RoleSync> {
+    let Some(mut record) = graph.get_secret(secret_ref)? else {
+        bail!("vault secret not found: {secret_ref}");
+    };
+    if record.allowed_roles.is_empty() {
+        bail!(
+            "secret [{secret_ref}] has an empty allowed_roles, which means any role may read it; \
+             adding a role would restrict it, so nothing was changed"
+        );
+    }
+    if !record.allowed_guests.is_empty() {
+        bail!(
+            "secret [{secret_ref}] is also restricted to guests {:?}; a role grant alone would \
+             not open it, so nothing was changed",
+            record.allowed_guests
+        );
+    }
+
+    let before = record.allowed_roles.clone();
+    let added: Vec<String> = desired
+        .iter()
+        .filter(|role| !before.iter().any(|existing| existing == *role))
+        .map(|role| role.to_string())
+        .collect();
+    let mut after = before.clone();
+    after.extend(added.iter().cloned());
+
+    let written = !dry_run && !added.is_empty();
+    if written {
+        record.allowed_roles = after.clone();
+        record.updated_at = now_secs();
+        graph.upsert_secret(&record)?;
+    }
+    Ok(RoleSync {
+        before,
+        after,
+        added,
+        written,
+    })
 }
 
 pub fn resolve_secret(
@@ -170,7 +236,7 @@ fn load_or_create_root_key() -> Result<Vec<u8>> {
         return Ok(from_file);
     }
 
-    if cfg!(target_os = "macos") {
+    if keychain::enabled() {
         if let Some(existing) = load_keychain_root_key()? {
             return Ok(existing);
         }
@@ -181,8 +247,11 @@ fn load_or_create_root_key() -> Result<Vec<u8>> {
     }
 
     bail!(
-        "{} must be set to a base64-encoded 32-byte key, or ~/.philotic/vault-master-key.env must exist, before using the hotel vault on this platform",
-        VAULT_ENV_KEY
+        "{} must be set to a base64-encoded 32-byte key, or ~/.philotic/vault-master-key.env must exist, before using the hotel vault here.\n\
+         The macOS Keychain backend is not in use on this host (non-macOS, {}=0, or a detected CI environment). \
+         The Keychain is deliberately skipped where there is no unlocked login keychain, because the `security` CLI blocks indefinitely rather than failing.",
+        VAULT_ENV_KEY,
+        keychain::KEYCHAIN_ENABLED_ENV
     )
 }
 
@@ -217,17 +286,17 @@ fn vault_master_key_env_path() -> Result<PathBuf> {
 }
 
 fn load_keychain_root_key() -> Result<Option<Vec<u8>>> {
-    let output = Command::new("security")
-        .args([
+    let output = keychain::run_security(
+        &[
             "find-generic-password",
             "-s",
             VAULT_KEYCHAIN_SERVICE,
             "-a",
             &vault_key_account(),
             "-w",
-        ])
-        .output()
-        .context("failed to run macOS security CLI while reading the Philotic vault root key")?;
+        ],
+        "reading the Philotic vault root key",
+    )?;
 
     if output.status.success() {
         let raw = String::from_utf8(output.stdout)
@@ -254,8 +323,8 @@ fn load_keychain_root_key() -> Result<Option<Vec<u8>>> {
 
 fn store_keychain_root_key(key_bytes: &[u8]) -> Result<()> {
     let encoded = BASE64_STANDARD.encode(key_bytes);
-    let output = Command::new("security")
-        .args([
+    let output = keychain::run_security(
+        &[
             "add-generic-password",
             "-U",
             "-s",
@@ -266,9 +335,23 @@ fn store_keychain_root_key(key_bytes: &[u8]) -> Result<()> {
             &encoded,
             "-T",
             "",
-        ])
-        .output()
-        .context("failed to run macOS security CLI while storing the Philotic vault root key")?;
+        ],
+        "storing the Philotic vault root key",
+    )?;
+
+    // The read path already tolerates a locked/non-interactive keychain by
+    // returning Ok(None); the write path used to hard-fail on it, which turned a
+    // recoverable "no keychain here" into an error after the caller had already
+    // generated a key.
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if !output.status.success() && stderr.contains("User interaction is not allowed") {
+        bail!(
+            "the login Keychain is locked or unavailable, so the generated vault root key could \
+             not be stored. Set {}=0 and provide {} or ~/.philotic/vault-master-key.env instead.",
+            keychain::KEYCHAIN_ENABLED_ENV,
+            VAULT_ENV_KEY
+        );
+    }
 
     if !output.status.success() {
         bail!(
@@ -325,7 +408,7 @@ fn now_secs() -> u64 {
 mod tests {
     use super::{
         SecretAccess, SecretInput, decode_root_key, load_or_create_root_key, resolve_secret,
-        store_secret, vault_key_account,
+        store_secret, sync_secret_roles, vault_key_account,
     };
     use ansible_mesh_core::domain::GraphDomain;
     use ansible_mesh_core::sqlite_storage::SqliteGraphStorage;
@@ -337,6 +420,142 @@ mod tests {
         unsafe {
             std::env::set_var("PHILOTIC_VAULT_MASTER_KEY", key);
         }
+    }
+
+    fn access(role: &str) -> SecretAccess {
+        SecretAccess {
+            role: role.into(),
+            guest_id: "any-guest".into(),
+        }
+    }
+
+    fn stored(graph: &GraphDomain, roles: &[&str], guests: &[&str]) -> String {
+        store_secret(
+            graph,
+            SecretInput {
+                secret_kind: "openrouter_api_key".into(),
+                scope: "hotel".into(),
+                allowed_roles: roles.iter().map(|r| r.to_string()).collect(),
+                allowed_guests: guests.iter().map(|g| g.to_string()).collect(),
+                plaintext: "sk-or-test-plaintext".into(),
+            },
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn sync_roles_opens_an_existing_entry_to_new_roles_without_touching_the_key() {
+        set_test_key();
+        let graph = GraphDomain::new(Arc::new(
+            SqliteGraphStorage::open(":memory:").unwrap().adapter(),
+        ));
+        // An entry sealed before the decisions roles existed.
+        let secret_ref = stored(&graph, &["model", "model.openrouter"], &[]);
+        let before = graph.get_secret(&secret_ref).unwrap().unwrap();
+        assert!(resolve_secret(&graph, &secret_ref, &access("heal-dispatcher")).is_err());
+
+        let dry = sync_secret_roles(
+            &graph,
+            &secret_ref,
+            &["model.decisions", "heal-dispatcher"],
+            true,
+        )
+        .unwrap();
+        assert_eq!(dry.added, ["model.decisions", "heal-dispatcher"]);
+        assert!(!dry.written, "a dry run writes nothing");
+        assert!(resolve_secret(&graph, &secret_ref, &access("heal-dispatcher")).is_err());
+
+        let done = sync_secret_roles(
+            &graph,
+            &secret_ref,
+            &[
+                "model",
+                "model.openrouter",
+                "model.decisions",
+                "heal-dispatcher",
+            ],
+            false,
+        )
+        .unwrap();
+        assert!(done.written);
+        assert_eq!(
+            done.after,
+            [
+                "model",
+                "model.openrouter",
+                "model.decisions",
+                "heal-dispatcher"
+            ],
+            "existing roles keep their order and nothing is duplicated"
+        );
+
+        // Now readable by the new roles, and still by the old ones.
+        for role in [
+            "heal-dispatcher",
+            "model.decisions",
+            "model",
+            "model.openrouter",
+        ] {
+            assert_eq!(
+                resolve_secret(&graph, &secret_ref, &access(role))
+                    .unwrap()
+                    .as_deref(),
+                Some("sk-or-test-plaintext"),
+                "{role}"
+            );
+        }
+        // Other roles are still refused.
+        assert!(resolve_secret(&graph, &secret_ref, &access("membrane")).is_err());
+
+        // The key itself was never decrypted or re-encrypted.
+        let after = graph.get_secret(&secret_ref).unwrap().unwrap();
+        assert_eq!(after.ciphertext_b64, before.ciphertext_b64);
+        assert_eq!(after.nonce_b64, before.nonce_b64);
+    }
+
+    #[test]
+    fn sync_roles_is_idempotent() {
+        set_test_key();
+        let graph = GraphDomain::new(Arc::new(
+            SqliteGraphStorage::open(":memory:").unwrap().adapter(),
+        ));
+        let secret_ref = stored(&graph, &["model", "heal-dispatcher"], &[]);
+        let result =
+            sync_secret_roles(&graph, &secret_ref, &["model", "heal-dispatcher"], false).unwrap();
+        assert!(result.added.is_empty() && !result.written);
+        assert_eq!(result.before, result.after);
+    }
+
+    #[test]
+    fn sync_roles_refuses_the_cases_where_a_grant_would_mislead() {
+        set_test_key();
+        let graph = GraphDomain::new(Arc::new(
+            SqliteGraphStorage::open(":memory:").unwrap().adapter(),
+        ));
+
+        // Empty roles means ANY role may read it; adding one would restrict it.
+        let open = stored(&graph, &[], &[]);
+        let err = sync_secret_roles(&graph, &open, &["heal-dispatcher"], false).unwrap_err();
+        assert!(err.to_string().contains("empty allowed_roles"), "{err}");
+        assert!(
+            graph
+                .get_secret(&open)
+                .unwrap()
+                .unwrap()
+                .allowed_roles
+                .is_empty()
+        );
+
+        // A guest restriction keeps denying whatever roles say.
+        let guarded = stored(&graph, &["model"], &["only-this-guest"]);
+        let err = sync_secret_roles(&graph, &guarded, &["heal-dispatcher"], false).unwrap_err();
+        assert!(err.to_string().contains("restricted to guests"), "{err}");
+        assert_eq!(
+            graph.get_secret(&guarded).unwrap().unwrap().allowed_roles,
+            ["model"]
+        );
+
+        assert!(sync_secret_roles(&graph, "secret://nope", &["x"], false).is_err());
     }
 
     #[test]

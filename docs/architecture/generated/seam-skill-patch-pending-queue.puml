@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - skill-patch-pending-queue
+
+rectangle "skill-patch-pending-queue" as skill_patch_pending_queue #Orange {
+}
+
+
+@enduml

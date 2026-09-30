@@ -1,20 +1,34 @@
-//! Dream Engine — post-session memory consolidation.
+//! Memory sleep — Cortex-side maintenance of philote Muninn vaults.
 //!
-//! # What this does
+//! Phase 2 M6 (2026-09-16). The previous "dream" sweep never worked in
+//! production: it recalled through a REST route Muninn does not expose
+//! (`GET /api/recall`), "evolved" engrams by posting a Hebbian delta to an
+//! endpoint that REPLACES content, discovered vaults with a guest-config scheme
+//! that matches no real guests, depended on a local Ollama + embedding sidecar,
+//! and ran on every hotel — where observer replicas reject writes (421).
 //!
-//! Called by the hotel after all guests have drained (Phase 2 of graceful shutdown),
-//! before the internal shutdown broadcast fires. For each active agent vault:
+//! # What this does now
 //!
-//! 1. **Recall** recent session engrams from MuninnDB.
-//! 2. **Embed** each engram via the ONNX sidecar at :11435 (Ollama-compat endpoint).
-//! 3. **Cluster** by cosine similarity (threshold 0.82) to find related memories.
-//! 4. **Consolidate** each cluster ≥ 2 via Ollama (:11434, `gemma4:e4b`) + MuninnDB
-//!    `POST /api/consolidate`. The LLM merges the cluster into a single concise engram.
-//! 5. **Evolve** non-consolidated engrams via `POST /api/engrams/{id}/evolve` to apply
-//!    Hebbian potentiation updates.
+//! Runs **only on the Cortex hotel** (the hotel with no `muninn_write_route`),
+//! so every mutation goes through the primary and replicates. For each memory
+//! vault this hotel holds a token for (`default`, `fleet_knowledge`, `user_*`,
+//! `self_*` — observer hotels' agent vaults arrive via M4 forwarding):
 //!
-//! Every step is non-fatal: a failed vault is logged and skipped; a failed Ollama call
-//! drops consolidation for that cluster and falls back to evolve-only.
+//! 1. **List** active engrams (`GET /api/engrams`, bounded).
+//! 2. **Plan** deterministically, no model:
+//!    - exact duplicates (same normalized concept + content) → one
+//!      `POST /api/consolidate` per group, keeping the newest content (Muninn
+//!      supersedes the rest with lineage);
+//!    - diagnostic traffic (smoke tests, canaries, probes) → soft forget.
+//! 3. **Report** contradictions (`GET /api/contradictions`) and tombstones
+//!    (`GET /api/deleted`) — resolving those needs judgment, so they are
+//!    counted, not mutated. REST has no hard delete; tombstones are reported.
+//! 4. **Execute** only when `PHILOTIC_MEMORY_SLEEP_MUTATE` is truthy; otherwise
+//!    the run is a proposal (logged + recorded) — the autonomy posture moves
+//!    from proposal to execution per hotel by operator choice.
+//!
+//! Never run the `muninn dream` CLI on a cluster node: it opens Pebble without
+//! the replication log, so its changes never reach the observers.
 
 use ansible_mesh_core::domain::GraphDomain;
 use anyhow::Result;
@@ -116,417 +130,387 @@ pub fn ensure_scheduled(
 
 // ──── Public entry point ──────────────────────────────────────────────────────
 
-/// Run the dream sweep across all active agent vaults.
+/// Env var: when truthy, the sleep cycle executes its plan (consolidate exact
+/// duplicates, forget diagnostic traffic). Unset = proposal only.
+pub const ENV_MUTATE: &str = "PHILOTIC_MEMORY_SLEEP_MUTATE";
+
+/// Config-key prefix for the last sleep run summary (per hotel).
+pub const CONFIG_KEY_LAST_RUN_PREFIX: &str = "memory_sleep:last_run:";
+
+/// Upper bound on engrams listed per vault per run.
+const MAX_ENGRAMS_PER_VAULT: usize = 2_000;
+const LIST_PAGE: usize = 200;
+
+/// Run the sleep cycle across this hotel's memory vaults.
 ///
-/// Non-fatal: returns immediately without propagating errors — all failures are
-/// logged at warn/debug level. Caller should `await` but not `?` the result.
+/// Non-fatal: failures are logged and the run continues with the next vault.
 pub async fn dream_sweep(config: &MuninnConfig, graph: &GraphDomain, hotel_name: &str) {
+    if let Some(route) = config.shared_write_route.as_deref() {
+        debug!(
+            hotel = %hotel_name,
+            cortex = %route,
+            "MemorySleep: not the Cortex hotel (writes route to {route}) — skipping"
+        );
+        return;
+    }
+    let mutate = mutate_enabled(|k| std::env::var(k).ok());
+
     let client = match reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(15))
+        .timeout(std::time::Duration::from_secs(30))
         .build()
     {
         Ok(c) => c,
         Err(e) => {
-            warn!("DreamsPhase: failed to build HTTP client — {e}");
+            warn!("MemorySleep: failed to build HTTP client — {e}");
             return;
         }
     };
 
-    let vault_names = collect_agent_vault_names(graph, hotel_name);
-    if vault_names.is_empty() {
-        debug!("DreamsPhase: no agent vaults found for hotel {hotel_name}");
-        return;
-    }
-
-    info!(count = vault_names.len(), "DreamsPhase: starting sweep");
-
-    for vault_name in &vault_names {
-        let token = match config.vault_tokens.get(vault_name) {
-            Some(t) => t.clone(),
-            None => {
-                debug!(vault = %vault_name, "DreamsPhase: no token — skipping");
-                continue;
-            }
+    let vaults = sleep_vault_names(config);
+    info!(hotel = %hotel_name, vaults = vaults.len(), mutate, "MemorySleep: starting");
+    let mut summary = SleepRunSummary {
+        hotel_name: hotel_name.to_string(),
+        mutate,
+        ..Default::default()
+    };
+    for vault in &vaults {
+        let Some(token) = config.vault_tokens.get(vault) else {
+            continue;
         };
-
-        sweep_vault(&client, config, &token, vault_name).await;
-    }
-
-    info!("DreamsPhase: complete");
-}
-
-// ──── Per-vault sweep ─────────────────────────────────────────────────────────
-
-async fn sweep_vault(
-    client: &reqwest::Client,
-    config: &MuninnConfig,
-    token: &str,
-    vault_name: &str,
-) {
-    // Step 1: Recall recent session engrams.
-    let engrams = match recall_recent(client, &config.base_url, token, vault_name, 20).await {
-        Ok(e) if !e.is_empty() => e,
-        Ok(_) => {
-            debug!(vault = %vault_name, "DreamsPhase: no recent engrams — skipping");
-            return;
-        }
-        Err(e) => {
-            warn!(vault = %vault_name, error = %e, "DreamsPhase: recall failed — skipping");
-            return;
-        }
-    };
-
-    // Step 2: Embed via ONNX sidecar.
-    let embedded = embed_engrams(client, &engrams).await;
-    if embedded.is_empty() {
-        warn!(vault = %vault_name, "DreamsPhase: all embeddings failed — evolve-only");
-        evolve_all(client, &config.base_url, token, vault_name, &engrams).await;
-        return;
-    }
-
-    // Step 3: Cluster by cosine similarity.
-    let clusters = cosine_cluster(&embedded, 0.82);
-
-    // Step 4: Consolidate clusters ≥ 2.
-    let mut consolidated_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
-    for cluster in clusters.iter().filter(|c| c.len() >= 2) {
-        let ids: Vec<&str> = cluster.iter().map(|e| e.id.as_str()).collect();
-        match ollama_merge(client, cluster).await {
-            Ok(merged_content) => {
-                match consolidate(
-                    client,
-                    &config.base_url,
-                    token,
-                    vault_name,
-                    &ids,
-                    &merged_content,
-                )
-                .await
-                {
-                    Ok(_) => {
-                        for e in cluster {
-                            consolidated_ids.insert(e.id.clone());
-                        }
-                        info!(
-                            vault = %vault_name,
-                            count = cluster.len(),
-                            "DreamsPhase: consolidated cluster"
-                        );
-                    }
-                    Err(e) => {
-                        warn!(vault = %vault_name, error = %e, "DreamsPhase: consolidate failed — falling back to evolve");
-                    }
-                }
-            }
+        match sleep_vault(&client, &config.base_url, token, vault, mutate).await {
+            Ok(outcome) => summary.absorb(vault, outcome),
             Err(e) => {
-                debug!(vault = %vault_name, error = %e, "DreamsPhase: Ollama merge failed — evolve-only for cluster");
+                warn!(vault = %vault, error = %e, "MemorySleep: vault failed — continuing");
+                summary.failed_vaults.push(vault.clone());
             }
         }
     }
-
-    // Step 5: Evolve non-consolidated engrams.
-    let to_evolve: Vec<&EngramSummary> = engrams
-        .iter()
-        .filter(|e| !consolidated_ids.contains(&e.id))
-        .collect();
-
-    for engram in &to_evolve {
-        if let Err(e) = evolve_engram(client, &config.base_url, token, vault_name, &engram.id).await
-        {
-            debug!(vault = %vault_name, id = %engram.id, error = %e, "DreamsPhase: evolve failed (non-fatal)");
-        }
-    }
-
+    summary.finished_at = now_secs();
     info!(
-        vault = %vault_name,
-        total = engrams.len(),
-        consolidated = consolidated_ids.len(),
-        evolved = to_evolve.len(),
-        "DreamsPhase: vault sweep complete"
+        hotel = %hotel_name,
+        vaults = summary.vaults_scanned,
+        engrams = summary.engrams_scanned,
+        duplicate_groups = summary.duplicate_groups,
+        diagnostic = summary.diagnostic,
+        contradictions = summary.contradictions,
+        tombstones = summary.tombstones,
+        consolidated = summary.consolidated,
+        forgotten = summary.forgotten,
+        mutate,
+        "MemorySleep: complete"
     );
-}
-
-// ──── Types ───────────────────────────────────────────────────────────────────
-
-#[derive(Debug, Clone, Deserialize)]
-struct EngramSummary {
-    id: String,
-    concept: String,
-    content: String,
-}
-
-#[derive(Debug, Clone)]
-struct EmbeddedEngram {
-    id: String,
-    concept: String,
-    content: String,
-    vector: Vec<f32>,
-}
-
-// ──── Step 1: Recall ──────────────────────────────────────────────────────────
-
-async fn recall_recent(
-    client: &reqwest::Client,
-    base_url: &str,
-    token: &str,
-    vault_name: &str,
-    limit: u32,
-) -> Result<Vec<EngramSummary>> {
-    let url = format!(
-        "{}/api/recall?vault={}&q=session&limit={}",
-        base_url.trim_end_matches('/'),
-        vault_name,
-        limit,
-    );
-
-    let resp = client
-        .get(&url)
-        .header("Authorization", format!("Bearer {token}"))
-        .send()
-        .await?;
-
-    if !resp.status().is_success() {
-        let status = resp.status();
-        let body = resp.text().await.unwrap_or_default();
-        anyhow::bail!("recall returned {status}: {body}");
-    }
-
-    Ok(resp.json::<Vec<EngramSummary>>().await?)
-}
-
-// ──── Step 2: Embed (ONNX sidecar :11435) ────────────────────────────────────
-
-#[derive(Serialize)]
-struct EmbedRequest<'a> {
-    prompt: &'a str,
-}
-
-#[derive(Deserialize)]
-struct EmbedResponse {
-    embedding: Vec<f32>,
-}
-
-const ONNX_SIDECAR_URL: &str = "http://localhost:11435/api/embeddings";
-
-async fn embed_engrams(client: &reqwest::Client, engrams: &[EngramSummary]) -> Vec<EmbeddedEngram> {
-    let mut out = Vec::with_capacity(engrams.len());
-    for engram in engrams {
-        let text = format!("{}: {}", engram.concept, engram.content);
-        match client
-            .post(ONNX_SIDECAR_URL)
-            .json(&EmbedRequest { prompt: &text })
-            .send()
-            .await
-        {
-            Ok(resp) if resp.status().is_success() => match resp.json::<EmbedResponse>().await {
-                Ok(r) if !r.embedding.is_empty() => {
-                    out.push(EmbeddedEngram {
-                        id: engram.id.clone(),
-                        concept: engram.concept.clone(),
-                        content: engram.content.clone(),
-                        vector: r.embedding,
-                    });
-                }
-                Ok(_) => debug!(id = %engram.id, "DreamsPhase: empty embedding vector"),
-                Err(e) => debug!(id = %engram.id, error = %e, "DreamsPhase: embed parse failed"),
-            },
-            Ok(resp) => {
-                debug!(id = %engram.id, status = %resp.status(), "DreamsPhase: embed non-2xx")
+    let key = format!("{CONFIG_KEY_LAST_RUN_PREFIX}{hotel_name}");
+    match serde_json::to_string(&summary) {
+        Ok(json) => {
+            if let Err(e) = graph.set_config_value(&key, &json) {
+                warn!(error = %e, "MemorySleep: could not record run summary");
             }
-            Err(e) => debug!(id = %engram.id, error = %e, "DreamsPhase: embed request failed"),
         }
+        Err(e) => warn!(error = %e, "MemorySleep: could not serialize run summary"),
     }
-    out
 }
 
-// ──── Step 3: Cosine cluster ──────────────────────────────────────────────────
+/// True when the operator has allowed the sleep cycle to change the store.
+pub fn mutate_enabled(env: impl Fn(&str) -> Option<String>) -> bool {
+    env(ENV_MUTATE)
+        .is_some_and(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
+}
 
-/// Greedily cluster `engrams` by cosine similarity.
-///
-/// Iterates pairs in order; once an engram is assigned to a cluster it is not
-/// re-evaluated. Singletons form their own cluster of length 1.
-fn cosine_cluster(engrams: &[EmbeddedEngram], threshold: f32) -> Vec<Vec<EmbeddedEngram>> {
-    let mut assigned = vec![false; engrams.len()];
-    let mut clusters: Vec<Vec<EmbeddedEngram>> = Vec::new();
+/// Memory vaults the sleep cycle maintains: every routable memory vault this
+/// hotel holds a Muninn token for (non-memory registry entries such as API
+/// keys are excluded by name).
+pub fn sleep_vault_names(config: &MuninnConfig) -> Vec<String> {
+    let mut names: Vec<String> = config
+        .vault_tokens
+        .keys()
+        .filter(|name| memory_core::is_cortex_routable_vault(name))
+        .cloned()
+        .collect();
+    names.sort();
+    names
+}
 
-    for i in 0..engrams.len() {
-        if assigned[i] {
+// ──── Planning (pure) ─────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+pub struct EngramItem {
+    pub id: String,
+    #[serde(default)]
+    pub concept: String,
+    #[serde(default)]
+    pub content: String,
+    #[serde(default)]
+    pub tags: Vec<String>,
+    #[serde(default)]
+    pub created_at: i64,
+}
+
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct SleepPlan {
+    /// Groups of ≥2 exact duplicates: `(ids newest-first, merged_content)`.
+    pub consolidate: Vec<(Vec<String>, String)>,
+    /// Diagnostic traffic to soft-forget.
+    pub forget: Vec<String>,
+}
+
+fn normalize_for_dedup(text: &str) -> String {
+    text.split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase()
+}
+
+/// Plan one vault's maintenance. Pure and deterministic.
+pub fn plan_vault_sleep(engrams: &[EngramItem]) -> SleepPlan {
+    let mut plan = SleepPlan::default();
+    let mut groups: std::collections::BTreeMap<(String, String), Vec<&EngramItem>> =
+        Default::default();
+    for engram in engrams {
+        if memory_core::write_hygiene::is_diagnostic_capture(
+            &engram.concept,
+            &engram.content,
+            &engram.tags,
+        ) {
+            plan.forget.push(engram.id.clone());
             continue;
         }
-        let mut cluster = vec![engrams[i].clone()];
-        assigned[i] = true;
-
-        for j in (i + 1)..engrams.len() {
-            if assigned[j] {
+        let key = (
+            normalize_for_dedup(&engram.concept),
+            normalize_for_dedup(&engram.content),
+        );
+        if key.1.is_empty() {
+            continue;
+        }
+        groups.entry(key).or_default().push(engram);
+    }
+    for (_, mut members) in groups {
+        if members.len() < 2 {
+            continue;
+        }
+        members.sort_by(|a, b| b.created_at.cmp(&a.created_at).then(b.id.cmp(&a.id)));
+        let merged = members[0].content.clone();
+        // Muninn consolidates at most 50 ids per call.
+        for chunk in members.chunks(50) {
+            if chunk.len() < 2 {
                 continue;
             }
-            if cosine_similarity(&engrams[i].vector, &engrams[j].vector) >= threshold {
-                cluster.push(engrams[j].clone());
-                assigned[j] = true;
+            plan.consolidate
+                .push((chunk.iter().map(|e| e.id.clone()).collect(), merged.clone()));
+        }
+    }
+    plan
+}
+
+// ──── Per-vault execution ─────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct VaultSleepOutcome {
+    pub engrams_scanned: usize,
+    pub duplicate_groups: usize,
+    pub diagnostic: usize,
+    pub contradictions: usize,
+    pub tombstones: usize,
+    pub consolidated: usize,
+    pub forgotten: usize,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct SleepRunSummary {
+    pub hotel_name: String,
+    pub mutate: bool,
+    pub finished_at: u64,
+    pub vaults_scanned: usize,
+    pub engrams_scanned: usize,
+    pub duplicate_groups: usize,
+    pub diagnostic: usize,
+    pub contradictions: usize,
+    pub tombstones: usize,
+    pub consolidated: usize,
+    pub forgotten: usize,
+    #[serde(default)]
+    pub failed_vaults: Vec<String>,
+}
+
+impl SleepRunSummary {
+    fn absorb(&mut self, _vault: &str, o: VaultSleepOutcome) {
+        self.vaults_scanned += 1;
+        self.engrams_scanned += o.engrams_scanned;
+        self.duplicate_groups += o.duplicate_groups;
+        self.diagnostic += o.diagnostic;
+        self.contradictions += o.contradictions;
+        self.tombstones += o.tombstones;
+        self.consolidated += o.consolidated;
+        self.forgotten += o.forgotten;
+    }
+}
+
+async fn sleep_vault(
+    client: &reqwest::Client,
+    base_url: &str,
+    token: &str,
+    vault: &str,
+    mutate: bool,
+) -> Result<VaultSleepOutcome> {
+    let engrams = list_engrams(client, base_url, token, vault).await?;
+    let plan = plan_vault_sleep(&engrams);
+    let mut outcome = VaultSleepOutcome {
+        engrams_scanned: engrams.len(),
+        duplicate_groups: plan.consolidate.len(),
+        diagnostic: plan.forget.len(),
+        contradictions: count_json_array(
+            client,
+            base_url,
+            token,
+            vault,
+            "/api/contradictions",
+            "contradictions",
+        )
+        .await,
+        tombstones: count_json_array(
+            client,
+            base_url,
+            token,
+            vault,
+            "/api/deleted?limit=100",
+            "deleted",
+        )
+        .await,
+        ..Default::default()
+    };
+
+    if !mutate {
+        if outcome.duplicate_groups > 0 || outcome.diagnostic > 0 {
+            info!(
+                vault = %vault,
+                duplicate_groups = outcome.duplicate_groups,
+                diagnostic = outcome.diagnostic,
+                "MemorySleep: proposal only ({ENV_MUTATE} unset) — no changes made"
+            );
+        }
+        return Ok(outcome);
+    }
+
+    for (ids, merged) in &plan.consolidate {
+        let url = format!("{}/api/consolidate", base_url.trim_end_matches('/'));
+        let resp = client
+            .post(&url)
+            .bearer_auth(token)
+            .json(&serde_json::json!({ "vault": vault, "ids": ids, "merged_content": merged }))
+            .send()
+            .await;
+        match resp {
+            Ok(r) if r.status().is_success() => outcome.consolidated += ids.len(),
+            Ok(r) => {
+                warn!(vault = %vault, status = %r.status(), "MemorySleep: consolidate refused")
             }
+            Err(e) => warn!(vault = %vault, error = %e, "MemorySleep: consolidate failed"),
         }
-        clusters.push(cluster);
     }
-    clusters
+    for id in &plan.forget {
+        let url = format!(
+            "{}/api/engrams/{}?vault={}",
+            base_url.trim_end_matches('/'),
+            id,
+            vault
+        );
+        match client.delete(&url).bearer_auth(token).send().await {
+            Ok(r) if r.status().is_success() => outcome.forgotten += 1,
+            Ok(r) => {
+                warn!(vault = %vault, id = %id, status = %r.status(), "MemorySleep: forget refused")
+            }
+            Err(e) => warn!(vault = %vault, id = %id, error = %e, "MemorySleep: forget failed"),
+        }
+    }
+    Ok(outcome)
 }
 
-fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
-    if a.len() != b.len() || a.is_empty() {
-        return 0.0;
-    }
-    let dot: f32 = a.iter().zip(b.iter()).map(|(x, y)| x * y).sum();
-    let norm_a: f32 = a.iter().map(|x| x * x).sum::<f32>().sqrt();
-    let norm_b: f32 = b.iter().map(|x| x * x).sum::<f32>().sqrt();
-    if norm_a == 0.0 || norm_b == 0.0 {
-        return 0.0;
-    }
-    dot / (norm_a * norm_b)
-}
-
-// ──── Step 4a: Ollama merge ───────────────────────────────────────────────────
-
-const OLLAMA_CHAT_URL: &str = "http://localhost:11434/v1/chat/completions";
-const OLLAMA_MODEL: &str = "gemma4:e4b";
-
-async fn ollama_merge(client: &reqwest::Client, cluster: &[EmbeddedEngram]) -> Result<String> {
-    let memories = cluster
-        .iter()
-        .map(|e| format!("- {}: {}", e.concept, e.content))
-        .collect::<Vec<_>>()
-        .join("\n");
-
-    let prompt = format!(
-        "You are a memory consolidation engine. \
-         Merge these related memories into one concise engram. \
-         Output only the merged memory text — no commentary, no labels.\n\n\
-         Memories:\n{memories}"
-    );
-
-    let body = serde_json::json!({
-        "model": OLLAMA_MODEL,
-        "messages": [
-            { "role": "user", "content": prompt }
-        ],
-        "stream": false,
-    });
-
-    let resp = client.post(OLLAMA_CHAT_URL).json(&body).send().await?;
-
-    if !resp.status().is_success() {
-        let status = resp.status();
-        let text = resp.text().await.unwrap_or_default();
-        anyhow::bail!("Ollama returned {status}: {text}");
-    }
-
-    let json: serde_json::Value = resp.json().await?;
-    let content = json
-        .pointer("/choices/0/message/content")
-        .and_then(serde_json::Value::as_str)
-        .ok_or_else(|| anyhow::anyhow!("Ollama response missing choices[0].message.content"))?
-        .trim()
-        .to_string();
-
-    if content.is_empty() {
-        anyhow::bail!("Ollama returned empty merge content");
-    }
-
-    Ok(content)
-}
-
-// ──── Step 4b: MuninnDB consolidate ──────────────────────────────────────────
-
-#[derive(Serialize)]
-struct ConsolidateRequest<'a> {
-    vault: &'a str,
-    ids: &'a [&'a str],
-    merged_content: &'a str,
-}
-
-async fn consolidate(
+async fn list_engrams(
     client: &reqwest::Client,
     base_url: &str,
     token: &str,
-    vault_name: &str,
-    ids: &[&str],
-    merged_content: &str,
-) -> Result<()> {
-    let url = format!("{}/api/consolidate", base_url.trim_end_matches('/'));
-    let resp = client
-        .post(&url)
-        .header("Authorization", format!("Bearer {token}"))
-        .json(&ConsolidateRequest {
-            vault: vault_name,
-            ids,
-            merged_content,
-        })
-        .send()
-        .await?;
-
-    if !resp.status().is_success() {
-        let status = resp.status();
-        let body = resp.text().await.unwrap_or_default();
-        anyhow::bail!("consolidate returned {status}: {body}");
+    vault: &str,
+) -> Result<Vec<EngramItem>> {
+    #[derive(Deserialize)]
+    struct Page {
+        #[serde(default)]
+        engrams: Vec<EngramItem>,
     }
-    Ok(())
+    let mut out = Vec::new();
+    let mut offset = 0usize;
+    while out.len() < MAX_ENGRAMS_PER_VAULT {
+        let url = format!(
+            "{}/api/engrams?vault={}&limit={}&offset={}",
+            base_url.trim_end_matches('/'),
+            vault,
+            LIST_PAGE,
+            offset
+        );
+        let resp = client.get(&url).bearer_auth(token).send().await?;
+        if !resp.status().is_success() {
+            anyhow::bail!("list engrams returned {}", resp.status());
+        }
+        let page: Page = resp.json().await?;
+        let n = page.engrams.len();
+        out.extend(page.engrams);
+        if n < LIST_PAGE {
+            break;
+        }
+        offset += n;
+    }
+    Ok(out)
 }
 
-// ──── Step 5: Evolve ─────────────────────────────────────────────────────────
-
-#[derive(Serialize)]
-struct EvolveRequest<'a> {
-    vault: &'a str,
-    delta: f32,
-}
-
-async fn evolve_engram(
+/// Length of a JSON array found at `field` (or the top level) of a GET
+/// response; 0 when the endpoint is unavailable. Report-only.
+async fn count_json_array(
     client: &reqwest::Client,
     base_url: &str,
     token: &str,
-    vault_name: &str,
-    engram_id: &str,
-) -> Result<()> {
+    vault: &str,
+    path_and_query: &str,
+    field: &str,
+) -> usize {
+    let sep = if path_and_query.contains('?') {
+        '&'
+    } else {
+        '?'
+    };
     let url = format!(
-        "{}/api/engrams/{}/evolve",
+        "{}{}{}vault={}",
         base_url.trim_end_matches('/'),
-        engram_id,
+        path_and_query,
+        sep,
+        vault
     );
-    let resp = client
-        .post(&url)
-        .header("Authorization", format!("Bearer {token}"))
-        .json(&EvolveRequest {
-            vault: vault_name,
-            delta: 0.1,
-        })
-        .send()
-        .await?;
-
+    let Ok(resp) = client.get(&url).bearer_auth(token).send().await else {
+        return 0;
+    };
     if !resp.status().is_success() {
-        let status = resp.status();
-        anyhow::bail!("evolve returned {status}");
+        return 0;
     }
-    Ok(())
+    let Ok(json) = resp.json::<serde_json::Value>().await else {
+        return 0;
+    };
+    json.get(field)
+        .and_then(|v| v.as_array())
+        .or_else(|| json.as_array())
+        .map(|a| a.len())
+        .unwrap_or(0)
 }
 
-async fn evolve_all(
-    client: &reqwest::Client,
-    base_url: &str,
-    token: &str,
-    vault_name: &str,
-    engrams: &[EngramSummary],
-) {
-    for engram in engrams {
-        if let Err(e) = evolve_engram(client, base_url, token, vault_name, &engram.id).await {
-            debug!(vault = %vault_name, id = %engram.id, error = %e, "DreamsPhase: evolve failed (non-fatal)");
-        }
-    }
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 // ──── Helpers ─────────────────────────────────────────────────────────────────
 
 /// Derive `self_{agent_id}` vault names for all active guests in the hotel.
 ///
-/// `pub(crate)` so the memory.hygiene sweep (`crate::memory_hygiene`) can
-/// reuse the same vault-derivation logic instead of duplicating it.
+/// Retained for `memory_delta_digest`; the sleep cycle uses
+/// [`sleep_vault_names`] (the token registry), which matches real vaults.
 pub(crate) fn collect_agent_vault_names(graph: &GraphDomain, hotel_name: &str) -> Vec<String> {
     graph
         .list_guests(hotel_name, true)
@@ -546,70 +530,99 @@ pub(crate) fn collect_agent_vault_names(graph: &GraphDomain, hotel_name: &str) -
 mod tests {
     use super::*;
 
-    fn vec2(x: f32, y: f32) -> Vec<f32> {
-        vec![x, y]
+    fn item(id: &str, concept: &str, content: &str, at: i64) -> EngramItem {
+        EngramItem {
+            id: id.into(),
+            concept: concept.into(),
+            content: content.into(),
+            tags: vec![],
+            created_at: at,
+        }
     }
 
     #[test]
-    fn cosine_similarity_identical_vectors() {
-        let v = vec2(1.0, 0.0);
-        assert!((cosine_similarity(&v, &v) - 1.0).abs() < 1e-6);
-    }
-
-    #[test]
-    fn cosine_similarity_orthogonal_vectors() {
-        let a = vec2(1.0, 0.0);
-        let b = vec2(0.0, 1.0);
-        assert!((cosine_similarity(&a, &b)).abs() < 1e-6);
-    }
-
-    #[test]
-    fn cosine_similarity_length_mismatch_returns_zero() {
-        assert_eq!(cosine_similarity(&[1.0], &[1.0, 0.0]), 0.0);
-    }
-
-    #[test]
-    fn cosine_cluster_groups_similar() {
-        let e = |id: &str, v: Vec<f32>| EmbeddedEngram {
-            id: id.to_string(),
-            concept: id.to_string(),
-            content: id.to_string(),
-            vector: v,
-        };
-        // a and b are identical (sim=1.0), c is orthogonal to both.
+    fn plan_consolidates_exact_duplicates_keeping_newest_and_forgets_probes() {
         let engrams = vec![
-            e("a", vec2(1.0, 0.0)),
-            e("b", vec2(1.0, 0.0)),
-            e("c", vec2(0.0, 1.0)),
+            item("01A", "rehearsal", "Choir rehearsal moved to Thursday.", 10),
+            item(
+                "01B",
+                "Rehearsal",
+                "choir rehearsal  moved to thursday.",
+                30,
+            ),
+            item("01C", "rehearsal", "Choir rehearsal moved to Thursday.", 20),
+            item(
+                "01D",
+                "perplexity.note: Cross-hotel routing test",
+                "routing test ping",
+                5,
+            ),
+            item("01E", "rehearsal", "Choir rehearsal moved to Friday.", 40),
         ];
-        let clusters = cosine_cluster(&engrams, 0.82);
-
-        // a+b cluster together; c is singleton.
-        assert_eq!(clusters.len(), 2);
-        let big = clusters.iter().find(|c| c.len() == 2).expect("a+b cluster");
-        assert!(big.iter().any(|e| e.id == "a"));
-        assert!(big.iter().any(|e| e.id == "b"));
-        let singleton = clusters.iter().find(|c| c.len() == 1).expect("c singleton");
-        assert_eq!(singleton[0].id, "c");
+        let plan = plan_vault_sleep(&engrams);
+        assert_eq!(plan.forget, vec!["01D".to_string()]);
+        assert_eq!(plan.consolidate.len(), 1);
+        let (ids, merged) = &plan.consolidate[0];
+        assert_eq!(
+            ids,
+            &vec!["01B".to_string(), "01C".to_string(), "01A".to_string()]
+        );
+        assert_eq!(merged, "choir rehearsal  moved to thursday.");
     }
 
     #[test]
-    fn cosine_cluster_all_singletons_below_threshold() {
-        let e = |id: &str, v: Vec<f32>| EmbeddedEngram {
-            id: id.to_string(),
-            concept: id.to_string(),
-            content: id.to_string(),
-            vector: v,
-        };
-        let engrams = vec![e("a", vec2(1.0, 0.0)), e("b", vec2(0.0, 1.0))];
-        let clusters = cosine_cluster(&engrams, 0.82);
-        assert_eq!(clusters.len(), 2);
-        assert!(clusters.iter().all(|c| c.len() == 1));
+    fn mutation_requires_explicit_opt_in() {
+        assert!(!mutate_enabled(|_| None));
+        assert!(!mutate_enabled(|k| (k == ENV_MUTATE).then(|| "0".into())));
+        assert!(mutate_enabled(|k| (k == ENV_MUTATE).then(|| "true".into())));
+        // The nightly-sweep opt-in alone does not allow changes.
+        assert!(!mutate_enabled(|k| (k == ENV_ENABLED).then(|| "1".into())));
     }
 
     #[test]
-    fn cosine_cluster_empty_input() {
-        assert!(cosine_cluster(&[], 0.82).is_empty());
+    fn plan_leaves_distinct_memories_alone() {
+        let engrams = vec![
+            item("01A", "pref", "Aisle seat", 1),
+            item("01B", "pref", "Window seat", 2),
+            item("01C", "empty", "   ", 3),
+            item("01D", "empty", "", 4),
+        ];
+        assert_eq!(plan_vault_sleep(&engrams), SleepPlan::default());
+    }
+
+    #[test]
+    fn sleep_vaults_come_from_the_token_registry_and_exclude_non_memory_entries() {
+        let config = memory_core::MuninnConfig::local("default")
+            .with_vault_token("self_agent-bjork-01", "t1")
+            .with_vault_token("user_likesjx", "t2")
+            .with_vault_token("openai_api_key", "t3")
+            .with_vault_token("session_01abc", "t4");
+        assert_eq!(
+            sleep_vault_names(&config),
+            vec![
+                "self_agent-bjork-01".to_string(),
+                "user_likesjx".to_string()
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn sleep_skips_non_cortex_hotels() {
+        // An observer hotel must never attempt maintenance writes. With a write
+        // route set the sweep returns before building a client or listing.
+        let mut config = memory_core::MuninnConfig::local("default");
+        config.base_url = "http://127.0.0.1:9".into();
+        config.shared_write_route = Some("vps-jane-aiua-01".into());
+        let storage = ansible_mesh_core::sqlite_storage::SqliteGraphStorage::open_in_memory()
+            .expect("storage");
+        let graph = GraphDomain::new(std::sync::Arc::new(storage.adapter()));
+        dream_sweep(&config, &graph, "mac-jane").await;
+        assert!(
+            graph
+                .get_config_value(&format!("{CONFIG_KEY_LAST_RUN_PREFIX}mac-jane"))
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]

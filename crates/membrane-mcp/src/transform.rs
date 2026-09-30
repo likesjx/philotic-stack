@@ -63,10 +63,10 @@ fn apply_field_map(args: &Value, mappings: &[FieldMapping]) -> Value {
     }
 
     // If no mappings are declared, pass the full args object through.
-    if mappings.is_empty() {
-        if let Some(obj) = args.as_object() {
-            payload = obj.clone();
-        }
+    if mappings.is_empty()
+        && let Some(obj) = args.as_object()
+    {
+        payload = obj.clone();
     }
 
     Value::Object(payload)
@@ -170,6 +170,7 @@ mod tests {
             },
             outbound_transform: outbound,
             auth: None,
+            handler: None,
         }
     }
 

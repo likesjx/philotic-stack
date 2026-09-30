@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - model-reflex-per-ask
+
+rectangle "model-reflex-per-ask" as model_reflex_per_ask #Orange {
+}
+
+
+@enduml

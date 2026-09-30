@@ -35,9 +35,16 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Verify outbound egress inventory
+        run: python3 scripts/check-outbound-egress-inventory.py
+
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        # Pinned to match rust-toolchain.toml. Must be bumped in lockstep with
+        # it: the toolchain file decides which rustc cargo uses, so the target
+        # below has to be installed against that exact toolchain.
+        uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: "1.94.0"
           targets: x86_64-unknown-linux-gnu
 
       - name: Cache cargo
@@ -91,6 +98,12 @@ jobs:
           fi
 
       - name: Build release binaries
+        env:
+          # Baked into every binary via philotic_client::build_sha() and logged
+          # by each guest at startup, so a deployed binary can always say which
+          # commit it came from. Added after a vps runner was found answering
+          # with code from an unmerged branch, undetectable from the outside.
+          PHILOTIC_BUILD_SHA: ${{ github.sha }}
         run: |
           cargo build --release --target "${TARGET}" --bins \
             -p aiua \
@@ -98,6 +111,8 @@ jobs:
             -p membrane-telegram \
             -p membrane-discord \
             -p membrane-mcp \
+            -p membrane-mcp-client \
+            -p egress-http-runner \
             -p model-router \
             -p tool-runner \
             -p graph-datasource \
@@ -138,6 +153,7 @@ jobs:
           # in philotic_binaries but are not build outputs (the ansible remote
           # path stats-and-skips them), so they are intentionally NOT required here.
           for bin in aiua philote philote-worker membrane-telegram membrane-discord membrane-mcp \
+                     membrane-mcp-client egress-http-runner \
                      model-router model-controller-elevenlabs \
                      model-controller-gemini model-controller-openai \
                      model-controller-anthropic \

@@ -1,25 +1,94 @@
-//! Plan-eval-repeat support: the "eval" and "repeat" stages of the agent-level
-//! plan → execute → eval → repeat cycle.
+//! Plan → execute → verify each step → evaluate the whole plan.
 //!
-//! After a turn's final Respond, [`evaluate_plan`] derives a completion verdict
-//! for the turn's `ActivePlan` without a second model round-trip: it trusts the
-//! model's own per-step status claims when the response contract carried them
-//! (`basis = model_reported`), and falls back to a cheap heuristic that matches
-//! step text / bound tools against the turn's tool history successes
-//! (`basis = heuristic`), flagging heuristic completions as uncertain.
+//! There are two layers here, and the difference between them matters.
 //!
-//! The runtime consumes the outcome to persist a
-//! [`crate::session::CarryoverPlan`], emit `plan_eval` / `plan_continuation`
-//! turn events, and synthesize budgeted continuation turns through the
-//! `pending_drains` mechanism.
+//! **Cross-turn carryover (the repeat stage).** After a turn's final Respond,
+//! [`evaluate_plan`] derives a verdict for the turn's `ActivePlan` without a
+//! second model round-trip. The runtime persists a
+//! [`crate::session::CarryoverPlan`], emits `plan_eval` / `plan_continuation`
+//! turn events, and synthesizes budgeted continuation turns through
+//! `pending_drains`. This is the overflow path for work that genuinely exceeds
+//! one turn, and it repeats until the plan is verifiably done, the loop stalls
+//! out, or the budget is spent.
+//!
+//! This layer used to trust `step.status == "done"` — the same self-certification
+//! the in-turn layer below was built to eliminate. That left the two halves of
+//! the cycle disagreeing: the turn refused to *claim* completion it could not
+//! prove, while the eval that decided whether to *repeat* took the model's word
+//! for it, so a plan that marked itself done escaped the loop with the work
+//! undone. Both layers now share [`verify_plan_steps`] / [`evaluate_whole_plan`],
+//! and the carryover carries evidence (`verified_step_ids`) separately from
+//! settlement (`steps_done`) so a model claim can never be fed back as proof.
+//!
+//! **In-turn execution and grounded verification (this layer).** Trusting
+//! `step.status == "done"` is self-certification, not evaluation. A model that
+//! marks a step done without doing it yields a `Complete` verdict and then
+//! reports success to the operator — which is exactly what happened live: an
+//! agent was asked to add five family members to the LifeGraph, marked every
+//! step done, told the operator "Yes, I now have all five", and one of them had
+//! never been created.
+//!
+//! So completion is now grounded in the turn's actual tool results:
+//!
+//! - [`should_plan`] decides whether a turn plans at all — by default it does,
+//!   skipping only trivially conversational messages.
+//! - [`plan_directive`] requires atomic, tool-bound steps, because a step that
+//!   bundles several artifacts is cleared by one successful call while the rest
+//!   silently never happen.
+//! - [`verify_plan_steps`] attributes successful tool calls to steps one-to-one,
+//!   using the tokens that distinguish each step from its siblings.
+//! - [`evaluate_whole_plan`] and [`plan_integrity_note`] make it impossible for
+//!   a turn to report a plan as finished while a step is unverified.
+//! - [`reentry_hint`] keeps the turn working through its steps instead of
+//!   returning to the user after each one, bounded by
+//!   [`PLAN_EXECUTION_BUDGET_SECS`] so the hotel's 300s zombie watchdog never
+//!   reaps a turn mid-plan.
 
 use crate::r#loop::{ToolCall, ToolResult};
-use crate::session::{ActivePlan, CarryoverPlan, PlanStep};
+use crate::session::{ActivePlan, CarryoverPlan, PlanStep, WorkingTurn};
 use serde_json::json;
+use std::collections::BTreeMap;
 
 /// Default number of auto-continuation turns per carried-over plan.
 /// Role-overridable via `TurnLoopConfig.plan_continuation_budget`.
 pub const DEFAULT_PLAN_CONTINUATION_BUDGET: u32 = 3;
+
+/// Ceiling on the outstanding-scaled continuation budget. Bounds the repeat
+/// stage so a plan can never loop indefinitely, however many steps it declares.
+pub const PLAN_CONTINUATION_BUDGET_CEILING: u32 = 8;
+
+/// Absolute cap on continuation turns over a plan's whole lifetime.
+///
+/// The per-stretch budget is refunded whenever a continuation settles a new
+/// step (progress must never be what exhausts the loop — stalls are what the
+/// budget exists to bound, and `MAX_CONSECUTIVE_PLAN_STALLS` already blocks a
+/// spin). This cap is the backstop the refund needs: a plan that keeps growing
+/// its own step list could otherwise alternate one settled step with fresh
+/// work forever. Sized at 3× the per-stretch ceiling — far above any plan the
+/// loop legitimately runs, so hitting it is itself a signal worth surfacing.
+pub const PLAN_CONTINUATION_LIFETIME_CAP: u32 = 24;
+
+/// Consecutive stalled continuations tolerated before the plan is `Blocked`.
+///
+/// One stall is not failure. Under grounded evaluation a turn only counts as
+/// progress when a step actually settles, and a turn legitimately spent on a
+/// failed call, a rate limit, or a read that sets up the next step settles
+/// nothing — the previous rule (`Blocked` on the first stall) killed those
+/// plans one turn before they would have recovered. Two in a row is a spin.
+pub const MAX_CONSECUTIVE_PLAN_STALLS: u32 = 2;
+
+/// Continuation budget for a plan, widened to fit the work actually left.
+///
+/// A flat budget of 3 is generous for a two-step plan and arbitrary for a
+/// twelve-step one; the same ceiling then truncates every large plan at the
+/// same place regardless of size. Scale with outstanding steps, bounded by
+/// [`PLAN_CONTINUATION_BUDGET_CEILING`], and never shrink a configured budget.
+pub fn scaled_continuation_budget(configured: u32, outstanding: usize) -> u32 {
+    let scaled = u32::try_from(outstanding)
+        .unwrap_or(PLAN_CONTINUATION_BUDGET_CEILING)
+        .min(PLAN_CONTINUATION_BUDGET_CEILING);
+    configured.max(scaled)
+}
 
 /// Operator kill switch: when set, the plan-eval-repeat loop never persists a
 /// carryover and never synthesizes continuation turns.
@@ -55,19 +124,21 @@ impl PlanEvalVerdict {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PlanEvalBasis {
-    /// The model's response contract carried per-step (or whole-plan) status
-    /// claims — the eval trusts them.
+    /// At least one step is bound to a tool, so completion was checked against
+    /// real tool results.
+    Grounded,
+    /// No step in the plan declares a tool, so there is no artifact to check
+    /// and the model's own claims are the only signal available. Surfaced in
+    /// the `plan_eval` event because it is also the cheapest way to evade
+    /// verification: a plan that binds no tools cannot be contradicted.
     ModelReported,
-    /// The contract was silent on completion; steps were matched against the
-    /// turn's tool-history successes.
-    Heuristic,
 }
 
 impl PlanEvalBasis {
     pub fn as_str(&self) -> &'static str {
         match self {
+            Self::Grounded => "grounded",
             Self::ModelReported => "model_reported",
-            Self::Heuristic => "heuristic",
         }
     }
 }
@@ -76,11 +147,30 @@ impl PlanEvalBasis {
 #[derive(Debug, Clone)]
 pub struct PlanEvalOutcome {
     pub steps_total: usize,
+    /// Steps that are settled: verified by evidence, or unverifiable and
+    /// claimed done by the model.
     pub steps_done: usize,
-    /// Index-aligned per-step completion flags (merged with any prior flags).
+    /// Steps backed by an actual tool result. Never exceeds `steps_done`.
+    pub steps_verified: usize,
+    /// Index-aligned settled flags.
     pub steps_done_flags: Vec<bool>,
-    /// Step ids marked done by the heuristic rather than a model claim.
+    /// Ids of evidence-backed steps, to carry into the next continuation.
+    pub verified_step_ids: Vec<u32>,
+    /// Steps counted as settled on the model's word alone (no bound tool).
     pub uncertain_step_ids: Vec<u32>,
+    /// Steps the model marked done that the tool history contradicts.
+    pub contradicted_step_ids: Vec<u32>,
+    /// Steps bundling several outcomes; never settled until split.
+    pub non_atomic_step_ids: Vec<u32>,
+    /// Ids of steps still to do.
+    pub outstanding_step_ids: Vec<u32>,
+    /// `"<id>: <description>"` for each outstanding step, so a status line
+    /// can say what is left instead of a bare number (live 2026-09-15 the
+    /// reply said "not done: step(s) 13" and the model then told the operator
+    /// "there was no Step 13").
+    pub outstanding_step_briefs: Vec<String>,
+    /// Consecutive continuations (including this one) that settled nothing new.
+    pub stalled_continuations: u32,
     pub verdict: PlanEvalVerdict,
     pub basis: PlanEvalBasis,
 }
@@ -91,93 +181,144 @@ impl PlanEvalOutcome {
         json!({
             "steps_total": self.steps_total,
             "steps_done": self.steps_done,
+            "steps_verified": self.steps_verified,
             "verdict": self.verdict.as_str(),
             "basis": self.basis.as_str(),
             "uncertain_steps": self.uncertain_step_ids,
+            "contradicted_steps": self.contradicted_step_ids,
+            "non_atomic_steps": self.non_atomic_step_ids,
+            "outstanding_steps": self.outstanding_step_ids,
+            "outstanding_briefs": self.outstanding_step_briefs,
+            "stalls": self.stalled_continuations,
         })
     }
 }
 
-/// Evaluate plan completion after a turn's final Respond.
+/// What an earlier turn of the *same* plan established, threaded into this eval.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct PriorPlanState<'a> {
+    /// Evidence-backed step ids from previous turns. Only ever set by
+    /// [`verify_plan_steps`] against a real tool result.
+    pub verified_step_ids: &'a [u32],
+    /// How many steps were settled as of the previous eval, for stall detection.
+    pub settled_count: usize,
+    /// Consecutive stalls already recorded for this plan.
+    pub stalls: u32,
+}
+
+/// True when any step declares a tool, i.e. the plan has something checkable.
+fn plan_has_checkable_step(plan: &ActivePlan) -> bool {
+    plan.steps.iter().any(step_is_tool_bound)
+}
+
+/// Evaluate the plan after a turn's final Respond, and decide whether the
+/// cycle repeats.
 ///
-/// `prior_done` carries the per-step flags from an existing carryover (i.e.
-/// this turn was a continuation); a step once done stays done. When
-/// `prior_done` is present and the eval finds no *new* completed step, the
-/// verdict is `Blocked` — a continuation that made no forward progress must
-/// not spin the loop again.
+/// Completion is grounded: a step settles when [`verify_plan_steps`] attributes
+/// a successful tool call to it, or — only when it declares no tool, so there
+/// is nothing to check — when the model claims it. `plan.status == "done"` is
+/// no longer sufficient on its own; a plan that marks itself finished with
+/// unverified steps yields `Continue`, and the loop goes back for the rest.
+///
+/// `prior` carries the same plan's earlier state. Evidence comes in as step
+/// **ids** (never as settled flags — see [`CarryoverPlan::verified_step_ids`]),
+/// because a continuation that splits a bundled step renumbers the tail.
 pub fn evaluate_plan(
     plan: &ActivePlan,
-    prior_done: Option<&[bool]>,
+    prior: Option<PriorPlanState<'_>>,
     tool_history: &[(ToolCall, ToolResult)],
 ) -> PlanEvalOutcome {
     let total = plan.steps.len();
-    let plan_declared_done = plan.status == "done";
     let plan_declared_failed = plan.status == "failed";
+    let checkable = plan_has_checkable_step(plan);
 
-    // The model "engaged" with status tracking if the plan or any step carries
-    // a terminal status. When silent, completion falls to the heuristic.
-    let model_engaged = plan_declared_done
-        || plan_declared_failed
-        || plan
-            .steps
-            .iter()
-            .any(|s| matches!(s.status.as_str(), "done" | "failed"));
+    // Evidence carried from earlier turns of this plan, re-keyed by step id.
+    // Each continuation turn starts with a fresh `working_tool_history`, so
+    // without this the proof of an already-finished step disappears and the
+    // loop redoes it.
+    let prior_verified: Vec<bool> = plan
+        .steps
+        .iter()
+        .map(|s| {
+            prior
+                .map(|p| p.verified_step_ids.contains(&s.id))
+                .unwrap_or(false)
+        })
+        .collect();
+
+    let verification = verify_plan_steps(plan, tool_history, &prior_verified);
+    let completion = evaluate_whole_plan(plan, &verification);
 
     let mut flags = vec![false; total];
     let mut uncertain: Vec<u32> = Vec::new();
-    let mut any_step_failed = false;
-
     for (i, step) in plan.steps.iter().enumerate() {
-        match step.status.as_str() {
-            "done" => flags[i] = true,
-            "failed" => any_step_failed = true,
-            _ => {
-                if plan_declared_done {
-                    // Whole-plan claim covers steps the model forgot to mark.
-                    flags[i] = true;
-                } else if heuristic_step_done(step, tool_history) {
-                    flags[i] = true;
-                    uncertain.push(step.id);
-                }
-            }
-        }
-        if let Some(prior) = prior_done {
-            if prior.get(i).copied().unwrap_or(false) {
-                flags[i] = true;
-            }
+        flags[i] = !completion.outstanding.contains(&i);
+        // Settled without evidence: nothing to check it against, so this rests
+        // on the model's word. Reported so the gap stays visible.
+        if flags[i] && verification.evidence.get(i) != Some(&StepEvidence::Verified) {
+            uncertain.push(step.id);
         }
     }
 
+    // A plan that binds no tools anywhere has nothing to verify, so a
+    // whole-plan `done` still covers steps the model left unmarked. Without
+    // this a purely conversational plan could never settle and would spin the
+    // continuation budget on work that has no artifact to produce.
+    let mut complete = completion.complete;
+    if !checkable && plan.status == "done" && total > 0 {
+        flags.iter_mut().for_each(|f| *f = true);
+        uncertain = plan.steps.iter().map(|s| s.id).collect();
+        complete = true;
+    }
+
     let done = flags.iter().filter(|f| **f).count();
-    let basis = if model_engaged {
-        PlanEvalBasis::ModelReported
-    } else {
-        PlanEvalBasis::Heuristic
+    let verified_step_ids: Vec<u32> = plan
+        .steps
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| verification.evidence.get(*i) == Some(&StepEvidence::Verified))
+        .map(|(_, s)| s.id)
+        .collect();
+    let outstanding_step_ids: Vec<u32> = plan
+        .steps
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| !flags[*i])
+        .map(|(_, s)| s.id)
+        .collect();
+    let outstanding_step_briefs: Vec<String> = plan
+        .steps
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| !flags[*i])
+        .map(|(_, s)| format!("{}: {}", s.id, step_brief(&s.description)))
+        .collect();
+
+    // A continuation that settled nothing new is a stall. One is tolerated —
+    // see MAX_CONSECUTIVE_PLAN_STALLS — because under grounded evaluation a
+    // turn spent on a failed call makes no progress but is not yet a spin.
+    let stalls = match prior {
+        Some(p) if done <= p.settled_count => p.stalls.saturating_add(1),
+        Some(_) => 0,
+        None => 0,
     };
+
+    let every_step_settled_or_failed = plan
+        .steps
+        .iter()
+        .enumerate()
+        .all(|(i, s)| flags[i] || s.status == "failed");
 
     let verdict = if plan_declared_failed {
         PlanEvalVerdict::Blocked
-    } else if total > 0 && done == total {
+    } else if complete {
         PlanEvalVerdict::Complete
-    } else if plan_declared_done {
-        PlanEvalVerdict::Complete
-    } else if any_step_failed
-        && plan
-            .steps
-            .iter()
-            .enumerate()
-            .all(|(i, s)| flags[i] || s.status == "failed")
-    {
-        // Everything is either done or failed — nothing left to continue with.
+    } else if every_step_settled_or_failed {
+        // Everything is either settled or explicitly failed — nothing left to
+        // continue with.
         PlanEvalVerdict::Blocked
-    } else if let Some(prior) = prior_done {
-        let prior_count = prior.iter().filter(|f| **f).count();
-        if done <= prior_count {
-            // Continuation turn made no forward progress.
-            PlanEvalVerdict::Blocked
-        } else {
-            PlanEvalVerdict::Continue
-        }
+    } else if stalls >= MAX_CONSECUTIVE_PLAN_STALLS {
+        PlanEvalVerdict::Blocked
     } else {
         PlanEvalVerdict::Continue
     };
@@ -185,55 +326,66 @@ pub fn evaluate_plan(
     PlanEvalOutcome {
         steps_total: total,
         steps_done: done,
+        steps_verified: verification.verified_count(),
         steps_done_flags: flags,
+        verified_step_ids,
         uncertain_step_ids: uncertain,
+        contradicted_step_ids: verification.contradicted_step_ids.clone(),
+        non_atomic_step_ids: verification.non_atomic_step_ids.clone(),
+        outstanding_step_ids,
+        outstanding_step_briefs,
+        stalled_continuations: stalls,
         verdict,
-        basis,
+        basis: if checkable {
+            PlanEvalBasis::Grounded
+        } else {
+            PlanEvalBasis::ModelReported
+        },
     }
 }
 
-/// Cheap heuristic: does the tool history contain a successful call that
-/// plausibly executed this step? Conservative on purpose — under-marking only
-/// costs one continuation turn, over-marking silently skips work.
-fn heuristic_step_done(step: &PlanStep, history: &[(ToolCall, ToolResult)]) -> bool {
-    // Strongest signal: the step is bound to a tool and that tool ran successfully.
-    if let Some(tool) = step.tool_name.as_deref() {
-        if !tool.is_empty() {
-            return history
-                .iter()
-                .any(|(call, result)| call.tool_name == tool && tool_result_looks_ok(result));
-        }
-    }
-
-    // Fallback: significant token overlap between the step description and a
-    // successful call's tool name + arguments.
-    let step_tokens = significant_tokens(&step.description);
-    if step_tokens.is_empty() {
+pub(crate) fn tool_result_looks_ok(result: &ToolResult) -> bool {
+    let trimmed = result.content.trim_start().to_lowercase();
+    if trimmed.starts_with("error")
+        || trimmed.starts_with("{\"error\"")
+        || trimmed.starts_with("tool execution failed")
+    {
         return false;
     }
-    history.iter().any(|(call, result)| {
-        if !tool_result_looks_ok(result) {
-            return false;
-        }
-        let haystack = format!(
-            "{} {}",
-            call.tool_name.replace(['.', '_', '-'], " "),
-            call.arguments
-        )
-        .to_lowercase();
-        let matched = step_tokens
-            .iter()
-            .filter(|t| haystack.contains(t.as_str()))
-            .count();
-        matched >= 2 || (step_tokens.len() == 1 && matched == 1)
-    })
+    // The hotel's own refusals render as "<message> | kind=ipc_failure |
+    // code=…" and open with prose: live 2026-09-15 16:35 UTC "only
+    // orchestrator or management guests may registering skills |
+    // kind=ipc_failure | code=REGISTER_FORBIDDEN" verified the plan's only
+    // step and the reply promised "I will register this now" (DEF-136).
+    !crate::runtime::distill::tool_result_is_error(&result.content)
 }
 
-fn tool_result_looks_ok(result: &ToolResult) -> bool {
-    let trimmed = result.content.trim_start().to_lowercase();
-    !(trimmed.starts_with("error")
-        || trimmed.starts_with("{\"error\"")
-        || trimmed.starts_with("tool execution failed"))
+/// Lowercased `life:<label>:<slug>` ids named in a step description.
+pub fn life_ids_in(text: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let bytes = text.as_bytes();
+    let mut i = 0;
+    while let Some(pos) = text[i..].find("life:") {
+        let start = i + pos;
+        if start > 0 && (bytes[start - 1] as char).is_ascii_alphanumeric() {
+            i = start + 5;
+            continue;
+        }
+        let mut end = start;
+        for (off, ch) in text[start..].char_indices() {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | ':') {
+                end = start + off + ch.len_utf8();
+            } else {
+                break;
+            }
+        }
+        let id = text[start..end].trim_end_matches(':').to_ascii_lowercase();
+        if id.matches(':').count() >= 2 && !out.contains(&id) {
+            out.push(id);
+        }
+        i = end.max(start + 5);
+    }
+    out
 }
 
 fn significant_tokens(text: &str) -> Vec<String> {
@@ -251,9 +403,27 @@ fn significant_tokens(text: &str) -> Vec<String> {
 /// Structured "continue the plan" brief for the synthesized continuation turn.
 /// Cites exactly what is done and what remains so the next turn's model sees
 /// the remaining work without re-planning.
+///
+/// The remaining list is not a bare restatement of the plan. It says *why* each
+/// step is still outstanding, because the two ways a step survives a turn need
+/// opposite responses: a step the model marked done but no tool call performed
+/// must be redone (restating it plainly invites the model to mark it done
+/// again), and a step bundling several outcomes must be split before it can
+/// ever settle — under grounded evaluation it is unconditionally outstanding,
+/// so a continuation that does not split it burns the whole budget and still
+/// finishes with the plan unfinished.
 pub fn plan_continuation_brief(carryover: &CarryoverPlan, budget: u32) -> String {
     let done_list = step_list(&carryover.plan, &carryover.steps_done, true);
-    let remaining_list = step_list(&carryover.plan, &carryover.steps_done, false);
+    // No tool history: with the carryover's evidence as the only input, this
+    // reports each step's standing as of the last eval.
+    let verification = verify_plan_steps(
+        &carryover.plan,
+        &[],
+        &carryover.verified_flags_for(&carryover.plan),
+    );
+    let completion = evaluate_whole_plan(&carryover.plan, &verification);
+    let remaining_list = outstanding_lines(&carryover.plan, &verification, &completion);
+
     let mut brief = format!(
         "[Plan continuation {}/{}] Continue executing your existing plan. Goal: {}\n",
         carryover.continuations_used + 1,
@@ -263,12 +433,36 @@ pub fn plan_continuation_brief(carryover: &CarryoverPlan, budget: u32) -> String
     if !done_list.is_empty() {
         brief.push_str(&format!("Completed steps:\n{done_list}\n"));
     }
-    brief.push_str(&format!(
-        "Remaining steps:\n{remaining_list}\n\
-         Pick up at the first remaining step. Do not re-plan or repeat completed work. \
-         Update step statuses in active_plan as you execute; when every step is done, \
-         deliver a final summary of the whole plan to the user."
-    ));
+    brief.push_str(&format!("Remaining steps:\n{remaining_list}\n"));
+
+    if carryover.stalled_continuations > 0 {
+        brief.push_str(
+            "The previous continuation finished without completing a single outstanding step. \
+             Do not repeat the approach that just failed — take a different route to the same \
+             outcome, or say specifically what is blocking you.\n",
+        );
+    }
+
+    // The loop stops after this turn, and it stops as a turn event the operator
+    // never sees. If the model does not name the shortfall in its own reply,
+    // nobody learns the work was abandoned — which is the same silence as a
+    // false success claim, just from the other direction.
+    if carryover.continuations_used + 1 >= budget {
+        brief.push_str(
+            "This is the LAST continuation for this plan — no further automatic turns follow. \
+             If you cannot finish everything here, your reply must tell the user plainly which \
+             items are done, which are not, and what you need in order to finish. Do not imply \
+             that work will continue on its own.\n",
+        );
+    }
+
+    brief.push_str(
+        "Pick up at the first remaining step. Do not re-plan from scratch and do not repeat \
+         completed work. Update step statuses in active_plan as you execute. A step counts as \
+         done only when a successful tool call in this turn actually did it — marking it done \
+         without one leaves it outstanding. When every step is genuinely done, deliver a final \
+         summary of the whole plan to the user.",
+    );
     brief
 }
 
@@ -284,10 +478,32 @@ pub fn plan_stop_notice(carryover: &CarryoverPlan, reason: &str) -> String {
         remaining_list
     };
     format!(
-        "*(Plan paused: {reason}. Goal: {}. {done}/{total} steps done. Remaining:\n{remaining}\n\
-         Send a message to keep going manually, or /plan drop to discard.)*",
+        "*(Plan stopped: {reason}. Goal: {}. {done}/{total} steps done. Remaining:\n{remaining}\n\
+         The carryover has been cleared — the remaining steps will not run automatically.)*",
         carryover.plan.goal
     )
+}
+
+/// `data.health_score` (or top-level `health_score`) of a `life.audit` result.
+pub fn audit_health_score(content: &str) -> Option<u64> {
+    let v: serde_json::Value = serde_json::from_str(content).ok()?;
+    let data = v.get("data").unwrap_or(&v);
+    data.get("health_score").and_then(serde_json::Value::as_u64)
+}
+
+/// A step description cut to its first clause, ≤ 72 chars, for status lines.
+pub fn step_brief(description: &str) -> String {
+    let first = description
+        .split(|c| c == ';' || c == '\n')
+        .next()
+        .unwrap_or(description)
+        .trim();
+    if first.chars().count() <= 72 {
+        first.to_string()
+    } else {
+        let cut: String = first.chars().take(69).collect();
+        format!("{}…", cut.trim_end())
+    }
 }
 
 fn step_list(plan: &ActivePlan, flags: &[bool], done: bool) -> String {
@@ -295,9 +511,1401 @@ fn step_list(plan: &ActivePlan, flags: &[bool], done: bool) -> String {
         .iter()
         .enumerate()
         .filter(|(i, _)| flags.get(*i).copied().unwrap_or(false) == done)
-        .map(|(_, s)| format!("- step {}: {}", s.id, s.description))
+        .map(|(_, s)| {
+            // A completed step is listed for orientation only. Its call
+            // payload ("…: call life.tidy with {…}") is an invitation to run
+            // it again — live 2026-09-15 16:33 UTC the continuation re-ran
+            // all twelve completed tidies from these lines.
+            let description = if done {
+                s.description
+                    .split_once(": call ")
+                    .map(|(head, _)| head)
+                    .unwrap_or(&s.description)
+            } else {
+                s.description.as_str()
+            };
+            format!("- step {}{}: {}", s.id, step_tool_suffix(s), description)
+        })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+/// ` (tool: X)` for a tool-bound step, empty otherwise.
+///
+/// Load-bearing in continuation briefs, not decoration: the brief is the
+/// continuation turn's only tool-projection relevance text, and the keyword
+/// gates in `project_tools_for_turn` know nothing about the plan. A brief that
+/// names only step descriptions can have exactly the tools the remaining steps
+/// need stripped from the projection — worst case, a goal phrased with a `?`
+/// trips the conversational gate and the continuation runs with zero tools,
+/// stalls twice, and the plan is blocked. Naming the bound tool makes the
+/// explicit tool-name match fire first, which bypasses those gates entirely.
+fn step_tool_suffix(step: &PlanStep) -> String {
+    match step.tool_name.as_deref() {
+        Some(t) if !t.is_empty() => format!(" (tool: {t})"),
+        _ => String::new(),
+    }
+}
+
+// ── Grounded step verification ──────────────────────────────────────────────
+//
+// `evaluate_plan` above trusts `step.status == "done"` when the model engaged
+// with status tracking. That is self-certification, not evaluation: a model
+// that marks a step done without doing it produces a Complete verdict and then
+// reports success to the operator. This section grounds completion in the
+// turn's actual tool history instead.
+
+/// The hotel's zombie-turn watchdog fails any turn still `running` this many
+/// seconds after its `started_at` (`heal-dispatcher` issues
+/// `RepairStaleSessionTurns { min_age_secs }`). There is no heartbeat that
+/// resets the clock, so this is a hard wall-clock ceiling on a single turn —
+/// not an iteration ceiling. `iteration_cap` was never the binding constraint.
+///
+/// Re-exported from [`ansible_mesh_core::turn_budget`] so this file and the
+/// hotel-side reaper cannot drift apart again: they were independently
+/// hardcoded to 300, which put the backstop at or below every guest-side
+/// budget it was supposed to outlast.
+pub use ansible_mesh_core::turn_budget::TURN_ZOMBIE_REAP_SECS;
+
+/// Wall-clock budget for executing plan steps inside one turn, measured from
+/// the turn's `started_at` (which includes queue time and the planning call).
+/// The remainder of [`TURN_ZOMBIE_REAP_SECS`] is reserved for composing and
+/// delivering the final reply — a turn that gets reaped mid-plan loses the
+/// reply entirely, which is strictly worse than stopping early with an honest
+/// summary. Observed Beacon turns run 2–14s, so this allows roughly 25–70
+/// iterations before the budget binds.
+pub const PLAN_EXECUTION_BUDGET_SECS: u64 = 210;
+
+/// Current unix seconds — the clock the turn budget and the hotel's zombie
+/// watchdog both read.
+pub fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Quiet period between interim messages inside one turn.
+///
+/// Sized against the turn's own budget: with [`PLAN_EXECUTION_BUDGET_SECS`] at
+/// 210, a 45s floor allows at most a handful of interim notes on the longest
+/// possible turn, and none at all on a short one.
+pub const INTERIM_REPLY_MIN_GAP_SECS: u64 = 45;
+
+/// Iterations a turn runs before it may speak without finishing.
+///
+/// The first steps of a plan are usually fast, and narrating them is the
+/// per-step receipt behaviour the operator objected to. Silence is correct
+/// until a turn is demonstrably long-running.
+pub const INTERIM_REPLY_MIN_ITERATION: u32 = 2;
+
+/// Whether the loop will carry an interim message from the model right now.
+///
+/// The model decides *what* to say — it holds the context. The loop decides
+/// *whether it may be said*, because only the loop holds the clock and the
+/// mandate not to chatter. An interim message does not end the turn: it edits
+/// the same draft the final reply will overwrite, so an admitted note costs
+/// nothing in the transcript and a declined one costs nothing at all.
+pub fn interim_reply_admissible(
+    turn_started_at_unix: Option<u64>,
+    last_interim_at_unix: Option<u64>,
+    iteration: u32,
+    now_unix: u64,
+) -> bool {
+    if iteration < INTERIM_REPLY_MIN_ITERATION {
+        return false;
+    }
+    // Unknown start time — stay quiet rather than risk narrating a fast turn.
+    let Some(started) = turn_started_at_unix else {
+        return false;
+    };
+    if now_unix.saturating_sub(started) < INTERIM_REPLY_MIN_GAP_SECS {
+        return false;
+    }
+    match last_interim_at_unix {
+        Some(last) => now_unix.saturating_sub(last) >= INTERIM_REPLY_MIN_GAP_SECS,
+        None => true,
+    }
+}
+
+/// True when in-turn plan execution must stop and hand off to the final reply.
+pub fn plan_execution_budget_exhausted(started_at_unix: Option<u64>, now_unix: u64) -> bool {
+    let Some(started) = started_at_unix else {
+        // Unknown start time — fail open rather than truncating every turn.
+        return false;
+    };
+    now_unix.saturating_sub(started) >= PLAN_EXECUTION_BUDGET_SECS
+}
+
+/// What the turn's tool history says about one plan step.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StepEvidence {
+    /// A successful tool call in this turn is attributable to this step.
+    Verified,
+    /// The step declares a tool, that tool's successful calls are all already
+    /// attributed to other steps (or never happened), so nothing backs it.
+    /// A model claim of `done` does not clear this.
+    Missing,
+    /// The step declares no tool, so there is no artifact to check against.
+    /// The model's own claim is the only available signal.
+    NotCheckable,
+}
+
+impl StepEvidence {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Verified => "verified",
+            Self::Missing => "missing",
+            Self::NotCheckable => "not_checkable",
+        }
+    }
+}
+
+/// Grounded verification of every step in a plan.
+#[derive(Debug, Clone)]
+pub struct PlanVerification {
+    /// Index-aligned with `plan.steps`.
+    pub evidence: Vec<StepEvidence>,
+    /// Steps the model marked `done` that the tool history contradicts. These
+    /// are the ones that silently become false claims to the operator.
+    pub contradicted_step_ids: Vec<u32>,
+    /// Steps that bundle several artifacts into one description and therefore
+    /// cannot be verified one-to-one. See [`atomicity_violations`].
+    pub non_atomic_step_ids: Vec<u32>,
+}
+
+impl PlanVerification {
+    pub fn verified_count(&self) -> usize {
+        self.evidence
+            .iter()
+            .filter(|e| **e == StepEvidence::Verified)
+            .count()
+    }
+
+    /// Steps with no supporting evidence, as `plan.steps` indices.
+    pub fn missing_indices(&self) -> Vec<usize> {
+        self.evidence
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| **e == StepEvidence::Missing)
+            .map(|(i, _)| i)
+            .collect()
+    }
+
+    /// Sticky flags to carry into the next iteration: evidence can scroll out
+    /// of the working tool history, and a step once verified stays verified.
+    pub fn verified_flags(&self) -> Vec<bool> {
+        self.evidence
+            .iter()
+            .map(|e| *e == StepEvidence::Verified)
+            .collect()
+    }
+
+    pub fn event_json(&self) -> serde_json::Value {
+        json!({
+            "verified": self.verified_count(),
+            "total": self.evidence.len(),
+            "evidence": self.evidence.iter().map(|e| e.as_str()).collect::<Vec<_>>(),
+            "contradicted_steps": self.contradicted_step_ids,
+            "non_atomic_steps": self.non_atomic_step_ids,
+        })
+    }
+}
+
+/// Tokens that identify *which* artifact a step is about: the significant
+/// tokens unique to that step among its siblings. "Propose Daxton Thomas
+/// Wagner as a Person node" and "Propose Zerin Maluy as a Person node" share
+/// every word but the names, so the names are what make each step's evidence
+/// individually attributable. Without this, one successful `life.observe`
+/// clears all five children.
+fn distinctive_tokens(plan: &ActivePlan) -> Vec<Vec<String>> {
+    let per_step: Vec<Vec<String>> = plan
+        .steps
+        .iter()
+        .map(|s| significant_tokens(&s.description))
+        .collect();
+
+    let mut counts: BTreeMap<String, usize> = BTreeMap::new();
+    for tokens in &per_step {
+        let mut seen: Vec<&String> = Vec::new();
+        for t in tokens {
+            if !seen.contains(&t) {
+                seen.push(t);
+                *counts.entry(t.clone()).or_default() += 1;
+            }
+        }
+    }
+
+    per_step
+        .iter()
+        .map(|tokens| {
+            let mut uniq: Vec<String> = Vec::new();
+            for t in tokens {
+                if counts.get(t).copied() == Some(1) && !uniq.contains(t) {
+                    uniq.push(t.clone());
+                }
+            }
+            uniq
+        })
+        .collect()
+}
+
+/// A step bound to a tool only accepts evidence from that tool. An unbound
+/// step accepts any tool — the distinctive-token match is what attributes it.
+fn step_tool_compatible(step: &PlanStep, call: &ToolCall) -> bool {
+    match step.tool_name.as_deref() {
+        Some(t) if !t.is_empty() => call.tool_name == t,
+        _ => true,
+    }
+}
+
+fn step_is_tool_bound(step: &PlanStep) -> bool {
+    step.tool_name
+        .as_deref()
+        .map(|t| !t.is_empty())
+        .unwrap_or(false)
+}
+
+/// Verify each step against the turn's tool history, one call to at most one
+/// step. `prior_verified` carries flags from earlier iterations of the same
+/// turn; a step once verified stays verified even after its evidence scrolls
+/// out of the working history.
+///
+/// Two passes, both consuming: strong matches (distinctive token present in
+/// the call's arguments) are assigned first so that a generic tool-name match
+/// cannot steal the evidence a named step needs.
+pub fn verify_plan_steps(
+    plan: &ActivePlan,
+    tool_history: &[(ToolCall, ToolResult)],
+    prior_verified: &[bool],
+) -> PlanVerification {
+    verify_plan_steps_with_batches(
+        plan,
+        tool_history,
+        prior_verified,
+        &crate::catalog::tool_batch_of,
+    )
+}
+
+/// Expand every batch call (a tool whose catalog record declares `batch_of`)
+/// into one `(member call, item result)` entry per item, placed right after
+/// the batch call, which is kept so a step bound to the batch tool itself
+/// still verifies. Live 2026-09-16 11:18 EDT: steps bound to `life.observe`
+/// were written by ONE `life.observe.batch` call and the plan reported
+/// "stopped, 0/2 verified" under two real writes.
+///
+/// Per-item results come from the batch payload: `results[].{index,result}`
+/// for attempted items, `evaluation.rejected[].{index,reason,detail}` and
+/// `evaluation.not_attempted[].{index}` for the rest. A batch whose result is
+/// an error fails every item; a result that cannot be attributed per item is
+/// left unexpanded rather than guessed.
+pub fn expand_batch_calls(
+    tool_history: &[(ToolCall, ToolResult)],
+    batch_of_for: &dyn Fn(&str) -> Option<ansible_mesh_core::graph::ToolBatchOf>,
+) -> Vec<(ToolCall, ToolResult)> {
+    let mut out = Vec::with_capacity(tool_history.len());
+    for (call, result) in tool_history {
+        out.push((call.clone(), result.clone()));
+        let Some(batch) = batch_of_for(&call.tool_name) else {
+            continue;
+        };
+        let Some(serde_json::Value::Array(items)) = call.arguments.pointer(&batch.items_pointer)
+        else {
+            continue;
+        };
+        let batch_failed = crate::runtime::distill::tool_result_is_error(&result.content);
+        let per_item = if batch_failed {
+            None
+        } else {
+            match batch_item_outcomes(&result.content) {
+                Some(outcomes) => Some(outcomes),
+                None => continue,
+            }
+        };
+        for (index, item) in items.iter().enumerate() {
+            let arguments = match item {
+                serde_json::Value::String(text) => {
+                    serde_json::from_str(text.trim()).unwrap_or_else(|_| item.clone())
+                }
+                other => other.clone(),
+            };
+            let content = match &per_item {
+                None => result.content.clone(),
+                Some(outcomes) => outcomes.get(&index).cloned().unwrap_or_else(|| {
+                    format!("Error: batch item {index} has no reported outcome")
+                }),
+            };
+            out.push((
+                ToolCall {
+                    tool_name: batch.tool.clone(),
+                    arguments,
+                },
+                ToolResult {
+                    tool_name: batch.tool.clone(),
+                    content,
+                },
+            ));
+        }
+    }
+    out
+}
+
+/// Per-item outcome text keyed by item index, or `None` when the payload
+/// carries no per-item attribution.
+fn batch_item_outcomes(content: &str) -> Option<BTreeMap<usize, String>> {
+    let parsed = parse_json_payload(content)?;
+    let body = find_object_with_key(&parsed, "results")?;
+    let mut outcomes = BTreeMap::new();
+    for entry in body.get("results")?.as_array()? {
+        let index = entry.get("index")?.as_u64()? as usize;
+        let item = entry
+            .get("result")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null);
+        outcomes.insert(index, item.to_string());
+    }
+    if let Some(evaluation) = body.get("evaluation") {
+        for entry in evaluation
+            .get("rejected")
+            .and_then(serde_json::Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            if let Some(index) = entry.get("index").and_then(serde_json::Value::as_u64) {
+                outcomes.insert(
+                    index as usize,
+                    format!(
+                        "Error: batch item {index} rejected ({}): {}",
+                        entry
+                            .get("reason")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or("invalid"),
+                        entry
+                            .get("detail")
+                            .map(|d| d.to_string())
+                            .unwrap_or_default()
+                    ),
+                );
+            }
+        }
+        for entry in evaluation
+            .get("not_attempted")
+            .and_then(serde_json::Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            if let Some(index) = entry.get("index").and_then(serde_json::Value::as_u64) {
+                outcomes.insert(
+                    index as usize,
+                    format!("Error: batch item {index} was not attempted (batch budget exhausted)"),
+                );
+            }
+        }
+    }
+    Some(outcomes)
+}
+
+fn parse_json_payload(content: &str) -> Option<serde_json::Value> {
+    let trimmed = content.trim();
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed) {
+        return Some(value);
+    }
+    let start = trimmed.find('{')?;
+    let end = trimmed.rfind('}')?;
+    serde_json::from_str(&trimmed[start..=end]).ok()
+}
+
+fn find_object_with_key<'a>(
+    value: &'a serde_json::Value,
+    key: &str,
+) -> Option<&'a serde_json::Value> {
+    match value {
+        serde_json::Value::Object(map) => {
+            if map.get(key).is_some_and(serde_json::Value::is_array) {
+                return Some(value);
+            }
+            map.values().find_map(|v| find_object_with_key(v, key))
+        }
+        serde_json::Value::Array(items) => items.iter().find_map(|v| find_object_with_key(v, key)),
+        _ => None,
+    }
+}
+
+/// [`verify_plan_steps`] with an explicit batch lookup (tests inject it).
+pub fn verify_plan_steps_with_batches(
+    plan: &ActivePlan,
+    tool_history: &[(ToolCall, ToolResult)],
+    prior_verified: &[bool],
+    batch_of_for: &dyn Fn(&str) -> Option<ansible_mesh_core::graph::ToolBatchOf>,
+) -> PlanVerification {
+    let expanded = expand_batch_calls(tool_history, batch_of_for);
+    let tool_history: &[(ToolCall, ToolResult)] = &expanded;
+    let distinctive = distinctive_tokens(plan);
+    let mut consumed = vec![false; tool_history.len()];
+    let mut evidence = vec![StepEvidence::NotCheckable; plan.steps.len()];
+
+    for (i, ev) in evidence.iter_mut().enumerate() {
+        if prior_verified.get(i).copied().unwrap_or(false) {
+            *ev = StepEvidence::Verified;
+        }
+    }
+
+    let haystacks: Vec<String> = tool_history
+        .iter()
+        .map(|(call, _)| {
+            format!(
+                "{} {}",
+                call.tool_name.replace(['.', '_', '-'], " "),
+                call.arguments
+            )
+            .to_lowercase()
+        })
+        .collect();
+    // Which history index each step's evidence came from — a read step that
+    // follows other steps must be evidenced by a call made AFTER theirs.
+    let mut consumed_by_step: Vec<Option<usize>> = vec![None; plan.steps.len()];
+
+    // Pass 0 — exact: a step that names LifeGraph ids is proven only by a
+    // call whose arguments carry every one of them. Sibling steps that
+    // share all their words (twelve "retire_duplicate life:open_loop:
+    // escalation-…-08-23 under …-08-26" steps, live 2026-09-14 21:20 UTC)
+    // have no distinctive tokens, so Pass B credited each successful tidy
+    // to the first unproven sibling; the real steps were re-run on the
+    // continuation, hit "already retired", and stalled the plan. Id-bearing
+    // steps never fall through to the token passes.
+    //
+    // An id that several steps share does not distinguish any of them: the
+    // twelve link steps of a gardening pass all name the anchor role
+    // `life:role:chief-of-staff`, and a step whose only other id is not a
+    // `life:` id at all ("ontology:extensions") would otherwise be proven by
+    // the first tidy call that names the anchor — which is every tidy call.
+    // Live 2026-09-15 18:30 UTC that stole the organ-practice and
+    // help_daxton calls from steps 3 and 7 (both called, both "tidied",
+    // both reported outstanding) while the in-turn latch drifted to 13/13.
+    let raw_ids: Vec<Vec<String>> = plan
+        .steps
+        .iter()
+        .map(|s| life_ids_in(&s.description))
+        .collect();
+    let shared_ids: Vec<&String> = raw_ids
+        .iter()
+        .flatten()
+        .filter(|id| raw_ids.iter().filter(|ids| ids.contains(id)).count() >= 2)
+        .collect();
+    let step_ids: Vec<Vec<String>> = raw_ids
+        .iter()
+        .map(|ids| {
+            ids.iter()
+                .filter(|id| !shared_ids.contains(id))
+                .cloned()
+                .collect()
+        })
+        .collect();
+    for (i, step) in plan.steps.iter().enumerate() {
+        if evidence[i] == StepEvidence::Verified || step_ids[i].is_empty() {
+            continue;
+        }
+        for (j, (call, result)) in tool_history.iter().enumerate() {
+            if consumed[j] || !tool_result_looks_ok(result) || !step_tool_compatible(step, call) {
+                continue;
+            }
+            if step_ids[i]
+                .iter()
+                .all(|id| haystacks[j].contains(id.as_str()))
+            {
+                evidence[i] = StepEvidence::Verified;
+                consumed[j] = true;
+                consumed_by_step[i] = Some(j);
+                break;
+            }
+        }
+    }
+
+    // Pass A — strong: a distinctive token of this step appears in the call's
+    // arguments (and the tool is compatible). A read-only step that follows
+    // other steps only takes a call made after theirs (see Pass B): "re-run
+    // life.audit" names its own tool, which is in every audit call's haystack.
+    for (i, step) in plan.steps.iter().enumerate() {
+        if evidence[i] == StepEvidence::Verified
+            || distinctive[i].is_empty()
+            || !step_ids[i].is_empty()
+        {
+            continue;
+        }
+        let floor = if step_tool_is_read_only(step) {
+            consumed_by_step[..i].iter().flatten().max().copied()
+        } else {
+            None
+        };
+        for (j, (call, result)) in tool_history.iter().enumerate() {
+            if consumed[j] || !tool_result_looks_ok(result) || !step_tool_compatible(step, call) {
+                continue;
+            }
+            if floor.is_some_and(|f| j <= f) {
+                continue;
+            }
+            if distinctive[i].iter().any(|t| haystacks[j].contains(t)) {
+                evidence[i] = StepEvidence::Verified;
+                consumed[j] = true;
+                consumed_by_step[i] = Some(j);
+                break;
+            }
+        }
+    }
+
+    // Pass B — weak: nothing distinguishes this step textually, so a
+    // successful call on its bound tool is the best evidence available. Still
+    // one-to-one, so N identical steps require N successful calls.
+    //
+    // A step bound to a READ-ONLY tool takes this pass even when its text is
+    // distinctive: a retrieval has no per-item artifact, so a successful call
+    // of the bound tool IS the outcome. Live 2026-09-15 09:21 and 09:28 EDT
+    // (bjork, mac-jane): "Examine local database state and confirm the batch
+    // of observations has landed" bound to `life.list`, and "Inspect
+    // registered skills … verify music.repertoire-gardener configuration"
+    // bound to `skill.list {}`, could never verify — three and two successful
+    // calls each — so every such plan stalled twice, was declared `blocked`,
+    // and shipped "⚠️ Plan stopped before finishing: 0/1 steps verified"
+    // under a reply that (correctly) reported what the read had found.
+    //
+    // The relaxed read step must be evidenced by a call made AFTER the calls
+    // that satisfied the steps before it: a seeded gardening plan ends with
+    // "re-run life.audit to measure the pass", and the `life.audit` that
+    // seeded the plan — before any tidy ran — must not count as that re-run.
+    for (i, step) in plan.steps.iter().enumerate() {
+        let relaxed_read = !distinctive[i].is_empty() && step_tool_is_read_only(step);
+        if evidence[i] == StepEvidence::Verified
+            || (!distinctive[i].is_empty() && !relaxed_read)
+            || !step_ids[i].is_empty()
+            || !step_is_tool_bound(step)
+        {
+            continue;
+        }
+        let floor = if relaxed_read {
+            consumed_by_step[..i].iter().flatten().max().copied()
+        } else {
+            None
+        };
+        for (j, (call, result)) in tool_history.iter().enumerate() {
+            if consumed[j] || !tool_result_looks_ok(result) {
+                continue;
+            }
+            if floor.is_some_and(|f| j <= f) {
+                continue;
+            }
+            if step.tool_name.as_deref() == Some(call.tool_name.as_str()) {
+                evidence[i] = StepEvidence::Verified;
+                consumed[j] = true;
+                consumed_by_step[i] = Some(j);
+                break;
+            }
+        }
+    }
+
+    // Pass C — unique READ tool: a read-only step whose bound tool no other
+    // step in the plan binds is proven by any successful call of that tool,
+    // whatever its wording. Live 2026-09-15 14:10 UTC: the closing "Re-run
+    // life.audit to measure the pass" step has distinctive words (measure,
+    // report, score) that never appear in an argument-less audit call, so
+    // Pass A could not credit it — the harness called life.audit on three
+    // continuations and the plan still blocked at 12/13.
+    //
+    // Read-only and ordered, like Pass B: a write step ("Log Zerin Maluy",
+    // `life.observe`) must still name its artifact in the call — any
+    // successful observe is exactly the wrong-thing-written false positive
+    // the token and id passes exist to catch — and a closing read only takes
+    // a call made after the calls that satisfied the steps before it (the
+    // `life.audit` that seeded a gardening plan is not its re-audit).
+    for (i, step) in plan.steps.iter().enumerate() {
+        if evidence[i] == StepEvidence::Verified
+            || !step_is_tool_bound(step)
+            || !step_tool_is_read_only(step)
+        {
+            continue;
+        }
+        let tool = step.tool_name.as_deref().unwrap_or("");
+        let shared = plan
+            .steps
+            .iter()
+            .enumerate()
+            .any(|(k, other)| k != i && other.tool_name.as_deref() == Some(tool));
+        if shared {
+            continue;
+        }
+        let floor = consumed_by_step[..i].iter().flatten().max().copied();
+        for (j, (call, result)) in tool_history.iter().enumerate() {
+            if consumed[j] || !tool_result_looks_ok(result) || call.tool_name != tool {
+                continue;
+            }
+            if floor.is_some_and(|f| j <= f) {
+                continue;
+            }
+            evidence[i] = StepEvidence::Verified;
+            consumed[j] = true;
+            consumed_by_step[i] = Some(j);
+            break;
+        }
+    }
+
+    // Whatever is left: a tool-bound step is checkable and came up empty.
+    // A tool-free step has no artifact to check, so the model's claim stands.
+    let mut contradicted = Vec::new();
+    for (i, step) in plan.steps.iter().enumerate() {
+        if evidence[i] == StepEvidence::Verified || !step_is_tool_bound(step) {
+            continue;
+        }
+        evidence[i] = StepEvidence::Missing;
+        if step.status == "done" {
+            contradicted.push(step.id);
+        }
+    }
+
+    PlanVerification {
+        evidence,
+        contradicted_step_ids: contradicted,
+        non_atomic_step_ids: atomicity_violations(plan),
+    }
+}
+
+/// Steps that bundle several artifacts into one description.
+///
+/// Such a step cannot be verified one-to-one: the first successful call clears
+/// it while the remaining artifacts silently never happen. This is the exact
+/// shape of the live Beacon failure — a single step reading "propose Zerin,
+/// Mali and Daxton" was marked done after only Zerin landed, and the agent
+/// then told the operator all five children were in place when Daxton did not
+/// exist. One step must mean one verifiable outcome.
+///
+/// Two shapes are exempt, because for them "one call cleared it while the
+/// rest never happened" cannot occur (live 2026-09-11, Beacon morning brief:
+/// `Log Jared's drive with Daxton to school on Thursday morning, 2026-09-10,
+/// as a proposed event` and `Retrieve oldest active open loops, aspirations,
+/// and roles` were both flagged, could never settle, and the plan burned its
+/// whole continuation budget re-observing the same two facts — four Telegram
+/// messages, two duplicate LifeGraph events, and a final "fully executed and
+/// verified" over a `blocked` verdict):
+/// - a step bound to a read-only tool (`life.recall`, `life.list`, …) produces
+///   no artifact per list item — one retrieval covers every topic it names;
+/// - a description whose commas are not a list (dates, appositives) — a real
+///   enumeration of artifacts reads `A, B and C` / `A and B and C`, never
+///   `on Thursday morning, 2026-09-10, as a proposed event`.
+pub fn atomicity_violations(plan: &ActivePlan) -> Vec<u32> {
+    plan.steps
+        .iter()
+        // Only a step bound to a tool produces artifacts that can be proven
+        // one call per item. A prose step ("Render a clean, structured review
+        // grouped by type with individual and batch validation mechanisms")
+        // was split into "Render a clean" / "structured review … individual"
+        // / "batch validation mechanisms." (live 2026-09-16 19:38 UTC, DEF-154).
+        .filter(|s| step_is_tool_bound(s))
+        .filter(|s| !step_tool_is_read_only(s))
+        .filter(|s| description_enumerates_artifacts(&s.description))
+        .map(|s| s.id)
+        .collect()
+}
+
+/// Tools that retrieve rather than create. A step bound to one of these
+/// cannot bundle *artifacts*, however many topics its description lists.
+fn step_tool_is_read_only(step: &PlanStep) -> bool {
+    step.tool_name
+        .as_deref()
+        .is_some_and(tool_name_is_read_only)
+}
+
+/// A tool whose successful call changes nothing: a retrieval or a status
+/// read. Such a call is not "work done" for the say-do gate (live 2026-09-16
+/// 12:44 UTC: `memory.recall` alone, then "I will make sure this is tracked
+/// and followed up" — and nothing was).
+pub fn tool_name_is_read_only(tool: &str) -> bool {
+    let tool = tool.trim().to_ascii_lowercase();
+    const READ_ONLY_SUFFIXES: &[&str] = &[
+        ".recall",
+        ".audit",
+        ".recall.feedback",
+        ".list",
+        ".search",
+        ".get",
+        ".status",
+        ".read",
+        ".inspect",
+        ".describe",
+        ".feedback",
+    ];
+    READ_ONLY_SUFFIXES.iter().any(|s| tool.ends_with(s))
+}
+
+/// Split every bundled, tool-bound step of a model-declared plan into one
+/// step per enumerated item, in place. Returns `(original_id, new_ids)` for
+/// each split so callers can log it.
+///
+/// The evaluator refuses to settle a bundled step ("Log Nadi, Daxton, Gabby,
+/// and Brandon as Person nodes") because one call cannot prove four
+/// artifacts — and it tells the model to split. Live 2026-09-12 11:00 UTC
+/// the model instead re-ran all four observes on every continuation, the
+/// step stayed outstanding, and the plan burned three continuations (four
+/// Telegram messages) to a `blocked` verdict with all four people actually
+/// written. The harness now splits for it: each item becomes its own step
+/// with the same tool, so the distinctive-token pass in
+/// [`verify_plan_steps`] can credit each observe to its own person.
+///
+/// Read-only tool steps and non-enumerating steps are left alone (see
+/// [`atomicity_violations`]). Items are the comma/`and`-separated pieces of
+/// the description; the lead-in before a colon is kept on every piece so
+/// the steps still read as instructions.
+/// Unbind steps the model tied to its own reply rather than to a callable
+/// tool (`text.generate`, `respond`, …). No tool call can ever prove such a
+/// step, so it was reported "contradicted" on every continuation: live
+/// 2026-09-16 19:38–19:39 UTC Beacon re-sent the same review four times and
+/// the plan stopped "before finishing" under a reply that contained it
+/// (DEF-154). Unbound, the step settles on the model's word like any other
+/// reasoning step. Returns the ids that were unbound.
+pub fn unbind_reply_pseudo_tools(plan: &mut ActivePlan) -> Vec<u32> {
+    const PSEUDO: &[&str] = &[
+        "respond",
+        "reply",
+        "response",
+        "model",
+        "llm",
+        "generate_text",
+        "render",
+        "compose",
+        "none",
+        "n/a",
+    ];
+    let mut unbound = Vec::new();
+    for step in plan.steps.iter_mut() {
+        let Some(tool) = step.tool_name.as_deref() else {
+            continue;
+        };
+        let t = tool.trim().to_ascii_lowercase();
+        if t.is_empty() || t.starts_with("text.") || PSEUDO.contains(&t.as_str()) {
+            step.tool_name = None;
+            unbound.push(step.id);
+        }
+    }
+    unbound
+}
+
+pub fn split_bundled_steps(plan: &mut ActivePlan) -> Vec<(u32, Vec<u32>)> {
+    let bundled = atomicity_violations(plan);
+    if bundled.is_empty() {
+        return Vec::new();
+    }
+    let mut next_id = plan.steps.iter().map(|s| s.id).max().unwrap_or(0) + 1;
+    let mut out = Vec::new();
+    let mut new_steps: Vec<PlanStep> = Vec::with_capacity(plan.steps.len() + 4);
+    for step in plan.steps.drain(..) {
+        if !bundled.contains(&step.id) {
+            new_steps.push(step);
+            continue;
+        }
+        let mut items = enumerated_items(&step.description);
+        if items.len() < 2 {
+            new_steps.push(step);
+            continue;
+        }
+        let (mut lead, _) = split_lead_in(&step.description);
+        // No colon: "Propose Zerin, Mali and Daxton" — the first item carries
+        // the verb. Lift a leading imperative onto every item so the steps
+        // read "Propose Zerin" / "Propose Mali" instead of "Mali".
+        if lead.is_none() {
+            const VERBS: &[&str] = &[
+                "propose", "log", "record", "create", "add", "register", "observe", "capture",
+                "update", "resolve", "commit", "mark", "retire", "confirm", "write", "store",
+                "save", "set", "schedule", "send", "note",
+            ];
+            if let Some((first, rest)) = items[0].split_once(' ') {
+                if VERBS.contains(&first.to_lowercase().as_str()) {
+                    lead = Some(first.to_string());
+                    items[0] = rest.trim().to_string();
+                }
+            }
+        }
+        let mut ids = Vec::with_capacity(items.len());
+        for item in items {
+            let description = match lead.as_deref() {
+                Some(lead) => format!("{lead} {item}"),
+                None => item,
+            };
+            new_steps.push(PlanStep {
+                id: next_id,
+                description,
+                tool_name: step.tool_name.clone(),
+                // A split step is never inherited as done: each item must be
+                // proven by its own call.
+                status: if step.status == "done" || step.status == "in_progress" {
+                    "pending".to_string()
+                } else {
+                    step.status.clone()
+                },
+            });
+            ids.push(next_id);
+            next_id += 1;
+        }
+        out.push((step.id, ids));
+    }
+    plan.steps = new_steps;
+    out
+}
+
+/// "Log key contacts: Nadi, Daxton, Gabby, and Brandon as Person nodes" →
+/// lead-in "Log key contacts:" and body "Nadi, Daxton, Gabby, and Brandon as
+/// Person nodes". Without a colon the whole description is the body.
+fn split_lead_in(description: &str) -> (Option<String>, String) {
+    match description.find(':') {
+        Some(idx) if idx + 1 < description.len() => (
+            Some(description[..=idx].trim().to_string()),
+            description[idx + 1..].trim().to_string(),
+        ),
+        _ => (None, description.trim().to_string()),
+    }
+}
+
+/// The enumerated pieces of a bundled description, split on `, `, `; `,
+/// ` and `, ` & ` and newlines, with bullet markers and the Oxford comma's
+/// leading "and" stripped. A trailing clause after the last item ("as
+/// Person nodes") stays attached to that item — it is harmless to the
+/// distinctive-token match and keeps the step readable.
+fn enumerated_items(description: &str) -> Vec<String> {
+    let (_, body) = split_lead_in(description);
+    let mut pieces: Vec<String> = Vec::new();
+    for line in body.split('\n') {
+        let line = line
+            .trim()
+            .trim_start_matches(['-', '*', '•'])
+            .trim_start_matches(|c: char| c.is_ascii_digit() || c == '.' || c == ')')
+            .trim();
+        if line.is_empty() {
+            continue;
+        }
+        let mut buf = line.replace(" & ", ", ").replace("; ", ", ");
+        buf = buf.replace(", and ", ", ").replace(" and ", ", ");
+        for piece in buf.split(", ") {
+            let piece = piece.trim().trim_start_matches("and ").trim();
+            if !piece.is_empty() {
+                pieces.push(piece.to_string());
+            }
+        }
+    }
+    // The last item usually drags the shared trailing clause with it
+    // ("Brandon as Person nodes scoped to the Chief of Staff role"). Cut it
+    // at the first clause marker so the item is just the item: otherwise
+    // its words ("person", "scoped", "staff") become distinctive tokens that
+    // let a sibling's call be credited to it.
+    if let Some(last) = pieces.last_mut() {
+        const CLAUSE_MARKERS: &[&str] = &[
+            " as ", " to ", " into ", " with ", " for ", " under ", " scoped", " linked", " via ",
+            " so ", " on the ", " in the ",
+        ];
+        let lower = last.to_lowercase();
+        let cut = CLAUSE_MARKERS
+            .iter()
+            .filter_map(|m| lower.find(m))
+            .filter(|&i| i > 0)
+            .min();
+        if let Some(i) = cut {
+            *last = last[..i].trim().to_string();
+        }
+    }
+    pieces
+}
+
+fn description_enumerates_artifacts(description: &str) -> bool {
+    let lower = description.to_lowercase();
+    let conjunctions = lower.matches(" and ").count() + lower.matches(" & ").count();
+    let list_separators = lower.matches(", ").count() + lower.matches("; ").count();
+    let newlines = lower.matches('\n').count();
+    // `A, B and C` (Oxford or not), `A and B and C`, or a multi-line bullet
+    // list. Commas alone are not a list: `on Thursday morning, 2026-09-10, as
+    // a proposed event` names one artifact.
+    (conjunctions >= 1 && list_separators >= 1) || conjunctions >= 2 || newlines >= 2
+}
+
+/// Whole-plan verdict for the turn, grounded in [`verify_plan_steps`].
+#[derive(Debug, Clone)]
+pub struct PlanCompletion {
+    pub total: usize,
+    pub verified: usize,
+    /// Indices of steps still outstanding — not verified, and not merely
+    /// unverifiable reasoning steps the model has already claimed.
+    pub outstanding: Vec<usize>,
+    /// True when nothing is outstanding: safe to compose a final reply that
+    /// claims the plan is done.
+    pub complete: bool,
+}
+
+/// Evaluate the plan as a whole. A step counts as settled when it is either
+/// verified by tool evidence, or not checkable *and* claimed done by the
+/// model. Anything else is outstanding and must not be reported as finished.
+///
+/// A non-atomic step is never settled, whatever its evidence says. This is the
+/// load-bearing case: "propose Zerin, Mali and Daxton" is *verified* by the one
+/// `life.observe` that ran for Zerin, so evidence alone reports it complete and
+/// the other two artifacts vanish silently — which is the original incident. A
+/// step that bundles outcomes cannot be checked one-to-one, so it stays
+/// outstanding until it is split.
+pub fn evaluate_whole_plan(plan: &ActivePlan, verification: &PlanVerification) -> PlanCompletion {
+    let mut outstanding = Vec::new();
+    for (i, step) in plan.steps.iter().enumerate() {
+        if verification.non_atomic_step_ids.contains(&step.id) {
+            outstanding.push(i);
+            continue;
+        }
+        let settled = match verification.evidence.get(i) {
+            Some(StepEvidence::Verified) => true,
+            Some(StepEvidence::NotCheckable) => step.status == "done",
+            _ => false,
+        };
+        if !settled {
+            outstanding.push(i);
+        }
+    }
+    PlanCompletion {
+        total: plan.steps.len(),
+        verified: verification.verified_count(),
+        complete: outstanding.is_empty() && !plan.steps.is_empty(),
+        outstanding,
+    }
+}
+
+/// The guard that stops a turn from claiming work it did not do.
+///
+/// Injected into the projection before the final reply. Returns `None` when
+/// every step is settled — in that case the model is free to report success.
+pub fn plan_integrity_note(
+    plan: &ActivePlan,
+    verification: &PlanVerification,
+    completion: &PlanCompletion,
+) -> Option<String> {
+    if completion.complete {
+        return None;
+    }
+
+    let mut note = String::from(
+        "[Plan integrity check] Do NOT tell the user the plan is finished. \
+         Verification against this turn's tool results found work that did not land:\n",
+    );
+
+    for i in &completion.outstanding {
+        let Some(step) = plan.steps.get(*i) else {
+            continue;
+        };
+        let why = if verification.non_atomic_step_ids.contains(&step.id) {
+            "this step bundles several outcomes, so one tool call cannot have completed all of \
+             them. Split it into one step per outcome and do the parts that are still missing"
+        } else {
+            match verification.evidence.get(*i) {
+                Some(StepEvidence::Missing) if step.status == "done" => {
+                    "you marked this done, but no successful tool call in this turn did it"
+                }
+                Some(StepEvidence::Missing) => "no successful tool call in this turn did it",
+                _ => "not completed",
+            }
+        };
+        note.push_str(&format!(
+            "- step {}: {} — {why}\n",
+            step.id, step.description
+        ));
+    }
+
+    if !verification.non_atomic_step_ids.is_empty() {
+        note.push_str(&format!(
+            "Steps {} each bundle several outcomes, so they cannot be checked individually. \
+             Split them into one step per outcome and execute the parts that are still missing.\n",
+            verification
+                .non_atomic_step_ids
+                .iter()
+                .map(u32::to_string)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+
+    note.push_str(
+        "State plainly which items are done and which are not. Never claim an artifact exists \
+         unless a tool call in this turn created it.",
+    );
+    Some(note)
+}
+
+/// Whether this turn should declare a plan before acting.
+///
+/// Planning used to be opt-in behind a keyword allowlist ("plan", "roadmap",
+/// "design", ...), so ordinary multi-part requests executed one tool at a time
+/// with no structure to verify against. The polarity is now inverted: plan by
+/// default, and skip only for turns that are trivially conversational.
+///
+/// The skip branch is not a nicety. A four-step plan attached to "Going for a
+/// run tonight." is a worse experience than the bug being fixed here.
+/// Word-boundary request markers that make a message plan-worthy.
+const REQUEST_MARKERS: &[&str] = &[
+    "can you",
+    "could you",
+    "would you",
+    "please",
+    "i need",
+    "i want",
+    "lets",
+    "let s",
+    "add",
+    "create",
+    "set",
+    "update",
+    "change",
+    "get",
+    "find",
+    "make",
+    "show",
+    "list",
+    "record",
+    "track",
+    "plan",
+    "fix",
+    "check",
+    "remove",
+    "delete",
+    "schedule",
+    "remind",
+    "write",
+    "build",
+    "send",
+    "look up",
+    "figure out",
+    "help me",
+    "map",
+    "propose",
+];
+
+pub fn should_plan(user_content: &str) -> bool {
+    let trimmed = user_content.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    let lower = trimmed.to_lowercase();
+
+    // Anything that asks for something, or asks a question, gets a plan —
+    // even a one-step one, so its completion is checkable.
+    //
+    // Matched on word boundaries, not as raw substrings: "over budget" ends in
+    // "get", "forget it" contains "get", and "planning to relax" contains
+    // "plan". A false positive only costs a one-step plan, but it costs it on
+    // exactly the chit-chat the skip branch exists to protect.
+    let words_padded = words_padded(&lower);
+    if trimmed.contains('?') || request_marker_present(&words_padded) {
+        return true;
+    }
+
+    // A statement carrying several distinct facts is work even without an
+    // explicit ask — each fact is something to capture, and handling only the
+    // first is exactly the failure this replaces.
+    let words = trimmed.split_whitespace().count();
+    let sentences = trimmed
+        .split(|c| c == '.' || c == '!' || c == '\n')
+        .filter(|s| s.split_whitespace().count() >= 3)
+        .count();
+    if sentences >= 2 || words >= 25 {
+        return true;
+    }
+
+    // An enumeration is work even when it is one short sentence with no
+    // request verb: "more habits that i am building: duolingo morning and
+    // evening, morning supplements and evening, reading before bed" carries
+    // five artifacts, no marker word, no `?`, and only 17 words — live
+    // 2026-08-27 it got no plan, and only the first item was captured. Same
+    // separator threshold as `description_enumerates_artifacts`: two or more
+    // separators means several distinct items.
+    enumeration_present(&lower)
+}
+
+fn request_marker_present(words_padded: &str) -> bool {
+    REQUEST_MARKERS
+        .iter()
+        .any(|m| words_padded.contains(&format!(" {m} ")))
+}
+
+fn enumeration_present(lower: &str) -> bool {
+    let separators = lower.matches(", ").count()
+        + lower.matches("; ").count()
+        + lower.matches(" and ").count()
+        + lower.matches(" & ").count();
+    separators >= 2
+}
+
+fn words_padded(lower: &str) -> String {
+    format!(
+        " {} ",
+        lower
+            .chars()
+            .map(|c| if c.is_alphanumeric() { c } else { ' ' })
+            .collect::<String>()
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+    )
+}
+
+/// A plan-worthy message that is a statement rather than a question and
+/// carries an explicit signal of work: a request marker, an enumeration, or
+/// a reported outcome. Deliberately narrower than [`should_plan`], which
+/// also treats any two-sentence message as plan-worthy — that rule is right
+/// for prompting a plan but wrong for handing tools to, or re-entering, a
+/// two-sentence thank-you. Questions are answered from context.
+pub fn is_plan_worthy_statement(user_content: &str) -> bool {
+    if user_content.contains('?') {
+        return false;
+    }
+    let lower = user_content.trim().to_lowercase();
+    request_marker_present(&words_padded(&lower))
+        || enumeration_present(&lower)
+        || reports_an_outcome(&lower)
+}
+
+/// Does this message report that something HAPPENED — an outcome the
+/// operator lived, rather than a request or a question? Past-tense
+/// completion language on word boundaries. Drives the outcome reflex.
+pub fn reports_an_outcome(normalized: &str) -> bool {
+    if normalized.contains('?') {
+        return false;
+    }
+    let padded = words_padded(normalized);
+    // "haven't received", "didn't finish", "never sent": not an outcome.
+    if [
+        "not",
+        "haven t",
+        "havent",
+        "hasn t",
+        "hasnt",
+        "didn t",
+        "didnt",
+        "never",
+        "still need",
+    ]
+    .iter()
+    .any(|n| padded.contains(&format!(" {n} ")))
+    {
+        return false;
+    }
+    // Bare past participles that only ever report completion.
+    if [
+        "renewed",
+        "purchased",
+        "submitted",
+        "delivered",
+        "completed",
+        "finished",
+        "booked",
+        "reinstated",
+    ]
+    .iter()
+    .any(|w| padded.contains(&format!(" {w} ")))
+    {
+        return true;
+    }
+    const OUTCOME_PHRASES: &[&str] = &[
+        "i gave",
+        "gave my",
+        "gave the",
+        "i finished",
+        "finished my",
+        "finished the",
+        "i completed",
+        "completed my",
+        "completed the",
+        "i delivered",
+        "delivered my",
+        "delivered the",
+        "i submitted",
+        "submitted my",
+        "submitted the",
+        "i sent",
+        "sent the",
+        "i booked",
+        "booked the",
+        "tickets purchased",
+        "tickets are booked",
+        "i purchased",
+        "i bought",
+        "i paid",
+        "paid the",
+        "i passed",
+        "passed my",
+        "passed the",
+        "i attended",
+        "i went to",
+        "we went to",
+        "i did it",
+        "got it done",
+        "is done",
+        "are done",
+        "all done",
+        "done with",
+        "wrapped up",
+        "i closed",
+        "closed the",
+        "i resolved",
+        "resolved the",
+        "took care of",
+        "i handled",
+        "i signed",
+        "i renewed",
+        "renewed my",
+        "renewed the",
+        "i received",
+        "received my",
+        "received the",
+        "picked up",
+        "dropped off",
+        "i fixed",
+        "fixed the",
+        "i installed",
+        "i shipped",
+        "i mailed",
+        "i called",
+        "met with",
+        "i talked to",
+        "i spoke with",
+        "got him back",
+        "got her back",
+        "got back into",
+        "is back in",
+        "reinstated",
+    ];
+    OUTCOME_PHRASES
+        .iter()
+        .any(|p| padded.contains(&format!(" {p} ")))
+}
+
+/// Instruction injected when a plan-worthy turn has not declared a plan yet.
+///
+/// The atomicity requirement is load-bearing, not style. A step that reads
+/// "propose Zerin, Mali and Daxton" is cleared by one successful call while
+/// the other two silently never happen — which is precisely how an operator
+/// was told all five of their children had been added when one had not.
+/// One step must mean one verifiable outcome.
+pub fn plan_directive() -> &'static str {
+    "[Plan first] Before acting, declare an `active_plan` in your response with a `goal` and \
+     ordered `steps`. Rules:\n\
+     - One step = one verifiable outcome = one tool call. Never bundle several artifacts into \
+     one step; write a separate step per artifact.\n\
+     - Set each step's `tool_name` to the tool that will carry it out, so completion can be \
+     checked against real results. Leave it unset only for pure reasoning steps.\n\
+     - Then execute the steps yourself in THIS turn, updating each step's `status` as you go. \
+     Do not send the user a message between steps.\n\
+     - A step counts as done only when a successful tool call actually did it."
+}
+
+fn outstanding_lines(
+    plan: &ActivePlan,
+    verification: &PlanVerification,
+    completion: &PlanCompletion,
+) -> String {
+    let mut lines: Vec<String> = completion
+        .outstanding
+        .iter()
+        .filter_map(|i| {
+            let step = plan.steps.get(*i)?;
+            let marker = match verification.evidence.get(*i) {
+                Some(StepEvidence::Missing) if step.status == "done" => {
+                    " — you marked this done, but no successful tool call in this turn did it. Redo it."
+                }
+                _ => "",
+            };
+            Some(format!(
+                "- step {}{}: {}{marker}",
+                step.id,
+                step_tool_suffix(step),
+                step.description
+            ))
+        })
+        .collect();
+
+    if !verification.non_atomic_step_ids.is_empty() {
+        lines.push(format!(
+            "Steps {} each bundle several outcomes into one step, so none of them can be \
+             checked individually. Split them into one step per outcome.",
+            verification
+                .non_atomic_step_ids
+                .iter()
+                .map(u32::to_string)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+    lines.join("\n")
+}
+
+/// The re-entry instruction appended to the projection after tool results.
+///
+/// Three exits, deliberately. The previous wording offered two — "continue with
+/// the next pending step, **or respond to the user if all necessary work is
+/// complete**" — and that second clause is the escape hatch that produced
+/// one-step turns: the model took it after a single `life.observe` and
+/// delivered a receipt instead of finishing the plan, so a five-item request
+/// became five round-trips. But deleting the escape entirely is also wrong: a
+/// plan can legitimately need the user before it can proceed, and with no
+/// stated exit for that the turn burns iterations to the cap and falls back to
+/// a canned stop message. So: continue (default), finish, or block — and say
+/// which.
+pub fn reentry_hint(turn: &WorkingTurn) -> String {
+    let Some(plan) = turn.active_plan.as_ref() else {
+        // The interim-note invitation must appear here too, not only on the
+        // plan branch below. DEF-077's flush shipped on the ToolCall path for
+        // every re-entry, but a plan-less multi-tool turn never saw any prompt
+        // to use `partial_replies` — and watched-live (2026-08-06) a 458s,
+        // six-tool-call turn stayed silent throughout while the loop's gate
+        // was open the whole time. Models do not spontaneously use an
+        // unexplained optional contract field.
+        return "Review the above tool results. If your task is complete, respond to the user \
+                now. Only call another tool if a specific next step is still required. \
+                If you are continuing a long stretch of work, you may add one short line to \
+                `partial_replies` alongside the tool call to tell the user what you are doing — \
+                it reaches them without ending the turn, and the loop drops it if you are \
+                speaking too often. Use it when the silence would be long, not after every step."
+            .to_string();
+    };
+
+    let verification =
+        verify_plan_steps(plan, &turn.working_tool_history, &turn.plan_steps_verified);
+    let completion = evaluate_whole_plan(plan, &verification);
+
+    if completion.complete {
+        return format!(
+            "All {} plan steps are complete and verified against this turn's tool results. \
+             Deliver your final response to the user now. Do not call any more tools.",
+            completion.total
+        );
+    }
+
+    let outstanding = outstanding_lines(plan, &verification, &completion);
+
+    if plan_execution_budget_exhausted(turn.started_at_unix, unix_now()) {
+        return format!(
+            "This turn has reached its wall-clock budget with {}/{} steps verified. Stop calling \
+             tools and reply now.\nStill outstanding:\n{outstanding}\n\
+             State plainly which items are done and which are not, and offer to continue. \
+             Never claim an artifact exists unless a tool call in this turn created it.",
+            completion.verified, completion.total,
+        );
+    }
+
+    format!(
+        "{}/{} plan steps verified against actual tool results.\nStill outstanding:\n{outstanding}\n\
+         Keep working in THIS turn — do not hand the plan back to the user between steps. \
+         Take exactly one of these three exits:\n\
+         1. Execute the next outstanding step now with a tool call. This is the default.\n\
+         2. If every step is finished, deliver ONE final reply covering the whole plan.\n\
+         3. If a step genuinely cannot proceed without the user — a decision only they can make, \
+         a missing credential, an ambiguity you cannot resolve — and no other step can move \
+         while you wait, reply now, say specifically what you need, and name the step it blocks. \
+         If the other steps CAN still move, do not stop: put what you need in `partial_replies` \
+         and carry on with them.\n\
+         You may also add one short line to `partial_replies` alongside a tool call to say what \
+         you are doing on a long stretch of work. It reaches the user without ending the turn, \
+         and the loop drops it if you are speaking too often — so use it when the silence would \
+         be long, not after every step.\n\
+         Never report a step as done unless a successful tool call in this turn did it.",
+        completion.verified, completion.total,
+    )
 }
 
 #[cfg(test)]
@@ -321,6 +1929,7 @@ mod tests {
                 .collect(),
             status: status.into(),
             context_1_advisory: None,
+            procedure_id: None,
         }
     }
 
@@ -342,8 +1951,23 @@ mod tests {
             .collect()
     }
 
+    fn carryover(p: ActivePlan, steps_done: Vec<bool>, used: u32) -> CarryoverPlan {
+        CarryoverPlan {
+            plan: p,
+            steps_done,
+            verified_step_ids: Vec::new(),
+            stalled_continuations: 0,
+            continuations_used: used,
+            lifetime_continuations: 0,
+            created_turn_id: "turn-0".into(),
+        }
+    }
+
     #[test]
-    fn model_reported_all_done_is_complete() {
+    fn unbound_steps_all_claimed_done_is_complete() {
+        // Nothing declares a tool, so there is no artifact to check against and
+        // the model's claim is the only signal. Complete, but reported as
+        // uncertain and `model_reported` so the gap is visible.
         let p = plan(
             "executing",
             &[("read config", None, "done"), ("apply fix", None, "done")],
@@ -352,11 +1976,12 @@ mod tests {
         assert_eq!(out.verdict, PlanEvalVerdict::Complete);
         assert_eq!(out.basis, PlanEvalBasis::ModelReported);
         assert_eq!(out.steps_done, 2);
-        assert!(out.uncertain_step_ids.is_empty());
+        assert_eq!(out.steps_verified, 0);
+        assert_eq!(out.uncertain_step_ids, vec![1, 2]);
     }
 
     #[test]
-    fn plan_status_done_trusts_whole_plan_claim() {
+    fn whole_plan_done_claim_covers_unmarked_steps_only_when_nothing_is_checkable() {
         let p = plan(
             "done",
             &[
@@ -370,20 +1995,35 @@ mod tests {
         assert_eq!(out.steps_done, 2);
     }
 
+    /// The defect this change exists to close, at the carryover layer.
+    ///
+    /// The model declares the whole plan done and marks every step done. One
+    /// step is bound to a tool that never ran successfully. The old eval
+    /// returned `Complete` on the strength of those claims and dropped the
+    /// carryover, so the loop exited with the work undone — the same
+    /// self-certification the in-turn layer already refused to accept.
     #[test]
-    fn model_reported_partial_continues() {
+    fn plan_declaring_itself_done_still_continues_when_a_step_is_unverified() {
         let p = plan(
-            "executing",
+            "done",
             &[
-                ("read config", None, "done"),
-                ("apply fix", None, "pending"),
-                ("verify deploy", None, "pending"),
+                ("add Zerin as a Person node", Some("life.observe"), "done"),
+                ("add Daxton as a Person node", Some("life.observe"), "done"),
             ],
         );
-        let out = evaluate_plan(&p, None, &[]);
+        // Only Zerin's call landed.
+        let h = history_args(&[(
+            "life.observe",
+            serde_json::json!({"text": "Zerin is a child"}),
+            "created life:person:zerin",
+        )]);
+        let out = evaluate_plan(&p, None, &h);
         assert_eq!(out.verdict, PlanEvalVerdict::Continue);
-        assert_eq!(out.basis, PlanEvalBasis::ModelReported);
-        assert_eq!(out.steps_done, 1);
+        assert_eq!(out.basis, PlanEvalBasis::Grounded);
+        assert_eq!(out.steps_verified, 1);
+        assert_eq!(out.outstanding_step_ids, vec![2]);
+        // The false claim is surfaced, not silently accepted.
+        assert_eq!(out.contradicted_step_ids, vec![2]);
     }
 
     #[test]
@@ -391,7 +2031,6 @@ mod tests {
         let p = plan("failed", &[("read config", None, "pending")]);
         let out = evaluate_plan(&p, None, &[]);
         assert_eq!(out.verdict, PlanEvalVerdict::Blocked);
-        assert_eq!(out.basis, PlanEvalBasis::ModelReported);
     }
 
     #[test]
@@ -405,8 +2044,7 @@ mod tests {
     }
 
     #[test]
-    fn heuristic_bound_tool_success_marks_step_uncertain() {
-        // Contract silent: every step "pending", but the bound tool ran fine.
+    fn bound_tool_success_verifies_step() {
         let p = plan(
             "executing",
             &[
@@ -416,14 +2054,18 @@ mod tests {
         );
         let h = history(&[("hotel.status", "hotel green")]);
         let out = evaluate_plan(&p, None, &h);
-        assert_eq!(out.basis, PlanEvalBasis::Heuristic);
+        assert_eq!(out.basis, PlanEvalBasis::Grounded);
         assert_eq!(out.verdict, PlanEvalVerdict::Continue);
-        assert_eq!(out.steps_done, 1);
-        assert_eq!(out.uncertain_step_ids, vec![1]);
+        assert_eq!(out.steps_verified, 1);
+        assert_eq!(out.verified_step_ids, vec![1]);
+        // Step 1 has evidence, so it is not uncertain; step 2 is unbound and
+        // unclaimed, so it is outstanding rather than settled.
+        assert!(out.uncertain_step_ids.is_empty());
+        assert_eq!(out.outstanding_step_ids, vec![2]);
     }
 
     #[test]
-    fn heuristic_bound_tool_error_does_not_mark_step() {
+    fn bound_tool_error_does_not_verify_step() {
         let p = plan(
             "executing",
             &[("check hotel status", Some("hotel.status"), "pending")],
@@ -434,100 +2076,1749 @@ mod tests {
         assert_eq!(out.verdict, PlanEvalVerdict::Continue);
     }
 
+    /// Token attribution still settles an unbound step — but one call now
+    /// clears exactly one step.
+    ///
+    /// The old heuristic asked "does *any* successful call look like this
+    /// step?" for every step independently, so a single `life.observe` answered
+    /// yes for all five children and the plan read as complete. Attribution is
+    /// consuming: N sibling steps need N successful calls.
     #[test]
-    fn heuristic_description_token_match() {
+    fn one_call_settles_one_step_not_every_similar_sibling() {
         let p = plan(
             "executing",
-            &[("recall session memory context", None, "pending")],
+            &[
+                ("recall Zerin from memory", None, "pending"),
+                ("recall Daxton from memory", None, "pending"),
+            ],
         );
-        let h = history(&[("memory.recall", "3 memories found for session context")]);
+        let h = history_args(&[(
+            "memory.recall",
+            serde_json::json!({"query": "Zerin"}),
+            "1 memory found",
+        )]);
         let out = evaluate_plan(&p, None, &h);
-        assert_eq!(out.basis, PlanEvalBasis::Heuristic);
-        assert_eq!(out.steps_done, 1);
-        assert_eq!(out.uncertain_step_ids, vec![1]);
+        assert_eq!(out.steps_verified, 1, "one call must clear only one step");
+        assert_eq!(out.verified_step_ids, vec![1]);
+        assert_eq!(out.outstanding_step_ids, vec![2]);
+        assert_eq!(out.verdict, PlanEvalVerdict::Continue);
     }
 
     #[test]
-    fn heuristic_silent_history_continues_with_zero_done() {
+    fn silent_history_continues_with_zero_done() {
         let p = plan(
             "executing",
             &[("write deployment runbook", None, "pending")],
         );
         let out = evaluate_plan(&p, None, &[]);
-        assert_eq!(out.basis, PlanEvalBasis::Heuristic);
         assert_eq!(out.verdict, PlanEvalVerdict::Continue);
         assert_eq!(out.steps_done, 0);
     }
 
+    /// Evidence, not settlement, is what carries across turns: a step proven in
+    /// turn 1 stays proven in turn 2 even though the continuation starts with
+    /// an empty tool history.
     #[test]
-    fn prior_done_flags_merge_and_stay_done() {
+    fn prior_evidence_keeps_a_step_verified_across_turns() {
         let p = plan(
             "executing",
             &[
-                ("read config", None, "pending"),
-                ("apply fix", None, "done"),
-                ("verify deploy", None, "pending"),
+                ("add Zerin", Some("life.observe"), "done"),
+                ("add Daxton", Some("life.observe"), "pending"),
             ],
         );
-        let out = evaluate_plan(&p, Some(&[true, false, false]), &[]);
-        // step 1 stays done from prior, step 2 newly model-reported done.
-        assert_eq!(out.steps_done, 2);
-        assert!(out.steps_done_flags[0] && out.steps_done_flags[1]);
+        let prior = PriorPlanState {
+            verified_step_ids: &[1],
+            settled_count: 1,
+            stalls: 0,
+        };
+        let out = evaluate_plan(&p, Some(prior), &[]);
+        assert!(out.steps_done_flags[0], "turn-1 evidence must survive");
+        assert_eq!(out.verified_step_ids, vec![1]);
+        assert_eq!(out.outstanding_step_ids, vec![2]);
         assert_eq!(out.verdict, PlanEvalVerdict::Continue);
     }
 
+    /// A carryover must never be able to promote a model claim into evidence.
+    /// Only `verified_step_ids` seeds verification, and it is populated solely
+    /// from `verify_plan_steps` output.
     #[test]
-    fn continuation_without_progress_is_blocked() {
+    fn settled_flags_are_not_accepted_as_evidence() {
+        let p = plan("executing", &[("add Daxton", Some("life.observe"), "done")]);
+        // Nothing ran, and no prior *evidence* exists — only a claim.
+        let prior = PriorPlanState {
+            verified_step_ids: &[],
+            settled_count: 1,
+            stalls: 0,
+        };
+        let out = evaluate_plan(&p, Some(prior), &[]);
+        assert_eq!(out.steps_verified, 0);
+        assert_eq!(out.outstanding_step_ids, vec![1]);
+        assert_ne!(out.verdict, PlanEvalVerdict::Complete);
+    }
+
+    /// One stalled continuation is tolerated; two in a row is a spin.
+    ///
+    /// Under grounded evaluation a turn spent on a failing tool settles
+    /// nothing, and blocking on the first such turn kills plans one turn before
+    /// they recover.
+    #[test]
+    fn first_stall_continues_and_second_blocks() {
         let p = plan(
             "executing",
             &[
-                ("read config", None, "done"),
-                ("apply fix", None, "pending"),
+                ("read config", Some("hotel.status"), "pending"),
+                ("apply fix", Some("life.observe"), "pending"),
             ],
         );
-        // Prior already had step 1 done — this continuation added nothing.
-        let out = evaluate_plan(&p, Some(&[true, false]), &[]);
-        assert_eq!(out.verdict, PlanEvalVerdict::Blocked);
+        let first = evaluate_plan(
+            &p,
+            Some(PriorPlanState {
+                verified_step_ids: &[],
+                settled_count: 0,
+                stalls: 0,
+            }),
+            &[],
+        );
+        assert_eq!(first.verdict, PlanEvalVerdict::Continue);
+        assert_eq!(first.stalled_continuations, 1);
+
+        let second = evaluate_plan(
+            &p,
+            Some(PriorPlanState {
+                verified_step_ids: &[],
+                settled_count: 0,
+                stalls: first.stalled_continuations,
+            }),
+            &[],
+        );
+        assert_eq!(second.verdict, PlanEvalVerdict::Blocked);
+        assert_eq!(second.stalled_continuations, 2);
+    }
+
+    #[test]
+    fn forward_progress_resets_the_stall_counter() {
+        let p = plan(
+            "executing",
+            &[
+                ("check hotel status", Some("hotel.status"), "pending"),
+                ("apply fix", Some("life.observe"), "pending"),
+            ],
+        );
+        let h = history(&[("hotel.status", "hotel green")]);
+        let out = evaluate_plan(
+            &p,
+            Some(PriorPlanState {
+                verified_step_ids: &[],
+                settled_count: 0,
+                stalls: 1,
+            }),
+            &h,
+        );
+        assert_eq!(out.stalled_continuations, 0);
+        assert_eq!(out.verdict, PlanEvalVerdict::Continue);
+    }
+
+    // ── Interim replies: speaking without ending the turn ────────────────
+
+    #[test]
+    fn interim_reply_is_declined_on_the_first_iterations() {
+        // Long-running turn, but only one step in: narrating here is the
+        // per-step receipt behaviour, not a progress note.
+        assert!(!interim_reply_admissible(Some(1_000), None, 0, 1_500));
+        assert!(!interim_reply_admissible(Some(1_000), None, 1, 1_500));
+        assert!(interim_reply_admissible(Some(1_000), None, 2, 1_500));
+    }
+
+    #[test]
+    fn interim_reply_is_declined_until_the_turn_is_actually_long() {
+        let started = 1_000;
+        // Deep into the tool loop but only a few seconds in — still silent.
+        assert!(!interim_reply_admissible(
+            Some(started),
+            None,
+            9,
+            started + INTERIM_REPLY_MIN_GAP_SECS - 1
+        ));
+        assert!(interim_reply_admissible(
+            Some(started),
+            None,
+            9,
+            started + INTERIM_REPLY_MIN_GAP_SECS
+        ));
+    }
+
+    #[test]
+    fn interim_reply_enforces_a_quiet_period_between_messages() {
+        let started = 1_000;
+        let first = started + 60;
+        assert!(!interim_reply_admissible(
+            Some(started),
+            Some(first),
+            9,
+            first + INTERIM_REPLY_MIN_GAP_SECS - 1
+        ));
+        assert!(interim_reply_admissible(
+            Some(started),
+            Some(first),
+            9,
+            first + INTERIM_REPLY_MIN_GAP_SECS
+        ));
+    }
+
+    /// Unknown start time means the clock cannot be trusted; stay quiet rather
+    /// than risk narrating a fast turn.
+    #[test]
+    fn interim_reply_is_declined_without_a_known_start_time() {
+        assert!(!interim_reply_admissible(None, None, 9, 99_999));
+    }
+
+    /// The gate must leave room for several notes across the longest turn the
+    /// in-turn budget allows, or a long plan still runs effectively silent.
+    #[test]
+    fn interim_gap_admits_several_notes_within_the_turn_budget() {
+        assert!(PLAN_EXECUTION_BUDGET_SECS / INTERIM_REPLY_MIN_GAP_SECS >= 3);
+    }
+
+    /// The re-entry hint has to invite the channel it just enabled, or the
+    /// model never populates `partial_replies` and the flush is dead code.
+    #[test]
+    fn reentry_hint_invites_interim_notes_without_licensing_receipts() {
+        let p = plan(
+            "executing",
+            &[
+                ("read config", Some("hotel.status"), "pending"),
+                ("apply fix", Some("life.observe"), "pending"),
+            ],
+        );
+        let hint = reentry_hint(&turn_with(Some(p), vec![]));
+        assert!(hint.contains("partial_replies"));
+        assert!(
+            hint.contains("without ending the turn"),
+            "the model must know speaking does not stop the plan, got: {hint}"
+        );
+        // The blanket ban is gone, but the anti-chatter framing must remain.
+        assert!(!hint.contains("do not send a progress receipt after each tool call"));
+        assert!(hint.contains("not after every step"));
+    }
+
+    /// The plan-less branch needs the same invitation. Watched-live
+    /// (2026-08-06): a 458s six-tool-call turn with no plan emitted zero
+    /// interim notes because this branch never mentioned `partial_replies`
+    /// while the plan branch did — the field was offered in the contract but
+    /// nothing told the model it existed.
+    #[test]
+    fn planless_reentry_hint_also_invites_interim_notes() {
+        let hint = reentry_hint(&turn_with(None, vec![]));
+        assert!(hint.contains("partial_replies"));
+        assert!(
+            hint.contains("without ending the turn"),
+            "the model must know speaking does not stop the work, got: {hint}"
+        );
+        assert!(hint.contains("not after every step"));
+    }
+
+    /// Exit 3 used to end the plan whenever the model needed anything. It
+    /// should only do so when nothing else can move.
+    #[test]
+    fn reentry_hint_blocks_only_when_no_other_step_can_move() {
+        let p = plan(
+            "executing",
+            &[
+                ("read config", Some("hotel.status"), "pending"),
+                ("apply fix", Some("life.observe"), "pending"),
+            ],
+        );
+        let hint = reentry_hint(&turn_with(Some(p), vec![]));
+        assert!(hint.contains("If the other steps CAN still move, do not stop"));
+    }
+
+    #[test]
+    fn continuation_budget_scales_with_outstanding_work_and_is_bounded() {
+        // Never shrinks a configured budget.
+        assert_eq!(scaled_continuation_budget(3, 1), 3);
+        assert_eq!(scaled_continuation_budget(3, 0), 3);
+        // Widens to fit the work that is actually left.
+        assert_eq!(scaled_continuation_budget(3, 6), 6);
+        // Bounded, so a large plan cannot loop indefinitely.
+        assert_eq!(
+            scaled_continuation_budget(3, 40),
+            PLAN_CONTINUATION_BUDGET_CEILING
+        );
+        assert_eq!(scaled_continuation_budget(12, 40), 12);
     }
 
     #[test]
     fn continuation_brief_cites_remaining_steps_only() {
-        let carry = CarryoverPlan {
-            plan: plan(
+        let carry = carryover(
+            plan(
                 "executing",
                 &[
                     ("read config", None, "done"),
                     ("apply fix", None, "pending"),
                 ],
             ),
-            steps_done: vec![true, false],
-            continuations_used: 1,
-            created_turn_id: "turn-0".into(),
-        };
+            vec![true, false],
+            1,
+        );
         let brief = plan_continuation_brief(&carry, 3);
         assert!(brief.contains("[Plan continuation 2/3]"));
         assert!(brief.contains("Completed steps:\n- step 1: read config"));
         assert!(brief.contains("Remaining steps:\n- step 2: apply fix"));
     }
 
+    /// A step the model marked done that no tool call performed must be told to
+    /// redo it. Restating it as an ordinary pending step invites the model to
+    /// mark it done a second time.
+    #[test]
+    fn continuation_brief_tells_the_model_to_redo_an_unbacked_claim() {
+        let carry = carryover(
+            plan("executing", &[("add Daxton", Some("life.observe"), "done")]),
+            vec![false],
+            1,
+        );
+        let brief = plan_continuation_brief(&carry, 3);
+        assert!(brief.contains("Redo it."), "brief was: {brief}");
+    }
+
+    /// A bundled step is unconditionally outstanding, so a plan containing one
+    /// can never reach `Complete` until the model splits it. That is deliberate
+    /// — but it must not mean the plan grinds through the entire continuation
+    /// budget. A model that ignores the split instruction settles nothing new
+    /// each turn, so the stall guard stops it after two, not eight.
+    #[test]
+    fn a_bundled_step_the_model_never_splits_stops_on_stalls_not_budget() {
+        let p = plan(
+            "done",
+            &[(
+                "propose Zerin, Mali and Daxton as Person nodes",
+                Some("life.observe"),
+                "done",
+            )],
+        );
+        let h = history_args(&[(
+            "life.observe",
+            serde_json::json!({"text": "Zerin"}),
+            "created life:person:zerin",
+        )]);
+
+        // Turn 1: evidence exists, but a bundled step is never settled.
+        let first = evaluate_plan(&p, None, &h);
+        assert_eq!(first.verdict, PlanEvalVerdict::Continue);
+        assert_eq!(first.non_atomic_step_ids, vec![1]);
+        assert_eq!(first.steps_done, 0);
+
+        // Continuations that re-emit the same bundled step settle nothing.
+        let second = evaluate_plan(
+            &p,
+            Some(PriorPlanState {
+                verified_step_ids: &first.verified_step_ids,
+                settled_count: first.steps_done,
+                stalls: 0,
+            }),
+            &h,
+        );
+        assert_eq!(second.verdict, PlanEvalVerdict::Continue);
+        let third = evaluate_plan(
+            &p,
+            Some(PriorPlanState {
+                verified_step_ids: &second.verified_step_ids,
+                settled_count: second.steps_done,
+                stalls: second.stalled_continuations,
+            }),
+            &h,
+        );
+        assert_eq!(
+            third.verdict,
+            PlanEvalVerdict::Blocked,
+            "an unsplit bundle must stop on the stall guard"
+        );
+    }
+
+    /// And when the model *does* split it, the plan settles — the split steps
+    /// are individually attributable, and the goal is unchanged so the
+    /// carryover keeps its continuity.
+    #[test]
+    fn splitting_a_bundled_step_lets_the_plan_complete() {
+        let bundled = plan(
+            "executing",
+            &[(
+                "propose Zerin, Mali and Daxton as Person nodes",
+                Some("life.observe"),
+                "done",
+            )],
+        );
+        let first = evaluate_plan(&bundled, None, &[]);
+        assert_eq!(first.verdict, PlanEvalVerdict::Continue);
+
+        // The continuation re-emits the plan as one step per artifact.
+        let split = plan(
+            "executing",
+            &[
+                (
+                    "propose Zerin as a Person node",
+                    Some("life.observe"),
+                    "done",
+                ),
+                (
+                    "propose Mali as a Person node",
+                    Some("life.observe"),
+                    "done",
+                ),
+                (
+                    "propose Daxton as a Person node",
+                    Some("life.observe"),
+                    "done",
+                ),
+            ],
+        );
+        let h = history_args(&[
+            (
+                "life.observe",
+                serde_json::json!({"text": "Zerin"}),
+                "created life:person:zerin",
+            ),
+            (
+                "life.observe",
+                serde_json::json!({"text": "Mali"}),
+                "created life:person:mali",
+            ),
+            (
+                "life.observe",
+                serde_json::json!({"text": "Daxton"}),
+                "created life:person:daxton",
+            ),
+        ]);
+        let out = evaluate_plan(
+            &split,
+            Some(PriorPlanState {
+                verified_step_ids: &first.verified_step_ids,
+                settled_count: first.steps_done,
+                stalls: first.stalled_continuations,
+            }),
+            &h,
+        );
+        assert_eq!(out.verdict, PlanEvalVerdict::Complete);
+        assert_eq!(out.steps_verified, 3);
+    }
+
+    /// A bundled step is unconditionally outstanding, so a continuation that
+    /// does not split it can never settle the plan — it would burn the whole
+    /// budget and still finish unfinished.
+    #[test]
+    fn continuation_brief_demands_a_bundled_step_be_split() {
+        let carry = carryover(
+            plan(
+                "executing",
+                &[(
+                    "propose Zerin, Mali and Daxton as Person nodes",
+                    Some("life.observe"),
+                    "done",
+                )],
+            ),
+            vec![false],
+            1,
+        );
+        let brief = plan_continuation_brief(&carry, 3);
+        assert!(brief.contains("Split them into one step per outcome"));
+    }
+
+    /// The loop's terminal state is a turn event the operator never sees, so
+    /// the last continuation has to put the shortfall in the model's own reply.
+    #[test]
+    fn last_continuation_requires_the_reply_to_name_the_shortfall() {
+        let p = plan(
+            "executing",
+            &[
+                ("add Zerin", Some("life.observe"), "pending"),
+                ("add Daxton", Some("life.observe"), "pending"),
+            ],
+        );
+        // continuations_used = 2 of a budget of 3: this is the last one.
+        let last = carryover(p.clone(), vec![false, false], 2);
+        let brief = plan_continuation_brief(&last, 3);
+        assert!(brief.contains("LAST continuation"));
+        assert!(brief.contains("Do not imply that work will continue on its own."));
+
+        // An earlier continuation must not say so.
+        let earlier = carryover(p, vec![false, false], 0);
+        assert!(!plan_continuation_brief(&earlier, 3).contains("LAST continuation"));
+    }
+
+    #[test]
+    fn continuation_brief_after_a_stall_demands_a_different_approach() {
+        let mut carry = carryover(
+            plan(
+                "executing",
+                &[("apply fix", Some("life.observe"), "pending")],
+            ),
+            vec![false],
+            1,
+        );
+        carry.stalled_continuations = 1;
+        let brief = plan_continuation_brief(&carry, 3);
+        assert!(brief.contains("Do not repeat the approach that just failed"));
+    }
+
     #[test]
     fn stop_notice_reports_done_undone_and_reason() {
-        let carry = CarryoverPlan {
-            plan: plan(
+        let carry = carryover(
+            plan(
                 "executing",
                 &[
                     ("read config", None, "done"),
                     ("apply fix", None, "pending"),
                 ],
             ),
-            steps_done: vec![true, false],
-            continuations_used: 3,
-            created_turn_id: "turn-0".into(),
-        };
+            vec![true, false],
+            3,
+        );
         let notice = plan_stop_notice(&carry, "continuation budget exhausted");
         assert!(notice.contains("1/2 steps done"));
         assert!(notice.contains("continuation budget exhausted"));
         assert!(notice.contains("- step 2: apply fix"));
-        assert!(notice.contains("/plan drop"));
+        // The notice must tell the truth about what the loop did: the
+        // carryover is gone, so it must not advertise resumption paths
+        // ("send a message", "/plan drop") that no longer exist.
+        assert!(notice.contains("will not run automatically"));
+        assert!(!notice.contains("/plan drop"));
+    }
+
+    #[test]
+    fn step_lists_name_bound_tools_for_projection() {
+        // The brief is the continuation turn's only tool-projection relevance
+        // text: a bound tool must be named so the explicit tool-name match
+        // fires before any keyword gate can strip it (or zero-tool the turn).
+        let carry = carryover(
+            plan(
+                "executing",
+                &[
+                    ("read config", None, "done"),
+                    ("apply fix", Some("bash.exec"), "pending"),
+                ],
+            ),
+            vec![true, false],
+            0,
+        );
+        let brief = plan_continuation_brief(&carry, 3);
+        assert!(brief.contains("(tool: bash.exec)"), "{brief}");
+        let notice = plan_stop_notice(&carry, "whatever");
+        assert!(notice.contains("(tool: bash.exec)"), "{notice}");
+    }
+
+    // ── Grounded verification ───────────────────────────────────────────
+
+    /// Tool history with real arguments, so distinctive-token attribution has
+    /// something to match against.
+    fn history_args(entries: &[(&str, serde_json::Value, &str)]) -> Vec<(ToolCall, ToolResult)> {
+        entries
+            .iter()
+            .map(|(tool, args, content)| {
+                (
+                    ToolCall {
+                        tool_name: (*tool).to_string(),
+                        arguments: args.clone(),
+                    },
+                    ToolResult {
+                        tool_name: (*tool).to_string(),
+                        content: (*content).to_string(),
+                    },
+                )
+            })
+            .collect()
+    }
+
+    fn observe(name: &str) -> serde_json::Value {
+        serde_json::json!({ "claim": format!("Propose {name} as a Person node") })
+    }
+
+    /// The live Beacon failure: five children, one step each, all marked
+    /// `done` by the model, but no `life.observe` ever ran for Daxton. The
+    /// LifeGraph confirmed Daxton was missing while Beacon reported all five
+    /// were in place.
+    #[test]
+    fn missing_artifact_is_caught_despite_model_claiming_done() {
+        let p = plan(
+            "done",
+            &[
+                ("Propose Taysha Telenar", Some("life.observe"), "done"),
+                (
+                    "Propose Xanthos Gabriel Wagner",
+                    Some("life.observe"),
+                    "done",
+                ),
+                ("Propose Zerin Maluy", Some("life.observe"), "done"),
+                (
+                    "Propose Mali-KJerstine Althoff",
+                    Some("life.observe"),
+                    "done",
+                ),
+                ("Propose Daxton Thomas Wagner", Some("life.observe"), "done"),
+            ],
+        );
+        // Four of five actually ran. Daxton never did.
+        let h = history_args(&[
+            (
+                "life.observe",
+                observe("Taysha Telenar"),
+                "{\"node_id\":\"1\"}",
+            ),
+            (
+                "life.observe",
+                observe("Xanthos Gabriel Wagner"),
+                "{\"node_id\":\"2\"}",
+            ),
+            (
+                "life.observe",
+                observe("Zerin Maluy"),
+                "{\"node_id\":\"3\"}",
+            ),
+            (
+                "life.observe",
+                observe("Mali-KJerstine Althoff"),
+                "{\"node_id\":\"4\"}",
+            ),
+        ]);
+
+        let v = verify_plan_steps(&p, &h, &[]);
+        assert_eq!(v.verified_count(), 4);
+        assert_eq!(
+            v.evidence[4],
+            StepEvidence::Missing,
+            "Daxton must not verify"
+        );
+        assert_eq!(v.contradicted_step_ids, vec![5]);
+
+        let c = evaluate_whole_plan(&p, &v);
+        assert!(!c.complete, "plan must not read as complete");
+        assert_eq!(c.outstanding, vec![4]);
+
+        // And the final reply is explicitly barred from claiming success.
+        let note = plan_integrity_note(&p, &v, &c).expect("integrity note");
+        assert!(note.contains("Daxton"));
+        assert!(note.contains("you marked this done"));
+
+        // The carryover evaluator agrees. It used to accept the model's own
+        // claim here and return `Complete`, which dropped the carryover and
+        // ended the loop with Daxton still missing — the in-turn layer refused
+        // to *claim* the plan was done while the layer deciding whether to
+        // *repeat* took the claim at face value. Both are grounded now.
+        let out = evaluate_plan(&p, None, &h);
+        assert_eq!(out.verdict, PlanEvalVerdict::Continue);
+        assert_eq!(out.outstanding_step_ids, vec![5]);
+        assert_eq!(out.contradicted_step_ids, vec![5]);
+    }
+
+    /// One successful call must not clear several same-tool steps.
+    #[test]
+    fn evidence_is_consumed_one_call_per_step() {
+        let p = plan(
+            "executing",
+            &[
+                ("Propose Zerin Maluy", Some("life.observe"), "done"),
+                ("Propose Daxton Thomas Wagner", Some("life.observe"), "done"),
+            ],
+        );
+        let h = history_args(&[(
+            "life.observe",
+            observe("Zerin Maluy"),
+            "{\"node_id\":\"3\"}",
+        )]);
+        let v = verify_plan_steps(&p, &h, &[]);
+        assert_eq!(v.verified_count(), 1);
+        assert_eq!(v.evidence[0], StepEvidence::Verified);
+        assert_eq!(v.evidence[1], StepEvidence::Missing);
+    }
+
+    fn observe_batch_of(name: &str) -> Option<ansible_mesh_core::graph::ToolBatchOf> {
+        (name == "life.observe.batch").then(|| ansible_mesh_core::graph::ToolBatchOf {
+            tool: "life.observe".into(),
+            items_pointer: "/observations".into(),
+        })
+    }
+
+    fn two_item_batch(content: &str) -> Vec<(ToolCall, ToolResult)> {
+        vec![(
+            ToolCall {
+                tool_name: "life.observe.batch".into(),
+                arguments: serde_json::json!({"observations": [
+                    {"evidence": {"claim_ref": {"id": "life:appointment:organ_practice_20260916", "label": "Appointment"},
+                                  "claim_summary": "Organ practice tonight with Rachel Hammond"}},
+                    {"evidence": {"claim_ref": {"id": "life:appointment:choir_warmup_20260920", "label": "Appointment"},
+                                  "claim_summary": "Sunday choir warmup in the chapel"}}
+                ]}),
+            },
+            ToolResult {
+                tool_name: "life.observe.batch".into(),
+                content: content.into(),
+            },
+        )]
+    }
+
+    /// Live 2026-09-16 11:18 EDT: two steps bound to `life.observe`, both
+    /// written by ONE `life.observe.batch` call → "Plan stopped, 0/2".
+    #[test]
+    fn one_batch_call_verifies_one_member_step_per_written_item() {
+        let p = plan(
+            "executing",
+            &[
+                (
+                    "Propose tonight's organ practice session with Rachel Hammond in LifeGraph",
+                    Some("life.observe"),
+                    "done",
+                ),
+                (
+                    "Propose Sunday's choir warmup session in LifeGraph",
+                    Some("life.observe"),
+                    "done",
+                ),
+            ],
+        );
+        let ok = r#"{"data":{"status":"ok","requested":2,"succeeded":2,"failed":0,
+            "results":[{"index":0,"result":{"node_id":"life:appointment:organ_practice_20260916"}},
+                       {"index":1,"result":{"node_id":"life:appointment:choir_warmup_20260920"}}],
+            "evaluation":{"written":2,"rejected":[],"not_attempted":[]}}}"#;
+        let v = verify_plan_steps_with_batches(&p, &two_item_batch(ok), &[], &observe_batch_of);
+        assert_eq!(v.verified_count(), 2, "{:?}", v.evidence);
+        assert!(evaluate_whole_plan(&p, &v).complete);
+
+        // Without the catalog relationship the old behaviour stands.
+        let v = verify_plan_steps_with_batches(&p, &two_item_batch(ok), &[], &|_| None);
+        assert_eq!(v.verified_count(), 0);
+    }
+
+    /// Replay of the LIVE payload (captured from the hotel DB): the plan that
+    /// reported "stopped, 0/2 verified" now verifies both steps when the
+    /// catalog declares life.observe.batch as a batch of life.observe.
+    #[test]
+    fn live_2026_09_16_batch_turn_replays_to_two_verified_steps() {
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../tests/fixtures/live_observe_batch_2026_09_16.json"
+        ))
+        .expect("fixture parses");
+        let steps: Vec<(String, String)> = fixture["plan_steps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|s| {
+                (
+                    s["description"].as_str().unwrap().to_string(),
+                    s["tool_name"].as_str().unwrap().to_string(),
+                )
+            })
+            .collect();
+        let step_refs: Vec<(&str, Option<&str>, &str)> = steps
+            .iter()
+            .map(|(d, t)| (d.as_str(), Some(t.as_str()), "done"))
+            .collect();
+        let p = plan("executing", &step_refs);
+        let history = vec![(
+            ToolCall {
+                tool_name: "life.observe.batch".into(),
+                arguments: fixture["call_arguments"].clone(),
+            },
+            ToolResult {
+                tool_name: "life.observe.batch".into(),
+                content: fixture["result_content"].as_str().unwrap().to_string(),
+            },
+        )];
+
+        let before = verify_plan_steps_with_batches(&p, &history, &[], &|_| None);
+        assert_eq!(before.verified_count(), 0, "reproduces the live 0/2");
+
+        let after = verify_plan_steps_with_batches(&p, &history, &[], &observe_batch_of);
+        assert_eq!(after.verified_count(), 2, "{:?}", after.evidence);
+        assert!(evaluate_whole_plan(&p, &after).complete);
+    }
+
+    #[test]
+    fn rejected_or_unattempted_batch_items_do_not_verify_their_steps() {
+        let p = plan(
+            "executing",
+            &[
+                (
+                    "Propose tonight's organ practice session with Rachel Hammond in LifeGraph",
+                    Some("life.observe"),
+                    "done",
+                ),
+                (
+                    "Propose Sunday's choir warmup session in LifeGraph",
+                    Some("life.observe"),
+                    "done",
+                ),
+            ],
+        );
+        let partial = r#"{"data":{"status":"partial","succeeded":1,"failed":1,
+            "results":[{"index":0,"result":{"node_id":"life:appointment:organ_practice_20260916"}}],
+            "evaluation":{"written":1,"rejected":[{"index":1,"reason":"contract_invalid","detail":"expected a map"}],"not_attempted":[]}}}"#;
+        let v =
+            verify_plan_steps_with_batches(&p, &two_item_batch(partial), &[], &observe_batch_of);
+        assert_eq!(v.verified_count(), 1, "{:?}", v.evidence);
+
+        let failed = "Tool call failed: provider failed: contract_error: boom (provider: life-graph-runner, capability: life.observe.batch)";
+        let v = verify_plan_steps_with_batches(&p, &two_item_batch(failed), &[], &observe_batch_of);
+        assert_eq!(v.verified_count(), 0);
+    }
+
+    #[test]
+    fn a_step_bound_to_the_batch_tool_itself_still_verifies() {
+        let p = plan(
+            "executing",
+            &[(
+                "Record the organ practice with Rachel Hammond",
+                Some("life.observe.batch"),
+                "done",
+            )],
+        );
+        let ok = r#"{"results":[{"index":0,"result":{}},{"index":1,"result":{}}],"evaluation":{"rejected":[],"not_attempted":[]}}"#;
+        let v = verify_plan_steps_with_batches(&p, &two_item_batch(ok), &[], &observe_batch_of);
+        assert_eq!(v.verified_count(), 1);
+    }
+
+    /// Steps with no distinguishing text still consume one call each, so two
+    /// identical steps need two successful calls.
+    #[test]
+    fn indistinguishable_steps_each_need_their_own_call() {
+        let p = plan(
+            "executing",
+            &[
+                ("run the sweep", Some("hotel.sweep"), "done"),
+                ("run the sweep", Some("hotel.sweep"), "done"),
+            ],
+        );
+        let one = history_args(&[("hotel.sweep", serde_json::json!({}), "ok")]);
+        let v = verify_plan_steps(&p, &one, &[]);
+        assert_eq!(v.verified_count(), 1);
+
+        let two = history_args(&[
+            ("hotel.sweep", serde_json::json!({}), "ok"),
+            ("hotel.sweep", serde_json::json!({}), "ok"),
+        ]);
+        assert_eq!(verify_plan_steps(&p, &two, &[]).verified_count(), 2);
+    }
+
+    /// A reasoning step declares no tool, so there is no artifact to check and
+    /// the model's own claim stands. Verification must not invent failures.
+    #[test]
+    fn tool_free_step_is_not_checkable_and_settles_on_model_claim() {
+        let p = plan(
+            "executing",
+            &[
+                ("Propose Zerin Maluy", Some("life.observe"), "done"),
+                ("Summarize the family map for the user", None, "done"),
+            ],
+        );
+        let h = history_args(&[("life.observe", observe("Zerin Maluy"), "ok")]);
+        let v = verify_plan_steps(&p, &h, &[]);
+        assert_eq!(v.evidence[1], StepEvidence::NotCheckable);
+        assert!(v.contradicted_step_ids.is_empty());
+
+        let c = evaluate_whole_plan(&p, &v);
+        assert!(c.complete);
+        assert!(plan_integrity_note(&p, &v, &c).is_none());
+    }
+
+    /// A pending tool-free step is still outstanding — "not checkable" is not
+    /// a free pass.
+    #[test]
+    fn pending_tool_free_step_stays_outstanding() {
+        let p = plan(
+            "executing",
+            &[("Summarize the family map", None, "pending")],
+        );
+        let v = verify_plan_steps(&p, &[], &[]);
+        let c = evaluate_whole_plan(&p, &v);
+        assert!(!c.complete);
+        assert_eq!(c.outstanding, vec![0]);
+    }
+
+    /// Evidence scrolls out of the working history as a turn grows; a step
+    /// verified on an earlier iteration must stay verified.
+    #[test]
+    fn prior_verified_flags_are_sticky() {
+        let p = plan(
+            "executing",
+            &[("Propose Zerin Maluy", Some("life.observe"), "done")],
+        );
+        let v = verify_plan_steps(&p, &[], &[true]);
+        assert_eq!(v.evidence[0], StepEvidence::Verified);
+        assert!(v.contradicted_step_ids.is_empty());
+    }
+
+    /// Live 2026-09-15 13:28 UTC (bjork): a single read step whose words never
+    /// appear in `skill.list {}`. The successful listing is the outcome.
+    #[test]
+    fn read_step_verifies_on_the_successful_call_of_its_bound_tool() {
+        let p = plan(
+            "executing",
+            &[(
+                "Inspect registered skills in the hotel catalog to verify \
+                 music.repertoire-gardener configuration",
+                Some("skill.list"),
+                "done",
+            )],
+        );
+        let h = history_args(&[(
+            "skill.list",
+            serde_json::json!({}),
+            "Registered skills:\n- music.repertoire-gardener [validated] — Safely updates \
+             Jared's repertoire\n- music.weekly-practice-review [validated]",
+        )]);
+        let v = verify_plan_steps(&p, &h, &[]);
+        assert_eq!(v.evidence[0], StepEvidence::Verified);
+        assert!(v.contradicted_step_ids.is_empty());
+        assert!(evaluate_whole_plan(&p, &v).complete);
+    }
+
+    /// Live 2026-09-15 13:21 UTC (bjork): the step's words are in neither the
+    /// arguments nor the returned rows, yet the retrieval itself ran fine —
+    /// a read step has no artifact beyond "the read happened".
+    #[test]
+    fn read_step_verifies_on_a_successful_call_even_with_distinctive_text() {
+        let p = plan(
+            "executing",
+            &[(
+                "Examine local database state and confirm the batch of observations has \
+                 landed successfully",
+                Some("life.list"),
+                "done",
+            )],
+        );
+        let h = history_args(&[(
+            "life.list",
+            serde_json::json!({"include_terminal": true, "labels": ["Event", "Commitment"], "limit": 10}),
+            r#"{"data":{"as_of":"2026-09-15T13:21:11Z","count":2,"query":"filtered","read_only":true,"rows":[{"id":"life:event:jared-practice-2026-09-14"}]}}"#,
+        )]);
+        let v = verify_plan_steps(&p, &h, &[]);
+        assert_eq!(v.evidence[0], StepEvidence::Verified);
+        assert!(evaluate_whole_plan(&p, &v).complete);
+    }
+
+    /// The `life.audit` that SEEDED a gardening plan (before any tidy ran)
+    /// must not satisfy the plan's closing "re-run life.audit" step: a read
+    /// step after other steps needs a call that follows theirs.
+    #[test]
+    fn closing_read_step_needs_a_call_after_the_earlier_steps() {
+        let p = plan(
+            "executing",
+            &[
+                (
+                    "Retire duplicate life:habit:duolingo_morning (keeper \
+                     life:habit:duolingo_morning_20260812)",
+                    Some("life.tidy"),
+                    "done",
+                ),
+                (
+                    "Link life:place:home -> life:role:chief-of-staff",
+                    Some("life.tidy"),
+                    "pending",
+                ),
+                (
+                    "Re-run life.audit to measure the pass; then report the health_score delta \
+                     plus what still needs judgment.",
+                    Some("life.audit"),
+                    "pending",
+                ),
+            ],
+        );
+        let seed_audit = (
+            "life.audit",
+            serde_json::json!({}),
+            r#"{"data":{"status":"ok","health_score":12,"suggested_actions":[]}}"#,
+        );
+        let first_tidy = (
+            "life.tidy",
+            serde_json::json!({"action": {"kind": "retire_duplicate", "duplicate_id": "life:habit:duolingo_morning", "keeper_id": "life:habit:duolingo_morning_20260812"}}),
+            r#"{"status":"tidied"}"#,
+        );
+        let h = history_args(&[seed_audit.clone(), first_tidy.clone()]);
+        let v = verify_plan_steps(&p, &h, &[]);
+        assert_eq!(v.evidence[0], StepEvidence::Verified);
+        assert_eq!(v.evidence[1], StepEvidence::Missing);
+        assert_eq!(
+            v.evidence[2],
+            StepEvidence::Missing,
+            "the seeding audit predates the tidy and cannot be the re-audit"
+        );
+
+        let re_audit = (
+            "life.audit",
+            serde_json::json!({}),
+            r#"{"data":{"status":"ok","health_score":40,"suggested_actions":[]}}"#,
+        );
+        let h = history_args(&[seed_audit, first_tidy, re_audit]);
+        let v = verify_plan_steps(&p, &h, &[]);
+        assert_eq!(v.evidence[2], StepEvidence::Verified);
+    }
+
+    /// The relaxation is for READ tools only: a write step with distinctive
+    /// text still needs its words in the call, so a `life.observe` of the
+    /// wrong thing does not clear it.
+    #[test]
+    fn write_step_with_distinctive_text_still_needs_a_matching_call() {
+        let p = plan(
+            "executing",
+            &[("Log Zerin Maluy", Some("life.observe"), "done")],
+        );
+        let h = history_args(&[("life.observe", observe("Daxton Thomas"), "ok")]);
+        let v = verify_plan_steps(&p, &h, &[]);
+        assert_eq!(v.evidence[0], StepEvidence::Missing);
+        assert_eq!(v.contradicted_step_ids, vec![1]);
+    }
+
+    /// A read step is still one-to-one with calls, and a failed read is no
+    /// evidence.
+    #[test]
+    fn read_steps_stay_one_to_one_and_reject_failed_reads() {
+        let p = plan(
+            "executing",
+            &[
+                (
+                    "Verify the practice event landed",
+                    Some("life.list"),
+                    "done",
+                ),
+                (
+                    "Verify the Chopin commitment landed",
+                    Some("life.list"),
+                    "done",
+                ),
+            ],
+        );
+        let one = history_args(&[("life.list", serde_json::json!({"labels": ["Event"]}), "ok")]);
+        assert_eq!(verify_plan_steps(&p, &one, &[]).verified_count(), 1);
+
+        let failed = history_args(&[(
+            "life.list",
+            serde_json::json!({"labels": ["Event"]}),
+            "Error: runner unavailable",
+        )]);
+        assert_eq!(verify_plan_steps(&p, &failed, &[]).verified_count(), 0);
+    }
+
+    /// Live 2026-09-15 16:35 UTC: the hotel's refusal opens with prose, not
+    /// "error", and verified the plan's only step.
+    #[test]
+    fn hotel_refusal_payload_is_not_evidence() {
+        let p = plan(
+            "executing",
+            &[(
+                "Register the updated music.repertoire-gardener skill",
+                Some("skill.register"),
+                "done",
+            )],
+        );
+        let h = history_args(&[(
+            "skill.register",
+            serde_json::json!({"skill_name": "music.repertoire-gardener"}),
+            "only orchestrator or management guests may registering skills | kind=ipc_failure | \
+             code=REGISTER_FORBIDDEN | component=aiua | retryable=true",
+        )]);
+        let v = verify_plan_steps(&p, &h, &[]);
+        assert_eq!(v.evidence[0], StepEvidence::Missing);
+        assert_eq!(v.contradicted_step_ids, vec![1]);
+        assert!(!evaluate_whole_plan(&p, &v).complete);
+    }
+
+    #[test]
+    fn failed_tool_result_is_not_evidence() {
+        let p = plan(
+            "executing",
+            &[("Propose Zerin Maluy", Some("life.observe"), "done")],
+        );
+        let h = history_args(&[(
+            "life.observe",
+            observe("Zerin Maluy"),
+            "Error: runner unavailable",
+        )]);
+        let v = verify_plan_steps(&p, &h, &[]);
+        assert_eq!(v.evidence[0], StepEvidence::Missing);
+        assert_eq!(v.contradicted_step_ids, vec![1]);
+    }
+
+    /// The bundled step that started all of this.
+    #[test]
+    fn bundled_step_is_flagged_non_atomic() {
+        let p = plan(
+            "executing",
+            &[(
+                "Propose Zerin Maluy, Mali-KJerstine Althoff, and Daxton Thomas Wagner as Person nodes",
+                Some("life.observe"),
+                "done",
+            )],
+        );
+        assert_eq!(atomicity_violations(&p), vec![1]);
+
+        // Only Zerin's call ran. Evidence alone would mark the bundled step
+        // Verified and let the turn report all three as done — that is the
+        // original incident. Bundling must override the evidence.
+        let h = history_args(&[("life.observe", observe("Zerin Maluy"), "ok")]);
+        let v = verify_plan_steps(&p, &h, &[]);
+        assert_eq!(v.evidence[0], StepEvidence::Verified, "one call did match");
+
+        let c = evaluate_whole_plan(&p, &v);
+        assert!(
+            !c.complete,
+            "a bundled step must never settle the plan, however it verified"
+        );
+        assert_eq!(c.outstanding, vec![0]);
+
+        let note = plan_integrity_note(&p, &v, &c).expect("integrity note must fire");
+        assert!(note.contains("bundles several outcomes"));
+        assert!(note.contains("Split it into one step per outcome"));
+    }
+
+    #[test]
+    fn atomic_steps_are_not_flagged() {
+        let p = plan(
+            "executing",
+            &[
+                (
+                    "Propose Daxton Thomas Wagner as a Person node",
+                    None,
+                    "pending",
+                ),
+                ("Read the config and apply the fix", None, "pending"),
+            ],
+        );
+        assert!(atomicity_violations(&p).is_empty());
+    }
+
+    /// Live 2026-09-11 (Beacon morning brief): these two steps were flagged
+    /// non-atomic, could never settle, and drove four continuation turns that
+    /// re-observed the same facts. Commas that are not a list, and read-only
+    /// retrieval steps, are not bundles.
+    #[test]
+    fn date_commas_and_read_only_steps_are_not_bundles() {
+        let p = plan(
+            "executing",
+            &[
+                (
+                    "Log Jared's drive with Daxton to school on Thursday morning, 2026-09-10, as a proposed event.",
+                    Some("life.observe"),
+                    "pending",
+                ),
+                (
+                    "Retrieve oldest active open loops, aspirations, and roles to anchor the brief.",
+                    Some("life.recall"),
+                    "pending",
+                ),
+                (
+                    "List open loops, commitments, and next actions",
+                    Some("life.list"),
+                    "pending",
+                ),
+            ],
+        );
+        assert!(
+            atomicity_violations(&p).is_empty(),
+            "got {:?}",
+            atomicity_violations(&p)
+        );
+
+        // A one-step plan that verifies must then settle, so the brief does
+        // not loop on a step that cannot be split any further.
+        let single = plan(
+            "executing",
+            &[(
+                "Log Jared's drive with Daxton to school on Thursday morning, 2026-09-10, as a proposed event.",
+                Some("life.observe"),
+                "done",
+            )],
+        );
+        let h = history_args(&[("life.observe", observe("drive Daxton school"), "ok")]);
+        let v = verify_plan_steps(&single, &h, &[]);
+        assert!(evaluate_whole_plan(&single, &v).complete);
+    }
+
+    /// Live 2026-09-12 11:00 UTC: the bundled Person step that burned three
+    /// continuations. After the split, each observe settles its own item and
+    /// the plan completes on the same tool history.
+    #[test]
+    fn bundled_step_is_split_per_item_and_settles_on_per_item_evidence() {
+        let mut p = plan(
+            "executing",
+            &[
+                (
+                    "Log key contacts: Nadi, Daxton, Gabby, and Brandon as Person nodes scoped to the Chief of Staff role",
+                    Some("life.observe"),
+                    "done",
+                ),
+                (
+                    "Retrieve oldest open loops, aspirations, and roles to anchor the brief",
+                    Some("life.recall"),
+                    "pending",
+                ),
+            ],
+        );
+        let splits = split_bundled_steps(&mut p);
+        assert_eq!(
+            splits.len(),
+            1,
+            "only the observe step is bundled: {splits:?}"
+        );
+        assert_eq!(splits[0].0, 1);
+        assert_eq!(splits[0].1, vec![3, 4, 5, 6]);
+        assert_eq!(p.steps.len(), 5);
+        let descs: Vec<&str> = p.steps.iter().map(|s| s.description.as_str()).collect();
+        assert_eq!(descs[0], "Log key contacts: Nadi");
+        assert_eq!(descs[1], "Log key contacts: Daxton");
+        assert_eq!(descs[2], "Log key contacts: Gabby");
+        assert!(descs[3] == "Log key contacts: Brandon", "{}", descs[3]);
+        assert!(
+            p.steps[..4]
+                .iter()
+                .all(|s| s.status == "pending" && s.tool_name.as_deref() == Some("life.observe"))
+        );
+        assert_eq!(p.steps[4].id, 2, "unsplit steps keep their ids");
+        assert!(
+            atomicity_violations(&p).is_empty(),
+            "nothing bundled remains"
+        );
+
+        // Idempotent.
+        assert!(split_bundled_steps(&mut p).is_empty());
+
+        // Four observes, one per person, plus the recall: complete.
+        let h = history_args(&[
+            ("life.observe", observe("Nadi"), "ok"),
+            ("life.observe", observe("Daxton"), "ok"),
+            ("life.observe", observe("Gabby"), "ok"),
+            ("life.observe", observe("Brandon"), "ok"),
+            (
+                "life.recall",
+                serde_json::json!({"query_text": "open loops"}),
+                "ok",
+            ),
+        ]);
+        let v = verify_plan_steps(&p, &h, &[]);
+        let c = evaluate_whole_plan(&p, &v);
+        assert!(c.complete, "outstanding: {:?}", c.outstanding);
+
+        // Three observes only: Brandon stays outstanding, nothing else.
+        let h3 = history_args(&[
+            ("life.observe", observe("Nadi"), "ok"),
+            ("life.observe", observe("Daxton"), "ok"),
+            ("life.observe", observe("Gabby"), "ok"),
+            (
+                "life.recall",
+                serde_json::json!({"query_text": "open loops"}),
+                "ok",
+            ),
+        ]);
+        let v3 = verify_plan_steps(&p, &h3, &[]);
+        let c3 = evaluate_whole_plan(&p, &v3);
+        assert_eq!(c3.outstanding, vec![3]);
+    }
+
+    #[test]
+    fn enumerated_items_handles_bullets_and_oxford_commas() {
+        assert_eq!(
+            enumerated_items("Propose Zerin, Mali and Daxton as Person nodes"),
+            vec!["Propose Zerin", "Mali", "Daxton"]
+        );
+        assert_eq!(
+            enumerated_items("Log:\n- the run\n- the ride\n- the swim"),
+            vec!["the run", "the ride", "the swim"]
+        );
+        assert_eq!(
+            enumerated_items("Record the run and the bike ride and the swim"),
+            vec!["Record the run", "the bike ride", "the swim"]
+        );
+
+        // No colon: the verb is lifted onto every item.
+        let mut p = plan(
+            "executing",
+            &[(
+                "Propose Zerin, Mali and Daxton as Person nodes",
+                Some("life.observe"),
+                "pending",
+            )],
+        );
+        split_bundled_steps(&mut p);
+        let descs: Vec<&str> = p.steps.iter().map(|s| s.description.as_str()).collect();
+        assert_eq!(
+            descs,
+            vec!["Propose Zerin", "Propose Mali", "Propose Daxton"]
+        );
+    }
+
+    /// Live 2026-09-14 21:20 UTC: twelve retire_duplicate steps sharing every
+    /// word. Each must be credited only by the call carrying its own ids.
+    #[test]
+    fn id_bearing_steps_verify_only_against_their_own_ids() {
+        let p = plan(
+            "executing",
+            &[
+                (
+                    "Apply audit action retire_duplicate on life:open_loop:escalation-response_route_unresolved-2026-08-23 -> life:open_loop:escalation-response_route_unresolved-2026-08-26",
+                    Some("life.tidy"),
+                    "pending",
+                ),
+                (
+                    "Apply audit action retire_duplicate on life:open_loop:escalation-response_route_unresolved -> life:open_loop:escalation-response_route_unresolved-2026-08-26",
+                    Some("life.tidy"),
+                    "pending",
+                ),
+                (
+                    "Re-run life.audit to measure the pass",
+                    Some("life.audit"),
+                    "pending",
+                ),
+            ],
+        );
+        // Only the SECOND step's action ran.
+        let h = history_args(&[(
+            "life.tidy",
+            serde_json::json!({"action": {"kind": "retire_duplicate", "duplicate_id": "life:open_loop:escalation-response_route_unresolved", "keeper_id": "life:open_loop:escalation-response_route_unresolved-2026-08-26"}}),
+            "ok",
+        )]);
+        let v = verify_plan_steps(&p, &h, &[]);
+        assert_eq!(
+            v.evidence[0],
+            StepEvidence::Missing,
+            "step 1's ids are not in the call"
+        );
+        assert_eq!(v.evidence[1], StepEvidence::Verified);
+        assert_eq!(v.evidence[2], StepEvidence::Missing);
+        assert_eq!(life_ids_in(&p.steps[0].description).len(), 2);
+    }
+
+    /// Live 2026-09-15 14:10 UTC: the closing audit step ran (harness-issued,
+    /// no arguments) and still could not be credited.
+    #[test]
+    fn unique_tool_step_verifies_on_any_successful_call_of_its_tool() {
+        let p = plan(
+            "executing",
+            &[
+                (
+                    "Apply audit action retire_duplicate on life:a -> life:b",
+                    Some("life.tidy"),
+                    "done",
+                ),
+                (
+                    "Re-run life.audit to measure the pass; then report the health_score delta plus what still needs judgment.",
+                    Some("life.audit"),
+                    "pending",
+                ),
+            ],
+        );
+        let h = history_args(&[
+            (
+                "life.tidy",
+                serde_json::json!({"action": {"duplicate_id": "life:a", "keeper_id": "life:b"}}),
+                "ok",
+            ),
+            (
+                "life.audit",
+                serde_json::json!({}),
+                r#"{"data":{"health_score":58}}"#,
+            ),
+        ]);
+        let v = verify_plan_steps(&p, &h, &[]);
+        assert_eq!(
+            v.evidence,
+            vec![StepEvidence::Verified, StepEvidence::Verified]
+        );
+        assert!(evaluate_whole_plan(&p, &v).complete);
+        // Two steps binding the same tool are not both credited by one call.
+        let p2 = plan(
+            "executing",
+            &[
+                (
+                    "Re-run life.audit to measure",
+                    Some("life.audit"),
+                    "pending",
+                ),
+                ("Run life.audit again later", Some("life.audit"), "pending"),
+            ],
+        );
+        let v2 = verify_plan_steps(
+            &p2,
+            &history_args(&[("life.audit", serde_json::json!({}), "ok")]),
+            &[],
+        );
+        assert!(
+            v2.evidence
+                .iter()
+                .filter(|e| **e == StepEvidence::Verified)
+                .count()
+                <= 1
+        );
+    }
+
+    /// Live 2026-09-15 16:33 UTC: the continuation brief listed every
+    /// completed tidy with its full call payload and the model ran them all
+    /// again.
+    #[test]
+    fn continuation_brief_lists_completed_steps_without_their_call_payload() {
+        let plan = plan(
+            "executing",
+            &[
+                (
+                    "Apply audit action link on life:goal:a -> life:role:r: call life.tidy with {\"action\": {\"kind\":\"link\"}}",
+                    Some("life.tidy"),
+                    "done",
+                ),
+                (
+                    "Re-run life.audit to measure the pass",
+                    Some("life.audit"),
+                    "pending",
+                ),
+            ],
+        );
+        let carry = CarryoverPlan {
+            plan,
+            steps_done: vec![true, false],
+            verified_step_ids: vec![1],
+            stalled_continuations: 0,
+            continuations_used: 0,
+            lifetime_continuations: 0,
+            created_turn_id: "t0".into(),
+        };
+        let brief = plan_continuation_brief(&carry, 3);
+        assert!(brief.contains("Completed steps:\n- step 1 (tool: life.tidy): Apply audit action link on life:goal:a -> life:role:r\n"), "{brief}");
+        assert!(!brief.contains("call life.tidy with"), "{brief}");
+        assert!(brief.contains("Remaining steps:\n- step 2"), "{brief}");
+    }
+
+    /// Live 2026-09-15 18:30 UTC (vps, #519 build): the seeded gardening plan
+    /// had twelve link steps, all `-> life:role:chief-of-staff`; two of them
+    /// (ontology:extensions, pref-bjork-manages-musician-roles) carry no
+    /// `life:` id of their own. Ten tidies ran; plan_eval reported steps 3 and
+    /// 7 outstanding — the two whose calls had been eaten by steps 2 and 6.
+    #[test]
+    fn shared_anchor_id_does_not_prove_a_step() {
+        let subjects = [
+            "life:open_loop:escalation-duplicate_finalization-2026-08-25",
+            "ontology:extensions",
+            "life:commitment:organ-practice-2026-08-30",
+            "life:open_loop:escalation-emit_task_unserved_local_role-2026-08-26",
+            "life:open_loop:escalation-gemini-5xx-2026-08-26",
+            "pref-bjork-manages-musician-roles",
+            "life:goal:help_daxton_eagle_scout",
+            "life:person:zerin_maluy_likes",
+            "life:person:xanthos_gabriel_wagner_likes",
+            "life:person:mali_kjerstine_althoff_likes",
+            "life:goal:daxton_eagle_scout",
+            "life:routine:nightly_piano_practice",
+        ];
+        let action = |id: &str| serde_json::json!({"action": {"from_id": id, "kind": "link", "reason": "orphan: attach to the operator's anchor role so it is reachable", "rel_type": "SCOPED_TO", "to_id": "life:role:chief-of-staff"}});
+        let mut steps: Vec<(String, Option<&str>, &str)> = subjects
+            .iter()
+            .map(|id| {
+                (
+                    format!(
+                        "Apply audit action link on {id} -> life:role:chief-of-staff: call life.tidy with {}",
+                        action(id)
+                    ),
+                    Some("life.tidy"),
+                    "pending",
+                )
+            })
+            .collect();
+        steps.push((
+            "Re-run life.audit to measure the pass (health_score 61 before); then report the health_score delta plus what still needs judgment.".into(),
+            Some("life.audit"),
+            "pending",
+        ));
+        let step_refs: Vec<(&str, Option<&str>, &str)> =
+            steps.iter().map(|(d, t, s)| (d.as_str(), *t, *s)).collect();
+        let p = plan("executing", &step_refs);
+        // The ten calls the model made, in the live order (steps 2 and 6 skipped).
+        let called = [0, 2, 3, 4, 6, 7, 8, 9, 10, 11];
+        let history: Vec<(&str, serde_json::Value, &str)> = called
+            .iter()
+            .map(|i| {
+                (
+                    "life.tidy",
+                    action(subjects[*i]),
+                    r#"{"data":{"status":"tidied"}}"#,
+                )
+            })
+            .collect();
+        let h = history_args(&history);
+        let v = verify_plan_steps(&p, &h, &[]);
+        let verified: Vec<usize> = (0..13)
+            .filter(|i| v.evidence[*i] == StepEvidence::Verified)
+            .collect();
+        assert_eq!(verified, called.to_vec(), "{:?}", v.evidence);
+        // Incremental latching (one call at a time, prior flags carried) must
+        // agree with the batch verdict — the live in-turn latch said 13/13.
+        let mut flags = vec![false; 13];
+        for k in 1..=h.len() {
+            flags = verify_plan_steps(&p, &h[..k], &flags).verified_flags();
+        }
+        let latched: Vec<usize> = (0..13).filter(|i| flags[*i]).collect();
+        assert_eq!(latched, called.to_vec());
+    }
+
+    /// DEF-154 replay, live 2026-09-16 19:38 UTC.
+    #[test]
+    fn prose_steps_are_not_split_and_reply_bound_steps_are_unbound() {
+        let mut p = plan(
+            "executing",
+            &[
+                (
+                    "Fetch all proposed nodes from the LifeGraph.",
+                    Some("life.list"),
+                    "done",
+                ),
+                (
+                    "Render a clean, structured review grouped by type with individual and batch validation mechanisms.",
+                    None,
+                    "pending",
+                ),
+                (
+                    "Render a clean review interface.",
+                    Some("text.generate"),
+                    "done",
+                ),
+            ],
+        );
+        assert!(
+            atomicity_violations(&p).is_empty(),
+            "{:?}",
+            atomicity_violations(&p)
+        );
+        assert!(split_bundled_steps(&mut p).is_empty());
+        assert_eq!(p.steps.len(), 3);
+        assert_eq!(unbind_reply_pseudo_tools(&mut p), vec![3]);
+        assert!(p.steps[2].tool_name.is_none());
+        assert_eq!(p.steps[0].tool_name.as_deref(), Some("life.list"));
+        // Unbound and claimed done, the reply step settles; the plan completes.
+        let h = history_args(&[(
+            "life.list",
+            serde_json::json!({"validation_states": ["proposed"]}),
+            r#"{"data":{"count":50}}"#,
+        )]);
+        p.steps[1].status = "done".into();
+        let v = verify_plan_steps(&p, &h, &[]);
+        assert!(evaluate_whole_plan(&p, &v).complete, "{:?}", v.evidence);
+    }
+
+    #[test]
+    fn real_enumerations_are_still_bundles() {
+        let p = plan(
+            "executing",
+            &[
+                (
+                    "Propose Zerin, Mali and Daxton as Person nodes",
+                    Some("life.observe"),
+                    "pending",
+                ),
+                (
+                    "Record the run and the bike ride and the swim",
+                    Some("life.observe"),
+                    "pending",
+                ),
+                (
+                    "Log:\n- the run\n- the ride\n- the swim",
+                    Some("life.observe"),
+                    "pending",
+                ),
+                // Same enumeration on a read-only tool is fine: one recall
+                // covers every topic it names.
+                (
+                    "Recall Zerin, Mali and Daxton",
+                    Some("life.recall"),
+                    "pending",
+                ),
+            ],
+        );
+        assert_eq!(atomicity_violations(&p), vec![1, 2, 3]);
+    }
+
+    // ── Plan-by-default gate ────────────────────────────────────────────
+
+    /// Live 2026-09-11 18:23 UTC: the outcome report that got congratulations
+    /// instead of a plan.
+    #[test]
+    fn outcome_reports_are_detected() {
+        for msg in [
+            "i gave my icebreaker speech in toastmasters today! and i did ok. nadi came in support.",
+            "finished the expense reports",
+            "delta tickets purchased for utah trip: 28 sept - 4 october",
+            "daxton's teacher got him back into the gsu class",
+            "passport renewed and received",
+        ] {
+            assert!(reports_an_outcome(msg), "should read as an outcome: {msg}");
+        }
+        for msg in [
+            "can you remind me to finish the report tomorrow?",
+            "going for a run tonight.",
+            "did i finish the report?",
+            "i will give my speech on friday",
+            "thanks!",
+            "i haven't received the passport yet",
+            "thanks bjork, i really appreciate it. looks like you're working pretty well now.",
+        ] {
+            assert!(
+                !reports_an_outcome(msg),
+                "should NOT read as an outcome: {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn plan_worthy_statements_exclude_questions() {
+        assert!(is_plan_worthy_statement(
+            "please update the MRI commitment and confirm it"
+        ));
+        assert!(is_plan_worthy_statement(
+            "On the open loops:\n1 - I am still working on the icebreaker speech\n2 - Daxton's teacher got him back into the GSU class"
+        ));
+        assert!(!is_plan_worthy_statement("what's on my plate today?"));
+        assert!(!is_plan_worthy_statement("can you show me my open loops?"));
+        assert!(!is_plan_worthy_statement("ok"));
+    }
+
+    #[test]
+    fn trivial_chat_does_not_get_a_plan() {
+        // Real messages from the session that motivated this change.
+        for msg in [
+            "Going for a run tonight.",
+            "Kelley and I are watching The Bear - fourth season 😉",
+            "ok",
+            "Chef! 🫡",
+            // Substring collisions: these contain "get"/"plan"/"set" inside
+            // longer words and must not trip the request markers.
+            "forget it",
+            "we came in over budget",
+            "planning to relax tonight",
+            "the sunset was unreal",
+        ] {
+            assert!(!should_plan(msg), "should not plan: {msg}");
+        }
+    }
+
+    #[test]
+    fn requests_and_multi_fact_statements_get_a_plan() {
+        for msg in [
+            "let's get all my children added 🙂",
+            "do we have my children in my lifegraph?",
+            "So I do need to make sure that I remember my vacuuming chore every night. \
+             I am working on Beethoven's Moonlight Sonata (specifically the 3rd movement). \
+             I went into the office today but i feel bad for doing it",
+            "can you record this for me",
+        ] {
+            assert!(should_plan(msg), "should plan: {msg}");
+        }
+    }
+
+    /// The live 2026-08-27 habit incident: a short single-sentence message
+    /// with no request-marker word and no `?` enumerated five habits — it got
+    /// no plan, only the first item was captured, and the operator had to ask
+    /// six times. Two or more separators means several distinct items.
+    #[test]
+    fn short_enumerations_get_a_plan() {
+        for msg in [
+            "more habits that i am building: duolingo morning and evening, \
+             morning supplements and evening, reading before bed.",
+            "my current systems: morning pages, duolingo, evening reading",
+        ] {
+            assert!(should_plan(msg), "should plan: {msg}");
+        }
+        // A single "and"/comma is still conversation, not an enumeration.
+        assert!(!should_plan(
+            "Kelley and I are watching The Bear - fourth season 😉"
+        ));
+    }
+
+    // ── Re-entry hint ───────────────────────────────────────────────────
+
+    fn turn_with(plan: Option<ActivePlan>, history: Vec<(ToolCall, ToolResult)>) -> WorkingTurn {
+        let mut turn = WorkingTurn::for_plan_tests();
+        turn.plan_steps_verified = vec![false; plan.as_ref().map(|p| p.steps.len()).unwrap_or(0)];
+        turn.active_plan = plan;
+        turn.working_tool_history = history;
+        turn.started_at_unix = Some(unix_now());
+        turn
+    }
+
+    /// The regression that matters: with a step still unverified, the hint must
+    /// not license bailing out to the user with a receipt.
+    #[test]
+    fn hint_pushes_the_turn_to_keep_going_when_work_remains() {
+        let p = plan(
+            "executing",
+            &[
+                ("Propose Zerin Maluy", Some("life.observe"), "done"),
+                ("Propose Daxton Thomas Wagner", Some("life.observe"), "done"),
+            ],
+        );
+        let h = history_args(&[("life.observe", observe("Zerin Maluy"), "ok")]);
+        let hint = reentry_hint(&turn_with(Some(p), h));
+
+        assert!(hint.contains("1/2 plan steps verified"));
+        assert!(hint.contains("Daxton"));
+        assert!(hint.contains("Execute the next outstanding step now"));
+        assert!(hint.contains("do not hand the plan back to the user between steps"));
+        // The old escape hatch must be gone.
+        assert!(!hint.contains("or respond to the user if"));
+    }
+
+    /// But a genuine blocker still has somewhere to go — otherwise the turn
+    /// just burns iterations into the cap.
+    #[test]
+    fn hint_keeps_an_exit_for_work_that_needs_the_user() {
+        let p = plan(
+            "executing",
+            &[(
+                "Propose Daxton Thomas Wagner",
+                Some("life.observe"),
+                "pending",
+            )],
+        );
+        let hint = reentry_hint(&turn_with(Some(p), vec![]));
+        assert!(hint.contains("cannot proceed without the user"));
+        assert!(hint.contains("name the step it blocks"));
+    }
+
+    #[test]
+    fn hint_releases_the_turn_once_everything_is_verified() {
+        let p = plan(
+            "executing",
+            &[("Propose Zerin Maluy", Some("life.observe"), "done")],
+        );
+        let h = history_args(&[("life.observe", observe("Zerin Maluy"), "ok")]);
+        let hint = reentry_hint(&turn_with(Some(p), h));
+        assert!(hint.contains("Deliver your final response to the user now"));
+        assert!(hint.contains("Do not call any more tools"));
+    }
+
+    #[test]
+    fn hint_stops_the_turn_when_the_wall_clock_budget_is_spent() {
+        let p = plan(
+            "executing",
+            &[(
+                "Propose Daxton Thomas Wagner",
+                Some("life.observe"),
+                "pending",
+            )],
+        );
+        let mut turn = turn_with(Some(p), vec![]);
+        turn.started_at_unix = Some(unix_now() - PLAN_EXECUTION_BUDGET_SECS - 1);
+        let hint = reentry_hint(&turn);
+        assert!(hint.contains("wall-clock budget"));
+        assert!(hint.contains("Stop calling tools and reply now"));
+        assert!(hint.contains("Never claim an artifact exists"));
+    }
+
+    #[test]
+    fn execution_budget_binds_only_after_the_window() {
+        assert!(!plan_execution_budget_exhausted(Some(1_000), 1_000));
+        assert!(!plan_execution_budget_exhausted(
+            Some(1_000),
+            1_000 + PLAN_EXECUTION_BUDGET_SECS - 1
+        ));
+        assert!(plan_execution_budget_exhausted(
+            Some(1_000),
+            1_000 + PLAN_EXECUTION_BUDGET_SECS
+        ));
+        // Budget must leave room to compose a reply before the reaper fires.
+        assert!(PLAN_EXECUTION_BUDGET_SECS + 60 <= TURN_ZOMBIE_REAP_SECS);
+        // Unknown start time fails open rather than truncating every turn.
+        assert!(!plan_execution_budget_exhausted(None, u64::MAX));
     }
 }

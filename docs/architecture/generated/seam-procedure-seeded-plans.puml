@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - procedure-seeded-plans
+
+rectangle "procedure-seeded-plans" as procedure_seeded_plans #Orange {
+}
+
+
+@enduml

@@ -1,8 +1,12 @@
 pub mod blob;
+pub mod blob_transfer;
+pub mod command_manifest;
+pub mod continuity;
 pub mod cron_ticker;
 pub mod egress;
 pub mod execution_transport;
 pub mod golgi;
+pub mod governed_http;
 pub mod guest_manager;
 pub mod host_health_scan;
 pub mod ipc;

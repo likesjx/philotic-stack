@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - cypher-classifier-wall
+
+rectangle "cypher-classifier-wall" as cypher_classifier_wall #Orange {
+}
+
+
+@enduml

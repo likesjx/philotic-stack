@@ -97,6 +97,7 @@ dependencies = [
  "base64 0.22.1",
  "blake3",
  "chrono",
+ "chrono-tz",
  "clap",
  "ed25519-dalek",
  "hex",
@@ -104,6 +105,7 @@ dependencies = [
  "parakeet-runner",
  "perimeter-core",
  "philotic-client",
+ "prompt-guard",
  "rand 0.8.5",
  "reqwest",
  "rusqlite",
@@ -118,6 +120,7 @@ dependencies = [
  "tracing-subscriber",
  "uuid",
  "webrtc",
+ "zeroize",
 ]
 
 [[package]]
@@ -159,6 +162,7 @@ dependencies = [
  "ulid",
  "uuid",
  "x25519-dalek",
+ "zeroize",
 ]
 
 [[package]]
@@ -1176,6 +1180,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "chrono",
+ "chrono-tz",
  "datasource",
  "futures",
  "neo4rs",
@@ -1220,6 +1225,19 @@ name = "deadpool-runtime"
 version = "0.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "092966b41edc516079bdf31ec78a2e0588d1d0c08f78b91d8307215928642b2b"
+
+[[package]]
+name = "decisions-client"
+version = "0.1.0"
+dependencies = [
+ "ansible-mesh-core",
+ "anyhow",
+ "philotic-client",
+ "regex",
+ "reqwest",
+ "serde_json",
+ "tokio",
+]
 
 [[package]]
 name = "delegate"
@@ -1450,6 +1468,22 @@ dependencies = [
  "sha2",
  "subtle",
  "zeroize",
+]
+
+[[package]]
+name = "egress-http-runner"
+version = "0.1.0"
+dependencies = [
+ "ansible-mesh-core",
+ "anyhow",
+ "philotic-client",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
 ]
 
 [[package]]
@@ -1940,13 +1974,16 @@ version = "0.1.0"
 dependencies = [
  "ansible-mesh-core",
  "anyhow",
+ "decisions-client",
  "philotic-client",
  "reqwest",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "ulid",
 ]
 
 [[package]]
@@ -2731,13 +2768,15 @@ version = "0.1.0"
 dependencies = [
  "ansible-mesh-core",
  "anyhow",
+ "async-trait",
  "philotic-client",
- "reqwest",
  "serde",
  "serde_json",
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "url",
+ "uuid",
 ]
 
 [[package]]
@@ -2872,6 +2911,7 @@ dependencies = [
  "base64 0.22.1",
  "clap",
  "datasource",
+ "decisions-client",
  "futures",
  "media-codec",
  "media-prep",
@@ -3391,12 +3431,15 @@ dependencies = [
  "ansible-mesh-core",
  "anyhow",
  "chrono",
+ "chrono-tz",
  "clap",
  "data-memorygraphrag",
  "exec-guard",
  "media-prep",
  "memory-core",
  "philotic-client",
+ "prompt-guard",
+ "regex",
  "reqwest",
  "serde",
  "serde_json",
@@ -3654,6 +3697,14 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8fd00f0bb2e90d81d1044c2b32617f68fcb9fa3bb7640c23e9c748e53fb30934"
 dependencies = [
  "unicode-ident",
+]
+
+[[package]]
+name = "prompt-guard"
+version = "0.1.0"
+dependencies = [
+ "exec-guard",
+ "regex",
 ]
 
 [[package]]

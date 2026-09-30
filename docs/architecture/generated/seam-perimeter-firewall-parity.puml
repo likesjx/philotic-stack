@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - perimeter-firewall-parity
+
+rectangle "perimeter-firewall-parity" as perimeter_firewall_parity #Orange {
+}
+
+
+@enduml

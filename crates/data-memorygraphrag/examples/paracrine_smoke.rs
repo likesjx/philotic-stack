@@ -97,9 +97,9 @@ async fn main() -> anyhow::Result<()> {
     println!("✓ Signal node written: id={written_id}");
 
     // Verify node is readable back
-    let verify_q = neo_query(&format!(
-        "MATCH (n:Signal {{id: $id}}) RETURN n.validation_state AS vs, n.claim_summary AS cs"
-    ))
+    let verify_q = neo_query(
+        "MATCH (n:Signal {id: $id}) RETURN n.validation_state AS vs, n.claim_summary AS cs",
+    )
     .param("id", compiled.node_id.as_str());
 
     let mut verify_rows = graph.execute(verify_q).await?;

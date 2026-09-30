@@ -1,5 +1,5 @@
-use anyhow::{anyhow, Context, Result};
 use ansible_mesh_core::mcp_upstream::{McpEgressPolicy, McpStdioAllowEntry, McpStdioAllowlist};
+use anyhow::{anyhow, Context, Result};
 use clap::Subcommand;
 use philotic_client::{GuestIdentity, IpcRequest, IpcResponse, PhiloticClient};
 use std::path::{Path, PathBuf};
@@ -248,7 +248,13 @@ async fn upstreams() -> Result<()> {
                 let (state, projected, stale) = entry
                     .catalog
                     .as_ref()
-                    .map(|c| (format!("{:?}", c.state), c.tools.len(), c.stale_grants.len()))
+                    .map(|c| {
+                        (
+                            format!("{:?}", c.state),
+                            c.tools.len(),
+                            c.stale_grants.len(),
+                        )
+                    })
                     .unwrap_or_else(|| ("Pending".into(), 0, 0));
                 println!(
                     "{}  owner={}  [{}]  projected={} stale={}\n    {}",

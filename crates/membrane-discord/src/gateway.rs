@@ -65,6 +65,11 @@ fn should_discard_resume(http_4xx: bool, consecutive_failures: u32) -> bool {
 
 /// Events dispatched from the gateway loop to the main seat loop.
 #[derive(Debug)]
+// Mirrors Discord's gateway wire format. session_id/resume_url are decoded and
+// carried but not yet consumed — this client reconnects fresh rather than
+// issuing RESUME. Keeping them typed documents the payload and makes adding
+// RESUME a local change; `d` is the raw body of an event we do not model.
+#[allow(dead_code)]
 pub enum GatewayEvent {
     Ready {
         bot_user_id: String,
@@ -81,12 +86,6 @@ pub enum GatewayEvent {
         t: String,
         d: Value,
     },
-}
-
-/// Internal control messages to the gateway task.
-#[derive(Debug)]
-enum GatewayControl {
-    Reconnect,
 }
 
 /// Run the Discord Gateway WebSocket connection.
@@ -205,7 +204,7 @@ async fn connect_and_identify(
     };
 
     write
-        .send(Message::Text(identify_payload.to_string().into()))
+        .send(Message::Text(identify_payload.to_string()))
         .await?;
 
     let mut heartbeat_interval = interval(Duration::from_millis(heartbeat_interval_ms));
@@ -220,7 +219,7 @@ async fn connect_and_identify(
             // Heartbeat tick
             _ = heartbeat_interval.tick() => {
                 let hb = json!({ "op": 1, "d": current_sequence });
-                if let Err(e) = write.send(Message::Text(hb.to_string().into())).await {
+                if let Err(e) = write.send(Message::Text(hb.to_string())).await {
                     warn!("Gateway heartbeat send failed: {}", e);
                     return Ok(GatewayExitReason::Reconnect);
                 }
@@ -350,7 +349,7 @@ async fn connect_and_identify(
                     1 => {
                         // Heartbeat request — respond immediately
                         let hb = json!({ "op": 1, "d": current_sequence });
-                        let _ = write.send(Message::Text(hb.to_string().into())).await;
+                        let _ = write.send(Message::Text(hb.to_string())).await;
                     }
 
                     7 => {
@@ -375,8 +374,8 @@ async fn connect_and_identify(
                         let resumable = payload["d"].as_bool().unwrap_or(false);
                         warn!("Gateway: invalid session (resumable={})", resumable);
                         sleep(Duration::from_secs(if resumable { 1 } else { 5 })).await;
-                        if resumable {
-                            if let (Some(sid), Some(rurl), Some(seq)) =
+                        if resumable
+                            && let (Some(sid), Some(rurl), Some(seq)) =
                                 (current_session_id, current_resume_url, current_sequence)
                             {
                                 return Ok(GatewayExitReason::CleanResume {
@@ -387,7 +386,6 @@ async fn connect_and_identify(
                                     },
                                 });
                             }
-                        }
                         return Ok(GatewayExitReason::Reconnect);
                     }
 

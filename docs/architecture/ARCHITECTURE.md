@@ -3,7 +3,7 @@ title: Philotic Stack Architecture Reference
 doc_type: reference
 domain: runtime-sessions
 status: active
-last_updated: 2026-07-14
+last_updated: 2026-09-18
 tags:
 - runtime
 - reference
@@ -11,12 +11,17 @@ tags:
 - ipc
 - mesh
 - memory
+- integrations
+- egress
 related_docs:
 - README.md
 - ARCHITECTURE_STATUS.md
 - PORT_BLUEPRINT.md
 - KNOWLEDGE_ARCHITECTURE_PROPOSAL.md
 - MEMORY_TRANSPARENCY_PROPOSAL.md
+- OUTBOUND_INTEGRATIONS.md
+- OUTBOUND_INTEGRATION_FABRIC_PROPOSAL.md
+- MCP_CLIENT_FABRIC_PROPOSAL.md
 task_refs:
 - docs/task.md
 tracks_domains:
@@ -30,7 +35,7 @@ tracks_domains:
 
 # Philotic Stack — Architecture Reference
 
-> **Status:** Living Document | **Last Updated:** 2026-03-12
+> **Status:** Living Document | **Last Updated:** 2026-09-18
 
 This document describes the full runtime architecture of the Philotic Stack —
 a distributed AI agent operating system built in Rust. It is built around a powerful and intuitive **Hotel & Guest** metaphor. It covers The Hotel daemon (the orchestrator), all crates, all materialized Guest processes (the agents and gateways), the IPC and mesh transports,
@@ -44,6 +49,14 @@ work. For a legacy/transitional snapshot of current implementation status, use
 Generated UML/PlantUML diagrams for the graph-visible hierarchy live under
 `docs/architecture/generated/` and should be treated as derived views.
 
+Desktop operator access separates website identity and current MongoDB admin
+authority from hotel-owned sessions. A confidential gateway attests account-bound
+invite admission and obtains a short-lived, non-root hotel session; browser
+requests cannot supply that upstream credential. Both authorities are checked
+again during access. The [desktop gateway contract](../../crates/philotic-web/DESKTOP_GATEWAY.md)
+defines this boundary and its deployment gates; local integration tests are not
+proof that the public tunnel is enabled or production login is verified.
+
 ---
 
 ## Table of Contents
@@ -56,6 +69,7 @@ Generated UML/PlantUML diagrams for the graph-visible hierarchy live under
 6. [Client SDK — `crates/philotic-client`](#6-client-sdk--cratesphilotic-client)
 7. [Intra-Hotel IPC (Unix Domain Sockets)](#7-intra-hotel-ipc-unix-domain-sockets)
 8. [Inter-Hotel Mesh (Control Plane) and Execution Transport (Data Plane)](#8-inter-hotel-mesh-control-plane-and-execution-transport-data-plane)
+   - [Governed Outbound Integration Fabric](#88-governed-outbound-integration-fabric)
 9. [Storage Layer — Traits and Implementations](#9-storage-layer--traits-and-implementations)
 10. [Session Authority And Derived State Sync](#10-session-authority-and-derived-state-sync)
 11. [Guest Lifecycle — Materialization & Supervision](#11-guest-lifecycle--materialization--supervision)
@@ -116,6 +130,8 @@ Generated UML/PlantUML diagrams for the graph-visible hierarchy live under
 | `membrane-*`        | Protocol gateway guests (Telegram, Discord, MCP)             |
 | `philote`           | Persona/agent cognitive loop guest binary                    |
 | `model-router`      | Shared LLM inference routing SDK and provider controllers     |
+| `membrane-mcp-client` | Outgoing MCP protocol manager; delegates HTTP wire exchange to governed egress |
+| `egress-http-runner` | Binding-scoped HTTP executor with vault injection, placement, limits, and audit |
 | `philotic-web`      | Desktop operator surface (Next.js)                           |
 | `tool-runner`       | Workspace tool executor guest                                |
 | `agent-datasource`  | Per-agent cognitive graph partition datasource               |
@@ -447,6 +463,34 @@ The **Whisper Protocol** provides local paracrine dispatch for cooperative, conc
 - **Lookaside Reflex**: Solves immediate query routing by checking local capability indexes before falling back to external mesh dispatch.
 - **Membrane Attribution**: Ensures incoming events carry proper trace metadata detailing which gateway membrane or peer ingress received the request.
 - **ReturnRoute**: Keeps track of final response routing paths (`final_reply_guest_id`) so results can flow cleanly back through the exact same UDS connection and model router instance.
+
+### 8.8 Governed Outbound Integration Fabric
+
+Philotes receive binding-scoped tools, not ambient network access. The source
+hotel owns grants, projection, and placement. The selected execution hotel owns
+the final network hop, credential lookup, and content-free audit.
+
+Two materialized guests divide protocol from I/O:
+
+- `mcp-client-runner` owns MCP discovery, schemas, grants, allotments, and
+  local stdio lifecycle;
+- `egress-http-runner` owns HTTP validation, DNS/IP policy, resource limits,
+  credential injection, response sanitization, and external execution.
+
+The router is the control and placement plane, not a universal byte proxy.
+`vps-jane` is selected only when a binding prefers or requires it; specialized
+model, membrane, and local-service traffic retains its existing owner.
+
+Operator OIDC back-channel traffic uses a distinct local-only binding:
+`philotic-web` retains browser state, PKCE, identity linking, and session
+issuance, while the hotel and `egress-http-runner` own provider endpoints,
+client-secret resolution, token exchange, userinfo retrieval, claims
+allowlisting, and content-free per-leg audits. Access and refresh tokens never
+return to the web process or cross the mesh.
+
+For the authority map, canonical records, placement and failure semantics,
+runtime paths, and rendered sequence diagrams, see
+[OUTBOUND_INTEGRATIONS.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/OUTBOUND_INTEGRATIONS.md).
 
 ---
 

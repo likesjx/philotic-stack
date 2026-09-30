@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - eventkit-lifegraph-sync
+
+rectangle "eventkit-lifegraph-sync" as eventkit_lifegraph_sync #Orange {
+}
+
+
+@enduml

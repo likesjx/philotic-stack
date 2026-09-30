@@ -1,5 +1,7 @@
+---
 name: verification-orchestrator
 description: Coordinate the verification pipeline across proposals and seams. Track test coverage, manage SVER state transitions, and ensure verification claims match actual test results. Use when advancing proposals through the verification ladder.
+---
 
 # Verification Orchestrator
 

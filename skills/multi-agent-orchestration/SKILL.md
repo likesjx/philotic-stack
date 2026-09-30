@@ -1,5 +1,7 @@
+---
 name: multi-agent-orchestration
 description: Spin up multiple agents with different canonical profiles on the same workstream. Coordinate implementer, orchestrator, reviewer, and verifier agents working together.
+---
 
 # Multi-Agent Orchestration
 

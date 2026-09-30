@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - execution-plane-connection-hardening
+
+rectangle "execution-plane-connection-hardening" as execution_plane_connection_hardening #Orange {
+}
+
+
+@enduml

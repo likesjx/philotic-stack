@@ -51,7 +51,7 @@ pub fn scan_docs(root: &Path, engine: &GraphEngine) -> Result<usize> {
             for entry in WalkDir::new(&dir)
                 .into_iter()
                 .filter_map(|e| e.ok())
-                .filter(|e| e.path().extension().map_or(false, |ext| ext == "md"))
+                .filter(|e| e.path().extension().is_some_and(|ext| ext == "md"))
             {
                 md_files.push(entry.path().to_path_buf());
             }
@@ -62,7 +62,7 @@ pub fn scan_docs(root: &Path, engine: &GraphEngine) -> Result<usize> {
     if let Ok(entries) = fs::read_dir(root) {
         for entry in entries.filter_map(|e| e.ok()) {
             let path = entry.path();
-            if path.extension().map_or(false, |ext| ext == "md") && path.is_file() {
+            if path.extension().is_some_and(|ext| ext == "md") && path.is_file() {
                 md_files.push(path);
             }
         }
@@ -618,7 +618,7 @@ fn parse_task_items(body: &str, engine: &GraphEngine) -> Result<()> {
         // Match bulleted or numbered items
         let is_task = trimmed.starts_with("- [")
             || trimmed.starts_with("* [")
-            || (trimmed.len() > 2 && trimmed.chars().next().map_or(false, |c| c.is_ascii_digit()));
+            || (trimmed.len() > 2 && trimmed.chars().next().is_some_and(|c| c.is_ascii_digit()));
 
         if is_task {
             task_idx += 1;
@@ -683,8 +683,7 @@ fn doc_identity_stem(file_path: &Path) -> String {
 
 fn slugify(s: &str) -> String {
     s.to_lowercase()
-        .replace(' ', "-")
-        .replace('_', "-")
+        .replace([' ', '_'], "-")
         .chars()
         .filter(|c| c.is_alphanumeric() || *c == '-')
         .collect()

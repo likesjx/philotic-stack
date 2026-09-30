@@ -17,6 +17,15 @@ pub struct HealQueueRow {
     pub pattern_tag: Option<String>,
     pub heal_action: Option<String>,
     pub outcome: Option<String>,
+    /// How many detections this row stands for: 1 at insert, bumped each time
+    /// flood control collapses a repeat into it (so the collapse no longer
+    /// loses the count). Older peers omit it.
+    #[serde(default = "one")]
+    pub occurrences: u32,
+}
+
+fn one() -> u32 {
+    1
 }
 
 // ── Heal work items (Autopoiesis Slice A3) ───────────────────────────────────
@@ -123,6 +132,40 @@ pub const DEFAULT_ABANDON_CEILING_SECS: u64 = 3 * 24 * 3600;
 /// policy (distinct from operator/dispatcher `resolved`).
 pub const HEAL_STATUS_ABANDONED: &str = "abandoned";
 
+/// Terminal status for a row whose only action was to escalate to a human or
+/// an agent role — i.e. the fault was reported, **not repaired**.
+///
+/// DEF-070: this used to be written as `resolved`. On mbp-jane a dead muninn
+/// filed 919 `service_probe_failed:muninn` rows over three days and 918 of them
+/// were stamped `resolved` — the ledger claimed success for a fault that was
+/// still burning, and nothing surfaced the difference. Fleet-wide the ledger
+/// read 1426 `escalated` against exactly 4 `restarted`.
+///
+/// `escalated` is terminal for dispatch purposes (the dispatcher must never
+/// re-pick the row, or the 5-minute cadence simply returns under a new name)
+/// but is deliberately NOT `resolved`, so "reported" and "fixed" can be told
+/// apart by `phil doctor`, dashboards, and anyone reading the table.
+pub const HEAL_STATUS_ESCALATED: &str = "escalated";
+
+/// Terminal status for an escalation closed by the stale sweep because its
+/// `(guest_id, pattern_tag)` stopped recurring. Deliberately neither `resolved`
+/// (nothing was repaired — DEF-070) nor `escalated` (nobody needs to look now).
+/// See [`HealQueueStorage::close_stale_escalations`].
+pub const HEAL_STATUS_STALE: &str = "stale";
+
+/// Map a dispatcher outcome string to the terminal status it earns.
+///
+/// Only outcomes that actually *repaired* something may claim `resolved`.
+/// Escalation is a hand-off, so it gets [`HEAL_STATUS_ESCALATED`]. The
+/// dispatcher has historically emitted both `escalate` (the action name) and
+/// `escalated` (the past-tense outcome) into this column, so both are matched.
+pub fn terminal_status_for_outcome(outcome: &str) -> &'static str {
+    match outcome.trim() {
+        "escalate" | "escalated" => HEAL_STATUS_ESCALATED,
+        _ => "resolved",
+    }
+}
+
 /// Cheap, allocation-light dedup key for a raw guest-stderr line: the first
 /// line only, lowercased, with every run of ASCII digits collapsed to a single
 /// `#`. This makes a crash-looping guest's near-identical repeats (which differ
@@ -148,6 +191,39 @@ pub fn stderr_dedup_key(raw_text: &str) -> String {
     }
     out
 }
+
+/// Remove ANSI terminal escape sequences (`ESC [ … final-byte`, and a bare
+/// `ESC x` pair). Guest stderr arrives colourised by `tracing`'s terminal
+/// formatter, so rows read `^[[2m2026-…^[[0m ^[[31mERROR^[[0m …` — noise for
+/// operators, for the dedup key, and for any classifier the text is sent to.
+pub fn strip_ansi(text: &str) -> std::borrow::Cow<'_, str> {
+    if !text.contains('\u{1b}') {
+        return std::borrow::Cow::Borrowed(text);
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars();
+    while let Some(ch) = chars.next() {
+        if ch != '\u{1b}' {
+            out.push(ch);
+            continue;
+        }
+        // CSI: parameters/intermediates until a final byte in '@'..='~'. Any
+        // other escape is a two-character pair, dropped with the ESC.
+        if chars.next() == Some('[') {
+            for c in chars.by_ref() {
+                if ('@'..='~').contains(&c) {
+                    break;
+                }
+            }
+        }
+    }
+    std::borrow::Cow::Owned(out)
+}
+
+/// Default age after which an `escalated` row whose `(guest_id, pattern_tag)`
+/// has not recurred is closed by the stale sweep. See
+/// [`HealQueueStorage::close_stale_escalations`].
+pub const DEFAULT_STALE_ESCALATION_SECS: u64 = 48 * 3600;
 
 /// Cap a turn-failure raw line to [`MAX_TURN_FAILURE_RAW_BYTES`], truncating
 /// on a char boundary with a truncation marker.
@@ -412,7 +488,15 @@ pub fn heal_action_for_pattern_tag(tag: &str) -> &'static str {
         // self-heal re-probe hasn't recovered it) is an availability gap the
         // operator should see; restarting the guest just re-runs the same
         // stand-down. The lease_held case usually self-heals in ≤3 min.
-        | "seat_stood_down" => "escalate",
+        | "seat_stood_down"
+        // Tags the decisions fallback can assign to otherwise-unclassified
+        // stderr (heal-dispatcher `FALLBACK_TAGS`): a second poller on a bot
+        // token and a missing/invalid credential both need an operator; a
+        // restart re-runs the same failure.
+        | "telegram_poll_conflict"
+        | "config_error" => "escalate",
+        // Retry notices and expected noise: visible in the ledger, no action.
+        "benign_log" => "noop",
         // An alive-but-wedged guest (open socket, undrained outbound backlog)
         // IS fixed by a restart: respawn → resubscribe → drain resumes. The
         // hotel's shared respawn budget rate-limits this, so a flapping guest
@@ -454,9 +538,16 @@ pub trait HealQueueStorage: Send + Sync {
         pattern_tag: &str,
         heal_action: &str,
     ) -> Result<()>;
+    /// Stamp a terminal status + outcome on a row.
+    ///
+    /// The status is derived from `outcome` via
+    /// [`terminal_status_for_outcome`]: escalate-only outcomes become
+    /// [`HEAL_STATUS_ESCALATED`] rather than `resolved`, so a fault that was
+    /// merely reported is never recorded as fixed (DEF-070).
     fn resolve(&self, id: &str, outcome: &str) -> Result<()>;
-    /// Delete terminal rows (`resolved` **and** `abandoned`) older than
-    /// `older_than_secs`. Pending/assigned rows are never touched here.
+    /// Delete terminal rows (`resolved`, `abandoned` **and** `escalated`)
+    /// older than `older_than_secs`. Pending/assigned rows are never touched
+    /// here.
     fn vacuum_old(&self, older_than_secs: u64) -> Result<usize>;
     /// Secondary vacuum policy (F10): force-resolve `pending`/`assigned` rows
     /// older than `pending_ceiling_secs` to [`HEAL_STATUS_ABANDONED`] with an
@@ -469,6 +560,19 @@ pub trait HealQueueStorage: Send + Sync {
     ///
     /// [`vacuum_old`]: HealQueueStorage::vacuum_old
     fn vacuum_abandoned(&self, _pending_ceiling_secs: u64) -> Result<usize> {
+        Ok(0)
+    }
+    /// Close `escalated` rows older than `max_age_secs` whose
+    /// `(guest_id, pattern_tag)` has NOT been seen again within that window:
+    /// the condition stopped recurring, so the hand-off is stale. Status becomes
+    /// [`HEAL_STATUS_STALE`] with a `stale_closed` outcome note (never deleted here —
+    /// [`vacuum_old`] still reaps it on the normal schedule). A pattern that is
+    /// still recurring keeps every escalated row open. Returns rows closed.
+    ///
+    /// Default no-op so trait mocks keep compiling.
+    ///
+    /// [`vacuum_old`]: HealQueueStorage::vacuum_old
+    fn close_stale_escalations(&self, _max_age_secs: u64) -> Result<usize> {
         Ok(0)
     }
 }
@@ -499,6 +603,8 @@ impl SqliteHealQueueStorage {
     /// its id is returned and no new row is inserted. Genuinely distinct lines
     /// are always inserted.
     fn push_error_at(&self, guest_id: &str, raw_text: &str, now: i64) -> Result<String> {
+        let raw_text = strip_ansi(raw_text);
+        let raw_text = raw_text.as_ref();
         let key = stderr_dedup_key(raw_text);
         let cutoff = now - HEAL_FLOOD_WINDOW_SECS as i64;
         // Poisoned-lock recovery: never panic on the heal path (this is the
@@ -517,9 +623,14 @@ impl SqliteHealQueueStorage {
             mapped.collect::<rusqlite::Result<Vec<_>>>()?
         };
         for (id, text) in recent {
-            if stderr_dedup_key(&text) == key {
+            if stderr_dedup_key(&strip_ansi(&text)) == key {
                 // Collapse: return the existing row's real id so callers that
-                // surface it (IPC PushHealEntry) point at a live row.
+                // surface it (IPC PushHealEntry) point at a live row, and keep
+                // the count the collapse would otherwise lose.
+                conn.execute(
+                    "UPDATE heal_queue SET occurrences = occurrences + 1 WHERE id = ?1",
+                    params![id],
+                )?;
                 return Ok(id);
             }
         }
@@ -545,13 +656,14 @@ impl SqliteHealQueueStorage {
         let cutoff = now - HEAL_FLOOD_WINDOW_SECS as i64;
         // Flood control: collapse into any same-(guest, tag) entry seen inside
         // the window, regardless of its triage status.
-        let recent: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM heal_queue
-             WHERE guest_id = ?1 AND pattern_tag = ?2 AND timestamp >= ?3",
+        let bumped = conn.execute(
+            "UPDATE heal_queue SET occurrences = occurrences + 1
+             WHERE id = (SELECT id FROM heal_queue
+                         WHERE guest_id = ?1 AND pattern_tag = ?2 AND timestamp >= ?3
+                         ORDER BY timestamp DESC LIMIT 1)",
             params![guest_id, pattern_tag, cutoff],
-            |row| row.get(0),
         )?;
-        if recent > 0 {
+        if bumped > 0 {
             return Ok(None);
         }
         let id = ulid::Ulid::new().to_string();
@@ -570,7 +682,7 @@ impl SqliteHealQueueStorage {
         let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         let mut stmt = conn.prepare(
             "SELECT id, guest_id, timestamp, raw_text, severity, status,
-                    pattern_tag, heal_action, outcome
+                    pattern_tag, heal_action, outcome, occurrences
              FROM heal_queue ORDER BY timestamp ASC",
         )?;
         let rows = stmt.query_map([], |row| {
@@ -584,6 +696,7 @@ impl SqliteHealQueueStorage {
                 pattern_tag: row.get(6)?,
                 heal_action: row.get(7)?,
                 outcome: row.get(8)?,
+                occurrences: row.get(9)?,
             })
         })?;
         rows.collect::<rusqlite::Result<Vec<_>>>()
@@ -636,7 +749,45 @@ impl SqliteHealQueueStorage {
             COMMIT;
             ",
         )?;
+        // Additive migration: `occurrences` (flood-collapse count). Existing
+        // rows read as a single detection.
+        let has_occurrences = conn
+            .prepare("SELECT 1 FROM pragma_table_info('heal_queue') WHERE name = 'occurrences'")?
+            .exists([])?;
+        if !has_occurrences {
+            // Several openers (hotel, host-health scan, catalog sync) can race
+            // the first open after deploy: a concurrent winner is success.
+            match conn.execute_batch(
+                "ALTER TABLE heal_queue ADD COLUMN occurrences INTEGER NOT NULL DEFAULT 1;",
+            ) {
+                Ok(()) => {}
+                Err(e) if e.to_string().contains("duplicate column name") => {}
+                Err(e) => return Err(e.into()),
+            }
+        }
         Ok(())
+    }
+
+    /// [`HealQueueStorage::close_stale_escalations`] with an explicit clock.
+    fn close_stale_escalations_at(&self, max_age_secs: i64, now: i64) -> Result<usize> {
+        let cutoff = now.saturating_sub(max_age_secs.max(0));
+        let note = format!(
+            "escalated; stale_closed: pattern did not recur within {max_age_secs}s \
+             (heal-queue stale sweep)"
+        );
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        let n = conn.execute(
+            "UPDATE heal_queue AS old
+             SET status = 'stale', outcome = ?1
+             WHERE old.status = 'escalated' AND old.timestamp < ?2
+               AND NOT EXISTS (
+                   SELECT 1 FROM heal_queue AS recent
+                   WHERE recent.guest_id = old.guest_id
+                     AND recent.pattern_tag IS old.pattern_tag
+                     AND recent.timestamp >= ?2)",
+            params![note, cutoff],
+        )?;
+        Ok(n)
     }
 }
 
@@ -671,7 +822,7 @@ impl HealQueueStorage for SqliteHealQueueStorage {
         // eventually serviced at the cost of freshest-first responsiveness.
         let mut stmt = conn.prepare(
             "SELECT id, guest_id, timestamp, raw_text, severity, status,
-                    pattern_tag, heal_action, outcome
+                    pattern_tag, heal_action, outcome, occurrences
              FROM heal_queue WHERE status = 'pending'
              ORDER BY timestamp ASC LIMIT ?1",
         )?;
@@ -686,6 +837,7 @@ impl HealQueueStorage for SqliteHealQueueStorage {
                 pattern_tag: row.get(6)?,
                 heal_action: row.get(7)?,
                 outcome: row.get(8)?,
+                occurrences: row.get(9)?,
             })
         })?;
         rows.collect::<rusqlite::Result<Vec<_>>>()
@@ -710,10 +862,17 @@ impl HealQueueStorage for SqliteHealQueueStorage {
     }
 
     fn resolve(&self, id: &str, outcome: &str) -> Result<()> {
+        // DEF-070: an escalate-only outcome is a hand-off, not a repair. Stamp
+        // it `escalated` so the ledger stops claiming success for faults that
+        // are still burning. Both statuses are terminal for dispatch —
+        // `pending_errors` selects `status = 'pending'` only, so an escalated
+        // row is never re-picked and the old 5-minute re-file cadence cannot
+        // return under a new name.
+        let status = terminal_status_for_outcome(outcome);
         let conn = self.conn.lock().unwrap();
         conn.execute(
-            "UPDATE heal_queue SET outcome = ?1, status = 'resolved' WHERE id = ?2",
-            params![outcome, id],
+            "UPDATE heal_queue SET outcome = ?1, status = ?2 WHERE id = ?3",
+            params![outcome, status, id],
         )?;
         Ok(())
     }
@@ -725,11 +884,15 @@ impl HealQueueStorage for SqliteHealQueueStorage {
             .unwrap_or(0)
             .saturating_sub(older_than_secs) as i64;
         let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
-        // Reap both operator/dispatcher `resolved` rows and abandon-vacuum
-        // `abandoned` rows (F10) — both are terminal.
+        // Reap operator/dispatcher `resolved` rows, abandon-vacuum
+        // `abandoned` rows (F10), and `escalated` rows (DEF-070) — all three
+        // are terminal for dispatch. `escalated` is included deliberately:
+        // leaving it out would let a recurring escalate-only fault grow the
+        // table without bound (919 rows in three days on mbp-jane).
         let n = conn.execute(
             "DELETE FROM heal_queue
-             WHERE status IN ('resolved', 'abandoned') AND timestamp < ?1",
+             WHERE status IN ('resolved', 'abandoned', 'escalated', 'stale')
+               AND timestamp < ?1",
             params![cutoff],
         )?;
         Ok(n)
@@ -741,6 +904,14 @@ impl HealQueueStorage for SqliteHealQueueStorage {
             .map(|d| d.as_secs() as i64)
             .unwrap_or(0);
         self.vacuum_abandoned_at(pending_ceiling_secs.min(i64::MAX as u64) as i64, now)
+    }
+
+    fn close_stale_escalations(&self, max_age_secs: u64) -> Result<usize> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        self.close_stale_escalations_at(max_age_secs.min(i64::MAX as u64) as i64, now)
     }
 }
 
@@ -1399,5 +1570,253 @@ mod tests {
         });
         let back: HealWorkItemRecord = serde_json::from_value(legacy).expect("legacy");
         assert_eq!(back.audit_id, None);
+    }
+
+    // ── DEF-070: escalation is a hand-off, not a repair ──────────────────
+
+    #[test]
+    fn escalate_outcomes_map_to_escalated_status_others_to_resolved() {
+        // The dispatcher has emitted both the action name and the past-tense
+        // outcome into this column over time; both must count as escalation.
+        assert_eq!(
+            terminal_status_for_outcome("escalate"),
+            HEAL_STATUS_ESCALATED
+        );
+        assert_eq!(
+            terminal_status_for_outcome("escalated"),
+            HEAL_STATUS_ESCALATED
+        );
+        assert_eq!(
+            terminal_status_for_outcome(" escalated "),
+            HEAL_STATUS_ESCALATED
+        );
+
+        // Everything that actually did something keeps `resolved`.
+        for repaired in [
+            "restarted",
+            "noop",
+            "work_item_filed",
+            "restart_failed",
+            "restart_skipped_budget_exhausted",
+            "restart_skipped_not_a_guest",
+        ] {
+            assert_eq!(
+                terminal_status_for_outcome(repaired),
+                "resolved",
+                "outcome {repaired} must not be recorded as an escalation"
+            );
+        }
+    }
+
+    /// The regression this whole slice exists for: a service probe that fails
+    /// every 5 minutes for days must never leave a ledger that reads "all
+    /// resolved". On mbp-jane that produced 918 `resolved` rows for a dead
+    /// muninn.
+    #[test]
+    fn recurring_escalate_only_fault_never_reports_resolved() {
+        let store = SqliteHealQueueStorage::open(":memory:").expect("open");
+
+        const CADENCE_SECS: i64 = 300; // host-health scan interval
+        const CYCLES: i64 = 12;
+        let base = 1_700_000_000;
+
+        let mut ids = Vec::new();
+        for cycle in 0..CYCLES {
+            // Push far enough apart that the 60s flood window never collapses
+            // them — this is what made the real ledger grow one row per scan.
+            let id = store
+                .push_error_at(
+                    "host-health-scan",
+                    "host-health: service_probe_failed:muninn — no TCP connect to 127.0.0.1:8475",
+                    base + cycle * CADENCE_SECS,
+                )
+                .expect("push");
+            store
+                .update_triage(&id, "critical", "service_probe_failed:muninn", "escalate")
+                .expect("triage");
+            store.resolve(&id, "escalated").expect("resolve");
+            ids.push(id);
+        }
+
+        let rows = store.all_rows_for_test().expect("all rows");
+        let escalated = rows
+            .iter()
+            .filter(|r| r.status == HEAL_STATUS_ESCALATED)
+            .count();
+        let resolved = rows.iter().filter(|r| r.status == "resolved").count();
+
+        assert_eq!(
+            escalated, CYCLES as usize,
+            "every escalate-only cycle must be recorded as escalated"
+        );
+        assert_eq!(
+            resolved, 0,
+            "a fault that was only reported must never be recorded as resolved"
+        );
+
+        // Terminal for dispatch: an escalated row is never re-picked, or the
+        // 5-minute cadence simply returns under a new status name.
+        let pending = store.pending_errors(100).expect("pending");
+        assert!(
+            pending.is_empty(),
+            "escalated rows must not be re-dispatched, got {pending:?}"
+        );
+    }
+
+    /// Guards the coupling that shaped this design: the A3 recurrence tracker
+    /// counts *rows*, so escalated rows must keep landing individually. If a
+    /// future change collapses them at push time, the tracker stops seeing
+    /// recurrence and never files a work item.
+    #[test]
+    fn escalated_rows_remain_individually_visible_for_recurrence_counting() {
+        let store = SqliteHealQueueStorage::open(":memory:").expect("open");
+        let base = 1_700_000_000;
+
+        for cycle in 0..5 {
+            let id = store
+                .push_error_at("host-health-scan", "probe failed", base + cycle * 300)
+                .expect("push");
+            store
+                .update_triage(&id, "critical", "service_probe_failed:muninn", "escalate")
+                .expect("triage");
+            store.resolve(&id, "escalated").expect("resolve");
+        }
+
+        let rows = store.all_rows_for_test().expect("all rows");
+        let same_fault = rows
+            .iter()
+            .filter(|r| r.pattern_tag.as_deref() == Some("service_probe_failed:muninn"))
+            .count();
+        assert_eq!(
+            same_fault, 5,
+            "recurrence counting needs one row per detection, not a collapsed row"
+        );
+    }
+
+    #[test]
+    fn strip_ansi_removes_terminal_colour_codes() {
+        let raw = "\u{1b}[2m2026-09-24T15:46:18Z\u{1b}[0m \u{1b}[31mERROR\u{1b}[0m membrane_telegram: Conflict";
+        assert_eq!(
+            strip_ansi(raw),
+            "2026-09-24T15:46:18Z ERROR membrane_telegram: Conflict"
+        );
+        assert!(matches!(strip_ansi("plain"), std::borrow::Cow::Borrowed(_)));
+    }
+
+    #[test]
+    fn pushed_stderr_is_stored_without_colour_codes_and_collapses_count() {
+        let store = SqliteHealQueueStorage::open(":memory:").expect("open");
+        let a = store
+            .push_error_at("g", "\u{1b}[31mERROR\u{1b}[0m worker 12 died", 1_000)
+            .expect("push");
+        let b = store
+            .push_error_at("g", "ERROR worker 13 died", 1_010)
+            .expect("push");
+        assert_eq!(
+            a, b,
+            "the uncoloured repeat collapses into the coloured row"
+        );
+        let rows = store.all_rows_for_test().expect("rows");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].raw_text, "ERROR worker 12 died");
+        assert_eq!(rows[0].occurrences, 2, "the collapse keeps the count");
+    }
+
+    #[test]
+    fn classified_collapse_bumps_the_surviving_row() {
+        let store = SqliteHealQueueStorage::open(":memory:").expect("open");
+        assert!(store
+            .push_classified_at("g", "t", "low", "seat_stood_down:lease_held", 1_000)
+            .unwrap()
+            .is_some());
+        assert!(store
+            .push_classified_at("g", "t", "low", "seat_stood_down:lease_held", 1_030)
+            .unwrap()
+            .is_none());
+        let rows = store.all_rows_for_test().expect("rows");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].occurrences, 2);
+    }
+
+    #[test]
+    fn stale_sweep_closes_only_escalations_that_stopped_recurring() {
+        let store = SqliteHealQueueStorage::open(":memory:").expect("open");
+        let day = 24 * 3600;
+        let now = 10 * day;
+        let escalate = |guest: &str, tag: &str, at: i64| {
+            let id = store
+                .push_error_at(guest, &format!("{tag} {at}x"), at)
+                .unwrap();
+            store.update_triage(&id, "high", tag, "escalate").unwrap();
+            store.resolve(&id, "escalated").unwrap();
+        };
+        // Went quiet three days ago.
+        escalate("mac", "host_disk_low", now - 3 * day);
+        // Old row of a pattern that is STILL recurring (a fresh row today).
+        escalate("vps", "external_api_5xx", now - 3 * day);
+        escalate("vps", "external_api_5xx", now - 3600);
+        // Same tag on another guest does not keep it open.
+        escalate("mbp", "host_disk_low", now - 3600);
+
+        let closed = store
+            .close_stale_escalations_at(2 * day, now)
+            .expect("sweep");
+        assert_eq!(closed, 1);
+        let rows = store.all_rows_for_test().expect("rows");
+        let status = |guest: &str, at: i64| {
+            rows.iter()
+                .find(|r| r.guest_id == guest && r.timestamp == at)
+                .map(|r| r.status.clone())
+                .unwrap()
+        };
+        assert_eq!(status("mac", now - 3 * day), HEAL_STATUS_STALE);
+        assert_eq!(status("vps", now - 3 * day), HEAL_STATUS_ESCALATED);
+        assert_eq!(status("vps", now - 3600), HEAL_STATUS_ESCALATED);
+        assert_eq!(status("mbp", now - 3600), HEAL_STATUS_ESCALATED);
+        let mac = rows.iter().find(|r| r.guest_id == "mac").unwrap();
+        assert!(mac.outcome.as_deref().unwrap().contains("stale_closed"));
+    }
+
+    #[test]
+    fn occurrences_column_is_added_to_an_existing_table() {
+        let dir = std::env::temp_dir().join(format!("heal-occ-{}", ulid::Ulid::new()));
+        let path = dir.with_extension("db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE heal_queue (id TEXT PRIMARY KEY, guest_id TEXT NOT NULL,
+                    timestamp INTEGER NOT NULL, raw_text TEXT NOT NULL,
+                    severity TEXT NOT NULL DEFAULT 'unknown', status TEXT NOT NULL DEFAULT 'pending',
+                    pattern_tag TEXT, heal_action TEXT, outcome TEXT);
+                 INSERT INTO heal_queue (id, guest_id, timestamp, raw_text) VALUES ('a','g',1,'old');",
+            )
+            .unwrap();
+        }
+        let store = SqliteHealQueueStorage::open(&path).expect("migrates");
+        let rows = store.all_rows_for_test().expect("rows");
+        assert_eq!(rows[0].occurrences, 1);
+        drop(store);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn vacuum_reaps_escalated_rows_so_they_cannot_grow_without_bound() {
+        let store = SqliteHealQueueStorage::open(":memory:").expect("open");
+        let old = store
+            .push_error_at("g", "ancient escalate", 1_000)
+            .expect("push");
+        store.resolve(&old, "escalated").expect("resolve");
+
+        let rows = store.all_rows_for_test().expect("all");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].status, HEAL_STATUS_ESCALATED);
+
+        // Any sane retention window is far newer than epoch+1000.
+        let reaped = store.vacuum_old(60).expect("vacuum");
+        assert_eq!(
+            reaped, 1,
+            "escalated rows must be reapable like other terminal rows"
+        );
+        assert!(store.all_rows_for_test().expect("all").is_empty());
     }
 }

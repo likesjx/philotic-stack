@@ -1,0 +1,7 @@
+@startuml
+!theme plain
+
+title Proposal Architecture - doc:memory-token-self-heal
+
+
+@enduml

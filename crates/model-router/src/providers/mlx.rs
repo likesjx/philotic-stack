@@ -161,10 +161,10 @@ impl MlxProvider {
             return None;
         }
         // Prefer explicit model if requested and healthy.
-        if let Some(repo) = prefer_repo {
-            if let Some(inst) = healthy.iter().find(|i| i.config.repo_id == repo) {
-                return Some(inst);
-            }
+        if let Some(repo) = prefer_repo
+            && let Some(inst) = healthy.iter().find(|i| i.config.repo_id == repo)
+        {
+            return Some(inst);
         }
         // Otherwise pick highest priority.
         healthy.into_iter().max_by_key(|i| i.priority())
@@ -242,15 +242,15 @@ impl MlxProvider {
             .context("mlx_lm.server returned no choices")?;
 
         // Check for tool calls first.
-        if let Some(tool_calls) = choice.message.tool_calls {
-            if let Some(tc) = tool_calls.into_iter().next() {
-                let arguments: serde_json::Value =
-                    serde_json::from_str(&tc.function.arguments).unwrap_or(serde_json::json!({}));
-                return Ok(ProviderOutput::ToolCall {
-                    tool_name: tc.function.name,
-                    arguments,
-                });
-            }
+        if let Some(tool_calls) = choice.message.tool_calls
+            && let Some(tc) = tool_calls.into_iter().next()
+        {
+            let arguments: serde_json::Value =
+                serde_json::from_str(&tc.function.arguments).unwrap_or(serde_json::json!({}));
+            return Ok(ProviderOutput::ToolCall {
+                tool_name: tc.function.name,
+                arguments,
+            });
         }
 
         let content = choice.message.content.unwrap_or_default();

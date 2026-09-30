@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - graph-door-analyze
+
+rectangle "graph-door-analyze" as graph_door_analyze #Orange {
+}
+
+
+@enduml

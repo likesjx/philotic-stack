@@ -181,12 +181,12 @@ impl McpEndpointTable {
             .map(|d| d.as_secs())
             .unwrap_or(0);
 
-        self.config.as_ref().map_or(false, |c| {
+        self.config.as_ref().is_some_and(|c| {
             c.preapproval_rules.iter().any(|rule| {
-                if let Some(exp) = rule.expires_at {
-                    if now > exp {
-                        return false;
-                    }
+                if let Some(exp) = rule.expires_at
+                    && now > exp
+                {
+                    return false;
                 }
                 rule.action_pattern == "*" || rule.action_pattern == action
             })

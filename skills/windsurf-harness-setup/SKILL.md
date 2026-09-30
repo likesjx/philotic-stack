@@ -1,5 +1,7 @@
+---
 name: windsurf-harness-setup
 description: Configure windsurf-native harness with multi-role support. One harness declares all 4 canonical roles (implementer, orchestrator, reviewer, verifier) and auto-spins up sessions when workstream starts.
+---
 
 # Windsurf Harness Setup (Multi-Role)
 

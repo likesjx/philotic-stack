@@ -90,6 +90,36 @@ else
   fail "docs metadata anchor set passes frontmatter checks"
 fi
 
+# proposal:declare-system-dependencies — undeclared system packages made the
+# workspace only appear to build from a clean checkout.
+if "${ROOT_DIR}/scripts/preflight-system-deps.sh" >/dev/null 2>&1; then
+  pass "system dependency preflight passes"
+else
+  fail "system dependency preflight fails — run: just preflight"
+fi
+
+# proposal:secret-push-guard-activation — assert the guard is actually wired.
+#
+# .githooks/pre-push has existed (and invoked scripts/secret-push-check.py)
+# since March, but core.hooksPath pointed at an empty .git/hooks, so it had
+# NEVER FIRED — despite backup-pre-secret-rewrite-20260313 in this repo's
+# history showing the incident it exists to prevent already happened. A guard
+# nobody checks is indistinguishable from no guard, so check it.
+HOOKS_PATH="$(git -C "${ROOT_DIR}" config core.hooksPath 2>/dev/null || true)"
+if [[ "${HOOKS_PATH}" == ".githooks" ]]; then
+  pass "git core.hooksPath points at .githooks"
+else
+  fail "git core.hooksPath is '${HOOKS_PATH:-<unset>}', not .githooks — the secret-push and rustfmt hooks are INERT. Fix: just install-git-hooks"
+fi
+
+for hook in pre-push pre-commit; do
+  if [[ -x "${ROOT_DIR}/.githooks/${hook}" ]]; then
+    pass ".githooks/${hook} is present and executable"
+  else
+    fail ".githooks/${hook} is present and executable"
+  fi
+done
+
 run_in_repo "cargo check workspace baseline" cargo check --workspace
 run_in_repo "cargo test workspace baseline" cargo test --workspace
 

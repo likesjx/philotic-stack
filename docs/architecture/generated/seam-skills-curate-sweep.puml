@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - skills-curate-sweep
+
+rectangle "skills-curate-sweep" as skills_curate_sweep #Orange {
+}
+
+
+@enduml

@@ -1,3 +1,8 @@
+---
+name: graph-intelligence
+description: HIGH PRIORITY. Use the project graph as the primary orientation and context source at session start, before any code change, and before any proposal or status change. Covers graph_status, graph_digest, graph_next_task, graph_context_for, graph_impact, session_start/close, and graph_decide. Query the graph before reading raw files, and record decisions after completing work.
+---
+
 # Graph Intelligence Skill
 
 Use the project graph as your primary orientation and context source.

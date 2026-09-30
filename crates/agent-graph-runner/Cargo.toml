@@ -1,0 +1,4 @@
+
+# Clippy ratchet: this crate is warning-free and must stay that way.
+[lints]
+workspace = true

@@ -57,11 +57,11 @@ async fn main() -> Result<()> {
         };
         let payload: serde_json::Value =
             serde_json::from_str(&task_json).context("failed to decode preapprove reply")?;
-        if let Some(c) = payload.get("content").and_then(serde_json::Value::as_str) {
-            if !c.is_empty() {
-                preapprove_content = c.to_string();
-                break;
-            }
+        if let Some(c) = payload.get("content").and_then(serde_json::Value::as_str)
+            && !c.is_empty()
+        {
+            preapprove_content = c.to_string();
+            break;
         }
     }
 
@@ -102,11 +102,11 @@ async fn main() -> Result<()> {
         };
         let payload: serde_json::Value =
             serde_json::from_str(&task_json).context("failed to decode preapproved final reply")?;
-        if let Some(c) = payload.get("content").and_then(serde_json::Value::as_str) {
-            if !c.is_empty() {
-                final_content = c.to_string();
-                break;
-            }
+        if let Some(c) = payload.get("content").and_then(serde_json::Value::as_str)
+            && !c.is_empty()
+        {
+            final_content = c.to_string();
+            break;
         }
     }
 

@@ -1,0 +1,19 @@
+@startuml
+participant Philote
+participant SourceHotel
+participant ExitHotel
+participant EgressRunner
+participant ExitVault
+participant ExternalAPI
+Philote -> SourceHotel: Execute binding scoped HTTP tool
+SourceHotel -> ExitHotel: Route binding request and return route
+ExitHotel -> EgressRunner: Deliver bounded execution task
+EgressRunner -> ExitVault: Resolve credential reference
+ExitVault --> EgressRunner: Credential value
+EgressRunner -> ExternalAPI: Validated request with injected credential
+ExternalAPI --> EgressRunner: HTTP response
+EgressRunner -> ExitHotel: Append secret free audit
+EgressRunner -> ExitHotel: Emit sanitized response to return route
+ExitHotel -> SourceHotel: Routed response
+SourceHotel --> Philote: Enriched tool result
+@enduml

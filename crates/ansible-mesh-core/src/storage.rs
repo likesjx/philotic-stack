@@ -298,6 +298,54 @@ pub trait GraphAdapter: Send + Sync {
     fn get_node(&self, node_key: &str) -> Result<Option<GraphNode>>;
     fn delete_node(&self, node_key: &str) -> Result<()>;
     fn list_nodes_by_kind(&self, kind: &str) -> Result<Vec<GraphNode>>;
+
+    /// Nodes of `kind` whose top-level JSON `field` equals `value`, ordered
+    /// ascending by the numeric top-level JSON `order_field`. When `limit > 0`
+    /// only the most recent `limit` nodes are returned (still ascending).
+    ///
+    /// High-volume kinds (session events/turns) must never be answered by
+    /// loading the whole kind: backends should push this filter into the
+    /// store. The default implementation is the naive scan for in-memory
+    /// test adapters.
+    fn list_nodes_by_kind_json_eq(
+        &self,
+        kind: &str,
+        field: &str,
+        value: &str,
+        order_field: &str,
+        limit: usize,
+    ) -> Result<Vec<GraphNode>> {
+        let mut out: Vec<GraphNode> = self
+            .list_nodes_by_kind(kind)?
+            .into_iter()
+            .filter(|n| n.data.get(field).and_then(|v| v.as_str()) == Some(value))
+            .collect();
+        out.sort_by_key(|n| {
+            n.data
+                .get(order_field)
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0)
+        });
+        if limit > 0 && out.len() > limit {
+            out.drain(..out.len() - limit);
+        }
+        Ok(out)
+    }
+
+    /// Delete nodes of `kind` last touched before `cutoff_unix_secs`, keeping
+    /// any node whose top-level JSON `field` equals `value` in
+    /// `keep_json_field_eq`. Returns the number of deleted nodes.
+    ///
+    /// Retention only makes sense for persistent stores; the default is a
+    /// no-op so ephemeral test adapters are unaffected.
+    fn delete_nodes_by_kind_older_than(
+        &self,
+        _kind: &str,
+        _cutoff_unix_secs: u64,
+        _keep_json_field_eq: Option<(&str, &str)>,
+    ) -> Result<usize> {
+        Ok(0)
+    }
     fn upsert_edge(&self, edge: &GraphEdge) -> Result<()>;
     fn delete_edge(&self, edge_key: &str) -> Result<()>;
     fn list_edges_from(

@@ -8,12 +8,12 @@
 //! allowlist hotel-side before this ever runs; we re-assert the shape here as
 //! defense in depth.
 
-use anyhow::{Context, Result, anyhow, bail};
-use serde_json::{Value, json};
+use anyhow::{anyhow, bail, Context, Result};
+use serde_json::{json, Value};
 use std::process::Stdio;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout};
-use tokio::time::{Duration, timeout};
+use tokio::time::{timeout, Duration};
 
 /// Env vars that survive the scrub (plus anything in `MCP_STDIO_ENV_PASSTHROUGH`,
 /// a comma-separated allowlist the operator can set on the guest).
@@ -44,7 +44,11 @@ impl StdioTransport {
             }
         }
         if let Ok(passthrough) = std::env::var("MCP_STDIO_ENV_PASSTHROUGH") {
-            for key in passthrough.split(',').map(str::trim).filter(|k| !k.is_empty()) {
+            for key in passthrough
+                .split(',')
+                .map(str::trim)
+                .filter(|k| !k.is_empty())
+            {
                 if let Ok(val) = std::env::var(key) {
                     cmd.env(key, val);
                 }

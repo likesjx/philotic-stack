@@ -1,5 +1,7 @@
+---
 name: proposal-pipeline
 description: Manage proposal lifecycle from creation through disposition to implementation. Track disposition transitions, ensure metadata completeness, and identify stuck or orphaned proposals. Use when working with architecture proposals.
+---
 
 # Proposal Pipeline
 

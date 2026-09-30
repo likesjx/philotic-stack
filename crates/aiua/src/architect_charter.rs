@@ -12,9 +12,10 @@
 //! The steward is a MODEL. This module registers the role and the trigger —
 //! it does not sweep anything in Rust. [`DEFAULT_CHARTER_MANIFEST`] is the
 //! prompt that tells the model which tools/CLI verbs to call
-//! (`memory.delta_digest`, `bash.exec` against `phil heal list` /
-//! `phil autonomy status` / `phil graph status` / `phil graph seams`, and
-//! `docs/DEFECTS.md`) and what shape the reply should take. See
+//! (`memory.delta_digest`, the typed `heal.list` / `host.vitals` steward
+//! tools, `bash.exec` against `phil autonomy status` / `phil graph status` /
+//! `phil graph seams`, and `docs/DEFECTS.md`) and what shape the reply
+//! should take. See
 //! `docs/architecture/AUTOPOIESIS_PROPOSAL.md`'s A4 row and
 //! `docs/architecture/MEMORY_TRANSPARENCY_PROPOSAL.md`'s M3 row (this is the
 //! "push half" M3 named as deferred to whoever built A4).
@@ -236,10 +237,14 @@ charter fires, do the following, in order:
    the memory-delta digest built specifically for this brief (Memory
    Transparency Slice M3) — never hand-derive a memory-delta summary from
    raw recall; call the tool.
-2. Sweep for engineering signal with `bash.exec`:
-   - `phil heal list` — open self-heal work items filed by the heal circuit.
-   - `cat docs/DEFECTS.md` — open defects and technical debt, especially
-     anything newly filed or aging without movement.
+2. Sweep for engineering signal:
+   - Call the `heal.list` tool — pending self-heal queue entries and open
+     heal work items filed by the heal circuit. Call the `host.vitals` tool
+     for host pressure truth (disk floor and memory pressure are pre-graded —
+     trust the reported status over raw percentages). These are typed tools;
+     never shell out to `phil heal list` for this.
+   - `cat docs/DEFECTS.md` via `bash.exec` — open defects and technical debt,
+     especially anything newly filed or aging without movement.
    - `phil graph status` and `phil graph seams` — seam staleness and the
      proposal pipeline, IF the intel-graph server is reachable on this
      hotel. If it is not running, say so plainly in the brief rather than
@@ -471,7 +476,11 @@ mod tests {
     #[test]
     fn charter_manifest_names_the_mandatory_digest_call() {
         assert!(DEFAULT_CHARTER_MANIFEST.contains("memory.delta_digest"));
-        assert!(DEFAULT_CHARTER_MANIFEST.contains("phil heal list"));
+        // aria-mesh-steward slice 1: the heal sweep moved from a `phil heal
+        // list` shell-out to the typed heal.list / host.vitals steward tools;
+        // the assertion follows the charter, it is not weakened.
+        assert!(DEFAULT_CHARTER_MANIFEST.contains("heal.list"));
+        assert!(DEFAULT_CHARTER_MANIFEST.contains("host.vitals"));
         assert!(DEFAULT_CHARTER_MANIFEST.contains("phil autonomy status"));
         assert!(DEFAULT_CHARTER_MANIFEST.contains("DEFECTS.md"));
     }

@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - mcp-dispatch-test-harness
+
+rectangle "mcp-dispatch-test-harness" as mcp_dispatch_test_harness #Orange {
+}
+
+
+@enduml

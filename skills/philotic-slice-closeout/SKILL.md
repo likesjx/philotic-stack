@@ -1,5 +1,7 @@
+---
 name: philotic-slice-closeout
 description: HIGH PRIORITY. Use this skill to finish every implementation slice. It mandates "green status clearing" (verified build/test/smokes), updates to docs/task.md, and explicit disposition updates for touched architecture proposals. No slice is complete until this operational close-out is recorded and committed.
+---
 
 # Philotic Slice Closeout
 

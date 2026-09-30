@@ -21,3 +21,7 @@ tokio = { version = "1", features = ["full"] }
 tracing = "0.1"
 tokenizers = { version = "0.21", default-features = false, features = ["http", "fancy-regex"] }
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
+
+# Clippy ratchet: this crate is warning-free and must stay that way.
+[lints]
+workspace = true

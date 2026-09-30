@@ -10,6 +10,7 @@ DerivedData/
 
 ## Generated Xcode project (regenerated via `xcodegen generate`)
 PhiloticApp/PhiloticApp.xcodeproj/
+PhiloticApp/PhiloticApp-iOS-Info.plist
 
 ## Swift Package Manager
 .build/

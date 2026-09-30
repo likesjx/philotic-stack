@@ -1,0 +1,10 @@
+@startuml
+!theme plain
+
+title Seam Detail - model-trust-guidance
+
+rectangle "model-trust-guidance" as model_trust_guidance #Orange {
+}
+
+
+@enduml

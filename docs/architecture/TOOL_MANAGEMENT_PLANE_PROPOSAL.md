@@ -3,7 +3,7 @@ title: Philotic Tool Management Plane Proposal
 doc_type: proposal
 domain: tooling-execution
 status: accepted-current-slice
-last_updated: 2026-03-31
+last_updated: 2026-09-16
 tags:
 - tools
 - management-plane
@@ -348,6 +348,73 @@ Near-term assumptions:
 3. keep agent logic working against abstract tools only
 4. avoid hardcoding local-IPC-only assumptions into the agent
 5. let session bindings continue to narrow/hide tools while the system plane is formalized
+
+## Tool Catalog File (slice T1, 2026-09-16)
+
+Operator direction: tool definitions are not hard-coded; they live in an
+external file that can be edited and is loaded into the hotel graph.
+
+State found before the slice: three compiled catalogs had drifted apart.
+The philote's `catalog.rs` held 108 tools; the hotel's compiled
+`seed_abstract_tool_catalog` held 49; the LifeGraph runner keeps its own
+list. Only 36 names were in both philote and hotel catalogs, and only 3 of
+those shared an identical description. The hotel already stored and projected
+`abstract_tool` records, but the philote rebuilt its tool assembly from the
+compiled table and ignored them.
+
+Slice T1:
+
+- **`catalog/tools.yaml`** is the single source: 121 tools (the philote's 108,
+  whose descriptions/schemas/classes won every overlap, plus the 13 tools only
+  the hotel seed defined, keeping its `tool_markers`), with shared schema
+  fragments under `defs` referenced by `{"$ref": "#/defs/<name>"}`.
+- **Hotel loader** (`crates/aiua/src/tool_catalog.rs`): the file compiled into
+  aiua is the floor; `~/.philotic/<profile>/tool-catalog.yaml` and then
+  `PHILOTIC_TOOL_CATALOG` override entries by `tool_name`. Loaded into
+  `abstract_tool` records on every boot and `aiua load`, replacing the
+  1 124-line compiled seed array. A broken override is logged and skipped,
+  never fatal.
+- **Record field `batch_of: {tool, items_pointer}`** — the first relationship
+  expressed as data: `life.observe.batch` is a list of `life.observe` inputs at
+  `/observations`.
+- **Philote reads the records**: `GetToolCatalog` at startup fills a process
+  registry; tool descriptions and schemas in both assembly builders, argument
+  repair (including each batch item against the member schema), and plan
+  verification (a batch call credits one member step per written item) read
+  the records, with `catalog.rs` only as the fallback until the hotel answers.
+
+Watched-live gate: edit a description in the profile override, restart the
+hotel, see the edited text in a live prompt; a plan whose steps are bound to
+`life.observe` verifies when one `life.observe.batch` call writes them.
+
+Follow-on slices (not in T1), each replacing a compiled table with a record
+field:
+
+- `class`/approval from records (`tool_class`, `tool_requires_approval` still
+  return compiled `&'static str`; approval is security-relevant, so it moves
+  with its own tests).
+- `mutates` / read-only: `plan_eval::READ_ONLY_SUFFIXES` and
+  `turn_loop::LIFE_WRITE_TOOLS` disagree with each other and with the runner
+  (`.feedback` listed read-only though `life.recall.feedback` writes;
+  `graph.query`, a read, and `graph.mutate`, defined nowhere, listed as
+  writes). The record field must pick one truth: the runner's own
+  `LifeGraphToolName::mutates_graph()` is the source, because it is the only
+  one of the three the write path actually obeys; seed `mutates` from it.
+- Artifact-id argument pointers for write receipts (`uncited_writes`).
+- Skill ownership / relevance (`tools_for_skill`, `skill_implied_tools`,
+  `skill_is_relevant_for_turn`) from records.
+- Delete `catalog.rs` once every consumer reads records; the LifeGraph runner's
+  own tool list reads the same file.
+- Merge policy for runtime tool edits (`ToolsetProfileRecord::reconcile_seed_with_existing`
+  precedent) once a `tool.*` admin operation exists.
+- Uncatalogued records: the loader leaves records the file does not name. On
+  mac-jane 2026-09-16 that is four: `hotel.best_place_to_run` (a real local tool,
+  implied by skills, never defined in any catalog — it needs a catalog entry) and
+  `life.capture`, `life.flywheel.brief`, `life.flywheel.review` (orphans from older
+  binaries; no current code defines them). `hotel.best_place_to_run` is now in the
+  file (class `session`: a read-only recommendation must not inherit `config`
+  approval once class moves to records). Next: have the loader mark unnamed
+  records stale instead of silently keeping them.
 
 ## Implementation Phasing
 

@@ -1,5 +1,7 @@
+---
 name: check-engine
 description: End-of-session review. Sweeps Muninn for unstored session work, syncs MEMORY.md, surfaces open threads and next seams, and identifies SVE process gaps. Run at the end of every meaningful session.
+---
 
 # Check Engine
 
