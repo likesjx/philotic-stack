@@ -85,6 +85,14 @@ pub const SITES: &[SiteSpec] = &[
         class: DataClass::A,
         operator_opt_in: false,
     },
+    // philote's distill pre-screen, shadow only: the operator's message, a
+    // tool summary and the reply, asked "is there a reusable lesson here?".
+    // Operator opt-in for class C under zero data retention: 2026-09-30.
+    SiteSpec {
+        id: "distill.prescreen",
+        class: DataClass::C,
+        operator_opt_in: true,
+    },
 ];
 
 /// Longest tail of any single state string that may leave (characters).
@@ -339,13 +347,42 @@ mod tests {
     }
 
     #[test]
-    fn every_listed_site_is_class_a_until_the_policy_changes() {
-        // A tripwire: adding a class B or C site must be a deliberate edit that
-        // also updates this test and the proposal.
-        for site in SITES {
-            assert_eq!(site.class, DataClass::A, "{}", site.id);
-            assert!(!site.operator_opt_in, "{}", site.id);
-        }
+    fn the_site_table_is_exactly_the_reviewed_one() {
+        // A tripwire: adding or reclassifying a site must be a deliberate edit
+        // that also updates this test and the proposal's data policy.
+        let table: Vec<(&str, DataClass, bool)> = SITES
+            .iter()
+            .map(|s| (s.id, s.class, s.operator_opt_in))
+            .collect();
+        assert_eq!(
+            table,
+            [
+                ("heal.classify", DataClass::A, false),
+                ("smoke.live", DataClass::A, false),
+                // Operator opt-in 2026-09-30, zero data retention only.
+                ("distill.prescreen", DataClass::C, true),
+            ]
+        );
+    }
+
+    #[test]
+    fn distill_prescreen_leaves_only_on_the_zero_retention_transport() {
+        let mut request = heal_state("x");
+        request.site = "distill.prescreen".into();
+        request.state = json!({ "user_message": "no, that's wrong — use the staging db" });
+        assert_eq!(
+            admit(&request, DecisionsTransport::Native)
+                .unwrap_err()
+                .class,
+            DecisionsErrorClass::PolicyRefused
+        );
+        let out = admit(&request, DecisionsTransport::OpenRouter).unwrap();
+        assert_eq!(
+            out.state["user_message"],
+            "no, that's wrong — use the staging db"
+        );
+        // The class-A-only lookup used for trace labels still refuses it.
+        assert!(site_spec("distill.prescreen").is_err());
     }
 
     #[test]
