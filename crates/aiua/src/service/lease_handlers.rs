@@ -416,6 +416,159 @@ impl IpcServer {
         Self::pid_exists(pid)
     }
 
+    /// Does this guest record run `agent_id`'s philote? Either the per-agent
+    /// philote (its env names the agent: `{hotel}:philote-{key}` with
+    /// `PHILOTIC_AGENT_ID`) or one of the agent's role incarnations
+    /// (`{agent_id}:{role}`). Liveness is checked separately.
+    pub(super) fn guest_runs_agent_philote(
+        guest: &ansible_mesh_core::storage::GuestRecord,
+        agent_id: &str,
+    ) -> bool {
+        if guest
+            .guest_id
+            .strip_prefix(agent_id)
+            .is_some_and(|rest| rest.starts_with(':'))
+        {
+            return true;
+        }
+        serde_json::from_str::<serde_json::Value>(&guest.config_json)
+            .ok()
+            .and_then(|config| {
+                let env = config.get("env")?;
+                let command = config.get("command").and_then(|c| c.as_str()).unwrap_or("");
+                let named = env.get("PHILOTIC_AGENT_ID")?.as_str()? == agent_id;
+                Some(named && command.starts_with("philote") && !command.contains("worker"))
+            })
+            .unwrap_or(false)
+    }
+
+    /// Is `agent_id`'s philote running on THIS hotel right now (an active guest
+    /// record with a live pid)?
+    fn hotel_runs_agent_philote(graph: &GraphDomain, local_node_id: &str, agent_id: &str) -> bool {
+        let Some(local_hotel_name) = Self::local_hotel_name(graph, local_node_id) else {
+            return false;
+        };
+        let Ok(guests) = graph.list_guests(&local_hotel_name, true) else {
+            return false;
+        };
+        guests.iter().any(|guest| {
+            Self::guest_runs_agent_philote(guest, agent_id)
+                && guest
+                    .active_pid
+                    .as_deref()
+                    .and_then(|pid| pid.parse::<u32>().ok())
+                    .is_some_and(Self::pid_exists)
+        })
+    }
+
+    /// DEF-207: Telegram poll-conflict resolution, run only when a seat reports
+    /// repeated `409 terminated by other getUpdates request`.
+    ///
+    /// Rule (operator, 2026-10-01): the hotel that runs the agent's philote is
+    /// the preferred listener — but only once a conflict arises. Single writer:
+    /// only the philote's hotel ever writes, so two hotels can never claim the
+    /// same token in the same second. The claim is an ordinary stamped,
+    /// node-id-canonical transport-home record; the reply is `TransportHomeSet`,
+    /// so the IPC post-dispatch path marks hotel state dirty (UDP hotel-state
+    /// gossip carries it to every peer within one sync) and pushes
+    /// `TransportHomeChanged` locally. A peer that was polling applies the newer
+    /// record (LWW) and its seat stands down via the existing R2 path.
+    ///
+    /// - Not the philote's hotel: write nothing; the winner's claim will arrive.
+    /// - Already the stamped home and 409s continue: the second poller is
+    ///   outside the mesh — do not rewrite (no flapping); report it.
+    pub(super) fn handle_report_telegram_poll_conflict(
+        graph: &GraphDomain,
+        local_node_id: &str,
+        agent_id: String,
+        resource_ref: String,
+        conflicts: u32,
+    ) -> IpcResponse {
+        const OP: &str = "telegram_poll_conflict";
+        let Some(local_hotel_name) = Self::local_hotel_name(graph, local_node_id) else {
+            return IpcResponse::error(
+                OP,
+                "CONFLICT_AUTHORITY_UNKNOWN",
+                format!("current hotel could not be resolved for node [{local_node_id}]"),
+            );
+        };
+        if !Self::hotel_runs_agent_philote(graph, local_node_id, &agent_id) {
+            info!(
+                agent_id,
+                resource_ref,
+                conflicts,
+                "Telegram poll conflict: this hotel does not run the agent's philote; \
+                 waiting for the philote's hotel to claim the transport home"
+            );
+            return IpcResponse::error(
+                OP,
+                "CONFLICT_NOT_PHILOTE_HOST",
+                format!(
+                    "hotel [{local_hotel_name}] does not run [{agent_id}]'s philote; \
+                     the philote's hotel resolves this conflict"
+                ),
+            );
+        }
+        let existing = graph
+            .get_membrane_transport_home(&agent_id, "telegram", &resource_ref)
+            .ok()
+            .flatten();
+        if let Some(home) = existing.as_ref() {
+            let already_self = home.updated_unix > 0
+                && home.status == MembraneTransportHomeStatus::Active
+                && Self::resolve_hotel_node_id(graph, &home.active_home_hotel).as_deref()
+                    == Some(local_node_id);
+            if already_self {
+                warn!(
+                    agent_id,
+                    resource_ref,
+                    conflicts,
+                    "Telegram poll conflict persists although this hotel is the stamped transport \
+                     home: the second poller is outside the mesh (or a peer has not stood down yet)"
+                );
+                return IpcResponse::error(
+                    OP,
+                    "CONFLICT_EXTERNAL_POLLER",
+                    format!(
+                        "[{local_hotel_name}] already holds the stamped transport home for \
+                         [{resource_ref}]; the competing poller is not resolved by the mesh"
+                    ),
+                );
+            }
+        }
+        // Everyone else who was (or claimed to be) home becomes a standby.
+        let mut standby_hotels: Vec<String> = Vec::new();
+        if let Some(home) = existing.as_ref() {
+            for hotel in std::iter::once(&home.active_home_hotel).chain(home.standby_hotels.iter())
+            {
+                let resolved = Self::resolve_hotel_node_id(graph, hotel);
+                let is_self =
+                    hotel == &local_hotel_name || resolved.as_deref() == Some(local_node_id);
+                // A hotel this graph no longer knows cannot be canonicalized
+                // (set_transport_home would refuse the whole claim): drop it.
+                if !is_self && resolved.is_some() && !standby_hotels.contains(hotel) {
+                    standby_hotels.push(hotel.clone());
+                }
+            }
+        }
+        info!(
+            agent_id,
+            resource_ref,
+            conflicts,
+            ?standby_hotels,
+            "Telegram poll conflict: this hotel runs the agent's philote — claiming the transport home"
+        );
+        Self::perform_set_transport_home(
+            graph,
+            agent_id,
+            "telegram".into(),
+            resource_ref,
+            "hotel:telegram-conflict-resolver".into(),
+            local_hotel_name,
+            standby_hotels,
+        )
+    }
+
     fn drop_stale_telegram_poll_lease_if_needed(
         guard: &mut RuntimeLeaseRegistry,
         graph: &GraphDomain,
@@ -1790,6 +1943,217 @@ mod tests {
         IpcRequest, PhiloticClient, SubagentCompletionContract, SubagentContextPacket,
     };
     use std::path::Path;
+
+    // ── DEF-207 poll-conflict resolution ─────────────────────────────────────
+
+    /// local-hotel / local-aiua-01 with agent-coach's identity; optionally an
+    /// active philote guest for it whose pid is this (live) test process.
+    fn conflict_graph(runs_philote: bool) -> GraphDomain {
+        let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
+        let graph = GraphDomain::new(Arc::new(graph_store.adapter()));
+        graph
+            .upsert_hotel(&HotelRecord {
+                hotel_name: "local-hotel".into(),
+                capabilities: NodeCapabilities {
+                    node_id: "local-aiua-01".into(),
+                    roles: vec![],
+                    models: vec![],
+                    tools: vec![],
+                    constraints: Default::default(),
+                    build_version: String::new(),
+                },
+                mesh_port: 9000,
+                blob_port: 9001,
+                execution_port: 9002,
+                ipc_socket_path: "/tmp/unused.sock".into(),
+                active_pid: None,
+                mesh_host: None,
+            })
+            .expect("seed local hotel");
+        graph
+            .upsert_agent_identity(&AgentIdentityRecord {
+                agent_id: "agent-coach".into(),
+                persona_name: "Coach".into(),
+                authority_hotel: "local-hotel".into(),
+                bundle_json: serde_json::json!({}),
+            })
+            .expect("seed agent identity");
+        graph
+            .upsert_guest(&GuestRecord {
+                hotel_name: "local-hotel".into(),
+                guest_id: "local-hotel:philote-coach".into(),
+                role: "agent".into(),
+                config_json: serde_json::json!({
+                    "command": "philote",
+                    "env": { "PHILOTIC_AGENT_ID": "agent-coach" }
+                })
+                .to_string(),
+                is_active: true,
+                active_pid: runs_philote.then(|| std::process::id().to_string()),
+                last_active_at: None,
+            })
+            .expect("seed philote guest");
+        graph
+    }
+
+    fn legacy_vps_home() -> MembraneTransportHomeRecord {
+        MembraneTransportHomeRecord {
+            agent_id: "agent-coach".into(),
+            transport: "telegram".into(),
+            resource_ref: "telegram_bot_token_coach".into(),
+            active_home_hotel: "vps-jane".into(),
+            standby_hotels: vec!["mbp-jane".into(), "local-hotel".into()],
+            managed_by_role: "orchestrator".into(),
+            lease_type: "telegram_poll".into(),
+            failover_policy: "manual-or-explicit-delegation".into(),
+            status: MembraneTransportHomeStatus::Active,
+            updated_unix: 0,
+        }
+    }
+
+    fn report(graph: &GraphDomain) -> IpcResponse {
+        IpcServer::handle_report_telegram_poll_conflict(
+            graph,
+            "local-aiua-01",
+            "agent-coach".into(),
+            "telegram_bot_token_coach".into(),
+            3,
+        )
+    }
+
+    fn coach_home(graph: &GraphDomain) -> Option<MembraneTransportHomeRecord> {
+        graph
+            .get_membrane_transport_home("agent-coach", "telegram", "telegram_bot_token_coach")
+            .unwrap()
+    }
+
+    #[test]
+    fn philote_host_claims_the_home_over_a_stale_legacy_record() {
+        let graph = conflict_graph(true);
+        graph
+            .upsert_hotel(&HotelRecord {
+                hotel_name: "vps-jane".into(),
+                capabilities: NodeCapabilities {
+                    node_id: "vps-jane-aiua-01".into(),
+                    roles: vec![],
+                    models: vec![],
+                    tools: vec![],
+                    constraints: Default::default(),
+                    build_version: String::new(),
+                },
+                mesh_port: 9000,
+                blob_port: 9001,
+                execution_port: 9002,
+                ipc_socket_path: "/tmp/unused-vps.sock".into(),
+                active_pid: None,
+                mesh_host: None,
+            })
+            .expect("seed peer hotel");
+        // Names vps-jane (known) and mbp-jane (unknown here: dropped).
+        graph
+            .upsert_membrane_transport_home(&legacy_vps_home())
+            .unwrap();
+
+        match report(&graph) {
+            IpcResponse::TransportHomeSet { .. } => {}
+            other => panic!("expected TransportHomeSet, got {other:?}"),
+        }
+        let home = coach_home(&graph).expect("record");
+        assert_eq!(home.active_home_hotel, "local-aiua-01", "canonical node id");
+        assert!(
+            home.updated_unix > 0,
+            "stamped so hotel-state gossip carries it"
+        );
+        assert_eq!(home.standby_hotels, vec!["vps-jane-aiua-01".to_string()]);
+        assert!(!home.standby_hotels.iter().any(|h| h.contains("local")));
+    }
+
+    #[test]
+    fn philote_host_with_no_record_claims_it() {
+        let graph = conflict_graph(true);
+        assert!(matches!(
+            report(&graph),
+            IpcResponse::TransportHomeSet { .. }
+        ));
+        assert_eq!(
+            coach_home(&graph).unwrap().active_home_hotel,
+            "local-aiua-01"
+        );
+    }
+
+    #[test]
+    fn a_hotel_without_the_philote_never_writes() {
+        // Guest record exists but has no live pid: not running here.
+        let graph = conflict_graph(false);
+        graph
+            .upsert_membrane_transport_home(&legacy_vps_home())
+            .unwrap();
+        match report(&graph) {
+            IpcResponse::Standard {
+                ok: false, code, ..
+            } => {
+                assert_eq!(code, "CONFLICT_NOT_PHILOTE_HOST")
+            }
+            other => panic!("expected refusal, got {other:?}"),
+        }
+        assert_eq!(coach_home(&graph).unwrap().updated_unix, 0, "untouched");
+    }
+
+    #[test]
+    fn an_already_stamped_home_is_not_rewritten_when_conflicts_persist() {
+        let graph = conflict_graph(true);
+        assert!(matches!(
+            report(&graph),
+            IpcResponse::TransportHomeSet { .. }
+        ));
+        let first = coach_home(&graph).unwrap();
+        match report(&graph) {
+            IpcResponse::Standard {
+                ok: false, code, ..
+            } => {
+                assert_eq!(code, "CONFLICT_EXTERNAL_POLLER")
+            }
+            other => panic!("expected external-poller refusal, got {other:?}"),
+        }
+        assert_eq!(coach_home(&graph).unwrap().updated_unix, first.updated_unix);
+    }
+
+    #[test]
+    fn philote_guest_matcher_covers_both_guest_shapes_and_skips_workers() {
+        let guest = |id: &str, command: &str, agent: &str| GuestRecord {
+            hotel_name: "h".into(),
+            guest_id: id.into(),
+            role: "agent".into(),
+            config_json: serde_json::json!({
+                "command": command, "env": { "PHILOTIC_AGENT_ID": agent }
+            })
+            .to_string(),
+            is_active: true,
+            active_pid: None,
+            last_active_at: None,
+        };
+        let m = IpcServer::guest_runs_agent_philote;
+        assert!(m(
+            &guest("h:philote-coach", "philote", "agent-coach"),
+            "agent-coach"
+        ));
+        assert!(m(
+            &guest("agent-coach:orchestrator", "x", "other"),
+            "agent-coach"
+        ));
+        assert!(!m(
+            &guest("agent-coachy:orchestrator", "x", "other"),
+            "agent-coach"
+        ));
+        assert!(!m(
+            &guest("h:w", "philote-worker", "agent-coach"),
+            "agent-coach"
+        ));
+        assert!(!m(
+            &guest("h:philote-bjork", "philote", "agent-bjork-01"),
+            "agent-coach"
+        ));
+    }
 
     fn expect_telegram_poll_lease(response: IpcResponse) -> (bool, Option<LeaseEnvelope>) {
         match response {
