@@ -43,7 +43,7 @@ final class NativeSignInAttemptTests: XCTestCase {
         let start = Date(timeIntervalSince1970: 1_000)
         let attempt = try NativeSignInAttempt(client: .mac, now: start)
         let callback = URL(string: "com.philotic.apple.mac:/oauth/callback?state=\(attempt.state)&code=\(String(repeating: "a", count: 43))")!
-        XCTAssertThrowsError(try attempt.consume(callback, now: start.addingTimeInterval(120)))
+        XCTAssertThrowsError(try attempt.consume(callback, now: start.addingTimeInterval(300)))
         let cancelled = try NativeSignInAttempt(client: .mac)
         cancelled.cancel()
         XCTAssertThrowsError(try cancelled.consume(callback))

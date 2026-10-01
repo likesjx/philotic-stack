@@ -3,7 +3,7 @@ import SwiftUI
 
 @MainActor @Observable
 final class CortexStore {
-    private let client = CortexClient()
+    private let client = NativeCortexClient()
     private var token = ""
     private var generation = UUID()
     var snapshot: CortexSnapshot?
@@ -15,8 +15,10 @@ final class CortexStore {
     var busy = false
 
     func clear() {
+        let previousToken = token
         generation = UUID(); token = ""; snapshot = nil; memories = []
         detail = nil; selectedVault = ""; nextCursor = nil; busy = false; error = nil
+        if !previousToken.isEmpty { Task { await client.logout(token: previousToken) } }
     }
     func connect(token: String) async {
         clear(); self.token = token
@@ -30,7 +32,7 @@ final class CortexStore {
             let value = try await client.read(CortexSnapshot.self, token: token)
             guard generation == self.generation else { return }
             if let previous = snapshot, previous.cortexID != value.cortexID {
-                throw CortexClient.Failure.invalidResponse
+                throw NativeCortexClient.Failure.invalidResponse
             }
             snapshot = value; error = nil
         } catch {
@@ -50,7 +52,7 @@ final class CortexStore {
             guard generation == self.generation else { return }
             guard page.cortexID == snapshot?.cortexID, page.vaultID == selectedVault,
                   page.memories.allSatisfy({ $0.vaultID == selectedVault && !$0.memoryID.isEmpty })
-            else { throw CortexClient.Failure.invalidResponse }
+            else { throw NativeCortexClient.Failure.invalidResponse }
             var seen = Set(memories.map(\.id))
             memories.append(contentsOf: page.memories.filter { seen.insert($0.id).inserted })
             nextCursor = page.nextCursor; error = nil
@@ -68,7 +70,7 @@ final class CortexStore {
             let value = try await client.read(CortexMemory.self, token: token,
                 vault: item.vaultID, memory: item.memoryID)
             guard generation == self.generation else { return }
-            guard value.id == item.id else { throw CortexClient.Failure.invalidResponse }
+            guard value.id == item.id else { throw NativeCortexClient.Failure.invalidResponse }
             detail = value; error = nil
         } catch {
             guard generation == self.generation else { return }
@@ -80,7 +82,8 @@ final class CortexStore {
 
 struct CortexView: View {
     @State private var store = CortexStore()
-    @State private var operatorToken = ""
+    @State private var signIn = NativeCortexSignIn()
+    @State private var signingIn = false
     @State private var search = ""
     @Environment(\.scenePhase) private var scenePhase
 
@@ -118,19 +121,31 @@ struct CortexView: View {
                         } else if store.memories.isEmpty { Text("No memories in this vault.") }
                     }
                 }
-                Button("Disconnect Cortex", role: .destructive) { store.clear(); operatorToken = "" }
+                Button("Sign out of Cortex", role: .destructive) { store.clear() }
             } else {
                 Section("Connect to Cortex") {
-                    Text("vps-jane · Private Tailscale connection")
-                    Text(CortexClient.origin.absoluteString).font(.caption).textSelection(.enabled)
-                    SecureField("Hotel operator session token", text: $operatorToken)
-                    Text("Use an administrator session issued by this hotel—not your device enrollment token. Kept in memory only; cleared when the app enters the background. No credentials go to the public desktop.")
+                    Text("Browse your Philotic memory vaults.")
+                    Text("Sign in with your administrator account and approve Cortex access. You will be signed out when the app goes into the background.")
                         .font(.caption).foregroundStyle(.secondary)
-                    Button("Connect") {
-                        let token = operatorToken.trimmingCharacters(in: .whitespacesAndNewlines)
-                        operatorToken = ""
-                        Task { await store.connect(token: token) }
-                    }.disabled(store.busy || operatorToken.isEmpty)
+                    Button(signingIn ? "Signing in…" : "Sign in to Cortex") {
+                        signingIn = true; store.error = nil
+                        Task {
+                            defer { signingIn = false }
+                            do {
+                                let token = try await signIn.signIn()
+                                guard scenePhase != .background else {
+                                    await NativeCortexClient().logout(token: token)
+                                    return
+                                }
+                                await store.connect(token: token)
+                            } catch is CancellationError {
+                                store.error = nil
+                            } catch {
+                                store.error = "Could not sign in to Cortex. Check your account access and try again."
+                            }
+                        }
+                    }.disabled(store.busy || signingIn)
+                    if signingIn { Button("Cancel sign-in") { signIn.cancel() } }
                 }
             }
             if store.busy { ProgressView("Reading Cortex…") }
@@ -138,7 +153,9 @@ struct CortexView: View {
         }
         .navigationTitle("Cortex")
         .onChange(of: scenePhase) { _, value in
-            if value == .background { store.clear(); operatorToken = "" }
+            // The system browser can change scene phase during authentication.
+            // No memory or access token is retained during that browser handoff.
+            if value == .background { store.clear() }
         }
         .task {
             while !Task.isCancelled {

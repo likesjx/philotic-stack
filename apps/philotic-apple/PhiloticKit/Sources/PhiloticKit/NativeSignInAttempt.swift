@@ -2,8 +2,7 @@ import CryptoKit
 import Foundation
 import Security
 
-/// Local-only handoff primitive, not a login client. No browser registration,
-/// network request or gateway credential is introduced by this type.
+/// One browser handoff. The verifier never enters the authorization URL.
 @MainActor
 public final class NativeSignInAttempt {
     public enum Client: String, Sendable {
@@ -30,7 +29,16 @@ public final class NativeSignInAttempt {
         self.verifier = verifier
         state = try Self.randomSecret()
         challenge = Self.s256(verifier)
-        expiresAt = now.addingTimeInterval(120)
+        expiresAt = now.addingTimeInterval(300)
+    }
+
+    public var authorizationURL: URL {
+        var url = URLComponents(url: NativeCortexClient.origin, resolvingAgainstBaseURL: false)!
+        url.path = "/native-auth/start"
+        url.queryItems = [URLQueryItem(name: "client_id", value: client.rawValue),
+            URLQueryItem(name: "redirect_uri", value: client.callbackURL.absoluteString),
+            URLQueryItem(name: "state", value: state), URLQueryItem(name: "code_challenge", value: challenge)]
+        return url.url!
     }
 
     public func cancel() { verifier = nil }

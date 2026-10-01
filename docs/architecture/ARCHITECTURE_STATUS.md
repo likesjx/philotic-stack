@@ -126,12 +126,15 @@ verified on September 21. The Mac connection screen runs with Desktop preserved.
 Authenticated native UI and phone installation remain pending; manual operator
 sign-in and loaded-row filtering are transitional, not global search.
 
-The [native sign-in handoff](NATIVE_OPERATOR_SIGNIN_PROPOSAL.md) has a local-only
-PKCE/state/callback primitive with four passing targeted tests. It is not wired
-into the app and performs no network calls. The desktop deployment owner must
-agree and implement the HTTPS origin, one-time exchange and scoped native handle
-before authenticated native sign-in can be enabled. Gateway credentials remain
-server-only; PKCE is verifier possession, not proof of app identity.
+The [native sign-in handoff](NATIVE_OPERATOR_SIGNIN_PROPOSAL.md) now has system
+browser UI and an ephemeral Cortex-only client pinned to the operator-approved
+`https://desktop.jaredlikes.com`. Native handles are distinct from device and
+desktop credentials. The isolated gateway/website source is test-green; October
+1 Swift tests, signed iOS build and signature verification pass. Public routing,
+physical installation and real Google-to-Cortex reads are not yet proven.
+Gateway credentials remain server-only; PKCE proves verifier possession, not
+app identity. Scoped deployment must preserve the existing desktop and avoid
+opening general API/WebSocket access.
 
 ### Runtime and authority
 

@@ -2,8 +2,8 @@
 title: Native Apple Operator Sign-In
 doc_type: proposal
 domain: operator-control-plane
-status: proposed
-last_updated: 2026-09-23
+status: accepted-current-slice
+last_updated: 2026-10-01
 tags: [apple, authentication, pkce, cortex, gateway]
 related_docs:
   - CORTEX_VIEWER_PROPOSAL.md
@@ -35,7 +35,7 @@ hotel sessions server-side. The hotel remains the issuer/validator of hotel
 authority. Existing browser cookies and gateway-bound hotel tokens are not
 native credentials.
 
-### Proposed contract — not enabled
+### Accepted contract — rollout pending
 
 1. The app creates independent 256-bit verifier/state values. Only state and the
    S256 challenge enter the browser authorization request, never the verifier.
@@ -68,27 +68,47 @@ after cancellation or returning into a cleared attempt.
 
 ## Disposition
 
-Proposed, coordinated with the owner of the combined desktop/hotel deployment.
-Neither native HTTPS origin nor endpoint names are agreed or enabled. The
-existing private Cortex client's origin pin and authorization are unchanged.
+Accepted for the current slice. The operator approved Google sign-in and
+`https://desktop.jaredlikes.com` as the exchange and Cortex-read origin. Client
+and gateway implementation are test-green; public routing and authenticated
+physical-device proof remain pending. Approval of the origin does not authorize
+an unrestricted listener or arbitrary gateway routes.
 
 ## Current Slice
 
-`NativeSignInAttempt` is a local-only, unused-by-UI primitive. It generates
-verifier/state, computes S256, validates callbacks, expires after 120 seconds,
-and consumes or cancels each attempt once. Mac/iOS callback strings are proposed
-test fixtures, **not registered application or server redirects**. The primitive
-performs no network calls, issues no session, and cannot grant Cortex access.
+The shared Cortex screen now uses `ASWebAuthenticationSession` and an ephemeral,
+redirect-rejecting `NativeCortexClient`. The app starts `/native-auth/start`,
+redeems the one-time code at `/native-auth/exchange`, reads only `/native/cortex`,
+and revokes at `/native-auth/logout`. Native handles have the distinct
+`native-cortex-` prefix, `cortex:read` scope and at most 15-minute lifetime.
+The verifier/state attempt lasts five minutes; the gateway code lasts at most
+120 seconds. Credentials and Cortex contents remain memory-only.
 
-The deployment task owns gateway/hotel rollout. This task owns the native
-primitive and proposal; server handoff implementation and UI wiring must follow
-an agreed contract, not run ahead of it.
+The iOS callback scheme is registered as
+`com.philotic.apple.ios:/oauth/callback`. Generation checks prevent cancellation
+or cleanup of an old attempt from destroying a newer sign-in. Browser callbacks
+carry code/state only, never credentials. Mac physical sign-in remains unproven.
+
+Gateway source is isolated in `codex/native-cortex-signin`; website display and
+asset isolation are in `codex/native-cortex-identity`. Website admission and
+Mongo administrator status remain separate gates; invitations never grant roles.
+The gateway still binds loopback. Deployment must preserve the existing desktop
+and publish only approved native/callback routes, not general `/api/` or `/ws`.
 
 ## Verification and Remaining Gates
 
 Local tests cover the RFC 7636 challenge vector, independent entropy, both client
 callbacks, replay, expiry, cancellation, state mismatch, wrong origin/client,
 duplicate parameters, fragment injection and encoded-path aliases.
+
+October 1 verification: 115 Swift tests executed, one skipped, zero failures;
+the generic physical-iOS build and strict signature verification passed. Website
+typecheck, isolated-asset production build and 13 auth tests passed (one Mongo
+integration test skipped). Gateway restoration passed 18 tests on September 30,
+including real loopback HTTP reads, audience refusal and mid-read revocation.
+The paired iPhone is currently unavailable; this is not installation or live
+Google-to-Cortex proof. Public route deployment, account-bound admission and
+real authenticated device reads remain required.
 
 Before enabling real sign-in, test server-side concurrent redemption, replay,
 expired/mismatched codes, wrong verifier/account/callback, audience and scope

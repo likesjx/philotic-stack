@@ -34,10 +34,15 @@ Contract: [desktop gateway hotel sessions](../crates/philotic-web/DESKTOP_GATEWA
 ### Cortex viewer
 
 Native sign-in continuation: [handoff proposal](architecture/NATIVE_OPERATOR_SIGNIN_PROPOSAL.md),
-branch `codex/native-signin`, seam `operator-session-auth`. Local-only PKCE/state
-and callback primitive added; no UI wiring, endpoint enablement or credential
-transmission. Agree the HTTPS gateway origin and scoped native handle contract
-with the desktop deployment owner before server implementation and app hookup.
+branch `codex/native-signin`, seam `operator-session-auth`. Operator approved
+Google and `https://desktop.jaredlikes.com` for the native read-only exchange.
+Browser UI, pinned ephemeral client and distinct scoped gateway handle are
+implemented locally. October 1: Swift 115 tests (one skipped), signed iOS build
+and signature verification pass; website typecheck/build and 13 tests pass.
+Gateway 18 tests passed September 30. Public routing remains disabled: obtain
+scoped deployment approval, preserve loopback/private listeners and the existing
+desktop, check the selected Google account/admission, reconnect the phone,
+install and prove real Google sign-in plus Cortex inventory/detail reads.
 
 Branch: `codex/cortex-viewer`; seam: `muninn-admin-observability-plane`.
 Spec: [Cortex viewer](architecture/CORTEX_VIEWER_PROPOSAL.md).
