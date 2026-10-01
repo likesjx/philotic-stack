@@ -873,9 +873,14 @@ vps-deploy-ci:
     SSH_OPTS=(-o ConnectTimeout=15 -o ServerAliveInterval=15 -o ServerAliveCountMax=4)
 
     echo "▶ Finding latest successful build-linux run on develop..."
-    RUN_ID=$(gh run list --workflow=build-linux.yml --branch develop --status success --limit 1 --json databaseId -q '.[0].databaseId')
+    # Filter client-side: `gh run list --status success --limit 1` returned
+    # weeks-old runs (09-07, 09-21) while that day's develop builds had all
+    # succeeded, so the deploy shipped a stale build (DEF-213).
+    # PHILOTIC_VPS_DEPLOY_RUN_ID pins an exact run.
+    RUN_ID="${PHILOTIC_VPS_DEPLOY_RUN_ID:-$(gh run list --workflow=build-linux.yml --branch develop --limit 30 --json databaseId,conclusion -q '[.[] | select(.conclusion == "success")][0].databaseId')}"
     if [ -z "${RUN_ID}" ]; then echo "✗ no successful build-linux run on develop — push to develop or run the workflow first"; exit 1; fi
-    echo "  run ${RUN_ID}"
+    RUN_SHA=$(gh run view "${RUN_ID}" --json headSha,createdAt -q '"\(.headSha[0:8]) built \(.createdAt)"')
+    echo "  run ${RUN_ID} (${RUN_SHA}); origin/develop is $(git -C "${ROOT_DIR}" rev-parse --short=8 origin/develop 2>/dev/null || echo '?')"
 
     if [ "${PHILOTIC_VPS_DEPLOY_VIA_RSYNC:-0}" = "1" ]; then
       echo "▶ Fallback path (PHILOTIC_VPS_DEPLOY_VIA_RSYNC=1): downloading linux-x86_64 artifact locally..."
