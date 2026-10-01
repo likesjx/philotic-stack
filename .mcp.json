@@ -7,7 +7,9 @@
     "muninn-local": {
       "type": "stdio",
       "command": "muninn",
-      "args": ["mcp"],
+      "args": [
+        "mcp"
+      ],
       "env": {
         "MUNINN_MCP_URL": "http://127.0.0.1:8750/mcp"
       }
@@ -15,7 +17,16 @@
     "graphify": {
       "type": "stdio",
       "command": "graphify-mcp",
-      "args": ["graphify-out/graph.json"]
+      "args": [
+        "graphify-out/graph.json"
+      ]
+    },
+    "philotic": {
+      "type": "http",
+      "url": "https://mcp.jaredlikes.com/agent/mcp",
+      "headers": {
+        "Authorization": "Bearer ${PHILOTIC_AGENT_MCP_TOKEN:-}"
+      }
     }
   }
 }

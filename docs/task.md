@@ -423,11 +423,11 @@ Seam IDs: `mcp-upstream-route-target`, `agent-frontdoor-endpoint`, `remote-munin
 - [ ] S1 `McpUpstream` route target + cross-hotel endpoint-config dispatch + caller principal (code on `claude/stoic-goldberg-f8w99b`; not yet compiled — cloud session had no crates.io download access).
 - [x] S2 `scripts/muninn_mcp.py` frontdoor mode (`PHILOTIC_FRONTDOOR_URL` / `PHILOTIC_AGENT_MCP_TOKEN`); mock-frontdoor verified.
 - [x] S1 compiled + tested on mac-jane after merging develop (5 new tests green, `just check` green).
-- [ ] S3 Register upstreams — `intel-graph` on mac-jane DONE (connected, 12 tools; granted call ok, ungranted refused); `muninn-cortex` on vps-jane DONE (connected, 4 tools, Cortex bearer stored; granted recall ok, ungranted refused — moved off the Mac: Mac Muninn is a write-rejecting observer); provision `agent-frontdoor` endpoint on vps-jane; TLS path `/agent/mcp`.
+- [x] S3 upstreams `muninn-cortex` (vps-jane) + `intel-graph` (mac-jane) registered with grants; endpoint provisioned; Traefik `/agent/mcp` + iptables live.
 - [ ] S4 Hardening: proxy loopback trust DONE (#597, `is_trusted_loopback`); response-shape DONE (#601, no double-wrap); Mac-offline fast-fail = DEF-211 (30 s hang); endpoint config pushes dropped = DEF-212 (fixed #601); caller tag on writes: v1 relies on clients tagging (`claude`/`codex`), per-agent principal is in the endpoint audit.
 - [x] S3 endpoint `agent-frontdoor` provisioned on vps-jane (:8912, mesh, 16 tools, tokens for claude-cloud/codex-cloud in mac Keychain `philotic-agent-frontdoor`); loopback smoke green (`muninn_mcp.py bootstrap` → `transport: frontdoor`).
-- [ ] S5 Cloud client config (Claude Code / Codex env + allowlist, `.mcp.json` entry once live).
-- [ ] S6 `remote-agent-frontdoor` credential class + `mcp-client-uat.sh agent-frontdoor` mode.
+- [x] S5 `.mcp.json` `philotic` server + AGENTS.md/CLAUDE.md remote-agent bootstrap (PR #605); cloud env settings are operator-side. Handoff back: `docs/HANDOFF-2026-10-01-agent-frontdoor-cloud.md`.
+- [x] S6 credential class + `mcp-client-uat.sh agent-frontdoor` (#597); live 2026-10-01 after #601 deploy: public 16 tools, recall/graph round trips single-wrapped, live grant revoke refused immediately (no guest restart).
 
 ## New Project: Agent Loop Gap Closure
 

@@ -100,6 +100,28 @@ Quick orientation shortcuts:
 The graph gives you structural facts. Muninn gives you cognitive context
 (learnings, preferences, patterns). Use both. See `$graph-intelligence` skill.
 
+### Remote agents (cloud Claude Code / Codex)
+
+Cloud sessions cannot reach the tailnet, so they get the same continuity and
+coordination tools through the **agent frontdoor**
+(`https://mcp.jaredlikes.com/agent/mcp`, per-agent bearer; proposal
+[AGENT_FRONTDOOR_PROPOSAL.md](docs/architecture/AGENT_FRONTDOOR_PROPOSAL.md)).
+The environment must set `PHILOTIC_FRONTDOOR_URL` and
+`PHILOTIC_AGENT_MCP_TOKEN` and allow `mcp.jaredlikes.com`.
+
+- Bootstrap with `python3 scripts/muninn_mcp.py bootstrap`; it reports
+  `transport: frontdoor` when those variables are set. `just session-start`,
+  `idea-sweep` and `harness-drift` are local-only — skip them remotely.
+- The `philotic` MCP server (`.mcp.json`) exposes exactly 16 tools by their
+  usual names: `muninn_where_left_off|recall|remember|decide` (the vps
+  Cortex, `default` vault) and `graph_status|digest|next_task|context_for|impact|search|agent_dashboard`,
+  `session_start|activity|close`, `graph_decide`, `graph_record_test_run`
+  (intel-graph on mac-jane).
+- `graph_*`/`session_*` need mac-jane awake: once it has been offline ~15 s they fail fast with `TARGET_NODE_UNREACHABLE` (just after it sleeps they can still time out at 30 s; DEF-211)
+  Muninn keeps working either way. Tag Muninn writes with your client
+  (`claude`/`codex`).
+- Never paste the token into chat, commits, or files.
+
 ### Muninn Memory Contract
 
 Muninn is the continuity layer, not the task tracker, source of truth, or transcript archive.
