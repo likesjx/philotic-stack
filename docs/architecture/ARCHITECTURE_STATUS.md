@@ -3,7 +3,7 @@ title: Philotic Architecture Status
 doc_type: status
 domain: runtime-sessions
 status: active
-last_updated: 2026-09-22
+last_updated: 2026-10-01
 tags:
 - source-of-truth
 - current-state
@@ -130,11 +130,15 @@ The [native sign-in handoff](NATIVE_OPERATOR_SIGNIN_PROPOSAL.md) now has system
 browser UI and an ephemeral Cortex-only client pinned to the operator-approved
 `https://desktop.jaredlikes.com`. Native handles are distinct from device and
 desktop credentials. The isolated gateway/website source is test-green; October
-1 Swift tests, signed iOS build and signature verification pass. Public routing,
-physical installation and real Google-to-Cortex reads are not yet proven.
+1 Swift tests, signed iOS build and signature verification pass. The approved
+scoped HTTPS routes are deployed: real initiation, asset delivery and anonymous
+denial pass, while general API/WebSocket routes remain blocked. The hotel binary
+is unchanged and its restarted process has the distinct gateway credential.
+Physical installation, invitation redemption and real Google-to-Cortex reads
+remain unproven; the paired new phone is unavailable to Xcode.
 Gateway credentials remain server-only; PKCE proves verifier possession, not
-app identity. Scoped deployment must preserve the existing desktop and avoid
-opening general API/WebSocket access.
+app identity. The isolated identity assets and private loopback/proxy deployment
+preserve the existing desktop without opening general API/WebSocket access.
 
 ### Runtime and authority
 

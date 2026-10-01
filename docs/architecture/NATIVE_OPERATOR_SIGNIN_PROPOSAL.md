@@ -35,7 +35,7 @@ hotel sessions server-side. The hotel remains the issuer/validator of hotel
 authority. Existing browser cookies and gateway-bound hotel tokens are not
 native credentials.
 
-### Accepted contract — rollout pending
+### Accepted contract — scoped server rollout live; device proof pending
 
 1. The app creates independent 256-bit verifier/state values. Only state and the
    S256 challenge enter the browser authorization request, never the verifier.
@@ -70,8 +70,9 @@ after cancellation or returning into a cleared attempt.
 
 Accepted for the current slice. The operator approved Google sign-in and
 `https://desktop.jaredlikes.com` as the exchange and Cortex-read origin. Client
-and gateway implementation are test-green; public routing and authenticated
-physical-device proof remain pending. Approval of the origin does not authorize
+and gateway implementation are test-green; the explicitly approved scoped
+public routing is now live. Authenticated physical-device proof remains pending.
+Approval of the origin alone does not authorize
 an unrestricted listener or arbitrary gateway routes.
 
 ## Current Slice
@@ -107,8 +108,35 @@ typecheck, isolated-asset production build and 13 auth tests passed (one Mongo
 integration test skipped). Gateway restoration passed 18 tests on September 30,
 including real loopback HTTP reads, audience refusal and mid-read revocation.
 The paired iPhone is currently unavailable; this is not installation or live
-Google-to-Cortex proof. Public route deployment, account-bound admission and
-real authenticated device reads remain required.
+Google-to-Cortex proof. Account-bound admission and authenticated device reads
+remain required.
+
+### October 1 scoped server rollout
+
+Release `/home/deploy/releases/philotic-native-20261001` runs identity image
+`5e86abd6f0e5…` and gateway image `13cfbc128a25…`. The gateway still binds
+loopback inside a private namespace shared with an exact-path proxy. Only
+loopback host diagnostics ports are published. The new Traefik file adds
+native-auth, exact callback/finish paths, `/native/cortex`, identity authorization
+and isolated static assets; it does not publish general `/api/` or `/ws`.
+The original desktop remains installed and responds 200.
+
+The hotel environment gained a distinct confidential gateway credential with a
+mode-0600 rollback copy. `philotic-web` restarted as PID 1060262, using the same
+`/opt/philotic/bin/philotic-web` binary (SHA-256
+`a564e33a933ae7c61b142c60cde19b77606687119845bc90c1fbb59c1c17d3a1`).
+Its running environment contains the credential; no credential value was printed.
+
+Live smoke: iOS initiation returns 302 to the exact website identity path with
+the iOS client hint and secure flow cookie; the identity page and prefixed
+JavaScript return 200 with correct content types. Anonymous native Cortex and
+identity authorization return 401; general desktop API and WebSocket paths
+remain 403. These are route/runtime proofs, not successful user sign-in.
+The selected Google account already has an enabled admin role but no admission;
+generate its expiring invitation when the device is ready rather than consume
+its 15-minute window while installation is blocked. Xcode reports the new phone
+paired with Developer Mode enabled, but unavailable and last connected September
+24. No new app install occurred on October 1.
 
 Before enabling real sign-in, test server-side concurrent redemption, replay,
 expired/mismatched codes, wrong verifier/account/callback, audience and scope

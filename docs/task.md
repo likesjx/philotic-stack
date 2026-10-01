@@ -39,9 +39,13 @@ Google and `https://desktop.jaredlikes.com` for the native read-only exchange.
 Browser UI, pinned ephemeral client and distinct scoped gateway handle are
 implemented locally. October 1: Swift 115 tests (one skipped), signed iOS build
 and signature verification pass; website typecheck/build and 13 tests pass.
-Gateway 18 tests passed September 30. Public routing remains disabled: obtain
-scoped deployment approval, preserve loopback/private listeners and the existing
-desktop, check the selected Google account/admission, reconnect the phone,
+Gateway 18 tests passed September 30; four native tests passed again October 1.
+Scoped deployment approved and live: initiation, real assets and anonymous denial
+verified; general API/WebSocket routes remain blocked and desktop unchanged.
+Hotel binary unchanged; distinct credential configured in a fresh running PID.
+Selected Google account is already enabled/admin but needs account-bound
+invitation redemption. New phone is paired/Developer Mode enabled but Xcode
+reports unavailable. Next: restore its connection, issue the 15-minute invitation,
 install and prove real Google sign-in plus Cortex inventory/detail reads.
 
 Branch: `codex/cortex-viewer`; seam: `muninn-admin-observability-plane`.
