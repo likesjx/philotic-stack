@@ -2085,17 +2085,22 @@ Order: P0 → P1 → P2 ∥ P3 → P4. P5 deferred.
 
 ## New Project: Desktop Generative Surfaces
 
-Proposal: [DESKTOP_GENERATIVE_SURFACES_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/DESKTOP_GENERATIVE_SURFACES_PROPOSAL.md) (proposed 2026-09-14; outcome of the operator's A2UI/AG-UI investigation for `jaredlikes-desktop`; adopts A2UI v0.9 as the surface payload schema on the existing routed operator-chat stream, AG-UI kept as a deferred projection).
+Proposal: [DESKTOP_GENERATIVE_SURFACES_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/DESKTOP_GENERATIVE_SURFACES_PROPOSAL.md) (proposed 2026-09-14; **accepted 2026-10-01 with the cross-membrane amendment**: one Philotic-owned web renderer served by `philotic-web`, hosted by the desktop, an Apple `WKWebView`, Telegram Mini Apps, and an MCP App; AG-UI investigated as its own membrane).
 
-Order: S0 → S1a ∥ S1b ∥ S1c → S2 → S3. S4 deferred. Precondition: commit the cookie-session Aiua work sitting uncommitted in `jaredlikes-desktop`.
+Order: A0 → S0 → S1 → S2 → S3 → S4; AG-UI investigation independent. The uncommitted `jaredlikes-desktop` work gates only the desktop embed (S4).
 
+- [ ] A0 `approval-action-ids`: compact approval id in Telegram `callback_data` (`approve:<id8>`, `deny:<id8>`, `trust:<id8>`) built from `ApprovalRequest.approval_id`; philote refuses a tap whose id is not the pending approval ("no longer pending") before any trust pre-approval is set; bare legacy callbacks and typed `/approve` keep working; edge `ApprovalResolve` routing follows — watched-live-green (stale tap refused, fresh tap resolves on a live hotel).
 - [ ] S0 `surface-schema-and-types`: vendor the A2UI v0.9 JSON Schema subset for catalog `philotic.desktop.v1`; `typify` Rust types into `ansible-mesh-core::surface`; `validate()` with catalog allowlist + size ceilings; fixtures for every allowed and every excluded component — test-green.
-- [ ] S1a `surface-render-tools`: `ui.surface.create|update|delete`, `ui.data.update` in `philote/catalog.rs` + `tool_exec.rs`; `desktop.surfaces` abstract skill seeded and SkillDAG-implied; emit `turn_event{event:"ui_surface"}` with owner/hotel/session/seq attribution; tool description states the "only while a desktop turn is in flight" limit until S3 — test-green.
-- [ ] S1b `surface-stream-projection`: `philotic-web` types the frame as `operator_chat:ui_surface`; desktop `aiua-service` → `aiua:ui-surface`; Surfaces workspace app opens one window per `surface_id` — smoke-green on mac-jane (philote renders a hotel-status card).
-- [ ] S1c `surface-renderer-catalog` (`jaredlikes-desktop`): `a2ui-surface` element (adjacency list, JSON Pointer + relative binding, `ajv` validation, catalog map); new `ui-card`, `ui-list`, `ui-table` Shadow-DOM primitives; web-test-runner at the 80% gate — test-green.
-- [ ] S2 `surface-action-return`: `ui_action` on the chat adapter + `SendOperatorChatTurn`; `ui.action` observation in the philote dialogue; `context.action_id` correlation; approval card as an A2UI surface resolving the same approval record as Telegram's numbered card — watched-live-green (operator approves a real pending tool call from a desktop surface).
-- [ ] S3 `surface-persistence-rehydrate`: hotel-owned `ui_surfaces` records (`ListSurfaces`/`GetSurface` IPC, `GET /api/surfaces`); desktop rehydrate after reload; surfaces from cron/Telegram-initiated turns via the edge cursor ledger seam — smoke-green.
-- [ ] S4 `surface-agui-adapter` — deferred until an external AG-UI consumer exists (`GET /api/agents/:id/agui` SSE; `EdgeMessage::Surface` for the Apple edge client).
+- [ ] S1 `surface-persistence-rehydrate`: hotel-owned `ui_surfaces` records (`ListSurfaces`/`GetSurface` IPC, `GET /api/surfaces/:id`); `OutboundReply::Surface` / `EdgeMessage::Surface` with a native-lowering hint; delivery outcome `displayed`/`offered_link`/`rejected` back to the philote — test-green.
+- [ ] S1 `surface-render-tools`: `ui.surface.create|update|delete`, `ui.data.update`; `desktop.surfaces` abstract skill seeded and SkillDAG-implied; replies bound to the reported delivery outcome (say-do) — test-green.
+- [ ] S2 `surface-web-renderer`: A2UI→DOM renderer bundle in philotic-stack served at `/s/:surface_id`; catalog map, JSON Pointer binding, validation, card/list/table primitives; host action bridge — test-green.
+- [ ] S2 `surface-https-edge`: Tailscale Serve HTTPS for `philotic-web`; `web_public_base_url` so the transport can move to the native Philotic VPN — smoke-green.
+- [ ] S3 `surface-telegram-miniapp`: `web_app` Open button from the emitting philote's bot; `initData` Ed25519 third-party validation, `auth_date` freshness, operator user-id allowlist, operator-bot check; surface-scoped session — watched-live-green.
+- [ ] S3 `surface-apple-webview`: `WKWebView` host loading the server renderer; `WKScriptMessageHandler` → existing `EdgeMessage` connection; no web credential in the page — smoke-green on the operator's iPhone.
+- [ ] S4 `surface-stream-projection` + `surface-action-return`: desktop embeds the served renderer; `operator_chat:ui_surface` live frames; `ui_action` through `SendOperatorChatTurn` sharing A0's id correlation — watched-live-green.
+- [ ] S4 `surface-mcp-app`: `membrane-mcp` serves the fixed renderer as a `ui://` MCP App — smoke-green from one MCP Apps host.
+- [ ] `surface-agui-adapter` — **investigation: AG-UI as a membrane** (`membrane-agui` alongside `membrane-mcp`; auth; thread/run ↔ session mapping; A2UI carriage; `ag-ui` 0.5 alpha crates vs hand-mapped events) — report + recorded decision.
+- Superseded: S1c `surface-renderer-catalog` (renderer moved from `jaredlikes-desktop` into `surface-web-renderer`).
 
 ## New Project: MCP Endpoint Steward
 
