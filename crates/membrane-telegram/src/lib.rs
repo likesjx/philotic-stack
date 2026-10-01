@@ -18,6 +18,7 @@ use pulldown_cmark::{
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, oneshot, watch};
@@ -2355,6 +2356,52 @@ struct SeatPollContext {
     inbound_tx: mpsc::Sender<InboundEnvelope>,
     /// NetworkState from the hotel: polling is suppressed while `false`.
     online_rx: watch::Receiver<bool>,
+    /// DEF-207: cross-poller 409s seen by this loop, drained by the seat's
+    /// renew tick (see [`TelegramSeatGuest::report_poll_conflicts`]).
+    poll_conflicts: Arc<AtomicU32>,
+}
+
+/// DEF-207: is this Telegram error body the cross-poller conflict — another
+/// process polling the same bot — rather than a webhook or other 409?
+fn is_cross_poller_conflict(json: &Value) -> bool {
+    json.get("error_code").and_then(|c| c.as_i64()) == Some(409)
+        && json
+            .get("description")
+            .and_then(|d| d.as_str())
+            .is_some_and(|d| d.contains("terminated by other getUpdates"))
+}
+
+/// Conflicts that must accumulate inside [`POLL_CONFLICT_WINDOW_SECS`] before
+/// the seat asks the hotel to resolve. A single 409 right after sleep/wake is
+/// usually this process's own stale connection and clears by itself; a second
+/// poller keeps producing them.
+const POLL_CONFLICT_THRESHOLD: usize = 3;
+const POLL_CONFLICT_WINDOW_SECS: u64 = 600;
+/// Minimum gap between two resolution requests for the same seat.
+const POLL_CONFLICT_REPORT_COOLDOWN_SECS: u64 = 600;
+
+/// Debounce for poll-conflict reports: record `new` conflicts at `now`, prune
+/// the window, and say whether a report is due.
+fn poll_conflict_report_due(
+    window: &mut VecDeque<Instant>,
+    new: u32,
+    now: Instant,
+    last_report: Option<Instant>,
+) -> bool {
+    for _ in 0..new {
+        window.push_back(now);
+    }
+    let horizon = Duration::from_secs(POLL_CONFLICT_WINDOW_SECS);
+    while window
+        .front()
+        .is_some_and(|t| now.saturating_duration_since(*t) > horizon)
+    {
+        window.pop_front();
+    }
+    let cooled = last_report.is_none_or(|t| {
+        now.saturating_duration_since(t) >= Duration::from_secs(POLL_CONFLICT_REPORT_COOLDOWN_SECS)
+    });
+    window.len() >= POLL_CONFLICT_THRESHOLD && cooled
 }
 
 /// Telegram long-polling loop for one seat.
@@ -2447,6 +2494,9 @@ async fn seat_poll_loop(mut ctx: SeatPollContext) {
                             }
                         } else if let Some(desc) = json.get("description").and_then(|d| d.as_str()) {
                             error!("Telegram API error: {}", desc);
+                            if is_cross_poller_conflict(&json) {
+                                ctx.poll_conflicts.fetch_add(1, Ordering::Relaxed);
+                            }
                             // 409 Conflict: Telegram still has our previous connection open
                             // (common after sleep/wake). Back off exponentially so we don't
                             // hammer it. One JoinHandle = one connection; we just need to
@@ -2742,6 +2792,13 @@ struct TelegramSeatGuest {
     /// True while `renew` re-runs `setup` for a standby re-probe, so a repeat
     /// "still not home" answer stays quiet instead of filing a heal event again.
     reprobing_standby: bool,
+    /// DEF-207: cross-poller 409 counter shared with the poll task.
+    poll_conflicts: Arc<AtomicU32>,
+    /// Recent conflict instants (debounce window) and the last report.
+    poll_conflict_window: VecDeque<Instant>,
+    last_poll_conflict_report: Option<Instant>,
+    /// The hotel answered "unknown operation" once (older aiua); stop asking.
+    poll_conflict_unsupported: bool,
 }
 
 /// Why a seat stopped polling. See the `stand_down` field docs.
@@ -2809,6 +2866,10 @@ impl TelegramSeatGuest {
             last_denial_code: StdMutex::new(None),
             pending_lease_release: false,
             reprobing_standby: false,
+            poll_conflicts: Arc::new(AtomicU32::new(0)),
+            poll_conflict_window: VecDeque::new(),
+            last_poll_conflict_report: None,
+            poll_conflict_unsupported: false,
         }
     }
 
@@ -2927,6 +2988,61 @@ impl TelegramSeatGuest {
                     "heal event push failed (best-effort): {e}"
                 );
             }
+        }
+    }
+
+    /// DEF-207: drain the poll task's conflict counter; once enough
+    /// cross-poller 409s accumulate, ask the hotel to resolve the conflict
+    /// (the hotel running the agent's philote claims the transport home and
+    /// gossips it; other hotels' seats then stand down). Best-effort.
+    async fn report_poll_conflicts(&mut self, client: &mut PhiloticClient) {
+        let new = self.poll_conflicts.swap(0, Ordering::Relaxed);
+        if self.poll_conflict_unsupported {
+            return;
+        }
+        let now = Instant::now();
+        if !poll_conflict_report_due(
+            &mut self.poll_conflict_window,
+            new,
+            now,
+            self.last_poll_conflict_report,
+        ) {
+            return;
+        }
+        self.last_poll_conflict_report = Some(now);
+        let conflicts = self.poll_conflict_window.len() as u32;
+        warn!(
+            seat = %self.seat_guest_id,
+            token = %self.telegram_token_key,
+            conflicts,
+            "Telegram poll conflict (409: another poller on this bot) — asking the hotel to resolve"
+        );
+        let request = IpcRequest::ReportTelegramPollConflict {
+            agent_id: self.target_agent_id.clone(),
+            resource_ref: self.telegram_token_key.clone(),
+            conflicts,
+        };
+        match client.send_request(request).await {
+            Ok(IpcResponse::TransportHomeSet { .. }) => info!(
+                token = %self.telegram_token_key,
+                "Telegram poll conflict resolved: this hotel claimed the transport home"
+            ),
+            Ok(IpcResponse::Standard {
+                ok: false, code, ..
+            }) => {
+                // An aiua without this op cannot decode the request.
+                if code == "MALFORMED_PAYLOAD" {
+                    warn!("hotel does not support poll-conflict resolution yet; not asking again");
+                    self.poll_conflict_unsupported = true;
+                } else {
+                    info!(
+                        code,
+                        "Telegram poll conflict: hotel declined to claim ({code})"
+                    );
+                }
+            }
+            Ok(other) => debug!("poll-conflict report reply: {other:?}"),
+            Err(e) => warn!("poll-conflict report failed (best-effort): {e}"),
         }
     }
 
@@ -3264,6 +3380,7 @@ impl MembraneGuest for TelegramSeatGuest {
             update_dedupe: self.update_dedupe.clone(),
             inbound_tx: self.inbound_tx.clone(),
             online_rx: self.online_rx.clone(),
+            poll_conflicts: self.poll_conflicts.clone(),
         };
         self.poll_task = Some(tokio::spawn(seat_poll_loop(ctx)));
 
@@ -3276,6 +3393,7 @@ impl MembraneGuest for TelegramSeatGuest {
         // 2026-07-09 stuck-turn forensic). Runs even for a yielded seat / one
         // with no lease key yet, so nothing queued during setup is lost.
         self.flush_pending_heal_events(client).await;
+        self.report_poll_conflicts(client).await;
 
         // R2 (DEF-107): a TransportHomeChanged push moved the home away while we
         // were polling; the poll task is already stopped — release the lease now
@@ -4404,6 +4522,64 @@ pub async fn run() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn only_the_cross_poller_409_counts_as_a_conflict() {
+        use super::is_cross_poller_conflict;
+        use serde_json::json;
+        assert!(is_cross_poller_conflict(&json!({
+            "ok": false, "error_code": 409,
+            "description": "Conflict: terminated by other getUpdates request; make sure that only one bot instance is running"
+        })));
+        // A webhook conflict is a different problem; moving the home won't fix it.
+        assert!(!is_cross_poller_conflict(&json!({
+            "ok": false, "error_code": 409,
+            "description": "Conflict: can't use getUpdates method while webhook is active"
+        })));
+        assert!(!is_cross_poller_conflict(&json!({
+            "ok": false, "error_code": 401, "description": "Unauthorized"
+        })));
+    }
+
+    #[test]
+    fn poll_conflict_reports_are_debounced_and_cooled_down() {
+        use super::{
+            POLL_CONFLICT_REPORT_COOLDOWN_SECS, POLL_CONFLICT_WINDOW_SECS, poll_conflict_report_due,
+        };
+        use std::collections::VecDeque;
+        use std::time::{Duration, Instant};
+        let t0 = Instant::now();
+        let mut w = VecDeque::new();
+        // A lone post-wake 409 (self-conflict) does not trigger.
+        assert!(!poll_conflict_report_due(&mut w, 1, t0, None));
+        assert!(!poll_conflict_report_due(
+            &mut w,
+            1,
+            t0 + Duration::from_secs(20),
+            None
+        ));
+        assert!(poll_conflict_report_due(
+            &mut w,
+            1,
+            t0 + Duration::from_secs(40),
+            None
+        ));
+        // Cooldown after a report.
+        let reported = t0 + Duration::from_secs(40);
+        assert!(!poll_conflict_report_due(
+            &mut w,
+            1,
+            t0 + Duration::from_secs(60),
+            Some(reported)
+        ));
+        let later = reported + Duration::from_secs(POLL_CONFLICT_REPORT_COOLDOWN_SECS);
+        assert!(poll_conflict_report_due(&mut w, 3, later, Some(reported)));
+        // Old conflicts slide out of the window.
+        let mut w2 = VecDeque::new();
+        assert!(!poll_conflict_report_due(&mut w2, 2, t0, None));
+        let past = t0 + Duration::from_secs(POLL_CONFLICT_WINDOW_SECS + 1);
+        assert!(!poll_conflict_report_due(&mut w2, 1, past, None));
+    }
+
     use super::{
         ActiveTurn, TELEGRAM_MAX_COMMANDS, TELEGRAM_MENU_COMMANDS, TelegramBotCommand,
         TelegramFileRef, TelegramSeatGuest, UpdateDedupe, approval_callback_content,

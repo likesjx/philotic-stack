@@ -5916,6 +5916,17 @@ impl IpcServer {
                 )
                 .await
             }
+            IpcRequest::ReportTelegramPollConflict {
+                agent_id,
+                resource_ref,
+                conflicts,
+            } => Self::handle_report_telegram_poll_conflict(
+                graph,
+                local_node_id,
+                agent_id,
+                resource_ref,
+                conflicts,
+            ),
             IpcRequest::GetTelegramPollLeaseOwner { lease_key } => {
                 Self::handle_get_telegram_poll_lease_owner(
                     graph,

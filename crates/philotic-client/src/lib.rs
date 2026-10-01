@@ -1010,6 +1010,17 @@ pub enum IpcRequest {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         resource_ref: Option<String>,
     },
+    /// DEF-207: a seat saw repeated Telegram `409 terminated by other getUpdates
+    /// request` — another process (usually another hotel) polls the same bot.
+    /// The hotel resolves it: if it runs the agent's philote it claims the
+    /// transport home (stamped, gossiped); otherwise it waits for that hotel.
+    ReportTelegramPollConflict {
+        agent_id: String,
+        /// Bot token key, e.g. `telegram_bot_token_coach`.
+        resource_ref: String,
+        /// Conflicts seen inside the seat's debounce window.
+        conflicts: u32,
+    },
     AcquireDesktopMembraneLease {
         lease_key: String,
         port: u16,
