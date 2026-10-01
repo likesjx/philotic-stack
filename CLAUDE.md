@@ -12,6 +12,8 @@ Every session MUST begin with these steps in order:
 4.  **Verify Green Status**: Run `just check` and `just test` (or the relevant smoke) to confirm the baseline is stable before editing.
 5.  **Record Decisions**: After completing work, use `graph_decide` (MCP) or `phil graph decide` to record what you did and why. Use `muninn_decide` / `muninn_remember` for the durable memory delta: decisions, reality gaps, validation outcomes, next seams, and operator preferences.
 
+**Remote (cloud) sessions** can't reach the tailnet: bootstrap with `python3 scripts/muninn_mcp.py bootstrap` against the agent frontdoor (`PHILOTIC_FRONTDOOR_URL` + `PHILOTIC_AGENT_MCP_TOKEN`, `philotic` server in `.mcp.json`) and skip the local-only `just` steps — see AGENTS.md "Remote agents".
+
 When starting work on a specific proposal or seam, use the graph workflow:
 - `graph_next_task` → find the highest-priority unclaimed work
 - `graph_context_for` → load proposal + seams + code + verification + diagram in one call
