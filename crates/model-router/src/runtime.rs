@@ -8,6 +8,10 @@ use crate::transcribe_stream::{
     self, DEFAULT_IDLE_TIMEOUT_SECS, DEFAULT_MAX_SESSIONS, ElevenLabsRealtimeConnector,
     IpcStreamReplySink, StreamFrame, StreamReplySink, SttSessionManager, parse_stream_frame,
 };
+use ansible_mesh_core::decision_trace::{
+    DecisionTraceStorage, ShadowContext, SqliteDecisionTraceStorage,
+    default_db_path as decision_trace_db_path, shadow_trace_record,
+};
 use ansible_mesh_core::domain::GraphDomain;
 use ansible_mesh_core::router_trace::{
     RouterTraceStorage, RouterTrainingRecord, SqliteRouterTraceStorage,
@@ -1779,6 +1783,49 @@ async fn emit_failure(
 /// answer within this, the caller falls back rather than waiting on a vault stall.
 const DECISIONS_CONFIG_LOAD_TIMEOUT: Duration = Duration::from_secs(3);
 
+/// The node-local decisions trace store (`PHILOTIC_DECISION_TRACE_DB`, else
+/// beside `router_traces.db`), opened once. `None` if it cannot be opened: a
+/// shadow trace is observability, never a reason to fail the task.
+fn decision_trace_store() -> Option<&'static SqliteDecisionTraceStorage> {
+    static STORE: std::sync::OnceLock<Option<SqliteDecisionTraceStorage>> =
+        std::sync::OnceLock::new();
+    STORE
+        .get_or_init(
+            || match SqliteDecisionTraceStorage::open(decision_trace_db_path()) {
+                Ok(store) => Some(store),
+                Err(err) => {
+                    warn!("decision trace store unavailable ({err:#}); shadow traces are dropped");
+                    None
+                }
+            },
+        )
+        .as_ref()
+}
+
+fn record_shadow_trace(
+    site: &str,
+    shadow: &ShadowContext,
+    outcome: &std::result::Result<
+        ansible_mesh_core::decisions::DecisionsOutcome,
+        ansible_mesh_core::decisions::DecisionsError,
+    >,
+) {
+    let Some(store) = decision_trace_store() else {
+        return;
+    };
+    let row = shadow_trace_record(site, shadow, outcome);
+    if let Err(err) = store.record_trace(&row) {
+        warn!(site, "failed to record shadow decision trace: {err:#}");
+    } else {
+        info!(
+            site,
+            subject = %shadow.subject,
+            outcome = %row.outcome,
+            "shadow decision traced"
+        );
+    }
+}
+
 /// Serve one `decisions.evaluate` task end to end and reply with a
 /// `decisions_response`. Every path, including a failed config load, replies
 /// with a typed decision error; none goes through `emit_failure`, which would
@@ -1859,6 +1906,19 @@ async fn handle_decisions_task(
             "decision failed; the caller falls back to its deterministic decision: {}",
             err.message
         );
+    }
+
+    // A shadow call: the caller has already decided and is not waiting. The
+    // router records the judgment beside the incumbent's verdict and sends no
+    // reply, so every shadow site gets the same trace wherever it is served.
+    if let Some(shadow) = task_value
+        .get("shadow")
+        .cloned()
+        .and_then(|v| serde_json::from_value::<ShadowContext>(v).ok())
+    {
+        let site = decision.site.as_deref().unwrap_or("unknown");
+        record_shadow_trace(site, &shadow, &decision.outcome);
+        return Ok(());
     }
 
     let correlation_id = crate::decisions::correlation_id(task_value, task_id);

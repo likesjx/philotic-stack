@@ -18782,11 +18782,24 @@ pub(super) fn handle_register_skill_with_origin(
             "origin".into(),
             serde_json::Value::String(origin.to_string()),
         );
-        if let Some(trigger) = origin.strip_prefix("distill:") {
+        // `distill:<trigger>[:<source turn id>]`: the turn id joins the Draft
+        // skill back to the turn that fired the review (and its decisions
+        // shadow trace).
+        if let Some(rest) = origin.strip_prefix("distill:") {
+            let (trigger, source_turn_id) = match rest.split_once(':') {
+                Some((trigger, turn)) => (trigger, Some(turn)),
+                None => (rest, None),
+            };
             field_sources.insert(
                 "trigger".into(),
                 serde_json::Value::String(trigger.to_string()),
             );
+            if let Some(turn) = source_turn_id.filter(|t| !t.is_empty()) {
+                field_sources.insert(
+                    "source_turn_id".into(),
+                    serde_json::Value::String(turn.to_string()),
+                );
+            }
         }
     }
     if !field_sources.is_empty() {
@@ -20099,6 +20112,28 @@ pub(crate) mod tests {
         assert!(stored.skill_markers.iter().any(|m| m == "distilled"));
         assert_eq!(stored.field_sources["origin"], "distill:tool_count");
         assert_eq!(stored.field_sources["trigger"], "tool_count");
+        assert!(stored.field_sources.get("source_turn_id").is_none());
+
+        // With the source turn: trigger and turn are recorded separately so a
+        // Draft skill joins back to the turn (and its decisions shadow trace).
+        handle_register_skill_with_origin(
+            Some(&identity),
+            &graph,
+            "research.github-digest-turn".into(),
+            "Digest unread GitHub notifications by repo.".into(),
+            "philote-worker".into(),
+            "Collect notifications for {{repo}}, group, summarize.".into(),
+            vec!["web.fetch".into()],
+            vec![],
+            vec![],
+            Some("distill:error_recovered:turn-42".into()),
+        );
+        let joined = graph
+            .get_abstract_skill("research.github-digest-turn")
+            .expect("query skill")
+            .expect("persisted");
+        assert_eq!(joined.field_sources["trigger"], "error_recovered");
+        assert_eq!(joined.field_sources["source_turn_id"], "turn-42");
 
         // The same payload without an origin is the ordinary Validated path.
         let resp = handle_register_skill_with_origin(

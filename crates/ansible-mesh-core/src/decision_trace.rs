@@ -11,9 +11,12 @@
 //!
 //! # Authority
 //!
-//! Callers (`heal-dispatcher` today) write. Reads are for local analysis and the
-//! future calibration step. Traces are node-local by design; no mesh sync.
+//! Callers write: `heal-dispatcher` in-process, and model-router for any
+//! `decisions.evaluate` task that carries a [`ShadowContext`]. Reads are for
+//! local analysis and the future calibration step. Traces are node-local by
+//! design; no mesh sync.
 
+use crate::decisions::{DecisionAnswer, DecisionsError, DecisionsErrorClass, DecisionsOutcome};
 use anyhow::Result;
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
@@ -304,10 +307,163 @@ pub fn summarize(records: &[DecisionTraceRecord]) -> DecisionSummary {
     summary
 }
 
+// ──────────────────────────────────────────────────────────────────────────────
+// Router-side shadow traces
+// ──────────────────────────────────────────────────────────────────────────────
+
+/// What a shadow caller tells the router about the decision it already made,
+/// carried on a `decisions.evaluate` task as `"shadow": {...}`. The router that
+/// serves the call writes one trace row with it, so every shadow site gets the
+/// same trace (and the trace lives with the router, wherever that is).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ShadowContext {
+    /// A system identifier joining the judgment to its outcome (a turn id, a
+    /// heal row id), never operator content.
+    pub subject: String,
+    /// The site's data class (`A`, `B` or `C`), as the caller's gate saw it.
+    pub data_class: String,
+    /// The incumbent's verdict per question id: a bool for a `noul`, an option
+    /// key for a `choice`, `null` when the incumbent had no opinion.
+    #[serde(default)]
+    pub incumbent: BTreeMap<String, Value>,
+}
+
+/// Per question: did the judge agree with the incumbent? A `noul` agrees when
+/// `P(true) > 0.5` matches the incumbent's bool (a logging convenience, not a
+/// decision threshold: the probability is stored beside it); a `choice` agrees
+/// when the keys match. `None` = not comparable.
+pub fn agreement_with(
+    incumbent: &BTreeMap<String, Value>,
+    answers: &BTreeMap<String, DecisionAnswer>,
+) -> BTreeMap<String, Option<bool>> {
+    incumbent
+        .iter()
+        .map(|(question, verdict)| {
+            let agreed = match (answers.get(question), verdict) {
+                (Some(DecisionAnswer::Noul { noul }), Value::Bool(expected)) => {
+                    Some((*noul > 0.5) == *expected)
+                }
+                (Some(DecisionAnswer::Choice { choice, .. }), Value::String(expected)) => {
+                    Some(choice == expected)
+                }
+                _ => None,
+            };
+            (question.clone(), agreed)
+        })
+        .collect()
+}
+
+/// One trace row for a shadow decision served by the router. `bytes_sent` is
+/// zero here: the router path does not measure the wire body, and
+/// `input_tokens` carries the size instead.
+pub fn shadow_trace_record(
+    site: &str,
+    shadow: &ShadowContext,
+    result: &std::result::Result<DecisionsOutcome, DecisionsError>,
+) -> DecisionTraceRecord {
+    let base = DecisionTraceRecord {
+        trace_id: ulid::Ulid::new().to_string(),
+        timestamp: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs()),
+        site: site.to_string(),
+        data_class: shadow.data_class.clone(),
+        bytes_sent: 0,
+        outcome: "ok".into(),
+        error_class: None,
+        provider: None,
+        model: None,
+        transport: None,
+        latency_ms: None,
+        input_tokens: None,
+        output_tokens: None,
+        cost_usd: None,
+        legend_mismatch: false,
+        request_id: None,
+        subject: Some(shadow.subject.clone()),
+        incumbent: serde_json::to_value(&shadow.incumbent).ok(),
+        answers: None,
+        agreement: BTreeMap::new(),
+    };
+    match result {
+        Ok(outcome) => DecisionTraceRecord {
+            provider: Some(outcome.trace.provider.clone()),
+            model: Some(outcome.trace.model.clone()),
+            transport: Some(outcome.trace.transport.as_str().to_string()),
+            latency_ms: Some(outcome.trace.latency_ms),
+            input_tokens: Some(outcome.trace.usage.input_tokens),
+            output_tokens: Some(outcome.trace.usage.output_tokens),
+            cost_usd: outcome.trace.usage.cost_usd,
+            legend_mismatch: outcome.trace.legend_mismatch,
+            request_id: outcome.trace.request_id.clone(),
+            answers: serde_json::to_value(&outcome.result.answers).ok(),
+            agreement: agreement_with(&shadow.incumbent, &outcome.result.answers),
+            ..base
+        },
+        // The data policy declined to send: nothing left the machine.
+        Err(error) if error.class == DecisionsErrorClass::PolicyRefused => DecisionTraceRecord {
+            outcome: "skipped".into(),
+            error_class: Some(error.class.as_str().to_string()),
+            ..base
+        },
+        Err(error) => DecisionTraceRecord {
+            outcome: "error".into(),
+            error_class: Some(error.class.as_str().to_string()),
+            ..base
+        },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn shadow_agreement_compares_noul_and_choice_and_skips_the_rest() {
+        let incumbent: BTreeMap<String, Value> = [
+            ("lesson".to_string(), json!(true)),
+            ("kind".to_string(), json!("correction")),
+            ("unasked".to_string(), json!(true)),
+            ("no_view".to_string(), Value::Null),
+        ]
+        .into();
+        let answers: BTreeMap<String, DecisionAnswer> = [
+            ("lesson".to_string(), DecisionAnswer::Noul { noul: 0.31 }),
+            (
+                "kind".to_string(),
+                DecisionAnswer::Choice {
+                    choice: "correction".into(),
+                    probabilities: BTreeMap::new(),
+                    confidence: 0.9,
+                },
+            ),
+            ("no_view".to_string(), DecisionAnswer::Noul { noul: 0.9 }),
+        ]
+        .into();
+        let agreement = agreement_with(&incumbent, &answers);
+        assert_eq!(agreement["lesson"], Some(false));
+        assert_eq!(agreement["kind"], Some(true));
+        assert_eq!(agreement["unasked"], None, "the judge was not asked");
+        assert_eq!(agreement["no_view"], None, "the incumbent had no verdict");
+    }
+
+    #[test]
+    fn a_policy_refusal_is_a_skip_not_an_error() {
+        let shadow = ShadowContext {
+            subject: "turn-1".into(),
+            data_class: "C".into(),
+            incumbent: BTreeMap::new(),
+        };
+        let refused = Err(DecisionsError::new(
+            DecisionsErrorClass::PolicyRefused,
+            "not allowed",
+        ));
+        let row = shadow_trace_record("distill.prescreen", &shadow, &refused);
+        assert_eq!(row.outcome, "skipped");
+        assert_eq!(row.subject.as_deref(), Some("turn-1"));
+        assert_eq!(row.data_class, "C");
+    }
 
     fn record(id: &str, ts: u64, outcome: &str) -> DecisionTraceRecord {
         DecisionTraceRecord {

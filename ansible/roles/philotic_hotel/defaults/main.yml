@@ -45,6 +45,7 @@ philotic_binaries:
   - model-controller-anthropic
   - model-controller-openai
   - model-controller-openrouter
+  - model-controller-decisions
   - model-controller-mlx
   - model-controller-ollama
   - heal-dispatcher
