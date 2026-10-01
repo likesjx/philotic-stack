@@ -2,9 +2,9 @@
 title: Desktop Generative Surfaces — Philote-Authored UI as Data (A2UI over the Routed Operator Stream)
 doc_type: proposal
 domain: operator-control-plane
-status: proposed
-disposition: proposed
-last_updated: 2026-09-14
+status: accepted
+disposition: accepted
+last_updated: 2026-10-01
 tags:
   - desktop
   - generative-ui
@@ -14,6 +14,9 @@ tags:
   - operator-chat
   - approval-ux
   - skilldag
+  - telegram-mini-app
+  - apple-webview
+  - mcp-apps
 related_docs:
   - DESKTOP_WORKSPACE_COMPONENTS_PROPOSAL.md
   - DESKTOP_MEMBRANE_PROPOSAL.md
@@ -38,6 +41,12 @@ active_seams:
   - surface-action-return
   - surface-persistence-rehydrate
   - surface-agui-adapter
+  - approval-action-ids
+  - surface-web-renderer
+  - surface-https-edge
+  - surface-telegram-miniapp
+  - surface-apple-webview
+  - surface-mcp-app
 source_of_truth_targets:
   - ARCHITECTURE_STATUS.md
 ---
@@ -49,6 +58,51 @@ source_of_truth_targets:
 Let a philote build an interface for the operator inside `jaredlikes-desktop` (Likes OS) without ever shipping code to the browser: the philote emits a declarative UI description, the desktop renders it with its own component catalog inside a normal workspace window, and the operator's clicks and form entries flow back into the same conversation the philote is already having.
 
 This proposal answers the operator's ask of 2026-09-14 ("investigate creating an A2UI/AG-UI application within jared-desktop so that my philotes can create an interface for me") with a concrete shape, a protocol decision, and an ordered set of seams.
+
+## Amendment 2026-10-01 — Philote Surfaces Across Every Membrane (accepted)
+
+The operator widened the ask from "an interface in jared-desktop" to an A2UI/AG-UI strategy for the philotes as a whole, and accepted the amended plan on 2026-10-01. **Where this section conflicts with the 2026-09-14 text below, this section wins.** The 09-14 text stays as the investigation record.
+
+### What changed and why
+
+1. **One web renderer, many hosts.** The A2UI renderer is a small bundle **owned by philotic-stack and served by `philotic-web`** at `/s/:surface_id`, not code inside `jaredlikes-desktop`. Each host plugs into the same renderer through a small action bridge:
+
+   | Host | Loads the renderer from | Actions return via |
+   | --- | --- | --- |
+   | Desktop window (`jaredlikes-desktop`) | `philotic-web` (embed) | `SendOperatorChatTurn` `ui_action` |
+   | Apple app (`WKWebView`) | `philotic-web` (server-loaded, operator decision 2026-10-01) | `WKScriptMessageHandler` → Swift → the app's existing authenticated `EdgeMessage` connection. The page holds **no** web credential of its own |
+   | Telegram Mini App | `philotic-web`, launched from the emitting philote's own Telegram bot (`web_app` inline button, private chats only) | `initData`-authenticated POST into the same chat path |
+   | MCP App (`ui://` resource from `membrane-mcp`) | the same fixed renderer page, packaged as one MCP App | MCP Apps host bridge → gateway `tools/call` |
+
+   A fixed, Philotic-owned A2UI→HTML renderer keeps the "UI is data, never code" invariant: philotes still only emit A2UI data. Native SwiftUI rendering becomes optional polish. The uncommitted `jaredlikes-desktop` work leaves the critical path; it only gates the desktop embed.
+2. **Persistence moves ahead of every non-desktop host.** Mini Apps and webviews open a surface *later, by id*; they are not on the live `/ws` stream (which only exists during a desktop-initiated turn). Hotel-owned surface records plus `GET /api/surfaces/:id` are a prerequisite, not the last slice.
+3. **Delivery outcome is part of say-do.** Every membrane reports one of `displayed`, `offered_link` (Telegram: an Open button was sent), or `rejected` (cannot meet the surface's minimum fidelity). The philote's reply must match the reported outcome ("I sent you a link to open it", never "I showed you the form" when only a link went out). No half-rendering anywhere.
+4. **Native lowering stays for small things.** Approval cards and model pickers stay native Telegram inline keyboards (instant, no page load). Forms, tables, and dashboards go to the web renderer. Voice gets a spoken summary plus spoken choices. Discord components are net-new and out of the first slices.
+5. **Compact action ids everywhere.** Telegram `callback_data` is at most 64 bytes, so every actionable element carries a short Philotic id; context stays hotel-side. A2UI v1.0 may add a native action id (unconfirmed as of 2026-10-01); ours is required regardless. Today the approval id exists hotel-side (`ApprovalRequest.approval_id`) but never reaches any channel, so a stale Approve tap resolves whatever is pending now and a stale **Trust for session** tap grants session-wide pre-approval; `approval-action-ids` fixes that first.
+6. **Transport-agnostic reachability.** Mini Apps need HTTPS. The first slice uses **Tailscale Serve** (`*.ts.net` certificate; the phone is on the tailnet; Telegram Web's browser iframe is unsupported), which keeps `philotic-web` (the only authz boundary) off the public internet. The renderer base URL is configuration (`web_public_base_url`), not a Tailscale assumption, so the operator can move to the native Philotic hotel VPN (outbound dial + vps relay) without touching hosts or philotes.
+7. **AG-UI becomes a membrane investigation.** Operator direction 2026-10-01: investigate AG-UI as a possible membrane, an external-client surface in the same family as `membrane-mcp`, so AG-UI clients (CopilotKit and others) can drive a philote and receive A2UI surfaces as AG-UI events. Rust crates `ag-ui` / `ag-ui-a2ui` are at `0.5.0-alpha.3` (2026-09-28); the investigation decides whether to depend on them or hand-map the event vocabulary.
+
+### Telegram Mini App authentication rules
+
+`initData` is a new way into `philotic-web`, the only authz boundary, so all of these are required:
+
+- Verify Telegram's **Ed25519 third-party signature** against the bot id. This needs no bot token, so no persona bot tokens are copied into `philotic-web`.
+- Reject stale `auth_date` (short freshness window).
+- Allowlist the operator's Telegram user id.
+- Require that the bot id belongs to one of the operator's philote bots (from the hotel's membrane bindings).
+- The Mini App gets a short-lived session scoped to the surface it was launched for, not a general operator session.
+
+### Accepted seam order (supersedes the 09-14 order)
+
+A0 `approval-action-ids` → S0 `surface-schema-and-types` → S1 `surface-persistence-rehydrate` + `surface-render-tools` → S2 `surface-web-renderer` + `surface-https-edge` → S3 `surface-telegram-miniapp` ∥ `surface-apple-webview` → S4 `surface-stream-projection` (desktop embed) + `surface-action-return` ∥ `surface-mcp-app` → later: SwiftUI-native rendering, voice lowering, Discord components. `surface-agui-adapter` (AG-UI membrane investigation) runs independently.
+
+Superseded: `surface-renderer-catalog` (the renderer no longer lives in `jaredlikes-desktop`; its catalog work moves into `surface-web-renderer`).
+
+### Open after acceptance
+
+- Which personas get `desktop.surfaces` by default (09-14 open question 1).
+- Whether to commit the uncommitted `jaredlikes-desktop` work. No longer blocking; it gates only the desktop embed.
+- Unverified research to confirm before relying on it: whether A2UI v1.0 adds an action id; whether `@a2ui/web_core` still depends on Lit; AG-UI's interrupt event name.
 
 ## Investigation Summary (2026-09-14)
 
@@ -187,23 +241,31 @@ Explicitly **excluded** in v1: `Image`, `Video`, `AudioPlayer` (remote URL fetch
 
 ## Disposition
 
-`proposed`
+`accepted` (operator, 2026-10-01), as amended by the 2026-10-01 section above.
 
-Recorded 2026-09-14 as the outcome of the operator's investigation request. Acceptance decision is the operator's; the seams below are ordered so that S0–S2 form the first honest slice.
+Recorded `proposed` on 2026-09-14 as the outcome of the operator's investigation request.
 
 ## Seams
 
+Order and scope per the 2026-10-01 amendment. New seams first; the 09-14 rows below are kept and re-numbered by the amendment's order.
+
 | Seam | Scope | Rung to claim done |
 | --- | --- | --- |
+| `approval-action-ids` (A0) | Every approval card carries a compact approval id end to end (Telegram `callback_data`, edge `ApprovalRequest`/`ApprovalResolve`, desktop). A tap on a card that is no longer pending is refused with a visible "no longer pending" reply, and a stale Trust tap never grants session pre-approval. Bare legacy callbacks and typed `/approve` keep working | watched-live-green: a stale Telegram tap is refused, a fresh one resolves |
+| `surface-web-renderer` (S2) | Philotic-owned A2UI→DOM renderer bundle in philotic-stack, served by `philotic-web` at `/s/:surface_id`; catalog map, JSON Pointer binding, validation, card/list/table primitives; host action bridge interface. Supersedes `surface-renderer-catalog` | test-green |
+| `surface-https-edge` (S2) | HTTPS for `philotic-web` via Tailscale Serve; `web_public_base_url` config so the transport can later move to the native Philotic VPN | smoke-green |
+| `surface-telegram-miniapp` (S3) | Emitting philote's bot sends a `web_app` Open button; `initData` Ed25519 third-party validation, `auth_date` freshness, operator user-id allowlist, operator-bot check; surface-scoped short session | watched-live-green: operator opens and acts on a surface from Telegram |
+| `surface-apple-webview` (S3) | `WKWebView` host in PhiloticApp loading the server renderer; `WKScriptMessageHandler` bridge onto the existing `EdgeMessage` connection; no web credential in the page | smoke-green on the operator's iPhone |
+| `surface-mcp-app` (S4) | `membrane-mcp` serves the fixed renderer as a `ui://` MCP App for hosts such as Claude and ChatGPT | smoke-green from one MCP Apps host |
 | `surface-schema-and-types` (S0) | Vendor the A2UI v0.9 JSON Schema subset for `philotic.desktop.v1`; generate Rust types (`typify`) into `ansible-mesh-core::surface`; `validate()` with catalog allowlist and size ceilings; fixtures for every catalog component and every excluded one | test-green |
 | `surface-render-tools` (S1a) | `ui.surface.*` tools in `philote/catalog.rs` + `tool_exec.rs`; `desktop.surfaces` skill seeded and SkillDAG-implied; emission as `turn_event{event:"ui_surface"}` with attribution | test-green |
 | `surface-stream-projection` (S1b) | `philotic-web` types the frame as `operator_chat:ui_surface`; desktop `aiua-service` maps it to `aiua:ui-surface`; new Surfaces workspace app opens one window per `surface_id` via `windowManager` | smoke-green: a philote renders a hotel-status card in a desktop window on mac-jane |
-| `surface-renderer-catalog` (S1c) | `a2ui-surface` custom element: adjacency-list tree, JSON Pointer + relative binding, `ajv` validation, catalog map; new `ui-card`, `ui-list`, `ui-table` Shadow-DOM primitives; web-test-runner coverage at the repo's 80% gate | test-green in `jaredlikes-desktop` |
+| `surface-renderer-catalog` (superseded 2026-10-01 by `surface-web-renderer`) | `a2ui-surface` custom element: adjacency-list tree, JSON Pointer + relative binding, `ajv` validation, catalog map; new `ui-card`, `ui-list`, `ui-table` Shadow-DOM primitives; web-test-runner coverage at the repo's 80% gate | test-green in `jaredlikes-desktop` |
 | `surface-action-return` (S2) | `ui_action` on the chat adapter and on `SendOperatorChatTurn`; `ui.action` observation in the philote dialogue; `action_id` correlation; approval card rendered as an A2UI surface resolving the same approval record Telegram's numbered card resolves | watched-live-green: operator approves a real pending tool call from a desktop surface |
-| `surface-persistence-rehydrate` (S3) | Hotel-owned `ui_surfaces` records (`ListSurfaces`, `GetSurface` IPC; `GET /api/surfaces`); desktop rehydrates open surfaces after reload; surfaces emitted outside a desktop-initiated turn (cron, Telegram-initiated) reach the desktop via the edge cursor ledger seam already flagged in `serve/edge.rs` | smoke-green |
-| `surface-agui-adapter` (S4, deferred) | `GET /api/agents/:id/agui` SSE adapter mapping the internal frames to AG-UI events with surfaces in `CUSTOM`; `EdgeMessage::Surface` so the Apple edge client can render the same schema in SwiftUI | deferred until an external AG-UI consumer exists |
+| `surface-persistence-rehydrate` (S1, moved up 2026-10-01) | Hotel-owned `ui_surfaces` records (`ListSurfaces`, `GetSurface` IPC; `GET /api/surfaces/:id`); `OutboundReply::Surface` / `EdgeMessage::Surface` carry a surface reference plus a native-lowering hint; delivery outcome `displayed`/`offered_link`/`rejected` reported back to the philote; desktop rehydrates open surfaces after reload; surfaces emitted outside a desktop-initiated turn (cron, Telegram-initiated) reach the desktop via the edge cursor ledger seam already flagged in `serve/edge.rs` | smoke-green |
+| `surface-agui-adapter` (investigation, 2026-10-01) | **AG-UI as a membrane**: decide guest shape (`membrane-agui` alongside `membrane-mcp`), auth, mapping AG-UI threads and runs onto philote sessions, A2UI carriage (`CUSTOM`/activity events), and `ag-ui` crate dependency vs hand-mapped events. Originally a deferred SSE adapter | investigation report + decision recorded |
 
-Order: S0 → S1a ∥ S1b ∥ S1c → S2 → S3. S4 deferred.
+Order: see the 2026-10-01 amendment (A0 → S0 → S1 → S2 → S3 → S4; the AG-UI membrane investigation runs independently).
 
 ## Reality Gaps and Traps
 

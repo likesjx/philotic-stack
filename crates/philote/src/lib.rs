@@ -1,3 +1,4 @@
+pub mod approval_ref;
 pub mod catalog;
 pub mod commands;
 pub mod driver;
