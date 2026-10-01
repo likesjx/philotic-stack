@@ -58,6 +58,9 @@ targets:
       properties:
         CFBundleShortVersionString: "$(MARKETING_VERSION)"
         CFBundleVersion: "$(CURRENT_PROJECT_VERSION)"
+        CFBundleURLTypes:
+          - CFBundleURLName: com.philotic.apple.ios.signin
+            CFBundleURLSchemes: [com.philotic.apple.ios]
         NSAppTransportSecurity:
           NSExceptionDomains:
             # Transitional private vps-jane endpoint. Requires Tailscale on

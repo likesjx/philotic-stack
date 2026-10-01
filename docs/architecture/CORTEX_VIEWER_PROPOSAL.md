@@ -3,7 +3,7 @@ title: Cortex Viewer for the Apple Apps
 doc_type: proposal
 domain: memory-context
 status: accepted-current-slice
-last_updated: 2026-09-21
+last_updated: 2026-10-01
 tags: [cortex, muninn, apple, observability, read-only]
 related_docs:
   - MUNINN_MEMORY_CORE_PROPOSAL.md
@@ -62,10 +62,13 @@ live cluster leadership proof; migration must revoke/update it.
 The shared SwiftUI Cortex tab lists vaults, loads pages and displays full memory
 details. Filtering covers loaded rows only, not a global or semantic search.
 Offset pagination is not a stable snapshot under concurrent writes. The client
-pins the operator-approved `http://100.64.212.8:7700` Tailscale origin, rejects
-redirects and retains tokens/content only in memory. Backgrounding or logout
-clears them. An existing operator session must be entered manually; integrated
-native operator sign-in remains deferred. Public desktop routing is unchanged.
+previously pinned the private `http://100.64.212.8:7700` Tailscale origin. The
+current native-sign-in branch replaces manual token entry with system-browser
+Google sign-in and pins `https://desktop.jaredlikes.com` for a distinct,
+Cortex-read-only handle. It rejects redirects and retains tokens/content only
+in memory; backgrounding or logout clears them. This replacement is built and
+test-green but not publicly enabled or physically installed yet. Public desktop
+routing is unchanged; see [sign-in rollout](NATIVE_OPERATOR_SIGNIN_PROPOSAL.md).
 
 ### Coverage is evidence, not a label
 
@@ -118,5 +121,6 @@ or replica-completeness proof.
 Authenticated native UI, partial-outage behavior, full pagination coverage and
 the new viewer's physical iPhone deployment remain unproven. Installation hit a
 connection reset; the phone subsequently reported unavailable. Native sign-in
-still requires an existing operator session entered manually.
+was manual in the deployed baseline; the browser replacement still awaits
+scoped gateway rollout and authenticated physical-device proof.
 See [current status](ARCHITECTURE_STATUS.md) and [execution work](../task.md).
