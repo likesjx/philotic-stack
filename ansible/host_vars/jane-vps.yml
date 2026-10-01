@@ -32,8 +32,12 @@ philotic_agents:
     model:
       default_model: "{{ philotic_default_model }}"
     turn_loop_config:
+      # Gemini first; OpenRouter before Ollama so a Gemini outage (2026-10-01:
+      # sustained HTTP 503 "high demand") falls through to a working cloud tier.
+      # Ollama cannot serve Beacon on this host, so it is the last resort only.
       fallback_tiers:
         - "model"
+        - "model.openrouter"
         - "model.ollama"
     voice_response_policy:
       mode: "off"                          # off | auto | on  (/tts to toggle)
@@ -77,8 +81,9 @@ philotic_onnx_embed_repo: "Xenova/all-mpnet-base-v2"  # 768-dim, ONNX-optimized
 philotic_onnx_embed_dim: 768
 philotic_onnx_prefer_quantized: true
 
-# Decisions model shadow pilot (log-only; heal-dispatcher only). Requires the
-# openrouter vault key to also grant model.decisions + heal-dispatcher.
+# Decisions model shadow (log-only): heal-dispatcher's heal.classify pilot, and
+# philote's distill.prescreen via the model.decisions controller (PR #603).
+# Requires the openrouter vault key to grant model.decisions + heal-dispatcher.
 philotic_shadow_decisions_enabled: true
 # Decisions fallback applied on novel lines Gemma cannot classify (2026-09-30,
 # watched-live on mac-jane first: Telegram 409 -> telegram_poll_conflict).
