@@ -660,3 +660,34 @@ fn proxied_loopback_request_is_not_trusted_as_local() {
         );
     }
 }
+
+// ── Upstream CallToolResult is not double-wrapped ─────────────────────────────
+
+#[test]
+fn upstream_call_tool_result_passes_through_unwrapped() {
+    use crate::server::mcp_call_result_passthrough;
+
+    let upstream = json!({ "content": [{ "type": "text", "text": "{\"count\":1}" }] });
+    assert_eq!(
+        mcp_call_result_passthrough(&upstream),
+        Some(upstream.clone())
+    );
+
+    let upstream_error =
+        json!({ "content": [{ "type": "text", "text": "nope" }], "isError": true });
+    assert_eq!(
+        mcp_call_result_passthrough(&upstream_error),
+        Some(upstream_error.clone())
+    );
+
+    // Plain datasource payloads keep the JSON-as-text wrapping.
+    assert_eq!(mcp_call_result_passthrough(&json!({ "count": 1 })), None);
+    assert_eq!(
+        mcp_call_result_passthrough(&json!({ "content": [{ "text": "untyped" }] })),
+        None
+    );
+    assert_eq!(
+        mcp_call_result_passthrough(&json!({ "content": [], "rows": 3 })),
+        None
+    );
+}
