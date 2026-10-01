@@ -766,6 +766,19 @@ impl SessionState {
         self.parked_approval_turn.is_some()
     }
 
+    /// Id of the approval an approval command would resolve right now: the parked
+    /// approval turn's, else the active turn's while it waits for approval.
+    pub fn pending_approval_id(&self) -> Option<&str> {
+        self.parked_approval_turn
+            .as_ref()
+            .or(self
+                .active_turn
+                .as_ref()
+                .filter(|turn| turn.phase == TurnPhase::WaitingApproval))
+            .and_then(|turn| turn.pending_approval.as_ref())
+            .and_then(|approval| approval.approval_id.as_deref())
+    }
+
     /// Park the active turn for plan discussion. The turn must already have phase
     /// `PlanningDiscussion`. The session becomes free for other work while the
     /// operator reviews the proposed plan.
