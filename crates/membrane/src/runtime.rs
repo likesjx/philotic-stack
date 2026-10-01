@@ -147,12 +147,23 @@ impl MembraneRuntime {
 
                     // Inbound from guest → forward to hotel.
                     Some(envelope) = inbound_rx.recv() => {
-                        if let Err(e) = dispatch_inbound(&mut client, envelope, &self.node_id).await {
-                            if philotic_client::is_ipc_disconnect(&e) {
-                                warn!("IPC disconnect while dispatching inbound");
-                                break true;
+                        match dispatch_inbound(&mut client, envelope, &self.node_id).await {
+                            // The hotel refused a tool dispatch (e.g. its target
+                            // hotel is offline): answer the waiting caller now
+                            // instead of letting it time out.
+                            Ok(Some(refusal)) => {
+                                if let Err(e) = guest.handle_push(&refusal).await {
+                                    error!(err = %e, "refusal delivery error");
+                                }
                             }
-                            error!(err = %e, "inbound dispatch error");
+                            Ok(None) => {}
+                            Err(e) => {
+                                if philotic_client::is_ipc_disconnect(&e) {
+                                    warn!("IPC disconnect while dispatching inbound");
+                                    break true;
+                                }
+                                error!(err = %e, "inbound dispatch error");
+                            }
                         }
                     }
 
@@ -234,10 +245,48 @@ async fn dispatch_inbound(
     client: &mut PhiloticClient,
     envelope: InboundEnvelope,
     local_node_id: &str,
-) -> Result<()> {
+) -> Result<Option<philotic_client::IpcResponse>> {
     let req = build_inbound_request(&envelope, local_node_id);
-    client.send_request(req).await?;
-    Ok(())
+    let resp = client.send_request(req).await?;
+    Ok(refusal_push(&envelope, &resp))
+}
+
+/// When the hotel refuses a datasource / MCP-upstream dispatch (e.g.
+/// `TARGET_NODE_UNREACHABLE` for a sleeping peer hotel), build the
+/// `datasource_response` error push the guest would otherwise wait for, keyed
+/// by the envelope's turn. Other targets keep their existing behaviour.
+fn refusal_push(
+    envelope: &InboundEnvelope,
+    resp: &philotic_client::IpcResponse,
+) -> Option<philotic_client::IpcResponse> {
+    let philotic_client::IpcResponse::Standard {
+        ok: false,
+        code,
+        message,
+        ..
+    } = resp
+    else {
+        return None;
+    };
+    let target_kind = envelope
+        .raw_transport
+        .get("target_kind")
+        .and_then(|v| v.as_str());
+    if !matches!(target_kind, Some("mcp_upstream" | "datasource")) {
+        return None;
+    }
+    warn!(code, turn_id = %envelope.turn_id, "hotel refused tool dispatch; failing the call fast");
+    Some(philotic_client::IpcResponse::InboundTask {
+        source_node: String::new(),
+        task_id: uuid::Uuid::new_v4(),
+        task_json: serde_json::json!({
+            "action": "datasource_response",
+            "turn_id": envelope.turn_id,
+            "session_id": envelope.session_id,
+            "error": format!("{code}: {message}"),
+        })
+        .to_string(),
+    })
 }
 
 /// Build the IPC request for an inbound envelope. Pure so variants can unit-test
@@ -801,5 +850,51 @@ mod tests {
         assert_eq!(target_role, "mcp-client-runner");
         assert_eq!(payload["tool_name"], "mcp:intel-graph.life.recall");
         assert_eq!(payload["agent_id"], "mcp:lifegraph-reader");
+    }
+
+    #[test]
+    fn refused_upstream_dispatch_becomes_an_immediate_error_reply() {
+        use philotic_client::IpcResponse;
+
+        let mut envelope = mcp_datasource_envelope();
+        envelope.turn_id = "turn-42".into();
+        envelope.raw_transport = serde_json::json!({
+            "transport": "mcp",
+            "target_kind": "mcp_upstream",
+            "target_id": "intel-graph",
+            "target_node": "mac-jane-aiua-01"
+        });
+        let refused = IpcResponse::Standard {
+            ok: false,
+            code: "TARGET_NODE_UNREACHABLE".into(),
+            message: "peer stale".into(),
+            corr_id: "emit_task".into(),
+            data: None,
+        };
+        let Some(IpcResponse::InboundTask { task_json, .. }) = refusal_push(&envelope, &refused)
+        else {
+            panic!("expected a synthetic datasource_response push");
+        };
+        let push: serde_json::Value = serde_json::from_str(&task_json).unwrap();
+        assert_eq!(push["action"], "datasource_response");
+        assert_eq!(push["turn_id"], "turn-42");
+        assert!(
+            push["error"]
+                .as_str()
+                .unwrap()
+                .starts_with("TARGET_NODE_UNREACHABLE")
+        );
+
+        // Accepted dispatches and non-tool targets are left alone.
+        let accepted = IpcResponse::Standard {
+            ok: true,
+            code: "OK".into(),
+            message: "Success".into(),
+            corr_id: "emit".into(),
+            data: None,
+        };
+        assert!(refusal_push(&envelope, &accepted).is_none());
+        envelope.raw_transport = serde_json::json!({ "target_kind": "philote", "target_id": "a" });
+        assert!(refusal_push(&envelope, &refused).is_none());
     }
 }
