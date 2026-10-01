@@ -34,6 +34,10 @@ pub enum AuthCommand {
     /// Add the roles a provider's key spec now lists to a vault entry sealed
     /// before they were added, without decrypting or re-entering the key.
     SyncRoles(SyncRolesArgs),
+    /// Re-encrypt every secret this hotel's vault holds under a new master
+    /// key. Offline only: refuses a real run while this db's hotel record
+    /// shows a live `active_pid`.
+    RotateMasterKey(RotateMasterKeyArgs),
 }
 
 #[derive(Debug, Clone, Args)]
@@ -51,6 +55,29 @@ pub struct SyncRolesArgs {
     /// Show what would change and write nothing.
     #[arg(long)]
     pub dry_run: bool,
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct RotateMasterKeyArgs {
+    /// Path to this hotel's context database. Falls back to
+    /// `PHILOTIC_GRAPH_DB_PATH`.
+    #[arg(long)]
+    pub db: Option<String>,
+
+    /// The new master key, base64-encoded 32 bytes. Omit to have one
+    /// generated and printed once — capture it immediately, nothing in this
+    /// command stores it anywhere.
+    #[arg(long)]
+    pub new_key: Option<String>,
+
+    /// Show what would be migrated and write nothing.
+    #[arg(long)]
+    pub dry_run: bool,
+
+    /// Required for a real (non-dry-run) rotation: must exactly equal --db,
+    /// as a deliberate confirmation that this rewrites every vault secret.
+    #[arg(long)]
+    pub confirm: Option<String>,
 }
 
 #[derive(Debug, Args)]
@@ -181,6 +208,7 @@ pub async fn run_auth_command(command: AuthCommand) -> Result<()> {
             command: OpenAIAuthCommand::Validate(args),
         }) => run_openai_auth_validate(args).await,
         AuthCommand::SyncRoles(args) => run_sync_roles(args),
+        AuthCommand::RotateMasterKey(args) => run_rotate_master_key(args),
     }
 }
 
@@ -228,6 +256,101 @@ fn run_sync_roles(args: SyncRolesArgs) -> Result<()> {
     } else {
         println!("dry run, would add: {}", result.added.join(", "));
     }
+    Ok(())
+}
+
+/// `aiua auth rotate-master-key`: re-encrypt every secret this hotel's vault
+/// holds under a new master key. This command never persists the new key to
+/// an env file, Keychain, or ansible vault — applying it is a separate,
+/// host-specific step the printed instructions name but don't perform,
+/// because on a host where `PHILOTIC_VAULT_MASTER_KEY` is set via a systemd
+/// EnvironmentFile (vps-jane today), no file this command could write would
+/// take effect: the env var wins.
+fn run_rotate_master_key(args: RotateMasterKeyArgs) -> Result<()> {
+    let db = args
+        .db
+        .clone()
+        .or_else(|| std::env::var("PHILOTIC_GRAPH_DB_PATH").ok())
+        .filter(|path| !path.trim().is_empty())
+        .context("pass --db <this hotel's context db> or set PHILOTIC_GRAPH_DB_PATH")?;
+    if !std::path::Path::new(&db).is_file() {
+        bail!("no such database file: {db}");
+    }
+
+    if !args.dry_run {
+        match &args.confirm {
+            Some(value) if value == &db => {}
+            _ => bail!(
+                "a real rotation requires --confirm '{db}' (typed exactly, matching --db) — \
+                 this rewrites every secret in the vault"
+            ),
+        }
+    }
+
+    let storage = ansible_mesh_core::sqlite_storage::SqliteGraphStorage::open(&db)?;
+    let domain = GraphDomain::new(Arc::new(storage.adapter()));
+
+    if !args.dry_run {
+        let running: Vec<String> = domain
+            .list_hotels()?
+            .into_iter()
+            .filter(|hotel| hotel.active_pid.is_some())
+            .map(|hotel| hotel.hotel_name)
+            .collect();
+        if !running.is_empty() {
+            bail!(
+                "hotel(s) {} show a live active_pid in this db — stop the hotel before a real \
+                 rotation; a running process re-resolves the master key on every vault read and \
+                 will race the swap",
+                running.join(", ")
+            );
+        }
+    }
+
+    let (new_key_bytes, generated_here) = match &args.new_key {
+        Some(raw) => (crate::vault::decode_master_key_b64(raw)?, false),
+        None => {
+            let encoded = crate::vault::generate_root_key_b64();
+            let bytes = crate::vault::decode_master_key_b64(&encoded)?;
+            println!("generated new master key (base64): {encoded}");
+            println!("CAPTURE THIS NOW — this command does not store it anywhere.");
+            (bytes, true)
+        }
+    };
+
+    let report = crate::vault::rotate_master_key(&domain, &new_key_bytes, args.dry_run)?;
+
+    println!("db: {db}");
+    println!("total secrets: {}", report.total);
+    println!("old key fingerprint: {}", report.old_key_fingerprint);
+    println!("new key fingerprint: {}", report.new_key_fingerprint);
+
+    if args.dry_run {
+        println!(
+            "dry run — would migrate {} secret(s), {} already on the new key; wrote nothing",
+            report.migrated, report.already_on_new_key
+        );
+        return Ok(());
+    }
+
+    println!(
+        "migrated {} secret(s) ({} were already on the new key)",
+        report.migrated, report.already_on_new_key
+    );
+    println!();
+    println!("this database's ciphertexts now require the NEW key. The hotel will fail to");
+    println!("read any vault secret until the active key source is updated to it:");
+    println!(
+        "  source currently in use: {}",
+        crate::vault::describe_root_key_source()
+    );
+    if generated_here {
+        println!("  apply the key printed above to that source now,");
+    } else {
+        println!("  apply the --new-key value you supplied to that source now,");
+    }
+    println!("  then restart the hotel. Do not restart it with the old key still active.");
+
     Ok(())
 }
 
