@@ -44,7 +44,7 @@ final class DeviceReminderReader {
 
 /// Bound the callback-based query and ignore late completions after timeout.
 @MainActor
-private final class ReminderFetch {
+final class ReminderFetch {
     let store: EKEventStore
     private var continuation: CheckedContinuation<[EKReminder], Error>?
     private var token: Any?

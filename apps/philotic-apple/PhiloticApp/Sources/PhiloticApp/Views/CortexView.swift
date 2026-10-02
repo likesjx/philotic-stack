@@ -84,43 +84,13 @@ struct CortexView: View {
     @State private var store = CortexStore()
     @State private var signIn = NativeCortexSignIn()
     @State private var signingIn = false
-    @State private var search = ""
     @Environment(\.scenePhase) private var scenePhase
 
     var body: some View {
         List {
             if let snapshot = store.snapshot {
-                Section("Cortex · \(snapshot.cortexID)") {
-                    Text("Inventory checked \(snapshot.observedAt)").font(.caption)
-                    ForEach(snapshot.exclusions, id: \.self) { Text($0).font(.caption).foregroundStyle(.secondary) }
-                    ForEach(snapshot.vaults) { vault in
-                        Button { Task { await store.page(vault: vault.id) } } label: {
-                            HStack {
-                                Label(vault.id, systemImage: "archivebox")
-                                Spacer()
-                                Text(vault.memoryCount.map(String.init) ?? vault.status.rawValue)
-                            }
-                        }.disabled(vault.status != .available || store.busy)
-                    }
-                }
-                if !store.selectedVault.isEmpty {
-                    Section(store.selectedVault) {
-                        TextField("Filter loaded memories", text: $search)
-                        Text("Filtering \(store.memories.count) loaded memories. Load more to extend coverage.")
-                            .font(.caption).foregroundStyle(.secondary)
-                        ForEach(store.memories.filter { search.isEmpty || ($0.concept + " " + $0.content + " " + $0.tags.joined(separator: " ")).localizedCaseInsensitiveContains(search) }) { memory in
-                            Button { Task { await store.open(memory) } } label: {
-                                VStack(alignment: .leading) {
-                                    Text(memory.concept)
-                                    Text(memory.content).lineLimit(2).font(.caption).foregroundStyle(.secondary)
-                                }
-                            }.disabled(store.busy)
-                        }
-                        if store.nextCursor != nil {
-                            Button("Load more") { Task { await store.page(vault: store.selectedVault, more: true) } }.disabled(store.busy)
-                        } else if store.memories.isEmpty { Text("No memories in this vault.") }
-                    }
-                }
+                CortexWorkspaceView(store: store, snapshot: snapshot)
+                    .listRowInsets(EdgeInsets(top: 12, leading: 12, bottom: 12, trailing: 12))
                 Button("Sign out of Cortex", role: .destructive) { store.clear() }
             } else {
                 Section("Connect to Cortex") {

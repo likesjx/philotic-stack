@@ -123,8 +123,9 @@ gate access; device enrollment alone is insufficient. PR #578 is merged and
 deployed: running server hashes match CI artifacts. Live inventory reported 13
 vaults and 1,464 memories, with page/detail reads and revoked-session rejection
 verified on September 21. The Mac connection screen runs with Desktop preserved.
-Authenticated native UI and phone installation remain pending; manual operator
-sign-in and loaded-row filtering are transitional, not global search.
+Authenticated phone loading was operator-confirmed October 1 after native
+browser sign-in. Native Mac sign-in remains unverified; loaded-row filtering
+is transitional, not global search.
 
 The [native sign-in handoff](NATIVE_OPERATOR_SIGNIN_PROPOSAL.md) now has system
 browser UI and an ephemeral Cortex-only client pinned to the operator-approved
@@ -134,11 +135,25 @@ desktop credentials. The isolated gateway/website source is test-green; October
 scoped HTTPS routes are deployed: real initiation, asset delivery and anonymous
 denial pass, while general API/WebSocket routes remain blocked. The hotel binary
 is unchanged and its restarted process has the distinct gateway credential.
-Physical installation, invitation redemption and real Google-to-Cortex reads
-remain unproven; the paired new phone is unavailable to Xcode.
+October 1 follow-up: fresh signed app installed and launched on the new iPhone;
+invitation redeemed, and the gateway synchronized to the hotel's active
+credential. The operator confirmed real Google sign-in and Cortex loading.
+Exhaustive pagination, partial-outage handling and native Mac sign-in are not
+yet proven. Earlier routing-isolation claims describe the October 1 checks,
+not a guarantee about later parallel desktop gateway changes.
 Gateway credentials remain server-only; PKCE proves verifier possession, not
 app identity. The isolated identity assets and private loopback/proxy deployment
 preserve the existing desktop without opening general API/WebSocket access.
+
+The [Apple memory workspace](APPLE_MEMORY_WORKSPACE_PROPOSAL.md) on
+`codex/apple-memory-workspace` adds graph-first LifeGraph browsing and
+Cortex vault/topic/memory tiles, plus explicit title-only OpenLoop export to
+a chosen Reminders list. Topic filters reflect loaded-page tags, not stored
+Muninn association edges. Linked export checks completed reminders too, but
+does not confirm/close nodes or provide automatic two-way sync. This is
+source/build validation, not physical-device UI or EventKit-write proof;
+audited loop lifecycle actions and a durable multi-device sync ledger remain
+follow-up work in [docs/task.md](../task.md#apple-memory-workspace).
 
 ### Runtime and authority
 

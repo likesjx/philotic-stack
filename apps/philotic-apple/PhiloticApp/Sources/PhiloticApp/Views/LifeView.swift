@@ -10,6 +10,7 @@ import SwiftUI
 struct LifeView: View {
     @Bindable var session: ChatSessionManager
     @State private var contextText = ""
+    @State private var exploring = true
 
     private var store: LifeGraphStore { session.lifeGraph }
 
@@ -35,6 +36,10 @@ struct LifeView: View {
     private var lensList: some View {
         List {
             Section {
+                Picker("Display", selection: $exploring) {
+                    Label("Explore", systemImage: "point.3.connected.trianglepath.dotted").tag(true)
+                    Label("Records", systemImage: "list.bullet").tag(false)
+                }.pickerStyle(.segmented)
                 Picker("Lens", selection: Binding(
                     get: { store.selectedLens },
                     set: { newLens in
@@ -72,12 +77,16 @@ struct LifeView: View {
                         description: Text("The \(store.selectedLens.title) lens came back empty.")
                     )
                 } else {
-                    ForEach(store.packets) { ranked in
-                        NavigationLink(
-                            destination: LifeNodeDetailView(
-                                session: session, nodeId: ranked.packet.claimRef.id)
-                        ) {
-                            LensRow(ranked: ranked)
+                    if exploring {
+                        LifeExploreView(session: session, packets: store.packets)
+                    } else {
+                        ForEach(store.packets) { ranked in
+                            NavigationLink(
+                                destination: LifeNodeDetailView(
+                                    session: session, nodeId: ranked.packet.claimRef.id)
+                            ) {
+                                LensRow(ranked: ranked)
+                            }
                         }
                     }
                 }
@@ -174,6 +183,7 @@ struct LifeNodeDetailView: View {
     @State private var editing = false
     @State private var auditId: String?
     @State private var loadedHotel: URL?
+    @State private var exportingReminder = false
 
     /// Provenance-envelope keys rendered in their own section (and therefore
     /// excluded from the generic properties list).
@@ -225,6 +235,11 @@ struct LifeNodeDetailView: View {
                 }
             }
         }
+        .sheet(isPresented: $exportingReminder) {
+            if let node = detail?.node, let loadedHotel {
+                OpenLoopReminderSheet(node: node, hotelURL: loadedHotel)
+            }
+        }
     }
 
     @ViewBuilder
@@ -240,6 +255,14 @@ struct LifeNodeDetailView: View {
                 if let state = node.string("validation_state") {
                     ProvenanceChip(text: state, tint: state == "confirmed" ? .green : .orange)
                 }
+            }
+        }
+
+        if node.labels.contains("OpenLoop"), node.canonicalId?.hasPrefix("life:") == true {
+            Section("Open-loop actions") {
+                Button("Send to Reminders", systemImage: "checklist") { exportingReminder = true }
+                Text("Export only the title to a list you choose. Completing a reminder does not confirm or close this LifeGraph node.")
+                    .font(.caption).foregroundStyle(.secondary)
             }
         }
 

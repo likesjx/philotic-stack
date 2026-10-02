@@ -43,10 +43,10 @@ Gateway 18 tests passed September 30; four native tests passed again October 1.
 Scoped deployment approved and live: initiation, real assets and anonymous denial
 verified; general API/WebSocket routes remain blocked and desktop unchanged.
 Hotel binary unchanged; distinct credential configured in a fresh running PID.
-Selected Google account is already enabled/admin but needs account-bound
-invitation redemption. New phone is paired/Developer Mode enabled but Xcode
-reports unavailable. Next: restore its connection, issue the 15-minute invitation,
-install and prove real Google sign-in plus Cortex inventory/detail reads.
+October 1 follow-up: fresh signed app installed and launched on the new phone;
+invitation redeemed and gateway synchronized to the hotel-owned credential.
+Operator confirmed Google sign-in succeeded and Cortex loaded. Exhaustive
+pagination, partial outages and native Mac sign-in remain unverified.
 
 Branch: `codex/cortex-viewer`; seam: `muninn-admin-observability-plane`.
 Spec: [Cortex viewer](architecture/CORTEX_VIEWER_PROPOSAL.md).
@@ -57,8 +57,21 @@ Spec: [Cortex viewer](architecture/CORTEX_VIEWER_PROPOSAL.md).
 - [x] Integrate current develop, merge PR #578, deploy both backend binaries with running-hash proof, and attest the inspected primary Cortex endpoint.
 - [x] Live backend inventory (13 vaults / 1,464 memories), page/detail and second-page reads; temporary admin session revoked and token replay rejected (September 21).
 - [x] Build and launch Mac viewer with existing notch/Desktop work preserved; observe Cortex connection screen.
-- [ ] Verify authenticated native UI, partial outages and exhaustive pagination. Signed iPhone build passes; installation awaits phone reconnection after a connection reset.
+- [x] Install and launch the signed app on the new iPhone; operator confirmed Google sign-in and Cortex loading October 1.
+- [ ] Verify partial outages and exhaustive pagination, and authenticated native Mac UI.
 - [ ] Follow up with native operator sign-in, durable access auditing and global search; current filtering covers loaded rows only.
+
+### Apple memory workspace
+
+Branch: `codex/apple-memory-workspace`; based on native sign-in plus current
+develop. Spec: [graphical workspace](architecture/APPLE_MEMORY_WORKSPACE_PROPOSAL.md).
+
+- [x] Add default LifeGraph Explore entry cards and stored-neighbor graph with fit/zoom and accessible relationship-list fallback.
+- [x] Add Cortex vault/topic/memory tiles; explicit-tag and loaded-page coverage, no fabricated semantic edges.
+- [x] Add explicit title-only OpenLoop export to a chosen Reminders list, including linked completed-item deduplication; never mutate graph status.
+- [ ] Prove the graphical UI and real EventKit export/repeat-export on device; current validation is tests/builds, not installed-runtime acceptance.
+- [ ] Implement audited device-authorized confirm/close/reopen and reviewed two-way Reminders reconciliation with a durable multi-device binding ledger.
+- [ ] Add authorized Cortex association/search endpoints and focused semantic-neighborhood exploration.
 
 ### Native LifeGraph editor
 
