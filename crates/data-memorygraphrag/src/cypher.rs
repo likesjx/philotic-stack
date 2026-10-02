@@ -46,6 +46,12 @@ const KNOWN_LABELS: &[&str] = &[
     "Asset",
     "CreativeWork",
     "Moment",
+    // Health & fitness domain (memory-RAG audit follow-up, 2026-09-30):
+    // structured lived records — a tracked workout session and a point-in-time
+    // health/body measurement — so importers (Hevy, HealthKit) land typed
+    // nodes instead of prose Events. Vector indexes: V007 migration.
+    "Workout",
+    "Measurement",
 ];
 
 /// Living-cycle relationship types allowed on `life.observe` edge writes.
@@ -130,7 +136,14 @@ pub const AGENDA_EDGE_RULES: &[AgendaEdgeRule] = &[
     },
     AgendaEdgeRule {
         rel_type: "OCCURS_AT",
-        source_labels: &["Event", "Trip", "Appointment", "Moment", "Routine"],
+        source_labels: &[
+            "Event",
+            "Trip",
+            "Appointment",
+            "Moment",
+            "Routine",
+            "Workout",
+        ],
         target_labels: &["Place"],
     },
     AgendaEdgeRule {
@@ -1352,7 +1365,14 @@ mod tests {
                 ),
                 (
                     "OCCURS_AT",
-                    vec!["Event", "Trip", "Appointment", "Moment", "Routine"],
+                    vec![
+                        "Event",
+                        "Trip",
+                        "Appointment",
+                        "Moment",
+                        "Routine",
+                        "Workout"
+                    ],
                     vec!["Place"]
                 ),
                 (

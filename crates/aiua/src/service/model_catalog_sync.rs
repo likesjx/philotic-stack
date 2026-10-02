@@ -77,19 +77,61 @@ pub fn spawn_loop(
         };
 
         tokio::time::sleep(Duration::from_secs(initial_delay_secs())).await;
-        let mut interval = tokio::time::interval(Duration::from_secs(sync_interval_secs()));
+        // Due-ness is judged on WALL-clock age, polled on a short monotonic tick.
+        // A bare `tokio::time::interval(6h)` runs on `Instant`, which stops while
+        // macOS sleeps — a mostly-asleep laptop hotel (mac-jane) accrued 6h of
+        // awake time so rarely that its catalog only refreshed on hotel restart.
+        let interval_secs = sync_interval_secs();
+        let mut tick = tokio::time::interval(Duration::from_secs(poll_tick_secs(interval_secs)));
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut last: Option<(u64, bool)> = None;
         loop {
-            interval.tick().await;
+            tick.tick().await;
+            let now = wall_secs();
+            if !sync_due(now, last, interval_secs) {
+                continue;
+            }
             let result = async {
                 let body = fetch_openrouter_catalog(&socket_path, &local_node_id).await?;
                 run_once(&graph, heal.as_ref(), &body).await
             }
             .await;
-            if let Err(e) = result {
+            if let Err(e) = &result {
                 warn!("model-catalog-sync: run failed: {e:#}");
             }
+            last = Some((now, result.is_ok()));
         }
     });
+}
+
+/// Retry delay after a failed run — a transient egress failure should not leave
+/// the catalog stale for a whole [`SYNC_INTERVAL_SECS`].
+const RETRY_AFTER_FAILURE_SECS: u64 = 30 * 60;
+/// Upper bound on the monotonic poll tick.
+const MAX_POLL_TICK_SECS: u64 = 5 * 60;
+
+fn poll_tick_secs(interval_secs: u64) -> u64 {
+    interval_secs.clamp(1, MAX_POLL_TICK_SECS)
+}
+
+fn wall_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Whether a sync is due at wall time `now`, given the last attempt
+/// `(wall_secs, succeeded)`. A backwards clock step counts as due rather than
+/// wedging the loop until the clock catches up.
+fn sync_due(now: u64, last: Option<(u64, bool)>, interval_secs: u64) -> bool {
+    let Some((at, ok)) = last else { return true };
+    let wait = if ok {
+        interval_secs
+    } else {
+        RETRY_AFTER_FAILURE_SECS.min(interval_secs)
+    };
+    now < at || now - at >= wait
 }
 
 /// One discovery pass: fetch → diff vs persisted snapshot → persist → alert.
@@ -426,6 +468,33 @@ fn fallback_ladders(graph: &GraphDomain) -> Vec<(String, Vec<String>)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sync_due_uses_wall_clock_age_and_retries_failures_sooner() {
+        let six_h = SYNC_INTERVAL_SECS;
+        assert!(sync_due(1_000, None, six_h), "first pass is always due");
+        // Success: not due until a full interval of WALL time has passed —
+        // however little of it the process spent awake.
+        assert!(!sync_due(1_000 + six_h - 1, Some((1_000, true)), six_h));
+        assert!(sync_due(1_000 + six_h, Some((1_000, true)), six_h));
+        // Failure: retried after the short retry delay, not a whole interval.
+        assert!(!sync_due(
+            1_000 + RETRY_AFTER_FAILURE_SECS - 1,
+            Some((1_000, false)),
+            six_h
+        ));
+        assert!(sync_due(
+            1_000 + RETRY_AFTER_FAILURE_SECS,
+            Some((1_000, false)),
+            six_h
+        ));
+        // A backwards clock step must not wedge the loop.
+        assert!(sync_due(500, Some((1_000, true)), six_h));
+        // A short smoke interval caps the failure retry and the poll tick.
+        assert!(sync_due(1_010, Some((1_000, false)), 10));
+        assert_eq!(poll_tick_secs(10), 10);
+        assert_eq!(poll_tick_secs(six_h), MAX_POLL_TICK_SECS);
+    }
 
     fn ev(kind: CatalogDiffKind, reasoning: Option<bool>) -> CatalogDiffEvent {
         CatalogDiffEvent {

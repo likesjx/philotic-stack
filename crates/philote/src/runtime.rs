@@ -1,3 +1,6 @@
+use crate::approval_ref::{
+    approval_callback, callback_approval_ref, is_trust_callback, ref_matches,
+};
 use crate::commands::{SlashCommand, command_manifest, parse_slash_command};
 use crate::r#loop::{
     AgentAction, ApprovalRequest, PlanProposalAction, ToolCall, ToolResult, TurnPhase,
@@ -1684,6 +1687,11 @@ pub struct AgentRuntime {
     /// Dedup + budget ledger for the LifeGraph auto-capture lane (Slice E2).
     /// Live-only (never checkpointed), mirroring the prefetch-dispatched flag.
     life_capture_ledger: LifeCaptureLedger,
+    /// Vaults whose tokens were rejected during a partial cross-scope recall.
+    /// Healed AFTER the reply is delivered (deliver_text_reply) instead of on
+    /// the recall path — the heal is a 20s-budget IPC round-trip that must
+    /// not sit between the user's message and the model call.
+    pending_token_heals: Vec<String>,
     /// Correlation id of an in-flight origin-tier probe per session (Slice 2
     /// fallback-override auto-recovery — see `turn_loop::probe_degraded_sessions`).
     /// Bounds "at most one probe in flight per session": a session_id present
@@ -2023,6 +2031,7 @@ impl AgentRuntime {
             network_offline: false,
             role_name: None,
             life_capture_ledger: LifeCaptureLedger::default(),
+            pending_token_heals: Vec::new(),
             pending_fallback_probes: HashMap::new(),
             voice_chunk_pipelines: HashMap::new(),
         }
@@ -2664,12 +2673,45 @@ impl AgentRuntime {
                         return Ok(());
                     }
 
-                    // "Trust for session" button sends callback_data="trust" which membrane
-                    // translates to /approve + preserves the original callback_data.
+                    // A button that names its approval must answer the approval pending
+                    // now. Refuse a stale tap before anything else, so it can neither
+                    // resolve a different approval nor grant session trust.
+                    if let Some(reference) = task
+                        .callback_data
+                        .as_deref()
+                        .and_then(callback_approval_ref)
+                    {
+                        let pending_id = self
+                            .sessions
+                            .get(&session_id)
+                            .and_then(|state| state.pending_approval_id());
+                        if !ref_matches(reference, pending_id) {
+                            info!(
+                                session_id = %session_id,
+                                reference,
+                                "Refusing approval tap for an approval that is no longer pending"
+                            );
+                            return self
+                                .reply_approval_notice(
+                                    task_id,
+                                    session_id,
+                                    turn_id,
+                                    chat_id,
+                                    final_reply_to,
+                                    final_reply_role,
+                                    final_reply_guest_id,
+                                    "That approval is no longer pending. Nothing was approved or denied.",
+                                )
+                                .await;
+                        }
+                    }
+
+                    // "Trust for session" button sends callback_data="trust[:<ref>]" which
+                    // membrane translates to /approve + preserves the original callback_data.
                     // Pre-approve the session before resolving the parked turn, and
                     // immediately checkpoint so the policy survives process restarts
                     // and the next refresh_bindings_from_snapshot call.
-                    if task.callback_data.as_deref() == Some("trust") {
+                    if task.callback_data.as_deref().is_some_and(is_trust_callback) {
                         let checkpoint_info = self.sessions.get_mut(&session_id).map(|state| {
                             state.set_preapprove_this_session();
                             (state.checkpoint_memory_type(), state.checkpoint_json())
@@ -3170,6 +3212,7 @@ impl AgentRuntime {
                 pending_approval: None,
                 working_tool_history: Vec::new(),
                 recalled_memories: Vec::new(),
+                memory_degraded: None,
                 active_plan: seeded_plan,
                 consecutive_step_failures: 0,
                 streak_extension: 0,
@@ -7797,6 +7840,7 @@ mod tests {
             pending_approval: None,
             working_tool_history: Vec::new(),
             recalled_memories: Vec::new(),
+            memory_degraded: None,
             active_plan: None,
             consecutive_step_failures: 0,
             streak_extension: 0,
@@ -8895,6 +8939,7 @@ mod tests {
             pending_approval: None,
             working_tool_history: Vec::new(),
             recalled_memories: Vec::new(),
+            memory_degraded: None,
             active_plan: None,
             consecutive_step_failures: 0,
             streak_extension: 0,
@@ -13964,6 +14009,170 @@ mod tests {
                 .active_turn
                 .is_none(),
             "orphaned continuation must not start a turn"
+        );
+
+        drop(runtime);
+        let _ = server.await;
+        let _ = std::fs::remove_file(&socket_path);
+    }
+
+    /// Park an approval turn whose pending approval has `approval_id`, as
+    /// `handle_approval_request` leaves it after sending the card.
+    fn park_approval(runtime: &mut AgentRuntime, session_id: &str, approval_id: &str) {
+        let mut turn = test_working_turn(TurnPhase::WaitingApproval);
+        turn.chat_id = "555".into();
+        turn.final_reply_to = "membrane-node-01".into();
+        turn.final_reply_role = "membrane".into();
+        turn.final_reply_guest_id = Some("membrane-seat-1".into());
+        turn.pending_approval = Some(ApprovalRequest {
+            approval_id: Some(approval_id.into()),
+            reason: "run deploy".into(),
+            approved_response: "deploying".into(),
+        });
+        runtime
+            .sessions
+            .get_mut(session_id)
+            .expect("session exists")
+            .parked_approval_turn = Some(turn);
+    }
+
+    fn approval_tap(session_id: &str, callback_data: &str) -> InboundTaskPayload {
+        InboundTaskPayload {
+            session_id: Some(session_id.into()),
+            chat_id: Some("555".into()),
+            content: Some(if callback_data.starts_with("deny") {
+                "/deny".into()
+            } else {
+                "/approve".into()
+            }),
+            callback_data: Some(callback_data.into()),
+            ..Default::default()
+        }
+    }
+
+    /// approval-action-ids: a tap on a card for an approval that is no longer
+    /// pending must be refused, never resolve the approval pending now.
+    #[tokio::test]
+    async fn stale_approval_tap_is_refused_and_current_approval_stays_pending() {
+        let (mut runtime, emitted, server, socket_path) = plan_test_runtime("stale-tap").await;
+        let session_id = "sess-stale-tap";
+        runtime
+            .ensure_session_loaded(session_id, "telegram")
+            .await
+            .expect("session load");
+        park_approval(&mut runtime, session_id, "approval-current");
+
+        let stale = crate::approval_ref::approval_callback("approve", Some("approval-old"));
+        runtime
+            .handle_user_message(approval_tap(session_id, &stale), Uuid::new_v4())
+            .await
+            .expect("stale tap handled");
+
+        let state = runtime.session(session_id).expect("session");
+        assert_eq!(
+            state.pending_approval_id(),
+            Some("approval-current"),
+            "a stale tap must leave the current approval pending"
+        );
+        assert!(state.has_parked_approval_turn());
+
+        drop(runtime);
+        let _ = server.await;
+        let _ = std::fs::remove_file(&socket_path);
+        let emitted = emitted.lock().unwrap();
+        assert!(
+            emitted.iter().any(|e| e["task"]["action"] == "send_reply"
+                && e["task"]["content"]
+                    .as_str()
+                    .is_some_and(|c| c.contains("no longer pending"))),
+            "operator must be told the tap was refused: {emitted:#?}"
+        );
+    }
+
+    /// A stale "Trust for session" tap is worse than a stale approve: it would
+    /// pre-approve the whole session. It must be refused before trust is set.
+    #[tokio::test]
+    async fn stale_trust_tap_does_not_preapprove_session() {
+        let (mut runtime, _emitted, server, socket_path) = plan_test_runtime("stale-trust").await;
+        let session_id = "sess-stale-trust";
+        runtime
+            .ensure_session_loaded(session_id, "telegram")
+            .await
+            .expect("session load");
+        park_approval(&mut runtime, session_id, "approval-current");
+
+        let stale = crate::approval_ref::approval_callback("trust", Some("approval-old"));
+        runtime
+            .handle_user_message(approval_tap(session_id, &stale), Uuid::new_v4())
+            .await
+            .expect("stale trust handled");
+
+        let state = runtime.session(session_id).expect("session");
+        assert!(
+            !state.approval_policy.auto_approve_all,
+            "a stale trust tap must not pre-approve the session"
+        );
+        assert_eq!(state.pending_approval_id(), Some("approval-current"));
+
+        drop(runtime);
+        let _ = server.await;
+        let _ = std::fs::remove_file(&socket_path);
+    }
+
+    /// The tap that names the pending approval resolves it, and its trust
+    /// variant still pre-approves the session.
+    #[tokio::test]
+    async fn matching_trust_tap_resolves_and_preapproves() {
+        let (mut runtime, _emitted, server, socket_path) = plan_test_runtime("match-tap").await;
+        let session_id = "sess-match-tap";
+        runtime
+            .ensure_session_loaded(session_id, "telegram")
+            .await
+            .expect("session load");
+        park_approval(&mut runtime, session_id, "approval-current");
+
+        let fresh = crate::approval_ref::approval_callback("trust", Some("approval-current"));
+        runtime
+            .handle_user_message(approval_tap(session_id, &fresh), Uuid::new_v4())
+            .await
+            .expect("matching tap handled");
+
+        let state = runtime.session(session_id).expect("session");
+        assert!(state.approval_policy.auto_approve_all);
+        assert_eq!(
+            state.pending_approval_id(),
+            None,
+            "the matching tap must consume the pending approval"
+        );
+
+        drop(runtime);
+        let _ = server.await;
+        let _ = std::fs::remove_file(&socket_path);
+    }
+
+    /// Cards sent before this change carry bare `callback_data`; they keep
+    /// resolving the pending approval unchecked.
+    #[tokio::test]
+    async fn legacy_bare_approval_tap_still_resolves() {
+        let (mut runtime, _emitted, server, socket_path) = plan_test_runtime("bare-tap").await;
+        let session_id = "sess-bare-tap";
+        runtime
+            .ensure_session_loaded(session_id, "telegram")
+            .await
+            .expect("session load");
+        park_approval(&mut runtime, session_id, "approval-current");
+
+        runtime
+            .handle_user_message(approval_tap(session_id, "deny"), Uuid::new_v4())
+            .await
+            .expect("bare tap handled");
+
+        assert_eq!(
+            runtime
+                .session(session_id)
+                .expect("session")
+                .pending_approval_id(),
+            None
         );
 
         drop(runtime);

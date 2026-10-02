@@ -152,6 +152,14 @@ Seam IDs: `model-catalog-schema`, `model-catalog-seed`, `model-catalog-projectio
   - keep Bjork/mac-jane available for local runtime verification and operator desktop work
   - keep Beacon/vps-jane as the hosted durability and remote-service target
 - [ ] Delete `origin/codex/model-graph-catalog` after valid catalog work lands or is explicitly abandoned.
+- [x] Mesh freshness (2026-09-24, `codex/model-graph-mesh-freshness`): DEF-202 (catalog refresh stalled on sleeping Macs — wall-clock due check), DEF-203 (vps `PHILOTIC_GRAPH_DB_PATH` pointed at retired `graph-runner.db`, stranding vps model health), DEF-204 (one legacy `model_profile` row emptied vps's gossiped profile list). Code + template test-green.
+  - [ ] Deploy: aiua to all 3 hotels; `deploy_hotel.yml` (config) + hotel restart on vps-jane; delete the 2 legacy vps rows.
+  - [ ] Watched-live proof: a `model_profile:*:vps-jane-aiua-01` row appears in mac-jane's/mbp-jane's `context.db`; mac-jane `model_catalog.openrouter` refreshes within 6 h wall time without a restart.
+- [x] Heal-queue drain/organize H0+H1 (2026-09-24, `codex/heal-queue-organize`): stale-escalation sweep, `occurrences` count, ANSI strip, recurrence on row time (DEF-205/208); decisions fallback for rows Ollama cannot classify (DEF-206). Test-green.
+  - [ ] Deploy all 3 hotels; set `PHILOTIC_HEAL_DECISIONS_FALLBACK=1` on mac-jane's heal-dispatcher (Ollama 93% errors there) after `aiua auth sync-roles --provider openrouter --db ~/.philotic/bjork/context.db`; watch `heal-dispatcher --decision-summary` and new `telegram_poll_conflict` rows.
+  - [ ] H2 cluster triage (`heal.triage`), H3 digest + D4 calibration — see DECISIONS_MODEL_PROPOSAL "Heal-queue drain and organize".
+  - [ ] DEF-207 Telegram 409 second poller (mac-jane + vps-jane).
+- [ ] Jev as model router — assessed 2026-09-24 in `DECISIONS_MODEL_PROPOSAL.md` ("Assessment: Jev as a model router"): not an inline router; R0 Seam A (per-ask tier) → R1 route features + token estimate → R2 shadow `route.difficulty` (blocked on operator class-B opt-in, or local classifier first) → R3 promote on evidence.
 
 ## New Project: Cypher-First Graph Datasource
 
@@ -421,6 +429,20 @@ Seam IDs: `session-compaction`
 - [x] Add slash-command short-circuiting for deterministic agent/system commands before the normal model loop.
 - [x] Add approval interrupts with explicit history and a pre-approval runtime path.
 - [x] Extend the shared cross-component task error envelope beyond the current model/TTS path so tool-runner, membrane, and other routed components return structured failures instead of silent fallback strings.
+
+## New Project: Agent Frontdoor (remote agents → Muninn + intel-graph)
+
+Proposal: [AGENT_FRONTDOOR_PROPOSAL.md](architecture/AGENT_FRONTDOOR_PROPOSAL.md). Handoff: [HANDOFF-2026-09-30-agent-frontdoor-mac-jane.md](HANDOFF-2026-09-30-agent-frontdoor-mac-jane.md).
+Seam IDs: `mcp-upstream-route-target`, `agent-frontdoor-endpoint`, `remote-muninn-bootstrap`, `frontdoor-proxy-loopback-trust`
+
+- [ ] S1 `McpUpstream` route target + cross-hotel endpoint-config dispatch + caller principal (code on `claude/stoic-goldberg-f8w99b`; not yet compiled — cloud session had no crates.io download access).
+- [x] S2 `scripts/muninn_mcp.py` frontdoor mode (`PHILOTIC_FRONTDOOR_URL` / `PHILOTIC_AGENT_MCP_TOKEN`); mock-frontdoor verified.
+- [x] S1 compiled + tested on mac-jane after merging develop (5 new tests green, `just check` green).
+- [x] S3 upstreams `muninn-cortex` (vps-jane) + `intel-graph` (mac-jane) registered with grants; endpoint provisioned; Traefik `/agent/mcp` + iptables live.
+- [ ] S4 Hardening: proxy loopback trust DONE (#597, `is_trusted_loopback`); response-shape DONE (#601, no double-wrap); Mac-offline fast-fail = DEF-211 (30 s hang); endpoint config pushes dropped = DEF-212 (fixed #601); caller tag on writes: v1 relies on clients tagging (`claude`/`codex`), per-agent principal is in the endpoint audit.
+- [x] S3 endpoint `agent-frontdoor` provisioned on vps-jane (:8912, mesh, 16 tools, tokens for claude-cloud/codex-cloud in mac Keychain `philotic-agent-frontdoor`); loopback smoke green (`muninn_mcp.py bootstrap` → `transport: frontdoor`).
+- [x] S5 `.mcp.json` `philotic` server + AGENTS.md/CLAUDE.md remote-agent bootstrap (PR #605); cloud env settings are operator-side. Handoff back: `docs/HANDOFF-2026-10-01-agent-frontdoor-cloud.md`.
+- [x] S6 credential class + `mcp-client-uat.sh agent-frontdoor` (#597); live 2026-10-01 after #601 deploy: public 16 tools, recall/graph round trips single-wrapped, live grant revoke refused immediately (no guest restart).
 
 ## New Project: Agent Loop Gap Closure
 
@@ -2078,17 +2100,25 @@ Order: P0 → P1 → P2 ∥ P3 → P4. P5 deferred.
 
 ## New Project: Desktop Generative Surfaces
 
-Proposal: [DESKTOP_GENERATIVE_SURFACES_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/DESKTOP_GENERATIVE_SURFACES_PROPOSAL.md) (proposed 2026-09-14; outcome of the operator's A2UI/AG-UI investigation for `jaredlikes-desktop`; adopts A2UI v0.9 as the surface payload schema on the existing routed operator-chat stream, AG-UI kept as a deferred projection).
+Proposal: [DESKTOP_GENERATIVE_SURFACES_PROPOSAL.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/DESKTOP_GENERATIVE_SURFACES_PROPOSAL.md) (proposed 2026-09-14; **accepted 2026-10-01 with the cross-membrane amendment**: one Philotic-owned web renderer served by `philotic-web`, hosted by the desktop, an Apple `WKWebView`, Telegram Mini Apps, and an MCP App; AG-UI investigated as its own membrane).
 
-Order: S0 → S1a ∥ S1b ∥ S1c → S2 → S3. S4 deferred. Precondition: commit the cookie-session Aiua work sitting uncommitted in `jaredlikes-desktop`.
+Order: A0 → S0 → S1 → S2 → S3 → S4; AG-UI investigation independent. The uncommitted `jaredlikes-desktop` work gates only the desktop embed (S4).
 
+- [ ] A0 `approval-action-ids`: compact approval id in Telegram `callback_data` (`approve:<id8>`, `deny:<id8>`, `trust:<id8>`) built from `ApprovalRequest.approval_id`; philote refuses a tap whose id is not the pending approval ("no longer pending") before any trust pre-approval is set; bare legacy callbacks and typed `/approve` keep working; edge `ApprovalResolve` routing follows — watched-live-green (stale tap refused, fresh tap resolves on a live hotel).
+  - [x] Telegram + philote half — **test-green** 2026-10-01: `philote::approval_ref` (FNV-1a 10-hex ref, ≤64-byte callbacks, collision-free for prefixed ids); keyboard built from the normalized `approval_id`; `SessionState::pending_approval_id()`; runtime refuses a mismatched ref before trust is set ("That approval is no longer pending."); membrane-telegram unchanged (already maps `verb:` prefixes and preserves raw `callback_data`). Tests: `stale_approval_tap_is_refused_and_current_approval_stays_pending`, `stale_trust_tap_does_not_preapprove_session`, `matching_trust_tap_resolves_and_preapproves`, `legacy_bare_approval_tap_still_resolves` + 7 unit tests.
+  - [ ] Edge `ApprovalResolve` routing (philotic-web `serve/edge.rs` only logs it today) and edge `ApprovalRequest` emission.
+  - [ ] Watched-live on a hotel: tap a superseded card → refused; tap the current card → resolves.
 - [ ] S0 `surface-schema-and-types`: vendor the A2UI v0.9 JSON Schema subset for catalog `philotic.desktop.v1`; `typify` Rust types into `ansible-mesh-core::surface`; `validate()` with catalog allowlist + size ceilings; fixtures for every allowed and every excluded component — test-green.
-- [ ] S1a `surface-render-tools`: `ui.surface.create|update|delete`, `ui.data.update` in `philote/catalog.rs` + `tool_exec.rs`; `desktop.surfaces` abstract skill seeded and SkillDAG-implied; emit `turn_event{event:"ui_surface"}` with owner/hotel/session/seq attribution; tool description states the "only while a desktop turn is in flight" limit until S3 — test-green.
-- [ ] S1b `surface-stream-projection`: `philotic-web` types the frame as `operator_chat:ui_surface`; desktop `aiua-service` → `aiua:ui-surface`; Surfaces workspace app opens one window per `surface_id` — smoke-green on mac-jane (philote renders a hotel-status card).
-- [ ] S1c `surface-renderer-catalog` (`jaredlikes-desktop`): `a2ui-surface` element (adjacency list, JSON Pointer + relative binding, `ajv` validation, catalog map); new `ui-card`, `ui-list`, `ui-table` Shadow-DOM primitives; web-test-runner at the 80% gate — test-green.
-- [ ] S2 `surface-action-return`: `ui_action` on the chat adapter + `SendOperatorChatTurn`; `ui.action` observation in the philote dialogue; `context.action_id` correlation; approval card as an A2UI surface resolving the same approval record as Telegram's numbered card — watched-live-green (operator approves a real pending tool call from a desktop surface).
-- [ ] S3 `surface-persistence-rehydrate`: hotel-owned `ui_surfaces` records (`ListSurfaces`/`GetSurface` IPC, `GET /api/surfaces`); desktop rehydrate after reload; surfaces from cron/Telegram-initiated turns via the edge cursor ledger seam — smoke-green.
-- [ ] S4 `surface-agui-adapter` — deferred until an external AG-UI consumer exists (`GET /api/agents/:id/agui` SSE; `EdgeMessage::Surface` for the Apple edge client).
+- [ ] S1 `surface-persistence-rehydrate`: hotel-owned `ui_surfaces` records (`ListSurfaces`/`GetSurface` IPC, `GET /api/surfaces/:id`); `OutboundReply::Surface` / `EdgeMessage::Surface` with a native-lowering hint; delivery outcome `displayed`/`offered_link`/`rejected` back to the philote — test-green.
+- [ ] S1 `surface-render-tools`: `ui.surface.create|update|delete`, `ui.data.update`; `desktop.surfaces` abstract skill seeded and SkillDAG-implied; replies bound to the reported delivery outcome (say-do) — test-green.
+- [ ] S2 `surface-web-renderer`: A2UI→DOM renderer bundle in philotic-stack served at `/s/:surface_id`; catalog map, JSON Pointer binding, validation, card/list/table primitives; host action bridge — test-green.
+- [ ] S2 `surface-https-edge`: Tailscale Serve HTTPS for `philotic-web`; `web_public_base_url` so the transport can move to the native Philotic VPN — smoke-green.
+- [ ] S3 `surface-telegram-miniapp`: `web_app` Open button from the emitting philote's bot; `initData` Ed25519 third-party validation, `auth_date` freshness, operator user-id allowlist, operator-bot check; surface-scoped session — watched-live-green.
+- [ ] S3 `surface-apple-webview`: `WKWebView` host loading the server renderer; `WKScriptMessageHandler` → existing `EdgeMessage` connection; no web credential in the page — smoke-green on the operator's iPhone.
+- [ ] S4 `surface-stream-projection` + `surface-action-return`: desktop embeds the served renderer; `operator_chat:ui_surface` live frames; `ui_action` through `SendOperatorChatTurn` sharing A0's id correlation — watched-live-green.
+- [ ] S4 `surface-mcp-app`: `membrane-mcp` serves the fixed renderer as a `ui://` MCP App — smoke-green from one MCP Apps host.
+- [ ] `surface-agui-adapter` — **investigation: AG-UI as a membrane** (`membrane-agui` alongside `membrane-mcp`; auth; thread/run ↔ session mapping; A2UI carriage; `ag-ui` 0.5 alpha crates vs hand-mapped events) — report + recorded decision.
+- Superseded: S1c `surface-renderer-catalog` (renderer moved from `jaredlikes-desktop` into `surface-web-renderer`).
 
 ## New Project: MCP Endpoint Steward
 
@@ -2271,3 +2301,20 @@ A typed, calibrated decision capability (yes/no, choose-one, score) beside gener
 - [ ] D4 calibrate per question from `decision_traces` / `router_traces` / approve-deny events / `life.recall.feedback`; promote through the autonomy postures only on earned agreement.
 - [ ] D5 (optional) make the provider the first production producer of `Context1Advisory` (`philote/src/session/types.rs:398`, currently test-only).
 - [ ] Re-verify vendor claims before relying on them: 70–500 ms latency, 67.8 % agreement, 193.6×/444.6× benchmark.
+
+## New Project: Memory Graph RAG Audit Fixes (S1–S10)
+
+Audit 2026-09-30 (full read: philote Muninn lane, `data-memorygraphrag` runner, Muninn↔LifeGraph overlap, live probe — findings on `doc:life-graph-os` via graph_decide and in Muninn). All ten ranked recommendations implemented on `codex/memory-rag-fixes`, one commit per slice, PR #599 → develop. Test-green: philote 641/641, data-memorygraphrag 222/222, memory-core 43/43, workspace check + fmt clean.
+
+- [x] S1 `life.commit` promotion gate: provider checks the STORED node's `validation_state`; philote drops model-set `operator_approved` on `life.commit`/`life.patch.apply` (same guard as tidy-retire). Closes the self-attestable confirmation hole.
+- [x] S2 Ownership clarity: LifeGraph added to both Muninn skills' ownership tables; `KNOWLEDGE_ARCHITECTURE_PROPOSAL` Overlap Ownership Rules (preferences, people, lived facts, ideas).
+- [x] S3 Muninn lineage through the auto-fork: `life_capture` derives the Attend `{vault}:{concept}` key (lockstep-tested) → `muninn_engram` source ref → `origin_engram_id`/`origin_trust` populate on real traffic (agent-inference trust; the ≥0.7 bonus stays reserved).
+- [x] S4 Attend hardening + curation: inline 401-heal/retry/enrich on Attend's local write; memory-core uses MuninnDB's NATIVE evolve endpoint (`POST /api/engrams/{id}/evolve` — the shim comment was stale); new `memory.evolve` tool, cluster-routed.
+- [x] S5 Hygiene sweep default-ON (opt out `PHILOTIC_LIFE_HYGIENE_ENABLED=0`); gardener skill gains the proposed-backlog confirm-or-retire triage lane (backlog was 210/856 nodes). NOTE: the gardening cron is ALIVE (`ac6e8d5f`, Beacon reports 2026-09-30) — the audit's "dead cron" finding was corrected live.
+- [x] S6 Entities in MuninnDB's first-class write fields (inline enrichment) instead of the opaque metadata blob. Read-side entity return from activate is the named follow-up seam.
+- [x] S7 Health & fitness domain: `Workout`/`Measurement` labels + V007 vector indexes (**apply migration on vps Memgraph BEFORE runner rollout**) + `scripts/lifegraph-ingest-hevy.py` (first real ingestion lane; deterministic ids, `imported_record`/`inferred` provenance).
+- [x] S8 Recall resilience: 60s Unreachable circuit breaker in the vault skip registry; partial token heals deferred to post-reply; `[Memory status]` degraded-recall prompt marker (outage ≠ empty history).
+- [x] S9 `memory_core::admin::AdminClient` canonical; dream sweep ported; remaining hand-rolled clients tracked as DEF-210 (hygiene+delta first, then the two memory_explain copies onto `MemoryEngine::activate`).
+- [x] S10 Docs true-up: MEMORY_TRANSPARENCY stale promotion-seam claim corrected; MEMORY_CONTEXT superseded; REFLEXIVE_LIFE_GRAPH slice-1 status fixed.
+- [ ] Deploy: apply V007 on vps Memgraph, then standard 3-hotel rollout; watch one live turn for the auto-recall marker and one auto-capture carrying `origin_engram_id`.
+- [ ] Follow-ups (ranked): DEF-209 client ports; activate-side entity return; positive reinforcement in `life.recall.feedback`; Measurement importer (HealthKit); life.audit O(n²) → MAGE.

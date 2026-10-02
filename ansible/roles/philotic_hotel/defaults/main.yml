@@ -45,6 +45,7 @@ philotic_binaries:
   - model-controller-anthropic
   - model-controller-openai
   - model-controller-openrouter
+  - model-controller-decisions
   - model-controller-mlx
   - model-controller-ollama
   - heal-dispatcher
@@ -78,6 +79,9 @@ philotic_memory_sleep_mutate: false
 # configure openrouter bakes both in; an older entry needs
 # `aiua auth sync-roles --provider openrouter`).
 philotic_shadow_decisions_enabled: false
+# Decisions fallback (slice H1, applied — tag + severity only, never a restart)
+# when Gemma fails or abstains. Same key/role requirements as the shadow pilot.
+philotic_heal_decisions_fallback_enabled: false
 
 # Mesh auth
 philotic_enable_rust_auth: "1"

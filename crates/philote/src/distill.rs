@@ -29,6 +29,7 @@
 //! - the whisper prompt is bounded by `PARACRINE_WHISPER_PROMPT_MAX_CHARS`.
 
 use super::*;
+use ansible_mesh_core::decisions::CAPABILITY_DECISIONS_EVALUATE;
 use ansible_mesh_core::procedure::{
     ProcedureGraphRecord, ProcedurePatchRecord, ProcedureRunRecord,
 };
@@ -104,8 +105,9 @@ pub(crate) fn tool_allowed(tool_name: &str) -> bool {
     TOOL_ALLOWLIST.contains(&tool_name)
 }
 
-/// Map a turn's intent (`skills.distill:<trigger>`) to the `origin` the
-/// hotel expects on `RegisterSkill` (`distill:<trigger>`).
+/// Map a turn's intent (`skills.distill:<trigger>[:<source turn>]`) to the
+/// `origin` the hotel expects on `RegisterSkill` (`distill:<trigger>[:<turn>]`).
+/// The hotel records the trigger and the source turn id separately.
 pub(super) fn origin_from_intent(intent: &str) -> Option<String> {
     if intent == INTENT {
         return Some("distill".to_string());
@@ -226,6 +228,123 @@ pub(super) fn evaluate_turn(turn: &WorkingTurn) -> Option<DistillTrigger> {
         return Some(DistillTrigger::UserCorrection);
     }
     None
+}
+
+/// The decisions shadow site for this pre-screen (`decisions_client::gate::SITES`).
+pub(super) const PRESCREEN_SITE: &str = "distill.prescreen";
+/// The role that serves `decisions.evaluate` when the hotel has no route for it.
+const DECISIONS_ROLE: &str = "model.decisions";
+/// The reply excerpt sent for judgment. The whole request is also bounded by
+/// the decisions token budget, checked by the router before anything leaves.
+const PRESCREEN_REPLY_CHARS: usize = 4_000;
+/// A shadow call may not hold up anything; the router gives up after this.
+const PRESCREEN_DEADLINE_MS: u64 = 4_000;
+
+/// `PHILOTIC_SHADOW_DECISIONS` set to a truthy value (`1`, `true`, `yes`, `on`).
+pub(super) fn shadow_decisions_enabled(env: impl Fn(&str) -> Option<String>) -> bool {
+    env("PHILOTIC_SHADOW_DECISIONS").is_some_and(|v| {
+        matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+    })
+}
+
+/// The `decisions.evaluate` task for one closed turn, or `None` when the turn
+/// is not a candidate (a whisper, or no tools used). The questions mirror the
+/// mechanical trigger so the router can score agreement per question; the
+/// subject is the turn id, which a distilled Draft skill also carries in its
+/// origin (`distill:<trigger>:<turn>`), so a verdict joins to what the review
+/// actually produced.
+pub(super) fn build_prescreen_task(turn: &WorkingTurn, reply: &str) -> Option<Value> {
+    use ansible_mesh_core::decision_trace::ShadowContext;
+    use ansible_mesh_core::decisions::{
+        DecisionOption, DecisionQuestion, DecisionsRequest, QuestionSpec,
+    };
+
+    if turn.paracrine_origin.is_some() || turn.paracrine_intent.is_some() {
+        return None;
+    }
+    if turn.working_tool_history.is_empty() {
+        return None;
+    }
+
+    let tools: Vec<Value> = turn
+        .working_tool_history
+        .iter()
+        .map(|(call, result)| {
+            serde_json::json!({
+                "tool": call.tool_name,
+                "outcome": if tool_result_is_error(&result.content) { "error" } else { "ok" },
+                "arguments": excerpt(&call.arguments.to_string(), TOOL_SUMMARY_CHARS),
+                "result": excerpt(&result.content, TOOL_SUMMARY_CHARS),
+            })
+        })
+        .collect();
+    let request = DecisionsRequest {
+        site: PRESCREEN_SITE.into(),
+        state: serde_json::json!({
+            "user_message": turn.user_content,
+            "tools": tools,
+            "reply": excerpt(reply, PRESCREEN_REPLY_CHARS),
+        }),
+        questions: vec![
+            DecisionQuestion {
+                id: "lesson".into(),
+                instructions: "Did this assistant turn surface a reusable lesson worth saving \
+                               as a skill or memory: a non-obvious procedure worth repeating, a \
+                               failure that was worked around, or a correction from the user \
+                               that should change how similar requests are handled?"
+                    .into(),
+                spec: QuestionSpec::Noul {
+                    when_true: Some("There is a lesson worth keeping".into()),
+                    when_false: Some("Routine work; nothing worth keeping".into()),
+                },
+            },
+            DecisionQuestion {
+                id: "kind".into(),
+                instructions: "What kind of lesson is it, if any?".into(),
+                spec: QuestionSpec::Choice {
+                    options: vec![
+                        DecisionOption::new("tool_count", "A multi-step procedure worth repeating"),
+                        DecisionOption::new("error_recovered", "A failure that was worked around"),
+                        DecisionOption::new(
+                            "user_correction",
+                            "The user corrected the assistant's approach",
+                        ),
+                        DecisionOption::new("none", "Nothing worth keeping"),
+                    ],
+                },
+            },
+        ],
+    };
+
+    // The incumbent is the mechanical trigger: `kind` is its trigger name
+    // (`none` when it would not fire), `lesson` is whether it fires at all.
+    let incumbent_trigger = evaluate_turn(turn);
+    let shadow = ShadowContext {
+        subject: turn.turn_id.clone(),
+        data_class: "C".into(),
+        incumbent: [
+            (
+                "lesson".to_string(),
+                Value::Bool(incumbent_trigger.is_some()),
+            ),
+            (
+                "kind".to_string(),
+                Value::String(incumbent_trigger.map_or("none", |t| t.as_str()).to_string()),
+            ),
+        ]
+        .into(),
+    };
+
+    Some(serde_json::json!({
+        "kind": CAPABILITY_DECISIONS_EVALUATE,
+        "decisions": request,
+        "shadow": shadow,
+        "deadline_ms": PRESCREEN_DEADLINE_MS,
+        "turn_id": turn.turn_id,
+    }))
 }
 
 fn excerpt(text: &str, max_chars: usize) -> String {
@@ -489,6 +608,10 @@ impl AgentRuntime {
     ) {
         use ansible_mesh_core::autonomy::LANE_SKILLS_DISTILL;
 
+        // Shadow only: ask the decisions model the same question the mechanical
+        // trigger answers, log both, change nothing.
+        self.shadow_distill_prescreen(session_id, turn, reply).await;
+
         let Some(trigger) = evaluate_turn(turn) else {
             return;
         };
@@ -523,6 +646,56 @@ impl AgentRuntime {
             "distill review",
         )
         .await;
+    }
+
+    /// Decisions shadow for the distill pre-screen (site `distill.prescreen`).
+    ///
+    /// Off unless `PHILOTIC_SHADOW_DECISIONS` is set. Fire-and-forget through
+    /// the router: the task goes to whatever the hotel routes
+    /// `decisions.evaluate` to (the `model.decisions` controller by default),
+    /// which holds the key, calls the model under zero data retention and writes
+    /// the trace. Philote never holds the key and never waits for an answer.
+    ///
+    /// The state is the operator's own words (class C), so it is sent only to a
+    /// controller on this hotel: the mesh is signed but not encrypted, and
+    /// operator content must not cross it until it is.
+    async fn shadow_distill_prescreen(
+        &mut self,
+        session_id: &str,
+        turn: &WorkingTurn,
+        reply: &str,
+    ) {
+        if !shadow_decisions_enabled(|k| std::env::var(k).ok()) {
+            return;
+        }
+        let Some(task) = build_prescreen_task(turn, reply) else {
+            return;
+        };
+        let (target_node, target_role, target_guest_id) = resolve_model_execution_target(
+            self.sessions.get(session_id),
+            CAPABILITY_DECISIONS_EVALUATE,
+            DECISIONS_ROLE,
+        );
+        if target_node != local_node_id() {
+            info!(
+                session_id = %session_id,
+                target_node = %target_node,
+                "distill shadow skipped: operator content stays on this hotel until the mesh is encrypted"
+            );
+            return;
+        }
+        let emit = self
+            .ipc_client
+            .send_request(IpcRequest::EmitTask {
+                target_node,
+                target_role,
+                target_guest_id,
+                task_json: task.to_string(),
+            })
+            .await;
+        if let Err(e) = emit {
+            debug!(session_id = %session_id, error = %e, "distill shadow emit failed");
+        }
     }
 
     /// Procedural graphs P4: after a terminal plan eval landed on the run
@@ -755,7 +928,10 @@ impl AgentRuntime {
         let exosome = Exosome {
             prompt: prompt.clone(),
             context: Some(serde_json::json!({
-                "intent": format!("{INTENT}:{}", trigger.as_str()),
+                // The source turn rides in the intent so a Draft skill's origin
+                // (`distill:<trigger>:<turn>`) joins back to the turn that fired
+                // it, and so to the decisions shadow trace for that turn.
+                "intent": format!("{INTENT}:{}:{turn_id}", trigger.as_str()),
                 "trigger": trigger.as_str(),
                 "lane": lane,
                 "source_turn_id": turn_id,
@@ -871,6 +1047,53 @@ mod tests {
     }
 
     #[test]
+    fn prescreen_task_carries_the_turn_the_questions_and_the_incumbent() {
+        let turn = turn_with(
+            vec![("shell.exec", "Error: no such file"), ("shell.exec", "ok")],
+            "no, use the staging db",
+        );
+        let task = build_prescreen_task(&turn, "Done — switched to staging.").expect("candidate");
+        assert_eq!(task["kind"], "decisions.evaluate");
+        assert_eq!(task["decisions"]["site"], PRESCREEN_SITE);
+        assert_eq!(
+            task["decisions"]["state"]["user_message"],
+            "no, use the staging db"
+        );
+        assert_eq!(task["decisions"]["state"]["tools"][0]["outcome"], "error");
+        assert_eq!(task["decisions"]["state"]["tools"][1]["outcome"], "ok");
+        // The router parses the decisions block as a typed request.
+        let request: ansible_mesh_core::decisions::DecisionsRequest =
+            serde_json::from_value(task["decisions"].clone()).expect("typed request");
+        let ids: Vec<&str> = request.questions.iter().map(|q| q.id.as_str()).collect();
+        assert_eq!(ids, ["lesson", "kind"]);
+        // The incumbent is the mechanical trigger, keyed to the same questions.
+        assert_eq!(task["shadow"]["subject"], "t-1");
+        assert_eq!(task["shadow"]["data_class"], "C");
+        assert_eq!(task["shadow"]["incumbent"]["lesson"], true);
+        assert_eq!(task["shadow"]["incumbent"]["kind"], "error_recovered");
+    }
+
+    #[test]
+    fn prescreen_skips_whispers_and_tool_free_turns_and_records_none() {
+        assert!(build_prescreen_task(&turn_with(vec![], "hi"), "hello").is_none());
+        let mut whisper = turn_with(vec![("skill.list", "ok")], "review");
+        whisper.paracrine_intent = Some("skills.distill:tool_count:t-0".into());
+        assert!(build_prescreen_task(&whisper, "no-op").is_none());
+
+        let quiet = turn_with(vec![("memory.recall", "ok")], "what did I say yesterday?");
+        let task = build_prescreen_task(&quiet, "You said …").expect("candidate");
+        assert_eq!(task["shadow"]["incumbent"]["lesson"], false);
+        assert_eq!(task["shadow"]["incumbent"]["kind"], "none");
+    }
+
+    #[test]
+    fn shadow_flag_is_off_unless_truthy() {
+        assert!(!shadow_decisions_enabled(|_| None));
+        assert!(!shadow_decisions_enabled(|_| Some("0".into())));
+        assert!(shadow_decisions_enabled(|_| Some(" true ".into())));
+    }
+
+    #[test]
     fn tool_count_predicate_fires_at_threshold() {
         let five = vec![("a", "ok"); 5];
         assert_eq!(
@@ -938,6 +1161,11 @@ mod tests {
         assert_eq!(
             origin_from_intent("skills.distill:error_recovered").as_deref(),
             Some("distill:error_recovered")
+        );
+        assert_eq!(
+            origin_from_intent("skills.distill:tool_count:turn-42").as_deref(),
+            Some("distill:tool_count:turn-42"),
+            "the source turn rides through to the hotel"
         );
         assert_eq!(origin_from_intent("steward.checkin"), None);
     }

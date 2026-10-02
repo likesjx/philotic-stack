@@ -213,6 +213,35 @@ struct WriteRequest {
     /// reinforce rather than accumulate.
     #[serde(skip_serializing_if = "Option::is_none")]
     idempotent_id: Option<String>,
+    /// Inline enrichment: MuninnDB's REAL entity fields (`[{name, type}]`).
+    /// Entities sent here land in the entity knowledge graph immediately
+    /// (find_by_entity, entity timelines, contradiction detection) instead
+    /// of sitting invisible inside the opaque metadata blob.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    entities: Option<serde_json::Value>,
+    /// Inline typed entity-to-entity relationships
+    /// (`[{from_entity, to_entity, rel_type, weight}]`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    entity_relationships: Option<serde_json::Value>,
+}
+
+/// Lift the caller's shaped entities/relationships out of the metadata blob
+/// into MuninnDB's first-class write fields. The metadata copy is kept —
+/// the recall read side still renders its entity overlay from metadata
+/// (activate items do not return server-side entities yet). Shapes already
+/// match the wire contract: philote's `shaped_memory_entities` emits
+/// `{name, type}` and `shaped_memory_relationships` emits
+/// `{from_entity, rel_type, to_entity, weight}`.
+fn inline_enrichment_from_metadata(
+    metadata: Option<&serde_json::Value>,
+) -> (Option<serde_json::Value>, Option<serde_json::Value>) {
+    let field = |key: &str| {
+        metadata
+            .and_then(|m| m.get(key))
+            .filter(|v| v.as_array().is_some_and(|a| !a.is_empty()))
+            .cloned()
+    };
+    (field("entities"), field("relationships"))
 }
 
 #[derive(Debug, Deserialize)]
@@ -528,6 +557,10 @@ enum VaultSkipReason {
     Empty,
     /// The vault's token was rejected (HTTP 401).
     TokenRejected,
+    /// The vault timed out or refused the connection. Circuit breaker: a hung
+    /// Muninn otherwise costs the full recall timeout on EVERY turn. Short
+    /// TTL so a transient blip recovers within a minute.
+    Unreachable,
     /// Confirmed to hold memories; not skipped. Recorded so a non-empty vault
     /// that returns nothing for an off-topic query is not re-checked each turn.
     NonEmpty,
@@ -535,9 +568,21 @@ enum VaultSkipReason {
 
 impl VaultSkipReason {
     fn skips_recall(self) -> bool {
-        matches!(self, Self::Empty | Self::TokenRejected)
+        matches!(self, Self::Empty | Self::TokenRejected | Self::Unreachable)
+    }
+
+    /// Per-reason registry TTL: empties/401s are stable states worth the full
+    /// TTL; an unreachable vault gets a short breaker window.
+    fn ttl(self) -> Duration {
+        match self {
+            Self::Unreachable => VAULT_UNREACHABLE_TTL,
+            _ => VAULT_SKIP_TTL,
+        }
     }
 }
+
+/// Circuit-breaker window for a vault that timed out or refused connection.
+const VAULT_UNREACHABLE_TTL: Duration = Duration::from_secs(60);
 
 #[derive(Debug, Deserialize)]
 struct StatsResponse {
@@ -757,7 +802,7 @@ impl MuninnRestEngine {
         let key = self.vault_skip_key(vault);
         let mut registry = vault_skip_registry().lock().unwrap();
         match registry.get(&key) {
-            Some((at, reason)) if at.elapsed() < VAULT_SKIP_TTL => Some(*reason),
+            Some((at, reason)) if at.elapsed() < reason.ttl() => Some(*reason),
             Some(_) => {
                 registry.remove(&key);
                 None
@@ -962,6 +1007,7 @@ impl MuninnRestEngine {
             serde_json::Value::Null => None,
             other => Some(other),
         };
+        let (entities, entity_relationships) = inline_enrichment_from_metadata(metadata.as_ref());
         let body = WriteRequest {
             vault: vault.to_string(),
             concept: concept.to_string(),
@@ -970,6 +1016,8 @@ impl MuninnRestEngine {
             confidence: None,
             metadata,
             idempotent_id: Some(format!("{}:{}", vault, concept)),
+            entities,
+            entity_relationships,
         };
         let resp = self
             .with_auth(self.client.post(self.url("/api/engrams")), vault)
@@ -1018,6 +1066,7 @@ impl MemoryEngine for MuninnRestEngine {
             other => Some(other),
         };
 
+        let (entities, entity_relationships) = inline_enrichment_from_metadata(metadata.as_ref());
         let body = WriteRequest {
             vault: vault.clone(),
             concept: concept.to_string(),
@@ -1026,6 +1075,8 @@ impl MemoryEngine for MuninnRestEngine {
             confidence: None,
             metadata,
             idempotent_id: Some(format!("{}:{}", vault, concept)),
+            entities,
+            entity_relationships,
         };
 
         let resp = self
@@ -1122,26 +1173,75 @@ impl MemoryEngine for MuninnRestEngine {
         &self,
         id: &EngramId,
         content: &str,
+        reason: &str,
         tags: Option<Vec<String>>,
     ) -> anyhow::Result<EngramRef> {
-        // MuninnDB REST does not yet expose a direct PATCH endpoint;
-        // evolve is available via MCP (muninn_evolve). For now, write the
-        // updated content as a new engram and link it as supersedes.
-        // Phase 5 (MBP) will replace this with a native evolve call.
-        let existing = self
-            .read(id)
+        // Native MuninnDB evolve: POST /api/engrams/{id}/evolve supersedes
+        // the old version in place (it stays retrievable as history) instead
+        // of the old read-copy-Supersedes shim, which left the stale copy
+        // fully active and competing in recall. Tags are inherited from the
+        // previous version by the server; an explicit override is not part
+        // of the endpoint, so it is reported rather than silently dropped.
+        if tags.is_some() {
+            tracing::debug!(
+                id = %id,
+                "evolve: tag override ignored — native evolve inherits tags; retag separately"
+            );
+        }
+        let reason = if reason.trim().is_empty() {
+            "evolved via memory engine"
+        } else {
+            reason
+        };
+        let body = serde_json::json!({ "new_content": content, "reason": reason });
+
+        #[derive(serde::Deserialize)]
+        struct EvolveResponse {
+            id: String,
+        }
+
+        let base_url = self.url(&format!("/api/engrams/{id}/evolve"));
+        if let Some(vault) = self.cached_vault(id).await {
+            // Fast path: vault known from the write-side cache.
+            let url = format!("{}?vault={}", base_url, vault);
+            let resp = self
+                .with_auth(self.client.post(&url), &vault)
+                .json(&body)
+                .send()
+                .await?;
+            let resp = Self::auth_checked(resp, &vault)?.error_for_status()?;
+            let evolved: EvolveResponse = resp.json().await?;
+            self.invalidate_recall_state();
+            if let Ok(mut cache) = self.id_vault_cache.try_write() {
+                cache.insert(evolved.id.clone(), vault.clone());
+            }
+            return Ok(EngramRef {
+                id: evolved.id,
+                vault_id: vault,
+            });
+        }
+
+        // Slow path: vault unknown — try the configured vaults like forget().
+        let client = &self.client;
+        if let Some((vault, resp)) = self
+            .discover_vault(|vault, token| {
+                let url = format!("{}?vault={}", base_url, vault);
+                client.post(&url).bearer_auth(token).json(&body)
+            })
             .await?
-            .ok_or_else(|| anyhow::anyhow!("evolve: engram not found: {id}"))?;
-
-        let effective_tags = tags.unwrap_or_else(|| existing.tags.clone());
-        let scope = MemoryScope::SelfOnly; // evolve preserves vault via link
-        let new_ref = self
-            .remember(scope, &existing.concept, content, effective_tags)
-            .await?;
-
-        self.link(id, &new_ref.id, LinkKind::Supersedes).await?;
-
-        Ok(new_ref)
+        {
+            let resp = resp.error_for_status()?;
+            let evolved: EvolveResponse = resp.json().await?;
+            self.invalidate_recall_state();
+            if let Ok(mut cache) = self.id_vault_cache.try_write() {
+                cache.insert(evolved.id.clone(), vault.clone());
+            }
+            return Ok(EngramRef {
+                id: evolved.id,
+                vault_id: vault,
+            });
+        }
+        anyhow::bail!("evolve: engram not found in any configured vault: {id}")
     }
 
     async fn forget(&self, id: &EngramId) -> anyhow::Result<()> {
@@ -1345,6 +1445,10 @@ impl MemoryEngine for MuninnRestEngine {
                             first_token_rejected = Some(err);
                         }
                     } else {
+                        // Timeout / connect refusal: open the short-TTL
+                        // breaker so the next turns skip this vault instead
+                        // of re-paying the full recall timeout each time.
+                        self.mark_vault_skip(vault, VaultSkipReason::Unreachable);
                         failed_vaults.push(vault.clone());
                     }
                     continue;
@@ -2244,5 +2348,28 @@ mod shared_write_route_tests {
         let json = serde_json::to_string(&cfg).unwrap();
         let back: MuninnConfig = serde_json::from_str(&json).unwrap();
         assert_eq!(back.shared_write_route.as_deref(), Some("vps-jane-aiua-01"));
+    }
+
+    #[test]
+    fn inline_enrichment_lifts_entities_out_of_metadata() {
+        let metadata = serde_json::json!({
+            "entities": [{"name": "proposal:life-graph-os", "type": "proposal"}],
+            "relationships": [{
+                "from_entity": "seam:x", "rel_type": "belongs_to",
+                "to_entity": "proposal:life-graph-os", "weight": 0.9
+            }],
+            "other": "kept",
+        });
+        let (ents, rels) = inline_enrichment_from_metadata(Some(&metadata));
+        assert_eq!(ents.unwrap()[0]["name"], "proposal:life-graph-os");
+        assert_eq!(rels.unwrap()[0]["rel_type"], "belongs_to");
+
+        // Empty arrays, wrong types, and absent metadata all stay None —
+        // never send an empty/garbage inline field the server would reject.
+        let empty = serde_json::json!({"entities": [], "relationships": "nope"});
+        let (ents, rels) = inline_enrichment_from_metadata(Some(&empty));
+        assert!(ents.is_none() && rels.is_none());
+        let (ents, rels) = inline_enrichment_from_metadata(None);
+        assert!(ents.is_none() && rels.is_none());
     }
 }

@@ -104,6 +104,20 @@ impl DecisionsTransport {
             Self::OpenRouter => "openrouter",
         }
     }
+
+    /// Whether every request on this transport is pinned to zero data retention.
+    ///
+    /// OpenRouter: yes. [`build_wire_request`] always sends
+    /// `provider: {zdr: true, data_collection: "deny"}`, so OpenRouter routes only
+    /// to ZDR endpoints (TypeSafe's Jev is on its ZDR list) or refuses the call.
+    /// Native: no. TypeSafe offers ZDR on its own API to enterprise accounts only.
+    /// The data-policy gate allows operator content (class C) only where this holds.
+    pub fn enforces_zero_retention(self) -> bool {
+        match self {
+            Self::Native => false,
+            Self::OpenRouter => true,
+        }
+    }
 }
 
 /// Map a provider-neutral model name onto the transport's model slug.
@@ -585,7 +599,23 @@ struct WireRequest<'a> {
     model: &'a str,
     state: &'a Value,
     questions: OrderedMap<'a, WireQuestion<'a>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    provider: Option<WireProvider>,
 }
+
+/// OpenRouter provider routing: zero data retention, no data collection. Sent
+/// on every OpenRouter request whatever the site's data class; see
+/// [`DecisionsTransport::enforces_zero_retention`].
+#[derive(Serialize)]
+struct WireProvider {
+    zdr: bool,
+    data_collection: &'static str,
+}
+
+const OPENROUTER_ZERO_RETENTION: WireProvider = WireProvider {
+    zdr: true,
+    data_collection: "deny",
+};
 
 #[derive(Serialize)]
 struct WireNoulCriteria<'a> {
@@ -676,6 +706,10 @@ pub fn build_wire_request(
                 .map(|q| (q.id.as_str(), wire_question(transport, q)))
                 .collect(),
         ),
+        provider: match transport {
+            DecisionsTransport::OpenRouter => Some(OPENROUTER_ZERO_RETENTION),
+            DecisionsTransport::Native => None,
+        },
     };
     serde_json::to_string(&wire)
         .map_err(|err| DecisionsError::invalid_request(format!("cannot encode request: {err}")))
@@ -1249,8 +1283,24 @@ mod tests {
                         "instructions": "Does this convey urgency?",
                         "criteria": { "true": "Explicitly time-sensitive", "false": "No urgency expressed" }
                     }
-                }
+                },
+                "provider": { "zdr": true, "data_collection": "deny" }
             })
+        );
+    }
+
+    #[test]
+    fn only_openrouter_pins_zero_retention_on_the_wire() {
+        assert!(DecisionsTransport::OpenRouter.enforces_zero_retention());
+        assert!(!DecisionsTransport::Native.enforces_zero_retention());
+        let native: Value = serde_json::from_str(
+            &build_wire_request(DecisionsTransport::Native, &urgency_request(), "jev-latest")
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(
+            native.get("provider").is_none(),
+            "the native API has no provider routing block"
         );
     }
 
@@ -1461,7 +1511,13 @@ mod tests {
             "typesafe/jev-1.13",
         )
         .unwrap();
-        let sent: Value = serde_json::from_str(&body).unwrap();
+        let mut sent: Value = serde_json::from_str(&body).unwrap();
+        // The recorded request predates the zero-retention routing block, which
+        // is appended last; the rest must still match byte-for-byte in order.
+        assert_eq!(
+            sent.as_object_mut().unwrap().remove("provider"),
+            Some(serde_json::json!({ "zdr": true, "data_collection": "deny" }))
+        );
         let recorded: Value = serde_json::from_str(RECORDED_MIXED_REQUEST).unwrap();
         assert_eq!(sent, recorded);
         // Not just equal as JSON: the same key order, which is the whole reason

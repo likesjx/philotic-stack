@@ -20,14 +20,15 @@ fn guest_id() -> String {
 const HYGIENE_INITIAL_DELAY: Duration = Duration::from_secs(5 * 60);
 
 /// Spawn the internal nightly hygiene-sweep timer, gated on
-/// `PHILOTIC_LIFE_HYGIENE_ENABLED` (default OFF). Non-fatal by design: a
-/// sweep error is logged and the loop keeps ticking — it must never crash
+/// `PHILOTIC_LIFE_HYGIENE_ENABLED` (default ON since the 2026-09-30
+/// memory-RAG audit; set "0"/"false"/"no" to opt out). Non-fatal by design:
+/// a sweep error is logged and the loop keeps ticking — it must never crash
 /// the runner or affect `life.observe`/`life.recall` availability.
 fn spawn_hygiene_sweep_timer() {
     if !hygiene::hygiene_enabled_from_env() {
         info!(
             env = hygiene::HYGIENE_ENABLED_ENV,
-            "life-graph hygiene sweep disabled (set to \"1\"/\"true\"/\"yes\" to enable)"
+            "life-graph hygiene sweep disabled by explicit opt-out"
         );
         return;
     }

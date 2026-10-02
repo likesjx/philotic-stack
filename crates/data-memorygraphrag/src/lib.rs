@@ -2580,6 +2580,40 @@ impl MemoryGraphRagRunner {
         })
     }
 
+    /// Server-side promotion gate for `life.commit`, checked against the
+    /// STORED node's `validation_state` (never the caller's evidence — the
+    /// caller's `validation_state: confirmed` is self-attestation and passes
+    /// `plan_commit` by construction). Returns the block reason, or `None`
+    /// when the commit may proceed.
+    ///
+    /// Rules:
+    /// - `operator_approved` clears the gate (the philote harness drops that
+    ///   flag unless the operator's own message reads as approval).
+    /// - a node already stored as `confirmed` may be re-committed (refresh).
+    /// - anything else — `proposed`, `inferred`, `conflicted`, `retired`, or
+    ///   a missing `validation_state` — needs the operator.
+    pub fn commit_promotion_block_reason(
+        stored_validation_state: Option<&str>,
+        operator_approved: bool,
+    ) -> Option<String> {
+        if operator_approved {
+            return None;
+        }
+        match stored_validation_state {
+            Some("confirmed") => None,
+            Some(state) => Some(format!(
+                "life.commit blocked: stored node is '{state}', and caller-supplied confirmed \
+                 evidence is not trusted — promotion to confirmed requires operator approval"
+            )),
+            None => Some(
+                "life.commit blocked: stored node has no validation_state, and caller-supplied \
+                 confirmed evidence is not trusted — promotion to confirmed requires operator \
+                 approval"
+                    .into(),
+            ),
+        }
+    }
+
     fn plan_commit(&self, input: LifeCommitInput) -> Result<RunnerPlan, ContractError> {
         input.evidence.validate()?;
         let confirmed = matches!(input.evidence.validation_state, ValidationState::Confirmed);
@@ -4141,6 +4175,28 @@ mod tests {
             operator_approved: true,
         };
         assert!(blank.validate().is_err());
+    }
+
+    #[test]
+    fn commit_promotion_gate_trusts_stored_state_not_caller_evidence() {
+        // Already-confirmed stored node: re-commit allowed without approval.
+        assert!(
+            MemoryGraphRagRunner::commit_promotion_block_reason(Some("confirmed"), false).is_none()
+        );
+        // Operator approval clears the gate regardless of stored state.
+        assert!(
+            MemoryGraphRagRunner::commit_promotion_block_reason(Some("proposed"), true).is_none()
+        );
+        assert!(MemoryGraphRagRunner::commit_promotion_block_reason(None, true).is_none());
+        // Self-attested confirmed evidence over a proposed/inferred/absent
+        // stored state blocks — this is the hole the gate closes.
+        for state in ["proposed", "inferred", "conflicted", "retired"] {
+            let reason = MemoryGraphRagRunner::commit_promotion_block_reason(Some(state), false)
+                .expect("non-confirmed stored state must block");
+            assert!(reason.contains(state));
+            assert!(reason.contains("operator approval"));
+        }
+        assert!(MemoryGraphRagRunner::commit_promotion_block_reason(None, false).is_some());
     }
 
     #[test]

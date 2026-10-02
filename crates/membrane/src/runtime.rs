@@ -147,12 +147,23 @@ impl MembraneRuntime {
 
                     // Inbound from guest → forward to hotel.
                     Some(envelope) = inbound_rx.recv() => {
-                        if let Err(e) = dispatch_inbound(&mut client, envelope, &self.node_id).await {
-                            if philotic_client::is_ipc_disconnect(&e) {
-                                warn!("IPC disconnect while dispatching inbound");
-                                break true;
+                        match dispatch_inbound(&mut client, envelope, &self.node_id).await {
+                            // The hotel refused a tool dispatch (e.g. its target
+                            // hotel is offline): answer the waiting caller now
+                            // instead of letting it time out.
+                            Ok(Some(refusal)) => {
+                                if let Err(e) = guest.handle_push(&refusal).await {
+                                    error!(err = %e, "refusal delivery error");
+                                }
                             }
-                            error!(err = %e, "inbound dispatch error");
+                            Ok(None) => {}
+                            Err(e) => {
+                                if philotic_client::is_ipc_disconnect(&e) {
+                                    warn!("IPC disconnect while dispatching inbound");
+                                    break true;
+                                }
+                                error!(err = %e, "inbound dispatch error");
+                            }
                         }
                     }
 
@@ -234,10 +245,48 @@ async fn dispatch_inbound(
     client: &mut PhiloticClient,
     envelope: InboundEnvelope,
     local_node_id: &str,
-) -> Result<()> {
+) -> Result<Option<philotic_client::IpcResponse>> {
     let req = build_inbound_request(&envelope, local_node_id);
-    client.send_request(req).await?;
-    Ok(())
+    let resp = client.send_request(req).await?;
+    Ok(refusal_push(&envelope, &resp))
+}
+
+/// When the hotel refuses a datasource / MCP-upstream dispatch (e.g.
+/// `TARGET_NODE_UNREACHABLE` for a sleeping peer hotel), build the
+/// `datasource_response` error push the guest would otherwise wait for, keyed
+/// by the envelope's turn. Other targets keep their existing behaviour.
+fn refusal_push(
+    envelope: &InboundEnvelope,
+    resp: &philotic_client::IpcResponse,
+) -> Option<philotic_client::IpcResponse> {
+    let philotic_client::IpcResponse::Standard {
+        ok: false,
+        code,
+        message,
+        ..
+    } = resp
+    else {
+        return None;
+    };
+    let target_kind = envelope
+        .raw_transport
+        .get("target_kind")
+        .and_then(|v| v.as_str());
+    if !matches!(target_kind, Some("mcp_upstream" | "datasource")) {
+        return None;
+    }
+    warn!(code, turn_id = %envelope.turn_id, "hotel refused tool dispatch; failing the call fast");
+    Some(philotic_client::IpcResponse::InboundTask {
+        source_node: String::new(),
+        task_id: uuid::Uuid::new_v4(),
+        task_json: serde_json::json!({
+            "action": "datasource_response",
+            "turn_id": envelope.turn_id,
+            "session_id": envelope.session_id,
+            "error": format!("{code}: {message}"),
+        })
+        .to_string(),
+    })
 }
 
 /// Build the IPC request for an inbound envelope. Pure so variants can unit-test
@@ -292,6 +341,8 @@ fn build_inbound_request(
 
     let mut payload = if target_kind == Some("datasource") {
         datasource_payload(envelope, transport)
+    } else if target_kind == Some("mcp_upstream") {
+        mcp_upstream_payload(envelope, transport)
     } else {
         serde_json::json!({
         "session_id":             envelope.session_id,
@@ -319,6 +370,14 @@ fn build_inbound_request(
         for (key, value) in &envelope.extra {
             obj.insert(key.clone(), value.clone());
         }
+    }
+
+    // The upstream grant check keys on `agent_id`; it must be the membrane's
+    // authenticated caller, never something a transport extra could override.
+    if target_kind == Some("mcp_upstream")
+        && let Some(obj) = payload.as_object_mut()
+    {
+        obj.insert("agent_id".into(), mcp_caller_principal(envelope).into());
     }
 
     if let Some(node) = target_node {
@@ -357,6 +416,8 @@ fn resolve_target(
         ),
         Some("tool") => ("tool-runner".into(), hinted_target_id),
         Some("philote") => ("agent".into(), hinted_target_id),
+        // The MCP client fabric guest; the upstream id travels in `tool_name`.
+        Some("mcp_upstream") => (MCP_CLIENT_RUNNER_ROLE.into(), None),
         _ => ("agent".into(), hinted_target_id),
     }
 }
@@ -390,6 +451,40 @@ fn datasource_payload(envelope: &InboundEnvelope, transport: Option<String>) -> 
         "reply_role": envelope.final_reply_role,
         "reply_guest_id": envelope.final_reply_guest_id,
     })
+}
+
+/// Role of the `membrane-mcp-client` guest that owns upstream MCP connections.
+const MCP_CLIENT_RUNNER_ROLE: &str = "mcp-client-runner";
+
+/// Principal presented to `mcp-client-runner` for an MCP caller. Mirrors
+/// `ansible_mesh_core::mcp_route::mcp_caller_principal` (this crate does not
+/// depend on ansible-mesh-core). Upstream `grant_agents` list this form.
+fn mcp_caller_principal(envelope: &InboundEnvelope) -> String {
+    format!(
+        "mcp:{}",
+        envelope.sender.id.as_deref().unwrap_or("anonymous")
+    )
+}
+
+/// Build the `execute_tool` task `mcp-client-runner` expects for an
+/// `McpUpstream` route: the datasource shape, with `tool_name` projected to
+/// `mcp:<upstream_id>.<remote_tool>`.
+fn mcp_upstream_payload(
+    envelope: &InboundEnvelope,
+    transport: Option<String>,
+) -> serde_json::Value {
+    let mut payload = datasource_payload(envelope, transport);
+    let upstream_id = envelope
+        .raw_transport
+        .get("target_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default();
+    let remote_tool = payload["tool_name"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    payload["tool_name"] = format!("mcp:{upstream_id}.{remote_tool}").into();
+    payload
 }
 
 /// Extract an [`OutboundReply`] from a hotel push message if it contains
@@ -682,5 +777,124 @@ mod tests {
             matches!(req, IpcRequest::CreateTask { ref target_role, .. } if target_role == "tool-runner"),
             "tool targets are not guest ids and must stay a role dispatch: {req:?}"
         );
+    }
+
+    #[test]
+    fn mcp_upstream_target_emits_projected_call_to_pinned_node() {
+        use philotic_client::IpcRequest;
+
+        let mut envelope = mcp_datasource_envelope();
+        envelope.sender.id = Some("claude-cloud".into());
+        envelope.content = serde_json::json!({
+            "action": "muninn_recall",
+            "payload": { "context": ["philotic frontdoor"] },
+            "target_kind": "mcp_upstream",
+            "target_id": "muninn-local"
+        })
+        .to_string();
+        envelope.raw_transport = serde_json::json!({
+            "transport": "mcp",
+            "tool": "memory.recall",
+            "target_kind": "mcp_upstream",
+            "target_id": "muninn-local",
+            "target_node": "mac-jane-aiua-01"
+        });
+        // A transport extra must not be able to spoof the caller principal.
+        envelope.extra = serde_json::json!({ "agent_id": "operator" })
+            .as_object()
+            .cloned()
+            .unwrap();
+
+        let req = build_inbound_request(&envelope, "vps-jane-aiua-01");
+        let IpcRequest::EmitTask {
+            target_node,
+            target_role,
+            target_guest_id,
+            task_json,
+        } = req
+        else {
+            panic!("expected EmitTask, got {req:?}");
+        };
+        assert_eq!(target_node, "mac-jane-aiua-01");
+        assert_eq!(target_role, "mcp-client-runner");
+        assert_eq!(target_guest_id, None);
+
+        let payload: serde_json::Value = serde_json::from_str(&task_json).unwrap();
+        assert_eq!(payload["action"], "execute_tool");
+        assert_eq!(payload["tool_name"], "mcp:muninn-local.muninn_recall");
+        assert_eq!(payload["arguments"]["context"][0], "philotic frontdoor");
+        assert_eq!(payload["agent_id"], "mcp:claude-cloud");
+        assert_eq!(payload["reply_to"], "vps-jane-aiua-01");
+        assert_eq!(payload["reply_role"], "mcp-membrane");
+    }
+
+    #[test]
+    fn mcp_upstream_without_node_stays_local() {
+        use philotic_client::IpcRequest;
+
+        let mut envelope = mcp_datasource_envelope();
+        envelope.raw_transport = serde_json::json!({
+            "transport": "mcp",
+            "target_kind": "mcp_upstream",
+            "target_id": "intel-graph",
+            "target_node": null
+        });
+        let req = build_inbound_request(&envelope, "vps-jane-aiua-01");
+        let IpcRequest::CreateTask {
+            target_role,
+            payload,
+        } = req
+        else {
+            panic!("expected CreateTask, got {req:?}");
+        };
+        assert_eq!(target_role, "mcp-client-runner");
+        assert_eq!(payload["tool_name"], "mcp:intel-graph.life.recall");
+        assert_eq!(payload["agent_id"], "mcp:lifegraph-reader");
+    }
+
+    #[test]
+    fn refused_upstream_dispatch_becomes_an_immediate_error_reply() {
+        use philotic_client::IpcResponse;
+
+        let mut envelope = mcp_datasource_envelope();
+        envelope.turn_id = "turn-42".into();
+        envelope.raw_transport = serde_json::json!({
+            "transport": "mcp",
+            "target_kind": "mcp_upstream",
+            "target_id": "intel-graph",
+            "target_node": "mac-jane-aiua-01"
+        });
+        let refused = IpcResponse::Standard {
+            ok: false,
+            code: "TARGET_NODE_UNREACHABLE".into(),
+            message: "peer stale".into(),
+            corr_id: "emit_task".into(),
+            data: None,
+        };
+        let Some(IpcResponse::InboundTask { task_json, .. }) = refusal_push(&envelope, &refused)
+        else {
+            panic!("expected a synthetic datasource_response push");
+        };
+        let push: serde_json::Value = serde_json::from_str(&task_json).unwrap();
+        assert_eq!(push["action"], "datasource_response");
+        assert_eq!(push["turn_id"], "turn-42");
+        assert!(
+            push["error"]
+                .as_str()
+                .unwrap()
+                .starts_with("TARGET_NODE_UNREACHABLE")
+        );
+
+        // Accepted dispatches and non-tool targets are left alone.
+        let accepted = IpcResponse::Standard {
+            ok: true,
+            code: "OK".into(),
+            message: "Success".into(),
+            corr_id: "emit".into(),
+            data: None,
+        };
+        assert!(refusal_push(&envelope, &accepted).is_none());
+        envelope.raw_transport = serde_json::json!({ "target_kind": "philote", "target_id": "a" });
+        assert!(refusal_push(&envelope, &refused).is_none());
     }
 }

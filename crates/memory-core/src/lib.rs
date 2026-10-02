@@ -1,3 +1,4 @@
+pub mod admin;
 pub mod cognitive;
 pub mod engine;
 pub mod null;

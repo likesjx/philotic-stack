@@ -1,8 +1,8 @@
 ---
 doc_type: architecture
 domain: memory-context
-status: draft
-last_updated: 2026-03-31
+status: superseded
+last_updated: 2026-09-30
 tags:
 - memory
 - muninn
@@ -17,6 +17,13 @@ refs:
 ---
 
 # Memory Context Architecture
+
+> **SUPERSEDED (2026-09-30).** This March-2026 draft predates the LifeGraph and
+> describes Muninn as "the memory and context system for Philotic". The current
+> boundary is the three-plane split — Muninn (cognitive continuity), LifeGraph
+> (structured operator-world truth under governance), intel graph (work
+> structure) — declared in `KNOWLEDGE_ARCHITECTURE_PROPOSAL.md` (including its
+> Overlap Ownership Rules) and `LIFE_GRAPH_OS_PROPOSAL.md`. Kept for history.
 
 ## Overview
 

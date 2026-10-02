@@ -3884,8 +3884,12 @@ impl AgentRuntime {
         } else {
             memory_candidate
         };
-        self.maybe_autocapture_life_fact(&session_id, memory_candidate.as_ref())
-            .await;
+        self.maybe_autocapture_life_fact(
+            &session_id,
+            memory_candidate.as_ref(),
+            memory_concept.as_deref(),
+        )
+        .await;
 
         // Claim audit: a turn WITH tool calls can still over-claim. Every
         // LifeGraph id the reply cites must either have been written by a
@@ -4328,6 +4332,10 @@ impl AgentRuntime {
             }
         }
 
+        // Deferred vault-token heals from this turn's recall: run them now,
+        // post-reply, where the 20s IPC budget costs bookkeeping time only.
+        self.drain_pending_token_heals().await;
+
         // Attend hook (Slice E): autobiographical memory write.
         // Saves the model's explicit `memory_candidate` when it gave one. When it
         // did not, a conservative deterministic classifier (S3) may capture an
@@ -4442,21 +4450,50 @@ impl AgentRuntime {
                     warn!(agent = %agent_id, concept = %concept, "Attend: memory write queued for the cluster primary");
                 }
                 super::memory_integration::ForwardOutcome::NotApplicable => {
+                    // Inline, not spawned: the reply is already delivered by
+                    // this point, so awaiting costs only bookkeeping time —
+                    // and a spawned task cannot heal a stale vault token
+                    // (IPC needs the runtime), which silently lost
+                    // autobiographical writes. Mirror memory.remember:
+                    // write → 401-heal → retry once → prompt enrichment.
                     if let Some(engine) = self.memory_engine_for(&agent_id, &memory_user_id) {
-                        tokio::spawn(async move {
-                            use memory_core::MemoryEngine as _;
-                            match engine
-                                .remember_with_metadata(scope, &concept, &content, tags, metadata)
-                                .await
-                            {
-                                Ok(engram) => {
-                                    info!(agent = %agent_id, id = %engram.id, "Attend: memory written")
-                                }
-                                Err(e) => {
-                                    warn!(agent = %agent_id, error = %e, "Attend: memory write failed (non-fatal)")
+                        use memory_core::MemoryEngine as _;
+                        let mut engine = engine;
+                        let mut write = engine
+                            .remember_with_metadata(
+                                scope.clone(),
+                                &concept,
+                                &content,
+                                tags.clone(),
+                                metadata.clone(),
+                            )
+                            .await;
+                        if let Err(err) = &write {
+                            if let Some(vault) = memory_core::token_rejected_vault(err) {
+                                let vault = vault.to_string();
+                                if self.heal_memory_token(&vault).await {
+                                    if let Some(fresh) =
+                                        self.memory_engine_for(&agent_id, &memory_user_id)
+                                    {
+                                        engine = fresh;
+                                        write = engine
+                                            .remember_with_metadata(
+                                                scope, &concept, &content, tags, metadata,
+                                            )
+                                            .await;
+                                    }
                                 }
                             }
-                        });
+                        }
+                        match write {
+                            Ok(engram) => {
+                                let _ = engine.retry_enrich(&engram.id).await;
+                                info!(agent = %agent_id, id = %engram.id, "Attend: memory written")
+                            }
+                            Err(e) => {
+                                warn!(agent = %agent_id, error = %e, "Attend: memory write failed (non-fatal)")
+                            }
+                        }
                     }
                 }
             }

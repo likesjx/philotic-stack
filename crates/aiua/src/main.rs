@@ -2415,6 +2415,8 @@ struct SharedControllerGates {
     anthropic_key_present: bool,
     openai_key_present: bool,
     ollama_reachable: bool,
+    /// The decisions controller (TypeSafe Jev) runs on the hotel's OpenRouter key.
+    openrouter_key_present: bool,
 }
 
 /// True when the provider's API key is discoverable through any supported
@@ -2482,7 +2484,18 @@ fn detect_shared_controller_gates(graph: &GraphDomain) -> SharedControllerGates 
         ),
         openai_key_present: provider_key_configured(graph, "openai", Some("OPENAI_API_KEY")),
         ollama_reachable: ollama_available(graph),
+        openrouter_key_present: provider_key_configured(
+            graph,
+            "openrouter",
+            Some("OPENROUTER_API_KEY"),
+        ),
     };
+    if !gates.openrouter_key_present {
+        info!(
+            "model-controller-decisions seeded INACTIVE — provide an OpenRouter key \
+             (`phil keys configure openrouter`) and re-run `aiua load` to activate."
+        );
+    }
     if !gates.anthropic_key_present {
         info!(
             "model-controller-anthropic seeded INACTIVE — provide an Anthropic key \
@@ -2738,6 +2751,27 @@ fn hotel_shared_guests(
             })
             .to_string(),
             is_active: controller_gates.ollama_reachable,
+            active_pid: None,
+            last_active_at: None,
+        },
+        // Typed judgments (`decisions.evaluate`, TypeSafe Jev). Callers reach it
+        // through the router (capability route, local or another hotel), never
+        // by holding the key themselves. Not a fallback tier: a decision is
+        // never a turn reply.
+        GuestRecord {
+            hotel_name: hotel_name.to_string(),
+            guest_id: format!("{hotel_name}:model-controller-decisions"),
+            role: "model.decisions".into(),
+            config_json: serde_json::json!({
+                "command": "model-controller-decisions",
+                "args": [],
+                "env": {
+                    "PHILOTIC_HOTEL_SOCKET": socket_path.clone(),
+                    "PHILOTIC_NODE_ID": node_id.clone()
+                }
+            })
+            .to_string(),
+            is_active: controller_gates.openrouter_key_present,
             active_pid: None,
             last_active_at: None,
         },
@@ -8128,15 +8162,52 @@ async fn main() -> Result<()> {
                 // without bound. Ceiling is env-overridable, defaulting to
                 // several days.
                 tokio::spawn(async move {
-                    use ansible_mesh_core::heal_queue::DEFAULT_ABANDON_CEILING_SECS;
+                    use ansible_mesh_core::heal_queue::{
+                        DEFAULT_ABANDON_CEILING_SECS, DEFAULT_STALE_ESCALATION_SECS,
+                    };
                     const SEVEN_DAYS: u64 = 7 * 24 * 3600;
                     let abandon_ceiling = std::env::var("PHILOTIC_HEAL_ABANDON_CEILING_SECS")
                         .ok()
                         .and_then(|v| v.parse::<u64>().ok())
                         .filter(|v| *v > 0)
                         .unwrap_or(DEFAULT_ABANDON_CEILING_SECS);
+                    // `0` disables the stale-escalation sweep.
+                    let stale_escalation = std::env::var("PHILOTIC_HEAL_STALE_ESCALATION_SECS")
+                        .ok()
+                        .and_then(|v| v.parse::<u64>().ok())
+                        .unwrap_or(DEFAULT_STALE_ESCALATION_SECS);
+                    // Hourly by WALL clock, polled on a short tick: a plain
+                    // `sleep(3600)` counts awake time only, which a mostly-asleep
+                    // laptop hotel rarely accrues (DEF-202). First pass shortly
+                    // after boot, so a restart clears a stale backlog at once.
+                    let wall = || {
+                        std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_secs())
+                            .unwrap_or(0)
+                    };
+                    tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                    let mut last_pass: Option<u64> = None;
                     loop {
-                        tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+                        if let Some(at) = last_pass {
+                            tokio::time::sleep(std::time::Duration::from_secs(300)).await;
+                            let now = wall();
+                            if now >= at && now - at < 3600 {
+                                continue;
+                            }
+                        }
+                        last_pass = Some(wall());
+                        // Close escalations whose pattern stopped recurring, so the
+                        // escalated view holds live hand-offs, not a week of history.
+                        if stale_escalation > 0 {
+                            match hq_vacuum.close_stale_escalations(stale_escalation) {
+                                Ok(n) if n > 0 => {
+                                    info!(closed = n, "heal_queue closed stale escalations")
+                                }
+                                Ok(_) => {}
+                                Err(e) => warn!("heal_queue stale-escalation sweep failed: {e}"),
+                            }
+                        }
                         // Abandon stuck pending/assigned rows first so this
                         // pass's vacuum_old can reap the ones already past 7d.
                         match hq_vacuum.vacuum_abandoned(abandon_ceiling) {
@@ -8969,7 +9040,7 @@ mod tests {
     #[test]
     fn default_guest_seed_injects_hotel_socket_env() {
         let guests = default_guest_seed("beta-hotel");
-        assert_eq!(guests.len(), 15); // shared guests omit graph-datasource off the configured home hotel and the retired graph-runner; profile: agent, agent-datasource; +3 full-suite controllers (anthropic/openai/ollama); dormant egress HTTP runner
+        assert_eq!(guests.len(), 16); // shared guests omit graph-datasource off the configured home hotel and the retired graph-runner; profile: agent, agent-datasource; +3 full-suite controllers (anthropic/openai/ollama); decisions controller; dormant egress HTTP runner
         // Membrane is the first guest from hotel_shared_guests
         let membrane = guests
             .iter()
@@ -9008,7 +9079,12 @@ mod tests {
         // controllers are seeded (visible/activatable) but NOT active, so the
         // supervisor never spawns a controller that can only fail turns.
         let guests = default_guest_seed("gated-hotel");
-        for role in ["model.anthropic", "model.openai", "model.ollama"] {
+        for role in [
+            "model.anthropic",
+            "model.openai",
+            "model.ollama",
+            "model.decisions",
+        ] {
             let guest = guests
                 .iter()
                 .find(|g| g.role == role)
@@ -9028,7 +9104,20 @@ mod tests {
                 anthropic_key_present: true,
                 openai_key_present: true,
                 ollama_reachable: true,
+                openrouter_key_present: true,
             },
+        );
+
+        let decisions = guests
+            .iter()
+            .find(|g| g.role == "model.decisions")
+            .expect("decisions controller");
+        assert!(decisions.is_active);
+        assert_eq!(decisions.guest_id, "keyed-hotel:model-controller-decisions");
+        let config: serde_json::Value = serde_json::from_str(&decisions.config_json).unwrap();
+        assert_eq!(
+            config["command"].as_str(),
+            Some("model-controller-decisions")
         );
 
         let anthropic = guests

@@ -635,3 +635,59 @@ async fn deliver_error_reply_yields_err_outcome() {
         other => panic!("expected Err, got {other:?}"),
     }
 }
+
+// ── Loopback trust behind a reverse proxy ─────────────────────────────────────
+
+#[test]
+fn proxied_loopback_request_is_not_trusted_as_local() {
+    use crate::server::is_trusted_loopback;
+    use axum::http::{HeaderMap, HeaderValue};
+
+    let loopback: SocketAddr = "127.0.0.1:50000".parse().unwrap();
+    let remote: SocketAddr = "100.64.0.7:50000".parse().unwrap();
+
+    assert!(is_trusted_loopback(&loopback, &HeaderMap::new()));
+    assert!(!is_trusted_loopback(&remote, &HeaderMap::new()));
+
+    // The TLS proxy on vps-jane reaches the listener over 127.0.0.1 and adds
+    // forwarding headers; any of them marks the request as remote.
+    for header in ["x-forwarded-for", "forwarded", "x-real-ip"] {
+        let mut headers = HeaderMap::new();
+        headers.insert(header, HeaderValue::from_static("203.0.113.9"));
+        assert!(
+            !is_trusted_loopback(&loopback, &headers),
+            "{header} on a loopback peer must not be trusted as local"
+        );
+    }
+}
+
+// ── Upstream CallToolResult is not double-wrapped ─────────────────────────────
+
+#[test]
+fn upstream_call_tool_result_passes_through_unwrapped() {
+    use crate::server::mcp_call_result_passthrough;
+
+    let upstream = json!({ "content": [{ "type": "text", "text": "{\"count\":1}" }] });
+    assert_eq!(
+        mcp_call_result_passthrough(&upstream),
+        Some(upstream.clone())
+    );
+
+    let upstream_error =
+        json!({ "content": [{ "type": "text", "text": "nope" }], "isError": true });
+    assert_eq!(
+        mcp_call_result_passthrough(&upstream_error),
+        Some(upstream_error.clone())
+    );
+
+    // Plain datasource payloads keep the JSON-as-text wrapping.
+    assert_eq!(mcp_call_result_passthrough(&json!({ "count": 1 })), None);
+    assert_eq!(
+        mcp_call_result_passthrough(&json!({ "content": [{ "text": "untyped" }] })),
+        None
+    );
+    assert_eq!(
+        mcp_call_result_passthrough(&json!({ "content": [], "rows": 3 })),
+        None
+    );
+}

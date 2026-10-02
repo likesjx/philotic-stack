@@ -766,6 +766,19 @@ impl SessionState {
         self.parked_approval_turn.is_some()
     }
 
+    /// Id of the approval an approval command would resolve right now: the parked
+    /// approval turn's, else the active turn's while it waits for approval.
+    pub fn pending_approval_id(&self) -> Option<&str> {
+        self.parked_approval_turn
+            .as_ref()
+            .or(self
+                .active_turn
+                .as_ref()
+                .filter(|turn| turn.phase == TurnPhase::WaitingApproval))
+            .and_then(|turn| turn.pending_approval.as_ref())
+            .and_then(|approval| approval.approval_id.as_deref())
+    }
+
     /// Park the active turn for plan discussion. The turn must already have phase
     /// `PlanningDiscussion`. The session becomes free for other work while the
     /// operator reviews the proposed plan.
@@ -4020,8 +4033,21 @@ impl SessionState {
         let Some(turn) = self.active_turn.as_ref() else {
             return String::new();
         };
-        if turn.recalled_memories.is_empty() || crate::runtime::distill::turn_is_distill(turn) {
+        if crate::runtime::distill::turn_is_distill(turn) {
             return String::new();
+        }
+        // A degraded recall must be visible: without this marker a memory
+        // outage is indistinguishable from "nothing relevant stored", and the
+        // model treats absence of recall as absence of history.
+        let degraded_marker = turn.memory_degraded.as_ref().map(|reason| {
+            format!(
+                "[Memory status] Recall was DEGRADED this turn ({reason}). Missing items are \
+                 an outage, not evidence of absence — do not conclude something was never \
+                 discussed or stored.\n"
+            )
+        });
+        if turn.recalled_memories.is_empty() {
+            return degraded_marker.unwrap_or_default();
         }
 
         const PREAMBLE: &str = "[Recalled memory]\n\
@@ -4103,7 +4129,8 @@ impl SessionState {
                 .map(|pos| pos + 1)
         };
 
-        let mut out = String::from(PREAMBLE);
+        let mut out = degraded_marker.unwrap_or_default();
+        out.push_str(PREAMBLE);
         for (pos, (idx, line)) in lines.iter().enumerate() {
             let memory = &turn.recalled_memories[*idx];
             out.push_str(&format!("{}. {}", pos + 1, line));
@@ -5220,6 +5247,8 @@ impl SessionState {
                     .cloned()
                     .and_then(|v| serde_json::from_value::<Vec<RecalledMemoryRecord>>(v).ok())
                     .unwrap_or_default(),
+                // A restored turn re-recalls; never restore a stale outage marker.
+                memory_degraded: None,
                 active_plan: turn
                     .get("active_plan")
                     .cloned()
@@ -6892,6 +6921,7 @@ mod tests {
             pending_approval: None,
             working_tool_history: Vec::new(),
             recalled_memories: Vec::new(),
+            memory_degraded: None,
             active_plan,
             consecutive_step_failures: 0,
             streak_extension: 0,
@@ -7200,6 +7230,7 @@ mod tests {
             pending_approval: None,
             working_tool_history: Vec::new(),
             recalled_memories: Vec::new(),
+            memory_degraded: None,
             active_plan: None,
             consecutive_step_failures: 0,
             streak_extension: 0,
@@ -7642,6 +7673,7 @@ mod tests {
             pending_approval: None,
             working_tool_history: Vec::new(),
             recalled_memories: Vec::new(),
+            memory_degraded: None,
             active_plan: None,
             consecutive_step_failures: 0,
             streak_extension: 0,
@@ -7703,6 +7735,7 @@ mod tests {
             pending_approval: None,
             working_tool_history: Vec::new(),
             recalled_memories: Vec::new(),
+            memory_degraded: None,
             active_plan: None,
             consecutive_step_failures: 0,
             streak_extension: 0,
@@ -8674,6 +8707,7 @@ mod tests {
                 },
             )],
             recalled_memories: Vec::new(),
+            memory_degraded: None,
             active_plan: None,
             consecutive_step_failures: 0,
             streak_extension: 0,
@@ -8778,6 +8812,7 @@ mod tests {
             pending_approval: None,
             working_tool_history: Vec::new(),
             recalled_memories: Vec::new(),
+            memory_degraded: None,
             active_plan: None,
             consecutive_step_failures: 0,
             streak_extension: 0,
@@ -9309,6 +9344,7 @@ mod tests {
             pending_approval: None,
             working_tool_history: Vec::new(),
             recalled_memories: Vec::new(),
+            memory_degraded: None,
             active_plan: None,
             consecutive_step_failures: 0,
             streak_extension: 0,
@@ -9397,6 +9433,7 @@ mod tests {
             pending_approval: None,
             working_tool_history: Vec::new(),
             recalled_memories: Vec::new(),
+            memory_degraded: None,
             active_plan: None,
             consecutive_step_failures: 0,
             streak_extension: 0,
@@ -9477,6 +9514,7 @@ mod tests {
             pending_approval: None,
             working_tool_history: Vec::new(),
             recalled_memories: Vec::new(),
+            memory_degraded: None,
             active_plan: None,
             consecutive_step_failures: 0,
             streak_extension: 0,
@@ -11304,6 +11342,7 @@ mod tests {
             pending_approval: None,
             working_tool_history: Vec::new(),
             recalled_memories: Vec::new(),
+            memory_degraded: None,
             active_plan: None,
             consecutive_step_failures: 0,
             streak_extension: 0,
@@ -11372,6 +11411,7 @@ mod tests {
             pending_approval: None,
             working_tool_history: Vec::new(),
             recalled_memories: Vec::new(),
+            memory_degraded: None,
             active_plan: None,
             consecutive_step_failures: 0,
             streak_extension: 0,
@@ -11455,6 +11495,7 @@ mod tests {
             pending_approval: None,
             working_tool_history: Vec::new(),
             recalled_memories: Vec::new(),
+            memory_degraded: None,
             active_plan: None,
             consecutive_step_failures: 0,
             streak_extension: 0,
@@ -11539,6 +11580,7 @@ mod tests {
             pending_approval: None,
             working_tool_history: Vec::new(),
             recalled_memories: Vec::new(),
+            memory_degraded: None,
             active_plan: None,
             consecutive_step_failures: 0,
             streak_extension: 0,
@@ -11921,6 +11963,7 @@ mod tests {
                 })),
                 ..Default::default()
             }],
+            memory_degraded: None,
             active_plan: None,
             consecutive_step_failures: 0,
             streak_extension: 0,
@@ -12359,6 +12402,7 @@ mod tests {
             pending_approval: None,
             working_tool_history: Vec::new(),
             recalled_memories: Vec::new(),
+            memory_degraded: None,
             active_plan: Some(plan),
             consecutive_step_failures: 0,
             streak_extension: 0,
@@ -12909,6 +12953,7 @@ mod tests {
             pending_approval: None,
             working_tool_history: Vec::new(),
             recalled_memories: Vec::new(),
+            memory_degraded: None,
             active_plan: None,
             consecutive_step_failures: 0,
             streak_extension: 0,

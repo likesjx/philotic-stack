@@ -356,14 +356,17 @@ impl AgentRuntime {
             )
             .await;
 
+        // Buttons carry a compact reference to this approval so a tap on a stale
+        // card is refused instead of resolving whatever is pending later.
+        let approval_id = approval.approval_id.as_deref();
         let approval_keyboard = serde_json::json!({
             "inline_keyboard": [
                 [
-                    {"text": "✅ Approve", "callback_data": "approve"},
-                    {"text": "❌ Deny", "callback_data": "deny"}
+                    {"text": "✅ Approve", "callback_data": approval_callback("approve", approval_id)},
+                    {"text": "❌ Deny", "callback_data": approval_callback("deny", approval_id)}
                 ],
                 [
-                    {"text": "🔓 Trust for session", "callback_data": "trust"}
+                    {"text": "🔓 Trust for session", "callback_data": approval_callback("trust", approval_id)}
                 ]
             ]
         });
@@ -416,21 +419,29 @@ impl AgentRuntime {
 
             // `operator_approved` is a model-settable flag; on a life.tidy
             // `retire` it is the only thing standing between a confirmed node
-            // and retirement. Honor it only when the operator's own message
-            // this turn reads as an approval — live 2026-09-14 20:47 UTC the
-            // model set it on its own initiative.
-            if tool_call.tool_name == "life.tidy" {
-                let is_retire = tool_call
-                    .arguments
-                    .pointer("/action/kind")
-                    .and_then(serde_json::Value::as_str)
-                    == Some("retire");
+            // and retirement, on life.commit it promotes a proposed node to
+            // confirmed truth, and on life.patch.apply it lands an ontology
+            // change. Honor it only when the operator's own message this turn
+            // reads as an approval — live 2026-09-14 20:47 UTC the model set
+            // it on its own initiative.
+            let approval_gated = match tool_call.tool_name.as_str() {
+                "life.tidy" => {
+                    tool_call
+                        .arguments
+                        .pointer("/action/kind")
+                        .and_then(serde_json::Value::as_str)
+                        == Some("retire")
+                }
+                "life.commit" | "life.patch.apply" => true,
+                _ => false,
+            };
+            if approval_gated {
                 let claimed = tool_call
                     .arguments
                     .get("operator_approved")
                     .and_then(serde_json::Value::as_bool)
                     .unwrap_or(false);
-                if is_retire && claimed {
+                if claimed {
                     let user_text = self
                         .sessions
                         .get(&session_id)
@@ -453,7 +464,8 @@ impl AgentRuntime {
                     if !approved {
                         warn!(
                             session_id = %session_id,
-                            "life.tidy retire: dropping model-set operator_approved (no approval in the operator's message)"
+                            tool = %tool_call.tool_name,
+                            "dropping model-set operator_approved (no approval in the operator's message)"
                         );
                         if let Some(args) = tool_call.arguments.as_object_mut() {
                             args.insert("operator_approved".into(), serde_json::Value::Bool(false));
@@ -1158,6 +1170,53 @@ impl AgentRuntime {
         })
     }
 
+    /// Complete an approval command task with a notice and send the notice back
+    /// to the channel it came from, without touching any pending approval.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) async fn reply_approval_notice(
+        &mut self,
+        command_task_id: Uuid,
+        session_id: String,
+        command_turn_id: String,
+        command_chat_id: String,
+        command_reply_to: String,
+        command_reply_role: String,
+        command_reply_guest_id: Option<String>,
+        notice: &str,
+    ) -> Result<()> {
+        let _ = self
+            .ipc_client
+            .send_request(IpcRequest::CompleteTask {
+                task_id: command_task_id,
+                result: serde_json::json!({
+                    "session_id": session_id,
+                    "turn_id": command_turn_id,
+                    "chat_id": command_chat_id,
+                    "content": notice
+                }),
+            })
+            .await?;
+        let reply_payload = FinalReplyPayload {
+            action: "send_reply",
+            session_id,
+            turn_id: command_turn_id,
+            chat_id: command_chat_id,
+            content: notice.into(),
+            audio_artifact: None,
+            send_text_caption: false,
+            reply_markup: None,
+        };
+        self.ipc_client
+            .send_request(IpcRequest::EmitTask {
+                target_node: command_reply_to,
+                target_role: command_reply_role,
+                target_guest_id: command_reply_guest_id,
+                task_json: serde_json::to_string(&reply_payload)?,
+            })
+            .await?;
+        Ok(())
+    }
+
     pub(super) async fn handle_approval_command(
         &mut self,
         command_task_id: Uuid,
@@ -1211,37 +1270,18 @@ impl AgentRuntime {
             approval,
         )) = pending
         else {
-            let _ = self
-                .ipc_client
-                .send_request(IpcRequest::CompleteTask {
-                    task_id: command_task_id,
-                    result: serde_json::json!({
-                        "session_id": session_id,
-                        "turn_id": command_turn_id,
-                        "chat_id": command_chat_id,
-                        "content": "No approval pending."
-                    }),
-                })
-                .await?;
-            let reply_payload = FinalReplyPayload {
-                action: "send_reply",
-                session_id,
-                turn_id: command_turn_id,
-                chat_id: command_chat_id,
-                content: "No approval pending.".into(),
-                audio_artifact: None,
-                send_text_caption: false,
-                reply_markup: None,
-            };
-            self.ipc_client
-                .send_request(IpcRequest::EmitTask {
-                    target_node: command_reply_to,
-                    target_role: command_reply_role,
-                    target_guest_id: command_reply_guest_id,
-                    task_json: serde_json::to_string(&reply_payload)?,
-                })
-                .await?;
-            return Ok(());
+            return self
+                .reply_approval_notice(
+                    command_task_id,
+                    session_id,
+                    command_turn_id,
+                    command_chat_id,
+                    command_reply_to,
+                    command_reply_role,
+                    command_reply_guest_id,
+                    "No approval pending.",
+                )
+                .await;
         };
 
         let command_has_steering = command.steering_note().is_some();
@@ -6902,6 +6942,8 @@ impl AgentRuntime {
             "memory.recall" => self.execute_memory_recall_tool(payload).await,
 
             "memory.remember" => self.execute_memory_remember_tool(payload).await,
+
+            "memory.evolve" => self.execute_memory_evolve_tool(payload).await,
 
             "memory.cultivate" => self.execute_memory_cultivate_tool(payload).await,
 

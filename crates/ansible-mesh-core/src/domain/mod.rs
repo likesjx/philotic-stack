@@ -2022,13 +2022,20 @@ impl GraphDomain {
         }
     }
 
+    /// Malformed rows are skipped with a warning, never fatal: one legacy-shape
+    /// row (`model_id` instead of `model_ref`) used to fail the whole list, and
+    /// the hotel-state sync's `unwrap_or_default()` then gossiped ZERO profiles —
+    /// vps-jane's model health never reached the mesh.
     pub fn list_model_profiles(&self) -> Result<Vec<ModelProfileRecord>> {
         let mut out = Vec::new();
         for node in self.adapter.list_nodes_by_kind(NODE_KIND_MODEL_PROFILE)? {
-            out.push(
-                serde_json::from_value(node.data)
-                    .context("GraphDomain::list_model_profiles: deserialize")?,
-            );
+            match serde_json::from_value(node.data) {
+                Ok(profile) => out.push(profile),
+                Err(e) => warn!(
+                    node_key = %node.node_key,
+                    "GraphDomain::list_model_profiles: skipping malformed row: {e}"
+                ),
+            }
         }
         Ok(out)
     }
@@ -2382,6 +2389,35 @@ mod tests {
         let storage =
             SqliteGraphStorage::open_in_memory().expect("in-memory SqliteGraphStorage failed");
         GraphDomain::new(Arc::new(storage.adapter()))
+    }
+
+    #[test]
+    fn list_model_profiles_skips_legacy_rows_instead_of_failing() {
+        let domain = make_domain();
+        // The June-2026 vps-jane shape: `model_id`, no `model_ref`.
+        domain
+            .adapter
+            .upsert_node(&GraphNode {
+                node_key: "model_profile:gpt-4.1-mini:vps-jane-aiua-01".into(),
+                kind: NODE_KIND_MODEL_PROFILE.into(),
+                label: None,
+                data: serde_json::json!({
+                    "model_id": "gpt-4.1-mini",
+                    "node_id": "vps-jane-aiua-01",
+                    "provider": "openai",
+                    "is_healthy": true
+                }),
+            })
+            .unwrap();
+        domain
+            .observe_model_outcome("gemini", "vps-jane-aiua-01", 900, true)
+            .unwrap();
+
+        let profiles = domain
+            .list_model_profiles()
+            .expect("a bad row is not fatal");
+        assert_eq!(profiles.len(), 1);
+        assert_eq!(profiles[0].model_ref, "gemini");
     }
 
     fn turn(session: &str, id: &str, started: Option<u64>) -> SessionTurnRecord {

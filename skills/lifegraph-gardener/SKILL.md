@@ -103,6 +103,28 @@ types for the operator. Never replace or remove those edges.
   met at a place belongs to the event, a commitment to its loop.
 - Graph science first, judgment second: the report decides; the model explains.
 
+## Proposed-Backlog Triage
+
+The `proposed` tier is a review queue, not a resting state. The hygiene sweep
+(default-on since 2026-09-30) auto-retires stale `proposed` OpenLoop/Event/Signal
+nodes after 45 days, but everything else — and everything younger — needs judgment.
+On each gardening pass, after the audit/tidy loop:
+
+1. `life.list` the oldest `proposed` nodes (start with non-Signal labels:
+   Commitment, Goal, Person, Habit, Decision — the ones whose truth matters).
+2. For each, decide one of three dispositions:
+   - **Confirm**: the operator's own words this turn approve it, or its evidence is
+     already operator-confirmed → `life.commit`. Never self-approve: the runner
+     blocks promotion of a stored non-confirmed node without real operator approval.
+   - **Retire**: contradicted, duplicated, or no longer true → `life.tidy` retire
+     (under a keeper when it duplicates one).
+   - **Hold**: genuinely uncertain → leave proposed; it ages toward the sweep.
+3. Batch the confirmations that need the operator into ONE question ("These N
+   proposed facts look true — confirm?") instead of N interruptions, and apply
+   their `life.commit`s only after the operator answers.
+
+Keep each pass bounded: at most ~10 triage decisions per pass, oldest first.
+
 ## Scheduling
 
 Register a daily gardening pass with `cron.register` (session target isolated, quiet

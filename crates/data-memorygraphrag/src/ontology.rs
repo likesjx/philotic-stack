@@ -88,6 +88,8 @@ pub const NODE_LABELS: &[&str] = &[
     "Asset",
     "CreativeWork",
     "Moment",
+    "Workout",
+    "Measurement",
 ];
 
 /// Structured date/time properties, in the order a "best date" coalesce
@@ -931,6 +933,8 @@ mod tests {
             "Asset",
             "CreativeWork",
             "Moment",
+            "Workout",
+            "Measurement",
         ] {
             assert!(
                 crate::projection::embedding_space_for_label(label).is_some(),

@@ -1,0 +1,63 @@
+# Traefik dynamic config for mcp.jaredlikes.com on vps-jane.
+# Live path: /home/deploy/traefik/dynamic/mcp-membrane.yml (file provider,
+# watched; no restart needed). Traefik runs in Docker (deploy-traefik-1) and
+# sets X-Forwarded-For from the real client, which membrane-mcp uses to refuse
+# loopback trust for proxied requests (server.rs is_trusted_loopback).
+http:
+  routers:
+    mcp-membrane:
+      rule: "Host(`mcp.jaredlikes.com`) && PathPrefix(`/mcp`)"
+      entryPoints:
+        - websecure
+      tls:
+        certResolver: letsencrypt
+      service: mcp-membrane
+
+    lifegraph-mcp:
+      rule: "Host(`mcp.jaredlikes.com`) && PathPrefix(`/lifegraph`)"
+      entryPoints:
+        - websecure
+      middlewares:
+        - lifegraph-stripprefix
+      tls:
+        certResolver: letsencrypt
+      service: lifegraph-mcp
+
+    # Agent frontdoor (proposal agent-frontdoor): /agent/mcp -> :8912/mcp
+    agent-mcp:
+      rule: "Host(`mcp.jaredlikes.com`) && PathPrefix(`/agent`)"
+      entryPoints:
+        - websecure
+      middlewares:
+        - agent-stripprefix
+      tls:
+        certResolver: letsencrypt
+      service: agent-mcp
+
+  middlewares:
+    lifegraph-stripprefix:
+      stripPrefix:
+        prefixes:
+          - "/lifegraph"
+    agent-stripprefix:
+      stripPrefix:
+        prefixes:
+          - "/agent"
+
+  services:
+    # Loopback-bound general listener, bridged from docker0 by
+    # mcp-frontdoor-bridge.service (socat 172.17.0.1:9100 -> 127.0.0.1:9100).
+    mcp-membrane:
+      loadBalancer:
+        servers:
+          - url: "http://host.docker.internal:9100"
+    # Endpoint listeners with exposure mesh/internet bind 0.0.0.0; the host
+    # firewall admits them from docker bridges only (iptables-mcp.rules).
+    lifegraph-mcp:
+      loadBalancer:
+        servers:
+          - url: "http://host.docker.internal:8911"
+    agent-mcp:
+      loadBalancer:
+        servers:
+          - url: "http://host.docker.internal:8912"
