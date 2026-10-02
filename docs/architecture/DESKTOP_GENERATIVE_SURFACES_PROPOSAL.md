@@ -98,6 +98,30 @@ A0 `approval-action-ids` → S0 `surface-schema-and-types` → S1 `surface-persi
 
 Superseded: `surface-renderer-catalog` (the renderer no longer lives in `jaredlikes-desktop`; its catalog work moves into `surface-web-renderer`).
 
+### AG-UI membrane investigation (2026-10-02, seam `surface-agui-adapter`)
+
+**Recommendation: defer building until an AG-UI client is actually wanted.** When it is, build it as an SSE route inside `philotic-web`, not as a standalone `membrane-agui` guest. The route would be `POST /api/agui/agents/:agent/run`, and events would be hand-mapped with serde, with no runtime dependency on the `ag-ui` crates.
+
+**Why:**
+- AG-UI adds nothing the A2UI plan lacks for the operator's own hosts. Its value is third-party clients (CopilotKit), and none exist yet.
+- `philotic-web` is the only audited authz boundary, so a separate guest would be a second one.
+- The Rust crates `ag-ui` and `ag-ui-a2ui` are an unaffiliated `0.5.0-alpha.3` (2026-09-28, a few hundred downloads). `ag-ui-core` and `ag-ui-client` have been stale at 0.1.0 since 2025-08.
+
+**Protocol facts to build against:**
+- **Interrupts are not a mid-stream pause.** A run ends with `RUN_FINISHED{outcome:{type:"interrupt", interrupts:[{id, reason, message, responseSchema}]}}`, and a new run on the same `threadId` resumes with `resume:[{interruptId, status, payload}]`. A Philotic approval maps to one interrupt whose `id` is the A0 approval reference.
+- **A2UI rides as activity events.** It goes out as `ACTIVITY_SNAPSHOT{activityType:"a2ui-surface"}`, and clicks return in `forwardedProps.a2uiAction`.
+- **Transport and auth.** Transport is HTTP POST with SSE; auth is up to the host.
+- **Frontend-declared client tools are rejected.**
+
+**Mapping:**
+- `threadId` → philote session
+- `runId` → turn
+- turn_event / partial_reply / send_reply → lifecycle, text and step events
+
+**Seams when activated:** `agui-event-model` → `agui-run-endpoint` → `agui-interrupt-resume` → `agui-a2ui-activity` → `agui-scoped-credential`.
+
+**Still unverified:** the exact wire `type` strings, the `a2ui_operations` payload schema, and real CopilotKit compatibility.
+
 ### Open after acceptance
 
 - Which personas get `desktop.surfaces` by default (09-14 open question 1).
@@ -162,26 +186,36 @@ The philote emits an ordinary turn event whose `event` is `ui_surface` and whose
   "session_id": "…",
   "agent_id": "beacon",
   "source_hotel": "mac-jane",
-  "surface_id": "hotel-status-2026-09-14",
+  "surface_id": "s01JQ…",
   "seq": 3,
   "emitted_at": "2026-09-14T15:40:00Z",
   "a2ui": {
     "version": "v0.9",
     "updateComponents": {
-      "surfaceId": "hotel-status-2026-09-14",
+      "surfaceId": "s01JQ…",
       "components": [
         { "id": "root", "component": "Column", "children": ["title", "guests"] },
         { "id": "title", "component": "Text", "text": "mac-jane — 4 guests live", "variant": "h2" },
-        { "id": "guests", "component": "List", "template": "guest-row", "items": "/guests" },
-        { "id": "guest-row", "component": "Card", "children": ["guest-name", "guest-restart"] },
-        { "id": "guest-name", "component": "Text", "text": "name" },
-        { "id": "guest-restart", "component": "Button", "label": "Restart",
-          "action": { "name": "restart_guest", "context": { "action_id": "act_01J…", "guest_id": "guest_id" } } }
+        { "id": "guests", "component": "List", "children": { "componentId": "guest-row", "path": "/guests" } },
+        { "id": "guest-row", "component": "Card", "child": "guest-body" },
+        { "id": "guest-body", "component": "Row", "children": ["guest-name", "guest-restart"] },
+        { "id": "guest-name", "component": "Text", "text": { "path": "name" } },
+        { "id": "guest-restart-label", "component": "Text", "text": "Restart" },
+        { "id": "guest-restart", "component": "Button", "child": "guest-restart-label",
+          "action": { "event": { "name": "restart_guest",
+                                 "context": { "action_id": "a3f9c01b2d4e5", "guest_id": { "path": "id" } } } } }
       ]
     }
   }
 }
 ```
+
+**Corrected 2026-10-02 against the vendored v0.9 schemas** (`crates/ansible-mesh-core/specs/a2ui/v0_9/`). The 09-14 example used pre-spec shapes:
+- A Button takes a `child` component (usually a Text) and `action.event.{name, context}`, not a `label` with a flat `action`.
+- A List repeats a template through `children: {componentId, path}`, with relative paths inside the template.
+- A Card has a single `child`.
+
+The surface id and every `context.action_id` are **minted by the hotel**. Ids the model supplies are overwritten.
 
 `philotic-web` forwards this today through the catch-all as `operator_chat:event`; the first slice gives it a typed name, `operator_chat:ui_surface`, and the desktop service maps that to `aiua:ui-surface` on the event bus. `createSurface`, `updateDataModel`, and `deleteSurface` ride the same envelope.
 
@@ -211,14 +245,19 @@ POST /api/mesh/targets/:node/agents/:agent/chat
 
 ### Catalog `philotic.desktop.v1`
 
-First slice, mapped onto existing or new desktop primitives:
+**Source of truth (2026-10-02):** `crates/ansible-mesh-core/specs/a2ui/philotic_desktop_v1.json`. Both the hotel validator (`ansible-mesh-core::surface`) and the web renderer read it.
+- It is the basic-catalog subset plus `Table`, with no catalog functions in v1. `{"call": …}` and `functionCall` actions are refused, which also covers `openUrl`.
+- Themes accept only `primaryColor` and `agentDisplayName`.
+- Limits: 200 components, depth 16, 64 KiB per message, 256 KiB data model, 4 KiB per string.
+
+The 09-14 element mapping below predates the decision that the renderer lives in philotic-stack:
 
 | A2UI component | Desktop element | Notes |
 | --- | --- | --- |
 | `Text` | native, tokenized | `variant` h1/h2/body/caption |
 | `Column`, `Row`, `Divider` | native flex | |
 | `Card` | new `ui-card` | header/body/footer slots |
-| `List` | new `ui-list` | `template` + `items` JSON Pointer; relative-path binding per item |
+| `List` | new `ui-list` | `children: {componentId, path}` template; relative-path binding per item |
 | `Button` | `ui-button` | action requires `context.action_id` |
 | `TextField` | `ui-input` | two-way bound to a data-model path |
 | `CheckBox` | `ui-checkbox` / `ui-toggle` | |
