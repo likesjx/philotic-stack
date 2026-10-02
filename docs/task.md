@@ -2092,7 +2092,8 @@ Order: A0 → S0 → S1 → S2 → S3 → S4; AG-UI investigation independent. T
 - [ ] A0 `approval-action-ids`: compact approval id in Telegram `callback_data` (`approve:<id8>`, `deny:<id8>`, `trust:<id8>`) built from `ApprovalRequest.approval_id`; philote refuses a tap whose id is not the pending approval ("no longer pending") before any trust pre-approval is set; bare legacy callbacks and typed `/approve` keep working; edge `ApprovalResolve` routing follows — watched-live-green (stale tap refused, fresh tap resolves on a live hotel).
   - [x] Telegram + philote half — **test-green** 2026-10-01: `philote::approval_ref` (FNV-1a 10-hex ref, ≤64-byte callbacks, collision-free for prefixed ids); keyboard built from the normalized `approval_id`; `SessionState::pending_approval_id()`; runtime refuses a mismatched ref before trust is set ("That approval is no longer pending."); membrane-telegram unchanged (already maps `verb:` prefixes and preserves raw `callback_data`). Tests: `stale_approval_tap_is_refused_and_current_approval_stays_pending`, `stale_trust_tap_does_not_preapprove_session`, `matching_trust_tap_resolves_and_preapproves`, `legacy_bare_approval_tap_still_resolves` + 7 unit tests.
   - [ ] Edge `ApprovalResolve` routing (philotic-web `serve/edge.rs` only logs it today) and edge `ApprovalRequest` emission.
-  - [ ] Watched-live on a hotel: tap a superseded card → refused; tap the current card → resolves.
+  - [x] **Watched-live-green 2026-10-02 (operator, Beacon on vps-jane)**: PR #607 deployed mac-jane 2026-10-01 12:51 and vps-jane 22:41 UTC (run 36914247499, `failed=0`). Two `bash.exec` echo approvals: a tap on the superseded card's Approve and its Trust were refused with "no longer pending" (session stayed untrusted), and the current card resolved.
+  - [ ] Gap found while scripting the test: `/approval reset` clears only `preapproved_tools`/`preapproved_classes`, never `auto_approve_all`, so no command undoes "Trust for session".
 - [ ] S0 `surface-schema-and-types`: vendor the A2UI v0.9 JSON Schema subset for catalog `philotic.desktop.v1`; `typify` Rust types into `ansible-mesh-core::surface`; `validate()` with catalog allowlist + size ceilings; fixtures for every allowed and every excluded component — test-green.
 - [ ] S1 `surface-persistence-rehydrate`: hotel-owned `ui_surfaces` records (`ListSurfaces`/`GetSurface` IPC, `GET /api/surfaces/:id`); `OutboundReply::Surface` / `EdgeMessage::Surface` with a native-lowering hint; delivery outcome `displayed`/`offered_link`/`rejected` back to the philote — test-green.
 - [ ] S1 `surface-render-tools`: `ui.surface.create|update|delete`, `ui.data.update`; `desktop.surfaces` abstract skill seeded and SkillDAG-implied; replies bound to the reported delivery outcome (say-do) — test-green.
@@ -2102,7 +2103,18 @@ Order: A0 → S0 → S1 → S2 → S3 → S4; AG-UI investigation independent. T
 - [ ] S3 `surface-apple-webview`: `WKWebView` host loading the server renderer; `WKScriptMessageHandler` → existing `EdgeMessage` connection; no web credential in the page — smoke-green on the operator's iPhone.
 - [ ] S4 `surface-stream-projection` + `surface-action-return`: desktop embeds the served renderer; `operator_chat:ui_surface` live frames; `ui_action` through `SendOperatorChatTurn` sharing A0's id correlation — watched-live-green.
 - [ ] S4 `surface-mcp-app`: `membrane-mcp` serves the fixed renderer as a `ui://` MCP App — smoke-green from one MCP Apps host.
-- [ ] `surface-agui-adapter` — **investigation: AG-UI as a membrane** (`membrane-agui` alongside `membrane-mcp`; auth; thread/run ↔ session mapping; A2UI carriage; `ag-ui` 0.5 alpha crates vs hand-mapped events) — report + recorded decision.
+- [x] `surface-agui-adapter` — **investigation: AG-UI as a membrane**. Report done 2026-10-02 (proposal § "AG-UI membrane investigation"). Recommendation: defer; when a client is wanted, build `POST /api/agui/agents/:agent/run` (SSE) inside philotic-web with hand-mapped events, approvals mapped to AG-UI interrupt/resume, and A2UI carried as `ACTIVITY_SNAPSHOT`. Operator decision pending.
+- [x] S0 `surface-schema-and-types` — **test-green** 2026-10-02 (25 tests):
+  - Vendored the A2UI v0.9 schemas plus `philotic_desktop_v1.json` (the single allowlist) under `crates/ansible-mesh-core/specs/a2ui/`.
+  - `ansible-mesh-core::surface` provides:
+    - a strict `SurfaceMessage` parse (exactly one operation, no unknown fields, v0.9 only, our catalogId only);
+    - per-component catalog validation that refuses every function call;
+    - `validate_tree` (root present, references resolve, no cycles, depth and count limits);
+    - `SurfaceState` that applies atomically and can replay as messages;
+    - an RFC 6901 pointer set/remove;
+    - hotel-minted `assign_action_ids`;
+    - client `SurfaceAction`.
+  - The proposal's wire example was corrected to the real spec shapes.
 - Superseded: S1c `surface-renderer-catalog` (renderer moved from `jaredlikes-desktop` into `surface-web-renderer`).
 
 ## New Project: MCP Endpoint Steward

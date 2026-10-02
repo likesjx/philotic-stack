@@ -48,6 +48,7 @@ pub mod runtime;
 pub mod sealed_secret;
 pub mod sqlite_storage;
 pub mod storage;
+pub mod surface;
 pub mod tools;
 pub mod turn_budget;
 pub mod validation;
