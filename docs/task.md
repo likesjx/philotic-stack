@@ -69,8 +69,10 @@ develop. Spec: [graphical workspace](architecture/APPLE_MEMORY_WORKSPACE_PROPOSA
 - [x] Add default LifeGraph Explore entry cards and stored-neighbor graph with fit/zoom and accessible relationship-list fallback.
 - [x] Add Cortex vault/topic/memory tiles; explicit-tag and loaded-page coverage, no fabricated semantic edges.
 - [x] Add explicit title-only OpenLoop export to a chosen Reminders list, including linked completed-item deduplication; never mutate graph status.
-- [ ] Prove the graphical UI and real EventKit export/repeat-export on device; current validation is tests/builds, not installed-runtime acceptance.
-- [ ] Implement audited device-authorized confirm/close/reopen and reviewed two-way Reminders reconciliation with a durable multi-device binding ledger.
+- [x] Install and launch the signed graphical workspace on the new iPhone (October 2); interactive graph and real EventKit export/repeat-export acceptance remain pending.
+- [x] Implement audited device-authorized confirm/close/reopen with original-snapshot/revision guards and retry receipts; Mac/iOS builds, client/runner/authority tests and disposable Memgraph persistence/race checks pass (October 3).
+- [ ] Merge/deploy the action endpoint and runner, install the updated app, and prove live save/read-back/audit plus phone UI acceptance; these new actions are not yet on the phone.
+- [ ] Implement reviewed two-way Reminders reconciliation with a durable multi-device binding ledger; extend lifecycle revision discipline across existing writers.
 - [ ] Add authorized Cortex association/search endpoints and focused semantic-neighborhood exploration.
 
 ### Native LifeGraph editor

@@ -180,10 +180,15 @@ struct LifeNodeDetailView: View {
 
     @State private var detail: LifeNodeDetail?
     @State private var loadError: String?
-    @State private var editing = false
+    @State private var sheet: DetailSheet?
     @State private var auditId: String?
     @State private var loadedHotel: URL?
-    @State private var exportingReminder = false
+    private enum DetailSheet: Identifiable {
+        case edit(LifeGraphNode, URL), reminder(LifeGraphNode, URL), action(LifeGraphNode, URL, LifeLoopAction.Action)
+        var id: String {
+            switch self { case .edit: "edit"; case .reminder: "reminder"; case .action(_, _, let action): action.rawValue }
+        }
+    }
 
     /// Provenance-envelope keys rendered in their own section (and therefore
     /// excluded from the generic properties list).
@@ -224,20 +229,19 @@ struct LifeNodeDetailView: View {
         .refreshable { await load() }
         .toolbar {
             Button("Reload", systemImage: "arrow.clockwise") { Task { await load() } }
-            Button("Edit", systemImage: "pencil") { editing = true }
+            Button("Edit", systemImage: "pencil") {
+                if let node = detail?.node, let loadedHotel { sheet = .edit(node, loadedHotel) }
+            }
                 .disabled(detail?.node?.canonicalId?.hasPrefix("life:") != true)
         }
-        .sheet(isPresented: $editing) {
-            if let node = detail?.node, let loadedHotel {
-                LifeNodeEditor(session: session, node: node, hotelURL: loadedHotel) { receipt in
-                    auditId = receipt
-                    Task { await load() }
-                }
-            }
-        }
-        .sheet(isPresented: $exportingReminder) {
-            if let node = detail?.node, let loadedHotel {
-                OpenLoopReminderSheet(node: node, hotelURL: loadedHotel)
+        .sheet(item: $sheet) { destination in
+            switch destination {
+            case .edit(let node, let hotel):
+                LifeNodeEditor(session: session, node: node, hotelURL: hotel, onSaved: saved)
+            case .reminder(let node, let hotel):
+                OpenLoopReminderSheet(node: node, hotelURL: hotel)
+            case .action(let node, let hotel, let action):
+                LifeLoopActionSheet(session: session, node: node, hotelURL: hotel, action: action, onSaved: saved)
             }
         }
     }
@@ -260,7 +264,20 @@ struct LifeNodeDetailView: View {
 
         if node.labels.contains("OpenLoop"), node.canonicalId?.hasPrefix("life:") == true {
             Section("Open-loop actions") {
-                Button("Send to Reminders", systemImage: "checklist") { exportingReminder = true }
+                if LifeLoopAction.availableActions(for: node).isEmpty {
+                    Text("Lifecycle actions are unavailable for this node's current state or property format. Reload to check for updates.")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
+                ForEach(LifeLoopAction.availableActions(for: node)) { action in
+                    Button(action.title) {
+                        if let loadedHotel { sheet = .action(node, loadedHotel, action) }
+                    }
+                }
+                Text("Confirm verifies a loop. Close resolves it. Each action is saved with an audit record.")
+                    .font(.caption).foregroundStyle(.secondary)
+                Button("Send to Reminders", systemImage: "checklist") {
+                    if let loadedHotel { sheet = .reminder(node, loadedHotel) }
+                }
                 Text("Export only the title to a list you choose. Completing a reminder does not confirm or close this LifeGraph node.")
                     .font(.caption).foregroundStyle(.secondary)
             }
@@ -319,6 +336,16 @@ struct LifeNodeDetailView: View {
                         }
                     }
                 }
+            }
+        }
+    }
+
+    private func saved(_ receipt: String) {
+        auditId = receipt
+        Task {
+            await load()
+            if let (url, token) = session.lifeGraphCredentials() {
+                await session.lifeGraph.refresh(baseURL: url, bearerToken: token)
             }
         }
     }

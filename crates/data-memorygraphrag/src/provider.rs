@@ -680,6 +680,19 @@ impl DatasourceProvider for LifeGraphProvider {
             "life.recall.stats" => self.handle_recall_stats(task).await,
             "life.view.node" => self.handle_view_node(task).await,
             "life.node.edit" => self.handle_node_edit(task).await,
+            "life.loop.action" => {
+                let input: data_memorygraphrag::loop_action::LoopAction =
+                    serde_json::from_value(task.parameters.clone())?;
+                let graph = self.connect().await?;
+                Ok(ProviderOutput::ResultSet(
+                    data_memorygraphrag::loop_action::apply(
+                        &graph,
+                        &input,
+                        &chrono::Utc::now().to_rfc3339(),
+                    )
+                    .await?,
+                ))
+            }
             "life.view.neighborhood" => self.handle_view_neighborhood(task).await,
             "life.list" => self.handle_list(task).await,
             "life.audit" => self.handle_audit(task).await,
@@ -738,6 +751,7 @@ fn change_notification_for(kind: &str, data: &Value) -> Option<Value> {
         "life.tidy" => "tidied",
         "life.commit" => "committed",
         "life.node.edit" => "edited",
+        "life.loop.action" => "loop_acted",
         "life.resolve" | "life.conflict.resolve" => "resolved",
         "life.conflict" | "life.conflict.handle" => "conflict_opened",
         "life.patch.propose" => "patch_proposed",

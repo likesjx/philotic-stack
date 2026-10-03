@@ -3,7 +3,7 @@ title: Philotic Architecture Status
 doc_type: status
 domain: runtime-sessions
 status: active
-last_updated: 2026-10-01
+last_updated: 2026-10-03
 tags:
 - source-of-truth
 - current-state
@@ -150,9 +150,15 @@ The [Apple memory workspace](APPLE_MEMORY_WORKSPACE_PROPOSAL.md) on
 Cortex vault/topic/memory tiles, plus explicit title-only OpenLoop export to
 a chosen Reminders list. Topic filters reflect loaded-page tags, not stored
 Muninn association edges. Linked export checks completed reminders too, but
-does not confirm/close nodes or provide automatic two-way sync. This is
-source/build validation, not physical-device UI or EventKit-write proof;
-audited loop lifecycle actions and a durable multi-device sync ledger remain
+does not confirm/close nodes or provide automatic two-way sync. The graphical
+build was installed and launched on the new iPhone October 2; physical-device
+UI acceptance and EventKit-write proof remain pending. October 3 source adds
+separate device-authorized confirm/close/reopen controls with atomic
+`LifeLoopAction` audits, full text/lifecycle conflict guards and retry receipts.
+Mac/iOS builds and actual disposable-Memgraph persistence/concurrent retry
+tests pass. These actions are not deployed or installed on the phone yet;
+their revision guard is not yet shared by legacy lifecycle writers. Live
+action validation and a durable multi-device Reminders sync ledger remain
 follow-up work in [docs/task.md](../task.md#apple-memory-workspace).
 
 ### Runtime and authority

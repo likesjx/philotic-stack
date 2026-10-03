@@ -11,6 +11,7 @@ pub mod cypher;
 pub mod entanglement;
 pub mod heartbeat;
 pub mod hygiene;
+pub mod loop_action;
 pub mod node_edit;
 pub mod ontology;
 pub mod projection;
