@@ -322,6 +322,11 @@ pub fn tool_catalog() -> &'static HashMap<String, ToolDefinition> {
 /// for unknown or zero-implied-tool skills.
 pub fn skill_implied_tools(skill_name: &str) -> &'static [&'static str] {
     match skill_name {
+        "desktop.surfaces" => &[
+            "ui.surface.create",
+            "ui.surface.update",
+            "ui.surface.delete",
+        ],
         "handoff.to_role" => &["session.status", "handoff.to_role", "handoff.back"],
         "handoff.back" => &["session.status", "handoff.back"],
         "role.governance" => &[
@@ -492,6 +497,11 @@ pub fn tools_for_skill(skill_name: &str) -> &'static [&'static str] {
             "hotel.relocate_status",
         ],
         "role.authoring" => &["role.create_or_update"],
+        "desktop.surfaces" => &[
+            "ui.surface.create",
+            "ui.surface.update",
+            "ui.surface.delete",
+        ],
         "skill.authoring" => &[
             "skill.register",
             "skill.assign",
@@ -725,6 +735,19 @@ pub fn skill_is_relevant_for_turn(skill_name: &str, turn_text: &str) -> bool {
                 || t.contains("agent.configure")
                 || t.contains("set_home")
         }
+        "desktop.surfaces" => {
+            t.contains("[surface action]")
+                || t.contains("ui.surface")
+                || t.contains("surface")
+                || t.contains("dashboard")
+                || t.contains("interface")
+                || t.contains("buttons")
+                || t.contains("a card")
+                || t.contains("form")
+                || t.contains("table")
+                || t.contains("checklist")
+                || (t.contains("show me") && (t.contains("status") || t.contains("list")))
+        }
         "role.authoring" => {
             t.contains("create role")
                 || t.contains("update role")
@@ -900,6 +923,20 @@ pub fn tool_requires_approval(tool_name: &str) -> bool {
     }
     matches!(tool_class(tool_name), Some("config") | Some("shell"))
 }
+
+/// `ui.surface.create` description; keep in step with catalog/tools.yaml.
+const UI_SURFACE_CREATE_DESCRIPTION: &str = "Show the operator an interface you build from data: \
+    an A2UI v0.9 surface (catalog philotic.desktop.v1). Components are a flat list of objects \
+    {\"id\", \"component\", ...props}; one must have id \"root\". Children are referenced by id. \
+    Allowed components: Text {text, variant h1-h5|body|caption}, Column/Row/List {children: [ids] \
+    or {componentId, path}}, Card {child}, Divider, Button {child: id of a Text label, action: \
+    {event: {name, context}}}, TextField, CheckBox, ChoicePicker, Slider, Modal, Table {columns: \
+    [{header, field}], rows}. Any value may be a literal or {\"path\": \"/data/pointer\"} into \
+    data_model (relative paths inside a List template). No functions, images or URLs. The hotel \
+    assigns the surface id and button action ids. The result says outcome=displayed only if the \
+    operator was actually shown it; on Telegram only Text, Column, Row, List, Card, Divider and \
+    Button can be shown today. A button press comes back to you as a [surface action] message. \
+    Never claim you showed a surface unless the outcome says displayed.";
 
 fn build_catalog() -> HashMap<String, ToolDefinition> {
     let mut m = HashMap::new();
@@ -1736,6 +1773,68 @@ fn build_catalog() -> HashMap<String, ToolDefinition> {
                     }
                 },
                 "required": ["skill_name", "description", "subagent_kind", "goal"]
+            }),
+            class: Some("capability".into()),
+        },
+    );
+
+    // Surfaces (doc:desktop-generative-surfaces). Mirrors catalog/tools.yaml,
+    // which the hotel serves and philote prefers.
+    m.insert(
+        "ui.surface.create".into(),
+        ToolDefinition {
+            tool_name: "ui.surface.create".into(),
+            description: UI_SURFACE_CREATE_DESCRIPTION.into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "title": {"type": "string", "description": "Short title for the surface, e.g. 'Hotel status'."},
+                    "components": {"type": "array", "items": {"type": "object"},
+                                   "description": "A2UI v0.9 components (flat list, one with id 'root')."},
+                    "data_model": {"type": "object",
+                                   "description": "Optional initial data model object that components bind to with {\"path\": ...}."}
+                },
+                "required": ["title", "components"]
+            }),
+            class: Some("capability".into()),
+        },
+    );
+    m.insert(
+        "ui.surface.update".into(),
+        ToolDefinition {
+            tool_name: "ui.surface.update".into(),
+            description: "Change a surface you created: replace or add components by id, replace \
+                          the whole data_model, or set one value with data_path (JSON Pointer) + \
+                          data_value (omit data_value to remove the key). Only the surface owner \
+                          may update it. The result reports the delivery outcome like ui.surface.create."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "surface_id": {"type": "string", "description": "The id returned by ui.surface.create."},
+                    "components": {"type": "array", "items": {"type": "object"},
+                                   "description": "Components to add or replace (matched by id)."},
+                    "data_model": {"type": "object", "description": "Replacement data model object."},
+                    "data_path": {"type": "string",
+                                  "description": "JSON Pointer of one data-model value to set or remove, e.g. '/guests/0/status'."},
+                    "data_value": {"description": "Value to set at data_path; omit to remove the key."}
+                },
+                "required": ["surface_id"]
+            }),
+            class: Some("capability".into()),
+        },
+    );
+    m.insert(
+        "ui.surface.delete".into(),
+        ToolDefinition {
+            tool_name: "ui.surface.delete".into(),
+            description: "Delete a surface you created. Its buttons stop working.".into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "surface_id": {"type": "string", "description": "The id returned by ui.surface.create."}
+                },
+                "required": ["surface_id"]
             }),
             class: Some("capability".into()),
         },

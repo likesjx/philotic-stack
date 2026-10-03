@@ -2133,7 +2133,14 @@ Order: A0 → S0 → S1 → S2 → S3 → S4; AG-UI investigation independent. T
     - IPC `ApplySurfaceMessages` / `GetSurface` / `ListSurfaces` answer through `Standard` (no new `IpcResponse` variant).
     - philotic-web serves `GET /api/surfaces` and `GET /api/surfaces/:id` (authenticated; returns the record plus replay messages).
     - Tests: 8 in mesh-core, plus aiua `apply_surface_messages_creates_stores_and_enforces_ownership`.
-  - [ ] S1b `OutboundReply::Surface` / `EdgeMessage::Surface` + delivery outcome (with `surface-render-tools`).
+  - [x] S1b render tools, native lowering and delivery outcome — **test-green** 2026-10-03:
+    - **Tools.** `ui.surface.create|update|delete` live in `catalog/tools.yaml`, the philote fallback catalog, and the `desktop.surfaces` skill. That skill is seeded with implied tools and is on-demand for the orchestrator, admin and architect profiles; seeds reconcile into live profiles on boot. The relevance gate fires on surface, dashboard, interface, buttons, table, form and `[surface action]`.
+    - **Native lowering.** `surface::lower::lower_to_chat` turns the subset Text, Column, Row, List, Card, Divider and Button into Telegram text plus an inline keyboard with `sa:<action_id>` callbacks. Inputs, Modal, Table and templated buttons refuse honestly.
+    - **Delivery outcome (say-do).** The result reports `outcome=displayed|rejected|deleted`, and a rejection says "the operator has NOT seen it".
+    - **Taps.** A `sa:` tap is acked by membrane-telegram, and philote resolves it, via `ListSurfaces`, into a `[surface action]` turn with resolved context and no leaked action id. A dead button gets "That button is no longer active."
+    - **Tests.** `surface_create_lowers_to_telegram_and_a_tap_returns_as_an_action` (real apply logic in the mock hotel), plus unit tests.
+  - [ ] Moved to S2 (it needs a renderer): `OutboundReply::Surface` / `EdgeMessage::Surface`, and showing a surface on non-Telegram channels.
+  - [ ] Watched-live: ask Beacon for a status card with buttons on Telegram, tap a button, and confirm Beacon handles the `[surface action]`.
 - [ ] S1 `surface-render-tools`: `ui.surface.create|update|delete`, `ui.data.update`; `desktop.surfaces` abstract skill seeded and SkillDAG-implied; replies bound to the reported delivery outcome (say-do) — test-green.
 - [ ] S2 `surface-web-renderer`: A2UI→DOM renderer bundle in philotic-stack served at `/s/:surface_id`; catalog map, JSON Pointer binding, validation, card/list/table primitives; host action bridge — test-green.
 - [ ] S2 `surface-https-edge`: Tailscale Serve HTTPS for `philotic-web`; `web_public_base_url` so the transport can move to the native Philotic VPN — smoke-green.

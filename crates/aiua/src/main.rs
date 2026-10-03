@@ -3621,6 +3621,26 @@ fn seed_abstract_skill_catalog(graph: &GraphDomain) -> anyhow::Result<()> {
             ..Default::default()
         },
         AbstractSkillRecord {
+            skill_name: "desktop.surfaces".into(),
+            description: "Show the operator an interface built from data (an A2UI surface: \
+                          cards, lists, tables, buttons, simple forms) instead of a wall of text. \
+                          Create it with ui.surface.create, change it with ui.surface.update, \
+                          remove it with ui.surface.delete. The result says whether the operator \
+                          actually saw it; a button press comes back as a [surface action] message."
+                .into(),
+            implied_tools: vec![
+                "ui.surface.create".into(),
+                "ui.surface.update".into(),
+                "ui.surface.delete".into(),
+            ],
+            validation_state: ansible_mesh_core::graph::SkillValidationState::Validated,
+            field_sources: serde_json::json!({
+                "required_fields": ["skill_name", "description", "implied_tools"],
+                "source": "doc:desktop-generative-surfaces"
+            }),
+            ..Default::default()
+        },
+        AbstractSkillRecord {
             skill_name: "skill.authoring".into(),
             description: "Author a new delegation skill for yourself. Identify a recurring pattern \
                           in your work, give it a name, write a goal template, declare what tools the \
@@ -4318,6 +4338,8 @@ fn seed_toolset_profiles(graph: &GraphDomain) -> anyhow::Result<()> {
                 "mcp.manage".into(),
                 "mcp.endpoint_steward".into(),
                 "integration.steward".into(),
+                // Philote-authored A2UI surfaces (doc:desktop-generative-surfaces).
+                "desktop.surfaces".into(),
                 // Projects only on maintenance-language turns; the server-side
                 // operational-admin gate protects the mutating heal ops from
                 // non-admin agents.
@@ -4587,6 +4609,7 @@ fn seed_toolset_profiles(graph: &GraphDomain) -> anyhow::Result<()> {
                 "cron.manage".into(),
                 "mcp.endpoint_steward".into(),
                 "integration.steward".into(),
+                "desktop.surfaces".into(),
             ],
             remote_tool_runners: vec![],
             seed_baseline: None,
@@ -4650,6 +4673,7 @@ fn seed_toolset_profiles(graph: &GraphDomain) -> anyhow::Result<()> {
                 "cron.manage".into(),
                 "mcp.endpoint_steward".into(),
                 "integration.steward".into(),
+                "desktop.surfaces".into(),
             ],
             remote_tool_runners: vec![],
             seed_baseline: None,
