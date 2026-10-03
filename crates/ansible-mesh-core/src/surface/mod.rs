@@ -11,6 +11,7 @@
 
 pub mod catalog;
 pub mod pointer;
+pub mod record;
 pub mod validate;
 
 use std::collections::BTreeMap;
@@ -54,6 +55,12 @@ impl SurfaceError {
     }
     pub fn too_large(message: impl Into<String>) -> Self {
         Self::new("SURFACE_TOO_LARGE", message)
+    }
+    pub fn forbidden(message: impl Into<String>) -> Self {
+        Self::new("SURFACE_FORBIDDEN", message)
+    }
+    pub fn deleted(message: impl Into<String>) -> Self {
+        Self::new("SURFACE_DELETED", message)
     }
     pub fn code(&self) -> &'static str {
         self.code

@@ -39,6 +39,7 @@ use crate::storage::{
     CONFIG_GRAPH_RUNNER_REGISTRY, CONFIG_MUNINN_ENDPOINT, CONFIG_MUNINN_WRITE_ROUTE,
     CONFIG_VAULT_REGISTRY,
 };
+use crate::surface::record::{SurfaceRecord, SurfaceStatus};
 use crate::NodeCapabilities;
 use anyhow::{Context, Result};
 use std::sync::Arc;
@@ -1151,6 +1152,77 @@ impl GraphDomain {
             }
         }
         Ok(skills)
+    }
+
+    // ── Surface methods (doc:desktop-generative-surfaces) ─────────────────────
+
+    fn surface_key(surface_id: &str) -> String {
+        format!("{}:{}", NODE_KIND_UI_SURFACE, surface_id)
+    }
+
+    /// Store a surface. Callers apply and validate first
+    /// (`surface::record::apply_surface_messages`); this is storage only.
+    pub fn upsert_surface(&self, surface: &SurfaceRecord) -> Result<()> {
+        let data = serde_json::to_value(surface)
+            .context("GraphDomain::upsert_surface: serialize SurfaceRecord")?;
+        self.adapter.upsert_node(&GraphNode {
+            node_key: Self::surface_key(&surface.surface_id),
+            kind: NODE_KIND_UI_SURFACE.to_string(),
+            label: surface
+                .title
+                .clone()
+                .or_else(|| Some(surface.surface_id.clone())),
+            data,
+        })
+    }
+
+    pub fn get_surface(&self, surface_id: &str) -> Result<Option<SurfaceRecord>> {
+        match self.adapter.get_node(&Self::surface_key(surface_id))? {
+            None => Ok(None),
+            Some(node) => Ok(Some(
+                serde_json::from_value(node.data)
+                    .context("GraphDomain::get_surface: deserialize SurfaceRecord")?,
+            )),
+        }
+    }
+
+    /// Newest-first surfaces, optionally for one owner and/or one session.
+    pub fn list_surfaces(
+        &self,
+        owner_agent_id: Option<&str>,
+        session_id: Option<&str>,
+        include_deleted: bool,
+        limit: usize,
+    ) -> Result<Vec<SurfaceRecord>> {
+        let nodes = match owner_agent_id {
+            Some(owner) => self.adapter.list_nodes_by_kind_json_eq(
+                NODE_KIND_UI_SURFACE,
+                "owner_agent_id",
+                owner,
+                "updated_at",
+                usize::MAX,
+            )?,
+            None => self.adapter.list_nodes_by_kind(NODE_KIND_UI_SURFACE)?,
+        };
+        let mut out: Vec<SurfaceRecord> = nodes
+            .into_iter()
+            .filter_map(|node| match serde_json::from_value::<SurfaceRecord>(node.data) {
+                Ok(s) => Some(s),
+                Err(err) => {
+                    warn!(node_key = %node.node_key, "Skipping incompatible ui_surface record: {}", err);
+                    None
+                }
+            })
+            .filter(|s| include_deleted || s.status == SurfaceStatus::Active)
+            .filter(|s| session_id.is_none_or(|id| s.session_id.as_deref() == Some(id)))
+            .collect();
+        out.sort_by(|a, b| {
+            b.updated_at
+                .cmp(&a.updated_at)
+                .then(a.surface_id.cmp(&b.surface_id))
+        });
+        out.truncate(limit);
+        Ok(out)
     }
 
     // ── Procedural graph methods (doc:procedural-graphs) ──────────────────────
@@ -2582,6 +2654,78 @@ mod tests {
                 .count_recent_session_events_by_kind("memory_auto_recall_completed", 5000)
                 .unwrap(),
             0
+        );
+    }
+
+    #[test]
+    fn surfaces_store_filter_and_list_newest_first() {
+        use crate::surface::record::{apply_surface_messages, ApplyContext};
+        use serde_json::json;
+        let domain = make_domain();
+        let batch = vec![
+            json!({"version": "v0.9", "createSurface": {"surfaceId": "x", "catalogId": "philotic.desktop.v1"}}),
+            json!({"version": "v0.9", "updateComponents": {"surfaceId": "x", "components": [
+                {"id": "root", "component": "Text", "text": "hi"}]}}),
+        ];
+        let make = |id: &str, owner: &str, session: &str, now: u64| {
+            let ctx = ApplyContext {
+                caller_guest_id: owner.into(),
+                source_hotel: "mac-jane".into(),
+                title: None,
+                session_id: Some(session.into()),
+                chat_id: None,
+                transport: None,
+                now,
+            };
+            apply_surface_messages(
+                None,
+                || id.to_string(),
+                &ctx,
+                &batch,
+                || "a000000000000".into(),
+            )
+            .unwrap()
+        };
+        domain
+            .upsert_surface(&make("s1", "agent-beacon", "sess-a", 10))
+            .unwrap();
+        domain
+            .upsert_surface(&make("s2", "agent-beacon", "sess-b", 20))
+            .unwrap();
+        domain
+            .upsert_surface(&make("s3", "agent-jane", "sess-a", 30))
+            .unwrap();
+        let mut deleted = make("s4", "agent-beacon", "sess-a", 40);
+        deleted.status = SurfaceStatus::Deleted;
+        domain.upsert_surface(&deleted).unwrap();
+
+        assert_eq!(
+            domain.get_surface("s1").unwrap().unwrap().owner_agent_id,
+            "agent-beacon"
+        );
+        assert!(domain.get_surface("missing").unwrap().is_none());
+
+        let ids =
+            |list: Vec<SurfaceRecord>| list.into_iter().map(|s| s.surface_id).collect::<Vec<_>>();
+        assert_eq!(
+            ids(domain.list_surfaces(None, None, false, 10).unwrap()),
+            ["s3", "s2", "s1"]
+        );
+        assert_eq!(
+            ids(domain
+                .list_surfaces(Some("agent-beacon"), None, false, 10)
+                .unwrap()),
+            ["s2", "s1"]
+        );
+        assert_eq!(
+            ids(domain
+                .list_surfaces(None, Some("sess-a"), true, 10)
+                .unwrap()),
+            ["s4", "s3", "s1"]
+        );
+        assert_eq!(
+            ids(domain.list_surfaces(None, None, false, 1).unwrap()),
+            ["s3"]
         );
     }
 

@@ -2126,6 +2126,14 @@ Order: A0 → S0 → S1 → S2 → S3 → S4; AG-UI investigation independent. T
   - [ ] Gap found while scripting the test: `/approval reset` clears only `preapproved_tools`/`preapproved_classes`, never `auto_approve_all`, so no command undoes "Trust for session".
 - [ ] S0 `surface-schema-and-types`: vendor the A2UI v0.9 JSON Schema subset for catalog `philotic.desktop.v1`; `typify` Rust types into `ansible-mesh-core::surface`; `validate()` with catalog allowlist + size ceilings; fixtures for every allowed and every excluded component — test-green.
 - [ ] S1 `surface-persistence-rehydrate`: hotel-owned `ui_surfaces` records (`ListSurfaces`/`GetSurface` IPC, `GET /api/surfaces/:id`); `OutboundReply::Surface` / `EdgeMessage::Surface` with a native-lowering hint; delivery outcome `displayed`/`offered_link`/`rejected` back to the philote — test-green.
+  - [x] S1a storage + IPC + GET — **test-green** 2026-10-03:
+    - `surface::record` defines `SurfaceRecord` (owner = base agent id, source hotel, session, seq, active/deleted status).
+    - `apply_surface_messages` mints the `s`+ULID surface id, normalises every message's `surfaceId`, mints action ids, enforces owner-only writes, and applies the batch atomically (root required).
+    - Records are `ui_surface` graph nodes (`GraphDomain::{upsert,get,list}_surface`).
+    - IPC `ApplySurfaceMessages` / `GetSurface` / `ListSurfaces` answer through `Standard` (no new `IpcResponse` variant).
+    - philotic-web serves `GET /api/surfaces` and `GET /api/surfaces/:id` (authenticated; returns the record plus replay messages).
+    - Tests: 8 in mesh-core, plus aiua `apply_surface_messages_creates_stores_and_enforces_ownership`.
+  - [ ] S1b `OutboundReply::Surface` / `EdgeMessage::Surface` + delivery outcome (with `surface-render-tools`).
 - [ ] S1 `surface-render-tools`: `ui.surface.create|update|delete`, `ui.data.update`; `desktop.surfaces` abstract skill seeded and SkillDAG-implied; replies bound to the reported delivery outcome (say-do) — test-green.
 - [ ] S2 `surface-web-renderer`: A2UI→DOM renderer bundle in philotic-stack served at `/s/:surface_id`; catalog map, JSON Pointer binding, validation, card/list/table primitives; host action bridge — test-green.
 - [ ] S2 `surface-https-edge`: Tailscale Serve HTTPS for `philotic-web`; `web_public_base_url` so the transport can move to the native Philotic VPN — smoke-green.

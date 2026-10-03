@@ -8196,6 +8196,55 @@ impl IpcServer {
                 ),
                 Err(e) => IpcResponse::error("get_procedure", "PROCEDURE_ERROR", e.to_string()),
             },
+            IpcRequest::ApplySurfaceMessages {
+                surface_id,
+                messages,
+                title,
+                session_id,
+                chat_id,
+                transport,
+            } => handle_apply_surface_messages(
+                current_identity.as_ref(),
+                graph,
+                &local_node_id,
+                surface_id,
+                messages,
+                SurfaceAttribution {
+                    title,
+                    session_id,
+                    chat_id,
+                    transport,
+                },
+            ),
+            IpcRequest::GetSurface { surface_id } => match graph.get_surface(&surface_id) {
+                Ok(Some(s)) => IpcResponse::success(
+                    "get_surface",
+                    Some(serde_json::to_value(&s).unwrap_or(serde_json::Value::Null)),
+                ),
+                Ok(None) => IpcResponse::error(
+                    "get_surface",
+                    "SURFACE_NOT_FOUND",
+                    format!("no surface {surface_id}"),
+                ),
+                Err(e) => IpcResponse::error("get_surface", "SURFACE_ERROR", e.to_string()),
+            },
+            IpcRequest::ListSurfaces {
+                owner_agent_id,
+                session_id,
+                include_deleted,
+                limit,
+            } => match graph.list_surfaces(
+                owner_agent_id.as_deref(),
+                session_id.as_deref(),
+                include_deleted,
+                limit.unwrap_or(50).min(500),
+            ) {
+                Ok(list) => IpcResponse::success(
+                    "list_surfaces",
+                    Some(serde_json::json!({ "surfaces": list })),
+                ),
+                Err(e) => IpcResponse::error("list_surfaces", "SURFACE_ERROR", e.to_string()),
+            },
             IpcRequest::ListProcedures {} => match graph.list_procedures() {
                 Ok(list) => IpcResponse::success(
                     "list_procedures",
@@ -18527,6 +18576,78 @@ pub(super) fn evaluate_procedure_trials(
     decided
 }
 
+/// Where a surface write came from, stamped on the record.
+pub(super) struct SurfaceAttribution {
+    pub title: Option<String>,
+    pub session_id: Option<String>,
+    pub chat_id: Option<String>,
+    pub transport: Option<String>,
+}
+
+/// Desktop generative surfaces (doc:desktop-generative-surfaces S1): apply an
+/// A2UI batch to a hotel-owned surface.
+///
+/// The caller must be a registered guest; its base agent id becomes (or must
+/// match) the owner, so one philote cannot repaint another's surface. The hotel
+/// mints the surface id and every action id, validates against
+/// `philotic.desktop.v1`, and stores nothing unless the whole batch applies.
+pub(super) fn handle_apply_surface_messages(
+    identity: Option<&GuestIdentity>,
+    graph: &GraphDomain,
+    local_node_id: &str,
+    surface_id: Option<String>,
+    messages: Vec<serde_json::Value>,
+    attribution: SurfaceAttribution,
+) -> IpcResponse {
+    use ansible_mesh_core::surface::new_action_id;
+    use ansible_mesh_core::surface::record::{
+        ApplyContext, apply_surface_messages, new_surface_id,
+    };
+    const OP: &str = "apply_surface_messages";
+
+    let Some(identity) = identity else {
+        return IpcResponse::error(
+            OP,
+            "SURFACE_UNREGISTERED",
+            "guest must register before writing surfaces",
+        );
+    };
+    let existing = match surface_id.as_deref() {
+        None => None,
+        Some(id) => match graph.get_surface(id) {
+            Ok(Some(record)) => Some(record),
+            Ok(None) => {
+                return IpcResponse::error(OP, "SURFACE_NOT_FOUND", format!("no surface {id}"));
+            }
+            Err(e) => return IpcResponse::error(OP, "SURFACE_ERROR", e.to_string()),
+        },
+    };
+    let ctx = ApplyContext {
+        caller_guest_id: identity.guest_id.clone(),
+        source_hotel: local_node_id.to_string(),
+        title: attribution.title,
+        session_id: attribution.session_id,
+        chat_id: attribution.chat_id,
+        transport: attribution.transport,
+        now: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0),
+    };
+    let record =
+        match apply_surface_messages(existing, new_surface_id, &ctx, &messages, new_action_id) {
+            Ok(record) => record,
+            Err(e) => return IpcResponse::error(OP, e.code(), e.to_string()),
+        };
+    if let Err(e) = graph.upsert_surface(&record) {
+        return IpcResponse::error(OP, "SURFACE_ERROR", e.to_string());
+    }
+    IpcResponse::success(
+        OP,
+        Some(serde_json::to_value(&record).unwrap_or(serde_json::Value::Null)),
+    )
+}
+
 /// Procedural graphs (doc:procedural-graphs P0): `procedure.register`.
 ///
 /// Gated exactly like `skill.register`: a skill-admin identity, the L5
@@ -20158,6 +20279,140 @@ pub(crate) mod tests {
             } => assert_eq!(validation_state, "validated"),
             other => panic!("expected SkillRegistered, got: {other:?}"),
         }
+    }
+
+    // ── Desktop generative surfaces (doc:desktop-generative-surfaces S1) ──────
+
+    fn surface_attribution() -> SurfaceAttribution {
+        SurfaceAttribution {
+            title: Some("Hotel status".into()),
+            session_id: Some("sess-1".into()),
+            chat_id: None,
+            transport: Some("telegram".into()),
+        }
+    }
+
+    fn surface_create_batch() -> Vec<serde_json::Value> {
+        vec![
+            serde_json::json!({"version": "v0.9", "createSurface": {"surfaceId": "draft", "catalogId": "philotic.desktop.v1"}}),
+            serde_json::json!({"version": "v0.9", "updateComponents": {"surfaceId": "draft", "components": [
+                {"id": "root", "component": "Column", "children": ["go"]},
+                {"id": "label", "component": "Text", "text": "Restart"},
+                {"id": "go", "component": "Button", "child": "label",
+                 "action": {"event": {"name": "restart", "context": {"action_id": "forged"}}}}
+            ]}}),
+        ]
+    }
+
+    fn standard(resp: IpcResponse) -> (bool, String, Option<serde_json::Value>) {
+        match resp {
+            IpcResponse::Standard { ok, code, data, .. } => (ok, code, data),
+            other => panic!("expected Standard, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn apply_surface_messages_creates_stores_and_enforces_ownership() {
+        let graph = register_skill_test_graph();
+        let beacon = GuestIdentity {
+            guest_id: "agent-beacon:brain".into(),
+            role: "agent".into(),
+            supported_tools: vec![],
+        };
+        let jane = GuestIdentity {
+            guest_id: "agent-jane".into(),
+            role: "agent".into(),
+            supported_tools: vec![],
+        };
+
+        // Unregistered callers are refused before anything is parsed.
+        let (ok, code, _) = standard(handle_apply_surface_messages(
+            None,
+            &graph,
+            "mac-jane",
+            None,
+            surface_create_batch(),
+            surface_attribution(),
+        ));
+        assert!(!ok);
+        assert_eq!(code, "SURFACE_UNREGISTERED");
+
+        // Create: hotel mints the surface id and the action id.
+        let (ok, _, data) = standard(handle_apply_surface_messages(
+            Some(&beacon),
+            &graph,
+            "mac-jane",
+            None,
+            surface_create_batch(),
+            surface_attribution(),
+        ));
+        assert!(ok);
+        let data = data.expect("surface record");
+        let surface_id = data["surface_id"].as_str().unwrap().to_string();
+        assert!(surface_id.starts_with('s') && surface_id.len() == 27);
+        assert_eq!(data["owner_agent_id"], "agent-beacon");
+        assert_eq!(data["source_hotel"], "mac-jane");
+        let action_id =
+            data["state"]["components"]["go"]["action"]["event"]["context"]["action_id"]
+                .as_str()
+                .unwrap();
+        assert_ne!(action_id, "forged");
+        assert!(graph.get_surface(&surface_id).unwrap().is_some());
+
+        // Another agent may not change it; nothing is stored.
+        let update = vec![serde_json::json!({"version": "v0.9",
+            "updateDataModel": {"surfaceId": surface_id, "path": "/x", "value": 1}})];
+        let (ok, code, _) = standard(handle_apply_surface_messages(
+            Some(&jane),
+            &graph,
+            "mac-jane",
+            Some(surface_id.clone()),
+            update.clone(),
+            surface_attribution(),
+        ));
+        assert!(!ok);
+        assert_eq!(code, "SURFACE_FORBIDDEN");
+
+        // An invalid component is refused with its catalog code; nothing stored.
+        let bad = vec![
+            serde_json::json!({"version": "v0.9", "updateComponents": {"surfaceId": surface_id,
+            "components": [{"id": "pic", "component": "Image", "url": "https://x"}]}}),
+        ];
+        let (ok, code, _) = standard(handle_apply_surface_messages(
+            Some(&beacon),
+            &graph,
+            "mac-jane",
+            Some(surface_id.clone()),
+            bad,
+            surface_attribution(),
+        ));
+        assert!(!ok);
+        assert_eq!(code, "SURFACE_COMPONENT_NOT_ALLOWED");
+        assert_eq!(graph.get_surface(&surface_id).unwrap().unwrap().seq, 2);
+
+        // The owner's update applies.
+        let (ok, _, data) = standard(handle_apply_surface_messages(
+            Some(&beacon),
+            &graph,
+            "mac-jane",
+            Some(surface_id.clone()),
+            update,
+            surface_attribution(),
+        ));
+        assert!(ok);
+        assert_eq!(data.unwrap()["seq"], 3);
+
+        // Unknown surface ids are a clean not-found.
+        let (ok, code, _) = standard(handle_apply_surface_messages(
+            Some(&beacon),
+            &graph,
+            "mac-jane",
+            Some("s-missing".into()),
+            surface_create_batch(),
+            surface_attribution(),
+        ));
+        assert!(!ok);
+        assert_eq!(code, "SURFACE_NOT_FOUND");
     }
 
     // ── Procedural graphs (doc:procedural-graphs P0) ──────────────────────────
