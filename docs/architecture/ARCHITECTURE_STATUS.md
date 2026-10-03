@@ -156,9 +156,14 @@ UI acceptance and EventKit-write proof remain pending. October 3 source adds
 separate device-authorized confirm/close/reopen controls with atomic
 `LifeLoopAction` audits, full text/lifecycle conflict guards and retry receipts.
 Mac/iOS builds and actual disposable-Memgraph persistence/concurrent retry
-tests pass. These actions are not deployed or installed on the phone yet;
-their revision guard is not yet shared by legacy lifecycle writers. Live
-action validation and a durable multi-device Reminders sync ledger remain
+tests pass. PR #612 merged to develop `04856a44`; exact CI artifacts are deployed
+October 3 with changed running gateway/runner executable hashes verified.
+Live enrolled-device confirm/close/reopen, audit replay, stale HTTP 409,
+read-back and persisted audits pass; synthetic records were cleaned up.
+Auth configuration and native callback containers were unchanged. The signed
+phone action build is ready but not installed because the device is unavailable;
+the revision guard is not yet shared by legacy lifecycle writers. Phone UI
+acceptance and a durable multi-device Reminders sync ledger remain
 follow-up work in [docs/task.md](../task.md#apple-memory-workspace).
 
 ### Runtime and authority

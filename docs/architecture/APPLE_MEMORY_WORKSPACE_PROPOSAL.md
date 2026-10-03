@@ -41,8 +41,10 @@ and act on open loops without treating a list of database rows as the product.
 Accepted for current slice. Initial graphical navigation and linked export are
 implemented on `codex/apple-memory-workspace`, followed by audited lifecycle
 actions. The graphical build was installed and launched on the new iPhone on
-October 2; physical UI acceptance, real EventKit writes and the new lifecycle
-actions' deployment remain unverified. The complete requested workflow is
+October 2. PR #612 merged to develop `04856a44`, and the new lifecycle gateway
+and runner are deployed with watched-live API/audit proof October 3. The updated
+signed phone build is ready but installation is blocked by device availability;
+physical UI acceptance and real EventKit writes remain unverified. The complete requested workflow is
 **not** implemented by these slices.
 
 ## Current Slice
@@ -96,9 +98,9 @@ Apple-owned; an export receipt is not proof that another device received it.
 
 ## Next Implementation Work
 
-- Merge/deploy both action boundaries, install the updated app, and verify
-  live enrolled-device save/read-back plus persisted audit on a disposable
-  loop. Verify native UI confirm/close/reopen and stale-screen rejection.
+- Reconnect the new iPhone, install the signed app, and verify native UI
+  confirm/close/reopen and stale-screen rejection. Server API/audit proof is
+  complete, not a substitute for physical UI acceptance.
 - Extend lifecycle revision discipline to other writers before claiming a
   graph-wide revision guarantee; keep generic text editing narrow.
 - Add reviewable reconciliation: reminder completed / loop still open,
@@ -125,6 +127,18 @@ against disposable Memgraph 3.5.0 proves actual audit persistence, protected
 property preservation, stale/ABA rejection, exact retry replay, concurrent
 retry deduplication, legacy alias clearing, wrong-label and duplicate-ID
 rejection. This is integration/test-green, not deployed or phone-action proof.
+October 3 rollout: all four PR gates pass; merge `04856a44` Linux build
+`37140980630` succeeds. Only `/opt/philotic/bin/life-graph-runner` and
+`/opt/philotic/bin/philotic-web` were updated; existing auth EnvironmentFiles
+and native callback containers were preserved, with pre-rollout binary backups.
+Restarted runner PID 2188181 and gateway PID 2188249 use those paths and their
+running executable hashes match the changed installed artifacts. Both services
+are active. The real enrolled-device path passed confirm/close/reopen, exact
+receipt replay, stale HTTP 409, read-back and three persisted audits with
+unchanged protected provenance. The uniquely named synthetic loop and audits
+were removed and absence checked. Server actions are **watched-live-green**.
+Signed iOS build and strict signature verification pass; the new iPhone is
+unavailable to Xcode, so this action build is not installed or phone-accepted.
 Physical graph interaction, VoiceOver, permission revocation, real export,
 repeat export and completed-reminder reconciliation still require UI acceptance.
 
