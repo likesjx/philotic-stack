@@ -105,6 +105,10 @@ pub const LOCAL_AGENT_TOOLS: &[&str] = &[
     "host.vitals",
     "session.repair_stale",
     "component.restart",
+    // ── Surfaces (doc:desktop-generative-surfaces S1) ───────────────────────
+    "ui.surface.create",
+    "ui.surface.update",
+    "ui.surface.delete",
 ];
 
 /// Returns `true` when `name` executes inside the agent process

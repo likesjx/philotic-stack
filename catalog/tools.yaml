@@ -2791,7 +2791,7 @@ tools:
     required: []
     type: object
 - tool_name: ui.surface.create
-  class: capability
+  class: surface
   description: 'Show the operator an interface you build from data: an A2UI v0.9 surface (catalog philotic.desktop.v1).
     Components are a flat list of objects {"id", "component", ...props}; one must have id "root". Children are referenced
     by id. Allowed components: Text {text, variant h1-h5|body|caption}, Column/Row/List {children: [ids] or {componentId,
@@ -2820,7 +2820,7 @@ tools:
     - components
     type: object
 - tool_name: ui.surface.update
-  class: capability
+  class: surface
   description: 'Change a surface you created: replace or add components by id, replace the whole data_model, or set
     one value with data_path (JSON Pointer) + data_value (omit data_value to remove the key). Only the surface owner
     may update it. The result reports the delivery outcome like ui.surface.create.'
@@ -2846,7 +2846,7 @@ tools:
     - surface_id
     type: object
 - tool_name: ui.surface.delete
-  class: capability
+  class: surface
   description: Delete a surface you created. Its buttons stop working.
   input_schema:
     properties:

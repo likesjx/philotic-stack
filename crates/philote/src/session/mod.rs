@@ -5565,7 +5565,7 @@ pub fn apply_life_recall_char_budget(
 
 /// Returns true if `phrase` appears in `text` as a standalone word/phrase, not as a
 /// substring of a larger word — e.g. "ok" must not match inside "look" or "took".
-fn contains_word_boundary(text: &str, phrase: &str) -> bool {
+pub(crate) fn contains_word_boundary(text: &str, phrase: &str) -> bool {
     let mut start = 0;
     while let Some(idx) = text[start..].find(phrase) {
         let abs_start = start + idx;
@@ -9946,6 +9946,56 @@ mod tests {
             projected_names.contains("life.recall"),
             "expected life.recall to survive tool projection, got {projected_names:?}"
         );
+    }
+
+    /// desktop-generative-surfaces S1: the `surface` class grant puts the
+    /// ui.surface tools in the assembly; the on-demand `desktop.surfaces`
+    /// skill keeps them off turns that do not ask for an interface.
+    #[test]
+    fn surface_tools_project_only_for_interface_turns() {
+        let mut state =
+            SessionState::new("sess-1".into(), "agent-beacon".into(), "telegram".into());
+        state.add_tool_binding("memory.remember");
+        state.bindings.allowed_classes = vec!["surface".into()];
+        state.bindings.on_demand_skills = vec!["desktop.surfaces".into()];
+        state.rebuild_default_tool_assembly();
+        let assembled: Vec<_> = state
+            .tool_assembly
+            .tools_for_model
+            .iter()
+            .map(|t| t.tool_name.clone())
+            .collect();
+        assert!(
+            assembled.iter().any(|t| t == "ui.surface.create"),
+            "class grant did not assemble the surface tools: {assembled:?}"
+        );
+
+        let names = |text: &str| {
+            state
+                .project_tools_for_turn(text)
+                .into_iter()
+                .map(|t| t.tool_name)
+                .collect::<std::collections::BTreeSet<_>>()
+        };
+        // Note: a turn that names a tool ("hotel status" → hotel.status) takes
+        // the explicitly-named projection and gets only that tool; interface
+        // requests must not name one.
+        let asked = names("make me a dashboard of my open loops with done buttons");
+        for tool in [
+            "ui.surface.create",
+            "ui.surface.update",
+            "ui.surface.delete",
+        ] {
+            assert!(asked.contains(tool), "{tool} missing from {asked:?}");
+        }
+        let chat = names("here's the information you asked for about the platform");
+        assert!(
+            !chat.iter().any(|t| t.starts_with("ui.surface")),
+            "surface tools leaked onto an ordinary turn: {chat:?}"
+        );
+        // A pressed button must keep the tools so the philote can update the surface.
+        let tap = names("[surface action] the operator pressed \"restart\" on your surface");
+        assert!(tap.contains("ui.surface.update"), "{tap:?}");
     }
 
     #[test]

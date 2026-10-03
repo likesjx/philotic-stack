@@ -4308,7 +4308,7 @@ fn seed_toolset_profiles(graph: &GraphDomain) -> anyhow::Result<()> {
                 "cron.remove".into(),
                 "router.stats".into(),
             ],
-            allowed_classes: vec!["session".into(), "utility".into(), "config".into(), "memory".into(), "graph".into(), "agent_graph".into(), "table".into(), "cron".into(), "mcp".into(), "desktop".into(), "life_graph".into()],
+            allowed_classes: vec!["session".into(), "utility".into(), "config".into(), "memory".into(), "graph".into(), "agent_graph".into(), "table".into(), "cron".into(), "mcp".into(), "desktop".into(), "surface".into(), "life_graph".into()],
             allowed_skills: vec![
                 "handoff.to_role".into(),
                 "handoff.back".into(),
@@ -4580,6 +4580,7 @@ fn seed_toolset_profiles(graph: &GraphDomain) -> anyhow::Result<()> {
                 "cron".into(),
                 "mcp".into(),
                 "desktop".into(),
+                "surface".into(),
                 "life_graph".into(),
                 "heal".into(),
             ],
@@ -4656,7 +4657,7 @@ fn seed_toolset_profiles(graph: &GraphDomain) -> anyhow::Result<()> {
             // for the charter's own profile and the sweep goes blind. The
             // mutating heal ops stay refused server-side (operational-admin
             // gate); this grant only makes the read surface visible.
-            allowed_classes: vec!["session".into(), "utility".into(), "workspace".into(), "memory".into(), "graph".into(), "agent_graph".into(), "life_graph".into(), "heal".into()],
+            allowed_classes: vec!["session".into(), "utility".into(), "workspace".into(), "memory".into(), "graph".into(), "agent_graph".into(), "life_graph".into(), "heal".into(), "surface".into()],
             allowed_skills: vec![
                 "handoff.back".into(),
                 "capability.request".into(),

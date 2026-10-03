@@ -478,6 +478,12 @@ impl ToolsetProfileRecord {
 /// made these grants expand to nothing ("dead classes").
 pub fn tools_for_tool_class(class: &str) -> &'static [&'static str] {
     match class {
+        // Philote-authored surfaces (doc:desktop-generative-surfaces S1).
+        "surface" => &[
+            "ui.surface.create",
+            "ui.surface.update",
+            "ui.surface.delete",
+        ],
         "life_graph" => &[
             "life.observe",
             "life.observe.batch",

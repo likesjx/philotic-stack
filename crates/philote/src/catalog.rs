@@ -736,17 +736,32 @@ pub fn skill_is_relevant_for_turn(skill_name: &str, turn_text: &str) -> bool {
                 || t.contains("set_home")
         }
         "desktop.surfaces" => {
+            // Whole words only: substring matching would fire on
+            // "information", "platform", "stable" and attach three schemas to
+            // most turns.
+            const WORDS: &[&str] = &[
+                "surface",
+                "surfaces",
+                "dashboard",
+                "dashboards",
+                "interface",
+                "button",
+                "buttons",
+                "card",
+                "cards",
+                "form",
+                "forms",
+                "table",
+                "tables",
+                "checklist",
+                "widget",
+                "ui",
+            ];
             t.contains("[surface action]")
                 || t.contains("ui.surface")
-                || t.contains("surface")
-                || t.contains("dashboard")
-                || t.contains("interface")
-                || t.contains("buttons")
-                || t.contains("a card")
-                || t.contains("form")
-                || t.contains("table")
-                || t.contains("checklist")
-                || (t.contains("show me") && (t.contains("status") || t.contains("list")))
+                || WORDS
+                    .iter()
+                    .any(|w| crate::session::contains_word_boundary(t, w))
         }
         "role.authoring" => {
             t.contains("create role")
@@ -1796,7 +1811,7 @@ fn build_catalog() -> HashMap<String, ToolDefinition> {
                 },
                 "required": ["title", "components"]
             }),
-            class: Some("capability".into()),
+            class: Some("surface".into()),
         },
     );
     m.insert(
@@ -1821,7 +1836,7 @@ fn build_catalog() -> HashMap<String, ToolDefinition> {
                 },
                 "required": ["surface_id"]
             }),
-            class: Some("capability".into()),
+            class: Some("surface".into()),
         },
     );
     m.insert(
@@ -1836,7 +1851,7 @@ fn build_catalog() -> HashMap<String, ToolDefinition> {
                 },
                 "required": ["surface_id"]
             }),
-            class: Some("capability".into()),
+            class: Some("surface".into()),
         },
     );
 
@@ -5323,6 +5338,34 @@ mod tests {
             assert!(
                 catalog.contains_key(*tool),
                 "mesh.steward implied tool {tool} should have a real catalog schema"
+            );
+        }
+    }
+
+    #[test]
+    fn desktop_surfaces_relevance_is_whole_word() {
+        for turn in [
+            "show me a hotel status dashboard",
+            "give me buttons to restart guests",
+            "make a checklist for tomorrow",
+            "[surface action] the operator pressed \"restart\"",
+            "update ui.surface s01 with the new count",
+            "put it in a table",
+        ] {
+            assert!(
+                skill_is_relevant_for_turn("desktop.surfaces", turn),
+                "{turn}"
+            );
+        }
+        for turn in [
+            "here's the information you asked for",
+            "the platform is stable and comfortable",
+            "please perform the format migration",
+            "what's notable today?",
+        ] {
+            assert!(
+                !skill_is_relevant_for_turn("desktop.surfaces", turn),
+                "{turn}"
             );
         }
     }
