@@ -44,7 +44,7 @@ targets:
         INFOPLIST_KEY_NSMicrophoneUsageDescription: "PhiloticApp uses the microphone for voice messages to your agents."
         INFOPLIST_KEY_NSSpeechRecognitionUsageDescription: "Speech is transcribed on-device to send voice messages."
         INFOPLIST_KEY_NSLocationUsageDescription: "PhiloticApp shares a location snapshot with your agents only when you tap Share Current Location."
-        INFOPLIST_KEY_NSRemindersFullAccessUsageDescription: "Preview upcoming reminders on this Mac. Philotic does not change reminders or send them to agents."
+        INFOPLIST_KEY_NSRemindersFullAccessUsageDescription: "Preview upcoming reminders and export an open-loop title to a list you choose. Philotic does not automatically complete reminders or upload your reminder lists."
 
   PhiloticApp-iOS:
     type: application
@@ -58,6 +58,9 @@ targets:
       properties:
         CFBundleShortVersionString: "$(MARKETING_VERSION)"
         CFBundleVersion: "$(CURRENT_PROJECT_VERSION)"
+        CFBundleURLTypes:
+          - CFBundleURLName: com.philotic.apple.ios.signin
+            CFBundleURLSchemes: [com.philotic.apple.ios]
         NSAppTransportSecurity:
           NSExceptionDomains:
             # Transitional private vps-jane endpoint. Requires Tailscale on
@@ -92,7 +95,7 @@ targets:
         INFOPLIST_KEY_NSSpeechRecognitionUsageDescription: "Speech is transcribed on-device to send voice messages."
         INFOPLIST_KEY_NSHealthShareUsageDescription: "Review selected activity, sleep, and heart-rate summaries for personal wellness. Data stays on this device unless you separately confirm sharing summaries with your LifeGraph and agents."
         INFOPLIST_KEY_NSLocationWhenInUseUsageDescription: "PhiloticApp shares a location snapshot with your agents only when you tap Share Current Location."
-        INFOPLIST_KEY_NSRemindersFullAccessUsageDescription: "Preview upcoming reminders on this iPhone. Philotic does not change reminders or send them to agents."
+        INFOPLIST_KEY_NSRemindersFullAccessUsageDescription: "Preview upcoming reminders and export an open-loop title to a list you choose. Philotic does not automatically complete reminders or upload your reminder lists."
         TARGETED_DEVICE_FAMILY: "1,2"
         # Device-install ready. Automatic signing: open the project in Xcode,
         # select the PhiloticApp-iOS target -> Signing & Capabilities, and

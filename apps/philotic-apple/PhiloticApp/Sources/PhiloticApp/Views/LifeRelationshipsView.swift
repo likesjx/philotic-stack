@@ -7,13 +7,19 @@ struct LifeRelationshipsView: View {
     let session: ChatSessionManager
     let node: LifeGraphNode
     let neighbors: [LifeNodeNeighbor]
+    @State private var zoom = 0.55
 
     private var visible: [LifeNodeNeighbor] { Array(neighbors.prefix(8)) }
     private let center = CGPoint(x: 290, y: 230)
 
     var body: some View {
         VStack(alignment: .leading) {
-            ScrollView(.horizontal) {
+            HStack {
+                Button("Fit", systemImage: "arrow.down.right.and.arrow.up.left") { zoom = 0.55 }
+                Slider(value: $zoom, in: 0.55...1.4).accessibilityLabel("Graph zoom")
+                Text("\(Int(zoom * 100))%").font(.caption.monospacedDigit())
+            }
+            ScrollView([.horizontal, .vertical]) {
                 ZStack {
                     ForEach(Array(visible.enumerated()), id: \.offset) { index, edge in
                         let end = point(index)
@@ -53,7 +59,10 @@ struct LifeRelationshipsView: View {
                     badge(node, selected: true).position(center)
                 }
                 .frame(width: 580, height: 460)
+                .scaleEffect(zoom, anchor: .topLeading)
+                .frame(width: 580 * zoom, height: 460 * zoom, alignment: .topLeading)
             }
+            .frame(height: min(460 * zoom, 460))
             Text("One-hop view · \(visible.count) of \(neighbors.count) returned relationships. Arrows show stored direction. Select a node to explore.")
                 .font(.caption).foregroundStyle(.secondary)
         }

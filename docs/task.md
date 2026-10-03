@@ -33,6 +33,21 @@ Contract: [desktop gateway hotel sessions](../crates/philotic-web/DESKTOP_GATEWA
 
 ### Cortex viewer
 
+Native sign-in continuation: [handoff proposal](architecture/NATIVE_OPERATOR_SIGNIN_PROPOSAL.md),
+branch `codex/native-signin`, seam `operator-session-auth`. Operator approved
+Google and `https://desktop.jaredlikes.com` for the native read-only exchange.
+Browser UI, pinned ephemeral client and distinct scoped gateway handle are
+implemented locally. October 1: Swift 115 tests (one skipped), signed iOS build
+and signature verification pass; website typecheck/build and 13 tests pass.
+Gateway 18 tests passed September 30; four native tests passed again October 1.
+Scoped deployment approved and live: initiation, real assets and anonymous denial
+verified; general API/WebSocket routes remain blocked and desktop unchanged.
+Hotel binary unchanged; distinct credential configured in a fresh running PID.
+October 1 follow-up: fresh signed app installed and launched on the new phone;
+invitation redeemed and gateway synchronized to the hotel-owned credential.
+Operator confirmed Google sign-in succeeded and Cortex loaded. Exhaustive
+pagination, partial outages and native Mac sign-in remain unverified.
+
 Branch: `codex/cortex-viewer`; seam: `muninn-admin-observability-plane`.
 Spec: [Cortex viewer](architecture/CORTEX_VIEWER_PROPOSAL.md).
 
@@ -42,8 +57,23 @@ Spec: [Cortex viewer](architecture/CORTEX_VIEWER_PROPOSAL.md).
 - [x] Integrate current develop, merge PR #578, deploy both backend binaries with running-hash proof, and attest the inspected primary Cortex endpoint.
 - [x] Live backend inventory (13 vaults / 1,464 memories), page/detail and second-page reads; temporary admin session revoked and token replay rejected (September 21).
 - [x] Build and launch Mac viewer with existing notch/Desktop work preserved; observe Cortex connection screen.
-- [ ] Verify authenticated native UI, partial outages and exhaustive pagination. Signed iPhone build passes; installation awaits phone reconnection after a connection reset.
+- [x] Install and launch the signed app on the new iPhone; operator confirmed Google sign-in and Cortex loading October 1.
+- [ ] Verify partial outages and exhaustive pagination, and authenticated native Mac UI.
 - [ ] Follow up with native operator sign-in, durable access auditing and global search; current filtering covers loaded rows only.
+
+### Apple memory workspace
+
+Branch: `codex/apple-memory-workspace`; based on native sign-in plus current
+develop. Spec: [graphical workspace](architecture/APPLE_MEMORY_WORKSPACE_PROPOSAL.md).
+
+- [x] Add default LifeGraph Explore entry cards and stored-neighbor graph with fit/zoom and accessible relationship-list fallback.
+- [x] Add Cortex vault/topic/memory tiles; explicit-tag and loaded-page coverage, no fabricated semantic edges.
+- [x] Add explicit title-only OpenLoop export to a chosen Reminders list, including linked completed-item deduplication; never mutate graph status.
+- [x] Install and launch the signed graphical workspace on the new iPhone (October 2); interactive graph and real EventKit export/repeat-export acceptance remain pending.
+- [x] Implement audited device-authorized confirm/close/reopen with original-snapshot/revision guards and retry receipts; Mac/iOS builds, client/runner/authority tests and disposable Memgraph persistence/race checks pass (October 3).
+- [ ] Merge/deploy the action endpoint and runner, install the updated app, and prove live save/read-back/audit plus phone UI acceptance; these new actions are not yet on the phone.
+- [ ] Implement reviewed two-way Reminders reconciliation with a durable multi-device binding ledger; extend lifecycle revision discipline across existing writers.
+- [ ] Add authorized Cortex association/search endpoints and focused semantic-neighborhood exploration.
 
 ### Native LifeGraph editor
 

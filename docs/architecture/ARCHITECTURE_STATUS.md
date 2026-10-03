@@ -3,7 +3,7 @@ title: Philotic Architecture Status
 doc_type: status
 domain: runtime-sessions
 status: active
-last_updated: 2026-09-22
+last_updated: 2026-10-03
 tags:
 - source-of-truth
 - current-state
@@ -123,8 +123,43 @@ gate access; device enrollment alone is insufficient. PR #578 is merged and
 deployed: running server hashes match CI artifacts. Live inventory reported 13
 vaults and 1,464 memories, with page/detail reads and revoked-session rejection
 verified on September 21. The Mac connection screen runs with Desktop preserved.
-Authenticated native UI and phone installation remain pending; manual operator
-sign-in and loaded-row filtering are transitional, not global search.
+Authenticated phone loading was operator-confirmed October 1 after native
+browser sign-in. Native Mac sign-in remains unverified; loaded-row filtering
+is transitional, not global search.
+
+The [native sign-in handoff](NATIVE_OPERATOR_SIGNIN_PROPOSAL.md) now has system
+browser UI and an ephemeral Cortex-only client pinned to the operator-approved
+`https://desktop.jaredlikes.com`. Native handles are distinct from device and
+desktop credentials. The isolated gateway/website source is test-green; October
+1 Swift tests, signed iOS build and signature verification pass. The approved
+scoped HTTPS routes are deployed: real initiation, asset delivery and anonymous
+denial pass, while general API/WebSocket routes remain blocked. The hotel binary
+is unchanged and its restarted process has the distinct gateway credential.
+October 1 follow-up: fresh signed app installed and launched on the new iPhone;
+invitation redeemed, and the gateway synchronized to the hotel's active
+credential. The operator confirmed real Google sign-in and Cortex loading.
+Exhaustive pagination, partial-outage handling and native Mac sign-in are not
+yet proven. Earlier routing-isolation claims describe the October 1 checks,
+not a guarantee about later parallel desktop gateway changes.
+Gateway credentials remain server-only; PKCE proves verifier possession, not
+app identity. The isolated identity assets and private loopback/proxy deployment
+preserve the existing desktop without opening general API/WebSocket access.
+
+The [Apple memory workspace](APPLE_MEMORY_WORKSPACE_PROPOSAL.md) on
+`codex/apple-memory-workspace` adds graph-first LifeGraph browsing and
+Cortex vault/topic/memory tiles, plus explicit title-only OpenLoop export to
+a chosen Reminders list. Topic filters reflect loaded-page tags, not stored
+Muninn association edges. Linked export checks completed reminders too, but
+does not confirm/close nodes or provide automatic two-way sync. The graphical
+build was installed and launched on the new iPhone October 2; physical-device
+UI acceptance and EventKit-write proof remain pending. October 3 source adds
+separate device-authorized confirm/close/reopen controls with atomic
+`LifeLoopAction` audits, full text/lifecycle conflict guards and retry receipts.
+Mac/iOS builds and actual disposable-Memgraph persistence/concurrent retry
+tests pass. These actions are not deployed or installed on the phone yet;
+their revision guard is not yet shared by legacy lifecycle writers. Live
+action validation and a durable multi-device Reminders sync ledger remain
+follow-up work in [docs/task.md](../task.md#apple-memory-workspace).
 
 ### Runtime and authority
 

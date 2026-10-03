@@ -274,6 +274,39 @@ public struct LifeNeighborhood: Codable, Equatable, Sendable {
 // MARK: - Client
 
 public struct LifeGraphClient: Sendable {
+    public enum LoopActionError: Error, LocalizedError {
+        case conflict, unavailable, rejected(Int), invalidReceipt
+        public var errorDescription: String? {
+            switch self {
+            case .conflict: "This loop changed or is unavailable. Close this sheet, reload, and review it before acting again."
+            case .unavailable: "This hotel does not yet support loop actions. Its web service and LifeGraph runner need the update."
+            case .rejected(let code): "The hotel rejected this action (HTTP \(code)). No success was confirmed."
+            case .invalidReceipt: "No matching audit receipt was returned. Retry the same action to check whether it saved."
+            }
+        }
+    }
+
+    public func actOnLoop(baseURL: URL, bearerToken: String, nodeId: String,
+                          action: LifeLoopAction) async throws -> LifeLoopActionReceipt {
+        let url = baseURL.appending(path: "api/edge/lifegraph/node").appending(component: nodeId).appending(path: "action")
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue("Bearer \(bearerToken)", forHTTPHeaderField: "Authorization")
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = try JSONEncoder().encode(action)
+        let (data, response) = try await session.data(for: request)
+        let status = (response as? HTTPURLResponse)?.statusCode ?? -1
+        if status == 409 { throw LoopActionError.conflict }
+        if [404, 405, 501].contains(status) { throw LoopActionError.unavailable }
+        guard status == 200 else { throw LoopActionError.rejected(status) }
+        guard let receipt = try? JSONDecoder().decode(LifeLoopActionReceipt.self, from: data),
+              receipt.status == "saved", receipt.nodeId == nodeId, !receipt.auditId.isEmpty,
+              receipt.requestId == action.requestId, receipt.action == action.action else {
+            throw LoopActionError.invalidReceipt
+        }
+        return receipt
+    }
+
     public enum EditError: Error, LocalizedError {
         case conflict, unavailable, rejected(Int), invalidReceipt
         public var errorDescription: String? {

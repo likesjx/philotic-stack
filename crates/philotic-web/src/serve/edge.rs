@@ -974,6 +974,53 @@ pub(crate) async fn handle_edge_lifegraph_edit(
     }
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct EdgeLoopActionBody {
+    request_id: String,
+    action: String,
+    before: std::collections::BTreeMap<String, serde_json::Value>,
+    note: String,
+}
+
+/// Operator-only lifecycle command. Device identity comes from enrollment,
+/// never from the payload; the runner validates the full original snapshot.
+pub(crate) async fn handle_edge_loop_action(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Path(node_id): Path<String>,
+    Json(body): Json<EdgeLoopActionBody>,
+) -> Response {
+    let Some(actor) = node_edit_actor(edge_bearer_identity(&headers, &state)) else {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({"error":"An enrolled device is required"})),
+        )
+            .into_response();
+    };
+    if !["confirm", "close", "reopen"].contains(&body.action.as_str()) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error":"Unknown loop action"})),
+        )
+            .into_response();
+    }
+    let args = json!({"id":node_id, "actor":actor, "request_id":body.request_id,
+        "action":body.action, "before":body.before, "note":body.note});
+    match super::ipc_life_graph_datasource_call(&state.socket, "life.loop.action", args).await {
+        Ok(data) => {
+            let status = match data.get("status").and_then(serde_json::Value::as_str) {
+                Some("saved") => StatusCode::OK,
+                Some("conflict") => StatusCode::CONFLICT,
+                Some("invalid_request") => StatusCode::BAD_REQUEST,
+                _ => StatusCode::BAD_GATEWAY,
+            };
+            (status, Json(data)).into_response()
+        }
+        Err(err) => life_graph_unavailable(err),
+    }
+}
+
 #[cfg(test)]
 mod node_edit_authority_tests {
     use super::*;
@@ -1000,6 +1047,16 @@ mod node_edit_authority_tests {
             "before": {"title": null}, "changes": {"title": "New"}
         }))
         .is_ok());
+    }
+    #[test]
+    fn loop_action_body_rejects_identity_and_arbitrary_mutations() {
+        let body = json!({"request_id":"a".repeat(32),"action":"close","before":{},"note":""});
+        assert!(serde_json::from_value::<EdgeLoopActionBody>(body.clone()).is_ok());
+        for key in ["actor", "id", "changes"] {
+            let mut forged = body.clone();
+            forged[key] = json!("forged");
+            assert!(serde_json::from_value::<EdgeLoopActionBody>(forged).is_err());
+        }
     }
 }
 

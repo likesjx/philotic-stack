@@ -10,6 +10,7 @@ import SwiftUI
 struct LifeView: View {
     @Bindable var session: ChatSessionManager
     @State private var contextText = ""
+    @State private var exploring = true
 
     private var store: LifeGraphStore { session.lifeGraph }
 
@@ -35,6 +36,10 @@ struct LifeView: View {
     private var lensList: some View {
         List {
             Section {
+                Picker("Display", selection: $exploring) {
+                    Label("Explore", systemImage: "point.3.connected.trianglepath.dotted").tag(true)
+                    Label("Records", systemImage: "list.bullet").tag(false)
+                }.pickerStyle(.segmented)
                 Picker("Lens", selection: Binding(
                     get: { store.selectedLens },
                     set: { newLens in
@@ -72,12 +77,16 @@ struct LifeView: View {
                         description: Text("The \(store.selectedLens.title) lens came back empty.")
                     )
                 } else {
-                    ForEach(store.packets) { ranked in
-                        NavigationLink(
-                            destination: LifeNodeDetailView(
-                                session: session, nodeId: ranked.packet.claimRef.id)
-                        ) {
-                            LensRow(ranked: ranked)
+                    if exploring {
+                        LifeExploreView(session: session, packets: store.packets)
+                    } else {
+                        ForEach(store.packets) { ranked in
+                            NavigationLink(
+                                destination: LifeNodeDetailView(
+                                    session: session, nodeId: ranked.packet.claimRef.id)
+                            ) {
+                                LensRow(ranked: ranked)
+                            }
                         }
                     }
                 }
@@ -171,9 +180,15 @@ struct LifeNodeDetailView: View {
 
     @State private var detail: LifeNodeDetail?
     @State private var loadError: String?
-    @State private var editing = false
+    @State private var sheet: DetailSheet?
     @State private var auditId: String?
     @State private var loadedHotel: URL?
+    private enum DetailSheet: Identifiable {
+        case edit(LifeGraphNode, URL), reminder(LifeGraphNode, URL), action(LifeGraphNode, URL, LifeLoopAction.Action)
+        var id: String {
+            switch self { case .edit: "edit"; case .reminder: "reminder"; case .action(_, _, let action): action.rawValue }
+        }
+    }
 
     /// Provenance-envelope keys rendered in their own section (and therefore
     /// excluded from the generic properties list).
@@ -214,15 +229,19 @@ struct LifeNodeDetailView: View {
         .refreshable { await load() }
         .toolbar {
             Button("Reload", systemImage: "arrow.clockwise") { Task { await load() } }
-            Button("Edit", systemImage: "pencil") { editing = true }
+            Button("Edit", systemImage: "pencil") {
+                if let node = detail?.node, let loadedHotel { sheet = .edit(node, loadedHotel) }
+            }
                 .disabled(detail?.node?.canonicalId?.hasPrefix("life:") != true)
         }
-        .sheet(isPresented: $editing) {
-            if let node = detail?.node, let loadedHotel {
-                LifeNodeEditor(session: session, node: node, hotelURL: loadedHotel) { receipt in
-                    auditId = receipt
-                    Task { await load() }
-                }
+        .sheet(item: $sheet) { destination in
+            switch destination {
+            case .edit(let node, let hotel):
+                LifeNodeEditor(session: session, node: node, hotelURL: hotel, onSaved: saved)
+            case .reminder(let node, let hotel):
+                OpenLoopReminderSheet(node: node, hotelURL: hotel)
+            case .action(let node, let hotel, let action):
+                LifeLoopActionSheet(session: session, node: node, hotelURL: hotel, action: action, onSaved: saved)
             }
         }
     }
@@ -240,6 +259,27 @@ struct LifeNodeDetailView: View {
                 if let state = node.string("validation_state") {
                     ProvenanceChip(text: state, tint: state == "confirmed" ? .green : .orange)
                 }
+            }
+        }
+
+        if node.labels.contains("OpenLoop"), node.canonicalId?.hasPrefix("life:") == true {
+            Section("Open-loop actions") {
+                if LifeLoopAction.availableActions(for: node).isEmpty {
+                    Text("Lifecycle actions are unavailable for this node's current state or property format. Reload to check for updates.")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
+                ForEach(LifeLoopAction.availableActions(for: node)) { action in
+                    Button(action.title) {
+                        if let loadedHotel { sheet = .action(node, loadedHotel, action) }
+                    }
+                }
+                Text("Confirm verifies a loop. Close resolves it. Each action is saved with an audit record.")
+                    .font(.caption).foregroundStyle(.secondary)
+                Button("Send to Reminders", systemImage: "checklist") {
+                    if let loadedHotel { sheet = .reminder(node, loadedHotel) }
+                }
+                Text("Export only the title to a list you choose. Completing a reminder does not confirm or close this LifeGraph node.")
+                    .font(.caption).foregroundStyle(.secondary)
             }
         }
 
@@ -296,6 +336,16 @@ struct LifeNodeDetailView: View {
                         }
                     }
                 }
+            }
+        }
+    }
+
+    private func saved(_ receipt: String) {
+        auditId = receipt
+        Task {
+            await load()
+            if let (url, token) = session.lifeGraphCredentials() {
+                await session.lifeGraph.refresh(baseURL: url, bearerToken: token)
             }
         }
     }
