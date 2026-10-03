@@ -10,6 +10,7 @@
 //! `docs/architecture/DESKTOP_GENERATIVE_SURFACES_PROPOSAL.md`.
 
 pub mod catalog;
+pub mod lower;
 pub mod pointer;
 pub mod record;
 pub mod validate;
