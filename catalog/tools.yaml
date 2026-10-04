@@ -2790,6 +2790,72 @@ tools:
         type: string
     required: []
     type: object
+- tool_name: ui.surface.create
+  class: surface
+  description: 'Show the operator an interface you build from data: an A2UI v0.9 surface (catalog philotic.desktop.v1).
+    Components are a flat list of objects {"id", "component", ...props}; one must have id "root". Children are referenced
+    by id. Allowed components: Text {text, variant h1-h5|body|caption}, Column/Row/List {children: [ids] or {componentId,
+    path}}, Card {child}, Divider, Button {child: id of a Text label, action: {event: {name, context}}}, TextField,
+    CheckBox, ChoicePicker, Slider, Modal, Table {columns: [{header, field}], rows}. Any value may be a literal or
+    {"path": "/data/pointer"} into data_model (relative paths inside a List template). No functions, images or URLs.
+    The hotel assigns the surface id and button action ids. The result says outcome=displayed only if the operator
+    was actually shown it; on Telegram only Text, Column, Row, List, Card, Divider and Button can be shown today. A
+    button press comes back to you as a [surface action] message. Never claim you showed a surface unless the outcome
+    says displayed.'
+  input_schema:
+    properties:
+      title:
+        description: Short title for the surface, e.g. 'Hotel status'.
+        type: string
+      components:
+        description: A2UI v0.9 components (flat list, one with id 'root').
+        items:
+          type: object
+        type: array
+      data_model:
+        description: 'Optional initial data model object that components bind to with {"path": ...}.'
+        type: object
+    required:
+    - title
+    - components
+    type: object
+- tool_name: ui.surface.update
+  class: surface
+  description: 'Change a surface you created: replace or add components by id, replace the whole data_model, or set
+    one value with data_path (JSON Pointer) + data_value (omit data_value to remove the key). Only the surface owner
+    may update it. The result reports the delivery outcome like ui.surface.create.'
+  input_schema:
+    properties:
+      surface_id:
+        description: The id returned by ui.surface.create.
+        type: string
+      components:
+        description: Components to add or replace (matched by id).
+        items:
+          type: object
+        type: array
+      data_model:
+        description: Replacement data model object.
+        type: object
+      data_path:
+        description: JSON Pointer of one data-model value to set or remove, e.g. '/guests/0/status'.
+        type: string
+      data_value:
+        description: Value to set at data_path; omit to remove the key.
+    required:
+    - surface_id
+    type: object
+- tool_name: ui.surface.delete
+  class: surface
+  description: Delete a surface you created. Its buttons stop working.
+  input_schema:
+    properties:
+      surface_id:
+        description: The id returned by ui.surface.create.
+        type: string
+    required:
+    - surface_id
+    type: object
 - tool_name: procedure.get
   class: capability
   description: 'Fetches one procedural graph from the hotel by id: its tool-bound nodes, typed edges with

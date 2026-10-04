@@ -3421,6 +3421,11 @@ impl AgentRuntime {
                 .await
             }
 
+            // ── Surfaces (doc:desktop-generative-surfaces) ─────────────────
+            "ui.surface.create" | "ui.surface.update" | "ui.surface.delete" => {
+                self.handle_surface_tool(payload).await
+            }
+
             // ── Procedural graphs (doc:procedural-graphs) ──────────────────
             "procedure.get" => {
                 let args = &payload.arguments;
@@ -9233,7 +9238,7 @@ impl AgentRuntime {
     /// Deliver a procedure tool's result as an ordinary tool_result turn
     /// event (doc:procedural-graphs). Mirrors the inline literal every other
     /// hotel-backed tool arm carries.
-    async fn deliver_procedure_tool_result(
+    pub(super) async fn deliver_procedure_tool_result(
         &mut self,
         payload: ToolExecutionPayload,
         content: String,

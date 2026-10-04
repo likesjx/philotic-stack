@@ -72,6 +72,9 @@ use mcp_handling::*;
 #[path = "procedure_runtime.rs"]
 mod procedure_runtime;
 
+#[path = "surface_tools.rs"]
+mod surface_tools;
+
 #[path = "memory_explain_tool.rs"]
 mod memory_explain_tool;
 
@@ -2606,6 +2609,37 @@ impl AgentRuntime {
                 return Ok(());
             }
         }
+
+        // A pressed lowered-surface button (`sa:<action_id>`,
+        // doc:desktop-generative-surfaces) becomes a structured surface-action
+        // turn. A button whose surface is gone is answered, never guessed at.
+        let content = match task
+            .callback_data
+            .as_deref()
+            .and_then(ansible_mesh_core::surface::lower::parse_surface_action_callback)
+        {
+            Some(action_id) => match self
+                .surface_action_observation(&session_id, action_id)
+                .await
+            {
+                Some(observation) => observation,
+                None => {
+                    return self
+                        .reply_approval_notice(
+                            task_id,
+                            session_id,
+                            turn_id,
+                            chat_id,
+                            final_reply_to,
+                            final_reply_role,
+                            final_reply_guest_id,
+                            "That button is no longer active.",
+                        )
+                        .await;
+                }
+            },
+            None => content,
+        };
 
         if let Some(command) = parse_slash_command(&content) {
             match command {
@@ -9699,6 +9733,10 @@ mod tests {
     ) {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let (mut stream, _) = listener.accept().await.expect("accept");
+        let mut surfaces = std::collections::BTreeMap::<
+            String,
+            ansible_mesh_core::surface::record::SurfaceRecord,
+        >::new();
         loop {
             let buf = match async {
                 let mut len_buf = [0u8; 4];
@@ -9770,6 +9808,59 @@ mod tests {
                     serde_json::to_vec(&philotic_client::IpcResponse::ConfigureRoleOk {
                         role_name: role_name.clone(),
                     })
+                    .unwrap()
+                }
+                // Surfaces: the real apply logic over an in-memory store.
+                philotic_client::IpcRequest::ApplySurfaceMessages {
+                    surface_id,
+                    messages,
+                    title,
+                    session_id,
+                    chat_id,
+                    transport,
+                } => {
+                    use ansible_mesh_core::surface::record::{
+                        ApplyContext, apply_surface_messages,
+                    };
+                    let existing = surface_id.as_ref().and_then(|id| surfaces.get(id).cloned());
+                    let ctx = ApplyContext {
+                        caller_guest_id: "agent-stub".into(),
+                        source_hotel: "stub-hotel".into(),
+                        title: title.clone(),
+                        session_id: session_id.clone(),
+                        chat_id: chat_id.clone(),
+                        transport: transport.clone(),
+                        now: 1,
+                    };
+                    let next_id = format!("s{:026}", surfaces.len() + 1);
+                    let response = match apply_surface_messages(
+                        existing,
+                        || next_id,
+                        &ctx,
+                        messages,
+                        ansible_mesh_core::surface::new_action_id,
+                    ) {
+                        Ok(record) => {
+                            surfaces.insert(record.surface_id.clone(), record.clone());
+                            philotic_client::IpcResponse::success(
+                                "apply_surface_messages",
+                                Some(serde_json::to_value(&record).unwrap()),
+                            )
+                        }
+                        Err(e) => philotic_client::IpcResponse::error(
+                            "apply_surface_messages",
+                            e.code(),
+                            e.to_string(),
+                        ),
+                    };
+                    serde_json::to_vec(&response).unwrap()
+                }
+                philotic_client::IpcRequest::ListSurfaces { .. } => {
+                    let list: Vec<_> = surfaces.values().cloned().collect();
+                    serde_json::to_vec(&philotic_client::IpcResponse::success(
+                        "list_surfaces",
+                        Some(serde_json::json!({ "surfaces": list })),
+                    ))
                     .unwrap()
                 }
                 _ => {
@@ -14048,6 +14139,171 @@ mod tests {
             callback_data: Some(callback_data.into()),
             ..Default::default()
         }
+    }
+
+    fn surface_tool_payload(
+        session_id: &str,
+        tool_name: &str,
+        arguments: serde_json::Value,
+    ) -> crate::runtime::ToolExecutionPayload {
+        crate::runtime::ToolExecutionPayload {
+            action: "tool_execution",
+            session_id: session_id.into(),
+            turn_id: "turn-1".into(),
+            chat_id: "555".into(),
+            tool_name: tool_name.into(),
+            arguments,
+            execution_mode: "local".into(),
+            agent_id: "agent-stub".into(),
+            user_id: None,
+            runner_id: None,
+            incarnation_id: None,
+            hotel_id: None,
+            environment_id: None,
+            task_runner_kind: None,
+            task_runner_config: None,
+            selection_reason: None,
+            workspace_ref: None,
+            task_runner_overlay: None,
+            return_route: None,
+            reply_to: "agent-node".into(),
+            reply_role: "agent".into(),
+            reply_guest_id: None,
+            final_reply_to: "membrane-node-01".into(),
+            final_reply_role: "membrane".into(),
+            final_reply_guest_id: Some("membrane-seat-1".into()),
+        }
+    }
+
+    /// desktop-generative-surfaces S1b: ui.surface.create stores the surface on
+    /// the hotel, sends the lowered Telegram message with `sa:` buttons, and a
+    /// tap on one of those buttons comes back as a [surface action] turn.
+    /// `execute_local_agent_tool`'s state machine overflows the default test
+    /// stack (see `tool_exec::tests::run_with_big_stack`); run on a big one.
+    #[test]
+    fn surface_create_lowers_to_telegram_and_a_tap_returns_as_an_action() {
+        std::thread::Builder::new()
+            .stack_size(64 * 1024 * 1024)
+            .spawn(|| {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("runtime")
+                    .block_on(surface_create_lowers_body());
+            })
+            .expect("spawn")
+            .join()
+            .expect("surface test panicked");
+    }
+
+    async fn surface_create_lowers_body() {
+        let (mut runtime, emitted, server, socket_path) = plan_test_runtime("surface").await;
+        let session_id = "sess-surface";
+        runtime
+            .ensure_session_loaded(session_id, "telegram")
+            .await
+            .expect("session load");
+        runtime
+            .sessions
+            .get_mut(session_id)
+            .expect("session")
+            .start_turn(def004_working_turn("turn-1", "ui.surface.create"));
+
+        runtime
+            .execute_local_agent_tool(surface_tool_payload(
+                session_id,
+                "ui.surface.create",
+                serde_json::json!({
+                    "title": "Guests",
+                    "components": [
+                        {"id": "root", "component": "Column", "children": ["t", "go"]},
+                        {"id": "t", "component": "Text", "text": {"path": "/guest"}},
+                        {"id": "l", "component": "Text", "text": "Restart"},
+                        {"id": "go", "component": "Button", "child": "l",
+                         "action": {"event": {"name": "restart_guest"}}}
+                    ],
+                    "data_model": {"guest": "beacon"}
+                }),
+            ))
+            .await
+            .expect("surface tool");
+
+        // A separate free session receives the tap (the mock lists all surfaces).
+        let tap_session = "sess-surface-tap";
+        runtime
+            .ensure_session_loaded(tap_session, "telegram")
+            .await
+            .expect("tap session load");
+
+        let callback = {
+            let emitted = emitted.lock().unwrap();
+            let reply = emitted
+                .iter()
+                .find(|e| {
+                    e["task"]["action"] == "send_reply" && e["task"]["reply_markup"].is_object()
+                })
+                .unwrap_or_else(|| panic!("no lowered surface message: {emitted:#?}"));
+            assert_eq!(reply["task"]["content"], "beacon");
+            assert_eq!(reply["target_role"], "membrane");
+            let data = reply["task"]["reply_markup"]["inline_keyboard"][0][0]["callback_data"]
+                .as_str()
+                .unwrap()
+                .to_string();
+            assert!(data.starts_with("sa:a") && data.len() == 16, "{data}");
+            data
+        };
+
+        runtime
+            .handle_user_message(
+                InboundTaskPayload {
+                    session_id: Some(tap_session.into()),
+                    chat_id: Some("555".into()),
+                    content: Some(format!("Telegram callback action: {callback}")),
+                    callback_data: Some(callback),
+                    ..Default::default()
+                },
+                Uuid::new_v4(),
+            )
+            .await
+            .expect("tap handled");
+        let turn = runtime
+            .session(tap_session)
+            .expect("session")
+            .active_turn
+            .as_ref()
+            .expect("the tap starts a turn");
+        assert!(
+            turn.user_content.starts_with("[surface action]"),
+            "{}",
+            turn.user_content
+        );
+        assert!(turn.user_content.contains("restart_guest"));
+
+        // A button whose action no surface carries is answered, not guessed.
+        runtime
+            .handle_user_message(
+                InboundTaskPayload {
+                    session_id: Some("sess-dead-tap".into()),
+                    chat_id: Some("555".into()),
+                    content: Some("Telegram callback action: sa:a000000000000".into()),
+                    callback_data: Some("sa:a000000000000".into()),
+                    ..Default::default()
+                },
+                Uuid::new_v4(),
+            )
+            .await
+            .expect("dead tap handled");
+
+        drop(runtime);
+        let _ = server.await;
+        let _ = std::fs::remove_file(&socket_path);
+        let emitted = emitted.lock().unwrap();
+        assert!(
+            emitted
+                .iter()
+                .any(|e| e["task"]["content"] == "That button is no longer active."),
+            "dead tap must be answered: {emitted:#?}"
+        );
     }
 
     /// approval-action-ids: a tap on a card for an approval that is no longer

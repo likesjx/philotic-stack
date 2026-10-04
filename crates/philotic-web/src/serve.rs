@@ -778,6 +778,8 @@ pub async fn run(
             post(handle_routing_policy_disposition),
         )
         .route("/api/skills", get(handle_skills))
+        .route("/api/surfaces", get(handle_list_surfaces))
+        .route("/api/surfaces/:surface_id", get(handle_get_surface))
         .route("/api/toolsets", get(handle_toolsets))
         .route("/api/config", get(handle_config))
         .route("/api/config/telegram", get(handle_config_telegram))
@@ -3889,6 +3891,94 @@ async fn handle_skills(headers: HeaderMap, State(state): State<AppState>) -> Res
             Json(json!({"error": e.to_string()})),
         )
             .into_response(),
+    }
+}
+
+// ── GET /api/surfaces[/:surface_id] (doc:desktop-generative-surfaces) ─────────
+
+#[derive(Debug, serde::Deserialize, Default)]
+struct SurfaceListQuery {
+    owner: Option<String>,
+    session: Option<String>,
+    #[serde(default)]
+    include_deleted: bool,
+    limit: Option<usize>,
+}
+
+/// A surface record plus the A2UI messages a renderer replays to draw it.
+/// Surface data is only ever served from `/api/*`, which the edge fence and
+/// `check_auth` gate; the `/s/:id` page (S2) is a static shell that fetches it.
+fn surface_view(record: Value) -> Value {
+    let messages =
+        serde_json::from_value::<ansible_mesh_core::surface::record::SurfaceRecord>(record.clone())
+            .map(|r| r.state.to_messages())
+            .unwrap_or_default();
+    json!({ "surface": record, "messages": messages })
+}
+
+async fn handle_get_surface(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Path(surface_id): Path<String>,
+) -> Response {
+    if !check_auth(&headers, &state) {
+        return unauthorized();
+    }
+    match ipc_surface_request(
+        &state.socket,
+        IpcRequest::GetSurface {
+            surface_id: surface_id.clone(),
+        },
+    )
+    .await
+    {
+        Ok(Some(record)) => Json(surface_view(record)).into_response(),
+        Ok(None) => (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": format!("no surface {surface_id}")})),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": e.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
+async fn handle_list_surfaces(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Query(query): Query<SurfaceListQuery>,
+) -> Response {
+    if !check_auth(&headers, &state) {
+        return unauthorized();
+    }
+    let request = IpcRequest::ListSurfaces {
+        owner_agent_id: query.owner,
+        session_id: query.session,
+        include_deleted: query.include_deleted,
+        limit: query.limit,
+    };
+    match ipc_surface_request(&state.socket, request).await {
+        Ok(Some(data)) => Json(data).into_response(),
+        Ok(None) => Json(json!({"surfaces": []})).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": e.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
+/// `Ok(None)` for SURFACE_NOT_FOUND; other refusals are errors.
+async fn ipc_surface_request(socket: &str, request: IpcRequest) -> Result<Option<Value>> {
+    let mut client = connect_management_client(socket, "philotic-web-surfaces").await?;
+    match client.send_request(request).await? {
+        IpcResponse::Standard { ok: true, data, .. } => Ok(data),
+        IpcResponse::Standard { code, .. } if code == "SURFACE_NOT_FOUND" => Ok(None),
+        IpcResponse::Standard { message, .. } => Err(anyhow!(message)),
+        other => Err(anyhow!("unexpected surface response: {other:?}")),
     }
 }
 

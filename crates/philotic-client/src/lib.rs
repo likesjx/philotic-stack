@@ -1383,6 +1383,40 @@ pub enum IpcRequest {
     },
     /// List every procedural graph with its version and validation state.
     ListProcedures {},
+    /// Apply a batch of A2UI v0.9 messages to a philote-authored surface
+    /// (doc:desktop-generative-surfaces). `surface_id: None` creates one: the
+    /// batch must start with `createSurface` and the hotel mints the id. Every
+    /// message's `surfaceId` is normalised to the record's id and Button action
+    /// ids are minted hotel-side. Only the owning agent may change a surface.
+    /// Answers `Standard` with `data` = the stored `SurfaceRecord`.
+    ApplySurfaceMessages {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        surface_id: Option<String>,
+        messages: Vec<serde_json::Value>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        title: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        chat_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        transport: Option<String>,
+    },
+    /// Fetch one surface record by id (deleted surfaces included).
+    GetSurface {
+        surface_id: String,
+    },
+    /// Newest-first surfaces, optionally for one owner agent and/or session.
+    ListSurfaces {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        owner_agent_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session_id: Option<String>,
+        #[serde(default)]
+        include_deleted: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        limit: Option<usize>,
+    },
     /// Append one terminal plan evaluation to a procedure's run ledger.
     /// `run` is a serialized `ProcedureRunRecord`; the hotel stamps
     /// `recorded_at` and the caller's `agent_id` when absent.

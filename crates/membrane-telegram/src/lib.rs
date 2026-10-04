@@ -1573,6 +1573,14 @@ fn approval_callback_content(callback_data: &str) -> String {
 /// (Approve / Deny / Trust). Used to ack the callback query so Telegram
 /// dismisses the loading spinner — the slash-promotion ack path only fires
 /// for `/`-prefixed callback_data, which approval buttons don't use.
+/// True for a lowered surface button (`sa:<action_id>`); mirrors
+/// `ansible_mesh_core::surface::lower::parse_surface_action_callback`.
+fn is_surface_action_callback(callback_data: &str) -> bool {
+    callback_data
+        .strip_prefix("sa:")
+        .is_some_and(|id| !id.is_empty() && id.len() <= 64)
+}
+
 fn is_approval_callback(callback_data: &str) -> bool {
     callback_data == "approve"
         || callback_data.starts_with("approve:")
@@ -2641,7 +2649,9 @@ async fn seat_process_update(
                 &envelope.raw_transport_event,
             )
             .await;
-        } else if is_approval_callback(data) {
+        } else if is_approval_callback(data) || is_surface_action_callback(data) {
+            // Surface buttons (`sa:<action_id>`, doc:desktop-generative-surfaces)
+            // reach philote through the preserved callback_data; ack them too.
             // Approve/Deny/Trust buttons: the envelope already carries the
             // translated /approve or /deny content for philote, but the
             // callback query itself was never answered — Telegram keeps
@@ -5076,6 +5086,14 @@ mod tests {
             Some(start),
             tokio::time::Instant::now()
         ));
+    }
+
+    #[test]
+    fn surface_action_callbacks_are_recognised_for_ack() {
+        assert!(super::is_surface_action_callback("sa:a0123456789ab"));
+        assert!(!super::is_surface_action_callback("sa:"));
+        assert!(!super::is_surface_action_callback("approve:x"));
+        assert!(!super::is_surface_action_callback("/role x"));
     }
 
     #[test]

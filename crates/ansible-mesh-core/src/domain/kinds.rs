@@ -55,6 +55,11 @@ pub const NODE_KIND_PROCEDURE_RUN: &str = "procedure_run";
 /// Refiner-proposed edit to a procedure, with its trial outcome (P4). Never deleted.
 pub const NODE_KIND_PROCEDURE_PATCH: &str = "procedure_patch";
 
+// Desktop generative surfaces (doc:desktop-generative-surfaces, slice S1)
+/// A philote-authored A2UI surface (`surface::record::SurfaceRecord`). Deleted
+/// surfaces keep their node with status `deleted` so stale renderers can tell.
+pub const NODE_KIND_UI_SURFACE: &str = "ui_surface";
+
 // Relocation Ceremony (doc:relocation-ceremony, slice R6)
 /// A recorded, resumable multi-phase relocation of a role incarnation (and
 /// optionally its paired transport) from one hotel to another. Never deleted.
