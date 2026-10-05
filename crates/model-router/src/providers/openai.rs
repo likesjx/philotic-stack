@@ -549,7 +549,9 @@ impl OpenAIProvider {
     }
 
     fn parse_structured_text(content: &str) -> StructuredTextParts {
-        let Ok(value) = serde_json::from_str::<Value>(content) else {
+        // The whole reply as one object, or a leading object followed by the
+        // user-facing prose (DEF-219) — the prose then is the display text.
+        let Some((value, trailing_prose)) = super::split_structured_reply(content) else {
             return (None, None, None, None, None);
         };
 
@@ -561,7 +563,8 @@ impl OpenAIProvider {
             .get("display_text")
             .or_else(|| object.get("content"))
             .and_then(Value::as_str)
-            .map(str::to_string);
+            .map(str::to_string)
+            .or_else(|| (!trailing_prose.is_empty()).then(|| trailing_prose.clone()));
         let spoken_text = object
             .get("spoken_text")
             .and_then(Value::as_str)
@@ -906,6 +909,13 @@ impl OpenAIProvider {
 
         let (display_text, spoken_text, memory_concept, memory_candidate, active_plan) =
             Self::parse_structured_text(&content);
+        // A structured reply's user-facing text replaces the raw model output
+        // as `content` too, so a leading plan/JSON object never reaches the
+        // user (DEF-219). Unstructured replies pass through untouched.
+        let content = match (&display_text, super::split_structured_reply(&content)) {
+            (Some(text), Some((_, trailing_prose))) if !trailing_prose.is_empty() => text.clone(),
+            _ => content,
+        };
 
         Ok(ProviderOutput::Text {
             display_text: display_text.or_else(|| Some(content.clone())),
@@ -1936,6 +1946,60 @@ mod tests {
                 assert_eq!(display_text.as_deref(), Some("Hello"));
                 assert_eq!(spoken_text.as_deref(), Some("Hello there"));
                 assert_eq!(active_plan, Some(json!({ "goal": "test" })));
+            }
+            other => panic!("unexpected output: {:?}", other),
+        }
+    }
+
+    /// DEF-219: glm-5.3 (via OpenRouter) answered a plan-gated re-entry with
+    /// the plan object followed by the real answer; the whole thing used to be
+    /// sent to the user. The plan must be lifted out and only the prose sent.
+    #[tokio::test]
+    async fn leading_plan_object_is_lifted_out_of_the_reply() {
+        let app = Router::new().route(
+            "/v1/chat/completions",
+            post(|| async move {
+                Json(json!({
+                    "choices": [{
+                        "message": {
+                            "content": "{\"active_plan\":{\"goal\":\"Confirm the fix\",\"steps\":[{\"description\":\"Reply\",\"status\":\"done\",\"tool_name\":null}]}}\n\nAll good — the fix is working."
+                        }
+                    }]
+                }))
+            }),
+        );
+        let (base_url, _handle) = spawn_test_server(app).await;
+
+        let provider = OpenAIProvider::new(
+            reqwest::Client::new(),
+            Some(OpenAIAuth::ApiKey("secret".into())),
+            Some(base_url),
+            None,
+            None,
+            None,
+        );
+        let task = ControllerTask::from_value(&json!({
+            "kind": "text.generate",
+            "context": { "active_turn": { "text": "check" } }
+        }))
+        .unwrap();
+
+        match provider.invoke(&task).await.unwrap() {
+            ProviderOutput::Text {
+                content,
+                display_text,
+                active_plan,
+                ..
+            } => {
+                assert_eq!(content, "All good — the fix is working.");
+                assert_eq!(
+                    display_text.as_deref(),
+                    Some("All good — the fix is working.")
+                );
+                assert_eq!(
+                    active_plan.and_then(|plan| plan.get("goal").cloned()),
+                    Some(json!("Confirm the fix"))
+                );
             }
             other => panic!("unexpected output: {:?}", other),
         }
