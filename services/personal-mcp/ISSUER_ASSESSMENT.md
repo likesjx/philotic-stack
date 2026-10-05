@@ -20,7 +20,7 @@ refresh rotation/family revocation and stable internal subjects. It reuses the
 identity service and Mongo; no additional service/database is intrinsically
 required. See that worktree's `docs/PERSONAL_OAUTH.md`. Future Apple sign-in is
 planned through explicit verified identity mapping, without email-based linking.
-57 isolated identity tests (including real Mongo/HTTP handlers and gateway
+56 isolated identity tests (including real Mongo/HTTP handlers and gateway
 interoperability) and the original 43 gateway tests pass. Real ChatGPT linking,
 TLS/browser/provider acceptance, review and deployment remain blocked. No live
 setup occurred. This choice replaces the initial Keycloak recommendation below;

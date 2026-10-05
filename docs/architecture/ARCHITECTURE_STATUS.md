@@ -346,7 +346,7 @@ in `services/personal-mcp`, reusing the existing Muninn/LifeGraph frontdoors.
 43 synthetic gateway tests pass. Owner selected a first-party issuer in the
 existing identity deployment; the isolated identity worktree implements OAuth
 consent/code/PKCE, exact preregistered client binding, stable internal subjects,
-durable Mongo refresh/replay controls and revocation. 57 isolated identity tests
+durable Mongo refresh/replay controls and revocation. 56 isolated identity tests
 (including real Mongo and gateway contract interoperation), typecheck and build
 pass. Apple sign-in remains an explicit future adapter/linking seam. Actual
 ChatGPT/provider/browser acceptance and production review remain outstanding. No deployment,

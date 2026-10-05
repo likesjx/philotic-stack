@@ -73,7 +73,7 @@ use separate collections, exact bindings, atomic consumption/rotation and versio
 revocation. Website logout uses a protected POST and invalidates the subject's OAuth families;
 trusted disable/re-enable operations atomically increment admission versions.
 
-Validation: 57 identity tests pass with isolated Mongo and actual gateway
+Validation: 56 identity tests pass with isolated Mongo and actual gateway
 interoperability subtest; 43 original gateway tests pass. Typecheck and production
 identity build pass. These are synthetic local tests, not real provider/browser/
 ChatGPT acceptance. Keycloak is an alternative, not a requirement.
