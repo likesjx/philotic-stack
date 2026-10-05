@@ -1303,6 +1303,18 @@ async fn wait_for_shutdown(mut shutdown_rx: watch::Receiver<bool>) {
 /// routing bootstrap/auth workflows into System Settings. The server remains
 /// the authority on session issuance and API access, but it should not replace
 /// the desktop with a parallel HTML login applet.
+/// Longest silence tolerated on the operator chat reply leg between hotel
+/// frames. A real turn can re-enter the model (say-do gate) and then
+/// synthesize voice before its first frame lands; 30 s cut those off and
+/// surfaced "timed out waiting for operator chat reply" for turns that
+/// completed moments later.
+const OPERATOR_CHAT_REPLY_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// CSP for the embedded desktop. `media-src blob:` lets the Aiua chat panel
+/// play persona-voice audio it decodes from `operator_chat:voice_chunk`
+/// frames into page-created blob URLs (no remote media origins).
+const DESKTOP_CSP: &str = "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; media-src 'self' blob:; font-src 'self' data:; connect-src 'self' ws: wss:; object-src 'none'; frame-ancestors 'none'; base-uri 'self'";
+
 async fn handle_index(headers: HeaderMap, State(state): State<AppState>) -> Response {
     serve_index_for_session(&state, current_operator_session(&headers, &state).as_ref()).await
 }
@@ -1353,9 +1365,7 @@ async fn serve_index_for_session(
     );
     headers.insert(
         header::CONTENT_SECURITY_POLICY,
-        HeaderValue::from_static(
-            "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data:; connect-src 'self' ws: wss:; object-src 'none'; frame-ancestors 'none'; base-uri 'self'",
-        ),
+        HeaderValue::from_static(DESKTOP_CSP),
     );
     response
 }
@@ -3357,7 +3367,7 @@ async fn stream_operator_chat_turn(
     }
 
     loop {
-        let inbound = tokio::time::timeout(Duration::from_secs(30), client.recv_task())
+        let inbound = tokio::time::timeout(OPERATOR_CHAT_REPLY_IDLE_TIMEOUT, client.recv_task())
             .await
             .map_err(|_| anyhow!("timed out waiting for operator chat reply"))??;
         let IpcResponse::InboundTask { task_json, .. } = inbound else {
@@ -9084,6 +9094,13 @@ fn oidc_callback_error_response(status: StatusCode, message: String) -> Response
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn desktop_csp_allows_blob_audio_but_no_remote_media() {
+        assert!(DESKTOP_CSP.contains("media-src 'self' blob:;"));
+        assert!(DESKTOP_CSP.contains("default-src 'self';"));
+        assert!(!DESKTOP_CSP.contains("media-src *"));
+    }
+
     #[test]
     fn operator_chat_message_kind_only_passes_voice() {
         assert_eq!(
