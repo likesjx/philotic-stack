@@ -1013,7 +1013,7 @@ pub(super) fn is_non_agent_infra_role(role: &str) -> bool {
     ) || role.ends_with("-runner")
 }
 
-fn is_response_like_agent_action(action: &str) -> bool {
+pub(super) fn is_response_like_agent_action(action: &str) -> bool {
     matches!(
         action,
         "model_response"
@@ -4439,7 +4439,31 @@ impl IpcServer {
         };
         graph
             .list_guests(&local_hotel_name, false)
-            .map(|guests| guests.into_iter().any(|guest| guest.guest_id == guest_id))
+            .map(|guests| {
+                guests.into_iter().any(|guest| {
+                    guest.guest_id == guest_id || Self::guest_record_hosts_agent(&guest, guest_id)
+                })
+            })
+            .unwrap_or(false)
+    }
+
+    /// A base philote guest record is keyed `<hotel>:philote-<name>` but registers
+    /// over IPC as its `PHILOTIC_AGENT_ID` (e.g. `agent-coach`). Treat that record
+    /// as hosting the agent id so routing doesn't mistake a locally configured
+    /// agent for a remote one (DEF-217).
+    fn guest_record_hosts_agent(guest: &GuestRecord, agent_id: &str) -> bool {
+        if guest.role != "agent" {
+            return false;
+        }
+        serde_json::from_str::<serde_json::Value>(&guest.config_json)
+            .ok()
+            .and_then(|config| {
+                config
+                    .get("env")
+                    .and_then(|env| env.get("PHILOTIC_AGENT_ID"))
+                    .and_then(serde_json::Value::as_str)
+                    .map(|id| id == agent_id)
+            })
             .unwrap_or(false)
     }
 
@@ -6619,7 +6643,20 @@ impl IpcServer {
                 // so the mesh dispatcher forwards the task to the correct hotel automatically.
                 let target_node = if target_node == local_node_id {
                     if let Some(ref guest_id) = resolved_target_guest_id {
-                        if !Self::configured_local_guest_exists(graph, local_node_id, guest_id) {
+                        // A guest subscribed to this inbox right now is local by
+                        // definition — never forward its task to a peer whose
+                        // roster happens to name the same agent (DEF-217).
+                        let is_live_local = {
+                            let guard = inboxes.lock().await;
+                            guard
+                                .get(target_role.as_str())
+                                .into_iter()
+                                .flatten()
+                                .any(|subscriber| &subscriber.guest_id == guest_id)
+                        };
+                        if !is_live_local
+                            && !Self::configured_local_guest_exists(graph, local_node_id, guest_id)
+                        {
                             let reg = registry.read().await;
                             if let Some(remote) =
                                 Self::resolve_guest_home_node(graph, &reg, guest_id)
@@ -20194,6 +20231,44 @@ pub(crate) mod tests {
             } => (code, message),
             other => panic!("expected register error, got: {other:?}"),
         }
+    }
+
+    /// DEF-217: a base philote record `mac-jane:philote-coach` registers over
+    /// IPC as `agent-coach`; routing must treat it as locally configured.
+    #[test]
+    fn guest_record_hosts_agent_matches_philotic_agent_id() {
+        let record = |role: &str, env_agent: &str| GuestRecord {
+            hotel_name: "mac-jane".into(),
+            guest_id: "mac-jane:philote-coach".into(),
+            role: role.into(),
+            config_json: serde_json::json!({
+                "command": "philote",
+                "env": {"PHILOTIC_AGENT_ID": env_agent}
+            })
+            .to_string(),
+            is_active: true,
+            active_pid: None,
+            last_active_at: None,
+        };
+        assert!(IpcServer::guest_record_hosts_agent(
+            &record("agent", "agent-coach"),
+            "agent-coach"
+        ));
+        assert!(!IpcServer::guest_record_hosts_agent(
+            &record("agent", "agent-bjork-01"),
+            "agent-coach"
+        ));
+        // Only base agent records count; a tool/model guest never hosts an agent.
+        assert!(!IpcServer::guest_record_hosts_agent(
+            &record("model.openrouter", "agent-coach"),
+            "agent-coach"
+        ));
+        let mut malformed = record("agent", "agent-coach");
+        malformed.config_json = "not json".into();
+        assert!(!IpcServer::guest_record_hosts_agent(
+            &malformed,
+            "agent-coach"
+        ));
     }
 
     /// Self-Improvement Loop L1: a distill-origin registration lands as Draft

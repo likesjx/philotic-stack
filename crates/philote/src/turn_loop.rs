@@ -991,6 +991,7 @@ impl AgentRuntime {
     pub async fn run(&mut self) -> Result<()> {
         info!("Listening for inbound Persona tasks from the Philotic Web...");
         self.fetch_agent_profile().await;
+        self.fetch_default_fallback_tiers().await;
         self.fetch_role_names().await;
         self.fetch_memory_config().await;
 
@@ -3235,6 +3236,15 @@ impl AgentRuntime {
                     .map(|tlc| tlc.fallback_tiers.clone())
             })
             .unwrap_or_default();
+        // No role ladder: walk the operator default (DEF-216), matching the
+        // primary dispatch in `role_ladder_tiers` so the two never disagree.
+        let configured_tiers = if configured_tiers.is_empty() {
+            operator_default_ladder()
+                .map(<[String]>::to_vec)
+                .unwrap_or_default()
+        } else {
+            configured_tiers
+        };
 
         // Per-agent model NAME bindings (Layer 1 — same precedence source as
         // `configured_tiers` above, so a live `ConfigureRole` edit and the

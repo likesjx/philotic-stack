@@ -11,8 +11,8 @@
 
 use super::ipc::{
     AgentRouteResolution, DeliveryClaimRegistry, InboxRegistry, IpcServer, ParkTarget,
-    ParkedInboundTask, attach_agent_graph_snapshot, claim_delivery, lookup_agent_authority_hotel,
-    placement_marker_policy, unix_ts,
+    ParkedInboundTask, attach_agent_graph_snapshot, claim_delivery, is_response_like_agent_action,
+    lookup_agent_authority_hotel, placement_marker_policy, unix_ts,
 };
 use crate::LedgerCommand;
 use crate::service::guest_manager::GuestMaterializationRequester;
@@ -1199,16 +1199,37 @@ impl IpcServer {
                     // falling through to the orchestrator. Without this, a cross-hotel
                     // paracrine turn's model_response is rerouted to bjork/orchestrator
                     // because the session's active_incarnation_id was never set via mesh.
-                    if let (Some(guest_id), Some(session_id)) = (
-                        &target_guest_id,
-                        serde_json::from_str::<serde_json::Value>(data)
-                            .ok()
-                            .and_then(|v| {
-                                v.get("session_id")
-                                    .and_then(serde_json::Value::as_str)
-                                    .map(str::to_string)
-                            }),
-                    ) {
+                    //
+                    // Only a turn-STARTING delivery may move the session's owner. A
+                    // reply (a vps life.recall `datasource_response` mid-turn) used to
+                    // flip it to another process, so the turn's own model_response
+                    // followed the flip to a process with no active turn and was
+                    // dropped — the first turn of every fresh session (DEF-214).
+                    let is_reply = serde_json::from_str::<serde_json::Value>(data)
+                        .ok()
+                        .and_then(|v| {
+                            v.get("action")
+                                .and_then(serde_json::Value::as_str)
+                                // A handoff bundle starts the specialist's turn, so
+                                // it still claims the session.
+                                .map(|action| {
+                                    action != "handoff_bundle"
+                                        && is_response_like_agent_action(action)
+                                })
+                        })
+                        .unwrap_or(false);
+                    if !is_reply
+                        && let (Some(guest_id), Some(session_id)) = (
+                            &target_guest_id,
+                            serde_json::from_str::<serde_json::Value>(data)
+                                .ok()
+                                .and_then(|v| {
+                                    v.get("session_id")
+                                        .and_then(serde_json::Value::as_str)
+                                        .map(str::to_string)
+                                }),
+                        )
+                    {
                         if let Err(err) =
                             Self::update_session_active_incarnation(graph, &session_id, guest_id)
                         {
@@ -1289,6 +1310,17 @@ impl IpcServer {
         base_guest: &str,
         task_json: &str,
     ) -> Option<String> {
+        // The live base process already owns this session here (it took the
+        // turn, so the session's local delivery provenance names it and no
+        // other incarnation is active): keep the address. Rewriting a mid-turn
+        // reply to `:orchestrator` stranded the turn running in the base
+        // process (DEF-214). DEF-179's case — no session yet, or one owned by
+        // an incarnation — still falls through to the resolution below.
+        if Self::base_process_owns_session(graph, inboxes, local_node_id, base_guest, task_json)
+            .await
+        {
+            return None;
+        }
         if let AgentRouteResolution::Deliver(Some(guest_id)) = Self::resolve_agent_route(
             graph,
             inboxes,
@@ -1312,6 +1344,50 @@ impl IpcServer {
                 .any(|subscriber| subscriber.guest_id == orchestrator)
         };
         live.then_some(orchestrator)
+    }
+
+    /// Whether the session named in `task_json` is owned on this hotel by the
+    /// live base process `base_guest`: no other incarnation is active and the
+    /// session's local delivery provenance points at the base id.
+    async fn base_process_owns_session(
+        graph: &GraphDomain,
+        inboxes: &InboxRegistry,
+        local_node_id: &str,
+        base_guest: &str,
+        task_json: &str,
+    ) -> bool {
+        let Some(session) = serde_json::from_str::<serde_json::Value>(task_json)
+            .ok()
+            .and_then(|payload| {
+                payload
+                    .get("session_id")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string)
+            })
+            .and_then(|session_id| graph.get_session(&session_id).ok().flatten())
+        else {
+            return false;
+        };
+        if session
+            .active_incarnation_id
+            .as_deref()
+            .is_some_and(|active| active != base_guest)
+        {
+            return false;
+        }
+        let local_hotel_name = Self::local_hotel_name(graph, local_node_id);
+        let provenance_names_base =
+            Self::local_delivery_provenance_hint(&session, local_hotel_name.as_deref())
+                .is_some_and(|hint| hint.guest_id == base_guest);
+        if !provenance_names_base {
+            return false;
+        }
+        let guard = inboxes.lock().await;
+        guard
+            .get("agent")
+            .into_iter()
+            .flatten()
+            .any(|subscriber| subscriber.guest_id == base_guest)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -5594,6 +5670,131 @@ mod tests {
                 guest_id: "agent-beacon:orchestrator".into()
             },
             "poisoned hint rejected; routing must fall back to the agent's orchestrator"
+        );
+    }
+
+    /// DEF-214: a cross-hotel reply addressed to the base agent id mid-turn (vps
+    /// life.recall `datasource_response`) must stay with the live base process
+    /// that owns the session — rewriting it to `:orchestrator` stranded the turn.
+    /// DEF-179's cases (no session yet / session owned by an incarnation) still
+    /// resolve to the orchestrator process.
+    #[tokio::test]
+    async fn remote_task_for_base_agent_stays_with_base_process_that_owns_session() {
+        let _env_guard = ipc_env_guard();
+        let now = unix_ts();
+        let graph_store = SqliteGraphStorage::open(":memory:").expect("open sqlite graph store");
+        let graph = Arc::new(GraphDomain::new(Arc::new(graph_store.adapter())));
+        graph
+            .upsert_hotel(&HotelRecord {
+                hotel_name: "local-hotel".into(),
+                capabilities: NodeCapabilities {
+                    node_id: "local-aiua-01".into(),
+                    roles: vec![],
+                    models: vec![],
+                    tools: vec![],
+                    constraints: Default::default(),
+                    build_version: String::new(),
+                },
+                mesh_port: 9000,
+                blob_port: 9001,
+                execution_port: 9002,
+                ipc_socket_path: "/tmp/unused.sock".into(),
+                active_pid: None,
+                mesh_host: None,
+            })
+            .expect("seed local hotel");
+        let session = |id: &str, active: Option<&str>| SessionRecord {
+            session_id: id.into(),
+            session_kind: "conversation".into(),
+            primary_agent_id: None,
+            active_incarnation_id: active.map(str::to_string),
+            channel_kind: Some("operator_chat".into()),
+            channel_session_key: Some(id.into()),
+            status: "active".into(),
+            lease_owner_component_id: None,
+            lease_expires_at: None,
+            summary_json: serde_json::json!({
+                "agent_runtime_provenance": {
+                    "delivery_hotel": "local-hotel",
+                    "delivery_target_guest_id": "agent-bjork-01",
+                    "delivery_target_role": "agent",
+                    "marker_kind": "transport_continuity",
+                    "marker_source": "operator_chat",
+                    "updated_at": now.saturating_sub(1)
+                }
+            }),
+            created_at: now.saturating_sub(30),
+            updated_at: now,
+        };
+        graph
+            .upsert_session(&session("sess-base-owned", None))
+            .expect("seed base-owned session");
+        graph
+            .upsert_session(&session(
+                "sess-orchestrator-owned",
+                Some("agent-bjork-01:orchestrator"),
+            ))
+            .expect("seed orchestrator-owned session");
+
+        let inboxes: InboxRegistry = Arc::new(Mutex::new(HashMap::new()));
+        let (tx, _rx) = mpsc::unbounded_channel::<IpcResponse>();
+        let mut subscribed_roles = Vec::new();
+        for guest in ["agent-bjork-01", "agent-bjork-01:orchestrator"] {
+            IpcServer::add_subscription(
+                &inboxes,
+                "agent",
+                Uuid::new_v4(),
+                guest,
+                &[],
+                &crate::service::ipc::CountedSender::detached(&tx),
+                &mut subscribed_roles,
+            )
+            .await;
+        }
+        let reply = |session_id: &str| {
+            serde_json::json!({
+                "action": "datasource_response",
+                "session_id": session_id,
+                "delivery_target_guest_id": "agent-bjork-01"
+            })
+            .to_string()
+        };
+
+        assert_eq!(
+            IpcServer::resolve_agent_process_for_remote_task(
+                &graph,
+                &inboxes,
+                "local-aiua-01",
+                "agent-bjork-01",
+                &reply("sess-base-owned"),
+            )
+            .await,
+            None,
+            "the base process owns the session: keep the address (DEF-214)"
+        );
+        assert_eq!(
+            IpcServer::resolve_agent_process_for_remote_task(
+                &graph,
+                &inboxes,
+                "local-aiua-01",
+                "agent-bjork-01",
+                &reply("sess-not-here-yet"),
+            )
+            .await,
+            Some("agent-bjork-01:orchestrator".into()),
+            "no session yet: the orchestrator process answers (DEF-179)"
+        );
+        assert_eq!(
+            IpcServer::resolve_agent_process_for_remote_task(
+                &graph,
+                &inboxes,
+                "local-aiua-01",
+                "agent-bjork-01",
+                &reply("sess-orchestrator-owned"),
+            )
+            .await,
+            Some("agent-bjork-01:orchestrator".into()),
+            "an incarnation owns the session: deliver to it"
         );
     }
 
