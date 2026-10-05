@@ -1179,7 +1179,7 @@ Seam IDs: `structured-model-envelope`, `hotel-gemini-oauth-flow`
   - Coach `voice_response_policy.model` `eleven_v3` → `eleven_v4` (agent_identity bundle DB patch + Coach philote respawn; not live-verified, see DEF-217).
   - Smoke-green: a fresh bjork session's text came from `deepseek-v4.1-flash` and its voice from `eleven_v4_turbo`. An existing session refreshes with `/role theoretician` then `/role orchestrator` (verified); don't use `/model` there (DEF-218).
   - [ ] Same OpenRouter/ladder change on mbp-jane and vps-jane.
-  - [ ] DEF-214 (first turn of every new session dropped), DEF-217 (coach operator-chat rerouted to vps), DEF-216 (code-default ladder is Gemini-first).
+  - [x] Fixed in code, `codex/model-routing-defects` (deploy pending): DEF-214 (first turn dropped; the hotel moved session ownership on a mid-turn vps reply), DEF-217 (coach operator-chat rerouted to vps), DEF-218 (`/model` wrote a stale ladder back), DEF-216 (new hotel config `default_fallback_tiers`).
   - [ ] v4 audio tags in `spoken_text` (strip before Kokoro + captions). Optional: Text-to-Dialogue websocket client for lower first-audio than per-sentence HTTP.
 
 ### Workstream: Model Graph Decision Layer
