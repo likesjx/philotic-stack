@@ -192,6 +192,19 @@ struct OperatorChatTurnBody {
     #[serde(default)]
     conversation_id: Option<String>,
     content: String,
+    /// `"voice"` asks the agent to answer with its persona voice (the same
+    /// marker membranes stamp on voice notes); anything else is a text turn.
+    #[serde(default)]
+    message_kind: Option<String>,
+}
+
+/// Only `"voice"` is meaningful to the philote; drop anything else rather
+/// than forwarding arbitrary client strings into the task.
+fn operator_chat_message_kind(raw: Option<&str>) -> Option<String> {
+    match raw.map(str::trim) {
+        Some(kind) if kind.eq_ignore_ascii_case("voice") => Some("voice".to_string()),
+        _ => None,
+    }
 }
 
 #[derive(Clone, serde::Serialize)]
@@ -3104,7 +3117,7 @@ async fn handle_mesh_target_agent_chat(
         &operator_session_id,
         conversation_id,
         body.content,
-        None,
+        operator_chat_message_kind(body.message_kind.as_deref()),
         Vec::new(),
     )
     .await
@@ -9071,6 +9084,21 @@ fn oidc_callback_error_response(status: StatusCode, message: String) -> Response
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn operator_chat_message_kind_only_passes_voice() {
+        assert_eq!(
+            operator_chat_message_kind(Some("voice")),
+            Some("voice".into())
+        );
+        assert_eq!(
+            operator_chat_message_kind(Some(" Voice ")),
+            Some("voice".into())
+        );
+        assert_eq!(operator_chat_message_kind(Some("text")), None);
+        assert_eq!(operator_chat_message_kind(Some("audio; drop table")), None);
+        assert_eq!(operator_chat_message_kind(None), None);
+    }
+
     use super::*;
     use ansible_mesh_core::storage::EventStorage;
     use std::fs;
