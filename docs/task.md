@@ -2369,7 +2369,7 @@ Audit 2026-09-30 (full read: philote Muninn lane, `data-memorygraphrag` runner, 
 
 ## Personal MCP OAuth recall boundary
 
-Branch: `codex/percival-oauth`; [proposal](architecture/PERSONAL_MCP_OAUTH_PROPOSAL.md).
+Branch: `codex/percival-oauth`; draft [#616](https://github.com/likesjx/philotic-stack/pull/616), paired identity [#9](https://github.com/likesjx/jaredlikes-com/pull/9); [proposal](architecture/PERSONAL_MCP_OAUTH_PROPOSAL.md).
 
 - [x] Implement local recall-only OAuth protected-resource adapter over existing frontdoors; independent Muninn/LifeGraph scopes, pinned issuer introspection, exact audience/operator/client checks and revocation rechecks.
 - [x] Pass 43 synthetic Node gateway tests, including success-field suppression.

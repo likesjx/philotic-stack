@@ -48,7 +48,7 @@ unverified. No credentials, admission records or live routes were configured.
 43 synthetic Node tests pass, including real ephemeral HTTP request/response
 tests. PKCE, callbacks and consent test the fake issuer; only requests through
 the actual gateway establish gateway paths under synthetic upstream contracts. No actual issuer, personal data, credentials, backend grants, or deployment
-was used. No Rust code changed. Source remains local/uncommitted by instruction.
+was used. No Rust code changed. Source is published in draft PR [#616](https://github.com/likesjx/philotic-stack/pull/616), paired with identity [#9](https://github.com/likesjx/jaredlikes-com/pull/9). Neither is merged or deployed.
 
 The adapter's direct outbound requests are confined to pinned issuer endpoints
 and explicit recall backend URLs; no user-supplied URL or general HTTP tool exists.

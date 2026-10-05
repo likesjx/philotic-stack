@@ -341,7 +341,7 @@ When a slice lands:
 
 ### Local personal MCP OAuth source (2026-10-05)
 
-`codex/percival-oauth` adds an uncommitted recall-only protected-resource adapter
+`codex/percival-oauth` adds a draft recall-only protected-resource adapter
 in `services/personal-mcp`, reusing the existing Muninn/LifeGraph frontdoors.
 43 synthetic gateway tests pass. Owner selected a first-party issuer in the
 existing identity deployment; the isolated identity worktree implements OAuth
