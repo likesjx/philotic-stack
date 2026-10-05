@@ -3,7 +3,7 @@
 // operator-owned deployment steps; this program only binds literal loopback.
 import { readFile } from 'node:fs/promises';
 import { pathToFileURL } from 'node:url';
-import { createPersonalMcp, issuerAdapter, frontdoorAdapter } from './gateway.mjs';
+import { createPersonalMcp, issuerAdapter, frontdoorAdapter, createDiscoveryBootstrap, selectedTools } from './gateway.mjs';
 
 export async function start(config, env = process.env) {
   const secret = name => {
@@ -11,13 +11,20 @@ export async function start(config, env = process.env) {
     return env[name];
   };
   if (!Number.isInteger(config.port) || config.port < 1024 || config.port > 65535) throw new Error('Explicit unprivileged port required');
+  const enabledTools = selectedTools(config.enabledTools);
+  if (config.mode !== undefined && !['active', 'discovery-only'].includes(config.mode)) throw new Error('Unknown mode');
+  if (config.mode === 'discovery-only') {
+    const server = createDiscoveryBootstrap({ resource: config.resource, issuer: config.issuer.issuer, enabledTools });
+    await new Promise((resolve, reject) => { server.once('error', reject); server.listen(config.port, '127.0.0.1', resolve); });
+    return server;
+  }
   if (!Array.isArray(config.allowedSubjects) || !Array.isArray(config.allowedClients)) throw new Error('Explicit operator/client arrays required');
   const endpoints = Object.fromEntries(Object.entries(config.upstreams || {}).map(([tool, value]) => [tool,
     { url: value.url, credential: async () => secret(value.credentialEnv) }]));
   const issuer = issuerAdapter({ ...config.issuer, clientSecret: secret(config.issuer.clientSecretEnv) });
-  const upstream = frontdoorAdapter({ endpoints });
+  const upstream = frontdoorAdapter({ endpoints, enabledTools });
   const server = await createPersonalMcp({ resource: config.resource, issuer, upstream,
-    allowedSubjects: new Set(config.allowedSubjects), allowedClients: new Set(config.allowedClients), muninnVault: config.muninnVault });
+    allowedSubjects: new Set(config.allowedSubjects), allowedClients: new Set(config.allowedClients), muninnVault: config.muninnVault, enabledTools });
   await new Promise((resolve, reject) => { server.once('error', reject); server.listen(config.port, '127.0.0.1', resolve); });
   return server;
 }

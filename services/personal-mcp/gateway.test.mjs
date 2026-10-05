@@ -8,14 +8,14 @@ const claims = () => ({ active: true, iss: authority, aud: resource, sub: 'synth
   iat: 1000, exp: 1900, scope: 'memory:recall life:recall' });
 async function fixture(t, mutate = value => value, options = {}) {
   const calls = []; let active = true;
-  const server = await createPersonalMcp({ resource, clock: () => 1100000, muninnVault: 'default',
+  const server = await createPersonalMcp({ resource, enabledTools: options.enabledTools ?? ['muninn_recall', 'life.recall'], clock: () => 1100000, muninnVault: 'default',
     allowedSubjects: new Set(['synthetic-operator']), allowedClients: new Set(['synthetic-client']),
     issuer: { issuer: authority, ready: async () => {}, inspect: async token => {
       if (options.inspect) return options.inspect(token);
       if (token !== 'synthetic-access-token') return { active: false };
       return mutate({ ...claims(), active });
     } }, upstream: {
-      list: async name => ({ name, description: 'Synthetic context', inputSchema: { type: 'object' } }),
+      list: async name => { options.list?.(name); return ({ name, description: 'Synthetic context', inputSchema: { type: 'object' } }); },
       call: async (name, args) => { calls.push({ name, args }); return options.call ? options.call(name, args) : { content: [{ type: 'text', text: 'synthetic packet' }] }; },
     } });
   server.listen(0, '127.0.0.1'); await new Promise(resolve => server.once('listening', resolve));
@@ -134,14 +134,14 @@ test('frontdoor selects per-tool credentials, checks response IDs and never forw
   const requests = [];
   const endpoints = Object.fromEntries(Object.keys({ muninn_recall: 1, 'life.recall': 1 }).map(name => [name,
     { url: 'http://127.0.0.1:9999/mcp', credential: async () => 'synthetic-scoped-backend' }]));
-  const adapter = frontdoorAdapter({ endpoints, fetchImpl: async (url, options) => {
+  const adapter = frontdoorAdapter({ endpoints, enabledTools: ['muninn_recall', 'life.recall'], fetchImpl: async (url, options) => {
     requests.push(options); const request = JSON.parse(options.body);
     return Response.json({ jsonrpc: '2.0', id: request.id, result: { content: [] } });
   } });
   await adapter.call('life.recall', { query_text: 'synthetic' });
   assert.equal(requests[0].headers.Authorization, 'Bearer synthetic-scoped-backend');
   assert.equal(JSON.parse(requests[0].body).params.name, 'life.recall');
-  const broken = frontdoorAdapter({ endpoints, fetchImpl: async () => Response.json({ jsonrpc: '2.0', id: 'wrong', result: {} }) });
+  const broken = frontdoorAdapter({ endpoints, enabledTools: ['muninn_recall', 'life.recall'], fetchImpl: async () => Response.json({ jsonrpc: '2.0', id: 'wrong', result: {} }) });
   await assert.rejects(broken.call('life.recall', {}));
 });
 test('bad configuration cannot create a gateway', async () => {
@@ -234,3 +234,34 @@ test('successful recall drops top-level and text-item diagnostic extras', async 
   assert.deepEqual(message.result, { isError: false, content: [{ type: 'text', text: 'approved recall' }] });
   assert.doesNotMatch(JSON.stringify(message), /private-diagnostic|debug|secret|structuredContent|_meta|annotations/);
 });
+
+test('Muninn-only startup, metadata and broad-token calls never touch LifeGraph', async t => {
+  const listed = [];
+  const f = await fixture(t, value => ({ ...value, scope: '* memory:recall life:recall' }), { enabledTools: ['muninn_recall'], list: name => listed.push(name) });
+  assert.deepEqual(listed, ['muninn_recall']);
+  const metadata = await (await fetch(f.base + '/.well-known/oauth-protected-resource/personal/mcp')).json();
+  assert.deepEqual(metadata.scopes_supported, ['memory:recall']);
+  const denied = await f.rpc('tools/list', {}, { Authorization: '' });
+  assert.doesNotMatch(denied.headers.get('www-authenticate'), /life:recall/);
+  const tools = (await (await f.rpc('tools/list')).json()).result.tools;
+  assert.deepEqual(tools.map(tool => tool.name), ['muninn_recall']);
+  assert.equal((await (await f.rpc('tools/call', { name: 'life.recall', arguments: { query_text: 'excluded' } })).json()).error.code, -32602);
+  assert.equal(f.calls.length, 0);
+  await f.rpc('tools/call', { name: 'muninn_recall', arguments: { context: ['synthetic'] } });
+  assert.deepEqual(f.calls[0], { name: 'muninn_recall', args: { context: ['synthetic'], vault: 'default', read_only: true, limit: 10 } });
+});
+test('default backend requires only Muninn and refuses disabled tools before credential access', async () => {
+  let credentialReads = 0, fetches = 0;
+  const backend = frontdoorAdapter({ endpoints: { muninn_recall: { url: 'http://127.0.0.1:9999/mcp', credential: async () => { credentialReads++; return 'synthetic'; } } },
+    fetchImpl: async (_url, init) => { fetches++; const rpc = JSON.parse(init.body); return Response.json({ jsonrpc: '2.0', id: rpc.id, result: { tools: [{ name: 'muninn_recall', inputSchema: {} }] } }); } });
+  await assert.rejects(backend.call('life.recall', {}));
+  assert.equal(credentialReads, 0); assert.equal(fetches, 0);
+  await backend.list('muninn_recall');
+  assert.equal(credentialReads, 1); assert.equal(fetches, 1);
+});
+for (const enabledTools of [[], ['unknown'], ['muninn_recall', 'muninn_recall'], 'muninn_recall']) {
+  test(`invalid enabled tool selection rejected: ${JSON.stringify(enabledTools)}`, async () => {
+    assert.throws(() => frontdoorAdapter({ endpoints: {}, enabledTools }));
+    await assert.rejects(createPersonalMcp({ resource, enabledTools }));
+  });
+}

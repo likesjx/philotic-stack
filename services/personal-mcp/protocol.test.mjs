@@ -109,9 +109,9 @@ async function fixture(t) {
   };
   const provider = issuerAdapter({ issuer, discovery: issuer + '/.well-known/oauth-authorization-server',
     introspection: issuer + '/introspect', clientId: 'fixture-introspection', clientSecret: 'synthetic-secret', fetchImpl: fixtureFetch });
-  const backend = frontdoorAdapter({ fetchImpl: fixtureFetch, endpoints: Object.fromEntries(['muninn_recall', 'life.recall'].map(name => [name,
+  const backend = frontdoorAdapter({ enabledTools: ['muninn_recall', 'life.recall'], fetchImpl: fixtureFetch, endpoints: Object.fromEntries(['muninn_recall', 'life.recall'].map(name => [name,
     { url: 'https://backend.example.test/mcp', credential: async () => 'synthetic-backend-grant' }])) });
-  const gateway = await createPersonalMcp({ resource, issuer: provider, upstream: backend, muninnVault: 'synthetic-vault',
+  const gateway = await createPersonalMcp({ resource, enabledTools: ['muninn_recall', 'life.recall'], issuer: provider, upstream: backend, muninnVault: 'synthetic-vault',
     allowedSubjects: new Set(['synthetic-operator']), allowedClients: new Set(['synthetic-client']) });
   const gatewayBase = await listen(t, gateway);
   const register = () => fetch(base + '/register', { method: 'POST', headers: { 'Content-Type': 'application/json' },

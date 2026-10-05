@@ -6,12 +6,12 @@ syntax with `npm run check`. Tests use synthetic identities/content and ephemera
 loopback listeners only.
 
 The gateway reuses the existing `membrane-mcp` tool contracts. It serves only
-`muninn_recall` (`memory:recall`) and `life.recall` (`life:recall`) at the exact
+`muninn_recall` (`memory:recall`) by default at the exact
 configured resource path, with protected-resource metadata at the root and
 path-specific well-known URI. Unauthenticated requests receive the discovery
 challenge. Tools are both filtered and checked before dispatch. Recall is forced
 to `read_only: true` for Muninn. No write/admin/graph/session tool can be dispatched.
-Muninn reads are pinned to the configured vault (`default` in the synthetic
+Muninn reads are pinned to the configured vault (`user_likesjx` in the
 example); client-supplied other vaults are denied. Choose the intended personal
 vault explicitly before deployment. Startup has no implicit vault default.
 Recall arguments use a curated bounded schema, reject unknown fields, and cap
@@ -25,6 +25,38 @@ OAuth user tokens never reach backend endpoints. Each backend needs its own
 operator-provisioned **recall-only** grant; do not reuse the 16-tool cloud-agent
 grant. The service binds only `127.0.0.1`; production HTTPS and host routing remain
 operator-owned. No service/supervisor or public route is installed by this slice.
+
+## Muninn-only configuration and bootstrap
+
+`enabledTools` defaults to `["muninn_recall"]`. A nonempty, unique list of
+supported names is required when specified. Both the resource server and backend
+adapter enforce the selection, so a broad OAuth token cannot enable a disabled
+tool. Startup probes only selected upstreams; metadata, challenges and tool lists
+advertise only selected scopes. LifeGraph requires a separate explicit
+`"life.recall"` selection and its own grant. It is excluded from this example and
+from the approved personal connection.
+
+Set `mode: "discovery-only"` to serve only path-specific protected-resource
+metadata and an unauthenticated challenge at the MCP path. This mode reads no
+credentials, initializes no issuer/upstream, returns no tools or private data,
+and does not issue tokens. The host-wide root well-known route is deliberately
+absent in bootstrap mode. Publish only the path-specific route on a shared host.
+This is **not a completed plugin registration**: the real issuer discovery must
+also work, and ChatGPT may require authenticated initialization. Never substitute
+the synthetic issuer fixture or relax callback matching to finish registration.
+Remove discovery-only mode only after pinning the actual callback, subject,
+client, resource and scoped backend grant and verifying the issuer.
+
+Provision a separate Muninn `observe` key pinned to `user_likesjx`; never reuse a
+full-mode hotel key or mixed frontdoor grant. The existing hotel load-config
+provisioner mints `full` keys, so it is not the supported least-privilege path for
+this connection. The Muninn admin API/CLI supports `observe` keys, but CLI output
+contains the token once. An operator must authenticate through a private terminal
+and store that output directly in a protected server-side secret file/store,
+without chat, logs, shell arguments or clipboard transfer. Do not expose the
+Muninn admin API publicly. Verify deployed authorization and no-learning behavior
+before admitting private recall; a version label or dirty build stamp is not
+sufficient provenance.
 
 ## OAuth authority boundary
 

@@ -2,6 +2,13 @@ import { createServer } from 'node:http';
 import { createHash } from 'node:crypto';
 
 export const SCOPES = Object.freeze({ muninn_recall: 'memory:recall', 'life.recall': 'life:recall' });
+export function selectedTools(value = ['muninn_recall']) {
+  if (!Array.isArray(value) || !value.length || value.length > Object.keys(SCOPES).length ||
+      new Set(value).size !== value.length || value.some(tool => !Object.hasOwn(SCOPES, tool))) {
+    throw new Error('Explicit nonempty unique supported tools required');
+  }
+  return [...value];
+}
 const versions = ['2025-11-25', '2025-06-18', '2025-03-26'];
 class Rejected extends Error {
   constructor(status, code) { super(code); this.status = status; this.code = code; }
@@ -96,8 +103,9 @@ function recallArguments(tool, args, vault) {
   return { ...args, max_context_packets: args.max_context_packets ?? 6 };
 }
 
-export function frontdoorAdapter({ endpoints, fetchImpl = fetch }) {
-  for (const tool of Object.keys(SCOPES)) {
+export function frontdoorAdapter({ endpoints, enabledTools, fetchImpl = fetch }) {
+  const tools = selectedTools(enabledTools);
+  for (const tool of tools) {
     const config = endpoints[tool];
     if (!config || typeof config.credential !== 'function') throw new Error(`Missing scoped upstream for ${tool}`);
     const url = new URL(config.url);
@@ -108,6 +116,7 @@ export function frontdoorAdapter({ endpoints, fetchImpl = fetch }) {
   }
   let sequence = 0;
   async function rpc(tool, method, params) {
+    if (!tools.includes(tool)) deny(403, 'tool_not_enabled');
     const { url, credential } = endpoints[tool];
     const secret = await credential();
     if (typeof secret !== 'string' || !secret || /[\r\n]/.test(secret)) deny(503, 'upstream_unavailable');
@@ -131,7 +140,8 @@ export function frontdoorAdapter({ endpoints, fetchImpl = fetch }) {
 }
 
 export async function createPersonalMcp({ resource, issuer, upstream, allowedSubjects, allowedClients,
-  clock = () => Date.now(), maxLifetimeSeconds = 900, muninnVault }) {
+  clock = () => Date.now(), maxLifetimeSeconds = 900, muninnVault, enabledTools }) {
+  const tools = selectedTools(enabledTools);
   const canonical = httpsUrl(resource);
   if (!canonical.pathname.endsWith('/mcp')) throw new Error('Resource must identify the MCP path');
   if (!(allowedSubjects instanceof Set) || !allowedSubjects.size || !(allowedClients instanceof Set) || !allowedClients.size) {
@@ -143,7 +153,7 @@ export async function createPersonalMcp({ resource, issuer, upstream, allowedSub
   if (typeof muninnVault !== 'string' || !/^[A-Za-z0-9_-]{1,128}$/.test(muninnVault)) throw new Error('Explicit bounded Muninn vault required');
   await issuer.ready({ allowPreregistered: true }); // Explicit client allowlist supports pre-registration.
   const descriptors = new Map();
-  for (const tool of Object.keys(SCOPES)) {
+  for (const tool of tools) {
     const descriptor = await upstream.list(tool);
     descriptors.set(tool, { name: tool, description: descriptor.description, inputSchema: recallSchema(tool, muninnVault),
       annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false },
@@ -152,8 +162,8 @@ export async function createPersonalMcp({ resource, issuer, upstream, allowedSub
   }
   const metadataPath = '/.well-known/oauth-protected-resource' + canonical.pathname;
   const metadataUrl = canonical.origin + metadataPath;
-  const challenge = `Bearer resource_metadata="${metadataUrl}", scope="memory:recall life:recall"`;
-  const metadata = { resource, authorization_servers: [issuer.issuer], scopes_supported: Object.values(SCOPES), bearer_methods_supported: ['header'] };
+  const challenge = `Bearer resource_metadata="${metadataUrl}", scope="${tools.map(tool => SCOPES[tool]).join(' ')}"`;
+  const metadata = { resource, authorization_servers: [issuer.issuer], scopes_supported: tools.map(tool => SCOPES[tool]), bearer_methods_supported: ['header'] };
   function presentedToken(req) {
     if (req.rawHeaders.filter((header, index) => index % 2 === 0 && header.toLowerCase() === 'authorization').length !== 1) deny(401, 'invalid_token');
     const match = /^Bearer ([\x21-\x7e]{1,4096})$/.exec(req.headers.authorization || '');
@@ -255,5 +265,28 @@ export async function createPersonalMcp({ resource, issuer, upstream, allowedSub
   server.requestTimeout = 15000;
   server.headersTimeout = 10000;
   server.maxHeadersCount = 64;
+  return server;
+}
+
+// Public resource discovery only: no issuer/credential initialization, RPC, or data.
+// This does not make a plugin ready: the real issuer must also publish discovery.
+export function createDiscoveryBootstrap({ resource, issuer, enabledTools }) {
+  const canonical = httpsUrl(resource);
+  httpsUrl(issuer);
+  if (!canonical.pathname.endsWith('/mcp')) throw new Error('Resource must identify the MCP path');
+  const scopes = selectedTools(enabledTools).map(tool => SCOPES[tool]);
+  const path = '/.well-known/oauth-protected-resource' + canonical.pathname;
+  const server = createServer((req, res) => {
+    const url = new URL(req.url, canonical.origin);
+    const discovery = req.method === 'GET' && !url.search && url.pathname === path;
+    const mcp = url.pathname === canonical.pathname && !url.search;
+    res.writeHead(discovery ? 200 : mcp ? 401 : 404, {
+      'Content-Type': 'application/json', 'Cache-Control': 'no-store', 'X-Content-Type-Options': 'nosniff',
+      ...(mcp ? { 'WWW-Authenticate': `Bearer resource_metadata="${canonical.origin + path}", scope="${scopes.join(' ')}"` } : {}),
+    });
+    res.end(JSON.stringify(discovery ? { resource, authorization_servers: [issuer], scopes_supported: scopes, bearer_methods_supported: ['header'] }
+      : { error: mcp ? 'setup_incomplete' : 'not_found' }));
+  });
+  server.requestTimeout = 15000; server.headersTimeout = 10000; server.maxHeadersCount = 64;
   return server;
 }
