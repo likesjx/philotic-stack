@@ -3,7 +3,7 @@ title: Agent Frontdoor — Remote Agents Reach Muninn + Intel-Graph Through memb
 doc_type: proposal
 domain: operator-control-plane
 status: in_progress
-last_updated: 2026-09-30
+last_updated: 2026-10-05
 tags:
 - mcp
 - membrane-mcp
@@ -318,6 +318,136 @@ live Mac changed the design in one place and fixed two script bugs:
   the Cortex bearer local Claude uses resolves to the `default` vault.
 - Upstream owners: `agent-bjork-01` (intel-graph on mac-jane),
   `agent-beacon` (muninn-cortex and the endpoint on vps-jane).
+
+## Next slices (2026-10-05)
+
+S1–S3, S5 and S6 are live (public UAT 2026-10-01: 16 tools, round trips
+single-wrapped, grant revocation immediate). The work below closes what the
+2026-10-01 handoff (`docs/HANDOFF-2026-10-01-agent-frontdoor-cloud.md`) left
+open. Each slice is small and can be done from a cloud session up to the
+deploy step.
+
+### F1 — Task expiry for frontdoor dispatches: rest of DEF-211 (S–M)
+
+**Problem.**
+- Inside the 15 s peer TTL, an `execute_tool` EmitTask to a sleeping mac-jane
+  is queued with `created_at: 0, expires_at: None` (`aiua/src/service/ipc.rs:6807-6822`).
+- The caller sees a 30 s timeout (`membrane-mcp/src/server.rs:34`), and the
+  task can still run when the Mac wakes. A retried `session_start` or
+  `graph_decide` may then apply twice.
+
+**Plan.**
+- This is slice L5 of `MESH_DELIVERY_GUARANTEES_PROPOSAL.md`, scoped down:
+  1. stamp `created_at` and `expires_at` (ms) = now + 25 s on `execute_tool`
+     EmitTasks;
+  2. the mesh dispatcher (`mesh_dispatcher.rs:261-356`) skips expired events
+     and answers the local originator with a `TARGET_NODE_UNREACHABLE`-style
+     error, so membrane-mcp returns a clear error before its own 30 s
+     timeout;
+  3. the receiver refuses expired envelopes as well.
+- If L4's dead-letter table isn't there yet, log plus a heal tag
+  `mesh_task_expired` is enough for F1.
+
+**Tests.**
+- Dispatcher unit test: an expired event is never sent and produces the
+  error reply.
+- `ipc.rs`: `execute_tool` envelopes carry `expires_at`.
+
+**Live check.**
+1. With mac-jane asleep, `graph_status` via `/agent/mcp` errors in ≤ 25 s.
+2. After waking the Mac, nothing runs late (the intel-graph session log is
+   unchanged).
+
+### F2 — Fix the two older provisioning scripts: DEF-209 (S)
+
+Port the `register` op plus the read-until-reply framing, already used by
+`scripts/provision-agent-frontdoor.py`, to these two scripts. Use an
+owner-prefixed guest id (`<owner>:mcp-provisioner`) and role `operator`
+(not `hotel.internal`, which `PERIMETER_ENFORCEMENT_PROPOSAL.md` P2 will
+reserve).
+- `scripts/provision-lifegraph-mcp.py`
+- `scripts/provision-mcp-bearer.py`
+
+Factor the shared framing into `scripts/philotic_ipc.py` so the four
+provisioning scripts stop drifting.
+
+**Verification.**
+- `DRY_RUN`-style unit test of the framing against a fake socket that pushes
+  an unsolicited frame first.
+- Re-run `provision-lifegraph-mcp.py` on vps-jane against the existing
+  endpoint (idempotent), then `mcp-client-uat.sh lifegraph-recall`.
+
+### F3 — Server-side caller tag on Muninn writes (S)
+
+**Where.** `membrane-mcp-client` already receives the authenticated principal
+(`agent_id = mcp:<token_id>`, `crates/membrane-mcp-client/src/main.rs:199`).
+
+**Plan.**
+- Add an optional per-tool `inject_caller_tags: bool` to `McpUpstreamToolGrant`
+  (`ansible-mesh-core/src/mcp_upstream.rs`, `#[serde(default)]`).
+- When set, `execute_call` appends `["remote-agent", "<token_id>"]` to
+  `arguments.tags` (creating the array if absent) before calling upstream.
+- Enable it for `muninn_remember` and `muninn_decide` on the `muninn-cortex`
+  registration.
+
+**Tests.**
+- Tags are appended, not replaced.
+- Absent `tags` creates the array.
+- Tools without the flag are untouched.
+
+**Live check.** `muninn_remember` via the frontdoor, then `muninn_recall` with
+`tags_any: ["claude-cloud"]` returns it.
+
+### F4 — Local Codex on mac-jane writes to the Cortex (S, ops)
+
+Local Codex points at the Mac Muninn observer, which rejects writes with
+`-32002`. To fix it:
+- give the Codex harness a Cortex bearer (operator Keychain) and the tailnet
+  URL of the vps-jane native Muninn MCP, through an SSH tunnel per
+  `MUNINN_DIRECT_CLIENT_ACCESS.md`;
+- or point it at the frontdoor with a `codex-local` grant (simpler, and the
+  same tools).
+
+The decision is operator-side. Recommendation: the frontdoor grant. It gives
+one path and one credential class for every agent.
+
+**Verification.** A Codex `muninn_remember` from mac-jane appears on the
+Cortex.
+
+### F5 — Real argument schemas in `tools/list` (S–M)
+
+v1 advertises `{"type":"object"}`. This slice:
+- extends `scripts/provision-agent-frontdoor.py` to fetch each upstream's
+  projected catalog (`GetMcpUpstreams` returns the reported
+  `McpUpstreamCatalog`) and copy `input_schema` and `description` into the
+  endpoint tool specs;
+- runs it from vps-jane for `muninn-cortex`, and over the mesh query for
+  `intel-graph`'s catalog on mac-jane.
+
+**Verification.** `tools/list` shows real `properties` for `muninn_recall`
+and `graph_context_for`.
+
+### F6 — Token rotation drill and expiry alarm (S, ops)
+
+- **Expiry.** Grants expire around 2026-10-30. Add a `phil doctor` check
+  `mcp.grant-expiry` that warns 7 days before any endpoint grant's
+  `expires_at`.
+- **Rotation drill** before the 10-30 expiry:
+  1. rerun `provision-agent-frontdoor.py` (rotates every agent);
+  2. update the cloud environment variables and the Keychain;
+  3. run `mcp-client-uat.sh agent-frontdoor`;
+  4. confirm the old token is refused.
+- Record the drill per `MCP_CREDENTIAL_LIFECYCLE.md`.
+
+### F7 — Housekeeping (S)
+
+- Remove the stale unchecked "S1 … not yet compiled" line in `docs/task.md`,
+  which the checked S1 line below it supersedes.
+- Move this proposal to `implemented`, with per-slice SVER levels, once F1
+  and F6 are done.
+
+**Ordering:** F2, F3, F5 and F7 are independent and cloud-doable. F1 rides
+with mesh L5 or ships standalone. F4 and F6 need the operator.
 
 ## Open questions
 

@@ -445,6 +445,19 @@ Seam IDs: `session-compaction`
 - [x] Add approval interrupts with explicit history and a pre-approval runtime path.
 - [x] Extend the shared cross-component task error envelope beyond the current model/TTS path so tool-runner, membrane, and other routed components return structured failures instead of silent fallback strings.
 
+## Atlas Follow-Through (2026-10-05)
+
+Six work items from the 2026-09-30 Philotic Stack Atlas assessment, each with a detailed plan. All are `proposed`, waiting on operator approval, and each plan ends with "Operator decisions needed".
+
+- [ ] Mesh delivery guarantees (L1–L7): [MESH_DELIVERY_GUARANTEES_PROPOSAL.md](architecture/MESH_DELIVERY_GUARANTEES_PROPOSAL.md). DEF-182/184/192/059/211/185.
+- [ ] Watch-live burn-down (W0–W7): [WATCH_LIVE_BURNDOWN_PROPOSAL.md](architecture/WATCH_LIVE_BURNDOWN_PROPOSAL.md). Inventory, status vocabularies, procedure/hygiene/relocation proofs, doctor readiness.
+- [ ] IPC dispatch split (S0–S6): [IPC_DISPATCH_SPLIT_PROPOSAL.md](architecture/IPC_DISPATCH_SPLIT_PROPOSAL.md). `ipc.rs` → `ipc/` family modules, plus park-path fixes.
+- [ ] Release train (R0–R7): [RELEASE_TRAIN_PROPOSAL.md](architecture/RELEASE_TRAIN_PROPOSAL.md). Sync main, `v0.2.0`, release artifacts, versioned installs, rollback, rollout proof.
+- [ ] Perimeter enforcement (P1–P8): [PERIMETER_ENFORCEMENT_PROPOSAL.md](architecture/PERIMETER_ENFORCEMENT_PROPOSAL.md). IPC identity, config ACL, vault AAD, MAC v2, signed placement, egress policy.
+- [ ] Agent frontdoor next slices (F1–F7): [AGENT_FRONTDOOR_PROPOSAL.md § Next slices](architecture/AGENT_FRONTDOOR_PROPOSAL.md). DEF-211 rest, DEF-209, caller tags, schemas, rotation.
+
+Cross-plan coordination: mesh L5 ⟷ frontdoor F1 (same change); IPC split S3/S5 must not run concurrently with perimeter P2/P3 or mesh L5; release R2 feeds watch-live W7.
+
 ## New Project: Agent Frontdoor (remote agents → Muninn + intel-graph)
 
 Proposal: [AGENT_FRONTDOOR_PROPOSAL.md](architecture/AGENT_FRONTDOOR_PROPOSAL.md). Handoff: [HANDOFF-2026-09-30-agent-frontdoor-mac-jane.md](HANDOFF-2026-09-30-agent-frontdoor-mac-jane.md).
