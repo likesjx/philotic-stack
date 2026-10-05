@@ -1167,7 +1167,12 @@ Seam IDs: `structured-model-envelope`, `hotel-gemini-oauth-flow`
   - `follow_up_questions`
 - [ ] Add `spoken_text` / expressive speech projection alongside user-visible text.
 - [ ] Define ElevenLabs default-voice pinning plus upstream voice override behavior.
-- [ ] Add Eleven v3 model selection and expressive-tag support without pretending it is the same as the low-latency conversational path.
+- [~] ~~Add Eleven v3 model selection and expressive-tag support~~ — superseded by Eleven v4 (2026-10-05, `codex/elevenlabs-v4`):
+  - [x] Spike: `eleven_v4` **and** `eleven_v4_turbo` both work on the existing HTTP `/v1/text-to-speech/{voice}/stream` path (live through mac-jane `model.elevenlabs`; bogus model id → 400 control). v4 accepts `speed`/`style` without error (docs say ignored). No new transport needed.
+  - [x] model-router honours `elevenlabs_default_model` / `elevenlabs_base_url` (+ `PHILOTIC_ELEVENLABS_*` env); batch STT default `scribe_v1` → `scribe_v2`.
+  - [x] philotic-web REST operator chat accepts `message_kind: "voice"`; browser desktop (jaredlikes-desktop `codex/voice-chunk-playback`) consumes `operator_chat:reply|voice_chunk|error` and plays persona voice (toggle, ordered chunk queue, barge-in). Live: voice turn → `voice_chunk` with audio + `reply` via local philotic-web on mac-jane.
+  - [ ] Set hotel `elevenlabs_default_model=eleven_v4_turbo` once the new model-router is deployed; watched-live listen in the browser.
+  - [ ] v4 audio tags in `spoken_text` (strip before Kokoro + captions). Optional: Text-to-Dialogue websocket client for lower first-audio than per-sentence HTTP.
 
 ### Workstream: Model Graph Decision Layer
 
