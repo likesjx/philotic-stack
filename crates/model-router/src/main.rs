@@ -32,11 +32,15 @@ async fn main() -> Result<()> {
                     ),
                     configs.gemini_base_url.clone(),
                 )),
-                std::sync::Arc::new(ElevenLabsProvider::new(
-                    http_client.clone(),
-                    configs.elevenlabs_api_key.clone(),
-                    configs.elevenlabs_default_voice_id.clone(),
-                )),
+                std::sync::Arc::new(
+                    ElevenLabsProvider::new(
+                        http_client.clone(),
+                        configs.elevenlabs_api_key.clone(),
+                        configs.elevenlabs_default_voice_id.clone(),
+                    )
+                    .with_default_model(configs.elevenlabs_default_model.clone())
+                    .with_base_url(configs.elevenlabs_base_url.clone()),
+                ),
                 std::sync::Arc::new(OllamaProvider::new(
                     http_client,
                     configs.ollama_base_url.clone(),
