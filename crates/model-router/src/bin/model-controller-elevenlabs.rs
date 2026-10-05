@@ -12,11 +12,15 @@ async fn main() -> Result<()> {
             .as_deref()
             == Some("1"),
         providers: Box::new(|http_client, configs| {
-            vec![std::sync::Arc::new(ElevenLabsProvider::new(
-                http_client,
-                configs.elevenlabs_api_key.clone(),
-                configs.elevenlabs_default_voice_id.clone(),
-            ))]
+            vec![std::sync::Arc::new(
+                ElevenLabsProvider::new(
+                    http_client,
+                    configs.elevenlabs_api_key.clone(),
+                    configs.elevenlabs_default_voice_id.clone(),
+                )
+                .with_default_model(configs.elevenlabs_default_model.clone())
+                .with_base_url(configs.elevenlabs_base_url.clone()),
+            )]
         }),
         live_providers: Box::new(|_http_client, _configs| Vec::new()),
     })
