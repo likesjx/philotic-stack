@@ -1171,7 +1171,15 @@ Seam IDs: `structured-model-envelope`, `hotel-gemini-oauth-flow`
   - [x] Spike: `eleven_v4` **and** `eleven_v4_turbo` both work on the existing HTTP `/v1/text-to-speech/{voice}/stream` path (live through mac-jane `model.elevenlabs`; bogus model id → 400 control). v4 accepts `speed`/`style` without error (docs say ignored). No new transport needed.
   - [x] model-router honours `elevenlabs_default_model` / `elevenlabs_base_url` (+ `PHILOTIC_ELEVENLABS_*` env); batch STT default `scribe_v1` → `scribe_v2`.
   - [x] philotic-web REST operator chat accepts `message_kind: "voice"`; browser desktop (jaredlikes-desktop `codex/voice-chunk-playback`) consumes `operator_chat:reply|voice_chunk|error` and plays persona voice (toggle, ordered chunk queue, barge-in). Live: voice turn → `voice_chunk` with audio + `reply` via local philotic-web on mac-jane.
-  - [ ] Set hotel `elevenlabs_default_model=eleven_v4_turbo` once the new model-router is deployed; watched-live listen in the browser.
+  - [x] mac-jane (2026-10-05): `model-controller-elevenlabs` from `c4a510de` installed alone (new inode, re-signed; backup `Cellar/aiua/0.1.0-alpha/single-backup-model-controller-elevenlabs-20261005`), controller-only respawn, hotel `elevenlabs_default_model="eleven_v4_turbo"`. Smoke-green: no-model synth → `eleven_v4_turbo`; explicit `--model eleven_multilingual_v2` still wins; bjork operator-chat voice turn → `voice_chunk` voiced by `eleven_v4_turbo`. Rollback: reinstall the backup or `phil config set --hotel mac-jane elevenlabs_default_model '"eleven_multilingual_v2"'` + kill the controller (never set it empty).
+  - [ ] Same rollout on mbp-jane / vps-jane; watched-live listen in the browser (needs jaredlikes-desktop PR #20 + philotic-web from develop on the serving hotel).
+- [x] Gemini capped for October 2026, so mac-jane moved to OpenRouter only and newest models (2026-10-05):
+  - hotel config `openrouter_default_model=z-ai/glm-5.3` (was glm-5.2); `openrouter_fallback_models=["z-ai/glm-5.3-flash","qwen/qwen3.8-flash"]` (OpenRouter server-side `route: fallback`, read per task, so no restart).
+  - Model-only `ConfigureRole` over IPC for all 8 mac-jane role incarnations: ladder `[model.openrouter, model.ollama]` (Gemini `model` tier removed). bjork orchestrator binding `deepseek/deepseek-v3.2` → `deepseek/deepseek-v4.1-flash`. Backup: `~/.philotic/bjork/role_and_identity.bak-20261005T1500.json`.
+  - Coach `voice_response_policy.model` `eleven_v3` → `eleven_v4` (agent_identity bundle DB patch + Coach philote respawn; not live-verified, see DEF-217).
+  - Smoke-green: a fresh bjork session's text came from `deepseek-v4.1-flash` and its voice from `eleven_v4_turbo`. An existing session refreshes with `/role theoretician` then `/role orchestrator` (verified); don't use `/model` there (DEF-218).
+  - [ ] Same OpenRouter/ladder change on mbp-jane and vps-jane.
+  - [ ] DEF-214 (first turn of every new session dropped), DEF-217 (coach operator-chat rerouted to vps), DEF-216 (code-default ladder is Gemini-first).
   - [ ] v4 audio tags in `spoken_text` (strip before Kokoro + captions). Optional: Text-to-Dialogue websocket client for lower first-audio than per-sentence HTTP.
 
 ### Workstream: Model Graph Decision Layer
