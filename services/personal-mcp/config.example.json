@@ -1,0 +1,18 @@
+{
+  "resource": "https://mcp.example.test/personal/mcp",
+  "port": 8913,
+  "muninnVault": "default",
+  "issuer": {
+    "issuer": "https://identity.example.test",
+    "discovery": "https://identity.example.test/.well-known/oauth-authorization-server",
+    "introspection": "https://identity.example.test/introspect",
+    "clientId": "configured-confidential-introspection-client",
+    "clientSecretEnv": "PERSONAL_MCP_INTROSPECTION_SECRET"
+  },
+  "allowedSubjects": ["configured-operator-subject"],
+  "allowedClients": ["configured-plugin-oauth-client"],
+  "upstreams": {
+    "muninn_recall": { "url": "http://127.0.0.1:8912/mcp", "credentialEnv": "PERSONAL_MCP_MUNINN_RECALL_TOKEN" },
+    "life.recall": { "url": "http://127.0.0.1:8911/mcp", "credentialEnv": "PERSONAL_MCP_LIFE_RECALL_TOKEN" }
+  }
+}

@@ -2365,3 +2365,16 @@ Audit 2026-09-30 (full read: philote Muninn lane, `data-memorygraphrag` runner, 
 - [x] S10 Docs true-up: MEMORY_TRANSPARENCY stale promotion-seam claim corrected; MEMORY_CONTEXT superseded; REFLEXIVE_LIFE_GRAPH slice-1 status fixed.
 - [ ] Deploy: apply V007 on vps Memgraph, then standard 3-hotel rollout; watch one live turn for the auto-recall marker and one auto-capture carrying `origin_engram_id`.
 - [ ] Follow-ups (ranked): DEF-209 client ports; activate-side entity return; positive reinforcement in `life.recall.feedback`; Measurement importer (HealthKit); life.audit O(n²) → MAGE.
+
+
+## Personal MCP OAuth recall boundary
+
+Branch: `codex/percival-oauth`; [proposal](architecture/PERSONAL_MCP_OAUTH_PROPOSAL.md).
+
+- [x] Implement local recall-only OAuth protected-resource adapter over existing frontdoors; independent Muninn/LifeGraph scopes, pinned issuer introspection, exact audience/operator/client checks and revocation rechecks.
+- [x] Pass 43 synthetic Node gateway tests, including success-field suppression.
+- [x] Owner selected first-party issuer; implement in isolated identity worktree `codex/percival-first-party-oauth`, using existing sign-in/Mongo, exact preregistered bindings, consent/session CSRF, atomic hashed codes, refresh-family replay revocation and stable internal subject. Apple adapter/linking deferred explicitly.
+- [x] Identity typecheck/build pass; 57 tests pass with temporary isolated Mongo plus real gateway contract test, no skipped tests in that run.
+- [ ] Real ChatGPT/browser/provider acceptance, production security/edge review, exact owner admission and backend grants. Transitional Node resource boundary is retained for the test milestone; native membrane OAuth integration is not implemented.
+- [ ] Obtain explicit approval for live credentials/backend grants, persistent service, HTTPS routing and plugin connection; nothing deployed or connected.
+- [ ] Coordinate eventual proposed-evidence/continuity writes with Claude's October 5 frontdoor caller-tag and task-expiry plans.
