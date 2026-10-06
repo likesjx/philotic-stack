@@ -380,9 +380,16 @@ impl AnthropicProvider {
     /// Parse the structured-contract JSON out of a text reply.
     /// Returns `(display_text, spoken_text, memory_concept, memory_candidate, active_plan)`.
     fn parse_structured_text(content: &str) -> StructuredTextParts {
-        let Ok(value) = serde_json::from_str::<Value>(Self::strip_json_code_fences(content)) else {
-            return (None, None, None, None, None);
-        };
+        // Whole reply (optionally fenced) first; else a leading object followed
+        // by the user-facing prose (DEF-219).
+        let (value, trailing_prose) =
+            match serde_json::from_str::<Value>(Self::strip_json_code_fences(content)) {
+                Ok(value) => (value, String::new()),
+                Err(_) => match super::split_structured_reply(content) {
+                    Some(split) => split,
+                    None => return (None, None, None, None, None),
+                },
+            };
         let Some(object) = value.as_object() else {
             return (None, None, None, None, None);
         };
@@ -392,7 +399,8 @@ impl AnthropicProvider {
             .or_else(|| object.get("content"))
             .and_then(Value::as_str)
             .filter(|s| !s.trim().is_empty())
-            .map(str::to_string);
+            .map(str::to_string)
+            .or_else(|| (!trailing_prose.is_empty()).then(|| trailing_prose.clone()));
         let spoken_text = object
             .get("spoken_text")
             .and_then(Value::as_str)
@@ -467,6 +475,11 @@ impl AnthropicProvider {
             } else {
                 (None, None, None, None, None)
             };
+        // A leading object + prose reply sends only the prose (DEF-219).
+        let content = match (&display_text, super::split_structured_reply(&content)) {
+            (Some(text), Some((_, trailing_prose))) if !trailing_prose.is_empty() => text.clone(),
+            _ => content,
+        };
 
         Ok(ProviderOutput::Text {
             display_text: display_text.or_else(|| Some(content.clone())),
