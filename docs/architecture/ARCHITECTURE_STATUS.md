@@ -337,3 +337,19 @@ When a slice lands:
 - [README.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/README.md)
 - [ARCHITECTURE.md](/Users/jaredlikes/code/philotic-stack/docs/architecture/ARCHITECTURE.md)
 - [docs/task.md](/Users/jaredlikes/code/philotic-stack/docs/task.md)
+
+
+### Local personal MCP OAuth source (2026-10-05)
+
+`codex/percival-oauth` adds a draft recall-only protected-resource adapter
+in `services/personal-mcp`, reusing the existing Muninn/LifeGraph frontdoors.
+43 synthetic gateway tests pass. Owner selected a first-party issuer in the
+existing identity deployment; the isolated identity worktree implements OAuth
+consent/code/PKCE, exact preregistered client binding, stable internal subjects,
+durable Mongo refresh/replay controls and revocation. 56 isolated identity tests
+(including real Mongo and gateway contract interoperation), typecheck and build
+pass. Apple sign-in remains an explicit future adapter/linking seam. Actual
+ChatGPT/provider/browser acceptance and production review remain outstanding. No deployment,
+live credentials/grants or persistent plugin access exist from this slice.
+See [proposal](PERSONAL_MCP_OAUTH_PROPOSAL.md) and
+[task](../task.md#personal-mcp-oauth-recall-boundary).
