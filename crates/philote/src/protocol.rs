@@ -127,6 +127,33 @@ pub struct InboundTaskPayload {
     /// WaitingApproval with nobody awake and ride the watchdog to eviction.
     #[serde(default)]
     pub cron_preapproved_tools: Vec<String>,
+    /// Operator-owned turn policy of the firing cron job (aiua
+    /// `effective_cron_policy`): tool allowlist, preapprovals, approval mode.
+    /// Supersedes `cron_preapproved_tools`. Applied to the fired turn only.
+    #[serde(default)]
+    pub cron_policy: Option<ansible_mesh_core::cron::CronTurnPolicy>,
+}
+
+impl InboundTaskPayload {
+    /// The turn policy a cron fire runs under: the typed `cron_policy`, else
+    /// the legacy `cron_preapproved_tools` list. `None` for non-cron tasks —
+    /// cron keys on a task without `cron_job_id` are ignored.
+    pub fn effective_cron_policy(&self) -> Option<ansible_mesh_core::cron::CronTurnPolicy> {
+        self.cron_job_id.as_ref()?;
+        if let Some(policy) = self.cron_policy.clone() {
+            return Some(policy.normalized());
+        }
+        if self.cron_preapproved_tools.is_empty() {
+            return None;
+        }
+        Some(
+            ansible_mesh_core::cron::CronTurnPolicy {
+                preapproved_tools: self.cron_preapproved_tools.clone(),
+                ..Default::default()
+            }
+            .normalized(),
+        )
+    }
 }
 
 // Transitional note: older emitters may still carry failures in

@@ -198,6 +198,50 @@ impl AgentRuntime {
                 .unwrap_or(false)
         };
 
+        // Cron Turn Policy: an unattended cron turn must not park for an
+        // approval nobody can give — with no chat to ask (or a job whose
+        // operator chose `Deny`), the tool is refused now and the model carries
+        // on, instead of WaitingApproval riding the 300 s watchdog to eviction.
+        if !preapproved {
+            let unattended_denial = self.sessions.get(&session_id).and_then(|state| {
+                let turn = state.active_turn.as_ref()?;
+                let tool = turn.pending_tool_call.as_ref()?;
+                if !state.active_turn_is_cron() {
+                    return None;
+                }
+                let mode = state
+                    .active_cron_policy()
+                    .map(|p| p.approval_mode)
+                    .unwrap_or_default();
+                let deny = match mode {
+                    ansible_mesh_core::cron::CronApprovalMode::Deny => true,
+                    ansible_mesh_core::cron::CronApprovalMode::AskOrDeny => {
+                        turn.chat_id.trim().is_empty()
+                    }
+                };
+                deny.then(|| tool.tool_name.clone())
+            });
+            if let Some(tool_name) = unattended_denial {
+                warn!(
+                    session_id = %session_id,
+                    tool = %tool_name,
+                    "cron turn policy: approval needed but nobody to ask — tool denied"
+                );
+                let denial = format!(
+                    "'{tool_name}' needs operator approval, and this scheduled (cron) run cannot \
+                     ask for it. Do not retry it; finish without it and say in your reply that \
+                     the operator can preapprove '{tool_name}' for this job if it is needed."
+                );
+                if let Some(state) = self.sessions.get_mut(&session_id) {
+                    state.clear_pending_tool_call();
+                }
+                // Boxed: `handle_tool_result` is a very large future, and inlining it
+                // into this one overflows the 2 MiB test-thread stack.
+                return Box::pin(self.deliver_tool_denial(session_id, turn_id, tool_name, denial))
+                    .await;
+            }
+        }
+
         let (
             task_id,
             chat_id,
@@ -535,6 +579,33 @@ impl AgentRuntime {
                      Either call skill.register / memory.remember, or reply exactly: DISTILL: nothing",
                     tool_call.tool_name,
                     super::distill::TOOL_ALLOWLIST.join(", ")
+                );
+                return self
+                    .deliver_tool_denial(session_id, turn_id, tool_call.tool_name, denial)
+                    .await;
+            }
+
+            // Cron Turn Policy: the operator's allowlist for this cron job's
+            // fires. Enforced at dispatch so no prompt or plan can widen it.
+            let cron_allowlist_refusal = self.sessions.get(&session_id).and_then(|s| {
+                (!s.cron_turn_allows_tool(&tool_call.tool_name)).then(|| {
+                    let allowed = s
+                        .active_cron_policy()
+                        .and_then(|p| p.allowed_tools.clone())
+                        .unwrap_or_default();
+                    format!(
+                        "'{}' is not allowed in this scheduled (cron) run — the operator limited \
+                         this job to: {}. Finish with those tools or report what you could not do.",
+                        tool_call.tool_name,
+                        allowed.join(", ")
+                    )
+                })
+            });
+            if let Some(denial) = cron_allowlist_refusal {
+                warn!(
+                    session_id = %session_id,
+                    tool = %tool_call.tool_name,
+                    "cron turn policy: tool outside the job's allowlist refused"
                 );
                 return self
                     .deliver_tool_denial(session_id, turn_id, tool_call.tool_name, denial)
@@ -5836,21 +5907,36 @@ impl AgentRuntime {
 
             "cron.list" => {
                 use philotic_client::IpcRequest;
-                let (content, tool_err) =
-                    match self.ipc_client.send_request(IpcRequest::ListCronJobs).await {
-                        Ok(IpcResponse::CronJobList { jobs }) => {
-                            if jobs.is_empty() {
-                                ("No cron jobs registered on this hotel.".into(), None)
-                            } else {
-                                // Fire times render in both clocks (raw epoch ms
-                                // is unreadable to the model, and schedule fields
-                                // are raw UTC — DEF-090's confusion surface).
-                                let user_tz = self.default_agent_profile.user_timezone.clone();
-                                let lines: Vec<String> = jobs
+                let (content, tool_err) = match self
+                    .ipc_client
+                    .send_request(IpcRequest::ListCronJobs)
+                    .await
+                {
+                    Ok(IpcResponse::CronJobList { jobs }) => {
+                        if jobs.is_empty() {
+                            ("No cron jobs registered on this hotel.".into(), None)
+                        } else {
+                            // Fire times render in both clocks (raw epoch ms
+                            // is unreadable to the model, and schedule fields
+                            // are raw UTC — DEF-090's confusion surface).
+                            let user_tz = self.default_agent_profile.user_timezone.clone();
+                            let lines: Vec<String> = jobs
                                     .iter()
                                     .map(|j| {
+                                        let policy = match &j.policy {
+                                            None => String::new(),
+                                            Some(p) => format!(
+                                                " policy(operator): allow={} preapproved={} approval={:?}",
+                                                p.allowed_tools
+                                                    .as_ref()
+                                                    .map(|t| t.join(","))
+                                                    .unwrap_or_else(|| "role".into()),
+                                                p.preapproved_tools.join(","),
+                                                p.approval_mode,
+                                            ),
+                                        };
                                         format!(
-                                            "- id={} role={} schedule={} enabled={} next_fire={}",
+                                            "- id={} role={} schedule={} enabled={} next_fire={}{}",
                                             j.id,
                                             j.target_role,
                                             j.schedule,
@@ -5859,33 +5945,34 @@ impl AgentRuntime {
                                                 j.next_fire_at,
                                                 user_tz.as_deref(),
                                             ),
+                                            policy,
                                         )
                                     })
                                     .collect();
-                                (
-                                    format!("Cron jobs ({}):\n{}", jobs.len(), lines.join("\n")),
-                                    None,
-                                )
-                            }
+                            (
+                                format!("Cron jobs ({}):\n{}", jobs.len(), lines.join("\n")),
+                                None,
+                            )
                         }
-                        Ok(IpcResponse::Standard {
-                            ok: false,
-                            code,
-                            message,
-                            ..
-                        }) => {
-                            let e = TaskErrorPayload::ipc_failure("aiua", &*code, message);
-                            (e.display_message(), Some(e))
-                        }
-                        Ok(_) => ("cron.list: unexpected response".into(), None),
-                        Err(e) => {
-                            let err = TaskErrorPayload::transport_error(
-                                "philote",
-                                format!("cron.list: IPC transport error — {e}"),
-                            );
-                            (err.display_message(), Some(err))
-                        }
-                    };
+                    }
+                    Ok(IpcResponse::Standard {
+                        ok: false,
+                        code,
+                        message,
+                        ..
+                    }) => {
+                        let e = TaskErrorPayload::ipc_failure("aiua", &*code, message);
+                        (e.display_message(), Some(e))
+                    }
+                    Ok(_) => ("cron.list: unexpected response".into(), None),
+                    Err(e) => {
+                        let err = TaskErrorPayload::transport_error(
+                            "philote",
+                            format!("cron.list: IPC transport error — {e}"),
+                        );
+                        (err.display_message(), Some(err))
+                    }
+                };
                 self.handle_tool_result(InboundTaskPayload {
                     action: Some("tool_result".into()),
                     source: Some("agent".into()),
@@ -5988,6 +6075,7 @@ impl AgentRuntime {
                     // regardless, but setting it here too keeps the
                     // constructed value honest.
                     session_target: ansible_mesh_core::cron::CronSessionTarget::Isolated,
+                    policy: None,
                 };
                 let job_id = job.id.clone();
 

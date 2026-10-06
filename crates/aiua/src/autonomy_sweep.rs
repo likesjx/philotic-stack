@@ -96,6 +96,7 @@ pub fn ensure_scheduled(graph: &GraphDomain, hotel_name: &str, now_ms: u64) -> a
         created_by: ansible_mesh_core::cron::CronJobSource::Operator,
         silent_ok: true,
         session_target: ansible_mesh_core::cron::CronSessionTarget::Isolated,
+        policy: None,
     };
     graph.upsert_cron_job(&job)?;
     info!(

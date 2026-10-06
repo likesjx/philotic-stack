@@ -833,6 +833,7 @@ pub async fn run(
         .route("/api/cron/:job_id", delete(handle_cron_delete))
         .route("/api/cron/:job_id/enable", post(handle_cron_enable))
         .route("/api/cron/:job_id/disable", post(handle_cron_disable))
+        .route("/api/cron/:job_id/policy", post(handle_cron_set_policy))
         .route("/api/secrets", get(handle_secrets))
         .route("/api/secrets/rotate", post(handle_secret_rotate))
         .route("/api/vault", post(handle_vault_add))
@@ -4050,6 +4051,63 @@ struct CreateCronBody {
     enabled: bool,
     #[serde(default)]
     silent_ok: bool,
+    /// Operator-owned turn policy (tool allowlist, preapprovals, approval mode).
+    #[serde(default)]
+    policy: Option<ansible_mesh_core::cron::CronTurnPolicy>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct SetCronPolicyBody {
+    /// `null` clears the job's policy.
+    #[serde(default)]
+    policy: Option<ansible_mesh_core::cron::CronTurnPolicy>,
+}
+
+async fn handle_cron_set_policy(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Path(job_id): Path<String>,
+    Json(body): Json<SetCronPolicyBody>,
+) -> Response {
+    if !check_auth(&headers, &state) {
+        return unauthorized();
+    }
+    let mut client = match connect_management_client(&state.socket, "philotic-web-cron").await {
+        Ok(client) => client,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": e.to_string()})),
+            )
+                .into_response()
+        }
+    };
+    let result = client
+        .send_request(IpcRequest::SetCronPolicy {
+            job_id: job_id.clone(),
+            policy: body.policy,
+        })
+        .await;
+    match result {
+        Ok(IpcResponse::Standard { ok: true, data, .. }) => {
+            let event = json!({ "type": "cron:updated", "payload": { "job_id": job_id } });
+            let _ = state.tx.send(event.to_string());
+            Json(json!({"ok": true, "data": data})).into_response()
+        }
+        Ok(IpcResponse::Standard { message, .. }) | Ok(IpcResponse::Error(message)) => {
+            (StatusCode::BAD_REQUEST, Json(json!({"error": message}))).into_response()
+        }
+        Ok(other) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": format!("unexpected response: {other:?}")})),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": e.to_string()})),
+        )
+            .into_response(),
+    }
 }
 
 async fn handle_cron_create(
@@ -4081,6 +4139,7 @@ async fn handle_cron_create(
         // `RegisterCronJob` IPC handler re-asserts this regardless, but
         // setting it here too keeps the constructed value honest.
         session_target: ansible_mesh_core::cron::CronSessionTarget::Isolated,
+        policy: body.policy,
     };
     match ipc_register_cron_job(&state.socket, job.clone()).await {
         Ok(()) => {

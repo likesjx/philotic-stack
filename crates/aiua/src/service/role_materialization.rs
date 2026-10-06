@@ -3250,6 +3250,7 @@ mod tests {
             created_by: CronJobSource::Guest(agent_id.into()),
             silent_ok: false,
             session_target: ansible_mesh_core::cron::CronSessionTarget::Main,
+            policy: None,
         }
     }
 

@@ -3286,12 +3286,24 @@ impl AgentRuntime {
             // approval policy so the unattended fire can execute the tools
             // its instruction names instead of parking WaitingApproval with
             // no operator awake and riding the watchdog to eviction.
-            if task.cron_job_id.is_some() {
-                for tool in &task.cron_preapproved_tools {
-                    if !state.approval_policy.preapproved_tools.contains(tool) {
-                        state.approval_policy.preapproved_tools.push(tool.clone());
-                    }
+            //
+            // Cron Turn Policy (2026-10-04): the policy now rides on the turn
+            // (`WorkingTurn::cron_policy`) instead of being appended to the
+            // session's approval policy, where grants were checkpointed and
+            // never revoked. Scrub what earlier builds left behind, ONCE: a
+            // session restored from a pre-policy checkpoint drops its standing
+            // grants at its next fire (`needs_legacy_cron_scrub`, DEF-221).
+            let cron_turn_policy = task.effective_cron_policy().map(Box::new);
+            if task.cron_job_id.is_some() && session_id.starts_with("cron:") {
+                if state.needs_legacy_cron_scrub {
+                    state.approval_policy.preapproved_tools.clear();
+                    state.approval_policy.preapproved_classes.clear();
+                    state.needs_legacy_cron_scrub = false;
                 }
+                // Replace (never merge) the session's fire policy so the turns
+                // this fire spawns stay under it, and a cleared job policy
+                // takes effect on the next fire.
+                state.cron_fire_policy = cron_turn_policy.clone();
             }
 
             let selection_source = if task.cron_job_id.is_some() {
@@ -3322,6 +3334,7 @@ impl AgentRuntime {
             }
 
             state.start_turn(WorkingTurn {
+                cron_policy: cron_turn_policy,
                 task_id,
                 turn_id: turn_id.clone(),
                 chat_id: chat_id.clone(),
@@ -7961,6 +7974,7 @@ mod tests {
 
     pub(super) fn test_working_turn(phase: TurnPhase) -> WorkingTurn {
         WorkingTurn {
+            cron_policy: None,
             task_id: Uuid::nil(),
             turn_id: "turn-1".into(),
             chat_id: "123".into(),
@@ -9120,6 +9134,7 @@ mod tests {
         let mut state =
             SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
         state.start_turn(WorkingTurn {
+            cron_policy: None,
             task_id: Uuid::nil(),
             turn_id: "turn-1".into(),
             chat_id: "123".into(),
@@ -14866,19 +14881,31 @@ mod tests {
         let _ = std::fs::remove_file(&socket_path);
     }
 
-    /// Operator-authored cron preapproval: `cron_preapproved_tools` on a
-    /// cron-delivered task must seed the session's approval policy so the
-    /// unattended fire can execute its named tools instead of parking
-    /// WaitingApproval. (aiua only forwards the field for operator-created
-    /// jobs — see CronTicker tests.)
+    /// Operator-authored cron preapproval rides on the TURN, not the session:
+    /// the legacy `cron_preapproved_tools` becomes the turn's `cron_policy`,
+    /// the session's approval policy stays clean, and grants an older build
+    /// left in the `cron:` session are scrubbed (they were never revoked).
     #[tokio::test]
-    async fn cron_preapproved_tools_seed_session_approval_policy() {
+    async fn cron_preapproval_is_turn_scoped_and_scrubs_stale_session_grants() {
         let (mut runtime, _emitted, server, socket_path) = plan_test_runtime("cronpreapp").await;
-        let session_id = "cron:ephemeral:agent-cronpreapp";
+        let session_id = "cron:job-backup";
         runtime
             .ensure_session_loaded(session_id, "cron")
             .await
             .expect("session load");
+        {
+            // A session restored from a pre-policy checkpoint, holding a grant
+            // an older build seeded and never revoked.
+            let state = runtime
+                .sessions
+                .get_mut(session_id)
+                .expect("session exists");
+            state
+                .approval_policy
+                .preapproved_tools
+                .push("memory.forget".into());
+            state.needs_legacy_cron_scrub = true;
+        }
 
         runtime
             .handle_user_message(
@@ -14894,14 +14921,55 @@ mod tests {
             .await
             .expect("turn started");
 
-        let policy = &runtime
-            .session(session_id)
-            .expect("session")
-            .approval_policy;
+        let state = runtime.session(session_id).expect("session");
+        assert!(
+            state.approval_policy.preapproved_tools.is_empty(),
+            "stale session grant must be scrubbed and nothing new written: {:?}",
+            state.approval_policy.preapproved_tools
+        );
+        let turn_policy = state
+            .active_cron_policy()
+            .expect("turn carries the cron policy");
+        assert_eq!(turn_policy.preapproved_tools, vec!["bash.exec".to_string()]);
+        assert!(state.cron_turn_preapproves("bash.exec"));
+        assert!(!state.cron_turn_preapproves("memory.forget"));
+        assert!(
+            state.cron_turn_allows_tool("memory.forget"),
+            "no allowlist set — the role's toolset is untouched"
+        );
+        assert!(!state.needs_legacy_cron_scrub, "scrub runs once");
+
+        // An operator grant made after the scrub (approve-always) survives the
+        // next fire.
+        {
+            let state = runtime.sessions.get_mut(session_id).expect("session");
+            state.active_turn = None;
+            state
+                .approval_policy
+                .preapproved_tools
+                .push("life.recall".into());
+        }
+        runtime
+            .handle_user_message(
+                InboundTaskPayload {
+                    session_id: Some(session_id.into()),
+                    content: Some("run the nightly backup".into()),
+                    cron_job_id: Some("job-backup".into()),
+                    ..Default::default()
+                },
+                Uuid::new_v4(),
+            )
+            .await
+            .expect("second fire");
+        let state = runtime.session(session_id).expect("session");
         assert_eq!(
-            policy.preapproved_tools,
-            vec!["bash.exec".to_string()],
-            "cron preapproval must seed the session policy exactly once"
+            state.approval_policy.preapproved_tools,
+            vec!["life.recall".to_string()],
+            "operator grants after the one-time scrub are kept"
+        );
+        assert!(
+            state.active_cron_policy().is_none(),
+            "a fire with no policy clears the session fire policy (revocation)"
         );
 
         drop(runtime);
@@ -14941,6 +15009,207 @@ mod tests {
                 .preapproved_tools
                 .is_empty(),
             "non-cron tasks must not seed approval policy"
+        );
+        assert!(
+            runtime
+                .session(session_id)
+                .expect("session")
+                .active_cron_policy()
+                .is_none(),
+            "cron keys on a task without cron_job_id are ignored"
+        );
+
+        drop(runtime);
+        let _ = server.await;
+        let _ = std::fs::remove_file(&socket_path);
+    }
+
+    /// Cron Turn Policy approval mode: an unattended cron turn (no chat to
+    /// ask) denies a gated tool immediately instead of parking
+    /// WaitingApproval for the 300 s watchdog; with a chat it still asks.
+    #[tokio::test]
+    async fn unattended_cron_turn_denies_instead_of_parking() {
+        for (tag, chat_id, expect_parked) in [
+            ("cronnochat", None, false),
+            ("cronchat", Some("7898847424"), true),
+        ] {
+            let (mut runtime, _emitted, server, socket_path) = plan_test_runtime(tag).await;
+            let session_id = format!("cron:job-{tag}");
+            runtime
+                .ensure_session_loaded(&session_id, "cron")
+                .await
+                .expect("session load");
+            runtime
+                .handle_user_message(
+                    InboundTaskPayload {
+                        session_id: Some(session_id.clone()),
+                        chat_id: chat_id.map(str::to_string),
+                        content: Some("nightly maintenance".into()),
+                        cron_job_id: Some(format!("job-{tag}")),
+                        ..Default::default()
+                    },
+                    Uuid::new_v4(),
+                )
+                .await
+                .expect("turn started");
+            let turn_id = {
+                let state = runtime.sessions.get_mut(&session_id).expect("session");
+                state.set_pending_tool_call(ToolCall {
+                    tool_name: "bash.exec".into(),
+                    arguments: serde_json::json!({"command": "true"}),
+                });
+                state.active_turn.as_ref().expect("turn").turn_id.clone()
+            };
+
+            runtime
+                .handle_approval_request(
+                    session_id.clone(),
+                    turn_id,
+                    ApprovalRequest {
+                        approval_id: None,
+                        reason: "Tool 'bash.exec' requires approval before execution.".into(),
+                        approved_response: "Executing bash.exec.".into(),
+                    },
+                    false,
+                )
+                .await
+                .expect("approval handled");
+
+            let state = runtime.session(&session_id).expect("session");
+            assert_eq!(
+                state.parked_approval_turn.is_some(),
+                expect_parked,
+                "{tag}: parked={}",
+                state.parked_approval_turn.is_some(),
+            );
+
+            drop(runtime);
+            let _ = server.await;
+            let _ = std::fs::remove_file(&socket_path);
+        }
+    }
+
+    /// Cron Turn Policy allowlist: the operator's `allowed_tools` narrows what
+    /// the fired turn sees AND may dispatch (an off-allowlist call is a denial
+    /// tool-result, not an approval park), and it still governs a later turn
+    /// in the same `cron:` session that carries no `cron_job_id` (plan
+    /// continuation / carryover) — those turns must not get the full toolset.
+    #[tokio::test]
+    async fn cron_policy_allowlist_narrows_fire_dispatch_and_continuations() {
+        let (mut runtime, _emitted, server, socket_path) = plan_test_runtime("cronallow").await;
+        let session_id = "cron:job-allow";
+        let content = "summarize the LifeGraph and check the calendar";
+        runtime
+            .ensure_session_loaded(session_id, "cron")
+            .await
+            .expect("session load");
+        let unrestricted: Vec<String> = runtime
+            .session(session_id)
+            .expect("session")
+            .project_tools_for_turn(content)
+            .into_iter()
+            .map(|t| t.tool_name)
+            .collect();
+        assert!(
+            unrestricted.len() >= 2,
+            "fixture must project several tools: {unrestricted:?}"
+        );
+        let allowed = unrestricted[0].clone();
+        let forbidden = unrestricted[1].clone();
+
+        runtime
+            .handle_user_message(
+                InboundTaskPayload {
+                    session_id: Some(session_id.into()),
+                    content: Some(content.into()),
+                    cron_job_id: Some("job-allow".into()),
+                    cron_policy: Some(ansible_mesh_core::cron::CronTurnPolicy {
+                        allowed_tools: Some(vec![allowed.clone()]),
+                        approval_mode: ansible_mesh_core::cron::CronApprovalMode::Deny,
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+                Uuid::new_v4(),
+            )
+            .await
+            .expect("turn started");
+
+        {
+            let state = runtime.session(session_id).expect("session");
+            assert!(state.cron_turn_allows_tool(&allowed));
+            assert!(!state.cron_turn_allows_tool(&forbidden));
+            let projected: Vec<String> = state
+                .project_tools_for_turn(content)
+                .into_iter()
+                .map(|t| t.tool_name)
+                .collect();
+            assert_eq!(projected, vec![allowed.clone()], "projection = allowlist");
+        }
+
+        // Dispatch gate: an off-allowlist call is refused with a tool-result.
+        let turn_id = runtime
+            .session(session_id)
+            .and_then(|s| s.active_turn.as_ref())
+            .expect("turn")
+            .turn_id
+            .clone();
+        runtime
+            .route_tool_call_execution(
+                session_id.to_string(),
+                turn_id,
+                ToolCall {
+                    tool_name: forbidden.clone(),
+                    arguments: serde_json::json!({}),
+                },
+                false,
+            )
+            .await
+            .expect("dispatch handled");
+        {
+            let state = runtime.session(session_id).expect("session");
+            assert!(
+                state.parked_approval_turn.is_none(),
+                "off-allowlist call must not park for approval"
+            );
+            let denied = state
+                .active_turn
+                .as_ref()
+                .map(|t| {
+                    t.working_tool_history.iter().any(|(call, result)| {
+                        call.tool_name == forbidden
+                            && result.content.contains("not allowed in this scheduled")
+                    })
+                })
+                .unwrap_or(false);
+            assert!(denied, "dispatch must record the allowlist denial");
+        }
+
+        // A continuation turn in the same cron session (no cron_job_id) stays
+        // under the fire's policy.
+        runtime
+            .sessions
+            .get_mut(session_id)
+            .expect("session")
+            .active_turn = None;
+        runtime
+            .handle_user_message(
+                InboundTaskPayload {
+                    session_id: Some(session_id.into()),
+                    content: Some("continue the plan".into()),
+                    ..Default::default()
+                },
+                Uuid::new_v4(),
+            )
+            .await
+            .expect("continuation started");
+        let state = runtime.session(session_id).expect("session");
+        assert!(state.active_turn.is_some(), "continuation turn started");
+        assert!(state.active_turn_is_cron());
+        assert!(state.cron_turn_allows_tool(&allowed));
+        assert!(
+            !state.cron_turn_allows_tool(&forbidden),
+            "continuation must not regain the role's full toolset"
         );
 
         drop(runtime);
