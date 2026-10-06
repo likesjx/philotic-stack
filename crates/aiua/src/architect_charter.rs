@@ -403,6 +403,7 @@ pub fn ensure_scheduled(
         // `[SILENT]` cron-reply convention.
         silent_ok: false,
         session_target: CronSessionTarget::Isolated,
+        policy: None,
     };
     graph.upsert_cron_job(&job)?;
     info!(

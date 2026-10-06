@@ -751,6 +751,7 @@ impl WorkingTurn {
     /// at their starting values.
     pub(crate) fn test_turn(turn_id: &str, user_content: &str) -> WorkingTurn {
         WorkingTurn {
+            cron_policy: None,
             task_id: Uuid::new_v4(),
             turn_id: turn_id.into(),
             chat_id: "chat-1".into(),
@@ -804,6 +805,14 @@ impl WorkingTurn {
 pub struct WorkingTurn {
     pub task_id: Uuid,
     pub turn_id: String,
+    /// Operator-owned policy of the cron job that fired this turn (tool
+    /// allowlist, preapprovals, approval mode). Turn-scoped on purpose: it
+    /// dies with the turn and is never merged into the session's
+    /// `approval_policy`, so editing or clearing the job's policy takes effect
+    /// on the next fire. Set only from the CronTicker's `cron_policy` task key,
+    /// which the hotel strips from every guest-emitted task.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cron_policy: Option<ansible_mesh_core::cron::CronTurnPolicy>,
     pub chat_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub primary_user_id: Option<String>,
@@ -990,6 +999,7 @@ impl WorkingTurn {
     /// that plan evaluation reads is left for the caller to set.
     pub(crate) fn for_plan_tests() -> Self {
         Self {
+            cron_policy: None,
             task_id: Uuid::nil(),
             turn_id: "turn-test".into(),
             chat_id: String::new(),
@@ -2152,6 +2162,7 @@ mod paracrine_budget_tests {
     /// starting values (0 hops, no chain start).
     fn sample_turn() -> WorkingTurn {
         WorkingTurn {
+            cron_policy: None,
             task_id: Uuid::new_v4(),
             turn_id: "turn-test".into(),
             chat_id: "chat-1".into(),

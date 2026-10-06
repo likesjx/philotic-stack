@@ -50,6 +50,68 @@ fn default_session_target_legacy() -> CronSessionTarget {
     CronSessionTarget::Main
 }
 
+/// What an unattended cron turn does when a tool needs approval that its
+/// [`CronTurnPolicy`] does not preapprove.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CronApprovalMode {
+    /// Park and ask in the payload's `chat_id` when there is one; when there
+    /// is no chat to ask, deny the tool immediately instead of parking a turn
+    /// nobody can answer until the 300 s watchdog evicts it.
+    #[default]
+    AskOrDeny,
+    /// Never ask: deny any tool call that is not preapproved.
+    Deny,
+}
+
+/// Operator-owned execution policy for one cron job's fires.
+///
+/// Only the operator (or a surface acting for the operator) may set this — the
+/// hotel clears it on any guest registration, on mesh-replicated jobs, and the
+/// philote applies it to the fired turn only, never to the session.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CronTurnPolicy {
+    /// When set, the fired turn may use ONLY these tools (plus any tool in
+    /// `allowed_classes`). Narrows the target role's toolset; never widens it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allowed_tools: Option<Vec<String>>,
+    /// Tool classes (catalog `class:`) the fired turn may use alongside
+    /// `allowed_tools`. Ignored when `allowed_tools` is `None`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allowed_classes: Vec<String>,
+    /// Tools that run without an approval prompt during the fired turn.
+    /// Unconditional gates (`skill.register`, `rule.propose`, ...) still ask.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub preapproved_tools: Vec<String>,
+    /// Tool classes that run without an approval prompt during the fired turn.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub preapproved_classes: Vec<String>,
+    /// What to do when a tool still needs approval.
+    #[serde(default)]
+    pub approval_mode: CronApprovalMode,
+}
+
+impl CronTurnPolicy {
+    /// Trim, drop empties and dedupe every list so stored policy is canonical.
+    pub fn normalized(mut self) -> Self {
+        fn clean(list: Vec<String>) -> Vec<String> {
+            let mut out: Vec<String> = Vec::new();
+            for item in list {
+                let item = item.trim().to_string();
+                if !item.is_empty() && !out.contains(&item) {
+                    out.push(item);
+                }
+            }
+            out
+        }
+        self.allowed_tools = self.allowed_tools.map(clean);
+        self.allowed_classes = clean(self.allowed_classes);
+        self.preapproved_tools = clean(self.preapproved_tools);
+        self.preapproved_classes = clean(self.preapproved_classes);
+        self
+    }
+}
+
 /// The `cron:<job_id>` session id used for `CronSessionTarget::Isolated`
 /// fires. Philote checkpoints its rolling turn window under
 /// `short_session:{session_id}`, so this gives every isolated cron job its
@@ -154,6 +216,12 @@ pub struct CronJob {
     /// explicitly at `IpcRequest::RegisterCronJob`, not via this default.
     #[serde(default = "default_session_target_legacy")]
     pub session_target: CronSessionTarget,
+
+    /// Operator-owned turn policy (tools, preapprovals, approval mode).
+    /// `None` = the target role's toolset and the default approval behavior.
+    /// Writable only by an operator identity — see `CronTurnPolicy`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy: Option<CronTurnPolicy>,
 }
 
 /// Variables available for payload template interpolation at fire time.

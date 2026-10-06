@@ -65,18 +65,26 @@ Use this skill to set up recurring scheduled work on the hotel. Cron jobs fire o
 
 ## Payload design
 
-The payload is what the target role receives as its task. Write it as if you are handing work to that role directly:
+The payload is what the target role receives as its task. A job for a `role:` target **must** carry its instruction in a `message` string — the hotel refuses a payload with no `message`/`content`/`paracrine_signal` (`CRON_PAYLOAD_UNDELIVERABLE`), because the agent would drop it on every fire. Add `chat_id` only when the reply (and any approval question) should go to that chat:
 
 ```json
 {
-  "action": "scheduled_check",
-  "job_id": "{job_id}",
-  "fired_at": "{iso_timestamp}",
-  "intent": "Review new training samples and flag any requiring correction."
+  "message": "Review new training samples and flag any requiring correction. Fired {iso_timestamp} by job {job_id}.",
+  "chat_id": "7898847424"
 }
 ```
 
-The role should be able to act on the payload without additional context injection.
+The role should be able to act on the message without additional context injection.
+
+## Tools and approvals during a fire (operator-owned policy)
+
+Each fire is a full turn with the target role's toolset. A job may also carry a **turn policy** — a tool allowlist, preapproved tools, and an approval mode — but **only the operator sets it** (`phil cron policy <job_id> ...` or `POST /api/cron/:id/policy`). The hotel refuses `cron.register` with a `policy` from an agent (`CRON_POLICY_OPERATOR_ONLY`), and **editing (re-registering) a job clears its policy** — the operator approved the old instruction, not the new one.
+
+When a fire needs a tool that requires approval and the policy does not preapprove it:
+- with a `chat_id` in the payload, the operator is asked there;
+- with no chat (or a `deny` policy), the tool is refused immediately — finish without it and say in the reply which tool the operator could preapprove.
+
+If a recurring job genuinely needs a gated tool, tell the operator the job id and the tool; do not try to work around the denial.
 
 ## Paracrine heartbeat payloads
 
@@ -109,7 +117,7 @@ Use `target_role = "attention-steward"` for the first observe-only Life Graph su
 
 ## Guardrails
 
-- Do not register jobs that fire more frequently than the task actually requires — prefer longer intervals
+- Do not register jobs that fire more frequently than the task actually requires — prefer longer intervals. Every fire is a full model turn that costs money: a sub-hour "anything new?" poll is almost never worth it (two 15-minute polling jobs ran up a ~$138 model bill in October 2026)
 - Do not register jobs to `orchestrator` role unless the operator has explicitly authorized recurring orchestrator tasks
 - Always call `cron.list` before `cron.register` to prevent accidental duplicates
 - Jobs targeting roles that are not currently materialized will queue until the role materializes — this is expected behavior, not an error

@@ -909,31 +909,12 @@ fn build_cron_task_json(
                 obj[key] = v.clone();
             }
         }
-        // Operator-authored jobs may carry a narrow standing tool
-        // preapproval: the operator approved these tools when they authored
-        // the job's payload, so the receiving philote seeds them into the
-        // cron session's approval policy instead of parking an unattended
-        // turn as WaitingApproval. NEVER forwarded for guest-created jobs —
-        // a guest could otherwise register a cron job that self-grants
-        // approval for high-agency tools (privilege escalation).
-        if matches!(
-            job.created_by,
-            ansible_mesh_core::cron::CronJobSource::Operator
-        ) {
-            if let Some(tools) = payload_json
-                .get("preapproved_tools")
-                .and_then(serde_json::Value::as_array)
-            {
-                let clean: Vec<serde_json::Value> = tools
-                    .iter()
-                    .filter(|t| t.as_str().is_some_and(|s| !s.trim().is_empty()))
-                    .cloned()
-                    .collect();
-                if !clean.is_empty() {
-                    obj["cron_preapproved_tools"] = serde_json::Value::Array(clean);
-                }
-            }
+        // Legacy wire key for philotes that predate `cron_policy` (mixed
+        // rollout): the operator payload's own `preapproved_tools` list.
+        if let Some(policy) = legacy_payload_preapproval(job, &payload_json) {
+            obj["cron_preapproved_tools"] = serde_json::json!(policy.preapproved_tools);
         }
+        attach_cron_policy(&mut obj, job, &payload_json);
         return apply_cron_session_routing(obj, job).to_string();
     };
 
@@ -985,7 +966,68 @@ fn build_cron_task_json(
         "payload": payload_json,
         "paracrine_signal": serde_json::Value::Object(signal),
     });
+    let mut task = task;
+    attach_cron_policy(&mut task, job, &payload_json);
     apply_cron_session_routing(task, job).to_string()
+}
+
+/// Operator-authored jobs written before `CronJob::policy` existed carried
+/// their standing tool preapproval inside the payload JSON
+/// (`"preapproved_tools": [...]`). Honored only for `created_by=Operator`
+/// jobs with no typed policy — a guest-created job must never self-grant
+/// approval (privilege escalation).
+fn legacy_payload_preapproval(
+    job: &CronJob,
+    payload_json: &serde_json::Value,
+) -> Option<ansible_mesh_core::cron::CronTurnPolicy> {
+    if job.policy.is_some()
+        || !matches!(
+            job.created_by,
+            ansible_mesh_core::cron::CronJobSource::Operator
+        )
+    {
+        return None;
+    }
+    let tools: Vec<String> = payload_json
+        .get("preapproved_tools")?
+        .as_array()?
+        .iter()
+        .filter_map(serde_json::Value::as_str)
+        .map(str::to_string)
+        .collect();
+    let policy = ansible_mesh_core::cron::CronTurnPolicy {
+        preapproved_tools: tools,
+        ..Default::default()
+    }
+    .normalized();
+    (!policy.preapproved_tools.is_empty()).then_some(policy)
+}
+
+/// The policy this fire runs under: the job's operator-set typed policy, else
+/// the legacy operator payload preapproval. Carried to the philote as
+/// `cron_policy`, which applies it to the fired turn only. Only the ticker
+/// sets this key — the hotel strips every `cron_*` key from guest `EmitTask`
+/// frames (`strip_forged_cron_keys`), so a guest cannot forge one.
+pub(crate) fn effective_cron_policy(
+    job: &CronJob,
+    payload_json: &serde_json::Value,
+) -> Option<ansible_mesh_core::cron::CronTurnPolicy> {
+    job.policy
+        .clone()
+        .map(ansible_mesh_core::cron::CronTurnPolicy::normalized)
+        .or_else(|| legacy_payload_preapproval(job, payload_json))
+}
+
+fn attach_cron_policy(
+    task: &mut serde_json::Value,
+    job: &CronJob,
+    payload_json: &serde_json::Value,
+) {
+    if let Some(value) =
+        effective_cron_policy(job, payload_json).and_then(|p| serde_json::to_value(p).ok())
+    {
+        task["cron_policy"] = value;
+    }
 }
 
 #[cfg(test)]
@@ -1029,6 +1071,7 @@ mod tests {
             created_by: CronJobSource::Operator,
             silent_ok: false,
             session_target: ansible_mesh_core::cron::CronSessionTarget::Main,
+            policy: None,
         }
     }
 
@@ -1090,6 +1133,62 @@ mod tests {
             value.get("cron_preapproved_tools").is_none(),
             "guest-created jobs must not self-grant tool approval"
         );
+        assert!(
+            value.get("cron_policy").is_none(),
+            "the legacy key must not become a typed policy for a guest job either"
+        );
+    }
+
+    /// Cron Turn Policy: a job's typed (operator-set) policy rides as
+    /// `cron_policy` on both task shapes, and supersedes the legacy payload key.
+    #[test]
+    fn typed_policy_rides_as_cron_policy_on_both_task_shapes() {
+        let mut job = test_job();
+        job.created_by = CronJobSource::Guest("agent-beacon".into());
+        job.policy = Some(ansible_mesh_core::cron::CronTurnPolicy {
+            allowed_tools: Some(vec!["life.recall".into(), " life.recall ".into()]),
+            preapproved_tools: vec!["life.recall".into()],
+            ..Default::default()
+        });
+        for payload in [
+            r#"{"message":"daily brief","preapproved_tools":["bash.exec"]}"#,
+            r#"{"paracrine_signal":{"signal_type":"heartbeat"}}"#,
+        ] {
+            let task = build_cron_task_json(&job, 1_234, "vps-jane-aiua-01", payload.into());
+            let value: serde_json::Value = serde_json::from_str(&task).unwrap();
+            assert_eq!(
+                value["cron_policy"]["allowed_tools"],
+                serde_json::json!(["life.recall"]),
+                "{payload}: policy is normalized and attached"
+            );
+            assert_eq!(
+                value["cron_policy"]["preapproved_tools"],
+                serde_json::json!(["life.recall"])
+            );
+            assert!(
+                value.get("cron_preapproved_tools").is_none(),
+                "{payload}: a typed policy supersedes the legacy payload key"
+            );
+        }
+    }
+
+    /// Legacy operator payload preapproval is carried as a typed policy too, so
+    /// new philotes read one shape (old philotes keep reading the legacy key).
+    #[test]
+    fn legacy_operator_preapproval_becomes_cron_policy() {
+        let task = build_cron_task_json(
+            &test_job(),
+            1_234,
+            "vps-jane-aiua-01",
+            r#"{"message":"daily brief","preapproved_tools":["life.recall","life.recall.feedback"]}"#
+                .into(),
+        );
+        let value: serde_json::Value = serde_json::from_str(&task).unwrap();
+        assert_eq!(
+            value["cron_policy"]["preapproved_tools"],
+            serde_json::json!(["life.recall", "life.recall.feedback"])
+        );
+        assert!(value["cron_policy"].get("allowed_tools").is_none());
     }
 
     #[test]
@@ -1544,6 +1643,7 @@ mod tests {
             created_by: CronJobSource::Operator,
             silent_ok: true,
             session_target: ansible_mesh_core::cron::CronSessionTarget::Isolated,
+            policy: None,
         }
     }
 
@@ -1665,6 +1765,7 @@ mod tests {
             created_by: CronJobSource::Operator,
             silent_ok: false,
             session_target: ansible_mesh_core::cron::CronSessionTarget::Isolated,
+            policy: None,
         }
     }
 
@@ -1866,6 +1967,7 @@ mod tests {
             created_by: CronJobSource::Operator,
             silent_ok: true,
             session_target: ansible_mesh_core::cron::CronSessionTarget::Isolated,
+            policy: None,
         }
     }
 

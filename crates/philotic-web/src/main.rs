@@ -5,6 +5,7 @@ use std::path::PathBuf;
 mod autonomy;
 mod component;
 mod config;
+mod cron;
 mod doctor;
 mod explain;
 mod flush;
@@ -243,6 +244,13 @@ enum Command {
     Config {
         #[command(subcommand)]
         action: config::ConfigAction,
+    },
+
+    /// Hotel crontab: list jobs, set a job's operator-owned turn policy
+    /// (tool allowlist, preapprovals, approval mode)
+    Cron {
+        #[command(subcommand)]
+        action: cron::CronAction,
     },
 
     /// Autonomy trust ledger — per-lane posture, budget, and promotion
@@ -605,6 +613,7 @@ async fn main() -> Result<()> {
         Command::Keys { action } => keys::run(action).await,
         Command::Heal { action } => heal::run(action).await,
         Command::Config { action } => config::run(action).await,
+        Command::Cron { action } => cron::run(action).await,
         Command::Autonomy { action } => autonomy::run(action).await,
         Command::Procedure { action } => procedure::run(action).await,
         Command::Memory { action } => memory_explain::run(action).await,

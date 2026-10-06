@@ -1,4 +1,6 @@
-pub use ansible_mesh_core::cron::{CronJob, CronJobId, CronJobSource};
+pub use ansible_mesh_core::cron::{
+    CronApprovalMode, CronJob, CronJobId, CronJobSource, CronTurnPolicy,
+};
 pub use ansible_mesh_core::graph::{
     MembraneTransportHomeRecord, MembraneTransportHomeStatus, RoleIncarnationRecord,
 };
@@ -1831,6 +1833,16 @@ pub enum IpcRequest {
     /// Disable a cron job without removing it.
     DisableCronJob {
         job_id: CronJobId,
+    },
+    /// Set (or clear, with `None`) a cron job's operator-owned turn policy —
+    /// tool allowlist, preapprovals and approval mode for its fires.
+    ///
+    /// Operator-only: the hotel refuses this from any guest identity
+    /// (`CRON_POLICY_OPERATOR_ONLY`). Responds with [`IpcResponse::Standard`].
+    SetCronPolicy {
+        job_id: CronJobId,
+        #[serde(default)]
+        policy: Option<CronTurnPolicy>,
     },
     // ── MCP membrane IPC ──────────────────────────────────────────────────────
     /// Acquire the singleton MCP membrane lease for a given port.
