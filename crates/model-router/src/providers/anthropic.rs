@@ -233,53 +233,13 @@ impl AnthropicProvider {
     }
 
     fn wants_structured(task: &ControllerTask) -> bool {
-        task.kind == TaskKind::TextGenerate
-            && (task.wants_channel("spoken_text")
-                || task.wants_channel("memory_concept")
-                || task.wants_channel("active_plan"))
+        super::wants_structured_reply(task)
     }
 
     /// System prompt carrying the structured-output contract. Tools stay native
     /// (`tool_use` blocks) — only the text-reply shape is constrained.
     fn system_text(task: &ControllerTask) -> Option<String> {
-        if !Self::wants_structured(task) {
-            return None;
-        }
-
-        let memory_instruction = if task.wants_channel("memory_concept") {
-            " If — and only if — this exchange contains something genuinely worth remembering \
-             (a user preference, a decision made, a fact learned, or a pattern worth recalling \
-             later), include \"memory_candidate\" with fields: \"concept\" (short kebab-case \
-             slug), \"content\" (one or two sentences distilling what is worth keeping), and \
-             optional \"tags\" (array of short strings). Omit memory_candidate entirely for \
-             routine exchanges, simple questions, greetings, or transient state."
-        } else {
-            ""
-        };
-        let plan_instruction = if task.wants_channel("active_plan") {
-            " When working a multi-step task, also include \"active_plan\" in that JSON object: \
-             {\"goal\": string, \"status\": string, \"steps\": [{\"id\": integer, \
-             \"description\": string, \"tool_name\": string, \"status\": string}]}. Omit \
-             active_plan for single-step exchanges."
-        } else {
-            ""
-        };
-
-        let tool_clause = if task.tools.is_empty() {
-            ""
-        } else {
-            "When a tool is needed, call one of the declared tools natively — do not write a \
-             JSON tool_call object by hand. Use tool input fields exactly as declared and \
-             include every required field.\n"
-        };
-
-        Some(format!(
-            "{}When replying with text, reply with ONLY a raw JSON object — no markdown code \
-             fences, no text outside the JSON — containing \"display_text\" (your reply, \
-             markdown fine) and \"spoken_text\" (conversational version for voice, no \
-             markdown).{}{}",
-            tool_clause, memory_instruction, plan_instruction,
-        ))
+        super::structured_reply_contract(task)
     }
 
     fn numeric_provider_option(task: &ControllerTask, key: &str) -> Option<Value> {
