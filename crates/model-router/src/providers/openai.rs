@@ -353,9 +353,18 @@ impl OpenAIProvider {
     }
 
     fn chat_request_body(&self, task: &ControllerTask) -> Result<Value> {
+        // Structured channels (voice text, memory, plan) come back inside one
+        // JSON object under the same contract the Anthropic provider sends;
+        // without it OpenRouter models improvised the plan into the reply
+        // (DEF-219). Philote unwraps the `display_text` envelope.
+        let mut messages = Vec::new();
+        if let Some(contract) = super::structured_reply_contract(task) {
+            messages.push(json!({ "role": "system", "content": contract }));
+        }
+        messages.push(Self::user_message(task)?);
         let mut body = json!({
             "model": self.default_model(task),
-            "messages": [Self::user_message(task)?],
+            "messages": messages,
             "stream": false,
         });
 
@@ -389,6 +398,11 @@ impl OpenAIProvider {
 
         if let Some(response_format) = Self::response_format(task) {
             body["response_format"] = response_format;
+        } else if task.tools.is_empty() && super::wants_structured_reply(task) {
+            // JSON mode backs the contract only on tool-less turns: on some
+            // models it suppresses native tool calls, and the turn loop needs
+            // those.
+            body["response_format"] = json!({ "type": "json_object" });
         }
 
         for key in ["reasoning_effort", "verbosity"] {
@@ -1371,6 +1385,57 @@ mod tests {
         assert_eq!(body["messages"][0]["content"][0]["type"], "text");
         assert_eq!(body["messages"][0]["content"][1]["type"], "image_url");
         assert_eq!(body["tools"][0]["function"]["name"], "workspace.read");
+    }
+
+    /// DEF-219: a turn asking for structured channels gets the JSON reply
+    /// contract as a system message; JSON mode backs it only when the turn has
+    /// no tools (it can suppress native tool calls on some models).
+    #[test]
+    fn structured_channels_send_the_reply_contract() {
+        let provider = OpenAIProvider::new(
+            reqwest::Client::new(),
+            Some(OpenAIAuth::ApiKey("secret".into())),
+            Some("http://127.0.0.1:9".into()),
+            None,
+            Some("z-ai/glm-5.3".into()),
+            None,
+        );
+        let structured = |with_tools: bool| {
+            let mut task = json!({
+                "kind": "text.generate",
+                "response_contract": { "channels": ["spoken_text", "active_plan"] },
+                "context": { "active_turn": { "text": "check" } }
+            });
+            if with_tools {
+                task["tools_for_model"] = json!([{
+                    "tool_name": "workspace.read",
+                    "description": "Read a file",
+                    "input_schema": { "type": "object", "properties": {} }
+                }]);
+            }
+            ControllerTask::from_value(&task).unwrap()
+        };
+
+        let body = provider.chat_request_body(&structured(false)).unwrap();
+        assert_eq!(body["messages"][0]["role"], "system");
+        let contract = body["messages"][0]["content"].as_str().unwrap();
+        assert!(contract.contains("display_text") && contract.contains("active_plan"));
+        assert_eq!(body["messages"][1]["role"], "user");
+        assert_eq!(body["response_format"]["type"], "json_object");
+
+        let body = provider.chat_request_body(&structured(true)).unwrap();
+        assert_eq!(body["messages"][0]["role"], "system");
+        assert!(body.get("response_format").is_none());
+
+        // A plain text turn is untouched.
+        let plain = ControllerTask::from_value(&json!({
+            "kind": "text.generate",
+            "context": { "active_turn": { "text": "hi" } }
+        }))
+        .unwrap();
+        let body = provider.chat_request_body(&plain).unwrap();
+        assert_eq!(body["messages"][0]["role"], "user");
+        assert!(body.get("response_format").is_none());
     }
 
     #[test]
