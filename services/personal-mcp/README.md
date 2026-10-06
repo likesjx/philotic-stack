@@ -169,3 +169,27 @@ introspection contract in an isolated-Mongo interoperability test. Keep this
 resource adapter temporarily to avoid expanding Rust route authentication and
 IPC authority in the same change as the issuer. This is an explicitly tested
 transitional boundary; native membrane integration remains proposed.
+
+## Encrypted hotel vault references
+
+An upstream specifies exactly one of `credentialSecretRef`,
+`credentialSecretRefFile` (reference-only file, bounded to 4 KiB), or
+`credentialEnv` (legacy/synthetic configuration). The example uses the reference
+file produced by the private operator helper and connects directly to local
+Muninn with its observe key. The key remains in the encrypted hotel vault.
+
+The credential adapter registers only as `percival-personal-recall`, resolves the
+exact configured reference through local Unix IPC `get_secret` for each backend
+request, and closes the connection. It writes no credential file, uses no secret
+cache, forwards no caller identity, and suppresses raw hotel diagnostics. The
+helper stores the key with that dedicated role alone. Hotel ACL enforcement and
+local socket access remain required; this adapter does not run sudo or change
+permissions. Discovery-only mode never initializes or calls the vault.
+
+Operational blocker: the current gateway service runs as deploy, which cannot
+write the hotel socket. Do not widen socket permissions or run the gateway as
+root to overcome this. Runtime identity/broker access needs a concrete least-
+privilege deployment arrangement and acceptance tests before active mode. The
+private operator helper's existing sudo access permits storage only; it does not
+automatically grant the gateway runtime access. Source-only fake IPC tests do not
+attest the deployed hotel's authorization or Muninn no-learning behavior.

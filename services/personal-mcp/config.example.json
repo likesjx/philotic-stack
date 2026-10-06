@@ -17,11 +17,14 @@
   ],
   "upstreams": {
     "muninn_recall": {
-      "url": "http://127.0.0.1:8912/mcp",
-      "credentialEnv": "PERSONAL_MCP_MUNINN_RECALL_TOKEN"
+      "url": "http://127.0.0.1:8750/mcp",
+      "credentialSecretRefFile": "/home/deploy/percival-personal-mcp/secrets/muninn-observe.ref"
     }
   },
   "enabledTools": [
     "muninn_recall"
-  ]
+  ],
+  "vault": {
+    "socketPath": "/run/philotic/vps-jane.sock"
+  }
 }

@@ -1,7 +1,8 @@
 // Explicit composition entry point. Nothing starts when this module is imported.
 // Production TLS, issuer/client registration and scoped hotel grants are
 // operator-owned deployment steps; this program only binds literal loopback.
-import { readFile } from 'node:fs/promises';
+import { readFile, open } from 'node:fs/promises';
+import { vaultCredential } from './vault.mjs';
 import { pathToFileURL } from 'node:url';
 import { createPersonalMcp, issuerAdapter, frontdoorAdapter, createDiscoveryBootstrap, selectedTools } from './gateway.mjs';
 
@@ -19,8 +20,27 @@ export async function start(config, env = process.env) {
     return server;
   }
   if (!Array.isArray(config.allowedSubjects) || !Array.isArray(config.allowedClients)) throw new Error('Explicit operator/client arrays required');
-  const endpoints = Object.fromEntries(Object.entries(config.upstreams || {}).map(([tool, value]) => [tool,
-    { url: value.url, credential: async () => secret(value.credentialEnv) }]));
+  const credential = async value => {
+    const choices = [value.credentialEnv, value.credentialSecretRef, value.credentialSecretRefFile].filter(v => v !== undefined);
+    if (choices.length !== 1) throw new Error('Exactly one credential source required');
+    if (value.credentialEnv !== undefined) return async () => secret(value.credentialEnv);
+    let secretRef = value.credentialSecretRef;
+    if (value.credentialSecretRefFile !== undefined) {
+      const file = await open(value.credentialSecretRefFile, 'r');
+      try {
+        const bytes = Buffer.alloc(4097);
+        const { bytesRead } = await file.read(bytes, 0, bytes.length, 0);
+        if (bytesRead > 4096) throw new Error('Oversized secret reference file');
+        secretRef = bytes.subarray(0, bytesRead).toString('utf8').trim();
+      } finally { await file.close(); }
+    }
+    return vaultCredential({ socketPath: config.vault?.socketPath, secretRef });
+  };
+  const endpoints = Object.fromEntries(await Promise.all(enabledTools.map(async tool => {
+    const value = config.upstreams?.[tool];
+    if (!value) throw new Error('Selected upstream required');
+    return [tool, { url: value.url, credential: await credential(value) }];
+  })));
   const issuer = issuerAdapter({ ...config.issuer, clientSecret: secret(config.issuer.clientSecretEnv) });
   const upstream = frontdoorAdapter({ endpoints, enabledTools });
   const server = await createPersonalMcp({ resource: config.resource, issuer, upstream,
