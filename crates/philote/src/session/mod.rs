@@ -314,6 +314,19 @@ pub struct SessionState {
     pub settings: AgentSettings,
     pub status: String,
     pub approval_policy: ApprovalPolicy,
+    /// The operator-owned policy of the latest cron fire into this `cron:`
+    /// session. REPLACED (never merged) at every fire, so editing or clearing
+    /// the job's policy takes effect on the next fire. Covers the turns a fire
+    /// spawns that carry no `cron_job_id` — plan continuations, the carryover
+    /// after an approval eviction, paracrine responses — which would otherwise
+    /// run with the role's full toolset. Read via [`Self::active_cron_policy`].
+    pub cron_fire_policy: Option<Box<ansible_mesh_core::cron::CronTurnPolicy>>,
+    /// Restored from a checkpoint written before Cron Turn Policy (no
+    /// `cron_fire_policy` key): its `approval_policy` may hold cron grants an
+    /// older build appended and never revoked (DEF-221). Cleared once, at the
+    /// next cron fire — operator grants made afterwards (approve-always,
+    /// `/preapprove`) are left alone. Not checkpointed: derived on restore.
+    pub needs_legacy_cron_scrub: bool,
     pub bindings: SessionBindings,
     pub component_route_assembly: ComponentRouteAssembly,
     pub tool_assembly: ToolAssembly,
@@ -465,6 +478,8 @@ impl SessionState {
             settings: AgentSettings::default(),
             status: "active".into(),
             approval_policy: ApprovalPolicy::default(),
+            cron_fire_policy: None,
+            needs_legacy_cron_scrub: false,
             tool_assembly: default_tool_assembly_for_bindings(&bindings),
             component_route_assembly: ComponentRouteAssembly::default(),
             bindings,
@@ -1179,9 +1194,26 @@ impl SessionState {
         false
     }
 
-    /// The operator-owned policy of the cron job that fired the active turn.
+    /// The operator-owned policy governing the active turn: the policy the
+    /// firing task carried, else — for any other turn in a `cron:` session
+    /// (continuation, carryover, paracrine response) — the latest fire's.
     pub fn active_cron_policy(&self) -> Option<&ansible_mesh_core::cron::CronTurnPolicy> {
-        self.active_turn.as_ref()?.cron_policy.as_ref()
+        let turn = self.active_turn.as_ref()?;
+        turn.cron_policy.as_deref().or_else(|| {
+            self.session_id
+                .starts_with("cron:")
+                .then_some(self.cron_fire_policy.as_deref())
+                .flatten()
+        })
+    }
+
+    /// Is the active turn running inside a cron job's session (the fire itself
+    /// or a turn it spawned)?
+    pub fn active_turn_is_cron(&self) -> bool {
+        self.active_turn
+            .as_ref()
+            .is_some_and(|t| t.cron_policy.is_some())
+            || (self.active_turn.is_some() && self.session_id.starts_with("cron:"))
     }
 
     /// Does the active cron turn's policy preapprove `tool_name` (by name or
@@ -4895,6 +4927,7 @@ impl SessionState {
             "role_activation": self.role_activation,
             "status": self.status,
             "approval_policy": self.approval_policy,
+            "cron_fire_policy": self.cron_fire_policy,
             "bindings": self.bindings,
             "tool_success_streak": self.tool_success_streak,
             "pending_preapproval_thresholds": self.pending_preapproval_thresholds,
@@ -5124,6 +5157,15 @@ impl SessionState {
             .cloned()
             .and_then(|value| serde_json::from_value::<ApprovalPolicy>(value).ok())
             .unwrap_or_default();
+        let cron_fire_policy = checkpoint
+            .get("cron_fire_policy")
+            .cloned()
+            .and_then(|value| {
+                serde_json::from_value::<ansible_mesh_core::cron::CronTurnPolicy>(value)
+                    .ok()
+                    .map(Box::new)
+            });
+        let needs_legacy_cron_scrub = checkpoint.get("cron_fire_policy").is_none();
         let tool_success_streak: std::collections::HashMap<String, u32> = checkpoint
             .get("tool_success_streak")
             .cloned()
@@ -5485,6 +5527,8 @@ impl SessionState {
             settings: AgentSettings::default(),
             status,
             approval_policy,
+            cron_fire_policy,
+            needs_legacy_cron_scrub,
             bindings,
             component_route_assembly,
             tool_assembly,

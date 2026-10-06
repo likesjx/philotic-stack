@@ -206,13 +206,11 @@ impl AgentRuntime {
             let unattended_denial = self.sessions.get(&session_id).and_then(|state| {
                 let turn = state.active_turn.as_ref()?;
                 let tool = turn.pending_tool_call.as_ref()?;
-                let is_cron_turn = turn.cron_policy.is_some() || session_id.starts_with("cron:");
-                if !is_cron_turn {
+                if !state.active_turn_is_cron() {
                     return None;
                 }
-                let mode = turn
-                    .cron_policy
-                    .as_ref()
+                let mode = state
+                    .active_cron_policy()
                     .map(|p| p.approval_mode)
                     .unwrap_or_default();
                 let deny = match mode {
@@ -237,8 +235,9 @@ impl AgentRuntime {
                 if let Some(state) = self.sessions.get_mut(&session_id) {
                     state.clear_pending_tool_call();
                 }
-                return self
-                    .deliver_tool_denial(session_id, turn_id, tool_name, denial)
+                // Boxed: `handle_tool_result` is a very large future, and inlining it
+                // into this one overflows the 2 MiB test-thread stack.
+                return Box::pin(self.deliver_tool_denial(session_id, turn_id, tool_name, denial))
                     .await;
             }
         }

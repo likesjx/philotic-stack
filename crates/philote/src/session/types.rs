@@ -812,7 +812,7 @@ pub struct WorkingTurn {
     /// on the next fire. Set only from the CronTicker's `cron_policy` task key,
     /// which the hotel strips from every guest-emitted task.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub cron_policy: Option<ansible_mesh_core::cron::CronTurnPolicy>,
+    pub cron_policy: Option<Box<ansible_mesh_core::cron::CronTurnPolicy>>,
     pub chat_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub primary_user_id: Option<String>,

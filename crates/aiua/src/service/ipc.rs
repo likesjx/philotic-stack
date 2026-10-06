@@ -5525,7 +5525,8 @@ impl IpcServer {
             } => {
                 info!("PublishMessage for role: {}", target_role);
                 let task_id = Uuid::new_v4();
-                let payload_json = payload.to_string();
+                // CronTicker-only keys are never trusted from a guest (DEF-220).
+                let (payload_json, _) = strip_forged_cron_keys(payload.to_string());
                 Self::record_session_activity_from_value(
                     graph,
                     &payload,
@@ -5588,7 +5589,8 @@ impl IpcServer {
             } => {
                 info!("CreateTask for role: {}", target_role);
                 let task_id = Uuid::new_v4();
-                let payload_json = payload.to_string();
+                // CronTicker-only keys are never trusted from a guest (DEF-220).
+                let (payload_json, _) = strip_forged_cron_keys(payload.to_string());
                 Self::record_session_activity_from_value(
                     graph,
                     &payload,
