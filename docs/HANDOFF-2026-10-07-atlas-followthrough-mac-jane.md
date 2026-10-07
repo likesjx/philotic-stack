@@ -56,7 +56,7 @@ has moved since 10-05).
 | 7 | **Mesh L4** ack-what-you-delivered + `mesh_dead_letters` (7-day retention) + `phil mesh dead-letters` (replay operator-only) | MESH_DELIVERY_GUARANTEES | Extract `apply_ledger_command` first. |
 | 8 | **IPC split S4–S5** (desktop/placement, tasks/emit/delivery) | IPC_DISPATCH_SPLIT | Not concurrently with step 9. |
 | 9 | **Mesh L5 + frontdoor F1**: `NodeCapabilities.features`, `created_at`/`expires_at` ms (25 s for `execute_tool`), dispatcher expiry + attempts | MESH_DELIVERY_GUARANTEES, AGENT_FRONTDOOR | Closes DEF-211. |
-| 10 | **IPC split S6** park-path fixes (DEF-214 ParacrineEmit env gap first), cron `fire` acts on undelivered | IPC_DISPATCH_SPLIT | Smoke: `just smoke-paracrine`. |
+| 10 | **IPC split S6** park-path fixes (DEF-223 ParacrineEmit env gap first), cron `fire` acts on undelivered | IPC_DISPATCH_SPLIT | Smoke: `just smoke-paracrine`. |
 | 11 | **Perimeter P3** guest capability tokens + `operator.token`, **soft mode** (log-only) first | PERIMETER_ENFORCEMENT | Enforce in the following release. Migrate `sync-muninn-vault-tokens.py` to the operator token. |
 | 12 | **Perimeter P4** MAC v2 phase A (dual-verify) → B → C latch → D min-version | PERIMETER_ENFORCEMENT | One phase per fleet deploy; never skip. |
 | 13 | **Perimeter P5** signed placement + route `set_home` through the home | PERIMETER_ENFORCEMENT | After P4. Add operator break-glass for a dead home hotel. |

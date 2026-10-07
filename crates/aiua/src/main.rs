@@ -1134,6 +1134,17 @@ fn handle_cron_fired_broadcast(graph: &GraphDomain, payload_json: &str) {
     }
 }
 
+fn strip_replicated_cron_policy(job: &mut ansible_mesh_core::cron::CronJob) {
+    job.policy = None;
+    if let Ok(serde_json::Value::Object(mut payload)) =
+        serde_json::from_str::<serde_json::Value>(&job.payload)
+    {
+        if payload.remove("preapproved_tools").is_some() {
+            job.payload = serde_json::Value::Object(payload).to_string();
+        }
+    }
+}
+
 /// Handle an inbound `CronJobSync` broadcast from a peer hotel.
 ///
 /// Replicates job definitions locally so this hotel can participate in
@@ -1156,7 +1167,12 @@ fn handle_cron_job_sync(graph: &GraphDomain, payload_json: &str) {
 
     match parsed.op.as_str() {
         "upsert" => {
-            if let Some(job) = parsed.job {
+            if let Some(mut job) = parsed.job {
+                // Turn policy is operator-owned per hotel: a peer-supplied job
+                // never brings standing tool grants with it (a mesh peer is not
+                // this hotel's operator). Drops both the typed policy and the
+                // legacy payload `preapproved_tools` key.
+                strip_replicated_cron_policy(&mut job);
                 if let Err(e) = graph.upsert_cron_job(&job) {
                     warn!("handle_cron_job_sync: upsert failed for {}: {e}", job.id);
                 } else {

@@ -1084,16 +1084,78 @@ fn pre_ladder_dispatch_target(
     None
 }
 
+/// Pick the turn-loop config a `/model` swap should build on: the hotel's
+/// current role record when it could be read, else the session's checkpointed
+/// snapshot. The snapshot can predate an operator ladder change, so preferring
+/// it would write the stale ladder back to the role record (DEF-218).
+fn prefer_live_turn_loop_config(
+    live: Option<ansible_mesh_core::graph::TurnLoopConfig>,
+    session_snapshot: ansible_mesh_core::graph::TurnLoopConfig,
+) -> ansible_mesh_core::graph::TurnLoopConfig {
+    live.unwrap_or(session_snapshot)
+}
+
+/// Hotel-config override for the ladder used when a role has none of its own
+/// (`default_fallback_tiers`, a JSON array of model roles). Loaded once at
+/// startup; unset keeps the built-in `DEFAULT_FALLBACK_TIERS` behaviour. Lets
+/// an operator take a provider out of every unconfigured ladder — e.g. Gemini
+/// while its spend cap is hit — without touching each role (DEF-216).
+static OPERATOR_DEFAULT_LADDER: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+
+fn operator_default_ladder() -> Option<&'static [String]> {
+    OPERATOR_DEFAULT_LADDER
+        .get()
+        .map(Vec::as_slice)
+        .filter(|tiers| !tiers.is_empty())
+}
+
+/// Parse the `default_fallback_tiers` config value: a JSON array of strings,
+/// also accepted when stored as a JSON string holding that array. Blank
+/// entries are dropped; anything unparseable yields an empty ladder (= unset).
+fn parse_default_fallback_tiers(raw: &str) -> Vec<String> {
+    let value = match serde_json::from_str::<serde_json::Value>(raw.trim()) {
+        Ok(serde_json::Value::String(inner)) => {
+            serde_json::from_str::<serde_json::Value>(&inner).unwrap_or(serde_json::Value::Null)
+        }
+        Ok(value) => value,
+        Err(_) => serde_json::Value::Null,
+    };
+    value
+        .as_array()
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .map(str::trim)
+                .filter(|tier| !tier.is_empty())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// A role's own non-empty ladder wins; otherwise the operator default.
+fn ladder_or_operator_default<'a>(
+    role_ladder: Option<&'a [String]>,
+    operator_default: Option<&'a [String]>,
+) -> Option<&'a [String]> {
+    role_ladder
+        .filter(|tiers| !tiers.is_empty())
+        .or(operator_default)
+}
+
 /// The active role's configured fallback ladder (`turn_loop_config.fallback_tiers`),
 /// when the session has a role active with a non-empty custom ladder. `None`
 /// when no role is active, the role has no `turn_loop_config`, or its ladder is
 /// empty (the `DEFAULT_FALLBACK_TIERS` constant governs those cases elsewhere).
 fn role_ladder_tiers(state: Option<&SessionState>) -> Option<&[String]> {
-    state
-        .and_then(|state| state.role_activation.as_ref())
-        .and_then(|ra| ra.turn_loop_config.as_ref())
-        .map(|tlc| tlc.fallback_tiers.as_slice())
-        .filter(|tiers| !tiers.is_empty())
+    ladder_or_operator_default(
+        state
+            .and_then(|state| state.role_activation.as_ref())
+            .and_then(|ra| ra.turn_loop_config.as_ref())
+            .map(|tlc| tlc.fallback_tiers.as_slice()),
+        operator_default_ladder(),
+    )
 }
 
 /// Resolves the per-agent model NAME bound to `target_role` (a provider
@@ -1872,6 +1934,34 @@ impl AgentRuntime {
                 entries,
             });
         }
+    }
+
+    /// Load the operator's `default_fallback_tiers` override once (DEF-216).
+    /// A restart picks up later changes; unset/unreadable keeps the built-in
+    /// default ladder.
+    pub(super) async fn fetch_default_fallback_tiers(&mut self) {
+        let raw = match self
+            .ipc_client
+            .send_request_with_timeout(
+                IpcRequest::GetConfig {
+                    key: "default_fallback_tiers".into(),
+                },
+                Duration::from_secs(5),
+            )
+            .await
+        {
+            Ok(IpcResponse::ConfigData {
+                value_json: Some(v),
+                ..
+            }) => v,
+            _ => return,
+        };
+        let tiers = parse_default_fallback_tiers(&raw);
+        if tiers.is_empty() {
+            return;
+        }
+        info!(?tiers, "Using operator default fallback ladder");
+        let _ = OPERATOR_DEFAULT_LADDER.set(tiers);
     }
 
     /// Read the hotel's compact model catalog (config node
@@ -3196,12 +3286,24 @@ impl AgentRuntime {
             // approval policy so the unattended fire can execute the tools
             // its instruction names instead of parking WaitingApproval with
             // no operator awake and riding the watchdog to eviction.
-            if task.cron_job_id.is_some() {
-                for tool in &task.cron_preapproved_tools {
-                    if !state.approval_policy.preapproved_tools.contains(tool) {
-                        state.approval_policy.preapproved_tools.push(tool.clone());
-                    }
+            //
+            // Cron Turn Policy (2026-10-04): the policy now rides on the turn
+            // (`WorkingTurn::cron_policy`) instead of being appended to the
+            // session's approval policy, where grants were checkpointed and
+            // never revoked. Scrub what earlier builds left behind, ONCE: a
+            // session restored from a pre-policy checkpoint drops its standing
+            // grants at its next fire (`needs_legacy_cron_scrub`, DEF-221).
+            let cron_turn_policy = task.effective_cron_policy().map(Box::new);
+            if task.cron_job_id.is_some() && session_id.starts_with("cron:") {
+                if state.needs_legacy_cron_scrub {
+                    state.approval_policy.preapproved_tools.clear();
+                    state.approval_policy.preapproved_classes.clear();
+                    state.needs_legacy_cron_scrub = false;
                 }
+                // Replace (never merge) the session's fire policy so the turns
+                // this fire spawns stay under it, and a cleared job policy
+                // takes effect on the next fire.
+                state.cron_fire_policy = cron_turn_policy.clone();
             }
 
             let selection_source = if task.cron_job_id.is_some() {
@@ -3232,6 +3334,7 @@ impl AgentRuntime {
             }
 
             state.start_turn(WorkingTurn {
+                cron_policy: cron_turn_policy,
                 task_id,
                 turn_id: turn_id.clone(),
                 chat_id: chat_id.clone(),
@@ -5975,7 +6078,7 @@ impl AgentRuntime {
                     // ConfigureRole a "model-selection-only" change, which the
                     // hotel gate lets any role (orchestrator or not) apply to
                     // its own record (see role_materialization.rs).
-                    let (role_name, mut tlc, toolset_profile) = {
+                    let (role_name, session_tlc, toolset_profile) = {
                         match self.sessions.get(&session_id) {
                             Some(state) => {
                                 let ra = state.role_activation.as_ref();
@@ -6007,6 +6110,17 @@ impl AgentRuntime {
                             ),
                         }
                     };
+                    // The session's role_activation is a checkpoint snapshot taken
+                    // when the role was activated; an operator may have changed the
+                    // role's ladder since. Build from the hotel's CURRENT record so
+                    // `/model` never writes a stale ladder back (DEF-218); fall back
+                    // to the snapshot only when the hotel can't be read.
+                    let mut tlc = prefer_live_turn_loop_config(
+                        self.fetch_role_activation(&role_name)
+                            .await
+                            .and_then(|ra| ra.turn_loop_config),
+                        session_tlc,
+                    );
 
                     // Make the preset's provider tier primary, then bind the
                     // concrete model name to that tier (Layer 1 model_bindings).
@@ -7668,12 +7782,12 @@ mod tests {
         STREAK_CAP_CEILING, classify_provider_error, cognitive_response_contract,
         context_pressure_pct_from_projection, decide_no_response_action, effective_iteration_cap,
         extract_model_error, extract_model_error_payload, format_role_command_reply,
-        format_roles_report, loop_stop_fallback_reply, loop_stop_reason,
-        media_analysis_attachments, next_ladder_tier, normalized_user_content,
-        parse_compact_model_catalog, pick_oracle_role, primary_dispatch_used_ladder,
-        provider_for_role, resolve_media_routing, resolve_model_execution_target,
-        role_model_binding, shadow_eligible_capability, should_attempt_provider_repair,
-        tool_step_earns_streak,
+        format_roles_report, ladder_or_operator_default, loop_stop_fallback_reply,
+        loop_stop_reason, media_analysis_attachments, next_ladder_tier, normalized_user_content,
+        parse_compact_model_catalog, parse_default_fallback_tiers, pick_oracle_role,
+        prefer_live_turn_loop_config, primary_dispatch_used_ladder, provider_for_role,
+        resolve_media_routing, resolve_model_execution_target, role_model_binding,
+        shadow_eligible_capability, should_attempt_provider_repair, tool_step_earns_streak,
     };
     use crate::commands::SlashCommand;
     use crate::r#loop::{ApprovalRequest, PlanProposalAction, ToolCall, ToolResult, TurnPhase};
@@ -7860,6 +7974,7 @@ mod tests {
 
     pub(super) fn test_working_turn(phase: TurnPhase) -> WorkingTurn {
         WorkingTurn {
+            cron_policy: None,
             task_id: Uuid::nil(),
             turn_id: "turn-1".into(),
             chat_id: "123".into(),
@@ -8512,6 +8627,66 @@ mod tests {
         }
     }
 
+    /// DEF-216: `default_fallback_tiers` accepts a JSON array (or that array
+    /// stored as a JSON string) and drops blanks; junk means "unset".
+    #[test]
+    fn parse_default_fallback_tiers_accepts_array_or_encoded_array() {
+        let expected = vec!["model.openrouter".to_string(), "model.ollama".to_string()];
+        assert_eq!(
+            parse_default_fallback_tiers(r#"["model.openrouter", " ", "model.ollama"]"#),
+            expected
+        );
+        assert_eq!(
+            parse_default_fallback_tiers(r#""[\"model.openrouter\",\"model.ollama\"]""#),
+            expected
+        );
+        assert!(parse_default_fallback_tiers("not json").is_empty());
+        assert!(parse_default_fallback_tiers(r#""model.openrouter""#).is_empty());
+    }
+
+    /// DEF-216: a role's own ladder always wins; the operator default only
+    /// fills in for roles (and role-less sessions) that have none.
+    #[test]
+    fn role_ladder_wins_over_operator_default() {
+        let role = vec!["model".to_string()];
+        let operator = vec!["model.openrouter".to_string()];
+        assert_eq!(
+            ladder_or_operator_default(Some(&role), Some(&operator)),
+            Some(role.as_slice())
+        );
+        assert_eq!(
+            ladder_or_operator_default(Some(&[]), Some(&operator)),
+            Some(operator.as_slice())
+        );
+        assert_eq!(
+            ladder_or_operator_default(None, Some(&operator)),
+            Some(operator.as_slice())
+        );
+        assert_eq!(ladder_or_operator_default(None, None), None);
+    }
+
+    /// DEF-218: `/model` builds on the hotel's current role ladder, not the
+    /// session's stale checkpoint, so a Gemini tier removed by the operator is
+    /// not written back.
+    #[test]
+    fn model_swap_prefers_live_role_ladder_over_session_snapshot() {
+        let tlc = |tiers: &[&str]| ansible_mesh_core::graph::TurnLoopConfig {
+            fallback_tiers: tiers.iter().map(|t| t.to_string()).collect(),
+            ..Default::default()
+        };
+        let stale = tlc(&["model.openrouter", "model"]);
+        let live = tlc(&["model.openrouter", "model.ollama"]);
+        assert_eq!(
+            prefer_live_turn_loop_config(Some(live.clone()), stale.clone()).fallback_tiers,
+            live.fallback_tiers
+        );
+        // Hotel unreachable: keep the session snapshot rather than an empty ladder.
+        assert_eq!(
+            prefer_live_turn_loop_config(None, stale.clone()).fallback_tiers,
+            stale.fallback_tiers
+        );
+    }
+
     /// `role_model_binding` resolves independently per provider role — the
     /// core requirement that per-agent model selection covers both the
     /// primary dispatch AND every fallback tier, not just tier 0.
@@ -8959,6 +9134,7 @@ mod tests {
         let mut state =
             SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
         state.start_turn(WorkingTurn {
+            cron_policy: None,
             task_id: Uuid::nil(),
             turn_id: "turn-1".into(),
             chat_id: "123".into(),
@@ -14705,19 +14881,31 @@ mod tests {
         let _ = std::fs::remove_file(&socket_path);
     }
 
-    /// Operator-authored cron preapproval: `cron_preapproved_tools` on a
-    /// cron-delivered task must seed the session's approval policy so the
-    /// unattended fire can execute its named tools instead of parking
-    /// WaitingApproval. (aiua only forwards the field for operator-created
-    /// jobs — see CronTicker tests.)
+    /// Operator-authored cron preapproval rides on the TURN, not the session:
+    /// the legacy `cron_preapproved_tools` becomes the turn's `cron_policy`,
+    /// the session's approval policy stays clean, and grants an older build
+    /// left in the `cron:` session are scrubbed (they were never revoked).
     #[tokio::test]
-    async fn cron_preapproved_tools_seed_session_approval_policy() {
+    async fn cron_preapproval_is_turn_scoped_and_scrubs_stale_session_grants() {
         let (mut runtime, _emitted, server, socket_path) = plan_test_runtime("cronpreapp").await;
-        let session_id = "cron:ephemeral:agent-cronpreapp";
+        let session_id = "cron:job-backup";
         runtime
             .ensure_session_loaded(session_id, "cron")
             .await
             .expect("session load");
+        {
+            // A session restored from a pre-policy checkpoint, holding a grant
+            // an older build seeded and never revoked.
+            let state = runtime
+                .sessions
+                .get_mut(session_id)
+                .expect("session exists");
+            state
+                .approval_policy
+                .preapproved_tools
+                .push("memory.forget".into());
+            state.needs_legacy_cron_scrub = true;
+        }
 
         runtime
             .handle_user_message(
@@ -14733,14 +14921,55 @@ mod tests {
             .await
             .expect("turn started");
 
-        let policy = &runtime
-            .session(session_id)
-            .expect("session")
-            .approval_policy;
+        let state = runtime.session(session_id).expect("session");
+        assert!(
+            state.approval_policy.preapproved_tools.is_empty(),
+            "stale session grant must be scrubbed and nothing new written: {:?}",
+            state.approval_policy.preapproved_tools
+        );
+        let turn_policy = state
+            .active_cron_policy()
+            .expect("turn carries the cron policy");
+        assert_eq!(turn_policy.preapproved_tools, vec!["bash.exec".to_string()]);
+        assert!(state.cron_turn_preapproves("bash.exec"));
+        assert!(!state.cron_turn_preapproves("memory.forget"));
+        assert!(
+            state.cron_turn_allows_tool("memory.forget"),
+            "no allowlist set — the role's toolset is untouched"
+        );
+        assert!(!state.needs_legacy_cron_scrub, "scrub runs once");
+
+        // An operator grant made after the scrub (approve-always) survives the
+        // next fire.
+        {
+            let state = runtime.sessions.get_mut(session_id).expect("session");
+            state.active_turn = None;
+            state
+                .approval_policy
+                .preapproved_tools
+                .push("life.recall".into());
+        }
+        runtime
+            .handle_user_message(
+                InboundTaskPayload {
+                    session_id: Some(session_id.into()),
+                    content: Some("run the nightly backup".into()),
+                    cron_job_id: Some("job-backup".into()),
+                    ..Default::default()
+                },
+                Uuid::new_v4(),
+            )
+            .await
+            .expect("second fire");
+        let state = runtime.session(session_id).expect("session");
         assert_eq!(
-            policy.preapproved_tools,
-            vec!["bash.exec".to_string()],
-            "cron preapproval must seed the session policy exactly once"
+            state.approval_policy.preapproved_tools,
+            vec!["life.recall".to_string()],
+            "operator grants after the one-time scrub are kept"
+        );
+        assert!(
+            state.active_cron_policy().is_none(),
+            "a fire with no policy clears the session fire policy (revocation)"
         );
 
         drop(runtime);
@@ -14780,6 +15009,207 @@ mod tests {
                 .preapproved_tools
                 .is_empty(),
             "non-cron tasks must not seed approval policy"
+        );
+        assert!(
+            runtime
+                .session(session_id)
+                .expect("session")
+                .active_cron_policy()
+                .is_none(),
+            "cron keys on a task without cron_job_id are ignored"
+        );
+
+        drop(runtime);
+        let _ = server.await;
+        let _ = std::fs::remove_file(&socket_path);
+    }
+
+    /// Cron Turn Policy approval mode: an unattended cron turn (no chat to
+    /// ask) denies a gated tool immediately instead of parking
+    /// WaitingApproval for the 300 s watchdog; with a chat it still asks.
+    #[tokio::test]
+    async fn unattended_cron_turn_denies_instead_of_parking() {
+        for (tag, chat_id, expect_parked) in [
+            ("cronnochat", None, false),
+            ("cronchat", Some("7898847424"), true),
+        ] {
+            let (mut runtime, _emitted, server, socket_path) = plan_test_runtime(tag).await;
+            let session_id = format!("cron:job-{tag}");
+            runtime
+                .ensure_session_loaded(&session_id, "cron")
+                .await
+                .expect("session load");
+            runtime
+                .handle_user_message(
+                    InboundTaskPayload {
+                        session_id: Some(session_id.clone()),
+                        chat_id: chat_id.map(str::to_string),
+                        content: Some("nightly maintenance".into()),
+                        cron_job_id: Some(format!("job-{tag}")),
+                        ..Default::default()
+                    },
+                    Uuid::new_v4(),
+                )
+                .await
+                .expect("turn started");
+            let turn_id = {
+                let state = runtime.sessions.get_mut(&session_id).expect("session");
+                state.set_pending_tool_call(ToolCall {
+                    tool_name: "bash.exec".into(),
+                    arguments: serde_json::json!({"command": "true"}),
+                });
+                state.active_turn.as_ref().expect("turn").turn_id.clone()
+            };
+
+            runtime
+                .handle_approval_request(
+                    session_id.clone(),
+                    turn_id,
+                    ApprovalRequest {
+                        approval_id: None,
+                        reason: "Tool 'bash.exec' requires approval before execution.".into(),
+                        approved_response: "Executing bash.exec.".into(),
+                    },
+                    false,
+                )
+                .await
+                .expect("approval handled");
+
+            let state = runtime.session(&session_id).expect("session");
+            assert_eq!(
+                state.parked_approval_turn.is_some(),
+                expect_parked,
+                "{tag}: parked={}",
+                state.parked_approval_turn.is_some(),
+            );
+
+            drop(runtime);
+            let _ = server.await;
+            let _ = std::fs::remove_file(&socket_path);
+        }
+    }
+
+    /// Cron Turn Policy allowlist: the operator's `allowed_tools` narrows what
+    /// the fired turn sees AND may dispatch (an off-allowlist call is a denial
+    /// tool-result, not an approval park), and it still governs a later turn
+    /// in the same `cron:` session that carries no `cron_job_id` (plan
+    /// continuation / carryover) — those turns must not get the full toolset.
+    #[tokio::test]
+    async fn cron_policy_allowlist_narrows_fire_dispatch_and_continuations() {
+        let (mut runtime, _emitted, server, socket_path) = plan_test_runtime("cronallow").await;
+        let session_id = "cron:job-allow";
+        let content = "summarize the LifeGraph and check the calendar";
+        runtime
+            .ensure_session_loaded(session_id, "cron")
+            .await
+            .expect("session load");
+        let unrestricted: Vec<String> = runtime
+            .session(session_id)
+            .expect("session")
+            .project_tools_for_turn(content)
+            .into_iter()
+            .map(|t| t.tool_name)
+            .collect();
+        assert!(
+            unrestricted.len() >= 2,
+            "fixture must project several tools: {unrestricted:?}"
+        );
+        let allowed = unrestricted[0].clone();
+        let forbidden = unrestricted[1].clone();
+
+        runtime
+            .handle_user_message(
+                InboundTaskPayload {
+                    session_id: Some(session_id.into()),
+                    content: Some(content.into()),
+                    cron_job_id: Some("job-allow".into()),
+                    cron_policy: Some(ansible_mesh_core::cron::CronTurnPolicy {
+                        allowed_tools: Some(vec![allowed.clone()]),
+                        approval_mode: ansible_mesh_core::cron::CronApprovalMode::Deny,
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+                Uuid::new_v4(),
+            )
+            .await
+            .expect("turn started");
+
+        {
+            let state = runtime.session(session_id).expect("session");
+            assert!(state.cron_turn_allows_tool(&allowed));
+            assert!(!state.cron_turn_allows_tool(&forbidden));
+            let projected: Vec<String> = state
+                .project_tools_for_turn(content)
+                .into_iter()
+                .map(|t| t.tool_name)
+                .collect();
+            assert_eq!(projected, vec![allowed.clone()], "projection = allowlist");
+        }
+
+        // Dispatch gate: an off-allowlist call is refused with a tool-result.
+        let turn_id = runtime
+            .session(session_id)
+            .and_then(|s| s.active_turn.as_ref())
+            .expect("turn")
+            .turn_id
+            .clone();
+        runtime
+            .route_tool_call_execution(
+                session_id.to_string(),
+                turn_id,
+                ToolCall {
+                    tool_name: forbidden.clone(),
+                    arguments: serde_json::json!({}),
+                },
+                false,
+            )
+            .await
+            .expect("dispatch handled");
+        {
+            let state = runtime.session(session_id).expect("session");
+            assert!(
+                state.parked_approval_turn.is_none(),
+                "off-allowlist call must not park for approval"
+            );
+            let denied = state
+                .active_turn
+                .as_ref()
+                .map(|t| {
+                    t.working_tool_history.iter().any(|(call, result)| {
+                        call.tool_name == forbidden
+                            && result.content.contains("not allowed in this scheduled")
+                    })
+                })
+                .unwrap_or(false);
+            assert!(denied, "dispatch must record the allowlist denial");
+        }
+
+        // A continuation turn in the same cron session (no cron_job_id) stays
+        // under the fire's policy.
+        runtime
+            .sessions
+            .get_mut(session_id)
+            .expect("session")
+            .active_turn = None;
+        runtime
+            .handle_user_message(
+                InboundTaskPayload {
+                    session_id: Some(session_id.into()),
+                    content: Some("continue the plan".into()),
+                    ..Default::default()
+                },
+                Uuid::new_v4(),
+            )
+            .await
+            .expect("continuation started");
+        let state = runtime.session(session_id).expect("session");
+        assert!(state.active_turn.is_some(), "continuation turn started");
+        assert!(state.active_turn_is_cron());
+        assert!(state.cron_turn_allows_tool(&allowed));
+        assert!(
+            !state.cron_turn_allows_tool(&forbidden),
+            "continuation must not regain the role's full toolset"
         );
 
         drop(runtime);

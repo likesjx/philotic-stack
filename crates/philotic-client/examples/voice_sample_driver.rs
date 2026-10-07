@@ -85,13 +85,20 @@ async fn main() -> Result<()> {
         other => bail!("unexpected emit response: {other:?}"),
     }
 
-    let inbound = timeout(Duration::from_secs(30), client.recv_task())
-        .await
-        .context("timed out waiting for voice sample reply")??;
-
-    let IpcResponse::InboundTask { task_json, .. } = inbound else {
-        bail!("unexpected voice sample envelope: {inbound:?}");
-    };
+    // The hotel may push unrelated frames (e.g. MuninnStatus) before the
+    // reply lands; skip them until the InboundTask arrives.
+    let task_json = timeout(Duration::from_secs(60), async {
+        loop {
+            match client.recv_task().await? {
+                IpcResponse::InboundTask { task_json, .. } => {
+                    return Ok::<_, anyhow::Error>(task_json);
+                }
+                other => eprintln!("skipping non-task frame: {other:?}"),
+            }
+        }
+    })
+    .await
+    .context("timed out waiting for voice sample reply")??;
 
     let payload: Value =
         serde_json::from_str(&task_json).context("failed to decode model reply json")?;

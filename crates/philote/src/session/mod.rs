@@ -314,6 +314,19 @@ pub struct SessionState {
     pub settings: AgentSettings,
     pub status: String,
     pub approval_policy: ApprovalPolicy,
+    /// The operator-owned policy of the latest cron fire into this `cron:`
+    /// session. REPLACED (never merged) at every fire, so editing or clearing
+    /// the job's policy takes effect on the next fire. Covers the turns a fire
+    /// spawns that carry no `cron_job_id` — plan continuations, the carryover
+    /// after an approval eviction, paracrine responses — which would otherwise
+    /// run with the role's full toolset. Read via [`Self::active_cron_policy`].
+    pub cron_fire_policy: Option<Box<ansible_mesh_core::cron::CronTurnPolicy>>,
+    /// Restored from a checkpoint written before Cron Turn Policy (no
+    /// `cron_fire_policy` key): its `approval_policy` may hold cron grants an
+    /// older build appended and never revoked (DEF-221). Cleared once, at the
+    /// next cron fire — operator grants made afterwards (approve-always,
+    /// `/preapprove`) are left alone. Not checkpointed: derived on restore.
+    pub needs_legacy_cron_scrub: bool,
     pub bindings: SessionBindings,
     pub component_route_assembly: ComponentRouteAssembly,
     pub tool_assembly: ToolAssembly,
@@ -465,6 +478,8 @@ impl SessionState {
             settings: AgentSettings::default(),
             status: "active".into(),
             approval_policy: ApprovalPolicy::default(),
+            cron_fire_policy: None,
+            needs_legacy_cron_scrub: false,
             tool_assembly: default_tool_assembly_for_bindings(&bindings),
             component_route_assembly: ComponentRouteAssembly::default(),
             bindings,
@@ -1142,6 +1157,9 @@ impl SessionState {
             {
                 return true;
             }
+            if self.cron_turn_preapproves(&tool.tool_name) {
+                return true;
+            }
             if let Some(class) = tool_class(&tool.tool_name) {
                 if self
                     .approval_policy
@@ -1174,6 +1192,55 @@ impl SessionState {
             }
         }
         false
+    }
+
+    /// The operator-owned policy governing the active turn: the policy the
+    /// firing task carried, else — for any other turn in a `cron:` session
+    /// (continuation, carryover, paracrine response) — the latest fire's.
+    pub fn active_cron_policy(&self) -> Option<&ansible_mesh_core::cron::CronTurnPolicy> {
+        let turn = self.active_turn.as_ref()?;
+        turn.cron_policy.as_deref().or_else(|| {
+            self.session_id
+                .starts_with("cron:")
+                .then_some(self.cron_fire_policy.as_deref())
+                .flatten()
+        })
+    }
+
+    /// Is the active turn running inside a cron job's session (the fire itself
+    /// or a turn it spawned)?
+    pub fn active_turn_is_cron(&self) -> bool {
+        self.active_turn
+            .as_ref()
+            .is_some_and(|t| t.cron_policy.is_some())
+            || (self.active_turn.is_some() && self.session_id.starts_with("cron:"))
+    }
+
+    /// Does the active cron turn's policy preapprove `tool_name` (by name or
+    /// catalog class)? Turn-scoped — never written into `approval_policy`.
+    pub fn cron_turn_preapproves(&self, tool_name: &str) -> bool {
+        let Some(policy) = self.active_cron_policy() else {
+            return false;
+        };
+        policy.preapproved_tools.iter().any(|t| t == tool_name)
+            || tool_class(tool_name)
+                .is_some_and(|class| policy.preapproved_classes.iter().any(|c| c == class))
+    }
+
+    /// May the active turn use `tool_name` under its cron policy's allowlist?
+    /// `true` when the turn has no cron policy or the policy sets no
+    /// `allowed_tools` — the allowlist only ever narrows the role's toolset.
+    pub fn cron_turn_allows_tool(&self, tool_name: &str) -> bool {
+        let Some(allowed) = self.active_cron_policy().and_then(|p| {
+            p.allowed_tools
+                .as_ref()
+                .map(|tools| (tools, &p.allowed_classes))
+        }) else {
+            return true;
+        };
+        let (tools, classes) = allowed;
+        tools.iter().any(|t| t == tool_name)
+            || tool_class(tool_name).is_some_and(|class| classes.iter().any(|c| c == class))
     }
 
     pub fn set_preapprove_this_session(&mut self) {
@@ -2469,6 +2536,10 @@ impl SessionState {
                 tools.push(tool.clone());
             }
         }
+        // Cron Turn Policy: an operator allowlist narrows what the fired turn
+        // sees — last, so plan-bound tools cannot slip past it (enforced again
+        // at dispatch in `route_tool_call_execution`).
+        tools.retain(|t| self.cron_turn_allows_tool(&t.tool_name));
         tools
     }
 
@@ -4856,6 +4927,7 @@ impl SessionState {
             "role_activation": self.role_activation,
             "status": self.status,
             "approval_policy": self.approval_policy,
+            "cron_fire_policy": self.cron_fire_policy,
             "bindings": self.bindings,
             "tool_success_streak": self.tool_success_streak,
             "pending_preapproval_thresholds": self.pending_preapproval_thresholds,
@@ -5085,6 +5157,15 @@ impl SessionState {
             .cloned()
             .and_then(|value| serde_json::from_value::<ApprovalPolicy>(value).ok())
             .unwrap_or_default();
+        let cron_fire_policy = checkpoint
+            .get("cron_fire_policy")
+            .cloned()
+            .and_then(|value| {
+                serde_json::from_value::<ansible_mesh_core::cron::CronTurnPolicy>(value)
+                    .ok()
+                    .map(Box::new)
+            });
+        let needs_legacy_cron_scrub = checkpoint.get("cron_fire_policy").is_none();
         let tool_success_streak: std::collections::HashMap<String, u32> = checkpoint
             .get("tool_success_streak")
             .cloned()
@@ -5176,6 +5257,7 @@ impl SessionState {
                 .unwrap_or_else(Uuid::nil);
 
             Some(WorkingTurn {
+                cron_policy: None,
                 task_id,
                 turn_id: turn.get("turn_id")?.as_str()?.to_string(),
                 chat_id: turn
@@ -5445,6 +5527,8 @@ impl SessionState {
             settings: AgentSettings::default(),
             status,
             approval_policy,
+            cron_fire_policy,
+            needs_legacy_cron_scrub,
             bindings,
             component_route_assembly,
             tool_assembly,
@@ -6907,6 +6991,7 @@ mod tests {
 
     fn test_working_turn(active_plan: Option<ActivePlan>) -> WorkingTurn {
         WorkingTurn {
+            cron_policy: None,
             task_id: Uuid::nil(),
             turn_id: "turn-1".into(),
             chat_id: "123".into(),
@@ -7216,6 +7301,7 @@ mod tests {
         let mut state =
             SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
         state.start_turn(WorkingTurn {
+            cron_policy: None,
             task_id: Uuid::nil(),
             turn_id: "turn-1".into(),
             chat_id: "123".into(),
@@ -7659,6 +7745,7 @@ mod tests {
         let mut state =
             SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
         state.start_turn(WorkingTurn {
+            cron_policy: None,
             task_id: Uuid::nil(),
             turn_id: "turn-1".into(),
             chat_id: "123".into(),
@@ -7721,6 +7808,7 @@ mod tests {
             "A".repeat(1_900_000) // ~1.9MB
         );
         state.start_turn(WorkingTurn {
+            cron_policy: None,
             task_id: Uuid::nil(),
             turn_id: "turn-1".into(),
             chat_id: "123".into(),
@@ -8684,6 +8772,7 @@ mod tests {
             Some("User anchor: Jared prefers direct collaboration.".into());
         state.agent_profile.memory_summary = Some("Memory seed: architecture matters.".into());
         state.start_turn(WorkingTurn {
+            cron_policy: None,
             task_id: Uuid::nil(),
             turn_id: "turn-ctx-1".into(),
             chat_id: "123".into(),
@@ -8798,6 +8887,7 @@ mod tests {
             SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
         state.status = "paused".into();
         state.start_turn(WorkingTurn {
+            cron_policy: None,
             task_id: Uuid::nil(),
             turn_id: "turn-ctx-2".into(),
             chat_id: "123".into(),
@@ -9330,6 +9420,7 @@ mod tests {
             ..Default::default()
         });
         state.start_turn(WorkingTurn {
+            cron_policy: None,
             task_id: Uuid::nil(),
             turn_id: "turn-handoff-1".into(),
             chat_id: "123".into(),
@@ -9419,6 +9510,7 @@ mod tests {
         state.status = "active".into();
         state.active_incarnation_id = Some("agent-beacon:orchestrator".into());
         state.start_turn(WorkingTurn {
+            cron_policy: None,
             task_id: Uuid::nil(),
             turn_id: "turn-handoff-2".into(),
             chat_id: "123".into(),
@@ -9500,6 +9592,7 @@ mod tests {
             ..Default::default()
         });
         state.start_turn(WorkingTurn {
+            cron_policy: None,
             task_id: Uuid::nil(),
             turn_id: "turn-subagent-1".into(),
             chat_id: "123".into(),
@@ -11378,6 +11471,7 @@ mod tests {
         let mut first =
             SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
         first.start_turn(WorkingTurn {
+            cron_policy: None,
             task_id: Uuid::nil(),
             turn_id: "turn-1".into(),
             chat_id: "123".into(),
@@ -11447,6 +11541,7 @@ mod tests {
         let mut state =
             SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
         state.start_turn(WorkingTurn {
+            cron_policy: None,
             task_id: Uuid::nil(),
             turn_id: "turn-1".into(),
             chat_id: "123".into(),
@@ -11531,6 +11626,7 @@ mod tests {
         let mut state =
             SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
         state.start_turn(WorkingTurn {
+            cron_policy: None,
             task_id: Uuid::nil(),
             turn_id: "turn-1".into(),
             chat_id: "123".into(),
@@ -11616,6 +11712,7 @@ mod tests {
         let mut state =
             SessionState::new("sess-1".into(), "agent-jane-01".into(), "telegram".into());
         state.start_turn(WorkingTurn {
+            cron_policy: None,
             task_id: Uuid::nil(),
             turn_id: "turn-voice-1".into(),
             chat_id: "123".into(),
@@ -11981,6 +12078,7 @@ mod tests {
             "telegram".into(),
         );
         state.start_turn(WorkingTurn {
+            cron_policy: None,
             task_id: Uuid::nil(),
             turn_id: "turn-memory".into(),
             chat_id: "chat-memory".into(),
@@ -12438,6 +12536,7 @@ mod tests {
 
     fn make_turn_with_plan(plan: ActivePlan) -> WorkingTurn {
         WorkingTurn {
+            cron_policy: None,
             task_id: Uuid::nil(),
             turn_id: "turn-1".into(),
             chat_id: "c1".into(),
@@ -12989,6 +13088,7 @@ mod tests {
         let mut state =
             SessionState::new("sess-4".into(), "agent-bjork-01".into(), "telegram".into());
         let turn = WorkingTurn {
+            cron_policy: None,
             task_id: Uuid::nil(),
             turn_id: "turn-x".into(),
             chat_id: "c1".into(),

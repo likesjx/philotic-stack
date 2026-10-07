@@ -11,7 +11,10 @@ pub struct ElevenLabsProvider {
     default_model: String,
     default_output_format: String,
     default_stt_model: String,
+    base_url: String,
 }
+
+const DEFAULT_BASE_URL: &str = "https://api.elevenlabs.io";
 
 impl ElevenLabsProvider {
     pub fn new(
@@ -25,8 +28,27 @@ impl ElevenLabsProvider {
             default_voice_id,
             default_model: "eleven_multilingual_v2".into(),
             default_output_format: "mp3_44100_128".into(),
-            default_stt_model: "scribe_v1".into(),
+            // scribe_v1 is deprecated upstream; scribe_v2 is its replacement.
+            default_stt_model: "scribe_v2".into(),
+            base_url: DEFAULT_BASE_URL.into(),
         }
+    }
+
+    /// Apply the hotel's `elevenlabs_default_model` (TTS model used when a
+    /// task does not name one, e.g. `eleven_v4` / `eleven_v4_turbo`).
+    pub fn with_default_model(mut self, model: Option<String>) -> Self {
+        if let Some(model) = model.filter(|m| !m.trim().is_empty()) {
+            self.default_model = model.trim().to_string();
+        }
+        self
+    }
+
+    /// Apply the hotel's `elevenlabs_base_url` (e.g. a regional endpoint).
+    pub fn with_base_url(mut self, base_url: Option<String>) -> Self {
+        if let Some(url) = base_url.filter(|u| !u.trim().is_empty()) {
+            self.base_url = url.trim().trim_end_matches('/').to_string();
+        }
+        self
     }
 
     fn resolve_voice_id<'a>(&'a self, task: &'a ControllerTask) -> Result<&'a str> {
@@ -121,8 +143,8 @@ impl ModelProvider for ElevenLabsProvider {
                 let response = self
                     .http_client
                     .post(format!(
-                        "https://api.elevenlabs.io/v1/text-to-speech/{}/stream",
-                        voice_id
+                        "{}/v1/text-to-speech/{}/stream",
+                        self.base_url, voice_id
                     ))
                     .header("xi-api-key", api_key)
                     .query(&[("output_format", output_format.as_str())])
@@ -220,7 +242,7 @@ impl ModelProvider for ElevenLabsProvider {
 
                 let stt_resp = self
                     .http_client
-                    .post("https://api.elevenlabs.io/v1/speech-to-text")
+                    .post(format!("{}/v1/speech-to-text", self.base_url))
                     .header("xi-api-key", api_key)
                     .multipart(form)
                     .send()
@@ -352,8 +374,47 @@ mod tests {
     }
 
     #[test]
-    fn default_stt_model_is_scribe_v1() {
+    fn default_stt_model_is_scribe_v2() {
         let provider = ElevenLabsProvider::new(reqwest::Client::new(), None, None);
-        assert_eq!(provider.default_stt_model, "scribe_v1");
+        assert_eq!(provider.default_stt_model, "scribe_v2");
+    }
+
+    #[test]
+    fn configured_default_model_applies_when_task_names_none() {
+        let provider = ElevenLabsProvider::new(reqwest::Client::new(), None, None)
+            .with_default_model(Some("eleven_v4_turbo".into()));
+        let task = ControllerTask::from_value(&json!({
+            "kind": "voice.synthesize",
+            "text": "hello"
+        }))
+        .unwrap();
+        assert_eq!(
+            provider.request_body(&task).unwrap()["model_id"],
+            "eleven_v4_turbo"
+        );
+
+        let pinned = ControllerTask::from_value(&json!({
+            "kind": "voice.synthesize",
+            "text": "hello",
+            "model": "eleven_multilingual_v2"
+        }))
+        .unwrap();
+        assert_eq!(
+            provider.request_body(&pinned).unwrap()["model_id"],
+            "eleven_multilingual_v2"
+        );
+    }
+
+    #[test]
+    fn blank_overrides_keep_builtin_defaults() {
+        let provider = ElevenLabsProvider::new(reqwest::Client::new(), None, None)
+            .with_default_model(Some("  ".into()))
+            .with_base_url(None);
+        assert_eq!(provider.default_model, "eleven_multilingual_v2");
+        assert_eq!(provider.base_url, "https://api.elevenlabs.io");
+
+        let regional = ElevenLabsProvider::new(reqwest::Client::new(), None, None)
+            .with_base_url(Some("https://api.eu.residency.elevenlabs.io/".into()));
+        assert_eq!(regional.base_url, "https://api.eu.residency.elevenlabs.io");
     }
 }

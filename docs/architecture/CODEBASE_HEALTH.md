@@ -77,7 +77,7 @@ At **36,564 lines** (2026-10-07; it was 4,911 at the March baseline), with 173 d
 - Hard to reason about in review
 - The most impactful place for a latent panic to surface in production
 
-**Recommendation:** Split by concern. The concrete plan is [IPC_DISPATCH_SPLIT_PROPOSAL.md](IPC_DISPATCH_SPLIT_PROPOSAL.md) (S0–S6: `ipc.rs` → `ipc/` family modules, plus the park-path fixes such as DEF-214).
+**Recommendation:** Split by concern. The concrete plan is [IPC_DISPATCH_SPLIT_PROPOSAL.md](IPC_DISPATCH_SPLIT_PROPOSAL.md) (S0–S6: `ipc.rs` → `ipc/` family modules, plus the park-path fixes such as DEF-223).
 
 ### 2. 119 runtime `unwrap()` calls — MEDIUM risk
 At the March baseline `ipc.rs` carried 195 `unwrap()`/`expect()` calls (some in test code, many not); by 2026-10-07 production code in `ipc.rs` is down to 4. A panicking `unwrap()` in an async tokio task silently kills that task. For a daemon that's supposed to be a stable hotel supervisor this is a reliability risk, not just a style issue.

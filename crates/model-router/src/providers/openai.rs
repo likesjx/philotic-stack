@@ -353,9 +353,18 @@ impl OpenAIProvider {
     }
 
     fn chat_request_body(&self, task: &ControllerTask) -> Result<Value> {
+        // Structured channels (voice text, memory, plan) come back inside one
+        // JSON object under the same contract the Anthropic provider sends;
+        // without it OpenRouter models improvised the plan into the reply
+        // (DEF-219). Philote unwraps the `display_text` envelope.
+        let mut messages = Vec::new();
+        if let Some(contract) = super::structured_reply_contract(task) {
+            messages.push(json!({ "role": "system", "content": contract }));
+        }
+        messages.push(Self::user_message(task)?);
         let mut body = json!({
             "model": self.default_model(task),
-            "messages": [Self::user_message(task)?],
+            "messages": messages,
             "stream": false,
         });
 
@@ -389,6 +398,11 @@ impl OpenAIProvider {
 
         if let Some(response_format) = Self::response_format(task) {
             body["response_format"] = response_format;
+        } else if task.tools.is_empty() && super::wants_structured_reply(task) {
+            // JSON mode backs the contract only on tool-less turns: on some
+            // models it suppresses native tool calls, and the turn loop needs
+            // those.
+            body["response_format"] = json!({ "type": "json_object" });
         }
 
         for key in ["reasoning_effort", "verbosity"] {
@@ -549,7 +563,9 @@ impl OpenAIProvider {
     }
 
     fn parse_structured_text(content: &str) -> StructuredTextParts {
-        let Ok(value) = serde_json::from_str::<Value>(content) else {
+        // The whole reply as one object, or a leading object followed by the
+        // user-facing prose (DEF-219) — the prose then is the display text.
+        let Some((value, trailing_prose)) = super::split_structured_reply(content) else {
             return (None, None, None, None, None);
         };
 
@@ -561,7 +577,8 @@ impl OpenAIProvider {
             .get("display_text")
             .or_else(|| object.get("content"))
             .and_then(Value::as_str)
-            .map(str::to_string);
+            .map(str::to_string)
+            .or_else(|| (!trailing_prose.is_empty()).then(|| trailing_prose.clone()));
         let spoken_text = object
             .get("spoken_text")
             .and_then(Value::as_str)
@@ -906,6 +923,13 @@ impl OpenAIProvider {
 
         let (display_text, spoken_text, memory_concept, memory_candidate, active_plan) =
             Self::parse_structured_text(&content);
+        // A structured reply's user-facing text replaces the raw model output
+        // as `content` too, so a leading plan/JSON object never reaches the
+        // user (DEF-219). Unstructured replies pass through untouched.
+        let content = match (&display_text, super::split_structured_reply(&content)) {
+            (Some(text), Some((_, trailing_prose))) if !trailing_prose.is_empty() => text.clone(),
+            _ => content,
+        };
 
         Ok(ProviderOutput::Text {
             display_text: display_text.or_else(|| Some(content.clone())),
@@ -1361,6 +1385,57 @@ mod tests {
         assert_eq!(body["messages"][0]["content"][0]["type"], "text");
         assert_eq!(body["messages"][0]["content"][1]["type"], "image_url");
         assert_eq!(body["tools"][0]["function"]["name"], "workspace.read");
+    }
+
+    /// DEF-219: a turn asking for structured channels gets the JSON reply
+    /// contract as a system message; JSON mode backs it only when the turn has
+    /// no tools (it can suppress native tool calls on some models).
+    #[test]
+    fn structured_channels_send_the_reply_contract() {
+        let provider = OpenAIProvider::new(
+            reqwest::Client::new(),
+            Some(OpenAIAuth::ApiKey("secret".into())),
+            Some("http://127.0.0.1:9".into()),
+            None,
+            Some("z-ai/glm-5.3".into()),
+            None,
+        );
+        let structured = |with_tools: bool| {
+            let mut task = json!({
+                "kind": "text.generate",
+                "response_contract": { "channels": ["spoken_text", "active_plan"] },
+                "context": { "active_turn": { "text": "check" } }
+            });
+            if with_tools {
+                task["tools_for_model"] = json!([{
+                    "tool_name": "workspace.read",
+                    "description": "Read a file",
+                    "input_schema": { "type": "object", "properties": {} }
+                }]);
+            }
+            ControllerTask::from_value(&task).unwrap()
+        };
+
+        let body = provider.chat_request_body(&structured(false)).unwrap();
+        assert_eq!(body["messages"][0]["role"], "system");
+        let contract = body["messages"][0]["content"].as_str().unwrap();
+        assert!(contract.contains("display_text") && contract.contains("active_plan"));
+        assert_eq!(body["messages"][1]["role"], "user");
+        assert_eq!(body["response_format"]["type"], "json_object");
+
+        let body = provider.chat_request_body(&structured(true)).unwrap();
+        assert_eq!(body["messages"][0]["role"], "system");
+        assert!(body.get("response_format").is_none());
+
+        // A plain text turn is untouched.
+        let plain = ControllerTask::from_value(&json!({
+            "kind": "text.generate",
+            "context": { "active_turn": { "text": "hi" } }
+        }))
+        .unwrap();
+        let body = provider.chat_request_body(&plain).unwrap();
+        assert_eq!(body["messages"][0]["role"], "user");
+        assert!(body.get("response_format").is_none());
     }
 
     #[test]
@@ -1936,6 +2011,60 @@ mod tests {
                 assert_eq!(display_text.as_deref(), Some("Hello"));
                 assert_eq!(spoken_text.as_deref(), Some("Hello there"));
                 assert_eq!(active_plan, Some(json!({ "goal": "test" })));
+            }
+            other => panic!("unexpected output: {:?}", other),
+        }
+    }
+
+    /// DEF-219: glm-5.3 (via OpenRouter) answered a plan-gated re-entry with
+    /// the plan object followed by the real answer; the whole thing used to be
+    /// sent to the user. The plan must be lifted out and only the prose sent.
+    #[tokio::test]
+    async fn leading_plan_object_is_lifted_out_of_the_reply() {
+        let app = Router::new().route(
+            "/v1/chat/completions",
+            post(|| async move {
+                Json(json!({
+                    "choices": [{
+                        "message": {
+                            "content": "{\"active_plan\":{\"goal\":\"Confirm the fix\",\"steps\":[{\"description\":\"Reply\",\"status\":\"done\",\"tool_name\":null}]}}\n\nAll good — the fix is working."
+                        }
+                    }]
+                }))
+            }),
+        );
+        let (base_url, _handle) = spawn_test_server(app).await;
+
+        let provider = OpenAIProvider::new(
+            reqwest::Client::new(),
+            Some(OpenAIAuth::ApiKey("secret".into())),
+            Some(base_url),
+            None,
+            None,
+            None,
+        );
+        let task = ControllerTask::from_value(&json!({
+            "kind": "text.generate",
+            "context": { "active_turn": { "text": "check" } }
+        }))
+        .unwrap();
+
+        match provider.invoke(&task).await.unwrap() {
+            ProviderOutput::Text {
+                content,
+                display_text,
+                active_plan,
+                ..
+            } => {
+                assert_eq!(content, "All good — the fix is working.");
+                assert_eq!(
+                    display_text.as_deref(),
+                    Some("All good — the fix is working.")
+                );
+                assert_eq!(
+                    active_plan.and_then(|plan| plan.get("goal").cloned()),
+                    Some(json!("Confirm the fix"))
+                );
             }
             other => panic!("unexpected output: {:?}", other),
         }

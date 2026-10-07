@@ -192,6 +192,19 @@ struct OperatorChatTurnBody {
     #[serde(default)]
     conversation_id: Option<String>,
     content: String,
+    /// `"voice"` asks the agent to answer with its persona voice (the same
+    /// marker membranes stamp on voice notes); anything else is a text turn.
+    #[serde(default)]
+    message_kind: Option<String>,
+}
+
+/// Only `"voice"` is meaningful to the philote; drop anything else rather
+/// than forwarding arbitrary client strings into the task.
+fn operator_chat_message_kind(raw: Option<&str>) -> Option<String> {
+    match raw.map(str::trim) {
+        Some(kind) if kind.eq_ignore_ascii_case("voice") => Some("voice".to_string()),
+        _ => None,
+    }
 }
 
 #[derive(Clone, serde::Serialize)]
@@ -820,6 +833,7 @@ pub async fn run(
         .route("/api/cron/:job_id", delete(handle_cron_delete))
         .route("/api/cron/:job_id/enable", post(handle_cron_enable))
         .route("/api/cron/:job_id/disable", post(handle_cron_disable))
+        .route("/api/cron/:job_id/policy", post(handle_cron_set_policy))
         .route("/api/secrets", get(handle_secrets))
         .route("/api/secrets/rotate", post(handle_secret_rotate))
         .route("/api/vault", post(handle_vault_add))
@@ -1290,6 +1304,18 @@ async fn wait_for_shutdown(mut shutdown_rx: watch::Receiver<bool>) {
 /// routing bootstrap/auth workflows into System Settings. The server remains
 /// the authority on session issuance and API access, but it should not replace
 /// the desktop with a parallel HTML login applet.
+/// Longest silence tolerated on the operator chat reply leg between hotel
+/// frames. A real turn can re-enter the model (say-do gate) and then
+/// synthesize voice before its first frame lands; 30 s cut those off and
+/// surfaced "timed out waiting for operator chat reply" for turns that
+/// completed moments later.
+const OPERATOR_CHAT_REPLY_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// CSP for the embedded desktop. `media-src blob:` lets the Aiua chat panel
+/// play persona-voice audio it decodes from `operator_chat:voice_chunk`
+/// frames into page-created blob URLs (no remote media origins).
+const DESKTOP_CSP: &str = "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; media-src 'self' blob:; font-src 'self' data:; connect-src 'self' ws: wss:; object-src 'none'; frame-ancestors 'none'; base-uri 'self'";
+
 async fn handle_index(headers: HeaderMap, State(state): State<AppState>) -> Response {
     serve_index_for_session(&state, current_operator_session(&headers, &state).as_ref()).await
 }
@@ -1340,9 +1366,7 @@ async fn serve_index_for_session(
     );
     headers.insert(
         header::CONTENT_SECURITY_POLICY,
-        HeaderValue::from_static(
-            "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data:; connect-src 'self' ws: wss:; object-src 'none'; frame-ancestors 'none'; base-uri 'self'",
-        ),
+        HeaderValue::from_static(DESKTOP_CSP),
     );
     response
 }
@@ -3104,7 +3128,7 @@ async fn handle_mesh_target_agent_chat(
         &operator_session_id,
         conversation_id,
         body.content,
-        None,
+        operator_chat_message_kind(body.message_kind.as_deref()),
         Vec::new(),
     )
     .await
@@ -3344,7 +3368,7 @@ async fn stream_operator_chat_turn(
     }
 
     loop {
-        let inbound = tokio::time::timeout(Duration::from_secs(30), client.recv_task())
+        let inbound = tokio::time::timeout(OPERATOR_CHAT_REPLY_IDLE_TIMEOUT, client.recv_task())
             .await
             .map_err(|_| anyhow!("timed out waiting for operator chat reply"))??;
         let IpcResponse::InboundTask { task_json, .. } = inbound else {
@@ -4027,6 +4051,63 @@ struct CreateCronBody {
     enabled: bool,
     #[serde(default)]
     silent_ok: bool,
+    /// Operator-owned turn policy (tool allowlist, preapprovals, approval mode).
+    #[serde(default)]
+    policy: Option<ansible_mesh_core::cron::CronTurnPolicy>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct SetCronPolicyBody {
+    /// `null` clears the job's policy.
+    #[serde(default)]
+    policy: Option<ansible_mesh_core::cron::CronTurnPolicy>,
+}
+
+async fn handle_cron_set_policy(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Path(job_id): Path<String>,
+    Json(body): Json<SetCronPolicyBody>,
+) -> Response {
+    if !check_auth(&headers, &state) {
+        return unauthorized();
+    }
+    let mut client = match connect_management_client(&state.socket, "philotic-web-cron").await {
+        Ok(client) => client,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": e.to_string()})),
+            )
+                .into_response()
+        }
+    };
+    let result = client
+        .send_request(IpcRequest::SetCronPolicy {
+            job_id: job_id.clone(),
+            policy: body.policy,
+        })
+        .await;
+    match result {
+        Ok(IpcResponse::Standard { ok: true, data, .. }) => {
+            let event = json!({ "type": "cron:updated", "payload": { "job_id": job_id } });
+            let _ = state.tx.send(event.to_string());
+            Json(json!({"ok": true, "data": data})).into_response()
+        }
+        Ok(IpcResponse::Standard { message, .. }) | Ok(IpcResponse::Error(message)) => {
+            (StatusCode::BAD_REQUEST, Json(json!({"error": message}))).into_response()
+        }
+        Ok(other) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": format!("unexpected response: {other:?}")})),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": e.to_string()})),
+        )
+            .into_response(),
+    }
 }
 
 async fn handle_cron_create(
@@ -4058,6 +4139,7 @@ async fn handle_cron_create(
         // `RegisterCronJob` IPC handler re-asserts this regardless, but
         // setting it here too keeps the constructed value honest.
         session_target: ansible_mesh_core::cron::CronSessionTarget::Isolated,
+        policy: body.policy,
     };
     match ipc_register_cron_job(&state.socket, job.clone()).await {
         Ok(()) => {
@@ -9071,6 +9153,28 @@ fn oidc_callback_error_response(status: StatusCode, message: String) -> Response
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn desktop_csp_allows_blob_audio_but_no_remote_media() {
+        assert!(DESKTOP_CSP.contains("media-src 'self' blob:;"));
+        assert!(DESKTOP_CSP.contains("default-src 'self';"));
+        assert!(!DESKTOP_CSP.contains("media-src *"));
+    }
+
+    #[test]
+    fn operator_chat_message_kind_only_passes_voice() {
+        assert_eq!(
+            operator_chat_message_kind(Some("voice")),
+            Some("voice".into())
+        );
+        assert_eq!(
+            operator_chat_message_kind(Some(" Voice ")),
+            Some("voice".into())
+        );
+        assert_eq!(operator_chat_message_kind(Some("text")), None);
+        assert_eq!(operator_chat_message_kind(Some("audio; drop table")), None);
+        assert_eq!(operator_chat_message_kind(None), None);
+    }
+
     use super::*;
     use ansible_mesh_core::storage::EventStorage;
     use std::fs;

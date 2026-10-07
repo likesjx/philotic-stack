@@ -233,53 +233,13 @@ impl AnthropicProvider {
     }
 
     fn wants_structured(task: &ControllerTask) -> bool {
-        task.kind == TaskKind::TextGenerate
-            && (task.wants_channel("spoken_text")
-                || task.wants_channel("memory_concept")
-                || task.wants_channel("active_plan"))
+        super::wants_structured_reply(task)
     }
 
     /// System prompt carrying the structured-output contract. Tools stay native
     /// (`tool_use` blocks) — only the text-reply shape is constrained.
     fn system_text(task: &ControllerTask) -> Option<String> {
-        if !Self::wants_structured(task) {
-            return None;
-        }
-
-        let memory_instruction = if task.wants_channel("memory_concept") {
-            " If — and only if — this exchange contains something genuinely worth remembering \
-             (a user preference, a decision made, a fact learned, or a pattern worth recalling \
-             later), include \"memory_candidate\" with fields: \"concept\" (short kebab-case \
-             slug), \"content\" (one or two sentences distilling what is worth keeping), and \
-             optional \"tags\" (array of short strings). Omit memory_candidate entirely for \
-             routine exchanges, simple questions, greetings, or transient state."
-        } else {
-            ""
-        };
-        let plan_instruction = if task.wants_channel("active_plan") {
-            " When working a multi-step task, also include \"active_plan\" in that JSON object: \
-             {\"goal\": string, \"status\": string, \"steps\": [{\"id\": integer, \
-             \"description\": string, \"tool_name\": string, \"status\": string}]}. Omit \
-             active_plan for single-step exchanges."
-        } else {
-            ""
-        };
-
-        let tool_clause = if task.tools.is_empty() {
-            ""
-        } else {
-            "When a tool is needed, call one of the declared tools natively — do not write a \
-             JSON tool_call object by hand. Use tool input fields exactly as declared and \
-             include every required field.\n"
-        };
-
-        Some(format!(
-            "{}When replying with text, reply with ONLY a raw JSON object — no markdown code \
-             fences, no text outside the JSON — containing \"display_text\" (your reply, \
-             markdown fine) and \"spoken_text\" (conversational version for voice, no \
-             markdown).{}{}",
-            tool_clause, memory_instruction, plan_instruction,
-        ))
+        super::structured_reply_contract(task)
     }
 
     fn numeric_provider_option(task: &ControllerTask, key: &str) -> Option<Value> {
@@ -380,9 +340,16 @@ impl AnthropicProvider {
     /// Parse the structured-contract JSON out of a text reply.
     /// Returns `(display_text, spoken_text, memory_concept, memory_candidate, active_plan)`.
     fn parse_structured_text(content: &str) -> StructuredTextParts {
-        let Ok(value) = serde_json::from_str::<Value>(Self::strip_json_code_fences(content)) else {
-            return (None, None, None, None, None);
-        };
+        // Whole reply (optionally fenced) first; else a leading object followed
+        // by the user-facing prose (DEF-219).
+        let (value, trailing_prose) =
+            match serde_json::from_str::<Value>(Self::strip_json_code_fences(content)) {
+                Ok(value) => (value, String::new()),
+                Err(_) => match super::split_structured_reply(content) {
+                    Some(split) => split,
+                    None => return (None, None, None, None, None),
+                },
+            };
         let Some(object) = value.as_object() else {
             return (None, None, None, None, None);
         };
@@ -392,7 +359,8 @@ impl AnthropicProvider {
             .or_else(|| object.get("content"))
             .and_then(Value::as_str)
             .filter(|s| !s.trim().is_empty())
-            .map(str::to_string);
+            .map(str::to_string)
+            .or_else(|| (!trailing_prose.is_empty()).then(|| trailing_prose.clone()));
         let spoken_text = object
             .get("spoken_text")
             .and_then(Value::as_str)
@@ -467,6 +435,11 @@ impl AnthropicProvider {
             } else {
                 (None, None, None, None, None)
             };
+        // A leading object + prose reply sends only the prose (DEF-219).
+        let content = match (&display_text, super::split_structured_reply(&content)) {
+            (Some(text), Some((_, trailing_prose))) if !trailing_prose.is_empty() => text.clone(),
+            _ => content,
+        };
 
         Ok(ProviderOutput::Text {
             display_text: display_text.or_else(|| Some(content.clone())),

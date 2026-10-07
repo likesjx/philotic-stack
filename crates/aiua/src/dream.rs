@@ -122,6 +122,7 @@ pub fn ensure_scheduled(
         created_by: ansible_mesh_core::cron::CronJobSource::Operator,
         silent_ok: true,
         session_target: ansible_mesh_core::cron::CronSessionTarget::Isolated,
+        policy: None,
     };
     graph.upsert_cron_job(&job)?;
     info!(hotel = %hotel_name, job_id = %job_id, next_fire_at, "dream-sweep: nightly consolidation cron job registered");

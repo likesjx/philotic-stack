@@ -451,7 +451,7 @@ Six work items from the 2026-09-30 Philotic Stack Atlas assessment, each with a 
 
 - [ ] Mesh delivery guarantees (L1–L7): [MESH_DELIVERY_GUARANTEES_PROPOSAL.md](architecture/MESH_DELIVERY_GUARANTEES_PROPOSAL.md). DEF-182/184/192/059/211/185.
 - [ ] Watch-live burn-down (W0–W7): [WATCH_LIVE_BURNDOWN_PROPOSAL.md](architecture/WATCH_LIVE_BURNDOWN_PROPOSAL.md). Inventory, status vocabularies, procedure/hygiene/relocation proofs, doctor readiness.
-  - [x] W0 inventory + vocabulary (2026-10-07): [process/WATCH_LIVE_BACKLOG.md](process/WATCH_LIVE_BACKLOG.md) seeded (22 items, due 2026-11-04); DEFECTS status vocabulary tightened and every row normalized (new DEF-214); `scripts/docs-metadata-check.py` lints proposal and DEFECTS statuses (`--warn-only`, non-blocking `pr-check.yml` step parked as workflow patch 0001; make blocking after one week).
+  - [x] W0 inventory + vocabulary (2026-10-07): [process/WATCH_LIVE_BACKLOG.md](process/WATCH_LIVE_BACKLOG.md) seeded (22 items, due 2026-11-04); DEFECTS status vocabulary tightened and every row normalized (new DEF-223, renumbered from DEF-214 at merge — develop had already used 214); `scripts/docs-metadata-check.py` lints proposal and DEFECTS statuses (`--warn-only`, non-blocking `pr-check.yml` step parked as workflow patch 0001; make blocking after one week).
   - [x] W4 enablement (2026-10-07): ansible `philotic_memory_hygiene_enabled` (on for jane-vps). Proof window starts at the next vps deploy.
   - [ ] W1, W3, W5, W6 need hotel access; W3 step 5 and W7 are Rust.
   - [x] W2 proposal status reconciliation (2026-10-07): frontmatter `status`/`disposition` aligned with landed code across ~30 proposals; LIFE_GRAPH_ACTIVE gained frontmatter. Lint warnings cleared. Graph rescan (`phil graph scan`) pending from the main checkout after merge.
@@ -1191,7 +1191,20 @@ Seam IDs: `structured-model-envelope`, `hotel-gemini-oauth-flow`
   - `follow_up_questions`
 - [ ] Add `spoken_text` / expressive speech projection alongside user-visible text.
 - [ ] Define ElevenLabs default-voice pinning plus upstream voice override behavior.
-- [ ] Add Eleven v3 model selection and expressive-tag support without pretending it is the same as the low-latency conversational path.
+- [~] ~~Add Eleven v3 model selection and expressive-tag support~~ — superseded by Eleven v4 (2026-10-05, `codex/elevenlabs-v4`):
+  - [x] Spike: `eleven_v4` **and** `eleven_v4_turbo` both work on the existing HTTP `/v1/text-to-speech/{voice}/stream` path (live through mac-jane `model.elevenlabs`; bogus model id → 400 control). v4 accepts `speed`/`style` without error (docs say ignored). No new transport needed.
+  - [x] model-router honours `elevenlabs_default_model` / `elevenlabs_base_url` (+ `PHILOTIC_ELEVENLABS_*` env); batch STT default `scribe_v1` → `scribe_v2`.
+  - [x] philotic-web REST operator chat accepts `message_kind: "voice"`; browser desktop (jaredlikes-desktop `codex/voice-chunk-playback`) consumes `operator_chat:reply|voice_chunk|error` and plays persona voice (toggle, ordered chunk queue, barge-in). Live: voice turn → `voice_chunk` with audio + `reply` via local philotic-web on mac-jane.
+  - [x] mac-jane (2026-10-05): `model-controller-elevenlabs` from `c4a510de` installed alone (new inode, re-signed; backup `Cellar/aiua/0.1.0-alpha/single-backup-model-controller-elevenlabs-20261005`), controller-only respawn, hotel `elevenlabs_default_model="eleven_v4_turbo"`. Smoke-green: no-model synth → `eleven_v4_turbo`; explicit `--model eleven_multilingual_v2` still wins; bjork operator-chat voice turn → `voice_chunk` voiced by `eleven_v4_turbo`. Rollback: reinstall the backup or `phil config set --hotel mac-jane elevenlabs_default_model '"eleven_multilingual_v2"'` + kill the controller (never set it empty).
+  - [ ] Same rollout on mbp-jane / vps-jane; watched-live listen in the browser (needs jaredlikes-desktop PR #20 + philotic-web from develop on the serving hotel).
+- [x] Gemini capped for October 2026, so mac-jane moved to OpenRouter only and newest models (2026-10-05):
+  - hotel config `openrouter_default_model=z-ai/glm-5.3` (was glm-5.2); `openrouter_fallback_models=["z-ai/glm-5.3-flash","qwen/qwen3.8-flash"]` (OpenRouter server-side `route: fallback`, read per task, so no restart).
+  - Model-only `ConfigureRole` over IPC for all 8 mac-jane role incarnations: ladder `[model.openrouter, model.ollama]` (Gemini `model` tier removed). bjork orchestrator binding `deepseek/deepseek-v3.2` → `deepseek/deepseek-v4.1-flash`. Backup: `~/.philotic/bjork/role_and_identity.bak-20261005T1500.json`.
+  - Coach `voice_response_policy.model` `eleven_v3` → `eleven_v4` (agent_identity bundle DB patch + Coach philote respawn; not live-verified, see DEF-217).
+  - Smoke-green: a fresh bjork session's text came from `deepseek-v4.1-flash` and its voice from `eleven_v4_turbo`. An existing session refreshes with `/role theoretician` then `/role orchestrator` (verified); don't use `/model` there (DEF-218).
+  - [ ] Same OpenRouter/ladder change on mbp-jane and vps-jane.
+  - [x] Fixed in code, `codex/model-routing-defects` (deploy pending): DEF-214 (first turn dropped; the hotel moved session ownership on a mid-turn vps reply), DEF-217 (coach operator-chat rerouted to vps), DEF-218 (`/model` wrote a stale ladder back), DEF-216 (new hotel config `default_fallback_tiers`).
+  - [ ] v4 audio tags in `spoken_text` (strip before Kokoro + captions). Optional: Text-to-Dialogue websocket client for lower first-audio than per-sentence HTTP.
 
 ### Workstream: Model Graph Decision Layer
 
@@ -2384,3 +2397,13 @@ Audit 2026-09-30 (full read: philote Muninn lane, `data-memorygraphrag` runner, 
 - [x] S10 Docs true-up: MEMORY_TRANSPARENCY stale promotion-seam claim corrected; MEMORY_CONTEXT superseded; REFLEXIVE_LIFE_GRAPH slice-1 status fixed.
 - [ ] Deploy: apply V007 on vps Memgraph, then standard 3-hotel rollout; watch one live turn for the auto-recall marker and one auto-capture carrying `origin_engram_id`.
 - [ ] Follow-ups (ranked): DEF-209 client ports; activate-side entity return; positive reinforcement in `life.recall.feedback`; Measurement importer (HealthKit); life.audit O(n²) → MAGE.
+
+## Cron Turn Policy — operator-owned tools/approvals per cron job
+
+Branch `codex/cron-turn-policy`; decision on `doc:distributed-cron-proposal` (graph_decide 2026-10-04). Operator rule: a cron job's tool/approval policy is set only by the operator or on the operator's behalf; agents may create jobs, never grant them tools or approvals.
+
+- [x] Slice 1 (test-green): typed `CronJob.policy: Option<CronTurnPolicy>` (`allowed_tools`/`allowed_classes`, `preapproved_tools`/`preapproved_classes`, `approval_mode` ask_or_deny|deny); writable only via `cron_policy_authority` (operator / cli / philotic-web / desktop / bare `management` — NOT orchestrator incarnations) on `RegisterCronJob` and new `SetCronPolicy` IPC; a guest edit of a job clears its policy; register checks ownership; replicated jobs drop policy. Ticker attaches `cron_policy` (legacy operator payload `preapproved_tools` folded in). `EmitTask` strips CronTicker-only keys (DEF-220). Philote applies the policy to the turn only (allowlist at projection + dispatch; preapproval in `approval_policy_allows`; unattended deny instead of 300 s park), scrubs stale `cron:` session grants (DEF-221). Operator surfaces: `phil cron list|policy`, `POST /api/cron/:id/policy`, `policy` on `POST /api/cron`. `skills/cron-manage/SKILL.md` payload example fixed (DEF-152 shape).
+- [x] Deploy + watched-live (2026-10-06, PR #620 → develop 56b0cdc2): mac-jane WATCHED-LIVE — a throwaway operator job (allow+preapprove `session.status`, approval `deny`) fired; every model call of the fire AND its plan continuation offered only `session.status`, which ran unprompted; `bash.exec` was never offered and the agent reported it unavailable. vps-jane deployed (run 37516336072, failed=0, restart 19:25:57 UTC) and `lifegraph-daily-brief:vps-jane` migrated to a typed policy (preapprove life.recall, life.recall.feedback). On vps run `sudo -u philotic PHILOTIC_HOTEL_SOCKET=/run/philotic/vps-jane.sock /opt/philotic/bin/philotic-web cron ...` (`/opt/philotic/bin/phil` is a stale July copy without `cron`).
+- [ ] mbp-jane: deploy (offline on the tailnet since 2026-10-05) and migrate Aria `58baebb2…` (bash.exec) with `phil cron policy`.
+- [ ] Slice 2: agent REQUESTS a policy → job held disabled/pending → operator approval card; the tap must land on an operator-only hotel IPC (not a philote claim). Plus a sub-hour schedule floor for agent-created jobs (Gemini/Ariel 15-min poll incident, 2026-10-02).
+- [ ] Later: per-job model tier + iteration cap; explicit approval chat on the job instead of payload `chat_id`.
