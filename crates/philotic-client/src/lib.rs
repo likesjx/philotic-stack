@@ -1056,6 +1056,14 @@ pub enum IpcRequest {
     QueryOperatorTargetSecrets {
         target_node_id: String,
     },
+    /// Fetch one philote-authored surface record from any mesh target
+    /// (doc:desktop-generative-surfaces S2). Answered locally when the target
+    /// is this hotel, otherwise through the read-only `operator.surfaces.get`
+    /// handoff. `Standard` data = `{target_node_id, found, surface}`.
+    QueryOperatorTargetSurface {
+        target_node_id: String,
+        surface_id: String,
+    },
     QueryOperatorTargetPlacement {
         target_node_id: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]

@@ -2157,6 +2157,14 @@ Order: A0 → S0 → S1 → S2 → S3 → S4; AG-UI investigation independent. T
   - [ ] Watched-live: ask Beacon for a status card with buttons on Telegram, tap a button, and confirm Beacon handles the `[surface action]`.
 - [ ] S1 `surface-render-tools`: `ui.surface.create|update|delete`, `ui.data.update`; `desktop.surfaces` abstract skill seeded and SkillDAG-implied; replies bound to the reported delivery outcome (say-do) — test-green.
 - [ ] S2 `surface-web-renderer`: A2UI→DOM renderer bundle in philotic-stack served at `/s/:surface_id`; catalog map, JSON Pointer binding, validation, card/list/table primitives; host action bridge — test-green.
+  - [x] S2a — **test-green** 2026-10-07:
+    - **Cross-hotel reach.** Surfaces live on the authoring hotel, while philotic-web runs on vps-jane. `IpcRequest::QueryOperatorTargetSurface` answers locally, or else through the read-only operator handoff `operator.surfaces.get` (allowlisted, with a remote worker arm).
+    - **Routes.** philotic-web serves `GET /api/mesh/targets/:target/surfaces/:id`. It is authenticated, accepts a node id or hotel name, and returns 404 for an unknown target or surface and 502 for remote failure.
+    - **Page.** `/s/:target/:id` is a static shell with no data, under a strict CSP: `script-src 'self'`, no inline script, `frame-ancestors 'none'`.
+    - **Renderer.** `/surface-ui/{surface.js,surface.css,catalog.json}` serves a vanilla renderer with no npm step. It covers every catalog component, writes text only via `textContent`, checks components against the same catalog allowlist as the hotel, supports two-way input binding, and exposes a host bridge `window.PhiloticSurfaceHost.sendAction`. The standalone page posts actions to an endpoint that lands in S4 and says so.
+    - **Tests.** Route and CSP tests, plus guards that the renderer never parses HTML or evaluates code and covers every catalog component.
+    - **Not yet verified.** No browser smoke test yet. Locally, `edge_ws_e2e` times out on server start when run from the external target drive (environmental; it passes singly).
+  - [ ] S2b `surface-https-edge`: Tailscale Serve HTTPS. Fix the loopback-trust fence first, because Serve proxies arrive from loopback.
 - [ ] S2 `surface-https-edge`: Tailscale Serve HTTPS for `philotic-web`; `web_public_base_url` so the transport can move to the native Philotic VPN — smoke-green.
 - [ ] S3 `surface-telegram-miniapp`: `web_app` Open button from the emitting philote's bot; `initData` Ed25519 third-party validation, `auth_date` freshness, operator user-id allowlist, operator-bot check; surface-scoped session — watched-live-green.
 - [ ] S3 `surface-apple-webview`: `WKWebView` host loading the server renderer; `WKScriptMessageHandler` → existing `EdgeMessage` connection; no web credential in the page — smoke-green on the operator's iPhone.
