@@ -451,6 +451,8 @@ Six work items from the 2026-09-30 Philotic Stack Atlas assessment, each with a 
 
 - [ ] Mesh delivery guarantees (L1–L7): [MESH_DELIVERY_GUARANTEES_PROPOSAL.md](architecture/MESH_DELIVERY_GUARANTEES_PROPOSAL.md). DEF-182/184/192/059/211/185.
 - [ ] Watch-live burn-down (W0–W7): [WATCH_LIVE_BURNDOWN_PROPOSAL.md](architecture/WATCH_LIVE_BURNDOWN_PROPOSAL.md). Inventory, status vocabularies, procedure/hygiene/relocation proofs, doctor readiness.
+  - [x] W0 inventory + vocabulary (2026-10-07): [process/WATCH_LIVE_BACKLOG.md](process/WATCH_LIVE_BACKLOG.md) seeded (22 items, due 2026-11-04); DEFECTS status vocabulary tightened and every row normalized (new DEF-214); `scripts/docs-metadata-check.py` lints proposal and DEFECTS statuses (`--warn-only`, non-blocking step in `pr-check.yml`; make blocking after one week).
+  - [x] W2 proposal status reconciliation (2026-10-07): frontmatter `status`/`disposition` aligned with landed code across ~30 proposals; LIFE_GRAPH_ACTIVE gained frontmatter. Remaining lint warnings: VERIFICATION_LADDER (`process-documentation`), MEMORY_CULTIVATION_TRUE_UP (status vs disposition). Graph rescan (`phil graph scan`) pending from the main checkout after merge.
 - [ ] IPC dispatch split (S0–S6): [IPC_DISPATCH_SPLIT_PROPOSAL.md](architecture/IPC_DISPATCH_SPLIT_PROPOSAL.md). `ipc.rs` → `ipc/` family modules, plus park-path fixes.
 - [ ] Release train (R0–R7): [RELEASE_TRAIN_PROPOSAL.md](architecture/RELEASE_TRAIN_PROPOSAL.md). Sync main, `v0.2.0`, release artifacts, versioned installs, rollback, rollout proof.
 - [ ] Perimeter enforcement (P1–P8): [PERIMETER_ENFORCEMENT_PROPOSAL.md](architecture/PERIMETER_ENFORCEMENT_PROPOSAL.md). IPC identity, config ACL, vault AAD, MAC v2, signed placement, egress policy.
@@ -463,7 +465,6 @@ Cross-plan coordination: mesh L5 ⟷ frontdoor F1 (same change); IPC split S3/S5
 Proposal: [AGENT_FRONTDOOR_PROPOSAL.md](architecture/AGENT_FRONTDOOR_PROPOSAL.md). Handoff: [HANDOFF-2026-09-30-agent-frontdoor-mac-jane.md](HANDOFF-2026-09-30-agent-frontdoor-mac-jane.md).
 Seam IDs: `mcp-upstream-route-target`, `agent-frontdoor-endpoint`, `remote-muninn-bootstrap`, `frontdoor-proxy-loopback-trust`
 
-- [ ] S1 `McpUpstream` route target + cross-hotel endpoint-config dispatch + caller principal (code on `claude/stoic-goldberg-f8w99b`; not yet compiled — cloud session had no crates.io download access).
 - [x] S2 `scripts/muninn_mcp.py` frontdoor mode (`PHILOTIC_FRONTDOOR_URL` / `PHILOTIC_AGENT_MCP_TOKEN`); mock-frontdoor verified.
 - [x] S1 compiled + tested on mac-jane after merging develop (5 new tests green, `just check` green).
 - [x] S3 upstreams `muninn-cortex` (vps-jane) + `intel-graph` (mac-jane) registered with grants; endpoint provisioned; Traefik `/agent/mcp` + iptables live.
