@@ -1575,8 +1575,9 @@ mod tests {
             &delivery_claims,
         )
         .await;
-        assert!(
+        assert_eq!(
             handled,
+            crate::service::role_materialization::DeliveryOutcome::AlreadyClaimed,
             "second consumer should report the claimed event as handled"
         );
 

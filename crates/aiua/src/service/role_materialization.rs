@@ -29,6 +29,45 @@ use tokio::sync::{Mutex, mpsc};
 use tracing::{info, warn};
 use uuid::Uuid;
 
+/// What [`IpcServer::deliver_event_envelope_or_park`] did with one envelope
+/// (MESH_DELIVERY_GUARANTEES L1). It used to return a `bool` that every caller
+/// discarded, so a dropped task was indistinguishable from a delivered one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum DeliveryOutcome {
+    /// Handed to a live local subscriber (or applied in-process).
+    Delivered,
+    /// Parked for a dormant guest that is being materialized.
+    Parked,
+    /// A dormant runner role was revived and the task parked for it.
+    Rescued,
+    /// Another consumer already owns this event id.
+    AlreadyClaimed,
+    /// Not a task for this hotel (addressed elsewhere, or not a task kind).
+    NotMine,
+    /// Accepted but neither delivered, parked nor rescued.
+    Dropped(DropReason),
+}
+
+impl DeliveryOutcome {
+    /// The pre-L1 `bool`: true for every task this hotel took responsibility
+    /// for, false only when the envelope was not ours.
+    #[cfg(test)]
+    pub(crate) fn handled(&self) -> bool {
+        !matches!(self, Self::NotMine)
+    }
+}
+
+/// Why an accepted cross-hotel task was dropped.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum DropReason {
+    /// No subscriber for the role, no specific guest, nothing to rescue.
+    NoSubscriber { target_role: String },
+    /// A forwarded fleet-memory write failed to apply on the cluster primary.
+    MemoryWriteForwardFailed { error: String },
+    /// The operator-surface handoff was refused by policy.
+    OperatorHandoffRefused { reason: String },
+}
+
 impl IpcServer {
     /// Park a task for a dormant target and trigger its materialization, flushed when the
     /// target philote connects and registers under the parked guest_id.
@@ -1024,7 +1063,7 @@ impl IpcServer {
         parked_inbound: &Arc<Mutex<HashMap<String, Vec<ParkedInboundTask>>>>,
         mat_req: Option<&dyn GuestMaterializationRequester>,
         delivery_claims: &DeliveryClaimRegistry,
-    ) -> bool {
+    ) -> DeliveryOutcome {
         // An event explicitly addressed to a different node arrived in this hotel's mesh
         // inbox (gossiped/relayed batch). It is not ours to deliver or park here — doing so
         // previously caused a hotel to try materializing a remote hotel's infrastructure
@@ -1033,7 +1072,7 @@ impl IpcServer {
         // task permanently parked until the turn watchdog timed it out ~90s later.
         if let Some(target_node) = event.target_node_id.as_deref() {
             if target_node != local_node_id {
-                return false;
+                return DeliveryOutcome::NotMine;
             }
         }
         match (&event.kind, &event.target_agent_id, &event.payload) {
@@ -1053,7 +1092,7 @@ impl IpcServer {
                         target_role = target_role.as_str(),
                         "Skipping event delivery: already claimed by another consumer."
                     );
-                    return true;
+                    return DeliveryOutcome::AlreadyClaimed;
                 }
                 // A peer's attachment arrives inline (DEF-200): file it in this
                 // hotel's blob store and point the task at it, so the agent
@@ -1078,11 +1117,13 @@ impl IpcServer {
                             source_node = %event.source_node_id,
                             "Refusing operator surface handoff: {reason}"
                         );
-                        return true;
+                        return DeliveryOutcome::Dropped(DropReason::OperatorHandoffRefused {
+                            reason: reason.to_string(),
+                        });
                     }
                     if let Some(tx) = operator_surface_tx {
                         let _ = tx.try_send(data.clone()).ok();
-                        return true;
+                        return DeliveryOutcome::Delivered;
                     }
                 }
                 // Muninn-cluster single-writer routing: a lobe hotel forwarded
@@ -1093,7 +1134,7 @@ impl IpcServer {
                 // Idempotent per {vault}:{concept}, so a redelivered envelope
                 // reinforces rather than duplicates.
                 if target_role == philotic_client::MEMORY_WRITE_FORWARD_ROLE {
-                    match crate::memory::apply_forwarded_write(graph, data).await {
+                    return match crate::memory::apply_forwarded_write(graph, data).await {
                         Ok(engram_id) => {
                             info!(
                                 event_id = %event.event_id,
@@ -1101,6 +1142,7 @@ impl IpcServer {
                                 engram_id = %engram_id,
                                 "memory.write_forward applied to cluster primary"
                             );
+                            DeliveryOutcome::Delivered
                         }
                         Err(err) => {
                             warn!(
@@ -1109,9 +1151,11 @@ impl IpcServer {
                                 error = %err,
                                 "memory.write_forward FAILED to apply — forwarded memory write not stored on primary"
                             );
+                            DeliveryOutcome::Dropped(DropReason::MemoryWriteForwardFailed {
+                                error: format!("{err:#}"),
+                            })
                         }
-                    }
-                    return true;
+                    };
                 }
                 let mut target_guest_id: Option<String> =
                     serde_json::from_str::<serde_json::Value>(data)
@@ -1189,7 +1233,7 @@ impl IpcServer {
                             data.clone(),
                         )
                         .await;
-                        return true;
+                        return DeliveryOutcome::Delivered;
                     }
                 }
 
@@ -1248,6 +1292,7 @@ impl IpcServer {
                         data.clone(),
                     )
                     .await;
+                    DeliveryOutcome::Delivered
                 } else if let Some(ref agent_guest_id) = target_guest_id {
                     Self::park_and_materialize(
                         graph,
@@ -1261,6 +1306,7 @@ impl IpcServer {
                         ParkTarget::CrossHotelGuest { agent_guest_id },
                     )
                     .await;
+                    DeliveryOutcome::Parked
                 } else {
                     // Same rescue as the local EmitTask path: a governed task
                     // arriving over the mesh for a runner role this hotel seeds
@@ -1282,16 +1328,20 @@ impl IpcServer {
                         data,
                     )
                     .await;
-                    if rescued.is_none() {
+                    if rescued.is_some() {
+                        DeliveryOutcome::Rescued
+                    } else {
                         warn!(
                             "Cross-hotel task {}: no subscriber for role '{}', no specific guest; task dropped.",
                             event.event_id, target_role
                         );
+                        DeliveryOutcome::Dropped(DropReason::NoSubscriber {
+                            target_role: target_role.to_string(),
+                        })
                     }
                 }
-                true
             }
-            _ => false,
+            _ => DeliveryOutcome::NotMine,
         }
     }
 
@@ -4658,6 +4708,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn deliver_event_envelope_or_park_reports_a_task_for_an_unserved_role_as_dropped() {
+        // MESH_DELIVERY_GUARANTEES L1: an accepted cross-hotel task for a role
+        // nobody here serves, with no specific guest and nothing to rescue,
+        // must say so instead of returning the same `true` as a delivery.
+        let inboxes: InboxRegistry = Arc::new(Mutex::new(HashMap::new()));
+        let graph = Arc::new(GraphDomain::new(Arc::new(TestGraphAdapter)));
+        let parked_inbound: Arc<Mutex<HashMap<String, Vec<ParkedInboundTask>>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+        let mat_req = MockMaterializationRequester::default();
+        let event = EventEnvelope {
+            event_id: Uuid::new_v4(),
+            seq: 1,
+            source_node_id: "mac-jane-aiua-01".into(),
+            target_node_id: Some("vps-jane-aiua-01".into()),
+            source_agent_id: "agent-bjork-01".into(),
+            target_agent_id: Some("ghost-role".into()),
+            kind: EventKind::TaskInvoke,
+            corr_id: "test".into(),
+            attempt: 0,
+            created_at: 0,
+            expires_at: None,
+            payload: EventPayload::Inline {
+                data: serde_json::json!({ "action": "execute_tool" }).to_string(),
+            },
+            trace: vec![],
+        };
+        let outcome = IpcServer::deliver_event_envelope_or_park(
+            &inboxes,
+            &event,
+            None,
+            &graph,
+            "vps-jane-aiua-01",
+            &parked_inbound,
+            Some(&mat_req),
+            &new_delivery_claim_registry(),
+        )
+        .await;
+        assert_eq!(
+            outcome,
+            DeliveryOutcome::Dropped(DropReason::NoSubscriber {
+                target_role: "ghost-role".into()
+            })
+        );
+        assert!(outcome.handled(), "a dropped task was still ours");
+    }
+
+    #[tokio::test]
     async fn deliver_event_envelope_or_park_ignores_events_addressed_to_another_node() {
         // Regression: a mesh inbox batch can carry events explicitly addressed to a
         // different node (e.g. gossiped/relayed). Previously this hotel would try to
@@ -4704,8 +4801,9 @@ mod tests {
         )
         .await;
 
-        assert!(
-            !delivered,
+        assert_eq!(
+            delivered,
+            DeliveryOutcome::NotMine,
             "event addressed to a different node must not be handled here"
         );
         assert_eq!(
@@ -4788,7 +4886,7 @@ mod tests {
             &new_delivery_claim_registry(),
         )
         .await;
-        assert!(handled);
+        assert_eq!(handled, DeliveryOutcome::Delivered);
         assert!(
             matches!(
                 orchestrator_rx.try_recv(),
@@ -4872,9 +4970,12 @@ mod tests {
             )
             .await;
             assert!(
-                handled,
+                handled.handled(),
                 "attempt {attempt} should report the event as handled"
             );
+            if attempt == 1 {
+                assert_eq!(handled, DeliveryOutcome::AlreadyClaimed);
+            }
         }
 
         assert!(
@@ -4971,6 +5072,7 @@ mod tests {
                 &claims,
             )
             .await
+                == DeliveryOutcome::Delivered
         );
 
         assert!(

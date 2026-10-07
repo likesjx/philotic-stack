@@ -2,8 +2,8 @@
 title: Mesh Delivery Guarantees — Make the Mesh Loud Before Making It Bigger
 doc_type: proposal
 domain: mesh-placement
-status: proposed
-last_updated: 2026-10-05
+status: in-progress
+last_updated: 2026-10-07
 tags:
 - mesh
 - delivery
@@ -142,6 +142,28 @@ those. An operator can see backlog, dead letters and gossip budget from
 - A `mesh_event_undecodable` row must appear on the receiver within one dispatch tick.
 
 **Rollout:** any order.
+
+**Status (2026-10-07): implemented** on `codex/mesh-l1-loud-inbound`
+(test-green; live chaos check pending a deploy).
+- `decode_inbound_batch` + `report_undecodable_event` in `mesh_runtime.rs`.
+  The ack formula is unchanged (max seq of the decoded events); L4 owns
+  ack-what-you-delivered.
+- Gossip alarms use `ansible_mesh_core::mesh_alarm::GossipParseAlarm`, at
+  `mesh_runtime` heartbeat / capability sync / event ack and at `beacon.rs`
+  catalog sync / hotel state. Beacon's own heartbeat and capability-sync
+  parses are not alarmed separately: beacon forwards those messages to the
+  runtime inbox unconditionally, where the same parse is alarmed.
+- `DeliveryOutcome` / `DropReason` in `role_materialization.rs`. Drops also
+  cover a refused operator-surface handoff (heal only, no reply) and a
+  failed `memory.write_forward` (heal only: fire-and-forget, no waiting turn).
+- `dropped_task_error_reply` picks the reply by the dropped action:
+  - `execute_tool` → `tool_result`
+  - a model request → `model_response`
+  - a dotted capability → `datasource_response`
+  - anything else → `send_reply` to `final_reply_*`
+
+  `error` is always a `TaskErrorPayload` object; a bare string would fail
+  philote's parse. A dropped reply is never answered (loop guard).
 
 ### L2 — Loud gossip budget (S, independent of L1)
 

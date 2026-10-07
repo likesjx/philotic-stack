@@ -19,6 +19,7 @@ use tokio::sync::{Mutex, RwLock, mpsc};
 use tracing::{debug, error, info, warn};
 
 use crate::service::ipc::IpcServer;
+use crate::service::role_materialization::{DeliveryOutcome, DropReason};
 use crate::{
     LedgerCommand, capability_sync_fingerprint, execution_reachability_for_hotel,
     handle_cron_fired_broadcast, handle_cron_job_sync, handle_mesh_membership_accept,
@@ -156,6 +157,187 @@ pub(crate) fn decode_inbound_batch(payload: &[u8]) -> (Vec<EventEnvelope>, Vec<U
         }
     }
     (events, undecodable)
+}
+
+/// Short operator-facing description of a drop.
+fn drop_reason_message(reason: &DropReason) -> String {
+    match reason {
+        DropReason::NoSubscriber { target_role } => {
+            format!("no guest on this hotel serves role '{target_role}' and none could be revived")
+        }
+        DropReason::MemoryWriteForwardFailed { error } => {
+            format!("forwarded memory write failed to apply on the cluster primary: {error}")
+        }
+        DropReason::OperatorHandoffRefused { reason } => {
+            format!("operator-surface handoff refused: {reason}")
+        }
+    }
+}
+
+/// Actions that are themselves replies. A dropped reply is never answered,
+/// or two hotels could bounce error replies at each other forever.
+fn is_reply_action(action: &str) -> bool {
+    action.ends_with("_response")
+        || matches!(
+            action,
+            "tool_result" | "send_reply" | "partial_reply" | "send_error" | "turn_event"
+        )
+}
+
+/// The error reply owed to the originator of a cross-hotel task this hotel
+/// accepted and dropped (MESH_DELIVERY_GUARANTEES L1), so the caller's turn
+/// fails now instead of at its deadline. `None` when the task is itself a
+/// reply, carries no JSON, or names no route back.
+///
+/// The reply shape follows what the waiting philote consumes for the dropped
+/// request: `tool_result` for `execute_tool`, `model_response` for a model
+/// request, `datasource_response` for a dotted capability (`graph.query`, …),
+/// and otherwise a user-facing `send_reply` to the turn's `final_reply_*`
+/// membrane. Philote parses `error` as a `TaskErrorPayload` object, never a
+/// bare string.
+pub(crate) fn dropped_task_error_reply(
+    event: &EventEnvelope,
+    message: &str,
+    local_node_id: &str,
+) -> Option<EventEnvelope> {
+    use ansible_mesh_core::event::{EventKind, EventPayload};
+    if event.kind != EventKind::TaskInvoke {
+        return None;
+    }
+    let EventPayload::Inline { data } = &event.payload else {
+        return None;
+    };
+    let task = serde_json::from_str::<serde_json::Value>(data).ok()?;
+    let action = task
+        .get("action")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    if is_reply_action(action) {
+        return None;
+    }
+    let target_role = event.target_agent_id.as_deref().unwrap_or("");
+    let echo = |field: &str| task.get(field).cloned().unwrap_or(serde_json::Value::Null);
+    let error = serde_json::json!({
+        "kind": "delivery_failure",
+        "message": message,
+        "code": "TARGET_ROLE_UNSERVED",
+        "retryable": false,
+    });
+    let is_model = action == "generate_text" || target_role.starts_with("model");
+    let is_request = action == "execute_tool" || is_model || action.contains('.');
+    let (node, role, guest, reply) = if is_request {
+        let route = philotic_client::ReturnRoute::from_task(&task, &event.source_node_id, "agent");
+        let reply = if action == "execute_tool" {
+            serde_json::json!({
+                "action": "tool_result",
+                "tool_name": task.get("tool_name").or_else(|| task.get("tool")).cloned()
+                    .unwrap_or(serde_json::Value::Null),
+                "content": format!("Tool call failed: {message}"),
+                "error": error,
+            })
+        } else if is_model {
+            serde_json::json!({
+                "action": "model_response",
+                "content": "",
+                "agent_action": {
+                    "kind": "fail",
+                    "message": message,
+                    "model_result": { "error": error.clone() },
+                },
+                "error": error,
+            })
+        } else {
+            serde_json::json!({
+                "action": "datasource_response",
+                "capability": action,
+                "error": error,
+            })
+        };
+        (route.node, route.role, route.guest_id, reply)
+    } else {
+        let node = task
+            .get("final_reply_to")
+            .and_then(serde_json::Value::as_str)?
+            .to_string();
+        let role = task
+            .get("final_reply_role")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("membrane")
+            .to_string();
+        let guest = task
+            .get("final_reply_guest_id")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string);
+        let reply = serde_json::json!({
+            "action": "send_reply",
+            "content": format!("⚠️ Delivery failed: {message}"),
+        });
+        (node, role, guest, reply)
+    };
+    let mut reply = reply;
+    for field in ["session_id", "turn_id", "chat_id"] {
+        reply[field] = echo(field);
+    }
+    if let Some(guest) = guest {
+        reply["delivery_target_guest_id"] = serde_json::Value::String(guest);
+    }
+    Some(EventEnvelope {
+        event_id: uuid::Uuid::new_v4(),
+        seq: 0,
+        source_node_id: local_node_id.to_string(),
+        target_node_id: Some(node),
+        source_agent_id: "unknown".into(),
+        target_agent_id: Some(role),
+        kind: EventKind::TaskInvoke,
+        corr_id: format!("dropped:{}", event.event_id),
+        attempt: 0,
+        created_at: 0,
+        expires_at: None,
+        payload: EventPayload::Inline {
+            data: reply.to_string(),
+        },
+        trace: vec![],
+    })
+}
+
+/// File a dropped cross-hotel task (heal tag `mesh_task_dropped`) and send
+/// its originator an error reply when one is owed.
+async fn report_dropped_task(
+    heal_queue: Option<&dyn ansible_mesh_core::heal_queue::HealQueueStorage>,
+    dispatcher_tx: &mpsc::Sender<LedgerCommand>,
+    local_node_id: &str,
+    event: &EventEnvelope,
+    reason: &DropReason,
+) {
+    use ansible_mesh_core::mesh_alarm::{MESH_ALARM_SOURCE, MESH_TASK_DROPPED_TAG};
+    let message = drop_reason_message(reason);
+    if let Some(hq) = heal_queue {
+        let text = format!(
+            "[{MESH_TASK_DROPPED_TAG}] task {} from {} for role [{}] dropped: {message}",
+            event.event_id,
+            event.source_node_id,
+            event.target_agent_id.as_deref().unwrap_or("-"),
+        );
+        if let Err(err) =
+            hq.push_classified(MESH_ALARM_SOURCE, &text, "high", MESH_TASK_DROPPED_TAG)
+        {
+            warn!(error = %err, "Failed to push dropped-task alarm to heal queue");
+        }
+    }
+    // A refused operator handoff is a policy decision, and a forwarded memory
+    // write is fire-and-forget: neither has a waiting turn to fail.
+    if !matches!(reason, DropReason::NoSubscriber { .. }) {
+        return;
+    }
+    if let Some(reply) = dropped_task_error_reply(event, &message, local_node_id) {
+        info!(
+            event_id = %event.event_id,
+            reply_to = reply.target_node_id.as_deref().unwrap_or("-"),
+            reply_role = reply.target_agent_id.as_deref().unwrap_or("-"),
+            "Dropped cross-hotel task: error reply sent to its originator"
+        );
+        let _ = dispatcher_tx.send(LedgerCommand::AppendLocal(reply)).await;
+    }
 }
 
 /// Log and file an inbound batch element that did not decode.
@@ -560,7 +742,7 @@ pub(crate) async fn activate_mesh_runtime(ctx: MeshRuntimeContext) -> Result<()>
                                     );
                                     continue;
                                 }
-                                IpcServer::deliver_event_envelope_or_park(
+                                let outcome = IpcServer::deliver_event_envelope_or_park(
                                     &inbound_inboxes,
                                     event,
                                     inbound_operator_surface_tx.as_ref(),
@@ -571,6 +753,16 @@ pub(crate) async fn activate_mesh_runtime(ctx: MeshRuntimeContext) -> Result<()>
                                     &inbound_delivery_claims,
                                 )
                                 .await;
+                                if let DeliveryOutcome::Dropped(reason) = &outcome {
+                                    report_dropped_task(
+                                        inbound_heal_queue.as_deref(),
+                                        &dispatcher_inbound_tx,
+                                        &inbound_local_node_id,
+                                        event,
+                                        reason,
+                                    )
+                                    .await;
+                                }
                                 // The control-plane handlers below act on their
                                 // payload as addressed to THIS hotel. An event
                                 // addressed to a third node is one the sender check
@@ -1149,5 +1341,125 @@ mod decode_batch_tests {
             "{}",
             bad[0].error
         );
+    }
+
+    fn task(role: &str, data: serde_json::Value) -> EventEnvelope {
+        let mut e = event(7);
+        e.target_agent_id = Some(role.into());
+        e.payload = EventPayload::Inline {
+            data: data.to_string(),
+        };
+        e
+    }
+
+    fn reply_json(reply: &EventEnvelope) -> serde_json::Value {
+        let EventPayload::Inline { data } = &reply.payload else {
+            panic!("inline reply expected");
+        };
+        serde_json::from_str(data).unwrap()
+    }
+
+    #[test]
+    fn dropped_execute_tool_replies_tool_result_to_the_caller() {
+        let dropped = task(
+            "tool.weather",
+            serde_json::json!({
+                "action": "execute_tool",
+                "tool_name": "weather.now",
+                "session_id": "s1",
+                "turn_id": "t1",
+                "return_route": {"node": "mac-jane-aiua-01", "role": "agent", "guest_id": "agent-bjork-01:orchestrator"},
+                "final_reply_to": "mac-jane-aiua-01",
+                "final_reply_role": "membrane",
+            }),
+        );
+        let reply = super::dropped_task_error_reply(&dropped, "no guest", "vps-jane-aiua-01")
+            .expect("an execute_tool drop owes its caller a reply");
+        assert_eq!(reply.target_node_id.as_deref(), Some("mac-jane-aiua-01"));
+        assert_eq!(reply.target_agent_id.as_deref(), Some("agent"));
+        assert_eq!(reply.source_node_id, "vps-jane-aiua-01");
+        let body = reply_json(&reply);
+        assert_eq!(body["action"], "tool_result");
+        assert_eq!(body["tool_name"], "weather.now");
+        assert_eq!(body["turn_id"], "t1");
+        assert_eq!(
+            body["delivery_target_guest_id"],
+            "agent-bjork-01:orchestrator"
+        );
+        // Philote parses `error` as a TaskErrorPayload object.
+        let err: philotic_client::TaskErrorPayload =
+            serde_json::from_value(body["error"].clone()).expect("TaskErrorPayload shape");
+        assert_eq!(err.code.as_deref(), Some("TARGET_ROLE_UNSERVED"));
+    }
+
+    #[test]
+    fn dropped_datasource_request_replies_datasource_response() {
+        let dropped = task(
+            "graph-datasource",
+            serde_json::json!({
+                "action": "graph.query",
+                "session_id": "s1",
+                "turn_id": "t1",
+                "reply_to": "mac-jane-aiua-01",
+                "reply_role": "agent",
+            }),
+        );
+        let body = reply_json(
+            &super::dropped_task_error_reply(&dropped, "no guest", "vps-jane-aiua-01").unwrap(),
+        );
+        assert_eq!(body["action"], "datasource_response");
+        assert_eq!(body["capability"], "graph.query");
+        assert_eq!(body["session_id"], "s1");
+    }
+
+    #[test]
+    fn dropped_user_turn_replies_to_the_final_reply_membrane() {
+        let dropped = task(
+            "agent",
+            serde_json::json!({
+                "content": "hello",
+                "session_id": "telegram:1:agent-beacon",
+                "chat_id": "1",
+                "final_reply_to": "mac-jane-aiua-01",
+                "final_reply_role": "membrane",
+                "final_reply_guest_id": "membrane-telegram-beacon",
+            }),
+        );
+        let reply = super::dropped_task_error_reply(&dropped, "no guest", "vps-jane-aiua-01")
+            .expect("a dropped user turn owes the membrane a reply");
+        assert_eq!(reply.target_agent_id.as_deref(), Some("membrane"));
+        let body = reply_json(&reply);
+        assert_eq!(body["action"], "send_reply");
+        assert_eq!(body["chat_id"], "1");
+        assert_eq!(body["delivery_target_guest_id"], "membrane-telegram-beacon");
+    }
+
+    #[test]
+    fn a_dropped_reply_is_never_answered() {
+        for action in [
+            "tool_result",
+            "datasource_response",
+            "send_reply",
+            "model_response",
+        ] {
+            let dropped = task(
+                "agent",
+                serde_json::json!({
+                    "action": action,
+                    "final_reply_to": "mac-jane-aiua-01",
+                    "reply_to": "mac-jane-aiua-01",
+                }),
+            );
+            assert!(
+                super::dropped_task_error_reply(&dropped, "x", "vps-jane-aiua-01").is_none(),
+                "{action} must not be answered (reply loops)"
+            );
+        }
+    }
+
+    #[test]
+    fn a_dropped_user_turn_without_a_route_gets_no_reply() {
+        let dropped = task("agent", serde_json::json!({ "content": "hello" }));
+        assert!(super::dropped_task_error_reply(&dropped, "x", "vps-jane-aiua-01").is_none());
     }
 }
