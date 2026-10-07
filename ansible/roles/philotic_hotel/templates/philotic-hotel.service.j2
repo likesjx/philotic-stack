@@ -17,8 +17,8 @@ RuntimeDirectoryMode=0755
 
 # Runtime environment
 Environment="RUST_LOG={{ philotic_rust_log }}"
-Environment="PATH={{ philotic_bin_dir }}:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
-Environment="PHILOTIC_BIN_DIR={{ philotic_bin_dir }}"
+Environment="PATH={{ philotic_runtime_bin_dir }}:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+Environment="PHILOTIC_BIN_DIR={{ philotic_runtime_bin_dir }}"
 Environment="PHILOTIC_HOTEL_SOCKET={{ philotic_hotel_socket }}"
 Environment="PHILOTIC_HOTEL_PORT={{ philotic_hotel_port }}"
 Environment="PHILOTIC_ENABLE_RUST_AUTH={{ philotic_enable_rust_auth }}"
@@ -71,7 +71,7 @@ Environment="PHILOTIC_DECISION_TRACE_DB={{ philotic_data_dir }}/decision_traces.
 # Mesh PSK — injected from Ansible vault; never stored in plaintext on disk
 EnvironmentFile={{ philotic_etc_dir }}/secrets.env
 
-ExecStart={{ philotic_bin_dir }}/aiua --hotel {{ philotic_hotel_runtime_name }}
+ExecStart={{ philotic_runtime_bin_dir }}/aiua --hotel {{ philotic_hotel_runtime_name }}
 
 Restart=on-failure
 RestartSec=10

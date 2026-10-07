@@ -55,9 +55,12 @@ philotic_agents:
       document_action: "analyze_media"
       strip_tools_on_media: true
 
-# Artifacts — binaries built on host for first smoke
+# Artifacts — legacy layout only (vps-deploy-ci / vps-push pass their own
+# philotic_artifacts_dir). Default to the CI artifact drop, not the on-host
+# target/release (the VPS no longer compiles). Releases use
+# `just vps-deploy-release <tag>` instead (docs/process/RELEASE.md).
 philotic_artifacts_remote: true
-philotic_artifacts_dir: "/opt/philotic/src/target/release"
+philotic_artifacts_dir: "/home/deploy/ci-artifacts"
 
 # Mesh
 philotic_backbone_peers:

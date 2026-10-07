@@ -1,0 +1,62 @@
+---
+# Rollback (proposal:release-train R6). Runs only with `--tags rollback`:
+#   just rollback vps-jane            → newest installed release that is not current
+#   just rollback vps-jane v0.2.0-rc.1
+# Flips {{ philotic_current_link }} atomically and restarts the hotel.
+
+- name: Rollback | require the release layout
+  assert:
+    that:
+      - philotic_current_stat.stat.exists
+    fail_msg: "{{ philotic_current_link }} does not exist — this host is not on the release layout; nothing to roll back"
+
+- name: Rollback | flip current
+  shell: |
+    set -euo pipefail
+    releases={{ philotic_releases_dir | quote }}
+    link={{ philotic_current_link | quote }}
+    want={{ philotic_rollback_tag | quote }}
+    cd "$releases"
+    current="$(basename "$(readlink -f "$link")")"
+    if [ -z "$want" ]; then
+      want="$(ls -1td -- */ 2>/dev/null | sed 's#/$##' | grep -v '\.partial$' | grep -vxF -- "$current" | head -n 1 || true)"
+    fi
+    if [ -z "$want" ]; then
+      echo "no other installed release to roll back to (current: $current)" >&2
+      exit 1
+    fi
+    case "$want" in */*|.*) echo "invalid release name: $want" >&2; exit 1 ;; esac
+    if [ ! -x "$releases/$want/bin/aiua" ]; then
+      echo "release $want is not installed under $releases" >&2
+      exit 1
+    fi
+    if [ "$want" = "$current" ]; then
+      echo "current already -> $want"
+      exit 0
+    fi
+    tmp="${link}.tmp.$$"
+    ln -sfn "$releases/$want" "$tmp"
+    mv -Tf "$tmp" "$link"
+    echo "rolled back: $current -> $want"
+  args:
+    executable: /bin/bash
+  register: philotic_rollback_flip
+  changed_when: "'rolled back' in philotic_rollback_flip.stdout"
+
+- name: Rollback | restart philotic-hotel
+  systemd:
+    name: philotic-hotel
+    state: restarted
+  when: philotic_rollback_flip.changed
+
+- name: Rollback | report running version
+  command: "{{ philotic_current_link }}/bin/aiua --version"
+  register: philotic_rollback_version
+  changed_when: false
+  failed_when: false
+
+- name: Rollback | summary
+  debug:
+    msg:
+      - "{{ philotic_rollback_flip.stdout }}"
+      - "aiua --version: {{ philotic_rollback_version.stdout | default('') }}{{ philotic_rollback_version.stderr | default('') }}"

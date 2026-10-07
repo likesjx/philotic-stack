@@ -22,6 +22,26 @@ philotic_home_dir: "/opt/philotic"  # home for the philotic system user; hf_hub 
 # (e.g. built manually on the VPS for the first smoke).
 philotic_artifacts_dir: "{{ playbook_dir }}/../dist"
 philotic_artifacts_remote: false
+
+# Release layout (proposal:release-train R4, docs/process/RELEASE.md).
+# philotic_release_tag set (just vps-deploy-release <tag>) → unpack
+#   <cache>/<tag>/philotic-<tag>-<platform>.tar.gz into <releases>/<tag>/,
+#   atomically flip <current> → it, keep the newest N, run from <current>/bin.
+# philotic_bin_layout: "" = auto (release when <current> already exists on the
+#   host, else legacy) | "release" | "legacy" (copy into philotic_bin_dir and
+#   run from there — what vps-deploy-ci / vps-push pass).
+philotic_release_tag: ""
+philotic_bin_layout: ""
+philotic_releases_dir: "{{ philotic_install_dir }}/releases"
+philotic_current_link: "{{ philotic_install_dir }}/current"
+philotic_release_cache_dir: "/home/deploy/release-cache"
+philotic_release_platform: "linux-x86_64"
+philotic_releases_keep: 3
+# `--tags rollback` target; empty = the newest installed release that is not current.
+philotic_rollback_tag: ""
+# Overridden by set_fact in tasks/main.yml once the layout is resolved.
+philotic_runtime_bin_dir: "{{ philotic_bin_dir }}"
+
 # Must stay a subset of `scripts/release-packages.sh bins --platform linux`
 # (release/packages.toml); scripts/tests/test_release_packages.py enforces it.
 philotic_binaries:
