@@ -413,6 +413,137 @@ fn report_undecodable_event(
     }
 }
 
+/// Config key where the sender records its last hotel-state roster size, for
+/// `phil doctor`'s `mesh.hotel-state-budget` check (MESH_DELIVERY_GUARANTEES L3).
+pub(crate) const HOTEL_STATE_LAST_WIRE_BYTES_KEY: &str = "hotel_state.last_wire_bytes";
+
+/// Tracks the roster's wire size across broadcasts (MESH_DELIVERY_GUARANTEES
+/// L2, DEF-192). The size is logged and persisted when it changes, and a
+/// `hotel_state_budget` alarm is filed when the budget level rises.
+#[derive(Debug, Default)]
+pub(crate) struct HotelStateBudgetWatch {
+    last_bytes: Option<usize>,
+    last_level: Option<&'static str>,
+}
+
+impl HotelStateBudgetWatch {
+    /// The alarm to file for a new roster size, if any: only when the level
+    /// rises (none → warning → critical), so a steady over-budget roster files
+    /// once, not every 30 s.
+    pub(crate) fn alarm_for(&mut self, roster_bytes: usize) -> Option<&'static str> {
+        use ansible_mesh_core::heartbeat::hotel_state_budget_level;
+        let rank = |level: Option<&str>| match level {
+            Some("critical") => 2,
+            Some(_) => 1,
+            None => 0,
+        };
+        let level = hotel_state_budget_level(roster_bytes);
+        let rose = rank(level) > rank(self.last_level);
+        self.last_level = level;
+        if rose { level } else { None }
+    }
+
+    fn observe(
+        &mut self,
+        graph: &GraphDomain,
+        heal_queue: Option<&dyn ansible_mesh_core::heal_queue::HealQueueStorage>,
+        payload: &ansible_mesh_core::heartbeat::HotelStateSyncPayload,
+    ) {
+        use ansible_mesh_core::heartbeat::{
+            HOTEL_STATE_BUDGET_TAG, MAX_HOTEL_STATE_WIRE_BYTES, hotel_state_roster_wire_len,
+        };
+        let Ok(bytes) = hotel_state_roster_wire_len(payload) else {
+            return;
+        };
+        if self.last_bytes != Some(bytes) {
+            self.last_bytes = Some(bytes);
+            info!(
+                roster_wire_bytes = bytes,
+                budget = MAX_HOTEL_STATE_WIRE_BYTES,
+                guests = payload.guests.len(),
+                "hotel-state roster size changed"
+            );
+            let record = serde_json::json!({
+                "roster_wire_bytes": bytes,
+                "budget_bytes": MAX_HOTEL_STATE_WIRE_BYTES,
+                "guests": payload.guests.len(),
+                "recorded_at": std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs(),
+            });
+            if let Err(err) =
+                graph.set_config_value(HOTEL_STATE_LAST_WIRE_BYTES_KEY, &record.to_string())
+            {
+                debug!(error = %err, "failed to persist hotel-state roster size");
+            }
+        }
+        let Some(level) = self.alarm_for(bytes) else {
+            return;
+        };
+        warn!(
+            roster_wire_bytes = bytes,
+            budget = MAX_HOTEL_STATE_WIRE_BYTES,
+            level,
+            "hotel-state roster is near or over the UDP datagram budget (DEF-192)"
+        );
+        if let Some(hq) = heal_queue {
+            let message = format!(
+                "[{HOTEL_STATE_BUDGET_TAG}] hotel-state roster for {} is {bytes} B of a \
+                 {MAX_HOTEL_STATE_WIRE_BYTES} B datagram budget ({level}); over budget the \
+                 roster broadcast fails EMSGSIZE and peers stop learning this hotel's guests.",
+                payload.hotel_name
+            );
+            let severity = if level == "critical" {
+                "high"
+            } else {
+                "medium"
+            };
+            if let Err(err) = hq.push_classified(
+                ansible_mesh_core::mesh_alarm::MESH_ALARM_SOURCE,
+                &message,
+                severity,
+                HOTEL_STATE_BUDGET_TAG,
+            ) {
+                warn!(error = %err, "Failed to push hotel-state budget alarm to heal queue");
+            }
+        }
+    }
+}
+
+/// File a failed hotel-state broadcast (heal tag `hotel_state_send_failed`),
+/// at most once per minute per target.
+fn report_hotel_state_send_failed(
+    alarm: &mut ansible_mesh_core::mesh_alarm::GossipParseAlarm,
+    heal_queue: Option<&dyn ansible_mesh_core::heal_queue::HealQueueStorage>,
+    target_node_id: &str,
+    target_addr: &str,
+    error: &str,
+) {
+    use ansible_mesh_core::heartbeat::HOTEL_STATE_SEND_FAILED_TAG;
+    if !alarm.should_report(
+        target_node_id,
+        "hotel_state_send",
+        std::time::Instant::now(),
+    ) {
+        return;
+    }
+    if let Some(hq) = heal_queue {
+        let message = format!(
+            "[{HOTEL_STATE_SEND_FAILED_TAG}] hotel-state broadcast to {target_node_id} at \
+             {target_addr} failed: {error}. The peer's view of this hotel's roster is going stale."
+        );
+        if let Err(err) = hq.push_classified(
+            ansible_mesh_core::mesh_alarm::MESH_ALARM_SOURCE,
+            &message,
+            "medium",
+            HOTEL_STATE_SEND_FAILED_TAG,
+        ) {
+            warn!(error = %err, "Failed to push hotel-state send failure to heal queue");
+        }
+    }
+}
+
 pub(crate) async fn activate_mesh_runtime(ctx: MeshRuntimeContext) -> Result<()> {
     let daemon = Arc::new(
         BeaconDaemon::bind_with_registry(
@@ -456,13 +587,17 @@ pub(crate) async fn activate_mesh_runtime(ctx: MeshRuntimeContext) -> Result<()>
         let hs_state = ctx.local_hotel_state.clone();
         let hs_graph = ctx.graph_domain.clone();
         let hs_caps = ctx.caps.clone();
+        let hs_heal_queue = ctx.heal_queue.clone();
         let mut hs_shutdown = ctx.shutdown_tx.subscribe();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(30));
+            let mut budget = HotelStateBudgetWatch::default();
+            let mut send_alarm = ansible_mesh_core::mesh_alarm::GossipParseAlarm::default();
             loop {
                 tokio::select! {
                     _ = interval.tick() => {
                         let Some(payload) = hs_state.read().await.clone() else { continue };
+                        budget.observe(hs_graph.as_ref(), hs_heal_queue.as_deref(), &payload);
                         let targets = match mesh_targets_for_graph(hs_graph.as_ref(), &hs_caps.node_id) {
                             Ok(t) => t,
                             Err(e) => { warn!("hotel-state broadcast: failed to resolve targets: {e}"); continue }
@@ -472,6 +607,13 @@ pub(crate) async fn activate_mesh_runtime(ctx: MeshRuntimeContext) -> Result<()>
                             let Some(auth_key) = mesh_auth_key_for_node(hs_graph.as_ref(), &target_node_id).ok().flatten() else { continue };
                             if let Err(e) = emit_hotel_state_sync(&hs_socket, target, &hs_caps, payload.clone(), &auth_key).await {
                                 warn!("hotel-state broadcast to {}: {e}", target_addr);
+                                report_hotel_state_send_failed(
+                                    &mut send_alarm,
+                                    hs_heal_queue.as_deref(),
+                                    &target_node_id,
+                                    &target_addr,
+                                    &e.to_string(),
+                                );
                             }
                         }
                     }
@@ -1313,6 +1455,23 @@ mod sender_binding_tests {
             "vps-jane-aiua-01",
             "vps-jane-aiua-01"
         ));
+    }
+}
+
+#[cfg(test)]
+mod hotel_state_budget_tests {
+    use super::HotelStateBudgetWatch;
+
+    #[test]
+    fn budget_alarm_fires_only_when_the_level_rises() {
+        let mut watch = HotelStateBudgetWatch::default();
+        assert_eq!(watch.alarm_for(5_000), None, "under 75% is quiet");
+        assert_eq!(watch.alarm_for(7_873), Some("warning"));
+        assert_eq!(watch.alarm_for(7_900), None, "a steady warning files once");
+        assert_eq!(watch.alarm_for(9_100), Some("critical"));
+        assert_eq!(watch.alarm_for(9_200), None);
+        assert_eq!(watch.alarm_for(8_000), None, "falling back is not an alarm");
+        assert_eq!(watch.alarm_for(9_300), Some("critical"), "rising again is");
     }
 }
 

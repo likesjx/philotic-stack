@@ -201,6 +201,23 @@ those. An operator can see backlog, dead letters and gossip budget from
 - mac-jane's measured roster size drops. Log the wire length once per change.
 - No `hotel_state_budget` row appears at steady state.
 
+**Status (2026-10-07): implemented (steps 2–3)** on
+`codex/mesh-l2-gossip-budget`, test-green.
+- **Step 1 not done, by design.** Receivers rely on `active:false` entries:
+  `NodeRegistry::find_node_id_for_guest` includes inactive guests ("the
+  remote hotel will materialize them on receipt") and `best_host_for_agent`
+  ranks hotels by dormant guests. Dormant role incarnations are exactly what
+  cross-hotel paracrine/handoff targets, so active-only gossip would break
+  routing to sleeping roles. Shrinking the roster stays DEF-192 slice B.
+- The alarm measures the **roster** (`hotel_state_roster_wire_len`: guests,
+  agents, homes), because model profiles are already chunked across
+  datagrams. It files `hotel_state_budget` only when the level rises
+  (none → warning → critical), so a steady roster does not re-file every 30 s.
+- The roster size is logged on change and persisted as config
+  `hotel_state.last_wire_bytes` (JSON: `roster_wire_bytes`, `budget_bytes`,
+  `guests`, `recorded_at`) for L3's doctor check.
+- `hotel_state_send_failed` is throttled per target, once per minute.
+
 ### L3 — Mesh doctor checks (S, after L1 and L2)
 
 Add the following to `crates/philotic-web/src/doctor.rs`, which reads the

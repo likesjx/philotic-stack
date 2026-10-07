@@ -451,6 +451,7 @@ Six work items from the 2026-09-30 Philotic Stack Atlas assessment, each with a 
 
 - [ ] Mesh delivery guarantees (L1–L7): [MESH_DELIVERY_GUARANTEES_PROPOSAL.md](architecture/MESH_DELIVERY_GUARANTEES_PROPOSAL.md). DEF-182/184/192/059/211/185.
   - [x] L1 loud inbound (2026-10-07, test-green): per-event batch decode, gossip/undecodable/dropped-task heal tags, `DeliveryOutcome`, error reply to the originator of a dropped task. Live chaos check (`mesh_event_undecodable` within one tick) pending deploy.
+  - [x] L2 gossip budget (2026-10-07, test-green): roster-size alarm `hotel_state_budget` (75%/100%), `hotel_state_send_failed`, `hotel_state.last_wire_bytes` persisted. Active-only gossip NOT done: receivers route to dormant guests.
 - [ ] Watch-live burn-down (W0–W7): [WATCH_LIVE_BURNDOWN_PROPOSAL.md](architecture/WATCH_LIVE_BURNDOWN_PROPOSAL.md). Inventory, status vocabularies, procedure/hygiene/relocation proofs, doctor readiness.
   - [x] W0 inventory + vocabulary (2026-10-07): [process/WATCH_LIVE_BACKLOG.md](process/WATCH_LIVE_BACKLOG.md) seeded (22 items, due 2026-11-04); DEFECTS status vocabulary tightened and every row normalized (new DEF-223, renumbered from DEF-214 at merge — develop had already used 214); `scripts/docs-metadata-check.py` lints proposal and DEFECTS statuses (`--warn-only`, non-blocking `pr-check.yml` step (workflow patch 0001, applied 2026-10-07); make blocking after one week).
   - [x] W4 enablement (2026-10-07): ansible `philotic_memory_hygiene_enabled` (on for jane-vps). Proof window starts at the next vps deploy.
