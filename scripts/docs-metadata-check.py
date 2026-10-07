@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 from pathlib import Path
+import argparse
+import re
 import sys
 
 
@@ -202,6 +204,118 @@ REQUIRED_DOCS = {
 }
 
 
+# Proposal lifecycle states (docs/DOCUMENTATION_LIFECYCLE.md). `active` and
+# `historical` are kept because live docs use them; spelling variants such as
+# `in_progress` are normalized in the docs, not accepted here.
+PROPOSAL_STATUSES = {
+    "proposed",
+    "accepted",
+    "accepted-current-slice",
+    "in-progress",
+    "implemented",
+    "verified",
+    "architecture",
+    "superseded",
+    "deferred",
+    "archived",
+    "active",
+    "historical",
+}
+
+# Rough maturity order used only to spot a clearly contradictory
+# status/disposition pair (two or more steps apart). Terminal states such as
+# superseded/deferred/archived/historical are not ranked and never warn.
+STATUS_RANK = {
+    "proposed": 0,
+    "accepted": 1,
+    "accepted-current-slice": 1,
+    "in-progress": 2,
+    "active": 2,
+    "implemented": 3,
+    "verified": 4,
+    "architecture": 5,
+}
+
+DISPOSITION_SPELLINGS = {
+    "in_progress": "in-progress",
+    "accepted for current slice": "accepted-current-slice",
+    "accepted_current_slice": "accepted-current-slice",
+}
+
+# docs/DEFECTS.md Status column vocabulary (watch-live burn-down W0).
+DEFECT_STATUSES = {
+    "open",
+    "partial",
+    "fixed (deploy pending)",
+    "fixed (live pending)",
+    "fixed (verified)",
+    "resolved",
+    "wontfix",
+}
+
+DEFECT_STATUS_COLUMN = 3  # | ID | Title | Severity | Status | Pts | Found | Fixed by |
+
+
+def _clean_value(value: str) -> str:
+    value = value.strip()
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in "'\"":
+        value = value[1:-1].strip()
+    return value
+
+
+def check_proposal_statuses(arch_dir: Path) -> tuple[list[str], list[str]]:
+    """Return (errors, warnings) for docs/architecture/*_PROPOSAL.md frontmatter."""
+    errors: list[str] = []
+    warnings: list[str] = []
+    for path in sorted(arch_dir.glob("*_PROPOSAL.md")):
+        rel = path.name
+        try:
+            frontmatter = parse_frontmatter(path)
+        except ValueError:
+            # Docs without frontmatter are not status-checked here.
+            continue
+        status = _clean_value(frontmatter.get("status", ""))
+        if status not in PROPOSAL_STATUSES:
+            errors.append(
+                f"{rel}: unknown status {status!r} "
+                f"(allowed: {', '.join(sorted(PROPOSAL_STATUSES))})"
+            )
+        if "disposition" in frontmatter:
+            disposition = _clean_value(frontmatter["disposition"])
+            disposition = DISPOSITION_SPELLINGS.get(disposition, disposition)
+            if status in STATUS_RANK and disposition in STATUS_RANK:
+                if abs(STATUS_RANK[status] - STATUS_RANK[disposition]) >= 2:
+                    warnings.append(
+                        f"{rel}: status {status!r} contradicts disposition {disposition!r}"
+                    )
+    return errors, warnings
+
+
+def split_table_row(line: str) -> list[str]:
+    """Split a markdown table row on unescaped pipes."""
+    cells = re.split(r"(?<!\\)\|", line.strip())
+    return [cell.strip() for cell in cells[1:-1]]
+
+
+def check_defect_statuses(path: Path) -> list[str]:
+    errors: list[str] = []
+    if not path.is_file():
+        return errors
+    for lineno, line in enumerate(path.read_text().splitlines(), start=1):
+        if not line.startswith("| DEF-"):
+            continue
+        cells = split_table_row(line)
+        if len(cells) <= DEFECT_STATUS_COLUMN:
+            errors.append(f"{path.name}:{lineno}: malformed defect row")
+            continue
+        status = cells[DEFECT_STATUS_COLUMN]
+        if status not in DEFECT_STATUSES:
+            errors.append(
+                f"{path.name}:{lineno}: {cells[0]} has status {status!r} outside the vocabulary"
+            )
+    return errors
+
+
 def parse_frontmatter(path: Path) -> dict[str, str]:
     text = path.read_text()
     lines = text.splitlines()
@@ -238,11 +352,22 @@ def parse_frontmatter(path: Path) -> dict[str, str]:
     return data
 
 
-def main() -> int:
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description="Check docs frontmatter and status vocabularies.")
+    parser.add_argument(
+        "--warn-only",
+        action="store_true",
+        help="report proposal-status and DEFECTS vocabulary violations as warnings "
+        "(the required-keys checks stay fatal)",
+    )
+    parser.add_argument("--root", type=Path, default=ROOT, help=argparse.SUPPRESS)
+    args = parser.parse_args(argv)
+    root: Path = args.root
+
     failures: list[str] = []
 
     for rel_path, required_keys in REQUIRED_DOCS.items():
-        path = ROOT / rel_path
+        path = root / rel_path
         if not path.is_file():
             failures.append(f"{rel_path}: missing file")
             continue
@@ -256,6 +381,18 @@ def main() -> int:
         missing = sorted(required_keys - set(frontmatter))
         if missing:
             failures.append(f"{rel_path}: missing frontmatter keys: {', '.join(missing)}")
+
+    vocab_errors, warnings = check_proposal_statuses(root / "docs" / "architecture")
+    vocab_errors += check_defect_statuses(root / "docs" / "DEFECTS.md")
+
+    for warning in warnings:
+        print(f"warning: {warning}", file=sys.stderr)
+
+    if args.warn_only:
+        for error in vocab_errors:
+            print(f"warning: {error}", file=sys.stderr)
+    else:
+        failures.extend(vocab_errors)
 
     if failures:
         for failure in failures:
