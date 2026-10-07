@@ -456,7 +456,8 @@ Six work items from the 2026-09-30 Philotic Stack Atlas assessment, each with a 
   - [ ] W1, W3, W5, W6 need hotel access; W3 step 5 and W7 are Rust.
   - [x] W2 proposal status reconciliation (2026-10-07): frontmatter `status`/`disposition` aligned with landed code across ~30 proposals; LIFE_GRAPH_ACTIVE gained frontmatter. Lint warnings cleared. Graph rescan (`phil graph scan`) pending from the main checkout after merge.
 - [ ] IPC dispatch split (S0–S6): [IPC_DISPATCH_SPLIT_PROPOSAL.md](architecture/IPC_DISPATCH_SPLIT_PROPOSAL.md). `ipc.rs` → `ipc/` family modules, plus park-path fixes.
-  - [x] S0 skeleton (2026-10-07): `service/ipc/mod.rs` + `ipc/tests.rs`, orphan doc removed, `await_holding_lock` denied outside tests; aiua tests 654 → 654.
+  - [x] S0 skeleton (2026-10-07): `service/ipc/mod.rs` + `ipc/tests.rs`, orphan doc removed, `await_holding_lock` denied outside tests; aiua tests 654 → 654 (PR #626).
+  - [x] S1 pure free functions (2026-10-07): `tool_assembly`, `cron`, `surfaces`, `procedures`, `skills`, `agent_context` — verbatim, double-checked per commit; aiua tests 654 → 654.
 - [ ] Release train (R0–R7): [RELEASE_TRAIN_PROPOSAL.md](architecture/RELEASE_TRAIN_PROPOSAL.md). Sync main, `v0.2.0`, release artifacts, versioned installs, rollback, rollout proof.
   - [x] R0 runbook ([process/RELEASE.md](process/RELEASE.md)); `release/packages.toml` + `scripts/release-packages.sh`; `scripts/release-manifest.py`; R4 `just vps-deploy-release` + ansible release/rollback tasks; R5 `scripts/install-release-mac.sh`; R6/R7 `just rollback`, `just verify-release` (2026-10-07, validated locally: actionlint, shellcheck, ansible syntax + fake-tarball runs, 16 unit tests).
   - [x] R3 workflow changes: patches 0002 + 0003 applied 2026-10-07 (manifest package list re-verified identical: 16 `-p` flags after merging develop @ `36466d8b`).
