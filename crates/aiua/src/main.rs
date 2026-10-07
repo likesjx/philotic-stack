@@ -1,3 +1,9 @@
+// A std lock guard held across `.await` can deadlock the runtime; keep the
+// IPC family moves from regressing this (IPC_DISPATCH_SPLIT S0). Production
+// code only: async tests hold `ipc_env_guard()` for their whole body on purpose
+// to serialize process-env mutation.
+#![cfg_attr(not(test), deny(clippy::await_holding_lock))]
+
 use ansible_mesh_core::graph::{AbstractSkillRecord, ToolsetProfileRecord};
 use ansible_mesh_core::membership::{
     MeshMembershipAcceptPayload, derive_transport_session_key, fingerprint_from_base64url,
