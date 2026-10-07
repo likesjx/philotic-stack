@@ -32,21 +32,22 @@ pub const MESH_ALARM_SOURCE: &str = "aiua.mesh_inbound";
 /// Per-`(peer, kind)` throttle for undecodable-gossip reports.
 #[derive(Debug, Default)]
 pub struct GossipParseAlarm {
-    last_reported: HashMap<(String, &'static str), Instant>,
+    last_reported: HashMap<(String, String), Instant>,
 }
 
 impl GossipParseAlarm {
-    /// True when `(peer, kind)` has not been reported within
+    /// True when `(peer, key)` has not been reported within
     /// [`GOSSIP_ALARM_INTERVAL`] of `now`; records `now` when it returns true.
-    pub fn should_report(&mut self, peer: &str, kind: &'static str, now: Instant) -> bool {
-        let key = (peer.to_string(), kind);
-        match self.last_reported.get(&key) {
-            Some(last) if now.saturating_duration_since(*last) < GOSSIP_ALARM_INTERVAL => false,
-            _ => {
-                self.last_reported.insert(key, now);
-                true
-            }
+    /// Entries older than the interval are pruned so the map stays bounded.
+    pub fn should_report(&mut self, peer: &str, key: &str, now: Instant) -> bool {
+        self.last_reported
+            .retain(|_, last| now.saturating_duration_since(*last) < GOSSIP_ALARM_INTERVAL);
+        let key = (peer.to_string(), key.to_string());
+        if self.last_reported.contains_key(&key) {
+            return false;
         }
+        self.last_reported.insert(key, now);
+        true
     }
 
     /// Report an undecodable `kind` message from `peer`, throttled. Returns

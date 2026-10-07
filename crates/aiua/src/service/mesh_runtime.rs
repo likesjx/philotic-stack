@@ -253,6 +253,9 @@ pub(crate) fn dropped_task_error_reply(
                 "error": error,
             })
         };
+        // A request reply addressed only by role would reach whichever
+        // philote the receiving hotel picks; only answer a known caller.
+        route.guest_id.as_ref()?;
         (route.node, route.role, route.guest_id, reply)
     } else {
         let node = task
@@ -268,12 +271,32 @@ pub(crate) fn dropped_task_error_reply(
             .get("final_reply_guest_id")
             .and_then(serde_json::Value::as_str)
             .map(str::to_string);
-        let reply = serde_json::json!({
+        // EmitTask stamps the emitting agent on membrane replies so only that
+        // agent's seat posts it (DEF-166). This reply skips EmitTask, so stamp
+        // the agent the dropped turn was for. With neither a pinned guest nor
+        // an owner, every seat on the hotel would post it: send nothing.
+        let owner = task
+            .get("agent_id")
+            .and_then(serde_json::Value::as_str)
+            .filter(|agent| !agent.trim().is_empty());
+        if guest.is_none() && owner.is_none() {
+            return None;
+        }
+        let mut reply = serde_json::json!({
             "action": "send_reply",
             "content": format!("⚠️ Delivery failed: {message}"),
         });
+        if let Some(owner) = owner {
+            reply[crate::service::ipc::REPLY_OWNER_AGENT_ID_FIELD] =
+                serde_json::Value::String(owner.to_string());
+        }
         (node, role, guest, reply)
     };
+    // A reply addressed to this hotel would sit in the outbound ledger; the
+    // local caller's own timeout already covers it.
+    if node == local_node_id {
+        return None;
+    }
     let mut reply = reply;
     for field in ["session_id", "turn_id", "chat_id"] {
         reply[field] = echo(field);
@@ -341,12 +364,27 @@ async fn report_dropped_task(
 }
 
 /// Log and file an inbound batch element that did not decode.
+///
+/// Throttled per (peer, event id), falling back to kind: an undecodable event
+/// that stays unacked is re-sent by the peer on every dispatch tick until L4
+/// dead-letters it, and must not flood `aiua.log`.
 fn report_undecodable_event(
+    alarm: &mut ansible_mesh_core::mesh_alarm::GossipParseAlarm,
     heal_queue: Option<&dyn ansible_mesh_core::heal_queue::HealQueueStorage>,
     src_node: &str,
     bad: &UndecodableEvent,
 ) {
     use ansible_mesh_core::mesh_alarm::{MESH_ALARM_SOURCE, MESH_EVENT_UNDECODABLE_TAG};
+    let key = format!(
+        "event:{}",
+        bad.event_id
+            .as_deref()
+            .or(bad.kind.as_deref())
+            .unwrap_or("batch")
+    );
+    if !alarm.should_report(src_node, &key, std::time::Instant::now()) {
+        return;
+    }
     warn!(
         src_node,
         kind = bad.kind.as_deref().unwrap_or("-"),
@@ -720,6 +758,7 @@ pub(crate) async fn activate_mesh_runtime(ctx: MeshRuntimeContext) -> Result<()>
                         let (events, undecodable) = decode_inbound_batch(&msg.payload);
                         for bad in &undecodable {
                             report_undecodable_event(
+                                &mut gossip_alarm,
                                 inbound_heal_queue.as_deref(),
                                 &msg.src_node,
                                 bad,
@@ -1402,6 +1441,7 @@ mod decode_batch_tests {
                 "turn_id": "t1",
                 "reply_to": "mac-jane-aiua-01",
                 "reply_role": "agent",
+                "reply_guest_id": "agent-bjork-01:orchestrator",
             }),
         );
         let body = reply_json(
@@ -1455,6 +1495,68 @@ mod decode_batch_tests {
                 "{action} must not be answered (reply loops)"
             );
         }
+    }
+
+    #[test]
+    fn a_dropped_user_turn_reply_is_stamped_with_its_agent_as_owner() {
+        // No pinned membrane guest: the owner stamp is what keeps every other
+        // bot's seat on that hotel from posting the notice too (DEF-166).
+        let dropped = task(
+            "agent",
+            serde_json::json!({
+                "agent_id": "agent-beacon",
+                "session_id": "telegram:1:agent-beacon",
+                "final_reply_to": "mac-jane-aiua-01",
+                "final_reply_role": "membrane",
+            }),
+        );
+        let body = reply_json(
+            &super::dropped_task_error_reply(&dropped, "x", "vps-jane-aiua-01").unwrap(),
+        );
+        assert_eq!(body["reply_owner_agent_id"], "agent-beacon");
+        assert!(body.get("delivery_target_guest_id").is_none());
+    }
+
+    #[test]
+    fn a_dropped_user_turn_without_owner_or_guest_gets_no_reply() {
+        let dropped = task(
+            "agent",
+            serde_json::json!({
+                "session_id": "cron:job-1",
+                "final_reply_to": "mac-jane-aiua-01",
+                "final_reply_role": "membrane",
+            }),
+        );
+        assert!(
+            super::dropped_task_error_reply(&dropped, "x", "vps-jane-aiua-01").is_none(),
+            "an unowned role-only reply would be posted by every seat"
+        );
+    }
+
+    #[test]
+    fn a_dropped_request_with_no_known_caller_gets_no_reply() {
+        let dropped = task(
+            "graph-datasource",
+            serde_json::json!({
+                "action": "graph.query",
+                "session_id": "s1",
+                "reply_to": "mac-jane-aiua-01",
+                "reply_role": "agent",
+            }),
+        );
+        assert!(super::dropped_task_error_reply(&dropped, "x", "vps-jane-aiua-01").is_none());
+    }
+
+    #[test]
+    fn no_error_reply_is_addressed_to_this_hotel() {
+        let dropped = task(
+            "tool.weather",
+            serde_json::json!({
+                "action": "execute_tool",
+                "return_route": {"node": "vps-jane-aiua-01", "role": "agent", "guest_id": "agent-x"},
+            }),
+        );
+        assert!(super::dropped_task_error_reply(&dropped, "x", "vps-jane-aiua-01").is_none());
     }
 
     #[test]

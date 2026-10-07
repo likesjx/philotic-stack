@@ -164,6 +164,20 @@ those. An operator can see backlog, dead letters and gossip budget from
 
   `error` is always a `TaskErrorPayload` object; a bare string would fail
   philote's parse. A dropped reply is never answered (loop guard).
+- Reply routing rules (no EmitTask in the path, so its safeguards are
+  re-applied by hand):
+  - a request reply goes out only when the return route names a caller guest;
+  - a `send_reply` carries `reply_owner_agent_id` (DEF-166) from the dropped
+    task's `agent_id`, or a pinned `final_reply_guest_id`, else nothing is sent;
+  - nothing is sent to this hotel itself.
+- Ack consequence until L4:
+  - an undecodable element below the batch's highest decoded seq is acked,
+    so it is lost loudly;
+  - one above it is re-sent every tick (its alarm is throttled per event id).
+- **Live check needs a hook that does not exist yet:** neither
+  `PHILOTIC_MESH_CHAOS_GARBLE` nor `scripts/chaos-smoke.sh mesh-garble`
+  exists. Add one (release-safe, operator-gated) before claiming
+  watched-live.
 
 ### L2 — Loud gossip budget (S, independent of L1)
 
