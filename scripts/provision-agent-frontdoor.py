@@ -37,10 +37,10 @@ import json
 import os
 import pathlib
 import secrets
-import socket
-import struct
 import sys
 import time
+
+from philotic_ipc import Ipc, IpcError
 
 SOCKET_PATH = os.environ.get("PHILOTIC_HOTEL_SOCKET", "/run/philotic/vps-jane.sock")
 ENDPOINT_ID = os.environ.get("ENDPOINT_ID", "agent-frontdoor")
@@ -82,41 +82,6 @@ GRAPH_TOOLS = [
     ("graph_decide", "Intel-graph: record an architectural decision."),
     ("graph_record_test_run", "Intel-graph: record a verification/test run."),
 ]
-
-
-class Ipc:
-    """Length-prefixed JSON IPC. The hotel pushes unsolicited frames on the same
-    stream (e.g. a blob-endpoint advert right after connect), so a call reads
-    until it sees a Standard ok/code envelope or a key it expects."""
-
-    def __init__(self, path: str):
-        self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        self.sock.settimeout(15.0)
-        self.sock.connect(path)
-
-    def _read_exact(self, n: int) -> bytes:
-        buf = b""
-        while len(buf) < n:
-            chunk = self.sock.recv(n - len(buf))
-            if not chunk:
-                raise RuntimeError("socket closed")
-            buf += chunk
-        return buf
-
-    def call(self, operation: str, payload: dict, expect_keys=()) -> dict:
-        data = json.dumps({"operation": operation, "payload": payload}).encode()
-        self.sock.sendall(struct.pack(">I", len(data)) + data)
-        for _ in range(50):
-            (length,) = struct.unpack(">I", self._read_exact(4))
-            frame = json.loads(self._read_exact(length))
-            if isinstance(frame, dict) and (
-                "ok" in frame or "code" in frame or any(k in frame for k in expect_keys)
-            ):
-                return frame
-        raise RuntimeError(f"no response for {operation}")
-
-    def close(self) -> None:
-        self.sock.close()
 
 
 def response_payload(resp: dict) -> dict:
@@ -222,12 +187,10 @@ def main() -> None:
 
     ipc = Ipc(SOCKET_PATH)
     # Owner checks accept `<owner>:<suffix>` guest ids (aiua mcp_owner_identity_ok).
-    reg = ipc.call(
-        "register",
-        {"guest_id": f"{OWNER_AGENT_ID}:frontdoor-provisioner", "role": "hotel.internal", "supported_tools": []},
-    )
-    if reg.get("ok") is not True:
-        print(f"ERROR: register failed: {reg}", file=sys.stderr)
+    try:
+        ipc.register_operator(OWNER_AGENT_ID, "frontdoor-provisioner")
+    except IpcError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
         sys.exit(1)
 
     TOKEN_OUT_DIR.mkdir(parents=True, exist_ok=True)
