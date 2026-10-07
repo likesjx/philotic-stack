@@ -2,9 +2,9 @@
 title: MCP Membrane Gateway — Philote-Configured, Transform-Driven
 doc_type: proposal
 domain: membrane-transport
-status: proposed
+status: implemented
 disposition: implemented
-last_updated: 2026-06-22
+last_updated: 2026-10-07
 tags:
   - mcp
   - membrane
@@ -47,6 +47,10 @@ source_of_truth_targets:
 > inventory, is `MCP_MEMBRANE_HARDENING_PROPOSAL.md`
 > (proposal_id `mcp-membrane-hardening`). The missing consumer direction is
 > `MCP_CLIENT_FABRIC_PROPOSAL.md` (proposal_id `mcp-client-fabric`).
+
+## Disposition
+
+`implemented` (status aligned to the existing `disposition: implemented` on 2026-10-07, watch-live burn-down W2). The gateway ships as `crates/membrane-mcp`; its hardening follow-on is `MCP_MEMBRANE_HARDENING_PROPOSAL.md`.
 
 ## Problem
 

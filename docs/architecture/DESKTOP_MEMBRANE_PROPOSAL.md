@@ -2,9 +2,9 @@
 title: Desktop Membrane Proposal
 doc_type: proposal
 domain: membrane-transport
-status: proposed
+status: accepted-current-slice
 disposition: accepted-current-slice
-last_updated: 2026-05-12
+last_updated: 2026-10-07
 tags:
 - desktop
 - membrane
@@ -82,7 +82,7 @@ The desktop UI should not become a second control plane with nicer CSS, more dir
 
 ## Disposition
 
-`accepted for current slice`
+`accepted-current-slice` (status aligned to disposition 2026-10-07, watch-live burn-down W2). First slice smoke-green; slices 1–4 shipped (below); no watched-live record.
 
 Track follow-on work in [docs/task.md](/Users/jaredlikes/code/philotic-stack/docs/task.md).
 

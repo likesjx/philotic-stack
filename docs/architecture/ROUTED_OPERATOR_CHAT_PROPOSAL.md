@@ -2,9 +2,9 @@
 title: Routed Operator Chat Proposal
 doc_type: proposal
 domain: operator-control-plane
-status: proposed
+status: accepted-current-slice
 disposition: accepted-current-slice
-last_updated: 2026-03-31
+last_updated: 2026-10-07
 tags:
 - operator-chat
 - router
@@ -54,7 +54,7 @@ Put differently: Telegram and desktop should be two membranes over one conversat
 
 ## Disposition
 
-`proposed`
+`accepted-current-slice` (reconciled 2026-10-07, watch-live burn-down W2). A first implementation foothold exists; see Current Slice.
 
 Track follow-on work in [docs/task.md](/Users/jaredlikes/code/philotic-stack/docs/task.md).
 

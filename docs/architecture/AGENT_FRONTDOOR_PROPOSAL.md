@@ -2,8 +2,8 @@
 title: Agent Frontdoor — Remote Agents Reach Muninn + Intel-Graph Through membrane-mcp
 doc_type: proposal
 domain: operator-control-plane
-status: in_progress
-last_updated: 2026-10-05
+status: in-progress
+last_updated: 2026-10-07
 tags:
 - mcp
 - membrane-mcp

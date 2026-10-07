@@ -2,9 +2,9 @@
 title: Fleet Supervision — Nothing Owns "What Should Be Running Here"
 doc_type: proposal
 domain: operator-control-plane
-status: proposed
-disposition: proposed
-last_updated: 2026-08-05
+status: accepted-current-slice
+disposition: accepted-current-slice
+last_updated: 2026-10-07
 verification_level: field-evidence
 tags:
 - supervision
@@ -26,6 +26,14 @@ task_refs:
 
 > Detection was never the problem. Both outages below were detected thousands of
 > times. They were **action** failures.
+
+## Disposition
+
+`accepted-current-slice` (reconciled 2026-10-07, watch-live burn-down W2).
+S4 (escalation truth) and S6 (silence as signal, session half) are implemented
+and test-green; S2's recovery half shipped (PR #382) with its detection half
+open. S1, S3, S5 and S6's service half are not marked done in this doc. The launchd muninn
+`KeepAlive` change (below) was watched on both Macs on 2026-07-27.
 
 ## Premise
 

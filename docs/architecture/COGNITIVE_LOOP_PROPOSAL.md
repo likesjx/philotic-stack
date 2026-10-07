@@ -2,9 +2,9 @@
 title: Cognitive Loop Architecture
 doc_type: proposal
 domain: runtime-sessions
-status: accepted-current-slice
+status: implemented
 disposition: implemented
-last_updated: 2026-03-31
+last_updated: 2026-10-07
 tags:
 - agent-loop
 - context-envelope
@@ -45,7 +45,7 @@ multi-step plans are represented, and how the agent surfaces its work in real ti
 
 ## Disposition
 
-`accepted for current slice`
+`implemented` (reconciled 2026-10-07, watch-live burn-down W2); frontmatter `status` aligned to the existing `disposition: implemented`. No watched-live record in this doc.
 
 ---
 

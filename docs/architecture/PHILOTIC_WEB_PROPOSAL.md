@@ -2,9 +2,9 @@
 title: 'Philotic Web: The Mesh, Management Plane, and Distribution'
 doc_type: proposal
 domain: product-management-plane
-status: proposed
+status: accepted-current-slice
 disposition: accepted-current-slice
-last_updated: 2026-03-31
+last_updated: 2026-10-07
 tags:
 - philotic-web
 - aiua
@@ -60,7 +60,7 @@ This distinction matters for naming and mental model. You don't install a philot
 
 ## Disposition
 
-`proposed`
+`accepted-current-slice` (reconciled 2026-10-07, watch-live burn-down W2). `crates/philotic-web` is built and in use (desktop membrane, `phil doctor`, onboarding).
 
 Track implementation in [docs/task.md](/docs/task.md).
 
