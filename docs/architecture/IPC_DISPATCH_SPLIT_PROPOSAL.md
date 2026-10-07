@@ -192,6 +192,19 @@ These have no `IpcServer` state, so the move risk is lowest.
 **Tests:** about 27 direct calls into private functions need `pub(super)` or
 must move with the code.
 
+**Status (2026-10-07): done** on `codex/ipc-split-s1-tool-assembly`, one
+commit per family (`tool_assembly`, `cron`, `surfaces`, `procedures`,
+`skills`, `agent_context`), bundled into one PR rather than six because each
+commit is independently verified and nothing else touches these lines. Each
+move is checked two ways: the new file equals the removed text modulo
+visibility tokens/whitespace/trailing commas, and the commit's `mod.rs` diff
+is deletions plus `mod`/`use`/`#[allow]` wiring only. Visibility mapping:
+private → `pub(super)`, `pub(super)` → `pub(in crate::service)` (with a
+re-export at the old path), struct fields likewise. Tests stayed in
+`ipc/tests.rs` (reaching items via `use super::*`); they move per family in
+S3. The orphaned `require_skill_admin` doc block was reattached to its fn.
+`mod.rs` 19,256 → 15,673 lines; aiua tests 654 → 654.
+
 ### S2 — Small leaf families (S, about 6 PRs)
 
 `surfaces`, `cron` (arms only), `hotel_status`, `media_setup` and `memory`
