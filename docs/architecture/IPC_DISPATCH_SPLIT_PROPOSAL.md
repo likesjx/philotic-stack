@@ -2,8 +2,8 @@
 title: IPC Dispatch Split — Break service/ipc.rs Into Request-Family Modules
 doc_type: proposal
 domain: runtime-sessions
-status: proposed
-last_updated: 2026-10-05
+status: in-progress
+last_updated: 2026-10-07
 tags:
 - aiua
 - ipc
@@ -170,6 +170,14 @@ The lease arms join the existing `service/lease_handlers.rs`.
 - **Done when:** external paths compile unchanged (`main.rs`, `cron_ticker.rs`,
   `mesh_runtime.rs`, `golgi.rs`, `webrtc_signaling.rs` and the four sibling
   modules) and the test count is equal.
+- **Status (2026-10-07): done** on `codex/ipc-split-s0`. `cargo test -p aiua`
+  654 → 654. The lock rule needed one correction: production code is clean,
+  but ~150 async tests hold `ipc_env_guard()` (a std `Mutex`) for their whole
+  body on purpose, so the deny is `#![cfg_attr(not(test), deny(...))]`.
+  Optional `RequestCtx`/`ConnCtx` deferred (additive; add with the first family
+  that wants them). A second orphaned doc block (the `require_skill_admin`
+  gate doc + `#[allow(clippy::result_large_err)]`, sitting above
+  `cron_owner_agent_of_guest`) moves with the cron family and is removed there.
 
 ### S1 — Pure free functions (S, about 4 PRs)
 
@@ -281,8 +289,9 @@ S6 fixes each get their own smoke.
 - `CODEBASE_HEALTH.md` and `DEFECTS.md` are updated.
 - The `CLAUDE.md` hot-file entry changes from `ipc.rs` to `ipc/mod.rs`.
 
-## Operator decisions needed
+## Operator decisions
 
-1. Approve the directory layout (`service/ipc/`) over flat siblings
-   (`service/ipc_*.rs`).
+Approved 2026-10-07 (recommended option at every point):
+
+1. Directory layout (`service/ipc/`) over flat siblings (`service/ipc_*.rs`).
 2. Close or rebase the stale PRs #381 and #354 before S3.
