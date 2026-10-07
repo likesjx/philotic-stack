@@ -303,6 +303,27 @@ the slice PR.
 - **Either way:** until the option ships, push tag `ledger_untargeted_envelope`
   once per kind in the ledger writer.
 
+**Status (2026-10-07): option (a) implemented** on
+`codex/mesh-l6-delete-cron-broadcast` (operator approved the recommended
+option). The following are deleted:
+- the `CronFired` and `CronJobSync` emitters and `startup_sync` in
+  `cron_ticker.rs`;
+- the duplicate builders `broadcast_cron_sync_{upsert,remove}` in
+  `ipc/mod.rs`, plus their four call sites in the cron handlers (which also
+  lose their now-unused `local_node_id` / `dispatcher_tx` parameters);
+- the `mesh_runtime` dispatch arms;
+- the `main.rs` handlers and `strip_replicated_cron_policy`.
+
+Kept:
+- the `EventKind` variants, for wire compatibility;
+- the per-hotel fire-time guards (`enabled_locally`, own-job-id checks),
+  because a job record can still arrive in a copied or restored DB;
+- the ledger's once-per-kind untargeted-envelope warning, which still covers
+  any other emitter.
+
+Behavior is unchanged, since the ledger already dropped every one of these
+envelopes. Closes IPC_DISPATCH_SPLIT P-d.
+
 ### L7 — `life.observe` write confirmation (M, independent)
 
 Redelivery is safe:
@@ -376,7 +397,7 @@ while that extraction is in flight.
 ## Operator decisions needed
 
 1. DEF-184: option (a), delete the cron broadcast paths, or option (b),
-   per-peer replication?
+   per-peer replication? **Approved 2026-10-07: (a).**
 2. Dead-letter retention: 7 days is proposed.
 3. Should `phil mesh dead-letters --replay` be operator-only (an admin
    ceremony)?
