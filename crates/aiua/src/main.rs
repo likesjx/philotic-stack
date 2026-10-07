@@ -8676,6 +8676,7 @@ async fn main() -> Result<()> {
         ipc_operator_surface_tx: Some(inbound_operator_surface_tx),
         local_hotel_state: local_hotel_state.clone(),
         placement_change_tx: Some(placement_change_tx),
+        heal_queue: heal_queue_arc.clone(),
     };
 
     if let Err(e) = activate_mesh_runtime(mesh_runtime.clone()).await {

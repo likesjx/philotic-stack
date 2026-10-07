@@ -56,6 +56,10 @@ pub struct BeaconDaemon {
     /// hotel can push them to local guests at once (DEF-107). `None` = no
     /// subscriber; records are still applied to the graph.
     placement_change_tx: Option<mpsc::UnboundedSender<crate::placement_sync::PlacementChange>>,
+    /// Where undecodable gossip is reported (MESH_DELIVERY_GUARANTEES L1).
+    /// `None` = log only.
+    heal_queue: Option<Arc<dyn crate::heal_queue::HealQueueStorage>>,
+    gossip_alarm: std::sync::Mutex<crate::mesh_alarm::GossipParseAlarm>,
     /// Shared snapshot of this hotel's current guest+agent roster. Written by aiua
     /// whenever the roster changes; read by the beacon to include in anchor handshakes.
     pub local_hotel_state: Arc<RwLock<Option<HotelStateSyncPayload>>>,
@@ -117,8 +121,23 @@ impl BeaconDaemon {
             nonce_tracker,
             enable_rust_auth,
             placement_change_tx: None,
+            heal_queue: None,
+            gossip_alarm: std::sync::Mutex::new(Default::default()),
             local_hotel_state: Arc::new(RwLock::new(None)),
         })
+    }
+    /// Report undecodable gossip to `heal_queue` (throttled per peer and kind).
+    pub fn with_heal_queue(
+        mut self,
+        heal_queue: Option<Arc<dyn crate::heal_queue::HealQueueStorage>>,
+    ) -> Self {
+        self.heal_queue = heal_queue;
+        self
+    }
+    fn report_undecodable_gossip(&self, peer: &str, kind: &'static str, error: &str) {
+        if let Ok(mut alarm) = self.gossip_alarm.lock() {
+            alarm.report(self.heal_queue.as_deref(), peer, kind, error);
+        }
     }
     /// Report newly applied gossiped placement records (role homes,
     /// transport homes) on `tx` so the hotel can push them to local guests.
@@ -390,8 +409,15 @@ impl BeaconDaemon {
                 // Anchor handshake reply: update stale peer records from the sender's directory.
                 // Only updates mesh_port (port changes are the main drift vector). mesh_host is
                 // only filled in if empty — we trust stored Tailscale IPs over relayed values.
-                if let Ok(payload) = serde_json::from_slice::<MeshCatalogSyncPayload>(&msg.payload)
-                {
+                let parsed = serde_json::from_slice::<MeshCatalogSyncPayload>(&msg.payload);
+                if let Err(err) = &parsed {
+                    self.report_undecodable_gossip(
+                        &msg.src_node,
+                        "mesh_catalog_sync",
+                        &err.to_string(),
+                    );
+                }
+                if let Ok(payload) = parsed {
                     if let Ok(hotels) = self.graph.list_hotels() {
                         for peer in &payload.peers {
                             if peer.node_id == self.local_capabilities.node_id {
@@ -436,7 +462,15 @@ impl BeaconDaemon {
                 let _ = self.inbox_tx.send(msg).await;
             }
             MsgType::HotelStateSync => {
-                if let Ok(payload) = serde_json::from_slice::<HotelStateSyncPayload>(&msg.payload) {
+                let parsed = serde_json::from_slice::<HotelStateSyncPayload>(&msg.payload);
+                if let Err(err) = &parsed {
+                    self.report_undecodable_gossip(
+                        &msg.src_node,
+                        "hotel_state_sync",
+                        &err.to_string(),
+                    );
+                }
+                if let Ok(payload) = parsed {
                     if !claimed_node_is_sender(&payload.node_id, &msg) {
                         return;
                     }

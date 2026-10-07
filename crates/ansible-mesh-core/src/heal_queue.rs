@@ -474,6 +474,13 @@ pub fn heal_action_for_pattern_tag(tag: &str) -> &'static str {
         | "delivery_write_unconfirmed"
         | "delivery_channel_closed"
         | "emit_task_unknown_target_node"
+        // MESH_DELIVERY_GUARANTEES L1: inbound mesh traffic this hotel could
+        // not decode (a peer on an incompatible build), and accepted
+        // cross-hotel tasks it could neither deliver, park nor rescue. No
+        // local restart recovers either.
+        | "mesh_event_undecodable"
+        | "mesh_gossip_undecodable"
+        | "mesh_task_dropped"
         // A tier fallback that SUCCEEDED still means a provider tier is down
         // (2026-07-20: gemini schema 400s were invisible because the ladder
         // kept answering) — no restart fixes a provider; surface a work item.
@@ -1180,6 +1187,14 @@ mod tests {
             heal_action_for_pattern_tag("emit_task_unknown_target_node"),
             "escalate"
         );
+        // MESH_DELIVERY_GUARANTEES L1 tags, as filed by aiua's mesh inbound.
+        for tag in [
+            crate::mesh_alarm::MESH_EVENT_UNDECODABLE_TAG,
+            crate::mesh_alarm::MESH_GOSSIP_UNDECODABLE_TAG,
+            crate::mesh_alarm::MESH_TASK_DROPPED_TAG,
+        ] {
+            assert_eq!(heal_action_for_pattern_tag(tag), "escalate", "{tag}");
+        }
     }
 
     #[test]
