@@ -31,6 +31,7 @@ pub mod mcp_route;
 pub mod mcp_upstream;
 pub mod membership;
 pub mod memory_explain;
+pub mod mesh_alarm;
 pub mod meshops;
 pub mod model_catalog_discovery;
 pub mod model_manager;

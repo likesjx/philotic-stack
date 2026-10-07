@@ -98,6 +98,99 @@ pub(crate) struct MeshRuntimeContext {
     /// push `TransportHomeChanged` to local guests at once (DEF-107).
     pub(crate) placement_change_tx:
         Option<mpsc::UnboundedSender<ansible_mesh_core::placement_sync::PlacementChange>>,
+    /// Alarm bus for inbound mesh traffic that could not be decoded or
+    /// delivered (MESH_DELIVERY_GUARANTEES L1). `None` = log only.
+    pub(crate) heal_queue: Option<Arc<dyn ansible_mesh_core::heal_queue::HealQueueStorage>>,
+}
+
+/// One element of an inbound mesh event batch that did not decode as an
+/// [`EventEnvelope`] (or the whole payload, when it is not a JSON array).
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct UndecodableEvent {
+    /// Raw `kind` field, when the element had one.
+    pub(crate) kind: Option<String>,
+    pub(crate) event_id: Option<String>,
+    pub(crate) seq: Option<u64>,
+    pub(crate) error: String,
+}
+
+/// Decode an inbound `MeshEventBatch` / `ExecutionEventBatch` payload element by
+/// element (DEF-182). A batch used to be parsed as one `Vec<EventEnvelope>`, so a
+/// single element this build cannot decode (an unknown `EventKind` from a newer
+/// peer) silently dropped every event in the batch.
+pub(crate) fn decode_inbound_batch(payload: &[u8]) -> (Vec<EventEnvelope>, Vec<UndecodableEvent>) {
+    let values = match serde_json::from_slice::<Vec<serde_json::Value>>(payload) {
+        Ok(values) => values,
+        Err(err) => {
+            return (
+                Vec::new(),
+                vec![UndecodableEvent {
+                    kind: None,
+                    event_id: None,
+                    seq: None,
+                    error: format!("batch payload is not a JSON array: {err}"),
+                }],
+            );
+        }
+    };
+    let mut events = Vec::with_capacity(values.len());
+    let mut undecodable = Vec::new();
+    for value in values {
+        let kind = value.get("kind").map(|kind| match kind {
+            serde_json::Value::String(s) => s.clone(),
+            other => other.to_string(),
+        });
+        let event_id = value
+            .get("event_id")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string);
+        let seq = value.get("seq").and_then(serde_json::Value::as_u64);
+        match serde_json::from_value::<EventEnvelope>(value) {
+            Ok(event) => events.push(event),
+            Err(err) => undecodable.push(UndecodableEvent {
+                kind,
+                event_id,
+                seq,
+                error: err.to_string(),
+            }),
+        }
+    }
+    (events, undecodable)
+}
+
+/// Log and file an inbound batch element that did not decode.
+fn report_undecodable_event(
+    heal_queue: Option<&dyn ansible_mesh_core::heal_queue::HealQueueStorage>,
+    src_node: &str,
+    bad: &UndecodableEvent,
+) {
+    use ansible_mesh_core::mesh_alarm::{MESH_ALARM_SOURCE, MESH_EVENT_UNDECODABLE_TAG};
+    warn!(
+        src_node,
+        kind = bad.kind.as_deref().unwrap_or("-"),
+        event_id = bad.event_id.as_deref().unwrap_or("-"),
+        seq = bad.seq,
+        error = %bad.error,
+        "Undecodable mesh event from peer: not delivered (DEF-182)"
+    );
+    if let Some(hq) = heal_queue {
+        let message = format!(
+            "[{MESH_EVENT_UNDECODABLE_TAG}] event {} (kind {}, seq {}) from peer {src_node} did not \
+             decode and was not delivered: {}. The peer may run an incompatible build.",
+            bad.event_id.as_deref().unwrap_or("?"),
+            bad.kind.as_deref().unwrap_or("?"),
+            bad.seq.map(|s| s.to_string()).unwrap_or_else(|| "?".into()),
+            bad.error
+        );
+        if let Err(err) = hq.push_classified(
+            MESH_ALARM_SOURCE,
+            &message,
+            "high",
+            MESH_EVENT_UNDECODABLE_TAG,
+        ) {
+            warn!(error = %err, "Failed to push undecodable-event alarm to heal queue");
+        }
+    }
 }
 
 pub(crate) async fn activate_mesh_runtime(ctx: MeshRuntimeContext) -> Result<()> {
@@ -112,7 +205,8 @@ pub(crate) async fn activate_mesh_runtime(ctx: MeshRuntimeContext) -> Result<()>
             ctx.registry.clone(),
         )
         .await?
-        .with_placement_change_tx(ctx.placement_change_tx.clone()),
+        .with_placement_change_tx(ctx.placement_change_tx.clone())
+        .with_heal_queue(ctx.heal_queue.clone()),
     );
     *daemon.local_hotel_state.write().await = ctx.local_hotel_state.read().await.clone();
     // Keep beacon's snapshot in sync: whenever the shared Arc is updated, propagate here.
@@ -400,76 +494,95 @@ pub(crate) async fn activate_mesh_runtime(ctx: MeshRuntimeContext) -> Result<()>
         let webrtc_signal_tx_inbound = ctx.webrtc_signal_tx.clone();
         let local_node_id_webrtc_inbound = ctx.caps.node_id.clone();
         let inbound_operator_surface_tx = ctx.ipc_operator_surface_tx.clone();
+        let inbound_heal_queue = ctx.heal_queue.clone();
         tokio::spawn(async move {
+            let mut gossip_alarm = ansible_mesh_core::mesh_alarm::GossipParseAlarm::default();
             while let Some(msg) = inbox_rx.recv().await {
                 match msg.msg_type {
                     ansible_mesh_core::MsgType::Heartbeat => {
-                        if let Ok(payload) =
-                            serde_json::from_slice::<HeartbeatPayload>(&msg.payload)
-                        {
-                            reconcile_peer_execution_reachability(
+                        match serde_json::from_slice::<HeartbeatPayload>(&msg.payload) {
+                            Ok(payload) => reconcile_peer_execution_reachability(
                                 inbound_graph.as_ref(),
                                 &payload.capabilities,
                                 payload.execution_reachability.as_ref(),
-                            );
+                            ),
+                            Err(err) => {
+                                gossip_alarm.report(
+                                    inbound_heal_queue.as_deref(),
+                                    &msg.src_node,
+                                    "heartbeat",
+                                    &err.to_string(),
+                                );
+                            }
                         }
                     }
                     ansible_mesh_core::MsgType::CapabilitySync => {
-                        if let Ok(payload) =
-                            serde_json::from_slice::<CapabilitySyncPayload>(&msg.payload)
-                        {
-                            reconcile_peer_execution_reachability(
+                        match serde_json::from_slice::<CapabilitySyncPayload>(&msg.payload) {
+                            Ok(payload) => reconcile_peer_execution_reachability(
                                 inbound_graph.as_ref(),
                                 &payload.capabilities,
                                 payload.execution_reachability.as_ref(),
-                            );
+                            ),
+                            Err(err) => {
+                                gossip_alarm.report(
+                                    inbound_heal_queue.as_deref(),
+                                    &msg.src_node,
+                                    "capability_sync",
+                                    &err.to_string(),
+                                );
+                            }
                         }
                     }
                     ansible_mesh_core::MsgType::MeshEventBatch
                     | ansible_mesh_core::MsgType::ExecutionEventBatch => {
-                        if let Ok(events) =
-                            serde_json::from_slice::<Vec<EventEnvelope>>(&msg.payload)
-                        {
-                            if !events.is_empty() {
-                                let max_seq = events.iter().map(|e| e.seq).max().unwrap_or(0);
-                                for event in &events {
-                                    if !event_source_is_authenticated_sender(
-                                        event,
-                                        &msg.src_node,
-                                        &inbound_local_node_id,
-                                    ) {
-                                        warn!(
-                                            event_id = %event.event_id,
-                                            claimed_source = %event.source_node_id,
-                                            authenticated_sender = %msg.src_node,
-                                            kind = ?event.kind,
-                                            "Dropping mesh event: it claims a source other than the peer that sent it (DEF-170)"
-                                        );
-                                        continue;
-                                    }
-                                    IpcServer::deliver_event_envelope_or_park(
-                                        &inbound_inboxes,
-                                        event,
-                                        inbound_operator_surface_tx.as_ref(),
-                                        inbound_graph.as_ref(),
-                                        &inbound_local_node_id,
-                                        &inbound_parked,
-                                        inbound_mat_req.as_deref(),
-                                        &inbound_delivery_claims,
-                                    )
-                                    .await;
-                                    // The control-plane handlers below act on their
-                                    // payload as addressed to THIS hotel. An event
-                                    // addressed to a third node is one the sender check
-                                    // above lets through only because delivery ignores
-                                    // it — running cron/identity/handoff handlers on it
-                                    // would apply a peer-supplied record with forged
-                                    // provenance (DEF-183).
-                                    if event_is_addressed_elsewhere(event, &inbound_local_node_id) {
-                                        continue;
-                                    }
-                                    // Cron control-plane broadcasts.
-                                    match &event.kind {
+                        let (events, undecodable) = decode_inbound_batch(&msg.payload);
+                        for bad in &undecodable {
+                            report_undecodable_event(
+                                inbound_heal_queue.as_deref(),
+                                &msg.src_node,
+                                bad,
+                            );
+                        }
+                        if !events.is_empty() {
+                            let max_seq = events.iter().map(|e| e.seq).max().unwrap_or(0);
+                            for event in &events {
+                                if !event_source_is_authenticated_sender(
+                                    event,
+                                    &msg.src_node,
+                                    &inbound_local_node_id,
+                                ) {
+                                    warn!(
+                                        event_id = %event.event_id,
+                                        claimed_source = %event.source_node_id,
+                                        authenticated_sender = %msg.src_node,
+                                        kind = ?event.kind,
+                                        "Dropping mesh event: it claims a source other than the peer that sent it (DEF-170)"
+                                    );
+                                    continue;
+                                }
+                                IpcServer::deliver_event_envelope_or_park(
+                                    &inbound_inboxes,
+                                    event,
+                                    inbound_operator_surface_tx.as_ref(),
+                                    inbound_graph.as_ref(),
+                                    &inbound_local_node_id,
+                                    &inbound_parked,
+                                    inbound_mat_req.as_deref(),
+                                    &inbound_delivery_claims,
+                                )
+                                .await;
+                                // The control-plane handlers below act on their
+                                // payload as addressed to THIS hotel. An event
+                                // addressed to a third node is one the sender check
+                                // above lets through only because delivery ignores
+                                // it — running cron/identity/handoff handlers on it
+                                // would apply a peer-supplied record with forged
+                                // provenance (DEF-183).
+                                if event_is_addressed_elsewhere(event, &inbound_local_node_id) {
+                                    continue;
+                                }
+                                // Cron control-plane broadcasts.
+                                match &event.kind {
                                         ansible_mesh_core::event::EventKind::CronFired => {
                                             if let ansible_mesh_core::event::EventPayload::Inline {
                                                 data,
@@ -629,89 +742,94 @@ pub(crate) async fn activate_mesh_runtime(ctx: MeshRuntimeContext) -> Result<()>
                                         }
                                         _ => {}
                                     }
-                                }
-                                let _ = dispatcher_inbound_tx
-                                    .send(LedgerCommand::CommitInboundBatch {
-                                        events,
-                                        source_node: msg.src_node.clone(),
-                                    })
-                                    .await;
+                            }
+                            let _ = dispatcher_inbound_tx
+                                .send(LedgerCommand::CommitInboundBatch {
+                                    events,
+                                    source_node: msg.src_node.clone(),
+                                })
+                                .await;
 
-                                let ack_payload =
-                                    serde_json::json!({ "acked_seq": max_seq }).to_string();
-                                if let Some(target_addr) =
-                                    mesh_target_addr_for_node(inbound_graph.as_ref(), &msg.src_node)
+                            let ack_payload =
+                                serde_json::json!({ "acked_seq": max_seq }).to_string();
+                            if let Some(target_addr) =
+                                mesh_target_addr_for_node(inbound_graph.as_ref(), &msg.src_node)
+                                    .ok()
+                                    .flatten()
+                            {
+                                let Some(auth_key) =
+                                    mesh_auth_key_for_node(inbound_graph.as_ref(), &msg.src_node)
                                         .ok()
                                         .flatten()
-                                {
-                                    let Some(auth_key) = mesh_auth_key_for_node(
-                                        inbound_graph.as_ref(),
-                                        &msg.src_node,
-                                    )
-                                    .ok()
-                                    .flatten() else {
-                                        warn!(
-                                            "No mesh auth key found for ACK destination {}",
-                                            msg.src_node
-                                        );
-                                        continue;
-                                    };
-                                    let msg_id = uuid::Uuid::new_v4();
-                                    let seq = 0;
-                                    let timestamp = std::time::SystemTime::now()
-                                        .duration_since(std::time::UNIX_EPOCH)
-                                        .unwrap_or_default()
-                                        .as_secs();
-                                    let payload = ack_payload.into_bytes();
-                                    let hmac = ansible_mesh_core::authz::MeshAuth::new(auth_key)
-                                        .sign(&msg_id, seq as u64, &payload, timestamp);
-                                    let ack = ansible_mesh_core::BeaconMessage {
-                                        version: 1,
-                                        msg_id,
-                                        src_node: inbound_local_node_id.clone(),
-                                        dest_node: msg.src_node.clone(),
-                                        msg_type: ansible_mesh_core::MsgType::ExecutionEventAck,
-                                        seq,
-                                        total: 1,
-                                        payload: payload.into(),
-                                        timestamp,
-                                        hmac: hmac.into(),
-                                    };
-                                    // Off the inbound loop: this loop is the only
-                                    // consumer of every peer's batches, heartbeats and
-                                    // signals, and an ACK to a peer that just went dark
-                                    // used to hold all of them for the connect timeout
-                                    // (DEF-181). The send has its own bounded timeouts.
-                                    let ack_dest = msg.src_node.clone();
-                                    tokio::spawn(async move {
-                                        if let Err(err) =
-                                            crate::service::execution_transport::send_execution_message(
-                                                &target_addr,
-                                                &ack,
-                                            )
-                                            .await
-                                        {
-                                            warn!(
-                                                "Failed to return execution ACK to {} at {}: {}",
-                                                ack_dest, target_addr, err
-                                            );
-                                        }
-                                    });
-                                } else {
+                                else {
                                     warn!(
-                                        "No mesh target address found for ACK destination {}",
+                                        "No mesh auth key found for ACK destination {}",
                                         msg.src_node
                                     );
-                                }
+                                    continue;
+                                };
+                                let msg_id = uuid::Uuid::new_v4();
+                                let seq = 0;
+                                let timestamp = std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .unwrap_or_default()
+                                    .as_secs();
+                                let payload = ack_payload.into_bytes();
+                                let hmac = ansible_mesh_core::authz::MeshAuth::new(auth_key)
+                                    .sign(&msg_id, seq as u64, &payload, timestamp);
+                                let ack = ansible_mesh_core::BeaconMessage {
+                                    version: 1,
+                                    msg_id,
+                                    src_node: inbound_local_node_id.clone(),
+                                    dest_node: msg.src_node.clone(),
+                                    msg_type: ansible_mesh_core::MsgType::ExecutionEventAck,
+                                    seq,
+                                    total: 1,
+                                    payload: payload.into(),
+                                    timestamp,
+                                    hmac: hmac.into(),
+                                };
+                                // Off the inbound loop: this loop is the only
+                                // consumer of every peer's batches, heartbeats and
+                                // signals, and an ACK to a peer that just went dark
+                                // used to hold all of them for the connect timeout
+                                // (DEF-181). The send has its own bounded timeouts.
+                                let ack_dest = msg.src_node.clone();
+                                tokio::spawn(async move {
+                                    if let Err(err) =
+                                        crate::service::execution_transport::send_execution_message(
+                                            &target_addr,
+                                            &ack,
+                                        )
+                                        .await
+                                    {
+                                        warn!(
+                                            "Failed to return execution ACK to {} at {}: {}",
+                                            ack_dest, target_addr, err
+                                        );
+                                    }
+                                });
+                            } else {
+                                warn!(
+                                    "No mesh target address found for ACK destination {}",
+                                    msg.src_node
+                                );
                             }
                         }
                     }
                     ansible_mesh_core::MsgType::MeshEventAck
                     | ansible_mesh_core::MsgType::ExecutionEventAck => {
                         debug!("Received MeshEventAck from {}", msg.src_node);
-                        if let Ok(ack_payload) =
-                            serde_json::from_slice::<serde_json::Value>(&msg.payload)
-                        {
+                        let parsed = serde_json::from_slice::<serde_json::Value>(&msg.payload);
+                        if let Err(err) = &parsed {
+                            gossip_alarm.report(
+                                inbound_heal_queue.as_deref(),
+                                &msg.src_node,
+                                "event_ack",
+                                &err.to_string(),
+                            );
+                        }
+                        if let Ok(ack_payload) = parsed {
                             if let Some(acked_seq) =
                                 ack_payload.get("acked_seq").and_then(|v| v.as_u64())
                             {
@@ -964,5 +1082,72 @@ mod sender_binding_tests {
             "vps-jane-aiua-01",
             "vps-jane-aiua-01"
         ));
+    }
+}
+
+#[cfg(test)]
+mod decode_batch_tests {
+    use super::decode_inbound_batch;
+    use ansible_mesh_core::event::{EventEnvelope, EventKind, EventPayload};
+    use uuid::Uuid;
+
+    fn event(seq: u64) -> EventEnvelope {
+        EventEnvelope {
+            event_id: Uuid::new_v4(),
+            seq,
+            source_node_id: "mac-jane-aiua-01".into(),
+            target_node_id: Some("vps-jane-aiua-01".into()),
+            source_agent_id: "agent-bjork-01".into(),
+            target_agent_id: Some("agent".into()),
+            kind: EventKind::TaskInvoke,
+            corr_id: String::new(),
+            attempt: 0,
+            created_at: 0,
+            expires_at: None,
+            payload: EventPayload::Inline { data: "{}".into() },
+            trace: vec![],
+        }
+    }
+
+    #[test]
+    fn decode_inbound_batch_accepts_a_good_batch() {
+        let batch = vec![event(1), event(2)];
+        let (events, bad) = decode_inbound_batch(&serde_json::to_vec(&batch).unwrap());
+        assert_eq!(events.len(), 2);
+        assert!(bad.is_empty());
+    }
+
+    #[test]
+    fn decode_inbound_batch_keeps_good_events_around_one_bad_element() {
+        let mut values: Vec<serde_json::Value> = vec![
+            serde_json::to_value(event(1)).unwrap(),
+            serde_json::to_value(event(2)).unwrap(),
+            serde_json::to_value(event(3)).unwrap(),
+        ];
+        // A newer peer's event kind this build does not know.
+        values[1]["kind"] = serde_json::json!("FutureKindFromANewerPeer");
+        let bad_id = values[1]["event_id"].as_str().unwrap().to_string();
+        let (events, bad) = decode_inbound_batch(&serde_json::to_vec(&values).unwrap());
+        assert_eq!(
+            events.iter().map(|e| e.seq).collect::<Vec<_>>(),
+            vec![1, 3],
+            "one undecodable element must not drop the rest of the batch"
+        );
+        assert_eq!(bad.len(), 1);
+        assert_eq!(bad[0].kind.as_deref(), Some("FutureKindFromANewerPeer"));
+        assert_eq!(bad[0].event_id.as_deref(), Some(bad_id.as_str()));
+        assert_eq!(bad[0].seq, Some(2));
+    }
+
+    #[test]
+    fn decode_inbound_batch_reports_a_non_json_payload() {
+        let (events, bad) = decode_inbound_batch(b"\x00not json");
+        assert!(events.is_empty());
+        assert_eq!(bad.len(), 1);
+        assert!(
+            bad[0].error.contains("not a JSON array"),
+            "{}",
+            bad[0].error
+        );
     }
 }
