@@ -49,6 +49,7 @@ Use [$verification-ladder](../verification-ladder/SKILL.md) when the main questi
 - If the PID did not change, assume the old process may still be serving.
 - If logs do not show fresh startup/registration, assume restart did not take.
 - If the user-visible behavior contradicts the rollout story, trust the behavior first.
+- A tagged release is watched-live-green only after `just verify-release <hotel> <tag>` passes on all three hotels (vps-jane, mac-jane, mbp-jane) and a Telegram round trip succeeds on each persona hotel. See `docs/process/RELEASE.md`.
 
 ## Output Expectations
 

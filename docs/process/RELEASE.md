@@ -222,11 +222,14 @@ non-zero when any of these is true:
 - a binary's hash does not match;
 - a binary is missing;
 - `current` does not point at the tag;
-- on Linux, the running `aiua` executable is not in the release directory.
+- no hotel process is running, or the running `aiua` does not come from the
+  release (`releases/<tag>/bin` or `current/bin`).
 
-On macOS, a binary that matches its post-signing hash in `INSTALLED_SHA256SUMS`
-reports `RESIGNED`. That counts as a pass, because the pre-signing hashes were
-checked against the manifest at install time.
+On macOS, re-signing can change a binary's hash. Such a binary reports
+`RESIGNED`, which counts as a pass, only when both of these hold: the release
+directory's `SHA256SUMS` (the pre-signing hashes from the tarball) matches the
+manifest, and the binary still matches the post-signing hash recorded in
+`INSTALLED_SHA256SUMS`.
 
 The script also prints `aiua --version`. Until slice R2 (version stamping)
 lands, this shows `0.1.0` with no build SHA. The script reports that as `build

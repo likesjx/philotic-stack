@@ -975,6 +975,41 @@ vps-deploy-release tag:
       -e "philotic_release_tag=${TAG}"
     echo "✅ vps-jane on ${TAG}. Prove it: just verify-release vps-jane ${TAG}"
 
+# Roll a hotel back to an installed release (proposal:release-train R6).
+# No tag = the newest installed release that is not current. Flips `current`
+# atomically and restarts the hotel (systemd on vps-jane, launchd on the Macs).
+#   just rollback vps-jane
+#   just rollback mbp-jane v0.2.0-rc.1
+rollback host tag="":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    ROOT_DIR="{{justfile_directory()}}"
+    TAG="{{tag}}"
+    START="$(date +%s)"
+    case "{{host}}" in
+      vps-jane|jane-vps)
+        cd "${ROOT_DIR}/ansible" && ansible-playbook \
+          -i inventory/hosts.ini \
+          deploy_hotel.yml \
+          --limit jane-vps \
+          --tags rollback \
+          -e "philotic_rollback_tag=${TAG}" ;;
+      mac-jane)
+        "${ROOT_DIR}/scripts/install-release-mac.sh" "${PHILOTIC_MAC_JANE_TARGET:-local}" --rollback ${TAG:+"${TAG}"} --hotel mac-jane ;;
+      mbp-jane)
+        "${ROOT_DIR}/scripts/install-release-mac.sh" "${PHILOTIC_MBP_JANE_TARGET:-mbp-jane}" --rollback ${TAG:+"${TAG}"} --hotel mbp-jane ;;
+      *)
+        echo "✗ unknown host '{{host}}' (vps-jane | mac-jane | mbp-jane)"; exit 2 ;;
+    esac
+    echo "⏱ rollback took $(( $(date +%s) - START ))s. Prove it: just verify-release {{host}} <tag>"
+
+# Prove a hotel runs a release: installed binary sha256s vs the release's
+# manifest.json, `current` target, running aiua path, `aiua --version`.
+# Exits non-zero on any mismatch (proposal:release-train R7).
+#   just verify-release vps-jane v0.2.0
+verify-release host tag:
+    "{{justfile_directory()}}/scripts/verify-release.sh" "{{host}}" "{{tag}}"
+
 # Live smoke of the orchestrator skill administration plane (PR #430) against
 # a RUNNING hotel socket: gate rejections, SkillDAG edge persistence,
 # suspend/reinstate lifecycle, audit trail. Registers a throwaway

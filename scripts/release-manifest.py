@@ -18,11 +18,13 @@ Subcommands:
       Re-hash D/bin/* and check against D/manifest.json and D/SHA256SUMS.
       Exit 1 on any mismatch, missing or extra binary.
 
-  compare --manifest M --actual A [--installed I] [--label HOST]
+  compare --manifest M --actual A [--installed I --presign P] [--label HOST]
       A holds sha256sum-format lines ("<sha256>  <path>") for the binaries
-      on a host. I (optional) holds the post-codesign hashes recorded at
-      install time on macOS (INSTALLED_SHA256SUMS). Prints a PASS/FAIL table;
-      exit 1 when any binary is missing or matches neither.
+      on a host. On macOS, I is INSTALLED_SHA256SUMS (post-codesign hashes
+      recorded at install time) and P is the release dir's SHA256SUMS (the
+      pre-sign hashes the install verified). A binary whose hash differs from
+      the manifest is RESIGNED (a pass) only if P matches the manifest AND A
+      matches I. Prints a PASS/FAIL table; exit 1 on any FAIL or MISSING.
 
 Standard library only.
 """
@@ -142,7 +144,13 @@ def cmd_verify(args: argparse.Namespace) -> int:
     return 0
 
 
-def compare(manifest: dict, actual: dict[str, str], installed: dict[str, str]) -> tuple[list[tuple[str, str, str, str]], bool]:
+def compare(
+    manifest: dict,
+    actual: dict[str, str],
+    installed: dict[str, str],
+    presign: dict[str, str] | None = None,
+) -> tuple[list[tuple[str, str, str, str]], bool]:
+    presign = presign or {}
     rows: list[tuple[str, str, str, str]] = []
     ok = True
     for b in manifest["bins"]:
@@ -153,9 +161,10 @@ def compare(manifest: dict, actual: dict[str, str], installed: dict[str, str]) -
             ok = False
         elif got == want:
             status = "PASS"
-        elif installed.get(name) == got:
-            # macOS: re-signed at install time after the pre-sign hash was
-            # verified against this manifest; matches the recorded post-sign hash.
+        elif presign.get(name) == want and installed.get(name) == got:
+            # macOS: the unpacked (pre-sign) binary matched this manifest, was
+            # re-signed at install time, and is unchanged since (matches the
+            # post-sign hash recorded then).
             status = "RESIGNED"
         else:
             status = "FAIL"
@@ -168,7 +177,8 @@ def cmd_compare(args: argparse.Namespace) -> int:
     manifest = json.loads(Path(args.manifest).read_text())
     actual = parse_sums(Path(args.actual).read_text())
     installed = parse_sums(Path(args.installed).read_text()) if args.installed and Path(args.installed).exists() else {}
-    rows, ok = compare(manifest, actual, installed)
+    presign = parse_sums(Path(args.presign).read_text()) if args.presign and Path(args.presign).exists() else {}
+    rows, ok = compare(manifest, actual, installed, presign)
     width = max([len(r[0]) for r in rows] + [6])
     label = f" on {args.label}" if args.label else ""
     print(f"Release {manifest.get('tag', manifest['version'])} ({manifest['target']}, sha {manifest['sha'][:12]}){label}")
@@ -203,6 +213,7 @@ def main(argv: list[str] | None = None) -> int:
     c.add_argument("--manifest", required=True)
     c.add_argument("--actual", required=True)
     c.add_argument("--installed")
+    c.add_argument("--presign")
     c.add_argument("--label")
     c.set_defaults(func=cmd_compare)
 

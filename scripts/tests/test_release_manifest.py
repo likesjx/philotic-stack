@@ -101,11 +101,15 @@ class ReleaseManifestTest(unittest.TestCase):
                     "bins": [{"name": "a", "sha256": "1" * 64}, {"name": "b", "sha256": "2" * 64},
                              {"name": "c", "sha256": "3" * 64}, {"name": "d", "sha256": "4" * 64}]}
         actual = {"a": "1" * 64, "b": "9" * 64, "c": "8" * 64}
-        installed = {"b": "9" * 64}
-        rows, ok = rm.compare(manifest, actual, installed)
+        installed = {"b": "9" * 64, "c": "8" * 64}
+        presign = {"a": "1" * 64, "b": "2" * 64, "c": "7" * 64}  # c's pre-sign hash is from another build
+        rows, ok = rm.compare(manifest, actual, installed, presign)
         self.assertFalse(ok)
         self.assertEqual([r[3] for r in rows], ["PASS", "RESIGNED", "FAIL", "MISSING"])
-        rows, ok = rm.compare(manifest, {**actual, "c": "3" * 64, "d": "4" * 64}, installed)
+        # Without pre-sign proof, a post-sign match alone is not enough.
+        rows, _ = rm.compare(manifest, actual, installed)
+        self.assertEqual(rows[1][3], "FAIL")
+        rows, ok = rm.compare(manifest, {**actual, "c": "3" * 64, "d": "4" * 64}, installed, presign)
         self.assertTrue(ok)
 
     def test_compare_cli_exit_codes(self):
