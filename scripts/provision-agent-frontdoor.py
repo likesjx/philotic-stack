@@ -30,6 +30,19 @@ Usage (on the frontdoor hotel):
 
   DRY_RUN=1 AGENTS=claude-cloud python3 scripts/provision-agent-frontdoor.py
     prints the endpoint config (with placeholder vault refs) and exits.
+
+Real argument schemas (slice F5). `tools/list` advertises each upstream's own
+`input_schema` instead of a pass-through object when one is known:
+  - upstreams registered on THIS hotel are read from GetMcpUpstreams (the
+    catalog the local mcp-client-runner reported);
+  - upstreams on another hotel (intel-graph on mac-jane) come from a file
+    exported there first:
+      # on mac-jane
+      EXPORT_SCHEMAS=/tmp/frontdoor-schemas.json OWNER_AGENT_ID=agent-bjork-01 \
+        PHILOTIC_HOTEL_SOCKET=... python3 scripts/provision-agent-frontdoor.py
+      # copy the file to vps-jane, then provision with
+      SCHEMA_FILE=/tmp/frontdoor-schemas.json ... python3 scripts/provision-agent-frontdoor.py
+  Tools without a known schema keep the pass-through object.
 """
 
 import hashlib
@@ -55,6 +68,9 @@ GRAPH_UPSTREAM = os.environ.get("GRAPH_UPSTREAM", "intel-graph")
 GRAPH_NODE = os.environ.get("GRAPH_NODE", "mac-jane-aiua-01")
 EXPIRES_DAYS = int(os.environ.get("EXPIRES_DAYS", "30"))
 CALLS_PER_HOUR = int(os.environ.get("CALLS_PER_HOUR", "300"))
+SCHEMA_FILE = os.environ.get("SCHEMA_FILE", "")
+EXPORT_SCHEMAS = os.environ.get("EXPORT_SCHEMAS", "")
+MAX_REMOTE_DESCRIPTION = 600
 TOKEN_OUT_DIR = pathlib.Path(
     os.environ.get("TOKEN_OUT_DIR", str(pathlib.Path.home() / ".philotic" / "agent-frontdoor-tokens"))
 ).expanduser()
@@ -105,7 +121,49 @@ def upstream_target(upstream_id: str, node: str) -> dict:
     return target
 
 
-def build_tools(grants: list[dict]) -> list[dict]:
+PASS_THROUGH_SCHEMA = {"type": "object", "additionalProperties": True}
+
+
+def catalog_schemas(upstreams_reply: dict) -> dict:
+    """Map remote tool name -> {description, input_schema} from a
+    GetMcpUpstreams reply (`{"mcp_upstreams": [{config, catalog?}, ...]}`)."""
+    schemas = {}
+    for entry in upstreams_reply.get("mcp_upstreams") or []:
+        catalog = (entry or {}).get("catalog") or {}
+        for tool in catalog.get("tools") or []:
+            name = tool.get("remote_name")
+            schema = tool.get("input_schema")
+            if name and isinstance(schema, dict) and schema.get("type") == "object":
+                schemas[name] = {
+                    "description": str(tool.get("description") or ""),
+                    "input_schema": schema,
+                }
+    return schemas
+
+
+def load_schema_file(path: str) -> dict:
+    data = json.loads(pathlib.Path(path).read_text(encoding="utf-8"))
+    if not isinstance(data, dict):
+        raise ValueError(f"{path}: expected a JSON object of tool name -> schema")
+    return {
+        k: v for k, v in data.items()
+        if isinstance(v, dict) and isinstance(v.get("input_schema"), dict)
+    }
+
+
+def tool_description(curated: str, remote: dict | None) -> str:
+    # The curated line comes first; the upstream's own description (our
+    # servers, but still third-party text to the client) is appended, capped.
+    if not remote or not remote.get("description"):
+        return curated
+    extra = remote["description"].strip()
+    if len(extra) > MAX_REMOTE_DESCRIPTION:
+        extra = extra[:MAX_REMOTE_DESCRIPTION].rstrip() + "…"
+    return f"{curated}\n\n{extra}"
+
+
+def build_tools(grants: list[dict], schemas: dict | None = None) -> list[dict]:
+    schemas = schemas or {}
     auth = {"scheme": "bearer_token", "grants": grants}
     tools = []
     for upstream_id, node, catalog in (
@@ -113,13 +171,14 @@ def build_tools(grants: list[dict]) -> list[dict]:
         (GRAPH_UPSTREAM, GRAPH_NODE, GRAPH_TOOLS),
     ):
         for name, description in catalog:
+            remote = schemas.get(name)
             tools.append(
                 {
                     "name": name,
-                    "description": description,
-                    # Arguments pass through verbatim; the upstream validates
-                    # them against its own schema.
-                    "input_schema": {"type": "object", "additionalProperties": True},
+                    "description": tool_description(description, remote),
+                    # The upstream validates arguments against its own schema
+                    # either way; advertising it just helps the client.
+                    "input_schema": remote["input_schema"] if remote else PASS_THROUGH_SCHEMA,
                     "inbound_transform": {
                         "kind": "field_map",
                         "action": name,
@@ -133,8 +192,8 @@ def build_tools(grants: list[dict]) -> list[dict]:
     return tools
 
 
-def build_config(grants: list[dict], now: int) -> dict:
-    tools = build_tools(grants)
+def build_config(grants: list[dict], now: int, schemas: dict | None = None) -> dict:
+    tools = build_tools(grants, schemas)
     return {
         "endpoint_id": ENDPOINT_ID,
         "owner_agent_id": OWNER_AGENT_ID,
@@ -174,9 +233,27 @@ def main() -> None:
         sys.exit(1)
     now = int(time.time())
 
+    file_schemas = load_schema_file(SCHEMA_FILE) if SCHEMA_FILE else {}
+
     if DRY_RUN:
         grants = [grant(a, f"<vault-ref:{a}>", now) for a in AGENTS]
-        print(json.dumps(build_config(grants, now), indent=2))
+        print(json.dumps(build_config(grants, now, file_schemas), indent=2))
+        return
+
+    if EXPORT_SCHEMAS:
+        # Read-only: dump this hotel's upstream catalogs for a provisioning run
+        # on another hotel. Needs no blake3 and mints nothing.
+        ipc = Ipc(SOCKET_PATH)
+        try:
+            ipc.register_operator(OWNER_AGENT_ID, "frontdoor-schema-export")
+            schemas = catalog_schemas(ipc.call("get_mcp_upstreams", {}, expect_keys=("mcp_upstreams",)))
+        except IpcError as exc:
+            print(f"ERROR: {exc}", file=sys.stderr)
+            sys.exit(1)
+        finally:
+            ipc.close()
+        pathlib.Path(EXPORT_SCHEMAS).write_text(json.dumps(schemas, indent=2), encoding="utf-8")
+        print(f"Exported {len(schemas)} tool schemas to {EXPORT_SCHEMAS}: {', '.join(sorted(schemas))}")
         return
 
     try:
@@ -218,7 +295,12 @@ def main() -> None:
         print(f"  {agent}: vault_ref={vault_ref} sha256-preview={hashlib.sha256(raw.encode()).hexdigest()[:12]}")
         grants.append(grant(agent, vault_ref, now))
 
-    config = build_config(grants, now)
+    local = catalog_schemas(ipc.call("get_mcp_upstreams", {}, expect_keys=("mcp_upstreams",)))
+    schemas = {**file_schemas, **local}
+    advertised = sorted(n for n, _ in MUNINN_TOOLS + GRAPH_TOOLS if n in schemas)
+    print(f"  schemas: {len(advertised)} of {len(MUNINN_TOOLS) + len(GRAPH_TOOLS)} tools ({', '.join(advertised) or 'none'})")
+
+    config = build_config(grants, now, schemas)
     resp = ipc.call("provision_mcp_endpoint", {"config": config}, expect_keys=("endpoint_id",))
     ipc.close()
     if not is_endpoint_success(resp):
