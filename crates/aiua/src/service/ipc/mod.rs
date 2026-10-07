@@ -16616,13 +16616,6 @@ impl IpcServer {
     }
 }
 
-/// Shared authorization gate for every skill-administration IPC op
-/// (`RegisterSkill`, `AssignSkill`, `RevokeSkill`, `SetSkillState`,
-/// `ListSkillAudits`). Skills project tools onto agents, so administration is
-/// restricted to authenticated guests holding the `orchestrator` or
-/// `management` role. Centralized so new ops cannot fork the policy.
-#[allow(clippy::result_large_err)]
-// Err is the IpcResponse sent on the cold rejection path
 // ── Cron ownership scoping ───────────────────────────────────────────────────
 //
 // Every role holds the cron tools (operator decision 2026-09-04: "open to
@@ -16817,6 +16810,13 @@ pub(super) fn select_guest_targets(live_guest_ids: &[&str], target: &str) -> Vec
         .unwrap_or_default()
 }
 
+/// Shared authorization gate for every skill-administration IPC op
+/// (`RegisterSkill`, `AssignSkill`, `RevokeSkill`, `SetSkillState`,
+/// `ListSkillAudits`). Skills project tools onto agents, so administration is
+/// restricted to authenticated guests holding the `orchestrator` or
+/// `management` role. Centralized so new ops cannot fork the policy.
+#[allow(clippy::result_large_err)]
+// Err is the IpcResponse sent on the cold rejection path
 pub(super) fn require_skill_admin<'a>(
     identity: Option<&'a GuestIdentity>,
     op: &str,
