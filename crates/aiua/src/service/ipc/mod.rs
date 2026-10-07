@@ -6036,6 +6036,7 @@ impl IpcServer {
             | IpcRequest::QueryOperatorTargetConfig { .. }
             | IpcRequest::QueryOperatorTargetSecrets { .. }
             | IpcRequest::QueryOperatorTargetPlacement { .. }
+            | IpcRequest::QueryOperatorTargetSurface { .. }
             | IpcRequest::RegisterOperatorTargetComponent { .. }
             | IpcRequest::SetOperatorTargetComponentActive { .. }
             | IpcRequest::RestartOperatorTargetComponent { .. }

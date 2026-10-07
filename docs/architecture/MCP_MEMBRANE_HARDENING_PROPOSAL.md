@@ -2,9 +2,9 @@
 title: MCP Membrane Hardening — Perimeter-True, Authenticated, Identity-Bound
 doc_type: proposal
 domain: membrane-transport
-status: proposed
-disposition: proposed
-last_updated: 2026-07-15
+status: accepted-current-slice
+disposition: accepted-current-slice
+last_updated: 2026-10-07
 tags:
   - mcp
   - membrane-mcp
@@ -34,6 +34,24 @@ source_of_truth_targets:
 ---
 
 # MCP Membrane Hardening — Perimeter-True, Authenticated, Identity-Bound
+
+## Disposition
+
+`accepted-current-slice` (reconciled 2026-10-07, watch-live burn-down W2).
+Most of the hardening has landed; the legacy-mode retirement and B5 remain.
+
+| Slice | State | Evidence |
+|---|---|---|
+| H1 (S1 + S4 approval unification) | implemented, test-green | 29e18d56 (2026-07-18) |
+| H2 (S2) step 1 — opt-in publication | implemented, test-green | 740f30f9: `mcp_auto_publish` per agent |
+| H2 (S2) step 2 — legacy retirement | open | `UpdateMcpRoutes` still in `membrane-mcp`, `aiua`, `philotic-client` |
+| H3 (S3) | implemented, test-green | f856463c: token grants via vault, HmacSha256 retired |
+| H4 (S5) | implemented, test-green | 017fe2e7: honest protocol errors, version negotiation |
+| H5 (S6) | implemented, test-green | 3fd4fe20: dispatch harness across fence × auth × source |
+| B5 (Template transforms) | open | still a Phase-4 placeholder in `transform.rs` |
+
+No slice has a recorded watched-live proof here; see
+`docs/process/WATCH_LIVE_BACKLOG.md`.
 
 ## Problem
 

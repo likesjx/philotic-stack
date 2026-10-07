@@ -2,9 +2,9 @@
 title: Whisper Protocol — Silent Reactive Role Dispatch via Lookaside Turn
 doc_type: proposal
 domain: cognitive-plane
-status: proposed
+status: implemented
 disposition: implemented
-last_updated: 2026-04-01
+last_updated: 2026-10-07
 tags:
 - role-handoff
 - whisper
@@ -27,6 +27,10 @@ active_seams:
 ---
 
 # Whisper Protocol — Silent Reactive Role Dispatch via Lookaside Turn
+
+## Disposition
+
+`implemented` (status aligned to the existing `disposition: implemented` on 2026-10-07, watch-live burn-down W2). `delegate.whisper` is implemented in `crates/philote` (`runtime.rs`, `turn_loop.rs`).
 
 ## Goal
 

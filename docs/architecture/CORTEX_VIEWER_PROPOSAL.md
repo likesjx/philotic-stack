@@ -3,7 +3,7 @@ title: Cortex Viewer for the Apple Apps
 doc_type: proposal
 domain: memory-context
 status: accepted-current-slice
-last_updated: 2026-10-01
+last_updated: 2026-10-07
 tags: [cortex, muninn, apple, observability, read-only]
 related_docs:
   - MUNINN_MEMORY_CORE_PROPOSAL.md
@@ -40,8 +40,11 @@ repair are out of scope for the first viewer.
 ## Disposition
 
 Accepted for the native read-only viewer. The adapter is deployed and live
-reads are verified. The Mac connection screen is running; authenticated native
-UI and physical iPhone viewer validation remain pending.
+reads are verified. The Mac connection screen is running. **Physical iPhone
+viewer confirmed by the operator on 2026-10-01**: the signed app installed and
+launched on the new iPhone, Google sign-in worked and the Cortex loaded
+(`docs/task.md`). Authenticated native Mac UI, partial outages and exhaustive
+pagination remain pending.
 
 ## Current Slice
 
@@ -118,9 +121,10 @@ route; replaying its token returned 401. No credential was printed or saved
 locally. This is watched-live evidence for the backend, not exhaustive inventory
 or replica-completeness proof.
 
-Authenticated native UI, partial-outage behavior, full pagination coverage and
-the new viewer's physical iPhone deployment remain unproven. Installation hit a
-connection reset; the phone subsequently reported unavailable. Native sign-in
-was manual in the deployed baseline; the browser replacement still awaits
-scoped gateway rollout and authenticated physical-device proof.
+Authenticated native Mac UI, partial-outage behavior and full pagination
+coverage remain unproven. The physical iPhone deployment is no longer open: a
+first install hit a connection reset, but on 2026-10-01 the operator installed
+and launched the signed app on the new iPhone and confirmed Google sign-in and
+Cortex loading. Native sign-in was manual in the deployed baseline; the browser
+replacement still awaits scoped gateway rollout.
 See [current status](ARCHITECTURE_STATUS.md) and [execution work](../task.md).

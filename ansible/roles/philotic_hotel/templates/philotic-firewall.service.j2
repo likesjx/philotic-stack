@@ -1,0 +1,13 @@
+[Unit]
+Description=Philotic hotel port filter (nftables table inet philotic)
+Wants=network-pre.target
+Before=network-pre.target philotic-hotel.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/sbin/nft -f {{ philotic_etc_dir }}/philotic-firewall.nft
+ExecStop=/usr/sbin/nft delete table inet philotic
+
+[Install]
+WantedBy=multi-user.target

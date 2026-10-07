@@ -94,6 +94,16 @@ jobs:
       - name: cargo fmt --all --check
         run: cargo fmt --all --check
 
+      # Watch-live burn-down W0: proposal-status and DEFECTS status vocabulary
+      # lint. NON-BLOCKING for now (continue-on-error, and --warn-only keeps the
+      # vocabulary checks as warnings); the older required-keys checks still
+      # report pre-existing failures on develop. Make it blocking once green.
+      - name: docs metadata lint (non-blocking)
+        continue-on-error: true
+        run: |
+          python3 -m unittest discover -s scripts/tests -p 'test_*.py'
+          python3 scripts/docs-metadata-check.py --warn-only
+
   # proposal:pr-linux-compile-check — vps-jane runs Linux, but the test job is
   # macOS-only (the workspace has Apple-only crates, which is why
   # build-linux.yml builds a selective package set rather than --workspace).
@@ -135,23 +145,11 @@ jobs:
 
       - name: cargo check (vps-jane package set)
         run: |
-          cargo check --target x86_64-unknown-linux-gnu --bins \
-            -p aiua \
-            -p philote \
-            -p membrane-telegram \
-            -p membrane-discord \
-            -p membrane-mcp \
-            -p membrane-mcp-client \
-            -p egress-http-runner \
-            -p model-router \
-            -p tool-runner \
-            -p graph-datasource \
-            -p table-datasource \
-            -p router-listener \
-            -p agent-datasource \
-            -p heal-dispatcher \
-            -p data-memorygraphrag \
-            -p philotic-web
+          # Same list build-linux.yml and release.yml build: release/packages.toml.
+          read -r -a PKG_FLAGS <<< "$(scripts/release-packages.sh cargo-flags --platform linux)"
+          [ "${#PKG_FLAGS[@]}" -gt 0 ] || { echo "::error::release-packages.sh returned no packages"; exit 1; }
+          echo "packages: ${PKG_FLAGS[*]}"
+          cargo check --target x86_64-unknown-linux-gnu --bins "${PKG_FLAGS[@]}"
 
       - name: Save cargo cache
         if: always()

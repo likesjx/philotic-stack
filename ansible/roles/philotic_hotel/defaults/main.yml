@@ -22,6 +22,28 @@ philotic_home_dir: "/opt/philotic"  # home for the philotic system user; hf_hub 
 # (e.g. built manually on the VPS for the first smoke).
 philotic_artifacts_dir: "{{ playbook_dir }}/../dist"
 philotic_artifacts_remote: false
+
+# Release layout (proposal:release-train R4, docs/process/RELEASE.md).
+# philotic_release_tag set (just vps-deploy-release <tag>) → unpack
+#   <cache>/<tag>/philotic-<tag>-<platform>.tar.gz into <releases>/<tag>/,
+#   atomically flip <current> → it, keep the newest N, run from <current>/bin.
+# philotic_bin_layout: "" = auto (release when <current> already exists on the
+#   host, else legacy) | "release" | "legacy" (copy into philotic_bin_dir and
+#   run from there — what vps-deploy-ci / vps-push pass).
+philotic_release_tag: ""
+philotic_bin_layout: ""
+philotic_releases_dir: "{{ philotic_install_dir }}/releases"
+philotic_current_link: "{{ philotic_install_dir }}/current"
+philotic_release_cache_dir: "/home/deploy/release-cache"
+philotic_release_platform: "linux-x86_64"
+philotic_releases_keep: 3
+# `--tags rollback` target; empty = the newest installed release that is not current.
+philotic_rollback_tag: ""
+# Overridden by set_fact in tasks/main.yml once the layout is resolved.
+philotic_runtime_bin_dir: "{{ philotic_bin_dir }}"
+
+# Must stay a subset of `scripts/release-packages.sh bins --platform linux`
+# (release/packages.toml); scripts/tests/test_release_packages.py enforces it.
 philotic_binaries:
   - aiua
   - philote
@@ -37,8 +59,6 @@ philotic_binaries:
   - agent-datasource
   - life-graph-runner
   - tool-runner
-  - agent-core
-  - hegemon
   - model-router
   - model-controller-gemini
   - model-controller-elevenlabs
@@ -70,6 +90,24 @@ philotic_hotel_socket: "{{ philotic_runtime_dir }}/{{ philotic_hotel_runtime_nam
 # run first.
 philotic_memory_sleep_enabled: false
 philotic_memory_sleep_mutate: false
+
+# Memory hygiene (Memory Transparency M4, crates/aiua/src/memory_hygiene.rs).
+# Nightly 03:00 UTC contradiction + staleness sweep; files one aggregated,
+# annotation-only autonomy audit and never deletes. Enable on the Cortex hotel
+# (it sees the real vaults). WATCH_LIVE_BURNDOWN_PROPOSAL.md W4.
+philotic_memory_hygiene_enabled: false
+
+# Host firewall (PERIMETER_ENFORCEMENT_PROPOSAL.md P7). When enabled, an
+# nftables table owned by Philotic (`inet philotic`) drops traffic to the
+# hotel's own ports unless it arrives on loopback or from a trusted CIDR
+# (the tailnet). It never touches other ports (SSH, Traefik, ...). Requires
+# nftables; the play fails loudly if it cannot be installed.
+philotic_firewall_enabled: false
+philotic_firewall_trusted_cidrs:
+  - "100.64.0.0/10"   # Tailscale CGNAT (transitional mesh transport)
+# Extra ports to protect, e.g. hash-derived mesh/blob/exec ports when the
+# hotel record does not use the defaults above.
+philotic_firewall_extra_ports: []
 
 # Decisions model (TypeSafe Jev) shadow pilot — log-only; see
 # crates/heal-dispatcher/src/shadow.rs and DECISIONS_MODEL_PROPOSAL.md. Only

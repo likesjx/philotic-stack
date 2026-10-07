@@ -845,7 +845,7 @@ vps-push:
       -i inventory/hosts.ini \
       deploy_hotel.yml \
       --limit jane-vps \
-      --extra-vars "philotic_artifacts_remote=true philotic_artifacts_dir=${VPS_BUILD}"
+      --extra-vars "philotic_artifacts_remote=true philotic_artifacts_dir=${VPS_BUILD} philotic_bin_layout=legacy"
 
 # Config-only push to vps-jane: re-render mesh-config + secrets, restart service.
 # Does NOT rebuild or copy binaries — uses whatever is already in /opt/philotic/bin.
@@ -920,7 +920,95 @@ vps-deploy-ci:
       -i inventory/hosts.ini \
       deploy_hotel.yml \
       --limit jane-vps \
-      --extra-vars "philotic_artifacts_remote=true philotic_artifacts_dir=${REMOTE_DIR}"
+      --extra-vars "philotic_artifacts_remote=true philotic_artifacts_dir=${REMOTE_DIR} philotic_bin_layout=legacy"
+    # philotic_bin_layout=legacy: develop builds install into /opt/philotic/bin
+    # and the unit points back there, even if a release was installed before.
+    # `just vps-deploy-release <tag>` returns the host to the release layout.
+
+# Release deploy to vps-jane (proposal:release-train R4, docs/process/RELEASE.md).
+# Resolves the linux-x86_64 tarball + outer SHA256SUMS of a GitHub Release, has
+# the VPS download them into /home/deploy/release-cache/<tag>/, verifies with
+# sha256sum -c, then runs ansible with philotic_release_tag=<tag>: unpack into
+# /opt/philotic/releases/<tag>/, atomic flip of /opt/philotic/current, restart,
+# keep the newest 3. Release assets never expire (unlike CI artifacts).
+#   just vps-deploy-release v0.2.0-rc.1
+vps-deploy-release tag:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    ROOT_DIR="{{justfile_directory()}}"
+    TAG="{{tag}}"
+    VPS="${PHILOTIC_VPS_SSH_TARGET:-deploy@jane-vps}"
+    REPO="${PHILOTIC_GH_REPO:-likesjx/philotic-stack}"
+    PLATFORM="linux-x86_64"
+    ASSET="philotic-${TAG}-${PLATFORM}.tar.gz"
+    CACHE="/home/deploy/release-cache/${TAG}"
+    SSH_OPTS=(-o ConnectTimeout=15 -o ServerAliveInterval=15 -o ServerAliveCountMax=4)
+    if ! [[ "${TAG}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$ ]]; then
+      echo "✗ '${TAG}' is not a release tag (need vX.Y.Z or vX.Y.Z-rc.N — three parts)"; exit 1
+    fi
+
+    echo "▶ Resolving release ${TAG} assets on ${REPO}..."
+    TARBALL_URL=$(gh api "repos/${REPO}/releases/tags/${TAG}" -q ".assets[] | select(.name == \"${ASSET}\") | .browser_download_url")
+    SUMS_URL=$(gh api "repos/${REPO}/releases/tags/${TAG}" -q '.assets[] | select(.name == "SHA256SUMS") | .browser_download_url')
+    if [ -z "${TARBALL_URL}" ] || [ -z "${SUMS_URL}" ]; then
+      echo "✗ release ${TAG} has no ${ASSET} or SHA256SUMS asset (did release.yml finish?)"; exit 1
+    fi
+    echo "  ${TARBALL_URL}"
+
+    echo "▶ ${VPS} downloading ${ASSET} into ${CACHE}..."
+    ssh "${SSH_OPTS[@]}" "${VPS}" "set -euo pipefail; mkdir -p '${CACHE}' && cd '${CACHE}' \
+      && curl -fsSL --connect-timeout 15 --retry 3 -o SHA256SUMS '${SUMS_URL}' \
+      && curl -fsSL --connect-timeout 15 --retry 3 -o '${ASSET}.part' '${TARBALL_URL}' \
+      && mv -f '${ASSET}.part' '${ASSET}'"
+
+    echo "▶ Verifying ${ASSET} against the release SHA256SUMS on ${VPS}..."
+    if ! ssh -n "${SSH_OPTS[@]}" "${VPS}" "cd '${CACHE}' && grep '  ${ASSET}\$' SHA256SUMS | sha256sum -c -"; then
+      echo "✗ sha256 verification failed for ${VPS}:${CACHE}/${ASSET} — aborting before ansible"
+      exit 1
+    fi
+
+    echo "▶ Deploying ${TAG} via ansible (release layout)..."
+    cd "${ROOT_DIR}/ansible" && ansible-playbook \
+      -i inventory/hosts.ini \
+      deploy_hotel.yml \
+      --limit jane-vps \
+      -e "philotic_release_tag=${TAG}"
+    echo "✅ vps-jane on ${TAG}. Prove it: just verify-release vps-jane ${TAG}"
+
+# Roll a hotel back to an installed release (proposal:release-train R6).
+# No tag = the newest installed release that is not current. Flips `current`
+# atomically and restarts the hotel (systemd on vps-jane, launchd on the Macs).
+#   just rollback vps-jane
+#   just rollback mbp-jane v0.2.0-rc.1
+rollback host tag="":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    ROOT_DIR="{{justfile_directory()}}"
+    TAG="{{tag}}"
+    START="$(date +%s)"
+    case "{{host}}" in
+      vps-jane|jane-vps)
+        cd "${ROOT_DIR}/ansible" && ansible-playbook \
+          -i inventory/hosts.ini \
+          deploy_hotel.yml \
+          --limit jane-vps \
+          --tags rollback \
+          -e "philotic_rollback_tag=${TAG}" ;;
+      mac-jane)
+        "${ROOT_DIR}/scripts/install-release-mac.sh" "${PHILOTIC_MAC_JANE_TARGET:-local}" --rollback ${TAG:+"${TAG}"} --hotel mac-jane ;;
+      mbp-jane)
+        "${ROOT_DIR}/scripts/install-release-mac.sh" "${PHILOTIC_MBP_JANE_TARGET:-mbp-jane}" --rollback ${TAG:+"${TAG}"} --hotel mbp-jane ;;
+      *)
+        echo "✗ unknown host '{{host}}' (vps-jane | mac-jane | mbp-jane)"; exit 2 ;;
+    esac
+    echo "⏱ rollback took $(( $(date +%s) - START ))s. Prove it: just verify-release {{host}} <tag>"
+
+# Prove a hotel runs a release: installed binary sha256s vs the release's
+# manifest.json, `current` target, running aiua path, `aiua --version`.
+# Exits non-zero on any mismatch (proposal:release-train R7).
+#   just verify-release vps-jane v0.2.0
+verify-release host tag:
+    "{{justfile_directory()}}/scripts/verify-release.sh" "{{host}}" "{{tag}}"
 
 # Live smoke of the orchestrator skill administration plane (PR #430) against
 # a RUNNING hotel socket: gate rejections, SkillDAG edge persistence,

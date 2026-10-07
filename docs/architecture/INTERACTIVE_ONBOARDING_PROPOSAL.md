@@ -2,9 +2,9 @@
 title: Interactive Onboarding
 doc_type: proposal
 domain: operator-experience
-status: proposed
+status: accepted-current-slice
 disposition: accepted-current-slice
-last_updated: 2026-03-31
+last_updated: 2026-10-07
 tags:
 - onboarding
 - setup
@@ -46,7 +46,7 @@ keypair + Muninn initialization.
 
 ## Disposition
 
-`proposed`
+`accepted-current-slice` (reconciled 2026-10-07, watch-live burn-down W2). Status aligned to the frontmatter disposition; an onboarding surface exists in `crates/philotic-web/src/onboard.rs`.
 
 ---
 

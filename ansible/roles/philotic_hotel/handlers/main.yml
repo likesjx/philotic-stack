@@ -17,3 +17,9 @@
   systemd:
     name: philotic-onnx-sidecar
     state: restarted
+
+- name: Reload philotic firewall
+  systemd:
+    name: philotic-firewall
+    state: restarted
+    daemon_reload: yes

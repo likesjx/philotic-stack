@@ -2,9 +2,9 @@
 title: Transcription Flywheel — Router-Listener, Training Capture, and Whisper Fine-Tune Loop
 doc_type: proposal
 domain: voice-ai
-status: proposed
+status: accepted-current-slice
 disposition: accepted-current-slice
-last_updated: 2026-04-22
+last_updated: 2026-10-07
 tags:
 - whisper
 - transcription
@@ -358,7 +358,7 @@ sample volume at that time.
 
 ## Disposition
 
-`proposed` — no implementation started.
+`accepted-current-slice` (reconciled 2026-10-07, watch-live burn-down W2). The earlier "no implementation started" is stale: `crates/router-listener` exists and handles `transcription_capture` into the `ansible_mesh_core::whisper_training` store (Phase 1). No watched-live record.
 
 Priority: Phase 1 (capture) is low-risk, high-signal. Bjork produces multiple voice
 transcriptions per day. Starting capture now means the training store is already

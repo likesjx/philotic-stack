@@ -713,8 +713,7 @@ To move a guest process from Hotel A → Hotel B:
 | IPC            | Unix file-system permissions on the UDS socket                  |
 | Sandbox        | Landlock + seccomp constraints for guest processes in tool execution |
 
-Set `PHILOTIC_MESH_PSK=<secret>` on all hotels in the same mesh cluster for fallback.
-Default is `INSECURE_DEV_DEFAULT_PSK` — override before production.
+There is no shared mesh PSK: per-peer HMAC keys come from the Ed25519/X25519 invite handshake (`mesh_auth_key_for_node`). `PHILOTIC_MESH_PSK` was never read by code and was removed from deploy templates on 2026-10-07.
 
 ---
 
@@ -723,7 +722,6 @@ Default is `INSECURE_DEV_DEFAULT_PSK` — override before production.
 | Variable                              | Default                          | Effect                                              |
 | ------------------------------------- | -------------------------------- | --------------------------------------------------- |
 | `PHILOTIC_HOTEL_SOCKET`               | `/tmp/philotic-aiua.sock`     | IPC Unix domain socket path                         |
-| `PHILOTIC_MESH_PSK`                   | `INSECURE_DEV_DEFAULT_PSK`       | Shared mesh authentication key                      |
 | `PHILOTIC_HOTEL_PORT`                 | `9000`                           | IPC listen port                                     |
 | `PHILOTIC_BIN_DIR`                    | (none — uses `PATH`)             | Directory where guest binaries are resolved         |
 | `PHILOTIC_BLOB_BASE_URL`              | `http://127.0.0.1:<blob_port>`   | Base URL injected into guests for blob access       |

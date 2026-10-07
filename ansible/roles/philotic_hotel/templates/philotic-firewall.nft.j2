@@ -1,0 +1,29 @@
+#!/usr/sbin/nft -f
+# Managed by ansible (philotic_hotel role). PERIMETER_ENFORCEMENT_PROPOSAL.md P7.
+# Only the hotel's own ports are filtered; everything else is untouched.
+table inet philotic
+delete table inet philotic
+
+table inet philotic {
+  set trusted_v4 {
+    type ipv4_addr
+    flags interval
+    elements = { {{ philotic_firewall_trusted_cidrs | join(", ") }} }
+  }
+  set hotel_tcp {
+    type inet_service
+    elements = { {{ philotic_firewall_tcp_ports | unique | sort | join(", ") }} }
+  }
+  set hotel_udp {
+    type inet_service
+    elements = { {{ philotic_firewall_udp_ports | unique | sort | join(", ") }} }
+  }
+
+  chain input {
+    type filter hook input priority filter; policy accept;
+    iifname "lo" accept
+    ip saddr @trusted_v4 accept
+    tcp dport @hotel_tcp counter drop comment "philotic: hotel tcp port, untrusted source"
+    udp dport @hotel_udp counter drop comment "philotic: hotel udp port, untrusted source"
+  }
+}

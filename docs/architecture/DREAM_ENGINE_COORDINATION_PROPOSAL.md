@@ -2,9 +2,9 @@
 title: Dream Engine — Lifecycle Coordination in Aiua Guest Shutdown/Restart
 doc_type: proposal
 domain: cognitive-plane
-status: proposed
+status: accepted-current-slice
 disposition: accepted-current-slice
-last_updated: 2026-04-09
+last_updated: 2026-10-07
 proposal_id: dream-engine-coordination
 tags:
 - memory
@@ -27,7 +27,7 @@ active_seams:
 
 ## Status
 
-Proposed. No implementation blockers — can begin after worktree merge.
+`accepted-current-slice` (reconciled 2026-10-07, watch-live burn-down W2); status aligned to the frontmatter disposition. A dream sweep exists in `aiua` (`dream.rs`, nightly cron behind `PHILOTIC_DREAM_SWEEP_ENABLED`); `MUNINN_MEMORY_CORE_PROPOSAL.md` M6 rebuilt it as a Cortex-side sleep cycle and removed it from the shutdown drain. The session-close marker and restart orientation pass are not marked done here.
 
 ## Context
 
