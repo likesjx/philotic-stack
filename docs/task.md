@@ -2165,6 +2165,12 @@ Order: A0 → S0 → S1 → S2 → S3 → S4; AG-UI investigation independent. T
     - **Tests.** Route and CSP tests, plus guards that the renderer never parses HTML or evaluates code and covers every catalog component.
     - **Not yet verified.** No browser smoke test yet. Locally, `edge_ws_e2e` times out on server start when run from the external target drive (environmental; it passes singly).
   - [ ] S2b `surface-https-edge`: Tailscale Serve HTTPS. Fix the loopback-trust fence first, because Serve proxies arrive from loopback.
+    - [x] Fence fix — **test-green** 2026-10-07. `edge_fence_allows` treats any request carrying proxy headers (`X-Forwarded-For`/`-Proto`/`-Host`, `Forwarded`, `X-Real-IP`, `Tailscale-User-Login`) as remote. Such a request gets neither the loopback bypass nor the Local-tier pass, so Serve-relayed HTTPS always needs an operator session. Plain loopback tooling keeps both. Test: `fence_treats_proxied_loopback_requests_as_remote`.
+    - [ ] Enable (operator first turns on HTTPS certificates in the Tailscale admin console, under DNS):
+      - On vps-jane run `sudo tailscale serve --bg --https=443 http://100.64.212.8:7700`. That gives `https://<vps-machine>.<tailnet>.ts.net/`.
+      - **Serve only, never `funnel`.**
+      - The S3 Mini App reads that base URL from `web_public_base_url`, so moving to the native Philotic VPN only changes config.
+    - [ ] Smoke-green: from the phone on the tailnet, `https://…/s/mac-jane/<surface_id>` renders after operator login, and `/api/*` without a session returns 401.
 - [ ] S2 `surface-https-edge`: Tailscale Serve HTTPS for `philotic-web`; `web_public_base_url` so the transport can move to the native Philotic VPN — smoke-green.
 - [ ] S3 `surface-telegram-miniapp`: `web_app` Open button from the emitting philote's bot; `initData` Ed25519 third-party validation, `auth_date` freshness, operator user-id allowlist, operator-bot check; surface-scoped session — watched-live-green.
 - [ ] S3 `surface-apple-webview`: `WKWebView` host loading the server renderer; `WKScriptMessageHandler` → existing `EdgeMessage` connection; no web credential in the page — smoke-green on the operator's iPhone.
