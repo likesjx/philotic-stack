@@ -15613,11 +15613,13 @@ fn posture_str(posture: ansible_mesh_core::autonomy::AutonomyPosture) -> &'stati
 }
 
 mod tool_assembly;
+#[allow(unused_imports)]
 use self::tool_assembly::*;
 #[allow(unused_imports)]
 pub(super) use self::tool_assembly::{LiveToolRunner, compose_tool_assembly};
 
 mod cron;
+#[allow(unused_imports)]
 use self::cron::*;
 #[allow(unused_imports)]
 pub(super) use self::cron::{
@@ -15626,11 +15628,13 @@ pub(super) use self::cron::{
 };
 
 mod surfaces;
+#[allow(unused_imports)]
 use self::surfaces::*;
 #[allow(unused_imports)]
 pub(super) use self::surfaces::{SurfaceAttribution, handle_apply_surface_messages};
 
 mod procedures;
+#[allow(unused_imports)]
 use self::procedures::*;
 #[allow(unused_imports)]
 pub(super) use self::procedures::{
@@ -15642,6 +15646,7 @@ mod skills;
 #[cfg(test)]
 #[allow(unused_imports)]
 pub(super) use self::skills::handle_register_skill;
+#[allow(unused_imports)]
 use self::skills::*;
 #[allow(unused_imports)]
 pub(super) use self::skills::{
@@ -15653,6 +15658,7 @@ pub(super) use self::skills::{
 mod agent_context;
 #[allow(unused_imports)]
 pub(crate) use self::agent_context::REPLY_OWNER_AGENT_ID_FIELD;
+#[allow(unused_imports)]
 use self::agent_context::*;
 #[allow(unused_imports)]
 pub(super) use self::agent_context::{
