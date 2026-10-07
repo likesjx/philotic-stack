@@ -97,6 +97,7 @@
 
 mod cortex;
 pub(crate) mod edge;
+mod surface_routes;
 
 use ansible_mesh_core::domain::GraphDomain;
 use ansible_mesh_core::event::{EventEnvelope, EventKind, EventPayload};
@@ -793,6 +794,26 @@ pub async fn run(
         .route("/api/skills", get(handle_skills))
         .route("/api/surfaces", get(handle_list_surfaces))
         .route("/api/surfaces/:surface_id", get(handle_get_surface))
+        .route(
+            "/api/mesh/targets/:target_node_id/surfaces/:surface_id",
+            get(surface_routes::handle_mesh_target_surface),
+        )
+        .route(
+            "/s/:target/:surface_id",
+            get(surface_routes::handle_surface_page),
+        )
+        .route(
+            "/surface-ui/surface.js",
+            get(surface_routes::handle_surface_js),
+        )
+        .route(
+            "/surface-ui/surface.css",
+            get(surface_routes::handle_surface_css),
+        )
+        .route(
+            "/surface-ui/catalog.json",
+            get(surface_routes::handle_surface_catalog),
+        )
         .route("/api/toolsets", get(handle_toolsets))
         .route("/api/config", get(handle_config))
         .route("/api/config/telegram", get(handle_config_telegram))

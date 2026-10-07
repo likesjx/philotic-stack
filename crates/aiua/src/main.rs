@@ -641,6 +641,29 @@ async fn handle_operator_surface_query_task(
         | "operator.targets.roles.set_home" => {
             handle_forwarded_operator_target_surface(client, &payload, local_node_id).await?
         }
+        // Philote-authored surfaces (doc:desktop-generative-surfaces S2): a
+        // read-only fetch of one surface record this hotel owns.
+        "operator.surfaces.get" => {
+            let surface_id = payload
+                .payload
+                .get("surface_id")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| anyhow::anyhow!("operator.surfaces.get needs surface_id"))?
+                .to_string();
+            let surface = match client
+                .send_request(IpcRequest::GetSurface { surface_id })
+                .await?
+            {
+                IpcResponse::Standard { ok: true, data, .. } => data,
+                IpcResponse::Standard { code, .. } if code == "SURFACE_NOT_FOUND" => None,
+                other => anyhow::bail!("unexpected get_surface response: {other:?}"),
+            };
+            serde_json::to_string(&serde_json::json!({
+                "target_node_id": local_node_id,
+                "found": surface.is_some(),
+                "surface": surface,
+            }))?
+        }
         other => anyhow::bail!("unsupported operator surface handoff [{other}]"),
     };
 

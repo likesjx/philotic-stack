@@ -41,6 +41,127 @@ impl IpcServer {
         }
     }
 
+    /// One surface record from any mesh target (doc:desktop-generative-surfaces
+    /// S2). Local targets read the graph; remote ones use the read-only
+    /// `operator.surfaces.get` handoff. Unlike the inventory views there is no
+    /// degraded fallback: a failed remote query is an error the web layer maps.
+    pub(super) async fn operator_target_surface(
+        registry: &Arc<RwLock<NodeRegistry>>,
+        graph: &GraphDomain,
+        local_node_id: &str,
+        target_node_id: &str,
+        surface_id: &str,
+    ) -> anyhow::Result<serde_json::Value> {
+        if target_node_id == local_node_id {
+            let surface = graph.get_surface(surface_id)?;
+            return Ok(serde_json::json!({
+                "target_node_id": local_node_id,
+                "found": surface.is_some(),
+                "surface": surface,
+            }));
+        }
+        let source_hotel = Self::local_hotel_name(graph, local_node_id).ok_or_else(|| {
+            anyhow::anyhow!("local hotel record missing for node [{local_node_id}]")
+        })?;
+        let guard = registry.read().await;
+        let status = guard.get_node(target_node_id).ok_or_else(|| {
+            anyhow::anyhow!(
+                "mesh target [{target_node_id}] is not currently active in the registry"
+            )
+        })?;
+        let target_hotel = Self::target_hotel_name(graph, status, &source_hotel);
+        drop(guard);
+        let reply = Self::query_remote_operator_surface(
+            graph,
+            local_node_id,
+            target_node_id,
+            &target_hotel,
+            "operator.surfaces.get",
+            "fetch a philote-authored surface",
+            serde_json::json!({ "surface_id": surface_id }),
+        )
+        .await?;
+        let value: serde_json::Value = serde_json::from_str(&reply)?;
+        if value.get("target_node_id").and_then(|v| v.as_str()) != Some(target_node_id) {
+            anyhow::bail!("remote surface reply target mismatch for [{target_node_id}]");
+        }
+        Ok(value)
+    }
+
+    /// Send one read-only operator-surface handoff to `target_node_id` and
+    /// wait for its JSON reply (the pattern of the inventory queries, minus
+    /// the typed view).
+    pub(super) async fn query_remote_operator_surface(
+        graph: &GraphDomain,
+        local_node_id: &str,
+        target_node_id: &str,
+        target_hotel: &str,
+        surface: &str,
+        intent: &str,
+        payload: serde_json::Value,
+    ) -> anyhow::Result<String> {
+        let source_hotel = Self::local_hotel_name(graph, local_node_id).ok_or_else(|| {
+            anyhow::anyhow!("local hotel record missing for node [{local_node_id}]")
+        })?;
+        let socket_path = graph
+            .get_hotel(&source_hotel)?
+            .map(|hotel| hotel.ipc_socket_path)
+            .ok_or_else(|| anyhow::anyhow!("local hotel [{}] record missing", source_hotel))?;
+        let reply_guest_id = format!("operator-surface-query-{}", Uuid::new_v4());
+        let reply_role = OPERATOR_SURFACE_QUERY_REPLY_ROLE;
+        let mut client = PhiloticClient::connect_at(
+            &socket_path,
+            GuestIdentity {
+                guest_id: reply_guest_id.clone(),
+                role: reply_role.into(),
+                supported_tools: Vec::new(),
+            },
+        )
+        .await?;
+        match client
+            .send_request(IpcRequest::SubscribeInbox {
+                role: reply_role.into(),
+            })
+            .await?
+        {
+            IpcResponse::Standard { ok: true, .. } => {}
+            other => anyhow::bail!("unexpected query reply inbox subscribe response: {other:?}"),
+        }
+        let task_json = serde_json::to_string(&OperatorSurfaceQueryHandoff {
+            handoff_kind: OPERATOR_SURFACE_QUERY_HANDOFF_KIND.into(),
+            surface: surface.into(),
+            request_id: Uuid::new_v4().to_string(),
+            source_hotel,
+            target_hotel: target_hotel.to_string(),
+            target_node_id: target_node_id.to_string(),
+            caller_kind: "operator_surface_adapter".into(),
+            caller_id: local_node_id.to_string(),
+            visibility_scope: "operator".into(),
+            grant_scope: "default".into(),
+            intent: intent.into(),
+            payload,
+            reply_to_node: local_node_id.to_string(),
+            reply_to_role: reply_role.into(),
+            reply_to_guest_id: Some(reply_guest_id),
+            session_id: None,
+            trace: None,
+        })?;
+        match client
+            .send_request(IpcRequest::EmitTask {
+                target_node: target_node_id.to_string(),
+                target_role: OPERATOR_SURFACE_QUERY_ROLE.into(),
+                target_guest_id: None,
+                task_json,
+            })
+            .await?
+        {
+            IpcResponse::Standard { ok: true, .. } => {}
+            other => anyhow::bail!("unexpected remote {surface} emit response: {other:?}"),
+        }
+        Self::recv_operator_surface_reply(&mut client, OPERATOR_SURFACE_QUERY_TIMEOUT_SECS, surface)
+            .await
+    }
+
     pub(super) async fn recv_operator_surface_reply(
         client: &mut PhiloticClient,
         timeout_secs: u64,
@@ -95,6 +216,27 @@ impl IpcServer {
                     Err(err) => IpcResponse::error(
                         "operator_target_status",
                         "OPERATOR_TARGET_STATUS_ERROR",
+                        err.to_string(),
+                    ),
+                }
+            }
+            IpcRequest::QueryOperatorTargetSurface {
+                target_node_id,
+                surface_id,
+            } => {
+                match Self::operator_target_surface(
+                    registry,
+                    graph,
+                    local_node_id,
+                    &target_node_id,
+                    &surface_id,
+                )
+                .await
+                {
+                    Ok(data) => IpcResponse::success("operator_target_surface", Some(data)),
+                    Err(err) => IpcResponse::error(
+                        "operator_target_surface",
+                        "OPERATOR_TARGET_SURFACE_ERROR",
                         err.to_string(),
                     ),
                 }
@@ -1964,6 +2106,8 @@ const READ_ONLY_OPERATOR_SURFACES: &[&str] = &[
     "operator.targets.config",
     "operator.targets.secrets",
     "operator.targets.placement",
+    // doc:desktop-generative-surfaces S2: fetch one surface record by id.
+    "operator.surfaces.get",
 ];
 
 /// Surfaces the mesh never carries, whoever sends them. `agent.deploy_bundle`
