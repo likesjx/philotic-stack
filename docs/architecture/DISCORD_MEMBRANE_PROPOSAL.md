@@ -2,9 +2,9 @@
 title: Discord Membrane Proposal
 doc_type: proposal
 domain: membrane-transport
-status: proposed
+status: accepted-current-slice
 disposition: accepted-current-slice
-last_updated: 2026-03-31
+last_updated: 2026-10-07
 tags:
 - discord
 - membrane
@@ -69,7 +69,7 @@ The membrane's job is to get Discord audio into Philotic and Philotic audio back
 
 ## Disposition
 
-`proposed`
+`accepted-current-slice` (reconciled 2026-10-07, watch-live burn-down W2). The gateway is built (`crates/membrane-discord`, voice bridge included) but is not seeded or deployed on any hotel (see the DEFECTS.md technical-debt note "membrane-discord unshipped island").
 
 Track follow-on work in docs/task.md.
 

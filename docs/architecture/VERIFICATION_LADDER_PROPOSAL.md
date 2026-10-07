@@ -2,8 +2,8 @@
 domain: runtime-sessions
 doc_type: proposal
 disposition: accepted-current-slice
-status: process-documentation
-last_updated: 2026-03-31
+status: active
+last_updated: 2026-10-07
 ---
 
 # Verification Ladder Tracking Proposal

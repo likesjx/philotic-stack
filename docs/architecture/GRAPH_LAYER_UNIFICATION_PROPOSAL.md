@@ -2,9 +2,9 @@
 title: Graph Layer Unification
 doc_type: proposal
 domain: runtime-sessions
-status: proposed
+status: implemented
 disposition: implemented
-last_updated: 2026-03-31
+last_updated: 2026-10-07
 tags:
 - graph
 - storage
@@ -143,7 +143,12 @@ These constants are the shared data language. Any graph store that reads a node 
 
 ## Disposition
 
-`proposed` — not yet implemented. Acceptance gates:
+`implemented` (reconciled 2026-10-07, watch-live burn-down W2). All three
+acceptance gates are met in code: `GraphDomain` lives in
+`ansible-mesh-core/src/domain/mod.rs`, `SqliteGraphAdapter`
+(`sqlite_storage.rs`) implements the `GraphAdapter` trait (`storage.rs`), and
+hotel callers (`aiua` `main.rs`, `service/*`) hold `Arc<GraphDomain>`. The
+original gates, kept for reference:
 
 1. `GraphDomain` struct defined with at least two entity types migrated (proof of layer).
 2. `SqliteGraphAdapter` extracted from `SqliteGraphStorage` implementing only `GraphAdapter`.

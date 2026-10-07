@@ -1,9 +1,35 @@
+---
+title: Life Graph Active — From Passive Record to Life Manager
+doc_type: proposal
+domain: memory-context
+status: accepted-current-slice
+last_updated: 2026-10-07
+tags:
+- lifegraph
+- agenda
+- attention-steward
+- daily-brief
+related_docs:
+- LIFE_GRAPH_OS_PROPOSAL.md
+- REFLEXIVE_LIFE_GRAPH_PROPOSAL.md
+- life-graph/LIFE_GRAPH_SCHEMA.md
+- life-graph/ATTENTION_STEWARD.md
+task_refs:
+- docs/task.md
+proposal_id: life-graph-active
+active_seams: []
+source_of_truth_targets:
+- docs/architecture/LIFE_GRAPH_ACTIVE_PROPOSAL.md
+---
+
 # Life Graph Active — From Passive Record to Life Manager
 
 > **Operator intent (2026-07-23, paraphrased):** "The lifegraph has become the focus.
 > I need it to be able to manage my life — let's make it more active."
 
 Status: **proposal — slices S1/S2 implementation started on this branch**
+
+(Frontmatter added 2026-10-07, watch-live burn-down W2: `accepted-current-slice`. S2's agenda edge vocabulary is write-enabled on `life.observe` per `life-graph/LIFE_GRAPH_SCHEMA.md`.)
 
 ## Goal
 

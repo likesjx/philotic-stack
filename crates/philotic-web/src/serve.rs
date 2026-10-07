@@ -97,6 +97,7 @@
 
 mod cortex;
 pub(crate) mod edge;
+mod surface_routes;
 
 use ansible_mesh_core::domain::GraphDomain;
 use ansible_mesh_core::event::{EventEnvelope, EventKind, EventPayload};
@@ -793,6 +794,26 @@ pub async fn run(
         .route("/api/skills", get(handle_skills))
         .route("/api/surfaces", get(handle_list_surfaces))
         .route("/api/surfaces/:surface_id", get(handle_get_surface))
+        .route(
+            "/api/mesh/targets/:target_node_id/surfaces/:surface_id",
+            get(surface_routes::handle_mesh_target_surface),
+        )
+        .route(
+            "/s/:target/:surface_id",
+            get(surface_routes::handle_surface_page),
+        )
+        .route(
+            "/surface-ui/surface.js",
+            get(surface_routes::handle_surface_js),
+        )
+        .route(
+            "/surface-ui/surface.css",
+            get(surface_routes::handle_surface_css),
+        )
+        .route(
+            "/surface-ui/catalog.json",
+            get(surface_routes::handle_surface_catalog),
+        )
         .route("/api/toolsets", get(handle_toolsets))
         .route("/api/config", get(handle_config))
         .route("/api/config/telegram", get(handle_config_telegram))
@@ -2292,7 +2313,12 @@ fn edge_fence_allows(
     headers: &HeaderMap,
     peer: IpAddr,
 ) -> bool {
-    if state.exposure_tier == ExposureTier::Local {
+    // A request relayed by a local reverse proxy (Tailscale Serve for the
+    // HTTPS edge, doc:desktop-generative-surfaces S2b) arrives from loopback
+    // but comes from somewhere else. Neither the Local-tier pass nor the
+    // loopback bypass may apply to it.
+    let proxied = is_proxied_request(headers);
+    if state.exposure_tier == ExposureTier::Local && !proxied {
         return true;
     }
     if method == Method::OPTIONS {
@@ -2315,10 +2341,27 @@ fn edge_fence_allows(
     if !(path.starts_with("/api/") || path == "/ws") {
         return true;
     }
-    if peer.is_loopback() && state.exposure_tier <= ExposureTier::Mesh {
+    if peer.is_loopback() && state.exposure_tier <= ExposureTier::Mesh && !proxied {
         return true;
     }
     check_auth(headers, state)
+}
+
+/// True when a reverse proxy relayed the request. Tailscale Serve sets
+/// `X-Forwarded-For`/`X-Forwarded-Proto` and the `Tailscale-User-*` identity
+/// headers; generic proxies set `Forwarded` or `X-Real-IP`. A loopback caller
+/// that omits them is local tooling, which loopback already trusts.
+fn is_proxied_request(headers: &HeaderMap) -> bool {
+    [
+        "x-forwarded-for",
+        "x-forwarded-proto",
+        "x-forwarded-host",
+        "forwarded",
+        "x-real-ip",
+        "tailscale-user-login",
+    ]
+    .iter()
+    .any(|name| headers.contains_key(*name))
 }
 
 // ── Bind resolution ───────────────────────────────────────────────────────────
@@ -10364,6 +10407,55 @@ mod tests {
             "/api/status",
             &HeaderMap::new(),
             peer
+        ));
+    }
+
+    /// S2b: Tailscale Serve relays HTTPS from loopback. A proxied request must
+    /// not inherit the loopback bypass or the Local-tier pass, on any tier,
+    /// while plain loopback tooling keeps both.
+    #[test]
+    fn fence_treats_proxied_loopback_requests_as_remote() {
+        let loopback: IpAddr = "127.0.0.1".parse().unwrap();
+        for header in [
+            "x-forwarded-for",
+            "forwarded",
+            "tailscale-user-login",
+            "x-real-ip",
+        ] {
+            let mut proxied = HeaderMap::new();
+            proxied.insert(header, "100.64.1.9".parse().unwrap());
+            for tier in [ExposureTier::Local, ExposureTier::Lan, ExposureTier::Mesh] {
+                let state = test_state(None, tier);
+                assert!(
+                    !edge_fence_allows(&state, &Method::GET, "/api/status", &proxied, loopback),
+                    "{header} on {tier:?} must not bypass auth"
+                );
+                // Non-API shells stay reachable through the proxy.
+                assert!(edge_fence_allows(
+                    &state,
+                    &Method::GET,
+                    "/s/mac-jane/s1",
+                    &proxied,
+                    loopback
+                ));
+            }
+        }
+        // Plain loopback tooling keeps its bypass.
+        let mesh = test_state(None, ExposureTier::Mesh);
+        assert!(edge_fence_allows(
+            &mesh,
+            &Method::GET,
+            "/api/status",
+            &HeaderMap::new(),
+            loopback
+        ));
+        let local = test_state(None, ExposureTier::Local);
+        assert!(edge_fence_allows(
+            &local,
+            &Method::GET,
+            "/api/status",
+            &HeaderMap::new(),
+            loopback
         ));
     }
 

@@ -1,0 +1,143 @@
+---
+# Release layout install (proposal:release-train R4, docs/process/RELEASE.md).
+#
+#   {{ philotic_release_cache_dir }}/<tag>/philotic-<tag>-linux-x86_64.tar.gz
+#     (downloaded + outer-SHA256SUMS-verified by `just vps-deploy-release`)
+#   → {{ philotic_releases_dir }}/<tag>/{bin/,SHA256SUMS,manifest.json}
+#   → {{ philotic_current_link }} -> {{ philotic_releases_dir }}/<tag>   (atomic rename)
+#
+# Release dirs are root-owned and read-only to the service user: the hotel can
+# execute its binaries but cannot rewrite them.
+
+- name: Release | install {{ philotic_release_tag }}
+  when:
+    - philotic_bin_layout_effective == 'release'
+    - philotic_release_tag | length > 0
+  block:
+    - name: Release | validate tag
+      assert:
+        that:
+          - philotic_release_tag is match('^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$')
+        fail_msg: "philotic_release_tag '{{ philotic_release_tag }}' is not a vX.Y.Z[-pre] release tag"
+
+    - name: Release | resolve paths
+      set_fact:
+        philotic_release_dir: "{{ philotic_releases_dir }}/{{ philotic_release_tag }}"
+        philotic_release_tarball: >-
+          {{ philotic_release_cache_dir }}/{{ philotic_release_tag }}/philotic-{{ philotic_release_tag }}-{{ philotic_release_platform }}.tar.gz
+
+    - name: Release | create releases dir
+      file:
+        path: "{{ philotic_releases_dir }}"
+        state: directory
+        owner: root
+        group: "{{ philotic_group }}"
+        mode: "0755"
+
+    - name: Release | check whether {{ philotic_release_tag }} is already unpacked
+      stat:
+        path: "{{ philotic_release_dir }}/manifest.json"
+      register: philotic_release_manifest_stat
+
+    - name: Release | check the downloaded tarball
+      stat:
+        path: "{{ philotic_release_tarball }}"
+      register: philotic_release_tarball_stat
+      when: not philotic_release_manifest_stat.stat.exists
+
+    - name: Release | fail when the tarball was not downloaded
+      fail:
+        msg: >-
+          {{ philotic_release_tarball }} is missing. Download and verify it first:
+          just vps-deploy-release {{ philotic_release_tag }}
+      when:
+        - not philotic_release_manifest_stat.stat.exists
+        - not philotic_release_tarball_stat.stat.exists
+
+    - name: Release | unpack into a staging dir
+      when: not philotic_release_manifest_stat.stat.exists
+      block:
+        - name: Release | clear stale staging and partial release dirs
+          file:
+            path: "{{ item }}"
+            state: absent
+          loop:
+            - "{{ philotic_release_dir }}.partial"
+            - "{{ philotic_release_dir }}"
+
+        - name: Release | create staging dir
+          file:
+            path: "{{ philotic_release_dir }}.partial"
+            state: directory
+            owner: root
+            group: "{{ philotic_group }}"
+            mode: "0755"
+
+        - name: Release | unpack tarball
+          unarchive:
+            src: "{{ philotic_release_tarball }}"
+            dest: "{{ philotic_release_dir }}.partial"
+            remote_src: yes
+            owner: root
+            group: "{{ philotic_group }}"
+
+        - name: Release | verify inner SHA256SUMS before activating
+          command: sha256sum -c --quiet SHA256SUMS
+          args:
+            chdir: "{{ philotic_release_dir }}.partial"
+          changed_when: false
+
+        - name: Release | move staging dir into place
+          command: mv -T {{ (philotic_release_dir ~ '.partial') | quote }} {{ philotic_release_dir | quote }}
+
+    - name: Release | verify installed binaries against SHA256SUMS
+      command: sha256sum -c --quiet SHA256SUMS
+      args:
+        chdir: "{{ philotic_release_dir }}"
+      changed_when: false
+
+    - name: Release | flip {{ philotic_current_link }} to {{ philotic_release_tag }}
+      shell: |
+        set -euo pipefail
+        target={{ philotic_release_dir | quote }}
+        link={{ philotic_current_link | quote }}
+        if [ "$(readlink "$link" 2>/dev/null || true)" = "$target" ]; then
+          echo "current already -> $target"
+          exit 0
+        fi
+        tmp="${link}.tmp.$$"
+        ln -sfn "$target" "$tmp"
+        mv -Tf "$tmp" "$link"
+        echo "flipped current -> $target"
+      args:
+        executable: /bin/bash
+      register: philotic_release_flip
+      changed_when: "'flipped' in philotic_release_flip.stdout"
+      notify: Restart philotic-hotel
+
+    - name: Release | prune to the newest {{ philotic_releases_keep }} releases
+      shell: |
+        set -euo pipefail
+        cd {{ philotic_releases_dir | quote }}
+        current="$(basename "$(readlink -f {{ philotic_current_link | quote }})")"
+        n=0
+        # Newest first by install (dir mtime). Never prune what current points at.
+        while IFS= read -r d; do
+          d="${d%/}"
+          case "$d" in *.partial|"") continue ;; esac
+          n=$((n + 1))
+          if [ "$n" -gt {{ philotic_releases_keep | int }} ] && [ "$d" != "$current" ]; then
+            rm -rf -- "./$d"
+            echo "pruned $d"
+          fi
+        done < <(ls -1td -- */ 2>/dev/null)
+      args:
+        executable: /bin/bash
+      register: philotic_release_prune
+      changed_when: "'pruned' in philotic_release_prune.stdout"
+
+    - name: Release | report
+      debug:
+        msg: >-
+          {{ philotic_release_tag }} installed at {{ philotic_release_dir }};
+          {{ philotic_release_flip.stdout }}{{ ('; ' ~ philotic_release_prune.stdout_lines | join(', ')) if philotic_release_prune.stdout_lines else '' }}

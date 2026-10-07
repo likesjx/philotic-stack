@@ -4,7 +4,7 @@ doc_type: proposal
 domain: mesh-placement
 status: accepted-current-slice
 disposition: accepted-current-slice
-last_updated: 2026-09-05
+last_updated: 2026-10-07
 verification_level: test-green
 tags:
 - placement
@@ -66,6 +66,18 @@ ceremony that closes the gap.
 
 ## Disposition
 
+**Slice levels (reconciled 2026-10-07, watch-live burn-down W2):**
+
+| Slice | Level | Evidence |
+|---|---|---|
+| R1 graph truth outlives seed | test-green | PR #488; restart smoke pending |
+| R2 membrane standby + push stand-down | watched-live-green (2026-09-22) | PR #584: real Telegram round-trip |
+| R3 materialize request | watched-live (2026-09-09) | see below; DEF-124 |
+| R4 feasibility | test-green | `codex/relocation-r4-feasibility` |
+| R5 continuity transfer | test-green | PR #560; parked-turn smoke pending |
+| R6 `hotel.relocate` + `relocation_ceremony` record | test-green | PR #521; live Björk move pending (`WATCH_LIVE_BURNDOWN_PROPOSAL.md` W5) |
+| R7 sealed transport secret | test-green | PR #565 |
+
 `accepted-current-slice` (2026-09-05). **R1 test-green** (merged, PR #488): placement
 stamps on both home record kinds, reseed preserves `home_node` (DEF-106), runtime
 homes gossip in `HotelStateSync` with last-writer-wins apply (`placement_sync`).
@@ -116,7 +128,8 @@ the same signals using data that's already gossiped (`NodeHealthSnapshot`
 headroom, `HotelStateSync` guest roster for controller presence,
 `max_concurrent_jobs` vs. current guest count, `build_version` match) — a
 soft ranking preference for whom to ask, distinct from the target-side
-check's hard gate on whoever's actually asked. R6 onward not started. The
+check's hard gate on whoever's actually asked. (The 2026-09-05 note "R6 onward
+not started" is superseded; see the status table below.) The
 first concrete relocation
 this ceremony must carry is moving every orchestrator incarnation (Bjork, Coach,
 Mac on `mac-jane`; Astrid, Ariel, Jane, Aria on `mbp-jane`) to `vps-jane`, with

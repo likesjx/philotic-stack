@@ -1,7 +1,8 @@
 ---
 id: proposal:reflex-engine-e2e-validation
 kind: proposal
-status: planning
+status: proposed
+last_updated: 2026-10-07
 domain: voice-routing
 merged_prs: [49, 50, 51, 48, 47]
 ---

@@ -1,3 +1,5 @@
+> **Historical (ZeroClaw era).** Superseded by [docs/process/RELEASE.md](../process/RELEASE.md); do not follow this runbook for Philotic releases.
+
 # ZeroClaw Release Process
 
 This runbook defines the maintainers' standard release flow.

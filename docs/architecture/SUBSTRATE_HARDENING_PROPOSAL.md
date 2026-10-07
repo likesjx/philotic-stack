@@ -3,8 +3,8 @@ title: Substrate Hardening — The Ground Under Autonomy
 doc_type: proposal
 domain: operator-control-plane
 status: active
-disposition: proposed
-last_updated: 2026-07-20
+disposition: active
+last_updated: 2026-10-07
 verification_level: test-green
 tags:
 - substrate
@@ -74,7 +74,7 @@ outage generation).
 
 ## Disposition
 
-`proposed` — authored 2026-07-11 from the autopoiesis roadmap assessment.
+`active` (reconciled 2026-10-07, watch-live burn-down W2); frontmatter `disposition` aligned to `status`. Authored 2026-07-11 from the autopoiesis roadmap assessment; per-slice state below.
 S1 is the single highest-leverage item and should be the first slice claimed.
 
 ### Slice status

@@ -2,8 +2,8 @@
 title: Data-Driven Tool Grants (SkillDAG)
 doc_type: proposal
 domain: tooling-execution
-status: accepted for current slice
-last_updated: 2026-08-13
+status: accepted-current-slice
+last_updated: 2026-10-07
 tags:
 - tooling
 - grants

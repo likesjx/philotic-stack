@@ -2,9 +2,9 @@
 title: Muninn Memory Core — Effective Create/Recall Loop, Dispersal, and the Admin Observability Plane
 doc_type: proposal
 domain: memory-context
-status: proposed
-disposition: proposed
-last_updated: 2026-09-16
+status: accepted-current-slice
+disposition: accepted-current-slice
+last_updated: 2026-10-07
 tags:
   - muninn
   - memory
@@ -41,6 +41,14 @@ source_of_truth_targets:
 ---
 
 # Muninn Memory Core — Effective Create/Recall Loop, Dispersal, and the Admin Observability Plane
+
+## Disposition
+
+`accepted-current-slice` (reconciled 2026-10-07, watch-live burn-down W2).
+S1–S4 and S6a: test-green (PR #466). M1–M6: test-green, merged (PR #466) and
+deployed to all three hotels 2026-09-16; watched-live on mac-jane only. M7: open.
+The nightly sleep / memory-hygiene proof is tracked in
+`docs/process/WATCH_LIVE_BACKLOG.md`.
 
 ## Goal
 
@@ -412,8 +420,11 @@ every write goes through.
 ### Phase 2 status (2026-09-16)
 
 **M1–M6 implemented and test-green on `codex/muninn-memory-core` (PR #466)**, merged
-with develop first. Not yet deployed or watched-live. Corrections found while
-building:
+with develop first. **Update 2026-10-07:** merged to develop (`98e742b0`) and deployed
+to vps-jane, mac-jane and mbp-jane on 2026-09-16; live-verified on mac-jane only
+(auto-recall without role prefix, band gate, forwarded Cortex write + forget). vps/mbp
+natural-traffic evidence is still owed; M7 is operator-driven and open. Corrections
+found while building:
 
 - `memory.report` recall effectiveness counted session events by record kind, but
   philote turn events are stored as `emit_task` records with the event name in the

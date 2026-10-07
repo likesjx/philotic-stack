@@ -44,35 +44,21 @@ remote_file_exists() {
   exit 1
 }
 
-# Find the launchd LaunchAgent label managing this hotel on the remote, whether
-# currently loaded or just installed as a plist. Labels follow
-# com.philotic.aiua.<hotel> (mac-jane → com.philotic.aiua.mac-jane, mbp-jane →
-# com.philotic.aiua.mbp-jane) or the profile-prefixed
-# com.philotic.aiua.<profile>.<hotel> written by `phil service install` — so we
-# match by pattern, never a hardcoded label. Prints the label, or nothing when
-# the hotel is not launchd-managed (hand-start mode).
+# launchd stop/start/detection lives in scripts/lib/launchd.sh (shared with
+# scripts/install-release-mac.sh). LAUNCHD_TARGET points it at this remote.
+# shellcheck source=scripts/lib/launchd.sh
+source "${ROOT_DIR}/scripts/lib/launchd.sh"
+LAUNCHD_TARGET="${REMOTE}"
+
+# Label managing this hotel on the remote (loaded or installed), or nothing
+# when the hotel is not launchd-managed (hand-start mode).
 detect_launchd_label() {
-  local label
-  # Prefer a currently-loaded service (launchctl list column 3 is the label).
-  label="$(ssh -n "${SSH_OPTS[@]}" "${REMOTE}" \
-    "launchctl list 2>/dev/null | awk '{print \$3}' | grep '^com\\.philotic\\.aiua\\.' || true" \
-    | grep -E "(^|\.)${HOTEL_NAME}\$" | head -n 1 || true)"
-  if [[ -n "${label}" ]]; then
-    printf '%s\n' "${label}"
-    return 0
-  fi
-  # Fall back to an installed-but-unloaded LaunchAgent plist.
-  ssh -n "${SSH_OPTS[@]}" "${REMOTE}" \
-    "ls \$HOME/Library/LaunchAgents/com.philotic.aiua.*.plist 2>/dev/null || true" \
-    | sed -e 's#.*/##' -e 's#\.plist$##' \
-    | grep -E "(^|\.)${HOTEL_NAME}\$" | head -n 1 || true
+  launchd_detect_label "${HOTEL_NAME}"
 }
 
 # Is the given launchd service currently loaded in the remote gui domain?
 remote_launchd_loaded() {
-  local label="$1"
-  ssh -n "${SSH_OPTS[@]}" "${REMOTE}" \
-    "launchctl print gui/\$(id -u)/${label} >/dev/null 2>&1"
+  launchd_loaded "$1"
 }
 
 REMOTE_HOME="$(ssh "${SSH_OPTS[@]}" "${REMOTE}" 'echo $HOME')"
@@ -256,16 +242,13 @@ restart_hotel() {
     # points at a PID that still exists (or got reused), and a launchd respawn
     # can race the old row. Same profile→db derivation the rest of this script
     # uses: ~/.philotic/<profile>/context.db.
-    if ! ssh -n "${SSH_OPTS[@]}" "${REMOTE}" "sqlite3 \$HOME/.philotic/${REMOTE_PROFILE}/context.db \"UPDATE hotels SET active_pid = NULL WHERE hotel_name = '${HOTEL_NAME}';\""; then
+    if ! hotel_clear_active_pid "${REMOTE_PROFILE}" "${HOTEL_NAME}"; then
       echo "⚠ Could not clear hotels.active_pid (continuing — aiua may refuse to start if a stale live PID matches)"
     fi
-    if remote_launchd_loaded "${LAUNCHD_LABEL}"; then
-      ssh -n "${SSH_OPTS[@]}" "${REMOTE}" "launchctl kickstart -k gui/\$(id -u)/${LAUNCHD_LABEL}"
-    else
-      # The stop step booted the service out; bring it back under launchd
-      # (RunAtLoad starts it). Never hand-start a launchd-managed hotel.
-      ssh -n "${SSH_OPTS[@]}" "${REMOTE}" "launchctl bootstrap gui/\$(id -u) \$HOME/Library/LaunchAgents/${LAUNCHD_LABEL}.plist"
-    fi
+    # kickstart -k when loaded; otherwise the stop step booted it out, so
+    # bootstrap it back under launchd (RunAtLoad starts it). Never hand-start
+    # a launchd-managed hotel.
+    launchd_start "${LAUNCHD_LABEL}"
     echo "  ✓ ${LAUNCHD_LABEL} restarted under launchd supervision"
   else
     echo "▶ No launchd service — hand-starting hotel '${HOTEL_NAME}' on ${REMOTE} with Rust cutover flags..."
@@ -337,7 +320,7 @@ echo "▶ Stopping hotel '${HOTEL_NAME}' on ${REMOTE}..."
 STOP_EPOCH="$(date +%s)"
 HOTEL_STOPPED=1
 BOOTOUT_LABEL="${LAUNCHD_LABEL:-com.philotic.aiua.${HOTEL_NAME}}"
-ssh "${SSH_OPTS[@]}" "${REMOTE}" "uid=\$(id -u); launchctl bootout gui/\${uid}/${BOOTOUT_LABEL} 2>/dev/null || true; pkill -f '[a]iua --hotel ${HOTEL_NAME}' 2>/dev/null || pkill -f '[a]iua-webrtc-debug --hotel ${HOTEL_NAME}' 2>/dev/null || true; sleep 2"
+launchd_stop_hotel "${BOOTOUT_LABEL}" "${HOTEL_NAME}"
 
 echo "▶ Installing staged binaries on ${REMOTE}..."
 if ! ssh "${SSH_OPTS[@]}" "${REMOTE}" "bash -s -- $(printf '%q ' "${AIUA_CELLAR}" "${STAGE_DIR}" "${PHIL_ARG}" "${BIN_NAMES[@]}")" <<<"${REMOTE_INSTALL}"; then

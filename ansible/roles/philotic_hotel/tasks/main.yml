@@ -68,6 +68,46 @@
     group: "{{ philotic_group }}"
     mode: "0700"
 
+# ── Binary layout: release (/opt/philotic/current/bin) or legacy (bin_dir) ────
+# Tagged `always` so --tags config / --skip-tags binary / --tags rollback runs
+# render the unit against the same layout the host is actually in. Once a
+# release has been installed the host stays in release mode until a deploy
+# passes philotic_bin_layout=legacy (vps-deploy-ci, vps-push).
+
+- name: Check for an existing release layout
+  stat:
+    path: "{{ philotic_current_link }}"
+  register: philotic_current_stat
+  tags: always
+
+- name: Resolve binary layout
+  set_fact:
+    philotic_bin_layout_effective: >-
+      {{ 'release' if (philotic_release_tag | default('') | length > 0)
+         else (philotic_bin_layout if philotic_bin_layout in ['release', 'legacy']
+         else ('release' if philotic_current_stat.stat.exists else 'legacy')) }}
+  tags: always
+
+- name: Refuse release layout without an installed release
+  assert:
+    that:
+      - philotic_bin_layout_effective == 'legacy' or philotic_release_tag | length > 0 or philotic_current_stat.stat.exists
+    fail_msg: >-
+      philotic_bin_layout=release but {{ philotic_current_link }} does not exist and no
+      philotic_release_tag was given. Install one first: just vps-deploy-release <tag>
+  tags: always
+
+- name: Resolve runtime bin dir
+  set_fact:
+    philotic_runtime_bin_dir: >-
+      {{ (philotic_current_link ~ '/bin') if philotic_bin_layout_effective == 'release' else philotic_bin_dir }}
+  tags: always
+
+- name: Report binary layout
+  debug:
+    msg: "binary layout: {{ philotic_bin_layout_effective }} (runtime bin dir {{ philotic_runtime_bin_dir }})"
+  tags: always
+
 # ── Central graph database (optional Memgraph provider) ───────────────────────
 
 - name: Create Memgraph data directory
@@ -105,6 +145,8 @@
 # This role only places them. Build is not the role's responsibility.
 # philotic_artifacts_remote: false → copy from control machine (normal path)
 # philotic_artifacts_remote: true  → copy from already-present path on the host (first-smoke path)
+# These three tasks are the LEGACY layout (copy into philotic_bin_dir). In the
+# release layout binaries come from a release tarball instead (release.yml).
 
 - name: Copy Philotic binaries (from control machine)
   copy:
@@ -114,7 +156,9 @@
     group: "{{ philotic_group }}"
     mode: "0755"
   loop: "{{ philotic_binaries }}"
-  when: not (philotic_artifacts_remote | bool)
+  when:
+    - philotic_bin_layout_effective == 'legacy'
+    - not (philotic_artifacts_remote | bool)
   notify: Restart philotic-hotel
   tags: [binary]
 
@@ -123,7 +167,9 @@
     path: "{{ philotic_artifacts_dir }}/{{ item }}"
   loop: "{{ philotic_binaries }}"
   register: philotic_remote_artifact_stats
-  when: philotic_artifacts_remote | bool
+  when:
+    - philotic_bin_layout_effective == 'legacy'
+    - philotic_artifacts_remote | bool
   tags: [binary]
 
 - name: Warn about missing remote Philotic binaries
@@ -133,6 +179,7 @@
       is not present on the target host.
   loop: "{{ philotic_remote_artifact_stats.results }}"
   when:
+    - philotic_bin_layout_effective == 'legacy'
     - philotic_artifacts_remote | bool
     - not item.stat.exists
   tags: [binary]
@@ -148,13 +195,26 @@
   loop: >-
     {{
       philotic_remote_artifact_stats.results
+      | selectattr('stat', 'defined')
       | selectattr('stat.exists')
       | map(attribute='item')
       | list
     }}
-  when: philotic_artifacts_remote | bool
+  when:
+    - philotic_bin_layout_effective == 'legacy'
+    - philotic_artifacts_remote | bool
   notify: Restart philotic-hotel
   tags: [binary]
+
+# Release layout: unpack a verified release tarball, flip `current`, prune.
+- name: Install release (release layout)
+  import_tasks: release.yml
+  tags: [binary]
+
+# `--tags rollback` only (never runs in a normal deploy).
+- name: Roll back to a previous release
+  import_tasks: rollback.yml
+  tags: [never, rollback]
 
 # ── Config ─────────────────────────────────────────────────────────────────────
 
@@ -206,8 +266,11 @@
   when: tailscale_check.rc != 0
 
 # ── Firewall ───────────────────────────────────────────────────────────────────
+# Legacy ufw allow rules stay for hosts that run ufw; they are allow-only and
+# never default-deny. The enforcing filter is the nftables table below
+# (philotic_firewall_enabled), which drops untrusted traffic to hotel ports.
 
-- name: Allow inter-hotel beacon port (UDP)
+- name: Allow inter-hotel beacon port (UDP) via ufw
   ufw:
     rule: allow
     port: "{{ philotic_beacon_port }}"
@@ -215,9 +278,8 @@
   when:
     - ansible_facts["os_family"] == 'Debian'
     - ufw_check.rc == 0
-  ignore_errors: yes
 
-- name: Allow blob HTTP port (TCP, Tailscale-only — restrict if needed)
+- name: Allow blob HTTP port (TCP, tailnet only) via ufw
   ufw:
     rule: allow
     port: "{{ philotic_blob_port }}"
@@ -226,7 +288,69 @@
   when:
     - ansible_facts["os_family"] == 'Debian'
     - ufw_check.rc == 0
-  ignore_errors: yes
+
+- name: Compute hotel ports to filter
+  set_fact:
+    philotic_firewall_tcp_ports: >-
+      {{ ([philotic_hotel_port | int, philotic_hotel_port | int + 1, philotic_hotel_port | int + 2,
+           philotic_blob_port | int, philotic_onnx_sidecar_port | int]
+          + (philotic_firewall_extra_ports | map('int') | list)) | unique | list }}
+    philotic_firewall_udp_ports: >-
+      {{ ([philotic_beacon_port | int, philotic_hotel_port | int]
+          + (philotic_firewall_extra_ports | map('int') | list)) | unique | list }}
+  when: philotic_firewall_enabled | bool
+
+- name: Install nftables
+  apt:
+    name: nftables
+    state: present
+  when:
+    - philotic_firewall_enabled | bool
+    - ansible_facts["os_family"] == 'Debian'
+
+- name: Require nft for the hotel port filter
+  command: nft --version
+  register: nft_check
+  changed_when: false
+  failed_when: nft_check.rc != 0
+  when: philotic_firewall_enabled | bool
+
+- name: Deploy hotel port filter rules
+  template:
+    src: philotic-firewall.nft.j2
+    dest: "{{ philotic_etc_dir }}/philotic-firewall.nft"
+    owner: root
+    group: root
+    mode: "0644"
+    validate: "nft -c -f %s"
+  when: philotic_firewall_enabled | bool
+  notify: Reload philotic firewall
+
+- name: Install hotel port filter unit
+  template:
+    src: philotic-firewall.service.j2
+    dest: /etc/systemd/system/philotic-firewall.service
+    owner: root
+    group: root
+    mode: "0644"
+  when: philotic_firewall_enabled | bool
+  notify: Reload philotic firewall
+
+- name: Enable hotel port filter
+  systemd:
+    name: philotic-firewall
+    enabled: yes
+    state: started
+    daemon_reload: yes
+  when: philotic_firewall_enabled | bool
+
+- name: Remove hotel port filter when disabled
+  systemd:
+    name: philotic-firewall
+    enabled: no
+    state: stopped
+  when: not (philotic_firewall_enabled | bool)
+  failed_when: false
 
 # ── Secrets ────────────────────────────────────────────────────────────────────
 
@@ -250,9 +374,9 @@
       - --
       - sh
       - -lc
-      - "set -a && . {{ (philotic_etc_dir ~ '/secrets.env') | quote }} && set +a && cd {{ philotic_data_dir | quote }} && {{ philotic_bin_dir | quote }}/aiua load --file {{ philotic_etc_dir | quote }}/mesh-config.json --hotel {{ philotic_hotel_runtime_name | quote }}"
+      - "set -a && . {{ (philotic_etc_dir ~ '/secrets.env') | quote }} && set +a && cd {{ philotic_data_dir | quote }} && {{ philotic_runtime_bin_dir | quote }}/aiua load --file {{ philotic_etc_dir | quote }}/mesh-config.json --hotel {{ philotic_hotel_runtime_name | quote }}"
   environment:
-    PHILOTIC_BIN_DIR: "{{ philotic_bin_dir }}"
+    PHILOTIC_BIN_DIR: "{{ philotic_runtime_bin_dir }}"
     PHILOTIC_HOTEL_SOCKET: "{{ philotic_hotel_socket }}"
     PHILOTIC_GRAPH_DATABASE_DIR: "{{ philotic_data_dir }}/graphs"
     PHILOTIC_TABLE_DB: "{{ philotic_data_dir }}/tables"
@@ -352,16 +476,16 @@
   when: not philotic_onnx_sidecar_enabled
   ignore_errors: yes
 
-- name: Allow ONNX sidecar port through firewall
+- name: Allow ONNX sidecar port through ufw (tailnet only)
   ufw:
     rule: allow
     port: "{{ philotic_onnx_sidecar_port }}"
     proto: tcp
+    src: "100.64.0.0/10"
   when:
     - ansible_facts["os_family"] == "Debian"
     - philotic_onnx_sidecar_enabled
     - ufw_check.rc == 0
-  ignore_errors: yes
 
 # ── Muninn maintenance timer ────────────────────────────────────────────────
 # Muninn prunes its own backup dir and (since the replication-log retention

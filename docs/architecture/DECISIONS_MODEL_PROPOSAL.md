@@ -2,9 +2,9 @@
 title: Decisions Model — a typed, calibrated System One judge beside model-router
 doc_type: proposal
 domain: tooling-execution
-status: proposed
-disposition: proposed
-last_updated: 2026-09-19
+status: accepted-current-slice
+disposition: accepted-current-slice
+last_updated: 2026-10-07
 verification_level: none
 tags:
 - decisions
@@ -42,7 +42,19 @@ source_of_truth_targets:
 
 Add a fourth kind of model capability next to generate, transform and embed: a **decision**. The caller sends a piece of state and a set of typed questions (yes/no, choose one of N, score on an ordered scale). The provider returns typed answers with calibrated probabilities and no free text. The first concrete provider is TypeSafe AI's **Jev**, reachable natively or through OpenRouter. The capability is defined provider-neutrally so a local classifier can fill the same envelope later.
 
-This is a research-backed proposal. **Slice D0 (the pure envelope types and wire adapters) is implemented in `ansible-mesh-core/src/decisions.rs`; nothing is wired into a runtime yet. OpenRouter access was verified with one probe on 2026-09-19 (see Verified access).**
+This is a research-backed proposal. **D0–D2 are merged to develop (PR #574, 2026-09-23), and D2 (the log-only shadow judge in `heal-dispatcher`) is live on vps-jane since 2026-09-23. D1's hotel wiring, D3 and D4 are not done. OpenRouter access was verified with one probe on 2026-09-19 (see Verified access).**
+
+## Disposition
+
+`accepted-current-slice` (reconciled 2026-10-07, watch-live burn-down W2).
+
+| Slice | Level |
+|---|---|
+| D0 `decisions-envelope` | test-green (merged #574) |
+| D1 model-router decisions task | test-green (merged #574); hotel guest not seeded |
+| D2 `decisions-shadow-heal` | watched-live-green on vps-jane (shadow, log-only, since 2026-09-23) |
+| D3 | not started |
+| D4 | not started; needs the D2 agreement report (`WATCH_LIVE_BURNDOWN_PROPOSAL.md` W6) |
 
 ## Why this matters
 

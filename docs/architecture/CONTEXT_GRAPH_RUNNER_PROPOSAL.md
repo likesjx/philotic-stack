@@ -2,9 +2,9 @@
 title: Context Graph Tool Runner
 doc_type: proposal
 domain: tooling-execution
-status: proposed
+status: accepted-current-slice
 disposition: accepted-current-slice
-last_updated: 2026-03-31
+last_updated: 2026-10-07
 tags:
 - graph
 - tool-runner

@@ -17,8 +17,8 @@ RuntimeDirectoryMode=0755
 
 # Runtime environment
 Environment="RUST_LOG={{ philotic_rust_log }}"
-Environment="PATH={{ philotic_bin_dir }}:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
-Environment="PHILOTIC_BIN_DIR={{ philotic_bin_dir }}"
+Environment="PATH={{ philotic_runtime_bin_dir }}:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+Environment="PHILOTIC_BIN_DIR={{ philotic_runtime_bin_dir }}"
 Environment="PHILOTIC_HOTEL_SOCKET={{ philotic_hotel_socket }}"
 Environment="PHILOTIC_HOTEL_PORT={{ philotic_hotel_port }}"
 Environment="PHILOTIC_ENABLE_RUST_AUTH={{ philotic_enable_rust_auth }}"
@@ -49,6 +49,10 @@ Environment="PHILOTIC_DREAM_SWEEP_ENABLED=1"
 Environment="PHILOTIC_MEMORY_SLEEP_MUTATE=1"
 {% endif %}
 {% endif %}
+{% if philotic_memory_hygiene_enabled | default(false) | bool %}
+# Memory hygiene (M4): nightly 03:00 UTC annotation-only Muninn sweep.
+Environment="PHILOTIC_MEMORY_HYGIENE_ENABLED=1"
+{% endif %}
 {% if philotic_shadow_decisions_enabled | default(false) | bool %}
 # Decisions model shadow pilot (heal-dispatcher only, log-only). See
 # crates/heal-dispatcher/src/shadow.rs.
@@ -64,10 +68,10 @@ Environment="PHILOTIC_HEAL_DECISIONS_FALLBACK=1"
 Environment="PHILOTIC_DECISION_TRACE_DB={{ philotic_data_dir }}/decision_traces.db"
 {% endif %}
 
-# Mesh PSK — injected from Ansible vault; never stored in plaintext on disk
+# Hotel secrets (vault master key, provider keys) — rendered from Ansible vault
 EnvironmentFile={{ philotic_etc_dir }}/secrets.env
 
-ExecStart={{ philotic_bin_dir }}/aiua --hotel {{ philotic_hotel_runtime_name }}
+ExecStart={{ philotic_runtime_bin_dir }}/aiua --hotel {{ philotic_hotel_runtime_name }}
 
 Restart=on-failure
 RestartSec=10

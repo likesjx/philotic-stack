@@ -13,10 +13,10 @@ Usage:
 
 import json
 import os
-import socket
-import struct
 import sys
 import hashlib
+
+from philotic_ipc import Ipc, IpcError, secret_ref_of
 
 SOCKET_PATH = os.environ.get("PHILOTIC_HOTEL_SOCKET", "/run/philotic/vps-jane.sock")
 BEARER_TOKEN = os.environ.get("BEARER_TOKEN", "")
@@ -36,51 +36,19 @@ except ImportError:
     sys.exit(1)
 
 
-def send_frame(sock, payload: dict) -> None:
-    data = json.dumps(payload).encode()
-    sock.sendall(struct.pack(">I", len(data)) + data)
-
-
-def recv_frame(sock) -> dict:
-    raw_len = b""
-    while len(raw_len) < 4:
-        chunk = sock.recv(4 - len(raw_len))
-        if not chunk:
-            raise RuntimeError("socket closed")
-        raw_len += chunk
-    length = struct.unpack(">I", raw_len)[0]
-    data = b""
-    while len(data) < length:
-        chunk = sock.recv(length - len(data))
-        if not chunk:
-            raise RuntimeError("socket closed mid-frame")
-        data += chunk
-    return json.loads(data)
-
-
-def ipc_call(sock, operation: str, payload: dict) -> dict:
-    send_frame(sock, {"operation": operation, "payload": payload})
-    return recv_frame(sock)
-
-
 def main():
     token_hash_hex = blake3_hex(BEARER_TOKEN.encode())
     print(f"Bearer token SHA-256 preview: {hashlib.sha256(BEARER_TOKEN.encode()).hexdigest()[:12]}")
 
-    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    sock.connect(SOCKET_PATH)
-    sock.settimeout(10.0)
-
-    # Register as a guest
-    reg_resp = ipc_call(sock, "register_guest", {
-        "guest_id": "mcp-provisioner",
-        "role": "hotel.internal",
-        "supported_tools": []
-    })
-    print(f"Register: {reg_resp}")
+    ipc = Ipc(SOCKET_PATH)
+    try:
+        ipc.register_operator(AGENT_ID, "mcp-provisioner")
+    except IpcError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        sys.exit(1)
 
     # Store the BLAKE3 hash in the vault
-    add_resp = ipc_call(sock, "add_vault_entry", {
+    add_resp = ipc.call("add_vault_entry", {
         "vault_name": "default",
         "plaintext": token_hash_hex,
         "allowed_roles": ["mcp-membrane"]
@@ -91,7 +59,7 @@ def main():
         print("ERROR: AddVaultEntry failed", file=sys.stderr)
         sys.exit(1)
 
-    secret_ref = add_resp.get("secret_ref") or add_resp.get("data", {}).get("secret_ref")
+    secret_ref = secret_ref_of(add_resp)
     if not secret_ref:
         # Try to parse from nested response
         print(f"Full response: {json.dumps(add_resp, indent=2)}")
@@ -153,14 +121,16 @@ def main():
         "updated_at": now
     }
 
-    update_resp = ipc_call(sock, "update_mcp_routes", {
+    update_resp = ipc.call("update_mcp_routes", {
         "agent_id": AGENT_ID,
         "routes": [route],
         "vault_ref": secret_ref
-    })
+    }, expect_keys=("mcp_routes_agent_id",))
     print(f"UpdateMcpRoutes: {update_resp}")
-
-    sock.close()
+    ipc.close()
+    if update_resp.get("mcp_routes_agent_id") != AGENT_ID:
+        print("ERROR: UpdateMcpRoutes failed", file=sys.stderr)
+        sys.exit(1)
     print("\nProvisioned Perplexity/context.capture MCP bearer route")
     print(f"  token_id:  perplexity")
     print(f"  vault_ref: {secret_ref}")

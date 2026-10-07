@@ -1,0 +1,153 @@
+# The single list of deployable Philotic binaries (proposal:release-train R3).
+#
+# Read it through scripts/release-packages.sh — never copy the list:
+#   scripts/release-packages.sh cargo-flags --platform linux   # -p a -p b ...
+#   scripts/release-packages.sh bins --platform darwin         # one bin per line
+#   scripts/release-packages.sh required-bins --platform linux # bins a build must emit
+#
+# Consumers: .github/workflows/{build-linux,pr-check,release}.yml.
+# ansible/roles/philotic_hotel/defaults/main.yml `philotic_binaries` must stay a
+# subset of `bins` (enforced by scripts/tests/test_release_packages.py).
+#
+# Schema, one [[package]] per cargo package (order is preserved in output):
+#   name     cargo package name (`cargo build -p <name>`)
+#   linux    build/ship on x86_64-unknown-linux-gnu (vps-jane)
+#   darwin   build/ship on aarch64-apple-darwin (mac-jane, mbp-jane)
+#   bins     binaries the package emits that we ship
+#   required subset of bins a release/CI build must produce or fail
+
+[[package]]
+name = "aiua"
+linux = true
+darwin = true
+bins = ["aiua"]
+required = ["aiua"]
+
+[[package]]
+name = "philote"
+linux = true
+darwin = true
+bins = ["philote", "philote-worker"]
+required = ["philote", "philote-worker"]
+
+[[package]]
+name = "membrane-telegram"
+linux = true
+darwin = true
+bins = ["membrane-telegram"]
+required = ["membrane-telegram"]
+
+[[package]]
+name = "membrane-discord"
+linux = true
+darwin = true
+bins = ["membrane-discord"]
+required = ["membrane-discord"]
+
+[[package]]
+name = "membrane-mcp"
+linux = true
+darwin = true
+bins = ["membrane-mcp"]
+required = ["membrane-mcp"]
+
+[[package]]
+name = "membrane-mcp-client"
+linux = true
+darwin = true
+bins = ["membrane-mcp-client"]
+required = ["membrane-mcp-client"]
+
+[[package]]
+name = "egress-http-runner"
+linux = true
+darwin = true
+bins = ["egress-http-runner"]
+required = ["egress-http-runner"]
+
+[[package]]
+name = "model-router"
+linux = true
+darwin = true
+# model-router has no [[bin]] table: cargo autobins builds src/main.rs plus
+# every src/bin/*.rs on both platforms.
+bins = [
+  "model-router",
+  "model-controller-anthropic",
+  "model-controller-decisions",
+  "model-controller-elevenlabs",
+  "model-controller-gemini",
+  "model-controller-mlx",
+  "model-controller-ollama",
+  "model-controller-onnx",
+  "model-controller-openai",
+  "model-controller-openrouter",
+  "model-controller-parakeet",
+  "model-controller-vision",
+]
+required = [
+  "model-router",
+  "model-controller-elevenlabs",
+  "model-controller-gemini",
+  "model-controller-openai",
+  "model-controller-anthropic",
+  "model-controller-onnx",
+  "model-controller-ollama",
+  "model-controller-decisions",
+]
+
+[[package]]
+name = "tool-runner"
+linux = true
+darwin = true
+bins = ["tool-runner"]
+required = ["tool-runner"]
+
+[[package]]
+name = "graph-datasource"
+linux = true
+darwin = true
+bins = ["graph-datasource"]
+required = ["graph-datasource"]
+
+[[package]]
+name = "table-datasource"
+linux = true
+darwin = true
+bins = ["table-datasource"]
+required = []
+
+[[package]]
+name = "router-listener"
+linux = true
+darwin = true
+bins = ["router-listener"]
+required = []
+
+[[package]]
+name = "agent-datasource"
+linux = true
+darwin = true
+bins = ["agent-datasource"]
+required = ["agent-datasource"]
+
+[[package]]
+name = "heal-dispatcher"
+linux = true
+darwin = true
+bins = ["heal-dispatcher"]
+required = ["heal-dispatcher"]
+
+[[package]]
+name = "data-memorygraphrag"
+linux = true
+darwin = true
+bins = ["life-graph-runner"]
+required = ["life-graph-runner"]
+
+[[package]]
+name = "philotic-web"
+linux = true
+darwin = true
+bins = ["philotic-web"]
+required = ["philotic-web"]

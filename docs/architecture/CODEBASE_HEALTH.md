@@ -3,23 +3,37 @@ title: Codebase Health Assessment
 doc_type: reference
 domain: governance
 status: active
-last_updated: 2026-03-31
+last_updated: 2026-10-07
 tags:
 - health
 - metrics
 - automation
 related_docs:
 - ARCHITECTURE_STATUS.md
+- IPC_DISPATCH_SPLIT_PROPOSAL.md
 ---
 
 # Philotic Stack — Codebase Health Assessment
 
-> **Status:** Living Document | **Last Updated:** 2026-03-26
-> Generated from full static analysis of the codebase at commit `681d892`.
+> **Status:** Living Document | **Last Updated:** 2026-10-07
+> Originally generated from full static analysis at commit `681d892` (2026-03-26).
+> The ipc.rs and size numbers below were refreshed 2026-10-07; the rest of the
+> 2026-03-26 baseline is kept for history and is marked as such.
 
 ---
 
 ## Snapshot Metrics
+
+### Refresh (2026-10-07)
+
+| Metric | Value |
+| ------ | ----- |
+| `crates/aiua/src/service/ipc.rs` | 36,564 lines, 173 dispatch arms, 194 tests |
+| Production `unwrap()`/`expect()` in `ipc.rs` | 4 |
+| `aiua` crate | ~86k lines |
+| Test functions, workspace-wide | ~3,063 (Atlas count; a raw `#[test]`/`#[tokio::test]` grep finds ~3,150) |
+
+### Baseline (2026-03-26, commit `681d892`)
 
 | Metric | Value |
 | ------ | ----- |
@@ -58,15 +72,15 @@ UDP is used for control-plane gossip; TCP point-to-point is used for routed exec
 ## Problems and Risk Areas
 
 ### 1. `ipc.rs` is a god file — HIGH risk
-At **4,911 lines**, `service/ipc.rs` is the single most critical file in the stack and the most dangerous to maintain. It's the central IPC dispatch path where every guest interaction lands. Its size makes it:
+At **36,564 lines** (2026-10-07; it was 4,911 at the March baseline), with 173 dispatch arms and 194 tests, `service/ipc.rs` is the single most critical file in the stack and the most dangerous to maintain. It's the central IPC dispatch path where every guest interaction lands. Its size makes it:
 - A guaranteed merge conflict hotspot on parallel workstreams
 - Hard to reason about in review
 - The most impactful place for a latent panic to surface in production
 
-**Recommendation:** Split by concern — registration/heartbeat, event publish, apartment sync, model routing, tool dispatch — each into its own `service/ipc_*.rs` module.
+**Recommendation:** Split by concern. The concrete plan is [IPC_DISPATCH_SPLIT_PROPOSAL.md](IPC_DISPATCH_SPLIT_PROPOSAL.md) (S0–S6: `ipc.rs` → `ipc/` family modules, plus the park-path fixes such as DEF-223).
 
 ### 2. 119 runtime `unwrap()` calls — MEDIUM risk
-`ipc.rs` alone carries 195 `unwrap()`/`expect()` calls (some in test code, many not). A panicking `unwrap()` in an async tokio task silently kills that task. For a daemon that's supposed to be a stable hotel supervisor this is a reliability risk, not just a style issue.
+At the March baseline `ipc.rs` carried 195 `unwrap()`/`expect()` calls (some in test code, many not); by 2026-10-07 production code in `ipc.rs` is down to 4. A panicking `unwrap()` in an async tokio task silently kills that task. For a daemon that's supposed to be a stable hotel supervisor this is a reliability risk, not just a style issue.
 
 **Recommendation:** Audit `ipc.rs` and `main.rs` for `unwrap()` on `Option`/`Result` in async task bodies. Replace with logged errors and graceful degradation.
 
@@ -122,7 +136,7 @@ The biggest risk is **proposal accumulation outpacing implementation velocity**.
 
 ## Priority Recommendations
 
-1. **Split `ipc.rs`** into sub-modules by concern
+1. **Split `ipc.rs`** into sub-modules by concern — see [IPC_DISPATCH_SPLIT_PROPOSAL.md](IPC_DISPATCH_SPLIT_PROPOSAL.md)
 2. **Audit and fix `unwrap()` density** in async task bodies in `ansible/`
 3. **Activate or deprecate `tool-runner`** — resolve its status
 4. **Add one integration test per core crate** (`aiua`, `philote`, `membrane`)
