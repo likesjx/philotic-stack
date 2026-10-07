@@ -3198,180 +3198,7 @@ impl IpcServer {
     /// window, not a mint storm.
     const MUNINN_HEAL_MIN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(600);
 
-    /// Hotel-side handler for `IpcRequest::HealMemoryToken`: a guest hit a
-    /// token-401 (MuninnDB reachable but rejecting the stored bearer). The
-    /// hotel — which owns the vault master key, the Context Graph, and the
-    /// MuninnDB admin credential — re-mints the token and rotates the stored
-    /// secret in place, then returns the refreshed memory config so the guest
-    /// can retry once. Guardrails: per-vault mint budget (inside the window
-    /// no second mint happens, but the live config — which already carries
-    /// any just-rotated token — is served so other guests of a shared vault
-    /// are not stranded); vault must already be registered; no admin
-    /// credential → throttled operator escalation via the heal queue instead
-    /// of a mint. Raw tokens never appear in logs or heal entries.
-    async fn handle_heal_memory_token(
-        graph: &GraphDomain,
-        heal_queue: Option<&dyn ansible_mesh_core::heal_queue::HealQueueStorage>,
-        attempts: &Mutex<HashMap<String, std::time::Instant>>,
-        vault: &str,
-    ) -> IpcResponse {
-        {
-            let mut map = attempts.lock().await;
-            if let Some(last) = map.get(vault) {
-                if last.elapsed() < Self::MUNINN_HEAL_MIN_INTERVAL {
-                    // No second mint inside the window — but the FIRST heal
-                    // (the one that consumed the budget) rotated the secret in
-                    // the Context Graph, so serving the LIVE config still
-                    // heals this caller. Vaults are shared across guests
-                    // (`user_*`, fleet vaults): after a key-store wipe every
-                    // guest of the vault 401s and requests a heal near-
-                    // simultaneously; only the first may mint, the rest must
-                    // not be stranded with a bare error until the window
-                    // expires.
-                    info!(
-                        vault = %vault,
-                        "HealMemoryToken: mint budget consumed {:?} ago — serving live config without minting",
-                        last.elapsed()
-                    );
-                    let config_json = crate::memory::load_muninn_config(graph)
-                        .ok()
-                        .flatten()
-                        .and_then(|cfg| serde_json::to_string(&cfg).ok());
-                    if config_json.is_some() {
-                        return IpcResponse::MemoryConfig(MemoryConfigPayload { config_json });
-                    }
-                    return IpcResponse::error(
-                        "memory",
-                        "HEAL_BUDGET_EXHAUSTED",
-                        format!(
-                            "token heal for vault [{vault}] attempted {:?} ago — next attempt allowed after {:?}",
-                            last.elapsed(),
-                            Self::MUNINN_HEAL_MIN_INTERVAL
-                        ),
-                    );
-                }
-            }
-            map.insert(vault.to_string(), std::time::Instant::now());
-        }
-
-        let endpoint = graph
-            .get_muninn_endpoint()
-            .ok()
-            .flatten()
-            .unwrap_or_else(|| "http://127.0.0.1:8475".to_string());
-
-        let cred = match crate::muninn_provision::resolve_admin_credential(graph) {
-            Ok(Some(cred)) => cred,
-            Ok(None) => {
-                warn!(
-                    vault = %vault,
-                    "HealMemoryToken: MuninnDB rejects the stored token but no admin credential is available — manual resync required"
-                );
-                if let Some(hq) = heal_queue {
-                    let _ = hq.push_error(
-                        "hotel",
-                        &format!(
-                            "muninn token rejected for vault [{vault}] but no admin credential available to re-mint — manual token resync required (see MEMORY_TOKEN_SELF_HEAL_PROPOSAL)"
-                        ),
-                    );
-                }
-                return IpcResponse::error(
-                    "memory",
-                    "NO_ADMIN_CREDENTIAL",
-                    format!("cannot heal token for vault [{vault}]: no MuninnDB admin credential"),
-                );
-            }
-            Err(err) => {
-                return IpcResponse::error(
-                    "memory",
-                    "HEAL_FAILED",
-                    format!("admin credential resolution failed: {err}"),
-                );
-            }
-        };
-
-        match crate::muninn_provision::remint_vault_token(
-            graph,
-            &endpoint,
-            &cred.username,
-            &cred.password,
-            vault,
-        )
-        .await
-        {
-            Ok(()) => {
-                info!(vault = %vault, "HealMemoryToken: token re-minted and rotated — returning refreshed config");
-                let config_json = crate::memory::load_muninn_config(graph)
-                    .ok()
-                    .flatten()
-                    .and_then(|cfg| serde_json::to_string(&cfg).ok());
-                IpcResponse::MemoryConfig(MemoryConfigPayload { config_json })
-            }
-            Err(err) => {
-                warn!(vault = %vault, error = %err, "HealMemoryToken: re-mint failed");
-                if let Some(hq) = heal_queue {
-                    let _ = hq.push_error(
-                        "hotel",
-                        &format!("muninn token heal failed for vault [{vault}]: {err}"),
-                    );
-                }
-                IpcResponse::error(
-                    "memory",
-                    "HEAL_FAILED",
-                    format!("token heal for vault [{vault}] failed: {err}"),
-                )
-            }
-        }
-    }
-
     // ── MuninnDB reachability probe ───────────────────────────────────────────
-
-    /// Returns `true` if the MuninnDB REST endpoint answers any HTTP request.
-    /// A connection error (refused, timeout) returns `false`; any HTTP response returns `true`.
-    async fn probe_muninn_endpoint(http: &reqwest::Client, endpoint: &str) -> bool {
-        match http.get(endpoint).send().await {
-            Ok(_) => true,
-            Err(e) if e.is_connect() || e.is_timeout() => false,
-            Err(_) => true, // redirect, TLS, etc. — server exists
-        }
-    }
-
-    /// Periodic MuninnDB probe loop. Spawned at hotel boot when MuninnDB is configured.
-    /// Checks every 60 seconds; on state flip broadcasts `MuninnStatus` to all guests and
-    /// pushes a heal-queue entry when the endpoint goes down.
-    async fn run_muninn_probe_loop(
-        config: Arc<memory_core::MuninnConfig>,
-        reachable: Arc<std::sync::atomic::AtomicBool>,
-        broadcast_tx: tokio::sync::broadcast::Sender<IpcResponse>,
-        heal_queue: Option<Arc<dyn ansible_mesh_core::heal_queue::HealQueueStorage>>,
-    ) {
-        let endpoint = config.base_url.clone();
-        let http = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(5))
-            .build()
-            .unwrap_or_default();
-        let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(60));
-        loop {
-            interval.tick().await;
-            let available = Self::probe_muninn_endpoint(&http, &endpoint).await;
-            let was = reachable.swap(available, std::sync::atomic::Ordering::Relaxed);
-            if available != was {
-                info!(available, endpoint = %endpoint, "MuninnDB reachability changed");
-                let _ = broadcast_tx.send(IpcResponse::MuninnStatus {
-                    available,
-                    endpoint: endpoint.clone(),
-                });
-                if !available {
-                    if let Some(hq) = heal_queue.as_deref() {
-                        let msg = format!("MuninnDB unreachable: connection refused at {endpoint}");
-                        if let Err(e) = hq.push_error("hotel", &msg) {
-                            warn!(error = %e, "Failed to push MuninnDB outage to heal queue");
-                        }
-                    }
-                }
-            }
-        }
-    }
 
     // ── end MuninnDB reachability probe ───────────────────────────────────────
 
@@ -7198,48 +7025,30 @@ impl IpcServer {
                 session_id,
                 chat_id,
                 transport,
-            } => handle_apply_surface_messages(
-                current_identity.as_ref(),
-                graph,
-                &local_node_id,
+            } => Self::handle_apply_surface_messages(
                 surface_id,
                 messages,
-                SurfaceAttribution {
-                    title,
-                    session_id,
-                    chat_id,
-                    transport,
-                },
+                title,
+                session_id,
+                chat_id,
+                transport,
+                local_node_id,
+                graph,
+                current_identity,
             ),
-            IpcRequest::GetSurface { surface_id } => match graph.get_surface(&surface_id) {
-                Ok(Some(s)) => IpcResponse::success(
-                    "get_surface",
-                    Some(serde_json::to_value(&s).unwrap_or(serde_json::Value::Null)),
-                ),
-                Ok(None) => IpcResponse::error(
-                    "get_surface",
-                    "SURFACE_NOT_FOUND",
-                    format!("no surface {surface_id}"),
-                ),
-                Err(e) => IpcResponse::error("get_surface", "SURFACE_ERROR", e.to_string()),
-            },
+            IpcRequest::GetSurface { surface_id } => Self::handle_get_surface(surface_id, graph),
             IpcRequest::ListSurfaces {
                 owner_agent_id,
                 session_id,
                 include_deleted,
                 limit,
-            } => match graph.list_surfaces(
-                owner_agent_id.as_deref(),
-                session_id.as_deref(),
+            } => Self::handle_list_surfaces(
+                owner_agent_id,
+                session_id,
                 include_deleted,
-                limit.unwrap_or(50).min(500),
-            ) {
-                Ok(list) => IpcResponse::success(
-                    "list_surfaces",
-                    Some(serde_json::json!({ "surfaces": list })),
-                ),
-                Err(e) => IpcResponse::error("list_surfaces", "SURFACE_ERROR", e.to_string()),
-            },
+                limit,
+                graph,
+            ),
             IpcRequest::ListProcedures {} => match graph.list_procedures() {
                 Ok(list) => IpcResponse::success(
                     "list_procedures",
@@ -8256,203 +8065,49 @@ impl IpcServer {
                 IpcResponse::success("seed_remote_incarnation", None)
             }
             // ── Cron scheduler ──────────────────────────────────────────────
-            IpcRequest::RegisterCronJob { mut job } => {
-                Self::normalize_cron_target_role(graph, &mut job);
-                if job.target_role.starts_with("role:")
-                    && !crate::service::cron_ticker::cron_payload_reaches_an_agent(&job.payload)
-                {
-                    return IpcResponse::error(
-                        "register_cron_job",
-                        "CRON_PAYLOAD_UNDELIVERABLE",
-                        format!(
-                            "cron job NOT registered: a job for {} must carry its instruction in a \
-                             `message` string, e.g. {{\"message\": \"Run the LifeGraph gardening review \
-                             now: …\"}}. A payload with no `message`/`content` (got: {}) is dropped \
-                             by the agent every time it fires.",
-                            job.target_role,
-                            job.payload.chars().take(160).collect::<String>()
-                        ),
-                    );
-                }
-                // Register is an upsert by id: overwriting a job the caller
-                // does not own is a mutation of someone else's crontab.
-                let existing = graph.get_cron_job(&job.id).ok().flatten();
-                if let Some(existing) = existing.as_ref() {
-                    if !cron_job_visible_to(existing, current_identity.as_ref()) {
-                        return cron_forbidden(
-                            "register_cron_job",
-                            &job.id,
-                            current_identity.as_ref(),
-                        );
-                    }
-                }
-                // Turn policy is operator-owned. A guest may not set one, and
-                // a guest re-registering (editing) a job drops the operator's
-                // policy — the operator approved THAT instruction, not
-                // whatever the guest rewrote it to.
-                if !cron_policy_authority(current_identity.as_ref()) {
-                    if job.policy.is_some() {
-                        return IpcResponse::error(
-                            "register_cron_job",
-                            "CRON_POLICY_OPERATOR_ONLY",
-                            "cron job NOT registered: a cron job's tool/approval policy can only \
-                             be set by the operator. Register the job without `policy` and ask \
-                             the operator to set one."
-                                .to_string(),
-                        );
-                    }
-                    if existing.as_ref().is_some_and(|e| e.policy.is_some()) {
-                        warn!(
-                            job_id = %job.id,
-                            "RegisterCronJob: guest edit cleared the job's operator-set policy"
-                        );
-                    }
-                }
-                job.policy = job
-                    .policy
-                    .take()
-                    .map(ansible_mesh_core::cron::CronTurnPolicy::normalized);
-                // Ownership is stamped from the connection identity, never
-                // trusted from the wire: a guest's jobs belong to its agent.
-                if let Some(identity) = current_identity.as_ref() {
-                    if !cron_admin_identity(identity) {
-                        job.created_by = ansible_mesh_core::cron::CronJobSource::Guest(
-                            cron_owner_agent_of_guest(&identity.guest_id).to_string(),
-                        );
-                    }
-                }
-                // New job registrations always get an isolated `cron:<job_id>`
-                // session — `session_target` only defaults to `Main` via serde
-                // when deserializing legacy rows straight from storage
-                // (`default_session_target_legacy`). Registration is the only
-                // path that mints brand-new jobs, so it is safe to force
-                // `Isolated` here unconditionally; existing rows loaded from
-                // the graph never pass through this handler again.
-                job.session_target = ansible_mesh_core::cron::CronSessionTarget::Isolated;
-                info!("RegisterCronJob: id={} role={}", job.id, job.target_role);
-                match graph.upsert_cron_job(&job) {
-                    Ok(_) => {
-                        Self::broadcast_cron_sync_upsert(dispatcher_tx, local_node_id, &job).await;
-                        IpcResponse::success(
-                            "register_cron_job",
-                            Some(serde_json::json!({ "job_id": job.id })),
-                        )
-                    }
-                    Err(e) => IpcResponse::Error(format!("RegisterCronJob failed: {e}")),
-                }
+            IpcRequest::RegisterCronJob { job } => {
+                Self::handle_register_cron_job(
+                    job,
+                    local_node_id,
+                    dispatcher_tx,
+                    graph,
+                    current_identity,
+                )
+                .await
             }
             IpcRequest::RemoveCronJob { job_id } => {
-                info!("RemoveCronJob: id={}", job_id);
-                if let Err(refusal) = cron_job_mutation_allowed(
+                Self::handle_remove_cron_job(
+                    job_id,
+                    local_node_id,
+                    dispatcher_tx,
                     graph,
-                    &job_id,
-                    current_identity.as_ref(),
-                    "remove_cron_job",
-                ) {
-                    return refusal;
-                }
-                match graph.remove_cron_job(&job_id) {
-                    Ok(_) => {
-                        Self::broadcast_cron_sync_remove(dispatcher_tx, local_node_id, &job_id)
-                            .await;
-                        IpcResponse::success("remove_cron_job", None)
-                    }
-                    Err(e) => IpcResponse::Error(format!("RemoveCronJob failed: {e}")),
-                }
+                    current_identity,
+                )
+                .await
             }
-            IpcRequest::ListCronJobs => match graph.list_cron_jobs() {
-                // Every role may list, but a guest sees only its own agent's
-                // crontab; orchestrator/management/operator surfaces see all.
-                Ok(jobs) => IpcResponse::CronJobList {
-                    jobs: jobs
-                        .into_iter()
-                        .filter(|job| cron_job_visible_to(job, current_identity.as_ref()))
-                        .collect(),
-                },
-                Err(e) => IpcResponse::Error(format!("ListCronJobs failed: {e}")),
-            },
-            IpcRequest::EnableCronJob { job_id } => match graph.get_cron_job(&job_id) {
-                Ok(Some(mut job)) => {
-                    if !cron_job_visible_to(&job, current_identity.as_ref()) {
-                        return cron_forbidden(
-                            "enable_cron_job",
-                            &job_id,
-                            current_identity.as_ref(),
-                        );
-                    }
-                    job.enabled = true;
-                    match graph.upsert_cron_job(&job) {
-                        Ok(_) => {
-                            Self::broadcast_cron_sync_upsert(dispatcher_tx, local_node_id, &job)
-                                .await;
-                            IpcResponse::success("enable_cron_job", None)
-                        }
-                        Err(e) => IpcResponse::Error(format!("EnableCronJob failed: {e}")),
-                    }
-                }
-                Ok(None) => IpcResponse::Error(format!("cron job not found: {job_id}")),
-                Err(e) => IpcResponse::Error(format!("EnableCronJob failed: {e}")),
-            },
-            IpcRequest::DisableCronJob { job_id } => match graph.get_cron_job(&job_id) {
-                Ok(Some(mut job)) => {
-                    if !cron_job_visible_to(&job, current_identity.as_ref()) {
-                        return cron_forbidden(
-                            "disable_cron_job",
-                            &job_id,
-                            current_identity.as_ref(),
-                        );
-                    }
-                    job.enabled = false;
-                    match graph.upsert_cron_job(&job) {
-                        Ok(_) => {
-                            Self::broadcast_cron_sync_upsert(dispatcher_tx, local_node_id, &job)
-                                .await;
-                            IpcResponse::success("disable_cron_job", None)
-                        }
-                        Err(e) => IpcResponse::Error(format!("DisableCronJob failed: {e}")),
-                    }
-                }
-                Ok(None) => IpcResponse::Error(format!("cron job not found: {job_id}")),
-                Err(e) => IpcResponse::Error(format!("DisableCronJob failed: {e}")),
-            },
+            IpcRequest::ListCronJobs => Self::handle_list_cron_jobs(graph, current_identity),
+            IpcRequest::EnableCronJob { job_id } => {
+                Self::handle_enable_cron_job(
+                    job_id,
+                    local_node_id,
+                    dispatcher_tx,
+                    graph,
+                    current_identity,
+                )
+                .await
+            }
+            IpcRequest::DisableCronJob { job_id } => {
+                Self::handle_disable_cron_job(
+                    job_id,
+                    local_node_id,
+                    dispatcher_tx,
+                    graph,
+                    current_identity,
+                )
+                .await
+            }
             IpcRequest::SetCronPolicy { job_id, policy } => {
-                if !cron_policy_authority(current_identity.as_ref()) {
-                    warn!(
-                        job_id = %job_id,
-                        guest_id = current_identity.as_ref().map(|i| i.guest_id.as_str()).unwrap_or("-"),
-                        "SetCronPolicy refused: not an operator identity"
-                    );
-                    return IpcResponse::error(
-                        "set_cron_policy",
-                        "CRON_POLICY_OPERATOR_ONLY",
-                        format!(
-                            "cron job {job_id}: only the operator can set a cron job's tool/approval policy"
-                        ),
-                    );
-                }
-                match graph.get_cron_job(&job_id) {
-                    Ok(Some(mut job)) => {
-                        job.policy =
-                            policy.map(ansible_mesh_core::cron::CronTurnPolicy::normalized);
-                        info!(
-                            job_id = %job_id,
-                            has_policy = job.policy.is_some(),
-                            "SetCronPolicy"
-                        );
-                        match graph.upsert_cron_job(&job) {
-                            Ok(_) => IpcResponse::success(
-                                "set_cron_policy",
-                                Some(serde_json::json!({
-                                    "job_id": job.id,
-                                    "policy": job.policy,
-                                })),
-                            ),
-                            Err(e) => IpcResponse::Error(format!("SetCronPolicy failed: {e}")),
-                        }
-                    }
-                    Ok(None) => IpcResponse::Error(format!("cron job not found: {job_id}")),
-                    Err(e) => IpcResponse::Error(format!("SetCronPolicy failed: {e}")),
-                }
+                Self::handle_set_cron_policy(job_id, policy, graph, current_identity)
             }
             // GracefulShutdown is hotel→guest only; a guest sending it is a no-op.
             IpcRequest::GracefulShutdown { .. } => IpcResponse::error(
@@ -8858,115 +8513,14 @@ impl IpcServer {
             }
 
             IpcRequest::GetHotelStatus => {
-                let hotel_name = Self::local_hotel_name(graph, local_node_id)
-                    .unwrap_or_else(|| "unknown".to_string());
-
-                let guests: Vec<serde_json::Value> = graph
-                    .list_guests(&hotel_name, false)
-                    .unwrap_or_default()
-                    .into_iter()
-                    .map(|g| {
-                        serde_json::json!({
-                            "guest_id": g.guest_id,
-                            "role": g.role,
-                            "active": g.is_active,
-                        })
-                    })
-                    .collect();
-
-                let agents: Vec<serde_json::Value> = graph
-                    .list_agent_identities()
-                    .unwrap_or_default()
-                    .into_iter()
-                    .map(|id| {
-                        serde_json::json!({
-                            "agent_id": id.agent_id,
-                            "persona_name": id.persona_name,
-                        })
-                    })
-                    .collect();
-
-                let reg = registry.read().await;
-                let mesh_peers: Vec<serde_json::Value> = reg
-                    .remote_hotel_states()
-                    .map(|state| {
-                        let peer_guests: Vec<serde_json::Value> = state
-                            .guests
-                            .iter()
-                            .map(|g| {
-                                serde_json::json!({
-                                    "guest_id": g.guest_id,
-                                    "role": g.role,
-                                    "active": g.active,
-                                })
-                            })
-                            .collect();
-                        let peer_agents: Vec<serde_json::Value> = state
-                            .agents
-                            .iter()
-                            .map(|a| {
-                                serde_json::json!({
-                                    "agent_id": a.agent_id,
-                                    "persona_name": a.persona_name,
-                                })
-                            })
-                            .collect();
-                        serde_json::json!({
-                            "hotel_name": state.hotel_name,
-                            "node_id": state.node_id,
-                            "guests": peer_guests,
-                            "agents": peer_agents,
-                        })
-                    })
-                    .collect();
-                drop(reg);
-
-                IpcResponse::success(
-                    "hotel_status",
-                    Some(serde_json::json!({
-                        "hotel_name": hotel_name,
-                        "node_id": local_node_id,
-                        "guests": guests,
-                        "agents": agents,
-                        "mesh_peers": mesh_peers,
-                    })),
-                )
+                Self::handle_get_hotel_status(local_node_id, graph, registry).await
             }
 
-            IpcRequest::GetMemoryReport => {
-                // Proposal S6a: honest-sourcing memory-health report. Read-only;
-                // sources recall effectiveness from the session-event ledger and
-                // marks the multi-node/replication fields `unavailable`.
-                let report = crate::memory_report::assemble_live_memory_report(graph);
-                IpcResponse::success("memory_report", serde_json::to_value(&report).ok())
-            }
+            IpcRequest::GetMemoryReport => Self::handle_get_memory_report(graph),
 
             IpcRequest::ReadCortex { vault, id, offset } => {
-                if !current_identity.as_ref().is_some_and(|identity| {
-                    identity.role == "management" && identity.guest_id == "philotic-web-cortex"
-                }) {
-                    return IpcResponse::error(
-                        "cortex",
-                        "FORBIDDEN",
-                        "Cortex reads require the operator management adapter",
-                    );
-                }
-                match tokio::time::timeout(
-                    std::time::Duration::from_secs(35),
-                    crate::cortex_viewer::read(graph, local_node_id, vault, id, offset),
-                )
-                .await
-                {
-                    Ok(Ok(data)) => IpcResponse::success("cortex", Some(data)),
-                    _ => {
-                        tracing::warn!("Cortex read failed or exceeded deadline");
-                        IpcResponse::error(
-                            "cortex",
-                            "UNAVAILABLE",
-                            "Cortex read unavailable; check hotel configuration and connectivity",
-                        )
-                    }
-                }
+                Self::handle_read_cortex(vault, id, offset, local_node_id, graph, current_identity)
+                    .await
             }
 
             IpcRequest::BestPlaceToRun {
@@ -8975,59 +8529,21 @@ impl IpcServer {
                 tool_name,
                 required_markers,
                 prefer_locality,
-            } => match Self::best_place_to_run_view(
-                registry,
-                graph,
-                local_node_id,
-                agent_id.as_deref(),
-                role_name.as_deref(),
-                tool_name.as_deref(),
-                &required_markers,
-                prefer_locality,
-            )
-            .await
-            {
-                Ok(view) => IpcResponse::success("best_place_to_run", Some(view)),
-                Err(err) => {
-                    IpcResponse::error("best_place_to_run", "PLACEMENT_ERROR", err.to_string())
-                }
-            },
-
-            IpcRequest::GetHotelLogs { lines } => {
-                // Compute log path using the same PHILOTIC_PROFILE convention as the DB path.
-                let log_path = std::env::var("PHILOTIC_PROFILE")
-                    .ok()
-                    .filter(|s| !s.is_empty())
-                    .and_then(|profile| {
-                        std::env::var("HOME").ok().map(|home| {
-                            std::path::PathBuf::from(home)
-                                .join(".philotic")
-                                .join(profile)
-                                .join("aiua.log")
-                        })
-                    })
-                    .or_else(|| {
-                        std::env::var("HOME").ok().map(|home| {
-                            std::path::PathBuf::from(home)
-                                .join(".philotic")
-                                .join("aiua.log")
-                        })
-                    });
-
-                match log_path.and_then(|p| std::fs::read_to_string(&p).ok()) {
-                    Some(content) => {
-                        let all_lines: Vec<&str> = content.lines().collect();
-                        let start = all_lines.len().saturating_sub(lines as usize);
-                        let tail = all_lines[start..].join("\n");
-                        IpcResponse::success("hotel_logs", Some(serde_json::json!({ "log": tail })))
-                    }
-                    None => IpcResponse::error(
-                        "hotel_logs",
-                        "LOG_NOT_FOUND",
-                        "Hotel log file not found — check ~/.philotic/aiua.log",
-                    ),
-                }
+            } => {
+                Self::handle_best_place_to_run(
+                    agent_id,
+                    role_name,
+                    tool_name,
+                    required_markers,
+                    prefer_locality,
+                    local_node_id,
+                    graph,
+                    registry,
+                )
+                .await
             }
+
+            IpcRequest::GetHotelLogs { lines } => Self::handle_get_hotel_logs(lines),
 
             IpcRequest::GetRouterStats { window_secs } => {
                 use ansible_mesh_core::router_trace::{
@@ -12328,84 +11844,6 @@ impl IpcServer {
         }
     }
 
-    /// Handle `GetConfig("__memory_delta_digest__")` /
-    /// `GetConfig("__memory_delta_digest__:{hours}")` — the Memory
-    /// Transparency Slice M3 delta digest the `memory.delta_digest` philote
-    /// tool calls. Reconstructs a [`MuninnConfig`](memory_core::MuninnConfig)
-    /// on demand via [`crate::memory::load_muninn_config`] rather than
-    /// threading one through `process_request`'s already-long parameter
-    /// list — the same config `run_scheduled_sweep` uses, built from the same
-    /// graph-backed vault registry. Returns `ConfigData` with `value_json`
-    /// `null` when Muninn is not configured on this hotel (an honest "not
-    /// wired up" rather than an empty-but-successful digest).
-    async fn handle_memory_delta_digest(
-        graph: &GraphDomain,
-        local_node_id: &str,
-        window_hours: u64,
-    ) -> IpcResponse {
-        let key = format!("__memory_delta_digest__:{window_hours}");
-
-        let hotel_name = match Self::local_hotel_name(graph, local_node_id) {
-            Some(name) => name,
-            None => {
-                warn!("memory.delta_digest: local hotel record missing — cannot collect digest");
-                return IpcResponse::ConfigData {
-                    key,
-                    value_json: None,
-                };
-            }
-        };
-
-        let muninn_config = match crate::memory::load_muninn_config(graph) {
-            Ok(Some(config)) => config,
-            Ok(None) => {
-                debug!("memory.delta_digest: Muninn not configured on this hotel — skipping");
-                return IpcResponse::ConfigData {
-                    key,
-                    value_json: None,
-                };
-            }
-            Err(e) => {
-                warn!("memory.delta_digest: failed to load Muninn config: {e:#}");
-                return IpcResponse::ConfigData {
-                    key,
-                    value_json: None,
-                };
-            }
-        };
-
-        let client = match reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(15))
-            .build()
-        {
-            Ok(c) => c,
-            Err(e) => {
-                warn!("memory.delta_digest: failed to build HTTP client — {e}");
-                return IpcResponse::ConfigData {
-                    key,
-                    value_json: None,
-                };
-            }
-        };
-
-        let digest = crate::memory_delta_digest::collect(
-            &client,
-            &muninn_config,
-            graph,
-            &hotel_name,
-            window_hours,
-            chrono::Utc::now(),
-        )
-        .await;
-
-        let value_json = serde_json::to_string(&serde_json::json!({
-            "rendered": digest.render(),
-            "digest": digest,
-        }))
-        .ok();
-        IpcResponse::ConfigData { key, value_json }
-    }
-
     // ── Agent migration ───────────────────────────────────────────────────────
 
     /// Build an `AgentMigrationBundle`, upload it to the local blob store, then
@@ -12831,78 +12269,6 @@ impl IpcServer {
         Ok(bundle.agent_id)
     }
 
-    pub(super) async fn handle_register_component(
-        graph: &GraphDomain,
-        materialization_requester: Option<&dyn GuestMaterializationRequester>,
-        manifest: ComponentManifest,
-    ) -> IpcResponse {
-        let guest_id = manifest.guest_id.clone();
-        let role = manifest.role.clone();
-
-        // Build the spawn config blob expected by LocalProcessMaterializer.
-        let config_json = serde_json::json!({
-            "command": manifest.command,
-            "args": manifest.args,
-            "env": manifest.env,
-        });
-
-        let record = GuestRecord {
-            hotel_name: manifest.hotel.clone(),
-            guest_id: guest_id.clone(),
-            role: role.clone(),
-            config_json: config_json.to_string(),
-            is_active: manifest.auto_start,
-            active_pid: None,
-            last_active_at: None,
-        };
-
-        if let Err(e) = graph.upsert_guest(&record) {
-            error!(
-                "RegisterComponent: failed to upsert guest {}: {}",
-                guest_id, e
-            );
-            return IpcResponse::error("register_component", "UPSERT_FAILED", e.to_string());
-        }
-
-        // Store component-specific config for readback via GetConfig.
-        if !manifest.component_config.is_null() {
-            let config_key = format!("component:{}", guest_id);
-            if let Err(e) =
-                graph.set_config_value(&config_key, &manifest.component_config.to_string())
-            {
-                warn!(
-                    "RegisterComponent: failed to store component config for {}: {}",
-                    guest_id, e
-                );
-            }
-        }
-
-        info!(
-            guest_id = %guest_id,
-            role = %role,
-            hotel = %manifest.hotel,
-            auto_start = manifest.auto_start,
-            "component registered",
-        );
-
-        // Trigger immediate materialization if auto_start.
-        if manifest.auto_start {
-            if let Some(requester) = materialization_requester {
-                if let Err(e) = requester.ensure_guest_active(&guest_id).await {
-                    warn!(
-                        "RegisterComponent: ensure_guest_active failed for {}: {}",
-                        guest_id, e
-                    );
-                }
-            }
-        }
-
-        IpcResponse::ComponentRegistered {
-            registered_guest_id: guest_id,
-            registered_role: role,
-        }
-    }
-
     fn handle_patch_agent_bundle(
         graph: &GraphDomain,
         local_node_id: &str,
@@ -13297,346 +12663,6 @@ impl IpcServer {
             "target_addr": target_addr,
             "nonce": invite.payload.nonce
         }))
-    }
-
-    pub(super) fn component_inventory_entries(
-        graph: &GraphDomain,
-        local_node_id: &str,
-    ) -> anyhow::Result<Vec<ComponentInventoryEntryView>> {
-        let hotel_name = match Self::local_hotel_name(graph, local_node_id) {
-            Some(h) => h,
-            None => {
-                anyhow::bail!("local hotel record not found");
-            }
-        };
-
-        let guests = graph.list_guests(&hotel_name, false)?;
-
-        // Load tool_runner_registry once to enrich tool-runner entries with capabilities.
-        let tool_registry: Vec<serde_json::Value> = graph
-            .get_config_value("tool_runner_registry")
-            .ok()
-            .flatten()
-            .and_then(|s| serde_json::from_str::<Vec<serde_json::Value>>(&s).ok())
-            .unwrap_or_default();
-
-        Ok(guests
-            .into_iter()
-            .map(|g| {
-                let spawn_config = serde_json::from_str::<serde_json::Value>(&g.config_json)
-                    .unwrap_or(serde_json::Value::Null);
-                let command = spawn_config
-                    .get("command")
-                    .and_then(|value| value.as_str())
-                    .unwrap_or_default()
-                    .to_string();
-                let args = spawn_config
-                    .get("args")
-                    .and_then(|value| value.as_array())
-                    .cloned()
-                    .unwrap_or_default();
-                let env = spawn_config
-                    .get("env")
-                    .cloned()
-                    .unwrap_or_else(|| serde_json::json!({}));
-
-                // Keep the compatibility component_type hint, but stop pretending
-                // only model/tool-ish components exist on the authoring surface.
-                let component_type = if g.role == "model"
-                    || g.role.starts_with("model.")
-                    || g.role.starts_with("model-controller")
-                {
-                    "model-controller"
-                } else if g.role == "tool"
-                    || g.role.starts_with("tool.")
-                    || g.role.starts_with("tool-runner")
-                {
-                    "tool-runner"
-                } else if g.role == "membrane" || g.role.starts_with("membrane.") {
-                    "membrane"
-                } else if g.role == "agent" || g.role.starts_with("agent.") {
-                    "agent"
-                } else if g.role.contains("datasource") || g.role.contains("listener") {
-                    "data"
-                } else {
-                    "other"
-                };
-
-                // Read per-component config blob.
-                let component_config = {
-                    let key = format!("component:{}", g.guest_id);
-                    graph
-                        .get_config_value(&key)
-                        .ok()
-                        .flatten()
-                        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
-                        .unwrap_or(serde_json::Value::Null)
-                };
-
-                // Find capabilities from tool_runner_registry if this is a tool runner.
-                let capabilities: Vec<String> = tool_registry
-                    .iter()
-                    .find(|entry| {
-                        entry.get("guest_id").and_then(|v| v.as_str()) == Some(&g.guest_id)
-                    })
-                    .and_then(|entry| {
-                        entry
-                            .get("capabilities")
-                            .and_then(|v| v.as_array())
-                            .map(|arr| {
-                                arr.iter()
-                                    .filter_map(|c| c.as_str().map(String::from))
-                                    .collect()
-                            })
-                    })
-                    .unwrap_or_default();
-
-                ComponentInventoryEntryView {
-                    guest_id: g.guest_id,
-                    role: g.role,
-                    hotel: g.hotel_name,
-                    command,
-                    args: serde_json::from_value(serde_json::Value::Array(args))
-                        .unwrap_or_default(),
-                    env: serde_json::from_value(env).unwrap_or_default(),
-                    component_type: component_type.into(),
-                    is_active: g.is_active,
-                    auto_start: g.is_active,
-                    active_pid: g.active_pid,
-                    last_active_at: g.last_active_at,
-                    component_config,
-                    capabilities,
-                }
-            })
-            .collect())
-    }
-
-    fn handle_list_components(graph: &GraphDomain, local_node_id: &str) -> IpcResponse {
-        match Self::component_inventory_entries(graph, local_node_id) {
-            Ok(components) => IpcResponse::ComponentInventory {
-                components: components
-                    .into_iter()
-                    .map(|component| {
-                        serde_json::to_value(component).unwrap_or(serde_json::Value::Null)
-                    })
-                    .collect(),
-            },
-            Err(err) => IpcResponse::error("list_components", "STORAGE_ERROR", err.to_string()),
-        }
-    }
-
-    pub(super) async fn handle_set_component_active(
-        graph: &GraphDomain,
-        materialization_requester: Option<&dyn GuestMaterializationRequester>,
-        local_node_id: &str,
-        guest_id: &str,
-        active: bool,
-    ) -> IpcResponse {
-        let hotel_name = match Self::local_hotel_name(graph, local_node_id) {
-            Some(h) => h,
-            None => {
-                return IpcResponse::error(
-                    "set_component_active",
-                    "HOTEL_NOT_FOUND",
-                    "local hotel record not found",
-                );
-            }
-        };
-
-        // Verify guest exists.
-        let guest_record = graph
-            .list_guests(&hotel_name, false)
-            .ok()
-            .and_then(|guests| guests.into_iter().find(|g| g.guest_id == guest_id));
-
-        if guest_record.is_none() {
-            return IpcResponse::error(
-                "set_component_active",
-                "GUEST_NOT_FOUND",
-                format!("No component registered with guest_id={guest_id}"),
-            );
-        }
-        let guest = guest_record.unwrap();
-
-        if !active {
-            // Kill the process if running, then mark inactive.
-            if let Some(ref pid_str) = guest.active_pid {
-                if let Ok(pid) = pid_str.parse::<u32>() {
-                    let _ = ProcessCommand::new("kill")
-                        .args(["-15", &pid.to_string()])
-                        .status();
-                }
-            }
-            if let Err(e) = graph.set_guest_pid(&hotel_name, guest_id, None) {
-                warn!("SetComponentActive: failed to clear PID for {guest_id}: {e}");
-            }
-            if let Err(e) = graph.set_guest_active(&hotel_name, guest_id, false) {
-                return IpcResponse::error("set_component_active", "STORAGE_ERROR", e.to_string());
-            }
-            info!(guest_id = %guest_id, "component deactivated");
-        } else {
-            // Mark active then trigger materialization.
-            if let Err(e) = graph.set_guest_active(&hotel_name, guest_id, true) {
-                return IpcResponse::error("set_component_active", "STORAGE_ERROR", e.to_string());
-            }
-            if let Some(req) = materialization_requester {
-                if let Err(e) = req.ensure_guest_active(guest_id).await {
-                    warn!("SetComponentActive: ensure_guest_active failed for {guest_id}: {e}");
-                }
-            }
-            info!(guest_id = %guest_id, "component activated");
-        }
-
-        IpcResponse::success(
-            "set_component_active",
-            Some(serde_json::json!({ "guest_id": guest_id, "active": active })),
-        )
-    }
-
-    pub(super) async fn handle_restart_component(
-        graph: &GraphDomain,
-        materialization_requester: Option<&dyn GuestMaterializationRequester>,
-        local_node_id: &str,
-        guest_id: &str,
-        reason: RestartReason,
-    ) -> IpcResponse {
-        let hotel_name = match Self::local_hotel_name(graph, local_node_id) {
-            Some(h) => h,
-            None => {
-                return IpcResponse::error(
-                    "restart_component",
-                    "HOTEL_NOT_FOUND",
-                    "local hotel record not found",
-                );
-            }
-        };
-
-        let guest_record = graph
-            .list_guests(&hotel_name, false)
-            .ok()
-            .and_then(|guests| guests.into_iter().find(|g| g.guest_id == guest_id));
-
-        let Some(guest) = guest_record else {
-            return IpcResponse::error(
-                "restart_component",
-                "GUEST_NOT_FOUND",
-                format!("No component registered with guest_id={guest_id}"),
-            );
-        };
-
-        if !guest.is_active {
-            return IpcResponse::error(
-                "restart_component",
-                "COMPONENT_INACTIVE",
-                format!("Component {guest_id} is marked inactive; enable it first"),
-            );
-        }
-
-        // Flap protection for AUTOMATIC (heal-dispatcher) restarts only. Operator/CLI
-        // restarts are deliberate and never budget-limited. We consult the shared
-        // respawn budget BEFORE killing so a budget-exhausted guest is left running
-        // rather than terminated-with-no-respawn. A missing requester falls through to
-        // the NO_MATERIALIZER path below.
-        if reason == RestartReason::Heal {
-            if let Some(req) = materialization_requester {
-                if req.check_heal_restart_budget(guest_id).await == HealRestartVerdict::Denied {
-                    warn!(
-                        guest_id = %guest_id,
-                        "heal-restart skipped: guest exhausted its respawn budget"
-                    );
-                    return IpcResponse::error(
-                        "restart_component",
-                        "RESPAWN_BUDGET_EXHAUSTED",
-                        format!(
-                            "heal restart for {guest_id} skipped: respawn budget exhausted; \
-                             restarts paused until a clean window elapses"
-                        ),
-                    );
-                }
-            }
-        }
-
-        if let Some(req) = materialization_requester {
-            match req.restart_guest(guest_id).await {
-                Ok(true) => {}
-                Ok(false) => {
-                    return IpcResponse::error(
-                        "restart_component",
-                        "SPAWN_FAILED",
-                        format!("guest {guest_id} was not re-materialized"),
-                    );
-                }
-                Err(e) => {
-                    return IpcResponse::error("restart_component", "SPAWN_FAILED", e.to_string());
-                }
-            }
-        } else {
-            return IpcResponse::error(
-                "restart_component",
-                "NO_MATERIALIZER",
-                "no materialization requester available",
-            );
-        }
-
-        info!(guest_id = %guest_id, "component restarted");
-        IpcResponse::success(
-            "restart_component",
-            Some(serde_json::json!({ "guest_id": guest_id })),
-        )
-    }
-
-    pub(super) async fn handle_remove_component(
-        graph: &GraphDomain,
-        local_node_id: &str,
-        guest_id: &str,
-    ) -> IpcResponse {
-        let hotel_name = match Self::local_hotel_name(graph, local_node_id) {
-            Some(h) => h,
-            None => {
-                return IpcResponse::error(
-                    "remove_component",
-                    "HOTEL_NOT_FOUND",
-                    "local hotel record not found",
-                );
-            }
-        };
-
-        let guest = match graph.get_guest(&hotel_name, guest_id) {
-            Ok(Some(guest)) => guest,
-            Ok(None) => {
-                return IpcResponse::error(
-                    "remove_component",
-                    "GUEST_NOT_FOUND",
-                    format!("No component registered with guest_id={guest_id}"),
-                );
-            }
-            Err(e) => {
-                return IpcResponse::error("remove_component", "STORAGE_ERROR", e.to_string());
-            }
-        };
-
-        if let Some(ref pid_str) = guest.active_pid {
-            if let Ok(pid) = pid_str.parse::<u32>() {
-                let _ = ProcessCommand::new("kill")
-                    .args(["-15", &pid.to_string()])
-                    .status();
-            }
-        }
-
-        if let Err(e) = graph.remove_guest(&hotel_name, guest_id) {
-            return IpcResponse::error("remove_component", "STORAGE_ERROR", e.to_string());
-        }
-
-        let config_key = format!("component:{guest_id}");
-        if let Err(e) = graph.remove_config_value(&config_key) {
-            warn!("RemoveComponent: failed to remove component config for {guest_id}: {e}");
-        }
-
-        info!(guest_id = %guest_id, "component removed");
-        IpcResponse::success(
-            "remove_component",
-            Some(serde_json::json!({ "guest_id": guest_id })),
-        )
     }
 
     fn upsert_tool_runner_registry_entry(
@@ -15092,474 +14118,11 @@ impl IpcServer {
 
     // ── Training data admin handlers ──────────────────────────────────────────
 
-    fn handle_list_training_samples(
-        storage: Option<&dyn ansible_mesh_core::whisper_training::WhisperTrainingStorage>,
-        agent_id: Option<&str>,
-        limit: usize,
-        filter: &ansible_mesh_core::whisper_training::TrainingFilter,
-    ) -> IpcResponse {
-        let Some(storage) = storage else {
-            return IpcResponse::error(
-                "training_list",
-                "TRAINING_STORAGE_UNAVAILABLE",
-                "Training DB not configured for this hotel",
-            );
-        };
-        let capped = limit.min(200);
-        match storage.list_filtered(filter, agent_id, capped) {
-            Ok(samples) => {
-                let samples_json =
-                    serde_json::to_value(&samples).unwrap_or(serde_json::Value::Null);
-                IpcResponse::success(
-                    "training_list",
-                    Some(serde_json::json!({ "samples": samples_json, "count": samples.len() })),
-                )
-            }
-            Err(e) => IpcResponse::error("training_list", "QUERY_FAILED", &e.to_string()),
-        }
-    }
-
-    fn handle_correct_training_sample(
-        storage: Option<&dyn ansible_mesh_core::whisper_training::WhisperTrainingStorage>,
-        turn_id: &str,
-        corrected_transcript: &str,
-    ) -> IpcResponse {
-        let Some(storage) = storage else {
-            return IpcResponse::error(
-                "training_correct",
-                "TRAINING_STORAGE_UNAVAILABLE",
-                "Training DB not configured for this hotel",
-            );
-        };
-        match storage.update_correction(turn_id, corrected_transcript, "operator") {
-            Ok(true) => IpcResponse::success(
-                "training_correct",
-                Some(serde_json::json!({ "turn_id": turn_id, "updated": true })),
-            ),
-            Ok(false) => IpcResponse::error(
-                "training_correct",
-                "TURN_NOT_FOUND",
-                &format!("No sample found for turn_id '{turn_id}'"),
-            ),
-            Err(e) => IpcResponse::error("training_correct", "UPDATE_FAILED", &e.to_string()),
-        }
-    }
-
-    fn handle_export_training_samples(
-        storage: Option<&dyn ansible_mesh_core::whisper_training::WhisperTrainingStorage>,
-        format: &ansible_mesh_core::whisper_training::TrainingExportFormat,
-        output_path: &str,
-        limit: Option<usize>,
-    ) -> IpcResponse {
-        use ansible_mesh_core::whisper_training::TrainingExportFormat;
-        use std::io::Write;
-
-        let Some(storage) = storage else {
-            return IpcResponse::error(
-                "training_export",
-                "TRAINING_STORAGE_UNAVAILABLE",
-                "Training DB not configured for this hotel",
-            );
-        };
-        let capped = limit.unwrap_or(usize::MAX).min(10_000);
-        let samples = match storage.list_eligible(capped) {
-            Ok(s) => s,
-            Err(e) => return IpcResponse::error("training_export", "QUERY_FAILED", &e.to_string()),
-        };
-        if samples.is_empty() {
-            return IpcResponse::success(
-                "training_export",
-                Some(serde_json::json!({ "exported_count": 0, "output_path": output_path })),
-            );
-        }
-
-        let write_result = match format {
-            TrainingExportFormat::HuggingFace => {
-                let records: Vec<serde_json::Value> = samples
-                    .iter()
-                    .map(|s| {
-                        serde_json::json!({
-                            "audio": s.audio_path,
-                            "sentence": s.corrected_transcript.as_deref().unwrap_or(&s.raw_transcript),
-                            "model_gen": s.model_gen,
-                            "sample_id": s.sample_id,
-                        })
-                    })
-                    .collect();
-                std::fs::write(
-                    output_path,
-                    serde_json::to_vec_pretty(&records).unwrap_or_default(),
-                )
-            }
-            TrainingExportFormat::Nemo => {
-                let mut file = match std::fs::File::create(output_path) {
-                    Ok(f) => f,
-                    Err(e) => {
-                        return IpcResponse::error("training_export", "IO_ERROR", &e.to_string());
-                    }
-                };
-                for s in &samples {
-                    let record = serde_json::json!({
-                        "audio_filepath": s.audio_path.as_deref().unwrap_or(""),
-                        "text": s.corrected_transcript.as_deref().unwrap_or(&s.raw_transcript),
-                        "duration": 0.0,
-                    });
-                    if let Err(e) = writeln!(file, "{}", record) {
-                        return IpcResponse::error("training_export", "IO_ERROR", &e.to_string());
-                    }
-                }
-                Ok(())
-            }
-        };
-
-        if let Err(e) = write_result {
-            return IpcResponse::error("training_export", "IO_ERROR", &e.to_string());
-        }
-
-        let exported_at = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-        let ids: Vec<String> = samples.iter().map(|s| s.sample_id.clone()).collect();
-        let count = ids.len();
-        if let Err(e) = storage.mark_exported_at(&ids, exported_at) {
-            warn!(
-                "training_export: failed to mark {} samples exported: {}",
-                count, e
-            );
-        }
-
-        IpcResponse::success(
-            "training_export",
-            Some(serde_json::json!({ "exported_count": count, "output_path": output_path })),
-        )
-    }
-
-    fn handle_get_training_status(
-        storage: Option<&dyn ansible_mesh_core::whisper_training::WhisperTrainingStorage>,
-        agent_id: Option<&str>,
-    ) -> IpcResponse {
-        let Some(storage) = storage else {
-            return IpcResponse::error(
-                "training_status",
-                "TRAINING_STORAGE_UNAVAILABLE",
-                "Training DB not configured for this hotel",
-            );
-        };
-        match storage.count_status(agent_id) {
-            Ok(counts) => {
-                let status_json = serde_json::to_value(&counts).unwrap_or(serde_json::Value::Null);
-                IpcResponse::success(
-                    "training_status",
-                    Some(serde_json::json!({ "status": status_json })),
-                )
-            }
-            Err(e) => IpcResponse::error("training_status", "QUERY_FAILED", &e.to_string()),
-        }
-    }
-
     // ── ASR provider lifecycle handlers ───────────────────────────────────────
-
-    fn handle_asr_setup(
-        graph: &GraphDomain,
-        local_node_id: &str,
-        socket_path: &str,
-        python_path: &str,
-        model_name: Option<&str>,
-        auto_install: bool,
-    ) -> IpcResponse {
-        use std::process::Command;
-
-        let model = model_name.unwrap_or(parakeet_runner::DEFAULT_MODEL);
-
-        // Step 1: check nemo import.
-        let check_ok = Command::new(python_path)
-            .args(["-c", "import nemo.collections.asr"])
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false);
-
-        let nemo_available = if !check_ok && auto_install {
-            info!("asr.setup: nemo import failed; attempting pip install nemo-toolkit[asr]");
-            let install = Command::new(python_path)
-                .args(["-m", "pip", "install", "nemo-toolkit[asr]"])
-                .output();
-            match install {
-                Ok(o) if o.status.success() => {
-                    // Re-verify after install.
-                    Command::new(python_path)
-                        .args(["-c", "import nemo.collections.asr"])
-                        .output()
-                        .map(|o| o.status.success())
-                        .unwrap_or(false)
-                }
-                Ok(o) => {
-                    let stderr = String::from_utf8_lossy(&o.stderr).to_string();
-                    warn!("asr.setup: pip install failed: {stderr}");
-                    false
-                }
-                Err(e) => {
-                    warn!("asr.setup: pip install error: {e}");
-                    false
-                }
-            }
-        } else {
-            check_ok
-        };
-
-        if !nemo_available {
-            let hint = format!(
-                "nemo_asr import failed. Install manually: `{python_path} -m pip install nemo-toolkit[asr]`"
-            );
-            return IpcResponse::error("asr_setup", "NEMO_UNAVAILABLE", &hint);
-        }
-
-        // Step 2: write component config to hotel context graph.
-        let Some(hotel_name) = IpcServer::local_hotel_name(graph, local_node_id) else {
-            return IpcResponse::error(
-                "asr_setup",
-                "HOTEL_NOT_FOUND",
-                "could not resolve hotel name",
-            );
-        };
-        let guest_id = format!("{hotel_name}:{}", parakeet_runner::DEFAULT_GUEST_ID_SUFFIX);
-        let config = parakeet_runner::ParakeetConfig {
-            python_path: python_path.to_string(),
-            model_name: model.to_string(),
-            priority: 10,
-        };
-        let config_json = match serde_json::to_string(&config) {
-            Ok(j) => j,
-            Err(e) => return IpcResponse::error("asr_setup", "SERIALIZE_ERROR", &e.to_string()),
-        };
-        let key = format!("component:{guest_id}");
-        if let Err(e) = graph.set_config_value(&key, &config_json) {
-            return IpcResponse::error("asr_setup", "CONFIG_WRITE_ERROR", &e.to_string());
-        }
-
-        // Step 3: upsert the guest record so the reconcile loop spawns it.
-        let guest_record = GuestRecord {
-            hotel_name: hotel_name.clone(),
-            guest_id: guest_id.clone(),
-            role: "model.parakeet".to_string(),
-            config_json: serde_json::json!({
-                "command": "model-controller-parakeet",
-                "args": [],
-                "env": {
-                    "PHILOTIC_HOTEL_SOCKET": socket_path,
-                    "PHILOTIC_PARAKEET_GUEST_ID": guest_id,
-                }
-            })
-            .to_string(),
-            is_active: true,
-            active_pid: None,
-            last_active_at: None,
-        };
-        if let Err(e) = graph.upsert_guest(&guest_record) {
-            return IpcResponse::error("asr_setup", "GUEST_REGISTER_ERROR", &e.to_string());
-        }
-
-        info!(
-            hotel = %hotel_name,
-            guest_id = %guest_id,
-            model = %model,
-            "asr.setup: parakeet guest registered; will be spawned within 5s"
-        );
-
-        IpcResponse::success(
-            "asr_setup",
-            Some(serde_json::json!({
-                "message": format!(
-                    "Parakeet ASR configured. Guest '{guest_id}' registered — will start within 5 seconds."
-                ),
-                "guest_id": guest_id,
-                "model": model,
-                "python_path": python_path,
-                "nemo_available": true,
-            })),
-        )
-    }
-
-    fn handle_asr_status(graph: &GraphDomain, local_node_id: &str) -> IpcResponse {
-        use std::process::Command;
-
-        let Some(hotel_name) = IpcServer::local_hotel_name(graph, local_node_id) else {
-            return IpcResponse::error(
-                "asr_status",
-                "HOTEL_NOT_FOUND",
-                "could not resolve hotel name",
-            );
-        };
-        let guest_id = format!("{hotel_name}:{}", parakeet_runner::DEFAULT_GUEST_ID_SUFFIX);
-
-        // Read python_path from stored component config, fall back to "python3".
-        let component_key = format!("component:{guest_id}");
-        let python_path = graph
-            .get_config_value(&component_key)
-            .ok()
-            .flatten()
-            .and_then(|json| serde_json::from_str::<parakeet_runner::ParakeetConfig>(&json).ok())
-            .map(|cfg| cfg.python_path)
-            .unwrap_or_else(|| "python3".to_string());
-
-        let guest = graph.get_guest(&hotel_name, &guest_id).ok().flatten();
-        let guest_registered = guest.is_some();
-        let guest_active = guest.as_ref().map(|g| g.is_active).unwrap_or(false);
-        let guest_pid = guest.as_ref().and_then(|g| g.active_pid.clone());
-
-        let nemo_available = Command::new(&python_path)
-            .args(["-c", "import nemo.collections.asr"])
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false);
-
-        IpcResponse::success(
-            "asr_status",
-            Some(serde_json::json!({
-                "guest_id": guest_id,
-                "registered": guest_registered,
-                "active": guest_active,
-                "pid": guest_pid,
-                "nemo_available": nemo_available,
-                "python_path": python_path,
-            })),
-        )
-    }
 
     // ── Vision provider lifecycle handlers ────────────────────────────────────
 
     const VISION_GUEST_ID_SUFFIX: &'static str = "model-controller-vision-01";
-
-    fn handle_vision_setup(
-        graph: &GraphDomain,
-        local_node_id: &str,
-        socket_path: &str,
-        repo_id: Option<&str>,
-    ) -> IpcResponse {
-        let repo_id = repo_id.unwrap_or("onnx-community/Florence-2-base-ft");
-
-        // Step 1: resolve hotel name.
-        let Some(hotel_name) = IpcServer::local_hotel_name(graph, local_node_id) else {
-            return IpcResponse::error(
-                "vision_setup",
-                "HOTEL_NOT_FOUND",
-                "could not resolve hotel name",
-            );
-        };
-        let guest_id = format!("{hotel_name}:{}", Self::VISION_GUEST_ID_SUFFIX);
-
-        // Step 2: write component config (repo_id for the ONNX backend).
-        let config = serde_json::json!({ "repo_id": repo_id });
-        let config_json = match serde_json::to_string(&config) {
-            Ok(j) => j,
-            Err(e) => return IpcResponse::error("vision_setup", "SERIALIZE_ERROR", &e.to_string()),
-        };
-        let key = format!("component:{guest_id}");
-        if let Err(e) = graph.set_config_value(&key, &config_json) {
-            return IpcResponse::error("vision_setup", "CONFIG_WRITE_ERROR", &e.to_string());
-        }
-
-        // Step 3: upsert ModelProfileRecord so health-aware routing picks this provider up.
-        let profile = ModelProfileRecord {
-            model_ref: "vision".to_string(),
-            node_id: local_node_id.to_string(),
-            provider: "onnx".to_string(),
-            task_kinds: vec!["image.ocr".to_string(), "image.ground".to_string()],
-            trust_tier: "local_experimental".to_string(),
-            // ONNX/Florence has no tool calling or JSON-contract support.
-            supports_tools: false,
-            supports_structured: false,
-            ..Default::default()
-        };
-        if let Err(e) = graph.upsert_model_profile(&profile) {
-            return IpcResponse::error("vision_setup", "PROFILE_REGISTER_ERROR", &e.to_string());
-        }
-
-        // Step 4: upsert guest record so the reconcile loop spawns model-controller-vision.
-        let guest_record = GuestRecord {
-            hotel_name: hotel_name.clone(),
-            guest_id: guest_id.clone(),
-            role: "model-controller-vision".to_string(),
-            config_json: serde_json::json!({
-                "command": "model-controller-vision",
-                "args": [],
-                "env": {
-                    "PHILOTIC_HOTEL_SOCKET": socket_path,
-                    "PHILOTIC_VISION_GUEST_ID": guest_id,
-                    "PHILOTIC_VISION_REPO_ID": repo_id,
-                }
-            })
-            .to_string(),
-            is_active: true,
-            active_pid: None,
-            last_active_at: None,
-        };
-        if let Err(e) = graph.upsert_guest(&guest_record) {
-            return IpcResponse::error("vision_setup", "GUEST_REGISTER_ERROR", &e.to_string());
-        }
-
-        info!(
-            hotel = %hotel_name,
-            guest_id = %guest_id,
-            repo_id,
-            "vision.setup: ONNX guest registered; will be spawned within 5s"
-        );
-
-        IpcResponse::success(
-            "vision_setup",
-            Some(serde_json::json!({
-                "message": format!(
-                    "Vision provider configured (ONNX/Florence-2). Guest '{guest_id}' registered — will start within 5 seconds."
-                ),
-                "guest_id": guest_id,
-                "repo_id": repo_id,
-                "backend": "onnx",
-            })),
-        )
-    }
-
-    fn handle_vision_status(graph: &GraphDomain, local_node_id: &str) -> IpcResponse {
-        let Some(hotel_name) = IpcServer::local_hotel_name(graph, local_node_id) else {
-            return IpcResponse::error(
-                "vision_status",
-                "HOTEL_NOT_FOUND",
-                "could not resolve hotel name",
-            );
-        };
-        let guest_id = format!("{hotel_name}:{}", Self::VISION_GUEST_ID_SUFFIX);
-
-        let component_key = format!("component:{guest_id}");
-        let repo_id = graph
-            .get_config_value(&component_key)
-            .ok()
-            .flatten()
-            .and_then(|json| serde_json::from_str::<serde_json::Value>(&json).ok())
-            .and_then(|v| v.get("repo_id").and_then(|r| r.as_str()).map(String::from))
-            .unwrap_or_else(|| "onnx-community/Florence-2-base-ft".to_string());
-
-        let guest = graph.get_guest(&hotel_name, &guest_id).ok().flatten();
-        let guest_registered = guest.is_some();
-        let guest_active = guest.as_ref().map(|g| g.is_active).unwrap_or(false);
-        let guest_pid = guest.as_ref().and_then(|g| g.active_pid.clone());
-
-        let model_profile = graph
-            .get_model_profile("vision", local_node_id)
-            .ok()
-            .flatten();
-
-        IpcResponse::success(
-            "vision_status",
-            Some(serde_json::json!({
-                "guest_id": guest_id,
-                "registered": guest_registered,
-                "active": guest_active,
-                "pid": guest_pid,
-                "backend": "onnx",
-                "repo_id": repo_id,
-                "model_profile_status": model_profile.as_ref().map(|p| &p.status),
-            })),
-        )
-    }
 }
 
 /// Pick the inbox subscriber(s) a guest-targeted task should reach.
@@ -15668,6 +14231,14 @@ pub(super) use self::agent_context::{
     is_response_like_agent_action, lookup_agent_authority_hotel, peer_agent_node_from_roster,
     placement_marker_policy,
 };
+
+mod components;
+
+mod memory;
+
+mod media_setup;
+
+mod hotel_status;
 
 #[cfg(test)]
 pub(crate) mod tests;
