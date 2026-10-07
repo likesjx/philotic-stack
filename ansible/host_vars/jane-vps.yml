@@ -13,6 +13,12 @@ philotic_memgraph_enabled: true
 # (9 flagged memories, all genuine May test probes).
 philotic_memory_sleep_enabled: true
 philotic_memory_sleep_mutate: true
+# Memory hygiene nightly sweep runs on the Cortex hotel (W4 proof window).
+philotic_memory_hygiene_enabled: true
+# Hotel port filter (P7): untrusted (non-tailnet) traffic to hotel ports is
+# dropped. 16466-16468 are vps-jane's hash-derived mesh/blob/exec ports.
+philotic_firewall_enabled: true
+philotic_firewall_extra_ports: [16466, 16467, 16468]
 philotic_memgraph_image: "memgraph/memgraph-mage:3.10.1"
 # Bind Bolt to the Tailscale interface so central graph access is mesh-only.
 philotic_memgraph_host: "100.64.212.8"
