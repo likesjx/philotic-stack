@@ -47,7 +47,7 @@ require_worktree() {
 hot_file_patterns() {
     cat <<'EOF'
 crates/aiua/src/main.rs
-crates/aiua/src/service/ipc.rs
+crates/aiua/src/service/ipc/mod.rs
 crates/philote/src/runtime.rs
 crates/membrane-telegram/src/main.rs
 crates/model-router/src/main.rs
