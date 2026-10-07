@@ -4,6 +4,7 @@
 //! visibility was widened so the parent module can reach it.
 
 use super::*;
+use ansible_mesh_core::cron::{CronJob, CronJobId, CronTurnPolicy};
 
 // ── Cron ownership scoping ───────────────────────────────────────────────────
 //
@@ -149,5 +150,236 @@ pub(in crate::service) fn cron_job_mutation_allowed(
             Err(cron_forbidden(op, job_id, identity))
         }
         _ => Ok(()),
+    }
+}
+
+impl IpcServer {
+    #[allow(clippy::too_many_arguments)]
+    pub(super) async fn handle_register_cron_job(
+        mut job: CronJob,
+        local_node_id: &str,
+        dispatcher_tx: &mpsc::Sender<LedgerCommand>,
+        graph: &GraphDomain,
+        current_identity: &mut Option<GuestIdentity>,
+    ) -> IpcResponse {
+        Self::normalize_cron_target_role(graph, &mut job);
+        if job.target_role.starts_with("role:")
+            && !crate::service::cron_ticker::cron_payload_reaches_an_agent(&job.payload)
+        {
+            return IpcResponse::error(
+                "register_cron_job",
+                "CRON_PAYLOAD_UNDELIVERABLE",
+                format!(
+                    "cron job NOT registered: a job for {} must carry its instruction in a \
+                             `message` string, e.g. {{\"message\": \"Run the LifeGraph gardening review \
+                             now: …\"}}. A payload with no `message`/`content` (got: {}) is dropped \
+                             by the agent every time it fires.",
+                    job.target_role,
+                    job.payload.chars().take(160).collect::<String>()
+                ),
+            );
+        }
+        // Register is an upsert by id: overwriting a job the caller
+        // does not own is a mutation of someone else's crontab.
+        let existing = graph.get_cron_job(&job.id).ok().flatten();
+        if let Some(existing) = existing.as_ref() {
+            if !cron_job_visible_to(existing, current_identity.as_ref()) {
+                return cron_forbidden("register_cron_job", &job.id, current_identity.as_ref());
+            }
+        }
+        // Turn policy is operator-owned. A guest may not set one, and
+        // a guest re-registering (editing) a job drops the operator's
+        // policy — the operator approved THAT instruction, not
+        // whatever the guest rewrote it to.
+        if !cron_policy_authority(current_identity.as_ref()) {
+            if job.policy.is_some() {
+                return IpcResponse::error(
+                    "register_cron_job",
+                    "CRON_POLICY_OPERATOR_ONLY",
+                    "cron job NOT registered: a cron job's tool/approval policy can only \
+                             be set by the operator. Register the job without `policy` and ask \
+                             the operator to set one."
+                        .to_string(),
+                );
+            }
+            if existing.as_ref().is_some_and(|e| e.policy.is_some()) {
+                warn!(
+                    job_id = %job.id,
+                    "RegisterCronJob: guest edit cleared the job's operator-set policy"
+                );
+            }
+        }
+        job.policy = job
+            .policy
+            .take()
+            .map(ansible_mesh_core::cron::CronTurnPolicy::normalized);
+        // Ownership is stamped from the connection identity, never
+        // trusted from the wire: a guest's jobs belong to its agent.
+        if let Some(identity) = current_identity.as_ref() {
+            if !cron_admin_identity(identity) {
+                job.created_by = ansible_mesh_core::cron::CronJobSource::Guest(
+                    cron_owner_agent_of_guest(&identity.guest_id).to_string(),
+                );
+            }
+        }
+        // New job registrations always get an isolated `cron:<job_id>`
+        // session — `session_target` only defaults to `Main` via serde
+        // when deserializing legacy rows straight from storage
+        // (`default_session_target_legacy`). Registration is the only
+        // path that mints brand-new jobs, so it is safe to force
+        // `Isolated` here unconditionally; existing rows loaded from
+        // the graph never pass through this handler again.
+        job.session_target = ansible_mesh_core::cron::CronSessionTarget::Isolated;
+        info!("RegisterCronJob: id={} role={}", job.id, job.target_role);
+        match graph.upsert_cron_job(&job) {
+            Ok(_) => {
+                Self::broadcast_cron_sync_upsert(dispatcher_tx, local_node_id, &job).await;
+                IpcResponse::success(
+                    "register_cron_job",
+                    Some(serde_json::json!({ "job_id": job.id })),
+                )
+            }
+            Err(e) => IpcResponse::Error(format!("RegisterCronJob failed: {e}")),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) async fn handle_remove_cron_job(
+        job_id: CronJobId,
+        local_node_id: &str,
+        dispatcher_tx: &mpsc::Sender<LedgerCommand>,
+        graph: &GraphDomain,
+        current_identity: &mut Option<GuestIdentity>,
+    ) -> IpcResponse {
+        info!("RemoveCronJob: id={}", job_id);
+        if let Err(refusal) =
+            cron_job_mutation_allowed(graph, &job_id, current_identity.as_ref(), "remove_cron_job")
+        {
+            return refusal;
+        }
+        match graph.remove_cron_job(&job_id) {
+            Ok(_) => {
+                Self::broadcast_cron_sync_remove(dispatcher_tx, local_node_id, &job_id).await;
+                IpcResponse::success("remove_cron_job", None)
+            }
+            Err(e) => IpcResponse::Error(format!("RemoveCronJob failed: {e}")),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn handle_list_cron_jobs(
+        graph: &GraphDomain,
+        current_identity: &mut Option<GuestIdentity>,
+    ) -> IpcResponse {
+        match graph.list_cron_jobs() {
+            // Every role may list, but a guest sees only its own agent's
+            // crontab; orchestrator/management/operator surfaces see all.
+            Ok(jobs) => IpcResponse::CronJobList {
+                jobs: jobs
+                    .into_iter()
+                    .filter(|job| cron_job_visible_to(job, current_identity.as_ref()))
+                    .collect(),
+            },
+            Err(e) => IpcResponse::Error(format!("ListCronJobs failed: {e}")),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) async fn handle_enable_cron_job(
+        job_id: CronJobId,
+        local_node_id: &str,
+        dispatcher_tx: &mpsc::Sender<LedgerCommand>,
+        graph: &GraphDomain,
+        current_identity: &mut Option<GuestIdentity>,
+    ) -> IpcResponse {
+        match graph.get_cron_job(&job_id) {
+            Ok(Some(mut job)) => {
+                if !cron_job_visible_to(&job, current_identity.as_ref()) {
+                    return cron_forbidden("enable_cron_job", &job_id, current_identity.as_ref());
+                }
+                job.enabled = true;
+                match graph.upsert_cron_job(&job) {
+                    Ok(_) => {
+                        Self::broadcast_cron_sync_upsert(dispatcher_tx, local_node_id, &job).await;
+                        IpcResponse::success("enable_cron_job", None)
+                    }
+                    Err(e) => IpcResponse::Error(format!("EnableCronJob failed: {e}")),
+                }
+            }
+            Ok(None) => IpcResponse::Error(format!("cron job not found: {job_id}")),
+            Err(e) => IpcResponse::Error(format!("EnableCronJob failed: {e}")),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) async fn handle_disable_cron_job(
+        job_id: CronJobId,
+        local_node_id: &str,
+        dispatcher_tx: &mpsc::Sender<LedgerCommand>,
+        graph: &GraphDomain,
+        current_identity: &mut Option<GuestIdentity>,
+    ) -> IpcResponse {
+        match graph.get_cron_job(&job_id) {
+            Ok(Some(mut job)) => {
+                if !cron_job_visible_to(&job, current_identity.as_ref()) {
+                    return cron_forbidden("disable_cron_job", &job_id, current_identity.as_ref());
+                }
+                job.enabled = false;
+                match graph.upsert_cron_job(&job) {
+                    Ok(_) => {
+                        Self::broadcast_cron_sync_upsert(dispatcher_tx, local_node_id, &job).await;
+                        IpcResponse::success("disable_cron_job", None)
+                    }
+                    Err(e) => IpcResponse::Error(format!("DisableCronJob failed: {e}")),
+                }
+            }
+            Ok(None) => IpcResponse::Error(format!("cron job not found: {job_id}")),
+            Err(e) => IpcResponse::Error(format!("DisableCronJob failed: {e}")),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn handle_set_cron_policy(
+        job_id: CronJobId,
+        policy: Option<CronTurnPolicy>,
+        graph: &GraphDomain,
+        current_identity: &mut Option<GuestIdentity>,
+    ) -> IpcResponse {
+        if !cron_policy_authority(current_identity.as_ref()) {
+            warn!(
+                job_id = %job_id,
+                guest_id = current_identity.as_ref().map(|i| i.guest_id.as_str()).unwrap_or("-"),
+                "SetCronPolicy refused: not an operator identity"
+            );
+            return IpcResponse::error(
+                "set_cron_policy",
+                "CRON_POLICY_OPERATOR_ONLY",
+                format!(
+                    "cron job {job_id}: only the operator can set a cron job's tool/approval policy"
+                ),
+            );
+        }
+        match graph.get_cron_job(&job_id) {
+            Ok(Some(mut job)) => {
+                job.policy = policy.map(ansible_mesh_core::cron::CronTurnPolicy::normalized);
+                info!(
+                    job_id = %job_id,
+                    has_policy = job.policy.is_some(),
+                    "SetCronPolicy"
+                );
+                match graph.upsert_cron_job(&job) {
+                    Ok(_) => IpcResponse::success(
+                        "set_cron_policy",
+                        Some(serde_json::json!({
+                            "job_id": job.id,
+                            "policy": job.policy,
+                        })),
+                    ),
+                    Err(e) => IpcResponse::Error(format!("SetCronPolicy failed: {e}")),
+                }
+            }
+            Ok(None) => IpcResponse::Error(format!("cron job not found: {job_id}")),
+            Err(e) => IpcResponse::Error(format!("SetCronPolicy failed: {e}")),
+        }
     }
 }
