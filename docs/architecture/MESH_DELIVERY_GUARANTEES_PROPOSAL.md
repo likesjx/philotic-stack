@@ -234,6 +234,38 @@ hotel SQLite directly (the pattern of `mesh.orphan-hotel-node`, `:2536`):
 **Live check:** run `phil doctor` on all three hotels and attach the output to
 the slice PR.
 
+**Status (2026-10-07): implemented** on `codex/mesh-l3-doctor-checks`.
+mac-jane was run live; vps-jane and mbp-jane are pending (mbp-jane is offline).
+- `mesh.ledger-backlog`:
+  - **Local node id.** Comes from `node_capabilities:local`, falling back to
+    the hotel node named by `--hotel`. mac-jane has no capabilities record.
+    When neither resolves, the check reports itself as skipped rather than
+    passing.
+  - **Age.** `created_at` is often 0 until L5, so age is the longer of time
+    since the peer's cursor last advanced (`mesh_cursors.updated_at`, ms) and
+    the oldest non-zero `created_at`. Over 5 min is a warning; over 30 min is
+    an error.
+  - **Misaddressed rows.** Rows addressed to something that is not a known
+    hotel node id are reported separately as misaddressed (DEF-224).
+- `mesh.hotel-state-budget` reads L2's `hotel_state.last_wire_bytes`. It is
+  silent until a hotel runs L2.
+- `mesh.dead-letters` is silent until L4 creates `mesh_dead_letters`.
+- `mesh.nonce-store` checks for the `nonces.db` sidecar and the
+  `mesh_nonces` table.
+
+Live mac-jane output, 2026-10-07:
+```
+✗ mesh.ledger-backlog  [warning] 3 outbound mesh event(s) are addressed to 'local-aiua-01' … (misaddressed)
+✗ mesh.ledger-backlog  [warning] 1 outbound mesh event(s) are addressed to 'mac-jane' … (misaddressed)
+✗ mesh.ledger-backlog  [error] 2195 outbound mesh event(s) to mbp-jane-aiua-01 are unacknowledged (4164 min)
+✗ mesh.ledger-backlog  [warning] 1 outbound mesh event(s) are addressed to 'vps-jane' … (misaddressed)
+✓ mesh.hotel-state-budget
+✓ mesh.dead-letters
+✓ mesh.nonce-store
+```
+The mbp-jane backlog is that hotel being offline. The misaddressed rows are
+DEF-224. A green `mesh.nonce-store` is DEF-185's live proof on mac-jane.
+
 ### L4 — Ack what you delivered, plus dead letters (M, depends on L1)
 
 1. Extract the ledger writer loop body (`main.rs:8033-8155`) into

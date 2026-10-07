@@ -371,6 +371,10 @@ pub fn catalog() -> Vec<Box<dyn Check>> {
         Box::new(HealDispatcherStaleness),
         Box::new(SystemDiskSpace),
         Box::new(MeshOrphanHotelNode),
+        Box::new(MeshLedgerBacklog),
+        Box::new(MeshHotelStateBudget),
+        Box::new(MeshDeadLetters),
+        Box::new(MeshNonceStore),
     ]
 }
 
@@ -2776,6 +2780,487 @@ impl Check for MeshOrphanHotelNode {
                    not a powered-off real peer"
                 .to_string(),
         })
+    }
+}
+
+// ── mesh delivery checks (MESH_DELIVERY_GUARANTEES L3) ───────────────────
+
+/// Backlog older than this is a warning: the peer has not acked for a while.
+const MESH_BACKLOG_WARN_SECS: u64 = 5 * 60;
+/// Backlog older than this is an error: the peer is effectively cut off.
+const MESH_BACKLOG_FAIL_SECS: u64 = 30 * 60;
+
+/// This hotel's own node id, from the `node_capabilities:local` graph node the
+/// hotel writes at boot. `None` on a store that never booted a hotel.
+fn local_node_id(conn: &Connection) -> Result<Option<String>> {
+    if !table_exists(conn, "graph_nodes")? {
+        return Ok(None);
+    }
+    let data: Option<String> = conn
+        .query_row(
+            "SELECT data_json FROM graph_nodes WHERE node_key = 'node_capabilities:local'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok(data
+        .and_then(|d| serde_json::from_str::<serde_json::Value>(&d).ok())
+        .and_then(|v| {
+            v.get("node_id")
+                .and_then(|n| n.as_str())
+                .map(str::to_string)
+        }))
+}
+
+/// A stored config value (`GraphDomain::set_config_value` writes
+/// `graph_nodes` row `config:<key>` with `data_json = {"value": "<text>"}`).
+fn read_config_value(conn: &Connection, key: &str) -> Result<Option<String>> {
+    if !table_exists(conn, "graph_nodes")? {
+        return Ok(None);
+    }
+    let data: Option<String> = conn
+        .query_row(
+            "SELECT data_json FROM graph_nodes WHERE node_key = ?1",
+            params![format!("config:{key}")],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok(data
+        .and_then(|d| serde_json::from_str::<serde_json::Value>(&d).ok())
+        .and_then(|v| v.get("value").and_then(|s| s.as_str()).map(str::to_string)))
+}
+
+/// Outbound ledger rows still waiting for one peer's ack.
+#[derive(Debug, Clone, PartialEq)]
+struct MeshBacklog {
+    target_node_id: String,
+    rows: u64,
+    /// Oldest non-zero `created_at` among the rows, in unix seconds. Many
+    /// envelopes are still written with `created_at = 0` (stamped by L5).
+    oldest_created_secs: Option<u64>,
+    /// When the peer's cursor last advanced (`mesh_cursors.updated_at`, ms).
+    cursor_updated_ms: Option<u64>,
+}
+
+/// Envelope timestamps are seconds on older writers and milliseconds once L5
+/// lands; normalize to seconds.
+fn to_unix_secs(ts: u64) -> u64 {
+    if ts > 100_000_000_000 {
+        ts / 1000
+    } else {
+        ts
+    }
+}
+
+fn read_mesh_backlog(conn: &Connection, local_node_id: &str) -> Result<Vec<MeshBacklog>> {
+    let mut stmt = conn.prepare(
+        "SELECT target_node_id, COUNT(*), MIN(CASE WHEN created_at > 0 THEN created_at END)
+         FROM mesh_events
+         WHERE source_node_id = ?1 AND target_node_id IS NOT NULL AND target_node_id != ?1
+         GROUP BY target_node_id",
+    )?;
+    let rows = stmt.query_map(params![local_node_id], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, i64>(1)?,
+            row.get::<_, Option<i64>>(2)?,
+        ))
+    })?;
+    let has_cursors = table_exists(conn, "mesh_cursors")?;
+    let mut out = Vec::new();
+    for row in rows {
+        let (target, count, oldest) = row?;
+        let cursor_updated_ms = if has_cursors {
+            conn.query_row(
+                "SELECT updated_at FROM mesh_cursors WHERE consumer_node_id = ?1",
+                params![target],
+                |r| r.get::<_, i64>(0),
+            )
+            .optional()?
+            .map(|v| v.max(0) as u64)
+        } else {
+            None
+        };
+        out.push(MeshBacklog {
+            target_node_id: target,
+            rows: count.max(0) as u64,
+            oldest_created_secs: oldest.map(|v| to_unix_secs(v.max(0) as u64)),
+            cursor_updated_ms,
+        });
+    }
+    Ok(out)
+}
+
+/// Pure backlog grading, split out for unit tests. Age is the longer of "since
+/// the peer last acked" and "since the oldest stamped row was created"; a peer
+/// that never acked and rows with no stamp grade as a warning (age unknown).
+fn evaluate_mesh_backlog(
+    check_id: &'static str,
+    backlog: &[MeshBacklog],
+    known_node_ids: &std::collections::HashSet<String>,
+    now_secs: u64,
+) -> Vec<Finding> {
+    let mut findings = Vec::new();
+    for b in backlog {
+        if b.rows == 0 {
+            continue;
+        }
+        // Rows addressed to something that is not a mesh node id (a hotel
+        // name, a client default like `local-aiua-01`) are not waiting on a
+        // peer: no peer will ever ack them.
+        if !known_node_ids.contains(&b.target_node_id) {
+            findings.push(Finding {
+                check_id: check_id.to_string(),
+                severity: Severity::Warning,
+                message: format!(
+                    "{} outbound mesh event(s) are addressed to '{}', which is not a known mesh \
+                     node id; they can never be delivered (misaddressed)",
+                    b.rows, b.target_node_id
+                ),
+                evidence: json!({
+                    "target_node_id": b.target_node_id,
+                    "rows": b.rows,
+                    "oldest_created_secs": b.oldest_created_secs,
+                }),
+                fix_hint: "find the emitter that addressed a hotel name or client default instead \
+                           of a node id (`<hotel>-aiua-01`); the rows are dead-lettered once L4 \
+                           lands, or remove them by event_id"
+                    .to_string(),
+                auto_repairable: false,
+            });
+            continue;
+        }
+        let since_ack = b
+            .cursor_updated_ms
+            .map(|ms| now_secs.saturating_sub(to_unix_secs(ms)));
+        let since_created = b.oldest_created_secs.map(|s| now_secs.saturating_sub(s));
+        let age = match (since_ack, since_created) {
+            (Some(a), Some(c)) => Some(a.max(c)),
+            (a, c) => a.or(c),
+        };
+        let severity = match age {
+            Some(age) if age > MESH_BACKLOG_FAIL_SECS => Severity::Error,
+            Some(age) if age > MESH_BACKLOG_WARN_SECS => Severity::Warning,
+            Some(_) => continue,
+            None => Severity::Warning,
+        };
+        let age_desc = age
+            .map(|a| format!("{} min", a / 60))
+            .unwrap_or_else(|| "unknown age (peer never acked)".to_string());
+        findings.push(Finding {
+            check_id: check_id.to_string(),
+            severity,
+            message: format!(
+                "{} outbound mesh event(s) to {} are unacknowledged ({age_desc}); the peer is \
+                 not receiving this hotel's tasks and replies",
+                b.rows, b.target_node_id
+            ),
+            evidence: json!({
+                "target_node_id": b.target_node_id,
+                "rows": b.rows,
+                "age_secs": age,
+                "cursor_updated_ms": b.cursor_updated_ms,
+                "oldest_created_secs": b.oldest_created_secs,
+            }),
+            fix_hint: format!(
+                "check that {} is up and reachable (heartbeat in `phil doctor` on that hotel, \
+                 mesh ports, tailnet); the backlog drains on its next ack",
+                b.target_node_id
+            ),
+            auto_repairable: false,
+        });
+    }
+    findings
+}
+
+/// `mesh.ledger-backlog`: per peer, outbound events still waiting for an ack.
+struct MeshLedgerBacklog;
+
+impl Check for MeshLedgerBacklog {
+    fn id(&self) -> &'static str {
+        "mesh.ledger-backlog"
+    }
+
+    fn severity(&self) -> Severity {
+        Severity::Warning
+    }
+
+    fn detect(&self, ctx: &DoctorCtx) -> Result<Vec<Finding>> {
+        if let Some(findings) = missing_table_finding(ctx, self.id(), "mesh_events")? {
+            return Ok(findings);
+        }
+        // The boot-time capabilities record is the authority; hotels that never
+        // wrote it are identified by the hotel node `--hotel` names.
+        let local = match local_node_id(&ctx.conn)? {
+            Some(id) => Some(id),
+            None => {
+                let name = ctx.hotel.trim();
+                read_hotel_nodes(&ctx.conn)?
+                    .into_iter()
+                    .find(|h| !name.is_empty() && name != "default" && h.hotel_name == name)
+                    .map(|h| h.node_id)
+            }
+        };
+        let Some(local) = local else {
+            return Ok(vec![Finding {
+                check_id: self.id().to_string(),
+                severity: Severity::Warning,
+                message: "cannot tell which node is this hotel, so the outbound backlog was not \
+                          graded"
+                    .to_string(),
+                evidence: json!({ "hotel": ctx.hotel }),
+                fix_hint:
+                    "pass --hotel <this hotel's name> (e.g. mac-jane); check skipped, not run"
+                        .to_string(),
+                auto_repairable: false,
+            }]);
+        };
+        let backlog = read_mesh_backlog(&ctx.conn, &local)?;
+        let known: std::collections::HashSet<String> = read_hotel_nodes(&ctx.conn)?
+            .into_iter()
+            .map(|h| h.node_id)
+            .collect();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        Ok(evaluate_mesh_backlog(self.id(), &backlog, &known, now))
+    }
+}
+
+/// Pure grading of the persisted roster-size record (`hotel_state.last_wire_bytes`).
+fn evaluate_hotel_state_budget(check_id: &'static str, record: &serde_json::Value) -> Vec<Finding> {
+    let bytes = record.get("roster_wire_bytes").and_then(|v| v.as_u64());
+    let budget = record
+        .get("budget_bytes")
+        .and_then(|v| v.as_u64())
+        .filter(|b| *b > 0);
+    let (Some(bytes), Some(budget)) = (bytes, budget) else {
+        return Vec::new();
+    };
+    let severity = if bytes > budget {
+        Severity::Error
+    } else if bytes * 4 > budget * 3 {
+        Severity::Warning
+    } else {
+        return Vec::new();
+    };
+    vec![Finding {
+        check_id: check_id.to_string(),
+        severity,
+        message: format!(
+            "hotel-state roster is {bytes} B of a {budget} B datagram budget ({}%); over budget \
+             the roster broadcast fails and peers stop learning this hotel's guests (DEF-192)",
+            bytes * 100 / budget
+        ),
+        evidence: record.clone(),
+        fix_hint: "retire unused guests/role incarnations on this hotel; a paged roster \
+                   (DEF-192 slice B) is the structural fix"
+            .to_string(),
+        auto_repairable: false,
+    }]
+}
+
+/// `mesh.hotel-state-budget`: the last-sent roster size against its budget.
+struct MeshHotelStateBudget;
+
+impl Check for MeshHotelStateBudget {
+    fn id(&self) -> &'static str {
+        "mesh.hotel-state-budget"
+    }
+
+    fn severity(&self) -> Severity {
+        Severity::Warning
+    }
+
+    fn detect(&self, ctx: &DoctorCtx) -> Result<Vec<Finding>> {
+        // Absent on hotels that predate L2 or never broadcast: nothing to grade.
+        let Some(raw) = read_config_value(&ctx.conn, "hotel_state.last_wire_bytes")? else {
+            return Ok(Vec::new());
+        };
+        let Ok(record) = serde_json::from_str::<serde_json::Value>(&raw) else {
+            return Ok(Vec::new());
+        };
+        Ok(evaluate_hotel_state_budget(self.id(), &record))
+    }
+}
+
+/// `mesh.dead-letters`: count and newest reason. The table arrives with L4;
+/// until then the check has nothing to read and reports nothing.
+struct MeshDeadLetters;
+
+impl Check for MeshDeadLetters {
+    fn id(&self) -> &'static str {
+        "mesh.dead-letters"
+    }
+
+    fn severity(&self) -> Severity {
+        Severity::Warning
+    }
+
+    fn detect(&self, ctx: &DoctorCtx) -> Result<Vec<Finding>> {
+        if !table_exists(&ctx.conn, "mesh_dead_letters")? {
+            return Ok(Vec::new());
+        }
+        let count: i64 = ctx
+            .conn
+            .query_row("SELECT COUNT(*) FROM mesh_dead_letters", [], |r| r.get(0))?;
+        if count == 0 {
+            return Ok(Vec::new());
+        }
+        Ok(vec![Finding {
+            check_id: self.id().to_string(),
+            severity: Severity::Warning,
+            message: format!("{count} mesh event(s) were dead-lettered (never delivered)"),
+            evidence: json!({ "count": count }),
+            fix_hint: "inspect with `phil mesh dead-letters`; replay is operator-only".to_string(),
+            auto_repairable: false,
+        }])
+    }
+}
+
+/// `mesh.nonce-store`: the SQLite nonce stores the in-memory `NonceTracker`
+/// replaced must be gone (DEF-185 live proof).
+struct MeshNonceStore;
+
+impl Check for MeshNonceStore {
+    fn id(&self) -> &'static str {
+        "mesh.nonce-store"
+    }
+
+    fn severity(&self) -> Severity {
+        Severity::Warning
+    }
+
+    fn detect(&self, ctx: &DoctorCtx) -> Result<Vec<Finding>> {
+        let mut findings = Vec::new();
+        let sidecar = ctx
+            .db_path
+            .parent()
+            .map(|dir| dir.join("nonces.db"))
+            .unwrap_or_else(|| PathBuf::from("nonces.db"));
+        if sidecar.exists() {
+            findings.push(Finding {
+                check_id: self.id().to_string(),
+                severity: Severity::Warning,
+                message: format!(
+                    "legacy nonce sidecar {} still exists (it grew without bound; the hotel \
+                     retires it at boot since DEF-185)",
+                    sidecar.display()
+                ),
+                evidence: json!({ "path": sidecar.to_string_lossy() }),
+                fix_hint: "restart the hotel on a build with the in-memory NonceTracker; it \
+                           removes the sidecar at boot"
+                    .to_string(),
+                auto_repairable: false,
+            });
+        }
+        if table_exists(&ctx.conn, "mesh_nonces")? {
+            findings.push(Finding {
+                check_id: self.id().to_string(),
+                severity: Severity::Warning,
+                message: "legacy `mesh_nonces` table still present in the context DB".to_string(),
+                evidence: json!({ "table": "mesh_nonces" }),
+                fix_hint: "restart the hotel on a build with the in-memory NonceTracker; it \
+                           drops the table at boot"
+                    .to_string(),
+                auto_repairable: false,
+            });
+        }
+        Ok(findings)
+    }
+}
+
+#[cfg(test)]
+mod mesh_delivery_check_tests {
+    use super::*;
+
+    const NOW: u64 = 1_800_000_000;
+
+    fn backlog(rows: u64, ack_age_secs: Option<u64>, created_age_secs: Option<u64>) -> MeshBacklog {
+        MeshBacklog {
+            target_node_id: "vps-jane-aiua-01".into(),
+            rows,
+            oldest_created_secs: created_age_secs.map(|a| NOW - a),
+            cursor_updated_ms: ack_age_secs.map(|a| (NOW - a) * 1000),
+        }
+    }
+
+    fn known() -> std::collections::HashSet<String> {
+        ["vps-jane-aiua-01".to_string()].into_iter().collect()
+    }
+
+    #[test]
+    fn ledger_backlog_grades_by_age() {
+        let id = "mesh.ledger-backlog";
+        let k = known();
+        assert!(evaluate_mesh_backlog(id, &[backlog(3, Some(60), None)], &k, NOW).is_empty());
+        assert!(evaluate_mesh_backlog(id, &[backlog(0, Some(9_999), None)], &k, NOW).is_empty());
+        let warn = evaluate_mesh_backlog(id, &[backlog(3, Some(6 * 60), None)], &k, NOW);
+        assert_eq!(warn[0].severity, Severity::Warning);
+        let fail = evaluate_mesh_backlog(id, &[backlog(3, Some(60), Some(31 * 60))], &k, NOW);
+        assert_eq!(
+            fail[0].severity,
+            Severity::Error,
+            "the older of ack and creation age wins"
+        );
+        let unknown = evaluate_mesh_backlog(id, &[backlog(3, None, None)], &k, NOW);
+        assert_eq!(unknown[0].severity, Severity::Warning);
+    }
+
+    #[test]
+    fn ledger_backlog_to_a_non_node_target_is_misaddressed_not_an_outage() {
+        let mut misaddressed = backlog(1, None, Some(40 * 60));
+        misaddressed.target_node_id = "vps-jane".into();
+        let findings = evaluate_mesh_backlog("mesh.ledger-backlog", &[misaddressed], &known(), NOW);
+        assert_eq!(findings[0].severity, Severity::Warning);
+        assert!(
+            findings[0].message.contains("misaddressed"),
+            "{}",
+            findings[0].message
+        );
+    }
+
+    #[test]
+    fn ledger_backlog_query_counts_only_this_hotels_outbound_rows() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE mesh_events (seq INTEGER PRIMARY KEY AUTOINCREMENT, event_id TEXT,
+                 source_node_id TEXT, target_node_id TEXT, created_at INTEGER);
+             CREATE TABLE mesh_cursors (consumer_node_id TEXT PRIMARY KEY,
+                 last_acked_seq INTEGER, updated_at INTEGER);
+             INSERT INTO mesh_events (event_id, source_node_id, target_node_id, created_at) VALUES
+                 ('a', 'mac', 'vps', 0), ('b', 'mac', 'vps', 1700000000),
+                 ('c', 'vps', 'mac', 0), ('d', 'mac', 'mac', 0);
+             INSERT INTO mesh_cursors VALUES ('vps', 10, 1700000000000);",
+        )
+        .unwrap();
+        let rows = read_mesh_backlog(&conn, "mac").unwrap();
+        assert_eq!(
+            rows,
+            vec![MeshBacklog {
+                target_node_id: "vps".into(),
+                rows: 2,
+                oldest_created_secs: Some(1_700_000_000),
+                cursor_updated_ms: Some(1_700_000_000_000),
+            }]
+        );
+    }
+
+    #[test]
+    fn hotel_state_budget_grades_the_persisted_record() {
+        let id = "mesh.hotel-state-budget";
+        let rec = |b: u64| json!({"roster_wire_bytes": b, "budget_bytes": 9000});
+        assert!(evaluate_hotel_state_budget(id, &rec(5_000)).is_empty());
+        assert_eq!(
+            evaluate_hotel_state_budget(id, &rec(7_873))[0].severity,
+            Severity::Warning
+        );
+        assert_eq!(
+            evaluate_hotel_state_budget(id, &rec(9_500))[0].severity,
+            Severity::Error
+        );
+        assert!(evaluate_hotel_state_budget(id, &json!({})).is_empty());
     }
 }
 
