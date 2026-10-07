@@ -447,18 +447,19 @@ Seam IDs: `session-compaction`
 
 ## Atlas Follow-Through (2026-10-05)
 
-Six work items from the 2026-09-30 Philotic Stack Atlas assessment, each with a detailed plan. Operator approved implementing all of them with the recommended option at every decision point (2026-10-07). Cloud sessions so far could not download crates (`static.crates.io` not allowlisted) or push `.github/workflows/*` (GitHub App lacks `workflows` permission): all Rust slices are still open, and workflow changes wait as patches in [process/workflow-patches/](process/workflow-patches/README.md).
+Six work items from the 2026-09-30 Philotic Stack Atlas assessment, each with a detailed plan. Operator approved implementing all of them with the recommended option at every decision point (2026-10-07). Cloud sessions so far could not download crates (`static.crates.io` not allowlisted) or push `.github/workflows/*` (GitHub App lacks `workflows` permission). The parked workflow patches 0001–0003 were applied from mac-jane on 2026-10-07 (PR into develop); Rust slices proceed from mac-jane per [HANDOFF-2026-10-07-atlas-followthrough-mac-jane.md](HANDOFF-2026-10-07-atlas-followthrough-mac-jane.md).
 
 - [ ] Mesh delivery guarantees (L1–L7): [MESH_DELIVERY_GUARANTEES_PROPOSAL.md](architecture/MESH_DELIVERY_GUARANTEES_PROPOSAL.md). DEF-182/184/192/059/211/185.
 - [ ] Watch-live burn-down (W0–W7): [WATCH_LIVE_BURNDOWN_PROPOSAL.md](architecture/WATCH_LIVE_BURNDOWN_PROPOSAL.md). Inventory, status vocabularies, procedure/hygiene/relocation proofs, doctor readiness.
-  - [x] W0 inventory + vocabulary (2026-10-07): [process/WATCH_LIVE_BACKLOG.md](process/WATCH_LIVE_BACKLOG.md) seeded (22 items, due 2026-11-04); DEFECTS status vocabulary tightened and every row normalized (new DEF-223, renumbered from DEF-214 at merge — develop had already used 214); `scripts/docs-metadata-check.py` lints proposal and DEFECTS statuses (`--warn-only`, non-blocking `pr-check.yml` step parked as workflow patch 0001; make blocking after one week).
+  - [x] W0 inventory + vocabulary (2026-10-07): [process/WATCH_LIVE_BACKLOG.md](process/WATCH_LIVE_BACKLOG.md) seeded (22 items, due 2026-11-04); DEFECTS status vocabulary tightened and every row normalized (new DEF-223, renumbered from DEF-214 at merge — develop had already used 214); `scripts/docs-metadata-check.py` lints proposal and DEFECTS statuses (`--warn-only`, non-blocking `pr-check.yml` step (workflow patch 0001, applied 2026-10-07); make blocking after one week).
   - [x] W4 enablement (2026-10-07): ansible `philotic_memory_hygiene_enabled` (on for jane-vps). Proof window starts at the next vps deploy.
   - [ ] W1, W3, W5, W6 need hotel access; W3 step 5 and W7 are Rust.
   - [x] W2 proposal status reconciliation (2026-10-07): frontmatter `status`/`disposition` aligned with landed code across ~30 proposals; LIFE_GRAPH_ACTIVE gained frontmatter. Lint warnings cleared. Graph rescan (`phil graph scan`) pending from the main checkout after merge.
 - [ ] IPC dispatch split (S0–S6): [IPC_DISPATCH_SPLIT_PROPOSAL.md](architecture/IPC_DISPATCH_SPLIT_PROPOSAL.md). `ipc.rs` → `ipc/` family modules, plus park-path fixes.
 - [ ] Release train (R0–R7): [RELEASE_TRAIN_PROPOSAL.md](architecture/RELEASE_TRAIN_PROPOSAL.md). Sync main, `v0.2.0`, release artifacts, versioned installs, rollback, rollout proof.
   - [x] R0 runbook ([process/RELEASE.md](process/RELEASE.md)); `release/packages.toml` + `scripts/release-packages.sh`; `scripts/release-manifest.py`; R4 `just vps-deploy-release` + ansible release/rollback tasks; R5 `scripts/install-release-mac.sh`; R6/R7 `just rollback`, `just verify-release` (2026-10-07, validated locally: actionlint, shellcheck, ansible syntax + fake-tarball runs, 16 unit tests).
-  - [ ] R3 workflow changes: apply workflow patches 0002 + 0003, then rehearse `v0.2.0-rc.1`.
+  - [x] R3 workflow changes: patches 0002 + 0003 applied 2026-10-07 (manifest package list re-verified identical: 16 `-p` flags after merging develop @ `36466d8b`).
+  - [ ] R3 rehearsal: tag `v0.2.0-rc.1` on develop after R2.
   - [ ] R1 main sync, R2 version stamp (Rust), live installs + rollback drill per platform.
 - [ ] Perimeter enforcement (P1–P8): [PERIMETER_ENFORCEMENT_PROPOSAL.md](architecture/PERIMETER_ENFORCEMENT_PROPOSAL.md). IPC identity, config ACL, vault AAD, MAC v2, signed placement, egress policy.
   - [x] P1 step 4: provisioning scripts register as `operator` via shared `scripts/philotic_ipc.py` (also DEF-209).
